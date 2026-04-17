@@ -2,6 +2,15 @@
 
 Thanks for your interest in contributing!
 
+## Coding standards
+
+All Rust code in this repository must follow
+[RUST_GUIDELINES.md](RUST_GUIDELINES.md). Before opening a PR, review the
+Quick Reference Checklist at the end of that document; reviewers will
+enforce it. For Rust / Cargo / Clippy 1.95 specifics (new lints, new
+APIs, MSRV policy), see
+[docs/RUST_1_95_NOTES.md](docs/RUST_1_95_NOTES.md).
+
 ## Development prerequisites
 
 - Rust **1.95 or newer** (stable toolchain) — `edition = "2024"`.
