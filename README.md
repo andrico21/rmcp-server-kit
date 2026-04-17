@@ -78,7 +78,7 @@ Full API documentation and worked examples live in
 `mcpx` is published to two mirrors with identical contents; either may
 be used as a git dependency.
 
-- **GitHub** (canonical, public): <https://github.com/andrico21/mcp-mcpx>
+- **GitHub** (canonical, public): <https://github.com/andrico21/mcpx>
 - **GitLab** (internal mirror): <[REDACTED]>
 
 The canonical release artifact is the [`mcpx` crate on crates.io](https://crates.io/crates/mcpx).

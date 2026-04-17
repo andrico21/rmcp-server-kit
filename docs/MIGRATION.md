@@ -13,7 +13,7 @@ Pin to a tagged release:
 ```toml
 [dependencies]
 # Public mirror (GitHub):
-mcpx = { git = "https://github.com/andrico21/mcp-mcpx", tag = "0.9.30", features = ["oauth"] }
+mcpx = { git = "https://github.com/andrico21/mcpx", tag = "0.9.30", features = ["oauth"] }
 
 # Internal mirror (GitLab):
 # mcpx = { git = "[REDACTED]", tag = "0.9.30", features = ["oauth"] }
