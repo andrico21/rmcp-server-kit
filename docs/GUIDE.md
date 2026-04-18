@@ -303,12 +303,31 @@ let key = ApiKeyEntry::new("temp-key", hash, "viewer")
 
 #### `RateLimitConfig`
 
-Per-source-IP rate limiting for authentication attempts:
+Per-source-IP rate limiting for authentication. mcpx uses two independent
+token-bucket limiters keyed by source IP:
+
+1. **Pre-auth abuse gate** (`pre_auth_max_per_minute`, optional): consulted
+   *before* any password-hash work runs. Throttles unauthenticated traffic
+   from a single source IP so an attacker cannot pin the CPU on Argon2id by
+   spraying invalid bearer tokens. Defaults to **10x** the post-failure
+   quota when unset, and is disabled entirely if the wrapping
+   `RateLimitConfig` is itself absent. mTLS-authenticated connections
+   bypass this gate entirely (the TLS handshake already performed
+   expensive crypto with a verified peer, so the CPU-spray vector does
+   not apply).
+2. **Post-failure backoff** (`max_attempts_per_minute`, required):
+   consulted *after* an authentication attempt fails. Provides explicit
+   backpressure on bad credentials.
 
 ```rust
 use mcpx::auth::RateLimitConfig;
 
-let rate_limit = RateLimitConfig::new(30); // 30 attempts/min per IP
+// Default: 30 failed attempts/min and ~300 unauthenticated requests/min
+// (10x default) per source IP.
+let rate_limit = RateLimitConfig::new(30);
+
+// Tighter pre-auth gate, e.g. for a public-facing instance:
+let rate_limit = RateLimitConfig::new(30).with_pre_auth_max_per_minute(60);
 ```
 
 When exceeded, the middleware returns HTTP 429 Too Many Requests.
@@ -1119,6 +1138,11 @@ default_role = "operator"
 
 [server.auth.rate_limit]
 max_attempts_per_minute = 30
+# Optional: cap on unauthenticated requests/min per source IP, consulted
+# BEFORE Argon2id verification runs. Protects against CPU-spray attacks.
+# Defaults to 10 * max_attempts_per_minute when omitted. mTLS callers
+# bypass this gate entirely.
+# pre_auth_max_per_minute = 300
 
 # OAuth 2.1 (requires 'oauth' feature)
 [server.auth.oauth]

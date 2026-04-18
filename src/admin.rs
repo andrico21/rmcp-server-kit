@@ -193,6 +193,7 @@ mod tests {
                 "admin",
             )]),
             rate_limiter: None,
+            pre_auth_limiter: None,
             #[cfg(feature = "oauth")]
             jwks_cache: None,
             seen_identities: Mutex::new(std::collections::HashSet::default()),

@@ -285,6 +285,10 @@ where
     let auth_state: Option<Arc<AuthState>> = match config.auth {
         Some(ref auth_config) if auth_config.enabled => {
             let rate_limiter = auth_config.rate_limit.as_ref().map(build_rate_limiter);
+            let pre_auth_limiter = auth_config
+                .rate_limit
+                .as_ref()
+                .map(crate::auth::build_pre_auth_limiter);
 
             #[cfg(feature = "oauth")]
             let jwks_cache = auth_config
@@ -297,6 +301,7 @@ where
             Some(Arc::new(AuthState {
                 api_keys: ArcSwap::new(Arc::new(auth_config.api_keys.clone())),
                 rate_limiter,
+                pre_auth_limiter,
                 #[cfg(feature = "oauth")]
                 jwks_cache,
                 seen_identities: std::sync::Mutex::new(std::collections::HashSet::new()),

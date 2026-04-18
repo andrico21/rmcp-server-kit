@@ -236,15 +236,34 @@ Generic wrapper around a consumer's `ServerHandler` that runs:
 `AuthState` is built inside `serve()` at `src/transport.rs:253-276`. It contains:
 - `api_keys: ArcSwap<HashMap<KeyHash, ApiKeyEntry>>` (`src/auth.rs:387`)
 - `mtls: Arc<MtlsIdentities>` (the shared `RwLock<HashMap<SocketAddr, AuthIdentity>>`)
-- `auth_rate_limiter: Option<Arc<…>>` — governor limit on auth attempts per IP
+- `rate_limiter: Option<Arc<KeyedLimiter>>` — **post-failure backoff**:
+  governor limit on *failed* auth attempts per IP. Consulted only after a
+  credential check has run and rejected the caller.
+- `pre_auth_limiter: Option<Arc<KeyedLimiter>>` — **pre-auth abuse gate**:
+  governor limit on *unauthenticated* requests per IP, consulted *before*
+  any Argon2id work runs. Defends the bearer-verification path against
+  CPU-spray attacks (an attacker submitting a flood of invalid tokens to
+  pin the CPU on Argon2id verification). Defaults to `10x` the
+  post-failure quota when `pre_auth_max_per_minute` is unset on
+  `RateLimitConfig`. **mTLS-authenticated requests bypass this gate
+  entirely** (the TLS handshake already performed expensive crypto with a
+  verified peer, so mTLS callers cannot be used to mount a CPU-spray
+  attack).
 - `jwks_cache: Option<Arc<JwksCache>>` (`src/oauth.rs:264`) when `feature=oauth` is on and `oauth.issuer_url` is configured
 
 ### API key flow
 1. Client sends `Authorization: Bearer <api-key>`.
-2. `auth_middleware` looks up the key by an indexed prefix (constant-time
-   compare via `subtle`), then verifies Argon2id against `ApiKeyEntry.hash`.
-3. On success, builds `AuthIdentity { method: ApiKey, role: entry.role, … }`.
-4. On too many failures from one IP, the auth rate limiter returns `429`.
+2. `auth_middleware` first runs the **pre-auth abuse gate** keyed by the
+   request's source IP. If the gate is exhausted the middleware returns
+   `429` immediately, *without* touching Argon2id (`src/auth.rs:769-784`,
+   `src/auth.rs:822-824`).
+3. Otherwise the middleware looks up the key by an indexed prefix
+   (constant-time compare via `subtle`), then verifies Argon2id against
+   `ApiKeyEntry.hash`.
+4. On success, builds `AuthIdentity { method: ApiKey, role: entry.role, … }`.
+5. On failure, the **post-failure backoff** limiter is consulted; if
+   exhausted from one IP, the middleware returns `429`
+   (`src/auth.rs:847-854`).
 
 API keys are never logged. They are wrapped in `secrecy::SecretString`
 and zeroized on drop. Bearer tokens accepted as OAuth JWTs are likewise

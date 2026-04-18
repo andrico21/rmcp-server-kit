@@ -72,7 +72,11 @@ enum AuthFailureClass {
     MissingCredential,
     InvalidCredential,
     ExpiredCredential,
+    /// Source IP exceeded the post-failure backoff limit.
     RateLimited,
+    /// Source IP exceeded the pre-auth abuse gate (rejected before any
+    /// password-hash work — see [`AuthState::pre_auth_limiter`]).
+    PreAuthGate,
 }
 
 impl AuthFailureClass {
@@ -82,6 +86,7 @@ impl AuthFailureClass {
             Self::InvalidCredential => "invalid_credential",
             Self::ExpiredCredential => "expired_credential",
             Self::RateLimited => "rate_limited",
+            Self::PreAuthGate => "pre_auth_gate",
         }
     }
 
@@ -94,6 +99,10 @@ impl AuthFailureClass {
             Self::InvalidCredential => ("invalid_token", "token is invalid"),
             Self::ExpiredCredential => ("invalid_token", "token is expired"),
             Self::RateLimited => ("invalid_request", "too many failed authentication attempts"),
+            Self::PreAuthGate => (
+                "invalid_request",
+                "too many unauthenticated requests from this source",
+            ),
         }
     }
 
@@ -103,6 +112,7 @@ impl AuthFailureClass {
             Self::InvalidCredential => "unauthorized: invalid credential",
             Self::ExpiredCredential => "unauthorized: expired credential",
             Self::RateLimited => "rate limited",
+            Self::PreAuthGate => "rate limited (pre-auth)",
         }
     }
 }
@@ -123,8 +133,11 @@ pub struct AuthCountersSnapshot {
     pub failure_invalid_credential: u64,
     /// Failures because the credential had expired.
     pub failure_expired_credential: u64,
-    /// Failures because the source IP was rate-limited.
+    /// Failures because the source IP was rate-limited (post-failure backoff).
     pub failure_rate_limited: u64,
+    /// Failures because the source IP exceeded the pre-auth abuse gate.
+    /// These never reach the password-hash verification path.
+    pub failure_pre_auth_gate: u64,
 }
 
 /// Internal atomic counters backing [`AuthCountersSnapshot`].
@@ -137,6 +150,7 @@ pub struct AuthCounters {
     failure_invalid_credential: AtomicU64,
     failure_expired_credential: AtomicU64,
     failure_rate_limited: AtomicU64,
+    failure_pre_auth_gate: AtomicU64,
 }
 
 impl AuthCounters {
@@ -171,6 +185,9 @@ impl AuthCounters {
             AuthFailureClass::RateLimited => {
                 self.failure_rate_limited.fetch_add(1, Ordering::Relaxed);
             }
+            AuthFailureClass::PreAuthGate => {
+                self.failure_pre_auth_gate.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -183,6 +200,7 @@ impl AuthCounters {
             failure_invalid_credential: self.failure_invalid_credential.load(Ordering::Relaxed),
             failure_expired_credential: self.failure_expired_credential.load(Ordering::Relaxed),
             failure_rate_limited: self.failure_rate_limited.load(Ordering::Relaxed),
+            failure_pre_auth_gate: self.failure_pre_auth_gate.load(Ordering::Relaxed),
         }
     }
 }
@@ -242,21 +260,54 @@ fn default_mtls_role() -> String {
 }
 
 /// Rate limiting configuration for authentication attempts.
+///
+/// mcpx uses two independent per-IP token-bucket limiters for auth:
+///
+/// 1. **Pre-auth abuse gate** ([`Self::pre_auth_max_per_minute`]): consulted
+///    *before* any password-hash work. Throttles unauthenticated traffic from
+///    a single source IP so an attacker cannot pin the CPU on Argon2id by
+///    spraying invalid bearer tokens. Sized generously (default = 10× the
+///    post-failure quota) so legitimate clients are unaffected. mTLS-
+///    authenticated connections bypass this gate entirely (the TLS handshake
+///    already performed expensive crypto with a verified peer).
+/// 2. **Post-failure backoff** ([`Self::max_attempts_per_minute`]): consulted
+///    *after* an authentication attempt fails. Provides explicit backpressure
+///    on bad credentials.
 #[derive(Debug, Clone, Deserialize)]
 #[non_exhaustive]
 pub struct RateLimitConfig {
-    /// Maximum authentication attempts per source IP per minute.
+    /// Maximum failed authentication attempts per source IP per minute.
+    /// Successful authentications do not consume this budget.
     #[serde(default = "default_max_attempts")]
     pub max_attempts_per_minute: u32,
+    /// Maximum *unauthenticated* requests per source IP per minute admitted
+    /// to the password-hash verification path. When `None`, defaults to
+    /// `max_attempts_per_minute * 10` at limiter-construction time.
+    ///
+    /// Set higher than [`Self::max_attempts_per_minute`] so honest clients
+    /// retrying with the wrong key never trip this gate; its purpose is only
+    /// to bound CPU usage under spray attacks.
+    #[serde(default)]
+    pub pre_auth_max_per_minute: Option<u32>,
 }
 
 impl RateLimitConfig {
-    /// Create a rate limit config with the given max attempts per minute.
+    /// Create a rate limit config with the given max failed attempts per minute.
+    /// Pre-auth gate defaults to `10x` this value at limiter-construction time.
     #[must_use]
     pub fn new(max_attempts_per_minute: u32) -> Self {
         Self {
             max_attempts_per_minute,
+            pre_auth_max_per_minute: None,
         }
+    }
+
+    /// Override the pre-auth abuse-gate quota (per source IP per minute).
+    /// When unset, defaults to `max_attempts_per_minute * 10`.
+    #[must_use]
+    pub fn with_pre_auth_max_per_minute(mut self, quota: u32) -> Self {
+        self.pre_auth_max_per_minute = Some(quota);
+        self
     }
 }
 
@@ -406,8 +457,11 @@ impl TlsConnInfo {
 pub struct AuthState {
     /// Active set of API keys (hot-swappable).
     pub api_keys: ArcSwap<Vec<ApiKeyEntry>>,
-    /// Optional per-IP rate limiter for auth attempts.
+    /// Optional per-IP post-failure rate limiter (consulted *after* auth fails).
     pub rate_limiter: Option<Arc<KeyedLimiter>>,
+    /// Optional per-IP pre-auth abuse gate (consulted *before* password-hash work).
+    /// mTLS-authenticated connections bypass this gate.
+    pub pre_auth_limiter: Option<Arc<KeyedLimiter>>,
     #[cfg(feature = "oauth")]
     /// Optional JWKS cache for OAuth JWT validation.
     pub jwks_cache: Option<Arc<crate::oauth::JwksCache>>,
@@ -470,7 +524,7 @@ impl AuthState {
 // SAFETY: unwrap() is safe - literal 30 is provably non-zero (const-evaluated).
 const DEFAULT_AUTH_RATE: NonZeroU32 = NonZeroU32::new(30).unwrap();
 
-/// Create a rate limiter from config.
+/// Create a post-failure rate limiter from config.
 #[must_use]
 pub fn build_rate_limiter(config: &RateLimitConfig) -> Arc<KeyedLimiter> {
     let quota = governor::Quota::per_minute(
@@ -478,6 +532,33 @@ pub fn build_rate_limiter(config: &RateLimitConfig) -> Arc<KeyedLimiter> {
     );
     Arc::new(RateLimiter::keyed(quota))
 }
+
+/// Create a pre-auth abuse-gate rate limiter from config.
+///
+/// Quota: `pre_auth_max_per_minute` if set, otherwise
+/// `max_attempts_per_minute * 10` (capped at `u32::MAX`). The 10× factor
+/// keeps the gate generous enough for honest retries while still bounding
+/// attacker CPU on Argon2 verification.
+#[must_use]
+pub fn build_pre_auth_limiter(config: &RateLimitConfig) -> Arc<KeyedLimiter> {
+    let resolved = config.pre_auth_max_per_minute.unwrap_or_else(|| {
+        config
+            .max_attempts_per_minute
+            .saturating_mul(PRE_AUTH_DEFAULT_MULTIPLIER)
+    });
+    let quota =
+        governor::Quota::per_minute(NonZeroU32::new(resolved).unwrap_or(DEFAULT_PRE_AUTH_RATE));
+    Arc::new(RateLimiter::keyed(quota))
+}
+
+/// Default multiplier applied to `max_attempts_per_minute` when the operator
+/// does not set `pre_auth_max_per_minute` explicitly.
+const PRE_AUTH_DEFAULT_MULTIPLIER: u32 = 10;
+
+/// Default pre-auth abuse-gate rate (used only if both the configured value
+/// and the multiplied fallback are zero, which `NonZeroU32::new` rejects).
+// SAFETY: unwrap() is safe - literal 300 is provably non-zero (const-evaluated).
+const DEFAULT_PRE_AUTH_RATE: NonZeroU32 = NonZeroU32::new(300).unwrap();
 
 /// Parse an mTLS client certificate and extract an `AuthIdentity`.
 ///
@@ -674,6 +755,33 @@ async fn authenticate_bearer_identity(
     Err(failure_class)
 }
 
+/// Consult the pre-auth abuse gate for the given peer.
+///
+/// Returns `Some(response)` if the request should be rejected (limiter
+/// configured AND quota exhausted for this source IP). Returns `None`
+/// otherwise (limiter absent, peer address unknown, or quota available),
+/// in which case the caller should proceed with credential verification.
+///
+/// Side effects on rejection: increments the `pre_auth_gate` failure
+/// counter and emits a warn-level log. mTLS-authenticated requests must
+/// be admitted by the caller *before* invoking this helper.
+fn pre_auth_gate(state: &AuthState, peer_addr: Option<SocketAddr>) -> Option<Response> {
+    let limiter = state.pre_auth_limiter.as_ref()?;
+    let addr = peer_addr?;
+    if limiter.check_key(&addr.ip()).is_ok() {
+        return None;
+    }
+    state.counters.record_failure(AuthFailureClass::PreAuthGate);
+    tracing::warn!(
+        ip = %addr.ip(),
+        "auth rate limited by pre-auth gate (request rejected before credential verification)"
+    );
+    Some(
+        McpxError::RateLimited("too many unauthenticated requests from this source".into())
+            .into_response(),
+    )
+}
+
 /// Axum middleware that enforces authentication.
 ///
 /// Tries authentication methods in priority order:
@@ -696,11 +804,22 @@ pub async fn auth_middleware(state: Arc<AuthState>, req: Request<Body>, next: Ne
 
     // 1. Try mTLS identity (extracted by the TLS acceptor during handshake
     //    and attached to the connection itself).
+    //
+    //    mTLS connections bypass the pre-auth abuse gate below: the TLS
+    //    handshake already performed expensive crypto with a verified peer,
+    //    so we trust them not to be a CPU-spray attacker.
     if let Some(id) = tls_info.and_then(|ci| ci.0.identity) {
         state.log_auth(&id, "mTLS");
         let mut req = req;
         req.extensions_mut().insert(id);
         return next.run(req).await;
+    }
+
+    // 2. Pre-auth abuse gate: rejects CPU-spray attacks BEFORE the Argon2id
+    //    verification path runs. Keyed by source IP. mTLS connections (above)
+    //    are exempt; this gate only protects the bearer/JWT verification path.
+    if let Some(blocked) = pre_auth_gate(&state, peer_addr) {
+        return blocked;
     }
 
     let failure_class = if let Some(value) = req.headers().get(header::AUTHORIZATION) {
@@ -828,6 +947,7 @@ mod tests {
     fn rate_limiter_allows_within_quota() {
         let config = RateLimitConfig {
             max_attempts_per_minute: 5,
+            pre_auth_max_per_minute: None,
         };
         let limiter = build_rate_limiter(&config);
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
@@ -844,6 +964,7 @@ mod tests {
     fn rate_limiter_separate_ips() {
         let config = RateLimitConfig {
             max_attempts_per_minute: 2,
+            pre_auth_max_per_minute: None,
         };
         let limiter = build_rate_limiter(&config);
         let ip1: IpAddr = "10.0.0.1".parse().unwrap();
@@ -920,6 +1041,7 @@ mod tests {
         Arc::new(AuthState {
             api_keys: ArcSwap::new(Arc::new(keys)),
             rate_limiter: None,
+            pre_auth_limiter: None,
             #[cfg(feature = "oauth")]
             jwks_cache: None,
             seen_identities: Mutex::new(HashSet::new()),
@@ -1011,7 +1133,9 @@ mod tests {
             api_keys: ArcSwap::new(Arc::new(vec![])),
             rate_limiter: Some(build_rate_limiter(&RateLimitConfig {
                 max_attempts_per_minute: 1,
+                pre_auth_max_per_minute: None,
             })),
+            pre_auth_limiter: None,
             #[cfg(feature = "oauth")]
             jwks_cache: None,
             seen_identities: Mutex::new(HashSet::new()),
@@ -1043,6 +1167,7 @@ mod tests {
     fn rate_limit_semantics_failed_only() {
         let config = RateLimitConfig {
             max_attempts_per_minute: 3,
+            pre_auth_max_per_minute: None,
         };
         let limiter = build_rate_limiter(&config);
         let ip: IpAddr = "192.168.1.100".parse().unwrap();
@@ -1073,5 +1198,185 @@ mod tests {
         //
         // This means N successful requests followed by M failed requests
         // will only count M toward the rate limit, not N+M.
+    }
+
+    // -- pre-auth abuse gate (H-S1) --
+
+    /// The pre-auth gate must default to ~10x the post-failure quota so honest
+    /// retry storms never trip it but a Argon2-spray attacker is throttled.
+    #[test]
+    fn pre_auth_default_multiplier_is_10x() {
+        let config = RateLimitConfig {
+            max_attempts_per_minute: 5,
+            pre_auth_max_per_minute: None,
+        };
+        let limiter = build_pre_auth_limiter(&config);
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        // Quota should be 50 (5 * 10), not 5. We expect the first 50 to pass.
+        for i in 0..50 {
+            assert!(
+                limiter.check_key(&ip).is_ok(),
+                "pre-auth attempt {i} (of expected 50) should be allowed under default 10x multiplier"
+            );
+        }
+        // The 51st attempt must be blocked: confirms quota is bounded, not infinite.
+        assert!(
+            limiter.check_key(&ip).is_err(),
+            "pre-auth attempt 51 should be blocked (quota is 50, not unbounded)"
+        );
+    }
+
+    /// An explicit `pre_auth_max_per_minute` override must win over the
+    /// 10x-multiplier default.
+    #[test]
+    fn pre_auth_explicit_override_wins() {
+        let config = RateLimitConfig {
+            max_attempts_per_minute: 100,     // would default to 1000 pre-auth quota
+            pre_auth_max_per_minute: Some(2), // but operator caps at 2
+        };
+        let limiter = build_pre_auth_limiter(&config);
+        let ip: IpAddr = "10.0.0.2".parse().unwrap();
+
+        assert!(limiter.check_key(&ip).is_ok(), "attempt 1 allowed");
+        assert!(limiter.check_key(&ip).is_ok(), "attempt 2 allowed");
+        assert!(
+            limiter.check_key(&ip).is_err(),
+            "attempt 3 must be blocked (explicit override of 2 wins over 10x default of 1000)"
+        );
+    }
+
+    /// End-to-end: the pre-auth gate must reject before the bearer-verification
+    /// path runs. We exhaust the gate's quota (Some(1)) with one bad-bearer
+    /// request, then the second request must be rejected with 429 + the
+    /// `pre_auth_gate` failure counter incremented (NOT
+    /// `failure_invalid_credential`, which would prove Argon2 ran).
+    #[tokio::test]
+    async fn pre_auth_gate_blocks_before_argon2_verification() {
+        let (_token, hash) = generate_api_key().unwrap();
+        let keys = vec![ApiKeyEntry {
+            name: "test-key".into(),
+            hash,
+            role: "ops".into(),
+            expires_at: None,
+        }];
+        let config = RateLimitConfig {
+            max_attempts_per_minute: 100,
+            pre_auth_max_per_minute: Some(1),
+        };
+        let state = Arc::new(AuthState {
+            api_keys: ArcSwap::new(Arc::new(keys)),
+            rate_limiter: None,
+            pre_auth_limiter: Some(build_pre_auth_limiter(&config)),
+            #[cfg(feature = "oauth")]
+            jwks_cache: None,
+            seen_identities: Mutex::new(HashSet::new()),
+            counters: AuthCounters::default(),
+        });
+        let app = auth_router(Arc::clone(&state));
+        let peer: SocketAddr = "10.0.0.10:54321".parse().unwrap();
+
+        // First bad-bearer request: gate has quota, bearer verification runs,
+        // returns 401 (invalid credential).
+        let mut req1 = Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/mcp")
+            .header("authorization", "Bearer obviously-not-a-real-token")
+            .body(Body::empty())
+            .unwrap();
+        req1.extensions_mut().insert(ConnectInfo(peer));
+        let resp1 = app.clone().oneshot(req1).await.unwrap();
+        assert_eq!(
+            resp1.status(),
+            StatusCode::UNAUTHORIZED,
+            "first attempt: gate has quota, falls through to bearer auth which fails with 401"
+        );
+
+        // Second bad-bearer request from same IP: gate quota exhausted, must
+        // reject with 429 BEFORE the Argon2 verification path runs.
+        let mut req2 = Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/mcp")
+            .header("authorization", "Bearer also-not-a-real-token")
+            .body(Body::empty())
+            .unwrap();
+        req2.extensions_mut().insert(ConnectInfo(peer));
+        let resp2 = app.oneshot(req2).await.unwrap();
+        assert_eq!(
+            resp2.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "second attempt from same IP: pre-auth gate must reject with 429"
+        );
+
+        let counters = state.counters_snapshot();
+        assert_eq!(
+            counters.failure_pre_auth_gate, 1,
+            "exactly one request must have been rejected by the pre-auth gate"
+        );
+        // Critical: Argon2 verification must NOT have run on the gated request.
+        // The first request's 401 increments `failure_invalid_credential` to 1;
+        // the second (gated) request must NOT increment it further.
+        assert_eq!(
+            counters.failure_invalid_credential, 1,
+            "bearer verification must run exactly once (only the un-gated first request)"
+        );
+    }
+
+    /// mTLS-authenticated requests must bypass the pre-auth gate entirely.
+    /// The TLS handshake already performed expensive crypto with a verified
+    /// peer, so mTLS callers should never be throttled by this gate.
+    ///
+    /// Setup: a pre-auth gate with quota 1 (very tight). Submit two mTLS
+    /// requests in quick succession from the same IP. Both must succeed.
+    #[tokio::test]
+    async fn pre_auth_gate_does_not_throttle_mtls() {
+        let config = RateLimitConfig {
+            max_attempts_per_minute: 100,
+            pre_auth_max_per_minute: Some(1), // tight: would block 2nd plain request
+        };
+        let state = Arc::new(AuthState {
+            api_keys: ArcSwap::new(Arc::new(vec![])),
+            rate_limiter: None,
+            pre_auth_limiter: Some(build_pre_auth_limiter(&config)),
+            #[cfg(feature = "oauth")]
+            jwks_cache: None,
+            seen_identities: Mutex::new(HashSet::new()),
+            counters: AuthCounters::default(),
+        });
+        let app = auth_router(Arc::clone(&state));
+        let peer: SocketAddr = "10.0.0.20:54321".parse().unwrap();
+        let identity = AuthIdentity {
+            name: "cn=test-client".into(),
+            role: "viewer".into(),
+            method: AuthMethod::MtlsCertificate,
+            raw_token: None,
+            sub: None,
+        };
+        let tls_info = TlsConnInfo::new(peer, Some(identity));
+
+        for i in 0..3 {
+            let mut req = Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/mcp")
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(tls_info.clone()));
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "mTLS request {i} must succeed: pre-auth gate must not apply to mTLS callers"
+            );
+        }
+
+        let counters = state.counters_snapshot();
+        assert_eq!(
+            counters.failure_pre_auth_gate, 0,
+            "pre-auth gate counter must remain at zero: mTLS bypasses the gate"
+        );
+        assert_eq!(
+            counters.success_mtls, 3,
+            "all three mTLS requests must have been counted as successful"
+        );
     }
 }
