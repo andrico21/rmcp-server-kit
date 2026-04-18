@@ -44,6 +44,68 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.9.1
       - run: cargo test --all-features
+      - name: Doctests [H-T4]
+        run: cargo test --doc --all-features
+
+  features-matrix:
+    name: Feature matrix (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ""
+          - "--no-default-features"
+          - "--features oauth"
+          - "--features metrics"
+          - "--all-features"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+      - name: Build (${{ matrix.features }})
+        run: cargo build ${{ matrix.features }}
+      - name: Test (${{ matrix.features }})
+        run: cargo test ${{ matrix.features }}
+
+  semver-checks:
+    name: cargo-semver-checks
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+      - name: Install cargo-semver-checks
+        run: cargo install cargo-semver-checks --locked
+      - name: Check release semver
+        run: cargo semver-checks check-release
+
+  publish-dryrun:
+    name: cargo publish --dry-run
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+      - name: Verify the crate is publishable
+        run: cargo publish --dry-run --all-features
+
+  bench-thresholds:
+    name: Benchmark thresholds
+    runs-on: ubuntu-latest
+    # Allowed-to-fail for first ship of 0.11; promote to required after
+    # one green run on main (per plan H-T4 / shared bench tooling).
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+      - name: Run benches
+        run: cargo bench --bench rbac_redaction
+      - name: Assert redact_arg < 10µs
+        run: bash scripts/check-bench-threshold.sh bench_redact_arg 10000
 
   docs:
     name: Rustdoc

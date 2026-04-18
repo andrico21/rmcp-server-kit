@@ -104,6 +104,11 @@ wiremock = "0.6"
 reqwest = { version = "0.13.2", default-features = false, features = ["rustls-no-provider", "json"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 memory-stats = "1"
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "rbac_redaction"
+harness = false
 
 
 # ──────────────────────────────────────────────────────────────────────────
