@@ -3,8 +3,10 @@
 > **Audience**: AI agents and engineers who need to **modify** mcpx safely.
 > **Companion**: [`MINDMAP.md`](MINDMAP.md) for the visual view, [`../AGENTS.md`](../AGENTS.md) for the navigation hub, [`GUIDE.md`](GUIDE.md) for end-user usage.
 >
-> All file references use `file:line` against the working tree as of v0.9.30.
-> Line numbers are approximate (±10) — they help localize, not replace `Read`.
+> All file references use `file:line` against the working tree as of v0.12.0.
+> Line numbers are approximate (±20) — they help localize, not replace `Read`.
+> Citations are pinned by `tests/docs_citations.rs` so they fail loudly when
+> a cited file disappears or shrinks below a referenced line.
 
 ---
 
@@ -44,8 +46,8 @@ The crate has two transports:
 
 | Transport          | Function                                            | Auth/RBAC/TLS  | Use case                                         |
 |--------------------|-----------------------------------------------------|----------------|--------------------------------------------------|
-| **Streamable HTTP**| `serve()` — `src/transport.rs:220`                  | **Yes**        | Production network deployment                    |
-| stdio              | `serve_stdio()` — `src/transport.rs:1252`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
+| **Streamable HTTP**| `serve()` — `src/transport.rs:1004`                 | **Yes**        | Production network deployment                    |
+| stdio              | `serve_stdio()` — `src/transport.rs:1863`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
 
 ---
 
@@ -96,40 +98,40 @@ There are **no circular dependencies**.
 
 A complete HTTP request to `/mcp` flows through these layers, top-to-bottom
 (outermost → innermost). The corresponding code lives in
-`src/transport.rs:309-409` (middleware wiring) and in each module.
+`src/transport.rs:634-740` (middleware wiring inside `build_app_router`) and in each module.
 
 ```
-TCP / TLS handshake                         src/transport.rs:846-991  (TlsListener)
+TCP / TLS handshake                         src/transport.rs:1373-1545  (TlsListener)
    │  - mTLS: client cert verified, AuthIdentity stored in
    │    MtlsIdentities map keyed by peer SocketAddr
    ▼
-axum Router                                  src/transport.rs:247-249
+axum Router                                  src/transport.rs:542-1000  (build_app_router)
    │
-   ├── 1. Origin check                       src/transport.rs:1183
+   ├── 1. Origin check                       src/transport.rs:1773
    │      Rejects 403 if Origin/Host not allowed (MCP spec requirement)
    │
-   ├── 2. Security headers                   src/transport.rs:1110
+   ├── 2. Security headers                   src/transport.rs:1704
    │      HSTS, CSP, X-Frame-Options=DENY, X-Content-Type-Options, ...
    │
    ├── 3. CORS / Compression / Timeouts      tower-http layers
    │      Body size cap (default 1 MiB)
    │
-   ├── 4. Optional concurrency cap           src/transport.rs:524-541
+   ├── 4. Optional concurrency cap           src/transport.rs:897-913
    │      tower::limit::ConcurrencyLimitLayer + load_shed
    │
    ├── 5. Optional metrics middleware        src/metrics.rs (records
    │      request count, duration histograms, in-flight gauge)
    │
-   ├── 6. Auth middleware                    src/auth.rs::auth_middleware
+   ├── 6. Auth middleware                    src/auth.rs:846 (auth_middleware)
    │      Determines AuthIdentity from one of:
    │        a) Authorization: Bearer <api-key>  → Argon2 verify against
-   │           AuthState.api_keys (ArcSwap<HashMap>)
+   │           AuthState.api_keys (ArcSwap<Vec>)
    │        b) mTLS — look up AuthIdentity in MtlsIdentities by peer addr
    │        c) Authorization: Bearer <jwt>      → JwksCache::validate
    │           (feature = "oauth")
    │      On success: sets task-locals via `current_role`, `current_identity`, …
    │
-   ├── 7. RBAC middleware                    src/rbac.rs:431-535
+   ├── 7. RBAC middleware                    src/rbac.rs:584-700  (rbac_middleware) + 701-762 (enforce_tool_policy)
    │      For POSTs to /mcp:
    │        - Reads body up to limit
    │        - Parses JSON-RPC envelope
@@ -138,13 +140,13 @@ axum Router                                  src/transport.rs:247-249
    │             ArgumentAllowlist::argument_allowed(role, tool, args)
    │      Returns 403 on deny, 429 on rate-limit
    │
-   ├── 8. Per-IP tool rate limiter           src/rbac.rs:36-42
+   ├── 8. Per-IP tool rate limiter           src/rbac.rs:53-78
    │      governor::RateLimiter keyed by ClientIp
    │
    ▼
-rmcp StreamableHttpService                   src/transport.rs:230-241
+rmcp StreamableHttpService                   src/transport.rs:555-580
    └── Your ServerHandler::call_tool(...)
-       (optionally wrapped by HookedHandler — src/tool_hooks.rs:244-292)
+        (optionally wrapped by HookedHandler — src/tool_hooks.rs:356-540)
        │
        │  Inside the handler you can call:
        │    rbac::current_role()      -> Option<String>
@@ -161,12 +163,12 @@ Open endpoints (no auth):
 
 | Path                                       | Handler                                       |
 |--------------------------------------------|-----------------------------------------------|
-| `GET  /healthz`                            | `transport::healthz` (~`src/transport.rs:1013`) |
-| `GET  /readyz`                             | `transport::readyz`  (~`src/transport.rs:1036`) — runs configured readiness check |
-| `GET  /version`                            | `transport::version_payload` (~`src/transport.rs:1020`) |
-| `GET  /metrics`                            | served on a **separate listener** when `feature = "metrics"` (`src/metrics.rs:73`) |
-| `GET  /.well-known/oauth-protected-resource` | feature = `oauth` (`src/transport.rs:445-472`) |
-| `GET  /.well-known/oauth-authorization-server` | feature = `oauth` proxy (`src/transport.rs:686-771`) |
+| `GET  /healthz`                            | `transport::healthz` (~`src/transport.rs:1601`) |
+| `GET  /readyz`                             | `transport::readyz`  (~`src/transport.rs:1623`) — runs configured readiness check |
+| `GET  /version`                            | `transport::version_payload` (~`src/transport.rs:1612`) |
+| `GET  /metrics`                            | served on a **separate listener** when `feature = "metrics"` (`src/metrics.rs:95`) |
+| `GET  /.well-known/oauth-protected-resource` | feature = `oauth` (`src/transport.rs:826-832`) |
+| `GET  /.well-known/oauth-authorization-server` | feature = `oauth` proxy (`src/transport.rs:1225-1230`) |
 
 Authenticated endpoints:
 
@@ -174,14 +176,14 @@ Authenticated endpoints:
 |---------------------|------|------------------------------------------------|
 | `POST /mcp`         | Yes  | The MCP JSON-RPC endpoint (Streamable HTTP)    |
 | `GET  /mcp`         | Yes  | SSE stream for server → client messages        |
-| `*    /admin/*`     | Yes (role: `admin`) | `src/admin.rs:155-172`                        |
-| `POST /authorize`, `/token`, `/register`, `/introspect`, `/revoke` | feature `oauth` proxy | `src/transport.rs:685-771` |
+| `*    /admin/*`     | Yes (role: `admin`) | `src/admin.rs:133-170`                        |
+| `POST /authorize`, `/token`, `/register`, `/introspect`, `/revoke` | feature `oauth` proxy | `src/transport.rs:1214-1370` |
 
 ---
 
 ## 4. Core types
 
-### `McpServerConfig` — `src/transport.rs:46-169`
+### `McpServerConfig` — `src/transport.rs:71-468`
 Top-level builder-style config consumed by `serve()`. Holds:
 - bind address (`SocketAddr`)
 - server name + version
@@ -193,7 +195,7 @@ Top-level builder-style config consumed by `serve()`. Holds:
 - optional readiness check callback (`Arc<dyn Fn() -> bool + Send + Sync>`)
 - public URL (used in OAuth metadata responses)
 
-### `ReloadHandle` — `src/transport.rs:172-201`
+### `ReloadHandle` — `src/transport.rs:470-510`
 Returned (optionally) from `serve()` when the consumer needs runtime
 hot-reload. Two methods:
 - `reload_auth_keys(new_map)` — atomically swaps `AuthState.api_keys`
@@ -201,7 +203,7 @@ hot-reload. Two methods:
 
 Both use `arc-swap`, so live requests are not blocked or interrupted.
 
-### `AuthIdentity` — `src/auth.rs:36-53`
+### `AuthIdentity` — `src/auth.rs:40-58`
 Canonical caller record passed through the request scope:
 ```rust
 pub struct AuthIdentity {
@@ -213,14 +215,14 @@ pub struct AuthIdentity {
 }
 ```
 
-### `RbacPolicy` — `src/rbac.rs:259-269`
+### `RbacPolicy` — `src/rbac.rs:329-340`
 Holds:
 - `roles: HashMap<String, RoleConfig>` — per-role tool allow/deny rules
 - default-deny semantics with explicit overrides
 - per-tool argument allowlists
 - per-IP rate limiter shared across the server
 
-### `HookedHandler<H>` — `src/tool_hooks.rs:117-137`
+### `HookedHandler<H>` — `src/tool_hooks.rs:246-307`
 Generic wrapper around a consumer's `ServerHandler` that runs:
 - `before_call(name, args, identity)` — may rewrite args or short-circuit
 - `after_call(name, result, identity)` — may rewrite or audit the result
@@ -233,8 +235,8 @@ Generic wrapper around a consumer's `ServerHandler` that runs:
 **File**: `src/auth.rs` (~600 LOC).
 
 ### Construction
-`AuthState` is built inside `serve()` at `src/transport.rs:253-276`. It contains:
-- `api_keys: ArcSwap<HashMap<KeyHash, ApiKeyEntry>>` (`src/auth.rs:387`)
+`AuthState` is built inside `build_app_router()` at `src/transport.rs:572-601`. It contains:
+- `api_keys: ArcSwap<Vec<ApiKeyEntry>>` (`src/auth.rs:495-510`)
 - `mtls: Arc<MtlsIdentities>` (the shared `RwLock<HashMap<SocketAddr, AuthIdentity>>`)
 - `rate_limiter: Option<Arc<KeyedLimiter>>` — **post-failure backoff**:
   governor limit on *failed* auth attempts per IP. Consulted only after a
@@ -249,21 +251,21 @@ Generic wrapper around a consumer's `ServerHandler` that runs:
   entirely** (the TLS handshake already performed expensive crypto with a
   verified peer, so mTLS callers cannot be used to mount a CPU-spray
   attack).
-- `jwks_cache: Option<Arc<JwksCache>>` (`src/oauth.rs:264`) when `feature=oauth` is on and `oauth.issuer_url` is configured
+- `jwks_cache: Option<Arc<JwksCache>>` (`src/oauth.rs:460-481`) when `feature=oauth` is on and `oauth.issuer_url` is configured
 
 ### API key flow
 1. Client sends `Authorization: Bearer <api-key>`.
 2. `auth_middleware` first runs the **pre-auth abuse gate** keyed by the
    request's source IP. If the gate is exhausted the middleware returns
-   `429` immediately, *without* touching Argon2id (`src/auth.rs:769-784`,
-   `src/auth.rs:822-824`).
+   `429` immediately, *without* touching Argon2id (`src/auth.rs:846-913`,
+   `src/auth.rs:870-880`).
 3. Otherwise the middleware looks up the key by an indexed prefix
    (constant-time compare via `subtle`), then verifies Argon2id against
    `ApiKeyEntry.hash`.
 4. On success, builds `AuthIdentity { method: ApiKey, role: entry.role, … }`.
 5. On failure, the **post-failure backoff** limiter is consulted; if
    exhausted from one IP, the middleware returns `429`
-   (`src/auth.rs:847-854`).
+   (`src/auth.rs:910-914`).
 
 API keys are never logged. They are wrapped in `secrecy::SecretString`
 and zeroized on drop. Bearer tokens accepted as OAuth JWTs are likewise
@@ -274,7 +276,7 @@ threaded as `SecretString` from `AuthIdentity.raw_token` through
 1. The `TlsListener` validates the client cert chain (configured roots).
 2. It extracts CN/SAN as `name`, derives `role` from the configured
    subject→role mapping, and stores `AuthIdentity { method: Mtls, … }`
-   in `MtlsIdentities` keyed by **peer `SocketAddr`** (`src/transport.rs:921-960`).
+   in `MtlsIdentities` keyed by **peer `SocketAddr`** (`src/transport.rs:1379-1543`).
 3. `auth_middleware` picks up the identity by the request's `ConnectInfo<SocketAddr>`.
 
 ### OAuth JWT flow (feature = `oauth`)
@@ -294,24 +296,24 @@ See [§8](#8-oauth-21--jwks-feature-oauth).
 ### Policy model
 ```
 RbacPolicy {
-    roles: HashMap<String, RoleConfig>,   // src/rbac.rs:259
+    roles: HashMap<String, RoleConfig>,   // src/rbac.rs:329
 }
 
-RoleConfig {                              // src/rbac.rs:119
+RoleConfig {                              // src/rbac.rs:174-225
     allow_tools: Vec<String>,              // glob patterns supported
     deny_tools:  Vec<String>,              // deny overrides allow
     argument_allowlists: HashMap<String, ArgumentAllowlist>,  // per tool
     rate_limit: Option<RateLimit>,         // optional per-role override
 }
 
-ArgumentAllowlist {                       // src/rbac.rs:166
+ArgumentAllowlist {                       // src/rbac.rs:226-247
     fields: HashMap<String, FieldRule>,    // per JSON-RPC argument key
 }
 ```
 
 ### Decision function
-- `RbacPolicy::check(role, tool_name)` — pure allow/deny (`src/rbac.rs:320-339`)
-- `ArgumentAllowlist::argument_allowed(args)` — JSON value match (`src/rbac.rs:385-418`)
+- `RbacPolicy::check(role, tool_name)` — pure allow/deny (`src/rbac.rs:420-462`)
+- `ArgumentAllowlist::argument_allowed(args)` — JSON value match (`src/rbac.rs:464-580`)
 - `RbacPolicy::redact_arg(value)` — HMAC-SHA256 of an argument value with
   the policy's salt, returning an 8-char hex prefix. Used to keep raw
   argument values out of deny logs.
@@ -321,14 +323,14 @@ ArgumentAllowlist {                       // src/rbac.rs:166
   installed *after* enforcement (see "Task-locals" below).
 
 ### Middleware
-`rbac_middleware` (`src/rbac.rs:484-578`):
+`rbac_middleware` (`src/rbac.rs:584-700`):
 1. Extracts the role + identity name from the `AuthIdentity` request
    extension (set by the auth middleware).
 2. For `POST /mcp`, reads the body (bounded by body-size layer), parses
    JSON-RPC, and inspects `method`. Only enforces on `tools/call`.
 3. Calls `enforce_tool_policy(&policy, &identity_name, &role, params)`.
 4. Calls the per-IP tool rate limiter (`build_tool_rate_limiter` at
-   `src/rbac.rs:36-42`), returning `429` if exceeded.
+   `src/rbac.rs:53-78`), returning `429` if exceeded.
 5. On success, propagates the request downstream. The body is restored
    into the request so rmcp can read it again.
 
@@ -342,13 +344,13 @@ first use. 32 bits is enough entropy for log-line correlation while
 making preimage recovery infeasible. See `src/rbac.rs::redact_with_salt`.
 
 ### Task-locals
-`tokio::task_local!` block at `src/rbac.rs:46-51` defines four task-locals:
+`tokio::task_local!` block at `src/rbac.rs:83-91` defines four task-locals:
 - `CURRENT_ROLE: String`
 - `CURRENT_IDENTITY: String`
 - `CURRENT_TOKEN: SecretString`
 - `CURRENT_SUB: String`
 
-Public accessors (`src/rbac.rs:53-87`): `current_role()`, `current_identity()`,
+Public accessors (`src/rbac.rs:93-145`): `current_role()`, `current_identity()`,
 `current_token()`, `current_sub()`. They return `Option<T>` because the
 task-locals are absent outside the request scope.
 
@@ -364,14 +366,14 @@ token passthrough.
 
 ## 7. TLS / mTLS
 
-**Custom listener**: `TlsListener` in `src/transport.rs:834-918`, implementing
+**Custom listener**: `TlsListener` in `src/transport.rs:1373-1543`, implementing
 `axum::serve::Listener` so axum's hyper machinery accepts it as a drop-in
 replacement for `TcpListener`.
 
 Lifecycle:
 1. `TlsListener::new(...)` reads PEM cert + key, builds a `rustls::ServerConfig`,
    optionally wraps with mTLS verification using configured root CAs.
-2. On each `accept()` (`src/transport.rs:963-991`):
+2. On each `accept()` (`src/transport.rs:1545-1578`):
    - Performs the TLS handshake.
    - If the peer presented a cert, parses it (`x509-parser`), derives
      `AuthIdentity`, and writes to `MtlsIdentities` keyed by `SocketAddr`.
@@ -383,7 +385,7 @@ Configuration toggles:
 - mTLS: optional; when enabled, missing/invalid client cert → connection refused.
 
 **Plain HTTP fallback**: when no TLS cert is supplied, axum binds a
-plain `TcpListener` (`src/transport.rs:629-680`). For production
+plain `TcpListener` (`src/transport.rs:1013-1057`). For production
 deployments, TLS is strongly recommended.
 
 ---
@@ -394,12 +396,12 @@ deployments, TLS is strongly recommended.
 
 ### Validation flow
 1. Client sends `Authorization: Bearer <jwt>`.
-2. `JwksCache::validate(token)` (`src/oauth.rs:372-441`):
+2. `JwksCache::validate(token)` (`src/oauth.rs:569-647`):
    - Decodes the JWT header to get `kid` and `alg`.
    - `select_jwks_key()` looks up by `kid` in the cached JWKS
-     (`src/oauth.rs:452-477`).
-   - If not found, calls `refresh_with_cooldown()` (`src/oauth.rs:558-616`):
-     - Enforces `JWKS_REFRESH_COOLDOWN` (~`src/oauth.rs:283`) so multiple
+     (`src/oauth.rs:648-756`).
+   - If not found, calls `refresh_with_cooldown()` (`src/oauth.rs:758-820`):
+     - Enforces `JWKS_REFRESH_COOLDOWN` (~`src/oauth.rs:480`) so multiple
        invalid tokens cannot DoS the JWKS endpoint.
      - Deduplicates concurrent refreshes.
    - Validates signature, `iss`, `aud`, `exp`, `nbf` using `jsonwebtoken`.
@@ -408,7 +410,7 @@ deployments, TLS is strongly recommended.
 
 ### Optional OAuth 2.1 proxy
 When `oauth.proxy` is configured, mcpx mounts thin proxy endpoints under
-the server's own URL (`src/transport.rs:685-771`):
+the server's own URL (`src/transport.rs:1214-1230`):
 - `/.well-known/oauth-authorization-server`
 - `/authorize`, `/token`, `/register`, `/introspect`, `/revoke`
 
@@ -437,7 +439,7 @@ pub trait ToolHooks: Send + Sync + 'static {
 ```
 
 `HookedHandler<H>` implements `rmcp::ServerHandler` for any inner `H: ServerHandler`,
-delegating most calls but intercepting `call_tool` (`src/tool_hooks.rs:244-292`):
+delegating most calls but intercepting `call_tool` (`src/tool_hooks.rs:421-540`):
 1. Captures current identity from task-locals.
 2. Calls `before_call` — may rewrite args, may return early with an error.
 3. Calls inner handler.
@@ -454,7 +456,7 @@ custom audit/transformation.
 **File**: `src/admin.rs`.
 
 Mounted under `/admin/*` only when `config.admin_enabled = true`. The
-`require_admin_role` middleware (`src/admin.rs:128-152`) gates access to the
+`require_admin_role` middleware (`src/admin.rs:133-170`) gates access to the
 configured admin role (default: `"admin"`).
 
 | Endpoint               | Returns                                                  |
@@ -472,11 +474,11 @@ Useful for debugging hot-reload state and verifying RBAC after a swap.
 
 **File**: `src/observability.rs`.
 
-`init_tracing_from_config(...)` (~`src/observability.rs:23-31`) initializes
+`init_tracing_from_config(...)` (~`src/observability.rs:39-80`) initializes
 `tracing-subscriber` with:
 - `EnvFilter` from `RUST_LOG` (or supplied filter string)
 - console layer (pretty when stdout is a TTY, JSON otherwise)
-- optional **audit-file sink** (`src/observability.rs:130-172`) — appends
+- optional **audit-file sink** (`src/observability.rs:133-180`) — appends
   structured JSON events to a path; useful for compliance/forensics.
 
 Conventions used by mcpx itself:
@@ -495,7 +497,7 @@ Conventions used by mcpx itself:
 
 **File**: `src/metrics.rs`. Activated by `features = ["metrics"]`.
 
-`McpMetrics` (`src/metrics.rs:13-23`) wraps a `prometheus::Registry` and
+`McpMetrics` (`src/metrics.rs:26-93`) wraps a `prometheus::Registry` and
 records standard server metrics:
 - `mcpx_requests_total{path, status}` (counter)
 - `mcpx_request_duration_seconds{path}` (histogram)
@@ -505,7 +507,7 @@ records standard server metrics:
 
 The `/metrics` endpoint is served on a **separate listener** (often a
 private bind address) configured via `MetricsConfig` — see
-`src/metrics.rs::serve_metrics` (~`src/metrics.rs:73-91`). This isolates
+`src/metrics.rs::serve_metrics` (~`src/metrics.rs:95-180`). This isolates
 operational telemetry from the public MCP listener.
 
 ---
@@ -516,8 +518,8 @@ Two ArcSwaps power runtime reconfiguration:
 
 | State            | Type                           | Defined at                  |
 |------------------|---------------------------------|-----------------------------|
-| API keys         | `ArcSwap<HashMap<…>>`           | `src/auth.rs:387`           |
-| RBAC policy      | `ArcSwap<RbacPolicy>`           | `src/transport.rs:278-285`  |
+| API keys         | `ArcSwap<Vec<ApiKeyEntry>>`     | `src/auth.rs:495-510`       |
+| RBAC policy      | `ArcSwap<RbacPolicy>`           | `src/transport.rs:605-610`  |
 
 Procedure:
 1. Consumer calls `reload_handle.reload_auth_keys(new_map)` or
@@ -551,7 +553,7 @@ pub enum McpxError {
 }
 ```
 
-`impl IntoResponse for McpxError` (`src/error.rs:47-68`) maps each
+`impl IntoResponse for McpxError` (`src/error.rs:56-90`) maps each
 variant to a sanitized HTTP response:
 - Status code (`401`, `403`, `400`, `429`, `413`, `500`)
 - Generic body (no internal details leaked to clients per OWASP)
@@ -567,7 +569,7 @@ clippy lint enforces this.
 Two configuration surfaces:
 
 **Programmatic** — `McpServerConfig::new(addr, name, version)` builder
-(`src/transport.rs:130-169`). The consumer can set every field directly.
+(`src/transport.rs:155-468`). The consumer can set every field directly.
 
 **TOML** — `src/config.rs` defines deserializable structs
 (`AuthConfig`, `RbacConfigToml`, `OAuthConfigToml`, etc.) consumers can
@@ -613,17 +615,17 @@ These are **non-negotiable**. Breaking any of them is a security regression.
 
 1. **Origin check runs before auth.** Reordering would allow unauthenticated
    browser-origin requests to hit the auth path and amplify timing oracles.
-   Wired at `src/transport.rs:342-372`.
+   Wired at `src/transport.rs:962-967`.
 
 2. **Auth runs before RBAC.** Without an `AuthIdentity`, RBAC has no role
-   to evaluate. The middleware order in `src/transport.rs:374-409`
+   to evaluate. The middleware order in `src/transport.rs:680-740`
    enforces this.
 
 3. **Per-IP rate limiter sits inside auth.** Anonymous IPs cannot
    exhaust the rate-limit budget for authenticated callers.
 
 4. **JWKS refresh is rate-limited.** Removing `JWKS_REFRESH_COOLDOWN`
-   (`src/oauth.rs:283`) creates a DoS vector against the issuer's JWKS endpoint.
+   (`src/oauth.rs:480`) creates a DoS vector against the issuer's JWKS endpoint.
 
 5. **No symmetric JWT algorithms by default.** `HS*` algorithms with a
    public JWKS would enable algorithm-confusion attacks. Don't add them

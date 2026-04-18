@@ -3,17 +3,18 @@
 //! [`crate::tool_hooks::HookedHandler`] wraps any [`rmcp::ServerHandler`] with:
 //!
 //! - **Before hooks** (async) that observe `(tool_name, arguments, identity,
-//!   role, sub, request_id)` and may [`HookOutcome::Continue`],
-//!   [`HookOutcome::Deny`], or [`HookOutcome::Replace`] the call.
+//!   role, sub, request_id)` and may [`HookOutcome::Continue`](crate::tool_hooks::HookOutcome::Continue),
+//!   [`HookOutcome::Deny`](crate::tool_hooks::HookOutcome::Deny), or
+//!   [`HookOutcome::Replace`](crate::tool_hooks::HookOutcome::Replace) the call.
 //! - **After hooks** (async) that observe the same context plus a
-//!   [`HookDisposition`] describing how the call resolved and the
+//!   [`HookDisposition`](crate::tool_hooks::HookDisposition) describing how the call resolved and the
 //!   approximate result size in bytes.  After-hooks are spawned via
 //!   `tokio::spawn` and never block the response path.
 //! - **Result-size capping**: serialized tool results larger than
 //!   `max_result_bytes` are replaced with a structured error, preventing
 //!   token-expensive or memory-expensive payloads from reaching clients.
 //!   The cap applies both to inner-handler results and to
-//!   [`HookOutcome::Replace`] payloads.
+//!   [`HookOutcome::Replace`](crate::tool_hooks::HookOutcome::Replace) payloads.
 //!
 //! This is entirely **opt-in** at the application layer - `mcpx::serve()`
 //! does not wrap handlers automatically.  Applications that want hooks do:

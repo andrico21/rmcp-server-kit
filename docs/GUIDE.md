@@ -39,8 +39,8 @@ Add mcpx to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-mcpx = { path = "../crates/mcpx" }
-rmcp = { version = "1.3", features = ["server", "macros"] }
+mcpx = { version = "0.12", features = ["oauth"] }
+rmcp = { version = "1.5", features = ["server", "macros"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 ```
 
@@ -85,7 +85,7 @@ This gives you `/healthz`, `/readyz`, and `/mcp` endpoints out of the box.
 Enable in `Cargo.toml`:
 
 ```toml
-mcpx = { path = "../crates/mcpx", features = ["oauth", "metrics"] }
+mcpx = { version = "0.12", features = ["oauth", "metrics"] }
 ```
 
 ---
@@ -194,7 +194,7 @@ config.validate().expect("config valid");
 #### `serve()`
 
 ```rust
-pub async fn serve<H, F>(config: McpServerConfig, handler_factory: F) -> anyhow::Result<()>
+pub async fn serve<H, F>(config: McpServerConfig, handler_factory: F) -> mcpx::Result<()>
 where
     H: ServerHandler + 'static,
     F: Fn() -> H + Send + Sync + Clone + 'static,
@@ -606,10 +606,10 @@ use mcpx::rbac::{current_role, current_identity};
 
 fn handle_tool_call() {
     if let Some(role) = current_role() {
-        println!("Caller role: {role}");
+        tracing::info!(%role, "caller role");
     }
     if let Some(name) = current_identity() {
-        println!("Caller identity: {name}");
+        tracing::info!(identity = %name, "caller identity");
     }
 }
 ```
@@ -843,7 +843,7 @@ let metrics = McpMetrics::new()?;
 
 // After handling some requests...
 let prometheus_text = metrics.encode();
-println!("{prometheus_text}");
+tracing::info!(%prometheus_text, "exposition snapshot");
 ```
 
 Tracks:
@@ -853,7 +853,7 @@ Tracks:
 #### `serve_metrics()`
 
 ```rust
-pub async fn serve_metrics(bind: String, metrics: Arc<McpMetrics>) -> anyhow::Result<()>
+pub async fn serve_metrics(bind: String, metrics: Arc<McpMetrics>) -> mcpx::Result<()>
 ```
 
 Spawns a dedicated HTTP listener serving `/metrics` in Prometheus text format.
@@ -943,24 +943,60 @@ corresponding URLs are configured.
 `mcpx::tool_hooks::HookedHandler` is an opt-in wrapper around any
 `ServerHandler` that adds:
 
-- A `before` hook that may deny a tool call by returning
-  `ToolHookError::Deny(msg)`.
-- An `after` hook that observes each completed call and the approximate
-  serialized result size in bytes.
-- A hard `max_result_bytes` cap: oversized tool results are replaced
-  with a structured `result_too_large` error before reaching the client.
+- An async `before` hook that returns `HookOutcome::Continue` (proceed),
+  `HookOutcome::Deny(rmcp::ErrorData)` (short-circuit with a
+  structured JSON-RPC error), or
+  `HookOutcome::Replace(Box<rmcp::model::CallToolResult>)`
+  (short-circuit with a synthesized result).
+- An async `after` hook that observes each completed call along with
+  the approximate serialized result size in bytes and a
+  `HookDisposition` describing what actually happened
+  (`InnerExecuted`, `InnerErrored`, `DeniedBefore`, `ReplacedBefore`,
+  `ResultTooLarge`). After-hooks run via `tokio::spawn`, so they never
+  block the response path; panics inside them are isolated from the
+  caller.
+- A hard `max_result_bytes` cap: oversized tool results (whether
+  produced by the inner handler or returned via `Replace`) are
+  swapped for a structured `result_too_large` error before reaching
+  the client.
 
-Applications opt in at their handler-factory callsite:
+Applications opt in at their handler-factory callsite using the
+fluent `ToolHooks::new()` builder (the struct is `#[non_exhaustive]`,
+so direct struct-literal construction is no longer supported):
 
 ```rust
 use std::sync::Arc;
-use mcpx::tool_hooks::{HookedHandler, ToolHooks, with_hooks};
+use mcpx::tool_hooks::{HookOutcome, ToolHooks, with_hooks};
 
-let hooks = Arc::new(ToolHooks {
-    max_result_bytes: Some(256 * 1024),
-    before: None,
-    after: None,
-});
+let hooks = Arc::new(
+    ToolHooks::new()
+        .with_max_result_bytes(256 * 1024)
+        .with_before(Arc::new(|ctx| Box::pin(async move {
+            // Example: deny calls to any tool whose name starts with
+            // "danger_" unless the caller is in the "admin" role.
+            if ctx.tool_name.starts_with("danger_")
+                && ctx.role.as_deref() != Some("admin")
+            {
+                return HookOutcome::Deny(rmcp::ErrorData::invalid_request(
+                    "tool restricted to admin role",
+                    None,
+                ));
+            }
+            HookOutcome::Continue
+        })))
+        .with_after(Arc::new(|ctx, disposition, size_bytes| {
+            let tool = ctx.tool_name.clone();
+            Box::pin(async move {
+                tracing::info!(
+                    %tool,
+                    ?disposition,
+                    size_bytes,
+                    "tool call observed"
+                );
+            })
+        })),
+);
+
 let handler = with_hooks(MyHandler::new(), hooks);
 // ...pass `handler` to `serve()`...
 ```
@@ -1010,14 +1046,14 @@ impl ServerHandler for MyHandler {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> mcpx::Result<()> {
     let _ = mcpx::observability::init_tracing("info");
 
     // Generate API keys (in production, store hashes in a config file)
     let (admin_token, admin_hash) = generate_api_key();
     let (viewer_token, viewer_hash) = generate_api_key();
-    eprintln!("Admin token:  {admin_token}");
-    eprintln!("Viewer token: {viewer_token}");
+    tracing::info!(token = %admin_token, "admin token (rotate before production)");
+    tracing::info!(token = %viewer_token, "viewer token (rotate before production)");
 
     // Authentication
     let auth = AuthConfig::with_keys(vec![
