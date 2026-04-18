@@ -293,18 +293,34 @@ ArgumentAllowlist {                       // src/rbac.rs:166
 ### Decision function
 - `RbacPolicy::check(role, tool_name)` — pure allow/deny (`src/rbac.rs:320-339`)
 - `ArgumentAllowlist::argument_allowed(args)` — JSON value match (`src/rbac.rs:385-418`)
-- `enforce_tool_policy()` — used by the middleware to combine both (`src/rbac.rs:561-612`)
+- `RbacPolicy::redact_arg(value)` — HMAC-SHA256 of an argument value with
+  the policy's salt, returning an 8-char hex prefix. Used to keep raw
+  argument values out of deny logs.
+- `enforce_tool_policy(policy, identity_name, role, params)` — combines
+  allow/deny + argument-allowlist checks, emitting structured deny logs.
+  `identity_name` is passed explicitly because the task-local context is
+  installed *after* enforcement (see "Task-locals" below).
 
 ### Middleware
-`rbac_middleware` (`src/rbac.rs:431-535`):
-1. Extracts the role from task-local (set by auth middleware).
+`rbac_middleware` (`src/rbac.rs:484-578`):
+1. Extracts the role + identity name from the `AuthIdentity` request
+   extension (set by the auth middleware).
 2. For `POST /mcp`, reads the body (bounded by body-size layer), parses
    JSON-RPC, and inspects `method`. Only enforces on `tools/call`.
-3. Calls `enforce_tool_policy(role, tool_name, args)`.
+3. Calls `enforce_tool_policy(&policy, &identity_name, &role, params)`.
 4. Calls the per-IP tool rate limiter (`build_tool_rate_limiter` at
    `src/rbac.rs:36-42`), returning `429` if exceeded.
 5. On success, propagates the request downstream. The body is restored
    into the request so rmcp can read it again.
+
+### Argument-value redaction
+Deny logs for argument-allowlist violations never contain the raw value.
+Instead, an HMAC-SHA256(salt, value) prefix (4 bytes / 8 hex chars) is
+logged under the `arg_hmac` field. The salt is taken from
+`RbacConfig::redaction_salt` (set in TOML for stable cross-restart
+hashes) or, when absent, from a process-wide random salt generated on
+first use. 32 bits is enough entropy for log-line correlation while
+making preimage recovery infeasible. See `src/rbac.rs::redact_with_salt`.
 
 ### Task-locals
 `tokio::task_local!` block at `src/rbac.rs:46-51` defines four task-locals:

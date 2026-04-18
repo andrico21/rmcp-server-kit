@@ -18,9 +18,11 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use governor::{RateLimiter, clock::DefaultClock, state::keyed::DefaultKeyedStateStore};
+use hmac::{Hmac, Mac};
 use http_body_util::BodyExt;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
+use sha2::Sha256;
 
 use crate::{
     auth::{AuthIdentity, TlsConnInfo},
@@ -227,6 +229,16 @@ pub struct RbacConfig {
     /// Role definitions available to identities.
     #[serde(default)]
     pub roles: Vec<RoleConfig>,
+    /// Optional stable HMAC key (any length) used to redact argument
+    /// values in deny logs. When set, redacted hashes are stable across
+    /// process restarts (useful for log correlation across deploys).
+    /// When `None`, a random 32-byte key is generated per process at
+    /// first use; redacted hashes change every restart.
+    ///
+    /// The key is wrapped in [`SecretString`] so it never leaks via
+    /// `Debug`/`Display`/serde and is zeroized on drop.
+    #[serde(default)]
+    pub redaction_salt: Option<SecretString>,
 }
 
 impl RbacConfig {
@@ -236,6 +248,7 @@ impl RbacConfig {
         Self {
             enabled: true,
             roles,
+            redaction_salt: None,
         }
     }
 }
@@ -286,6 +299,9 @@ pub struct RbacPolicySummary {
 pub struct RbacPolicy {
     roles: Vec<RoleConfig>,
     enabled: bool,
+    /// HMAC key used to redact argument values in deny logs.
+    /// Either a configured stable salt or a per-process random salt.
+    redaction_salt: Arc<SecretString>,
 }
 
 impl RbacPolicy {
@@ -293,9 +309,14 @@ impl RbacPolicy {
     /// checks return [`RbacDecision::Allow`].
     #[must_use]
     pub fn new(config: &RbacConfig) -> Self {
+        let salt = config
+            .redaction_salt
+            .clone()
+            .unwrap_or_else(|| process_redaction_salt().clone());
         Self {
             roles: config.roles.clone(),
             enabled: config.enabled,
+            redaction_salt: Arc::new(salt),
         }
     }
 
@@ -305,6 +326,7 @@ impl RbacPolicy {
         Self {
             roles: Vec::new(),
             enabled: false,
+            redaction_salt: Arc::new(process_redaction_salt().clone()),
         }
     }
 
@@ -446,6 +468,66 @@ impl RbacPolicy {
     fn host_matches(patterns: &[String], host: &str) -> bool {
         patterns.iter().any(|p| glob_match(p, host))
     }
+
+    /// HMAC-SHA256 the given argument value with this policy's redaction
+    /// salt and return the first 8 hex characters (4 bytes / 32 bits).
+    ///
+    /// 32 bits is enough entropy for log correlation (1-in-4-billion
+    /// collision per pair) while being far short of any preimage attack
+    /// surface for an attacker reading logs. The HMAC construction
+    /// guarantees that even short or low-entropy values cannot be
+    /// recovered without the key.
+    #[must_use]
+    pub fn redact_arg(&self, value: &str) -> String {
+        redact_with_salt(self.redaction_salt.expose_secret().as_bytes(), value)
+    }
+}
+
+/// Process-wide random redaction salt, lazily generated on first use.
+/// Used when [`RbacConfig::redaction_salt`] is `None`.
+fn process_redaction_salt() -> &'static SecretString {
+    use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
+    static PROCESS_SALT: std::sync::OnceLock<SecretString> = std::sync::OnceLock::new();
+    PROCESS_SALT.get_or_init(|| {
+        let mut bytes = [0u8; 32];
+        rand::fill(&mut bytes);
+        // base64-encode so the SecretString is valid UTF-8; the HMAC
+        // accepts arbitrary key bytes regardless.
+        SecretString::from(STANDARD_NO_PAD.encode(bytes))
+    })
+}
+
+/// HMAC-SHA256(`salt`, `value`) → first 8 hex chars.
+///
+/// Pulled out as a free function so it can be unit-tested and benchmarked
+/// without constructing a full [`RbacPolicy`].
+fn redact_with_salt(salt: &[u8], value: &str) -> String {
+    use std::fmt::Write as _;
+
+    use sha2::Digest as _;
+
+    type HmacSha256 = Hmac<Sha256>;
+    // HMAC-SHA256 accepts keys of any byte length: the spec pads short
+    // keys with zeros and hashes long keys, so `new_from_slice` is
+    // infallible here. We still defensively re-key with a SHA-256 of
+    // the salt if construction ever fails (e.g. future hmac upstream
+    // tightens the contract); both branches produce a valid keyed MAC.
+    let mut mac = if let Ok(m) = HmacSha256::new_from_slice(salt) {
+        m
+    } else {
+        let digest = Sha256::digest(salt);
+        #[allow(clippy::expect_used)] // 32-byte digest always valid as HMAC key
+        HmacSha256::new_from_slice(&digest).expect("32-byte SHA256 digest is valid HMAC key")
+    };
+    mac.update(value.as_bytes());
+    let bytes = mac.finalize().into_bytes();
+    // 4 bytes → 8 hex chars.
+    let prefix = bytes.get(..4).unwrap_or(&[0; 4]);
+    let mut out = String::with_capacity(8);
+    for b in prefix {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 // -- RBAC middleware --
@@ -530,7 +612,7 @@ pub async fn rbac_middleware(
         }
         if let Some(ref params) = msg.params
             && policy.is_enabled()
-            && let Some(resp) = enforce_tool_policy(&policy, &role, params)
+            && let Some(resp) = enforce_tool_policy(&policy, &identity_name, &role, params)
         {
             return resp;
         }
@@ -580,8 +662,15 @@ fn enforce_rate_limit(
 
 /// Apply RBAC tool/host + argument-allowlist checks. Returns `Some(response)`
 /// when the caller must be rejected. Assumes `policy.is_enabled()`.
+///
+/// `identity_name` is passed explicitly (rather than read from
+/// [`current_identity()`]) because this function runs *before* the
+/// task-local context is installed by the middleware. Reading the
+/// task-local here would always yield `None`, producing deny logs with
+/// an empty `user` field.
 fn enforce_tool_policy(
     policy: &RbacPolicy,
+    identity_name: &str,
     role: &str,
     params: &serde_json::Value,
 ) -> Option<Response> {
@@ -597,9 +686,8 @@ fn enforce_tool_policy(
         policy.check_operation(role, tool_name)
     };
     if decision == RbacDecision::Deny {
-        let identity = current_identity().unwrap_or_default();
         tracing::warn!(
-            user = %identity,
+            user = %identity_name,
             role = %role,
             tool = tool_name,
             host = host.unwrap_or("-"),
@@ -615,11 +703,16 @@ fn enforce_tool_policy(
         if let Some(val_str) = arg_val.as_str()
             && !policy.argument_allowed(role, tool_name, arg_key, val_str)
         {
+            // Redact the raw value: log an HMAC-SHA256 prefix instead of
+            // the literal string. Operators correlate hashes across log
+            // lines without ever exposing potentially sensitive inputs
+            // (paths, IDs, tokens accidentally passed as args, etc.).
             tracing::warn!(
+                user = %identity_name,
                 role = %role,
                 tool = tool_name,
                 argument = arg_key,
-                value = val_str,
+                arg_hmac = %policy.redact_arg(val_str),
                 "argument not in allowlist"
             );
             return Some(
@@ -761,6 +854,7 @@ mod tests {
                     }],
                 },
             ],
+            redaction_salt: None,
         })
     }
 
@@ -812,6 +906,7 @@ mod tests {
         let policy = RbacPolicy::new(&RbacConfig {
             enabled: false,
             roles: vec![],
+            redaction_salt: None,
         });
         assert_eq!(
             policy.check("nonexistent", "resource_delete", "any-host"),
@@ -1033,6 +1128,7 @@ mod tests {
         let policy = RbacPolicy::new(&RbacConfig {
             enabled: false,
             roles: vec![],
+            redaction_salt: None,
         });
         assert_eq!(
             policy.check_operation("nonexistent", "anything"),
@@ -1252,5 +1348,123 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // -- redact_arg / redaction_salt tests --
+
+    #[test]
+    fn redact_with_salt_is_deterministic_per_salt() {
+        let salt = b"unit-test-salt";
+        let a = redact_with_salt(salt, "rm -rf /");
+        let b = redact_with_salt(salt, "rm -rf /");
+        assert_eq!(a, b, "same input + salt must yield identical hash");
+        assert_eq!(a.len(), 8, "redacted hash is 8 hex chars (4 bytes)");
+        assert!(
+            a.chars().all(|c| c.is_ascii_hexdigit()),
+            "redacted hash must be lowercase hex: {a}"
+        );
+    }
+
+    #[test]
+    fn redact_with_salt_differs_across_salts() {
+        let v = "the-same-value";
+        let h1 = redact_with_salt(b"salt-one", v);
+        let h2 = redact_with_salt(b"salt-two", v);
+        assert_ne!(
+            h1, h2,
+            "different salts must produce different hashes for the same value"
+        );
+    }
+
+    #[test]
+    fn redact_with_salt_distinguishes_values() {
+        let salt = b"k";
+        let h1 = redact_with_salt(salt, "alpha");
+        let h2 = redact_with_salt(salt, "beta");
+        // Hash collisions on 32 bits are 1-in-4-billion; safe to assert.
+        assert_ne!(h1, h2, "different values must produce different hashes");
+    }
+
+    #[test]
+    fn policy_with_configured_salt_redacts_consistently() {
+        let cfg = RbacConfig {
+            enabled: true,
+            roles: vec![],
+            redaction_salt: Some(SecretString::from("my-stable-salt")),
+        };
+        let p1 = RbacPolicy::new(&cfg);
+        let p2 = RbacPolicy::new(&cfg);
+        assert_eq!(
+            p1.redact_arg("payload"),
+            p2.redact_arg("payload"),
+            "policies built from the same configured salt must agree"
+        );
+    }
+
+    #[test]
+    fn policy_without_configured_salt_uses_process_salt() {
+        let cfg = RbacConfig {
+            enabled: true,
+            roles: vec![],
+            redaction_salt: None,
+        };
+        let p1 = RbacPolicy::new(&cfg);
+        let p2 = RbacPolicy::new(&cfg);
+        // Within one process, the lazy OnceLock salt is shared.
+        assert_eq!(
+            p1.redact_arg("payload"),
+            p2.redact_arg("payload"),
+            "process-wide salt must be consistent within one process"
+        );
+    }
+
+    #[test]
+    fn redact_arg_is_fast_enough() {
+        // Sanity floor: a single redaction should take well under 100 µs
+        // even in unoptimized debug builds. Production criterion bench
+        // (see H-T4 plan) will assert a stricter <10 µs threshold.
+        let salt = b"perf-sanity-salt-32-bytes-padded";
+        let value = "x".repeat(256);
+        let start = std::time::Instant::now();
+        let _ = redact_with_salt(salt, &value);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(5),
+            "single redact_with_salt took {elapsed:?}, expected <5 ms even in debug"
+        );
+    }
+
+    // -- enforce_tool_policy identity propagation regression test (BUG H-S3) --
+
+    /// Regression: when `enforce_tool_policy` denied a request, the deny
+    /// log used to read `current_identity()`, which was always `None` at
+    /// that point because the task-local context is installed *after*
+    /// policy enforcement. The fix passes `identity_name` explicitly.
+    ///
+    /// We assert the deny path returns 403 (the visible behaviour).
+    /// The log-content assertion lives behind tracing-test which we have
+    /// not yet added as a dev-dep; the explicit-parameter signature alone
+    /// makes the previous bug structurally impossible.
+    #[tokio::test]
+    async fn deny_path_uses_explicit_identity_not_task_local() {
+        let policy = Arc::new(test_policy());
+        let id = AuthIdentity {
+            method: crate::auth::AuthMethod::BearerToken,
+            name: "alice-the-auditor".into(),
+            role: "viewer".into(),
+            raw_token: None,
+            sub: None,
+        };
+        let app = rbac_router_with_identity(policy, id);
+        // viewer is not allowed to call resource_delete -> 403.
+        let body = tool_call_body("resource_delete", &serde_json::json!({}));
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 }

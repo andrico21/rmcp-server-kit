@@ -436,6 +436,12 @@ let config = RbacConfig::with_roles(vec![
 | `RbacConfig::default()` | Disabled (all operations allowed) |
 | `RbacConfig::with_roles(roles)` | Enabled with the given role definitions |
 
+##### Optional fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `redaction_salt` | `Option<SecretString>` | `None` | Stable HMAC key used to redact denied argument values in deny logs. When omitted, a random per-process salt is used. See the `[rbac]` TOML example below. |
+
 #### `RoleConfig`
 
 A single role definition.
@@ -1131,6 +1137,14 @@ role = "viewer"
 
 [rbac]
 enabled = true
+# Optional: stable HMAC key used to redact argument values in deny logs.
+# When an argument fails the per-tool allowlist, the denied value is
+# logged as `arg_hmac=<8-hex-chars>` (HMAC-SHA256 prefix) instead of the
+# raw value, so log readers can correlate repeats without seeing the
+# secret. When omitted, a random per-process salt is used (so the same
+# input hashes differently across restarts). Set this to a long random
+# string from your secret manager if you want stable correlation.
+# redaction_salt = "replace-with-long-random-string-from-secrets-manager"
 
 [[rbac.roles]]
 name = "admin"
