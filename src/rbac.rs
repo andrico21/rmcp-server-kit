@@ -46,8 +46,8 @@ const DEFAULT_TOOL_IDLE_EVICTION: Duration = Duration::from_mins(15);
 
 /// Build a per-IP tool rate limiter from a max-calls-per-minute value.
 ///
-/// Memory-bounded with [`DEFAULT_TOOL_MAX_TRACKED_KEYS`] tracked keys and
-/// [`DEFAULT_TOOL_IDLE_EVICTION`] idle eviction. Use
+/// Memory-bounded with `DEFAULT_TOOL_MAX_TRACKED_KEYS` tracked keys and
+/// `DEFAULT_TOOL_IDLE_EVICTION` idle eviction. Use
 /// [`build_tool_rate_limiter_with_bounds`] to override.
 #[must_use]
 pub fn build_tool_rate_limiter(max_per_minute: u32) -> Arc<ToolRateLimiter> {

@@ -1,6 +1,6 @@
 //! Memory-bounded keyed rate limiter.
 //!
-//! [`BoundedKeyedLimiter`] wraps a map of per-key
+//! [`crate::bounded_limiter::BoundedKeyedLimiter`] wraps a map of per-key
 //! [`governor::DefaultDirectRateLimiter`] instances behind a hard cap on the
 //! number of tracked keys, with an idle-eviction policy and an LRU fallback
 //! when the cap is reached.
@@ -14,7 +14,7 @@
 //! distinct source addresses can exhaust process memory regardless of the
 //! per-key quota.
 //!
-//! [`BoundedKeyedLimiter`] addresses this by:
+//! [`crate::bounded_limiter::BoundedKeyedLimiter`] addresses this by:
 //!
 //! 1. Holding a [`std::collections::HashMap`] of `K -> Entry` where each
 //!    `Entry` carries its own direct (per-key) limiter and a `last_seen`
