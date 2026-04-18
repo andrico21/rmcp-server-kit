@@ -217,7 +217,43 @@ impl ReloadHandle {
 // would require threading many `&mut Router` helpers and hurt readability
 // of the layer order (which is security-relevant and must stay visible).
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
-pub async fn serve<H, F>(mut config: McpServerConfig, handler_factory: F) -> anyhow::Result<()>
+/// Internal bundle of values produced by [`build_app_router`] and
+/// consumed by [`serve`] / [`serve_with_listener`] when driving the
+/// HTTP listener.
+struct AppRunParams {
+    /// TLS cert/key paths when TLS is configured.
+    tls_paths: Option<(PathBuf, PathBuf)>,
+    /// mTLS configuration when mutual-TLS auth is enabled.
+    mtls_config: Option<MtlsConfig>,
+    /// Graceful shutdown drain window.
+    shutdown_timeout: Duration,
+    /// Server-internal cancellation token. Cancelled by [`run_server`]
+    /// once the shutdown trigger fires (so rmcp's child token also
+    /// fires, terminating in-flight MCP sessions).
+    ct: CancellationToken,
+    /// `"http"` or `"https"` -- used only for boot-time logging.
+    scheme: &'static str,
+    /// Server name -- used only for boot-time logging.
+    name: String,
+}
+
+/// Build the full application axum [`axum::Router`] (MCP route +
+/// middleware stack + admin + OAuth + health endpoints + security
+/// headers + CORS + compression + concurrency limit + origin check)
+/// and the [`AppRunParams`] needed to drive it.
+///
+/// This is the shared core of [`serve`] and [`serve_with_listener`].
+/// It performs *no* network I/O: callers are responsible for binding
+/// (or accepting a pre-bound) [`TcpListener`] and invoking
+/// [`run_server`].
+#[allow(
+    clippy::cognitive_complexity,
+    reason = "router assembly is intrinsically sequential; splitting harms readability"
+)]
+fn build_app_router<H, F>(
+    mut config: McpServerConfig,
+    handler_factory: F,
+) -> anyhow::Result<(axum::Router, AppRunParams)>
 where
     H: ServerHandler + 'static,
     F: Fn() -> H + Send + Sync + Clone + 'static,
@@ -635,16 +671,11 @@ where
         origin_check_middleware(origins, log_request_headers, req, next)
     }));
 
-    let listener = TcpListener::bind(&config.bind_addr).await?;
     let scheme = if config.tls_cert_path.is_some() {
         "https"
     } else {
         "http"
     };
-    tracing::info!("{} listening on {}", config.name, config.bind_addr);
-    tracing::info!("  MCP endpoint: {scheme}://{}/mcp", config.bind_addr);
-    tracing::info!("  Health check: {scheme}://{}/healthz", config.bind_addr);
-    tracing::info!("  Readiness:   {scheme}://{}/readyz", config.bind_addr);
 
     let tls_paths = match (&config.tls_cert_path, &config.tls_key_path) {
         (Some(cert), Some(key)) => Some((cert.clone(), key.clone())),
@@ -652,19 +683,163 @@ where
     };
     let mtls_config = config.auth.as_ref().and_then(|a| a.mtls.as_ref()).cloned();
 
+    Ok((
+        router,
+        AppRunParams {
+            tls_paths,
+            mtls_config,
+            shutdown_timeout: config.shutdown_timeout,
+            ct,
+            scheme,
+            name: config.name.clone(),
+        },
+    ))
+}
+
+/// Run the MCP HTTP server, binding to `config.bind_addr` and serving
+/// until an OS shutdown signal (Ctrl-C / SIGTERM) is received.
+///
+/// This is the standard entry point for production deployments. For
+/// deterministic shutdown control (e.g. integration tests), see
+/// [`serve_with_listener`].
+///
+/// # Errors
+///
+/// Returns [`anyhow::Error`] if router construction fails (invalid
+/// auth/admin/OAuth configuration), if binding to `config.bind_addr`
+/// fails, or if the underlying axum server returns an error.
+pub async fn serve<H, F>(config: McpServerConfig, handler_factory: F) -> anyhow::Result<()>
+where
+    H: ServerHandler + 'static,
+    F: Fn() -> H + Send + Sync + Clone + 'static,
+{
+    let bind_addr = config.bind_addr.clone();
+    let (router, params) = build_app_router(config, handler_factory)?;
+
+    let listener = TcpListener::bind(&bind_addr).await?;
+    log_listening(&params.name, params.scheme, &bind_addr);
+
     run_server(
         router,
         listener,
-        tls_paths,
-        mtls_config,
-        config.shutdown_timeout,
-        ct,
+        params.tls_paths,
+        params.mtls_config,
+        params.shutdown_timeout,
+        params.ct,
     )
     .await
 }
 
+/// Run the MCP HTTP server on a pre-bound [`TcpListener`], with optional
+/// readiness signalling and external shutdown control.
+///
+/// This variant is intended for **deterministic integration tests** and
+/// for embedders that need to bind the listening socket themselves
+/// (e.g. systemd socket activation). Compared to [`serve`]:
+///
+/// * The caller passes a `TcpListener` that is already bound. This
+///   eliminates the bind race in tests that previously required
+///   poll-the-`/healthz`-loop start-up detection.
+/// * `ready_tx`, when `Some`, receives the socket's
+///   [`SocketAddr`] *after* the router is built and immediately before
+///   the server starts accepting connections. Tests can `await` the
+///   matching `oneshot::Receiver` to know exactly when it is safe to
+///   issue requests.
+/// * `shutdown`, when `Some`, gives the caller a
+///   [`CancellationToken`] that triggers the same graceful-shutdown
+///   path as a real OS signal. This avoids cross-platform issues with
+///   sending real `SIGTERM` from tests on Windows.
+///
+/// All three optional parameters degrade gracefully: if `ready_tx` is
+/// `None`, no signal is sent; if `shutdown` is `None`, the server only
+/// stops on an OS signal (just like [`serve`]).
+///
+/// # Errors
+///
+/// Returns [`anyhow::Error`] if router construction fails, if reading
+/// the listener's `local_addr()` fails, or if the underlying axum
+/// server returns an error.
+pub async fn serve_with_listener<H, F>(
+    listener: TcpListener,
+    config: McpServerConfig,
+    handler_factory: F,
+    ready_tx: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
+    shutdown: Option<CancellationToken>,
+) -> anyhow::Result<()>
+where
+    H: ServerHandler + 'static,
+    F: Fn() -> H + Send + Sync + Clone + 'static,
+{
+    let local_addr = listener.local_addr()?;
+    let (router, params) = build_app_router(config, handler_factory)?;
+
+    log_listening(&params.name, params.scheme, &local_addr.to_string());
+
+    // Forward external shutdown into the server-internal cancellation
+    // token so `run_server`'s shutdown trigger picks it up alongside
+    // any real OS signal.
+    if let Some(external) = shutdown {
+        let internal = params.ct.clone();
+        tokio::spawn(async move {
+            external.cancelled().await;
+            internal.cancel();
+        });
+    }
+
+    // Signal readiness *after* the router is fully built and external
+    // shutdown is wired, but *before* run_server takes ownership of
+    // the listener. The receiver can immediately issue requests.
+    if let Some(tx) = ready_tx {
+        // Receiver may have been dropped (test gave up). That's fine.
+        let _ = tx.send(local_addr);
+    }
+
+    run_server(
+        router,
+        listener,
+        params.tls_paths,
+        params.mtls_config,
+        params.shutdown_timeout,
+        params.ct,
+    )
+    .await
+}
+
+/// Emit the standard "listening on …" log lines used by both
+/// [`serve`] and [`serve_with_listener`].
+#[allow(
+    clippy::cognitive_complexity,
+    reason = "tracing::info! macro expansions inflate the score; logic is trivial"
+)]
+fn log_listening(name: &str, scheme: &str, addr: &str) {
+    tracing::info!("{name} listening on {addr}");
+    tracing::info!("  MCP endpoint: {scheme}://{addr}/mcp");
+    tracing::info!("  Health check: {scheme}://{addr}/healthz");
+    tracing::info!("  Readiness:   {scheme}://{addr}/readyz");
+}
+
 /// Drive the chosen axum server variant (TLS or plain) with a graceful
 /// shutdown window. Consumes the router and listener.
+///
+/// # Shutdown semantics
+///
+/// A single shutdown trigger (the FIRST of: OS signal via
+/// `shutdown_signal()`, or external cancellation of `ct`) starts BOTH:
+///
+/// 1. axum's `.with_graceful_shutdown(...)` future, which stops
+///    accepting new connections and waits for in-flight requests to
+///    drain;
+/// 2. a `tokio::time::sleep(shutdown_timeout)` race that forces exit if
+///    drainage exceeds `shutdown_timeout`.
+///
+/// Previously this function awaited `shutdown_signal()` independently
+/// in BOTH branches of a `tokio::select!`. Because `shutdown_signal`
+/// resolves once per future and consumes one signal, the force-exit
+/// timer was tied to a SECOND signal (a second SIGTERM the operator
+/// would never send). Under a single SIGTERM the graceful drain could
+/// hang indefinitely. The current implementation derives both branches
+/// from a single shared trigger so the timeout race is anchored to the
+/// FIRST (and only) signal.
 async fn run_server(
     router: axum::Router,
     listener: TcpListener,
@@ -673,10 +848,38 @@ async fn run_server(
     shutdown_timeout: Duration,
     ct: CancellationToken,
 ) -> anyhow::Result<()> {
-    let shutdown = async move {
-        shutdown_signal().await;
-        tracing::info!("shutting down (grace period: {shutdown_timeout:?})");
-        ct.cancel();
+    // `shutdown_trigger` fires when the FIRST source resolves: either
+    // an OS signal (Ctrl-C / SIGTERM) or external cancellation of `ct`
+    // (which the test harness uses for deterministic shutdown).
+    let shutdown_trigger = CancellationToken::new();
+    {
+        let trigger = shutdown_trigger.clone();
+        let parent = ct.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                () = shutdown_signal() => {}
+                () = parent.cancelled() => {}
+            }
+            trigger.cancel();
+        });
+    }
+
+    let graceful = {
+        let trigger = shutdown_trigger.clone();
+        let ct = ct.clone();
+        async move {
+            trigger.cancelled().await;
+            tracing::info!("shutting down (grace period: {shutdown_timeout:?})");
+            ct.cancel();
+        }
+    };
+
+    let force_exit_timer = {
+        let trigger = shutdown_trigger.clone();
+        async move {
+            trigger.cancelled().await;
+            tokio::time::sleep(shutdown_timeout).await;
+        }
     };
 
     if let Some((cert_path, key_path)) = tls_paths {
@@ -684,11 +887,8 @@ async fn run_server(
         let make_svc = router.into_make_service_with_connect_info::<TlsConnInfo>();
         tokio::select! {
             result = axum::serve(tls_listener, make_svc)
-                .with_graceful_shutdown(shutdown) => { result?; }
-            () = async {
-                shutdown_signal().await;
-                tokio::time::sleep(shutdown_timeout).await;
-            } => {
+                .with_graceful_shutdown(graceful) => { result?; }
+            () = force_exit_timer => {
                 tracing::warn!("shutdown timeout exceeded, forcing exit");
             }
         }
@@ -696,11 +896,8 @@ async fn run_server(
         let make_svc = router.into_make_service_with_connect_info::<SocketAddr>();
         tokio::select! {
             result = axum::serve(listener, make_svc)
-                .with_graceful_shutdown(shutdown) => { result?; }
-            () = async {
-                shutdown_signal().await;
-                tokio::time::sleep(shutdown_timeout).await;
-            } => {
+                .with_graceful_shutdown(graceful) => { result?; }
+            () = force_exit_timer => {
                 tracing::warn!("shutdown timeout exceeded, forcing exit");
             }
         }

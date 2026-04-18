@@ -12,7 +12,7 @@
 //! Spins up a real `serve()` instance on an ephemeral port with a minimal
 //! `ServerHandler` and makes HTTP requests against it.
 
-use std::{sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use mcpx::{
     auth::{ApiKeyEntry, AuthConfig, RateLimitConfig},
@@ -23,6 +23,8 @@ use rmcp::{
     handler::server::ServerHandler,
     model::{ServerCapabilities, ServerInfo},
 };
+use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
+use tokio_util::sync::CancellationToken;
 
 // -- Minimal test handler --
 
@@ -37,37 +39,122 @@ impl ServerHandler for TestHandler {
 
 // -- Test helpers --
 
-/// Find a free ephemeral port.
+/// Find a free ephemeral port. Retained for legacy call-sites that
+/// build a config from a port number; new tests should prefer
+/// [`spawn_server`] which uses port 0 + pre-bound listener.
 async fn free_port() -> u16 {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     listener.local_addr().unwrap().port()
 }
 
-/// Spawn a server and return its base URL. The server runs until the test
-/// drops (tokio runtime shutdown aborts the task).
-async fn spawn_server(config: McpServerConfig) -> String {
+/// Handle to a server spawned via [`spawn_server`]. Drop the harness
+/// (or call [`ServerHarness::shutdown`]) to terminate the server
+/// deterministically.
+#[allow(
+    dead_code,
+    reason = "shutdown() and join field are used by the BUG-NEW shutdown_timeout test added in the same release"
+)]
+struct ServerHarness {
+    /// Base URL (`http://127.0.0.1:<port>`). Always contains the
+    /// actually-bound port -- safe to use immediately.
+    base: String,
+    /// Cancellation token wired into `serve_with_listener`'s shutdown
+    /// path. Cancelling triggers the same graceful drain as a real
+    /// `SIGTERM`.
+    shutdown: CancellationToken,
+    /// Join handle for the server task. `None` after [`Self::shutdown`]
+    /// joins it.
+    join: Option<JoinHandle<anyhow::Result<()>>>,
+}
+
+#[allow(
+    dead_code,
+    reason = "shutdown() is used by the BUG-NEW shutdown_timeout test added in the same release"
+)]
+impl ServerHarness {
+    /// Cancel the shutdown token, await the server task, and return
+    /// the server's final result. Safe to call multiple times: only
+    /// the first invocation joins.
+    async fn shutdown(&mut self) -> anyhow::Result<()> {
+        self.shutdown.cancel();
+        match self.join.take() {
+            Some(h) => h.await.unwrap_or_else(|e| Err(e.into())),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for ServerHarness {
+    fn drop(&mut self) {
+        // Ensure the server task does not outlive the test even if
+        // the test forgot to call `shutdown`.
+        self.shutdown.cancel();
+    }
+}
+
+impl std::fmt::Display for ServerHarness {
+    /// Display formats as the harness's base URL so existing test
+    /// call-sites (`format!("{base}/healthz")`) keep working when
+    /// `base` is a [`ServerHarness`] rather than a `String`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.base)
+    }
+}
+
+/// Spawn a server on an ephemeral port using
+/// [`mcpx::transport::serve_with_listener`] and return a
+/// [`ServerHarness`] once the server has signalled readiness.
+///
+/// Replaces the previous "spawn + poll `/healthz` for 2.5s" pattern
+/// with a deterministic readiness oneshot, eliminating start-up
+/// races and removing the need for `config_on_port` to know the port
+/// ahead of time.
+async fn spawn_server(mut config: McpServerConfig) -> ServerHarness {
     // Ensure ring crypto provider is available for reqwest's TLS.
     rustls::crypto::ring::default_provider()
         .install_default()
         .ok();
 
-    let port = config.bind_addr.rsplit_once(':').unwrap().1.to_owned();
-    let base = format!("http://127.0.0.1:{port}");
+    // Bind the listener up front so the server has nothing to fail on
+    // address-in-use, and we know the actual port immediately.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bound: SocketAddr = listener.local_addr().unwrap();
+    // Keep config.bind_addr aligned with the real port for any
+    // public_url derivation paths that read it.
+    config.bind_addr = bound.to_string();
 
-    tokio::spawn(async move {
-        if let Err(e) = mcpx::transport::serve(config, || TestHandler).await {
-            eprintln!("server error: {e}");
-        }
+    let (ready_tx, ready_rx) = oneshot::channel::<SocketAddr>();
+    let shutdown = CancellationToken::new();
+    let shutdown_for_server = shutdown.clone();
+
+    let join = tokio::spawn(async move {
+        mcpx::transport::serve_with_listener(
+            listener,
+            config,
+            || TestHandler,
+            Some(ready_tx),
+            Some(shutdown_for_server),
+        )
+        .await
     });
 
-    // Wait for the listener to be ready.
-    for _ in 0..50 {
-        if reqwest::get(&format!("{base}/healthz")).await.is_ok() {
-            return base;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    // Deterministic readiness: wait for serve_with_listener to signal
+    // *after* router build, *before* accept loop. No polling loop, no
+    // sleep races.
+    let signalled: SocketAddr = tokio::time::timeout(Duration::from_secs(5), ready_rx)
+        .await
+        .expect("server did not signal readiness within 5s")
+        .expect("server task aborted before readiness signal");
+    assert_eq!(
+        signalled, bound,
+        "ready_tx address mismatched the pre-bound listener"
+    );
+
+    ServerHarness {
+        base: format!("http://{bound}"),
+        shutdown,
+        join: Some(join),
     }
-    panic!("server did not start within 2.5s");
 }
 
 fn config_on_port(port: u16) -> McpServerConfig {
@@ -621,5 +708,108 @@ async fn c3_admin_endpoints_exposed_when_enabled() {
         resp.status(),
         404,
         "/introspect must be mounted when expose_admin_endpoints=true"
+    );
+}
+
+// ==========================================================================
+// BUG-NEW: shutdown timeout double-signal regression test
+// ==========================================================================
+
+/// Regression test for the shutdown double-signal bug fixed in 0.11.0.
+///
+/// **Bug**: Both branches of the shutdown `tokio::select!` in
+/// `run_server` previously awaited `shutdown_signal()` independently.
+/// Because `shutdown_signal` resolves once per future and consumes one
+/// signal, the force-exit timer was tied to a *second* signal that
+/// would never come. Under a single SIGTERM with an in-flight request,
+/// graceful drain hung forever.
+///
+/// **What this test verifies**:
+/// 1. With a long-running in-flight request and a 500ms shutdown
+///    timeout, cancelling the harness's `CancellationToken` (the same
+///    code path a real SIGTERM would trigger after BUG-NEW's fix)
+///    causes the server to exit within ~500ms.
+/// 2. The server actually waits at least most of the graceful window
+///    (~450ms) instead of insta-killing the in-flight request -- this
+///    catches an over-correction that would skip graceful drain
+///    entirely.
+///
+/// **Cross-platform note**: real `SIGTERM` / Ctrl+C is intentionally
+/// NOT used here (Windows portability). Production `shutdown_signal()`
+/// still wires SIGTERM/SIGINT; this test exercises the same internal
+/// cancellation path via the unified `CancellationToken` from H-T1.
+#[tokio::test]
+async fn shutdown_timeout_honored_on_first_signal() {
+    use std::time::Instant;
+
+    use axum::routing::get;
+
+    // Build a server with a *short* graceful deadline (500ms) and an
+    // extra route that sleeps 10s server-side -- representing an
+    // in-flight tool call that will not finish before the deadline.
+    let port = free_port().await;
+    let mut cfg = config_on_port(port);
+    cfg.shutdown_timeout = Duration::from_millis(500);
+    cfg.extra_router = Some(axum::Router::new().route(
+        "/slow",
+        get(|| async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            "done"
+        }),
+    ));
+
+    let mut harness = spawn_server(cfg).await;
+    let base = harness.base.clone();
+
+    // Fire the long-running request in the background. It MUST be
+    // in-flight when we trigger shutdown; otherwise graceful drain
+    // would complete instantly regardless of the bug.
+    let slow_url = format!("{base}/slow");
+    let in_flight = tokio::spawn(async move {
+        // We don't care about the response -- only that the request
+        // was accepted and is occupying server resources during
+        // shutdown.
+        let _ = reqwest::get(&slow_url).await;
+    });
+
+    // Give the request a moment to actually reach the server before
+    // we trigger shutdown. 100ms is well under the 500ms deadline.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Trigger graceful shutdown. With BUG-NEW fixed, this is
+    // semantically identical to a single SIGTERM.
+    let start = Instant::now();
+    let res = tokio::time::timeout(Duration::from_secs(2), harness.shutdown()).await;
+    let elapsed = start.elapsed();
+
+    // Outer timeout MUST NOT fire -- if it did, the server hung past
+    // both its graceful window and the cushion, which is the bug.
+    let server_result = res.expect("server failed to shut down within 2s -- BUG-NEW regression");
+
+    // The server should exit cleanly (an error here would indicate a
+    // fault unrelated to this bug; surface it loudly).
+    server_result.expect("server returned an error during shutdown");
+
+    // Best-effort: drain the background HTTP task. It may complete
+    // with an error (connection reset by force-exit) or succeed if
+    // the runtime aborted it -- either is acceptable.
+    in_flight.abort();
+    let _ = in_flight.await;
+
+    // Lower bound: the server actually waited (most of) the graceful
+    // window. 450ms = 500ms - 50ms scheduling/cleanup slack. Catches
+    // an over-correction that skips graceful drain.
+    assert!(
+        elapsed >= Duration::from_millis(450),
+        "shutdown completed in {elapsed:?}, expected >= 450ms (server skipped graceful drain)"
+    );
+
+    // Upper bound: the server did NOT hang. 1500ms = 500ms graceful +
+    // 1000ms generous slack for CI scheduling jitter (the bug used to
+    // hang indefinitely; any value materially below the 2s outer
+    // timeout proves the fix).
+    assert!(
+        elapsed < Duration::from_millis(1500),
+        "shutdown took {elapsed:?}, expected < 1500ms (BUG-NEW regression)"
     );
 }
