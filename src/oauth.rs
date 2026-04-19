@@ -659,6 +659,12 @@ impl JwksCache {
     /// Performs header decode, algorithm allow-list check, JWKS key lookup
     /// (with on-demand refresh), signature verification, and standard
     /// claim validation (exp/nbf/iss) against the template.
+    ///
+    /// The CPU-bound `jsonwebtoken::decode` call (RSA / ECDSA signature
+    /// verification) is offloaded to [`tokio::task::spawn_blocking`] so a
+    /// burst of concurrent JWT validations never starves other tasks on
+    /// the multi-threaded runtime's worker pool. The blocking pool absorbs
+    /// the verification cost; the async path stays responsive.
     async fn decode_claims(&self, token: &str) -> Result<Claims, JwtValidationFailure> {
         let (key, alg) = self.select_jwks_key(token).await?;
 
@@ -668,19 +674,35 @@ impl JwksCache {
         let mut validation = self.validation_template.clone();
         validation.algorithms = vec![alg];
 
-        decode::<Claims>(token, &key, &validation)
-            .map(|td| td.claims)
-            .map_err(|e| {
+        // Move the (cheap) clones into the blocking task so the verifier
+        // does not hold a reference into the request's async scope.
+        let token_owned = token.to_owned();
+        let join =
+            tokio::task::spawn_blocking(move || decode::<Claims>(&token_owned, &key, &validation))
+                .await;
+
+        let decode_result = match join {
+            Ok(r) => r,
+            Err(join_err) => {
                 core::hint::cold_path();
-                let failure =
-                    if matches!(e.kind(), jsonwebtoken::errors::ErrorKind::ExpiredSignature) {
-                        JwtValidationFailure::Expired
-                    } else {
-                        JwtValidationFailure::Invalid
-                    };
-                tracing::debug!(error = %e, ?alg, ?failure, "JWT decode failed");
-                failure
-            })
+                tracing::error!(
+                    error = %join_err,
+                    "JWT decode task panicked or was cancelled"
+                );
+                return Err(JwtValidationFailure::Invalid);
+            }
+        };
+
+        decode_result.map(|td| td.claims).map_err(|e| {
+            core::hint::cold_path();
+            let failure = if matches!(e.kind(), jsonwebtoken::errors::ErrorKind::ExpiredSignature) {
+                JwtValidationFailure::Expired
+            } else {
+                JwtValidationFailure::Invalid
+            };
+            tracing::debug!(error = %e, ?alg, ?failure, "JWT decode failed");
+            failure
+        })
     }
 
     /// Decode the JWT header, check the algorithm against the allow-list,
@@ -1360,6 +1382,29 @@ struct OAuthErrorResponse {
     error_description: Option<String>,
 }
 
+/// Map an upstream OAuth error code to an allowlisted short code suitable
+/// for client exposure.
+///
+/// Returns one of the RFC 6749 §5.2 / RFC 8693 standard codes. Unknown or
+/// non-standard codes collapse to `server_error` to avoid leaking
+/// authorization-server implementation details to MCP clients.
+fn sanitize_oauth_error_code(raw: &str) -> &'static str {
+    match raw {
+        "invalid_request" => "invalid_request",
+        "invalid_client" => "invalid_client",
+        "invalid_grant" => "invalid_grant",
+        "unauthorized_client" => "unauthorized_client",
+        "unsupported_grant_type" => "unsupported_grant_type",
+        "invalid_scope" => "invalid_scope",
+        "temporarily_unavailable" => "temporarily_unavailable",
+        // RFC 8693 token-exchange specific.
+        "invalid_target" => "invalid_target",
+        // Anything else (including upstream-specific codes that may leak
+        // implementation details) collapses to a generic short code.
+        _ => "server_error",
+    }
+}
+
 /// Exchange an inbound access token for a downstream access token
 /// via RFC 8693 token exchange.
 ///
@@ -1400,36 +1445,47 @@ pub async fn exchange_token(
 
     let resp = req.body(form_body).send().await.map_err(|e| {
         tracing::error!(error = %e, "token exchange request failed");
-        crate::error::McpxError::Auth("token exchange endpoint unreachable".into())
+        // Do NOT leak upstream URL, reqwest internals, or DNS detail to clients.
+        crate::error::McpxError::Auth("server_error".into())
     })?;
 
     let status = resp.status();
     let body_bytes = resp.bytes().await.map_err(|e| {
         tracing::error!(error = %e, "failed to read token exchange response");
-        crate::error::McpxError::Auth("failed to read token exchange response".into())
+        crate::error::McpxError::Auth("server_error".into())
     })?;
 
     if !status.is_success() {
         core::hint::cold_path();
-        let detail = serde_json::from_slice::<OAuthErrorResponse>(&body_bytes).map_or_else(
-            |_| format!("HTTP {status}"),
-            |e| {
-                format!(
-                    "{}: {}",
-                    e.error,
-                    e.error_description.as_deref().unwrap_or("unknown")
-                )
-            },
-        );
-        tracing::warn!(status = %status, detail = %detail, "token exchange rejected");
-        return Err(crate::error::McpxError::Auth(format!(
-            "token exchange failed: {detail}"
-        )));
+        // Parse upstream error for logging only; client-visible payload is a
+        // sanitized short code from the RFC 6749 §5.2 / RFC 8693 allowlist.
+        let parsed = serde_json::from_slice::<OAuthErrorResponse>(&body_bytes).ok();
+        let short_code = parsed
+            .as_ref()
+            .map_or("server_error", |e| sanitize_oauth_error_code(&e.error));
+        if let Some(ref e) = parsed {
+            tracing::warn!(
+                status = %status,
+                upstream_error = %e.error,
+                upstream_error_description = e.error_description.as_deref().unwrap_or(""),
+                client_code = %short_code,
+                "token exchange rejected by authorization server",
+            );
+        } else {
+            tracing::warn!(
+                status = %status,
+                client_code = %short_code,
+                "token exchange rejected (unparseable upstream body)",
+            );
+        }
+        return Err(crate::error::McpxError::Auth(short_code.into()));
     }
 
     let exchanged = serde_json::from_slice::<ExchangedToken>(&body_bytes).map_err(|e| {
         tracing::error!(error = %e, "failed to parse token exchange response");
-        crate::error::McpxError::Json(e)
+        // Avoid surfacing serde internals; map to sanitized short code so
+        // McpxError::into_response cannot leak parser detail to the client.
+        crate::error::McpxError::Auth("server_error".into())
     })?;
 
     log_exchanged_token(&exchanged);

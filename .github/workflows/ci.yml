@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    # Nightly at 03:17 UTC for cargo-mutants (advisory).
+    - cron: "17 3 * * *"
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -183,4 +187,62 @@ jobs:
         with:
           args: --offline --no-progress README.md docs/*.md
           fail: true
+
+  # ---------------------------------------------------------------------------
+  # Supply-chain advisory jobs (Phase 2 / 1.1.0).
+  #
+  # All three are `continue-on-error: true` so they surface signal without
+  # gating merges while we tune their configurations. Promote any of them
+  # to required after a stable green run.
+  # ---------------------------------------------------------------------------
+
+  vet:
+    name: cargo-vet (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+      - name: Install cargo-vet
+        run: cargo install cargo-vet --locked
+      - name: Generate Cargo.lock (library crate; lockfile is .gitignored)
+        run: cargo generate-lockfile
+      - name: Run cargo vet
+        # `cargo vet` exits non-zero when audits are missing; treat as
+        # informational until a full audit baseline is committed.
+        run: cargo vet --locked || true
+
+  machete:
+    name: cargo-machete (unused deps)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+      - name: Install cargo-machete
+        run: cargo install cargo-machete --locked
+      - name: Detect unused dependencies
+        run: cargo machete
+
+  mutants:
+    name: cargo-mutants (nightly mutation tests)
+    runs-on: ubuntu-latest
+    # Schedule-only / manual: mutation testing is expensive and is not run
+    # on every PR. Triggered nightly via the `schedule` event below or by
+    # manual dispatch.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+      - name: Run cargo mutants on rbac + auth + oauth
+        # Scope to the security-critical modules so a single nightly run
+        # completes in a reasonable wall-clock window.
+        run: cargo mutants --no-shuffle --timeout 300 -f src/rbac.rs -f src/auth.rs -f src/oauth.rs || true
+
 

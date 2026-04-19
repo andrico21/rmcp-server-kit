@@ -10,8 +10,65 @@ releases (`0.x.y`) used the convention that breaking changes bumped the
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-04-20
+
+This minor release rolls up the Phase 1 documentation/CI hardening (originally
+held in `[Unreleased]`) plus the Phase 2 additive correctness, performance,
+security, and supply-chain improvements from the code-review remediation plan.
+No breaking changes (`cargo semver-checks check-release` passes).
+
+### Security
+
+- **`src/oauth.rs::exchange_token`:** Sanitize all client-visible failure
+  branches of the OAuth `/token` exchange endpoint. Upstream IdP error bodies,
+  network failures, body-read failures, and JSON-parse failures previously
+  could leak through `McpxError::Auth`/`McpxError::Json` into the HTTP
+  response. Responses now carry only an RFC 6749 §5.2 / RFC 8693
+  allowlisted `error` code (`invalid_request`, `invalid_client`,
+  `invalid_grant`, `unauthorized_client`, `unsupported_grant_type`,
+  `invalid_scope`, `temporarily_unavailable`, `invalid_target`,
+  `server_error`); the rich detail goes to `tracing::warn!`/`tracing::error!`
+  for operator visibility. The `/token` proxy facade (Site A) and the admin
+  proxy (Site B) are unchanged — they were already correct.
+
+### Added
+
+- **`src/auth.rs::verify_bearer_token`:** Promoted to `pub` and marked
+  `#[must_use]`. This is purely additive (the function previously existed as
+  `pub(crate)`) and makes constant-time API-key verification available to
+  consumers writing custom middleware.
+- **`tests/properties.rs`:** New property-test harness using `proptest`
+  (`[dev-dependencies]`), covering three invariants:
+  1. `generate_api_key` → `verify_bearer_token` round-trip succeeds in the
+     presence of 0..4 decoy keys (64 cases; gated by Argon2id cost).
+  2. `RbacPolicy::argument_allowed` agrees with set-membership for the
+     literal-allowlist case (1024 cases).
+  3. `RbacPolicy::argument_allowed` never panics on adversarial glob
+     patterns (1024 cases).
+- **CI:** Three advisory supply-chain jobs added to
+  `.github/workflows/ci.yml` (`cargo-vet`, `cargo-machete`,
+  `cargo-mutants`). The mutants job runs on `schedule` (nightly) and
+  `workflow_dispatch` only and is scoped to the `rbac`, `auth`, and `oauth`
+  modules. All three are advisory (`continue-on-error: true`).
+
 ### Changed
 
+- **`src/oauth.rs::decode_claims`:** JWT decode is now wrapped in
+  `tokio::task::spawn_blocking` to avoid stalling the async runtime under
+  concurrent validation load. `JoinError` (panic / cancellation) maps to
+  `JwtValidationFailure::Invalid` with a `tracing::error!` event.
+- **`src/transport.rs` `/version` route:** The JSON body is now
+  pre-serialized once at router build time into an `Arc<[u8]>`; per-request
+  the handler `Arc::clone`s and returns the raw bytes with
+  `Content-Type: application/json`. Eliminates per-request `serde_json`
+  allocations on a hot health-check path.
+- **`src/tool_hooks.rs::HookedHandler::spawn_after`:** The user-supplied
+  after-hook future now (a) inherits the parent request's
+  `tracing::Span::current()` via `Instrument`, and (b) re-establishes the
+  RBAC task-local context (`role`, `identity`, `token`, `sub`) inside the
+  spawned task so `current_role()` / `current_identity()` /
+  `current_token()` / `current_sub()` continue to work from inside the
+  after-hook body.
 - **CI:** `cargo-audit` job now installs `cargo-audit` and runs
   `cargo generate-lockfile` before auditing, so the workflow no longer
   requires a committed `Cargo.lock` (libraries `.gitignore` it per the
@@ -35,13 +92,6 @@ releases (`0.x.y`) used the convention that breaking changes bumped the
 - **Docs:** `deny.toml` documents the cargo-deny v2 policy posture and
   why the deprecated v1 keys (`vulnerability`, `unmaintained`,
   `notice`) are intentionally absent.
-
-### Added
-
-- (no public API additions in this patch — the originally proposed
-  `clippy::string_to_string` lint was dropped because upstream clippy
-  has removed it; the broader `clippy::implicit_clone` lint was already
-  enabled at the crate level and covers the same regressions.)
 
 ### Fixed
 

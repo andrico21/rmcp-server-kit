@@ -1006,10 +1006,20 @@ where
         .route(
             "/version",
             axum::routing::get({
-                let payload = version_payload(&config.name, &config.version);
+                // Pre-serialize the version payload once at router-build
+                // time. The handler then serves a cheap `Arc::clone` of the
+                // immutable bytes per request, avoiding `serde_json::Value`
+                // allocation + serialization on every `/version` hit.
+                let payload_bytes: Arc<[u8]> =
+                    serialize_version_payload(&config.name, &config.version);
                 move || {
-                    let p = payload.clone();
-                    async move { axum::Json(p) }
+                    let p = Arc::clone(&payload_bytes);
+                    async move {
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            p.to_vec(),
+                        )
+                    }
                 }
             }),
         )
@@ -1863,6 +1873,20 @@ fn version_payload(name: &str, version: &str) -> serde_json::Value {
         "rust_version": option_env!("MCPX_RUSTC_VERSION").unwrap_or("unknown"),
         "mcpx_version": env!("CARGO_PKG_VERSION"),
     })
+}
+
+/// Pre-serialize the `/version` payload to immutable bytes.
+///
+/// This is called once at router-build time so per-request handling can
+/// reuse a cheap `Arc<[u8]>` clone instead of re-serializing a
+/// [`serde_json::Value`] on every hit.
+///
+/// Serialization of a flat `serde_json::Value` of static-string fields
+/// cannot fail in practice; the fallback to `b"{}"` exists only to
+/// satisfy the crate-wide `unwrap_used` / `expect_used` lint policy.
+fn serialize_version_payload(name: &str, version: &str) -> Arc<[u8]> {
+    let value = version_payload(name, version);
+    serde_json::to_vec(&value).map_or_else(|_| Arc::from(&b"{}"[..]), Arc::from)
 }
 
 async fn readyz(check: ReadinessCheck) -> impl IntoResponse {

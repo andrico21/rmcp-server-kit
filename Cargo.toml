@@ -1,6 +1,6 @@
 [package]
 name = "rmcp-server-kit"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 rust-version = "1.95.0"
 license = "MIT OR Apache-2.0"
@@ -113,6 +113,7 @@ reqwest = { version = "0.13.2", default-features = false, features = ["rustls-no
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 memory-stats = "1"
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+proptest = "1"
 
 [[bench]]
 name = "rbac_redaction"

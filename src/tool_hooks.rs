@@ -259,6 +259,13 @@ impl<H: ServerHandler> HookedHandler<H> {
     /// captures clones of `ctx` and the `Arc<AfterHook>` so it can run
     /// independently of the request task; panics inside the after-hook
     /// are caught by Tokio and never poison the response path.
+    ///
+    /// The spawned task is **instrumented** with the request span via
+    /// [`tracing::Instrument`] and re-establishes the per-request RBAC
+    /// task-locals (role, identity, token, sub) via
+    /// [`crate::rbac::with_rbac_scope`]. Without this, after-hooks lose
+    /// their parent span (breaking trace correlation) and observe
+    /// `current_role()` / `current_identity()` as `None`.
     fn spawn_after(
         after: Option<&Arc<AfterHookHolder>>,
         ctx: ToolCallContext,
@@ -266,11 +273,30 @@ impl<H: ServerHandler> HookedHandler<H> {
         size: usize,
     ) {
         if let Some(after) = after {
+            use tracing::Instrument;
+
             let after = Arc::clone(after);
-            tokio::spawn(async move {
-                let fut = (after.f)(&ctx, disposition, size);
-                fut.await;
-            });
+            // Capture the request span before leaving the request task so
+            // after-hook log lines are correlated with the originating call.
+            let span = tracing::Span::current();
+            // Snapshot RBAC task-locals; defaults are empty strings so the
+            // re-established scope is a no-op when the request had no
+            // authenticated identity (e.g. health checks, anonymous tools).
+            let role = crate::rbac::current_role().unwrap_or_default();
+            let identity = crate::rbac::current_identity().unwrap_or_default();
+            let token = crate::rbac::current_token()
+                .unwrap_or_else(|| secrecy::SecretString::from(String::new()));
+            let sub = crate::rbac::current_sub().unwrap_or_default();
+            tokio::spawn(
+                async move {
+                    crate::rbac::with_rbac_scope(role, identity, token, sub, async move {
+                        let fut = (after.f)(&ctx, disposition, size);
+                        fut.await;
+                    })
+                    .await;
+                }
+                .instrument(span),
+            );
         }
     }
 }

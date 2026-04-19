@@ -666,7 +666,11 @@ pub fn extract_mtls_identity(cert_der: &[u8], default_role: &str) -> Option<Auth
 ///
 /// Argon2id verification is CPU-intensive, so this should be called via
 /// `spawn_blocking`. Returns the matching identity if the token is valid.
-fn verify_bearer_token(token: &str, keys: &[ApiKeyEntry]) -> Option<AuthIdentity> {
+///
+/// Iterates **all** keys to completion to prevent timing side-channels
+/// that would reveal how many keys exist or which slot matched.
+#[must_use]
+pub fn verify_bearer_token(token: &str, keys: &[ApiKeyEntry]) -> Option<AuthIdentity> {
     let now = chrono::Utc::now();
 
     // Always iterate ALL keys to completion to prevent timing side-channels
