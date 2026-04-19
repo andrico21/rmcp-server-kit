@@ -121,34 +121,6 @@ pub enum HookDisposition {
     ResultTooLarge,
 }
 
-/// Legacy synchronous deny error.
-///
-/// Retained as a stable name for users still wiring the 0.11 API.  New
-/// code should construct [`HookOutcome::Deny`] directly with an
-/// [`ErrorData`].
-#[deprecated(
-    since = "0.12.0",
-    note = "use HookOutcome::Deny(ErrorData::invalid_request(..)) instead; this enum will be removed in 0.13"
-)]
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub enum ToolHookError {
-    /// Reject the call with the supplied message.
-    Deny(String),
-}
-
-#[allow(deprecated, reason = "Display impl for the deprecated enum")]
-impl fmt::Display for ToolHookError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Deny(m) => write!(f, "tool call denied: {m}"),
-        }
-    }
-}
-
-#[allow(deprecated, reason = "Error impl for the deprecated enum")]
-impl std::error::Error for ToolHookError {}
-
 /// Async before-hook callback type.
 ///
 /// Returns a [`HookOutcome`] controlling whether the inner handler runs.

@@ -8,6 +8,15 @@ Pre-1.0: breaking changes bump the **minor** version.
 
 ## [Unreleased]
 
+## [0.13.0] - unreleased
+
+### Removed
+
+- **[H-B2] `ToolHookError` removed.** The legacy synchronous deny enum
+  (deprecated since 0.12.0) is gone. Replace
+  `ToolHookError::Deny(msg)` with
+  `HookOutcome::Deny(rmcp::ErrorData::invalid_request(msg, None))`.
+
 ## [0.12.0] - 2026-04-19
 
 ### Changed
