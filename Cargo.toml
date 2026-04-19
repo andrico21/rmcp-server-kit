@@ -25,6 +25,10 @@ exclude = [
 name = "rmcp_server_kit"
 path = "src/lib.rs"
 
+[[example]]
+name = "oauth_server"
+required-features = ["oauth"]
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
