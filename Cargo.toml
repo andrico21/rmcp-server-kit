@@ -123,6 +123,18 @@ harness = false
 name = "hook_latency"
 harness = false
 
+# cargo-machete config: dependencies machete cannot detect via static
+# analysis but that ARE used at runtime.
+#
+# - humantime-serde: used as `#[serde(with = "humantime_serde")]` attribute
+#   path in src/auth.rs (machete does not follow `serde(with = ...)` paths).
+# - subtle: kept as a direct dependency for constant-time comparison
+#   primitives; currently consumed transitively via argon2 / password-hash
+#   but we want a stable direct version pin available for future use in
+#   custom auth helpers.
+[package.metadata.cargo-machete]
+ignored = ["humantime-serde", "subtle"]
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # Standalone configuration (activated by scripts/extract-mcpx.ps1/sh).
