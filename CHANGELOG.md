@@ -8,6 +8,22 @@ Pre-1.0: breaking changes bump the **minor** version.
 
 ## [Unreleased]
 
+## [1.0.0-rc1] - 2026-04-19
+
+First release candidate for the `1.0.0` line. No functional changes
+relative to `0.13.0`; this RC promotes the `0.13.0` API surface for
+public stabilization review. The 1.0 series will be released after a
+soak period and final review of:
+
+- `OauthHttpClient` builder ergonomics (currently `::new()` only).
+- Whether `McpServerConfig` direct field access should be demoted to
+  `pub(crate)` (today: `#[deprecated]` with builder-only accessors).
+- Generic `Validated<T>` as a public utility (today: only used for
+  `McpServerConfig`).
+
+If no issues surface during the RC window, `1.0.0` will follow with no
+API changes versus this RC.
+
 ## [0.13.0] - 2026-04-19
 
 ### Changed
