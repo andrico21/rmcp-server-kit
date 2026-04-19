@@ -70,88 +70,196 @@ pub type ReadinessCheck =
 #[non_exhaustive]
 pub struct McpServerConfig {
     /// Socket address the MCP HTTP server binds to.
+    #[deprecated(
+        since = "0.13.0",
+        note = "use McpServerConfig::new() / with_bind_addr(); direct field access will become pub(crate) in 1.0"
+    )]
     pub bind_addr: String,
     /// Server name advertised via MCP `initialize`.
+    #[deprecated(
+        since = "0.13.0",
+        note = "set via McpServerConfig::new(); direct field access will become pub(crate) in 1.0"
+    )]
     pub name: String,
     /// Server version advertised via MCP `initialize`.
+    #[deprecated(
+        since = "0.13.0",
+        note = "set via McpServerConfig::new(); direct field access will become pub(crate) in 1.0"
+    )]
     pub version: String,
     /// Path to the TLS certificate (PEM). Required for TLS/mTLS.
+    #[deprecated(
+        since = "0.13.0",
+        note = "use McpServerConfig::with_tls(); direct field access will become pub(crate) in 1.0"
+    )]
     pub tls_cert_path: Option<PathBuf>,
     /// Path to the TLS private key (PEM). Required for TLS/mTLS.
+    #[deprecated(
+        since = "0.13.0",
+        note = "use McpServerConfig::with_tls(); direct field access will become pub(crate) in 1.0"
+    )]
     pub tls_key_path: Option<PathBuf>,
     /// Optional authentication config. When `Some` and `enabled`, auth
     /// is enforced on `/mcp`. `/healthz` is always open.
+    #[deprecated(
+        since = "0.13.0",
+        note = "use McpServerConfig::with_auth(); direct field access will become pub(crate) in 1.0"
+    )]
     pub auth: Option<AuthConfig>,
     /// Optional RBAC policy. When present and enabled, tool calls are
     /// checked against the policy after authentication.
+    #[deprecated(
+        since = "0.13.0",
+        note = "use McpServerConfig::with_rbac(); direct field access will become pub(crate) in 1.0"
+    )]
     pub rbac: Option<Arc<RbacPolicy>>,
     /// Allowed Origin values for DNS rebinding protection (MCP spec MUST).
     /// When empty and `public_url` is set, the origin is auto-derived from
     /// the public URL. When both are empty, only requests with no Origin
     /// header are accepted.
     /// Example entries: `"http://localhost:3000"`, `"https://myapp.example.com"`.
+    #[deprecated(
+        since = "0.13.0",
+        note = "use McpServerConfig::with_allowed_origins(); direct field access will become pub(crate) in 1.0"
+    )]
     pub allowed_origins: Vec<String>,
     /// Maximum tool invocations per source IP per minute.
     /// When set, enforced on every `tools/call` request.
+    #[deprecated(
+        since = "0.13.0",
+        note = "use McpServerConfig::with_tool_rate_limit(); direct field access will become pub(crate) in 1.0"
+    )]
     pub tool_rate_limit: Option<u32>,
     /// Optional readiness probe for `/readyz`.
     /// When `None`, `/readyz` mirrors `/healthz` (always OK).
+    #[deprecated(
+        since = "0.13.0",
+        note = "use McpServerConfig::with_readiness_check(); direct field access will become pub(crate) in 1.0"
+    )]
     pub readiness_check: Option<ReadinessCheck>,
     /// Maximum request body size in bytes. Default: 1 MiB.
     /// Protects against oversized payloads causing OOM.
+    #[deprecated(
+        since = "0.13.0",
+        note = "use McpServerConfig::with_max_request_body(); direct field access will become pub(crate) in 1.0"
+    )]
     pub max_request_body: usize,
     /// Request processing timeout. Default: 120s.
     /// Requests exceeding this duration receive 408 Request Timeout.
+    #[deprecated(
+        since = "0.13.0",
+        note = "use McpServerConfig::with_request_timeout(); direct field access will become pub(crate) in 1.0"
+    )]
     pub request_timeout: Duration,
     /// Graceful shutdown timeout. Default: 30s.
     /// After the shutdown signal, in-flight requests have this long to finish.
+    #[deprecated(
+        since = "0.13.0",
+        note = "use McpServerConfig::with_shutdown_timeout(); direct field access will become pub(crate) in 1.0"
+    )]
     pub shutdown_timeout: Duration,
     /// Idle timeout for MCP sessions. Sessions with no activity for this
     /// duration are closed automatically. Default: 20 minutes.
+    #[deprecated(
+        since = "0.13.0",
+        note = "use McpServerConfig::with_session_idle_timeout(); direct field access will become pub(crate) in 1.0"
+    )]
     pub session_idle_timeout: Duration,
     /// Interval for SSE keep-alive pings. Prevents proxies and load
     /// balancers from killing idle connections. Default: 15 seconds.
+    #[deprecated(
+        since = "0.13.0",
+        note = "use McpServerConfig::with_sse_keep_alive(); direct field access will become pub(crate) in 1.0"
+    )]
     pub sse_keep_alive: Duration,
     /// Callback invoked once the server is built, delivering a
     /// [`ReloadHandle`] for hot-reloading auth keys and RBAC policy
     /// at runtime (e.g. on SIGHUP). Only useful when auth/RBAC is enabled.
+    #[deprecated(
+        since = "0.13.0",
+        note = "use McpServerConfig::with_reload_callback(); direct field access will become pub(crate) in 1.0"
+    )]
     pub on_reload_ready: Option<Box<dyn FnOnce(ReloadHandle) + Send>>,
     /// Additional application-specific routes merged into the top-level
     /// router.  These routes **bypass** the MCP auth and RBAC middleware,
     /// so the application is responsible for its own auth on them.
+    #[deprecated(
+        since = "0.13.0",
+        note = "use McpServerConfig::with_extra_router(); direct field access will become pub(crate) in 1.0"
+    )]
     pub extra_router: Option<axum::Router>,
     /// Externally reachable base URL (e.g. `https://mcp.example.com`).
     /// When set, OAuth metadata endpoints advertise this URL instead of
     /// the listen address. Required when binding `0.0.0.0` behind a
     /// reverse proxy or inside a container.
+    #[deprecated(
+        since = "0.13.0",
+        note = "use McpServerConfig::with_public_url(); direct field access will become pub(crate) in 1.0"
+    )]
     pub public_url: Option<String>,
     /// Log inbound HTTP request headers at DEBUG level.
     /// Sensitive values remain redacted.
+    #[deprecated(
+        since = "0.13.0",
+        note = "use McpServerConfig::enable_request_header_logging(); direct field access will become pub(crate) in 1.0"
+    )]
     pub log_request_headers: bool,
     /// Enable gzip/br response compression on MCP responses.
     /// Defaults to `false` to preserve existing behaviour.
+    #[deprecated(
+        since = "0.13.0",
+        note = "use McpServerConfig::enable_compression(); direct field access will become pub(crate) in 1.0"
+    )]
     pub compression_enabled: bool,
     /// Minimum response body size (in bytes) before compression kicks in.
     /// Only used when `compression_enabled` is true. Default: 1024.
+    #[deprecated(
+        since = "0.13.0",
+        note = "use McpServerConfig::enable_compression(); direct field access will become pub(crate) in 1.0"
+    )]
     pub compression_min_size: u16,
     /// Global cap on in-flight HTTP requests across the whole server.
     /// When `Some`, requests over the cap receive 503 Service Unavailable
     /// via `tower::load_shed`. Default: `None` (unlimited).
+    #[deprecated(
+        since = "0.13.0",
+        note = "use McpServerConfig::with_max_concurrent_requests(); direct field access will become pub(crate) in 1.0"
+    )]
     pub max_concurrent_requests: Option<usize>,
     /// Enable `/admin/*` diagnostic endpoints. Requires `auth` to be
     /// configured and `enabled`. Default: `false`.
+    #[deprecated(
+        since = "0.13.0",
+        note = "use McpServerConfig::enable_admin(); direct field access will become pub(crate) in 1.0"
+    )]
     pub admin_enabled: bool,
     /// RBAC role required to access admin endpoints. Default: `"admin"`.
+    #[deprecated(
+        since = "0.13.0",
+        note = "use McpServerConfig::enable_admin(); direct field access will become pub(crate) in 1.0"
+    )]
     pub admin_role: String,
     /// Enable Prometheus metrics endpoint on a separate listener.
     /// Requires the `metrics` crate feature.
     #[cfg(feature = "metrics")]
+    #[deprecated(
+        since = "0.13.0",
+        note = "use McpServerConfig::with_metrics(); direct field access will become pub(crate) in 1.0"
+    )]
     pub metrics_enabled: bool,
     /// Bind address for the Prometheus metrics listener. Default: `127.0.0.1:9090`.
     #[cfg(feature = "metrics")]
+    #[deprecated(
+        since = "0.13.0",
+        note = "use McpServerConfig::with_metrics(); direct field access will become pub(crate) in 1.0"
+    )]
     pub metrics_bind: String,
 }
 
+#[allow(
+    deprecated,
+    reason = "internal builders/validators legitimately read/write the deprecated `pub` fields they were designed to manage"
+)]
 impl McpServerConfig {
     /// Create a new server configuration with the given bind address,
     /// server name, and version. All other fields use safe defaults.
@@ -210,6 +318,15 @@ impl McpServerConfig {
     #[must_use]
     pub fn with_auth(mut self, auth: AuthConfig) -> Self {
         self.auth = Some(auth);
+        self
+    }
+
+    /// Override the bind address (e.g. `127.0.0.1:8080`). Useful when the
+    /// final port is only known after pre-binding an ephemeral listener
+    /// (tests, dynamic-port deployments).
+    #[must_use]
+    pub fn with_bind_addr(mut self, addr: impl Into<String>) -> Self {
+        self.bind_addr = addr.into();
         self
     }
 
@@ -538,6 +655,10 @@ struct AppRunParams {
 #[allow(
     clippy::cognitive_complexity,
     reason = "router assembly is intrinsically sequential; splitting harms readability"
+)]
+#[allow(
+    deprecated,
+    reason = "internal router assembly reads deprecated `pub` config fields by design until 1.0 makes them pub(crate)"
 )]
 fn build_app_router<H, F>(
     mut config: McpServerConfig,
@@ -1007,6 +1128,10 @@ where
     F: Fn() -> H + Send + Sync + Clone + 'static,
 {
     config.validate()?;
+    #[allow(
+        deprecated,
+        reason = "internal serve() reads `bind_addr` to construct the listener; field becomes pub(crate) in 1.0"
+    )]
     let bind_addr = config.bind_addr.clone();
     let (router, params) = build_app_router(config, handler_factory).map_err(anyhow_to_startup)?;
 
@@ -1892,7 +2017,9 @@ mod tests {
         clippy::indexing_slicing,
         clippy::unwrap_in_result,
         clippy::print_stdout,
-        clippy::print_stderr
+        clippy::print_stderr,
+        deprecated,
+        reason = "internal unit tests legitimately read/write the deprecated `pub` fields they were designed to verify"
     )]
     use std::sync::Arc;
 

@@ -112,7 +112,7 @@ impl std::fmt::Display for ServerHarness {
 /// with a deterministic readiness oneshot, eliminating start-up
 /// races and removing the need for `config_on_port` to know the port
 /// ahead of time.
-async fn spawn_server(mut config: McpServerConfig) -> ServerHarness {
+async fn spawn_server(config: McpServerConfig) -> ServerHarness {
     // Ensure ring crypto provider is available for reqwest's TLS.
     rustls::crypto::ring::default_provider()
         .install_default()
@@ -124,7 +124,7 @@ async fn spawn_server(mut config: McpServerConfig) -> ServerHarness {
     let bound: SocketAddr = listener.local_addr().unwrap();
     // Keep config.bind_addr aligned with the real port for any
     // public_url derivation paths that read it.
-    config.bind_addr = bound.to_string();
+    let config = config.with_bind_addr(bound.to_string());
 
     let (ready_tx, ready_rx) = oneshot::channel::<SocketAddr>();
     let shutdown = CancellationToken::new();
@@ -161,9 +161,8 @@ async fn spawn_server(mut config: McpServerConfig) -> ServerHarness {
 }
 
 fn config_on_port(port: u16) -> McpServerConfig {
-    let mut cfg = McpServerConfig::new(format!("127.0.0.1:{port}"), "test-mcpx", "0.0.1");
-    cfg.shutdown_timeout = Duration::from_millis(100);
-    cfg
+    McpServerConfig::new(format!("127.0.0.1:{port}"), "test-mcpx", "0.0.1")
+        .with_shutdown_timeout(Duration::from_millis(100))
 }
 
 // ==========================================================================
@@ -203,8 +202,7 @@ async fn readyz_mirrors_healthz_when_no_check() {
 #[tokio::test]
 async fn readyz_returns_503_when_not_ready() {
     let port = free_port().await;
-    let mut cfg = config_on_port(port);
-    cfg.readiness_check = Some(Arc::new(|| {
+    let cfg = config_on_port(port).with_readiness_check(Arc::new(|| {
         Box::pin(async { serde_json::json!({"ready": false, "reason": "starting"}) })
     }));
     let base = spawn_server(cfg).await;
@@ -224,8 +222,7 @@ fn test_auth_config(keys: Vec<ApiKeyEntry>) -> AuthConfig {
 #[tokio::test]
 async fn auth_rejects_unauthenticated_mcp() {
     let port = free_port().await;
-    let mut cfg = config_on_port(port);
-    cfg.auth = Some(test_auth_config(vec![]));
+    let cfg = config_on_port(port).with_auth(test_auth_config(vec![]));
     let base = spawn_server(cfg).await;
 
     // /healthz is always open.
@@ -249,8 +246,7 @@ async fn auth_accepts_valid_bearer() {
     let keys = vec![ApiKeyEntry::new("e2e-key", hash, "ops")];
 
     let port = free_port().await;
-    let mut cfg = config_on_port(port);
-    cfg.auth = Some(test_auth_config(keys));
+    let cfg = config_on_port(port).with_auth(test_auth_config(keys));
     let base = spawn_server(cfg).await;
 
     let client = reqwest::Client::new();
@@ -273,8 +269,7 @@ async fn auth_rejects_wrong_bearer() {
     let keys = vec![ApiKeyEntry::new("e2e-key", hash, "ops")];
 
     let port = free_port().await;
-    let mut cfg = config_on_port(port);
-    cfg.auth = Some(test_auth_config(keys));
+    let cfg = config_on_port(port).with_auth(test_auth_config(keys));
     let base = spawn_server(cfg).await;
 
     let client = reqwest::Client::new();
@@ -295,8 +290,7 @@ async fn auth_rejects_wrong_bearer() {
 #[tokio::test]
 async fn origin_allowed_passes() {
     let port = free_port().await;
-    let mut cfg = config_on_port(port);
-    cfg.allowed_origins = vec!["http://localhost:3000".into()];
+    let cfg = config_on_port(port).with_allowed_origins(["http://localhost:3000"]);
     let base = spawn_server(cfg).await;
 
     let client = reqwest::Client::new();
@@ -315,8 +309,7 @@ async fn origin_allowed_passes() {
 #[tokio::test]
 async fn origin_rejected() {
     let port = free_port().await;
-    let mut cfg = config_on_port(port);
-    cfg.allowed_origins = vec!["http://localhost:3000".into()];
+    let cfg = config_on_port(port).with_allowed_origins(["http://localhost:3000"]);
     let base = spawn_server(cfg).await;
 
     let client = reqwest::Client::new();
@@ -333,8 +326,7 @@ async fn origin_rejected() {
 #[tokio::test]
 async fn no_origin_header_passes() {
     let port = free_port().await;
-    let mut cfg = config_on_port(port);
-    cfg.allowed_origins = vec!["http://localhost:3000".into()];
+    let cfg = config_on_port(port).with_allowed_origins(["http://localhost:3000"]);
     let base = spawn_server(cfg).await;
 
     // No Origin header -- non-browser client, should pass.
@@ -375,9 +367,9 @@ async fn rbac_denies_unpermitted_tool() {
     ])));
 
     let port = free_port().await;
-    let mut cfg = config_on_port(port);
-    cfg.auth = Some(test_auth_config(keys));
-    cfg.rbac = Some(policy);
+    let cfg = config_on_port(port)
+        .with_auth(test_auth_config(keys))
+        .with_rbac(policy);
     let base = spawn_server(cfg).await;
 
     let client = reqwest::Client::new();
@@ -404,9 +396,9 @@ async fn rbac_allows_permitted_tool() {
     ])));
 
     let port = free_port().await;
-    let mut cfg = config_on_port(port);
-    cfg.auth = Some(test_auth_config(keys));
-    cfg.rbac = Some(policy);
+    let cfg = config_on_port(port)
+        .with_auth(test_auth_config(keys))
+        .with_rbac(policy);
     let base = spawn_server(cfg).await;
 
     let client = reqwest::Client::new();
@@ -445,9 +437,9 @@ async fn rbac_argument_allowlist_enforced() {
     ])));
 
     let port = free_port().await;
-    let mut cfg = config_on_port(port);
-    cfg.auth = Some(test_auth_config(keys));
-    cfg.rbac = Some(policy);
+    let cfg = config_on_port(port)
+        .with_auth(test_auth_config(keys))
+        .with_rbac(policy);
     let base = spawn_server(cfg).await;
 
     let client = reqwest::Client::new();
@@ -488,8 +480,8 @@ async fn rbac_argument_allowlist_enforced() {
 #[tokio::test]
 async fn auth_rate_limit_triggers() {
     let port = free_port().await;
-    let mut cfg = config_on_port(port);
-    cfg.auth = Some(AuthConfig::with_keys(vec![]).with_rate_limit(RateLimitConfig::new(2)));
+    let cfg = config_on_port(port)
+        .with_auth(AuthConfig::with_keys(vec![]).with_rate_limit(RateLimitConfig::new(2)));
     let base = spawn_server(cfg).await;
 
     let client = reqwest::Client::new();
@@ -521,9 +513,9 @@ async fn c1_origin_rejected_before_auth() {
     let keys = vec![ApiKeyEntry::new("guard-key", hash, "ops")];
 
     let port = free_port().await;
-    let mut cfg = config_on_port(port);
-    cfg.auth = Some(test_auth_config(keys));
-    cfg.allowed_origins = vec!["http://localhost:3000".into()];
+    let cfg = config_on_port(port)
+        .with_auth(test_auth_config(keys))
+        .with_allowed_origins(["http://localhost:3000"]);
     let base = spawn_server(cfg).await;
 
     let client = reqwest::Client::new();
@@ -556,11 +548,11 @@ async fn c1_body_limit_applies_before_rbac() {
     ])));
 
     let port = free_port().await;
-    let mut cfg = config_on_port(port);
-    cfg.auth = Some(test_auth_config(keys));
-    cfg.rbac = Some(policy);
-    // 512 byte cap — much smaller than default 1 MiB.
-    cfg.max_request_body = 512;
+    let cfg = config_on_port(port)
+        .with_auth(test_auth_config(keys))
+        .with_rbac(policy)
+        // 512 byte cap — much smaller than default 1 MiB.
+        .with_max_request_body(512);
     let base = spawn_server(cfg).await;
 
     // Build a 16 KiB JSON-RPC body (well over 512).
@@ -620,11 +612,11 @@ fn oauth_cfg_with_proxy(expose: bool) -> mcpx::oauth::OAuthConfig {
 #[tokio::test]
 async fn c3_admin_endpoints_hidden_by_default() {
     let port = free_port().await;
-    let mut cfg = config_on_port(port);
     let mut auth = AuthConfig::with_keys(vec![]);
     auth.oauth = Some(oauth_cfg_with_proxy(false));
-    cfg.auth = Some(auth);
-    cfg.public_url = Some(format!("http://127.0.0.1:{port}"));
+    let cfg = config_on_port(port)
+        .with_auth(auth)
+        .with_public_url(format!("http://127.0.0.1:{port}"));
     let base = spawn_server(cfg).await;
 
     // Metadata must NOT advertise the admin endpoints.
@@ -673,11 +665,11 @@ async fn c3_admin_endpoints_hidden_by_default() {
 #[tokio::test]
 async fn c3_admin_endpoints_exposed_when_enabled() {
     let port = free_port().await;
-    let mut cfg = config_on_port(port);
     let mut auth = AuthConfig::with_keys(vec![]);
     auth.oauth = Some(oauth_cfg_with_proxy(true));
-    cfg.auth = Some(auth);
-    cfg.public_url = Some(format!("http://127.0.0.1:{port}"));
+    let cfg = config_on_port(port)
+        .with_auth(auth)
+        .with_public_url(format!("http://127.0.0.1:{port}"));
     let base = spawn_server(cfg).await;
 
     let meta: serde_json::Value =
@@ -751,15 +743,15 @@ async fn shutdown_timeout_honored_on_first_signal() {
     // extra route that sleeps 10s server-side -- representing an
     // in-flight tool call that will not finish before the deadline.
     let port = free_port().await;
-    let mut cfg = config_on_port(port);
-    cfg.shutdown_timeout = Duration::from_millis(500);
-    cfg.extra_router = Some(axum::Router::new().route(
-        "/slow",
-        get(|| async {
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            "done"
-        }),
-    ));
+    let cfg = config_on_port(port)
+        .with_shutdown_timeout(Duration::from_millis(500))
+        .with_extra_router(axum::Router::new().route(
+            "/slow",
+            get(|| async {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                "done"
+            }),
+        ));
 
     let mut harness = spawn_server(cfg).await;
     let base = harness.base.clone();
@@ -825,6 +817,10 @@ async fn shutdown_timeout_honored_on_first_signal() {
 /// assignment. Asserts a representative subset of fields touched by
 /// every common builder so future drift surfaces here first.
 #[tokio::test]
+#[allow(
+    deprecated,
+    reason = "intentionally exercises the deprecated direct-field-write path to verify builder equivalence; this test IS the equivalence proof"
+)]
 async fn builder_matches_direct_field_assignment() {
     let port = free_port().await;
     let bind = format!("127.0.0.1:{port}");
@@ -912,6 +908,10 @@ async fn validate_rejects_admin_without_auth() {
 /// Setting only the TLS cert (or only the key) must be rejected by
 /// `validate()`. Both paths must be present together or absent together.
 #[tokio::test]
+#[allow(
+    deprecated,
+    reason = "intentionally exercises direct field writes to test partial-pair rejection (no builder sets only one of the pair)"
+)]
 async fn validate_rejects_partial_tls_pair() {
     let mut cfg = McpServerConfig::new("127.0.0.1:0", "test", "0.0.1");
     cfg.tls_cert_path = Some(std::path::PathBuf::from("/tmp/cert.pem"));
@@ -1015,8 +1015,7 @@ async fn hooked_handler_serves_healthz() {
         .await
         .unwrap();
     let bound: SocketAddr = listener.local_addr().unwrap();
-    let mut cfg = cfg;
-    cfg.bind_addr = bound.to_string();
+    let cfg = cfg.with_bind_addr(bound.to_string());
 
     let (ready_tx, ready_rx) = oneshot::channel::<SocketAddr>();
     let shutdown = CancellationToken::new();

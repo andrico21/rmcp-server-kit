@@ -10,6 +10,20 @@ Pre-1.0: breaking changes bump the **minor** version.
 
 ## [0.13.0] - unreleased
 
+### Deprecated
+
+- **[H-B3] Direct field access on `McpServerConfig` is deprecated.** All
+  `pub` fields now carry `#[deprecated(since = "0.13.0", note = "use
+  McpServerConfig::with_*(); direct field access will become pub(crate)
+  in 1.0")]`. Migrate `cfg.field = value;` writes to the matching
+  `.with_field(value)` builder. The fields remain `pub` for the entire
+  0.x line; they are slated to become `pub(crate)` at 1.0. A new
+  `with_bind_addr` builder was added for parity. Existing builders
+  (`with_auth`, `with_rbac`, `with_allowed_origins`,
+  `with_readiness_check`, `with_max_request_body`,
+  `with_shutdown_timeout`, `with_extra_router`, `with_public_url`,
+  `with_tls`, etc.) are unchanged and remain the migration target.
+
 ### Removed
 
 - **[H-B2] `ToolHookError` removed.** The legacy synchronous deny enum
