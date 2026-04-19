@@ -735,23 +735,45 @@ async fn c3_admin_endpoints_exposed_when_enabled() {
 /// cancellation path via the unified `CancellationToken` from H-T1.
 #[tokio::test]
 async fn shutdown_timeout_honored_on_first_signal() {
-    use std::time::Instant;
+    use std::{sync::Mutex, time::Instant};
 
-    use axum::routing::get;
+    use axum::{extract::State, routing::get};
+    use tokio::sync::oneshot;
 
     // Build a server with a *short* graceful deadline (500ms) and an
     // extra route that sleeps 10s server-side -- representing an
     // in-flight tool call that will not finish before the deadline.
+    //
+    // The handler signals via a oneshot channel as soon as it begins
+    // executing, so the test can wait for the request to be
+    // *deterministically* in-flight before triggering shutdown
+    // (eliminates the prior race where slow CI scheduling could let
+    // shutdown fire before the server even saw the request).
     let port = free_port().await;
+    let (started_tx, started_rx) = oneshot::channel::<()>();
+    let started_state = Arc::new(Mutex::new(Some(started_tx)));
     let cfg = config_on_port(port)
         .with_shutdown_timeout(Duration::from_millis(500))
-        .with_extra_router(axum::Router::new().route(
-            "/slow",
-            get(|| async {
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                "done"
-            }),
-        ));
+        .with_extra_router(
+            axum::Router::new()
+                .route(
+                    "/slow",
+                    get(
+                        |State(state): State<Arc<Mutex<Option<oneshot::Sender<()>>>>>| async move {
+                            // Signal exactly once that we've begun
+                            // serving the request.
+                            if let Ok(mut guard) = state.lock()
+                                && let Some(tx) = guard.take()
+                            {
+                                let _ = tx.send(());
+                            }
+                            tokio::time::sleep(Duration::from_secs(10)).await;
+                            "done"
+                        },
+                    ),
+                )
+                .with_state(started_state),
+        );
 
     let mut harness = spawn_server(cfg).await;
     let base = harness.base.clone();
@@ -767,9 +789,15 @@ async fn shutdown_timeout_honored_on_first_signal() {
         let _ = reqwest::get(&slow_url).await;
     });
 
-    // Give the request a moment to actually reach the server before
-    // we trigger shutdown. 100ms is well under the 500ms deadline.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait deterministically until the handler has started executing
+    // server-side (replaces the prior fixed 100ms sleep, which was
+    // race-prone on slow CI runners). Bound the wait so a real
+    // regression in request acceptance still surfaces as a test
+    // failure rather than a hang.
+    tokio::time::timeout(Duration::from_secs(5), started_rx)
+        .await
+        .expect("/slow handler did not start within 5s -- request never reached the server")
+        .expect("started_tx dropped without sending");
 
     // Trigger graceful shutdown. With BUG-NEW fixed, this is
     // semantically identical to a single SIGTERM.

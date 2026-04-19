@@ -109,7 +109,7 @@ jobs:
       - name: Run hook_latency bench
         run: cargo bench --bench hook_latency
       - name: Assert hook overhead <= 2us
-        run: bash scripts/check-bench-overhead.sh
+        run: bash scripts/check-bench-overhead.sh hook_latency_hooked hook_latency_bare 2000
 
   docs:
     name: Rustdoc
@@ -141,9 +141,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Generate Cargo.lock (library crate; lockfile is .gitignored)
+        run: cargo generate-lockfile
+      - name: Run cargo audit
+        run: cargo audit
 
   msrv:
     name: MSRV (1.95.0)
