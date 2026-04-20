@@ -37,19 +37,23 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
+          # Write notes to RUNNER_TEMP so the working tree stays clean for
+          # cargo publish (which refuses to publish from a dirty workdir).
+          NOTES_PATH="${RUNNER_TEMP}/RELEASE_NOTES.md"
           # Extract everything between "## [TAG]" and the next "## [" header.
           # Strips the version header line itself; release page already shows the version as the title.
           awk -v ver="$TAG" '
             $0 ~ "^## \\[" ver "\\]" { found=1; next }
             found && /^## \[/        { exit }
             found                    { print }
-          ' CHANGELOG.md > RELEASE_NOTES.md
-          if [ ! -s RELEASE_NOTES.md ]; then
+          ' CHANGELOG.md > "$NOTES_PATH"
+          if [ ! -s "$NOTES_PATH" ]; then
             echo "::error::No CHANGELOG.md section found for version $TAG"
             exit 1
           fi
+          echo "NOTES_PATH=${NOTES_PATH}" >> "$GITHUB_ENV"
           echo "----- RELEASE_NOTES.md -----"
-          cat RELEASE_NOTES.md
+          cat "$NOTES_PATH"
           echo "----- end -----"
 
       - name: Dry-run publish
@@ -63,4 +67,4 @@ jobs:
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3
         with:
-          body_path: RELEASE_NOTES.md
+          body_path: ${{ env.NOTES_PATH }}
