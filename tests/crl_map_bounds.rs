@@ -194,11 +194,8 @@ async fn cache_hard_cap_drops_newest() {
         "https://b.example.test/crl",
         "https://c.example.test/crl",
     ] {
-        set.__test_insert_cache(
-            url,
-            CachedCrl::__test_synthetic(now),
-        )
-        .await;
+        set.__test_insert_cache(url, CachedCrl::__test_synthetic(now))
+            .await;
     }
 
     assert_eq!(
@@ -240,11 +237,8 @@ async fn stale_removal_also_clears_seen() {
     // Insert a stale cache entry whose next_update + grace is in the
     // past, so the refresh loop treats fetch-failure as removable.
     let past = SystemTime::now() - Duration::from_secs(60 * 60 * 24 * 30); // 30 days ago
-    set.__test_insert_cache(
-        url,
-        CachedCrl::__test_stale(past),
-    )
-    .await;
+    set.__test_insert_cache(url, CachedCrl::__test_stale(past))
+        .await;
     assert!(
         set.__test_cache_contains(url),
         "precondition: URL should be cached"

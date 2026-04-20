@@ -49,7 +49,11 @@ use x509_parser::{
     revocation_list::CertificateRevocationList,
 };
 
-use crate::{auth::MtlsConfig, error::McpxError};
+use crate::{
+    auth::MtlsConfig,
+    error::McpxError,
+    ssrf::{check_scheme, ip_block_reason},
+};
 
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
 const MIN_AUTO_REFRESH: Duration = Duration::from_mins(10);
@@ -57,267 +61,6 @@ const MAX_AUTO_REFRESH: Duration = Duration::from_hours(24);
 /// Connection timeout for CRL HTTP fetches. Independent of overall fetch
 /// timeout to bound time spent on unreachable hosts.
 const CRL_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// SSRF guard for CRL CDP URLs.
-///
-/// CRL Distribution Points are pre-authentication: an attacker who controls
-/// a client certificate's CDP extension can pivot the server into the
-/// internal network or trigger response-amplification `DoS`. Defenses:
-/// scheme allowlist, redirect=none on the HTTP client, body-size cap,
-/// concurrency caps (global + per-host), and IP allowlist that rejects
-/// loopback / private / link-local / multicast / cloud-metadata addresses.
-///
-/// Re-resolution at fetch time (not at discovery) prevents the discovered
-/// URL set from being trusted later if DNS rotates -- every fetch goes
-/// through the IP guard.
-mod ssrf_guard {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-
-    use url::Url;
-
-    /// AWS / GCP / Azure metadata endpoint. Always blocked even if private
-    /// IPs are otherwise allowed -- this address is unique to cloud-VM
-    /// privilege-escalation pivots.
-    pub(super) const CLOUD_METADATA_V4: Ipv4Addr = Ipv4Addr::new(169, 254, 169, 254);
-
-    /// Validate scheme of a parsed CDP URL.
-    ///
-    /// Accepts only `https`, plus `http` when `allow_http` is true. Rejects
-    /// anything else (`file`, `ldap`, `ftp`, ...). Scheme is matched
-    /// case-insensitively per RFC 3986 §3.1, but `Url::parse` already
-    /// lowercases it.
-    pub(super) fn check_scheme(url: &Url, allow_http: bool) -> Result<(), &'static str> {
-        match url.scheme() {
-            "https" => Ok(()),
-            "http" if allow_http => Ok(()),
-            "http" => Err("http_scheme_disallowed"),
-            _ => Err("invalid_scheme"),
-        }
-    }
-
-    /// Check whether an IP address must be rejected before any TCP connect.
-    /// Returns `Some(reason)` if blocked, `None` if permitted.
-    ///
-    /// Blocked classes:
-    /// - Cloud metadata service (169.254.169.254).
-    /// - IPv4 loopback (127.0.0.0/8), unspecified (0.0.0.0), broadcast.
-    /// - IPv4 RFC 1918 private (10/8, 172.16/12, 192.168/16).
-    /// - IPv4 link-local (169.254/16).
-    /// - IPv4 CGNAT (100.64/10).
-    /// - IPv4 documentation (192.0.2/24, 198.51.100/24, 203.0.113/24).
-    /// - IPv4 benchmarking (198.18/15).
-    /// - IPv4 multicast (224/4) and reserved future use (240/4).
-    /// - IPv6 loopback (`::1`), unspecified (`::`).
-    /// - IPv6 link-local (`fe80::/10`).
-    /// - IPv6 unique local (`fc00::/7`).
-    /// - IPv6 multicast (`ff00::/8`).
-    /// - IPv6 documentation (`2001:db8::/32`).
-    /// - IPv4-mapped IPv6 inheriting any of the above.
-    pub(super) fn ip_block_reason(ip: IpAddr) -> Option<&'static str> {
-        match ip {
-            IpAddr::V4(v4) => block_reason_v4(v4),
-            IpAddr::V6(v6) => {
-                if let Some(mapped) = v6.to_ipv4_mapped() {
-                    return block_reason_v4(mapped);
-                }
-                block_reason_v6(v6)
-            }
-        }
-    }
-
-    fn block_reason_v4(v4: Ipv4Addr) -> Option<&'static str> {
-        if v4 == CLOUD_METADATA_V4 {
-            return Some("cloud_metadata");
-        }
-        if v4.is_loopback() {
-            return Some("loopback");
-        }
-        if v4.is_unspecified() {
-            return Some("unspecified");
-        }
-        if v4.is_broadcast() {
-            return Some("broadcast");
-        }
-        if v4.is_private() {
-            return Some("private_rfc1918");
-        }
-        if v4.is_link_local() {
-            return Some("link_local");
-        }
-        if v4.is_multicast() {
-            return Some("multicast");
-        }
-        let octets = v4.octets();
-        // CGNAT 100.64.0.0/10 (RFC 6598).
-        if octets[0] == 100 && (octets[1] & 0b1100_0000) == 0b0100_0000 {
-            return Some("cgnat");
-        }
-        // Documentation 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24.
-        if (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
-            || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
-            || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
-        {
-            return Some("documentation");
-        }
-        // Benchmarking 198.18.0.0/15 (RFC 2544).
-        if octets[0] == 198 && (octets[1] == 18 || octets[1] == 19) {
-            return Some("benchmarking");
-        }
-        // Reserved 240.0.0.0/4.
-        if octets[0] >= 240 {
-            return Some("reserved");
-        }
-        None
-    }
-
-    fn block_reason_v6(v6: Ipv6Addr) -> Option<&'static str> {
-        if v6.is_loopback() {
-            return Some("loopback");
-        }
-        if v6.is_unspecified() {
-            return Some("unspecified");
-        }
-        if v6.is_multicast() {
-            return Some("multicast");
-        }
-        let segments = v6.segments();
-        // Link-local fe80::/10.
-        if (segments[0] & 0xffc0) == 0xfe80 {
-            return Some("link_local");
-        }
-        // Unique local fc00::/7.
-        if (segments[0] & 0xfe00) == 0xfc00 {
-            return Some("unique_local");
-        }
-        // Documentation 2001:db8::/32.
-        if segments[0] == 0x2001 && segments[1] == 0x0db8 {
-            return Some("documentation");
-        }
-        None
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-
-        use url::Url;
-
-        use super::{check_scheme, ip_block_reason};
-
-        #[test]
-        fn https_always_allowed() {
-            let url = Url::parse("https://crl.example/ca.crl").expect("parse");
-            assert!(check_scheme(&url, false).is_ok());
-            assert!(check_scheme(&url, true).is_ok());
-        }
-
-        #[test]
-        fn http_gated_by_flag() {
-            let url = Url::parse("http://crl.example/ca.crl").expect("parse");
-            assert_eq!(check_scheme(&url, false), Err("http_scheme_disallowed"));
-            assert!(check_scheme(&url, true).is_ok());
-        }
-
-        #[test]
-        fn other_schemes_rejected() {
-            for raw in ["ldap://x/", "file:///etc/passwd", "ftp://x/", "gopher://x/"] {
-                let url = Url::parse(raw).expect("parse");
-                assert_eq!(check_scheme(&url, true), Err("invalid_scheme"));
-            }
-        }
-
-        #[test]
-        fn cloud_metadata_blocked() {
-            assert_eq!(
-                ip_block_reason(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))),
-                Some("cloud_metadata")
-            );
-        }
-
-        #[test]
-        fn loopback_blocked() {
-            assert_eq!(
-                ip_block_reason(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-                Some("loopback")
-            );
-            assert_eq!(
-                ip_block_reason(IpAddr::V6(Ipv6Addr::LOCALHOST)),
-                Some("loopback")
-            );
-        }
-
-        #[test]
-        fn rfc1918_blocked() {
-            for raw in [[10, 0, 0, 1], [172, 16, 0, 1], [192, 168, 1, 1]] {
-                let ip = IpAddr::V4(Ipv4Addr::new(raw[0], raw[1], raw[2], raw[3]));
-                assert_eq!(ip_block_reason(ip), Some("private_rfc1918"), "{ip}");
-            }
-        }
-
-        #[test]
-        fn link_local_blocked_v4_v6() {
-            assert_eq!(
-                ip_block_reason(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1))),
-                Some("link_local")
-            );
-            assert_eq!(
-                ip_block_reason(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1))),
-                Some("link_local")
-            );
-        }
-
-        #[test]
-        fn cgnat_blocked() {
-            assert_eq!(
-                ip_block_reason(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))),
-                Some("cgnat")
-            );
-            assert_eq!(
-                ip_block_reason(IpAddr::V4(Ipv4Addr::new(100, 127, 255, 254))),
-                Some("cgnat")
-            );
-        }
-
-        #[test]
-        fn documentation_and_benchmarking_blocked() {
-            for raw in [[192, 0, 2, 1], [198, 51, 100, 1], [203, 0, 113, 1]] {
-                let ip = IpAddr::V4(Ipv4Addr::new(raw[0], raw[1], raw[2], raw[3]));
-                assert_eq!(ip_block_reason(ip), Some("documentation"), "{ip}");
-            }
-            assert_eq!(
-                ip_block_reason(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1))),
-                Some("benchmarking")
-            );
-        }
-
-        #[test]
-        fn unique_local_v6_blocked() {
-            assert_eq!(
-                ip_block_reason(IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1))),
-                Some("unique_local")
-            );
-        }
-
-        #[test]
-        fn ipv4_mapped_v6_inherits_block() {
-            // ::ffff:127.0.0.1 must be blocked as loopback.
-            let mapped = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 0x0001));
-            assert_eq!(ip_block_reason(mapped), Some("loopback"));
-        }
-
-        #[test]
-        fn public_ips_allowed() {
-            assert_eq!(ip_block_reason(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))), None);
-            assert_eq!(ip_block_reason(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))), None);
-            assert_eq!(
-                ip_block_reason(IpAddr::V6(Ipv6Addr::new(
-                    0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111
-                ))),
-                None
-            );
-        }
-    }
-}
 
 /// Parsed CRL cached in memory and keyed by its source URL.
 #[derive(Clone, Debug)]
@@ -377,6 +120,7 @@ pub struct CrlSet {
     /// Cached cap on per-fetch response body size; copied from `config` so the
     /// hot path doesn't re-read the (rarely changing) config struct.
     max_response_bytes: u64,
+    last_cap_warn: Mutex<HashMap<&'static str, Instant>>,
 }
 
 impl CrlSet {
@@ -422,7 +166,65 @@ impl CrlSet {
             host_semaphores,
             discovery_limiter,
             max_response_bytes,
+            last_cap_warn: Mutex::new(HashMap::new()),
         }))
+    }
+
+    fn warn_cap_exceeded_throttled(&self, which: &'static str) {
+        let now = Instant::now();
+        let cooldown = Duration::from_mins(1);
+        let should_warn = match self.last_cap_warn.lock() {
+            Ok(mut guard) => {
+                let should_emit = guard.get(which).is_none_or(|last| {
+                    now.saturating_duration_since(*last) >= cooldown
+                });
+                if should_emit {
+                    guard.insert(which, now);
+                }
+                should_emit
+            }
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                let should_emit = guard.get(which).is_none_or(|last| {
+                    now.saturating_duration_since(*last) >= cooldown
+                });
+                if should_emit {
+                    guard.insert(which, now);
+                }
+                should_emit
+            }
+        };
+
+        if should_warn {
+            tracing::warn!(which = which, "CRL map cap exceeded; dropping newest entry");
+        }
+    }
+
+    async fn insert_cache_entry(&self, url: String, cached: CachedCrl) -> bool {
+        let inserted = {
+            let mut guard = self.cache.write().await;
+            if guard.len() >= self.config.crl_max_cache_entries && !guard.contains_key(&url) {
+                false
+            } else {
+                guard.insert(url.clone(), cached);
+                true
+            }
+        };
+
+        if inserted {
+            match self.cached_urls.lock() {
+                Ok(mut cached_urls) => {
+                    cached_urls.insert(url);
+                }
+                Err(poisoned) => {
+                    poisoned.into_inner().insert(url);
+                }
+            }
+        } else {
+            self.warn_cap_exceeded_throttled("cache");
+        }
+
+        inserted
     }
 
     /// Force an immediate refresh of all currently known CRL URLs.
@@ -467,10 +269,22 @@ impl CrlSet {
         for (url, result) in results {
             match result {
                 Ok(cached) => {
+                    if cache.len() >= self.config.crl_max_cache_entries && !cache.contains_key(&url)
+                    {
+                        drop(cache);
+                        self.warn_cap_exceeded_throttled("cache");
+                        cache = self.cache.write().await;
+                        continue;
+                    }
                     cache.insert(url.clone(), cached);
                     changed = true;
-                    if let Ok(mut cached_urls) = self.cached_urls.lock() {
-                        cached_urls.insert(url);
+                    match self.cached_urls.lock() {
+                        Ok(mut cached_urls) => {
+                            cached_urls.insert(url);
+                        }
+                        Err(poisoned) => {
+                            poisoned.into_inner().insert(url);
+                        }
                     }
                 }
                 Err(error) => {
@@ -484,8 +298,21 @@ impl CrlSet {
                     if remove_entry {
                         cache.remove(&url);
                         changed = true;
-                        if let Ok(mut cached_urls) = self.cached_urls.lock() {
-                            cached_urls.remove(&url);
+                        match self.cached_urls.lock() {
+                            Ok(mut cached_urls) => {
+                                cached_urls.remove(&url);
+                            }
+                            Err(poisoned) => {
+                                poisoned.into_inner().remove(&url);
+                            }
+                        }
+                        match self.seen_urls.lock() {
+                            Ok(mut seen_urls) => {
+                                seen_urls.remove(&url);
+                            }
+                            Err(poisoned) => {
+                                poisoned.into_inner().remove(&url);
+                            }
                         }
                     }
                 }
@@ -507,13 +334,13 @@ impl CrlSet {
             &url,
             self.config.crl_allow_http,
             self.max_response_bytes,
+            self.config.crl_max_host_semaphores,
         )
         .await?;
-        let mut cache = self.cache.write().await;
-        cache.insert(url.clone(), cached);
-        if let Ok(mut cached_urls) = self.cached_urls.lock() {
-            cached_urls.insert(url);
+        if !self.insert_cache_entry(url, cached).await {
+            return Ok(());
         }
+        let cache = self.cache.read().await;
         self.swap_verifier_from_cache(&cache)?;
         Ok(())
     }
@@ -568,9 +395,12 @@ impl CrlSet {
                 continue;
             }
             // Admission succeeded: now safe to dedup permanently.
-            if let Ok(mut seen) = self.seen_urls.lock() {
-                seen.insert(url);
+            let mut guard = self.seen_urls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if guard.len() >= self.config.crl_max_seen_urls {
+                self.warn_cap_exceeded_throttled("seen_urls");
+                break;
             }
+            guard.insert(url);
         }
 
         if self.config.crl_deny_on_unavailable {
@@ -682,7 +512,37 @@ impl CrlSet {
     /// flag the production verifier uses to decide whether to fail the handshake.
     #[doc(hidden)]
     pub fn __test_note_discovered_urls(&self, urls: &[String]) -> bool {
-        self.note_discovered_urls(urls)
+        let missing_cached = self.note_discovered_urls(urls);
+        if self.discover_tx.is_closed() {
+            match self.seen_urls.lock() {
+                Ok(mut guard) => {
+                    for url in urls {
+                        if guard.contains(url) {
+                            continue;
+                        }
+                        if guard.len() >= self.config.crl_max_seen_urls {
+                            self.warn_cap_exceeded_throttled("seen_urls");
+                            break;
+                        }
+                        guard.insert(url.clone());
+                    }
+                }
+                Err(poisoned) => {
+                    let mut guard = poisoned.into_inner();
+                    for url in urls {
+                        if guard.contains(url) {
+                            continue;
+                        }
+                        if guard.len() >= self.config.crl_max_seen_urls {
+                            self.warn_cap_exceeded_throttled("seen_urls");
+                            break;
+                        }
+                        guard.insert(url.clone());
+                    }
+                }
+            }
+        }
+        missing_cached
     }
 
     /// Test-only: report whether a URL has been promoted to the
@@ -697,6 +557,92 @@ impl CrlSet {
         }
     }
 
+    /// Test-only: current count of host semaphores. Used by
+    /// `tests/crl_map_bounds.rs` to assert the cap is enforced.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    pub fn __test_host_semaphore_count(&self) -> usize {
+        self.host_semaphores
+            .try_lock()
+            .map_or(0, |guard| guard.len())
+    }
+
+    /// Test-only: current number of entries in the CRL cache.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    pub fn __test_cache_len(&self) -> usize {
+        self.cache.try_read().map_or(0, |guard| guard.len())
+    }
+
+    /// Test-only: whether a specific URL is currently cached.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    pub fn __test_cache_contains(&self, url: &str) -> bool {
+        self.cache
+            .try_read()
+            .is_ok_and(|guard| guard.contains_key(url))
+    }
+
+    /// Test-only: triggers the request-hot-path fetch path for `url`
+    /// WITHOUT going through the TLS handshake. Returns any error the
+    /// host-semaphore cap check produces. A network-unreachable
+    /// failure for the fetch itself is treated as `Ok(())` (test only
+    /// cares about the cap; real tests use mock hosts that won't
+    /// resolve — the cap must fire BEFORE network I/O).
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    pub async fn __test_trigger_fetch(&self, url: &str) -> Result<(), McpxError> {
+        if let Err(error) = gated_fetch(
+            &self.client,
+            &self.global_fetch_sem,
+            &self.host_semaphores,
+            url,
+            self.config.crl_allow_http,
+            self.max_response_bytes,
+            self.config.crl_max_host_semaphores,
+        )
+        .await
+        {
+            if error
+                .to_string()
+                .contains("crl_host_semaphore_cap_exceeded")
+            {
+                Err(error)
+            } else {
+                Ok(())
+            }
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Test-only: directly insert `cached` under `url` into both
+    /// `cache` and `cached_urls`, bypassing HTTP. Does NOT enforce
+    /// `crl_max_cache_entries` when called pre-cap — the test uses it
+    /// to stage preconditions. For cap-breach coverage, tests invoke
+    /// the real production insertion path.
+    ///
+    /// Wait — the `cache_hard_cap_drops_newest` test DOES use this
+    /// helper to assert the cap fires. Therefore this helper MUST
+    /// enforce the hard cap (silent drop with warn!) the same way the
+    /// production code does. The helper is a thin wrapper around the
+    /// same internal insertion fn the production path uses.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    pub async fn __test_insert_cache(&self, url: &str, cached: CachedCrl) {
+        let _ = self.insert_cache_entry(url.to_owned(), cached).await;
+    }
+
+    /// Test-only: trigger a refresh cycle for a single URL. Exercises
+    /// the same stale-grace / fetch-failure path as `refresh_urls()`.
+    /// Returns the refresh error (if any) — most tests ignore it
+    /// because they assert post-state, not the transient error.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    pub async fn __test_trigger_refresh_url(&self, url: &str) -> Result<(), McpxError> {
+        self.refresh_urls(vec![url.to_owned()]).await
+    }
+
     async fn fetch_url_results(
         &self,
         urls: Vec<String>,
@@ -708,9 +654,18 @@ impl CrlSet {
             let host_map = Arc::clone(&self.host_semaphores);
             let allow_http = self.config.crl_allow_http;
             let max_bytes = self.max_response_bytes;
+            let max_host_semaphores = self.config.crl_max_host_semaphores;
             tasks.spawn(async move {
-                let result =
-                    gated_fetch(&client, &global_sem, &host_map, &url, allow_http, max_bytes).await;
+                let result = gated_fetch(
+                    &client,
+                    &global_sem,
+                    &host_map,
+                    &url,
+                    allow_http,
+                    max_bytes,
+                    max_host_semaphores,
+                )
+                .await;
                 (url, result)
             });
         }
@@ -736,6 +691,40 @@ impl CrlSet {
         self.inner_verifier
             .store(Arc::new(VerifierHandle(verifier)));
         Ok(())
+    }
+}
+
+impl CachedCrl {
+    /// Test-only: synthesize a cache entry that looks valid, `next_update`
+    /// = now + 24h. Fields used only to populate the HashMap — the bytes
+    /// are a minimal CRL-shape that won't be parsed by tests.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __test_synthetic(now: SystemTime) -> Self {
+        Self {
+            der: CertificateRevocationListDer::from(vec![0x30, 0x00]),
+            this_update: now,
+            next_update: now.checked_add(Duration::from_hours(24)),
+            fetched_at: now,
+            source_url: "test://synthetic".to_owned(),
+        }
+    }
+
+    /// Test-only: synthesize a STALE cache entry (`next_update` in the
+    /// deep past so `is_stale_beyond_grace` fires with any sensible
+    /// `crl_stale_grace`).
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __test_stale(reference_past: SystemTime) -> Self {
+        Self {
+            der: CertificateRevocationListDer::from(vec![0x30, 0x00]),
+            this_update: reference_past,
+            next_update: Some(reference_past),
+            fetched_at: reference_past,
+            source_url: "test://stale".to_owned(),
+        }
     }
 }
 
@@ -865,7 +854,7 @@ pub fn extract_cdp_urls(cert_der: &[u8], allow_http: bool) -> Vec<String> {
                                 tracing::debug!(url = %raw, "CDP URL parse failed; dropped");
                                 continue;
                             };
-                            if let Err(reason) = ssrf_guard::check_scheme(&parsed, allow_http) {
+                            if let Err(reason) = check_scheme(&parsed, allow_http) {
                                 tracing::debug!(
                                     url = %raw,
                                     reason,
@@ -925,6 +914,7 @@ pub async fn bootstrap_fetch(
     let host_semaphores = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let allow_http = config.crl_allow_http;
     let max_bytes = config.crl_max_response_bytes;
+    let max_host_semaphores = config.crl_max_host_semaphores;
 
     let mut initial_cache = HashMap::new();
     let mut tasks = JoinSet::new();
@@ -941,6 +931,7 @@ pub async fn bootstrap_fetch(
                 &url,
                 allow_http,
                 max_bytes,
+                max_host_semaphores,
             )
             .await;
             (url, result)
@@ -1108,6 +1099,7 @@ async fn gated_fetch(
     url: &str,
     allow_http: bool,
     max_bytes: u64,
+    max_host_semaphores: usize,
 ) -> Result<CachedCrl, McpxError> {
     let host_key = Url::parse(url)
         .ok()
@@ -1116,10 +1108,23 @@ async fn gated_fetch(
 
     let host_sem = {
         let mut map = host_semaphores.lock().await;
-        Arc::clone(
-            map.entry(host_key)
-                .or_insert_with(|| Arc::new(Semaphore::new(1))),
-        )
+        if !map.contains_key(&host_key) {
+            if map.len() >= max_host_semaphores {
+                return Err(McpxError::Config(
+                    "crl_host_semaphore_cap_exceeded: too many distinct CRL hosts in flight"
+                        .to_owned(),
+                ));
+            }
+            map.insert(host_key.clone(), Arc::new(Semaphore::new(1)));
+        }
+        match map.get(&host_key) {
+            Some(semaphore) => Arc::clone(semaphore),
+            None => {
+                return Err(McpxError::Tls(
+                    "CRL host semaphore missing after insertion".to_owned(),
+                ));
+            }
+        }
     };
 
     let _global_permit = Arc::clone(global_sem)
@@ -1143,7 +1148,7 @@ async fn fetch_crl(
     let parsed =
         Url::parse(url).map_err(|error| McpxError::Tls(format!("CRL URL parse {url}: {error}")))?;
 
-    if let Err(reason) = ssrf_guard::check_scheme(&parsed, allow_http) {
+    if let Err(reason) = check_scheme(&parsed, allow_http) {
         tracing::warn!(url = %url, reason, "CRL fetch denied: scheme");
         return Err(McpxError::Tls(format!(
             "CRL scheme rejected ({reason}): {url}"
@@ -1164,7 +1169,7 @@ async fn fetch_crl(
     let mut any_addr = false;
     for addr in addrs {
         any_addr = true;
-        if let Some(reason) = ssrf_guard::ip_block_reason(addr.ip()) {
+        if let Some(reason) = ip_block_reason(addr.ip()) {
             tracing::warn!(
                 url = %url,
                 resolved_ip = %addr.ip(),
