@@ -10,6 +10,123 @@ releases (`0.x.y`) used the convention that breaking changes bumped the
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-04-20
+
+This is a security patch release that rolls up three coordinated fixes
+(F1 CRL SSRF, F2 OAuth HTTPS, F3 CDP discovery rate-limit) plus the
+restoration of custom CA support across all OAuth-bound HTTP traffic.
+**No breaking changes** -- `cargo semver-checks check-release` passes.
+
+The pre-existing no-arg constructor `OauthHttpClient::new()` is
+preserved for source compatibility but is now `#[deprecated(since =
+"1.2.1")]`. A new constructor `OauthHttpClient::with_config(&OAuthConfig)`
+should be used instead so that token / introspection / revocation /
+exchange traffic inherits the same custom-CA trust and HTTPS-only
+redirect policy as the JWKS fetch client. See the `Deprecated`
+section below for the migration path.
+
+### Deprecated
+
+- **`src/oauth.rs` -- `OauthHttpClient::new()` (no-arg).** The
+  no-arg constructor cannot honour [`OAuthConfig::ca_cert_path`]
+  (so token / introspection / revocation / exchange traffic falls
+  back to the system trust store, breaking enterprise PKI
+  deployments) and ignores the [`OAuthConfig::allow_http_oauth_urls`]
+  dev-mode toggle. Both of these are bugs that the new constructor
+  fixes. Migration: replace
+  `OauthHttpClient::new()?` with
+  `OauthHttpClient::with_config(&oauth_config)?`, plumbing the same
+  `&OAuthConfig` you already pass to `JwksCache::new` /
+  `auth.oauth = Some(...)`. The deprecation warning will become a
+  hard removal no earlier than `2.0.0`.
+
+### Security
+
+- **`src/oauth.rs` (B1) -- Redirect-downgrade protection now covers all
+  OAuth-bound HTTP traffic, not just JWKS.** The shared
+  `OauthHttpClient` (used by `handle_token`, `handle_introspect`,
+  `handle_revoke`, `proxy_oauth_admin_request`, and `exchange_token`)
+  now installs a custom redirect policy that *always* rejects an
+  `https -> http` redirect even when `allow_http_oauth_urls` is set
+  (the flag only governs the *original* request URL, never an
+  in-flight downgrade). Both the new
+  [`OauthHttpClient::with_config`] constructor and the deprecated
+  no-arg [`OauthHttpClient::new`] enforce this guard. Closes the
+  credential / token leakage path identified during 1.2.1 self-review
+  where a hostile or compromised upstream IdP could return
+  `302 Location: http://...` and have the resulting plaintext hop
+  intercepted on the wire. The new
+  [`OauthHttpClient::with_config`] constructor *additionally*
+  honours [`OAuthConfig::ca_cert_path`] for *every* OAuth request,
+  restoring the custom-CA behaviour that existed pre-`0.10.0`
+  before the `OauthHttpClient` wrapper landed (until 1.2.0, only
+  the JWKS fetch trusted the configured CA bundle; token /
+  introspection / revocation / exchange traffic silently fell back
+  to system roots, breaking enterprise PKI deployments).
+
+- **`src/mtls_revocation.rs` (F1) — SSRF hardening on CRL fetcher.** The CDP
+  (CRL Distribution Points) fetcher now refuses to dial private, loopback,
+  link-local, multicast, CGNAT, documentation, benchmarking, IPv6 ULA, IPv6
+  documentation, IPv4-mapped-V6, and metadata (169.254.169.254) addresses
+  after DNS resolution. Disallowed schemes (anything other than `http` /
+  `https`) are dropped at CDP-extraction time with a debug log. Both reqwest
+  clients (the long-lived `CrlSet::client` and the bootstrap one-shot) now
+  pin `connect_timeout = 3s`, disable TCP keep-alives, and refuse all
+  redirects (`Policy::none`). Response bodies are streamed and capped at
+  `crl_max_response_bytes` (default 5 MiB) so an attacker cannot exhaust
+  memory through a hostile CDP. Concurrency is bounded by a global
+  semaphore (`crl_max_concurrent_fetches`, default 4) and a per-host
+  semaphore of size 1 (one in-flight fetch per CDP host at any time),
+  preventing a malicious chain that lists thousands of CDP URLs from
+  saturating the egress path. New `MtlsConfig` fields (all `#[serde(default)]`):
+  `crl_max_concurrent_fetches`, `crl_max_response_bytes`,
+  `crl_discovery_rate_per_min`. **Behavioural deltas vs 1.2.x**: CRL
+  fetches now *always* run inside the global+per-host concurrency gate
+  (no opt-out) and bodies are *always* capped at 5 MiB by default --
+  prior releases had no such gates, so single-binary upgrades from
+  1.2.x will see at most 4 concurrent fetches and any CRL larger than
+  5 MiB will fail with a body-cap error. Operators with very large
+  CRLs should raise `crl_max_response_bytes`. `crl_allow_http`
+  remains `true` by default — RFC 5280 §4.2.1.13 specifies CDP URLs
+  over plain HTTP, and CRLs are themselves signed by the issuing CA,
+  so transport confidentiality is not the relevant control.
+
+- **`src/oauth.rs` (F2) — HTTPS enforcement on all OAuth-issuer URLs.** The
+  OAuth metadata, token, authorize, JWKS, and revocation URLs are now
+  validated at config-construction time: any `http://` URL is rejected
+  unless the new opt-in `OAuthConfig::allow_http_oauth_urls` flag is set
+  (default `false`; intended for local development against an HTTP-only
+  test IdP). Validation uses `url::Url::parse` so malformed or
+  non-`http(s)` schemes are rejected with `McpxError::Config`. The
+  reqwest client used for JWKS fetches installs a custom redirect
+  policy that rejects scheme downgrades (`https → http`), and as of
+  this release the same policy is also installed on the shared
+  `OauthHttpClient` (see B1).
+
+- **`src/transport.rs` (F3) — Pre-auth gating + global rate-limit on CDP
+  discovery, with retriable rate-limit drops.** The mTLS verifier's
+  `note_discovered_urls` path no longer forwards every CDP URL it
+  observes during the handshake to the background fetcher. A
+  `governor` direct rate-limiter (default `crl_discovery_rate_per_min
+  = 60`) gates the channel send, dropping excess submissions with a
+  `WARN` log. **A URL is committed to the `seen_urls` dedup set
+  *only* after the rate-limiter admits it AND the background channel
+  accepts the send.** This guarantees that a URL which loses a
+  rate-limiter race during a handshake remains retriable on
+  subsequent handshakes -- previously such URLs were marked seen
+  before admission and silently lost forever, which under
+  `crl_deny_on_unavailable = true` could indefinitely fail mTLS. The
+  lock-then-snapshot refactor in `note_discovered_urls` collects
+  candidate URLs while briefly holding the `seen_urls` mutex, drops
+  the lock, then runs rate-limit checks and the unbounded send --
+  eliminating any chance of holding the mutex across an
+  `await`/blocking call. **Scope:** the limiter is *global* in 1.2.1;
+  per-IP scoping is deferred to a future release because it requires
+  a public-API change on the verifier hook to plumb the peer
+  `SocketAddr` through to the limiter map.
+
+
+
 ## [1.2.0] - 2026-04-20
 
 ### Added

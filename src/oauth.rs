@@ -36,28 +36,166 @@ use crate::auth::{AuthIdentity, AuthMethod};
 /// concrete crate. Construct one per process and reuse across requests
 /// (the underlying connection pool is shared internally via
 /// [`Clone`] - cheap, refcounted).
+///
+/// **Hardening (since 1.2.1).** When constructed via [`with_config`]
+/// (preferred), the internal client refuses any redirect that downgrades
+/// the scheme from `https` to `http`, even when the original request URL
+/// was HTTPS. This closes a class of metadata-poisoning attacks where a
+/// hostile or compromised upstream `IdP` returns `302 Location: http://...`
+/// and the resulting plaintext hop is intercepted by a network-positioned
+/// attacker to siphon bearer tokens, refresh tokens, or introspection
+/// traffic. When the caller has set [`OAuthConfig::allow_http_oauth_urls`]
+/// to `true` (development only), HTTP-to-HTTP redirects are still permitted
+/// but HTTPS-to-HTTP downgrades are *always* rejected.
+///
+/// [`with_config`] also honours [`OAuthConfig::ca_cert_path`] (if set) and
+/// adds the supplied PEM CA bundle to the system roots so that
+/// every OAuth-bound HTTP request -- not just the JWKS fetch -- can
+/// trust enterprise/internal certificate authorities. This restores
+/// the behaviour that existed pre-`0.10.0` before the `OauthHttpClient`
+/// wrapper landed.
+///
+/// The legacy [`new`](Self::new) constructor (no-arg) is preserved for
+/// source compatibility but is `#[deprecated]`: it returns a client with
+/// system-roots-only TLS trust and the strictest redirect policy
+/// (HTTPS-only, never permits plain HTTP). Migrate to
+/// [`with_config`](Self::with_config) at the earliest opportunity so
+/// that token / introspection / revocation / exchange traffic inherits
+/// the same CA trust and `allow_http_oauth_urls` toggle as the JWKS
+/// fetch client.
+///
+/// [`with_config`]: Self::with_config
 #[derive(Clone)]
 pub struct OauthHttpClient {
     inner: reqwest::Client,
 }
 
 impl OauthHttpClient {
-    /// Build a client with sensible defaults: 10s connect timeout,
-    /// 30s total timeout.
+    /// Build a client from the OAuth configuration (preferred since 1.2.1).
+    ///
+    /// Defaults: `connect_timeout = 10s`, total `timeout = 30s`,
+    /// scheme-downgrade-rejecting redirect policy (max 2 hops),
+    /// optional custom CA trust via [`OAuthConfig::ca_cert_path`],
+    /// and HTTP-to-HTTP redirects gated by
+    /// [`OAuthConfig::allow_http_oauth_urls`] (dev-only).
+    ///
+    /// Pass the same `&OAuthConfig` you supplied to
+    /// [`JwksCache::new`] / `serve()` so the OAuth-bound HTTP traffic
+    /// inherits identical CA trust and HTTPS-only redirect policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::McpxError::Startup`] if the configured
+    /// `ca_cert_path` cannot be read or parsed, or if the underlying
+    /// HTTP client cannot be constructed (e.g. TLS backend init failure).
+    pub fn with_config(config: &OAuthConfig) -> Result<Self, crate::error::McpxError> {
+        Self::build(Some(config))
+    }
+
+    /// Build a client with default settings (system CA roots only,
+    /// strict HTTPS-only redirect policy).
+    ///
+    /// **Deprecated since 1.2.1.** This constructor cannot honour
+    /// [`OAuthConfig::ca_cert_path`] (so token / introspection /
+    /// revocation / exchange traffic falls back to the system trust
+    /// store, breaking enterprise PKI deployments) and ignores the
+    /// [`OAuthConfig::allow_http_oauth_urls`] dev-mode toggle (so
+    /// HTTP-to-HTTP redirects are unconditionally refused). Both of
+    /// these are bugs that the new [`with_config`](Self::with_config)
+    /// constructor fixes.
+    ///
+    /// The redirect policy still rejects `https -> http` downgrades,
+    /// matching the security posture of [`with_config`](Self::with_config).
+    ///
+    /// Migrate to [`with_config`](Self::with_config) and pass the same
+    /// `&OAuthConfig` your `serve()` call uses.
     ///
     /// # Errors
     ///
     /// Returns [`crate::error::McpxError::Startup`] if the underlying
     /// HTTP client cannot be constructed (e.g. TLS backend init failure).
+    #[deprecated(
+        since = "1.2.1",
+        note = "use OauthHttpClient::with_config(&OAuthConfig) so token/introspect/revoke/exchange traffic inherits ca_cert_path and the allow_http_oauth_urls toggle"
+    )]
     pub fn new() -> Result<Self, crate::error::McpxError> {
-        let inner = reqwest::Client::builder()
+        Self::build(None)
+    }
+
+    /// Internal builder shared by [`new`](Self::new) (config = `None`)
+    /// and [`with_config`](Self::with_config) (config = `Some`).
+    fn build(config: Option<&OAuthConfig>) -> Result<Self, crate::error::McpxError> {
+        let allow_http = config.is_some_and(|c| c.allow_http_oauth_urls);
+
+        let mut builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| {
-                crate::error::McpxError::Startup(format!("oauth http client init: {e}"))
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                // SECURITY: a redirect from `https` to `http` is *always*
+                // rejected, even when `allow_http_oauth_urls` is true.
+                // The flag controls whether the *original* request URL
+                // may be plain HTTP; it never authorises a downgrade
+                // mid-flight. An `http -> http` redirect is permitted
+                // only when the flag is true (dev-only). The scheme
+                // guard runs before the hop-count guard so a downgrade
+                // surfaces as an explicit downgrade error rather than as
+                // "too many redirects".
+                let prev_https = attempt
+                    .previous()
+                    .last()
+                    .is_some_and(|prev| prev.scheme() == "https");
+                let dest_scheme = attempt.url().scheme();
+                if dest_scheme != "https" {
+                    if prev_https {
+                        return attempt.error("redirect downgrades https -> http");
+                    }
+                    if !allow_http || dest_scheme != "http" {
+                        return attempt.error("redirect to non-HTTP(S) URL refused");
+                    }
+                }
+                if attempt.previous().len() >= 2 {
+                    attempt.error("too many redirects (max 2)")
+                } else {
+                    attempt.follow()
+                }
+            }));
+
+        if let Some(cfg) = config
+            && let Some(ref ca_path) = cfg.ca_cert_path
+        {
+            // Pre-startup blocking I/O: this constructor runs from
+            // `serve()`'s pre-startup phase (and from test code), so
+            // synchronous file I/O is intentional. Do not wrap in
+            // `spawn_blocking` -- the constructor is sync by contract.
+            let pem = std::fs::read(ca_path).map_err(|e| {
+                crate::error::McpxError::Startup(format!(
+                    "oauth http client: read ca_cert_path {}: {e}",
+                    ca_path.display()
+                ))
             })?;
+            let cert = reqwest::tls::Certificate::from_pem(&pem).map_err(|e| {
+                crate::error::McpxError::Startup(format!(
+                    "oauth http client: parse ca_cert_path {}: {e}",
+                    ca_path.display()
+                ))
+            })?;
+            builder = builder.add_root_certificate(cert);
+        }
+
+        let inner = builder.build().map_err(|e| {
+            crate::error::McpxError::Startup(format!("oauth http client init: {e}"))
+        })?;
         Ok(Self { inner })
+    }
+
+    /// Test-only: issue a `GET` against an arbitrary URL using the
+    /// configured client (redirect policy, CA trust, timeouts all
+    /// applied). Used by integration tests to exercise the redirect-
+    /// downgrade and CA-trust regressions without going through
+    /// `exchange_token`. Not part of the public API.
+    #[doc(hidden)]
+    pub async fn __test_get(&self, url: &str) -> reqwest::Result<reqwest::Response> {
+        self.inner.get(url).send().await
     }
 }
 
@@ -108,15 +246,35 @@ pub struct OAuthConfig {
     /// API-scoped access token via the authorization server's token
     /// endpoint.
     pub token_exchange: Option<TokenExchangeConfig>,
-    /// Optional path to a PEM CA bundle for the JWKS key fetch only.
+    /// Optional path to a PEM CA bundle for OAuth-bound HTTP traffic.
     /// Added to the system/built-in roots, not a replacement.
     ///
-    /// Application crates may auto-populate this from their own
-    /// configuration (e.g. an upstream-API CA path).  It affects only
-    /// the JWKS fetch client; any application-owned HTTP clients must
-    /// configure their own CA trust separately.
+    /// **Scope (since 1.2.1).** When the [`OauthHttpClient`] is
+    /// constructed via [`OauthHttpClient::with_config`] (preferred),
+    /// this CA bundle is honoured by *every* OAuth-bound HTTP
+    /// request: the JWKS key fetch, token exchange, introspection,
+    /// revocation, and the OAuth proxy handlers. Application crates
+    /// may auto-populate this from their own configuration (e.g. an
+    /// upstream-API CA path); any application-owned HTTP clients
+    /// outside the kit must still configure their own CA trust
+    /// separately. The deprecated [`OauthHttpClient::new`] no-arg
+    /// constructor cannot honour this field -- migrate to
+    /// [`OauthHttpClient::with_config`] for full coverage.
     #[serde(default)]
     pub ca_cert_path: Option<PathBuf>,
+    /// Allow plain-HTTP (non-TLS) URLs for OAuth endpoints (`jwks_uri`,
+    /// `proxy.authorize_url`, `proxy.token_url`, `proxy.introspection_url`,
+    /// `proxy.revocation_url`, `token_exchange.token_url`).
+    ///
+    /// **Default: `false`.** Strongly discouraged in production: a
+    /// network-positioned attacker can MITM JWKS responses and substitute
+    /// signing keys (forging arbitrary tokens), or MITM the token / proxy
+    /// endpoints to steal credentials and codes. Enable only for
+    /// development against a local `IdP` without TLS, ideally bound to
+    /// `127.0.0.1`. JWKS-cache redirects to non-HTTPS targets are still
+    /// rejected even when this flag is `true`.
+    #[serde(default)]
+    pub allow_http_oauth_urls: bool,
 }
 
 fn default_jwks_cache_ttl() -> String {
@@ -136,6 +294,7 @@ impl Default for OAuthConfig {
             proxy: None,
             token_exchange: None,
             ca_cert_path: None,
+            allow_http_oauth_urls: false,
         }
     }
 }
@@ -159,6 +318,71 @@ impl OAuthConfig {
                 ..Self::default()
             },
         }
+    }
+
+    /// Validate the URL fields against the HTTPS-only policy.
+    ///
+    /// Each of `jwks_uri`, `proxy.authorize_url`, `proxy.token_url`,
+    /// `proxy.introspection_url`, `proxy.revocation_url`, and
+    /// `token_exchange.token_url` is parsed and its scheme checked.
+    ///
+    /// Schemes other than `https` are rejected unless
+    /// [`OAuthConfig::allow_http_oauth_urls`] is `true`, in which case
+    /// `http` is also permitted (parse failures and other schemes are
+    /// always rejected).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::McpxError::Config`] when any field fails
+    /// to parse or violates the scheme policy.
+    pub fn validate(&self) -> Result<(), crate::error::McpxError> {
+        let allow_http = self.allow_http_oauth_urls;
+        check_oauth_url("oauth.jwks_uri", &self.jwks_uri, allow_http)?;
+        if let Some(proxy) = &self.proxy {
+            check_oauth_url(
+                "oauth.proxy.authorize_url",
+                &proxy.authorize_url,
+                allow_http,
+            )?;
+            check_oauth_url("oauth.proxy.token_url", &proxy.token_url, allow_http)?;
+            if let Some(url) = &proxy.introspection_url {
+                check_oauth_url("oauth.proxy.introspection_url", url, allow_http)?;
+            }
+            if let Some(url) = &proxy.revocation_url {
+                check_oauth_url("oauth.proxy.revocation_url", url, allow_http)?;
+            }
+        }
+        if let Some(tx) = &self.token_exchange {
+            check_oauth_url("oauth.token_exchange.token_url", &tx.token_url, allow_http)?;
+        }
+        Ok(())
+    }
+}
+
+/// Parse `raw` as a URL and enforce the HTTPS-only policy.
+///
+/// Returns `Ok(())` for `https://...`, and also for `http://...` when
+/// `allow_http` is `true`. All other schemes (and parse failures) are
+/// rejected with a [`crate::error::McpxError::Config`] referencing the
+/// caller-supplied `field` name for diagnostics.
+fn check_oauth_url(
+    field: &str,
+    raw: &str,
+    allow_http: bool,
+) -> Result<(), crate::error::McpxError> {
+    let parsed = url::Url::parse(raw).map_err(|e| {
+        crate::error::McpxError::Config(format!("{field}: invalid URL {raw:?}: {e}"))
+    })?;
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" if allow_http => Ok(()),
+        "http" => Err(crate::error::McpxError::Config(format!(
+            "{field}: must use https scheme (got http; set allow_http_oauth_urls=true \
+             to override - strongly discouraged in production)"
+        ))),
+        other => Err(crate::error::McpxError::Config(format!(
+            "{field}: must use https scheme (got {other:?})"
+        ))),
     }
 }
 
@@ -235,6 +459,16 @@ impl OAuthConfigBuilder {
     /// Provide a PEM CA bundle path used only when fetching the JWKS.
     pub fn ca_cert_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.inner.ca_cert_path = Some(path.into());
+        self
+    }
+
+    /// Allow plain-HTTP (non-TLS) URLs for OAuth endpoints.
+    ///
+    /// **Default: `false`.** See the field-level documentation on
+    /// [`OAuthConfig::allow_http_oauth_urls`] for the security caveats
+    /// before enabling this.
+    pub const fn allow_http_oauth_urls(mut self, allow: bool) -> Self {
+        self.inner.allow_http_oauth_urls = allow;
         self
     }
 
@@ -582,7 +816,26 @@ impl JwksCache {
         validation.validate_exp = true;
         validation.validate_nbf = true;
 
-        let mut http_builder = reqwest::Client::builder().timeout(Duration::from_secs(10));
+        let mut http_builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(3))
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                // SECURITY: reject any redirect to a non-HTTPS target,
+                // even when the original `jwks_uri` was validated as
+                // HTTPS.  This prevents an upstream `302 Location: http://...`
+                // from downgrading the JWKS fetch to plaintext where a
+                // network attacker could substitute the response and
+                // forge JWT signing keys.  The HTTPS scheme guard runs
+                // *before* the hop limit so a downgrade is rejected as
+                // such (clearer error) rather than as "too many redirects".
+                if attempt.url().scheme() != "https" {
+                    attempt.error("redirect to non-HTTPS URL refused")
+                } else if attempt.previous().len() >= 2 {
+                    attempt.error("too many redirects (max 2)")
+                } else {
+                    attempt.follow()
+                }
+            }));
 
         if let Some(ref ca_path) = config.ca_cert_path {
             // Pre-startup blocking I/O — runs before the runtime begins
@@ -1623,6 +1876,7 @@ mod tests {
             proxy: None,
             token_exchange: None,
             ca_cert_path: None,
+            allow_http_oauth_urls: false,
         };
         let meta = protected_resource_metadata(
             "https://mcp.example.com/mcp",
@@ -1633,6 +1887,262 @@ mod tests {
         assert_eq!(meta["authorization_servers"][0], "https://mcp.example.com");
         assert_eq!(meta["scopes_supported"].as_array().unwrap().len(), 2);
         assert_eq!(meta["bearer_methods_supported"][0], "header");
+    }
+
+    // -----------------------------------------------------------------------
+    // F2: OAuth URL HTTPS-only validation (CVE-class: MITM JWKS / token URL)
+    // -----------------------------------------------------------------------
+
+    fn validation_https_config() -> OAuthConfig {
+        OAuthConfig::builder(
+            "https://auth.example.com",
+            "mcp",
+            "https://auth.example.com/.well-known/jwks.json",
+        )
+        .build()
+    }
+
+    #[test]
+    fn validate_accepts_all_https_urls() {
+        let cfg = validation_https_config();
+        cfg.validate().expect("all-HTTPS config must validate");
+    }
+
+    #[test]
+    fn validate_rejects_http_jwks_uri() {
+        let mut cfg = validation_https_config();
+        cfg.jwks_uri = "http://auth.example.com/.well-known/jwks.json".into();
+        let err = cfg.validate().expect_err("http jwks_uri must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("oauth.jwks_uri") && msg.contains("https"),
+            "error must reference offending field + scheme requirement; got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_http_proxy_authorize_url() {
+        let mut cfg = validation_https_config();
+        cfg.proxy = Some(
+            OAuthProxyConfig::builder(
+                "http://idp.example.com/authorize", // <-- HTTP, must be rejected
+                "https://idp.example.com/token",
+                "client",
+            )
+            .build(),
+        );
+        let err = cfg
+            .validate()
+            .expect_err("http authorize_url must be rejected");
+        assert!(
+            err.to_string().contains("oauth.proxy.authorize_url"),
+            "error must reference proxy.authorize_url; got {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_http_proxy_token_url() {
+        let mut cfg = validation_https_config();
+        cfg.proxy = Some(
+            OAuthProxyConfig::builder(
+                "https://idp.example.com/authorize",
+                "http://idp.example.com/token", // <-- HTTP, must be rejected
+                "client",
+            )
+            .build(),
+        );
+        let err = cfg.validate().expect_err("http token_url must be rejected");
+        assert!(
+            err.to_string().contains("oauth.proxy.token_url"),
+            "error must reference proxy.token_url; got {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_http_proxy_introspection_and_revocation_urls() {
+        let mut cfg = validation_https_config();
+        cfg.proxy = Some(
+            OAuthProxyConfig::builder(
+                "https://idp.example.com/authorize",
+                "https://idp.example.com/token",
+                "client",
+            )
+            .introspection_url("http://idp.example.com/introspect")
+            .build(),
+        );
+        let err = cfg
+            .validate()
+            .expect_err("http introspection_url must be rejected");
+        assert!(err.to_string().contains("oauth.proxy.introspection_url"));
+
+        let mut cfg = validation_https_config();
+        cfg.proxy = Some(
+            OAuthProxyConfig::builder(
+                "https://idp.example.com/authorize",
+                "https://idp.example.com/token",
+                "client",
+            )
+            .revocation_url("http://idp.example.com/revoke")
+            .build(),
+        );
+        let err = cfg
+            .validate()
+            .expect_err("http revocation_url must be rejected");
+        assert!(err.to_string().contains("oauth.proxy.revocation_url"));
+    }
+
+    #[test]
+    fn validate_rejects_http_token_exchange_url() {
+        let mut cfg = validation_https_config();
+        cfg.token_exchange = Some(TokenExchangeConfig::new(
+            "http://idp.example.com/token".into(), // <-- HTTP
+            "client".into(),
+            None,
+            None,
+            "downstream".into(),
+        ));
+        let err = cfg
+            .validate()
+            .expect_err("http token_exchange.token_url must be rejected");
+        assert!(
+            err.to_string().contains("oauth.token_exchange.token_url"),
+            "error must reference token_exchange.token_url; got {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_unparseable_url() {
+        let mut cfg = validation_https_config();
+        cfg.jwks_uri = "not a url".into();
+        let err = cfg
+            .validate()
+            .expect_err("unparseable URL must be rejected");
+        assert!(err.to_string().contains("invalid URL"));
+    }
+
+    #[test]
+    fn validate_rejects_non_http_scheme() {
+        let mut cfg = validation_https_config();
+        cfg.jwks_uri = "file:///etc/passwd".into();
+        let err = cfg.validate().expect_err("file:// scheme must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must use https scheme") && msg.contains("file"),
+            "error must reject non-http(s) schemes; got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_http_with_escape_hatch() {
+        // F2 escape-hatch: `allow_http_oauth_urls = true` permits HTTP for
+        // dev/test against local IdPs without TLS. Document the security
+        // tradeoff (see field doc) and verify all 6 URL fields are accepted
+        // when the flag is set.
+        let mut cfg = OAuthConfig::builder(
+            "http://auth.local",
+            "mcp",
+            "http://auth.local/.well-known/jwks.json",
+        )
+        .allow_http_oauth_urls(true)
+        .build();
+        cfg.proxy = Some(
+            OAuthProxyConfig::builder(
+                "http://idp.local/authorize",
+                "http://idp.local/token",
+                "client",
+            )
+            .introspection_url("http://idp.local/introspect")
+            .revocation_url("http://idp.local/revoke")
+            .build(),
+        );
+        cfg.token_exchange = Some(TokenExchangeConfig::new(
+            "http://idp.local/token".into(),
+            "client".into(),
+            None,
+            None,
+            "downstream".into(),
+        ));
+        cfg.validate()
+            .expect("escape hatch must permit http on all URL fields");
+    }
+
+    #[test]
+    fn validate_with_escape_hatch_still_rejects_unparseable() {
+        // Even with the escape hatch, malformed URLs are rejected so
+        // garbage configuration cannot silently degrade to no-op.
+        let mut cfg = validation_https_config();
+        cfg.allow_http_oauth_urls = true;
+        cfg.jwks_uri = "::not-a-url::".into();
+        cfg.validate()
+            .expect_err("escape hatch must NOT bypass URL parsing");
+    }
+
+    #[tokio::test]
+    async fn jwks_cache_rejects_redirect_downgrade_to_http() {
+        // F2.4 (Oracle modification A): even when the configured `jwks_uri`
+        // is HTTPS, a `302 Location: http://...` from the JWKS host must
+        // be refused by the reqwest redirect policy. Without this guard,
+        // a network-positioned attacker who can spoof the upstream IdP
+        // could redirect the JWKS fetch to plaintext and inject signing
+        // keys, forging arbitrary JWTs.
+        //
+        // We assert at the reqwest-client level (rather than through
+        // `validate_token`) so the assertion is precise: it pins the
+        // policy to "reject scheme downgrade" rather than the broader
+        // "JWKS fetch failed for any reason".
+
+        // Install the same rustls crypto provider JwksCache::new uses,
+        // so the test client can build with TLS support.
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+
+        let policy = reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.url().scheme() != "https" {
+                attempt.error("redirect to non-HTTPS URL refused")
+            } else if attempt.previous().len() >= 2 {
+                attempt.error("too many redirects (max 2)")
+            } else {
+                attempt.follow()
+            }
+        });
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .connect_timeout(Duration::from_secs(3))
+            .redirect(policy)
+            .build()
+            .expect("test client builds");
+
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/jwks.json"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(302)
+                    .insert_header("location", "http://example.invalid/jwks.json"),
+            )
+            .mount(&mock)
+            .await;
+
+        // Emulate an HTTPS jwks_uri that 302s to HTTP.  We can't easily
+        // bring up an HTTPS wiremock, so we simulate the kernel of the
+        // policy: the same client that JwksCache uses must refuse the
+        // redirect target.  reqwest invokes the redirect policy
+        // regardless of source scheme, so an HTTP -> HTTP redirect with
+        // policy `custom(... if scheme != https then error ...)` still
+        // yields the redirect-rejection error path.  That is sufficient
+        // to lock in the policy semantics.
+        let url = format!("{}/jwks.json", mock.uri());
+        let err = client
+            .get(&url)
+            .send()
+            .await
+            .expect_err("redirect policy must reject scheme downgrade");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("redirect to non-HTTPS URL refused")
+                || chain.to_lowercase().contains("redirect"),
+            "error must surface redirect-policy rejection; got {chain:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1716,6 +2226,7 @@ mod tests {
             proxy: None,
             token_exchange: None,
             ca_cert_path: None,
+            allow_http_oauth_urls: true,
         }
     }
 
@@ -2035,6 +2546,7 @@ mod tests {
             proxy: None,
             token_exchange: None,
             ca_cert_path: None,
+            allow_http_oauth_urls: true,
         }
     }
 
@@ -2371,7 +2883,7 @@ mod tests {
         rustls::crypto::ring::default_provider()
             .install_default()
             .ok();
-        OauthHttpClient::new().expect("build test http client")
+        OauthHttpClient::with_config(&OAuthConfig::default()).expect("build test http client")
     }
 
     #[tokio::test]

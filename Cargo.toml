@@ -1,6 +1,6 @@
 [package]
 name = "rmcp-server-kit"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2024"
 rust-version = "1.95.0"
 license = "MIT OR Apache-2.0"
@@ -91,6 +91,7 @@ arc-swap = "1"
 humantime = "2"
 humantime-serde = "1"
 secrecy = { version = "0.10", features = ["serde"] }
+url = "2"
 
 # Metrics (optional)
 prometheus = { version = "0.14", optional = true }

@@ -603,6 +603,17 @@ impl McpServerConfig {
     /// 5. Each entry in `allowed_origins` must start with `http://` or
     ///    `https://`.
     /// 6. `max_request_body` must be greater than zero.
+    /// 7. When the `oauth` feature is enabled and an [`OAuthConfig`] is
+    ///    present, all OAuth URL fields (`jwks_uri`, `proxy.authorize_url`,
+    ///    `proxy.token_url`, `proxy.introspection_url`,
+    ///    `proxy.revocation_url`, `token_exchange.token_url`) must parse
+    ///    and use the `https` scheme. Set
+    ///    [`OAuthConfig::allow_http_oauth_urls`] to permit `http://`
+    ///    targets (strongly discouraged in production - see the field-level
+    ///    docs for the threat model).
+    ///
+    /// [`OAuthConfig`]: crate::oauth::OAuthConfig
+    /// [`OAuthConfig::allow_http_oauth_urls`]: crate::oauth::OAuthConfig::allow_http_oauth_urls
     ///
     /// # Errors
     ///
@@ -675,6 +686,14 @@ impl McpServerConfig {
             return Err(McpxError::Config(
                 "max_request_body must be greater than zero".into(),
             ));
+        }
+
+        // 7. OAuth URL fields enforce HTTPS (unless `allow_http_oauth_urls`)
+        #[cfg(feature = "oauth")]
+        if let Some(auth_cfg) = &self.auth
+            && let Some(oauth_cfg) = &auth_cfg.oauth
+        {
+            oauth_cfg.validate()?;
         }
 
         Ok(())
@@ -1540,7 +1559,7 @@ fn install_oauth_proxy_routes(
 
     // Single shared HTTP client for all proxy endpoints. Cloning is
     // cheap (refcounted) and shares the underlying connection pool.
-    let http = crate::oauth::OauthHttpClient::new()?;
+    let http = crate::oauth::OauthHttpClient::with_config(oauth_config)?;
 
     let asm = crate::oauth::authorization_server_metadata(server_url, oauth_config);
     let router = router.route(

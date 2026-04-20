@@ -281,11 +281,43 @@ pub struct MtlsConfig {
     #[serde(default)]
     pub crl_end_entity_only: bool,
     /// Allow HTTP CRL distribution-point URLs in addition to HTTPS.
+    ///
+    /// Defaults to `true` because RFC 5280 §4.2.1.13 designates HTTP (and
+    /// LDAP) as the canonical transport for CRL distribution points.
+    /// SSRF defense for HTTP CDPs is provided by the IP-allowlist guard
+    /// (private/loopback/link-local/multicast/cloud-metadata addresses are
+    /// always rejected), redirect=none, body-size cap, and per-host
+    /// concurrency limit -- not by forcing HTTPS.
     #[serde(default = "default_true")]
     pub crl_allow_http: bool,
     /// Enforce CRL expiration during certificate validation.
     #[serde(default = "default_true")]
     pub crl_enforce_expiration: bool,
+    /// Maximum concurrent CRL fetches across all hosts. Defense in depth
+    /// against SSRF amplification: even if many CDPs are discovered, no
+    /// more than this many fetches run in parallel. Per-host concurrency
+    /// is independently capped at 1 regardless of this value.
+    /// Default: `4`.
+    #[serde(default = "default_crl_max_concurrent_fetches")]
+    pub crl_max_concurrent_fetches: usize,
+    /// Hard cap on each CRL response body in bytes. Fetches exceeding this
+    /// are aborted mid-stream to bound memory and prevent gzip-bomb-style
+    /// amplification. Default: 5 MiB (`5 * 1024 * 1024`).
+    #[serde(default = "default_crl_max_response_bytes")]
+    pub crl_max_response_bytes: u64,
+    /// Global CDP discovery rate limit, in URLs per minute. Throttles
+    /// how many *new* CDP URLs the verifier may admit into the fetch
+    /// pipeline across the whole process, bounding asymmetric `DoS`
+    /// amplification when attacker-controlled certificates carry large
+    /// CDP lists. The limit is global (not per-source-IP) in this
+    /// release; per-IP scoping is deferred to a future version because
+    /// it requires plumbing the peer `SocketAddr` through the verifier
+    /// hook. URLs that lose the rate-limiter race are *not* marked as
+    /// seen, so subsequent handshakes observing the same URL can
+    /// retry admission.
+    /// Default: `60`.
+    #[serde(default = "default_crl_discovery_rate_per_min")]
+    pub crl_discovery_rate_per_min: u32,
 }
 
 fn default_mtls_role() -> String {
@@ -302,6 +334,18 @@ const fn default_crl_fetch_timeout() -> Duration {
 
 const fn default_crl_stale_grace() -> Duration {
     Duration::from_hours(24)
+}
+
+const fn default_crl_max_concurrent_fetches() -> usize {
+    4
+}
+
+const fn default_crl_max_response_bytes() -> u64 {
+    5 * 1024 * 1024
+}
+
+const fn default_crl_discovery_rate_per_min() -> u32 {
+    60
 }
 
 /// Rate limiting configuration for authentication attempts.
