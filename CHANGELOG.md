@@ -28,9 +28,10 @@ subsystems, addressing four classes of resource exhaustion and SSRF risks.
     held in memory.
 - **`src/oauth.rs` — Fail-closed JWKS key cap.** New `OAuthConfig` knob
   `max_jwks_keys` (default 256) limits the number of public keys parsed from
-  a JWKS document. Documents exceeding this limit are rejected with a
-  `Security` error, preventing "Key Stuffing" resource exhaustion attacks
-  where a hostile IdP returns thousands of keys to slow down validation.
+  a JWKS document. Documents exceeding this limit are rejected (logged as 
+  security failure; surfaces as internal error), preventing "Key Stuffing" 
+  resource exhaustion attacks where a hostile IdP returns thousands of keys 
+  to slow down validation.
 - **`src/ssrf.rs` — Shared internal SSRF guard.** Extracted the 1.2.1 CRL SSRF
   logic into a dedicated `pub(crate)` module, providing a unified blocklist
   (private/loopback/link-local/metadata/multicast/etc.) for all outbound
@@ -44,8 +45,9 @@ subsystems, addressing four classes of resource exhaustion and SSRF risks.
   previously introduced for CRLs in 1.2.1.
 - **`src/oauth.rs` — Hardened OAuth URL validation.** `check_oauth_url` now
   rejects URLs containing userinfo (e.g., `https://user:pass@host/`) and
-  rejects IP literals in the host position (e.g., `https://127.0.0.1/`) to
-  prevent bypasses of the trust-boundary model.
+  rejects ALL IP literals in the host position (e.g., `https://127.0.0.1/`)
+  at validate-time to prevent bypasses of the trust-boundary model. All 6
+  OAuth URL fields (including `issuer`) are now covered (Oracle B1/B2).
 
 ### Fixed
 

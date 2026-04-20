@@ -92,9 +92,10 @@ in 1.2.1 is now **enforced across all OAuth-bound HTTP traffic** (JWKS
 fetching, token exchange, introspection, and revocation).
 
 Any outbound request (including redirects) that resolves to a
-private/loopback/link-local/metadata address will now fail with a
-`Security` error. This matches the threat model where Identity Providers are
-untrusted for the purpose of internal network discovery.
+private/loopback/link-local/metadata address will now fail with an 
+internal error (logged as a security failure; matches the pre-B3
+Oracle findings). This matches the threat model where Identity Providers are
+untrustworthy for the purpose of internal network discovery.
 
 ### OAuth hardening: URL validation and JWKS caps
 

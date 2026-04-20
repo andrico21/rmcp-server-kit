@@ -157,8 +157,8 @@ applies three resource-exhaustion caps:
 | Knob                            | Default       | Purpose                                                                                       |
 |---------------------------------|---------------|-----------------------------------------------------------------------------------------------|
 | `max_jwks_keys`                 | `256`         | Caps the number of public keys parsed from a single JWKS document; fail-closed on overflow.   |
-| `oauth_redirect_limit`          | `10`          | Hard limit on the number of HTTP redirects followed during a fetch.                           |
-| `oauth_fetch_timeout`           | `30 s`        | Total timeout for an OAuth-bound HTTP request.                                                |
+| `reqwest` default              | `10`          | Hard limit on the number of HTTP redirects followed during a fetch (not user-tunable).       |
+| `OauthHttpClient` timeout      | `30 s`        | Total timeout for an OAuth-bound HTTP request (default).                                     |
 
 Furthermore, `check_oauth_url` (applied at config-construction time
 and redirect time) now rejects URLs that:
@@ -190,8 +190,11 @@ token exchange, the optional `/authorize`/`/token`/`/register`/
 The `oauth.issuer_url`, `oauth.jwks_uri`, and other OAuth/OIDC endpoint
 URLs are treated as **operator-trusted configuration**, not as
 attacker-supplied input. As of **1.3.0**, the OAuth fetcher enforces a
-strict per-hop DNS/private-IP SSRF guard (shared with the CRL fetcher)
-and rejects IP literals or userinfo in URLs.
+strict per-hop DNS/private-IP SSRF guard (shared with the CRL fetcher).
+The validate-time check rejects userinfo and ALL literal IP hosts (operators 
+must use DNS hostnames for the 6 OAuth URL fields). The runtime per-hop 
+redirect guard rejects userinfo and literal IPs in forbidden ranges 
+(private/loopback/link-local/metadata).
 
 Implications:
 
