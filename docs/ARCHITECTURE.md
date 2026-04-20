@@ -60,6 +60,8 @@ src/
 ├── auth.rs              authn primitives: ApiKeyEntry, AuthState, mw     (~600+ LOC)
 ├── rbac.rs              authz: RbacPolicy, task-locals, mw, rate-limit   (~620+ LOC)
 ├── oauth.rs             OAuth 2.1 + JWKS cache (feature = "oauth")       (~640+ LOC)
+├── mtls_revocation.rs   CDP-driven CRL fetcher + dynamic verifier (1.2.0+)
+├── ssrf.rs              Shared SSRF guard logic (1.3.0+)
 ├── admin.rs             /admin/* router + admin role middleware
 ├── tool_hooks.rs        opt-in HookedHandler wrapping ServerHandler
 ├── observability.rs     tracing init, JSON logging, audit-file sink
@@ -424,26 +426,26 @@ Failure modes:
 - `crl_allow_http = false` rejects `http://` CDP URLs.
 - `crl_end_entity_only = true` checks only the leaf, skipping intermediates.
 
-### SSRF hardening (since 1.2.1)
+### SSRF hardening (since 1.2.1/1.3.0)
 
-`ssrf_guard` (`src/mtls_revocation.rs:73-200`) runs against every CDP URL
-*before* the HTTP request is issued, rejecting non-`http(s)` schemes,
-URLs with userinfo, and any host that resolves to a private/loopback/
-link-local/multicast/unspecified/broadcast/cloud-metadata address (IPv4
-and IPv6, including IPv4-mapped IPv6 and IPv4-compatible IPv6). The
-fetcher also pins `redirect::Policy::none()` for CRL traffic — a CRL is
-signed by the issuing CA, so following operator-unintended redirects has
-no security benefit. Three knobs cap the blast radius even when a CDP is
+`ssrf_guard` (now in its own `ssrf` module, `src/ssrf.rs`) runs against
+every outbound HTTP URL *before* the request is issued. It rejects:
+- non-`http(s)` schemes
+- URLs with userinfo
+- any host that resolves to a private/loopback/link-local/multicast/
+  unspecified/broadcast/cloud-metadata address (IPv4 and IPv6).
+
+As of **1.3.0**, this guard covers **both CRL and OAuth traffic**.
+
+Additionally, several knobs cap the blast radius even when a host is
 reachable:
 
-- `crl_max_concurrent_fetches` (default 4) — global parallel-fetch cap;
-  per-host concurrency is independently hard-capped at 1 via
-  `host_semaphores`.
-- `crl_max_response_bytes` (default 5 MiB) — streams aborted mid-response
-  when exceeded (defends against gzip-bomb amplification).
-- `crl_discovery_rate_per_min` (default 60) — `governor`-based
-  process-global rate limit on **new** CDP URLs admitted to the fetch
-  pipeline.
+- `crl_max_concurrent_fetches` (default 4) — global parallel-fetch cap.
+- `crl_max_response_bytes` (default 5 MiB) — body size cap.
+- `crl_discovery_rate_per_min` (default 60) — discovery rate limit.
+- `crl_max_host_semaphores` (default 1024) — caps unique CDP hosts.
+- `crl_max_seen_urls` (default 4096) — caps discovery deduplication map.
+- `crl_max_cache_entries` (default 1024) — caps CRL memory cache.
 
 ### Discovery admission ordering (since 1.2.1)
 
@@ -515,21 +517,21 @@ These let downstream MCP clients discover OAuth via the same origin as
 - Symmetric keys (`HS*`) are rejected by default — protects against
   algorithm-confusion attacks.
 - JWKS responses cached with TTL; stale-while-revalidate semantics.
-- HTTPS-downgrade-rejecting redirect policy on `OauthHttpClient` (since
-  1.2.1): HTTPS → HTTP redirects are denied unconditionally; HTTP → HTTP
-  is allowed only when `oauth.allow_http_oauth_urls = true`.
+- HTTPS-downgrade-rejecting redirect policy on `OauthHttpClient`.
+- **SSRF Guard (since 1.3.0)**: per-hop DNS/private-IP blocklist and URL
+  validation (no userinfo, no IP literals).
+- **JWKS Key Cap (since 1.3.0)**: `max_jwks_keys` (default 256) blocks
+  key-stuffing resource exhaustion.
 - Prefer `OauthHttpClient::with_config(&OAuthConfig)` (since 1.2.1) over
-  the deprecated `OauthHttpClient::new()` so the redirect policy and CA
-  bundle are wired consistently.
+  the deprecated `OauthHttpClient::new()` so the redirect policy, SSRF
+  guard, and CA bundle are wired consistently.
 
-### Trust boundary (1.2.x)
+### Trust boundary (1.3.x)
 
 OAuth endpoint URLs (`issuer_url`, `jwks_uri`, discovery URLs) are
-**operator-trusted configuration**. Per-hop DNS/private-IP SSRF guarding
-is **not** applied to OAuth-bound fetches in 1.2.x — that hardening is
-queued for 1.3.0 (extract `ssrf_guard` from `src/mtls_revocation.rs` and
-apply it per redirect hop in `JwksCache`). Until then, never let tenants
-or end-users influence OAuth endpoint URLs at runtime.
+**operator-trusted configuration**. As of **1.3.0**, these URLs are
+subject to strict validation and an SSRF guard, but operators must still
+ensure they point to intended, authenticated Identity Providers.
 
 ---
 

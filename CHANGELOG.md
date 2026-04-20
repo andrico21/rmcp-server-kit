@@ -8,46 +8,51 @@ Starting with `1.0.0`, breaking changes bump the **major** version. Pre-1.0
 releases (`0.x.y`) used the convention that breaking changes bumped the
 **minor** version.
 
-## [Unreleased]
+## [1.3.0] - 2026-04-20
 
-### Documentation
+This release focuses on multi-layered security hardening across OAuth and mTLS
+subsystems, addressing four classes of resource exhaustion and SSRF risks.
+**No breaking changes** -- `cargo semver-checks check-release` passes.
 
-- **Post-1.2.1 documentation follow-up.** Expanded `SECURITY.md`,
-  `docs/GUIDE.md`, `docs/MIGRATION.md`, `docs/ARCHITECTURE.md`,
-  `docs/MINDMAP.md`, and `README.md` to cover the 1.2.1 security
-  hardening surface end-to-end:
-  - New `SECURITY.md` subsections "CRL fetch SSRF hardening (since
-    1.2.1)", "OAuth HTTPS enforcement (since 1.2.1)", and "Trust
-    boundary on OAuth endpoint URLs", plus a refreshed
-    Supported-versions table (1.2.x active, 1.1.x maintenance).
-  - `docs/GUIDE.md` CRL/mTLS configuration block now documents the
-    three new TOML knobs (`crl_max_concurrent_fetches`,
-    `crl_max_response_bytes`, `crl_discovery_rate_per_min`) with
-    defaults (4 / 5 MiB / 60 per minute) and tuning guidance.
-  - New `docs/MIGRATION.md` "Migrating from 1.2.0 to 1.2.1" section
-    covering the `OauthHttpClient::with_config` migration and the
-    new CRL knobs.
-  - `docs/ARCHITECTURE.md` §7 gains "SSRF hardening (since 1.2.1)"
-    and "Discovery admission ordering (since 1.2.1)" subsections;
-    §8 documents the OAuth hardening defaults and the operator
-    trust boundary on `jwks_uri` / `issuer` / `authorization_endpoint`.
-  - `docs/MINDMAP.md` mTLS+OAuth subtree gains the SSRF-guard and
-    `OauthHttpClient::with_config` nodes.
-  - `README.md` OAuth example annotates the
-    `OauthHttpClient::with_config` migration with cross-links to
-    `MIGRATION.md` and `SECURITY.md`.
-  - Minor rustdoc clarification on
-    [`OauthHttpClient::with_config`] in `src/oauth.rs` explaining
-    the `ca_cert_path` propagation scope.
-- A known follow-up tracked for `1.3.0`: tighten OAuth HTTP fetch
-  paths (JWKS / token / introspection / revocation / exchange) with
-  the same per-hop SSRF guard already used for CRL fetches, reject
-  userinfo in `check_oauth_url`, and normalise IP literals
-  (octal/hex/percent-encoded) in `mtls_revocation`. The current
-  1.2.1 surface is safe under the documented operator-trusted
-  configuration model; see
-  `SECURITY.md#trust-boundary-on-oauth-endpoint-urls` for the
-  threat-model boundary.
+### Added
+
+- **`src/mtls_revocation.rs` — Bounded growth of CRL revocation maps.** Three
+  new `MtlsConfig` knobs (all `#[serde(default)]`) prevent memory exhaustion
+  from high-cardinality CRL discovery:
+  - `crl_max_host_semaphores` (default 1024): caps the number of unique CDP
+    hosts tracked for per-host concurrency gating.
+  - `crl_max_seen_urls` (default 4096): caps the Bloom-filter/map of URLs
+    ever observed during handshakes to prevent a malicious chain from
+    bloating the "seen" set.
+  - `crl_max_cache_entries` (default 1024): caps the number of parsed CRLs
+    held in memory.
+- **`src/oauth.rs` — Fail-closed JWKS key cap.** New `OAuthConfig` knob
+  `max_jwks_keys` (default 256) limits the number of public keys parsed from
+  a JWKS document. Documents exceeding this limit are rejected with a
+  `Security` error, preventing "Key Stuffing" resource exhaustion attacks
+  where a hostile IdP returns thousands of keys to slow down validation.
+- **`src/ssrf.rs` — Shared internal SSRF guard.** Extracted the 1.2.1 CRL SSRF
+  logic into a dedicated `pub(crate)` module, providing a unified blocklist
+  (private/loopback/link-local/metadata/multicast/etc.) for all outbound
+  framework traffic.
+
+### Changed
+
+- **`src/oauth.rs` — SSRF guard now covers all OAuth-bound HTTP traffic.**
+  The JWKS fetcher and the shared `OauthHttpClient` (token / introspection /
+  revocation / exchange) now enforce the same per-hop SSRF blocklist
+  previously introduced for CRLs in 1.2.1.
+- **`src/oauth.rs` — Hardened OAuth URL validation.** `check_oauth_url` now
+  rejects URLs containing userinfo (e.g., `https://user:pass@host/`) and
+  rejects IP literals in the host position (e.g., `https://127.0.0.1/`) to
+  prevent bypasses of the trust-boundary model.
+
+### Fixed
+
+- **`src/mtls_revocation.rs` — IP literal normalization.** CRL discovery now
+  normalizes IP literals in CDP URLs (rejecting octal/hex/percent-encoded
+  obfuscation) before the SSRF check, closing the bypass window identified
+  in 1.2.1.
 
 ## [1.2.1] - 2026-04-20
 

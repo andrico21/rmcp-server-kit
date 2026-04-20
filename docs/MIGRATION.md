@@ -79,6 +79,64 @@ Both remain opt-in to keep the default dependency footprint small.
 
 ---
 
+## Migrating from 1.2.1 to 1.3.0
+
+`1.3.0` is a **security-hardening release** focused on OAuth and mTLS
+resilience. While there are no breaking public-API changes, several new
+resource caps and an SSRF guard are now active by default.
+
+### Universal SSRF guard on outbound HTTP
+
+The per-hop DNS/private-IP SSRF guard previously introduced for CRL fetches
+in 1.2.1 is now **enforced across all OAuth-bound HTTP traffic** (JWKS
+fetching, token exchange, introspection, and revocation).
+
+Any outbound request (including redirects) that resolves to a
+private/loopback/link-local/metadata address will now fail with a
+`Security` error. This matches the threat model where Identity Providers are
+untrusted for the purpose of internal network discovery.
+
+### OAuth hardening: URL validation and JWKS caps
+
+`check_oauth_url` (applied at config-construction and redirect time) now
+rejects URLs containing userinfo or IP literals. Additionally, a new
+fail-closed cap on the number of JWKS keys is enforced:
+
+```toml
+[oauth]
+max_jwks_keys = 256  # default; fail-closed on overflow
+```
+
+If your IdP publishes an unusually large number of keys (exceeding 256), raise
+`max_jwks_keys` to match your deployment requirements.
+
+### Bounded growth for mTLS revocation (mTLS deployments only)
+
+Three new knobs were added to `MtlsConfig` to cap memory usage in the face
+of high-cardinality CRL discovery:
+
+```toml
+[mtls]
+crl_max_host_semaphores = 1024  # default
+crl_max_seen_urls       = 4096  # default
+crl_max_cache_entries   = 1024  # default
+```
+
+These defaults are sized for enterprise deployments; operators with
+thousands of distinct issuing CAs or CDP hosts should scale these caps
+upward.
+
+### Action items
+
+1. `cargo update -p rmcp-server-kit` (or bump the pin to `"1.3.0"`).
+2. If you use mTLS with a very high number of distinct CRL sources, review
+   the new `crl_max_*` caps.
+3. If you use OAuth, verify your `issuer_url` and `jwks_uri` do not use
+   IP literals (use DNS names instead).
+4. No action required if you do not use mTLS or OAuth.
+
+---
+
 ## Migrating from 1.2.0 to 1.2.1
 
 `1.2.1` is a **security-hardening patch release**. There are no breaking
