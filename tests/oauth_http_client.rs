@@ -446,3 +446,107 @@ fn nonexistent_ca_cert_path_returns_startup_error() {
         "expected ca_cert_path read error, got: {rendered}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 1.3.0 hardening: per-hop SSRF guard in redirect policies
+// ---------------------------------------------------------------------------
+//
+// The 1.2.1 redirect policies on both `OauthHttpClient::build` and
+// `JwksCache::new` only enforce scheme + hop-count. An attacker can
+// still redirect a validator to `https://10.0.0.1/` or
+// `https://127.0.0.1/` — both pass scheme + hop checks. 1.3.0 adds a
+// sync literal-IP guard (`redirect_target_reason`) that rejects
+// private / loopback / link-local / cloud-metadata destinations, plus
+// a userinfo check.
+
+#[tokio::test]
+async fn rejects_per_hop_redirect_to_private_ip_oauth_client() {
+    install_crypto_provider();
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/redir"))
+        .respond_with(
+            ResponseTemplate::new(302).insert_header("location", "https://10.0.0.1/internal"),
+        )
+        .mount(&mock)
+        .await;
+
+    let mut config = OAuthConfig::default();
+    config.allow_http_oauth_urls = true;
+    let client = OauthHttpClient::with_config(&config).expect("client builds");
+
+    let url = format!("{}/redir", mock.uri());
+    let result = client.__test_get(&url).await;
+    let err = result.expect_err("redirect to private IP must be rejected");
+    let rendered = render_error_chain(&err);
+    assert!(
+        rendered.contains("redirect target forbidden")
+            || rendered.contains("private")
+            || rendered.contains("rfc1918"),
+        "expected redirect-target-forbidden error (per-hop SSRF guard), got: {rendered}"
+    );
+    assert!(
+        err.is_redirect(),
+        "expected reqwest::Error::is_redirect()=true, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn rejects_per_hop_redirect_to_loopback_oauth_client() {
+    // Same guard, loopback target. Covered separately because
+    // `redirect_target_reason` returns distinct reasons for the two
+    // categories; we want proof both branches fire.
+    install_crypto_provider();
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/redir"))
+        .respond_with(
+            ResponseTemplate::new(302).insert_header("location", "https://127.0.0.1/admin"),
+        )
+        .mount(&mock)
+        .await;
+
+    let mut config = OAuthConfig::default();
+    config.allow_http_oauth_urls = true;
+    let client = OauthHttpClient::with_config(&config).expect("client builds");
+
+    let url = format!("{}/redir", mock.uri());
+    let result = client.__test_get(&url).await;
+    let err = result.expect_err("redirect to loopback must be rejected");
+    let rendered = render_error_chain(&err);
+    assert!(
+        rendered.contains("redirect target forbidden") || rendered.contains("loopback"),
+        "expected loopback redirect rejection, got: {rendered}"
+    );
+    assert!(err.is_redirect(), "expected redirect-error, got {err:?}");
+}
+
+#[tokio::test]
+async fn rejects_redirect_with_userinfo_oauth_client() {
+    install_crypto_provider();
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/redir"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", "https://evil@example.com/pwn"),
+        )
+        .mount(&mock)
+        .await;
+
+    let mut config = OAuthConfig::default();
+    config.allow_http_oauth_urls = true;
+    let client = OauthHttpClient::with_config(&config).expect("client builds");
+
+    let url = format!("{}/redir", mock.uri());
+    let result = client.__test_get(&url).await;
+    let err = result.expect_err("redirect with userinfo must be rejected");
+    let rendered = render_error_chain(&err);
+    assert!(
+        rendered.contains("redirect target forbidden")
+            || rendered.contains("userinfo")
+            || rendered.contains("credentials"),
+        "expected userinfo redirect rejection, got: {rendered}"
+    );
+    assert!(err.is_redirect(), "expected redirect-error, got {err:?}");
+}
