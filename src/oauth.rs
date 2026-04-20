@@ -874,23 +874,45 @@ impl JwksCache {
         validation.validate_exp = true;
         validation.validate_nbf = true;
 
+        let allow_http = config.allow_http_oauth_urls;
+
         let mut http_builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .connect_timeout(Duration::from_secs(3))
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                // SECURITY: reject any redirect to a non-HTTPS target,
-                // even when the original `jwks_uri` was validated as
-                // HTTPS.  This prevents an upstream `302 Location: http://...`
-                // from downgrading the JWKS fetch to plaintext where a
-                // network attacker could substitute the response and
-                // forge JWT signing keys.  The HTTPS scheme guard runs
-                // *before* the hop limit so a downgrade is rejected as
-                // such (clearer error) rather than as "too many redirects".
-                if attempt.url().scheme() != "https" {
-                    attempt.error("redirect to non-HTTPS URL refused")
-                } else if let Some(reason) = crate::ssrf::redirect_target_reason(attempt.url()) {
-                    attempt.error(format!("redirect target forbidden: {reason}"))
-                } else if attempt.previous().len() >= 2 {
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                // SECURITY: a redirect from `https` to `http` is *always*
+                // rejected, even when `allow_http_oauth_urls` is true.
+                // The flag controls whether the *original* request URL
+                // may be plain HTTP; it never authorises a downgrade
+                // mid-flight. An `http -> http` redirect is permitted
+                // only when the flag is true (dev-only). The scheme
+                // guard runs before the hop-count guard so a downgrade
+                // surfaces as an explicit downgrade error rather than as
+                // "too many redirects".
+                let prev_https = attempt
+                    .previous()
+                    .last()
+                    .is_some_and(|prev| prev.scheme() == "https");
+                let target_url = attempt.url();
+                let dest_scheme = target_url.scheme();
+                if dest_scheme != "https" {
+                    let reason = if prev_https {
+                        Some("redirect downgrades https -> http".to_owned())
+                    } else if !allow_http || dest_scheme != "http" {
+                        Some("redirect to non-HTTP(S) URL refused".to_owned())
+                    } else {
+                        None
+                    };
+                    if let Some(reason) = reason {
+                        tracing::warn!(reason = %reason, target = %target_url, "oauth redirect rejected");
+                        return attempt.error(reason);
+                    }
+                }
+                if let Some(reason) = crate::ssrf::redirect_target_reason(target_url) {
+                    tracing::warn!(reason = %reason, target = %target_url, "oauth redirect rejected");
+                    return attempt.error(format!("redirect target forbidden: {reason}"));
+                }
+                if attempt.previous().len() >= 2 {
                     attempt.error("too many redirects (max 2)")
                 } else {
                     attempt.follow()
