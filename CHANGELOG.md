@@ -10,6 +10,17 @@ releases (`0.x.y`) used the convention that breaking changes bumped the
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-04-20
+
+### Security
+
+- Republish of `1.1.0` with all references to a private internal mirror
+  removed from the documentation set (`README.md`, `AGENTS.md`,
+  `SECURITY.md`, `CODE_OF_CONDUCT.md`, `docs/MIGRATION.md`,
+  `docs/MINDMAP.md`). Versions `1.0.0` and `1.1.0` have been yanked;
+  deletion of the published tarballs has been requested from the
+  crates.io team. No code changes — pure documentation hygiene.
+
 ## [1.1.0] - 2026-04-20
 
 This minor release rolls up the Phase 1 documentation/CI hardening (originally

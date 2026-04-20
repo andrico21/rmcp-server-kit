@@ -19,7 +19,6 @@ mindmap
       Dual MIT / Apache-2.0
       Repos
         GitHub andrico21/rmcp-server-kit
-        GitHub mirror
         crates.io rmcp-server-kit
     Purpose
       Reusable framework
