@@ -21,10 +21,6 @@ reporting) on the public repository:
 
 <https://github.com/andrico21/rmcp-server-kit/security/advisories/new>
 
-Users of the internal mirror at
-`[REDACTED]` may alternatively open a
-**confidential issue** in that project.
-
 Include:
 
 - A description of the vulnerability and its impact.

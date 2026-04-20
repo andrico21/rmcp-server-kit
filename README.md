@@ -135,13 +135,9 @@ let config = McpServerConfig::new("127.0.0.1:8443", "my-server", "0.1.0")
 
 `rmcp-server-kit` targets stable Rust **1.95** or newer (tracks `edition = "2024"`).
 
-## Repositories
+## Repository
 
-`rmcp-server-kit` is published to two mirrors with identical contents; either may
-be used as a git dependency.
-
-- **GitHub** (canonical, public): <https://github.com/andrico21/rmcp-server-kit>
-- **GitLab** (internal mirror): <[REDACTED]>
+- **GitHub** (canonical): <https://github.com/andrico21/rmcp-server-kit>
 
 The canonical release artifact is the [`rmcp-server-kit` crate on crates.io](https://crates.io/crates/rmcp-server-kit).
 

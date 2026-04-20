@@ -49,10 +49,8 @@ spaces.
 Instances of abusive, harassing, or otherwise unacceptable behavior may
 be reported to the community leaders responsible for enforcement by
 opening a **private GitHub Security Advisory** at
-<https://github.com/andrico21/rmcp-server-kit/security/advisories/new>, or
-(for users of the internal mirror) a **confidential issue** in
-`[REDACTED]`. All complaints will be
-reviewed and investigated promptly and fairly.
+<https://github.com/andrico21/rmcp-server-kit/security/advisories/new>.
+All complaints will be reviewed and investigated promptly and fairly.
 
 ## Attribution
 

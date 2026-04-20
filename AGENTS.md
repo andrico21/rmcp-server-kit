@@ -33,7 +33,6 @@ shutdown.
 | License       | `MIT OR Apache-2.0` (dual)                                         |
 | Crate type    | **Library** (no `src/main.rs`; runnable code lives in `examples/`) |
 | Repository    | https://github.com/andrico21/rmcp-server-kit (canonical)           |
-| Mirror        | [REDACTED]                  |
 | Crates.io     | https://crates.io/crates/rmcp-server-kit                           |
 
 ---
