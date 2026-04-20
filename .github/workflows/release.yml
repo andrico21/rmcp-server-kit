@@ -32,6 +32,26 @@ jobs:
             exit 1
           fi
 
+      - name: Extract release notes for this version
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          # Extract everything between "## [TAG]" and the next "## [" header.
+          # Strips the version header line itself; release page already shows the version as the title.
+          awk -v ver="$TAG" '
+            $0 ~ "^## \\[" ver "\\]" { found=1; next }
+            found && /^## \[/        { exit }
+            found                    { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "::error::No CHANGELOG.md section found for version $TAG"
+            exit 1
+          fi
+          echo "----- RELEASE_NOTES.md -----"
+          cat RELEASE_NOTES.md
+          echo "----- end -----"
+
       - name: Dry-run publish
         run: cargo publish --dry-run --all-features
 
@@ -43,5 +63,4 @@ jobs:
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3
         with:
-          generate_release_notes: true
-          body_path: CHANGELOG.md
+          body_path: RELEASE_NOTES.md
