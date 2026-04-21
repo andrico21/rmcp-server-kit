@@ -204,10 +204,13 @@ affects code that constructed `OauthHttpClient` directly.
 ### Trust-boundary clarification for OAuth endpoint URLs
 
 `oauth.issuer` / `oauth.jwks_uri` / discovery URLs are treated as
-**operator-trusted configuration** in 1.2.x. Per-hop DNS/private-IP
-SSRF guarding for OAuth-bound traffic is deferred to **1.3.0**; in the
-meantime, do not let tenants or end-users influence those URLs at
-runtime. See
+**operator-trusted configuration** in 1.2.x and continue to be in
+1.3.x. In 1.2.x there is no per-hop SSRF guard on OAuth-bound traffic,
+so do not let tenants or end-users influence those URLs at runtime.
+1.3.0 adds the two-layer OAuth URL hardening (validate-time
+literal-IP/userinfo rejection plus a sync per-hop SSRF range guard in
+both the `OauthHttpClient` and `JwksCache` redirect closures); see the
+[1.2.1 → 1.3.0 migration notes](#migrating-from-121-to-130) and
 [`SECURITY.md` — Trust boundary on OAuth endpoint URLs](../SECURITY.md#trust-boundary-on-oauth-endpoint-urls).
 
 ### Action items

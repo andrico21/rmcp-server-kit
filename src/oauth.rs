@@ -26,6 +26,55 @@ use tokio::sync::RwLock;
 use crate::auth::{AuthIdentity, AuthMethod};
 
 // ---------------------------------------------------------------------------
+// Shared OAuth redirect-policy helper
+// ---------------------------------------------------------------------------
+
+/// Outcome of evaluating a single OAuth redirect hop against the
+/// shared policy used by both [`OauthHttpClient::build`] and
+/// [`JwksCache::new`].
+///
+/// `Ok(())` means the redirect should be followed; `Err(reason)` means
+/// the closure should reject it. Callers are responsible for emitting
+/// the `tracing::warn!` rejection log so the policy stays a pure
+/// function (no I/O, no logging) and so the closures keep their
+/// cognitive complexity below the crate-wide clippy threshold.
+///
+/// The policy mirrors the documented behaviour exactly:
+///   1. `https -> http` redirect downgrades are *always* rejected.
+///   2. Non-`https` targets are accepted only when `allow_http` is true
+///      *and* the destination scheme is `http`.
+///   3. Targets resolving to disallowed IP ranges (private / loopback /
+///      link-local / multicast / broadcast / unspecified /
+///      cloud-metadata) are rejected via [`crate::ssrf::redirect_target_reason`].
+///   4. The hop count is capped at 2 (i.e. at most 2 prior redirects).
+fn evaluate_oauth_redirect(
+    attempt: &reqwest::redirect::Attempt<'_>,
+    allow_http: bool,
+) -> Result<(), String> {
+    let prev_https = attempt
+        .previous()
+        .last()
+        .is_some_and(|prev| prev.scheme() == "https");
+    let target_url = attempt.url();
+    let dest_scheme = target_url.scheme();
+    if dest_scheme != "https" {
+        if prev_https {
+            return Err("redirect downgrades https -> http".to_owned());
+        }
+        if !allow_http || dest_scheme != "http" {
+            return Err("redirect to non-HTTP(S) URL refused".to_owned());
+        }
+    }
+    if let Some(reason) = crate::ssrf::redirect_target_reason(target_url) {
+        return Err(format!("redirect target forbidden: {reason}"));
+    }
+    if attempt.previous().len() >= 2 {
+        return Err("too many redirects (max 2)".to_owned());
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // HTTP client wrapper
 // ---------------------------------------------------------------------------
 
@@ -136,30 +185,20 @@ impl OauthHttpClient {
                 // The flag controls whether the *original* request URL
                 // may be plain HTTP; it never authorises a downgrade
                 // mid-flight. An `http -> http` redirect is permitted
-                // only when the flag is true (dev-only). The scheme
-                // guard runs before the hop-count guard so a downgrade
-                // surfaces as an explicit downgrade error rather than as
-                // "too many redirects".
-                let prev_https = attempt
-                    .previous()
-                    .last()
-                    .is_some_and(|prev| prev.scheme() == "https");
-                let dest_scheme = attempt.url().scheme();
-                if dest_scheme != "https" {
-                    if prev_https {
-                        return attempt.error("redirect downgrades https -> http");
+                // only when the flag is true (dev-only). The full
+                // policy lives in `evaluate_oauth_redirect` so the
+                // OauthHttpClient and JwksCache closures stay
+                // byte-for-byte identical.
+                match evaluate_oauth_redirect(&attempt, allow_http) {
+                    Ok(()) => attempt.follow(),
+                    Err(reason) => {
+                        tracing::warn!(
+                            reason = %reason,
+                            target = %attempt.url(),
+                            "oauth redirect rejected"
+                        );
+                        attempt.error(reason)
                     }
-                    if !allow_http || dest_scheme != "http" {
-                        return attempt.error("redirect to non-HTTP(S) URL refused");
-                    }
-                }
-                if let Some(reason) = crate::ssrf::redirect_target_reason(attempt.url()) {
-                    return attempt.error(format!("redirect target forbidden: {reason}"));
-                }
-                if attempt.previous().len() >= 2 {
-                    attempt.error("too many redirects (max 2)")
-                } else {
-                    attempt.follow()
                 }
             }));
 
@@ -885,37 +924,20 @@ impl JwksCache {
                 // The flag controls whether the *original* request URL
                 // may be plain HTTP; it never authorises a downgrade
                 // mid-flight. An `http -> http` redirect is permitted
-                // only when the flag is true (dev-only). The scheme
-                // guard runs before the hop-count guard so a downgrade
-                // surfaces as an explicit downgrade error rather than as
-                // "too many redirects".
-                let prev_https = attempt
-                    .previous()
-                    .last()
-                    .is_some_and(|prev| prev.scheme() == "https");
-                let target_url = attempt.url();
-                let dest_scheme = target_url.scheme();
-                if dest_scheme != "https" {
-                    let reason = if prev_https {
-                        Some("redirect downgrades https -> http".to_owned())
-                    } else if !allow_http || dest_scheme != "http" {
-                        Some("redirect to non-HTTP(S) URL refused".to_owned())
-                    } else {
-                        None
-                    };
-                    if let Some(reason) = reason {
-                        tracing::warn!(reason = %reason, target = %target_url, "oauth redirect rejected");
-                        return attempt.error(reason);
+                // only when the flag is true (dev-only). The full
+                // policy lives in `evaluate_oauth_redirect` so the
+                // OauthHttpClient and JwksCache closures stay
+                // byte-for-byte identical.
+                match evaluate_oauth_redirect(&attempt, allow_http) {
+                    Ok(()) => attempt.follow(),
+                    Err(reason) => {
+                        tracing::warn!(
+                            reason = %reason,
+                            target = %attempt.url(),
+                            "oauth redirect rejected"
+                        );
+                        attempt.error(reason)
                     }
-                }
-                if let Some(reason) = crate::ssrf::redirect_target_reason(target_url) {
-                    tracing::warn!(reason = %reason, target = %target_url, "oauth redirect rejected");
-                    return attempt.error(format!("redirect target forbidden: {reason}"));
-                }
-                if attempt.previous().len() >= 2 {
-                    attempt.error("too many redirects (max 2)")
-                } else {
-                    attempt.follow()
                 }
             }));
 
