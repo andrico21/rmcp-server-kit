@@ -4,9 +4,9 @@
 
 | Version  | Supported |
 |----------|-----------|
+| 1.3.x    | ✅        |
 | 1.2.x    | ✅        |
-| 1.1.x    | ✅        |
-| < 1.1    | ❌        |
+| < 1.2    | ❌        |
 
 We support the latest minor release and the previous one for security
 fixes. Patch releases (`x.y.Z`) are issued for the supported lines only.
@@ -132,14 +132,41 @@ SSRF/DoS amplification even if a CRL host is reachable:
 | `crl_max_response_bytes`        | `5 MiB`       | Body size cap; streams aborted mid-response when exceeded.                                    |
 | `crl_discovery_rate_per_min`    | `60`          | Process-global rate limit on *new* CDP URLs admitted into the fetch pipeline.                  |
 | `crl_fetch_timeout`             | `30 s`        | Per-fetch HTTP timeout.                                                                        |
+| `crl_max_host_semaphores`      | `1024`        | Caps the number of unique CDP hosts tracked for per-host concurrency gating (since 1.3.0).    |
+| `crl_max_seen_urls`            | `4096`        | Caps the URL-deduplication map to prevent unbounded memory growth from discovery (since 1.3.0). |
+| `crl_max_cache_entries`        | `1024`        | Caps the number of parsed CRLs held in memory (since 1.3.0).                                  |
 
 The fetcher also disables HTTP redirects entirely for CRL traffic — a
 CRL is signed by the issuing CA, so blindly following a redirect to an
 operator-unintended host has no security benefit.
 
-URLs that lose the discovery rate-limiter race are **not** marked as
-seen, so a subsequent handshake observing the same URL can retry
-admission once the limiter window opens.
+As of **1.3.0**, discovery URLs containing IP literals are normalized
+(rejecting octal/hex/percent-encoded obfuscation) before the SSRF check,
+eliminating the bypass window identified in 1.2.1.
+
+### OAuth SSRF hardening (since 1.3.0)
+
+When the optional `oauth` feature is enabled, the JWKS fetcher and the
+shared `OauthHttpClient` (used for token exchange, introspection, and
+revocation) now enforce the same per-hop SSRF guard as the CRL fetcher.
+This closes the internal-HTTPS-GET exposure identified in 1.2.1.
+
+In addition to the per-hop DNS/private-IP guard, the OAuth subsystem
+applies three resource-exhaustion caps:
+
+| Knob                            | Default       | Purpose                                                                                       |
+|---------------------------------|---------------|-----------------------------------------------------------------------------------------------|
+| `max_jwks_keys`                 | `256`         | Caps the number of public keys parsed from a single JWKS document; fail-closed on overflow.   |
+| `reqwest` default              | `10`          | Hard limit on the number of HTTP redirects followed during a fetch (not user-tunable).       |
+| `OauthHttpClient` timeout      | `30 s`        | Total timeout for an OAuth-bound HTTP request (default).                                     |
+
+Furthermore, `check_oauth_url` (applied at config-construction time
+and redirect time) now rejects URLs that:
+- Carry RFC 3986 userinfo (`https://user:pass@host/`).
+- Use an IP literal in the host position (`https://127.0.0.1/`).
+
+These hardening measures ensure that the operator-trusted configuration
+model remains robust against hostile or compromised Identity Providers.
 
 ### OAuth HTTPS enforcement (since 1.2.1)
 
@@ -160,23 +187,30 @@ token exchange, the optional `/authorize`/`/token`/`/register`/
 
 #### Trust boundary on OAuth endpoint URLs
 
-The `oauth.issuer_url`, `oauth.jwks_uri`, and other OAuth/OIDC endpoint
+The `oauth.issuer`, `oauth.jwks_uri`, and other OAuth/OIDC endpoint
 URLs are treated as **operator-trusted configuration**, not as
-attacker-supplied input. As of 1.2.x the OAuth fetcher enforces scheme
-and redirect policy but **does not** apply the per-hop DNS/private-IP
-SSRF guard that the CRL fetcher applies, because that guard is intended
-for URLs extracted from peer X.509 extensions.
+attacker-supplied input. As of **1.3.0**, OAuth URL hardening operates
+in two layers: `OAuthConfig::validate` rejects userinfo and ALL literal
+IP hosts across the six configured URL fields (operators must use DNS
+hostnames), and a sync per-hop SSRF range guard runs inside both the
+`OauthHttpClient` and `JwksCache` redirect closures, rejecting targets
+that resolve to private, loopback, link-local, multicast, broadcast,
+unspecified, or cloud-metadata IP ranges. `https -> http` redirect
+downgrades are always rejected; `http -> http` is permitted only when
+`allow_http_oauth_urls = true`. This release does not add an async
+DNS-resolution guard on the initial (non-redirect) OAuth request.
 
 Implications:
 
 - Do **not** allow tenants or end-users to influence
-  `oauth.issuer_url` / `oauth.jwks_uri` / discovery URLs at runtime.
-- A compromised IdP can make the server perform blind HTTPS GETs to any
-  internal host reachable from the deployment. Combine with strict
-  egress firewalling for high-assurance environments.
-- Per-hop SSRF guarding for OAuth fetches is tracked for **1.3.0**
-  (issue: extract `ssrf_guard` from `src/mtls_revocation.rs` and apply
-  it per redirect hop in `src/oauth.rs::JwksCache`).
+  `oauth.issuer` / `oauth.jwks_uri` / discovery URLs at runtime.
+- A compromised IdP cannot reach internal hosts behind the SSRF guard,
+  but can still trigger HTTPS GETs to any public host reachable from
+  the deployment. Combine with strict egress firewalling for
+  high-assurance environments.
+- "Key stuffing" attacks where a hostile IdP returns thousands of JWKS
+  keys to slow down validation are blocked by the `max_jwks_keys` cap
+  (default 256).
 
 ### Defence-in-depth (still recommended)
 

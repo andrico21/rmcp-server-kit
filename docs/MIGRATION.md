@@ -79,6 +79,83 @@ Both remain opt-in to keep the default dependency footprint small.
 
 ---
 
+## Migrating from 1.2.1 to 1.3.0
+
+`1.3.0` is a **security-hardening release** focused on OAuth and mTLS
+resilience. While there are no breaking public-API changes, several new
+resource caps and an SSRF guard are now active by default.
+
+### OAuth URL hardening and per-hop redirect SSRF guard
+
+OAuth URL hardening operates in two layers:
+
+- **At config-construction time**, `OAuthConfig::validate` rejects any of
+  the six configured URL fields (`issuer`, `jwks_uri`,
+  `authorization_endpoint`, `token_endpoint`, `revocation_endpoint`,
+  `introspection_endpoint`) that contain HTTP userinfo (`user:pass@host`)
+  or that use a literal IP host (IPv4 or IPv6). Operators must use DNS
+  hostnames.
+- **At runtime, on every HTTP redirect hop**, both the shared
+  `OauthHttpClient` and the `JwksCache` redirect closures run a sync
+  per-hop SSRF guard that rejects targets resolving to private, loopback,
+  link-local, multicast, broadcast, unspecified, or cloud-metadata IP
+  ranges. `https -> http` downgrades are always rejected; `http -> http`
+  is permitted only when `allow_http_oauth_urls = true`.
+
+A redirect that violates either the scheme policy or the per-hop range
+guard fails the underlying `reqwest` call; on the OAuth path this surfaces
+as an HTTP 500 with `"failed to fetch ..."` and the rejection reason is
+emitted as a `WARN` log line.
+
+This release does **not** perform async DNS-based private-IP rejection
+on direct (non-redirect) OAuth requests. The validate-time blanket
+literal-IP rejection is the primary trust anchor for operator-supplied
+URLs.
+
+### OAuth hardening: URL validation and JWKS caps
+
+`check_oauth_url` (applied at config-construction and redirect time) now
+rejects URLs containing userinfo or IP literals. Additionally, a new
+fail-closed cap on the number of JWKS keys is enforced:
+
+```toml
+[oauth]
+max_jwks_keys = 256  # default; fail-closed on overflow
+```
+
+If your IdP publishes an unusually large number of keys (exceeding 256), raise
+`max_jwks_keys` to match your deployment requirements.
+
+### Bounded growth for mTLS revocation (mTLS deployments only)
+
+Three new knobs were added to `MtlsConfig` to cap memory usage in the face
+of high-cardinality CRL discovery:
+
+```toml
+[mtls]
+crl_max_host_semaphores = 1024  # default
+crl_max_seen_urls       = 4096  # default
+crl_max_cache_entries   = 1024  # default
+```
+
+These defaults are sized for enterprise deployments; operators with
+thousands of distinct issuing CAs or CDP hosts should scale these caps
+upward.
+
+### Action items
+
+1. `cargo update -p rmcp-server-kit` (or bump the pin to `"1.3.0"`).
+2. If you use mTLS with a very high number of distinct CRL sources, review
+   the new `crl_max_*` caps.
+3. If you use OAuth, verify your `issuer` and `jwks_uri` (and any of
+   `authorization_endpoint`, `token_endpoint`, `revocation_endpoint`,
+   `introspection_endpoint` you set) do not use IP literals or contain
+   userinfo (use DNS names instead).
+
+4. No action required if you do not use mTLS or OAuth.
+
+---
+
 ## Migrating from 1.2.0 to 1.2.1
 
 `1.2.1` is a **security-hardening patch release**. There are no breaking
@@ -126,11 +203,14 @@ affects code that constructed `OauthHttpClient` directly.
 
 ### Trust-boundary clarification for OAuth endpoint URLs
 
-`oauth.issuer_url` / `oauth.jwks_uri` / discovery URLs are treated as
-**operator-trusted configuration** in 1.2.x. Per-hop DNS/private-IP
-SSRF guarding for OAuth-bound traffic is deferred to **1.3.0**; in the
-meantime, do not let tenants or end-users influence those URLs at
-runtime. See
+`oauth.issuer` / `oauth.jwks_uri` / discovery URLs are treated as
+**operator-trusted configuration** in 1.2.x and continue to be in
+1.3.x. In 1.2.x there is no per-hop SSRF guard on OAuth-bound traffic,
+so do not let tenants or end-users influence those URLs at runtime.
+1.3.0 adds the two-layer OAuth URL hardening (validate-time
+literal-IP/userinfo rejection plus a sync per-hop SSRF range guard in
+both the `OauthHttpClient` and `JwksCache` redirect closures); see the
+[1.2.1 → 1.3.0 migration notes](#migrating-from-121-to-130) and
 [`SECURITY.md` — Trust boundary on OAuth endpoint URLs](../SECURITY.md#trust-boundary-on-oauth-endpoint-urls).
 
 ### Action items

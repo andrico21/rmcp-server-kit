@@ -26,6 +26,55 @@ use tokio::sync::RwLock;
 use crate::auth::{AuthIdentity, AuthMethod};
 
 // ---------------------------------------------------------------------------
+// Shared OAuth redirect-policy helper
+// ---------------------------------------------------------------------------
+
+/// Outcome of evaluating a single OAuth redirect hop against the
+/// shared policy used by both [`OauthHttpClient::build`] and
+/// [`JwksCache::new`].
+///
+/// `Ok(())` means the redirect should be followed; `Err(reason)` means
+/// the closure should reject it. Callers are responsible for emitting
+/// the `tracing::warn!` rejection log so the policy stays a pure
+/// function (no I/O, no logging) and so the closures keep their
+/// cognitive complexity below the crate-wide clippy threshold.
+///
+/// The policy mirrors the documented behaviour exactly:
+///   1. `https -> http` redirect downgrades are *always* rejected.
+///   2. Non-`https` targets are accepted only when `allow_http` is true
+///      *and* the destination scheme is `http`.
+///   3. Targets resolving to disallowed IP ranges (private / loopback /
+///      link-local / multicast / broadcast / unspecified /
+///      cloud-metadata) are rejected via [`crate::ssrf::redirect_target_reason`].
+///   4. The hop count is capped at 2 (i.e. at most 2 prior redirects).
+fn evaluate_oauth_redirect(
+    attempt: &reqwest::redirect::Attempt<'_>,
+    allow_http: bool,
+) -> Result<(), String> {
+    let prev_https = attempt
+        .previous()
+        .last()
+        .is_some_and(|prev| prev.scheme() == "https");
+    let target_url = attempt.url();
+    let dest_scheme = target_url.scheme();
+    if dest_scheme != "https" {
+        if prev_https {
+            return Err("redirect downgrades https -> http".to_owned());
+        }
+        if !allow_http || dest_scheme != "http" {
+            return Err("redirect to non-HTTP(S) URL refused".to_owned());
+        }
+    }
+    if let Some(reason) = crate::ssrf::redirect_target_reason(target_url) {
+        return Err(format!("redirect target forbidden: {reason}"));
+    }
+    if attempt.previous().len() >= 2 {
+        return Err("too many redirects (max 2)".to_owned());
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // HTTP client wrapper
 // ---------------------------------------------------------------------------
 
@@ -136,27 +185,20 @@ impl OauthHttpClient {
                 // The flag controls whether the *original* request URL
                 // may be plain HTTP; it never authorises a downgrade
                 // mid-flight. An `http -> http` redirect is permitted
-                // only when the flag is true (dev-only). The scheme
-                // guard runs before the hop-count guard so a downgrade
-                // surfaces as an explicit downgrade error rather than as
-                // "too many redirects".
-                let prev_https = attempt
-                    .previous()
-                    .last()
-                    .is_some_and(|prev| prev.scheme() == "https");
-                let dest_scheme = attempt.url().scheme();
-                if dest_scheme != "https" {
-                    if prev_https {
-                        return attempt.error("redirect downgrades https -> http");
+                // only when the flag is true (dev-only). The full
+                // policy lives in `evaluate_oauth_redirect` so the
+                // OauthHttpClient and JwksCache closures stay
+                // byte-for-byte identical.
+                match evaluate_oauth_redirect(&attempt, allow_http) {
+                    Ok(()) => attempt.follow(),
+                    Err(reason) => {
+                        tracing::warn!(
+                            reason = %reason,
+                            target = %attempt.url(),
+                            "oauth redirect rejected"
+                        );
+                        attempt.error(reason)
                     }
-                    if !allow_http || dest_scheme != "http" {
-                        return attempt.error("redirect to non-HTTP(S) URL refused");
-                    }
-                }
-                if attempt.previous().len() >= 2 {
-                    attempt.error("too many redirects (max 2)")
-                } else {
-                    attempt.follow()
                 }
             }));
 
@@ -275,10 +317,19 @@ pub struct OAuthConfig {
     /// rejected even when this flag is `true`.
     #[serde(default)]
     pub allow_http_oauth_urls: bool,
+    /// Maximum number of keys accepted from a JWKS refresh response.
+    /// Requests returning more keys than this are rejected fail-closed
+    /// (cache remains empty / unchanged). Default: 256.
+    #[serde(default = "default_max_jwks_keys")]
+    pub max_jwks_keys: usize,
 }
 
 fn default_jwks_cache_ttl() -> String {
     "10m".into()
+}
+
+const fn default_max_jwks_keys() -> usize {
+    256
 }
 
 impl Default for OAuthConfig {
@@ -295,6 +346,7 @@ impl Default for OAuthConfig {
             token_exchange: None,
             ca_cert_path: None,
             allow_http_oauth_urls: false,
+            max_jwks_keys: default_max_jwks_keys(),
         }
     }
 }
@@ -337,23 +389,59 @@ impl OAuthConfig {
     /// to parse or violates the scheme policy.
     pub fn validate(&self) -> Result<(), crate::error::McpxError> {
         let allow_http = self.allow_http_oauth_urls;
-        check_oauth_url("oauth.jwks_uri", &self.jwks_uri, allow_http)?;
+        let url = check_oauth_url("oauth.issuer", &self.issuer, allow_http)?;
+        if let Some(reason) = crate::ssrf::check_url_literal_ip(&url) {
+            return Err(crate::error::McpxError::Config(format!(
+                "oauth.issuer forbidden ({reason})"
+            )));
+        }
+        let url = check_oauth_url("oauth.jwks_uri", &self.jwks_uri, allow_http)?;
+        if let Some(reason) = crate::ssrf::check_url_literal_ip(&url) {
+            return Err(crate::error::McpxError::Config(format!(
+                "oauth.jwks_uri forbidden ({reason})"
+            )));
+        }
         if let Some(proxy) = &self.proxy {
-            check_oauth_url(
+            let url = check_oauth_url(
                 "oauth.proxy.authorize_url",
                 &proxy.authorize_url,
                 allow_http,
             )?;
-            check_oauth_url("oauth.proxy.token_url", &proxy.token_url, allow_http)?;
+            if let Some(reason) = crate::ssrf::check_url_literal_ip(&url) {
+                return Err(crate::error::McpxError::Config(format!(
+                    "oauth.proxy.authorize_url forbidden ({reason})"
+                )));
+            }
+            let url = check_oauth_url("oauth.proxy.token_url", &proxy.token_url, allow_http)?;
+            if let Some(reason) = crate::ssrf::check_url_literal_ip(&url) {
+                return Err(crate::error::McpxError::Config(format!(
+                    "oauth.proxy.token_url forbidden ({reason})"
+                )));
+            }
             if let Some(url) = &proxy.introspection_url {
-                check_oauth_url("oauth.proxy.introspection_url", url, allow_http)?;
+                let parsed = check_oauth_url("oauth.proxy.introspection_url", url, allow_http)?;
+                if let Some(reason) = crate::ssrf::check_url_literal_ip(&parsed) {
+                    return Err(crate::error::McpxError::Config(format!(
+                        "oauth.proxy.introspection_url forbidden ({reason})"
+                    )));
+                }
             }
             if let Some(url) = &proxy.revocation_url {
-                check_oauth_url("oauth.proxy.revocation_url", url, allow_http)?;
+                let parsed = check_oauth_url("oauth.proxy.revocation_url", url, allow_http)?;
+                if let Some(reason) = crate::ssrf::check_url_literal_ip(&parsed) {
+                    return Err(crate::error::McpxError::Config(format!(
+                        "oauth.proxy.revocation_url forbidden ({reason})"
+                    )));
+                }
             }
         }
         if let Some(tx) = &self.token_exchange {
-            check_oauth_url("oauth.token_exchange.token_url", &tx.token_url, allow_http)?;
+            let url = check_oauth_url("oauth.token_exchange.token_url", &tx.token_url, allow_http)?;
+            if let Some(reason) = crate::ssrf::check_url_literal_ip(&url) {
+                return Err(crate::error::McpxError::Config(format!(
+                    "oauth.token_exchange.token_url forbidden ({reason})"
+                )));
+            }
         }
         Ok(())
     }
@@ -369,13 +457,18 @@ fn check_oauth_url(
     field: &str,
     raw: &str,
     allow_http: bool,
-) -> Result<(), crate::error::McpxError> {
+) -> Result<url::Url, crate::error::McpxError> {
     let parsed = url::Url::parse(raw).map_err(|e| {
         crate::error::McpxError::Config(format!("{field}: invalid URL {raw:?}: {e}"))
     })?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(crate::error::McpxError::Config(format!(
+            "{field} rejected: URL contains userinfo (credentials in URL are forbidden)"
+        )));
+    }
     match parsed.scheme() {
-        "https" => Ok(()),
-        "http" if allow_http => Ok(()),
+        "https" => Ok(parsed),
+        "http" if allow_http => Ok(parsed),
         "http" => Err(crate::error::McpxError::Config(format!(
             "{field}: must use https scheme (got http; set allow_http_oauth_urls=true \
              to override - strongly discouraged in production)"
@@ -739,6 +832,7 @@ impl CachedKeys {
 pub struct JwksCache {
     jwks_uri: String,
     ttl: Duration,
+    max_jwks_keys: usize,
     inner: RwLock<Option<CachedKeys>>,
     http: reqwest::Client,
     validation_template: Validation,
@@ -819,24 +913,31 @@ impl JwksCache {
         validation.validate_exp = true;
         validation.validate_nbf = true;
 
+        let allow_http = config.allow_http_oauth_urls;
+
         let mut http_builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .connect_timeout(Duration::from_secs(3))
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                // SECURITY: reject any redirect to a non-HTTPS target,
-                // even when the original `jwks_uri` was validated as
-                // HTTPS.  This prevents an upstream `302 Location: http://...`
-                // from downgrading the JWKS fetch to plaintext where a
-                // network attacker could substitute the response and
-                // forge JWT signing keys.  The HTTPS scheme guard runs
-                // *before* the hop limit so a downgrade is rejected as
-                // such (clearer error) rather than as "too many redirects".
-                if attempt.url().scheme() != "https" {
-                    attempt.error("redirect to non-HTTPS URL refused")
-                } else if attempt.previous().len() >= 2 {
-                    attempt.error("too many redirects (max 2)")
-                } else {
-                    attempt.follow()
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                // SECURITY: a redirect from `https` to `http` is *always*
+                // rejected, even when `allow_http_oauth_urls` is true.
+                // The flag controls whether the *original* request URL
+                // may be plain HTTP; it never authorises a downgrade
+                // mid-flight. An `http -> http` redirect is permitted
+                // only when the flag is true (dev-only). The full
+                // policy lives in `evaluate_oauth_redirect` so the
+                // OauthHttpClient and JwksCache closures stay
+                // byte-for-byte identical.
+                match evaluate_oauth_redirect(&attempt, allow_http) {
+                    Ok(()) => attempt.follow(),
+                    Err(reason) => {
+                        tracing::warn!(
+                            reason = %reason,
+                            target = %attempt.url(),
+                            "oauth redirect rejected"
+                        );
+                        attempt.error(reason)
+                    }
                 }
             }));
 
@@ -856,6 +957,7 @@ impl JwksCache {
         Ok(Self {
             jwks_uri: config.jwks_uri.clone(),
             ttl,
+            max_jwks_keys: config.max_jwks_keys,
             inner: RwLock::new(None),
             http,
             validation_template: validation,
@@ -1107,18 +1209,24 @@ impl JwksCache {
         }
 
         // Perform the actual fetch.
-        self.refresh_inner().await;
+        let _ = self.refresh_inner().await;
     }
 
     /// Fetch JWKS from the configured URI and update the cache.
     ///
     /// Internal implementation - callers should use [`Self::refresh_with_cooldown`]
     /// to respect rate limiting.
-    async fn refresh_inner(&self) {
+    async fn refresh_inner(&self) -> Result<(), String> {
         let Some(jwks) = self.fetch_jwks().await else {
-            return;
+            return Ok(());
         };
-        let (keys, unnamed_keys) = build_key_cache(&jwks);
+        let (keys, unnamed_keys) = match build_key_cache(&jwks, self.max_jwks_keys) {
+            Ok(cache) => cache,
+            Err(msg) => {
+                tracing::warn!(reason = %msg, "JWKS key cap exceeded; refusing to populate cache");
+                return Err(msg);
+            }
+        };
 
         tracing::debug!(
             named = keys.len(),
@@ -1133,6 +1241,7 @@ impl JwksCache {
             fetched_at: Instant::now(),
             ttl: self.ttl,
         });
+        Ok(())
     }
 
     /// Fetch and parse the JWKS document. Returns `None` and logs on failure.
@@ -1152,10 +1261,48 @@ impl JwksCache {
             }
         }
     }
+
+    /// Test-only: drive `refresh_inner` now, surfacing the
+    /// `build_key_cache` error string. Used by `tests/jwks_key_cap.rs`.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    pub async fn __test_refresh_now(&self) -> Result<(), String> {
+        let jwks = self
+            .fetch_jwks()
+            .await
+            .ok_or_else(|| "failed to fetch or parse JWKS".to_owned())?;
+        let (keys, unnamed_keys) = build_key_cache(&jwks, self.max_jwks_keys)?;
+        let mut guard = self.inner.write().await;
+        *guard = Some(CachedKeys {
+            keys,
+            unnamed_keys,
+            fetched_at: Instant::now(),
+            ttl: self.ttl,
+        });
+        Ok(())
+    }
+
+    /// Test-only: returns whether the cache currently contains the
+    /// supplied kid. Read-only; takes the cache lock briefly.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    pub async fn __test_has_kid(&self, kid: &str) -> bool {
+        let guard = self.inner.read().await;
+        guard
+            .as_ref()
+            .is_some_and(|cache| cache.keys.contains_key(kid))
+    }
 }
 
 /// Partition a JWKS into a kid-indexed map plus a list of unnamed keys.
-fn build_key_cache(jwks: &JwkSet) -> JwksKeyCache {
+fn build_key_cache(jwks: &JwkSet, max_keys: usize) -> Result<JwksKeyCache, String> {
+    if jwks.keys.len() > max_keys {
+        return Err(format!(
+            "jwks_key_count_exceeds_cap: got {} keys, max is {}",
+            jwks.keys.len(),
+            max_keys
+        ));
+    }
     let mut keys = HashMap::new();
     let mut unnamed_keys = Vec::new();
     for jwk in &jwks.keys {
@@ -1171,7 +1318,7 @@ fn build_key_cache(jwks: &JwkSet) -> JwksKeyCache {
             unnamed_keys.push((alg, decoding_key));
         }
     }
-    (keys, unnamed_keys)
+    Ok((keys, unnamed_keys))
 }
 
 /// Look up a key from the cache by kid (if present) or by algorithm.
@@ -1880,6 +2027,7 @@ mod tests {
             token_exchange: None,
             ca_cert_path: None,
             allow_http_oauth_urls: false,
+            max_jwks_keys: default_max_jwks_keys(),
         };
         let meta = protected_resource_metadata(
             "https://mcp.example.com/mcp",
@@ -2230,6 +2378,7 @@ mod tests {
             token_exchange: None,
             ca_cert_path: None,
             allow_http_oauth_urls: true,
+            max_jwks_keys: default_max_jwks_keys(),
         }
     }
 
@@ -2550,6 +2699,7 @@ mod tests {
             token_exchange: None,
             ca_cert_path: None,
             allow_http_oauth_urls: true,
+            max_jwks_keys: default_max_jwks_keys(),
         }
     }
 

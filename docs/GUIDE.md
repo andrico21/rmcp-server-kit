@@ -449,6 +449,9 @@ crl_max_response_bytes     = 5242880   # 5 MiB hard cap; streams aborted mid-res
 crl_discovery_rate_per_min = 60        # process-global rate limit on *new* CDP URLs admitted
                                        # to the fetch pipeline; URLs that lose the race are
                                        # NOT marked as seen and may retry on the next handshake
+crl_max_host_semaphores    = 1024      # caps unique CDP hosts tracked (since 1.3.0)
+crl_max_seen_urls          = 4096      # caps URL-deduplication map (since 1.3.0)
+crl_max_cache_entries      = 1024      # caps parsed CRLs held in memory (since 1.3.0)
 ```
 
 > **Tuning guidance.** The defaults are calibrated for a typical
@@ -458,7 +461,9 @@ crl_discovery_rate_per_min = 60        # process-global rate limit on *new* CDP 
 > when CDPs are few and stable. Lower `crl_max_response_bytes` if your
 > CA publishes only small CRLs; raise it cautiously for very large
 > revocation lists. `crl_max_concurrent_fetches` is the global SSRF
-> blast-radius bound — keep it low.
+> blast-radius bound — keep it low. Raise `crl_max_seen_urls` and
+> `crl_max_cache_entries` if your PKI hierarchy is unusually deep
+> or diverse.
 
 ##### Defence-in-depth (still recommended even with CRL enabled)
 
@@ -848,37 +853,35 @@ scope = "mcp:read"
 role = "viewer"
 ```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `issuer` | `String` | Expected `iss` claim |
-| `audience` | `String` | Expected `aud` claim |
-| `jwks_uri` | `String` | JWKS endpoint URL |
-| `scopes` | `Vec<ScopeMapping>` | OAuth scope -> RBAC role mapping |
-| `jwks_cache_ttl` | `String` | Cache refresh interval (default: `"10m"`) |
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `issuer` | `String` | -- | Expected `iss` claim. |
+| `audience` | `String` | -- | Expected `aud` claim. |
+| `jwks_uri` | `String` | -- | JWKS endpoint URL. |
+| `scopes` | `Vec<ScopeMapping>` | `[]` | OAuth scope -> RBAC role mapping. |
+| `jwks_cache_ttl` | `String` | `"10m"` | JWKS cache refresh interval. |
+| `max_jwks_keys` | `usize` | `256` | Fail-closed cap on public keys in a JWKS document (since 1.3.0). |
+| `allow_http_oauth_urls` | `bool` | `false` | Permit `http://` issuer/JWKS/etc. for local dev only. |
 
-#### Supported Algorithms
+#### SSRF and DoS Hardening (OAuth)
 
-RS256, RS384, RS512, ES256, ES384, PS256, PS384, PS512, EdDSA.
+As of **1.3.0**, OAuth URL hardening operates in two layers:
 
-#### `looks_like_jwt()`
+- **At config-construction time**, `OAuthConfig::validate` rejects any of
+  the six configured URL fields (`issuer`, `jwks_uri`, `authorization_endpoint`,
+  `token_endpoint`, `revocation_endpoint`, `introspection_endpoint`) that
+  contain HTTP userinfo (`user:pass@host`) or that use a literal IP host
+  (IPv4 or IPv6). Operators must use DNS hostnames.
+- **At runtime, on every HTTP redirect hop**, both the shared
+  `OauthHttpClient` and the `JwksCache` redirect closures run a sync
+  per-hop SSRF guard that rejects targets resolving to private, loopback,
+  link-local, multicast, broadcast, unspecified, or cloud-metadata
+  IP ranges. `https -> http` downgrades are always rejected; `http -> http`
+  is permitted only when `allow_http_oauth_urls = true`.
 
-```rust
-pub fn looks_like_jwt(token: &str) -> bool
-```
+The redirect-hop limit (max 2) and per-request HTTP timeouts are enforced
+internally and are not configurable knobs in 1.3.0.
 
-Fast heuristic: 3 dot-separated segments where the header decodes to JSON
-with an `"alg"` key. Used by the auth middleware to route tokens to OAuth
-validation vs. API key verification.
-
-#### `protected_resource_metadata()`
-
-```rust
-pub fn protected_resource_metadata(resource_url: &str, config: &OAuthConfig) -> serde_json::Value
-```
-
-Generates RFC 9728 Protected Resource Metadata JSON. rmcp-server-kit automatically
-serves this at `/.well-known/oauth-protected-resource` when OAuth is
-configured.
 
 ---
 
