@@ -5,11 +5,10 @@
 | Version  | Supported |
 |----------|-----------|
 | 1.3.x    | ✅        |
-| 1.2.x    | ✅        |
-| < 1.2    | ❌        |
+| < 1.3    | ❌        |
 
-We support the latest minor release and the previous one for security
-fixes. Patch releases (`x.y.Z`) are issued for the supported lines only.
+We support the latest minor release for security fixes. Patch releases
+(`x.y.Z`) are issued for the supported line only.
 
 ## Reporting a vulnerability
 
@@ -45,7 +44,7 @@ within **30 days** for confirmed high-severity issues.
 
 ## Certificate revocation
 
-> ✅ **Since 1.2.0, rmcp-server-kit performs CDP-driven CRL revocation
+> ✅ **rmcp-server-kit performs CDP-driven CRL revocation
 > checking for client certificates by default whenever `[mtls]` is
 > configured.** OCSP is **not** implemented.
 
@@ -100,14 +99,14 @@ crl_stale_grace          = "24h"    # how long an expired CRL can still be trust
   rmcp-server-kit does not proxy or pin CDP URLs, but it does enforce a
   scheme allowlist, reject userinfo, and refuse private/loopback/link-local/
   cloud-metadata IP literals before issuing the fetch (see
-  [CRL fetch SSRF hardening](#crl-fetch-ssrf-hardening-since-121) below).
+  [CRL fetch SSRF hardening](#crl-fetch-ssrf-hardening) below).
   Operators must still ensure their issuing CA's CDP host is reachable
   from the server's network.
 - **Default is fail-open.** This protects availability over confidentiality;
   set `crl_deny_on_unavailable = true` if your threat model inverts that
   trade-off.
 
-### CRL fetch SSRF hardening (since 1.2.1)
+### CRL fetch SSRF hardening
 
 CRL Distribution Point URLs are extracted from X.509 extensions on
 attacker-influenceable client certificates, so the CRL fetcher is treated
@@ -132,24 +131,22 @@ SSRF/DoS amplification even if a CRL host is reachable:
 | `crl_max_response_bytes`        | `5 MiB`       | Body size cap; streams aborted mid-response when exceeded.                                    |
 | `crl_discovery_rate_per_min`    | `60`          | Process-global rate limit on *new* CDP URLs admitted into the fetch pipeline.                  |
 | `crl_fetch_timeout`             | `30 s`        | Per-fetch HTTP timeout.                                                                        |
-| `crl_max_host_semaphores`      | `1024`        | Caps the number of unique CDP hosts tracked for per-host concurrency gating (since 1.3.0).    |
-| `crl_max_seen_urls`            | `4096`        | Caps the URL-deduplication map to prevent unbounded memory growth from discovery (since 1.3.0). |
-| `crl_max_cache_entries`        | `1024`        | Caps the number of parsed CRLs held in memory (since 1.3.0).                                  |
+| `crl_max_host_semaphores`      | `1024`        | Caps the number of unique CDP hosts tracked for per-host concurrency gating.                  |
+| `crl_max_seen_urls`            | `4096`        | Caps the URL-deduplication map to prevent unbounded memory growth from discovery.             |
+| `crl_max_cache_entries`        | `1024`        | Caps the number of parsed CRLs held in memory.                                                |
 
 The fetcher also disables HTTP redirects entirely for CRL traffic — a
 CRL is signed by the issuing CA, so blindly following a redirect to an
 operator-unintended host has no security benefit.
 
-As of **1.3.0**, discovery URLs containing IP literals are normalized
-(rejecting octal/hex/percent-encoded obfuscation) before the SSRF check,
-eliminating the bypass window identified in 1.2.1.
+Discovery URLs containing IP literals are normalized
+(rejecting octal/hex/percent-encoded obfuscation) before the SSRF check.
 
-### OAuth SSRF hardening (since 1.3.0)
+### OAuth SSRF hardening
 
 When the optional `oauth` feature is enabled, the JWKS fetcher and the
 shared `OauthHttpClient` (used for token exchange, introspection, and
-revocation) now enforce the same per-hop SSRF guard as the CRL fetcher.
-This closes the internal-HTTPS-GET exposure identified in 1.2.1.
+revocation) enforce the same per-hop SSRF guard as the CRL fetcher.
 
 In addition to the per-hop DNS/private-IP guard, the OAuth subsystem
 applies three resource-exhaustion caps:
@@ -161,14 +158,14 @@ applies three resource-exhaustion caps:
 | `OauthHttpClient` timeout      | `30 s`        | Total timeout for an OAuth-bound HTTP request (default).                                     |
 
 Furthermore, `check_oauth_url` (applied at config-construction time
-and redirect time) now rejects URLs that:
+and redirect time) rejects URLs that:
 - Carry RFC 3986 userinfo (`https://user:pass@host/`).
 - Use an IP literal in the host position (`https://127.0.0.1/`).
 
 These hardening measures ensure that the operator-trusted configuration
 model remains robust against hostile or compromised Identity Providers.
 
-### OAuth HTTPS enforcement (since 1.2.1)
+### OAuth HTTPS enforcement
 
 When the optional `oauth` feature is enabled, `OauthHttpClient`
 (`src/oauth.rs`) installs a redirect policy that:
@@ -179,26 +176,28 @@ When the optional `oauth` feature is enabled, `OauthHttpClient`
   local development against a non-TLS IdP).
 - Caps redirect hops to a small constant.
 
-Prefer `OauthHttpClient::with_config(&OAuthConfig)` over the deprecated
-`OauthHttpClient::new()` so that this policy and the configured CA bundle
-are wired consistently for every OAuth-bound HTTPS call (JWKS, discovery,
-token exchange, the optional `/authorize`/`/token`/`/register`/
-`/introspect`/`/revoke` proxy upstreams).
+Prefer `OauthHttpClient::with_config(&OAuthConfig)` so that this policy
+and the configured CA bundle are wired consistently for every
+OAuth-bound HTTPS call (JWKS, discovery, token exchange, the optional
+`/authorize`/`/token`/`/register`/`/introspect`/`/revoke` proxy
+upstreams).
 
 #### Trust boundary on OAuth endpoint URLs
 
 The `oauth.issuer`, `oauth.jwks_uri`, and other OAuth/OIDC endpoint
 URLs are treated as **operator-trusted configuration**, not as
-attacker-supplied input. As of **1.3.0**, OAuth URL hardening operates
-in two layers: `OAuthConfig::validate` rejects userinfo and ALL literal
-IP hosts across the six configured URL fields (operators must use DNS
-hostnames), and a sync per-hop SSRF range guard runs inside both the
-`OauthHttpClient` and `JwksCache` redirect closures, rejecting targets
-that resolve to private, loopback, link-local, multicast, broadcast,
-unspecified, or cloud-metadata IP ranges. `https -> http` redirect
-downgrades are always rejected; `http -> http` is permitted only when
-`allow_http_oauth_urls = true`. This release does not add an async
-DNS-resolution guard on the initial (non-redirect) OAuth request.
+attacker-supplied input. OAuth URL hardening operates in two layers:
+`OAuthConfig::validate` rejects userinfo and ALL literal IP hosts across
+the six configured URL fields (operators must use DNS hostnames), and a
+sync per-hop SSRF range guard runs inside both the `OauthHttpClient` and
+`JwksCache` redirect closures, rejecting targets that resolve to
+private, loopback, link-local, multicast, broadcast, unspecified, or
+cloud-metadata IP ranges. `https -> http` redirect downgrades are always
+rejected; `http -> http` is permitted only when
+`allow_http_oauth_urls = true`. There is no async DNS-resolution guard
+on the initial (non-redirect) OAuth request — the validate-time blanket
+literal-IP rejection is the primary trust anchor for operator-supplied
+URLs.
 
 Implications:
 
