@@ -96,13 +96,12 @@ let mut auth = AuthConfig::with_keys(vec![]);
 auth.oauth = Some(oauth);
 ```
 
-> Since `1.3.0`, the OAuth fetcher and the shared `OauthHttpClient`
-> enforce a strict per-hop SSRF guard and JWKS key caps. Prefer
-> `OauthHttpClient::with_config(&oauth_config)` over the deprecated
-> `OauthHttpClient::new()` — the new constructor wires the configured
-> CA bundle, the SSRF guard, and the HTTPS-downgrade-rejecting
-> redirect policy in one call. See [`docs/MIGRATION.md`](docs/MIGRATION.md#migrating-from-121-to-130)
-> and [`SECURITY.md`](SECURITY.md#oauth-ssrf-hardening-since-130).
+> The OAuth fetcher and the shared `OauthHttpClient` enforce a strict
+> per-hop SSRF guard and a fail-closed cap on JWKS key counts. Construct
+> the client via `OauthHttpClient::with_config(&oauth_config)` so the
+> configured CA bundle, the SSRF guard, and the HTTPS-downgrade-rejecting
+> redirect policy are all wired in one call. See
+> [`SECURITY.md`](SECURITY.md#oauth-ssrf-hardening) for the trust model.
 
 **Prometheus metrics on a separate listener:**
 
