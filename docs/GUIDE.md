@@ -404,7 +404,7 @@ DNS SAN as the identity name. Used internally by the TLS acceptor.
 
 #### Certificate lifecycle and revocation (operator runbook)
 
-> ✅ **Since 1.2.0, rmcp-server-kit performs CDP-driven CRL revocation
+> ✅ **rmcp-server-kit performs CDP-driven CRL revocation
 > checking for client certificates by default whenever `[mtls]` is
 > configured.** OCSP is **not** implemented. See
 > [SECURITY.md](../SECURITY.md#certificate-revocation) for the full
@@ -442,16 +442,16 @@ crl_fetch_timeout        = "30s"    # per-fetch HTTP timeout
 crl_stale_grace          = "24h"    # how long an expired CRL can still be trusted while we keep retrying
 # crl_refresh_interval   = "1h"     # override the auto interval derived from nextUpdate
 
-# SSRF / DoS hardening knobs (since 1.2.1; defaults shown):
+# SSRF / DoS hardening knobs (defaults shown):
 crl_max_concurrent_fetches = 4         # global parallel CRL fetches across all hosts
                                        # (per-host concurrency is hard-capped at 1)
 crl_max_response_bytes     = 5242880   # 5 MiB hard cap; streams aborted mid-response when exceeded
 crl_discovery_rate_per_min = 60        # process-global rate limit on *new* CDP URLs admitted
                                        # to the fetch pipeline; URLs that lose the race are
                                        # NOT marked as seen and may retry on the next handshake
-crl_max_host_semaphores    = 1024      # caps unique CDP hosts tracked (since 1.3.0)
-crl_max_seen_urls          = 4096      # caps URL-deduplication map (since 1.3.0)
-crl_max_cache_entries      = 1024      # caps parsed CRLs held in memory (since 1.3.0)
+crl_max_host_semaphores    = 1024      # caps unique CDP hosts tracked
+crl_max_seen_urls          = 4096      # caps URL-deduplication map
+crl_max_cache_entries      = 1024      # caps parsed CRLs held in memory
 ```
 
 > **Tuning guidance.** The defaults are calibrated for a typical
@@ -860,12 +860,12 @@ role = "viewer"
 | `jwks_uri` | `String` | -- | JWKS endpoint URL. |
 | `scopes` | `Vec<ScopeMapping>` | `[]` | OAuth scope -> RBAC role mapping. |
 | `jwks_cache_ttl` | `String` | `"10m"` | JWKS cache refresh interval. |
-| `max_jwks_keys` | `usize` | `256` | Fail-closed cap on public keys in a JWKS document (since 1.3.0). |
+| `max_jwks_keys` | `usize` | `256` | Fail-closed cap on public keys in a JWKS document. |
 | `allow_http_oauth_urls` | `bool` | `false` | Permit `http://` issuer/JWKS/etc. for local dev only. |
 
 #### SSRF and DoS Hardening (OAuth)
 
-As of **1.3.0**, OAuth URL hardening operates in two layers:
+OAuth URL hardening operates in two layers:
 
 - **At config-construction time**, `OAuthConfig::validate` rejects any of
   the six configured URL fields (`issuer`, `jwks_uri`, `authorization_endpoint`,
@@ -880,7 +880,7 @@ As of **1.3.0**, OAuth URL hardening operates in two layers:
   is permitted only when `allow_http_oauth_urls = true`.
 
 The redirect-hop limit (max 2) and per-request HTTP timeouts are enforced
-internally and are not configurable knobs in 1.3.0.
+internally and are not configurable knobs.
 
 
 ---

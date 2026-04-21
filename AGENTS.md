@@ -27,7 +27,7 @@ shutdown.
 | Field         | Value                                                              |
 |---------------|--------------------------------------------------------------------|
 | Crate name    | `rmcp-server-kit`                                                  |
-| Version       | `1.0.0` (see [`Cargo.toml`](Cargo.toml))                          |
+| Version       | `1.3.1` (see [`Cargo.toml`](Cargo.toml))                          |
 | Edition       | `2024`                                                             |
 | MSRV          | Rust **1.95.0**                                                    |
 | License       | `MIT OR Apache-2.0` (dual)                                         |
@@ -46,8 +46,10 @@ Z:\TempPersistent\mcpx\
 │   ├── transport.rs            ★ Server entry: serve(), serve_stdio(), TLS, router, middleware wiring
 │   ├── auth.rs                 Authentication: API keys (Argon2), mTLS, AuthIdentity, AuthState
 │   ├── rbac.rs                 RBAC engine: RbacPolicy, task-local context, per-tool argument allowlists
+│   ├── bounded_limiter.rs      Memory-bounded keyed rate limiter (used by RBAC per-IP/per-tool limiter)
 │   ├── oauth.rs                OAuth 2.1 JWT + JWKS cache (feature = "oauth")
-│   ├── mtls_revocation.rs      CDP-driven CRL fetcher + cache + dynamic ClientCertVerifier (1.2.0+)
+│   ├── mtls_revocation.rs      CDP-driven CRL fetcher + cache + dynamic ClientCertVerifier
+│   ├── ssrf.rs                 Per-hop SSRF guard for outbound HTTP (JWKS / CRL / OAuth fetches)
 │   ├── admin.rs                Admin diagnostics router (/admin/*)
 │   ├── tool_hooks.rs           Optional HookedHandler wrapper (before/after hooks, result-size cap)
 │   ├── observability.rs        Tracing/JSON logging + audit-file sink
@@ -58,7 +60,9 @@ Z:\TempPersistent\mcpx\
 ├── tests/
 │   └── e2e.rs                Integration / E2E tests - spawns serve() on ephemeral ports
 ├── examples/
-│   └── minimal_server.rs     Minimal runnable example (`cargo run --example minimal_server`)
+│   ├── minimal_server.rs     Minimal runnable example (`cargo run --example minimal_server`)
+│   ├── api_key_rbac.rs       API-key auth + RBAC + argument allowlist example
+│   └── oauth_server.rs       OAuth 2.1 resource server example (requires `--features oauth`)
 ├── docs/
 │   ├── GUIDE.md              ★ Consumer-facing guide (architecture, TOML config, examples)
 │   ├── ARCHITECTURE.md       ★ Deep architecture map for agents (file:line citations)
@@ -106,6 +110,7 @@ Z:\TempPersistent\mcpx\
 **Cargo features**:
 - `oauth` (off by default) — OAuth 2.1 JWT validation against JWKS + optional OAuth proxy endpoints.
 - `metrics` (off by default) — Prometheus `/metrics` endpoint and recording middleware.
+- `test-helpers` (off by default) — exposes test-only helpers from `bounded_limiter` and `mtls_revocation` for downstream integration tests; not part of the stable API surface.
 
 ---
 
