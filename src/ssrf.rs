@@ -128,6 +128,7 @@ fn block_reason_v6(v6: Ipv6Addr) -> Option<&'static str> {
 /// falls in a private or public range. OAuth operators must use DNS
 /// hostnames; post-DNS runtime checks remain the responsibility of the
 /// fetch path.
+#[cfg(feature = "oauth")]
 pub(crate) fn check_url_literal_ip(url: &Url) -> Option<&'static str> {
     match url.host()? {
         url::Host::Ipv4(_) => Some("literal IPv4 addresses are forbidden; use a DNS hostname"),
@@ -142,6 +143,7 @@ pub(crate) fn check_url_literal_ip(url: &Url) -> Option<&'static str> {
 ///
 /// Used inside `reqwest::redirect::Policy::custom` closures in both
 /// `OauthHttpClient::build` and `JwksCache::new`. Does NOT perform DNS.
+#[cfg(feature = "oauth")]
 pub(crate) fn redirect_target_reason(url: &Url) -> Option<&'static str> {
     if !url.username().is_empty() || url.password().is_some() {
         return Some("userinfo (credentials in URL) forbidden");
