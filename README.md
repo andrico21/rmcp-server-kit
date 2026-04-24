@@ -108,6 +108,35 @@ auth.oauth = Some(oauth);
 > redirect policy are all wired in one call. See
 > [`SECURITY.md`](SECURITY.md#oauth-ssrf-hardening) for the trust model.
 
+**OAuth in-cluster IdP (private/loopback IdP target, opt-in):**
+
+```rust,ignore
+use rmcp_server_kit::oauth::{OAuthConfig, OAuthSsrfAllowlist};
+
+// `OAuthSsrfAllowlist` is `#[non_exhaustive]`; build it via
+// `Default::default()` and push into the public fields.
+let mut allowlist = OAuthSsrfAllowlist::default();
+allowlist.hosts.push("rhbk.ops.example.com".into());
+allowlist.cidrs.push("10.0.0.0/8".into());
+
+let oauth = OAuthConfig::builder(
+    "https://rhbk.ops.example.com/realms/main",
+    "my-mcp-server",
+    "https://rhbk.ops.example.com/realms/main/protocol/openid-connect/certs",
+)
+.ssrf_allowlist(allowlist)
+.build();
+```
+
+> The default fail-closed SSRF guard blocks targets that resolve into
+> private (RFC 1918), loopback, CGNAT, or unique-local space. Use
+> `ssrf_allowlist` only when the IdP legitimately lives there (e.g. a
+> Keycloak `Service` ClusterIP). Cloud-metadata addresses (AWS / GCP /
+> Alibaba) remain unbypassable regardless of the allowlist contents.
+> See [`docs/GUIDE.md`](docs/GUIDE.md#allowing-in-cluster-idps) and the
+> "Operator allowlist" subsection of [`SECURITY.md`](SECURITY.md#operator-allowlist)
+> for the full trust model.
+
 **Prometheus metrics on a separate listener:**
 
 ```rust,ignore
