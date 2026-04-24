@@ -14,6 +14,20 @@ Patch release fixing a tokenization bug in `RbacPolicy::argument_allowed`
 that prevented allowlist entries containing spaces from ever matching,
 and tightening fail-closed handling of malformed shell input.
 
+### Security
+
+- **`Cargo.lock`** -- bump transitive `rustls-webpki` `0.103.12 -> 0.103.13`
+  to pick up the fix for [RUSTSEC-2026-0104](https://rustsec.org/advisories/RUSTSEC-2026-0104).
+  The advisory describes a reachable panic in
+  `BorrowedCertRevocationList::from_der` /
+  `OwnedCertRevocationList::from_der` when parsing a syntactically valid
+  empty `BIT STRING` in the `onlySomeReasons` element of an
+  `IssuingDistributionPoint` CRL extension. The panic is reachable
+  before the CRL signature is verified, so any consumer that fetches
+  CRLs via `mtls_revocation` would be exposed; consumers that do not
+  use CRLs are unaffected. No code or API changes in this crate -- the
+  fix is entirely a transitive dependency bump.
+
 ### Fixed
 
 - **`src/rbac.rs`** -- `RbacPolicy::argument_allowed` now tokenizes
