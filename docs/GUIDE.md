@@ -864,6 +864,7 @@ role = "viewer"
 | `jwks_max_response_bytes` | `u64` | `1048576` | Fail-closed cap on the JWKS HTTP response body size (1 MiB default). |
 | `allow_http_oauth_urls` | `bool` | `false` | Permit `http://` issuer/JWKS/etc. for local dev only. |
 | `strict_audience_validation` | `bool` | `false` | When `true`, validate only `aud` and disable the legacy `azp` fallback. Recommended for new deployments. |
+| `ssrf_allowlist` | `table` | _unset_ | Operator opt-in allowlist of `hosts` and/or `cidrs` whose otherwise-blocked addresses (private/loopback/CGNAT/unique-local) the OAuth/JWKS fetcher is allowed to reach. Cloud-metadata addresses remain blocked. See "Allowing in-cluster IdPs" below and the "Operator allowlist" section in [`SECURITY.md`](../SECURITY.md). |
 
 #### SSRF and DoS Hardening (OAuth)
 
@@ -894,6 +895,65 @@ jwks_max_response_bytes = 1048576
 
 The redirect-hop limit (max 2) and per-request HTTP timeouts are enforced
 internally and are not configurable knobs.
+
+#### Allowing in-cluster IdPs
+
+By default, the post-DNS SSRF guard rejects OAuth/JWKS targets whose
+hostnames resolve to private (RFC 1918), loopback, link-local, CGNAT,
+unique-local, or cloud-metadata address space. This is the right default
+for internet-facing IdPs but blocks legitimate in-cluster deployments
+where, for example, Keycloak resolves to a `10.x.x.x` ClusterIP.
+
+Operators can opt in to **specific** trust by listing the hostnames or
+CIDR blocks the fetcher is permitted to reach. Cloud-metadata addresses
+(AWS/GCP/Alibaba IPv4 + IPv6) remain blocked **unconditionally**, even
+if a containing CIDR is listed -- see [`SECURITY.md`](../SECURITY.md)
+under "Operator allowlist" for the full trust model.
+
+```toml
+[server.auth.oauth]
+issuer = "https://rhbk.ops.example.com/realms/ops"
+audience = "mcp"
+jwks_uri = "https://rhbk.ops.example.com/realms/ops/protocol/openid-connect/certs"
+
+[server.auth.oauth.ssrf_allowlist]
+hosts = ["rhbk.ops.example.com"]
+cidrs = ["10.0.0.0/8"]
+```
+
+Builder API:
+
+```rust,ignore
+use rmcp_server_kit::oauth::{OAuthConfig, OAuthSsrfAllowlist};
+
+// `OAuthSsrfAllowlist` is `#[non_exhaustive]`; construct it via
+// `Default::default()` and append to the public fields, so future
+// additions remain non-breaking.
+let mut allowlist = OAuthSsrfAllowlist::default();
+allowlist.hosts.push("rhbk.ops.example.com".into());
+allowlist.cidrs.push("10.0.0.0/8".into());
+
+let cfg = OAuthConfig::builder(
+    "https://rhbk.ops.example.com/realms/ops",
+    "mcp",
+    "https://rhbk.ops.example.com/realms/ops/protocol/openid-connect/certs",
+)
+.ssrf_allowlist(allowlist)
+.build();
+```
+
+Configuration is validated up-front:
+
+- `hosts` entries must be bare DNS hostnames (no scheme, port, path,
+  userinfo, query, fragment) and must not be literal IPs (use `cidrs`
+  for those). Matching is case-insensitive exact match -- no wildcards.
+- `cidrs` entries are family-strict (no IPv4-mapped-IPv6, no `/0`, no
+  zone IDs); host bits must be zero.
+- A misconfigured allowlist is rejected by `OAuthConfig::validate()` and
+  by `JwksCache::new()` -- the server fails to start, rather than
+  fail-open.
+- A non-empty allowlist emits a `tracing::warn!` at validate time
+  naming the host and CIDR counts so the elevated trust is auditable.
 
 
 ---

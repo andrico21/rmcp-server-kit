@@ -16,6 +16,7 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -45,11 +46,15 @@ use crate::auth::{AuthIdentity, AuthMethod};
 ///      *and* the destination scheme is `http`.
 ///   3. Targets resolving to disallowed IP ranges (private / loopback /
 ///      link-local / multicast / broadcast / unspecified /
-///      cloud-metadata) are rejected via [`crate::ssrf::redirect_target_reason`].
+///      cloud-metadata) are rejected via
+///      [`crate::ssrf::redirect_target_reason_with_allowlist`], which
+///      consults the operator-supplied allowlist while keeping
+///      cloud-metadata addresses unbypassable.
 ///   4. The hop count is capped at 2 (i.e. at most 2 prior redirects).
 fn evaluate_oauth_redirect(
     attempt: &reqwest::redirect::Attempt<'_>,
     allow_http: bool,
+    allowlist: &crate::ssrf::CompiledSsrfAllowlist,
 ) -> Result<(), String> {
     let prev_https = attempt
         .previous()
@@ -65,7 +70,8 @@ fn evaluate_oauth_redirect(
             return Err("redirect to non-HTTP(S) URL refused".to_owned());
         }
     }
-    if let Some(reason) = crate::ssrf::redirect_target_reason(target_url) {
+    if let Some(reason) = crate::ssrf::redirect_target_reason_with_allowlist(target_url, allowlist)
+    {
         return Err(format!("redirect target forbidden: {reason}"));
     }
     if attempt.previous().len() >= 2 {
@@ -78,14 +84,20 @@ fn evaluate_oauth_redirect(
 ///
 /// This complements the per-redirect-hop guard in
 /// [`evaluate_oauth_redirect`]: redirects are screened synchronously via
-/// [`crate::ssrf::redirect_target_reason`], while the initial request target
-/// is screened here after DNS resolution so hostnames resolving to
-/// loopback/private/link-local/metadata space are rejected before any TCP
-/// dial occurs.
+/// [`crate::ssrf::redirect_target_reason_with_allowlist`], while the
+/// initial request target is screened here after DNS resolution so
+/// hostnames resolving to loopback/private/link-local/metadata space
+/// are rejected before any TCP dial occurs.
+///
+/// **Cloud-metadata addresses (IPv4 `169.254.169.254`, Alibaba/Tencent
+/// `100.100.100.200`, AWS IPv6 `fd00:ec2::254`, GCP IPv6
+/// `fd20:ce::254`) are blocked unconditionally** -- the operator
+/// allowlist cannot re-allow them.
 #[cfg_attr(not(any(test, feature = "test-helpers")), allow(dead_code))]
 async fn screen_oauth_target_with_test_override(
     url: &str,
     allow_http: bool,
+    allowlist: &crate::ssrf::CompiledSsrfAllowlist,
     #[cfg(any(test, feature = "test-helpers"))] test_allow_loopback_ssrf: bool,
 ) -> Result<(), crate::error::McpxError> {
     let parsed = check_oauth_url("oauth target", url, allow_http)?;
@@ -110,12 +122,36 @@ async fn screen_oauth_target_with_test_override(
         crate::error::McpxError::Config(format!("OAuth target DNS resolution {url}: {error}"))
     })?;
 
+    let host_allowed = !allowlist.is_empty() && allowlist.host_allowed(host);
     let mut any_addr = false;
     for addr in addrs {
         any_addr = true;
-        if let Some(reason) = crate::ssrf::ip_block_reason(addr.ip()) {
+        let ip = addr.ip();
+        if let Some(reason) = crate::ssrf::ip_block_reason(ip) {
+            // Cloud-metadata is unbypassable. Use the strict message
+            // that does NOT advertise the allowlist knob.
+            if reason == "cloud_metadata" {
+                return Err(crate::error::McpxError::Config(format!(
+                    "OAuth target resolved to blocked IP ({reason}): {url}"
+                )));
+            }
+            // Default-empty-allowlist path: preserve the historical
+            // message verbatim so existing tests continue to pass and
+            // operators get the same diagnostic they had before.
+            if allowlist.is_empty() {
+                return Err(crate::error::McpxError::Config(format!(
+                    "OAuth target resolved to blocked IP ({reason}): {url}"
+                )));
+            }
+            // Allowlist-configured path: consult host + per-IP allowlist.
+            if host_allowed || allowlist.ip_allowed(ip) {
+                continue;
+            }
             return Err(crate::error::McpxError::Config(format!(
-                "OAuth target resolved to blocked IP ({reason}): {url}"
+                "OAuth target blocked: hostname {host} resolved to {ip} ({reason}). \
+                 To allow, add the hostname to oauth.ssrf_allowlist.hosts or the CIDR \
+                 to oauth.ssrf_allowlist.cidrs (operators only -- see SECURITY.md). \
+                 URL: {url}"
             )));
         }
     }
@@ -128,10 +164,14 @@ async fn screen_oauth_target_with_test_override(
     Ok(())
 }
 
-async fn screen_oauth_target(url: &str, allow_http: bool) -> Result<(), crate::error::McpxError> {
+async fn screen_oauth_target(
+    url: &str,
+    allow_http: bool,
+    allowlist: &crate::ssrf::CompiledSsrfAllowlist,
+) -> Result<(), crate::error::McpxError> {
     #[cfg(any(test, feature = "test-helpers"))]
     {
-        screen_oauth_target_with_test_override(url, allow_http, false).await
+        screen_oauth_target_with_test_override(url, allow_http, allowlist, false).await
     }
     #[cfg(not(any(test, feature = "test-helpers")))]
     {
@@ -153,12 +193,30 @@ async fn screen_oauth_target(url: &str, allow_http: bool) -> Result<(), crate::e
             crate::error::McpxError::Config(format!("OAuth target DNS resolution {url}: {error}"))
         })?;
 
+        let host_allowed = !allowlist.is_empty() && allowlist.host_allowed(host);
         let mut any_addr = false;
         for addr in addrs {
             any_addr = true;
-            if let Some(reason) = crate::ssrf::ip_block_reason(addr.ip()) {
+            let ip = addr.ip();
+            if let Some(reason) = crate::ssrf::ip_block_reason(ip) {
+                if reason == "cloud_metadata" {
+                    return Err(crate::error::McpxError::Config(format!(
+                        "OAuth target resolved to blocked IP ({reason}): {url}"
+                    )));
+                }
+                if allowlist.is_empty() {
+                    return Err(crate::error::McpxError::Config(format!(
+                        "OAuth target resolved to blocked IP ({reason}): {url}"
+                    )));
+                }
+                if host_allowed || allowlist.ip_allowed(ip) {
+                    continue;
+                }
                 return Err(crate::error::McpxError::Config(format!(
-                    "OAuth target resolved to blocked IP ({reason}): {url}"
+                    "OAuth target blocked: hostname {host} resolved to {ip} ({reason}). \
+                     To allow, add the hostname to oauth.ssrf_allowlist.hosts or the CIDR \
+                     to oauth.ssrf_allowlist.cidrs (operators only -- see SECURITY.md). \
+                     URL: {url}"
                 )));
             }
         }
@@ -216,6 +274,11 @@ async fn screen_oauth_target(url: &str, allow_http: bool) -> Result<(), crate::e
 pub struct OauthHttpClient {
     inner: reqwest::Client,
     allow_http: bool,
+    /// Compiled SSRF allowlist applied to the initial-target screen and
+    /// to literal-IP redirect-hop screening. Wrapped in `Arc` so cloning
+    /// the client (which is cheap and refcounted) does not deep-copy
+    /// the parsed CIDR / host vectors.
+    allowlist: Arc<crate::ssrf::CompiledSsrfAllowlist>,
     #[cfg(any(test, feature = "test-helpers"))]
     test_allow_loopback_ssrf: bool,
 }
@@ -277,6 +340,21 @@ impl OauthHttpClient {
     fn build(config: Option<&OAuthConfig>) -> Result<Self, crate::error::McpxError> {
         let allow_http = config.is_some_and(|c| c.allow_http_oauth_urls);
 
+        // Compile the operator SSRF allowlist (if any) up front. Surface
+        // CIDR / host parse errors as Startup so misconfiguration fails
+        // fast at server boot, mirroring how OAuthConfig::validate
+        // surfaces them as Config errors.
+        let allowlist = match config.and_then(|c| c.ssrf_allowlist.as_ref()) {
+            Some(raw) => Arc::new(compile_oauth_ssrf_allowlist(raw).map_err(|e| {
+                crate::error::McpxError::Startup(format!("oauth http client: {e}"))
+            })?),
+            None => Arc::new(crate::ssrf::CompiledSsrfAllowlist::default()),
+        };
+
+        // Clone an Arc into the redirect closure so the policy can
+        // consult the operator allowlist without re-parsing.
+        let redirect_allowlist = Arc::clone(&allowlist);
+
         let mut builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
@@ -290,7 +368,7 @@ impl OauthHttpClient {
                 // policy lives in `evaluate_oauth_redirect` so the
                 // OauthHttpClient and JwksCache closures stay
                 // byte-for-byte identical.
-                match evaluate_oauth_redirect(&attempt, allow_http) {
+                match evaluate_oauth_redirect(&attempt, allow_http, &redirect_allowlist) {
                     Ok(()) => attempt.follow(),
                     Err(reason) => {
                         tracing::warn!(
@@ -331,6 +409,7 @@ impl OauthHttpClient {
         Ok(Self {
             inner,
             allow_http,
+            allowlist,
             #[cfg(any(test, feature = "test-helpers"))]
             test_allow_loopback_ssrf: false,
         })
@@ -343,12 +422,13 @@ impl OauthHttpClient {
     ) -> Result<reqwest::Response, crate::error::McpxError> {
         #[cfg(any(test, feature = "test-helpers"))]
         if self.test_allow_loopback_ssrf {
-            screen_oauth_target_with_test_override(url, self.allow_http, true).await?;
+            screen_oauth_target_with_test_override(url, self.allow_http, &self.allowlist, true)
+                .await?;
         } else {
-            screen_oauth_target(url, self.allow_http).await?;
+            screen_oauth_target(url, self.allow_http, &self.allowlist).await?;
         }
         #[cfg(not(any(test, feature = "test-helpers")))]
-        screen_oauth_target(url, self.allow_http).await?;
+        screen_oauth_target(url, self.allow_http, &self.allowlist).await?;
         request.send().await.map_err(|error| {
             crate::error::McpxError::Config(format!("oauth request {url}: {error}"))
         })
@@ -386,6 +466,132 @@ impl std::fmt::Debug for OauthHttpClient {
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
+
+/// Operator-trusted SSRF allowlist for OAuth/JWKS targets that resolve
+/// to addresses normally blocked by the post-DNS SSRF guard.
+///
+/// **Default: empty.** With both fields empty (or this struct unset),
+/// the existing fail-closed behavior is unchanged: any OAuth/JWKS URL
+/// resolving to RFC 1918, loopback, link-local, CGNAT, multicast,
+/// broadcast, unspecified, IPv6 unique-local / link-local / multicast,
+/// documentation, benchmarking, or reserved ranges is rejected before
+/// connect.
+///
+/// **Cloud-metadata addresses remain unbypassable** -- operators
+/// cannot opt in to metadata-service exposure. This carve-out covers:
+///
+/// - IPv4 `169.254.169.254` (AWS / GCP / Azure).
+/// - IPv4 `100.100.100.200` (Alibaba Cloud / Tencent Cloud).
+/// - IPv6 `fd00:ec2::254` (AWS IMDSv2 over IPv6).
+/// - IPv6 `fd20:ce::254` (GCP).
+///
+/// See `SECURITY.md` § "Operator allowlist".
+///
+/// Both lists are evaluated additively: a target is allowed if its
+/// hostname is in [`hosts`](Self::hosts) **or** every resolved IP for
+/// the target falls within at least one CIDR in [`cidrs`](Self::cidrs).
+///
+/// The allowlist applies to all six configured OAuth URL fields
+/// ([`OAuthConfig::issuer`], [`OAuthConfig::jwks_uri`],
+/// [`OAuthProxyConfig::authorize_url`], [`OAuthProxyConfig::token_url`],
+/// [`OAuthProxyConfig::introspection_url`],
+/// [`OAuthProxyConfig::revocation_url`],
+/// [`TokenExchangeConfig::token_url`]) and to the per-redirect-hop
+/// SSRF guard when a redirect target is a literal IP in a configured
+/// CIDR.
+///
+/// Entries are validated at startup: literal IPs in `hosts`, non-zero
+/// host bits in `cidrs`, malformed CIDRs, and entries containing
+/// ports / userinfo / paths are all rejected by
+/// [`OAuthConfig::validate`].
+///
+/// # Example
+///
+/// ```no_run
+/// use rmcp_server_kit::oauth::{OAuthConfig, OAuthSsrfAllowlist};
+///
+/// let mut allowlist = OAuthSsrfAllowlist::default();
+/// allowlist.hosts.push("rhbk.ops.example.com".into());
+/// allowlist.cidrs.push("10.0.0.0/8".into());
+/// let cfg = OAuthConfig::builder(
+///     "https://rhbk.ops.example.com/realms/ops",
+///     "mcp",
+///     "https://rhbk.ops.example.com/realms/ops/protocol/openid-connect/certs",
+/// )
+/// .ssrf_allowlist(allowlist)
+/// .build();
+/// cfg.validate().expect("operator allowlist parses");
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+#[non_exhaustive]
+pub struct OAuthSsrfAllowlist {
+    /// Hostnames allowed to resolve into otherwise-blocked address
+    /// ranges. Exact match, case-insensitive, no wildcards. Each entry
+    /// must be a bare DNS hostname: no scheme, no port, no userinfo,
+    /// not a literal IP.
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    /// CIDR blocks whose addresses are considered trusted even when
+    /// the address would otherwise be blocked. Accepts both IPv4
+    /// (e.g. `10.0.0.0/8`) and IPv6 (e.g. `fd00::/8`).
+    ///
+    /// Cloud-metadata addresses inside any listed range remain blocked.
+    #[serde(default)]
+    pub cidrs: Vec<String>,
+}
+
+/// Compile and validate an operator allowlist into the runtime form.
+///
+/// Lowercases hostnames, rejects literal-IP and ill-formed host
+/// entries, parses + validates each CIDR (see [`crate::ssrf::CidrEntry::parse`]).
+/// Returns a `String` error suitable for embedding in
+/// [`crate::error::McpxError::Config`] / [`crate::error::McpxError::Startup`].
+fn compile_oauth_ssrf_allowlist(
+    raw: &OAuthSsrfAllowlist,
+) -> Result<crate::ssrf::CompiledSsrfAllowlist, String> {
+    let mut hosts: Vec<String> = Vec::with_capacity(raw.hosts.len());
+    for (idx, entry) in raw.hosts.iter().enumerate() {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            return Err(format!("oauth.ssrf_allowlist.hosts[{idx}]: empty entry"));
+        }
+        // Reject embedded port / path / userinfo / query / fragment
+        // before reaching the URL parser, so the error is clearer than
+        // a generic "invalid host" diagnostic.
+        if trimmed.contains([':', '/', '@', '?', '#']) {
+            return Err(format!(
+                "oauth.ssrf_allowlist.hosts[{idx}] = {trimmed:?}: must be a bare DNS hostname \
+                 (no scheme, port, path, userinfo, query, or fragment)"
+            ));
+        }
+        match url::Host::parse(trimmed) {
+            Ok(url::Host::Domain(_)) => {}
+            Ok(url::Host::Ipv4(_) | url::Host::Ipv6(_)) => {
+                return Err(format!(
+                    "oauth.ssrf_allowlist.hosts[{idx}] = {trimmed:?}: literal IPs are forbidden \
+                     here -- list them via oauth.ssrf_allowlist.cidrs instead"
+                ));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "oauth.ssrf_allowlist.hosts[{idx}] = {trimmed:?}: invalid hostname: {e}"
+                ));
+            }
+        }
+        hosts.push(trimmed.to_ascii_lowercase());
+    }
+    hosts.sort();
+    hosts.dedup();
+
+    let mut cidrs = Vec::with_capacity(raw.cidrs.len());
+    for (idx, entry) in raw.cidrs.iter().enumerate() {
+        let parsed = crate::ssrf::CidrEntry::parse(entry)
+            .map_err(|e| format!("oauth.ssrf_allowlist.cidrs[{idx}]: {e}"))?;
+        cidrs.push(parsed);
+    }
+
+    Ok(crate::ssrf::CompiledSsrfAllowlist::new(hosts, cidrs))
+}
 
 /// OAuth 2.1 JWT configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -453,6 +659,16 @@ pub struct OAuthConfig {
     /// rejected even when this flag is `true`.
     #[serde(default)]
     pub allow_http_oauth_urls: bool,
+    /// Operator-trusted SSRF allowlist for OAuth/JWKS targets.
+    ///
+    /// **Default: `None`** (fail-closed; current behavior preserved).
+    /// When set, the listed hostnames and CIDR blocks may resolve into
+    /// otherwise-blocked address ranges (RFC 1918, loopback, link-local,
+    /// CGNAT, IPv6 unique-local, ...). **Cloud-metadata addresses
+    /// remain unbypassable regardless of this setting** -- see
+    /// [`OAuthSsrfAllowlist`] and `SECURITY.md` § "Operator allowlist".
+    #[serde(default)]
+    pub ssrf_allowlist: Option<OAuthSsrfAllowlist>,
     /// Maximum number of keys accepted from a JWKS refresh response.
     /// Requests returning more keys than this are rejected fail-closed
     /// (cache remains empty / unchanged). Default: 256.
@@ -502,6 +718,7 @@ impl Default for OAuthConfig {
             max_jwks_keys: default_max_jwks_keys(),
             strict_audience_validation: false,
             jwks_max_response_bytes: default_jwks_max_bytes(),
+            ssrf_allowlist: None,
         }
     }
 }
@@ -596,6 +813,23 @@ impl OAuthConfig {
                 return Err(crate::error::McpxError::Config(format!(
                     "oauth.token_exchange.token_url forbidden ({reason})"
                 )));
+            }
+        }
+        // Compile the operator allowlist (if any) at config-validate
+        // time so misconfiguration is rejected up-front, before any
+        // outbound HTTP client is ever built.
+        if let Some(raw) = &self.ssrf_allowlist {
+            let compiled = compile_oauth_ssrf_allowlist(raw).map_err(|e| {
+                crate::error::McpxError::Config(format!("oauth.ssrf_allowlist: {e}"))
+            })?;
+            if !compiled.is_empty() {
+                tracing::warn!(
+                    host_count = compiled.host_count(),
+                    cidr_count = compiled.cidr_count(),
+                    "oauth.ssrf_allowlist is configured: private/loopback OAuth/JWKS targets \
+                     are now reachable. Cloud-metadata addresses remain blocked. \
+                     See SECURITY.md \"Operator allowlist\"."
+                );
             }
         }
         Ok(())
@@ -733,6 +967,18 @@ impl OAuthConfigBuilder {
     /// Override the maximum JWKS response body size in bytes.
     pub const fn jwks_max_response_bytes(mut self, bytes: u64) -> Self {
         self.inner.jwks_max_response_bytes = bytes;
+        self
+    }
+
+    /// Set the operator SSRF allowlist for OAuth/JWKS targets.
+    ///
+    /// **Operator-only.** Use only when an in-cluster IdP (e.g. Keycloak)
+    /// resolves to private/loopback address space and must be reached.
+    /// Cloud-metadata addresses (AWS/GCP/Alibaba IPv4 + IPv6) remain
+    /// blocked regardless of allowlist contents -- see
+    /// [`OAuthSsrfAllowlist`] and `SECURITY.md`  "Operator allowlist".
+    pub fn ssrf_allowlist(mut self, allowlist: OAuthSsrfAllowlist) -> Self {
+        self.inner.ssrf_allowlist = Some(allowlist);
         self
     }
 
@@ -1033,6 +1279,10 @@ pub struct JwksCache {
     last_refresh_attempt: RwLock<Option<Instant>>,
     /// Serializes concurrent refresh attempts so only one fetch is in flight.
     refresh_lock: tokio::sync::Mutex<()>,
+    /// Compiled operator SSRF allowlist (empty by default = original
+    /// fail-closed behaviour). Wrapped in `Arc` so the redirect-policy
+    /// closure can capture a cheap clone without inflating the cache size.
+    allowlist: Arc<crate::ssrf::CompiledSsrfAllowlist>,
     #[cfg(any(test, feature = "test-helpers"))]
     test_allow_loopback_ssrf: bool,
 }
@@ -1103,6 +1353,18 @@ impl JwksCache {
 
         let allow_http = config.allow_http_oauth_urls;
 
+        // Compile operator allowlist up-front so misconfiguration is
+        // surfaced at startup rather than on first JWKS fetch.
+        let allowlist = match config.ssrf_allowlist.as_ref() {
+            Some(raw) => Arc::new(compile_oauth_ssrf_allowlist(raw).map_err(|e| {
+                Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                    "oauth.ssrf_allowlist: {e}"
+                ))
+            })?),
+            None => Arc::new(crate::ssrf::CompiledSsrfAllowlist::default()),
+        };
+        let redirect_allowlist = Arc::clone(&allowlist);
+
         let mut http_builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .connect_timeout(Duration::from_secs(3))
@@ -1116,7 +1378,7 @@ impl JwksCache {
                 // policy lives in `evaluate_oauth_redirect` so the
                 // OauthHttpClient and JwksCache closures stay
                 // byte-for-byte identical.
-                match evaluate_oauth_redirect(&attempt, allow_http) {
+                match evaluate_oauth_redirect(&attempt, allow_http, &redirect_allowlist) {
                     Ok(()) => attempt.follow(),
                     Err(reason) => {
                         tracing::warn!(
@@ -1158,6 +1420,7 @@ impl JwksCache {
             role_mappings: config.role_mappings.clone(),
             last_refresh_attempt: RwLock::new(None),
             refresh_lock: tokio::sync::Mutex::new(()),
+            allowlist,
             #[cfg(any(test, feature = "test-helpers"))]
             test_allow_loopback_ssrf: false,
         })
@@ -1458,12 +1721,18 @@ impl JwksCache {
     async fn fetch_jwks(&self) -> Option<JwkSet> {
         #[cfg(any(test, feature = "test-helpers"))]
         let screening = if self.test_allow_loopback_ssrf {
-            screen_oauth_target_with_test_override(&self.jwks_uri, self.allow_http, true).await
+            screen_oauth_target_with_test_override(
+                &self.jwks_uri,
+                self.allow_http,
+                &self.allowlist,
+                true,
+            )
+            .await
         } else {
-            screen_oauth_target(&self.jwks_uri, self.allow_http).await
+            screen_oauth_target(&self.jwks_uri, self.allow_http, &self.allowlist).await
         };
         #[cfg(not(any(test, feature = "test-helpers")))]
-        let screening = screen_oauth_target(&self.jwks_uri, self.allow_http).await;
+        let screening = screen_oauth_target(&self.jwks_uri, self.allow_http, &self.allowlist).await;
 
         if let Err(error) = screening {
             tracing::warn!(error = %error, uri = %self.jwks_uri, "failed to screen JWKS target");
@@ -2295,6 +2564,7 @@ mod tests {
             max_jwks_keys: default_max_jwks_keys(),
             strict_audience_validation: false,
             jwks_max_response_bytes: default_jwks_max_bytes(),
+            ssrf_allowlist: None,
         };
         let meta = protected_resource_metadata(
             "https://mcp.example.com/mcp",
@@ -2648,6 +2918,7 @@ mod tests {
             max_jwks_keys: default_max_jwks_keys(),
             strict_audience_validation: false,
             jwks_max_response_bytes: default_jwks_max_bytes(),
+            ssrf_allowlist: None,
         }
     }
 
@@ -2975,23 +3246,32 @@ mod tests {
             max_jwks_keys: default_max_jwks_keys(),
             strict_audience_validation: false,
             jwks_max_response_bytes: default_jwks_max_bytes(),
+            ssrf_allowlist: None,
         }
     }
 
     #[tokio::test]
     async fn screen_oauth_target_rejects_literal_ip() {
-        let err = screen_oauth_target("https://127.0.0.1/jwks.json", false)
-            .await
-            .expect_err("literal IPs must be rejected");
+        let err = screen_oauth_target(
+            "https://127.0.0.1/jwks.json",
+            false,
+            &crate::ssrf::CompiledSsrfAllowlist::default(),
+        )
+        .await
+        .expect_err("literal IPs must be rejected");
         let msg = err.to_string();
         assert!(msg.contains("literal IPv4 addresses are forbidden"));
     }
 
     #[tokio::test]
     async fn screen_oauth_target_rejects_private_dns_resolution() {
-        let err = screen_oauth_target("https://localhost/jwks.json", false)
-            .await
-            .expect_err("localhost resolution must be rejected");
+        let err = screen_oauth_target(
+            "https://localhost/jwks.json",
+            false,
+            &crate::ssrf::CompiledSsrfAllowlist::default(),
+        )
+        .await
+        .expect_err("localhost resolution must be rejected");
         let msg = err.to_string();
         assert!(
             msg.contains("blocked IP") && msg.contains("loopback"),
@@ -3001,18 +3281,26 @@ mod tests {
 
     #[tokio::test]
     async fn screen_oauth_target_rejects_literal_ip_even_with_allow_http() {
-        let err = screen_oauth_target("http://127.0.0.1/jwks.json", true)
-            .await
-            .expect_err("literal IPs must still be rejected when http is allowed");
+        let err = screen_oauth_target(
+            "http://127.0.0.1/jwks.json",
+            true,
+            &crate::ssrf::CompiledSsrfAllowlist::default(),
+        )
+        .await
+        .expect_err("literal IPs must still be rejected when http is allowed");
         let msg = err.to_string();
         assert!(msg.contains("literal IPv4 addresses are forbidden"));
     }
 
     #[tokio::test]
     async fn screen_oauth_target_rejects_private_dns_even_with_allow_http() {
-        let err = screen_oauth_target("http://localhost/jwks.json", true)
-            .await
-            .expect_err("private DNS resolution must still be rejected when http is allowed");
+        let err = screen_oauth_target(
+            "http://localhost/jwks.json",
+            true,
+            &crate::ssrf::CompiledSsrfAllowlist::default(),
+        )
+        .await
+        .expect_err("private DNS resolution must still be rejected when http is allowed");
         let msg = err.to_string();
         assert!(
             msg.contains("blocked IP") && msg.contains("loopback"),
@@ -3022,9 +3310,160 @@ mod tests {
 
     #[tokio::test]
     async fn screen_oauth_target_allows_public_hostname() {
-        screen_oauth_target("https://example.com/.well-known/jwks.json", false)
+        screen_oauth_target(
+            "https://example.com/.well-known/jwks.json",
+            false,
+            &crate::ssrf::CompiledSsrfAllowlist::default(),
+        )
+        .await
+        .expect("public hostname should pass screening");
+    }
+
+    // -----------------------------------------------------------------------
+    // Operator SSRF allowlist (1.4.0)
+    // -----------------------------------------------------------------------
+
+    /// Helper: compile an allowlist from string literals.
+    fn make_allowlist(hosts: &[&str], cidrs: &[&str]) -> crate::ssrf::CompiledSsrfAllowlist {
+        let raw = OAuthSsrfAllowlist {
+            hosts: hosts.iter().map(|s| (*s).to_string()).collect(),
+            cidrs: cidrs.iter().map(|s| (*s).to_string()).collect(),
+        };
+        compile_oauth_ssrf_allowlist(&raw).expect("test allowlist compiles")
+    }
+
+    #[test]
+    fn compile_oauth_ssrf_allowlist_lowercases_and_dedupes_hosts() {
+        let raw = OAuthSsrfAllowlist {
+            hosts: vec!["RHBK.ops.example.com".into(), "rhbk.ops.example.com".into()],
+            cidrs: vec![],
+        };
+        let compiled = compile_oauth_ssrf_allowlist(&raw).expect("compiles");
+        assert_eq!(compiled.host_count(), 1);
+        assert!(compiled.host_allowed("rhbk.ops.example.com"));
+        assert!(compiled.host_allowed("RHBK.OPS.EXAMPLE.COM"));
+    }
+
+    #[test]
+    fn compile_oauth_ssrf_allowlist_rejects_literal_ip_in_hosts() {
+        let raw = OAuthSsrfAllowlist {
+            hosts: vec!["10.0.0.1".into()],
+            cidrs: vec![],
+        };
+        let err = compile_oauth_ssrf_allowlist(&raw).expect_err("literal IP in hosts");
+        assert!(err.contains("literal IPs are forbidden"), "got {err:?}");
+    }
+
+    #[test]
+    fn compile_oauth_ssrf_allowlist_rejects_host_with_port() {
+        let raw = OAuthSsrfAllowlist {
+            hosts: vec!["rhbk.ops.example.com:8443".into()],
+            cidrs: vec![],
+        };
+        let err = compile_oauth_ssrf_allowlist(&raw).expect_err("host:port");
+        assert!(err.contains("must be a bare DNS hostname"), "got {err:?}");
+    }
+
+    #[test]
+    fn compile_oauth_ssrf_allowlist_rejects_invalid_cidr() {
+        let raw = OAuthSsrfAllowlist {
+            hosts: vec![],
+            cidrs: vec!["not-a-cidr".into()],
+        };
+        let err = compile_oauth_ssrf_allowlist(&raw).expect_err("invalid CIDR");
+        assert!(err.contains("oauth.ssrf_allowlist.cidrs[0]"), "got {err:?}");
+    }
+
+    #[test]
+    fn validate_rejects_misconfigured_allowlist() {
+        let mut cfg = OAuthConfig::builder(
+            "https://auth.example.com/",
+            "mcp",
+            "https://auth.example.com/jwks.json",
+        )
+        .build();
+        cfg.ssrf_allowlist = Some(OAuthSsrfAllowlist {
+            hosts: vec!["10.0.0.1".into()],
+            cidrs: vec![],
+        });
+        let err = cfg
+            .validate()
+            .expect_err("literal IP host must be rejected");
+        assert!(
+            err.to_string().contains("oauth.ssrf_allowlist"),
+            "got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn screen_oauth_target_with_allowlist_emits_helpful_error() {
+        // localhost resolves to loopback; with a *non-empty* allowlist that
+        // doesn't cover loopback, we expect the new verbose error referencing
+        // the config field.
+        let allow = make_allowlist(&["other.example.com"], &["10.0.0.0/8"]);
+        let err = screen_oauth_target("https://localhost/jwks.json", false, &allow)
             .await
-            .expect("public hostname should pass screening");
+            .expect_err("loopback must still be blocked when not in allowlist");
+        let msg = err.to_string();
+        assert!(msg.contains("OAuth target blocked"), "got {msg:?}");
+        assert!(msg.contains("oauth.ssrf_allowlist"), "got {msg:?}");
+        assert!(msg.contains("SECURITY.md"), "got {msg:?}");
+    }
+
+    #[tokio::test]
+    async fn screen_oauth_target_empty_allowlist_uses_legacy_message() {
+        // The default (empty) allowlist must continue to emit the
+        // pre-1.4.0 wording so existing operator runbooks keep working.
+        let err = screen_oauth_target(
+            "https://localhost/jwks.json",
+            false,
+            &crate::ssrf::CompiledSsrfAllowlist::default(),
+        )
+        .await
+        .expect_err("loopback rejection");
+        let msg = err.to_string();
+        assert!(msg.contains("blocked IP"), "got {msg:?}");
+        assert!(msg.contains("loopback"), "got {msg:?}");
+        // The legacy message must NOT advertise the new knob.
+        assert!(!msg.contains("oauth.ssrf_allowlist"), "got {msg:?}");
+    }
+
+    #[tokio::test]
+    async fn screen_oauth_target_allows_loopback_when_host_allowlisted() {
+        // localhost -> 127.0.0.1; allowlisting the hostname must let it through.
+        let allow = make_allowlist(&["localhost"], &[]);
+        screen_oauth_target("https://localhost/jwks.json", false, &allow)
+            .await
+            .expect("allowlisted host must pass");
+    }
+
+    #[tokio::test]
+    async fn screen_oauth_target_allows_loopback_when_cidr_allowlisted() {
+        // localhost may resolve to 127.0.0.1 and/or ::1 depending on the OS;
+        // allowlist both loopback ranges to make the test stable cross-platform.
+        let allow = make_allowlist(&[], &["127.0.0.0/8", "::1/128"]);
+        screen_oauth_target("https://localhost/jwks.json", false, &allow)
+            .await
+            .expect("allowlisted CIDR must pass");
+    }
+
+    #[tokio::test]
+    async fn jwks_cache_rejects_misconfigured_allowlist_at_startup() {
+        let mut cfg = OAuthConfig::builder(
+            "https://auth.example.com/",
+            "mcp",
+            "https://auth.example.com/jwks.json",
+        )
+        .build();
+        cfg.ssrf_allowlist = Some(OAuthSsrfAllowlist {
+            hosts: vec![],
+            cidrs: vec!["bad-cidr".into()],
+        });
+        let Err(err) = JwksCache::new(&cfg) else {
+            panic!("invalid CIDR must fail JwksCache::new")
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("oauth.ssrf_allowlist"), "got {msg:?}");
     }
 
     #[tokio::test]

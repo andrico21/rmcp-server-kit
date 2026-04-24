@@ -165,6 +165,56 @@ and redirect time) rejects URLs that:
 These hardening measures ensure that the operator-trusted configuration
 model remains robust against hostile or compromised Identity Providers.
 
+#### Operator allowlist
+
+Some deployments terminate OAuth/JWKS at an in-cluster IdP whose
+hostname legitimately resolves into private (RFC 1918), loopback, CGNAT,
+or unique-local space (for example a Keycloak `Service` ClusterIP). The
+default fail-closed policy described above blocks those targets.
+
+`OAuthConfig::ssrf_allowlist` is the **opt-in operator escape hatch**.
+It accepts:
+
+- `hosts`: case-insensitive exact-match DNS hostnames.
+- `cidrs`: IPv4 or IPv6 CIDR blocks whose addresses the fetcher is
+  permitted to reach even when otherwise classified as blocked.
+
+The allowlist is checked **after** the IP-block classifier runs, and
+**only** for non-cloud-metadata reasons. Concretely:
+
+1. Cloud-metadata addresses are unbypassable. AWS IPv4
+   (`169.254.169.254`), AWS IPv6 (`fd00:ec2::254`), GCP IPv6
+   (`fd20:ce::254`), and the Alibaba/Tencent IPv4 metadata address
+   (`100.100.100.200`) are classified as `cloud_metadata` *before* the
+   generic `unique_local` / `cgnat` / `link_local` buckets, so listing
+   `fd00::/8`, `100.64.0.0/10`, or `169.254.0.0/16` in `cidrs` never
+   re-allows the metadata addresses themselves.
+2. The empty (default) allowlist preserves the pre-1.4.0 behaviour
+   verbatim, including the exact wording of the "OAuth target resolved
+   to blocked IP" error message, so existing operator runbooks and
+   alerting continue to work unchanged.
+3. `https -> http` redirect downgrades remain rejected unconditionally.
+   `allow_http_oauth_urls = true` controls whether the **initial**
+   request URL may be plain HTTP; the allowlist does not weaken this
+   policy.
+4. Misconfiguration (literal IPs in `hosts`, ports/paths/userinfo in
+   `hosts`, malformed CIDRs, `/0`, IPv4-mapped IPv6 CIDRs, zone IDs,
+   non-zero host bits) is rejected at startup -- the server refuses to
+   come up, rather than fail-open.
+5. When the allowlist is non-empty, `OAuthConfig::validate` emits a
+   `tracing::warn!` naming the host and CIDR counts so the elevated
+   trust posture is auditable in the deployment's log pipeline.
+
+Operational guidance:
+
+- Prefer `cidrs` over `hosts` when the IdP is reached via a stable IP
+  range. Hostname allowlists trust DNS to remain truthful; CIDR
+  allowlists do not.
+- Keep the allowlist as narrow as possible. `10.0.0.0/8` is much
+  weaker than the actual `/24` of the IdP's `Service` subnet.
+- Audit the `oauth.ssrf_allowlist is configured` warn-level log line on
+  every restart and on every config reload.
+
 ### OAuth HTTPS enforcement
 
 When the optional `oauth` feature is enabled, `OauthHttpClient`
@@ -186,18 +236,25 @@ upstreams).
 
 The `oauth.issuer`, `oauth.jwks_uri`, and other OAuth/OIDC endpoint
 URLs are treated as **operator-trusted configuration**, not as
-attacker-supplied input. OAuth URL hardening operates in two layers:
-`OAuthConfig::validate` rejects userinfo and ALL literal IP hosts across
-the six configured URL fields (operators must use DNS hostnames), and a
-sync per-hop SSRF range guard runs inside both the `OauthHttpClient` and
-`JwksCache` redirect closures, rejecting targets that resolve to
-private, loopback, link-local, multicast, broadcast, unspecified, or
-cloud-metadata IP ranges. `https -> http` redirect downgrades are always
-rejected; `http -> http` is permitted only when
-`allow_http_oauth_urls = true`. There is no async DNS-resolution guard
-on the initial (non-redirect) OAuth request — the validate-time blanket
-literal-IP rejection is the primary trust anchor for operator-supplied
-URLs.
+attacker-supplied input. OAuth URL hardening operates in three layers:
+
+1. **Validate-time literal-IP rejection.** `OAuthConfig::validate`
+   rejects userinfo and ALL literal IP hosts across the six configured
+   URL fields (operators must use DNS hostnames). This is the primary
+   trust anchor for operator-supplied URLs.
+2. **Async post-DNS screening on the initial request.** Both
+   `OauthHttpClient` and `JwksCache` resolve the target hostname and
+   classify every returned IP against the SSRF range guard *before*
+   issuing the request, rejecting targets in private, loopback,
+   link-local, multicast, broadcast, unspecified, CGNAT, or
+   cloud-metadata ranges. The opt-in `OAuthConfig::ssrf_allowlist`
+   relaxes this for in-cluster IdPs but cannot bypass cloud-metadata
+   addresses (see the "Operator allowlist" subsection above).
+3. **Sync per-hop guard on redirects.** A per-hop SSRF range guard runs
+   inside both client redirect closures using literal-IP classification
+   (no extra DNS), rejecting cross-hop pivots into blocked ranges.
+   `https -> http` redirect downgrades are always rejected; `http -> http`
+   is permitted only when `allow_http_oauth_urls = true`.
 
 Implications:
 

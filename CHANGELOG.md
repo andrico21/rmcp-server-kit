@@ -8,6 +8,69 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-04-24
+
+Minor release adding an opt-in operator allowlist for the OAuth/JWKS
+post-DNS SSRF guard, so in-cluster IdPs (e.g. Keycloak resolving to
+RFC1918 addresses) can be reached without disabling SSRF protection.
+Defaults are unchanged (fail-closed), and cloud-metadata addresses
+remain blocked regardless of allowlist contents.
+
+### Added
+
+- **`src/oauth.rs`** — New `OAuthSsrfAllowlist { hosts, cidrs }` type and
+  `OAuthConfigBuilder::ssrf_allowlist(...)` setter. Lets operators name
+  the hostnames or CIDR blocks (IPv4 and IPv6) whose otherwise-blocked
+  addresses (private/loopback/link-local/CGNAT/unique-local) the
+  OAuth/JWKS fetcher is allowed to reach. Hosts are case-insensitive
+  exact match; CIDRs are family-strict (no IPv4-mapped-IPv6, no `/0`,
+  no zone IDs, host bits must be zero). Misconfiguration is rejected at
+  `OAuthConfig::validate()` and `JwksCache::new()` so deploy-time
+  feedback is immediate. When non-empty, validation logs a
+  `tracing::warn!` naming the host and CIDR counts.
+- **`src/ssrf.rs`** — New `CompiledSsrfAllowlist` + `CidrEntry` types
+  (crate-private) and `redirect_target_reason_with_allowlist` that
+  consults the allowlist on per-redirect-hop literal-IP screening while
+  keeping cloud-metadata unbypassable.
+- **`src/ssrf.rs`** — Cloud-metadata classifier now also covers AWS
+  IPv6 (`fd00:ec2::254`), GCP IPv6 (`fd20:ce::254`), and the
+  Alibaba/Tencent IPv4 metadata address (`100.100.100.200`). These
+  addresses are classified as `cloud_metadata` *before* the generic
+  `unique_local` / `cgnat` buckets so an operator allowlist for
+  `fd00::/8` or `100.64.0.0/10` cannot silently re-allow them.
+
+### Security
+
+- **`src/oauth.rs`** — Cloud-metadata IPv4 (`169.254.169.254`,
+  `100.100.100.200`) and IPv6 (`fd00:ec2::254`, `fd20:ce::254`) are
+  now explicitly carved out of the operator allowlist path: even when
+  an operator allowlists a containing CIDR, addresses classified as
+  `cloud_metadata` continue to use the strict legacy error message and
+  are never permitted. New unit tests pin this invariant
+  (`redirect_with_fd00_8_allowlist_still_blocks_aws_v6_metadata`,
+  `redirect_with_cgnat_allowlist_still_blocks_alibaba_metadata`).
+- **`src/oauth.rs`** — Empty (default) allowlist preserves the
+  pre-1.4.0 error message verbatim so existing operator runbooks and
+  alerting on "OAuth target resolved to blocked IP" keep working.
+  Configured allowlists that still block emit a more verbose error
+  naming the hostname, the resolved IP, the block reason, and the two
+  config fields the operator can edit.
+
+### Changed
+
+- **`src/oauth.rs`** — `evaluate_oauth_redirect`,
+  `screen_oauth_target`, and `screen_oauth_target_with_test_override`
+  now take a `&CompiledSsrfAllowlist` parameter. These are private
+  helpers; no downstream impact.
+
+### Documentation
+
+- **`docs/GUIDE.md`** — New "Allowing in-cluster IdPs" subsection in the
+  OAuth chapter showing the recommended TOML and builder snippets.
+- **`SECURITY.md`** — New "Operator allowlist" subsection under OAuth
+  SSRF hardening documenting the trust model, the cloud-metadata
+  carve-out, and the auditing expectations.
+
 ## [1.3.2] - 2026-04-21
 
 Security and quality patch release rolling up the post-1.3.1 multi-agent

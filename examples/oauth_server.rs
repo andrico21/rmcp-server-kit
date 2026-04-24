@@ -54,6 +54,14 @@ async fn main() -> rmcp_server_kit::Result<()> {
     )
     .scope("mcp:admin", "admin")
     .scope("mcp:read", "viewer")
+    // Optional: when the IdP is in-cluster and resolves to private
+    // address space, opt in via the operator allowlist. Cloud-metadata
+    // remains blocked unconditionally. See SECURITY.md for details.
+    //
+    // let mut allowlist = rmcp_server_kit::oauth::OAuthSsrfAllowlist::default();
+    // allowlist.hosts.push("rhbk.ops.example.com".into());
+    // allowlist.cidrs.push("10.0.0.0/8".into());
+    // .ssrf_allowlist(allowlist)
     .build();
 
     // 2. Plug OAuth into AuthConfig. No API keys needed when using OAuth.
