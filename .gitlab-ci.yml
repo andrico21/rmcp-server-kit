@@ -92,9 +92,13 @@ workflow:
 
 sast:
   stage: scan
+  # GitLab template image has no Rust toolchain; skip our rustc/cargo banner.
+  before_script: []
 
 secret_detection:
   stage: scan
+  # GitLab template image has no Rust toolchain; skip our rustc/cargo banner.
+  before_script: []
 
 # ---------------------------------------------------------------------------
 # Lint stage
