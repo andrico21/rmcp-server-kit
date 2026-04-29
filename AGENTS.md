@@ -27,7 +27,7 @@ shutdown.
 | Field         | Value                                                              |
 |---------------|--------------------------------------------------------------------|
 | Crate name    | `rmcp-server-kit`                                                  |
-| Version       | `1.4.1` (see [`Cargo.toml`](Cargo.toml))                          |
+| Version       | see [`Cargo.toml`](Cargo.toml) `[package].version`                 |
 | Edition       | `2024`                                                             |
 | MSRV          | Rust **1.95.0**                                                    |
 | License       | `MIT OR Apache-2.0` (dual)                                         |
