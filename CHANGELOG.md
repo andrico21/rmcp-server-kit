@@ -8,6 +8,19 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+### Fixed
+
+- **OAuth proxy** (`src/transport.rs`) -- `/token`, `/register`, `/introspect`,
+  and `/revoke` responses now include `Pragma: no-cache` and
+  `Vary: Authorization`, completing RFC 6749 §5.1 / RFC 6750 §5.4 compliance
+  for OAuth proxy deployments. `Cache-Control: no-store` was already set
+  globally by `security_headers_middleware`; this patch fills the remaining
+  legacy-cache and `Vary` gaps. The new `oauth_token_cache_headers_middleware`
+  is feature-gated (`oauth`) and only active when `OAuthConfig.proxy` is
+  configured -- resource-server-only deployments are unaffected. `Vary` is
+  appended (not replaced), preserving any pre-existing `Vary` value (e.g.
+  `Accept-Encoding` from the compression layer).
+
 ## [1.4.1] - 2026-04-24
 
 Patch release fixing a tokenization bug in `RbacPolicy::argument_allowed`

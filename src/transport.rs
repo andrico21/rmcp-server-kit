@@ -1591,7 +1591,10 @@ fn install_oauth_proxy_routes(
             let p = proxy_token.clone();
             let h = token_http.clone();
             async move { crate::oauth::handle_token(&h, &p, &body).await }
-        }),
+        })
+        .layer(axum::middleware::from_fn(
+            oauth_token_cache_headers_middleware,
+        )),
     );
 
     let proxy_register = proxy.clone();
@@ -1600,7 +1603,10 @@ fn install_oauth_proxy_routes(
         axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
             let p = proxy_register;
             async move { axum::Json(crate::oauth::handle_register(&p, &body)) }
-        }),
+        })
+        .layer(axum::middleware::from_fn(
+            oauth_token_cache_headers_middleware,
+        )),
     );
 
     let admin_routes_enabled = proxy.expose_admin_endpoints
@@ -1612,46 +1618,7 @@ fn install_oauth_proxy_routes(
     }
 
     let admin_router = if admin_routes_enabled {
-        let mut admin_router = axum::Router::new();
-        if proxy.introspection_url.is_some() {
-            let proxy_introspect = proxy.clone();
-            let introspect_http = http.clone();
-            admin_router = admin_router.route(
-                "/introspect",
-                axum::routing::post(move |body: String| {
-                    let p = proxy_introspect.clone();
-                    let h = introspect_http.clone();
-                    async move { crate::oauth::handle_introspect(&h, &p, &body).await }
-                }),
-            );
-        }
-        if proxy.revocation_url.is_some() {
-            let proxy_revoke = proxy.clone();
-            let revoke_http = http;
-            admin_router = admin_router.route(
-                "/revoke",
-                axum::routing::post(move |body: String| {
-                    let p = proxy_revoke.clone();
-                    let h = revoke_http.clone();
-                    async move { crate::oauth::handle_revoke(&h, &p, &body).await }
-                }),
-            );
-        }
-
-        if proxy.require_auth_on_admin_endpoints {
-            let Some(state) = auth_state else {
-                return Err(McpxError::Startup(
-                    "oauth proxy admin endpoints require auth state".into(),
-                ));
-            };
-            let state_for_mw = Arc::clone(state);
-            admin_router.layer(axum::middleware::from_fn(move |req, next| {
-                let s = Arc::clone(&state_for_mw);
-                auth_middleware(s, req, next)
-            }))
-        } else {
-            admin_router
-        }
+        build_oauth_admin_router(proxy, http, auth_state)?
     } else {
         axum::Router::new()
     };
@@ -1664,6 +1631,65 @@ fn install_oauth_proxy_routes(
         "OAuth 2.1 proxy endpoints enabled (/authorize, /token, /register)"
     );
     Ok(router)
+}
+
+/// Build the optional `/introspect` + `/revoke` admin sub-router.
+///
+/// Layered with [`oauth_token_cache_headers_middleware`] so RFC 6749 §5.1
+/// / RFC 6750 §5.4 cache headers are emitted, and conditionally with the
+/// auth middleware when `proxy.require_auth_on_admin_endpoints` is set.
+#[cfg(feature = "oauth")]
+fn build_oauth_admin_router(
+    proxy: &crate::oauth::OAuthProxyConfig,
+    http: crate::oauth::OauthHttpClient,
+    auth_state: Option<&Arc<AuthState>>,
+) -> Result<axum::Router, McpxError> {
+    let mut admin_router = axum::Router::new();
+    if proxy.introspection_url.is_some() {
+        let proxy_introspect = proxy.clone();
+        let introspect_http = http.clone();
+        admin_router = admin_router.route(
+            "/introspect",
+            axum::routing::post(move |body: String| {
+                let p = proxy_introspect.clone();
+                let h = introspect_http.clone();
+                async move { crate::oauth::handle_introspect(&h, &p, &body).await }
+            }),
+        );
+    }
+    if proxy.revocation_url.is_some() {
+        let proxy_revoke = proxy.clone();
+        let revoke_http = http;
+        admin_router = admin_router.route(
+            "/revoke",
+            axum::routing::post(move |body: String| {
+                let p = proxy_revoke.clone();
+                let h = revoke_http.clone();
+                async move { crate::oauth::handle_revoke(&h, &p, &body).await }
+            }),
+        );
+    }
+
+    let admin_router = admin_router.layer(axum::middleware::from_fn(
+        oauth_token_cache_headers_middleware,
+    ));
+
+    if proxy.require_auth_on_admin_endpoints {
+        let Some(state) = auth_state else {
+            return Err(McpxError::Startup(
+                "oauth proxy admin endpoints require auth state".into(),
+            ));
+        };
+        let state_for_mw = Arc::clone(state);
+        Ok(
+            admin_router.layer(axum::middleware::from_fn(move |req, next| {
+                let s = Arc::clone(&state_for_mw);
+                auth_middleware(s, req, next)
+            })),
+        )
+    } else {
+        Ok(admin_router)
+    }
 }
 
 /// Build the host allow-list for rmcp's DNS rebinding protection.
@@ -2172,6 +2198,34 @@ async fn security_headers_middleware(
     resp
 }
 
+/// Append RFC 6749 §5.1 / RFC 6750 §5.4 cache and `Vary` headers required
+/// on OAuth token-issuing responses.
+///
+/// `Cache-Control: no-store, max-age=0` is already applied globally by
+/// [`security_headers_middleware`]; this middleware adds:
+///
+/// - `Pragma: no-cache` -- mandated by RFC 6749 §5.1 for HTTP/1.0 caches.
+/// - `Vary: Authorization` -- mandated by RFC 6750 §5.4 for endpoints
+///   whose response depends on the `Authorization` header.
+///
+/// Applied only to the OAuth proxy token-class endpoints (`/token`,
+/// `/register`, `/introspect`, `/revoke`). `Vary` is appended (not
+/// inserted) so any `Vary` value already present (e.g. `Accept-Encoding`
+/// from a compression layer, or `Origin` from a CORS layer) is preserved.
+#[cfg(feature = "oauth")]
+async fn oauth_token_cache_headers_middleware(
+    req: Request<Body>,
+    next: Next,
+) -> axum::response::Response {
+    use axum::http::{HeaderValue, header};
+
+    let mut resp = next.run(req).await;
+    let headers = resp.headers_mut();
+    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    headers.append(header::VARY, HeaderValue::from_static("Authorization"));
+    resp
+}
+
 /// Per the MCP spec: if the Origin header is present and its value is not in
 /// the allowed list, respond with 403 Forbidden. Requests without an Origin
 /// header are allowed through (e.g. non-browser clients like curl, SDKs).
@@ -2569,6 +2623,84 @@ mod tests {
         assert!(
             hsts.to_str().unwrap().contains("max-age=63072000"),
             "HSTS must set 2-year max-age"
+        );
+    }
+
+    // -- oauth_token_cache_headers_middleware --
+
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn oauth_token_cache_headers_set_pragma_and_vary() {
+        let app = axum::Router::new()
+            .route("/token", axum::routing::post(|| async { "{}" }))
+            .layer(axum::middleware::from_fn(
+                oauth_token_cache_headers_middleware,
+            ));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/token")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let h = resp.headers();
+        assert_eq!(
+            h.get("pragma").unwrap(),
+            "no-cache",
+            "RFC 6749 §5.1: token responses must set Pragma: no-cache"
+        );
+        let vary_values: Vec<String> = h
+            .get_all("vary")
+            .iter()
+            .filter_map(|v| v.to_str().ok().map(str::to_owned))
+            .collect();
+        assert!(
+            vary_values
+                .iter()
+                .any(|v| v.eq_ignore_ascii_case("Authorization")),
+            "RFC 6750 §5.4: Vary must include Authorization, got {vary_values:?}"
+        );
+    }
+
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn oauth_token_cache_headers_preserve_existing_vary() {
+        // Simulates a handler/layer that already set `Vary: Accept-Encoding`
+        // (e.g. compression). Our middleware must APPEND, not REPLACE.
+        let app = axum::Router::new()
+            .route(
+                "/token",
+                axum::routing::post(|| async {
+                    axum::response::Response::builder()
+                        .header("vary", "Accept-Encoding")
+                        .body(axum::body::Body::from("{}"))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn(
+                oauth_token_cache_headers_middleware,
+            ));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/token")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        let vary: Vec<String> = resp
+            .headers()
+            .get_all("vary")
+            .iter()
+            .filter_map(|v| v.to_str().ok().map(str::to_owned))
+            .collect();
+        assert!(
+            vary.iter().any(|v| v.contains("Accept-Encoding")),
+            "must preserve pre-existing Vary value, got {vary:?}"
+        );
+        assert!(
+            vary.iter().any(|v| v.contains("Authorization")),
+            "must append Authorization to Vary, got {vary:?}"
         );
     }
 
