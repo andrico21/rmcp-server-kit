@@ -8,6 +8,21 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+### Added
+
+- **Configurable security headers** (`src/transport.rs`) -- new
+  `SecurityHeadersConfig` struct and `McpServerConfig::with_security_headers`
+  builder method allow operators to override or omit any of the twelve
+  OWASP security headers emitted by `security_headers_middleware`. Each
+  field is `Option<String>` with a three-state semantic: `None` keeps the
+  default, `Some("")` omits the header entirely, and `Some(value)` overrides.
+  Non-empty values are validated via `HeaderValue::from_str` inside
+  `McpServerConfig::validate()`; invalid values fail server startup. The
+  `Strict-Transport-Security` field additionally rejects any value containing
+  `preload` (case-insensitive) -- HSTS preload-list opt-in must be made via
+  a dedicated future builder, not smuggled through this knob. Existing
+  defaults are unchanged; this is a purely additive API surface change.
+
 ### Fixed
 
 - **OAuth proxy** (`src/transport.rs`) -- `/token`, `/register`, `/introspect`,

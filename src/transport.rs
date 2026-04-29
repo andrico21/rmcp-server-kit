@@ -60,6 +60,60 @@ fn io_to_startup(op: &str, e: std::io::Error) -> McpxError {
 pub type ReadinessCheck =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = serde_json::Value> + Send>> + Send + Sync>;
 
+/// Per-header overrides for the OWASP security headers emitted by the
+/// global response middleware.
+///
+/// Each field follows a three-state semantic:
+///
+/// | Value         | Behaviour                                                |
+/// |---------------|----------------------------------------------------------|
+/// | `None`        | Use the built-in default (current behaviour).            |
+/// | `Some("")`    | **Omit** the header entirely from responses.             |
+/// | `Some(value)` | Emit `header: value`. Validated at config-load time.     |
+///
+/// All non-empty values are validated via
+/// [`axum::http::HeaderValue::from_str`] inside
+/// [`McpServerConfig::validate`]; invalid values fail fast before the
+/// server starts accepting traffic.
+///
+/// `Strict-Transport-Security` has an additional rule: the substring
+/// `preload` (case-insensitive) is rejected. Operators who want to
+/// commit to the HSTS preload list must do so via a future explicit
+/// builder method, not by smuggling it through this knob.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct SecurityHeadersConfig {
+    /// Override for `X-Content-Type-Options`. Default: `nosniff`.
+    pub x_content_type_options: Option<String>,
+    /// Override for `X-Frame-Options`. Default: `deny`.
+    pub x_frame_options: Option<String>,
+    /// Override for `Cache-Control`. Default: `no-store, max-age=0`.
+    pub cache_control: Option<String>,
+    /// Override for `Referrer-Policy`. Default: `no-referrer`.
+    pub referrer_policy: Option<String>,
+    /// Override for `Cross-Origin-Opener-Policy`. Default: `same-origin`.
+    pub cross_origin_opener_policy: Option<String>,
+    /// Override for `Cross-Origin-Resource-Policy`. Default: `same-origin`.
+    pub cross_origin_resource_policy: Option<String>,
+    /// Override for `Cross-Origin-Embedder-Policy`. Default: `require-corp`.
+    pub cross_origin_embedder_policy: Option<String>,
+    /// Override for `Permissions-Policy`. Default:
+    /// `accelerometer=(), camera=(), geolocation=(), microphone=()`.
+    pub permissions_policy: Option<String>,
+    /// Override for `X-Permitted-Cross-Domain-Policies`. Default: `none`.
+    pub x_permitted_cross_domain_policies: Option<String>,
+    /// Override for `Content-Security-Policy`. Default:
+    /// `default-src 'none'; frame-ancestors 'none'`.
+    pub content_security_policy: Option<String>,
+    /// Override for `X-DNS-Prefetch-Control`. Default: `off`.
+    pub x_dns_prefetch_control: Option<String>,
+    /// Override for `Strict-Transport-Security`. Default (TLS only):
+    /// `max-age=63072000; includeSubDomains`. Only emitted when TLS is
+    /// active; the override is ignored on plaintext deployments. The
+    /// substring `preload` (any case) is rejected by the validator.
+    pub strict_transport_security: Option<String>,
+}
+
 /// Configuration for the MCP server.
 #[allow(
     missing_debug_implementations,
@@ -256,6 +310,14 @@ pub struct McpServerConfig {
         note = "use McpServerConfig::with_metrics(); direct field access will become pub(crate) in 1.0"
     )]
     pub metrics_bind: String,
+    /// Per-header overrides for the OWASP security headers emitted by
+    /// the global response middleware. See [`SecurityHeadersConfig`]
+    /// for the three-state semantic and validation rules.
+    #[deprecated(
+        since = "1.4.2",
+        note = "use McpServerConfig::with_security_headers(); direct field access will become pub(crate) in 1.0"
+    )]
+    pub security_headers: SecurityHeadersConfig,
 }
 
 /// Marker that wraps a value proven to satisfy its validation
@@ -399,6 +461,7 @@ impl McpServerConfig {
             metrics_enabled: false,
             #[cfg(feature = "metrics")]
             metrics_bind: "127.0.0.1:9090".into(),
+            security_headers: SecurityHeadersConfig::default(),
         }
     }
 
@@ -414,6 +477,16 @@ impl McpServerConfig {
     #[must_use]
     pub fn with_auth(mut self, auth: AuthConfig) -> Self {
         self.auth = Some(auth);
+        self
+    }
+
+    /// Override one or more of the OWASP security headers emitted on
+    /// every response. See [`SecurityHeadersConfig`] for the three-state
+    /// semantic (`None` = default, `Some("")` = omit, `Some(v)` =
+    /// override). Values are validated by [`Self::validate`].
+    #[must_use]
+    pub fn with_security_headers(mut self, headers: SecurityHeadersConfig) -> Self {
+        self.security_headers = headers;
         self
     }
 
@@ -695,6 +768,10 @@ impl McpServerConfig {
         {
             oauth_cfg.validate()?;
         }
+
+        // 8. Security-header overrides parse as valid HTTP header values,
+        //    and HSTS does not smuggle in a `preload` directive.
+        validate_security_headers(&self.security_headers)?;
 
         Ok(())
     }
@@ -1112,8 +1189,10 @@ where
     // OWASP security response headers (applied to all responses).
     // HSTS is conditional on TLS being configured.
     let is_tls = config.tls_cert_path.is_some();
+    let security_headers_cfg = Arc::new(config.security_headers.clone());
     router = router.layer(axum::middleware::from_fn(move |req, next| {
-        security_headers_middleware(is_tls, req, next)
+        let cfg = Arc::clone(&security_headers_cfg);
+        security_headers_middleware(is_tls, cfg, req, next)
     }));
 
     // CORS preflight layer (required for browser-based MCP clients).
@@ -2132,12 +2211,17 @@ async fn metrics_middleware(
 /// `Cross-Origin-Embedder-Policy`, `Permissions-Policy`,
 /// `X-Permitted-Cross-Domain-Policies`, `Content-Security-Policy`,
 /// `X-DNS-Prefetch-Control`, and (when TLS is active) `Strict-Transport-Security`.
+///
+/// Each header's value can be customised via [`SecurityHeadersConfig`]
+/// on [`McpServerConfig`]. See that type for the three-state semantic
+/// (`None` = default, `Some("")` = omit, `Some(v)` = override).
 async fn security_headers_middleware(
     is_tls: bool,
+    cfg: Arc<SecurityHeadersConfig>,
     req: Request<Body>,
     next: Next,
 ) -> axum::response::Response {
-    use axum::http::{HeaderName, HeaderValue, header};
+    use axum::http::{HeaderName, header};
 
     let mut resp = next.run(req).await;
     let headers = resp.headers_mut();
@@ -2146,56 +2230,201 @@ async fn security_headers_middleware(
     headers.remove(header::SERVER);
     headers.remove(HeaderName::from_static("x-powered-by"));
 
-    headers.insert(
+    apply_security_header(
+        headers,
         header::X_CONTENT_TYPE_OPTIONS,
-        HeaderValue::from_static("nosniff"),
+        cfg.x_content_type_options.as_deref(),
+        "nosniff",
     );
-    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("deny"));
-    headers.insert(
+    apply_security_header(
+        headers,
+        header::X_FRAME_OPTIONS,
+        cfg.x_frame_options.as_deref(),
+        "deny",
+    );
+    apply_security_header(
+        headers,
         header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store, max-age=0"),
+        cfg.cache_control.as_deref(),
+        "no-store, max-age=0",
     );
-    headers.insert(
+    apply_security_header(
+        headers,
         header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
+        cfg.referrer_policy.as_deref(),
+        "no-referrer",
     );
-    headers.insert(
+    apply_security_header(
+        headers,
         HeaderName::from_static("cross-origin-opener-policy"),
-        HeaderValue::from_static("same-origin"),
+        cfg.cross_origin_opener_policy.as_deref(),
+        "same-origin",
     );
-    headers.insert(
+    apply_security_header(
+        headers,
         HeaderName::from_static("cross-origin-resource-policy"),
-        HeaderValue::from_static("same-origin"),
+        cfg.cross_origin_resource_policy.as_deref(),
+        "same-origin",
     );
-    headers.insert(
+    apply_security_header(
+        headers,
         HeaderName::from_static("cross-origin-embedder-policy"),
-        HeaderValue::from_static("require-corp"),
+        cfg.cross_origin_embedder_policy.as_deref(),
+        "require-corp",
     );
-    headers.insert(
+    apply_security_header(
+        headers,
         HeaderName::from_static("permissions-policy"),
-        HeaderValue::from_static("accelerometer=(), camera=(), geolocation=(), microphone=()"),
+        cfg.permissions_policy.as_deref(),
+        "accelerometer=(), camera=(), geolocation=(), microphone=()",
     );
-    headers.insert(
+    apply_security_header(
+        headers,
         HeaderName::from_static("x-permitted-cross-domain-policies"),
-        HeaderValue::from_static("none"),
+        cfg.x_permitted_cross_domain_policies.as_deref(),
+        "none",
     );
-    headers.insert(
+    apply_security_header(
+        headers,
         HeaderName::from_static("content-security-policy"),
-        HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
+        cfg.content_security_policy.as_deref(),
+        "default-src 'none'; frame-ancestors 'none'",
     );
-    headers.insert(
+    apply_security_header(
+        headers,
         HeaderName::from_static("x-dns-prefetch-control"),
-        HeaderValue::from_static("off"),
+        cfg.x_dns_prefetch_control.as_deref(),
+        "off",
     );
 
     if is_tls {
-        headers.insert(
+        apply_security_header(
+            headers,
             header::STRICT_TRANSPORT_SECURITY,
-            HeaderValue::from_static("max-age=63072000; includeSubDomains"),
+            cfg.strict_transport_security.as_deref(),
+            "max-age=63072000; includeSubDomains",
         );
     }
 
     resp
+}
+
+/// Set a single security header on the response, honouring the
+/// three-state override semantic (None = default, Some("") = omit,
+/// Some(value) = override).
+///
+/// Defence-in-depth: if an override value somehow reaches this point
+/// despite [`validate_security_headers`] having approved it (e.g. a
+/// runtime mutation on a non-`Validated` field), we log at error level
+/// and fall back to the static default rather than panicking. The
+/// `Validated<McpServerConfig>` type makes that path unreachable in
+/// well-typed code paths.
+fn apply_security_header(
+    headers: &mut axum::http::HeaderMap,
+    name: axum::http::HeaderName,
+    override_value: Option<&str>,
+    default: &'static str,
+) {
+    use axum::http::HeaderValue;
+
+    match override_value {
+        None => {
+            headers.insert(name, HeaderValue::from_static(default));
+        }
+        Some("") => {
+            // Operator explicitly opted out of this header.
+        }
+        Some(v) => match HeaderValue::from_str(v) {
+            Ok(hv) => {
+                headers.insert(name, hv);
+            }
+            Err(err) => {
+                tracing::error!(
+                    header = %name,
+                    error = %err,
+                    "invalid security header override reached middleware; using default"
+                );
+                headers.insert(name, HeaderValue::from_static(default));
+            }
+        },
+    }
+}
+
+/// Validate every non-empty entry in a [`SecurityHeadersConfig`].
+///
+/// - `None` and `Some("")` are accepted unconditionally (use-default and
+///   omit, respectively).
+/// - `Some(v)` is rejected if `axum::http::HeaderValue::from_str(v)` fails.
+/// - `strict_transport_security` additionally rejects any value
+///   containing `preload` (case-insensitive). Operators who genuinely
+///   want to commit to the HSTS preload list must do so via a future
+///   explicit `with_hsts_preload(true)` builder, not by smuggling
+///   `preload` through this knob.
+fn validate_security_headers(cfg: &SecurityHeadersConfig) -> Result<(), McpxError> {
+    use axum::http::HeaderValue;
+
+    let fields: &[(&str, Option<&str>)] = &[
+        (
+            "x_content_type_options",
+            cfg.x_content_type_options.as_deref(),
+        ),
+        ("x_frame_options", cfg.x_frame_options.as_deref()),
+        ("cache_control", cfg.cache_control.as_deref()),
+        ("referrer_policy", cfg.referrer_policy.as_deref()),
+        (
+            "cross_origin_opener_policy",
+            cfg.cross_origin_opener_policy.as_deref(),
+        ),
+        (
+            "cross_origin_resource_policy",
+            cfg.cross_origin_resource_policy.as_deref(),
+        ),
+        (
+            "cross_origin_embedder_policy",
+            cfg.cross_origin_embedder_policy.as_deref(),
+        ),
+        ("permissions_policy", cfg.permissions_policy.as_deref()),
+        (
+            "x_permitted_cross_domain_policies",
+            cfg.x_permitted_cross_domain_policies.as_deref(),
+        ),
+        (
+            "content_security_policy",
+            cfg.content_security_policy.as_deref(),
+        ),
+        (
+            "x_dns_prefetch_control",
+            cfg.x_dns_prefetch_control.as_deref(),
+        ),
+        (
+            "strict_transport_security",
+            cfg.strict_transport_security.as_deref(),
+        ),
+    ];
+
+    for (field, value) in fields {
+        let Some(v) = value else { continue };
+        if v.is_empty() {
+            continue;
+        }
+        if let Err(err) = HeaderValue::from_str(v) {
+            return Err(McpxError::Config(format!(
+                "invalid security_headers.{field}: {err}"
+            )));
+        }
+    }
+
+    if let Some(v) = cfg.strict_transport_security.as_deref()
+        && !v.is_empty()
+        && v.to_ascii_lowercase().contains("preload")
+    {
+        return Err(McpxError::Config(format!(
+            "invalid security_headers.strict_transport_security: {v:?} contains the `preload` directive; \
+             HSTS preload must be opted into explicitly via a dedicated builder, not via this knob"
+        )));
+    }
+
+    Ok(())
 }
 
 /// Append RFC 6749 §5.1 / RFC 6750 §5.4 cache and `Vary` headers required
@@ -2567,10 +2796,16 @@ mod tests {
     // -- security_headers_middleware --
 
     fn security_router(is_tls: bool) -> axum::Router {
+        security_router_with(is_tls, SecurityHeadersConfig::default())
+    }
+
+    fn security_router_with(is_tls: bool, cfg: SecurityHeadersConfig) -> axum::Router {
+        let cfg = Arc::new(cfg);
         axum::Router::new()
             .route("/test", axum::routing::get(|| async { "ok" }))
             .layer(axum::middleware::from_fn(move |req, next| {
-                security_headers_middleware(is_tls, req, next)
+                let c = Arc::clone(&cfg);
+                security_headers_middleware(is_tls, c, req, next)
             }))
     }
 
@@ -2623,6 +2858,142 @@ mod tests {
         assert!(
             hsts.to_str().unwrap().contains("max-age=63072000"),
             "HSTS must set 2-year max-age"
+        );
+    }
+
+    // -- SecurityHeadersConfig validation + override semantics --
+
+    /// Build a minimal config with a custom SecurityHeadersConfig and
+    /// drive it through `check()`. Returns the result so individual
+    /// tests can assert on success or specific error messages.
+    fn check_with_security_headers(headers: SecurityHeadersConfig) -> Result<(), McpxError> {
+        let cfg =
+            McpServerConfig::new("127.0.0.1:8080", "test", "0.0.0").with_security_headers(headers);
+        cfg.check()
+    }
+
+    #[test]
+    fn security_headers_config_default_validates() {
+        check_with_security_headers(SecurityHeadersConfig::default())
+            .expect("default SecurityHeadersConfig must validate");
+    }
+
+    #[test]
+    fn security_headers_config_validate_accepts_empty_string() {
+        // All twelve fields explicitly set to "" -> omit-everything mode.
+        let h = SecurityHeadersConfig {
+            x_content_type_options: Some(String::new()),
+            x_frame_options: Some(String::new()),
+            cache_control: Some(String::new()),
+            referrer_policy: Some(String::new()),
+            cross_origin_opener_policy: Some(String::new()),
+            cross_origin_resource_policy: Some(String::new()),
+            cross_origin_embedder_policy: Some(String::new()),
+            permissions_policy: Some(String::new()),
+            x_permitted_cross_domain_policies: Some(String::new()),
+            content_security_policy: Some(String::new()),
+            x_dns_prefetch_control: Some(String::new()),
+            strict_transport_security: Some(String::new()),
+        };
+        check_with_security_headers(h).expect("Some(\"\") on every field must validate (omit-all)");
+    }
+
+    #[test]
+    fn security_headers_config_validate_rejects_bad_value() {
+        // 0x07 (BEL) is not a valid HTTP header value char.
+        let h = SecurityHeadersConfig {
+            referrer_policy: Some("\u{0007}".into()),
+            ..SecurityHeadersConfig::default()
+        };
+        let err = check_with_security_headers(h)
+            .expect_err("control char in referrer_policy must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("referrer_policy"),
+            "error must name the offending field, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn security_headers_config_validate_rejects_hsts_preload() {
+        let h = SecurityHeadersConfig {
+            strict_transport_security: Some("max-age=63072000; includeSubDomains; preload".into()),
+            ..SecurityHeadersConfig::default()
+        };
+        let err = check_with_security_headers(h).expect_err("HSTS with preload must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("strict_transport_security"),
+            "error must name the field, got: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("preload"),
+            "error must mention `preload`, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn security_headers_config_validate_rejects_hsts_preload_uppercase() {
+        // Case-insensitive match.
+        let h = SecurityHeadersConfig {
+            strict_transport_security: Some("max-age=600; PRELOAD".into()),
+            ..SecurityHeadersConfig::default()
+        };
+        check_with_security_headers(h).expect_err("HSTS preload check must be case-insensitive");
+    }
+
+    #[tokio::test]
+    async fn security_headers_override_honored() {
+        // Override X-Frame-Options to SAMEORIGIN.
+        let h = SecurityHeadersConfig {
+            x_frame_options: Some("SAMEORIGIN".into()),
+            ..SecurityHeadersConfig::default()
+        };
+        let app = security_router_with(false, h);
+        let req = Request::builder().uri("/test").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let xfo = resp.headers().get("x-frame-options").unwrap();
+        assert_eq!(xfo, "SAMEORIGIN");
+    }
+
+    #[tokio::test]
+    async fn security_headers_empty_string_omits() {
+        // Empty string on referrer-policy -> header absent.
+        let h = SecurityHeadersConfig {
+            referrer_policy: Some(String::new()),
+            ..SecurityHeadersConfig::default()
+        };
+        let app = security_router_with(false, h);
+        let req = Request::builder().uri("/test").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert!(
+            resp.headers().get("referrer-policy").is_none(),
+            "Some(\"\") must omit the header"
+        );
+        // Other defaults should still be present.
+        assert_eq!(
+            resp.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+    }
+
+    #[tokio::test]
+    async fn security_headers_hsts_only_when_tls() {
+        // HSTS override is irrelevant when TLS is off.
+        let h = SecurityHeadersConfig {
+            strict_transport_security: Some("max-age=600".into()),
+            ..SecurityHeadersConfig::default()
+        };
+        let app = security_router_with(false, h);
+        let req = Request::builder().uri("/test").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert!(
+            resp.headers().get("strict-transport-security").is_none(),
+            "HSTS must remain absent on plaintext deployments even with override"
         );
     }
 

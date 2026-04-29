@@ -1027,6 +1027,56 @@ across the server. When the cap is reached, excess requests are shed
 with `503 Service Unavailable` (JSON body `{"error":"overloaded"}`)
 rather than queued.
 
+### Customising security headers
+
+By default, rmcp-server-kit emits twelve OWASP security headers on every
+response (`X-Content-Type-Options`, `X-Frame-Options`, `Cache-Control`,
+`Referrer-Policy`, three `Cross-Origin-*-Policy` headers,
+`Permissions-Policy`, `X-Permitted-Cross-Domain-Policies`,
+`Content-Security-Policy`, `X-DNS-Prefetch-Control`, plus
+`Strict-Transport-Security` when TLS is active). The defaults are
+deliberately strict.
+
+For deployments that need to relax or tighten any of them, supply a
+`SecurityHeadersConfig` to
+[`McpServerConfig::with_security_headers`]. Each field follows a
+three-state semantic:
+
+| Value           | Behaviour                                                 |
+|-----------------|-----------------------------------------------------------|
+| `None`          | Use the built-in default (current behaviour).             |
+| `Some("")`      | **Omit** the header entirely from responses.              |
+| `Some(value)`   | Emit `header: value`. Validated at config-load time.      |
+
+Non-empty values are validated via `axum::http::HeaderValue::from_str`
+inside `McpServerConfig::validate()`; invalid values fail the server
+startup with a `Config` error before any traffic is accepted.
+
+Example -- relax CSP for an admin panel that legitimately embeds
+rmcp-server-kit responses, and shorten HSTS during initial rollout:
+
+```rust,ignore
+use rmcp_server_kit::transport::{McpServerConfig, SecurityHeadersConfig};
+
+let mut headers = SecurityHeadersConfig::default();
+headers.content_security_policy =
+    Some("default-src 'self'; frame-ancestors https://admin.example.com".into());
+headers.strict_transport_security = Some("max-age=600; includeSubDomains".into());
+// Disable Cross-Origin-Embedder-Policy entirely for this deployment.
+headers.cross_origin_embedder_policy = Some(String::new());
+
+let config = McpServerConfig::new("127.0.0.1:8443", "my-server", "0.1.0")
+    .with_tls("/etc/certs/server.crt", "/etc/certs/server.key")
+    .with_security_headers(headers);
+```
+
+**HSTS preload caveat.** The validator deliberately rejects any
+`strict_transport_security` value containing the substring `preload`
+(case-insensitive). Committing a domain to the public HSTS preload list
+is irrevocable for practical purposes; opting in must be a conscious,
+explicit decision and will require a future dedicated builder rather
+than a string-smuggled override.
+
 ### `/admin/*` diagnostic endpoints (opt-in)
 
 When `admin_enabled = true` and an authenticated role equal to
