@@ -10,6 +10,16 @@ Breaking changes bump the **major** version.
 
 ### Security
 
+- **M2: RBAC argument allowlists now reject non-string JSON values**
+  (`src/rbac.rs`). Previously the allowlist check was guarded by
+  `if let Some(val_str) = arg_val.as_str()`, so any caller could bypass
+  a configured `allowed = ["sh", "bash", …]` list by sending the
+  argument as an array (`["bash"]`), object (`{"raw":"sh"}`), number,
+  bool, or null — the value flowed straight to the tool handler. The
+  middleware now consults a new `RbacPolicy::has_argument_allowlist`
+  predicate and fails closed with 403 whenever a non-string value lands
+  on an argument that has any non-empty allowlist entry, logging the
+  rejected JSON type (not the value) for operator visibility.
 - **L2: Argon2 verification is now constant-time across slots** (`src/auth.rs`).
   Previously `verify_bearer_token` short-circuited on the first matching
   slot and skipped Argon2 entirely on expired slots, leaking timing

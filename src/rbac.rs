@@ -530,6 +530,30 @@ impl RbacPolicy {
         true
     }
 
+    /// Return `true` if `(role, tool, argument)` has any non-empty
+    /// allowlist entry configured.
+    ///
+    /// Used by the tools/call middleware to decide whether non-string
+    /// JSON values must be rejected (M2 fix). When this returns `true`,
+    /// the value at `argument` must be a JSON string and pass
+    /// [`Self::argument_allowed`]; otherwise the call is denied with
+    /// 403. When this returns `false`, the value is unconstrained by
+    /// allowlist policy.
+    #[must_use]
+    pub fn has_argument_allowlist(&self, role: &str, tool: &str, argument: &str) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let Some(role_cfg) = self.find_role(role) else {
+            return false;
+        };
+        role_cfg.argument_allowlists.iter().any(|al| {
+            (al.tool == tool || glob_match(&al.tool, tool))
+                && al.argument == argument
+                && !al.allowed.is_empty()
+        })
+    }
+
     /// Return the role config for a given role name.
     fn find_role(&self, name: &str) -> Option<&RoleConfig> {
         self.roles.iter().find(|r| r.name == name)
@@ -802,30 +826,78 @@ fn enforce_tool_policy(
 
     let args = params.get("arguments").and_then(|a| a.as_object())?;
     for (arg_key, arg_val) in args {
-        if let Some(val_str) = arg_val.as_str()
-            && !policy.argument_allowed(role, tool_name, arg_key, val_str)
+        if let Some(resp) = check_argument(policy, identity_name, role, tool_name, arg_key, arg_val)
         {
-            // Redact the raw value: log an HMAC-SHA256 prefix instead of
-            // the literal string. Operators correlate hashes across log
-            // lines without ever exposing potentially sensitive inputs
-            // (paths, IDs, tokens accidentally passed as args, etc.).
-            tracing::warn!(
-                user = %identity_name,
-                role = %role,
-                tool = tool_name,
-                argument = arg_key,
-                arg_hmac = %policy.redact_arg(val_str),
-                "argument not in allowlist"
-            );
-            return Some(
-                McpxError::Rbac(format!(
-                    "argument '{arg_key}' value not in allowlist for tool '{tool_name}'"
-                ))
-                .into_response(),
-            );
+            return Some(resp);
         }
     }
     None
+}
+
+fn check_argument(
+    policy: &RbacPolicy,
+    identity_name: &str,
+    role: &str,
+    tool_name: &str,
+    arg_key: &str,
+    arg_val: &serde_json::Value,
+) -> Option<Response> {
+    if !policy.has_argument_allowlist(role, tool_name, arg_key) {
+        return None;
+    }
+    let Some(val_str) = arg_val.as_str() else {
+        // M2: an allowlist is configured for this argument but the
+        // caller sent a non-string JSON value (array/object/number/
+        // bool/null), which can never satisfy a `Vec<String>`
+        // allowlist. Fail closed; log the type (not the value) so
+        // operators see the rejected shape without leaking inputs.
+        tracing::warn!(
+            user = %identity_name,
+            role = %role,
+            tool = tool_name,
+            argument = arg_key,
+            value_type = json_value_type(arg_val),
+            "non-string argument rejected by allowlist"
+        );
+        return Some(
+            McpxError::Rbac(format!(
+                "argument '{arg_key}' must be a string for tool '{tool_name}'"
+            ))
+            .into_response(),
+        );
+    };
+    if policy.argument_allowed(role, tool_name, arg_key, val_str) {
+        return None;
+    }
+    // Redact the raw value: log an HMAC-SHA256 prefix instead of
+    // the literal string. Operators correlate hashes across log
+    // lines without ever exposing potentially sensitive inputs
+    // (paths, IDs, tokens accidentally passed as args, etc.).
+    tracing::warn!(
+        user = %identity_name,
+        role = %role,
+        tool = tool_name,
+        argument = arg_key,
+        arg_hmac = %policy.redact_arg(val_str),
+        "argument not in allowlist"
+    );
+    Some(
+        McpxError::Rbac(format!(
+            "argument '{arg_key}' value not in allowlist for tool '{tool_name}'"
+        ))
+        .into_response(),
+    )
+}
+
+fn json_value_type(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
 }
 
 /// Simple glob matching: `*` matches any sequence of characters.
@@ -1876,5 +1948,162 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // -- M2 regression: non-string argument values bypass allowlist --
+
+    fn restricted_exec_identity() -> AuthIdentity {
+        AuthIdentity {
+            method: crate::auth::AuthMethod::BearerToken,
+            name: "carol".into(),
+            role: "restricted-exec".into(),
+            raw_token: None,
+            sub: None,
+        }
+    }
+
+    #[test]
+    fn has_argument_allowlist_matches_configured_tool_argument() {
+        let policy = test_policy();
+        assert!(policy.has_argument_allowlist("restricted-exec", "resource_exec", "cmd"));
+        assert!(!policy.has_argument_allowlist("restricted-exec", "resource_exec", "host"));
+        assert!(!policy.has_argument_allowlist("restricted-exec", "other_tool", "cmd"));
+        assert!(!policy.has_argument_allowlist("ops", "resource_exec", "cmd"));
+    }
+
+    #[tokio::test]
+    async fn array_arg_with_matching_allowlist_is_denied() {
+        let policy = Arc::new(test_policy());
+        let app = rbac_router_with_identity(policy, restricted_exec_identity());
+        let body = tool_call_body(
+            "resource_exec",
+            &serde_json::json!({ "host": "dev-1", "cmd": ["bash", "-c", "evil"] }),
+        );
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn object_arg_with_matching_allowlist_is_denied() {
+        let policy = Arc::new(test_policy());
+        let app = rbac_router_with_identity(policy, restricted_exec_identity());
+        let body = tool_call_body(
+            "resource_exec",
+            &serde_json::json!({ "host": "dev-1", "cmd": { "raw": "sh" } }),
+        );
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn number_arg_with_matching_allowlist_is_denied() {
+        let policy = Arc::new(test_policy());
+        let app = rbac_router_with_identity(policy, restricted_exec_identity());
+        let body = tool_call_body(
+            "resource_exec",
+            &serde_json::json!({ "host": "dev-1", "cmd": 42 }),
+        );
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn bool_arg_with_matching_allowlist_is_denied() {
+        let policy = Arc::new(test_policy());
+        let app = rbac_router_with_identity(policy, restricted_exec_identity());
+        let body = tool_call_body(
+            "resource_exec",
+            &serde_json::json!({ "host": "dev-1", "cmd": true }),
+        );
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn null_arg_with_matching_allowlist_is_denied() {
+        let policy = Arc::new(test_policy());
+        let app = rbac_router_with_identity(policy, restricted_exec_identity());
+        let body = tool_call_body(
+            "resource_exec",
+            &serde_json::json!({ "host": "dev-1", "cmd": null }),
+        );
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn non_string_arg_without_allowlist_is_passthrough() {
+        // ops has no argument_allowlist for any (tool, arg) tuple, so
+        // non-string values must reach the handler. resource_exec is in
+        // ops's allow list so the call should not be rejected by RBAC.
+        let policy = Arc::new(test_policy());
+        let id = AuthIdentity {
+            method: crate::auth::AuthMethod::BearerToken,
+            name: "olivia".into(),
+            role: "ops".into(),
+            raw_token: None,
+            sub: None,
+        };
+        let app = rbac_router_with_identity(policy, id);
+        let body = tool_call_body(
+            "resource_exec",
+            &serde_json::json!({ "host": "dev-1", "cmd": ["bash"] }),
+        );
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn string_arg_in_allowlist_still_passes() {
+        let policy = Arc::new(test_policy());
+        let app = rbac_router_with_identity(policy, restricted_exec_identity());
+        let body = tool_call_body(
+            "resource_exec",
+            &serde_json::json!({ "host": "dev-1", "cmd": "bash" }),
+        );
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
     }
 }
