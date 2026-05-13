@@ -832,6 +832,14 @@ impl OAuthConfig {
                 );
             }
         }
+        // Validate jwks_cache_ttl parses as a humantime duration so the
+        // limiter constructor can rely on a non-fallback value (M5).
+        humantime::parse_duration(&self.jwks_cache_ttl).map_err(|e| {
+            crate::error::McpxError::Config(format!(
+                "oauth.jwks_cache_ttl {:?} is not a valid humantime duration (e.g. \"10m\", \"1h30m\"): {e}",
+                self.jwks_cache_ttl
+            ))
+        })?;
         Ok(())
     }
 }
@@ -1320,6 +1328,13 @@ impl JwksCache {
     ///
     /// Returns an error if the CA bundle cannot be read or the HTTP client
     /// cannot be built.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `config.jwks_cache_ttl` is not a valid humantime duration.
+    /// Callers must invoke [`OAuthConfig::validate`] first; the typed
+    /// [`McpServerConfig::validate`](crate::transport::McpServerConfig::validate)
+    /// pipeline does this automatically.
     pub fn new(config: &OAuthConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // Ensure crypto providers are installed (idempotent -- ok() ignores
         // the error if already installed by another call in the same process).
@@ -1330,8 +1345,8 @@ impl JwksCache {
             .install_default()
             .ok();
 
-        let ttl =
-            humantime::parse_duration(&config.jwks_cache_ttl).unwrap_or(Duration::from_mins(10));
+        let ttl = humantime::parse_duration(&config.jwks_cache_ttl)
+            .expect("jwks_cache_ttl validated by OAuthConfig::validate");
 
         let mut validation = Validation::new(Algorithm::RS256);
         // Note: validation.algorithms is overridden per-decode to [header.alg]
@@ -2594,6 +2609,20 @@ mod tests {
     fn validate_accepts_all_https_urls() {
         let cfg = validation_https_config();
         cfg.validate().expect("all-HTTPS config must validate");
+    }
+
+    #[test]
+    fn validate_rejects_unparseable_jwks_cache_ttl() {
+        let mut cfg = validation_https_config();
+        cfg.jwks_cache_ttl = "not-a-duration".into();
+        let err = cfg
+            .validate()
+            .expect_err("malformed jwks_cache_ttl must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("jwks_cache_ttl"),
+            "error must reference offending field; got {msg:?}"
+        );
     }
 
     #[test]

@@ -8,6 +8,26 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+### Fixed
+
+- **M5: `oauth.jwks_cache_ttl` is now validated up-front** (`src/oauth.rs`).
+  Previously, a malformed `jwks_cache_ttl` (e.g. `"ten minutes"`) was
+  silently swallowed by `unwrap_or(Duration::from_mins(10))` inside
+  `JwksCache::new`, so the operator-configured TTL was ignored without
+  any warning. `OAuthConfig::validate` now parses the string and rejects
+  startup with a clear `McpxError::Config` on failure; `JwksCache::new`
+  therefore relies on a typed invariant instead of a silent fallback.
+- **M6: `max_concurrent_requests = Some(0)` is now rejected** at
+  `McpServerConfig::validate` time (`src/transport.rs`). A zero cap would
+  deadlock the global concurrency limiter and reject every request.
+  Mirrors the equivalent TOML-side check already present in
+  `src/config.rs`.
+- **M8: `auth.rate_limit.max_tracked_keys = 0` is now rejected** at
+  `McpServerConfig::validate` time (`src/transport.rs`). A zero cap would
+  force the bounded keyed limiter to evict on every insert and
+  effectively disable rate limiting. `BoundedKeyedLimiter::new` now also
+  carries a `debug_assert!(max_tracked_keys > 0)` as defense-in-depth.
+
 ## [1.6.0] - 2026-05-13
 
 ### Security

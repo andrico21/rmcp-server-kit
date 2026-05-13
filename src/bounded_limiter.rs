@@ -127,6 +127,10 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
     /// are correct.
     #[must_use]
     pub(crate) fn new(quota: Quota, max_tracked_keys: usize, idle_eviction: Duration) -> Self {
+        debug_assert!(
+            max_tracked_keys > 0,
+            "max_tracked_keys must be > 0; validated by McpServerConfig::check"
+        );
         let inner = Arc::new(Inner {
             map: Mutex::new(HashMap::new()),
             quota,

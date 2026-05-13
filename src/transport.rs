@@ -773,6 +773,27 @@ impl McpServerConfig {
         //    and HSTS does not smuggle in a `preload` directive.
         validate_security_headers(&self.security_headers)?;
 
+        // 9. max_concurrent_requests must be > 0 when set. Zero would
+        //    deadlock the global concurrency limiter and reject every
+        //    request. Mirrors the TOML-side check in `src/config.rs`.
+        if let Some(0) = self.max_concurrent_requests {
+            return Err(McpxError::Config(
+                "max_concurrent_requests must be greater than zero when set".into(),
+            ));
+        }
+
+        // 10. Auth rate-limit `max_tracked_keys` must be > 0. A zero cap
+        //     would force `BoundedKeyedLimiter` to evict on every insert
+        //     and effectively disable rate limiting.
+        if let Some(auth_cfg) = &self.auth
+            && let Some(rl) = &auth_cfg.rate_limit
+            && rl.max_tracked_keys == 0
+        {
+            return Err(McpxError::Config(
+                "auth.rate_limit.max_tracked_keys must be greater than zero".into(),
+            ));
+        }
+
         Ok(())
     }
 }
@@ -2632,6 +2653,36 @@ mod tests {
         let mut bad = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0");
         bad.max_request_body = 0;
         assert!(bad.validate().is_err(), "zero body cap must fail validate");
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_concurrent_requests() {
+        let cfg =
+            McpServerConfig::new("127.0.0.1:8080", "test", "1.0.0").with_max_concurrent_requests(0);
+        let err = cfg.validate().expect_err("zero concurrency cap must fail");
+        assert!(
+            format!("{err}").contains("max_concurrent_requests"),
+            "error should mention max_concurrent_requests, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_tracked_keys() {
+        let rl = crate::auth::RateLimitConfig {
+            max_tracked_keys: 0,
+            ..Default::default()
+        };
+        let auth_cfg = AuthConfig {
+            enabled: true,
+            rate_limit: Some(rl),
+            ..Default::default()
+        };
+        let cfg = McpServerConfig::new("127.0.0.1:8080", "test", "1.0.0").with_auth(auth_cfg);
+        let err = cfg.validate().expect_err("zero max_tracked_keys must fail");
+        assert!(
+            format!("{err}").contains("max_tracked_keys"),
+            "error should mention max_tracked_keys, got: {err}"
+        );
     }
 
     #[test]
