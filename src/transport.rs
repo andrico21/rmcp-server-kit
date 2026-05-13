@@ -1714,9 +1714,17 @@ fn install_oauth_proxy_routes(
 
     let admin_routes_enabled = proxy.expose_admin_endpoints
         && (proxy.introspection_url.is_some() || proxy.revocation_url.is_some());
-    if proxy.expose_admin_endpoints && !proxy.require_auth_on_admin_endpoints {
+    if proxy.expose_admin_endpoints
+        && !proxy.require_auth_on_admin_endpoints
+        && proxy.allow_unauthenticated_admin_endpoints
+    {
+        // M3 escape-hatch in effect: validate() let this through because
+        // the operator explicitly opted in. Surface it loudly at startup
+        // so the choice is auditable in logs.
         tracing::warn!(
-            "OAuth introspect/revoke endpoints are unauthenticated; consider setting require_auth_on_admin_endpoints = true"
+            "OAuth introspect/revoke endpoints are unauthenticated by explicit \
+             allow_unauthenticated_admin_endpoints opt-out; ensure an \
+             authenticated reverse proxy fronts these routes"
         );
     }
 

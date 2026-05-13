@@ -952,6 +952,12 @@ fn oauth_cfg_with_proxy(expose: bool) -> rmcp_server_kit::oauth::OAuthConfig {
     // OAuthConfig and OAuthProxyConfig are `#[non_exhaustive]`, so we build
     // them via serde from a TOML-equivalent JSON document. This is the same
     // path real consumers take when loading from a config file.
+    //
+    // `allow_unauthenticated_admin_endpoints = true` is the explicit M3
+    // escape hatch: this helper preserves the historical (pre-M3) behaviour
+    // of `expose=true, require_auth=false` for tests that exercise the
+    // route mounting/advertisement; production deployments should instead
+    // set `require_auth_on_admin_endpoints = true`.
     let json = serde_json::json!({
         "issuer": "https://upstream.example/",
         "audience": "rmcp-server-kit-test",
@@ -965,6 +971,7 @@ fn oauth_cfg_with_proxy(expose: bool) -> rmcp_server_kit::oauth::OAuthConfig {
             "revocation_url": "https://upstream.example/revoke",
             "expose_admin_endpoints": expose,
             "require_auth_on_admin_endpoints": false,
+            "allow_unauthenticated_admin_endpoints": expose,
         }
     });
     serde_json::from_value(json).expect("oauth config deserialization")

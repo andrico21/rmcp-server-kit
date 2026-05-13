@@ -10,6 +10,22 @@ Breaking changes bump the **major** version.
 
 ### Security
 
+- **M3: OAuth admin endpoints (`/introspect`, `/revoke`) now fail closed at
+  startup when exposed without authentication** (`src/oauth.rs`,
+  `src/transport.rs`). Previously a config of
+  `expose_admin_endpoints = true` combined with
+  `require_auth_on_admin_endpoints = false` (or unset) would silently mount
+  RFC 7662 introspection and RFC 7009 revocation as anonymous-callable POST
+  routes, leaking token validity, scopes, and `sub` to anyone who could
+  reach the listener — guarded only by a runtime `tracing::warn!` operators
+  routinely miss. `OAuthConfig::validate` now rejects this combination
+  outright with `McpxError::Config`. Operators who genuinely need
+  unauthenticated admin endpoints (lab / private-network only) must opt in
+  with the new explicit `OAuthProxyConfig::allow_unauthenticated_admin_endpoints = true`
+  builder; the runtime warning is preserved as belt-and-suspenders for that
+  escape-hatch path. **Behavioural break**: deployments relying on the
+  silent-warn default must either set `require_auth_on_admin_endpoints = true`
+  or explicitly set the new opt-in flag.
 - **M2: RBAC argument allowlists now reject non-string JSON values**
   (`src/rbac.rs`). Previously the allowlist check was guarded by
   `if let Some(val_str) = arg_val.as_str()`, so any caller could bypass

@@ -806,6 +806,25 @@ impl OAuthConfig {
                     )));
                 }
             }
+            // M3: refuse to start with admin endpoints exposed but no
+            // auth in front of them, unless the operator has explicitly
+            // opted out via `allow_unauthenticated_admin_endpoints`. The
+            // unauthenticated combination proxies arbitrary tokens to
+            // the upstream IdP and is only safe behind an authenticated
+            // reverse proxy / ingress.
+            if proxy.expose_admin_endpoints
+                && !proxy.require_auth_on_admin_endpoints
+                && !proxy.allow_unauthenticated_admin_endpoints
+            {
+                return Err(crate::error::McpxError::Config(
+                    "oauth.proxy: expose_admin_endpoints = true requires \
+                     require_auth_on_admin_endpoints = true (recommended) \
+                     or allow_unauthenticated_admin_endpoints = true \
+                     (explicit opt-out, only safe behind an authenticated \
+                     reverse proxy)"
+                        .into(),
+                ));
+            }
         }
         if let Some(tx) = &self.token_exchange {
             let url = check_oauth_url("oauth.token_exchange.token_url", &tx.token_url, allow_http)?;
@@ -1139,6 +1158,18 @@ pub struct OAuthProxyConfig {
     /// should set this to `true` when exposing admin endpoints.
     #[serde(default)]
     pub require_auth_on_admin_endpoints: bool,
+    /// Explicit operator opt-out for the M3 startup check that rejects
+    /// `expose_admin_endpoints = true` combined with
+    /// `require_auth_on_admin_endpoints = false`.
+    ///
+    /// **Default: `false`.** Setting this to `true` allows the unauth
+    /// admin-endpoint combination to start, which is only safe when the
+    /// rmcp-server-kit process sits behind an authenticated reverse
+    /// proxy / ingress that screens `/introspect` and `/revoke` itself.
+    /// Production deployments should leave this `false` and instead set
+    /// `require_auth_on_admin_endpoints = true`.
+    #[serde(default)]
+    pub allow_unauthenticated_admin_endpoints: bool,
 }
 
 impl OAuthProxyConfig {
@@ -1215,6 +1246,14 @@ impl OAuthProxyConfigBuilder {
     /// `/revoke`.
     pub const fn require_auth_on_admin_endpoints(mut self, require: bool) -> Self {
         self.inner.require_auth_on_admin_endpoints = require;
+        self
+    }
+
+    /// Explicit opt-out for the M3 startup check that rejects exposing
+    /// `/introspect`/`/revoke` without authentication. See
+    /// [`OAuthProxyConfig::allow_unauthenticated_admin_endpoints`].
+    pub const fn allow_unauthenticated_admin_endpoints(mut self, allow: bool) -> Self {
+        self.inner.allow_unauthenticated_admin_endpoints = allow;
         self
     }
 
@@ -2743,6 +2782,86 @@ mod tests {
         assert!(err.to_string().contains("oauth.proxy.revocation_url"));
     }
 
+    // -- M3 regression: unauthenticated /introspect and /revoke must fail validate --
+
+    #[test]
+    fn validate_rejects_exposed_admin_endpoints_without_auth() {
+        let mut cfg = validation_https_config();
+        cfg.proxy = Some(
+            OAuthProxyConfig::builder(
+                "https://idp.example.com/authorize",
+                "https://idp.example.com/token",
+                "client",
+            )
+            .introspection_url("https://idp.example.com/introspect")
+            .expose_admin_endpoints(true)
+            .build(),
+        );
+        let err = cfg
+            .validate()
+            .expect_err("expose_admin_endpoints without auth must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("require_auth_on_admin_endpoints"), "{msg}");
+        assert!(
+            msg.contains("allow_unauthenticated_admin_endpoints"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_exposed_admin_endpoints_with_auth() {
+        let mut cfg = validation_https_config();
+        cfg.proxy = Some(
+            OAuthProxyConfig::builder(
+                "https://idp.example.com/authorize",
+                "https://idp.example.com/token",
+                "client",
+            )
+            .introspection_url("https://idp.example.com/introspect")
+            .expose_admin_endpoints(true)
+            .require_auth_on_admin_endpoints(true)
+            .build(),
+        );
+        cfg.validate()
+            .expect("authed admin endpoints must validate");
+    }
+
+    #[test]
+    fn validate_accepts_exposed_admin_endpoints_with_explicit_unauth_optout() {
+        let mut cfg = validation_https_config();
+        cfg.proxy = Some(
+            OAuthProxyConfig::builder(
+                "https://idp.example.com/authorize",
+                "https://idp.example.com/token",
+                "client",
+            )
+            .introspection_url("https://idp.example.com/introspect")
+            .expose_admin_endpoints(true)
+            .allow_unauthenticated_admin_endpoints(true)
+            .build(),
+        );
+        cfg.validate()
+            .expect("explicit unauth opt-out must validate");
+    }
+
+    #[test]
+    fn validate_accepts_unexposed_admin_endpoints_without_auth() {
+        // The default safe shape: expose_admin_endpoints = false. The
+        // M3 check must not fire because the routes are not mounted.
+        let mut cfg = validation_https_config();
+        cfg.proxy = Some(
+            OAuthProxyConfig::builder(
+                "https://idp.example.com/authorize",
+                "https://idp.example.com/token",
+                "client",
+            )
+            .introspection_url("https://idp.example.com/introspect")
+            .build(),
+        );
+        cfg.validate()
+            .expect("unexposed admin endpoints must validate");
+    }
+
     #[test]
     fn validate_rejects_http_token_exchange_url() {
         let mut cfg = validation_https_config();
@@ -4051,6 +4170,7 @@ mod tests {
             revocation_url: None,
             expose_admin_endpoints: false,
             require_auth_on_admin_endpoints: false,
+            allow_unauthenticated_admin_endpoints: false,
         }
     }
 
