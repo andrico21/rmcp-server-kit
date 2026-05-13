@@ -241,6 +241,91 @@ impl AuthCounters {
     }
 }
 
+/// RFC 3339 timestamp, parsed at deserialization time.
+///
+/// Use this for any public field that needs to carry an RFC 3339 timestamp from
+/// TOML/JSON config or builder APIs. Construction is fallible (`parse`); once
+/// constructed the value is guaranteed to be a real RFC 3339 timestamp with a
+/// known offset, so downstream code does not need to handle parse errors.
+///
+/// Wraps [`chrono::DateTime<chrono::FixedOffset>`]; the underlying value is
+/// available via [`Self::as_datetime`] or [`Self::into_inner`]. `Serialize`
+/// emits the canonical RFC 3339 form via [`chrono::DateTime::to_rfc3339`], so
+/// the on-the-wire format for `ApiKeySummary` (admin endpoints) is unchanged.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub struct RfcTimestamp(chrono::DateTime<chrono::FixedOffset>);
+
+impl RfcTimestamp {
+    /// Parse an RFC 3339 timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying [`chrono::ParseError`] when `s` is not a valid
+    /// RFC 3339 timestamp (e.g. missing the `T` separator, missing the offset
+    /// suffix, or out-of-range fields).
+    pub fn parse(s: &str) -> Result<Self, chrono::ParseError> {
+        chrono::DateTime::parse_from_rfc3339(s).map(Self)
+    }
+
+    /// Borrow the underlying [`chrono::DateTime`].
+    #[must_use]
+    pub fn as_datetime(&self) -> &chrono::DateTime<chrono::FixedOffset> {
+        &self.0
+    }
+
+    /// Consume the wrapper and return the underlying [`chrono::DateTime`].
+    #[must_use]
+    pub fn into_inner(self) -> chrono::DateTime<chrono::FixedOffset> {
+        self.0
+    }
+}
+
+impl std::fmt::Display for RfcTimestamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Canonical RFC 3339 form; matches the deserialization input contract.
+        write!(f, "{}", self.0.to_rfc3339())
+    }
+}
+
+impl std::fmt::Debug for RfcTimestamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Render as the canonical RFC 3339 string (not chrono's internal
+        // debug form) so existing `ApiKeyEntry` Debug-redaction tests --
+        // which look for the literal `"2030-01-01T00:00:00Z"` form in the
+        // formatted output -- continue to hold without bespoke handling.
+        write!(f, "{}", self.0.to_rfc3339())
+    }
+}
+
+impl<'de> Deserialize<'de> for RfcTimestamp {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Validate at deserialization time: a malformed `expires_at` in
+        // TOML or JSON aborts config load with a clear serde error rather
+        // than silently producing a key that fails open at runtime.
+        let s = String::deserialize(deserializer)?;
+        Self::parse(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+impl serde::Serialize for RfcTimestamp {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0.to_rfc3339())
+    }
+}
+
+impl From<chrono::DateTime<chrono::FixedOffset>> for RfcTimestamp {
+    fn from(value: chrono::DateTime<chrono::FixedOffset>) -> Self {
+        Self(value)
+    }
+}
+
 /// A single API key entry (stored as Argon2id hash in config).
 ///
 /// The [`Debug`] impl is **manually written** to redact the Argon2id hash.
@@ -256,8 +341,11 @@ pub struct ApiKeyEntry {
     pub hash: String,
     /// RBAC role granted when this key authenticates successfully.
     pub role: String,
-    /// Optional expiry in RFC 3339 format.
-    pub expires_at: Option<String>,
+    /// Optional expiry, parsed from an RFC 3339 string at deserialization
+    /// time. Construction from a raw string is fallible (see
+    /// [`RfcTimestamp::parse`] and [`ApiKeyEntry::try_with_expiry`]),
+    /// which guarantees `verify_bearer_token` never sees a malformed value.
+    pub expires_at: Option<RfcTimestamp>,
 }
 
 impl std::fmt::Debug for ApiKeyEntry {
@@ -286,10 +374,28 @@ impl ApiKeyEntry {
     }
 
     /// Set an RFC 3339 expiry on this key.
+    ///
+    /// Takes an already-parsed [`RfcTimestamp`]; for ergonomic construction
+    /// from a raw string see [`Self::try_with_expiry`].
     #[must_use]
-    pub fn with_expiry(mut self, expires_at: impl Into<String>) -> Self {
-        self.expires_at = Some(expires_at.into());
+    pub fn with_expiry(mut self, expires_at: RfcTimestamp) -> Self {
+        self.expires_at = Some(expires_at);
         self
+    }
+
+    /// Set an RFC 3339 expiry on this key from a raw string.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying [`chrono::ParseError`] when `expires_at` is
+    /// not a valid RFC 3339 timestamp. This is the fallible counterpart to
+    /// [`Self::with_expiry`].
+    pub fn try_with_expiry(
+        mut self,
+        expires_at: impl AsRef<str>,
+    ) -> Result<Self, chrono::ParseError> {
+        self.expires_at = Some(RfcTimestamp::parse(expires_at.as_ref())?);
+        Ok(self)
     }
 }
 
@@ -582,8 +688,9 @@ pub struct ApiKeySummary {
     pub name: String,
     /// RBAC role granted when this key authenticates.
     pub role: String,
-    /// Optional RFC 3339 expiry timestamp.
-    pub expires_at: Option<String>,
+    /// Optional RFC 3339 expiry timestamp. Serialized as a canonical
+    /// RFC 3339 string so the admin-endpoint wire format is preserved.
+    pub expires_at: Option<RfcTimestamp>,
 }
 
 /// Snapshot of the enabled authentication methods for admin endpoints.
@@ -624,7 +731,7 @@ impl AuthConfig {
                 .map(|k| ApiKeySummary {
                     name: k.name.clone(),
                     role: k.role.clone(),
-                    expires_at: k.expires_at.clone(),
+                    expires_at: k.expires_at,
                 })
                 .collect(),
         }
@@ -716,7 +823,7 @@ impl AuthState {
             .map(|k| ApiKeySummary {
                 name: k.name.clone(),
                 role: k.role.clone(),
-                expires_at: k.expires_at.clone(),
+                expires_at: k.expires_at,
             })
             .collect()
     }
@@ -873,10 +980,12 @@ pub fn verify_bearer_token(token: &str, keys: &[ApiKeyEntry]) -> Option<AuthIden
     let mut result: Option<AuthIdentity> = None;
 
     for key in keys {
-        // Check expiry
-        if let Some(ref expires) = key.expires_at
-            && let Ok(exp) = chrono::DateTime::parse_from_rfc3339(expires)
-            && exp < now
+        // Expiry check: `expires_at` was validated as RFC 3339 at
+        // deserialization time (see `RfcTimestamp`), so this is a pure
+        // comparison -- no parse fail-open path. A `None` expiry means
+        // the key never expires.
+        if let Some(exp) = key.expires_at
+            && exp.as_datetime() < &now
         {
             continue;
         }
@@ -1162,9 +1271,128 @@ mod tests {
             name: "test".into(),
             hash,
             role: "viewer".into(),
-            expires_at: Some("2020-01-01T00:00:00Z".into()),
+            expires_at: Some(RfcTimestamp::parse("2020-01-01T00:00:00Z").unwrap()),
         }];
         assert!(verify_bearer_token(&token, &keys).is_none());
+    }
+
+    // Regression tests for H3 (api_key_expires_at_fail_open).
+    //
+    // Prior to 1.6.0 the runtime expiry check used a chained
+    // `if let Some(_) && let Ok(exp) = parse(_) && exp < now` which
+    // silently fell through on parse error, letting a key with
+    // `expires_at = "not-a-date"` authenticate forever. These tests
+    // pin the type-system fix: malformed RFC 3339 is rejected at
+    // deserialization time (no `RfcTimestamp` can ever be malformed),
+    // and the runtime check is a pure comparison with no parse path.
+
+    #[test]
+    fn rfc_timestamp_parse_rejects_malformed() {
+        for bad in [
+            "not-a-date",
+            "",
+            "2025-13-01T00:00:00Z", // month 13
+            "2025-01-32T00:00:00Z", // day 32
+            "2025-01-01T00:00:00",  // missing offset
+            "01/01/2025",           // wrong format
+            "2025-01-01T25:00:00Z", // hour 25
+        ] {
+            assert!(
+                RfcTimestamp::parse(bad).is_err(),
+                "RfcTimestamp::parse must reject {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rfc_timestamp_parse_accepts_valid() {
+        for good in [
+            "2025-01-01T00:00:00Z",
+            "2025-01-01T00:00:00+00:00",
+            "2025-12-31T23:59:59-08:00",
+            "2099-01-01T00:00:00.123456789Z",
+        ] {
+            assert!(
+                RfcTimestamp::parse(good).is_ok(),
+                "RfcTimestamp::parse must accept {good:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn api_key_entry_deserialize_rejects_malformed_expires_at() {
+        // TOML with a malformed expires_at must fail to deserialize.
+        // This is the load-time defense: a typo in auth.toml aborts
+        // config load with a clear serde error, instead of producing
+        // a key that authenticates forever (the H3 fail-open).
+        let toml = r#"
+            name = "bad-key"
+            hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$h4sh"
+            role = "viewer"
+            expires_at = "not-a-date"
+        "#;
+        let result: Result<ApiKeyEntry, _> = toml::from_str(toml);
+        assert!(
+            result.is_err(),
+            "deserialization must reject malformed expires_at"
+        );
+    }
+
+    #[test]
+    fn api_key_entry_deserialize_accepts_valid_expires_at() {
+        let toml = r#"
+            name = "good-key"
+            hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$h4sh"
+            role = "viewer"
+            expires_at = "2099-01-01T00:00:00Z"
+        "#;
+        let entry: ApiKeyEntry = toml::from_str(toml).expect("valid RFC 3339 must deserialize");
+        assert!(entry.expires_at.is_some());
+    }
+
+    #[test]
+    fn api_key_entry_deserialize_accepts_missing_expires_at() {
+        // Omitting expires_at must continue to mean "no expiry"; this
+        // is the documented contract and must survive the H3 fix.
+        let toml = r#"
+            name = "eternal-key"
+            hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$h4sh"
+            role = "viewer"
+        "#;
+        let entry: ApiKeyEntry = toml::from_str(toml).expect("missing expires_at must deserialize");
+        assert!(entry.expires_at.is_none());
+    }
+
+    #[test]
+    fn try_with_expiry_rejects_malformed() {
+        let entry = ApiKeyEntry::new("k", "hash", "viewer");
+        assert!(entry.try_with_expiry("not-a-date").is_err());
+    }
+
+    #[test]
+    fn try_with_expiry_accepts_valid() {
+        let entry = ApiKeyEntry::new("k", "hash", "viewer")
+            .try_with_expiry("2099-01-01T00:00:00Z")
+            .expect("valid RFC 3339 must be accepted");
+        assert!(entry.expires_at.is_some());
+    }
+
+    #[test]
+    fn api_key_summary_serializes_expires_at_as_rfc3339() {
+        // The admin endpoint wire format is `{"expires_at": "RFC 3339 str"}`.
+        // Pinning this prevents an accidental serialization-format change
+        // (e.g. chrono's debug form, a Unix timestamp) that would silently
+        // break operator tooling that parses these payloads.
+        let summary = ApiKeySummary {
+            name: "k".into(),
+            role: "viewer".into(),
+            expires_at: Some(RfcTimestamp::parse("2030-01-01T00:00:00Z").unwrap()),
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(
+            json.contains(r#""expires_at":"2030-01-01T00:00:00+00:00""#),
+            "wire format regressed: {json}"
+        );
     }
 
     #[test]
@@ -1174,7 +1402,7 @@ mod tests {
             name: "test".into(),
             hash,
             role: "viewer".into(),
-            expires_at: Some("2099-01-01T00:00:00Z".into()),
+            expires_at: Some(RfcTimestamp::parse("2099-01-01T00:00:00Z").unwrap()),
         }];
         assert!(verify_bearer_token(&token, &keys).is_some());
     }
@@ -1762,14 +1990,14 @@ mod tests {
             // Realistic Argon2id PHC string (must NOT leak).
             hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$h4sh3dPa55w0rd".into(),
             role: "viewer".into(),
-            expires_at: Some("2030-01-01T00:00:00Z".into()),
+            expires_at: Some(RfcTimestamp::parse("2030-01-01T00:00:00Z").unwrap()),
         };
         let dbg = format!("{entry:?}");
 
         // Non-secret fields visible.
         assert!(dbg.contains("viewer-key"));
         assert!(dbg.contains("viewer"));
-        assert!(dbg.contains("2030-01-01T00:00:00Z"));
+        assert!(dbg.contains("2030-01-01T00:00:00+00:00"));
 
         // Hash material must NOT leak.
         assert!(

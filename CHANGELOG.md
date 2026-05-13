@@ -8,8 +8,46 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-05-13
+
+### Security
+
+- **Fail-closed RFC 3339 validation for API key `expires_at`** (`src/auth.rs`).
+  Previously, a malformed `expires_at` string in the API key TOML file was
+  silently treated as "never expires" because `chrono::DateTime::parse_from_rfc3339`
+  errors inside `verify_bearer_token` were discarded. An operator who
+  mistyped (e.g. `"2026-01-01"` instead of `"2026-01-01T00:00:00Z"`) would
+  unknowingly ship a non-expiring key. Expiry strings are now parsed and
+  validated **at TOML deserialization time** via a new `RfcTimestamp`
+  newtype: any malformed value rejects server startup (or hot-reload) with
+  a clear error pointing at the offending key. `verify_bearer_token` no
+  longer needs to parse strings on the hot path.
+
+### Changed (BREAKING — source compatibility)
+
+> Shipped as **1.6.0** by maintainer policy: the only known downstream
+> consumer (`atlassian-mcp-rs`, same maintainer) does not touch the
+> affected API surface. `cargo-semver-checks` is temporarily disabled in
+> CI with a `FIXME(H3-fix, 2026-05-13)` marker; re-enable on the next
+> release with no public-API breaks.
+
+- `ApiKeyEntry::expires_at` is now `Option<RfcTimestamp>` (was
+  `Option<String>`).
+- `ApiKeySummary::expires_at` is now `Option<RfcTimestamp>` (was
+  `Option<String>`).
+- `ApiKeyEntry::with_expiry` now takes `RfcTimestamp` (was
+  `impl Into<String>`). For string input use the new
+  `ApiKeyEntry::try_with_expiry(impl AsRef<str>) -> Result<Self, chrono::ParseError>`.
+- `RfcTimestamp` (`Copy`) is now part of the public API in `src/auth.rs`;
+  its on-the-wire form is `chrono`'s canonical RFC 3339 with `+00:00`
+  (not `Z`) for UTC.
+
 ### Added
 
+- **`RfcTimestamp` newtype** in `src/auth.rs` wrapping
+  `chrono::DateTime<chrono::FixedOffset>` with a fail-closed `Deserialize`,
+  `Display`/`Debug` via `to_rfc3339`, `parse`, `as_datetime`, and
+  `into_inner`.
 - **Mutation-coverage tests** for `glob_match` / `match_middle` boundary
   cases in `src/rbac.rs` and for `RbacPolicy::argument_allowed` glob-tool
   matching, killing five surviving mutants surfaced by the nightly
@@ -24,6 +62,9 @@ Breaking changes bump the **major** version.
   `src/auth.rs`, asserting `bearer` is `true` iff `api_keys` is
   non-empty (kills the surviving `!`-deletion mutant at line 615) and
   pinning `enabled` / `mtls` / `oauth` propagation.
+- **`RfcTimestamp` regression suite** (`src/auth.rs`) — eight tests covering
+  malformed/valid parse, TOML deserialization fail-closed behavior,
+  `try_with_expiry`, and `ApiKeySummary` JSON serialization wire format.
 
 ## [1.5.0] - 2026-04-29
 

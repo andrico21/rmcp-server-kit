@@ -11,6 +11,11 @@
 //! client certificates is fire-and-forget and never blocks the synchronous
 //! handshake path.
 //!
+//! Security note: CDP URLs are extracted from attacker-controllable client
+//! certs *before* chain validation. This is safe by design; see the
+//! `// SECURITY:` comment on `DynamicClientCertVerifier::verify_client_cert`
+//! for the full rationale before changing the discovery ordering.
+//!
 //! Semantics:
 //! - `crl_deny_on_unavailable = false` => fail open with warn logs.
 //! - `crl_deny_on_unavailable = true` => fail closed when a certificate
@@ -350,6 +355,10 @@ impl CrlSet {
         // `DynamicClientCertVerifier::verify_client_cert`. The peer has
         // already presented a chain that parses; this method must not panic
         // under attacker-controlled URL contents.
+        //
+        // SECURITY: see `DynamicClientCertVerifier::verify_client_cert` for
+        // the rationale on why accepting URLs from an unverified cert is
+        // safe (no HTTP on this path; fetch is off-path and SSRF-gated).
         let mut missing_cached = false;
 
         // Snapshot the dedup set under the lock; do NOT mutate it yet.
@@ -778,6 +787,17 @@ impl ClientCertVerifier for DynamicClientCertVerifier {
         intermediates: &[CertificateDer<'_>],
         now: UnixTime,
     ) -> Result<ClientCertVerified, TlsError> {
+        // SECURITY: extracting CDP URLs from an unverified client cert
+        // here is intentional. No HTTP happens on this path -- the call
+        // to `note_discovered_urls` only enqueues onto a bounded,
+        // rate-limited channel. The actual fetch runs off-path in
+        // `run_crl_refresher` and is gated by SSRF screening
+        // (`src/ssrf.rs`), body-size cap, deadline, and the
+        // `crl_allow_http` policy. CRLs are CA-signed (RFC 5280 §5), so
+        // http(s) CDP URLs are protocol design, not an SSRF sink. The
+        // discovery must happen BEFORE delegating to the inner verifier
+        // so `crl_deny_on_unavailable = true` can fail-closed on a
+        // never-fetched CDP. Do NOT reorder.
         let mut discovered =
             extract_cdp_urls(end_entity.as_ref(), self.inner.config.crl_allow_http);
         for intermediate in intermediates {
