@@ -2,7 +2,7 @@
 
 > Visual map of the `rmcp-server-kit` crate. Pair with [`AGENTS.md`](../AGENTS.md) and
 > [`ARCHITECTURE.md`](ARCHITECTURE.md). All file:line references use the
-> code as of `rmcp-server-kit` 1.3.1.
+> code as of `rmcp-server-kit` 1.6.0.
 
 ---
 
@@ -10,7 +10,7 @@
 
 ```mermaid
 mindmap
-  root((rmcp-server-kit<br/>1.3.1))
+  root((rmcp-server-kit<br/>1.6.0))
     Identity
       Library crate
       No src/main.rs

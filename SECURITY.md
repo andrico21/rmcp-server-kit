@@ -4,8 +4,8 @@
 
 | Version  | Supported |
 |----------|-----------|
-| 1.3.x    | ✅        |
-| < 1.3    | ❌        |
+| 1.6.x    | ✅        |
+| < 1.6    | ❌        |
 
 We support the latest minor release for security fixes. Patch releases
 (`x.y.Z`) are issued for the supported line only.

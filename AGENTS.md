@@ -151,10 +151,10 @@ consumer applications and `examples/`.
 | Entry                                    | File                                                                  | Notes                                                                                                  |
 |------------------------------------------|----------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------|
 | Crate root / public API                  | [`src/lib.rs`](src/lib.rs)                                            | Re-exports all public modules                                                                          |
-| **Server entry (HTTP)**                  | [`src/transport.rs`](src/transport.rs) — `serve()` (~line 220)        | The function consumers call. Wires rmcp + axum + middleware + TLS + admin + metrics                    |
-| Server entry (stdio)                     | [`src/transport.rs`](src/transport.rs) — `serve_stdio()` (~line 1252) | For desktop/IDE clients. **Bypasses auth/RBAC/TLS** — use only for local subprocess MCP                |
-| Config builder                           | [`src/transport.rs`](src/transport.rs) — `McpServerConfig::new` (~line 130) | Builder-style config struct                                                                       |
-| Hot-reload handle                        | [`src/transport.rs`](src/transport.rs) — `ReloadHandle` (~line 172)   | `reload_auth_keys` / `reload_rbac` for runtime reconfig without restart                               |
+| **Server entry (HTTP)**                  | [`src/transport.rs`](src/transport.rs) — `serve()` (~line 1355)        | The function consumers call. Wires rmcp + axum + middleware + TLS + admin + metrics                    |
+| Server entry (stdio)                     | [`src/transport.rs`](src/transport.rs) — `serve_stdio()` (~line 2551) | For desktop/IDE clients. **Bypasses auth/RBAC/TLS** — use only for local subprocess MCP                |
+| Config builder                           | [`src/transport.rs`](src/transport.rs) — `McpServerConfig::new` (~line 127) | Builder-style config struct                                                                       |
+| Hot-reload handle                        | [`src/transport.rs`](src/transport.rs) — `ReloadHandle` (~line 789)   | `reload_auth_keys` / `reload_rbac` for runtime reconfig without restart                               |
 | Runnable example                         | [`examples/minimal_server.rs`](examples/minimal_server.rs)            | Smallest possible consumer of `serve()`                                                                |
 | E2E reference                            | [`tests/e2e.rs`](tests/e2e.rs)                                        | Real-world usage patterns; use as an integration cookbook                                              |
 
@@ -272,7 +272,7 @@ The most-violated rules — all `deny`-level in `Cargo.toml`:
 |------------------------------------------------|--------------------------------------------------------|
 | Server entry / router / middleware order       | `src/transport.rs` — `serve()` and surrounding helpers |
 | API key authentication                         | `src/auth.rs` — `AuthState`, `ApiKeyEntry`, `auth_middleware` |
-| mTLS identity extraction                       | `src/transport.rs` — `TlsListener::record_mtls_identity` (~line 921) |
+| mTLS identity extraction                       | `src/transport.rs` — `extract_mtls_identity` call site (~line 1940)   |
 | mTLS CRL revocation (CDP-driven)               | `src/mtls_revocation.rs` — `CrlSet`, `DynamicClientCertVerifier`, `bootstrap_fetch`, `run_crl_refresher` |
 | OAuth JWT validation / JWKS cache              | `src/oauth.rs` — `JwksCache`, feature-gated           |
 | RBAC policy evaluation                         | `src/rbac.rs` — `RbacPolicy::check`, `enforce_tool_policy` |
@@ -285,8 +285,8 @@ The most-violated rules — all `deny`-level in `Cargo.toml`:
 | Configuration struct (TOML schema)             | `src/config.rs` + `McpServerConfig` in `src/transport.rs` |
 | Error type → HTTP status mapping               | `src/error.rs` — `McpxError::into_response`           |
 | Origin / security headers / CORS               | `src/transport.rs` — `origin_check_middleware`, `security_headers_middleware` |
-| Graceful shutdown (Ctrl-C / SIGTERM)           | `src/transport.rs` — `shutdown_signal()` (~line 1050) |
-| Hot-reload of keys / RBAC                      | `src/transport.rs` — `ReloadHandle` (~line 172)       |
+| Graceful shutdown (Ctrl-C / SIGTERM)           | `src/transport.rs` — `shutdown_signal()` (~line 2150) |
+| Hot-reload of keys / RBAC                      | `src/transport.rs` — `ReloadHandle` (~line 789)       |
 
 ---
 

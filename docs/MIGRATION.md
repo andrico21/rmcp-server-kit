@@ -2,7 +2,7 @@
 
 This guide shows how to wire the standalone `rmcp-server-kit` crate into a
 downstream project. There is no version-to-version migration history yet —
-`1.3.1` is the first usable release on crates.io.
+`1.6.0` is the current release on crates.io.
 
 ## 1. Add the dependency
 
@@ -15,7 +15,7 @@ Use a caret range so patch and minor releases flow in automatically:
 rmcp-server-kit = { version = "1", features = ["oauth"] }
 ```
 
-Avoid the exact-version pin (`version = "=1.3.1"`); it prevents security
+Avoid the exact-version pin (`version = "=1.6.0"`); it prevents security
 patches from reaching your build.
 
 ### Git dependency (development / pre-release)
@@ -24,7 +24,7 @@ Pin to a tagged release:
 
 ```toml
 [dependencies]
-rmcp-server-kit = { git = "https://github.com/andrico21/rmcp-server-kit", tag = "1.3.1", features = ["oauth"] }
+rmcp-server-kit = { git = "https://github.com/andrico21/rmcp-server-kit", tag = "1.6.0", features = ["oauth"] }
 ```
 
 ## 2. Workspace integration
