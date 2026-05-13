@@ -1307,8 +1307,11 @@ where
             },
         ));
         let metrics_bind = config.metrics_bind.clone();
+        let metrics_shutdown = ct.clone();
         tokio::spawn(async move {
-            if let Err(e) = crate::metrics::serve_metrics(metrics_bind, metrics).await {
+            if let Err(e) =
+                crate::metrics::serve_metrics(metrics_bind, metrics, metrics_shutdown).await
+            {
                 tracing::error!("metrics listener failed: {e}");
             }
         });

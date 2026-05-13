@@ -8,6 +8,35 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+### Security
+
+- **L2: Argon2 verification is now constant-time across slots** (`src/auth.rs`).
+  Previously `verify_bearer_token` short-circuited on the first matching
+  slot and skipped Argon2 entirely on expired slots, leaking timing
+  information about (a) which slot held the matching credential and (b)
+  whether earlier slots had expired (CWE-208). Verification now runs
+  Argon2id against every configured slot — using the real hash for the
+  first non-expired pre-match slot and a fixed dummy PHC string elsewhere
+  — and folds per-slot match bits via `subtle::ConstantTimeEq`. The
+  observable timing is now bounded to "one Argon2 per configured key"
+  regardless of input.
+
+### Fixed
+
+- **M4: `oauth.role_claim` now resolves first-class `Claims` fields**
+  (`src/oauth.rs`). `resolve_role` previously only walked the `extra`
+  map, so `role_claim = "sub"` (or `azp` / `client_id` / `aud` / `scope`)
+  was silently treated as missing even when the JWT contained those
+  standard fields. A new `first_class_claim_values` helper layers the
+  RFC 7519 / RFC 8693 standard claims into the lookup, with `scope`
+  whitespace-split per RFC 8693 §4.2 and `aud` returning every audience.
+- **M7: Prometheus `/metrics` listener now participates in graceful
+  shutdown** (`src/metrics.rs`, `src/transport.rs`). `serve_metrics`
+  gained a `shutdown: CancellationToken` parameter and wires it into
+  `axum::serve(...).with_graceful_shutdown(...)`, so cancelling the
+  parent server's shutdown token now releases the metrics port instead
+  of leaking it until process exit.
+
 ### Fixed
 
 - **M5: `oauth.jwks_cache_ttl` is now validated up-front** (`src/oauth.rs`).

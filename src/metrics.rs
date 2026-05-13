@@ -99,11 +99,19 @@ impl McpMetrics {
 
 /// Spawn a dedicated HTTP listener that serves Prometheus metrics on `/metrics`.
 ///
+/// The listener exits and releases the bound port when `shutdown` is
+/// cancelled, keeping the metrics endpoint tied to the parent server's
+/// graceful-shutdown lifecycle (M7).
+///
 /// # Errors
 ///
 /// Returns [`McpxError::Startup`] if the TCP listener cannot bind or the
 /// underlying axum server fails.
-pub async fn serve_metrics(bind: String, metrics: Arc<McpMetrics>) -> Result<(), McpxError> {
+pub async fn serve_metrics(
+    bind: String,
+    metrics: Arc<McpMetrics>,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<(), McpxError> {
     let app = axum::Router::new().route(
         "/metrics",
         axum::routing::get(move || {
@@ -117,6 +125,7 @@ pub async fn serve_metrics(bind: String, metrics: Arc<McpMetrics>) -> Result<(),
         .map_err(|e| McpxError::Startup(format!("metrics bind {bind}: {e}")))?;
     tracing::info!("metrics endpoint listening on http://{bind}/metrics");
     axum::serve(listener, app)
+        .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await
         .map_err(|e| McpxError::Startup(format!("metrics serve: {e}")))?;
     Ok(())
@@ -205,5 +214,54 @@ mod tests {
         // The clone should see the same counter value.
         let output = m2.encode();
         assert!(output.contains(" 1"));
+    }
+
+    // M7 regression: cancelling the shutdown token must release the
+    // metrics listener's bound port so a subsequent bind to the same
+    // address succeeds. Prior to M7 the metrics endpoint ran without
+    // graceful_shutdown wiring and would leak the port until process
+    // exit.
+    #[tokio::test]
+    async fn serve_metrics_releases_port_on_shutdown() {
+        // Pick an ephemeral port, then drop the probe so serve_metrics
+        // can claim it.
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let metrics = Arc::new(McpMetrics::new().unwrap());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let handle = tokio::spawn(serve_metrics(
+            addr.to_string(),
+            Arc::clone(&metrics),
+            shutdown.clone(),
+        ));
+
+        // Wait until the listener is actually accepting connections.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "metrics listener never accepted on {addr}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // Cancel and await graceful shutdown.
+        shutdown.cancel();
+        let join = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("serve_metrics did not return within timeout");
+        join.expect("join error")
+            .expect("serve_metrics returned Err");
+
+        // Port must be immediately rebindable.
+        let rebind = tokio::net::TcpListener::bind(addr)
+            .await
+            .expect("port not released after shutdown");
+        drop(rebind);
     }
 }

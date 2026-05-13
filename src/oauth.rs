@@ -1616,7 +1616,9 @@ impl JwksCache {
     /// tokens in the `scope` claim against configured scope mappings.
     fn resolve_role(&self, claims: &Claims) -> Result<String, JwtValidationFailure> {
         if let Some(ref claim_path) = self.role_claim {
-            let values = resolve_claim_path(&claims.extra, claim_path);
+            let owned_first_class: Vec<String> = first_class_claim_values(claims, claim_path);
+            let mut values: Vec<&str> = owned_first_class.iter().map(String::as_str).collect();
+            values.extend(resolve_claim_path(&claims.extra, claim_path));
             return self
                 .role_mappings
                 .iter()
@@ -1889,6 +1891,39 @@ fn jwk_algorithm(jwk: &jsonwebtoken::jwk::Jwk) -> Option<Algorithm> {
 // ---------------------------------------------------------------------------
 // Claim path resolution
 // ---------------------------------------------------------------------------
+
+/// Resolve a `role_claim` path against the explicit [`Claims`] fields
+/// (`sub`, `aud`, `azp`, `client_id`, `scope`).
+///
+/// Operators commonly configure `role_claim = "scope"` or `"sub"` /
+/// `"client_id"` to map first-class JWT claims to roles. These claims are
+/// captured by [`Claims`] as named fields, so they never appear in the
+/// `extra` map that [`resolve_claim_path`] inspects. This helper bridges
+/// that gap by returning owned `String`s for those first-class fields
+/// when the claim path matches one of them; the caller layers the result
+/// over [`resolve_claim_path`] so dot-paths into custom claims continue
+/// to work.
+///
+/// `scope` is split on whitespace per the OAuth 2.0 convention so a token
+/// like `scope = "read write"` matches `claim_value = "read"` or
+/// `"write"`. `aud` returns every audience entry. Other fields return
+/// their value as a single element when present.
+fn first_class_claim_values(claims: &Claims, path: &str) -> Vec<String> {
+    match path {
+        "sub" => claims.sub.iter().cloned().collect(),
+        "azp" => claims.azp.iter().cloned().collect(),
+        "client_id" => claims.client_id.iter().cloned().collect(),
+        "aud" => claims.aud.0.clone(),
+        "scope" => claims
+            .scope
+            .as_deref()
+            .unwrap_or("")
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
 
 /// Resolve a dot-separated claim path to a list of string values.
 ///
@@ -3240,6 +3275,52 @@ mod tests {
         let mut extra = HashMap::new();
         extra.insert("count".into(), serde_json::json!(42));
         assert!(resolve_claim_path(&extra, "count").is_empty());
+    }
+
+    fn make_claims(json: serde_json::Value) -> Claims {
+        serde_json::from_value(json).expect("test claims must deserialize")
+    }
+
+    #[test]
+    fn first_class_scope_claim_splits_on_whitespace() {
+        let claims = make_claims(serde_json::json!({
+            "iss": "https://issuer.example.com",
+            "exp": 9_999_999_999_u64,
+            "scope": "read write admin",
+        }));
+        let values = first_class_claim_values(&claims, "scope");
+        assert_eq!(values, vec!["read", "write", "admin"]);
+    }
+
+    #[test]
+    fn first_class_sub_claim_returns_single_value() {
+        let claims = make_claims(serde_json::json!({
+            "iss": "https://issuer.example.com",
+            "exp": 9_999_999_999_u64,
+            "sub": "service-account-orders",
+        }));
+        let values = first_class_claim_values(&claims, "sub");
+        assert_eq!(values, vec!["service-account-orders"]);
+    }
+
+    #[test]
+    fn first_class_aud_claim_returns_every_audience() {
+        let claims = make_claims(serde_json::json!({
+            "iss": "https://issuer.example.com",
+            "exp": 9_999_999_999_u64,
+            "aud": ["api-a", "api-b"],
+        }));
+        let values = first_class_claim_values(&claims, "aud");
+        assert_eq!(values, vec!["api-a", "api-b"]);
+    }
+
+    #[test]
+    fn first_class_unknown_path_returns_empty() {
+        let claims = make_claims(serde_json::json!({
+            "iss": "https://issuer.example.com",
+            "exp": 9_999_999_999_u64,
+        }));
+        assert!(first_class_claim_values(&claims, "realm_access.roles").is_empty());
     }
 
     // -----------------------------------------------------------------------
