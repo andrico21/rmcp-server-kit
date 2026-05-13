@@ -16,7 +16,10 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -676,12 +679,27 @@ pub struct OAuthConfig {
     pub max_jwks_keys: usize,
     /// Enforce strict audience validation using only the JWT `aud` claim.
     ///
-    /// **Default: `false`.** When `false`, rmcp-server-kit preserves the
-    /// historical compatibility behavior of accepting either
-    /// `aud.contains(audience)` or `azp == audience`. New deployments should
-    /// prefer `true` so the resource-server check follows `aud` only.
+    /// **Deprecated since 1.7.0.** Use [`OAuthConfig::audience_validation_mode`]
+    /// instead. When [`OAuthConfig::audience_validation_mode`] is `None`,
+    /// this flag is consulted: `true` resolves to
+    /// [`AudienceValidationMode::Strict`], `false`/unset resolves to
+    /// [`AudienceValidationMode::Warn`] (the new default — accepts
+    /// `azp`-only matches with a one-shot warn log; previously silent).
     #[serde(default)]
+    #[deprecated(
+        since = "1.7.0",
+        note = "use `audience_validation_mode` instead; this field is consulted only when `audience_validation_mode` is None"
+    )]
     pub strict_audience_validation: bool,
+    /// How the resource server treats `azp` when validating JWT audience.
+    ///
+    /// When `None` (default), resolution falls back to
+    /// [`OAuthConfig::strict_audience_validation`] for backward
+    /// compatibility: `true` ⇒ [`AudienceValidationMode::Strict`],
+    /// `false`/unset ⇒ [`AudienceValidationMode::Warn`].
+    /// Set this field explicitly to make the policy unambiguous.
+    #[serde(default)]
+    pub audience_validation_mode: Option<AudienceValidationMode>,
     /// Maximum size of a JWKS HTTP response body in bytes.
     /// Responses exceeding this cap are refused and logged; the cache
     /// remains empty / unchanged. Default: 1 MiB.
@@ -701,6 +719,41 @@ const fn default_jwks_max_bytes() -> u64 {
     1024 * 1024
 }
 
+/// How the resource server treats `azp` when validating JWT audience.
+///
+/// **Background.** RFC 9068 §4 + OIDC Core §2 establish `aud` as the
+/// authoritative resource-server claim and `azp` as the authorized-party
+/// (client) claim. Some OAuth deployments — typically when the MCP server
+/// acts as both OAuth client *and* resource server (the documented
+/// [`OAuthProxyConfig`] topology) — issue tokens where the configured
+/// audience appears only in `azp`. This enum lets operators decide
+/// whether that historic compatibility fallback is honored, surfaced via
+/// a one-shot warning, or refused.
+///
+/// **Default**: [`AudienceValidationMode::Warn`] — accepts `azp`-only
+/// matches but emits a `tracing::warn!` once per process so operators
+/// can detect and migrate token-issuing IdP configurations toward
+/// populating `aud` correctly. Future major versions may default to
+/// [`AudienceValidationMode::Strict`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AudienceValidationMode {
+    /// Accept `aud` matches and `azp`-only matches silently. Pre-1.7
+    /// behavior. Use only when the IdP cannot be reconfigured to
+    /// populate `aud`.
+    Permissive,
+    /// Accept `aud` matches silently. Accept `azp`-only matches with a
+    /// one-shot `tracing::warn!` per process. Reject neither. **Default
+    /// since 1.7.0.**
+    #[default]
+    Warn,
+    /// Accept only `aud` matches. Reject `azp`-only matches as audience
+    /// mismatch. Recommended for new deployments and any IdP that can
+    /// be configured to populate `aud` reliably.
+    Strict,
+}
+
 impl Default for OAuthConfig {
     fn default() -> Self {
         Self {
@@ -716,7 +769,12 @@ impl Default for OAuthConfig {
             ca_cert_path: None,
             allow_http_oauth_urls: false,
             max_jwks_keys: default_max_jwks_keys(),
+            #[allow(
+                deprecated,
+                reason = "default-construct deprecated field for backward compat"
+            )]
             strict_audience_validation: false,
+            audience_validation_mode: None,
             jwks_max_response_bytes: default_jwks_max_bytes(),
             ssrf_allowlist: None,
         }
@@ -724,6 +782,24 @@ impl Default for OAuthConfig {
 }
 
 impl OAuthConfig {
+    /// Resolve the effective audience-validation policy.
+    ///
+    /// Precedence: explicit `audience_validation_mode` overrides the
+    /// legacy `strict_audience_validation` flag. When neither is set,
+    /// the default is [`AudienceValidationMode::Warn`].
+    #[must_use]
+    pub fn effective_audience_validation_mode(&self) -> AudienceValidationMode {
+        if let Some(mode) = self.audience_validation_mode {
+            return mode;
+        }
+        #[allow(deprecated, reason = "intentional: legacy flag resolution path")]
+        if self.strict_audience_validation {
+            AudienceValidationMode::Strict
+        } else {
+            AudienceValidationMode::Warn
+        }
+    }
+
     /// Start building an [`OAuthConfig`] with the three required fields.
     ///
     /// All other fields default to the same values as
@@ -986,8 +1062,34 @@ impl OAuthConfigBuilder {
 
     /// Toggle strict audience validation so only the JWT `aud` claim is
     /// considered and the compatibility fallback to `azp` is disabled.
+    ///
+    /// **Deprecated since 1.7.0.** Prefer
+    /// [`OAuthConfigBuilder::audience_validation_mode`] for explicit
+    /// three-state policy. This method clears
+    /// `audience_validation_mode` so the legacy bool resolution path
+    /// applies.
+    #[deprecated(since = "1.7.0", note = "use `audience_validation_mode` instead")]
     pub const fn strict_audience_validation(mut self, strict: bool) -> Self {
-        self.inner.strict_audience_validation = strict;
+        #[allow(
+            deprecated,
+            reason = "intentional: deprecated builder forwards to deprecated field"
+        )]
+        {
+            self.inner.strict_audience_validation = strict;
+        }
+        self.inner.audience_validation_mode = None;
+        self
+    }
+
+    /// Set the audience-validation policy explicitly.
+    ///
+    /// Takes precedence over the deprecated
+    /// [`OAuthConfigBuilder::strict_audience_validation`] flag. See
+    /// [`AudienceValidationMode`] for variant semantics. Defaults to
+    /// [`AudienceValidationMode::Warn`] when neither this method nor the
+    /// legacy flag is set.
+    pub const fn audience_validation_mode(mut self, mode: AudienceValidationMode) -> Self {
+        self.inner.audience_validation_mode = Some(mode);
         self
     }
 
@@ -1313,11 +1415,14 @@ pub struct JwksCache {
     inner: RwLock<Option<CachedKeys>>,
     http: reqwest::Client,
     validation_template: Validation,
-    /// Expected audience value from config - checked manually against
-    /// `aud` (array) and, unless strict validation is enabled, optionally
-    /// `azp` (authorized-party) for backward compatibility.
+    /// Expected audience value from config; checked against `aud` and,
+    /// per `audience_mode`, optionally `azp`.
     expected_audience: String,
-    strict_audience_validation: bool,
+    audience_mode: AudienceValidationMode,
+    /// Set to `true` after the first `azp`-only audience match while in
+    /// [`AudienceValidationMode::Warn`], so the deprecation warning logs
+    /// at most once per process lifetime.
+    azp_fallback_warned: AtomicBool,
     scopes: Vec<ScopeMapping>,
     role_claim: Option<String>,
     role_mappings: Vec<RoleMapping>,
@@ -1468,7 +1573,8 @@ impl JwksCache {
             http,
             validation_template: validation,
             expected_audience: config.audience.clone(),
-            strict_audience_validation: config.strict_audience_validation,
+            audience_mode: config.effective_audience_validation_mode(),
+            azp_fallback_warned: AtomicBool::new(false),
             scopes: config.scopes.clone(),
             role_claim: config.role_claim.clone(),
             role_mappings: config.role_mappings.clone(),
@@ -1622,27 +1728,47 @@ impl JwksCache {
 
     /// Manual audience check.
     ///
-    /// By default (`strict_audience_validation = false`), rmcp-server-kit
-    /// preserves the compatibility behavior of accepting either
-    /// `aud.contains(expected_audience)` or `azp == expected_audience`.
-    /// When [`OAuthConfig::strict_audience_validation`] is `true`, only the
-    /// `aud` claim is considered and the `azp` fallback is ignored.
+    /// Resolves per [`AudienceValidationMode`]: `aud` matches always
+    /// accept silently. `azp`-only matches accept silently in
+    /// [`AudienceValidationMode::Permissive`], accept with a one-shot
+    /// `tracing::warn!` per process in [`AudienceValidationMode::Warn`],
+    /// and reject in [`AudienceValidationMode::Strict`]. No-claim-match
+    /// always rejects.
     fn check_audience(&self, claims: &Claims) -> Result<(), JwtValidationFailure> {
-        let aud_ok = claims.aud.contains(&self.expected_audience)
-            || (!self.strict_audience_validation
-                && claims
-                    .azp
-                    .as_deref()
-                    .is_some_and(|azp| azp == self.expected_audience));
-        if aud_ok {
+        if claims.aud.contains(&self.expected_audience) {
             return Ok(());
+        }
+        let azp_match = claims
+            .azp
+            .as_deref()
+            .is_some_and(|azp| azp == self.expected_audience);
+        if azp_match {
+            match self.audience_mode {
+                AudienceValidationMode::Permissive => return Ok(()),
+                AudienceValidationMode::Warn => {
+                    if !self.azp_fallback_warned.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(
+                            expected = %self.expected_audience,
+                            azp = ?claims.azp,
+                            "JWT accepted via deprecated `azp`-only audience fallback. \
+                             Configure your IdP to populate `aud`, or set \
+                             `audience_validation_mode = \"strict\"` once tokens carry `aud` correctly. \
+                             To silence this warning without changing acceptance, \
+                             set `audience_validation_mode = \"permissive\"`. \
+                             This warning logs once per process."
+                        );
+                    }
+                    return Ok(());
+                }
+                AudienceValidationMode::Strict => {}
+            }
         }
         core::hint::cold_path();
         tracing::debug!(
             aud = ?claims.aud.0,
             azp = ?claims.azp,
             expected = %self.expected_audience,
-            strict = self.strict_audience_validation,
+            mode = ?self.audience_mode,
             "JWT rejected: audience mismatch"
         );
         Err(JwtValidationFailure::Invalid)
@@ -2651,7 +2777,12 @@ mod tests {
             ca_cert_path: None,
             allow_http_oauth_urls: false,
             max_jwks_keys: default_max_jwks_keys(),
+            #[allow(
+                deprecated,
+                reason = "test fixture: explicit value for the deprecated field"
+            )]
             strict_audience_validation: false,
+            audience_validation_mode: None,
             jwks_max_response_bytes: default_jwks_max_bytes(),
             ssrf_allowlist: None,
         };
@@ -3099,7 +3230,12 @@ mod tests {
             ca_cert_path: None,
             allow_http_oauth_urls: true,
             max_jwks_keys: default_max_jwks_keys(),
+            #[allow(
+                deprecated,
+                reason = "test fixture: explicit value for the deprecated field"
+            )]
             strict_audience_validation: false,
+            audience_validation_mode: None,
             jwks_max_response_bytes: default_jwks_max_bytes(),
             ssrf_allowlist: None,
         }
@@ -3473,7 +3609,12 @@ mod tests {
             ca_cert_path: None,
             allow_http_oauth_urls: true,
             max_jwks_keys: default_max_jwks_keys(),
+            #[allow(
+                deprecated,
+                reason = "test fixture: explicit value for the deprecated field"
+            )]
             strict_audience_validation: false,
+            audience_validation_mode: None,
             jwks_max_response_bytes: default_jwks_max_bytes(),
             ssrf_allowlist: None,
         }
@@ -3747,7 +3888,10 @@ mod tests {
 
         let jwks_uri = format!("{}/jwks.json", mock_server.uri());
         let mut config = test_config(&jwks_uri);
-        config.strict_audience_validation = true;
+        #[allow(deprecated, reason = "covers the legacy bool resolution path")]
+        {
+            config.strict_audience_validation = true;
+        }
         let cache = test_cache(&config);
 
         let now = jsonwebtoken::get_current_timestamp();
@@ -3770,6 +3914,149 @@ mod tests {
             .await
             .expect_err("strict audience validation must ignore azp fallback");
         assert_eq!(failure, JwtValidationFailure::Invalid);
+    }
+
+    #[tokio::test]
+    async fn warn_mode_accepts_azp_only_match_and_warns_once() {
+        let kid = "test-audience-warn-mode";
+        let (pem, jwks) = generate_test_keypair(kid);
+
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/jwks.json"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&jwks))
+            .mount(&mock_server)
+            .await;
+
+        let jwks_uri = format!("{}/jwks.json", mock_server.uri());
+        let mut config = test_config(&jwks_uri);
+        config.audience_validation_mode = Some(AudienceValidationMode::Warn);
+        let cache = test_cache(&config);
+
+        let now = jsonwebtoken::get_current_timestamp();
+        let claims = serde_json::json!({
+            "iss": "https://auth.test.local",
+            "aud": "https://some-other-resource.example.com",
+            "azp": "https://mcp.test.local/mcp",
+            "sub": "warn-client",
+            "scope": "mcp:read",
+            "exp": now + 3600,
+            "iat": now,
+        });
+        let token = mint_token_with_claims(&pem, kid, &claims);
+
+        let identity = cache
+            .validate_token_with_reason(&token)
+            .await
+            .expect("warn mode must accept azp-only match");
+        assert_eq!(identity.role, "viewer");
+        assert!(
+            cache.azp_fallback_warned.load(Ordering::Relaxed),
+            "warn-once flag should be set after first azp-only match"
+        );
+
+        let token2 = mint_token_with_claims(&pem, kid, &claims);
+        cache
+            .validate_token_with_reason(&token2)
+            .await
+            .expect("warn mode must continue accepting subsequent matches");
+        assert!(
+            cache.azp_fallback_warned.load(Ordering::Relaxed),
+            "warn-once flag must remain set; the assertion guards against accidental clearing"
+        );
+    }
+
+    #[tokio::test]
+    async fn permissive_mode_accepts_azp_only_match_silently() {
+        let kid = "test-audience-permissive-mode";
+        let (pem, jwks) = generate_test_keypair(kid);
+
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/jwks.json"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&jwks))
+            .mount(&mock_server)
+            .await;
+
+        let jwks_uri = format!("{}/jwks.json", mock_server.uri());
+        let mut config = test_config(&jwks_uri);
+        config.audience_validation_mode = Some(AudienceValidationMode::Permissive);
+        let cache = test_cache(&config);
+
+        let now = jsonwebtoken::get_current_timestamp();
+        let token = mint_token_with_claims(
+            &pem,
+            kid,
+            &serde_json::json!({
+                "iss": "https://auth.test.local",
+                "aud": "https://some-other-resource.example.com",
+                "azp": "https://mcp.test.local/mcp",
+                "sub": "permissive-client",
+                "scope": "mcp:read",
+                "exp": now + 3600,
+                "iat": now,
+            }),
+        );
+
+        cache
+            .validate_token_with_reason(&token)
+            .await
+            .expect("permissive mode must accept azp-only match");
+        assert!(
+            !cache.azp_fallback_warned.load(Ordering::Relaxed),
+            "permissive mode must not flip the warn-once flag"
+        );
+    }
+
+    #[test]
+    fn audience_validation_mode_overrides_legacy_bool() {
+        let mut config = OAuthConfig::default();
+        #[allow(deprecated, reason = "covers the precedence rule for the legacy bool")]
+        {
+            config.strict_audience_validation = false;
+        }
+        config.audience_validation_mode = Some(AudienceValidationMode::Strict);
+        assert_eq!(
+            config.effective_audience_validation_mode(),
+            AudienceValidationMode::Strict,
+            "explicit mode must override legacy false"
+        );
+
+        let mut config = OAuthConfig::default();
+        #[allow(deprecated, reason = "covers the precedence rule for the legacy bool")]
+        {
+            config.strict_audience_validation = true;
+        }
+        config.audience_validation_mode = Some(AudienceValidationMode::Permissive);
+        assert_eq!(
+            config.effective_audience_validation_mode(),
+            AudienceValidationMode::Permissive,
+            "explicit mode must override legacy true"
+        );
+    }
+
+    #[test]
+    fn audience_validation_mode_default_is_warn_when_unset() {
+        let config = OAuthConfig::default();
+        assert_eq!(
+            config.effective_audience_validation_mode(),
+            AudienceValidationMode::Warn,
+            "unset mode + unset bool must resolve to Warn (the new default)"
+        );
+    }
+
+    #[test]
+    fn audience_validation_legacy_bool_true_resolves_to_strict() {
+        let mut config = OAuthConfig::default();
+        #[allow(deprecated, reason = "covers the legacy bool resolution path")]
+        {
+            config.strict_audience_validation = true;
+        }
+        assert_eq!(
+            config.effective_audience_validation_mode(),
+            AudienceValidationMode::Strict,
+            "legacy bool=true must resolve to Strict for backward compat"
+        );
     }
 
     #[derive(Clone, Default)]

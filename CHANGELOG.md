@@ -10,6 +10,24 @@ Breaking changes bump the **major** version.
 
 ### Security
 
+- **M1: OAuth audience validation now exposes a three-state policy and
+  warns by default on `azp`-only matches** (`src/oauth.rs`). The previous
+  bool-only `strict_audience_validation` flag conflated "accept silently"
+  with "reject" and defaulted to silent acceptance of `azp`-only audience
+  matches — contradicting the `audience` field doc that promised
+  exact-`aud` match. A new `OAuthConfig::audience_validation_mode:
+  Option<AudienceValidationMode>` (variants `Permissive`, `Warn`,
+  `Strict`) makes the policy explicit. The new default
+  (`AudienceValidationMode::Warn`) accepts `azp`-only matches but emits a
+  `tracing::warn!` once per process so operators can detect deployments
+  whose IdP is not populating `aud` and migrate. The legacy bool field is
+  retained for source-compat (`#[deprecated(since = "1.7.0")]`) and
+  resolves: `true` ⇒ `Strict`, `false`/unset ⇒ `Warn`. Operators wanting
+  the prior silent-acceptance behavior must set
+  `audience_validation_mode = "permissive"` explicitly. **No tokens
+  previously accepted are now rejected**; the only operator-visible
+  behavior change is a one-shot WARN log on `azp`-only matches under the
+  new default.
 - **M3: OAuth admin endpoints (`/introspect`, `/revoke`) now fail closed at
   startup when exposed without authentication** (`src/oauth.rs`,
   `src/transport.rs`). Previously a config of
