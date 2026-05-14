@@ -101,6 +101,25 @@ Breaking changes bump the **major** version.
   effectively disable rate limiting. `BoundedKeyedLimiter::new` now also
   carries a `debug_assert!(max_tracked_keys > 0)` as defense-in-depth.
 
+### Documentation
+
+- **M9: `docs/GUIDE.md` configuration tables now match the actual `config.rs`
+  schema**. Added previously-missing `ServerConfig` rows
+  (`session_idle_timeout`, `sse_keep_alive`, `public_url`,
+  `compression_enabled`, `compression_min_size`, `max_concurrent_requests`,
+  `admin_enabled`, `admin_role`, `auth`), the `ObservabilityConfig`
+  `log_request_headers` row, and the `OAuthConfig`
+  `audience_validation_mode` row. The `stdio_enabled` row now warns that
+  stdio bypasses auth/RBAC/TLS/Origin checks. The
+  `strict_audience_validation` row is marked **Deprecated since 1.7.0**
+  with the resolution semantics documented; the "new deployments"
+  recommendation snippet now uses `audience_validation_mode = "strict"`.
+- **M10: crate-level rustdoc on `src/lib.rs` expanded** with a runnable
+  `no_run` quick-start example, a feature-flag overview (`oauth`,
+  `metrics`, `test-helpers`), and a prominent security warning for
+  `transport::serve_stdio` (which bypasses auth, RBAC, TLS, Origin
+  validation, and rate limiting).
+
 ## [1.6.0] - 2026-05-13
 
 ### Security
