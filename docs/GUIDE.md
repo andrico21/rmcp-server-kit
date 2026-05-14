@@ -81,7 +81,9 @@ This gives you `/healthz`, `/readyz`, and `/mcp` endpoints out of the box.
 | Feature   | Default | Description |
 |-----------|---------|-------------|
 | `oauth`   | No      | OAuth 2.1 JWT validation via JWKS. Adds `jsonwebtoken` and `reqwest`. |
+| `oauth-mtls-client` | No | RFC 8705 §2 mTLS client authentication for the OAuth token-exchange endpoint. Implies `oauth`. Without this feature, configurations that set `TokenExchangeConfig::client_cert` are rejected at startup by `OAuthConfig::validate`. See Recipe 2 for usage. |
 | `metrics` | No      | Prometheus metrics endpoint on a separate listener. Adds `prometheus`. |
+| `test-helpers` | No | Exposes test-only helpers from `bounded_limiter` and `mtls_revocation` for downstream integration tests. **Not part of the stable API surface** -- no semver guarantees across minor releases. |
 
 Enable in `Cargo.toml`:
 
@@ -1466,11 +1468,11 @@ let proxy = OAuthProxyConfig::builder(
 .build();
 
 let token_exchange = TokenExchangeConfig::new(
-    "https://downstream.example.com/oauth/token",
-    "downstream-client-id",
-    SecretString::new("downstream-secret".into()),
-    None,                                     // optional client cert (mTLS)
-    "downstream-audience",
+    "https://downstream.example.com/oauth/token".to_string(),
+    "downstream-client-id".to_string(),
+    Some(SecretString::new("downstream-secret".into())),  // RFC 6749 §2.3.1 client_secret
+    None,                                                 // RFC 8705 §2 client_cert (mTLS) -- see below
+    "downstream-audience".to_string(),
 );
 
 let oauth = OAuthConfig::builder(
@@ -1482,6 +1484,28 @@ let oauth = OAuthConfig::builder(
 .token_exchange(token_exchange)
 .build();
 ```
+
+`OAuthConfig::validate` enforces RFC 8705 §2 mutual exclusion: pass exactly one of `client_secret` or `client_cert`. Passing both, or neither, is a startup error.
+
+**RFC 8705 §2 mTLS client authentication** (requires the `oauth-mtls-client` cargo feature):
+
+```rust,ignore
+use std::path::PathBuf;
+use rmcp_server_kit::oauth::{ClientCertConfig, TokenExchangeConfig};
+
+let token_exchange = TokenExchangeConfig::new(
+    "https://downstream.example.com/oauth/token".to_string(),
+    "downstream-client-id".to_string(),
+    None,                                                 // omit client_secret
+    Some(ClientCertConfig::new(
+        PathBuf::from("/etc/certs/oauth-client.pem"),     // PEM cert (leaf or full chain)
+        PathBuf::from("/etc/certs/oauth-client.key"),     // PEM private key (PKCS#8 or RSA / EC; unencrypted)
+    )),
+    "downstream-audience".to_string(),
+);
+```
+
+Without the `oauth-mtls-client` feature enabled, a `client_cert`-bearing config fails closed at `OAuthConfig::validate` time. Cert + key paths are PEM-validated at startup (missing files, malformed PEM, and encrypted keys all surface before the first request). The token-exchange request authenticates by presenting the configured certificate at TLS handshake -- no `Authorization` header is sent -- and uses `redirect::Policy::none()` so an attacker-controlled 3xx from the token endpoint cannot re-present the client cert to a different host. Issued access tokens behave as bearer tokens once minted (`cnf.x5t#S256` certificate-binding per RFC 8705 §3 is out of scope). In-place certificate rotation requires server restart.
 
 Inside a tool handler, retrieve the (already-exchanged) downstream token via:
 

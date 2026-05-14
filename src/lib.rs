@@ -82,6 +82,10 @@
 //! - `oauth` — OAuth 2.1 Bearer JWT validation, JWKS cache, and optional
 //!   OAuth proxy endpoints. Pulls in [`jsonwebtoken`] and [`urlencoding`].
 //!   Required to use the [`oauth`] module.
+//! - `oauth-mtls-client` — RFC 8705 §2 mTLS client authentication for the
+//!   OAuth token-exchange endpoint. Implies `oauth`. Without this feature,
+//!   [`oauth::OAuthConfig::validate`] rejects any configuration that sets
+//!   [`oauth::TokenExchangeConfig::client_cert`].
 //! - `metrics` — Prometheus registry and `/metrics` listener. Pulls in
 //!   the [`prometheus`] crate. Required to use the [`metrics`] module.
 //! - `test-helpers` — exposes test-only helpers from [`bounded_limiter`] and
