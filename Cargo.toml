@@ -135,6 +135,7 @@ urlencoding = { version = "2", optional = true }
 [features]
 default = []
 oauth = ["dep:jsonwebtoken", "dep:urlencoding"]
+oauth-mtls-client = ["oauth"]
 metrics = ["dep:prometheus"]
 test-helpers = []
 

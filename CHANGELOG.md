@@ -64,6 +64,39 @@ Breaking changes bump the **major** version.
   — and folds per-slot match bits via `subtle::ConstantTimeEq`. The
   observable timing is now bounded to "one Argon2 per configured key"
   regardless of input.
+- **M-H4: OAuth token-exchange now supports RFC 8705 §2 mTLS client
+  authentication and fails closed on misconfiguration** (`src/oauth.rs`,
+  new `oauth-mtls-client` cargo feature). Previously a
+  `TokenExchangeConfig::client_cert`-only configuration silently
+  disabled client authentication: the runtime ignored the field, omitted
+  the Authorization header, and POSTed an unauthenticated token-exchange
+  request that some IdPs would accept. `OAuthConfig::validate` now
+  enforces RFC 8705 §2 mutual exclusion (exactly one of `client_secret`
+  / `client_cert`) and rejects `client_cert` configurations at startup
+  unless the `oauth-mtls-client` cargo feature is enabled. With the
+  feature enabled, the cert + key are PEM-validated at config-validate
+  time (missing files / malformed PEM / encrypted keys all surface
+  before the first request), and `exchange_token` routes through a
+  dedicated `reqwest::Client` that presents the configured TLS client
+  certificate at handshake. The cert-bearing client uses
+  `redirect::Policy::none()` so an attacker-controlled 3xx from the
+  token endpoint cannot re-present the client certificate to a
+  different host. **Scope**: implements RFC 8705 §2 (PKI-bound client
+  auth) only; RFC 8705 §3 self-signed client auth and the
+  `cnf.x5t#S256` certificate-bound access-token confirmation claim are
+  NOT enforced — issued access tokens behave as bearer tokens once
+  minted. In-place certificate rotation requires server restart.
+
+### Added
+
+- **`oauth-mtls-client` cargo feature** enabling RFC 8705 §2 mTLS
+  client authentication for the OAuth token-exchange endpoint.
+  Disabled by default; opt in via
+  `rmcp-server-kit = { version = "1", features = ["oauth-mtls-client"] }`.
+  See M-H4 entry under `### Security` for the full security rationale.
+- **`ClientCertConfig::new(cert_path, key_path)`** constructor for the
+  `#[non_exhaustive]` `ClientCertConfig` so downstream crates can build
+  one without struct-literal syntax.
 
 ### Fixed
 

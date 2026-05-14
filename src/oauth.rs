@@ -282,8 +282,24 @@ pub struct OauthHttpClient {
     /// the client (which is cheap and refcounted) does not deep-copy
     /// the parsed CIDR / host vectors.
     allowlist: Arc<crate::ssrf::CompiledSsrfAllowlist>,
+    /// M-H4: per-`(cert_path, key_path)` cache of cert-bearing
+    /// `reqwest::Client`s. Built eagerly with `redirect::Policy::none()`
+    /// so an attacker-controlled 3xx cannot re-present the client cert
+    /// to a different host (RFC 8705 §2 attack surface).
+    #[cfg(feature = "oauth-mtls-client")]
+    mtls_clients: Arc<HashMap<MtlsClientKey, reqwest::Client>>,
     #[cfg(any(test, feature = "test-helpers"))]
     test_allow_loopback_ssrf: bool,
+}
+
+/// M-H4: cache key for cert-bearing `reqwest::Client`s. Path-based
+/// (not contents-based) -- in-place cert rotation is not picked up
+/// without restart (documented limitation in `CHANGELOG.md` 1.6.0).
+#[cfg(feature = "oauth-mtls-client")]
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+struct MtlsClientKey {
+    cert_path: PathBuf,
+    key_path: PathBuf,
 }
 
 impl OauthHttpClient {
@@ -409,10 +425,16 @@ impl OauthHttpClient {
         let inner = builder.build().map_err(|e| {
             crate::error::McpxError::Startup(format!("oauth http client init: {e}"))
         })?;
+
+        #[cfg(feature = "oauth-mtls-client")]
+        let mtls_clients = build_mtls_clients(config)?;
+
         Ok(Self {
             inner,
             allow_http,
             allowlist,
+            #[cfg(feature = "oauth-mtls-client")]
+            mtls_clients,
             #[cfg(any(test, feature = "test-helpers"))]
             test_allow_loopback_ssrf: false,
         })
@@ -457,6 +479,31 @@ impl OauthHttpClient {
     #[doc(hidden)]
     pub async fn __test_get(&self, url: &str) -> reqwest::Result<reqwest::Response> {
         self.inner.get(url).send().await
+    }
+
+    /// M-H4: select the cert-bearing `reqwest::Client` cached for
+    /// `cfg.client_cert`'s paths, else the shared `inner` client.
+    /// Defence-in-depth: a missing cache entry falls through to
+    /// `inner`; combined with the Authorization-header skip in
+    /// `exchange_token`, this surfaces as an upstream auth failure
+    /// rather than silent secret-bearer fallback.
+    #[cfg(feature = "oauth-mtls-client")]
+    fn client_for(&self, cfg: &TokenExchangeConfig) -> &reqwest::Client {
+        if let Some(cc) = &cfg.client_cert {
+            let key = MtlsClientKey {
+                cert_path: cc.cert_path.clone(),
+                key_path: cc.key_path.clone(),
+            };
+            if let Some(client) = self.mtls_clients.get(&key) {
+                return client;
+            }
+        }
+        &self.inner
+    }
+
+    #[cfg(not(feature = "oauth-mtls-client"))]
+    fn client_for(&self, _cfg: &TokenExchangeConfig) -> &reqwest::Client {
+        &self.inner
     }
 }
 
@@ -909,6 +956,9 @@ impl OAuthConfig {
                     "oauth.token_exchange.token_url forbidden ({reason})"
                 )));
             }
+            // M-H4: enforce RFC 8705 §2 mutual exclusion + feature gate
+            // for token-exchange client authentication. See helper.
+            validate_token_exchange_client_auth(tx)?;
         }
         // Compile the operator allowlist (if any) at config-validate
         // time so misconfiguration is rejected up-front, before any
@@ -937,6 +987,176 @@ impl OAuthConfig {
         })?;
         Ok(())
     }
+}
+
+/// M-H4: enforce RFC 8705 §2 mutual exclusion (`client_secret` xor
+/// `client_cert`) + cargo-feature gating for token-exchange client
+/// authentication. Without this a `client_cert`-only config silently
+/// disables client auth at the token endpoint (the runtime path
+/// simply omits the Authorization header).
+fn validate_token_exchange_client_auth(
+    tx: &TokenExchangeConfig,
+) -> Result<(), crate::error::McpxError> {
+    match (&tx.client_cert, tx.client_secret.is_some()) {
+        (Some(_), true) => Err(crate::error::McpxError::Config(
+            "oauth.token_exchange: client_cert and client_secret are mutually \
+             exclusive (RFC 8705 §2). Set exactly one."
+                .into(),
+        )),
+        (None, false) => Err(crate::error::McpxError::Config(
+            "oauth.token_exchange: token exchange requires client authentication. \
+             Set either client_secret (RFC 6749 §2.3.1) or client_cert (RFC 8705 §2)."
+                .into(),
+        )),
+        (Some(cc), false) => validate_client_cert_config(cc),
+        (None, true) => Ok(()),
+    }
+}
+
+/// Validate a [`ClientCertConfig`] for RFC 8705 §2 mTLS client auth.
+///
+/// Without the `oauth-mtls-client` cargo feature this fails closed with
+/// a [`crate::error::McpxError::Config`] (M-H4: a `client_cert`-only
+/// config previously silently disabled client authentication). With the
+/// feature on, this performs the same PEM read + parse the runtime path
+/// would do, so missing files / malformed PEM / mismatched key&cert /
+/// encrypted (passphrase-protected) keys all surface at validate time
+/// rather than at first token-exchange request.
+///
+/// The returned error message includes the file path; the underlying
+/// IO / parse error stays in a `tracing::warn!` log line.
+fn validate_client_cert_config(cc: &ClientCertConfig) -> Result<(), crate::error::McpxError> {
+    #[cfg(not(feature = "oauth-mtls-client"))]
+    {
+        let _ = cc;
+        Err(crate::error::McpxError::Config(
+            "oauth.token_exchange.client_cert requires the `oauth-mtls-client` cargo feature; \
+             rebuild rmcp-server-kit with --features oauth-mtls-client (or have your \
+             application crate enable it via `rmcp-server-kit/oauth-mtls-client`), or remove \
+             the field"
+                .into(),
+        ))
+    }
+    #[cfg(feature = "oauth-mtls-client")]
+    {
+        let cert_bytes = std::fs::read(&cc.cert_path).map_err(|e| {
+            tracing::warn!(error = %e, path = %cc.cert_path.display(), "client cert read failed");
+            crate::error::McpxError::Config(format!(
+                "oauth.token_exchange.client_cert.cert_path unreadable: {}",
+                cc.cert_path.display()
+            ))
+        })?;
+        let key_bytes = std::fs::read(&cc.key_path).map_err(|e| {
+            tracing::warn!(error = %e, path = %cc.key_path.display(), "client cert key read failed");
+            crate::error::McpxError::Config(format!(
+                "oauth.token_exchange.client_cert.key_path unreadable: {}",
+                cc.key_path.display()
+            ))
+        })?;
+        let mut combined = Vec::with_capacity(cert_bytes.len() + 1 + key_bytes.len());
+        combined.extend_from_slice(&cert_bytes);
+        if !cert_bytes.ends_with(b"\n") {
+            combined.push(b'\n');
+        }
+        combined.extend_from_slice(&key_bytes);
+        let _identity = reqwest::Identity::from_pem(&combined).map_err(|e| {
+            tracing::warn!(
+                error = %e,
+                cert_path = %cc.cert_path.display(),
+                key_path = %cc.key_path.display(),
+                "client cert PEM parse failed"
+            );
+            crate::error::McpxError::Config(format!(
+                "oauth.token_exchange.client_cert: PEM parse failed (cert={}, key={})",
+                cc.cert_path.display(),
+                cc.key_path.display()
+            ))
+        })?;
+        Ok(())
+    }
+}
+
+/// M-H4: build the `(cert_path, key_path) -> reqwest::Client` cache
+/// consulted by [`OauthHttpClient::client_for`]. Each cert-bearing
+/// client uses `redirect::Policy::none()` (RFC 8705 §2: never present
+/// the client cert to a redirect target the operator did not approve)
+/// and inherits the same `ca_cert_path`, connect/total timeouts as
+/// the shared `inner` client. Returns an empty map when no
+/// `token_exchange.client_cert` is configured.
+#[cfg(feature = "oauth-mtls-client")]
+fn build_mtls_clients(
+    config: Option<&OAuthConfig>,
+) -> Result<Arc<HashMap<MtlsClientKey, reqwest::Client>>, crate::error::McpxError> {
+    let mut map: HashMap<MtlsClientKey, reqwest::Client> = HashMap::new();
+    let Some(cfg) = config else {
+        return Ok(Arc::new(map));
+    };
+    let Some(tx) = &cfg.token_exchange else {
+        return Ok(Arc::new(map));
+    };
+    let Some(cc) = &tx.client_cert else {
+        return Ok(Arc::new(map));
+    };
+
+    let cert_bytes = std::fs::read(&cc.cert_path).map_err(|e| {
+        crate::error::McpxError::Startup(format!(
+            "oauth http client mTLS: read cert_path {}: {e}",
+            cc.cert_path.display()
+        ))
+    })?;
+    let key_bytes = std::fs::read(&cc.key_path).map_err(|e| {
+        crate::error::McpxError::Startup(format!(
+            "oauth http client mTLS: read key_path {}: {e}",
+            cc.key_path.display()
+        ))
+    })?;
+    let mut combined = Vec::with_capacity(cert_bytes.len() + 1 + key_bytes.len());
+    combined.extend_from_slice(&cert_bytes);
+    if !cert_bytes.ends_with(b"\n") {
+        combined.push(b'\n');
+    }
+    combined.extend_from_slice(&key_bytes);
+    let identity = reqwest::Identity::from_pem(&combined).map_err(|e| {
+        crate::error::McpxError::Startup(format!(
+            "oauth http client mTLS: PEM parse (cert={}, key={}): {e}",
+            cc.cert_path.display(),
+            cc.key_path.display()
+        ))
+    })?;
+
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .identity(identity);
+
+    if let Some(ref ca_path) = cfg.ca_cert_path {
+        let pem = std::fs::read(ca_path).map_err(|e| {
+            crate::error::McpxError::Startup(format!(
+                "oauth http client mTLS: read ca_cert_path {}: {e}",
+                ca_path.display()
+            ))
+        })?;
+        let cert = reqwest::tls::Certificate::from_pem(&pem).map_err(|e| {
+            crate::error::McpxError::Startup(format!(
+                "oauth http client mTLS: parse ca_cert_path {}: {e}",
+                ca_path.display()
+            ))
+        })?;
+        builder = builder.add_root_certificate(cert);
+    }
+
+    let client = builder.build().map_err(|e| {
+        crate::error::McpxError::Startup(format!("oauth http client mTLS init: {e}"))
+    })?;
+    map.insert(
+        MtlsClientKey {
+            cert_path: cc.cert_path.clone(),
+            key_path: cc.key_path.clone(),
+        },
+        client,
+    );
+    Ok(Arc::new(map))
 }
 
 /// Parse `raw` as a URL and enforce the HTTPS-only policy.
@@ -1154,12 +1374,23 @@ pub struct TokenExchangeConfig {
     pub token_url: String,
     /// OAuth `client_id` of the MCP server (the requester).
     pub client_id: String,
-    /// OAuth `client_secret` for confidential-client authentication.
-    /// Omit when using `client_cert` (mTLS) instead.
+    /// OAuth `client_secret` for confidential-client authentication
+    /// (RFC 6749 §2.3.1 HTTP Basic). Mutually exclusive with
+    /// `client_cert` -- [`OAuthConfig::validate`] rejects configs
+    /// that set both, or neither.
     pub client_secret: Option<secrecy::SecretString>,
-    /// Client certificate for mTLS-based client authentication.
-    /// When set, the exchange request authenticates with a TLS client
-    /// certificate instead of a shared secret.
+    /// Client certificate for RFC 8705 §2 mTLS client authentication.
+    /// When set, the exchange request authenticates by presenting the
+    /// configured cert at TLS handshake (no Authorization header is
+    /// sent). Requires the `oauth-mtls-client` cargo feature; without
+    /// it, [`OAuthConfig::validate`] fails closed.
+    ///
+    /// **Scope**: implements RFC 8705 §2 only (PKI-bound client
+    /// auth). RFC 8705 §3 self-signed client auth and the
+    /// `cnf.x5t#S256` certificate-bound access-token confirmation
+    /// claim are NOT enforced; the issued access token behaves like a
+    /// bearer token once minted. In-place certificate rotation is
+    /// not picked up without restart.
     pub client_cert: Option<ClientCertConfig>,
     /// Target audience - the `client_id` of the downstream API
     /// (e.g. `upstream-api`).  The exchanged token will have this
@@ -1187,15 +1418,32 @@ impl TokenExchangeConfig {
     }
 }
 
-/// Client certificate paths for mTLS-based client authentication
-/// at the token exchange endpoint.
+/// Client certificate paths for RFC 8705 §2 mTLS client
+/// authentication at the token exchange endpoint. Requires the
+/// `oauth-mtls-client` cargo feature.
 #[derive(Debug, Clone, Deserialize)]
 #[non_exhaustive]
 pub struct ClientCertConfig {
-    /// Path to the PEM-encoded client certificate.
+    /// Path to the PEM-encoded client certificate (X.509, single
+    /// leaf or full chain). Read once at server startup.
     pub cert_path: PathBuf,
-    /// Path to the PEM-encoded private key.
+    /// Path to the PEM-encoded private key (PKCS#8 or RSA / EC).
+    /// Encrypted (passphrase-protected) keys are NOT supported and
+    /// fail closed at config validation.
     pub key_path: PathBuf,
+}
+
+impl ClientCertConfig {
+    /// Construct a `ClientCertConfig`. Required because the struct is
+    /// `#[non_exhaustive]` and so cannot be built with a struct literal
+    /// from outside the crate.
+    #[must_use]
+    pub fn new(cert_path: PathBuf, key_path: PathBuf) -> Self {
+        Self {
+            cert_path,
+            key_path,
+        }
+    }
 }
 
 /// Successful response from an RFC 8693 token exchange.
@@ -2572,14 +2820,23 @@ pub async fn exchange_token(
 ) -> Result<ExchangedToken, crate::error::McpxError> {
     use secrecy::ExposeSecret;
 
-    let mut req = http
-        .inner
+    let client = http.client_for(config);
+    let mut req = client
         .post(&config.token_url)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .header("Accept", "application/json");
 
-    // Client authentication: HTTP Basic if client_secret is present.
-    if let Some(ref secret) = config.client_secret {
+    // M-H4: client authentication strategy.
+    //   * `client_secret` set -> RFC 6749 §2.3.1 HTTP Basic.
+    //   * `client_cert`   set -> RFC 8705 §2 mTLS via the cert-bearing
+    //     `reqwest::Client` selected by `client_for`. NO Authorization
+    //     header is sent: presenting a TLS client certificate at
+    //     handshake time *is* the client authentication.
+    // `OAuthConfig::validate` enforces exactly-one-of so neither both
+    // nor neither reach this code path.
+    if config.client_cert.is_none()
+        && let Some(ref secret) = config.client_secret
+    {
         use base64::Engine;
         let credentials = base64::engine::general_purpose::STANDARD.encode(format!(
             "{}:{}",
@@ -2588,7 +2845,6 @@ pub async fn exchange_token(
         ));
         req = req.header("Authorization", format!("Basic {credentials}"));
     }
-    // TODO: mTLS client cert auth when config.client_cert is set.
 
     let form_body = build_exchange_form(config, subject_token);
 
@@ -3060,7 +3316,7 @@ mod tests {
         cfg.token_exchange = Some(TokenExchangeConfig::new(
             "http://idp.local/token".into(),
             "client".into(),
-            None,
+            Some(secrecy::SecretString::new("dev-secret".into())),
             None,
             "downstream".into(),
         ));
@@ -4587,6 +4843,188 @@ mod tests {
         assert_eq!(
             m["revocation_endpoint"],
             serde_json::Value::String("https://mcp.local/revoke".into())
+        );
+    }
+
+    // ---------- M-H4: token-exchange client authentication ----------
+
+    fn https_cfg_with_tx(tx: TokenExchangeConfig) -> OAuthConfig {
+        let mut cfg = validation_https_config();
+        cfg.token_exchange = Some(tx);
+        cfg
+    }
+
+    fn tx_with(
+        client_secret: Option<&str>,
+        client_cert: Option<ClientCertConfig>,
+    ) -> TokenExchangeConfig {
+        TokenExchangeConfig::new(
+            "https://idp.example.com/token".into(),
+            "client".into(),
+            client_secret.map(|s| secrecy::SecretString::new(s.into())),
+            client_cert,
+            "downstream".into(),
+        )
+    }
+
+    #[test]
+    fn validate_rejects_token_exchange_without_client_auth() {
+        let cfg = https_cfg_with_tx(tx_with(None, None));
+        let err = cfg
+            .validate()
+            .expect_err("token_exchange without client auth must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("requires client authentication"),
+            "error must explain missing client auth; got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_token_exchange_with_both_secret_and_cert() {
+        let cc = ClientCertConfig {
+            cert_path: PathBuf::from("/nonexistent/cert.pem"),
+            key_path: PathBuf::from("/nonexistent/key.pem"),
+        };
+        let cfg = https_cfg_with_tx(tx_with(Some("s"), Some(cc)));
+        let err = cfg
+            .validate()
+            .expect_err("client_secret + client_cert must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("mutually") && msg.contains("exclusive"),
+            "error must explain mutual exclusion; got {msg:?}"
+        );
+    }
+
+    #[cfg(not(feature = "oauth-mtls-client"))]
+    #[test]
+    fn validate_rejects_client_cert_without_feature() {
+        let cc = ClientCertConfig {
+            cert_path: PathBuf::from("/nonexistent/cert.pem"),
+            key_path: PathBuf::from("/nonexistent/key.pem"),
+        };
+        let cfg = https_cfg_with_tx(tx_with(None, Some(cc)));
+        let err = cfg
+            .validate()
+            .expect_err("client_cert without feature must be rejected");
+        assert!(
+            err.to_string().contains("oauth-mtls-client"),
+            "error must reference the cargo feature; got {err}"
+        );
+    }
+
+    #[cfg(feature = "oauth-mtls-client")]
+    #[test]
+    fn validate_rejects_missing_client_cert_files() {
+        let cc = ClientCertConfig {
+            cert_path: PathBuf::from("/nonexistent/cert.pem"),
+            key_path: PathBuf::from("/nonexistent/key.pem"),
+        };
+        let cfg = https_cfg_with_tx(tx_with(None, Some(cc)));
+        let err = cfg
+            .validate()
+            .expect_err("missing cert file must be rejected");
+        assert!(
+            err.to_string().contains("unreadable"),
+            "error must call out unreadable file; got {err}"
+        );
+    }
+
+    #[cfg(feature = "oauth-mtls-client")]
+    #[test]
+    fn validate_rejects_malformed_client_cert_pem() {
+        let dir = std::env::temp_dir();
+        let cert = dir.join(format!("rmcp-mtls-bad-cert-{}.pem", std::process::id()));
+        let key = dir.join(format!("rmcp-mtls-bad-key-{}.pem", std::process::id()));
+        std::fs::write(&cert, b"not a real PEM").expect("write tmp cert");
+        std::fs::write(&key, b"not a real PEM either").expect("write tmp key");
+        let cc = ClientCertConfig {
+            cert_path: cert.clone(),
+            key_path: key.clone(),
+        };
+        let cfg = https_cfg_with_tx(tx_with(None, Some(cc)));
+        let err = cfg.validate().expect_err("malformed PEM must be rejected");
+        let _ = std::fs::remove_file(&cert);
+        let _ = std::fs::remove_file(&key);
+        assert!(
+            err.to_string().contains("PEM parse failed"),
+            "error must call out PEM parse failure; got {err}"
+        );
+    }
+
+    #[cfg(feature = "oauth-mtls-client")]
+    fn write_self_signed_pem() -> (PathBuf, PathBuf) {
+        let cert = rcgen::generate_simple_self_signed(vec!["client.test".into()]).expect("rcgen");
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let nonce: u64 = rand::random();
+        let cert_path = dir.join(format!("rmcp-mtls-cert-{pid}-{nonce}.pem"));
+        let key_path = dir.join(format!("rmcp-mtls-key-{pid}-{nonce}.pem"));
+        std::fs::write(&cert_path, cert.cert.pem()).expect("write cert");
+        std::fs::write(&key_path, cert.signing_key.serialize_pem()).expect("write key");
+        (cert_path, key_path)
+    }
+
+    #[cfg(feature = "oauth-mtls-client")]
+    fn install_test_crypto_provider() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    #[cfg(feature = "oauth-mtls-client")]
+    #[test]
+    fn validate_accepts_well_formed_client_cert() {
+        install_test_crypto_provider();
+        let (cert_path, key_path) = write_self_signed_pem();
+        let cc = ClientCertConfig {
+            cert_path: cert_path.clone(),
+            key_path: key_path.clone(),
+        };
+        let cfg = https_cfg_with_tx(tx_with(None, Some(cc)));
+        let res = cfg.validate();
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+        res.expect("well-formed cert+key must validate");
+    }
+
+    #[cfg(feature = "oauth-mtls-client")]
+    #[test]
+    fn client_for_returns_cached_mtls_client() {
+        install_test_crypto_provider();
+        let (cert_path, key_path) = write_self_signed_pem();
+        let cc = ClientCertConfig {
+            cert_path: cert_path.clone(),
+            key_path: key_path.clone(),
+        };
+        let cfg = https_cfg_with_tx(tx_with(None, Some(cc)));
+        let http = OauthHttpClient::with_config(&cfg).expect("build mtls client");
+        let tx_ref = cfg.token_exchange.as_ref().expect("tx set");
+        let cert_client = http.client_for(tx_ref);
+        let inner_client = http.client_for(&tx_with(Some("s"), None));
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+        assert!(
+            !std::ptr::eq(cert_client, inner_client),
+            "client_for must return distinct clients for cert vs no-cert configs"
+        );
+    }
+
+    #[cfg(feature = "oauth-mtls-client")]
+    #[test]
+    fn client_for_falls_back_to_inner_when_cache_miss() {
+        install_test_crypto_provider();
+        let cfg = validation_https_config();
+        let http = OauthHttpClient::with_config(&cfg).expect("build client");
+        let unrelated_cc = ClientCertConfig {
+            cert_path: PathBuf::from("/cache/miss/cert.pem"),
+            key_path: PathBuf::from("/cache/miss/key.pem"),
+        };
+        let tx_unknown = tx_with(None, Some(unrelated_cc));
+        let fallback = http.client_for(&tx_unknown);
+        let inner = http.client_for(&tx_with(Some("s"), None));
+        assert!(
+            std::ptr::eq(fallback, inner),
+            "cache miss must fall back to inner client"
         );
     }
 }
