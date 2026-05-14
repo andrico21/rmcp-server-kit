@@ -976,6 +976,74 @@ Configuration is validated up-front:
   naming the host and CIDR counts so the elevated trust is auditable.
 
 
+#### `OAuthProxyConfig` (optional)
+
+Optional sub-table that turns rmcp-server-kit into an OAuth proxy in front of an upstream IdP. When present, MCP clients see this server as the authorization server and perform a standard Authorization Code + PKCE flow; rmcp-server-kit forwards `/oauth/authorize`, `/oauth/token`, and -- when the relevant URLs and `expose_admin_endpoints` are set -- `/introspect` and `/revoke` to the upstream IdP, injecting `client_id` and `client_secret` as required.
+
+```toml
+[server.auth.oauth.proxy]
+authorize_url = "https://auth.example.com/oauth/authorize"
+token_url = "https://auth.example.com/oauth/token"
+client_id = "my-mcp-server"
+client_secret = "..."                                    # confidential clients only
+introspection_url = "https://auth.example.com/oauth/introspect"
+revocation_url = "https://auth.example.com/oauth/revoke"
+expose_admin_endpoints = true
+require_auth_on_admin_endpoints = true                   # recommended for new deployments
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `authorize_url` | `String` | -- | Upstream authorization endpoint. |
+| `token_url` | `String` | -- | Upstream token endpoint. |
+| `client_id` | `String` | -- | OAuth `client_id` registered at the upstream IdP. |
+| `client_secret` | `Option<SecretString>` | `None` | OAuth `client_secret` for confidential clients. Omit (TOML: leave unset) for public clients. |
+| `introspection_url` | `Option<String>` | `None` | Upstream RFC 7662 introspection endpoint. Local `/introspect` is exposed only when this is set **and** `expose_admin_endpoints = true`. |
+| `revocation_url` | `Option<String>` | `None` | Upstream RFC 7009 revocation endpoint. Local `/revoke` is exposed only when this is set **and** `expose_admin_endpoints = true`. |
+| `expose_admin_endpoints` | `bool` | `false` | Mount `/introspect` and `/revoke`, and advertise them in the authorization-server metadata document. When `false` both endpoints return 404. |
+| `require_auth_on_admin_endpoints` | `bool` | `false` | Run the normal authentication middleware before `/introspect` and `/revoke`. **Recommended `true` for new deployments.** Pre-1.6 default of `false` is preserved for backward compatibility. |
+| `allow_unauthenticated_admin_endpoints` | `bool` | `false` | Operator opt-out for the M3 startup check that rejects `expose_admin_endpoints = true` combined with `require_auth_on_admin_endpoints = false`. Set `true` only when an authenticated reverse proxy / ingress screens `/introspect` and `/revoke` itself. Production should leave this `false` and set `require_auth_on_admin_endpoints = true` instead. |
+
+#### `TokenExchangeConfig` (optional)
+
+Optional sub-table that performs an RFC 8693 token exchange after authentication, swapping the inbound token for a downstream-API token that subsequent tool invocations can retrieve via `rmcp_server_kit::rbac::current_token()`.
+
+```toml
+[server.auth.oauth.token_exchange]
+token_url = "https://downstream.example.com/oauth/token"
+client_id = "downstream-client-id"
+client_secret = "..."                                    # exactly one of client_secret / client_cert
+audience = "downstream-audience"
+
+# OR -- RFC 8705 §2 mTLS client authentication (requires the `oauth-mtls-client` cargo feature):
+[server.auth.oauth.token_exchange.client_cert]
+cert_path = "/etc/certs/oauth-client.pem"
+key_path  = "/etc/certs/oauth-client.key"
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `token_url` | `String` | -- | Authorization-server token endpoint used for the exchange. |
+| `client_id` | `String` | -- | OAuth `client_id` of the MCP server (the requester). |
+| `client_secret` | `Option<SecretString>` | `None` | RFC 6749 §2.3.1 HTTP-Basic client secret. **Mutually exclusive with `client_cert`** -- `OAuthConfig::validate` rejects configs that set both, or neither. |
+| `client_cert` | `Option<ClientCertConfig>` | `None` | RFC 8705 §2 mTLS client authentication. **Requires the `oauth-mtls-client` cargo feature**; without it, `OAuthConfig::validate` fails closed at startup. See `ClientCertConfig` below. |
+| `audience` | `String` | -- | Target audience -- the `client_id` of the downstream API. The exchanged token will have this value in its `aud` claim. |
+
+#### `ClientCertConfig` (sub-table of `TokenExchangeConfig.client_cert`)
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `cert_path` | `PathBuf` | -- | Path to the PEM-encoded X.509 client certificate (single leaf or full chain). PEM-validated at startup. |
+| `key_path` | `PathBuf` | -- | Path to the PEM-encoded private key (PKCS#8 or RSA / EC). **Encrypted (passphrase-protected) keys are not supported** and are rejected at startup. |
+
+Operational notes for `client_cert`:
+
+- Cert + key files are read **once at server startup**; in-place rotation requires a process restart.
+- The token-exchange request authenticates by presenting the configured certificate at TLS handshake -- **no `Authorization` header is sent**.
+- The cert-bearing HTTP client uses `redirect::Policy::none()` so an attacker-controlled 3xx from the token endpoint cannot re-present the client certificate to a different host.
+- **Scope**: implements RFC 8705 §2 (PKI-bound client auth) only. RFC 8705 §3 self-signed client auth and the `cnf.x5t#S256` certificate-bound access-token confirmation claim are **not** enforced -- issued access tokens behave as bearer tokens once minted.
+
+
 ---
 
 ### metrics
