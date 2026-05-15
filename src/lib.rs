@@ -125,6 +125,7 @@ pub mod admin;
 pub mod secret;
 
 pub(crate) mod ssrf;
+pub(crate) mod ssrf_resolver;
 
 /// Opt-in tool-call hooks (before/after) and result-size cap.
 pub mod tool_hooks;

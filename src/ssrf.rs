@@ -180,14 +180,12 @@ pub(crate) fn check_url_literal_ip(url: &Url) -> Option<&'static str> {
 /// address (host bits cleared at parse time) and the prefix length so a
 /// candidate `IpAddr` can be matched against it without re-parsing on
 /// every request.
-#[cfg(feature = "oauth")]
 #[derive(Debug, Clone)]
 pub(crate) struct CidrEntry {
     network: IpAddr,
     prefix_len: u8,
 }
 
-#[cfg(feature = "oauth")]
 impl CidrEntry {
     /// Parse a CIDR like `10.0.0.0/8` or `fd00::/8`. Validates the
     /// prefix length, that the IP family is consistent, and that the
@@ -208,6 +206,10 @@ impl CidrEntry {
     /// - Non-zero host bits (`10.0.0.1/8`).
     ///
     /// Uses `std::net` only -- no new dependencies.
+    #[cfg_attr(
+        not(feature = "oauth"),
+        allow(dead_code, reason = "consumer is feature-gated")
+    )]
     pub(crate) fn parse(raw: &str) -> Result<Self, String> {
         let raw = raw.trim();
         let Some((addr_str, prefix_str)) = raw.split_once('/') else {
@@ -311,7 +313,6 @@ impl CidrEntry {
 /// (`screen_oauth_target`, `redirect_target_reason_with_allowlist`)
 /// short-circuit on a `"cloud_metadata"` block reason BEFORE consulting
 /// this struct.
-#[cfg(feature = "oauth")]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CompiledSsrfAllowlist {
     /// Lowercased hostname strings. `host_allowed` does an
@@ -322,10 +323,13 @@ pub(crate) struct CompiledSsrfAllowlist {
     cidrs: Vec<CidrEntry>,
 }
 
-#[cfg(feature = "oauth")]
 impl CompiledSsrfAllowlist {
     /// Construct a compiled allowlist from already-validated host
     /// entries (lowercased) and CIDR entries.
+    #[cfg_attr(
+        not(feature = "oauth"),
+        allow(dead_code, reason = "consumer is feature-gated")
+    )]
     pub(crate) fn new(hosts: Vec<String>, cidrs: Vec<CidrEntry>) -> Self {
         Self { hosts, cidrs }
     }
@@ -355,11 +359,19 @@ impl CompiledSsrfAllowlist {
     }
 
     /// Number of allowlisted hosts (for diagnostic logging).
+    #[cfg_attr(
+        not(feature = "oauth"),
+        allow(dead_code, reason = "consumer is feature-gated")
+    )]
     pub(crate) fn host_count(&self) -> usize {
         self.hosts.len()
     }
 
     /// Number of allowlisted CIDR entries (for diagnostic logging).
+    #[cfg_attr(
+        not(feature = "oauth"),
+        allow(dead_code, reason = "consumer is feature-gated")
+    )]
     pub(crate) fn cidr_count(&self) -> usize {
         self.cidrs.len()
     }

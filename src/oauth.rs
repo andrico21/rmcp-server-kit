@@ -288,8 +288,13 @@ pub struct OauthHttpClient {
     /// to a different host (RFC 8705 §2 attack surface).
     #[cfg(feature = "oauth-mtls-client")]
     mtls_clients: Arc<HashMap<MtlsClientKey, reqwest::Client>>,
+    /// M-H2: shared loopback bypass observed by both `send_screened`'s
+    /// pre-flight check AND the `SsrfScreeningResolver` installed on
+    /// `inner`. Flipping the bit via `__test_allow_loopback_ssrf` must
+    /// reach the already-built `reqwest::Client`, so a per-snapshot
+    /// `bool` (Oracle review B1) is forbidden.
     #[cfg(any(test, feature = "test-helpers"))]
-    test_allow_loopback_ssrf: bool,
+    test_allow_loopback_ssrf: crate::ssrf_resolver::TestLoopbackBypass,
 }
 
 /// M-H4: cache key for cert-bearing `reqwest::Client`s. Path-based
@@ -374,7 +379,31 @@ impl OauthHttpClient {
         // consult the operator allowlist without re-parsing.
         let redirect_allowlist = Arc::clone(&allowlist);
 
+        // M-H2: shared bypass holder created BEFORE the resolver so
+        // the resolver, send_screened, and the cached `inner` client
+        // all observe the same atomic.
+        #[cfg(any(test, feature = "test-helpers"))]
+        let test_bypass: crate::ssrf_resolver::TestLoopbackBypass =
+            Arc::new(AtomicBool::new(false));
+        #[cfg(not(any(test, feature = "test-helpers")))]
+        let test_bypass: crate::ssrf_resolver::TestLoopbackBypass = ();
+
+        let resolver: Arc<dyn reqwest::dns::Resolve> =
+            Arc::new(crate::ssrf_resolver::SsrfScreeningResolver::new(
+                Arc::clone(&allowlist),
+                // M-H2/B1: TestLoopbackBypass aliases to Arc<AtomicBool> in test
+                // builds and to `()` in production. Value clone is required
+                // because the type vanishes outside test cfg.
+                #[allow(clippy::clone_on_ref_ptr, reason = "type alias varies per feature")]
+                test_bypass.clone(),
+            ));
+
         let mut builder = reqwest::Client::builder()
+            // M-H2/N1: disable reqwest's auto-proxy detection. Without
+            // this, HTTP_PROXY / HTTPS_PROXY env vars route DNS through
+            // the proxy and bypass our SsrfScreeningResolver entirely.
+            .no_proxy()
+            .dns_resolver(Arc::clone(&resolver))
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::custom(move |attempt| {
@@ -427,7 +456,7 @@ impl OauthHttpClient {
         })?;
 
         #[cfg(feature = "oauth-mtls-client")]
-        let mtls_clients = build_mtls_clients(config)?;
+        let mtls_clients = build_mtls_clients(config, &allowlist, &test_bypass)?;
 
         Ok(Self {
             inner,
@@ -436,7 +465,7 @@ impl OauthHttpClient {
             #[cfg(feature = "oauth-mtls-client")]
             mtls_clients,
             #[cfg(any(test, feature = "test-helpers"))]
-            test_allow_loopback_ssrf: false,
+            test_allow_loopback_ssrf: test_bypass,
         })
     }
 
@@ -446,7 +475,7 @@ impl OauthHttpClient {
         request: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, crate::error::McpxError> {
         #[cfg(any(test, feature = "test-helpers"))]
-        if self.test_allow_loopback_ssrf {
+        if self.test_allow_loopback_ssrf.load(Ordering::Relaxed) {
             screen_oauth_target_with_test_override(url, self.allow_http, &self.allowlist, true)
                 .await?;
         } else {
@@ -466,8 +495,10 @@ impl OauthHttpClient {
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     #[must_use]
-    pub fn __test_allow_loopback_ssrf(mut self) -> Self {
-        self.test_allow_loopback_ssrf = true;
+    pub fn __test_allow_loopback_ssrf(self) -> Self {
+        // M-H2/B1: flip the SHARED atomic so the resolver inside
+        // `inner` and the pre-flight check both observe the bypass.
+        self.test_allow_loopback_ssrf.store(true, Ordering::Relaxed);
         self
     }
 
@@ -479,6 +510,18 @@ impl OauthHttpClient {
     #[doc(hidden)]
     pub async fn __test_get(&self, url: &str) -> reqwest::Result<reqwest::Response> {
         self.inner.get(url).send().await
+    }
+
+    /// Test-only: borrow the inner `reqwest::Client` so the M-H2
+    /// env-proxy matrix test (`tests/e2e.rs::ssrf_no_proxy_*`) can
+    /// drive `.get(...).send()` directly and observe whether the
+    /// SsrfScreeningResolver fired (vs. the proxy short-circuiting
+    /// the request). Not part of the public API.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __test_inner_client(&self) -> &reqwest::Client {
+        &self.inner
     }
 
     /// M-H4: select the cert-bearing `reqwest::Client` cached for
@@ -1086,6 +1129,8 @@ fn validate_client_cert_config(cc: &ClientCertConfig) -> Result<(), crate::error
 #[cfg(feature = "oauth-mtls-client")]
 fn build_mtls_clients(
     config: Option<&OAuthConfig>,
+    allowlist: &Arc<crate::ssrf::CompiledSsrfAllowlist>,
+    test_bypass: &crate::ssrf_resolver::TestLoopbackBypass,
 ) -> Result<Arc<HashMap<MtlsClientKey, reqwest::Client>>, crate::error::McpxError> {
     let mut map: HashMap<MtlsClientKey, reqwest::Client> = HashMap::new();
     let Some(cfg) = config else {
@@ -1124,7 +1169,21 @@ fn build_mtls_clients(
         ))
     })?;
 
+    let resolver: Arc<dyn reqwest::dns::Resolve> =
+        Arc::new(crate::ssrf_resolver::SsrfScreeningResolver::new(
+            Arc::clone(allowlist),
+            // M-H2/B1: TestLoopbackBypass aliases to Arc<AtomicBool> in test
+            // builds and to `()` in production. We need a value clone here
+            // (not Arc::clone) because the type vanishes outside test cfg;
+            // the allow is justified by the feature-gated type alias.
+            #[allow(clippy::clone_on_ref_ptr, reason = "type alias varies per feature")]
+            test_bypass.clone(),
+        ));
+
     let mut builder = reqwest::Client::builder()
+        // M-H2/N1: same proxy + DNS hardening as the shared client.
+        .no_proxy()
+        .dns_resolver(Arc::clone(&resolver))
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
@@ -1683,8 +1742,11 @@ pub struct JwksCache {
     /// fail-closed behaviour). Wrapped in `Arc` so the redirect-policy
     /// closure can capture a cheap clone without inflating the cache size.
     allowlist: Arc<crate::ssrf::CompiledSsrfAllowlist>,
+    /// M-H2/B1: shared loopback bypass; same Arc is captured by the
+    /// SSRF resolver inside the cached `reqwest::Client`. See the
+    /// matching field on `OauthHttpClient`.
     #[cfg(any(test, feature = "test-helpers"))]
-    test_allow_loopback_ssrf: bool,
+    test_allow_loopback_ssrf: crate::ssrf_resolver::TestLoopbackBypass,
 }
 
 /// Minimum cooldown between JWKS refresh attempts (prevents abuse).
@@ -1772,7 +1834,24 @@ impl JwksCache {
         };
         let redirect_allowlist = Arc::clone(&allowlist);
 
+        // M-H2: see OauthHttpClient::build for rationale; same pattern.
+        #[cfg(any(test, feature = "test-helpers"))]
+        let test_bypass: crate::ssrf_resolver::TestLoopbackBypass =
+            Arc::new(AtomicBool::new(false));
+        #[cfg(not(any(test, feature = "test-helpers")))]
+        let test_bypass: crate::ssrf_resolver::TestLoopbackBypass = ();
+
+        let resolver: Arc<dyn reqwest::dns::Resolve> =
+            Arc::new(crate::ssrf_resolver::SsrfScreeningResolver::new(
+                Arc::clone(&allowlist),
+                #[allow(clippy::clone_on_ref_ptr, reason = "type alias varies per feature")]
+                test_bypass.clone(),
+            ));
+
         let mut http_builder = reqwest::Client::builder()
+            // M-H2/N1: see OauthHttpClient::build.
+            .no_proxy()
+            .dns_resolver(Arc::clone(&resolver))
             .timeout(Duration::from_secs(10))
             .connect_timeout(Duration::from_secs(3))
             .redirect(reqwest::redirect::Policy::custom(move |attempt| {
@@ -1830,7 +1909,7 @@ impl JwksCache {
             refresh_lock: tokio::sync::Mutex::new(()),
             allowlist,
             #[cfg(any(test, feature = "test-helpers"))]
-            test_allow_loopback_ssrf: false,
+            test_allow_loopback_ssrf: test_bypass,
         })
     }
 
@@ -1840,8 +1919,10 @@ impl JwksCache {
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     #[must_use]
-    pub fn __test_allow_loopback_ssrf(mut self) -> Self {
-        self.test_allow_loopback_ssrf = true;
+    pub fn __test_allow_loopback_ssrf(self) -> Self {
+        // M-H2/B1: flip the SHARED atomic so the resolver inside the
+        // cached client and the pre-flight check both observe the bypass.
+        self.test_allow_loopback_ssrf.store(true, Ordering::Relaxed);
         self
     }
 
@@ -2150,7 +2231,7 @@ impl JwksCache {
     )]
     async fn fetch_jwks(&self) -> Option<JwkSet> {
         #[cfg(any(test, feature = "test-helpers"))]
-        let screening = if self.test_allow_loopback_ssrf {
+        let screening = if self.test_allow_loopback_ssrf.load(Ordering::Relaxed) {
             screen_oauth_target_with_test_override(
                 &self.jwks_uri,
                 self.allow_http,
@@ -3364,7 +3445,20 @@ mod tests {
                 attempt.follow()
             }
         });
+        // M-H2: even though this is a redirect-policy test harness
+        // (not a production code path), wire the same resolver +
+        // .no_proxy() so the audit-trail invariant "every reqwest
+        // builder in this crate uses SsrfScreeningResolver" holds.
+        // Loopback bypass is enabled so the wiremock fixture stays
+        // reachable.
+        let test_bypass: crate::ssrf_resolver::TestLoopbackBypass = Arc::new(AtomicBool::new(true));
+        let allowlist = Arc::new(crate::ssrf::CompiledSsrfAllowlist::default());
+        let resolver: Arc<dyn reqwest::dns::Resolve> = Arc::new(
+            crate::ssrf_resolver::SsrfScreeningResolver::new(Arc::clone(&allowlist), test_bypass),
+        );
         let client = reqwest::Client::builder()
+            .no_proxy()
+            .dns_resolver(Arc::clone(&resolver))
             .timeout(Duration::from_secs(5))
             .connect_timeout(Duration::from_secs(3))
             .redirect(policy)

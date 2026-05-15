@@ -135,7 +135,27 @@ impl CrlSet {
         discover_tx: mpsc::UnboundedSender<String>,
         initial_cache: HashMap<String, CachedCrl>,
     ) -> Result<Arc<Self>, McpxError> {
+        // M-H2: install the SSRF screening resolver on the CRL fetcher.
+        // CRL CDP URLs come from attacker-controllable client certs and
+        // their hosts are re-resolved per fetch -- exactly the TOCTOU
+        // class M-H2 closes. The allowlist is empty (default-strict),
+        // matching the existing CRL pre-flight posture; operators who
+        // need internal CDPs would extend this with the same
+        // CompiledSsrfAllowlist plumbing used by oauth.
+        let allowlist = Arc::new(crate::ssrf::CompiledSsrfAllowlist::default());
+        let resolver: Arc<dyn reqwest::dns::Resolve> =
+            Arc::new(crate::ssrf_resolver::SsrfScreeningResolver::new(
+                Arc::clone(&allowlist),
+                #[cfg(any(test, feature = "test-helpers"))]
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                #[cfg(not(any(test, feature = "test-helpers")))]
+                (),
+            ));
+
         let client = reqwest::Client::builder()
+            // M-H2/N1: see oauth.rs::OauthHttpClient::build for rationale.
+            .no_proxy()
+            .dns_resolver(Arc::clone(&resolver))
             .timeout(config.crl_fetch_timeout)
             .connect_timeout(CRL_CONNECT_TIMEOUT)
             .tcp_keepalive(None)
@@ -920,7 +940,23 @@ pub async fn bootstrap_fetch(
     urls.sort();
     urls.dedup();
 
+    // M-H2: same SSRF resolver hardening as CrlSet::new -- bootstrap
+    // fetches the same attacker-controlled CDP URLs, just earlier in
+    // the lifecycle.
+    let bootstrap_allowlist = Arc::new(crate::ssrf::CompiledSsrfAllowlist::default());
+    let bootstrap_resolver: Arc<dyn reqwest::dns::Resolve> =
+        Arc::new(crate::ssrf_resolver::SsrfScreeningResolver::new(
+            Arc::clone(&bootstrap_allowlist),
+            #[cfg(any(test, feature = "test-helpers"))]
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(not(any(test, feature = "test-helpers")))]
+            (),
+        ));
+
     let client = reqwest::Client::builder()
+        // M-H2/N1: see oauth.rs::OauthHttpClient::build for rationale.
+        .no_proxy()
+        .dns_resolver(Arc::clone(&bootstrap_resolver))
         .timeout(config.crl_fetch_timeout)
         .connect_timeout(CRL_CONNECT_TIMEOUT)
         .tcp_keepalive(None)

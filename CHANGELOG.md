@@ -10,82 +10,32 @@ Breaking changes bump the **major** version.
 
 ### Security
 
-- **M1: OAuth audience validation now exposes a three-state policy and
-  warns by default on `azp`-only matches** (`src/oauth.rs`). The previous
-  bool-only `strict_audience_validation` flag conflated "accept silently"
-  with "reject" and defaulted to silent acceptance of `azp`-only audience
-  matches — contradicting the `audience` field doc that promised
-  exact-`aud` match. A new `OAuthConfig::audience_validation_mode:
-  Option<AudienceValidationMode>` (variants `Permissive`, `Warn`,
-  `Strict`) makes the policy explicit. The new default
-  (`AudienceValidationMode::Warn`) accepts `azp`-only matches but emits a
-  `tracing::warn!` once per process so operators can detect deployments
-  whose IdP is not populating `aud` and migrate. The legacy bool field is
-  retained for source-compat (`#[deprecated(since = "1.7.0")]`) and
-  resolves: `true` ⇒ `Strict`, `false`/unset ⇒ `Warn`. Operators wanting
-  the prior silent-acceptance behavior must set
-  `audience_validation_mode = "permissive"` explicitly. **No tokens
-  previously accepted are now rejected**; the only operator-visible
-  behavior change is a one-shot WARN log on `azp`-only matches under the
-  new default.
-- **M3: OAuth admin endpoints (`/introspect`, `/revoke`) now fail closed at
-  startup when exposed without authentication** (`src/oauth.rs`,
-  `src/transport.rs`). Previously a config of
-  `expose_admin_endpoints = true` combined with
-  `require_auth_on_admin_endpoints = false` (or unset) would silently mount
-  RFC 7662 introspection and RFC 7009 revocation as anonymous-callable POST
-  routes, leaking token validity, scopes, and `sub` to anyone who could
-  reach the listener — guarded only by a runtime `tracing::warn!` operators
-  routinely miss. `OAuthConfig::validate` now rejects this combination
-  outright with `McpxError::Config`. Operators who genuinely need
-  unauthenticated admin endpoints (lab / private-network only) must opt in
-  with the new explicit `OAuthProxyConfig::allow_unauthenticated_admin_endpoints = true`
-  builder; the runtime warning is preserved as belt-and-suspenders for that
-  escape-hatch path. **Behavioural break**: deployments relying on the
-  silent-warn default must either set `require_auth_on_admin_endpoints = true`
-  or explicitly set the new opt-in flag.
-- **M2: RBAC argument allowlists now reject non-string JSON values**
-  (`src/rbac.rs`). Previously the allowlist check was guarded by
-  `if let Some(val_str) = arg_val.as_str()`, so any caller could bypass
-  a configured `allowed = ["sh", "bash", …]` list by sending the
-  argument as an array (`["bash"]`), object (`{"raw":"sh"}`), number,
-  bool, or null — the value flowed straight to the tool handler. The
-  middleware now consults a new `RbacPolicy::has_argument_allowlist`
-  predicate and fails closed with 403 whenever a non-string value lands
-  on an argument that has any non-empty allowlist entry, logging the
-  rejected JSON type (not the value) for operator visibility.
-- **L2: Argon2 verification is now constant-time across slots** (`src/auth.rs`).
-  Previously `verify_bearer_token` short-circuited on the first matching
-  slot and skipped Argon2 entirely on expired slots, leaking timing
-  information about (a) which slot held the matching credential and (b)
-  whether earlier slots had expired (CWE-208). Verification now runs
-  Argon2id against every configured slot — using the real hash for the
-  first non-expired pre-match slot and a fixed dummy PHC string elsewhere
-  — and folds per-slot match bits via `subtle::ConstantTimeEq`. The
-  observable timing is now bounded to "one Argon2 per configured key"
-  regardless of input.
-- **M-H4: OAuth token-exchange now supports RFC 8705 §2 mTLS client
-  authentication and fails closed on misconfiguration** (`src/oauth.rs`,
-  new `oauth-mtls-client` cargo feature). Previously a
-  `TokenExchangeConfig::client_cert`-only configuration silently
-  disabled client authentication: the runtime ignored the field, omitted
-  the Authorization header, and POSTed an unauthenticated token-exchange
-  request that some IdPs would accept. `OAuthConfig::validate` now
-  enforces RFC 8705 §2 mutual exclusion (exactly one of `client_secret`
-  / `client_cert`) and rejects `client_cert` configurations at startup
-  unless the `oauth-mtls-client` cargo feature is enabled. With the
-  feature enabled, the cert + key are PEM-validated at config-validate
-  time (missing files / malformed PEM / encrypted keys all surface
-  before the first request), and `exchange_token` routes through a
-  dedicated `reqwest::Client` that presents the configured TLS client
-  certificate at handshake. The cert-bearing client uses
-  `redirect::Policy::none()` so an attacker-controlled 3xx from the
-  token endpoint cannot re-present the client certificate to a
-  different host. **Scope**: implements RFC 8705 §2 (PKI-bound client
-  auth) only; RFC 8705 §3 self-signed client auth and the
-  `cnf.x5t#S256` certificate-bound access-token confirmation claim are
-  NOT enforced — issued access tokens behave as bearer tokens once
-  minted. In-place certificate rotation requires server restart.
+- **M-H2: Outbound HTTP clients now close the TOCTOU window between
+  pre-flight SSRF screening and connect-time DNS resolution**
+  (`src/ssrf_resolver.rs`, `src/ssrf.rs`, `src/oauth.rs`,
+  `src/mtls_revocation.rs`). Previously `screen_oauth_target` and
+  `CrlSet::new` performed an `IpAddr` lookup, validated it against the
+  cloud-metadata blocklist and operator allowlist, and then handed the
+  request to `reqwest`, which independently re-resolved the hostname
+  inside its own connector. A controlled-DNS attacker could pass the
+  pre-flight check with a public IP and have the connector see a
+  loopback / private / metadata answer microseconds later. Every
+  outbound `reqwest::Client` now installs a custom
+  `SsrfScreeningResolver` (`ClientBuilder::dns_resolver(...)`) that
+  re-applies the same `ip_block_reason` + `CompiledSsrfAllowlist`
+  policy on the addresses actually returned to the connector.
+  Cloud-metadata short-circuits before the allowlist is consulted and
+  remains unbypassable in every code path. The resolver fails closed
+  with a `"ssrf:"`-prefixed error on policy denial so operators can
+  distinguish deliberate denials from generic DNS failures. Defence in
+  depth: every `ClientBuilder` also calls `.no_proxy()` to disable
+  reqwest's auto-proxy detection, since `HTTP_PROXY` /
+  `HTTPS_PROXY` / `ALL_PROXY` env vars would otherwise route DNS
+  through the proxy and bypass the resolver entirely. Wired at all six
+  outbound construction sites: `OauthHttpClient::build`,
+  `build_mtls_clients`, `JwksCache::with_config`, the OAuth wiremock
+  test harness, `CrlSet::new`, and `bootstrap_fetch`. Closes the last
+  open finding from the 2026-05-13 deep code review.
 
 ### Added
 
