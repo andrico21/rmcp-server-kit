@@ -8,6 +8,24 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+## [1.7.2] - 2026-05-15
+
+### Fixed
+
+- **Test: consolidate the M-H2 env-proxy matrix into a single
+  sequential test to eliminate a Windows CI race**
+  (`tests/ssrf_resolver.rs`). The six per-variant tests
+  (`no_proxy_defeats_*`) each invoked `temp_env::with_var` to mutate
+  process-wide environment variables (`HTTP_PROXY` / `HTTPS_PROXY` /
+  `ALL_PROXY` upper- and lower-case) before constructing an
+  `OauthHttpClient`. Rust's default test runner runs `#[test]` cases
+  in parallel threads; the env-var mutations could leak across threads
+  and into other concurrently-running tests on Windows runners
+  (`Test (windows-latest)` failed on tag `1.7.1`). The matrix now
+  runs as one sequential `#[test]` so all six variants are exercised
+  without racing parallel tests. Coverage is preserved (still
+  asserting `ssrf:` diagnostic for every variant).
+
 ## [1.7.1] - 2026-05-15
 
 ### Fixed

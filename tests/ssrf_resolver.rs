@@ -226,55 +226,23 @@ fn run_with_env(var: &str, value: &str) -> String {
 }
 
 #[test]
-fn no_proxy_defeats_http_proxy_uppercase() {
-    let chain = run_with_env("HTTP_PROXY", DECOY_PROXY);
-    assert!(
-        chain.contains("ssrf:"),
-        "HTTP_PROXY must not bypass resolver; got: {chain}"
-    );
-}
-
-#[test]
-fn no_proxy_defeats_https_proxy_uppercase() {
-    let chain = run_with_env("HTTPS_PROXY", DECOY_PROXY);
-    assert!(
-        chain.contains("ssrf:"),
-        "HTTPS_PROXY must not bypass resolver; got: {chain}"
-    );
-}
-
-#[test]
-fn no_proxy_defeats_all_proxy_uppercase() {
-    let chain = run_with_env("ALL_PROXY", DECOY_PROXY);
-    assert!(
-        chain.contains("ssrf:"),
-        "ALL_PROXY must not bypass resolver; got: {chain}"
-    );
-}
-
-#[test]
-fn no_proxy_defeats_http_proxy_lowercase() {
-    let chain = run_with_env("http_proxy", DECOY_PROXY);
-    assert!(
-        chain.contains("ssrf:"),
-        "http_proxy must not bypass resolver; got: {chain}"
-    );
-}
-
-#[test]
-fn no_proxy_defeats_https_proxy_lowercase() {
-    let chain = run_with_env("https_proxy", DECOY_PROXY);
-    assert!(
-        chain.contains("ssrf:"),
-        "https_proxy must not bypass resolver; got: {chain}"
-    );
-}
-
-#[test]
-fn no_proxy_defeats_all_proxy_lowercase() {
-    let chain = run_with_env("all_proxy", DECOY_PROXY);
-    assert!(
-        chain.contains("ssrf:"),
-        "all_proxy must not bypass resolver; got: {chain}"
-    );
+fn no_proxy_defeats_all_env_proxy_variants() {
+    // All six variants run inside ONE #[test] so the process-wide env
+    // var mutations from temp_env::with_var cannot race against parallel
+    // tests on platforms where rustc test runs threads concurrently
+    // (notably Windows CI).
+    for var in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ] {
+        let chain = run_with_env(var, DECOY_PROXY);
+        assert!(
+            chain.contains("ssrf:"),
+            "{var} must not bypass resolver; got: {chain}"
+        );
+    }
 }
