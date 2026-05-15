@@ -45,6 +45,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
+      - name: Remove Homebrew rust shim (macOS arm64 PATH precedence)
+        if: runner.os == 'macOS'
+        run: |
+          brew uninstall --ignore-dependencies rustup rust 2>/dev/null || true
+          rm -f /opt/homebrew/bin/cargo /opt/homebrew/bin/rustc /opt/homebrew/bin/rustup /opt/homebrew/bin/rustup-init
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.9.1
       - run: cargo test --all-features
