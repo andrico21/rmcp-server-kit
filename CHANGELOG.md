@@ -8,6 +8,8 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-05-15
+
 ### Security
 
 - **M-H2: Outbound HTTP clients now close the TOCTOU window between
