@@ -8,6 +8,37 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+## [1.7.3] - 2026-05-15
+
+### Changed
+
+- **Deps: routine dependency refresh.** Bumped runtime crates `rmcp`
+  `1.6 -> 1.7` (via `cargo update`, semver-compatible),
+  `hmac` `0.12 -> 0.13`, `sha2` `0.10 -> 0.11`. The `hmac` 0.13 release
+  no longer re-exports `KeyInit` through the `Mac` trait, so
+  `src/rbac.rs` was updated to import `hmac::KeyInit` explicitly at the
+  single call-site that constructs `Hmac<Sha256>::new_from_slice`
+  (HMAC seed for the redaction token derivation). No behavioural
+  change, no public API change. Bumped dev/bench-only
+  `criterion` `0.5 -> 0.8`; the bench harness uses only stable
+  `criterion_group!` / `criterion_main!` / `Criterion::bench_function`
+  / `black_box` APIs, so no source changes were required in
+  `benches/`. Lockfile also picks up transitive `winnow` `1.0.2 ->
+  1.0.3` patch. After this update every direct dependency in the
+  manifest is at its latest crates.io stable; remaining lockfile
+  duplications (`hmac 0.12+0.13`, `sha2 0.10+0.11`, `thiserror 1+2`,
+  `rand 0.8+0.9+0.10`) are transitive-only and pinned by upstream
+  leaf crates (`argon2`, `jsonwebtoken`, `rcgen`, `rsa`, `wiremock`,
+  `prometheus`). The two `cargo update --verbose --dry-run`
+  hold-backs (`crypto-common 0.1.6 -> 0.1.7`,
+  `matchit 0.8.4 -> 0.8.6`) are unfixable from this repo:
+  `matchit` is exact-version pinned (`=0.8.4`) by `axum 0.8.9` and
+  `crypto-common` is held by transitive pins inside the RustCrypto
+  v0.10 / `digest 0.10` ecosystem that `jsonwebtoken 10.4.0` and
+  `argon2 0.5.3` still target. All 321 unit tests + 29 E2E tests
+  pass on Rust 1.95.0 under `--all-features`; clippy clean with
+  `-D warnings`; both benches execute end-to-end.
+
 ## [1.7.2] - 2026-05-15
 
 ### Fixed

@@ -17,7 +17,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use http_body_util::BodyExt;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;

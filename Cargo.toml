@@ -1,6 +1,6 @@
 [package]
 name = "rmcp-server-kit"
-version = "1.7.2"
+version = "1.7.3"
 edition = "2024"
 rust-version = "1.95.0"
 license = "MIT OR Apache-2.0"
@@ -104,8 +104,8 @@ governor = "0.10"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 rand = "0.10"
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
 
 # Lock-free pointer swap for hot-reload
 arc-swap = "1"
@@ -149,7 +149,7 @@ reqwest = { version = "0.13.2", default-features = false, features = [
 ] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
 memory-stats = "1"
-criterion = { version = "0.5", default-features = false, features = [
+criterion = { version = "0.8", default-features = false, features = [
   "cargo_bench_support",
 ] }
 proptest = "1"
