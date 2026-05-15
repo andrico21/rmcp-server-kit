@@ -1,30 +1,84 @@
 name: Release
 
+# Release publishes to crates.io ONLY when (a) a semver tag exists on a
+# commit AND (b) the CI workflow on that exact commit has completed
+# successfully. We achieve this by triggering off `workflow_run` for the
+# CI workflow instead of `push: tags`, and then verifying inside the job
+# that the head SHA of the CI run is the tip of a semver-shaped tag.
+#
+# Why not `push: tags`?  That trigger fires the moment a tag is pushed,
+# independent of whether CI on that commit has finished, so a red CI
+# could not block `cargo publish`.  See history: tag 1.7.3 was published
+# while CI on main was still in-progress.
+#
+# How a release happens now:
+#   1. Developer pushes the release commit to `main`.
+#   2. CI runs on `main` for that SHA.
+#   3. Developer pushes the tag (e.g. `1.7.3`) pointing at the same SHA.
+#   4. CI runs again on the tag ref for the same SHA.
+#   5. When step 4 completes successfully, this workflow triggers.
+#   6. The job verifies a semver tag points at the run's head SHA, then
+#      publishes.
+#
+# Either step 2 OR step 4 finishing can fire this workflow, but the
+# `find-tag` step rejects the run if no semver tag points at the head
+# SHA, so commits on `main` without a tag are no-ops.
 on:
-  push:
-    tags:
-      # Glob (not regex) - GitHub Actions tag filters use fnmatch-style globs.
-      # Matches semver-shaped tags like "0.10.0", "1.2.3-rc1", etc.
-      # The "Verify tag matches Cargo.toml version" step below is the real
-      # safety gate; this filter just keeps unrelated tags from triggering.
-      - "*.*.*"
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
 
 jobs:
   publish:
     name: cargo publish
+    # Cheap pre-gate: only proceed if the triggering CI run succeeded.
+    # The deeper checks (tag existence, name match) happen in steps so
+    # they emit a clear ::error:: message in the run log.
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      # Check out the exact commit that CI ran against, not the tip of
+      # `main`. workflow_run-triggered jobs default to the workflow file
+      # on the default branch but the working-tree checkout is up to us.
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          # We need tags for the `git tag --points-at` lookup below.
+          fetch-depth: 0
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.9.1
 
-      - name: Verify tag matches Cargo.toml version
+      - name: Find semver tag pointing at this commit
+        id: find-tag
         shell: bash
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"
+          SHA="${{ github.event.workflow_run.head_sha }}"
+          # Pick the first tag matching `N.N.N` (semver-shaped) at this
+          # commit. Pre-release tags like `1.2.3-rc1` also match the
+          # glob in the previous release.yml, so keep that allowance.
+          TAG=$(git tag --points-at "$SHA" \
+                | grep -E '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' \
+                | head -n1 \
+                || true)
+          if [ -z "$TAG" ]; then
+            echo "::notice::No semver tag points at $SHA - this run is from a non-release CI invocation. Skipping publish."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Found tag: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Verify tag matches Cargo.toml version
+        if: steps.find-tag.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.find-tag.outputs.tag }}"
           CRATE_VERSION=$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name == "rmcp-server-kit") | .version')
           if [ "$TAG" != "$CRATE_VERSION" ]; then
@@ -33,10 +87,11 @@ jobs:
           fi
 
       - name: Extract release notes for this version
+        if: steps.find-tag.outputs.skip != 'true'
         shell: bash
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"
+          TAG="${{ steps.find-tag.outputs.tag }}"
           # Write notes to RUNNER_TEMP so the working tree stays clean for
           # cargo publish (which refuses to publish from a dirty workdir).
           NOTES_PATH="${RUNNER_TEMP}/RELEASE_NOTES.md"
@@ -57,14 +112,18 @@ jobs:
           echo "----- end -----"
 
       - name: Dry-run publish
+        if: steps.find-tag.outputs.skip != 'true'
         run: cargo publish --dry-run --all-features
 
       - name: Publish to crates.io
+        if: steps.find-tag.outputs.skip != 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish --all-features
 
       - name: Create GitHub release
+        if: steps.find-tag.outputs.skip != 'true'
         uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ steps.find-tag.outputs.tag }}
           body_path: ${{ env.NOTES_PATH }}
