@@ -8,6 +8,25 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+## [1.7.1] - 2026-05-15
+
+### Fixed
+
+- **Build: replace runtime-RNG salt for the constant-time Argon2
+  placeholder with a fixed salt** (`src/auth.rs`). The
+  `DUMMY_PHC_HASH` was previously generated with
+  `SaltString::generate(&mut argon2::password_hash::rand_core::OsRng)`,
+  which depends on `rand_core 0.6`'s `getrandom` cargo feature being
+  activated transitively. That feature is not turned on in any
+  configuration of this crate (default, `--features metrics`,
+  `--no-default-features`), so the build broke as soon as `argon2`'s
+  re-exported `rand_core` was reached by name resolution. Switch to a
+  fixed 16-byte salt (`SaltString::from_b64("AAAA...")`); the dummy
+  hash never matches real input and is only used as a same-cost
+  Argon2 verification target to flatten timing across slots, so salt
+  randomness is irrelevant. Closes the post-release CI failure on
+  `1.7.0` tag.
+
 ## [1.7.0] - 2026-05-15
 
 ### Security

@@ -1045,9 +1045,16 @@ pub fn verify_bearer_token(token: &str, keys: &[ApiKeyEntry]) -> Option<AuthIden
 /// Generated once on first access using the same default Argon2 cost
 /// parameters as live verifications, so the dummy verify takes
 /// indistinguishable wall time from a real one. The plaintext
-/// (`"rmcp-server-kit-dummy"`) is unrelated to any real credential.
+/// (`"rmcp-server-kit-dummy"`) and the fixed salt are unrelated to any
+/// real credential — randomness is unnecessary because this hash is
+/// only ever compared against attacker-supplied input on slots that
+/// will be discarded regardless of match result. Using a fixed salt
+/// avoids depending on `rand_core`'s `getrandom` feature, which is not
+/// activated transitively in every feature configuration of this crate.
 static DUMMY_PHC_HASH: LazyLock<String> = LazyLock::new(|| {
-    let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
+    // 16 bytes of base64 (`AAAA...`) — minimum valid Argon2 salt length.
+    let salt = SaltString::from_b64("AAAAAAAAAAAAAAAAAAAAAA")
+        .expect("fixed 16-byte base64 salt is well-formed");
     Argon2::default()
         .hash_password(b"rmcp-server-kit-dummy", &salt)
         .expect("Argon2 default params hash a fixed plaintext")
