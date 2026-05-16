@@ -101,6 +101,66 @@ let last = v.last_mut().expect("just pushed");
 let last = v.push_mut(x);
 ```
 
+### DON'T: Use a single lifetime to parameterize both inputs and stored references
+
+When a function takes an input reference AND a `&mut` collection that stores
+references, sharing one lifetime is usually wrong. The mutable reference makes
+the lifetime parameter **invariant** (Rustonomicon: *"as soon as you try to
+stuff them in something like a mutable reference, they inherit invariance"*),
+so the compiler is forced to choose a single `'a` that satisfies every call
+site. The function compiles, isolated tests pass, and the trap only springs
+when a real caller tries to reuse the collection across inputs with disjoint
+scopes.
+
+```rust
+// BAD: 'a parameterizes both the input and the cached values.
+fn first_word<'a>(s: &'a str, cache: &mut HashMap<String, &'a str>) -> &'a str {
+    if let Some(cached) = cache.get(s) { return cached; }
+    let word = s.split_whitespace().next().unwrap_or("");
+    cache.insert(s.to_string(), word);
+    word
+}
+
+// Caller that the function-local tests never exercise:
+let mut cache: HashMap<String, &str> = HashMap::new();
+{
+    let s1 = String::from("hello world");
+    first_word(&s1, &mut cache);
+}   // <- error[E0597]: `s1` does not live long enough
+    //    s1 dropped here while still borrowed by `cache`.
+let s2 = String::from("foo bar");
+first_word(&s2, &mut cache);   // forces the borrow of s1 to extend to here
+```
+
+Verified against `rustc 1.94` — the function builds clean, but the caller
+fails to compile because `cache`'s element type `&'a str` is invariant in
+`'a`, so the compiler cannot let `s1` end its scope while `cache` is still
+alive. Once you wire the function into application code, every input must
+outlive the cache itself — almost never what you wanted.
+
+```rust
+// GOOD: store owned values when the collection outlives any single input
+fn first_word<'a>(s: &'a str, cache: &mut HashMap<String, String>) -> &'a str {
+    let _ = cache.entry(s.to_string())
+        .or_insert_with(|| s.split_whitespace().next().unwrap_or("").to_string());
+    s.split_whitespace().next().unwrap_or("")
+}
+
+// GOOD: split lifetimes with an explicit outlives bound when borrowing is required
+fn first_word<'cache, 'input: 'cache>(
+    s: &'input str,
+    cache: &mut HashMap<String, &'cache str>,
+) -> &'cache str { /* ... */ }
+```
+
+Rule of thumb: every time you add explicit lifetimes to a signature, sketch a
+real caller in your head — specifically one where the inputs have disjoint
+scopes from each other and from the collection. If `'a` appears inside both
+a `&mut` and the data being stored, it is invariant; the signature compiles
+in isolation but constrains every caller to keep all inputs alive for as
+long as the collection. Prefer owned storage in the collection, or split
+the lifetimes with an explicit outlives bound.
+
 ### DON'T: Clone to satisfy the borrow checker
 
 If the borrow checker rejects your code, the fix is almost never `.clone()`.
@@ -192,6 +252,28 @@ impl TryFrom<&str> for Port {
     }
 }
 ```
+
+### DO: Use `bool::try_from(n)` for strict 0/1 wire fields (Rust 1.95+)
+
+At boundaries where the encoding is "strictly 0 or 1, anything else is
+malformed" (NVS single-byte flags, MQTT retain/dup bits, hOn protocol
+bitfields stored as bytes, JSON `0`/`1` from a strict producer), prefer
+`bool::try_from(n)?` over `n != 0`. The `!= 0` form silently accepts `2`,
+`42`, `0xFF` as `true`, hiding upstream corruption. `TryFrom` makes the
+"any non-0/1 is a bug" contract explicit and surfaces it as a parse error
+the caller can report.
+
+```rust
+// BAD: any nonzero byte becomes true, including garbage from a torn NVS write
+let display_on: bool = nvs_byte != 0;
+
+// GOOD: strict — 0 or 1, anything else is a malformed record
+let display_on = bool::try_from(nvs_byte)
+    .map_err(|_| StorageError::InvalidFlag { tag: 0x09, value: nvs_byte })?;
+```
+
+Keep the plain `!= 0` form when you specifically mean "any nonzero is
+truthy" (e.g. a C-style int from a library that documents that contract).
 
 ---
 
@@ -319,6 +401,23 @@ match status {
     Status::Active => handle_active(),
     Status::Inactive | Status::Suspended => handle_disabled(),
     Status::Pending => handle_pending(),
+}
+```
+
+**Note (Rust 1.95+):** `if let` guards in `match` arms (stabilized in 1.95)
+do **NOT** participate in exhaustiveness checking — same rule as plain `if`
+guards. A new tool may suggest collapsing arms behind an `if let` guard
+and dropping the wildcard; the compiler will still require either an
+exhaustive listing or a `_` arm. Do not use an `if let` guard as
+justification for removing a previously-required wildcard.
+
+```rust
+// The `if let` guard does NOT cover Status::Pending — the wildcard or an
+// explicit Pending arm is still required for the match to compile.
+match status {
+    Status::Active if let Some(uid) = current_user() => handle_active(uid),
+    Status::Inactive => handle_inactive(),
+    _ => {} // still mandatory
 }
 ```
 
@@ -468,6 +567,30 @@ s.push_str("Hello, ");
 s.push_str(name);
 ```
 
+### DO: Allocate large buffers via `Vec`, not `Box::new([0; N])`
+
+`Box::new([0u8; 1 << 20])` constructs the array **on the stack first**, then
+moves it to the heap. In debug builds this overflows the stack. In release,
+rustc *sometimes* placement-allocates directly into the box, but that is
+not guaranteed by the language -- a single intermediate `let` binding can
+materialize the stack copy and crash.
+
+```rust
+// BAD: stack overflow in debug, brittle in release
+let buf = Box::new([0u8; 1024 * 1024]);
+
+// GOOD: heap allocation guaranteed by Vec
+let buf: Box<[u8]> = vec![0u8; 1024 * 1024].into_boxed_slice();
+```
+
+**ESP32 firmware note:** this matters more on embedded than on desktop.
+This workspace's task stacks are sized in tens of KB (see CLAUDE.md
+"Hardware Memory Budget"). A 4 KB array on the stack of a task with an
+8 KB stack is half the budget. For any buffer >= 1 KB inside an embassy
+task, allocate via `Vec` / `Box::<[u8]>::new_uninit_slice` (with explicit
+`assume_init`) or a static `StaticCell` -- never via `Box::new([0; N])`
+or a stack-local array bound to a `let`.
+
 ### DO: Use temporary mutability pattern
 
 Constrain mutability to initialization, then shadow as immutable.
@@ -480,6 +603,57 @@ let data = {
 };
 // `data` is now immutable -- no accidental modification
 ```
+
+### DO: Use `ptr::read_unaligned` (or `from_le_bytes`) for multi-byte reads from `&[u8]`
+
+ESP32-C3 and C6 are RISC-V (`riscv32imc` / `riscv32imac`). Unlike x86, RISC-V
+does **not** guarantee that unaligned loads work. Depending on CPU
+configuration, an unaligned multi-byte load either traps and is emulated by
+an exception handler (10-100x slower) or raises `LoadStoreMisaligned` and
+panics. Safe Rust never produces unaligned loads because references are
+always aligned -- the hazard appears **only in `unsafe` code that
+casts a `*const u8` to `*const u16`/`u32`/etc.** This workspace's lint
+posture is `unsafe_code = "deny"` plus SAFETY-commented `#[allow(unsafe_code)]`
+(see CLAUDE.md "Memory Safety Checklist"), so unsafe blocks **do** exist
+and the alignment rule applies.
+
+```rust
+// BAD: undefined behaviour on RISC-V if buf.as_ptr().add(2) is not 2-aligned.
+// `*const u16` deref and `ptr::read::<u16>` BOTH require T-alignment.
+// `&[u8]` is only 1-byte aligned. This compiles, runs on x86, traps on ESP32.
+let value: u16 = unsafe { *(buf.as_ptr().add(2) as *const u16) };
+let value: u16 = unsafe { core::ptr::read(buf.as_ptr().add(2) as *const u16) };
+
+// GOOD: safe, no `unsafe`, optimizer emits one load on platforms that allow it.
+let value = u16::from_le_bytes(buf[2..4].try_into().unwrap());
+
+// GOOD: when slice-to-array conversion is awkward (e.g. C FFI struct copy-out),
+// `read_unaligned` is the unsafe escape hatch. It explicitly tolerates any
+// alignment. SAFETY: comment must justify provenance and bounds.
+// SAFETY: `buf` is &[u8; >=4] from validated MQTT frame, `offset+2 <= len`.
+let value: u16 = unsafe { core::ptr::read_unaligned(buf.as_ptr().add(2) as *const u16) };
+```
+
+Rules:
+
+- For multi-byte reads out of `&[u8]` buffers, prefer the safe idiom:
+  `u16::from_le_bytes(slice.try_into().unwrap())` (or `from_be_bytes`).
+  Bounds-check the slice once and reuse it.
+- If you must use raw pointers (FFI struct read-out, `repr(C)` overlay),
+  use `core::ptr::read_unaligned` -- never `ptr::read` or `*ptr` on a
+  cast pointer.
+- This bug class is **invisible on x86 CI**. Unaligned loads succeed
+  silently on host machines. The trap only fires on the target hardware,
+  so code review and the guideline are the primary defenses.
+- Hot sites in this workspace: `haier.rs` UART frame parsing (u16
+  power/current/PM2.5 fields out of `&[u8]` payloads), `ota.rs` ESP32
+  image header parsing (u32 segment count out of streamed firmware
+  buffer), `mqtt.rs` packet-length and packet-ID parsing out of TCP RX
+  buffers, `tls.rs` mbedTLS FFI boundary where C writes into Rust-owned
+  buffers.
+- `bytemuck::pod_read_unaligned` is a safe wrapper for `Pod` types if you
+  want zero `unsafe`; pulling the dep in is acceptable when the parsing
+  surface area grows.
 
 ---
 
@@ -544,10 +718,112 @@ do_async_work().await;
 drop(guard);
 ```
 
+**LLM-bias note.** LLM-generated async code defaults to `std::sync::Mutex`
+because that type dominates non-async Rust in training data. Review every
+`Mutex` import in async modules:
+
+- `tokio` async tasks: use `tokio::sync::Mutex` when the guard may live
+  across `.await`; `std::sync::Mutex` only when the critical section is
+  strictly synchronous and short.
+- This firmware (embassy, `no_std`): use `embassy_sync::mutex::Mutex` for
+  async-aware locks. `embassy_sync::blocking_mutex::Mutex` (with the
+  `CriticalSectionRawMutex` raw mutex) is correct **only** when the
+  critical section never `.await`s -- typical use is for `Signal`,
+  `Channel`, or shared state read/written without yielding.
+- `clippy::await_holding_lock` catches the obvious case (guard variable
+  visibly alive across `.await` in the same function) but does **not**
+  see through helper-function returns, struct fields, or
+  `MutexGuard::map`. Treat the lint as necessary but not sufficient.
+
 ### DO: Use `tokio::task::yield_now()` in CPU-bound async loops
 
 If you must do CPU work in an async context, yield periodically to avoid
 starving other tasks.
+
+### DO: Annotate every async fn with cancel safety (cancel-safe / NOT cancel-safe)
+
+Futures in Rust are cancellable at **every** `.await` point. Any future used
+inside `tokio::select!`, `tokio::time::timeout`, `embassy_futures::select`,
+or `JoinHandle::abort` can be dropped between awaits, leaving partial state.
+Cancel safety is **not expressible in the type system** -- there is no
+`CancelSafe` marker trait. It lives only in documentation, and a refactor
+that moves a previously-sequential function into a `select!` arm will
+silently turn correct code into a duplicate-write / partial-state bug.
+
+LLM-generated code almost never raises this on its own. Treat the
+annotation as mandatory, not optional.
+
+```rust
+// NOT cancel-safe: if dropped between insert() and send_ack(), we wrote
+// to the DB but never acknowledged, so the client will retry and we duplicate.
+async fn process(stream: TcpStream, db: &Db) -> Result<()> {
+    let data = read_message(&stream).await?;
+    db.insert(&data).await?;       // <-- if cancelled here, dup on retry
+    send_ack(&stream).await?;
+    Ok(())
+}
+
+// GOOD: isolate the non-cancel-safe section so outer cancellation can't tear it.
+async fn process(stream: TcpStream, db: Arc<Db>) -> Result<()> {
+    let data = read_message(&stream).await?;
+    // cancel-safe: read_message is cancel-safe per tokio docs.
+    let handle = tokio::spawn(async move {
+        db.insert(&data).await?;
+        send_ack(&stream).await?;
+        Ok::<_, Error>(())
+    });
+    handle.await?
+}
+```
+
+Rules:
+
+- Every async fn that may run inside `select!`, `timeout`, or an `abort`-able
+  task MUST carry a `// cancel-safe: <reason>` or
+  `// NOT cancel-safe: <reason>` doc comment. No exceptions.
+- "All awaits are idempotent" is **not** a valid reason -- idempotency is
+  about retries, not about partial state between awaits.
+- Consult tokio docs per call. E.g. `AsyncReadExt::read` is cancel-safe,
+  `read_exact` is NOT.
+- For embassy on this firmware: `embassy_futures::select` cancels the
+  losing branch by dropping its future. Same rules apply. See the
+  `IR -> UART Flow` section in CLAUDE.md -- `haier_task` races a UART
+  read against the command channel via `select`, so any future placed on
+  either arm must be cancel-safe or wrapped in an unabortable region.
+
+### DO: Audit Drop impls of async resources (transactions, connections, guards)
+
+Drop runs on every exit path, including panics and cancellation. For types
+returned from `.await` (DB transactions, pooled connections, async file
+handles), the Drop impl may perform I/O. In an async runtime this can
+either run blocking code on a worker thread or silently no-op.
+
+```rust
+// Subtle bug: commit() can itself fail. The tx then drops in an indeterminate
+// state. Different libraries handle this differently:
+//   - sqlx: Drop queues a rollback that runs on the *next* async invocation of
+//     the underlying connection (or when returned to the pool). If nothing
+//     drives the connection after the drop, the rollback never executes.
+//     Source: launchbadge/sqlx, sqlx-core/src/transaction.rs Drop impl.
+//   - deadpool-postgres: wraps tokio_postgres, which uses similar deferred
+//     cleanup via the connection's background task; the rollback may not run
+//     if the runtime is shutting down.
+async fn run(pool: &Pool) -> Result<Data> {
+    let tx = pool.get().await?.transaction().await?;
+    match do_work(&tx).await {
+        Ok(result) => { tx.commit().await?; Ok(result) }
+        Err(e)    => { tx.rollback().await?; Err(e) }
+    }
+}
+```
+
+Rules:
+
+- For every async resource type you `.await` into scope, know what its Drop
+  does -- read the source, not just the docs.
+- Prefer explicit `commit` / `rollback` / `close` on every path. Do not
+  rely on Drop to clean up async work.
+- If Drop is the only cleanup path, document it at the call site.
 
 ---
 
@@ -713,6 +989,38 @@ introduce new warnings, breaking your build.
 #![deny(unused, dead_code)]
 ```
 
+### Blanket Impls in Public APIs (Semver Hazard)
+
+`impl<T: SomeBound> MyTrait for T` in a published crate is a semver hazard.
+Downstream code may already have its own `impl MyTrait for Foo` that
+compiles today; if you later add a second blanket impl, narrow the bound,
+or add another impl that overlaps, downstream compilation breaks. The
+breakage surfaces only on the consumer's CI, often months later.
+
+```rust
+// BAD in a public API: any downstream `impl MyTrait for ConcreteType`
+// becomes a coherence-error tripwire on future versions of this crate.
+pub trait MyTrait { fn do_it(&self) -> String; }
+impl<T: Display> MyTrait for T {
+    fn do_it(&self) -> String { format!("{}", self) }
+}
+
+// GOOD: per-type impls, or seal the trait so downstream can't impl it.
+pub trait MyTrait: sealed::Sealed { fn do_it(&self) -> String; }
+mod sealed { pub trait Sealed {} }
+impl sealed::Sealed for String {}
+impl MyTrait for String { fn do_it(&self) -> String { self.clone() } }
+```
+
+Rules:
+
+- Blanket impls in `pub` trait-or-type combinations require the trait to
+  be **sealed** (private supertrait pattern) so only this crate can add
+  impls.
+- If the trait is meant to be implementable downstream, write per-type
+  impls in this crate -- no blanket impls.
+- Internal (`pub(crate)` or smaller) blanket impls are fine.
+
 ### Overreliance on `String` in APIs
 
 Accept `&str` for reading, `impl Into<String>` for ownership transfer.
@@ -784,6 +1092,9 @@ Add to your `Cargo.toml`:
 [lints.clippy]
 all = "deny"
 pedantic = "warn"
+nursery = "warn"           # AI-generated code: extra unstable lints catch
+                           # patterns pedantic misses. Expect noise; allow
+                           # specific lints in `clippy.toml` if needed.
 ```
 
 ### Defensive Programming Lints
@@ -796,6 +1107,11 @@ wildcard_enum_match_arm = "deny"   # No catch-all _ in enums
 fn_params_excessive_bools = "deny" # Too many bool params
 must_use_candidate = "warn"        # Suggest #[must_use]
 unneeded_field_pattern = "warn"    # Unnecessary .. in patterns
+await_holding_lock = "deny"        # Held std/parking_lot MutexGuard across .await
+                                   # (catches the obvious case only -- still
+                                   # review every Mutex import in async modules)
+cast_ptr_alignment = "deny"        # *const u8 as *const u16 -- UB on RISC-V
+                                   # (see Section 4 "ptr::read_unaligned")
 ```
 
 ### Panic Prevention Lints
@@ -920,6 +1236,58 @@ individual items with a safety comment explaining the invariant.
 
 For library crates, `missing_docs = "warn"` ensures every public item
 has documentation. Promote to `"deny"` once existing docs are complete.
+
+### Lints for LLM-generated code
+
+The lints below are individually listed in the other subsections, but
+grouped here as the minimum surface specifically targeting failure modes
+that pass `cargo build` and `cargo test` on LLM-written Rust. Source:
+the Habr "Я заставил LLM писать Rust полгода" article (see References).
+
+```toml
+[lints.clippy]
+# Async cancel-safety / Mutex hazards (Habr Category 2 + 5)
+await_holding_lock = "deny"        # held std MutexGuard across .await
+await_holding_refcell_ref = "deny" # held RefCell borrow across .await
+
+# Unsafe alignment / pointer hazards (Habr Category 4)
+cast_ptr_alignment = "deny"        # *const u8 as *const u16, ptr::read on unaligned
+transmute_ptr_to_ref = "deny"      # mem::transmute hiding lifetime laundering
+not_unsafe_ptr_arg_deref = "deny"  # safe fn that deref's a caller-provided ptr
+
+# RAII / Drop hazards (Habr Category 3)
+mem_forget = "deny"                # leaks Drop; almost always a bug
+
+# Trait-system semver hazards (Habr Category 6)
+# (no direct lint exists; rely on the Section 7 anti-pattern rule and
+#  manual review of `impl<T: Bound> Trait for T` patterns.)
+
+# Stack-allocated boxes / large arrays (Habr Category 7)
+large_stack_arrays = "warn"        # arrays > clippy threshold on the stack
+large_stack_frames = "warn"        # functions with large local frames
+
+# AI-bias hazards (covered by clippy::pedantic + nursery already, but
+# called out explicitly because they are high-signal on LLM code):
+# - clippy::ptr_as_ptr
+# - clippy::cast_lossless
+# - clippy::redundant_clone
+# - clippy::needless_pass_by_value
+```
+
+Limitations to be aware of:
+
+- `await_holding_lock` only catches guards visibly alive across `.await`
+  in the same function. Guards returned from a helper, stored in a struct
+  field, or produced by `MutexGuard::map` slip past. Treat as necessary
+  but not sufficient -- hand-review every `Mutex` import in async modules.
+- `cast_ptr_alignment` fires on the obvious cast pattern but not on every
+  way to construct a misaligned pointer (e.g. `slice::from_raw_parts` with
+  a hand-computed offset). The Section 4 prose rule is still required.
+- There is no clippy lint for blanket-impl semver hazards or for async
+  cancel safety. Those remain prose-only rules in Sections 7 and 5.
+- This workspace also enforces `cargo +nightly miri test` for files with
+  `unsafe` (where the target permits -- see Section 12 "Miri caveats").
+  Miri is the only reliable catch for the UB cases that pass clippy.
 
 ### DO: Use `cargo fmt` for consistent formatting
 
@@ -1243,6 +1611,7 @@ Use this when reviewing code:
 - [ ] Functions accept borrowed types (`&str`, `&[T]`) not owned references (`&String`, `&Vec<T>`)
 - [ ] No `.clone()` used to work around the borrow checker
 - [ ] `mem::take` / `mem::replace` used instead of clone for owned enum fields
+- [ ] No single `'a` parameterizing both an input ref and a collection holding refs (lifetime laundering)
 - [ ] Consumed arguments returned in error variants for retryable operations
 
 **Error Handling**
@@ -1269,6 +1638,9 @@ Use this when reviewing code:
 - [ ] Blocking work wrapped in `spawn_blocking`
 - [ ] Timeouts use `tokio::select!`
 - [ ] No `std::sync::Mutex` held across `.await` points
+- [ ] Every async fn that may run inside `select!` / `timeout` / `embassy_futures::select` carries a `// cancel-safe:` or `// NOT cancel-safe:` doc comment with reasoning
+- [ ] Drop impls of async resources (transactions, pooled connections, guards) audited; explicit cleanup on every path, never relied on Drop alone
+- [ ] No `Box::new([0; N])` for large `N` -- use `vec![0; N].into_boxed_slice()` (especially in embassy tasks with small stacks)
 
 **Defensive**
 - [ ] No `..Default::default()` hiding new fields
@@ -1281,6 +1653,7 @@ Use this when reviewing code:
 - [ ] Constructors with validation return `Result`
 - [ ] No more than 3-4 boolean parameters (use enums or param struct)
 - [ ] Third-party types wrapped, not exposed in public APIs
+- [ ] No blanket `impl<T: Bound> PublicTrait for T` unless `PublicTrait` is sealed
 
 **Web Security (OWASP)**
 - [ ] OWASP security headers set on all HTTP responses (HSTS, CSP, X-Content-Type-Options, X-Frame-Options, Referrer-Policy)
@@ -1321,6 +1694,7 @@ Use this when reviewing code:
 - [ ] `cargo audit` and `cargo deny check` in CI
 - [ ] `cargo semver-checks` in CI for library crates
 - [ ] `rustfmt.toml` with `imports_granularity` and `group_imports` configured
+- [ ] `cargo miri` run (nightly job) against pure-Rust modules with `unsafe`; HAL/FFI-touching crates exempted with a note
 
 ---
 
@@ -1364,6 +1738,49 @@ consumers upgrade. Run it on every PR that touches the library crate.
 | `cargo-expand` | Expand macros - see what proc macros / derive macros generate | `cargo install cargo-expand` | `cargo expand <module>` |
 | `flamegraph` | CPU profiling via perf/dtrace | `cargo install flamegraph` | `cargo flamegraph --bin <name>` |
 | `tokio-console` | Async runtime introspection | `cargo install tokio-console` | `tokio-console` |
+| `cargo miri` | Detects undefined behavior in `unsafe` code: OOB reads, misaligned pointer access, Stacked Borrows violations, uninitialized reads. Catches UB that passes normal tests and `clippy`. | `rustup +nightly component add miri` | `cargo +nightly miri test -p <crate>` |
+
+**Miri caveats -- read before pushing back on a reviewer who asks for it:**
+
+- **FFI support is experimental and incomplete.** Miri added partial FFI via
+  `-Zmiri-native-lib` (Unix-only, 2024-2025). It can pass integer/pointer
+  arguments to C functions and trace some memory accesses, but does NOT
+  support function pointers passed to C, memory allocated by C and returned
+  to Rust, or non-Unix hosts. For this workspace, that means crates calling
+  into `mbedtls-rs` *might* work for narrow cases but should not be assumed
+  to. Treat FFI-heavy crates as Miri-untested unless someone has explicitly
+  validated the specific call pattern.
+- **No practical support for bare-metal targets.** Miri targets the host and
+  fails on memory-mapped I/O register access. The esp-hal maintainers
+  prototyped Miri integration in esp-rs/esp-hal#3297 and closed it with
+  "the PACs will make Miri very, very mad." Firmware code that touches
+  `esp-hal`, `esp-radio`, or any peripheral register is not Miri-testable
+  end-to-end. This is a platform limitation, not a workflow gap.
+- **Slow.** Tokio docs warn of a "dramatic increase" in test time; real-world
+  CI reports 35%+ time savings from skipping Miri-incompatible tests
+  (alloy-rs/core PR #1072). Use a separate nightly CI job, not the per-PR
+  critical path.
+
+**ESP32 firmware strategy:**
+
+1. Factor pure-Rust logic (protocol parsers, CRC, state machines,
+   byte-stuffing, NEC decode, hOn frame builders) into separate modules
+   or `no_std`-but-host-buildable inner crates.
+2. Write `#[cfg(test)]` unit tests for those modules. These tests build
+   for the host target and CAN run under Miri.
+3. Run Miri only against those modules: `cargo +nightly miri test -p haier_proto`
+   (or equivalent). The HAL-glue code that calls `esp-hal` stays untested
+   by Miri -- that's an inherent limitation of the platform, not a gap to
+   apologize for.
+4. For HAL-touching `unsafe`: rely on the existing discipline -- every
+   `unsafe` block carries a `// SAFETY:` comment justifying the invariant
+   (see CLAUDE.md "Memory Safety Checklist"). Human review is the only
+   tool we have for those blocks; Miri does not apply.
+
+`cargo-careful` (`cargo install cargo-careful`) is an intermediate option
+that enables extra debug checks in std without Miri's interpreter overhead.
+It supports FFI but catches a narrower class of bugs. Optional, not
+required.
 
 ### Version Policy
 
@@ -1462,3 +1879,4 @@ tests they can run autonomously vs which require human-assisted setup.
 - [Rust Anti-Patterns](https://rust-unofficial.github.io/patterns/anti_patterns/) -- common solutions that create more problems
 - [7 Rust Anti-Patterns Killing Your Performance](https://medium.com/solo-devs/the-7-rust-anti-patterns-that-are-secretly-killing-your-performance-and-how-to-fix-them-in-2025-dcebfdef7b54) -- clone epidemic, blocking async, unwrap addiction
 - [Patterns for Defensive Programming in Rust](https://corrode.dev/blog/defensive-programming/) -- constructors, exhaustive matching, `#[must_use]`, clippy lints
+- [Я заставил LLM писать Rust полгода (Habr, 2026)](https://habr.com/ru/articles/1035712/) -- LLM-specific Rust failure modes: lifetime laundering, async cancel safety, Drop in async, blanket impl semver hazards, stack-allocated boxes. Source of the cancel-safety and lifetime-laundering rules above.
