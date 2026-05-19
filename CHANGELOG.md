@@ -8,6 +8,29 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+## [1.7.4] - 2026-05-19
+
+### Added
+
+- **`cancel` module: `run_with_cancel_and_timeout` for cancel-safe
+  tool handlers.** Solves the "drop mid-`.await`" hazard when a
+  `tokio::select!` arm racing `CancellationToken::cancelled()` or
+  `tokio::time::sleep(timeout)` wins against a long-running future
+  that owns a remote-side resource (SSH channel, in-flight HTTP
+  body, DB transaction). Spawning the future onto `tokio::spawn`
+  first and racing the `JoinHandle` (without `.abort()`) lets the
+  inner future complete its own cleanup path while the caller
+  returns cancel/timeout to the client immediately. `DetachOutcome`
+  is `#[non_exhaustive]` and `#[must_use]`. The originating
+  tracing span is preserved via `.instrument(Span::current())`.
+  Task-local RBAC scope is intentionally NOT propagated into the
+  detached task -- detached work should finish or close
+  already-authorized resources rather than initiate fresh
+  RBAC-gated operations; the module-level `# Caveats` rustdoc
+  shows how to capture and rebind RBAC context for callers that
+  genuinely need it. Originally implemented in the downstream
+  `podmcp` crate to close that crate's M-6 deferred-audit finding.
+
 ## [1.7.3] - 2026-05-15
 
 ### Changed
