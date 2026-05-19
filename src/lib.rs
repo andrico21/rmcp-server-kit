@@ -118,6 +118,10 @@ pub mod rbac;
 /// Memory-bounded keyed rate limiter (LRU + idle eviction).
 pub mod bounded_limiter;
 
+/// Cancellation primitives that detach in-flight async work on
+/// cancel/timeout instead of dropping it mid-`.await`.
+pub mod cancel;
+
 /// Admin diagnostic endpoints (status, auth keys metadata, counters, RBAC).
 pub mod admin;
 
