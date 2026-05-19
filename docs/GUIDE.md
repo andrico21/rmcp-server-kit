@@ -23,6 +23,7 @@ You supply a `ServerHandler` implementation; rmcp-server-kit handles everything 
   - [config](#config) -- Server and observability configuration
   - [error](#error) -- Error types
   - [observability](#observability) -- Tracing and logging
+  - [cancel](#cancel) -- Cancel-safe detach helper for tool handlers
   - [oauth](#oauth) -- OAuth 2.1 JWT validation (feature-gated)
   - [metrics](#metrics) -- Prometheus metrics (feature-gated)
 - [Additional Built-in Endpoints and Features](#additional-built-in-endpoints-and-features)
@@ -838,6 +839,53 @@ Features:
 - JSON or pretty-printed output
 - Optional JSON audit log file (append mode, auto-creates parent dirs)
 - `RUST_LOG` env var takes precedence
+
+---
+
+### cancel
+
+Cancel-safe detach helper for tool handlers that own remote-side
+resources (SSH channels, in-flight HTTP bodies, DB transactions).
+
+`tokio::select!` arms racing a long-running future against
+`CancellationToken` or `tokio::time::sleep` drop the losing future
+mid-`.await`, which leaves remote-side resources half-open until
+some outer lifetime ends. The `cancel` module fixes that by
+spawning the future onto its own task frame and racing the
+`JoinHandle` instead: when cancel/timeout wins, the spawned task
+keeps running to completion and drives its own cleanup path.
+
+```rust,ignore
+use rmcp_server_kit::cancel::{run_with_cancel_and_timeout, DetachOutcome};
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
+
+# async fn handle(ct: CancellationToken, work: impl Future<Output = String> + Send + 'static) -> String {
+match run_with_cancel_and_timeout(work, &ct, Some(Duration::from_secs(30))).await {
+    DetachOutcome::Completed(value) => value,
+    DetachOutcome::Cancelled => "cancelled".into(),
+    DetachOutcome::TimedOut => "timed out".into(),
+    DetachOutcome::Panicked(join_err) => format!("panicked: {join_err}"),
+}
+# }
+```
+
+Highlights:
+- Pre-cancel short-circuit: an already-cancelled token never spawns
+  the future.
+- Completion wins on tie under `biased;`: prevents misreporting
+  cancel for an operation that actually succeeded.
+- Panics surface distinctly via `DetachOutcome::Panicked` rather
+  than folding into Cancelled/TimedOut.
+- Originating tracing span is propagated into the detached task
+  via `.instrument(Span::current())`.
+
+RBAC task-locals (`rbac::current_role()` and friends) are NOT
+propagated into the detached future -- detached work should
+finish/close already-authorized resources rather than initiate
+fresh RBAC-gated operations. See the module-level `# Caveats`
+rustdoc for a worked example of capturing and rebinding RBAC
+context when a caller genuinely needs it.
 
 ---
 
