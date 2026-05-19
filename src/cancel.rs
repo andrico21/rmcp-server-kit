@@ -232,10 +232,14 @@ fn map_join<T>(joined: Result<T, tokio::task::JoinError>) -> DetachOutcome<T> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::*;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32, Ordering},
+    };
+
     use tokio::time::Duration;
+
+    use super::*;
 
     #[tokio::test]
     async fn completed_returns_value_when_future_wins() {
