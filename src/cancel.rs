@@ -94,9 +94,10 @@
 //!       use rmcp_server_kit::secret::SecretString;
 //!       SecretString::new(String::new().into())
 //!   });
+//!   let sub = rbac::current_sub().unwrap_or_default();
 //!
 //!   let fut = async move {
-//!       rbac::with_rbac_scope(role, identity, token, None, async {
+//!       rbac::with_rbac_scope(role, identity, token, sub, async {
 //!           // Detached work here can call current_role() etc.
 //!       })
 //!       .await;
