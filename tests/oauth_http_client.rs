@@ -408,6 +408,17 @@ async fn redirect_chain_capped_at_two_hops() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "rustls-platform-verifier on Windows Schannel may reject self-signed test CAs \
+              even with 0.7.0's extra-roots fallback; behaviour depends on the platform \
+              cert store state and is not reproducible across runners. \
+              See https://github.com/rustls/rustls-platform-verifier/issues/214. \
+              The production code path (custom CA via reqwest::Certificate::from_pem + \
+              add_root_certificate) is exercised on Linux and macOS, and the related \
+              redirect-policy test (redirect_downgrade_https_to_http_is_rejected) runs \
+              on all platforms including Windows."
+)]
 async fn ca_cert_path_is_applied_to_oauth_http_client() {
     let pki = build_test_pki();
 
