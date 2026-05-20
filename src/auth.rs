@@ -474,8 +474,8 @@ pub struct MtlsConfig {
     /// verifier hook (a different subsystem than ordinary request
     /// middleware). Note: the **bearer pre-auth limiter** that gates
     /// API-key / OAuth `Authorization` headers is already per-IP — see
-    /// [`AuthConfig::pre_auth_per_ip_per_min`] and the keyed governor
-    /// initialised in [`AuthState::new`]. URLs that lose the
+    /// [`RateLimitConfig::pre_auth_max_per_minute`] and the keyed
+    /// governor built by `build_pre_auth_limiter`. URLs that lose the
     /// rate-limiter race are *not* marked as seen, so subsequent
     /// handshakes observing the same URL can retry admission.
     /// Default: `60`.

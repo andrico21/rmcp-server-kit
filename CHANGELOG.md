@@ -8,6 +8,8 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+## [1.7.6] - 2026-05-20
+
 ### Security / Hardening
 
 - **`SeenIdentitySet` is now memory-bounded** (M2). The internal
