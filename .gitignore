@@ -17,6 +17,9 @@
 /coverage
 *.profraw
 *.profdata
+# JUnit XML output from `cargo nextest` / similar; blocks `cargo publish`
+# from a clean tree if left in the working directory.
+junit.xml
 
 # OS cruft
 .DS_Store
