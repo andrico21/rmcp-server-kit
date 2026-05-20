@@ -236,6 +236,12 @@ impl<H: ServerHandler> fmt::Debug for HookedHandler<H> {
 /// `#[must_use]` attribute would be the natural enforcement here, but adding
 /// it to a public function is a SemVer-minor change per cargo-semver-checks;
 /// it is deferred to the next minor-version bump.
+///
+// NOTE(next-minor): add `#[must_use = "HookedHandler must be wired into a
+// ServerHandler (e.g. via `serve(..., || hooked)`) to take effect; dropping
+// the returned value silently disables the supplied hooks"]` here. Deferred
+// from patch releases on 1.7.x to avoid downstream `-D warnings` churn.
+// Cross-ref: CHANGELOG.md "[Unreleased]" — Quality / lint hygiene section.
 pub fn with_hooks<H: ServerHandler>(inner: H, hooks: Arc<ToolHooks>) -> HookedHandler<H> {
     HookedHandler {
         inner: Arc::new(inner),

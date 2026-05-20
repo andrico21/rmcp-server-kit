@@ -231,7 +231,12 @@ fn map_join<T>(joined: Result<T, tokio::task::JoinError>) -> DetachOutcome<T> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        reason = "test-only relaxations; production code uses ? and tracing"
+    )]
 
     use std::sync::{
         Arc,

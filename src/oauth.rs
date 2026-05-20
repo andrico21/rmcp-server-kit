@@ -2373,7 +2373,10 @@ fn lookup_key(cached: &CachedKeys, kid: Option<&str>, alg: Algorithm) -> Option<
 }
 
 /// Extract the algorithm from a JWK's common parameters.
-#[allow(clippy::wildcard_enum_match_arm)]
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "jsonwebtoken KeyAlgorithm is a large external enum; only the JWT-signing variants are mappable to `Algorithm`"
+)]
 fn jwk_algorithm(jwk: &jsonwebtoken::jwk::Jwk) -> Option<Algorithm> {
     jwk.common.key_algorithm.and_then(|ka| match ka {
         jsonwebtoken::jwk::KeyAlgorithm::RS256 => Some(Algorithm::RS256),

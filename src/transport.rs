@@ -847,7 +847,7 @@ impl ReloadHandle {
 ///
 /// Returns an error if the TCP listener cannot bind, TLS config is invalid,
 /// or the server fails.
-// TODO(refactor): cognitive complexity reduced from 111/25 to 83/25 by
+// NOTE: cognitive complexity reduced from 111/25 to 83/25 by
 // extracting `run_server` (serve-loop tail) and `install_oauth_proxy_routes`.
 // Remaining flow is a linear router builder: middleware layering, feature-
 // gated auth/RBAC wiring, and PRM/metrics installation. Further extraction
@@ -955,7 +955,7 @@ where
                 pre_auth_limiter,
                 #[cfg(feature = "oauth")]
                 jwks_cache,
-                seen_identities: std::sync::Mutex::new(std::collections::HashSet::new()),
+                seen_identities: crate::auth::SeenIdentitySet::new(),
                 counters: crate::auth::AuthCounters::default(),
             }))
         }
@@ -2121,7 +2121,10 @@ fn load_key(path: &Path) -> anyhow::Result<rustls::pki_types::PrivateKeyDer<'sta
         .map_err(|e| anyhow::anyhow!("failed to read key from {}: {e}", path.display()))
 }
 
-#[allow(clippy::unused_async)]
+#[allow(
+    clippy::unused_async,
+    reason = "axum route handler signature requires `async fn` even when the body is synchronous"
+)]
 async fn healthz() -> impl IntoResponse {
     axum::Json(serde_json::json!({
         "status": "ok",
@@ -2615,7 +2618,7 @@ mod tests {
         deprecated,
         reason = "internal unit tests legitimately read/write the deprecated `pub` fields they were designed to verify"
     )]
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     use axum::{
         body::Body,
@@ -2678,14 +2681,21 @@ mod tests {
 
     #[test]
     fn validate_rejects_zero_max_tracked_keys() {
+        // Defaults mirror auth::default_max_attempts / default_idle_eviction
+        // (module-private in auth.rs); spelled out here for review clarity.
         let rl = crate::auth::RateLimitConfig {
+            max_attempts_per_minute: 30,
+            pre_auth_max_per_minute: None,
             max_tracked_keys: 0,
-            ..Default::default()
+            idle_eviction: Duration::from_secs(15 * 60),
         };
         let auth_cfg = AuthConfig {
             enabled: true,
+            api_keys: Vec::new(),
+            mtls: None,
             rate_limit: Some(rl),
-            ..Default::default()
+            #[cfg(feature = "oauth")]
+            oauth: None,
         };
         let cfg = McpServerConfig::new("127.0.0.1:8080", "test", "1.0.0").with_auth(auth_cfg);
         let err = cfg.validate().expect_err("zero max_tracked_keys must fail");

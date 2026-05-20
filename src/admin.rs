@@ -173,8 +173,11 @@ pub(crate) fn admin_router(state: AdminState, config: &AdminConfig) -> Router {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
-    use std::sync::Mutex;
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        reason = "test-only relaxations; production code uses ? and tracing"
+    )]
 
     use axum::http::Request;
     use tower::ServiceExt as _;
@@ -196,7 +199,7 @@ mod tests {
             pre_auth_limiter: None,
             #[cfg(feature = "oauth")]
             jwks_cache: None,
-            seen_identities: Mutex::new(std::collections::HashSet::default()),
+            seen_identities: crate::auth::SeenIdentitySet::new(),
             counters: AuthCounters::default(),
         })
     }

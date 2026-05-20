@@ -470,10 +470,14 @@ pub struct MtlsConfig {
     /// amplification when attacker-controlled certificates carry large
     /// CDP lists. The limit is global (not per-source-IP) in this
     /// release; per-IP scoping is deferred to a future version because
-    /// it requires plumbing the peer `SocketAddr` through the verifier
-    /// hook. URLs that lose the rate-limiter race are *not* marked as
-    /// seen, so subsequent handshakes observing the same URL can
-    /// retry admission.
+    /// it requires plumbing the peer `SocketAddr` through the rustls
+    /// verifier hook (a different subsystem than ordinary request
+    /// middleware). Note: the **bearer pre-auth limiter** that gates
+    /// API-key / OAuth `Authorization` headers is already per-IP — see
+    /// [`AuthConfig::pre_auth_per_ip_per_min`] and the keyed governor
+    /// initialised in [`AuthState::new`]. URLs that lose the
+    /// rate-limiter race are *not* marked as seen, so subsequent
+    /// handshakes observing the same URL can retry admission.
     /// Default: `60`.
     #[serde(default = "default_crl_discovery_rate_per_min")]
     pub crl_discovery_rate_per_min: u32,
@@ -769,6 +773,119 @@ impl TlsConnInfo {
     }
 }
 
+/// Default hard cap on the number of distinct authenticated identities
+/// remembered by [`SeenIdentitySet`].
+///
+/// Sized to comfortably exceed realistic identity churn for an MCP server
+/// while bounding worst-case memory at roughly `4096 * avg_name_len`
+/// (~256 KiB at 64-byte names). Honest clients will never trigger eviction;
+/// hostile churn (rotating mTLS subjects or OAuth `sub` values) is bounded.
+const DEFAULT_SEEN_IDENTITY_CAP: usize = 4096;
+
+/// Bounded set tracking which authenticated identities have already been
+/// logged at INFO level (subsequent auths fall back to DEBUG).
+///
+/// # Why bounded?
+///
+/// `id.name` is attacker-influenced under mTLS (SAN/CN) and OAuth (`sub`).
+/// An unbounded [`std::collections::HashSet`] would grow with churn,
+/// producing both a slow memory leak and unbounded log-cardinality
+/// downstream (Loki/ES). The cap follows the same trade-off documented in
+/// [`crate::bounded_limiter`]: when an evicted identity reappears it
+/// re-fires INFO once. This is acceptable for diagnostic logging.
+///
+/// # Concurrency
+///
+/// Uses [`std::sync::Mutex`] because [`Self::insert_is_first`] is purely
+/// synchronous and the critical section never `.await`s. The mutex is
+/// poison-tolerant: a poisoned set is still logically consistent
+/// (only writer is `insert_is_first`, which performs an atomic insert
+/// + bounded eviction; no torn invariants are possible).
+pub(crate) struct SeenIdentitySet {
+    inner: Mutex<SeenInner>,
+}
+
+struct SeenInner {
+    set: HashSet<String>,
+    /// Insertion-order FIFO used for bounded eviction. Tracking strict LRU
+    /// would require touching the queue on every hit (under the mutex);
+    /// FIFO is sufficient because the contract only promises "bounded
+    /// memory", not "remember the most recently seen identities".
+    order: std::collections::VecDeque<String>,
+    cap: usize,
+}
+
+impl SeenIdentitySet {
+    /// Construct with the default cap of [`DEFAULT_SEEN_IDENTITY_CAP`].
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self::with_cap(DEFAULT_SEEN_IDENTITY_CAP)
+    }
+
+    /// Construct with an explicit cap. A `cap` of `0` is silently raised
+    /// to `1` to keep the invariant `set.len() <= cap` non-vacuous.
+    #[must_use]
+    pub(crate) fn with_cap(cap: usize) -> Self {
+        let cap = cap.max(1);
+        Self {
+            inner: Mutex::new(SeenInner {
+                set: HashSet::with_capacity(cap.min(64)),
+                order: std::collections::VecDeque::with_capacity(cap.min(64)),
+                cap,
+            }),
+        }
+    }
+
+    /// Insert `name`. Returns `true` if this is the first time `name` was
+    /// inserted (or it was previously evicted and reinserted), `false`
+    /// if it was already present.
+    ///
+    /// When the cap is reached, the oldest inserted entry is evicted to
+    /// make room. Eviction never blocks the caller.
+    pub(crate) fn insert_is_first(&self, name: &str) -> bool {
+        // SAFETY: the only writer is this method; a poisoned set remains
+        // logically consistent (atomic insert + bounded eviction preserve
+        // the `set.len() <= cap` invariant). Continuing past poison only
+        // affects diagnostic logging granularity, not correctness or
+        // security.
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        if guard.set.contains(name) {
+            return false;
+        }
+        // Cap enforcement: evict-then-insert keeps the invariant
+        // `set.len() <= cap` even when the cap is `1`.
+        if guard.set.len() >= guard.cap
+            && let Some(evicted) = guard.order.pop_front()
+        {
+            guard.set.remove(&evicted);
+        }
+        let owned = name.to_owned();
+        guard.set.insert(owned.clone());
+        guard.order.push_back(owned);
+        true
+    }
+
+    /// Test-only snapshot of the current size.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set
+            .len()
+    }
+}
+
+impl Default for SeenIdentitySet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Shared state for the auth middleware.
 ///
 /// `api_keys` uses [`ArcSwap`] so the SIGHUP handler can atomically
@@ -791,7 +908,9 @@ pub(crate) struct AuthState {
     pub jwks_cache: Option<Arc<crate::oauth::JwksCache>>,
     /// Tracks identity names that have already been logged at INFO level.
     /// Subsequent auths for the same identity are logged at DEBUG.
-    pub seen_identities: Mutex<HashSet<String>>,
+    /// Bounded to prevent attacker-driven memory growth via churned
+    /// mTLS subjects or OAuth `sub` claims (see [`SeenIdentitySet`]).
+    pub seen_identities: SeenIdentitySet,
     /// Lightweight in-memory auth success/failure counters for diagnostics.
     pub counters: AuthCounters,
 }
@@ -829,13 +948,15 @@ impl AuthState {
     }
 
     /// Log auth success: INFO on first occurrence per identity, DEBUG after.
+    ///
+    /// Backed by [`SeenIdentitySet`], a bounded FIFO set that caps
+    /// retained identities to prevent attacker-driven memory growth.
+    /// FIFO (not LRU) is intentional: this cache de-duplicates INFO logs,
+    /// not security state, so per-hit eviction-order mutation is not
+    /// justified. See [`SeenIdentitySet`] for the full trade-off rationale.
     fn log_auth(&self, id: &AuthIdentity, method: &str) {
         self.counters.record_success(id.method);
-        let first = self
-            .seen_identities
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(id.name.clone());
+        let first = self.seen_identities.insert_is_first(&id.name);
         if first {
             tracing::info!(name = %id.name, role = %id.role, "{method} authenticated");
         } else {
@@ -914,7 +1035,10 @@ pub fn extract_mtls_identity(cert_der: &[u8], default_role: &str) -> Option<Auth
             .ok()
             .flatten()
             .and_then(|san| {
-                #[allow(clippy::wildcard_enum_match_arm)]
+                #[allow(
+                    clippy::wildcard_enum_match_arm,
+                    reason = "x509-parser GeneralName is a large external enum; only DNSName is meaningful here"
+                )]
                 san.value.general_names.iter().find_map(|gn| match gn {
                     GeneralName::DNSName(dns) => Some((*dns).to_owned()),
                     _ => None,
@@ -1571,7 +1695,8 @@ mod tests {
         let config = RateLimitConfig {
             max_attempts_per_minute: 5,
             pre_auth_max_per_minute: None,
-            ..Default::default()
+            max_tracked_keys: default_max_tracked_keys(),
+            idle_eviction: default_idle_eviction(),
         };
         let limiter = build_rate_limiter(&config);
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
@@ -1589,7 +1714,8 @@ mod tests {
         let config = RateLimitConfig {
             max_attempts_per_minute: 2,
             pre_auth_max_per_minute: None,
-            ..Default::default()
+            max_tracked_keys: default_max_tracked_keys(),
+            idle_eviction: default_idle_eviction(),
         };
         let limiter = build_rate_limiter(&config);
         let ip1: IpAddr = "10.0.0.1".parse().unwrap();
@@ -1669,7 +1795,7 @@ mod tests {
             pre_auth_limiter: None,
             #[cfg(feature = "oauth")]
             jwks_cache: None,
-            seen_identities: Mutex::new(HashSet::new()),
+            seen_identities: SeenIdentitySet::new(),
             counters: AuthCounters::default(),
         })
     }
@@ -1759,12 +1885,13 @@ mod tests {
             rate_limiter: Some(build_rate_limiter(&RateLimitConfig {
                 max_attempts_per_minute: 1,
                 pre_auth_max_per_minute: None,
-                ..Default::default()
+                max_tracked_keys: default_max_tracked_keys(),
+                idle_eviction: default_idle_eviction(),
             })),
             pre_auth_limiter: None,
             #[cfg(feature = "oauth")]
             jwks_cache: None,
-            seen_identities: Mutex::new(HashSet::new()),
+            seen_identities: SeenIdentitySet::new(),
             counters: AuthCounters::default(),
         });
         let app = auth_router(state);
@@ -1794,7 +1921,8 @@ mod tests {
         let config = RateLimitConfig {
             max_attempts_per_minute: 3,
             pre_auth_max_per_minute: None,
-            ..Default::default()
+            max_tracked_keys: default_max_tracked_keys(),
+            idle_eviction: default_idle_eviction(),
         };
         let limiter = build_rate_limiter(&config);
         let ip: IpAddr = "192.168.1.100".parse().unwrap();
@@ -1836,7 +1964,8 @@ mod tests {
         let config = RateLimitConfig {
             max_attempts_per_minute: 5,
             pre_auth_max_per_minute: None,
-            ..Default::default()
+            max_tracked_keys: default_max_tracked_keys(),
+            idle_eviction: default_idle_eviction(),
         };
         let limiter = build_pre_auth_limiter(&config);
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
@@ -1862,7 +1991,8 @@ mod tests {
         let config = RateLimitConfig {
             max_attempts_per_minute: 100,     // would default to 1000 pre-auth quota
             pre_auth_max_per_minute: Some(2), // but operator caps at 2
-            ..Default::default()
+            max_tracked_keys: default_max_tracked_keys(),
+            idle_eviction: default_idle_eviction(),
         };
         let limiter = build_pre_auth_limiter(&config);
         let ip: IpAddr = "10.0.0.2".parse().unwrap();
@@ -1892,7 +2022,8 @@ mod tests {
         let config = RateLimitConfig {
             max_attempts_per_minute: 100,
             pre_auth_max_per_minute: Some(1),
-            ..Default::default()
+            max_tracked_keys: default_max_tracked_keys(),
+            idle_eviction: default_idle_eviction(),
         };
         let state = Arc::new(AuthState {
             api_keys: ArcSwap::new(Arc::new(keys)),
@@ -1900,7 +2031,7 @@ mod tests {
             pre_auth_limiter: Some(build_pre_auth_limiter(&config)),
             #[cfg(feature = "oauth")]
             jwks_cache: None,
-            seen_identities: Mutex::new(HashSet::new()),
+            seen_identities: SeenIdentitySet::new(),
             counters: AuthCounters::default(),
         });
         let app = auth_router(Arc::clone(&state));
@@ -1963,7 +2094,8 @@ mod tests {
         let config = RateLimitConfig {
             max_attempts_per_minute: 100,
             pre_auth_max_per_minute: Some(1), // tight: would block 2nd plain request
-            ..Default::default()
+            max_tracked_keys: default_max_tracked_keys(),
+            idle_eviction: default_idle_eviction(),
         };
         let state = Arc::new(AuthState {
             api_keys: ArcSwap::new(Arc::new(vec![])),
@@ -1971,7 +2103,7 @@ mod tests {
             pre_auth_limiter: Some(build_pre_auth_limiter(&config)),
             #[cfg(feature = "oauth")]
             jwks_cache: None,
-            seen_identities: Mutex::new(HashSet::new()),
+            seen_identities: SeenIdentitySet::new(),
             counters: AuthCounters::default(),
         });
         let app = auth_router(Arc::clone(&state));
@@ -2267,5 +2399,85 @@ mod tests {
             "summary.bearer must be false when api_keys is empty (kills `!` deletion at L615)"
         );
         assert!(s.api_keys.is_empty());
+    }
+
+    #[test]
+    fn seen_identity_set_first_then_repeat() {
+        let set = SeenIdentitySet::new();
+        assert!(set.insert_is_first("alice"), "first sighting is first");
+        assert!(
+            !set.insert_is_first("alice"),
+            "second sighting is not first"
+        );
+        assert!(set.insert_is_first("bob"));
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn seen_identity_set_evicts_oldest_at_cap() {
+        let set = SeenIdentitySet::with_cap(2);
+        assert!(set.insert_is_first("a"));
+        assert!(set.insert_is_first("b"));
+        // Cap reached; inserting "c" evicts "a".
+        assert!(set.insert_is_first("c"));
+        assert_eq!(set.len(), 2);
+        // "a" was evicted, so it re-fires as "first" (matches the documented
+        // bounded trade-off: re-INFO once on reappearance). Inserting "a"
+        // here evicts "b" (next oldest), leaving {c, a}.
+        assert!(set.insert_is_first("a"));
+        assert_eq!(set.len(), 2);
+        // "b" has now been evicted in turn, so it re-fires as "first" too.
+        assert!(set.insert_is_first("b"));
+        // Sanity: cap is never exceeded regardless of churn pattern.
+        for i in 0..32 {
+            set.insert_is_first(&format!("churn-{i}"));
+            assert!(set.len() <= 2, "cap invariant must hold");
+        }
+    }
+
+    #[test]
+    fn seen_identity_set_cap_zero_is_raised_to_one() {
+        let set = SeenIdentitySet::with_cap(0);
+        assert!(set.insert_is_first("only"));
+        assert_eq!(set.len(), 1);
+        // Next insert evicts "only".
+        assert!(set.insert_is_first("next"));
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn seen_identity_set_fifo_does_not_refresh_on_repeat_hit() {
+        // Locks in the FIFO contract: repeat hits MUST NOT bump an entry
+        // to the back of the eviction queue (that would be LRU).
+        let set = SeenIdentitySet::with_cap(2);
+        assert!(set.insert_is_first("a")); // order=[a]
+        assert!(set.insert_is_first("b")); // order=[a,b]
+        // Repeat hit on "a" - if this were LRU, "a" would move to the back
+        // and "b" would be the next eviction victim. Under FIFO, "a" stays
+        // at the front (oldest by insertion).
+        assert!(!set.insert_is_first("a"));
+        // Insert "c" forces eviction. Under FIFO, "a" (oldest by insertion)
+        // is evicted; "b" survives. Under LRU, "b" would have been evicted.
+        assert!(set.insert_is_first("c"));
+        // Prove "a" was evicted: re-inserting fires as first again.
+        assert!(set.insert_is_first("a"));
+        // Prove "b" was NOT evicted: re-inserting does NOT fire as first.
+        // (If LRU semantics had snuck in, this assertion would fail.)
+        // After the previous step, "a" eviction pushed out "b" as the new
+        // oldest, so we must re-add "b" via a fresh insert path. To keep
+        // the test deterministic we rebuild a small scenario:
+        let set = SeenIdentitySet::with_cap(2);
+        assert!(set.insert_is_first("x")); // order=[x]
+        assert!(set.insert_is_first("y")); // order=[x,y]
+        assert!(!set.insert_is_first("x")); // repeat hit (under FIFO: order unchanged)
+        assert!(set.insert_is_first("z")); // evicts "x" under FIFO
+        assert!(
+            !set.insert_is_first("y"),
+            "y must still be present (FIFO did not evict it)"
+        );
+        assert!(
+            set.insert_is_first("x"),
+            "x must have been evicted by FIFO (would NOT have been evicted under LRU)"
+        );
     }
 }

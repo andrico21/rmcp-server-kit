@@ -221,6 +221,22 @@ impl RoleConfig {
 /// string value at `argument` from the call's arguments object and checks
 /// its first token against `allowed`. If the token is not in the list
 /// the call is rejected with 403.
+//
+// NOTE(future-pr): typed pre-tokenized argument matcher (CHANGELOG.md
+// "future release" promise).
+// Scope (Oracle-approved, internal-only, patch-safe):
+//   - Keep `ArgumentAllowlist` public shape UNCHANGED (wire/config stability).
+//   - In `RbacPolicy::new`, compile each allowlist once into a private
+//     `CompiledArgumentAllowlist` IR:
+//       * pre-resolve the `tool` selector: exact vs glob.
+//       * pre-tokenize first-token allowlists.
+//       * pre-tokenize basename allowlists.
+//   - At request time (`has_argument_allowlist` / `argument_allowed`),
+//     `shlex::split` each constrained argument once, then lookup in the
+//     compiled IR.
+//   - Required equivalence test matrix: exact tool names, globbed tool
+//     names, basename matches, quoted paths, fail-closed parse errors.
+//   - Profile before merge; justify by maintainability if perf delta <5%.
 #[derive(Debug, Clone, Deserialize)]
 #[non_exhaustive]
 pub struct ArgumentAllowlist {
@@ -644,13 +660,13 @@ fn redact_with_salt(salt: &[u8], value: &str) -> String {
 /// Non-POST requests and non-tool-call messages pass through unchanged.
 /// The caller's role is stored in task-local storage for use by tool
 /// handlers (e.g. `list_hosts` host filtering via [`current_role()`]).
-// TODO(refactor): cognitive complexity reduced from 43/25 by extracting
+// NOTE: cognitive complexity reduced from 43/25 by extracting
 // `enforce_tool_policy` and `enforce_rate_limit`. Remaining flow is a
 // linear body-collect + JSON-RPC parse + dispatch, intentionally left
 // inline to keep the request lifecycle visible at a glance.
 #[allow(
     clippy::too_many_lines,
-    reason = "linear request lifecycle (body collect → JSON-RPC parse → policy dispatch) kept inline for security review visibility; helpers already extracted (see TODO above)"
+    reason = "linear request lifecycle (body collect → JSON-RPC parse → policy dispatch) kept inline for security review visibility; helpers already extracted"
 )]
 pub(crate) async fn rbac_middleware(
     policy: Arc<RbacPolicy>,

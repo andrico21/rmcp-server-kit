@@ -5,10 +5,12 @@
         clippy::unwrap_used,
         clippy::expect_used,
         clippy::panic,
+        clippy::panic_in_result_fn,
         clippy::indexing_slicing,
         clippy::unwrap_in_result,
         clippy::print_stdout,
-        clippy::print_stderr
+        clippy::print_stderr,
+        reason = "test-only relaxations; production code uses ? and tracing"
     )
 )]
 

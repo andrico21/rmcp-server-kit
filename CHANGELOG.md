@@ -8,6 +8,64 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+### Security / Hardening
+
+- **`SeenIdentitySet` is now memory-bounded** (M2). The internal
+  first-seen-identity log-dedup table in `src/auth.rs` previously used
+  an unbounded `Mutex<HashSet<String>>`, which grew with attacker-
+  influenced identity churn (mTLS SAN/CN or OAuth `sub`) until process
+  exit. Replaced with a bounded FIFO set capped at 4096 entries
+  (~256 KiB at 64-byte names). Poison-tolerant `Mutex` with explicit
+  `SAFETY:` rationale. Honest clients never trigger eviction; hostile
+  churn is bounded. Internal type, no public API change.
+
+### Quality / lint hygiene
+
+- **Spelled out test fixtures** (M1). Replaced 9 `..Default::default()`
+  shorthand uses across `src/auth.rs` and `src/transport.rs` test modules
+  with explicit per-field initialisation, making the assertions readable
+  without cross-referencing the type's `Default` impl.
+- **Demoted speculative `TODO(refactor):` markers to `NOTE:`** (L1) at
+  `src/rbac.rs:647` and `src/transport.rs:850` — these are documented
+  design trade-offs, not pending work.
+- **Added `reason = "..."` justifications** to remaining `#[allow]` /
+  `#[expect]` attributes (L2 / L3 / Q5): `src/auth.rs:1031`,
+  `src/transport.rs:2124`, `src/oauth.rs:2376`, plus the test-module
+  inner attributes in `src/config.rs`, `src/metrics.rs`,
+  `src/observability.rs`, `src/cancel.rs`, and the crate-level
+  `#![cfg_attr(test, allow(...))]` in `src/lib.rs`.
+- **Added `clippy::panic_in_result_fn` to the crate-level test-only
+  allow list** (Q8) in `src/lib.rs` as cheap future-proofing for
+  `Result`-returning `#[tokio::test]` bodies.
+- **`SAFETY:` comment** (M3) added to the `Mutex` poison-recovery path
+  in `SeenIdentitySet::insert_is_first` explaining why continuing past
+  poison preserves correctness.
+- **Removed unused `use std::sync::Mutex`** in `src/admin.rs` (bonus
+  cleanup surfaced during M2).
+
+### Docs
+
+- **Clarified `SeenIdentitySet` as FIFO, not LRU** (Q3). The type's
+  rustdoc and the call-site comment in `AuthState::log_auth` now
+  consistently say "bounded FIFO set" instead of the previously vague
+  "LRU-style". Added a unit test
+  (`seen_identity_set_fifo_does_not_refresh_on_repeat_hit`) that locks
+  in the FIFO contract by asserting repeat hits do **not** bump an
+  entry's eviction position.
+- **Clarified the global CRL discovery limiter** (Q13) at
+  `src/auth.rs:467-477` and `src/mtls_revocation.rs:117-125`. The
+  comments now explicitly note that this limiter is **distinct** from
+  the bearer pre-auth limiter (which is already keyed per-IP via a
+  bounded keyed governor in the ordinary request middleware path).
+- **Scoped the typed pre-tokenized argument matcher** (Q18) as a
+  `NOTE(future-pr):` design block above `ArgumentAllowlist` in
+  `src/rbac.rs`. Captures Oracle-approved scope: keep public
+  `ArgumentAllowlist` shape stable, add a private compiled IR owned by
+  `RbacPolicy::new`, with a required equivalence test matrix.
+- **Marked the deferred `#[must_use]` on `with_hooks`** (Q15) with a
+  `NOTE(next-minor):` comment in `src/tool_hooks.rs:239` so the next
+  minor-bump owner finds the deferred semver-minor change.
+
 ## [1.7.5] - 2026-05-20
 
 ### Changed

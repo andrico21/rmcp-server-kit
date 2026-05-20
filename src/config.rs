@@ -261,7 +261,8 @@ mod tests {
         clippy::indexing_slicing,
         clippy::unwrap_in_result,
         clippy::print_stdout,
-        clippy::print_stderr
+        clippy::print_stderr,
+        reason = "test-only relaxations; production code uses ? and tracing"
     )]
     use super::*;
 

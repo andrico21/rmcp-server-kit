@@ -120,7 +120,10 @@ pub struct CrlSet {
     /// Note: this ships as a process-global limiter; per-source-IP scoping
     /// is deferred to a future release because the rustls
     /// `verify_client_cert` callback does not carry a `SocketAddr` for the
-    /// peer.
+    /// peer. This is a CRL-discovery limiter in the TLS verifier path —
+    /// distinct from the bearer pre-auth limiter (`AuthState`), which is
+    /// already keyed per-IP via a bounded keyed governor and lives in the
+    /// ordinary request middleware path.
     discovery_limiter: Arc<DefaultDirectRateLimiter>,
     /// Cached cap on per-fetch response body size; copied from `config` so the
     /// hot path doesn't re-read the (rarely changing) config struct.
