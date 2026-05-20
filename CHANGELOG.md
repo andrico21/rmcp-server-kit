@@ -8,6 +8,8 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+## [1.7.5] - 2026-05-20
+
 ### Changed
 
 - **Lints: tightened `clippy::expect_used` from `allow` to `deny`** at the
