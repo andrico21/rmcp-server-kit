@@ -329,7 +329,7 @@ pub struct McpServerConfig {
 /// inner field is private, so downstream code cannot bypass
 /// validation by hand-constructing the wrapper.
 ///
-/// `Validated<T>` derefs to `&T` for read-only access. To mutate,
+/// Use [`Validated::as_inner`] for read-only borrowing. To mutate,
 /// recover the raw value with [`Validated::into_inner`] and
 /// re-validate.
 ///
@@ -403,14 +403,6 @@ impl<T> Validated<T> {
     #[must_use]
     pub fn into_inner(self) -> T {
         self.0
-    }
-}
-
-impl<T> std::ops::Deref for Validated<T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        &self.0
     }
 }
 
@@ -861,7 +853,11 @@ impl ReloadHandle {
 // gated auth/RBAC wiring, and PRM/metrics installation. Further extraction
 // would require threading many `&mut Router` helpers and hurt readability
 // of the layer order (which is security-relevant and must stay visible).
-#[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
+#[allow(
+    clippy::too_many_lines,
+    clippy::cognitive_complexity,
+    reason = "middleware layer order is security-critical and must remain visible at one glance; extracting `&mut Router` helpers would obscure the auth/RBAC/origin/rate-limit ordering"
+)]
 /// Internal bundle of values produced by [`build_app_router`] and
 /// consumed by [`serve`] / [`serve_with_listener`] when driving the
 /// HTTP listener.
@@ -2579,7 +2575,10 @@ fn format_request_headers_for_log(headers: &axum::http::HeaderMap) -> String {
 // NOTE: reported complexity 32/25 is driven entirely by `tracing::*!`
 // macro expansion in this 18-line function (info/warn/info + two matches).
 // There is nothing meaningful to extract; the allow stays.
-#[allow(clippy::cognitive_complexity)]
+#[allow(
+    clippy::cognitive_complexity,
+    reason = "complexity is purely tracing macro expansion (info/warn + match arms); 18 lines of straight-line code, nothing meaningful to extract"
+)]
 pub async fn serve_stdio<H>(handler: H) -> Result<(), McpxError>
 where
     H: ServerHandler + 'static,
@@ -2654,8 +2653,8 @@ mod tests {
         // Valid config -> Validated wrapper, original is consumed.
         let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0");
         let validated = cfg.validate().expect("valid config");
-        // Deref gives read-only access to inner fields.
-        assert_eq!(validated.name, "test-server");
+        // as_inner() gives read-only access to inner fields.
+        assert_eq!(validated.as_inner().name, "test-server");
         // into_inner recovers the raw value.
         let raw = validated.into_inner();
         assert_eq!(raw.name, "test-server");

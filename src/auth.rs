@@ -997,6 +997,10 @@ pub fn verify_bearer_token(token: &str, keys: &[ApiKeyEntry]) -> Option<AuthIden
     use subtle::ConstantTimeEq as _;
 
     let now = chrono::Utc::now();
+    #[allow(
+        clippy::expect_used,
+        reason = "DUMMY_PHC_HASH is a static LazyLock built from a fixed Argon2id PHC string by construction; PasswordHash::new on it is infallible. See DUMMY_PHC_HASH definition."
+    )]
     let dummy_hash = PasswordHash::new(&DUMMY_PHC_HASH)
         .expect("DUMMY_PHC_HASH is a valid Argon2id PHC string by construction");
 
@@ -1053,8 +1057,16 @@ pub fn verify_bearer_token(token: &str, keys: &[ApiKeyEntry]) -> Option<AuthIden
 /// activated transitively in every feature configuration of this crate.
 static DUMMY_PHC_HASH: LazyLock<String> = LazyLock::new(|| {
     // 16 bytes of base64 (`AAAA...`) — minimum valid Argon2 salt length.
+    #[allow(
+        clippy::expect_used,
+        reason = "fixed 22-char base64 ('AAAA...') decodes to a valid 16-byte salt; SaltString::from_b64 is infallible on this literal"
+    )]
     let salt = SaltString::from_b64("AAAAAAAAAAAAAAAAAAAAAA")
         .expect("fixed 16-byte base64 salt is well-formed");
+    #[allow(
+        clippy::expect_used,
+        reason = "Argon2::default() with a fixed plaintext and a well-formed salt is infallible; only fails on bad params/salt"
+    )]
     Argon2::default()
         .hash_password(b"rmcp-server-kit-dummy", &salt)
         .expect("Argon2 default params hash a fixed plaintext")

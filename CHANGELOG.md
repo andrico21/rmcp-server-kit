@@ -10,6 +10,40 @@ Breaking changes bump the **major** version.
 
 ### Changed
 
+- **Lints: tightened `clippy::expect_used` from `allow` to `deny`** at the
+  crate level. The five legitimate production `.expect()` sites
+  (`auth.rs` `DUMMY_PHC_HASH` PHC string construction, fixed-salt Argon2
+  hash; `oauth.rs` re-parsing the already-validated `jwks_cache_ttl`;
+  `rbac.rs` HMAC key construction from a 32-byte SHA-256 digest) now
+  carry per-site `#[allow(clippy::expect_used, reason = "...")]`
+  attributes that pin the safety argument next to the call. Closes the
+  asymmetry where `unwrap_used = "deny"` was bypassable via `.expect()`
+  with no machine-checked justification. Existing test files already
+  carry the `expect_used` allow at file scope; one (`oauth_url_validation.rs`)
+  was updated to match the convention.
+
+- **API: removed `impl Deref<Target = T> for Validated<T>`** in
+  `transport.rs`. `Validated<T>` is a typestate proof-of-validation
+  newtype; exposing `Deref` made the validation marker easy to lose at
+  call sites via implicit auto-deref. Use [`Validated::as_inner`] for
+  read-only borrowing or [`Validated::into_inner`] to recover the raw
+  value. The two `serve()` variants already called `into_inner()`
+  immediately, so the change is observable only through the test
+  helper and any downstream caller that wrote `*validated` or
+  `validated.<field>` instead of `validated.as_inner().<field>`.
+
+  **Migration**: replace `*validated` / `&*validated` with
+  `validated.as_inner()`, and `validated.<field>` with
+  `validated.as_inner().<field>`. The doc-comment on `Validated`
+  reflects the new access pattern.
+
+- **Lint attributes: upgraded four `#[allow(clippy::...)]` allows to
+  `reason = "..."` form** in `rbac.rs` (`rbac_middleware`),
+  `transport.rs` (`build_app_router`, `serve_stdio`), and `oauth.rs`
+  (`select_jwks_key`). The justifications previously lived in adjacent
+  comments only; they are now attached to the attribute itself so they
+  travel with the suppression in lint reports.
+
 - **CI: re-enabled the `cargo-semver-checks` job on pull requests.** Disabled
   for the 1.6.0 H3 break (`Option<String>` -> `Option<RfcTimestamp>` on
   `ApiKeyEntry::expires_at`); the intentional break shipped, became the

@@ -1799,6 +1799,10 @@ impl JwksCache {
             .install_default()
             .ok();
 
+        #[allow(
+            clippy::expect_used,
+            reason = "jwks_cache_ttl was already parsed successfully by OAuthConfig::validate (call site precondition); re-parsing the same validated string here is infallible"
+        )]
         let ttl = humantime::parse_duration(&config.jwks_cache_ttl)
             .expect("jwks_cache_ttl validated by OAuthConfig::validate");
 
@@ -2027,7 +2031,10 @@ impl JwksCache {
     // failure is observable. Collapsing them into a combinator chain
     // would lose those structured-field log sites without reducing
     // real cognitive load.
-    #[allow(clippy::cognitive_complexity)]
+    #[allow(
+        clippy::cognitive_complexity,
+        reason = "each failure arm pairs `cold_path()` with a distinct `tracing::debug!` site for observability; collapsing into combinators would lose structured-field log sites without reducing real complexity"
+    )]
     async fn select_jwks_key(
         &self,
         token: &str,

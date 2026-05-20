@@ -611,7 +611,10 @@ fn redact_with_salt(salt: &[u8], value: &str) -> String {
         m
     } else {
         let digest = Sha256::digest(salt);
-        #[allow(clippy::expect_used)] // 32-byte digest always valid as HMAC key
+        #[allow(
+            clippy::expect_used,
+            reason = "32-byte SHA-256 digest is unconditionally valid as an HMAC-SHA256 key (RFC 2104 allows any key length); see surrounding comment"
+        )]
         HmacSha256::new_from_slice(&digest).expect("32-byte SHA256 digest is valid HMAC key")
     };
     mac.update(value.as_bytes());
@@ -645,7 +648,10 @@ fn redact_with_salt(salt: &[u8], value: &str) -> String {
 // `enforce_tool_policy` and `enforce_rate_limit`. Remaining flow is a
 // linear body-collect + JSON-RPC parse + dispatch, intentionally left
 // inline to keep the request lifecycle visible at a glance.
-#[allow(clippy::too_many_lines)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "linear request lifecycle (body collect → JSON-RPC parse → policy dispatch) kept inline for security review visibility; helpers already extracted (see TODO above)"
+)]
 pub(crate) async fn rbac_middleware(
     policy: Arc<RbacPolicy>,
     tool_limiter: Option<Arc<ToolRateLimiter>>,
