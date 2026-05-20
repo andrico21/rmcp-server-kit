@@ -8,6 +8,16 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+### Changed
+
+- **CI: re-enabled the `cargo-semver-checks` job on pull requests.** Disabled
+  for the 1.6.0 H3 break (`Option<String>` -> `Option<RfcTimestamp>` on
+  `ApiKeyEntry::expires_at`); the intentional break shipped, became the
+  published baseline on crates.io, and was followed by purely additive
+  releases (1.7.4 added the `cancel` module and `McpxError::RetryableTimeout`).
+  Locally verified clean against the published baseline (222 checks pass,
+  no semver update required).
+
 ## [1.7.4] - 2026-05-19
 
 ### Added

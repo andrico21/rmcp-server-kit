@@ -83,26 +83,23 @@ jobs:
       - name: Test (${{ matrix.features }})
         run: cargo test ${{ matrix.features }}
 
-  # FIXME(H3-fix, 2026-05-13): Temporarily disabled for 1.6.0. The H3 security
-  # fix (RFC 3339 expires_at validation at deserialization time) requires
-  # changing `ApiKeyEntry::expires_at` and `ApiKeySummary::expires_at` from
-  # `Option<String>` to `Option<RfcTimestamp>`, and `ApiKeyEntry::with_expiry`
-  # to take `RfcTimestamp` instead of `impl Into<String>`. Per project policy
-  # this ships as 1.6.0 (not 2.0.0); the sole downstream consumer
-  # (atlassian-mcp-rs) is owned by the same maintainer and unaffected.
-  # Re-enable on the next release that has no public-API breaks.
-  # semver-checks:
-  #   name: cargo-semver-checks
-  #   runs-on: ubuntu-latest
-  #   if: github.event_name == 'pull_request'
-  #   steps:
-  #     - uses: actions/checkout@v6
-  #     - uses: dtolnay/rust-toolchain@stable
-  #     - uses: Swatinem/rust-cache@v2.9.1
-  #     - name: Install cargo-semver-checks
-  #       run: cargo install cargo-semver-checks --locked
-  #     - name: Check release semver
-  #       run: cargo semver-checks check-release
+  # Re-enabled after 1.6.0's H3 RFC-3339 break shipped. The intentional
+  # break is now the published baseline on crates.io, so cargo-semver-checks
+  # compares HEAD against that baseline going forward. Re-enable was deferred
+  # to the first additive release post-1.6.0 (1.7.4 added the `cancel` module
+  # and `McpxError::RetryableTimeout` variant — both purely additive).
+  semver-checks:
+    name: cargo-semver-checks
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+      - name: Install cargo-semver-checks
+        run: cargo install cargo-semver-checks --locked
+      - name: Check release semver
+        run: cargo semver-checks check-release
 
   publish-dryrun:
     name: cargo publish --dry-run
