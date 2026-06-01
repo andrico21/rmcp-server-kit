@@ -89,8 +89,8 @@ pub fn send(value: String) -> Result<(), SendError> {
 `Vec::push_mut`, `Vec::insert_mut`, `VecDeque::push_{front,back}_mut`, and
 `LinkedList::push_{front,back}_mut` return `&mut T` to the inserted element.
 Prefer them over the two-step `push` + `last_mut().unwrap()` pattern, which
-requires `unwrap`/`expect` that this workspace's `unwrap_used = "deny"`
-rule forbids.
+requires `unwrap`/`expect` that a `unwrap_used = "deny"` lint (see Section 9)
+forbids.
 
 ```rust
 // BAD (requires unwrap):
@@ -132,11 +132,11 @@ let s2 = String::from("foo bar");
 first_word(&s2, &mut cache);   // forces the borrow of s1 to extend to here
 ```
 
-Verified against `rustc 1.94` — the function builds clean, but the caller
+Verified against `rustc 1.94` - the function builds clean, but the caller
 fails to compile because `cache`'s element type `&'a str` is invariant in
 `'a`, so the compiler cannot let `s1` end its scope while `cache` is still
 alive. Once you wire the function into application code, every input must
-outlive the cache itself — almost never what you wanted.
+outlive the cache itself - almost never what you wanted.
 
 ```rust
 // GOOD: store owned values when the collection outlives any single input
@@ -154,7 +154,7 @@ fn first_word<'cache, 'input: 'cache>(
 ```
 
 Rule of thumb: every time you add explicit lifetimes to a signature, sketch a
-real caller in your head — specifically one where the inputs have disjoint
+real caller in your head - specifically one where the inputs have disjoint
 scopes from each other and from the collection. If `'a` appears inside both
 a `&mut` and the data being stored, it is invariant; the signature compiles
 in isolation but constrains every caller to keep all inputs alive for as
@@ -201,6 +201,33 @@ fn read_config(path: &str) -> Result<String, std::io::Error> {
     std::fs::read_to_string(path)
 }
 ```
+
+### DO: Pick `anyhow` vs `thiserror` per layer
+
+Use both crates intentionally; they cover different layers:
+
+| Layer                              | Crate       | Why                                                                                                          |
+|------------------------------------|-------------|--------------------------------------------------------------------------------------------------------------|
+| Public API / wire surface          | `thiserror` | Errors cross a boundary; callers pattern-match on stable codes/variants. Keeps the surface stable.           |
+| Internal library code              | `thiserror` | Lets callers match variants (e.g. `Denied` vs `Internal`). Keeps the public API stable.                      |
+| Glue / I/O / app boot (binary)     | `anyhow`    | One-shot context-rich errors with `.context(...)` chains. Output is human-readable; no caller matches on it. |
+| Tests                              | `anyhow`    | Same rationale as glue: terse, ergonomic, never inspected programmatically.                                  |
+
+Practical rules:
+
+- **Never** use `anyhow::Error` in a public crate API. Always convert
+  to a typed error at the module boundary.
+- **Never** use `thiserror`-style error enums for one-off CLI error
+  paths -- it's pure ceremony with no upside.
+- A library function that internally uses `anyhow::Result` for
+  ergonomics MUST convert to its declared `thiserror` error variant
+  before returning. The trait `From<anyhow::Error>` on your
+  `thiserror` enum (typically via a catch-all `Internal(String)`
+  variant) is the idiomatic bridge.
+- If your wire surface maps errors to a stable code set, map every
+  error through one helper so codes stay consistent, and enforce it
+  in CI (e.g. a lint or check script that bans raw error construction
+  outside that helper).
 
 ### DO: Use `unwrap_or`, `unwrap_or_else`, `unwrap_or_default` for fallbacks
 
@@ -256,20 +283,20 @@ impl TryFrom<&str> for Port {
 ### DO: Use `bool::try_from(n)` for strict 0/1 wire fields (Rust 1.95+)
 
 At boundaries where the encoding is "strictly 0 or 1, anything else is
-malformed" (NVS single-byte flags, MQTT retain/dup bits, hOn protocol
-bitfields stored as bytes, JSON `0`/`1` from a strict producer), prefer
+malformed" (single-byte flags in a binary format, protocol bitfields stored
+as bytes, JSON `0`/`1` from a strict producer), prefer
 `bool::try_from(n)?` over `n != 0`. The `!= 0` form silently accepts `2`,
 `42`, `0xFF` as `true`, hiding upstream corruption. `TryFrom` makes the
 "any non-0/1 is a bug" contract explicit and surfaces it as a parse error
 the caller can report.
 
 ```rust
-// BAD: any nonzero byte becomes true, including garbage from a torn NVS write
-let display_on: bool = nvs_byte != 0;
+// BAD: any nonzero byte becomes true, including garbage from a corrupted record
+let flag: bool = raw_byte != 0;
 
-// GOOD: strict — 0 or 1, anything else is a malformed record
-let display_on = bool::try_from(nvs_byte)
-    .map_err(|_| StorageError::InvalidFlag { tag: 0x09, value: nvs_byte })?;
+// GOOD: strict - 0 or 1, anything else is a malformed record
+let flag = bool::try_from(raw_byte)
+    .map_err(|_| ParseError::InvalidFlag { tag: 0x09, value: raw_byte })?;
 ```
 
 Keep the plain `!= 0` form when you specifically mean "any nonzero is
@@ -405,14 +432,14 @@ match status {
 ```
 
 **Note (Rust 1.95+):** `if let` guards in `match` arms (stabilized in 1.95)
-do **NOT** participate in exhaustiveness checking — same rule as plain `if`
+do **NOT** participate in exhaustiveness checking - same rule as plain `if`
 guards. A new tool may suggest collapsing arms behind an `if let` guard
 and dropping the wildcard; the compiler will still require either an
 exhaustive listing or a `_` arm. Do not use an `if let` guard as
 justification for removing a previously-required wildcard.
 
 ```rust
-// The `if let` guard does NOT cover Status::Pending — the wildcard or an
+// The `if let` guard does NOT cover Status::Pending - the wildcard or an
 // explicit Pending arm is still required for the match to compile.
 match status {
     Status::Active if let Some(uid) = current_user() => handle_active(uid),
@@ -583,12 +610,17 @@ let buf = Box::new([0u8; 1024 * 1024]);
 let buf: Box<[u8]> = vec![0u8; 1024 * 1024].into_boxed_slice();
 ```
 
-**ESP32 firmware note:** this matters more on embedded than on desktop.
-This workspace's task stacks are sized in tens of KB (see CLAUDE.md
-"Hardware Memory Budget"). A 4 KB array on the stack of a task with an
-8 KB stack is half the budget. For any buffer >= 1 KB inside an embassy
-task, allocate via `Vec` / `Box::<[u8]>::new_uninit_slice` (with explicit
-`assume_init`) or a static `StaticCell` -- never via `Box::new([0; N])`
+`Box::new_zeroed_slice(n)` (stable since 1.92) is another option for a zeroed
+heap slice; it returns `Box<[MaybeUninit<u8>]>`, so it needs an `unsafe`
+`assume_init` to finalize. The `vec!` form above is simpler and needs no
+`unsafe`, so prefer it unless you have a specific reason.
+
+**Embedded note:** this matters far more on embedded than on desktop.
+Task stacks in embedded async runtimes are often sized in only tens of KB.
+A 4 KB array on the stack of a task with an 8 KB stack is half the budget.
+For any buffer >= 1 KB inside such a task, allocate via `Vec` /
+`Box::new_zeroed_slice` / `Box::<[u8]>::new_uninit_slice` (with explicit
+`assume_init`) or a static cell - never via `Box::new([0; N])`
 or a stack-local array bound to a `let`.
 
 ### DO: Use temporary mutability pattern
@@ -606,21 +638,21 @@ let data = {
 
 ### DO: Use `ptr::read_unaligned` (or `from_le_bytes`) for multi-byte reads from `&[u8]`
 
-ESP32-C3 and C6 are RISC-V (`riscv32imc` / `riscv32imac`). Unlike x86, RISC-V
-does **not** guarantee that unaligned loads work. Depending on CPU
+Many targets do **not** guarantee that unaligned multi-byte loads work -
+most RISC-V configurations (e.g. `riscv32imc` / `riscv32imac`, as used on
+ESP32-C3/C6) and some ARM setups. Unlike x86, depending on CPU
 configuration, an unaligned multi-byte load either traps and is emulated by
-an exception handler (10-100x slower) or raises `LoadStoreMisaligned` and
+an exception handler (10-100x slower) or raises a misaligned-access fault and
 panics. Safe Rust never produces unaligned loads because references are
-always aligned -- the hazard appears **only in `unsafe` code that
-casts a `*const u8` to `*const u16`/`u32`/etc.** This workspace's lint
-posture is `unsafe_code = "deny"` plus SAFETY-commented `#[allow(unsafe_code)]`
-(see CLAUDE.md "Memory Safety Checklist"), so unsafe blocks **do** exist
-and the alignment rule applies.
+always aligned - the hazard appears **only in `unsafe` code that
+casts a `*const u8` to `*const u16`/`u32`/etc.** If your lint posture is
+`unsafe_code = "deny"` plus SAFETY-commented `#[allow(unsafe_code)]`
+(see Section 9), unsafe blocks **do** exist and the alignment rule applies.
 
 ```rust
 // BAD: undefined behaviour on RISC-V if buf.as_ptr().add(2) is not 2-aligned.
 // `*const u16` deref and `ptr::read::<u16>` BOTH require T-alignment.
-// `&[u8]` is only 1-byte aligned. This compiles, runs on x86, traps on ESP32.
+// `&[u8]` is only 1-byte aligned. This compiles, runs on x86, traps on RISC-V.
 let value: u16 = unsafe { *(buf.as_ptr().add(2) as *const u16) };
 let value: u16 = unsafe { core::ptr::read(buf.as_ptr().add(2) as *const u16) };
 
@@ -638,19 +670,27 @@ Rules:
 
 - For multi-byte reads out of `&[u8]` buffers, prefer the safe idiom:
   `u16::from_le_bytes(slice.try_into().unwrap())` (or `from_be_bytes`).
-  Bounds-check the slice once and reuse it.
+  Bounds-check the slice once and reuse it. Note the `try_into().unwrap()`
+  here relies on a proven length invariant; under `unwrap_used = "deny"`
+  either justify it with an invariant comment, or use
+  `<[T]>::as_array` (Rust 1.93+, returns `Option<&[T; N]>`) to drop the
+  unwrap entirely:
+
+  ```rust
+  let value = slice.get(2..4)
+      .and_then(|s| s.as_array::<2>())
+      .map(|a| u16::from_le_bytes(*a));   // Option<u16>, no unwrap
+  ```
 - If you must use raw pointers (FFI struct read-out, `repr(C)` overlay),
-  use `core::ptr::read_unaligned` -- never `ptr::read` or `*ptr` on a
+  use `core::ptr::read_unaligned` - never `ptr::read` or `*ptr` on a
   cast pointer.
 - This bug class is **invisible on x86 CI**. Unaligned loads succeed
   silently on host machines. The trap only fires on the target hardware,
   so code review and the guideline are the primary defenses.
-- Hot sites in this workspace: `haier.rs` UART frame parsing (u16
-  power/current/PM2.5 fields out of `&[u8]` payloads), `ota.rs` ESP32
-  image header parsing (u32 segment count out of streamed firmware
-  buffer), `mqtt.rs` packet-length and packet-ID parsing out of TCP RX
-  buffers, `tls.rs` mbedTLS FFI boundary where C writes into Rust-owned
-  buffers.
+- Typical hot sites: serial/UART frame parsing (multi-byte fields out of
+  `&[u8]` payloads), firmware image header parsing (u32 fields out of a
+  streamed buffer), network packet length/ID parsing out of TCP RX
+  buffers, and FFI boundaries where C writes into Rust-owned buffers.
 - `bytemuck::pod_read_unaligned` is a safe wrapper for `Pod` types if you
   want zero `unsafe`; pulling the dep in is acceptable when the parsing
   surface area grows.
@@ -725,7 +765,7 @@ because that type dominates non-async Rust in training data. Review every
 - `tokio` async tasks: use `tokio::sync::Mutex` when the guard may live
   across `.await`; `std::sync::Mutex` only when the critical section is
   strictly synchronous and short.
-- This firmware (embassy, `no_std`): use `embassy_sync::mutex::Mutex` for
+- Embedded async (`no_std`, e.g. embassy): use `embassy_sync::mutex::Mutex` for
   async-aware locks. `embassy_sync::blocking_mutex::Mutex` (with the
   `CriticalSectionRawMutex` raw mutex) is correct **only** when the
   critical section never `.await`s -- typical use is for `Signal`,
@@ -785,11 +825,10 @@ Rules:
   about retries, not about partial state between awaits.
 - Consult tokio docs per call. E.g. `AsyncReadExt::read` is cancel-safe,
   `read_exact` is NOT.
-- For embassy on this firmware: `embassy_futures::select` cancels the
-  losing branch by dropping its future. Same rules apply. See the
-  `IR -> UART Flow` section in CLAUDE.md -- `haier_task` races a UART
-  read against the command channel via `select`, so any future placed on
-  either arm must be cancel-safe or wrapped in an unabortable region.
+- For embedded async (e.g. embassy): `embassy_futures::select` cancels the
+  losing branch by dropping its future, so the same rules apply. Any future
+  raced in a `select` (e.g. a UART read against a command channel) must be
+  cancel-safe, or wrapped in an unabortable region.
 
 ### DO: Audit Drop impls of async resources (transactions, connections, guards)
 
@@ -1080,6 +1119,30 @@ See Section 3 (enums instead of booleans) for examples.
 Wrap third-party types so you can swap implementations without breaking
 callers.
 
+### DO: Accept `impl RangeBounds`; prefer Copy `core::range` types for stored ranges (Rust 1.96+)
+
+The legacy `core::ops::Range*` types are **not** `Copy` (they implement
+`Iterator` directly, and being both `Iterator` and `Copy` is a footgun).
+1.96 stabilized replacement types under `core::range` (`Range`, `RangeFrom`,
+`RangeInclusive`, plus iterators) that implement `IntoIterator` instead, so
+they **are** `Copy`. Two practical rules:
+
+- In public function signatures, accept `impl RangeBounds<T>` - it takes both
+  legacy and new range types, so callers are not forced to pick.
+- When you need to *store* a range in a struct (e.g. a span/slice accessor),
+  prefer `core::range::Range<usize>` so the containing type can derive `Copy`
+  instead of splitting into separate `start` / `end` fields.
+
+```rust
+use core::range::Range;
+
+#[derive(Clone, Copy)]      // possible because core::range::Range is Copy
+pub struct Span(Range<usize>);
+```
+
+Range syntax like `0..1` still produces the legacy (non-Copy) types for now;
+convert explicitly where you need the Copy version.
+
 ---
 
 ## 9. Clippy and Lints
@@ -1138,8 +1201,8 @@ Exceptions are allowed only with `#[allow(clippy::unwrap_used)]` and a
 comment explaining why the value is guaranteed to be `Some`/`Ok`.
 
 Clippy 1.95 added an `allow-unwrap-types` config key for `clippy.toml`
-that lets `unwrap_used` / `expect_used` ignore specific types. **Do not
-enable this** in this workspace - the deny is intentional. Fix the call
+that lets `unwrap_used` / `expect_used` ignore specific types. **Don't
+enable this** if the deny is intentional. Fix the call
 site or add a local `#[allow(...)]` with justification.
 
 ### Debug Artifact Prevention Lints
@@ -1176,7 +1239,7 @@ str_to_string = "warn"            # Prefer .to_owned() or .into()
 
 ### Library Crate Hygiene Lints
 
-For library crates (e.g. `mcpx`), public API surface must be
+For library crates, public API surface must be
 future-proof and documented.
 
 ```toml
@@ -1285,7 +1348,7 @@ Limitations to be aware of:
   a hand-computed offset). The Section 4 prose rule is still required.
 - There is no clippy lint for blanket-impl semver hazards or for async
   cancel safety. Those remain prose-only rules in Sections 7 and 5.
-- This workspace also enforces `cargo +nightly miri test` for files with
+- Consider also enforcing `cargo +nightly miri test` for files with
   `unsafe` (where the target permits -- see Section 12 "Miri caveats").
   Miri is the only reliable catch for the UB cases that pass clippy.
 
@@ -1373,7 +1436,7 @@ use axum::http::header;
 use tower_http::set_header::SetResponseHeaderLayer;
 
 let app = Router::new()
-    .route("/mcp", post(handler))
+    .route("/api", post(handler))
     .layer(SetResponseHeaderLayer::overriding(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
@@ -1475,7 +1538,8 @@ Err(e) => {
 }
 ```
 
-For structured JSON-RPC/MCP errors, use generic error codes and messages.
+For structured JSON-RPC or similar wire-protocol errors, use generic error
+codes and messages.
 The detailed cause goes to the server log, never the wire.
 
 ### DON'T: Hardcode secrets in source code
@@ -1746,36 +1810,34 @@ consumers upgrade. Run it on every PR that touches the library crate.
   `-Zmiri-native-lib` (Unix-only, 2024-2025). It can pass integer/pointer
   arguments to C functions and trace some memory accesses, but does NOT
   support function pointers passed to C, memory allocated by C and returned
-  to Rust, or non-Unix hosts. For this workspace, that means crates calling
-  into `mbedtls-rs` *might* work for narrow cases but should not be assumed
-  to. Treat FFI-heavy crates as Miri-untested unless someone has explicitly
-  validated the specific call pattern.
+  to Rust, or non-Unix hosts. That means crates calling into a C library
+  via FFI *might* work for narrow cases but should not be assumed to. Treat
+  FFI-heavy crates as Miri-untested unless someone has explicitly validated
+  the specific call pattern.
 - **No practical support for bare-metal targets.** Miri targets the host and
-  fails on memory-mapped I/O register access. The esp-hal maintainers
-  prototyped Miri integration in esp-rs/esp-hal#3297 and closed it with
-  "the PACs will make Miri very, very mad." Firmware code that touches
-  `esp-hal`, `esp-radio`, or any peripheral register is not Miri-testable
-  end-to-end. This is a platform limitation, not a workflow gap.
+  fails on memory-mapped I/O register access. Maintainers of embedded HAL
+  crates have found Miri fundamentally incompatible with peripheral-register
+  access (the peripheral-access crates "make Miri very mad"). Firmware code
+  that touches a HAL or any peripheral-access crate (PAC) register is not
+  Miri-testable end-to-end. This is a platform limitation, not a workflow gap.
 - **Slow.** Tokio docs warn of a "dramatic increase" in test time; real-world
-  CI reports 35%+ time savings from skipping Miri-incompatible tests
-  (alloy-rs/core PR #1072). Use a separate nightly CI job, not the per-PR
-  critical path.
+  CI reports significant time savings from skipping Miri-incompatible tests.
+  Use a separate nightly CI job, not the per-PR critical path.
 
-**ESP32 firmware strategy:**
+**Embedded firmware strategy:**
 
 1. Factor pure-Rust logic (protocol parsers, CRC, state machines,
-   byte-stuffing, NEC decode, hOn frame builders) into separate modules
+   byte-stuffing, frame builders) into separate modules
    or `no_std`-but-host-buildable inner crates.
 2. Write `#[cfg(test)]` unit tests for those modules. These tests build
    for the host target and CAN run under Miri.
-3. Run Miri only against those modules: `cargo +nightly miri test -p haier_proto`
-   (or equivalent). The HAL-glue code that calls `esp-hal` stays untested
-   by Miri -- that's an inherent limitation of the platform, not a gap to
+3. Run Miri only against those modules: `cargo +nightly miri test -p <proto_crate>`.
+   The HAL-glue code that calls the HAL stays untested
+   by Miri - that's an inherent limitation of the platform, not a gap to
    apologize for.
-4. For HAL-touching `unsafe`: rely on the existing discipline -- every
-   `unsafe` block carries a `// SAFETY:` comment justifying the invariant
-   (see CLAUDE.md "Memory Safety Checklist"). Human review is the only
-   tool we have for those blocks; Miri does not apply.
+4. For HAL-touching `unsafe`: rely on discipline - every
+   `unsafe` block carries a `// SAFETY:` comment justifying the invariant.
+   Human review is the only tool for those blocks; Miri does not apply.
 
 `cargo-careful` (`cargo install cargo-careful`) is an intermediate option
 that enables extra debug checks in std without Miri's interpreter overhead.
@@ -1789,9 +1851,38 @@ target the latest stable version - check with `cargo search <crate> --limit 1`
 before adding or updating. Run version checks regularly (at least monthly).
 No `rust-toolchain.toml` pin; CI uses whatever `stable` resolves to.
 
+Staying current is also a security control, not just a quality one. For
+example, Rust 1.96 shipped fixes for two Cargo advisories - CVE-2026-5223
+(symlink extraction from crate tarballs, medium) and CVE-2026-5222 (auth with
+normalized URLs, low). Both affect users of third-party / private registries;
+crates.io users are unaffected. If you pull crates from a private or alternate
+registry, treat toolchain currency as a hard requirement, not a nicety.
+
 ---
 
 ## 13. Testing Quality
+
+### DO: Use `assert_matches!` for pattern assertions in tests (Rust 1.96+)
+
+`assert_matches!` / `debug_assert_matches!` (stabilized in 1.96) check that a
+value matches a pattern and panic with the value's `Debug` output on failure.
+Prefer them over `assert!(matches!(...))`, which only prints `false` and tells
+you nothing about what the value actually was. They are not in the prelude
+(they collide with popular third-party macros of the same name), so import
+them explicitly from `core` or `std`.
+
+```rust
+use std::assert_matches::assert_matches;
+
+// BAD: failure just prints "assertion failed: matches!(...)"
+assert!(matches!(parse(input), Err(ParseError::InvalidFlag { .. })));
+
+// GOOD: failure prints the actual Err/Ok value you got
+assert_matches!(parse(input), Err(ParseError::InvalidFlag { value: 0x09, .. }));
+```
+
+(The official 1.96 examples import it as `use std::assert_matches;` - either
+form brings the macro into scope; pick whichever your style config prefers.)
 
 ### DO: Use property-based testing for input validation and parsing
 
@@ -1827,9 +1918,9 @@ proptest! {
 }
 ```
 
-For MCP tool input schemas, property-based tests are especially valuable:
-generate random tool arguments and verify the handler either succeeds
-or returns a well-formed error - never panics.
+For request or tool input schemas at a service boundary, property-based
+tests are especially valuable: generate random arguments and verify the
+handler either succeeds or returns a well-formed error - never panics.
 
 ### DO: Use mutation testing to verify test effectiveness
 
@@ -1868,8 +1959,8 @@ tests/
 └── e2e/            # Live services required - run with human setup
 ```
 
-Document which tier each test belongs to. The AI team must know which
-tests they can run autonomously vs which require human-assisted setup.
+Document which tier each test belongs to, so it is clear which tests
+can run autonomously vs which require human-assisted setup.
 
 ---
 
