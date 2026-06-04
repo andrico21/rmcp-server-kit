@@ -8,6 +8,8 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+## [1.7.7] - 2026-06-04
+
 ### Dependencies
 
 - **Bumped the `shlex` constraint `1.3` → `2`.** The RBAC argument-allowlist
