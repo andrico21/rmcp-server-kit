@@ -8,6 +8,17 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+### Changed
+
+- **Raised the minimum supported `rmcp` version from `1.5` to `1.7`.** The
+  crate is built and tested exclusively against `rmcp 1.7.x` in CI, so the
+  declared floor now matches the version actually exercised rather than
+  claiming support for a range that CI never verifies. The public API is
+  unchanged and the code still compiles and passes the full test suite
+  against `rmcp 1.5.0`; this bump tightens the dependency requirement only.
+  Downstream consumers pinned below `rmcp 1.7` must update their own `rmcp`
+  requirement accordingly.
+
 ## [1.7.7] - 2026-06-04
 
 ### Dependencies

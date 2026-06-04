@@ -24,7 +24,7 @@ mindmap
       Reusable framework
       MCP servers in Rust
       Streamable HTTP transport
-      Wraps rmcp 1.5
+      Wraps rmcp 1.7
       Consumers supply ServerHandler
     Modules src/
       lib.rs
