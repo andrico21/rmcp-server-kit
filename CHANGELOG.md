@@ -8,6 +8,8 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-06-04
+
 ### Changed
 
 - **Raised the minimum supported `rmcp` version from `1.5` to `1.7`.** The
