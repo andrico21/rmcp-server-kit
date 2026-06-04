@@ -8,6 +8,18 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+### Dependencies
+
+- **Validated the crate against the latest semver-compatible dependency
+  versions** (minor/patch only; no `Cargo.toml` constraint changes, and
+  `Cargo.lock` remains intentionally untracked for this library crate).
+  Confirmed clean against notable upstream releases including the `rmcp` MCP
+  SDK and `rmcp-macros` `1.5.0 → 1.7.0`, `rustls` `0.23.38 → 0.23.40`,
+  `tower-http` `0.6.8 → 0.6.11`, `jsonwebtoken` `10.3.0 → 10.4.0`, `reqwest`
+  `0.13.3 → 0.13.4`, `hyper` `1.9 → 1.10.1`, and `tokio` `1.52.1 → 1.52.3`.
+  Full build, Clippy (`-D warnings`), and the complete test suite
+  (`--all-features`) all pass unchanged.
+
 ## [1.7.6] - 2026-05-20
 
 ### Security / Hardening
