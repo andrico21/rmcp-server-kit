@@ -116,10 +116,12 @@ humantime-serde = "1"
 secrecy = { version = "0.10", features = ["serde"] }
 url = "2"
 # POSIX-shell-like lexical splitting for RBAC argument-allowlist matching.
-# Pinned to >=1.3 to stay on the post-RUSTSEC-2024-0006 line; that
-# advisory affects shlex::quote / shlex::join (CVE-2024-58266), not
-# shlex::split which is the only API consumed here.
-shlex = "1.3"
+# On the 2.x line: 2.0 only *removed* the deprecated quote/join APIs
+# (subject of RUSTSEC-2024-0006 / CVE-2024-58266) and an unsound DerefMut
+# impl. We consume only `shlex::split`, whose behaviour is unchanged from
+# the fully-patched 1.3 line, so 2.x is security- and behaviour-equivalent
+# here while collapsing the duplicate shlex copy pulled in transitively.
+shlex = "2"
 
 # Metrics (optional)
 prometheus = { version = "0.14", optional = true }
