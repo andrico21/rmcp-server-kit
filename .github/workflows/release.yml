@@ -23,6 +23,12 @@ name: Release
 # Either step 2 OR step 4 finishing can fire this workflow, but the
 # `find-tag` step rejects the run if no semver tag points at the head
 # SHA, so commits on `main` without a tag are no-ops.
+#
+# Because the release commit and its tag share one SHA, BOTH the main-push
+# CI run and the tag-push CI run pass `find-tag`, so this workflow can fire
+# twice and attempt `cargo publish` twice. The publish step is therefore
+# idempotent: a second attempt that sees "already exists on crates.io
+# index" exits success instead of leaving a spurious red run.
 on:
   workflow_run:
     workflows: ["CI"]
@@ -119,7 +125,31 @@ jobs:
         if: steps.find-tag.outputs.skip != 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --all-features
+        shell: bash
+        run: |
+          set -uo pipefail
+          TAG="${{ steps.find-tag.outputs.tag }}"
+          # This workflow can be triggered by BOTH the main-push CI run and
+          # the tag-push CI run for the same release commit: the tag points
+          # at the release SHA, so `find-tag` succeeds in both triggered
+          # Release runs and both attempt `cargo publish`. The first wins;
+          # the second would otherwise fail the run with
+          #   error: crate rmcp-server-kit@X.Y.Z already exists on crates.io index
+          # That race (and any manual re-run of an already-published tag) is
+          # benign, so we treat "already exists" as success. A genuine
+          # publish failure still fails the step.
+          OUTPUT=$(cargo publish --all-features 2>&1) && STATUS=0 || STATUS=$?
+          echo "$OUTPUT"
+          if [ "$STATUS" -eq 0 ]; then
+            echo "::notice::Published rmcp-server-kit@${TAG} to crates.io."
+            exit 0
+          fi
+          if echo "$OUTPUT" | grep -qiF "already exists on crates.io index"; then
+            echo "::notice::rmcp-server-kit@${TAG} is already on crates.io - treating as success (duplicate Release trigger or re-run)."
+            exit 0
+          fi
+          echo "::error::cargo publish failed for ${TAG} (exit ${STATUS})."
+          exit "$STATUS"
 
       - name: Create GitHub release
         if: steps.find-tag.outputs.skip != 'true'
