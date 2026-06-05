@@ -8,6 +8,19 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+### Changed
+
+- **Renamed build-time environment variables to match the crate name.**
+  The `/version` endpoint now reads `RMCP_SERVER_KIT_BUILD_SHA`,
+  `RMCP_SERVER_KIT_BUILD_TIME`, and `RMCP_SERVER_KIT_RUSTC_VERSION` (via
+  `option_env!`) instead of the legacy `MCPX_BUILD_SHA`,
+  `MCPX_BUILD_TIME`, and `MCPX_RUSTC_VERSION` names. Build pipelines that
+  populate these variables at compile time must update their CI / build
+  scripts; otherwise the affected `/version` fields silently fall back to
+  `"unknown"`. The runtime JSON shape (`build_git_sha`, `build_timestamp`,
+  `rust_version`, `mcpx_version`) and all public API surface are
+  unchanged.
+
 ## [1.8.0] - 2026-06-04
 
 ### Changed

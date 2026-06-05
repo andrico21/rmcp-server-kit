@@ -2134,15 +2134,16 @@ async fn healthz() -> impl IntoResponse {
 /// Build the `/version` JSON payload for a given server name and version.
 ///
 /// Build metadata (`build_git_sha`, `build_timestamp`, `rust_version`) is
-/// read at compile time from the `MCPX_BUILD_SHA`, `MCPX_BUILD_TIME`, and
-/// `MCPX_RUSTC_VERSION` env vars. Unset values resolve to `"unknown"`.
+/// read at compile time from the `RMCP_SERVER_KIT_BUILD_SHA`,
+/// `RMCP_SERVER_KIT_BUILD_TIME`, and `RMCP_SERVER_KIT_RUSTC_VERSION` env
+/// vars. Unset values resolve to `"unknown"`.
 fn version_payload(name: &str, version: &str) -> serde_json::Value {
     serde_json::json!({
         "name": name,
         "version": version,
-        "build_git_sha": option_env!("MCPX_BUILD_SHA").unwrap_or("unknown"),
-        "build_timestamp": option_env!("MCPX_BUILD_TIME").unwrap_or("unknown"),
-        "rust_version": option_env!("MCPX_RUSTC_VERSION").unwrap_or("unknown"),
+        "build_git_sha": option_env!("RMCP_SERVER_KIT_BUILD_SHA").unwrap_or("unknown"),
+        "build_timestamp": option_env!("RMCP_SERVER_KIT_BUILD_TIME").unwrap_or("unknown"),
+        "rust_version": option_env!("RMCP_SERVER_KIT_RUSTC_VERSION").unwrap_or("unknown"),
         "mcpx_version": env!("CARGO_PKG_VERSION"),
     })
 }

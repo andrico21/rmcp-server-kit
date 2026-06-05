@@ -177,16 +177,6 @@ harness = false
 [package.metadata.cargo-machete]
 ignored = ["humantime-serde", "subtle"]
 
-
-# ──────────────────────────────────────────────────────────────────────────
-# Standalone configuration (activated by scripts/extract-mcpx.ps1/sh).
-#
-# When mcpx is extracted into its own repository, the `[lints] workspace =
-# true` line above is removed and the blocks below are uncommented.  Keep
-# them in sync with the workspace root `Cargo.toml` and `clippy.toml` while
-# mcpx still lives inside this repo.
-# ──────────────────────────────────────────────────────────────────────────
-#
 [lints.rust]
 unsafe_code = "forbid"
 missing_debug_implementations = "warn"

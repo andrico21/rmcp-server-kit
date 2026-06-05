@@ -1147,8 +1147,9 @@ describing the running binary:
 ```
 
 `build_sha`, `build_time`, and `rust_version` are populated from the
-`MCPX_BUILD_SHA`, `MCPX_BUILD_TIME`, and `MCPX_RUSTC_VERSION` build-time
-environment variables.  Unset variables become `null`.
+`RMCP_SERVER_KIT_BUILD_SHA`, `RMCP_SERVER_KIT_BUILD_TIME`, and
+`RMCP_SERVER_KIT_RUSTC_VERSION` build-time environment variables. Unset
+variables become `null`.
 
 ### Response compression
 

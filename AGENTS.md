@@ -1,4 +1,4 @@
-# AGENTS.md — mcpx
+# AGENTS.md — rmcp-server-kit
 
 > **Audience**: AI coding agents (and humans) working on the `rmcp-server-kit` crate.
 > **Purpose**: Single source of truth for navigating, building, testing, and
@@ -40,7 +40,7 @@ shutdown.
 ## 2. Repository map (top 2-3 levels)
 
 ```
-Z:\TempPersistent\mcpx\
+Z:\TempPersistent\rmcp-server-kit\
 ├── src/                      Library source (THE crate)
 │   ├── lib.rs                  Crate root - re-exports public modules
 │   ├── transport.rs            ★ Server entry: serve(), serve_stdio(), TLS, router, middleware wiring
@@ -116,7 +116,7 @@ Z:\TempPersistent\mcpx\
 
 ## 4. Build / test / run cheat sheet
 
-> All commands assume cwd = `Z:\TempPersistent\mcpx`.
+> All commands assume cwd = `Z:\TempPersistent\rmcp-server-kit`.
 > Prefer the `rtk` wrapper (`Z:\TempPersistent\rtk.exe`) for token-efficient
 > output in agent contexts — e.g. `Z:\TempPersistent\rtk.exe cargo build`.
 
