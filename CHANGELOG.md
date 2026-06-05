@@ -8,6 +8,8 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-06-05
+
 ### Changed
 
 - **Renamed build-time environment variables to match the crate name.**
