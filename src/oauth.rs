@@ -96,15 +96,19 @@ fn evaluate_oauth_redirect(
 /// `100.100.100.200`, AWS IPv6 `fd00:ec2::254`, GCP IPv6
 /// `fd20:ce::254`) are blocked unconditionally** -- the operator
 /// allowlist cannot re-allow them.
-#[cfg_attr(not(any(test, feature = "test-helpers")), allow(dead_code))]
-async fn screen_oauth_target_with_test_override(
+///
+/// This single core is compiled identically under ALL cfgs, so the test
+/// suite always exercises the exact code production runs. Production
+/// callers go through [`screen_oauth_target`], which hardcodes
+/// `test_allow_loopback_ssrf = false`; the test-only bypass wrapper is
+/// [`screen_oauth_target_with_test_override`].
+async fn screen_oauth_target_core(
     url: &str,
     allow_http: bool,
     allowlist: &crate::ssrf::CompiledSsrfAllowlist,
-    #[cfg(any(test, feature = "test-helpers"))] test_allow_loopback_ssrf: bool,
+    test_allow_loopback_ssrf: bool,
 ) -> Result<(), crate::error::McpxError> {
     let parsed = check_oauth_url("oauth target", url, allow_http)?;
-    #[cfg(any(test, feature = "test-helpers"))]
     if test_allow_loopback_ssrf {
         return Ok(());
     }
@@ -167,70 +171,27 @@ async fn screen_oauth_target_with_test_override(
     Ok(())
 }
 
+/// Production entry point for OAuth/JWKS target screening. Delegates to
+/// [`screen_oauth_target_core`] with the loopback bypass hardcoded off.
 async fn screen_oauth_target(
     url: &str,
     allow_http: bool,
     allowlist: &crate::ssrf::CompiledSsrfAllowlist,
 ) -> Result<(), crate::error::McpxError> {
-    #[cfg(any(test, feature = "test-helpers"))]
-    {
-        screen_oauth_target_with_test_override(url, allow_http, allowlist, false).await
-    }
-    #[cfg(not(any(test, feature = "test-helpers")))]
-    {
-        let parsed = check_oauth_url("oauth target", url, allow_http)?;
-        if let Some(reason) = crate::ssrf::check_url_literal_ip(&parsed) {
-            return Err(crate::error::McpxError::Config(format!(
-                "OAuth target forbidden ({reason}): {url}"
-            )));
-        }
+    screen_oauth_target_core(url, allow_http, allowlist, false).await
+}
 
-        let host = parsed.host_str().ok_or_else(|| {
-            crate::error::McpxError::Config(format!("OAuth target URL has no host: {url}"))
-        })?;
-        let port = parsed.port_or_known_default().ok_or_else(|| {
-            crate::error::McpxError::Config(format!("OAuth target URL has no known port: {url}"))
-        })?;
-
-        let addrs = lookup_host((host, port)).await.map_err(|error| {
-            crate::error::McpxError::Config(format!("OAuth target DNS resolution {url}: {error}"))
-        })?;
-
-        let host_allowed = !allowlist.is_empty() && allowlist.host_allowed(host);
-        let mut any_addr = false;
-        for addr in addrs {
-            any_addr = true;
-            let ip = addr.ip();
-            if let Some(reason) = crate::ssrf::ip_block_reason(ip) {
-                if reason == "cloud_metadata" {
-                    return Err(crate::error::McpxError::Config(format!(
-                        "OAuth target resolved to blocked IP ({reason}): {url}"
-                    )));
-                }
-                if allowlist.is_empty() {
-                    return Err(crate::error::McpxError::Config(format!(
-                        "OAuth target resolved to blocked IP ({reason}): {url}"
-                    )));
-                }
-                if host_allowed || allowlist.ip_allowed(ip) {
-                    continue;
-                }
-                return Err(crate::error::McpxError::Config(format!(
-                    "OAuth target blocked: hostname {host} resolved to {ip} ({reason}). \
-                     To allow, add the hostname to oauth.ssrf_allowlist.hosts or the CIDR \
-                     to oauth.ssrf_allowlist.cidrs (operators only -- see SECURITY.md). \
-                     URL: {url}"
-                )));
-            }
-        }
-        if !any_addr {
-            return Err(crate::error::McpxError::Config(format!(
-                "OAuth target DNS resolution returned no addresses: {url}"
-            )));
-        }
-
-        Ok(())
-    }
+/// Test-only wrapper exposing the loopback-SSRF bypass flag of
+/// [`screen_oauth_target_core`] so higher-level OAuth flows can run
+/// against loopback-backed mock fixtures.
+#[cfg(any(test, feature = "test-helpers"))]
+async fn screen_oauth_target_with_test_override(
+    url: &str,
+    allow_http: bool,
+    allowlist: &crate::ssrf::CompiledSsrfAllowlist,
+    test_allow_loopback_ssrf: bool,
+) -> Result<(), crate::error::McpxError> {
+    screen_oauth_target_core(url, allow_http, allowlist, test_allow_loopback_ssrf).await
 }
 
 // ---------------------------------------------------------------------------
