@@ -151,10 +151,10 @@ consumer applications and `examples/`.
 | Entry                                    | File                                                                  | Notes                                                                                                  |
 |------------------------------------------|----------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------|
 | Crate root / public API                  | [`src/lib.rs`](src/lib.rs)                                            | Re-exports all public modules                                                                          |
-| **Server entry (HTTP)**                  | [`src/transport.rs`](src/transport.rs) — `serve()` (~line 1355)        | The function consumers call. Wires rmcp + axum + middleware + TLS + admin + metrics                    |
-| Server entry (stdio)                     | [`src/transport.rs`](src/transport.rs) — `serve_stdio()` (~line 2551) | For desktop/IDE clients. **Bypasses auth/RBAC/TLS** — use only for local subprocess MCP                |
-| Config builder                           | [`src/transport.rs`](src/transport.rs) — `McpServerConfig::new` (~line 127) | Builder-style config struct                                                                       |
-| Hot-reload handle                        | [`src/transport.rs`](src/transport.rs) — `ReloadHandle` (~line 789)   | `reload_auth_keys` / `reload_rbac` for runtime reconfig without restart                               |
+| **Server entry (HTTP)**                  | [`src/transport.rs`](src/transport.rs) — `serve()` (~line 1382)        | The function consumers call. Wires rmcp + axum + middleware + TLS + admin + metrics                    |
+| Server entry (stdio)                     | [`src/transport.rs`](src/transport.rs) — `serve_stdio()` (~line 2695) | For desktop/IDE clients. **Bypasses auth/RBAC/TLS** — use only for local subprocess MCP                |
+| Config builder                           | [`src/transport.rs`](src/transport.rs) — `McpServerConfig::new` (~line 425) | Builder-style config struct                                                                       |
+| Hot-reload handle                        | [`src/transport.rs`](src/transport.rs) — `ReloadHandle` (~line 805)   | `reload_auth_keys` / `reload_rbac` for runtime reconfig without restart                               |
 | Runnable example                         | [`examples/minimal_server.rs`](examples/minimal_server.rs)            | Smallest possible consumer of `serve()`                                                                |
 | E2E reference                            | [`tests/e2e.rs`](tests/e2e.rs)                                        | Real-world usage patterns; use as an integration cookbook                                              |
 
@@ -164,7 +164,7 @@ consumer applications and `examples/`.
 
 ```
                    ┌──────────────────────────────────┐
-   HTTP request ─► │  TlsListener  (TLS / mTLS)       │  src/transport.rs:846
+   HTTP request ─► │  TlsListener  (TLS / mTLS)       │  src/transport.rs:1904
                    └────────────────┬─────────────────┘
                                     ▼
                    ┌──────────────────────────────────┐
@@ -198,7 +198,7 @@ consumer applications and `examples/`.
 **State plane** (lock-free hot reload via `arc-swap`):
 - `AuthState.api_keys: ArcSwap<HashMap<…>>` — swap API keys at runtime
 - `rbac_swap: ArcSwap<RbacPolicy>` — swap RBAC policy at runtime
-- `MtlsIdentities: RwLock<HashMap<SocketAddr, AuthIdentity>>` — populated by TLS acceptor, read by auth middleware
+- mTLS identity: bound to the connection itself via `AuthenticatedTlsStream` / per-connection `TlsConnInfo` extension — set by the TLS handshake worker, read by auth middleware (no shared `SocketAddr`-keyed map)
 - Task-local: `current_role()`, `current_identity()`, `current_token()`, `current_sub()` — set by middleware, callable from inside tool handlers (`src/rbac.rs:46-75`)
 
 For a much deeper version see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
@@ -272,7 +272,7 @@ The most-violated rules — all `deny`-level in `Cargo.toml`:
 |------------------------------------------------|--------------------------------------------------------|
 | Server entry / router / middleware order       | `src/transport.rs` — `serve()` and surrounding helpers |
 | API key authentication                         | `src/auth.rs` — `AuthState`, `ApiKeyEntry`, `auth_middleware` |
-| mTLS identity extraction                       | `src/transport.rs` — `extract_mtls_identity` call site (~line 1940)   |
+| mTLS identity extraction                       | `src/transport.rs` — `extract_mtls_identity` call site (~line 2008)   |
 | mTLS CRL revocation (CDP-driven)               | `src/mtls_revocation.rs` — `CrlSet`, `DynamicClientCertVerifier`, `bootstrap_fetch`, `run_crl_refresher` |
 | OAuth JWT validation / JWKS cache              | `src/oauth.rs` — `JwksCache`, feature-gated           |
 | RBAC policy evaluation                         | `src/rbac.rs` — `RbacPolicy::check`, `enforce_tool_policy` |
@@ -285,8 +285,8 @@ The most-violated rules — all `deny`-level in `Cargo.toml`:
 | Configuration struct (TOML schema)             | `src/config.rs` + `McpServerConfig` in `src/transport.rs` |
 | Error type → HTTP status mapping               | `src/error.rs` — `McpxError::into_response`           |
 | Origin / security headers / CORS               | `src/transport.rs` — `origin_check_middleware`, `security_headers_middleware` |
-| Graceful shutdown (Ctrl-C / SIGTERM)           | `src/transport.rs` — `shutdown_signal()` (~line 2150) |
-| Hot-reload of keys / RBAC                      | `src/transport.rs` — `ReloadHandle` (~line 789)       |
+| Graceful shutdown (Ctrl-C / SIGTERM)           | `src/transport.rs` — `shutdown_signal()` (~line 2291) |
+| Hot-reload of keys / RBAC                      | `src/transport.rs` — `ReloadHandle` (~line 805)       |
 
 ---
 
@@ -296,7 +296,7 @@ The most-violated rules — all `deny`-level in `Cargo.toml`:
 2. **JWKS refresh is rate-limited.** Don't remove the `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:283-290`) — invalid JWTs would otherwise DoS the JWKS endpoint.
 3. **Task-local RBAC context only exists inside the request scope.** Calling `current_role()` from a `tokio::spawn`ed background task returns `None`. Capture the value before spawning.
 4. **`stdio` transport bypasses everything.** `serve_stdio` does NOT enforce auth, RBAC, TLS, or origin checks. It's intended for trusted local subprocess scenarios only.
-5. **mTLS identities are keyed by `SocketAddr`.** If a load balancer rewrites peer addresses you must terminate TLS at the LB and use a different identity-binding strategy.
+5. **mTLS identity is bound to the connection stream (`TlsConnInfo`), not to a shared `SocketAddr` map.** If a load balancer terminates TCP and rewrites peer addresses you must terminate TLS at the LB and use a different identity-binding strategy; the in-process binding itself is immune to port-reuse aliasing.
 6. **`ArcSwap` swaps are lock-free but eventually-consistent.** In-flight requests may use the previous policy. This is intentional. Do not switch to `RwLock`.
 
 ---

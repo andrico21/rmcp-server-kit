@@ -3,7 +3,8 @@
 > **Audience**: AI agents and engineers who need to **modify** rmcp-server-kit safely.
 > **Companion**: [`MINDMAP.md`](MINDMAP.md) for the visual view, [`../AGENTS.md`](../AGENTS.md) for the navigation hub, [`GUIDE.md`](GUIDE.md) for end-user usage.
 >
-> All file references use `file:line` against the working tree as of 1.6.0.
+> All file references use `file:line` against the working tree as of 1.8.1
+> (post-review fixes, commits `479f5ea..e23ea92`).
 > Line numbers are approximate (±20) — they help localize, not replace `Read`.
 > Citations are pinned by `tests/docs_citations.rs` so they fail loudly when
 > a cited file disappears or shrinks below a referenced line.
@@ -46,8 +47,8 @@ The crate has two transports:
 
 | Transport          | Function                                            | Auth/RBAC/TLS  | Use case                                         |
 |--------------------|-----------------------------------------------------|----------------|--------------------------------------------------|
-| **Streamable HTTP**| `serve()` — `src/transport.rs:1355`                 | **Yes**        | Production network deployment                    |
-| stdio              | `serve_stdio()` — `src/transport.rs:2551`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
+| **Streamable HTTP**| `serve()` — `src/transport.rs:1382`                 | **Yes**        | Production network deployment                    |
+| stdio              | `serve_stdio()` — `src/transport.rs:2695`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
 
 ---
 
@@ -101,20 +102,24 @@ There are **no circular dependencies**.
 
 A complete HTTP request to `/mcp` flows through these layers, top-to-bottom
 (outermost → innermost). The corresponding code lives in
-`src/transport.rs:887-1300` (middleware wiring inside `build_app_router`) and in each module.
+`src/transport.rs:907-1320` (middleware wiring inside `build_app_router`) and in each module.
 
 ```
-TCP / TLS handshake                         src/transport.rs:1846  (TlsListener)
+TCP / TLS handshake                         src/transport.rs:1904  (TlsListener)
+   │  - Handshakes run CONCURRENTLY on a background acceptor task
+   │    (run_tls_acceptor, src/transport.rs:2026): 256-permit in-flight
+   │    cap, 10 s per-handshake timeout; axum receives only completed
+   │    connections via a bounded channel.
    │  - mTLS: client cert verified during the handshake; the resulting
    │    AuthIdentity is attached to the **per-connection** TlsConnInfo
    │    extension (no shared SocketAddr-keyed map).
    ▼
-axum Router                                  src/transport.rs:887  (build_app_router)
+axum Router                                  src/transport.rs:907  (build_app_router)
    │
-   ├── 1. Origin check                       src/transport.rs:2461
+   ├── 1. Origin check                       src/transport.rs:2602
    │      Rejects 403 if Origin/Host not allowed (MCP spec requirement)
    │
-   ├── 2. Security headers                   src/transport.rs:2218
+   ├── 2. Security headers                   src/transport.rs:2359
    │      HSTS, CSP, X-Frame-Options=DENY, X-Content-Type-Options, ...
    │
    ├── 3. CORS / Compression / Timeouts      tower-http layers
@@ -286,7 +291,7 @@ threaded as `SecretString` from `AuthIdentity.raw_token` through
 2. It extracts CN/SAN as `name`, derives `role` from the configured
    subject→role mapping, and attaches `AuthIdentity { method: Mtls, … }`
    to the **per-connection** `TlsConnInfo` extension
-   (`src/transport.rs:1846-1944`).
+   (`src/transport.rs:1904-2016`).
 3. `auth_middleware` reads the identity directly from the connection
    extension (`src/auth.rs:1162-1165`); no shared SocketAddr-keyed map is
    consulted, so there is no port-reuse aliasing risk.
@@ -382,19 +387,30 @@ an outbound `Authorization` header for downstream token passthrough.
 
 ## 7. TLS / mTLS
 
-**Custom listener**: `TlsListener` in `src/transport.rs:1846`, implementing
+**Custom listener**: `TlsListener` in `src/transport.rs:1904`, implementing
 `axum::serve::Listener` so axum's hyper machinery accepts it as a drop-in
 replacement for `TcpListener`.
 
-Lifecycle:
+Lifecycle (concurrent-acceptor design, since the 1.8.1 review fixes):
 1. `TlsListener::new(...)` reads PEM cert + key, builds a `rustls::ServerConfig`,
-   optionally wraps with mTLS verification using configured root CAs.
-2. On each `accept()`:
-   - Performs the TLS handshake.
-   - If the peer presented a cert, parses it (`x509-parser`), derives
-     `AuthIdentity`, and stores it on the per-connection `TlsConnInfo`
-     extension that travels with the stream.
-   - Returns the wrapped TLS stream + `ConnectInfo<TlsConnInfo>`.
+   optionally wraps with mTLS verification using configured root CAs, then
+   spawns a dedicated background acceptor task (`run_tls_acceptor`,
+   `src/transport.rs:2026`) that owns the `TcpListener`.
+2. The acceptor task loops: acquires a permit from a
+   `MAX_INFLIGHT_TLS_HANDSHAKES` (256) semaphore **before** accepting (so
+   at saturation, excess connections wait in the kernel backlog), accepts
+   a TCP connection, and spawns a handshake worker.
+3. Each worker performs the TLS handshake under
+   `TLS_HANDSHAKE_TIMEOUT` (10 s). On success it parses the peer cert if
+   present (`x509-parser`), derives `AuthIdentity`, binds it to the stream
+   as `AuthenticatedTlsStream`, and pushes the pair into a bounded mpsc
+   channel (capacity 32). Failures and timeouts are logged at DEBUG and
+   the connection dropped; the permit is released either way.
+4. `TlsListener::accept()` is a cancel-safe `rx.recv()` that just dequeues
+   completed handshakes — it never performs handshake work itself, so one
+   slow or idle client can no longer stall other connections.
+5. Dropping the listener aborts the acceptor task, releasing the port
+   deterministically.
 
 Configuration toggles:
 - TLS version: TLSv1.2+ (set in `rustls` features).
@@ -765,8 +781,8 @@ These are **non-negotiable**. Breaking any of them is a security regression.
 
 1. **Origin check runs before auth.** Reordering would allow unauthenticated
    browser-origin requests to hit the auth path and amplify timing oracles.
-   Wired in `build_app_router` (`src/transport.rs:887`); the middleware
-   itself is at `src/transport.rs:2461`.
+Wired in `build_app_router` (`src/transport.rs:907`); the middleware
+itself is at `src/transport.rs:2602`.
 
 2. **Auth runs before RBAC.** Without an `AuthIdentity`, RBAC has no role
    to evaluate. The middleware order in `src/transport.rs` (auth at
@@ -782,9 +798,13 @@ These are **non-negotiable**. Breaking any of them is a security regression.
    public JWKS would enable algorithm-confusion attacks. Don't add them
    to the default allow-list.
 
-6. **mTLS identity map is keyed by `SocketAddr`, not by client name.**
-   Two simultaneous connections from the same client get distinct entries.
-   This is intentional and prevents identity hijack across connections.
+6. **mTLS identity is bound to the connection stream, never to a shared map.**
+   `AuthIdentity` travels inside `AuthenticatedTlsStream` / the per-connection
+   `TlsConnInfo` extension, so two simultaneous connections from the same
+   client (or a reused ephemeral port) can never observe each other's
+   identity. Do not reintroduce a `SocketAddr`-keyed map — that earlier
+   design was removed precisely because of port-reuse aliasing races
+   (see §5).
 
 7. **`stdio` transport bypasses ALL middleware** (auth, RBAC, TLS, origin).
    Document this loudly to consumers and never recommend it for network use.

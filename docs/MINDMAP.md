@@ -37,7 +37,7 @@ mindmap
         impl McpServerConfig L359-700
         ReloadHandle ~L712
         build_app_router ~L810
-        TlsListener ~L1720
+        TlsListener ~L1904
         shutdown_signal ~L2018
         origin_check_middleware def ~L2151 / wired ~L1228
         security_headers_middleware def ~L2082 / wired ~L1115
@@ -284,7 +284,7 @@ mindmap
 sequenceDiagram
     autonumber
     participant C as Client
-    participant TLS as TlsListener<br/>src/transport.rs:1720
+    participant TLS as TlsListener<br/>src/transport.rs:1904
     participant R as axum Router
     participant O as origin_check<br/>src/transport.rs:2151
     participant H as security_headers<br/>src/transport.rs:2082
@@ -420,7 +420,7 @@ graph TD
 | Server entry (HTTP)               | `src/transport.rs`                       | `serve` ~L1275, `McpServerConfig` L73-355, `ReloadHandle` ~L712              |
 | Server entry (stdio, no auth)     | `src/transport.rs`                       | `serve_stdio` ~L2241                                                          |
 | Router builder + middleware wire  | `src/transport.rs`                       | `build_app_router` ~L810, security headers wired ~L1115, origin wired ~L1228 |
-| TLS / mTLS acceptor               | `src/transport.rs`                       | `TlsListener` ~L1720                                                          |
+| TLS / mTLS acceptor               | `src/transport.rs`                       | `TlsListener` ~L1904                                                          |
 | Origin / security headers (defs)  | `src/transport.rs`                       | `origin_check_middleware` ~L2151, `security_headers_middleware` ~L2082       |
 | Graceful shutdown                 | `src/transport.rs`                       | `shutdown_signal` ~L2018                                                      |
 | API key + mTLS auth               | `src/auth.rs`                            | `AuthIdentity` L40, `AuthState` L621, `auth_middleware` L970                 |
