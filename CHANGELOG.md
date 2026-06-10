@@ -8,6 +8,8 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-06-10
+
 ### Added
 
 - **Opt-in per-IP rate limiting for `with_extra_router` routes** (closes
