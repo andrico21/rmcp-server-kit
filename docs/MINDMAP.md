@@ -418,15 +418,15 @@ graph TD
 | Area                              | Module / file                           | Notable symbols (file:line)                                                  |
 |-----------------------------------|------------------------------------------|-------------------------------------------------------------------------------|
 | Server entry (HTTP)               | `src/transport.rs`                       | `serve` ~L1275, `McpServerConfig` L73-355, `ReloadHandle` ~L712              |
-| Server entry (stdio, no auth)     | `src/transport.rs`                       | `serve_stdio` ~L2241                                                          |
-| Router builder + middleware wire  | `src/transport.rs`                       | `build_app_router` ~L810, security headers wired ~L1115, origin wired ~L1228 |
-| TLS / mTLS acceptor               | `src/transport.rs`                       | `TlsListener` ~L1904                                                          |
-| Origin / security headers (defs)  | `src/transport.rs`                       | `origin_check_middleware` ~L2151, `security_headers_middleware` ~L2082       |
-| Graceful shutdown                 | `src/transport.rs`                       | `shutdown_signal` ~L2018                                                      |
+| Server entry (stdio, no auth)     | `src/transport.rs`                       | `serve_stdio` ~L2944                                                          |
+| Router builder + middleware wire  | `src/transport.rs`                       | `build_app_router` ~L1080, security headers wired ~L1390, peer-addr normalize wired ~L1503, origin wired ~L1515 |
+| TLS / mTLS acceptor               | `src/transport.rs`                       | `TlsListener` ~L2106                                                          |
+| Origin / security headers (defs)  | `src/transport.rs`                       | `origin_check_middleware` ~L2851, `security_headers_middleware` ~L2564       |
+| Graceful shutdown                 | `src/transport.rs`                       | `shutdown_signal` ~L2496                                                      |
 | API key + mTLS auth               | `src/auth.rs`                            | `AuthIdentity` L40, `AuthState` L621, `auth_middleware` L970                 |
 | RBAC engine                       | `src/rbac.rs`                            | `RbacPolicy` L329, task-locals L83-145, `rbac_middleware` L584-700           |
 | Memory-bounded keyed limiter      | `src/bounded_limiter.rs`                 | `BoundedKeyedLimiter` L93                                                     |
-| OAuth JWT / JWKS                  | `src/oauth.rs` (feature `oauth`)         | `JwksCache` impl L878, `JWKS_REFRESH_COOLDOWN` ~L853, `select_jwks_key` L1075 |
+| OAuth JWT / JWKS                  | `src/oauth.rs` (feature `oauth`)         | `JwksCache` L1677, `JWKS_REFRESH_COOLDOWN` ~L1714, `select_jwks_key` L1997 |
 | SSRF guard (outbound HTTP)        | `src/ssrf.rs`                            | per-hop scheme/userinfo/IP-literal blocks                                     |
 | mTLS revocation (CRL)             | `src/mtls_revocation.rs`                 | `CrlSet` L95, `DynamicClientCertVerifier` L736, `bootstrap_fetch` L889       |
 | Tool hooks / size cap             | `src/tool_hooks.rs`                      | `HookedHandler` L219                                                          |
