@@ -259,26 +259,38 @@ jobs:
     # manual dispatch.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     continue-on-error: true
-    # Hard-cap the job well below GitHub's 6h ceiling so it terminates
+    # Hard-cap each shard well below GitHub's 6h ceiling so it terminates
     # gracefully (allowing `continue-on-error` to take effect) instead of
     # being SIGKILLed and marking the entire workflow run as failed.
     timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        # NOTE: cargo-mutants shards are ZERO-indexed: valid values for
+        # `--shard k/4` are 0..3. Passing 4/4 silently selects an empty
+        # shard instead of erroring.
+        shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.9.1
       - name: Install cargo-mutants
         run: cargo install cargo-mutants --locked
-      - name: Run cargo mutants on rbac + auth
-        # Scope to the two security-critical modules where mutation testing
-        # is most informative. `oauth.rs` was previously included but its
+      - name: Run cargo mutants on security-critical modules (shard ${{ matrix.shard }}/4)
+        # Scope to the security-critical modules where mutation testing is
+        # most informative. `oauth.rs` was previously included but its
         # ~1700 lines dominated runtime (the suite only reached ~30% of
         # mutants before the wall-clock cap) and most of its mutants are
-        # config-builder boilerplate. Dropping it lets the nightly run
-        # actually complete and produce an actionable MISSED report.
+        # config-builder boilerplate.
+        # The 1.8.1 review fixes added security-critical logic in
+        # transport.rs (concurrent TLS acceptor), ssrf.rs (IPv6 transition
+        # prefixes), and mtls_revocation.rs (semaphore eviction, timestamp
+        # clamp), so those files joined the scope; to keep each nightly
+        # job within the wall-clock budget the mutant list is now split
+        # deterministically across 4 parallel shards (`--shard K/4`).
         # Wrap in `timeout` so we exit 0 even if cargo-mutants itself
         # blows past the wall-clock budget (GitHub's job-level
         # `timeout-minutes` SIGKILLs and bypasses `|| true`).
-        run: timeout --preserve-status 170m cargo mutants --no-shuffle --timeout 180 -j 2 -f src/rbac.rs -f src/auth.rs || true
+        run: timeout --preserve-status 170m cargo mutants --no-shuffle --timeout 180 -j 2 --shard ${{ matrix.shard }}/4 -f src/rbac.rs -f src/auth.rs -f src/transport.rs -f src/ssrf.rs -f src/mtls_revocation.rs || true
 
 
