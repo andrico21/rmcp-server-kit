@@ -291,6 +291,11 @@ jobs:
         # Wrap in `timeout` so we exit 0 even if cargo-mutants itself
         # blows past the wall-clock budget (GitHub's job-level
         # `timeout-minutes` SIGKILLs and bypasses `|| true`).
-        run: timeout --preserve-status 170m cargo mutants --no-shuffle --timeout 180 -j 2 --shard ${{ matrix.shard }}/4 -f src/rbac.rs -f src/auth.rs -f src/transport.rs -f src/ssrf.rs -f src/mtls_revocation.rs || true
+        # `--timeout 360`: the per-test-run cap must exceed the FULL
+        # suite's runtime because the per-shard baseline (and any
+        # surviving mutant) runs the whole suite; the suite grew past the
+        # old 180s budget (~210s as of 1.8.2), which made a shard's
+        # baseline time out and silently skip all of its mutants.
+        run: timeout --preserve-status 170m cargo mutants --no-shuffle --timeout 360 -j 2 --shard ${{ matrix.shard }}/4 -f src/rbac.rs -f src/auth.rs -f src/transport.rs -f src/ssrf.rs -f src/mtls_revocation.rs || true
 
 
