@@ -8,7 +8,12 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
-use axum::{body::Body, extract::Request, middleware::Next, response::IntoResponse};
+use axum::{
+    body::Body,
+    extract::{ConnectInfo, Request},
+    middleware::Next,
+    response::IntoResponse,
+};
 use rmcp::{
     ServerHandler,
     transport::streamable_http_server::{
@@ -62,6 +67,88 @@ fn io_to_startup(op: &str, e: std::io::Error) -> McpxError {
 /// When `ready` is false, the endpoint returns HTTP 503.
 pub type ReadinessCheck =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = serde_json::Value> + Send>> + Send + Sync>;
+
+/// Direct socket peer address of the current HTTP/TLS connection.
+///
+/// Inserted as a request extension into every request served by [`serve`] —
+/// on both the plain and the TLS listener — and extractable in any axum
+/// handler, including routes mounted via
+/// [`McpServerConfig::with_extra_router`] (which bypass auth/RBAC and
+/// therefore often need the peer address for their own protection, e.g.
+/// per-IP rate limiting).
+///
+/// The same address is also mirrored into
+/// [`axum::extract::ConnectInfo`]`<SocketAddr>` on the TLS listener, so
+/// third-party middleware that expects the stock axum extension (e.g.
+/// per-IP rate-limit key extractors) works unmodified under TLS.
+///
+/// # Semantics
+///
+/// - **Direct peer only.** This is the socket's remote address. Behind an
+///   L4/L7 proxy or load balancer it is the proxy's address; the framework
+///   performs **no** `X-Forwarded-For` / `Forwarded` interpretation.
+/// - **Available on HTTP and TLS** transports alike ([`serve`]).
+/// - **Absent under [`serve_stdio`]** — a stdio session has no network
+///   peer (stdio bypasses the HTTP stack entirely).
+/// - The separate Prometheus metrics listener (feature `metrics`) is a
+///   different router and does not carry this extension.
+///
+/// # Privacy
+///
+/// `PeerAddr` exposes raw peer network metadata. The framework deliberately
+/// never logs it on its own; whether to log or persist peer addresses is
+/// application policy.
+///
+/// # Example
+///
+/// ```no_run
+/// use axum::{Router, routing::get};
+/// use rmcp_server_kit::transport::{McpServerConfig, PeerAddr};
+///
+/// async fn whoami(peer: PeerAddr) -> String {
+///     peer.addr.ip().to_string()
+/// }
+///
+/// let _config = McpServerConfig::new("127.0.0.1:8443", "my-server", "1.0.0")
+///     .with_extra_router(Router::new().route("/whoami", get(whoami)));
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct PeerAddr {
+    /// Direct socket peer of this connection.
+    pub addr: SocketAddr,
+}
+
+impl PeerAddr {
+    /// Construct a new [`PeerAddr`]. Framework-internal: downstream code
+    /// receives `PeerAddr` via request extensions and never constructs it.
+    #[must_use]
+    pub(crate) const fn new(addr: SocketAddr) -> Self {
+        Self { addr }
+    }
+}
+
+/// Extract [`PeerAddr`] from request extensions.
+///
+/// # Rejection
+///
+/// Responds `500 Internal Server Error` when the extension is missing.
+/// A missing `PeerAddr` means the handler is not running under [`serve`]
+/// (e.g. the router was mounted on a hand-rolled listener) — a wiring
+/// bug, not a client error.
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerAddr {
+    type Rejection = (axum::http::StatusCode, &'static str);
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        parts.extensions.get::<Self>().copied().ok_or((
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "peer address unavailable: not running under rmcp-server-kit serve()",
+        ))
+    }
+}
 
 /// Per-header overrides for the OWASP security headers emitted by the
 /// global response middleware.
@@ -242,6 +329,9 @@ pub struct McpServerConfig {
     /// Additional application-specific routes merged into the top-level
     /// router.  These routes **bypass** the MCP auth and RBAC middleware,
     /// so the application is responsible for its own auth on them.
+    /// Handlers can extract [`PeerAddr`] (or
+    /// [`axum::extract::ConnectInfo`]`<SocketAddr>` for third-party
+    /// middleware compatibility) regardless of whether TLS is enabled.
     #[deprecated(
         since = "0.13.0",
         note = "use McpServerConfig::with_extra_router(); direct field access will become pub(crate) in a future major release"
@@ -560,6 +650,15 @@ impl McpServerConfig {
     /// Merge an additional axum router at the top level. Routes added
     /// here **bypass** rmcp-server-kit auth and RBAC; the application is responsible
     /// for its own protection.
+    ///
+    /// To support that protection (e.g. per-IP rate limiting on
+    /// unauthenticated endpoints), every request served by [`serve`]
+    /// carries the client peer address regardless of whether TLS is
+    /// enabled: extract the framework-owned [`PeerAddr`] in your
+    /// handlers, or rely on [`axum::extract::ConnectInfo`]`<SocketAddr>`
+    /// for stock third-party middleware (e.g. per-IP rate-limit key
+    /// extractors). Neither extension exists under [`serve_stdio`],
+    /// which has no network peer.
     #[must_use]
     pub fn with_extra_router(mut self, router: axum::Router) -> Self {
         self.extra_router = Some(router);
@@ -1393,6 +1492,15 @@ where
             }
         });
     }
+
+    // Peer-address normalization. Mirrors the TLS branch's peer address
+    // into `ConnectInfo<SocketAddr>` and exposes the framework-owned
+    // `PeerAddr` extension on both listener branches, so ALL routes on
+    // the merged router (`/mcp`, `/healthz`, OAuth proxy endpoints,
+    // admin endpoints, extra_router, ...) and all inner middleware see a
+    // uniform peer-address contract regardless of TLS. Installed just
+    // inside the origin check, which stays outermost by design.
+    router = router.layer(axum::middleware::from_fn(normalize_peer_addr_middleware));
 
     // Origin validation layer (MCP spec: servers MUST validate the
     // Origin header to prevent DNS rebinding attacks). Installed as the
@@ -2693,6 +2801,50 @@ async fn oauth_token_cache_headers_middleware(
     resp
 }
 
+/// Normalize peer-address request extensions across listener branches.
+///
+/// The make-service installs `ConnectInfo<SocketAddr>` on the plain
+/// listener but `ConnectInfo<TlsConnInfo>` on the TLS listener (the
+/// latter additionally carries the connection-bound mTLS identity and
+/// stays `pub(crate)` — see the anti-aliasing rationale on
+/// [`TlsConnInfo`]). Application routes — in particular those merged via
+/// [`McpServerConfig::with_extra_router`], which bypass the auth
+/// middleware and its private fallback — could therefore not read the
+/// peer address under TLS.
+///
+/// This middleware makes both branches look identical to every route and
+/// inner middleware:
+///
+/// 1. mirrors the TLS peer address into `ConnectInfo<SocketAddr>` when
+///    (and only when) it is absent, so stock axum-ecosystem extractors
+///    work unmodified, and
+/// 2. inserts the framework-owned [`PeerAddr`] extension on both
+///    branches.
+///
+/// Precedence mirrors the auth middleware: an existing
+/// `ConnectInfo<SocketAddr>` always wins and is never overwritten. The
+/// peer address is deliberately not logged here.
+async fn normalize_peer_addr_middleware(
+    mut req: Request<Body>,
+    next: Next,
+) -> axum::response::Response {
+    let direct = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0);
+    let from_tls = req
+        .extensions()
+        .get::<ConnectInfo<TlsConnInfo>>()
+        .map(|ci| ci.0.addr);
+    if let Some(addr) = direct.or(from_tls) {
+        if direct.is_none() {
+            req.extensions_mut().insert(ConnectInfo(addr));
+        }
+        req.extensions_mut().insert(PeerAddr::new(addr));
+    }
+    next.run(req).await
+}
+
 /// Per the MCP spec: if the Origin header is present and its value is not in
 /// the allowed list, respond with 403 Forbidden. Requests without an Origin
 /// header are allowed through (e.g. non-browser clients like curl, SDKs).
@@ -3017,6 +3169,120 @@ mod tests {
         let resp = readyz(check).await.into_response();
         // Missing "ready" field defaults to false -> 503
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // -- normalize_peer_addr_middleware / PeerAddr --
+
+    /// Build a test router that reports the request's peer-address
+    /// extensions as `"<ConnectInfo>|<PeerAddr>"` (empty when absent).
+    fn peer_probe_router() -> axum::Router {
+        async fn probe(req: Request<Body>) -> String {
+            let ci = req
+                .extensions()
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|c| c.0.to_string())
+                .unwrap_or_default();
+            let pa = req
+                .extensions()
+                .get::<PeerAddr>()
+                .map(|p| p.addr.to_string())
+                .unwrap_or_default();
+            format!("{ci}|{pa}")
+        }
+        axum::Router::new()
+            .route("/probe", axum::routing::get(probe))
+            .layer(axum::middleware::from_fn(normalize_peer_addr_middleware))
+    }
+
+    async fn body_string(resp: axum::response::Response) -> String {
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn normalize_preserves_existing_connect_info_and_mirrors_peer_addr() {
+        // Precedence proof: when both extensions exist with DIFFERENT
+        // addresses, ConnectInfo<SocketAddr> wins and is never overwritten.
+        let plain: SocketAddr = "10.0.0.1:1111".parse().unwrap();
+        let tls: SocketAddr = "10.0.0.2:2222".parse().unwrap();
+        let req = Request::builder()
+            .uri("/probe")
+            .extension(ConnectInfo(plain))
+            .extension(ConnectInfo(TlsConnInfo::new(tls, None)))
+            .body(Body::empty())
+            .unwrap();
+        let resp = peer_probe_router().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_string(resp).await, format!("{plain}|{plain}"));
+    }
+
+    #[tokio::test]
+    async fn normalize_inserts_connect_info_and_peer_addr_from_tls() {
+        let tls: SocketAddr = "192.168.1.7:50443".parse().unwrap();
+        let req = Request::builder()
+            .uri("/probe")
+            .extension(ConnectInfo(TlsConnInfo::new(tls, None)))
+            .body(Body::empty())
+            .unwrap();
+        let resp = peer_probe_router().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_string(resp).await, format!("{tls}|{tls}"));
+    }
+
+    #[tokio::test]
+    async fn normalize_no_op_without_any_connect_info() {
+        let req = Request::builder()
+            .uri("/probe")
+            .body(Body::empty())
+            .unwrap();
+        let resp = peer_probe_router().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_string(resp).await, "|");
+    }
+
+    #[tokio::test]
+    async fn peer_addr_extractor_rejects_when_absent() {
+        async fn h(peer: PeerAddr) -> String {
+            peer.addr.to_string()
+        }
+        let app = axum::Router::new().route("/p", axum::routing::get(h));
+        let req = Request::builder().uri("/p").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn peer_addr_extractor_returns_value_when_present() {
+        async fn h(peer: PeerAddr) -> String {
+            peer.addr.to_string()
+        }
+        let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let app = axum::Router::new().route("/p", axum::routing::get(h));
+        let req = Request::builder()
+            .uri("/p")
+            .extension(PeerAddr::new(addr))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_string(resp).await, addr.to_string());
+    }
+
+    #[tokio::test]
+    async fn peer_addr_via_extension_extractor() {
+        async fn h(axum::Extension(peer): axum::Extension<PeerAddr>) -> String {
+            peer.addr.to_string()
+        }
+        let addr: SocketAddr = "127.0.0.1:4242".parse().unwrap();
+        let app = axum::Router::new().route("/p", axum::routing::get(h));
+        let req = Request::builder()
+            .uri("/p")
+            .extension(PeerAddr::new(addr))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_string(resp).await, addr.to_string());
     }
 
     // -- origin_check_middleware --

@@ -1574,3 +1574,196 @@ fn hook_outcome_variants_are_constructible() {
         "x".to_owned(),
     )])));
 }
+
+// ==========================================================================
+// Peer-address exposure for extra_router (PeerAddr + ConnectInfo<SocketAddr>)
+// ==========================================================================
+
+mod peer_addr_tests {
+    use std::{net::IpAddr, path::PathBuf};
+
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose,
+        IsCa, KeyPair, KeyUsagePurpose, SanType,
+    };
+    use rmcp_server_kit::transport::PeerAddr;
+
+    use super::*;
+
+    /// Extra router exposing `/peer`, which reports both peer-address
+    /// extensions as `"<ConnectInfo>|<PeerAddr>"`. Mounted via
+    /// `with_extra_router`, i.e. it bypasses auth/RBAC — exactly the
+    /// scenario from the downstream report.
+    fn peer_router() -> axum::Router {
+        async fn peer_probe(
+            axum::extract::ConnectInfo(ci): axum::extract::ConnectInfo<SocketAddr>,
+            peer: PeerAddr,
+        ) -> String {
+            format!("{ci}|{}", peer.addr)
+        }
+        axum::Router::new().route("/peer", axum::routing::get(peer_probe))
+    }
+
+    fn assert_loopback_peer(text: &str) {
+        let (ci, pa) = text.split_once('|').expect("probe format <ci>|<pa>");
+        let ci: SocketAddr = ci.parse().expect("ConnectInfo<SocketAddr> value");
+        let pa: SocketAddr = pa.parse().expect("PeerAddr value");
+        assert_eq!(ci, pa, "ConnectInfo and PeerAddr must agree");
+        assert_eq!(ci.ip(), IpAddr::from([127, 0, 0, 1]));
+    }
+
+    #[tokio::test]
+    async fn plain_extra_router_sees_peer_addr() {
+        let port = free_port().await;
+        let cfg = config_on_port(port).with_extra_router(peer_router());
+        let base = spawn_server(cfg).await;
+
+        let resp = reqwest::get(&format!("{base}/peer")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_loopback_peer(&resp.text().await.unwrap());
+    }
+
+    // -- server-side-TLS-only PKI (no mTLS, no CRL) --
+
+    /// PEM-encoded server-side-TLS-only materials (no mTLS, no CRL).
+    struct ServerTlsPki {
+        ca: String,
+        server_cert: String,
+        server_key: String,
+    }
+
+    fn build_server_tls_pki() -> ServerTlsPki {
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "peer-addr-test-ca");
+        let ca_key = KeyPair::generate().expect("ca key");
+        let ca = CertifiedIssuer::self_signed(ca_params, ca_key).expect("ca self-signed");
+
+        let mut params = CertificateParams::new(vec!["localhost".to_owned()]).expect("params");
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "localhost");
+        params
+            .subject_alt_names
+            .push(SanType::IpAddress(IpAddr::from([127, 0, 0, 1])));
+        params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyEncipherment,
+        ];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let server_key = KeyPair::generate().expect("server key");
+        let server_cert = params.signed_by(&server_key, &ca).expect("server cert");
+
+        ServerTlsPki {
+            ca: ca.pem(),
+            server_cert: server_cert.pem(),
+            server_key: server_key.serialize_pem(),
+        }
+    }
+
+    struct ServerTlsPaths {
+        _dir: PathBuf,
+        server_cert: PathBuf,
+        server_key: PathBuf,
+    }
+
+    async fn write_server_tls_materials(pki: &ServerTlsPki) -> ServerTlsPaths {
+        let dir = std::env::temp_dir().join(format!(
+            "rmcp-server-kit-peer-addr-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("create temp dir");
+
+        let server_cert = dir.join("server.pem");
+        let server_key = dir.join("server.key");
+        tokio::fs::write(&server_cert, &pki.server_cert)
+            .await
+            .expect("write server cert pem");
+        tokio::fs::write(&server_key, &pki.server_key)
+            .await
+            .expect("write server key pem");
+
+        ServerTlsPaths {
+            _dir: dir,
+            server_cert,
+            server_key,
+        }
+    }
+
+    async fn spawn_plain_tls_server(config: McpServerConfig) -> ServerHarness {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound: SocketAddr = listener.local_addr().unwrap();
+        let config = config.with_bind_addr(bound.to_string());
+
+        let (ready_tx, ready_rx) = oneshot::channel::<SocketAddr>();
+        let shutdown = CancellationToken::new();
+        let shutdown_for_server = shutdown.clone();
+
+        let join = tokio::spawn(async move {
+            rmcp_server_kit::transport::serve_with_listener(
+                listener,
+                config.validate().expect("tls test config valid"),
+                || TestHandler,
+                Some(ready_tx),
+                Some(shutdown_for_server),
+            )
+            .await
+        });
+
+        let signalled: SocketAddr = tokio::time::timeout(Duration::from_secs(5), ready_rx)
+            .await
+            .expect("tls server readiness")
+            .expect("tls server task aborted");
+
+        ServerHarness {
+            base: format!("https://localhost:{}", signalled.port()),
+            shutdown,
+            join: Some(join),
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_extra_router_sees_peer_addr() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let pki = build_server_tls_pki();
+        let paths = write_server_tls_materials(&pki).await;
+
+        let port = free_port().await;
+        let cfg = config_on_port(port)
+            .with_tls(&paths.server_cert, &paths.server_key)
+            .with_extra_router(peer_router());
+        let mut harness = spawn_plain_tls_server(cfg).await;
+
+        let ca = reqwest::Certificate::from_pem(pki.ca.as_bytes()).expect("ca cert");
+        let client = reqwest::Client::builder()
+            .add_root_certificate(ca)
+            .build()
+            .expect("tls reqwest client");
+
+        let resp = client
+            .get(format!("{}/peer", harness.base))
+            .send()
+            .await
+            .expect("tls /peer request");
+        assert_eq!(resp.status(), 200);
+        assert_loopback_peer(&resp.text().await.unwrap());
+
+        harness.shutdown().await.expect("shutdown tls server");
+    }
+}
