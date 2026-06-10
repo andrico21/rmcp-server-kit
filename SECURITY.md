@@ -142,6 +142,24 @@ operator-unintended host has no security benefit.
 Discovery URLs containing IP literals are normalized
 (rejecting octal/hex/percent-encoded obfuscation) before the SSRF check.
 
+#### IPv6 transition prefixes
+
+The IP range guard shared by the CRL and OAuth fetchers also classifies
+IPv6 transition-mechanism prefixes:
+
+- **NAT64 well-known prefix `64:ff9b::/96` (RFC 6052)** and
+  **6to4 `2002::/16` (RFC 3056)**: the IPv4 address embedded in the
+  prefix is extracted and checked against the full IPv4 block list. The
+  address is rejected when the embedded target is itself blocked (e.g.
+  `64:ff9b::10.0.0.1` would reach internal RFC 1918 space through a NAT64
+  gateway), and permitted when it embeds a public IPv4 address — on
+  DNS64/NAT64-only egress networks every public host maps into the NAT64
+  prefix, so blocking it wholesale would break all outbound fetches.
+- **Teredo `2001::/32` (RFC 4380)**: blocked outright. The tunneling
+  protocol is obsolete, its embedded client address is XOR-obfuscated and
+  attacker-chosen, and no legitimate JWKS/CRL endpoint is reachable only
+  via Teredo.
+
 ### OAuth SSRF hardening
 
 When the optional `oauth` feature is enabled, the JWKS fetcher and the

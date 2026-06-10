@@ -61,6 +61,9 @@ pub(crate) fn check_scheme(url: &Url, allow_http: bool) -> Result<(), &'static s
 /// - IPv6 unique local (`fc00::/7`).
 /// - IPv6 multicast (`ff00::/8`).
 /// - IPv6 documentation (`2001:db8::/32`).
+/// - IPv6 Teredo tunneling (`2001::/32`), blocked outright.
+/// - IPv6 NAT64 (`64:ff9b::/96`) and 6to4 (`2002::/16`) when the
+///   embedded IPv4 address is itself blocked by any rule above.
 /// - IPv4-mapped IPv6 inheriting any of the above.
 ///
 /// **Cloud-metadata addresses are checked BEFORE the generic buckets** so
@@ -155,7 +158,48 @@ fn block_reason_v6(v6: Ipv6Addr) -> Option<&'static str> {
     if segments[0] == 0x2001 && segments[1] == 0x0db8 {
         return Some("documentation");
     }
+    // Teredo tunneling 2001:0::/32 (RFC 4380). Obsolete tunneling
+    // protocol that is never a legitimate OAuth/JWKS/CRL dependency;
+    // blocked outright as defense in depth (the embedded client IPv4 is
+    // XOR-obfuscated and attacker-chosen, so it cannot be trusted).
+    if segments[0] == 0x2001 && segments[1] == 0x0000 {
+        return Some("teredo");
+    }
+    // NAT64 well-known prefix 64:ff9b::/96 (RFC 6052): the trailing 32
+    // bits embed an IPv4 address. On DNS64/NAT64 egress networks EVERY
+    // public host maps into this prefix, so blocking it wholesale would
+    // break all outbound fetches there; instead, delegate to the IPv4
+    // classifier and block only when the embedded target would itself be
+    // blocked (e.g. `64:ff9b::10.0.0.1` reaching internal RFC 1918 space).
+    if segments[0] == 0x0064
+        && segments[1] == 0xff9b
+        && segments[2] == 0
+        && segments[3] == 0
+        && segments[4] == 0
+        && segments[5] == 0
+    {
+        if block_reason_v4(embedded_v4(segments[6], segments[7])).is_some() {
+            return Some("nat64_embedded");
+        }
+        return None;
+    }
+    // 6to4 2002::/16 (RFC 3056): segments 1-2 embed the IPv4 address of
+    // the originating site. Same embedded-target policy as NAT64.
+    if segments[0] == 0x2002 {
+        if block_reason_v4(embedded_v4(segments[1], segments[2])).is_some() {
+            return Some("6to4_embedded");
+        }
+        return None;
+    }
     None
+}
+
+/// Reassemble an IPv4 address embedded in two adjacent IPv6 segments
+/// (`hi` carries the first two octets, `lo` the last two).
+const fn embedded_v4(hi: u16, lo: u16) -> Ipv4Addr {
+    let [a, b] = hi.to_be_bytes();
+    let [c, d] = lo.to_be_bytes();
+    Ipv4Addr::new(a, b, c, d)
 }
 
 /// Sync pre-DNS literal-IP check. Any literal IPv4 or IPv6 host is
@@ -470,6 +514,56 @@ mod tests {
             let ip = IpAddr::V4(Ipv4Addr::new(raw[0], raw[1], raw[2], raw[3]));
             assert_eq!(ip_block_reason(ip), Some("private_rfc1918"), "{ip}");
         }
+    }
+
+    #[test]
+    fn transition_prefix_classification() {
+        // NAT64 64:ff9b::/96 embedding private 10.0.0.1 -> blocked.
+        assert_eq!(
+            ip_block_reason(IpAddr::V6(Ipv6Addr::new(
+                0x0064, 0xff9b, 0, 0, 0, 0, 0x0a00, 0x0001
+            ))),
+            Some("nat64_embedded")
+        );
+        // NAT64 embedding public 8.8.8.8 -> allowed (DNS64 networks map
+        // every public host into this prefix).
+        assert_eq!(
+            ip_block_reason(IpAddr::V6(Ipv6Addr::new(
+                0x0064, 0xff9b, 0, 0, 0, 0, 0x0808, 0x0808
+            ))),
+            None
+        );
+        // NAT64 embedding the IPv4 cloud-metadata address -> blocked.
+        assert_eq!(
+            ip_block_reason(IpAddr::V6(Ipv6Addr::new(
+                0x0064, 0xff9b, 0, 0, 0, 0, 0xa9fe, 0xa9fe
+            ))),
+            Some("nat64_embedded")
+        );
+        // 6to4 2002::/16 embedding private 10.0.0.1 -> blocked.
+        assert_eq!(
+            ip_block_reason(IpAddr::V6(Ipv6Addr::new(
+                0x2002, 0x0a00, 0x0001, 0, 0, 0, 0, 0
+            ))),
+            Some("6to4_embedded")
+        );
+        // 6to4 embedding public 8.8.8.8 -> allowed.
+        assert_eq!(
+            ip_block_reason(IpAddr::V6(Ipv6Addr::new(
+                0x2002, 0x0808, 0x0808, 0, 0, 0, 0, 0
+            ))),
+            None
+        );
+        // Teredo 2001:0::/32 -> blocked outright.
+        assert_eq!(
+            ip_block_reason(IpAddr::V6(Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 1))),
+            Some("teredo")
+        );
+        // Documentation 2001:db8::/32 still classified as before.
+        assert_eq!(
+            ip_block_reason(IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1))),
+            Some("documentation")
+        );
     }
 
     #[test]
