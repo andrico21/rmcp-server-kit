@@ -1168,6 +1168,50 @@ across the server. When the cap is reached, excess requests are shed
 with `503 Service Unavailable` (JSON body `{"error":"overloaded"}`)
 rather than queued.
 
+### Extra routes and the client peer address
+
+`McpServerConfig::with_extra_router` merges your own axum routes into the
+top-level router. These routes **bypass** rmcp-server-kit auth and RBAC, so the
+application is responsible for its own protection — typically per-IP rate
+limiting on unauthenticated endpoints (OAuth callbacks, registration, …).
+
+To support that, every request served by `serve()` carries the client
+peer address **regardless of whether TLS is enabled**, in two forms:
+
+1. **`transport::PeerAddr`** — the framework-blessed extractor for your
+   own handlers:
+
+   ```rust,ignore
+   use axum::{Router, routing::get};
+   use rmcp_server_kit::transport::PeerAddr;
+
+   async fn authorize(peer: PeerAddr) -> String {
+       // e.g. key a rate-limit bucket by peer.addr.ip()
+       peer.addr.ip().to_string()
+   }
+
+   let extra = Router::new().route("/authorize", get(authorize));
+   let config = config.with_extra_router(extra);
+   ```
+
+2. **`axum::extract::ConnectInfo<SocketAddr>`** — for compatibility with
+   stock third-party middleware. On the TLS listener the kit mirrors the
+   peer address into this standard axum extension, so per-IP middleware
+   that expects it (e.g. `tower_governor`'s `PeerIpKeyExtractor`) works
+   unmodified on both plain and TLS deployments.
+
+Caveats:
+
+- **Direct socket peer only.** Behind an L4/L7 proxy or load balancer
+  this is the proxy's address; the kit performs no `X-Forwarded-For` /
+  `Forwarded` interpretation.
+- **Absent under `serve_stdio`** — a stdio session has no network peer.
+- The separate Prometheus metrics listener is a different router and
+  does not carry these extensions.
+- **Privacy**: `PeerAddr` exposes raw peer network metadata. The
+  framework deliberately never logs it on its own; whether to log or
+  persist peer addresses is application policy.
+
 ### Customising security headers
 
 By default, rmcp-server-kit emits twelve OWASP security headers on every

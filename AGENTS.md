@@ -182,12 +182,13 @@ consumer applications and `examples/`.
         (executed top-to-bottom on request)            │
                                                        │
         1. Origin check       src/transport.rs:1183    │  spec: MCP origin validation
-        2. Security headers   src/transport.rs:1110    │  HSTS, CSP, X-Frame-Options, ...
-        3. CORS / compression / body-size / timeouts   │  tower-http layers
-        4. Optional concurrency cap + metrics          │
-        5. Auth middleware    src/auth.rs              │  API key (Argon2) | mTLS | OAuth JWT
-        6. RBAC middleware    src/rbac.rs              │  parses JSON-RPC, enforces tools/call policy
-        7. Per-IP tool rate limiter (governor)         │
+        2. Peer-addr normalize (normalize_peer_addr_middleware) │  mirrors TLS peer into ConnectInfo<SocketAddr> + public PeerAddr (both branches)
+        3. Security headers   src/transport.rs:1110    │  HSTS, CSP, X-Frame-Options, ...
+        4. CORS / compression / body-size / timeouts   │  tower-http layers
+        5. Optional concurrency cap + metrics          │
+        6. Auth middleware    src/auth.rs              │  API key (Argon2) | mTLS | OAuth JWT
+        7. RBAC middleware    src/rbac.rs              │  parses JSON-RPC, enforces tools/call policy
+        8. Per-IP tool rate limiter (governor)         │
                                                        ▼
                    ┌──────────────────────────────────┐
                    │  rmcp StreamableHttpService       │  Streamable HTTP MCP protocol

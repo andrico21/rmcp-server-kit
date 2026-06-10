@@ -8,6 +8,25 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+### Added
+
+- **Uniform client peer-address exposure for application routes**
+  (requested by a downstream consumer running chained-OAuth endpoints on
+  `with_extra_router` under direct TLS):
+  - New public `transport::PeerAddr` request extension (`#[non_exhaustive]`,
+    `Copy`/`Eq`/`Hash`) carrying the direct socket peer address, inserted
+    on **both** the plain and the TLS listener and extractable via its
+    `FromRequestParts` impl or `Extension<PeerAddr>` — including from
+    `with_extra_router` routes, which bypass auth/RBAC. Direct peer only
+    (no `X-Forwarded-For` interpretation); absent under `serve_stdio`;
+    never logged by the framework.
+  - The TLS listener now also mirrors the peer address into the standard
+    `axum::extract::ConnectInfo<SocketAddr>` extension (insert-only-when-
+    absent), so stock per-IP middleware (e.g. `tower_governor`'s
+    `PeerIpKeyExtractor`) works unmodified on direct-TLS deployments
+    instead of failing every request. `TlsConnInfo` (and the mTLS
+    identity it carries) remains private and connection-bound.
+
 ## [1.9.0] - 2026-06-10
 
 ### Added

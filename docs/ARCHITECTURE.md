@@ -118,19 +118,27 @@ axum Router                                  src/transport.rs:907  (build_app_ro
    ├── 1. Origin check                       src/transport.rs:2602
    │      Rejects 403 if Origin/Host not allowed (MCP spec requirement)
    │
-   ├── 2. Security headers                   src/transport.rs:2359
+   ├── 2. Peer-address normalization         src/transport.rs (normalize_peer_addr_middleware)
+   │      Mirrors the TLS branch's peer address into ConnectInfo<SocketAddr>
+   │      (insert-only-when-absent) and inserts the public `PeerAddr`
+   │      extension on BOTH listener branches, so every route — including
+   │      extra_router routes that bypass auth/RBAC — sees a uniform
+   │      peer-address contract. mTLS identity stays on the private
+   │      per-connection TlsConnInfo.
+   │
+   ├── 3. Security headers                   src/transport.rs:2359
    │      HSTS, CSP, X-Frame-Options=DENY, X-Content-Type-Options, ...
    │
-   ├── 3. CORS / Compression / Timeouts      tower-http layers
+   ├── 4. CORS / Compression / Timeouts      tower-http layers
    │      Body size cap (default 1 MiB)
    │
-   ├── 4. Optional concurrency cap           src/transport.rs (build_app_router)
+   ├── 5. Optional concurrency cap           src/transport.rs (build_app_router)
    │      tower::limit::ConcurrencyLimitLayer + load_shed
    │
-   ├── 5. Optional metrics middleware        src/metrics.rs (records
+   ├── 6. Optional metrics middleware        src/metrics.rs (records
    │      request count, duration histograms, in-flight gauge)
    │
-   ├── 6. Auth middleware                    src/auth.rs:1156 (auth_middleware)
+   ├── 7. Auth middleware                    src/auth.rs:1156 (auth_middleware)
    │      Determines AuthIdentity from one of:
    │        a) Authorization: Bearer <api-key>  → Argon2 verify against
    │           AuthState.api_keys (ArcSwap<HashMap>)
@@ -142,7 +150,7 @@ axum Router                                  src/transport.rs:907  (build_app_ro
    │      (see `extract_bearer` in src/auth.rs).
    │      On success: sets task-locals via `current_role`, `current_identity`, …
    │
-   ├── 7. RBAC middleware                    src/rbac.rs:625  (rbac_middleware) + 773 (enforce_tool_policy)
+   ├── 8. RBAC middleware                    src/rbac.rs:625  (rbac_middleware) + 773 (enforce_tool_policy)
    │      For POSTs to /mcp:
    │        - Reads body up to limit
    │        - Parses JSON-RPC envelope
@@ -151,7 +159,7 @@ axum Router                                  src/transport.rs:907  (build_app_ro
    │             ArgumentAllowlist::argument_allowed(role, tool, argument, value)
    │      Returns 403 on deny, 429 on rate-limit
    │
-   ├── 8. Per-IP tool rate limiter           src/rbac.rs:53
+   ├── 9. Per-IP tool rate limiter           src/rbac.rs:53
    │      governor::RateLimiter keyed by ClientIp (BoundedKeyedLimiter)
    │
    ▼
@@ -238,6 +246,16 @@ Generic wrapper around a consumer's `ServerHandler` that runs:
 - `before_call(name, args, identity)` — may rewrite args or short-circuit
 - `after_call(name, result, identity)` — may rewrite or audit the result
 - enforces `max_result_bytes` (returns an error if the serialized result exceeds the cap)
+
+### `PeerAddr` — `src/transport.rs` (public, `#[non_exhaustive]`)
+Framework-owned request extension carrying the **direct socket peer
+address** of the connection. Inserted by `normalize_peer_addr_middleware`
+on both listener branches (plain and TLS), extractable via its
+`FromRequestParts` impl or `Extension<PeerAddr>` — including from
+`extra_router` routes, which bypass auth/RBAC and therefore cannot rely
+on the auth middleware's private `ConnectInfo<TlsConnInfo>` fallback.
+Direct peer only (no `X-Forwarded-For` interpretation); absent under
+`serve_stdio`; never logged by the framework.
 
 ---
 
