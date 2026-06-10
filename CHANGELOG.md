@@ -8,6 +8,76 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+### Security
+
+- **The SSRF IP range guard now classifies IPv6 transition prefixes.**
+  NAT64 (`64:ff9b::/96`, RFC 6052) and 6to4 (`2002::/16`, RFC 3056)
+  addresses are blocked when the IPv4 address they embed is itself
+  blocked (closing e.g. `64:ff9b::10.0.0.1` reaching internal RFC 1918
+  space through a NAT64 gateway) while remaining permitted for embedded
+  public addresses, so DNS64/NAT64-only egress networks keep working.
+  Teredo (`2001::/32`, RFC 4380) is blocked outright. Applies to both the
+  CRL and OAuth/JWKS fetch paths; see SECURITY.md "IPv6 transition
+  prefixes".
+
+### Changed
+
+- **`JwksCache::new` returns an error instead of panicking when
+  `jwks_cache_ttl` is not a valid humantime duration.** The documented
+  panic existed only for unvalidated configs (the `OAuthConfig::validate`
+  pipeline rejects invalid TTLs up front); the function signature already
+  returned `Result`, so the failure now surfaces through it.
+- **Deduplicated OAuth SSRF target screening (internal).** The screening
+  logic previously existed twice: a test-instrumented copy and a
+  byte-identical production copy compiled only under
+  `cfg(not(any(test, feature = "test-helpers")))` — meaning the test suite
+  never compiled the production branch and a future edit could silently
+  diverge the two. Both paths now delegate to one shared core
+  (`screen_oauth_target_core`) compiled identically under all cfgs, with
+  the loopback bypass plumbed as a parameter that production hardcodes to
+  `false`. No behavior change; error messages are byte-identical.
+- **Lint hardening (internal):** enabled `clippy::string_slice` (warn,
+  escalated to deny in CI) and pinned `clippy::await_holding_lock` to
+  deny. Manual `&str[range]` slicing in the RBAC glob matcher and the
+  origin auto-derivation was rewritten with checked `get(..)` accessors —
+  behavior is unchanged under the existing char-boundary invariants, and
+  a future invariant violation now degrades to a non-match instead of a
+  panic.
+- **Corrected the `log_format` field documentation** to list all three
+  accepted values (`json`, `pretty`, `text`) and the actual default
+  (`pretty`); the validator already accepted all three.
+
+### Fixed
+
+- **TLS accept loop no longer serializes handshakes (idle-connection
+  denial of service).** `TlsListener::accept` previously performed each
+  TLS handshake inline before accepting the next connection, so a single
+  idle TCP connection (e.g. `nc host 8443` sending no bytes) stalled ALL
+  new connections indefinitely. TCP accepts and TLS handshakes now run on
+  a dedicated background task that spawns each handshake onto its own
+  worker, bounded by a 256-handshake in-flight cap (with kernel-backlog
+  backpressure at saturation) and a 10-second per-handshake timeout. The
+  handshake-time mTLS identity extraction and its binding to the
+  connection stream are unchanged.
+- **CRL timestamps outside the platform-representable `SystemTime` range no
+  longer panic the CRL refresher.** `thisUpdate`/`nextUpdate` values are
+  parsed from raw fetched CRL bytes before signature validation, so they are
+  attacker-controlled; a pre-1601 timestamp (unrepresentable by Windows
+  `SystemTime`) previously panicked the spawned refresher task, silently
+  halting CRL discovery and refresh for the process lifetime. Conversion now
+  uses checked arithmetic and clamps unrepresentable or absurd values toward
+  `UNIX_EPOCH` — the safe direction (a clamped timestamp can only make a CRL
+  look older, forcing an eager refresh, never fresher).
+- **The per-host CRL fetch semaphore cap no longer permanently locks out new
+  CRL hosts.** Previously, once `crl_max_host_semaphores` (default 1024)
+  distinct CRL hosts had ever been seen, fetches for any NEW host failed
+  with `crl_host_semaphore_cap_exceeded` until process restart — an
+  attacker presenting client certificates with unique CDP hostnames could
+  poison the map permanently. At the cap, idle entries (no in-flight fetch)
+  are now evicted on demand; the cap error remains only for genuinely
+  concurrent fetch floods across `crl_max_host_semaphores` distinct hosts.
+
+
 ## [1.8.1] - 2026-06-05
 
 ### Changed
