@@ -926,6 +926,11 @@ fn json_value_type(v: &serde_json::Value) -> &'static str {
 ///
 /// Supports multiple `*` wildcards anywhere in the pattern.
 /// No `?`, `[...]`, or other advanced glob features.
+///
+/// All slice offsets are derived from `starts_with`/`ends_with`/`find`,
+/// which guarantee char-boundary alignment; the `get(..)` accessors keep
+/// that machine-checked (a violated invariant degrades to a non-match
+/// instead of a panic).
 fn glob_match(pattern: &str, text: &str) -> bool {
     let parts: Vec<&str> = pattern.split('*').collect();
     if parts.len() == 1 {
@@ -949,7 +954,7 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     if let Some(&last) = parts.last()
         && !last.is_empty()
     {
-        if !text[pos..].ends_with(last) {
+        if !text.get(pos..).unwrap_or_default().ends_with(last) {
             return false;
         }
         // Shrink the search area so middle parts don't overlap with the suffix.
@@ -958,13 +963,13 @@ fn glob_match(pattern: &str, text: &str) -> bool {
             return false;
         }
         // Check middle parts in the remaining region.
-        let middle = &text[pos..end];
+        let middle = text.get(pos..end).unwrap_or_default();
         let middle_parts = parts.get(1..parts.len() - 1).unwrap_or_default();
         return match_middle(middle, middle_parts);
     }
 
     // Pattern ends with * - just check middle parts.
-    let middle = &text[pos..];
+    let middle = text.get(pos..).unwrap_or_default();
     let middle_parts = parts.get(1..parts.len() - 1).unwrap_or_default();
     match_middle(middle, middle_parts)
 }
@@ -976,7 +981,7 @@ fn match_middle(mut text: &str, parts: &[&str]) -> bool {
             continue;
         }
         if let Some(idx) = text.find(part) {
-            text = &text[idx + part.len()..];
+            text = text.get(idx + part.len()..).unwrap_or_default();
         } else {
             return false;
         }
@@ -1093,6 +1098,21 @@ mod tests {
     fn glob_multiple_stars() {
         assert!(glob_match("*web*prod*", "my-web-us-prod-1"));
         assert!(!glob_match("*web*prod*", "my-api-us-staging"));
+    }
+
+    /// Pin char-boundary behavior of the `get(..)`-based slicing across
+    /// multi-byte UTF-8 text: offsets derived from `starts_with` /
+    /// `ends_with` / `find` are always boundary-aligned, and matching
+    /// must behave identically to the ASCII cases.
+    #[test]
+    fn glob_match_multibyte_utf8() {
+        assert!(glob_match("hé*llo", "héllo"));
+        assert!(glob_match("*ö*", "wörld"));
+        assert!(glob_match("über*", "übermensch"));
+        assert!(glob_match("*界", "世界"));
+        assert!(!glob_match("hé*llo", "hello"));
+        assert!(!glob_match("界*", "世界"));
+        assert!(glob_match("世*界", "世界"));
     }
 
     // -- glob_match boundary / mutation-coverage tests --

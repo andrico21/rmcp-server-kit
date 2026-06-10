@@ -1103,11 +1103,15 @@ where
         && let Some(ref url) = config.public_url
     {
         // Origin = scheme + "://" + host (+ ":" + port if non-default).
-        // Strip any path/query from the public URL.
+        // Strip any path/query from the public URL. Offsets come from
+        // `find`, so they are char-boundary-aligned; `get(..)` keeps that
+        // machine-checked (a violation degrades to an empty slice).
         if let Some(scheme_end) = url.find("://") {
-            let after_scheme = &url[scheme_end + 3..];
+            let scheme_with_sep = url.get(..scheme_end + 3).unwrap_or_default();
+            let after_scheme = url.get(scheme_end + 3..).unwrap_or_default();
             let host_end = after_scheme.find('/').unwrap_or(after_scheme.len());
-            let origin = format!("{}{}", &url[..scheme_end + 3], &after_scheme[..host_end]);
+            let host = after_scheme.get(..host_end).unwrap_or_default();
+            let origin = format!("{scheme_with_sep}{host}");
             tracing::info!(
                 %origin,
                 "auto-derived allowed origin from public_url"
