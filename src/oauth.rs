@@ -1741,15 +1741,13 @@ impl JwksCache {
     ///
     /// # Errors
     ///
-    /// Returns an error if the CA bundle cannot be read or the HTTP client
-    /// cannot be built.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `config.jwks_cache_ttl` is not a valid humantime duration.
-    /// Callers must invoke [`OAuthConfig::validate`] first; the typed
+    /// Returns an error if the CA bundle cannot be read, the HTTP client
+    /// cannot be built, or `config.jwks_cache_ttl` is not a valid
+    /// humantime duration. [`OAuthConfig::validate`] (run automatically by
+    /// the typed
     /// [`McpServerConfig::validate`](crate::transport::McpServerConfig::validate)
-    /// pipeline does this automatically.
+    /// pipeline) rejects invalid TTLs up front, so the TTL branch is
+    /// unreachable for validated configs.
     pub fn new(config: &OAuthConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // Ensure crypto providers are installed (idempotent -- ok() ignores
         // the error if already installed by another call in the same process).
@@ -1760,12 +1758,12 @@ impl JwksCache {
             .install_default()
             .ok();
 
-        #[allow(
-            clippy::expect_used,
-            reason = "jwks_cache_ttl was already parsed successfully by OAuthConfig::validate (call site precondition); re-parsing the same validated string here is infallible"
-        )]
-        let ttl = humantime::parse_duration(&config.jwks_cache_ttl)
-            .expect("jwks_cache_ttl validated by OAuthConfig::validate");
+        let ttl = humantime::parse_duration(&config.jwks_cache_ttl).map_err(|error| {
+            format!(
+                "invalid jwks_cache_ttl {:?}: {error}",
+                config.jwks_cache_ttl
+            )
+        })?;
 
         let mut validation = Validation::new(Algorithm::RS256);
         // Note: validation.algorithms is overridden per-decode to [header.alg]
@@ -4155,6 +4153,24 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(msg.contains("oauth.ssrf_allowlist"), "got {msg:?}");
+    }
+
+    #[tokio::test]
+    async fn jwks_cache_new_invalid_ttl_is_err() {
+        // An unvalidated config with a bogus TTL must surface as Err, not
+        // as the formerly-documented panic.
+        let cfg = OAuthConfig::builder(
+            "https://auth.example.com/",
+            "mcp",
+            "https://auth.example.com/jwks.json",
+        )
+        .jwks_cache_ttl("not-a-duration")
+        .build();
+        let Err(err) = JwksCache::new(&cfg) else {
+            panic!("invalid jwks_cache_ttl must fail JwksCache::new")
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("jwks_cache_ttl"), "got {msg:?}");
     }
 
     #[tokio::test]
