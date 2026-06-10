@@ -862,6 +862,55 @@ mod crl_tests {
             .await
             .expect("shutdown fail-closed server");
     }
+
+    /// Regression test for the serialized-accept-loop DoS: an idle TCP
+    /// connection that never sends a byte must NOT block other clients
+    /// from completing TLS handshakes. Pre-fix, `TlsListener::accept`
+    /// performed the handshake inline, so this test hung past its
+    /// deadline.
+    #[tokio::test]
+    async fn tls_idle_connection_does_not_block_others() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        // Plain TLS (no mTLS auth): the CDP URL in the cert is unused.
+        let pki = build_test_pki("http://127.0.0.1:1/unused.crl", 104, &[]);
+        let paths = write_tls_materials(&pki, "idle-conn").await;
+
+        let port = free_port().await;
+        let cfg = config_on_port(port).with_tls(&paths.server_cert, &paths.server_key);
+        let mut harness = spawn_tls_server(cfg).await;
+
+        // Open a raw TCP connection and send NOTHING, keeping it open.
+        let tls_port: u16 = harness
+            .base
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .expect("harness port");
+        let idle = tokio::net::TcpStream::connect(("127.0.0.1", tls_port))
+            .await
+            .expect("idle raw connection");
+
+        // While the idle connection is open, a full TLS request on a
+        // second connection must succeed within the deadline.
+        let ca_cert =
+            reqwest::Certificate::from_pem(pki.ca_pem.as_bytes()).expect("ca certificate");
+        let client = reqwest::Client::builder()
+            .add_root_certificate(ca_cert)
+            .build()
+            .expect("tls client");
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.get(format!("{}/healthz", harness.base)).send(),
+        )
+        .await
+        .expect("idle connection must not block other TLS handshakes")
+        .expect("healthz over TLS");
+        assert_eq!(response.status(), 200);
+
+        drop(idle);
+        harness.shutdown().await.expect("shutdown idle-conn server");
+    }
 }
 
 // ==========================================================================

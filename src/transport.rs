@@ -16,7 +16,10 @@ use rmcp::{
     },
 };
 use rustls::RootCertStore;
-use tokio::net::TcpListener;
+use tokio::{
+    net::TcpListener,
+    sync::{Semaphore, mpsc},
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -1608,6 +1611,7 @@ async fn run_server(
             &key_path,
             mtls_config.as_ref(),
             crl_set,
+            TLS_HANDSHAKE_TIMEOUT,
         )?;
         let make_svc = router.into_make_service_with_connect_info::<TlsConnInfo>();
         tokio::select! {
@@ -1864,17 +1868,44 @@ impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, TlsL
     }
 }
 
+/// Maximum time a single TLS handshake may take before the connection is
+/// dropped. Prevents idle or slow-loris connections from pinning handshake
+/// worker tasks (and their semaphore permits) indefinitely.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Upper bound on concurrently in-flight TLS handshakes. When saturated,
+/// the acceptor task stops pulling new connections from the kernel backlog
+/// (backpressure) instead of accepting and dropping them in user space.
+const MAX_INFLIGHT_TLS_HANDSHAKES: usize = 256;
+
+/// Capacity of the completed-handshake queue between the acceptor task and
+/// `axum::serve`'s `accept()` loop. Handshake workers block on `send` when
+/// the queue is full, so a slow accept loop back-pressures handshakes
+/// rather than buffering completed connections unboundedly.
+const TLS_ACCEPT_CHANNEL_CAPACITY: usize = 32;
+
 /// A TLS-wrapping listener that implements axum's `Listener` trait.
 ///
-/// When mTLS is configured, verifies client certificates against the
-/// configured CA and extracts the client identity at handshake time.
+/// TCP accepts and TLS handshakes run on a dedicated background task: each
+/// accepted connection's handshake is spawned onto its own worker task,
+/// bounded by [`MAX_INFLIGHT_TLS_HANDSHAKES`] concurrent handshakes and a
+/// per-handshake [`TLS_HANDSHAKE_TIMEOUT`]. A slow or idle client therefore
+/// cannot stall other connections behind a serialized inline handshake.
+///
+/// When mTLS is configured, client certificates are verified against the
+/// configured CA and the client identity is extracted at handshake time.
 /// The extracted identity is bound to the connection itself via the
 /// returned [`AuthenticatedTlsStream`], so it is impossible for an
 /// unrelated connection to observe it.
 struct TlsListener {
-    inner: TcpListener,
-    acceptor: tokio_rustls::TlsAcceptor,
-    mtls_default_role: String,
+    /// Bound address, captured eagerly before the `TcpListener` moves into
+    /// the acceptor task.
+    local_addr: SocketAddr,
+    /// Completed handshakes produced by the acceptor task's workers.
+    rx: mpsc::Receiver<(AuthenticatedTlsStream, SocketAddr)>,
+    /// Background task driving TCP accepts and concurrent TLS handshakes.
+    /// Aborted on drop so the listener releases its port deterministically.
+    acceptor_task: tokio::task::JoinHandle<()>,
 }
 
 impl TlsListener {
@@ -1884,6 +1915,7 @@ impl TlsListener {
         key_path: &Path,
         mtls_config: Option<&MtlsConfig>,
         crl_set: Option<Arc<CrlSet>>,
+        handshake_timeout: Duration,
     ) -> anyhow::Result<Self> {
         // Install the ring crypto provider (ok to call multiple times).
         rustls::crypto::ring::default_provider()
@@ -1948,10 +1980,19 @@ impl TlsListener {
             cert_path.display(),
             key_path.display()
         );
-        Ok(Self {
+        let local_addr = inner.local_addr()?;
+        let (tx, rx) = mpsc::channel(TLS_ACCEPT_CHANNEL_CAPACITY);
+        let acceptor_task = tokio::spawn(run_tls_acceptor(
             inner,
             acceptor,
             mtls_default_role,
+            tx,
+            handshake_timeout,
+        ));
+        Ok(Self {
+            local_addr,
+            rx,
+            acceptor_task,
         })
     }
 
@@ -1968,6 +2009,70 @@ impl TlsListener {
         let id = extract_mtls_identity(cert_der.as_ref(), default_role)?;
         tracing::debug!(name = %id.name, peer = %addr, "mTLS client cert accepted");
         Some(id)
+    }
+}
+
+/// Drive TCP accepts and concurrent TLS handshakes for [`TlsListener`].
+///
+/// Each accepted connection's handshake runs on its own worker task under
+/// a permit from a [`MAX_INFLIGHT_TLS_HANDSHAKES`]-sized semaphore and a
+/// `handshake_timeout` deadline. Completed handshakes are pushed to `tx`;
+/// failures and timeouts are logged at DEBUG and the connection dropped.
+/// The loop exits when the owning [`TlsListener`] is dropped.
+async fn run_tls_acceptor(
+    listener: TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+    default_role: String,
+    tx: mpsc::Sender<(AuthenticatedTlsStream, SocketAddr)>,
+    handshake_timeout: Duration,
+) {
+    let inflight = Arc::new(Semaphore::new(MAX_INFLIGHT_TLS_HANDSHAKES));
+    loop {
+        // Acquire the permit BEFORE accepting: at saturation, pending
+        // connections wait in the kernel backlog instead of being accepted
+        // and then buffered or dropped in user space.
+        let Ok(permit) = Arc::clone(&inflight).acquire_owned().await else {
+            // The semaphore is never closed; defensive exit.
+            return;
+        };
+        let (stream, addr) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::debug!("TCP accept error: {e}");
+                continue;
+            }
+        };
+        if tx.is_closed() {
+            // The listener was dropped (shutdown): stop accepting.
+            return;
+        }
+        let acceptor = acceptor.clone();
+        let default_role = default_role.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await {
+                Ok(Ok(tls_stream)) => {
+                    let identity =
+                        TlsListener::extract_handshake_identity(&tls_stream, &default_role, addr);
+                    let wrapped = AuthenticatedTlsStream {
+                        inner: tls_stream,
+                        identity,
+                    };
+                    // The receiver only disappears during shutdown; discard
+                    // the completed connection quietly rather than logging.
+                    let _ = tx.send((wrapped, addr)).await;
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!("TLS handshake failed from {addr}: {e}");
+                }
+                Err(_elapsed) => {
+                    tracing::debug!(
+                        "TLS handshake timed out from {addr} after {handshake_timeout:?}"
+                    );
+                }
+            }
+        });
     }
 }
 
@@ -2053,34 +2158,34 @@ impl axum::serve::Listener for TlsListener {
     type Io = AuthenticatedTlsStream;
     type Addr = SocketAddr;
 
+    /// Yield the next fully-handshaken TLS connection.
+    ///
+    /// Cancel-safe: this is a plain `mpsc::Receiver::recv`, so cancelling
+    /// the future (axum selects it against graceful shutdown) never loses
+    /// a connection.
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        loop {
-            let (stream, addr) = match self.inner.accept().await {
-                Ok(pair) => pair,
-                Err(e) => {
-                    tracing::debug!("TCP accept error: {e}");
-                    continue;
-                }
-            };
-            let tls_stream = match self.acceptor.accept(stream).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::debug!("TLS handshake failed from {addr}: {e}");
-                    continue;
-                }
-            };
-            let identity =
-                Self::extract_handshake_identity(&tls_stream, &self.mtls_default_role, addr);
-            let wrapped = AuthenticatedTlsStream {
-                inner: tls_stream,
-                identity,
-            };
-            return (wrapped, addr);
+        if let Some(pair) = self.rx.recv().await {
+            return pair;
         }
+        // The channel only closes if the acceptor task terminated, which
+        // means the TcpListener is gone and the OS already refuses new
+        // connections. `Listener::accept` is infallible and panicking is
+        // forbidden, so park forever: existing connections keep being
+        // served and graceful shutdown still completes.
+        tracing::error!("TLS acceptor task terminated; no further connections will be accepted");
+        std::future::pending().await
     }
 
     fn local_addr(&self) -> std::io::Result<Self::Addr> {
-        self.inner.local_addr()
+        Ok(self.local_addr)
+    }
+}
+
+impl Drop for TlsListener {
+    fn drop(&mut self) {
+        // Stop accepting immediately and release the bound port. In-flight
+        // handshake workers notice the closed channel and exit quietly.
+        self.acceptor_task.abort();
     }
 }
 
@@ -3220,5 +3325,64 @@ mod tests {
             resp.headers().get(header::CONTENT_ENCODING).unwrap(),
             "gzip"
         );
+    }
+
+    // -- TlsListener handshake timeout --
+
+    #[tokio::test]
+    async fn tls_handshake_timeout_reaps_idle_connections() {
+        use tokio::io::AsyncReadExt as _;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        // Self-signed cert material on disk (TlsListener::new takes paths).
+        let key = rcgen::KeyPair::generate().expect("generate key");
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
+            .expect("cert params")
+            .self_signed(&key)
+            .expect("self-signed cert");
+        let dir = std::env::temp_dir().join(format!(
+            "rmcp-server-kit-hs-timeout-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        tokio::fs::create_dir_all(&dir).await.expect("temp dir");
+        let cert_path = dir.join("server.crt");
+        let key_path = dir.join("server.key");
+        tokio::fs::write(&cert_path, cert.pem())
+            .await
+            .expect("write cert");
+        tokio::fs::write(&key_path, key.serialize_pem())
+            .await
+            .expect("write key");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let tls = TlsListener::new(
+            listener,
+            &cert_path,
+            &key_path,
+            None,
+            None,
+            Duration::from_millis(200),
+        )
+        .expect("tls listener");
+        let addr = axum::serve::Listener::local_addr(&tls).expect("local addr");
+
+        // Connect and send NOTHING: the handshake worker must time out
+        // after 200ms and drop the stream, which the client observes as
+        // EOF or a reset well within the 2s deadline.
+        let mut idle = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let mut buf = [0_u8; 16];
+        let read = tokio::time::timeout(Duration::from_secs(2), idle.read(&mut buf))
+            .await
+            .expect("server must reap the idle handshake within its timeout");
+        match read {
+            Ok(0) | Err(_) => {} // EOF or reset: connection was dropped.
+            Ok(n) => panic!("unexpected {n} bytes from server during reaped handshake"),
+        }
+
+        drop(tls);
     }
 }
