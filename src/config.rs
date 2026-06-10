@@ -16,6 +16,18 @@ pub struct ServerConfig {
     pub tls_cert_path: Option<PathBuf>,
     /// Path to the TLS private key (PEM). Required for TLS/mTLS.
     pub tls_key_path: Option<PathBuf>,
+    /// Per-handshake deadline on the TLS accept path, parsed via
+    /// `humantime`. Idle or slow-loris connections are dropped once it
+    /// elapses. Startup-only (not hot-reloadable); ignored unless TLS is
+    /// configured. Default: `10s`.
+    #[serde(default = "default_tls_handshake_timeout")]
+    pub tls_handshake_timeout: String,
+    /// Cap on concurrently in-flight TLS handshakes. At saturation the
+    /// acceptor stops pulling new connections from the kernel backlog
+    /// (backpressure). Startup-only (not hot-reloadable); ignored unless
+    /// TLS is configured. Default: `256`.
+    #[serde(default = "default_max_concurrent_tls_handshakes")]
+    pub max_concurrent_tls_handshakes: usize,
     /// Graceful shutdown timeout, parsed via `humantime`.
     #[serde(default = "default_shutdown_timeout")]
     pub shutdown_timeout: String,
@@ -76,6 +88,8 @@ impl Default for ServerConfig {
             listen_port: default_listen_port(),
             tls_cert_path: None,
             tls_key_path: None,
+            tls_handshake_timeout: default_tls_handshake_timeout(),
+            max_concurrent_tls_handshakes: default_max_concurrent_tls_handshakes(),
             shutdown_timeout: default_shutdown_timeout(),
             request_timeout: default_request_timeout(),
             allowed_origins: Vec::new(),
@@ -178,12 +192,36 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
             server.session_idle_timeout.as_str(),
         ),
         ("server.sse_keep_alive", server.sse_keep_alive.as_str()),
+        (
+            "server.tls_handshake_timeout",
+            server.tls_handshake_timeout.as_str(),
+        ),
     ] {
         if humantime::parse_duration(value).is_err() {
             return Err(McpxError::Config(format!(
                 "invalid duration for {field}: {value:?}"
             )));
         }
+    }
+
+    // The handshake deadline must be a positive duration: a zero value
+    // would reap every TLS handshake before it could complete. Mirrors
+    // check #11 in `McpServerConfig::check`.
+    if humantime::parse_duration(&server.tls_handshake_timeout)
+        .is_ok_and(|d| d == std::time::Duration::ZERO)
+    {
+        return Err(McpxError::Config(
+            "server.tls_handshake_timeout must be greater than zero".into(),
+        ));
+    }
+
+    // A zero-permit handshake semaphore would never admit a handshake,
+    // deadlocking the TLS accept path. Mirrors check #12 in
+    // `McpServerConfig::check`.
+    if server.max_concurrent_tls_handshakes == 0 {
+        return Err(McpxError::Config(
+            "server.max_concurrent_tls_handshakes must be greater than zero".into(),
+        ));
     }
 
     Ok(())
@@ -241,6 +279,12 @@ fn default_metrics_bind() -> String {
 }
 fn default_session_idle_timeout() -> String {
     "20m".into()
+}
+fn default_tls_handshake_timeout() -> String {
+    "10s".into()
+}
+const fn default_max_concurrent_tls_handshakes() -> usize {
+    256
 }
 fn default_admin_role() -> String {
     "admin".into()
@@ -345,6 +389,36 @@ mod tests {
     }
 
     #[test]
+    fn invalid_tls_handshake_timeout_rejected() {
+        let cfg = ServerConfig {
+            tls_handshake_timeout: "not-a-duration".into(),
+            ..ServerConfig::default()
+        };
+        let err = validate_server_config(&cfg).unwrap_err();
+        assert!(err.to_string().contains("tls_handshake_timeout"));
+    }
+
+    #[test]
+    fn zero_tls_handshake_timeout_rejected() {
+        let cfg = ServerConfig {
+            tls_handshake_timeout: "0s".into(),
+            ..ServerConfig::default()
+        };
+        let err = validate_server_config(&cfg).unwrap_err();
+        assert!(err.to_string().contains("tls_handshake_timeout"));
+    }
+
+    #[test]
+    fn zero_max_concurrent_tls_handshakes_rejected() {
+        let cfg = ServerConfig {
+            max_concurrent_tls_handshakes: 0,
+            ..ServerConfig::default()
+        };
+        let err = validate_server_config(&cfg).unwrap_err();
+        assert!(err.to_string().contains("max_concurrent_tls_handshakes"));
+    }
+
+    #[test]
     fn invalid_shutdown_timeout_rejected() {
         let cfg = ServerConfig {
             shutdown_timeout: "not-a-duration".into(),
@@ -435,6 +509,8 @@ mod tests {
         let cfg: ServerConfig = toml::from_str("").unwrap();
         assert_eq!(cfg.listen_port, 8443);
         assert_eq!(cfg.listen_addr, "127.0.0.1");
+        assert_eq!(cfg.tls_handshake_timeout, "10s");
+        assert_eq!(cfg.max_concurrent_tls_handshakes, 256);
     }
 
     #[test]

@@ -321,6 +321,27 @@ pub struct McpServerConfig {
         note = "use McpServerConfig::with_security_headers(); direct field access will become pub(crate) in a future major release"
     )]
     pub security_headers: SecurityHeadersConfig,
+    /// Per-handshake deadline on the TLS accept path. Idle or slow-loris
+    /// connections are dropped once it elapses. Default: 10s.
+    ///
+    /// Startup-only: bound at listener construction, NOT hot-reloadable
+    /// via [`ReloadHandle`]. Ignored unless TLS is configured.
+    #[deprecated(
+        since = "1.9.0",
+        note = "use McpServerConfig::with_tls_handshake_timeout(); direct field access will become pub(crate) in a future major release"
+    )]
+    pub tls_handshake_timeout: Duration,
+    /// Cap on concurrently in-flight TLS handshakes. At saturation the
+    /// acceptor stops pulling new connections from the kernel backlog
+    /// (backpressure) instead of accepting and dropping. Default: 256.
+    ///
+    /// Startup-only: bound at listener construction, NOT hot-reloadable
+    /// via [`ReloadHandle`]. Ignored unless TLS is configured.
+    #[deprecated(
+        since = "1.9.0",
+        note = "use McpServerConfig::with_max_concurrent_tls_handshakes(); direct field access will become pub(crate) in a future major release"
+    )]
+    pub max_concurrent_tls_handshakes: usize,
 }
 
 /// Marker that wraps a value proven to satisfy its validation
@@ -457,6 +478,8 @@ impl McpServerConfig {
             #[cfg(feature = "metrics")]
             metrics_bind: "127.0.0.1:9090".into(),
             security_headers: SecurityHeadersConfig::default(),
+            tls_handshake_timeout: DEFAULT_TLS_HANDSHAKE_TIMEOUT,
+            max_concurrent_tls_handshakes: DEFAULT_MAX_CONCURRENT_TLS_HANDSHAKES,
         }
     }
 
@@ -593,6 +616,33 @@ impl McpServerConfig {
     #[must_use]
     pub fn with_max_concurrent_requests(mut self, limit: usize) -> Self {
         self.max_concurrent_requests = Some(limit);
+        self
+    }
+
+    /// Override the per-handshake deadline on the TLS accept path.
+    /// Idle or slow-loris connections are dropped once it elapses.
+    /// Default: 10s. Must be greater than zero.
+    ///
+    /// Startup-only: the value is bound at listener construction and is
+    /// NOT hot-reloadable via [`ReloadHandle`]. Has no effect unless TLS
+    /// is configured via [`Self::with_tls`].
+    #[must_use]
+    pub fn with_tls_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.tls_handshake_timeout = timeout;
+        self
+    }
+
+    /// Override the cap on concurrently in-flight TLS handshakes. At
+    /// saturation the acceptor stops pulling new connections from the
+    /// kernel backlog (backpressure) instead of accepting and dropping.
+    /// Default: 256. Must be greater than zero.
+    ///
+    /// Startup-only: the value is bound at listener construction and is
+    /// NOT hot-reloadable via [`ReloadHandle`]. Has no effect unless TLS
+    /// is configured via [`Self::with_tls`].
+    #[must_use]
+    pub fn with_max_concurrent_tls_handshakes(mut self, limit: usize) -> Self {
+        self.max_concurrent_tls_handshakes = limit;
         self
     }
 
@@ -789,6 +839,26 @@ impl McpServerConfig {
             ));
         }
 
+        // 11. tls_handshake_timeout must be > 0. A zero deadline would
+        //     reap every handshake before it could complete, rejecting
+        //     all TLS connections. Mirrors the TOML-side check in
+        //     `src/config.rs`.
+        if self.tls_handshake_timeout == Duration::ZERO {
+            return Err(McpxError::Config(
+                "tls_handshake_timeout must be greater than zero".into(),
+            ));
+        }
+
+        // 12. max_concurrent_tls_handshakes must be > 0. A zero-permit
+        //     semaphore would never admit a handshake, deadlocking the
+        //     TLS accept path. Mirrors the TOML-side check in
+        //     `src/config.rs`.
+        if self.max_concurrent_tls_handshakes == 0 {
+            return Err(McpxError::Config(
+                "max_concurrent_tls_handshakes must be greater than zero".into(),
+            ));
+        }
+
         Ok(())
     }
 }
@@ -867,6 +937,10 @@ impl ReloadHandle {
 struct AppRunParams {
     /// TLS cert/key paths when TLS is configured.
     tls_paths: Option<(PathBuf, PathBuf)>,
+    /// Per-handshake deadline on the TLS accept path.
+    tls_handshake_timeout: Duration,
+    /// Cap on concurrently in-flight TLS handshakes.
+    max_concurrent_tls_handshakes: usize,
     /// mTLS configuration when mutual-TLS auth is enabled.
     mtls_config: Option<MtlsConfig>,
     /// Graceful shutdown drain window.
@@ -1345,12 +1419,16 @@ where
         (Some(cert), Some(key)) => Some((cert.clone(), key.clone())),
         _ => None,
     };
+    let tls_handshake_timeout = config.tls_handshake_timeout;
+    let max_concurrent_tls_handshakes = config.max_concurrent_tls_handshakes;
     let mtls_config = config.auth.as_ref().and_then(|a| a.mtls.as_ref()).cloned();
 
     Ok((
         router,
         AppRunParams {
             tls_paths,
+            tls_handshake_timeout,
+            max_concurrent_tls_handshakes,
             mtls_config,
             shutdown_timeout: config.shutdown_timeout,
             auth_state,
@@ -1404,6 +1482,8 @@ where
         router,
         listener,
         params.tls_paths,
+        params.tls_handshake_timeout,
+        params.max_concurrent_tls_handshakes,
         params.mtls_config,
         params.shutdown_timeout,
         params.auth_state,
@@ -1486,6 +1566,8 @@ where
         router,
         listener,
         params.tls_paths,
+        params.tls_handshake_timeout,
+        params.max_concurrent_tls_handshakes,
         params.mtls_config,
         params.shutdown_timeout,
         params.auth_state,
@@ -1541,6 +1623,8 @@ async fn run_server(
     router: axum::Router,
     listener: TcpListener,
     tls_paths: Option<(PathBuf, PathBuf)>,
+    tls_handshake_timeout: Duration,
+    max_concurrent_tls_handshakes: usize,
     mtls_config: Option<MtlsConfig>,
     shutdown_timeout: Duration,
     auth_state: Option<Arc<AuthState>>,
@@ -1615,7 +1699,8 @@ async fn run_server(
             &key_path,
             mtls_config.as_ref(),
             crl_set,
-            TLS_HANDSHAKE_TIMEOUT,
+            tls_handshake_timeout,
+            max_concurrent_tls_handshakes,
         )?;
         let make_svc = router.into_make_service_with_connect_info::<TlsConnInfo>();
         tokio::select! {
@@ -1872,21 +1957,22 @@ impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, TlsL
     }
 }
 
-/// Maximum time a single TLS handshake may take before the connection is
-/// dropped. Prevents idle or slow-loris connections from pinning handshake
-/// worker tasks (and their semaphore permits) indefinitely.
+/// Default per-handshake deadline on the TLS accept path. Prevents idle
+/// or slow-loris connections from pinning handshake worker tasks (and
+/// their semaphore permits) indefinitely.
 ///
-/// Tunability is deliberately deferred; tracked in
-/// <https://github.com/andrico21/rmcp-server-kit/issues/9>.
-const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Configurable since 1.9.0 via
+/// [`McpServerConfig::with_tls_handshake_timeout`].
+const DEFAULT_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Upper bound on concurrently in-flight TLS handshakes. When saturated,
-/// the acceptor task stops pulling new connections from the kernel backlog
-/// (backpressure) instead of accepting and dropping them in user space.
+/// Default upper bound on concurrently in-flight TLS handshakes. When
+/// saturated, the acceptor task stops pulling new connections from the
+/// kernel backlog (backpressure) instead of accepting and dropping them
+/// in user space.
 ///
-/// Tunability is deliberately deferred; tracked in
-/// <https://github.com/andrico21/rmcp-server-kit/issues/9>.
-const MAX_INFLIGHT_TLS_HANDSHAKES: usize = 256;
+/// Configurable since 1.9.0 via
+/// [`McpServerConfig::with_max_concurrent_tls_handshakes`].
+const DEFAULT_MAX_CONCURRENT_TLS_HANDSHAKES: usize = 256;
 
 /// Capacity of the completed-handshake queue between the acceptor task and
 /// `axum::serve`'s `accept()` loop. Handshake workers block on `send` when
@@ -1898,9 +1984,11 @@ const TLS_ACCEPT_CHANNEL_CAPACITY: usize = 32;
 ///
 /// TCP accepts and TLS handshakes run on a dedicated background task: each
 /// accepted connection's handshake is spawned onto its own worker task,
-/// bounded by [`MAX_INFLIGHT_TLS_HANDSHAKES`] concurrent handshakes and a
-/// per-handshake [`TLS_HANDSHAKE_TIMEOUT`]. A slow or idle client therefore
-/// cannot stall other connections behind a serialized inline handshake.
+/// bounded by a configurable concurrent-handshake cap (default
+/// [`DEFAULT_MAX_CONCURRENT_TLS_HANDSHAKES`]) and a per-handshake timeout
+/// (default [`DEFAULT_TLS_HANDSHAKE_TIMEOUT`]). A slow or idle client
+/// therefore cannot stall other connections behind a serialized inline
+/// handshake.
 ///
 /// When mTLS is configured, client certificates are verified against the
 /// configured CA and the client identity is extracted at handshake time.
@@ -1926,6 +2014,7 @@ impl TlsListener {
         mtls_config: Option<&MtlsConfig>,
         crl_set: Option<Arc<CrlSet>>,
         handshake_timeout: Duration,
+        max_concurrent_handshakes: usize,
     ) -> anyhow::Result<Self> {
         // Install the ring crypto provider (ok to call multiple times).
         rustls::crypto::ring::default_provider()
@@ -1998,6 +2087,7 @@ impl TlsListener {
             mtls_default_role,
             tx,
             handshake_timeout,
+            max_concurrent_handshakes,
         ));
         Ok(Self {
             local_addr,
@@ -2025,7 +2115,7 @@ impl TlsListener {
 /// Drive TCP accepts and concurrent TLS handshakes for [`TlsListener`].
 ///
 /// Each accepted connection's handshake runs on its own worker task under
-/// a permit from a [`MAX_INFLIGHT_TLS_HANDSHAKES`]-sized semaphore and a
+/// a permit from a `max_concurrent_handshakes`-sized semaphore and a
 /// `handshake_timeout` deadline. Completed handshakes are pushed to `tx`;
 /// failures and timeouts are logged at DEBUG and the connection dropped.
 /// The loop exits when the owning [`TlsListener`] is dropped.
@@ -2035,8 +2125,9 @@ async fn run_tls_acceptor(
     default_role: String,
     tx: mpsc::Sender<(AuthenticatedTlsStream, SocketAddr)>,
     handshake_timeout: Duration,
+    max_concurrent_handshakes: usize,
 ) {
-    let inflight = Arc::new(Semaphore::new(MAX_INFLIGHT_TLS_HANDSHAKES));
+    let inflight = Arc::new(Semaphore::new(max_concurrent_handshakes));
     loop {
         // Acquire the permit BEFORE accepting: at saturation, pending
         // connections wait in the kernel backlog instead of being accepted
@@ -2765,6 +2856,33 @@ mod tests {
         assert_eq!(cfg.request_timeout, Duration::from_mins(2));
         assert_eq!(cfg.shutdown_timeout, Duration::from_secs(30));
         assert!(!cfg.log_request_headers);
+        assert_eq!(cfg.tls_handshake_timeout, Duration::from_secs(10));
+        assert_eq!(cfg.max_concurrent_tls_handshakes, 256);
+    }
+
+    #[test]
+    fn tls_handshake_builders_set_fields() {
+        let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
+            .with_tls_handshake_timeout(Duration::from_secs(3))
+            .with_max_concurrent_tls_handshakes(64);
+        assert_eq!(cfg.tls_handshake_timeout, Duration::from_secs(3));
+        assert_eq!(cfg.max_concurrent_tls_handshakes, 64);
+    }
+
+    #[test]
+    fn validate_rejects_zero_tls_handshake_timeout() {
+        let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
+            .with_tls_handshake_timeout(Duration::ZERO);
+        let err = cfg.validate().expect_err("zero handshake timeout");
+        assert!(err.to_string().contains("tls_handshake_timeout"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_concurrent_tls_handshakes() {
+        let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
+            .with_max_concurrent_tls_handshakes(0);
+        let err = cfg.validate().expect_err("zero handshake concurrency");
+        assert!(err.to_string().contains("max_concurrent_tls_handshakes"));
     }
 
     #[test]
@@ -3376,6 +3494,7 @@ mod tests {
             None,
             None,
             Duration::from_millis(200),
+            8, // custom concurrency cap: proves the plumbing end-to-end
         )
         .expect("tls listener");
         let addr = axum::serve::Listener::local_addr(&tls).expect("local addr");
