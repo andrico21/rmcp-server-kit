@@ -8,6 +8,8 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-06-10
+
 ### Added
 
 - **Uniform client peer-address exposure for application routes**
