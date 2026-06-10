@@ -1875,11 +1875,17 @@ impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, TlsL
 /// Maximum time a single TLS handshake may take before the connection is
 /// dropped. Prevents idle or slow-loris connections from pinning handshake
 /// worker tasks (and their semaphore permits) indefinitely.
+///
+/// Tunability is deliberately deferred; tracked in
+/// <https://github.com/andrico21/rmcp-server-kit/issues/9>.
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Upper bound on concurrently in-flight TLS handshakes. When saturated,
 /// the acceptor task stops pulling new connections from the kernel backlog
 /// (backpressure) instead of accepting and dropping them in user space.
+///
+/// Tunability is deliberately deferred; tracked in
+/// <https://github.com/andrico21/rmcp-server-kit/issues/9>.
 const MAX_INFLIGHT_TLS_HANDSHAKES: usize = 256;
 
 /// Capacity of the completed-handshake queue between the acceptor task and
