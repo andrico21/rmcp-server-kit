@@ -8,6 +8,8 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-06-10
+
 ### Added
 
 - **TLS accept-path tuning knobs** (closes

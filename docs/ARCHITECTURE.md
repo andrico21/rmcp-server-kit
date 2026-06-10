@@ -3,7 +3,7 @@
 > **Audience**: AI agents and engineers who need to **modify** rmcp-server-kit safely.
 > **Companion**: [`MINDMAP.md`](MINDMAP.md) for the visual view, [`../AGENTS.md`](../AGENTS.md) for the navigation hub, [`GUIDE.md`](GUIDE.md) for end-user usage.
 >
-> All file references use `file:line` against the working tree as of 1.8.2.
+> All file references use `file:line` against the working tree as of 1.9.0.
 > Line numbers are approximate (±20) — they help localize, not replace `Read`.
 > Citations are pinned by `tests/docs_citations.rs` so they fail loudly when
 > a cited file disappears or shrinks below a referenced line.
