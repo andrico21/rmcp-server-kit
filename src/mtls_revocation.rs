@@ -1309,12 +1309,73 @@ fn clamp_refresh(duration: Duration) -> Duration {
     duration.clamp(MIN_AUTO_REFRESH, MAX_AUTO_REFRESH)
 }
 
+/// 9999-12-31T23:59:59Z — the maximum instant expressible as an ASN.1
+/// GeneralizedTime (four-digit year). Used to clamp absurd positive
+/// timestamps before converting to [`SystemTime`].
+const MAX_ASN1_TIMESTAMP_SECS: u64 = 253_402_300_799;
+
+/// Convert an ASN.1 time to [`SystemTime`] without ever panicking.
+///
+/// CRL metadata is parsed from raw fetched bytes *before* signature
+/// validation, so timestamps are attacker-controlled. Platform
+/// `SystemTime` ranges differ (Windows cannot represent pre-1601);
+/// unrepresentable values are clamped toward [`UNIX_EPOCH`], which is the
+/// safe direction: it can only make a CRL look *older* (forcing an
+/// eager refresh), never fresher.
 fn asn1_time_to_system_time(time: x509_parser::time::ASN1Time) -> SystemTime {
     let timestamp = time.timestamp();
     if timestamp >= 0 {
-        let seconds = u64::try_from(timestamp).unwrap_or(0);
-        UNIX_EPOCH + Duration::from_secs(seconds)
+        let seconds = u64::try_from(timestamp)
+            .unwrap_or(0)
+            .min(MAX_ASN1_TIMESTAMP_SECS);
+        UNIX_EPOCH
+            .checked_add(Duration::from_secs(seconds))
+            .unwrap_or(UNIX_EPOCH)
     } else {
-        UNIX_EPOCH - Duration::from_secs(timestamp.unsigned_abs())
+        UNIX_EPOCH
+            .checked_sub(Duration::from_secs(timestamp.unsigned_abs()))
+            .unwrap_or(UNIX_EPOCH)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn asn1(timestamp: i64) -> x509_parser::time::ASN1Time {
+        x509_parser::time::ASN1Time::from_timestamp(timestamp).expect("valid ASN.1 timestamp")
+    }
+
+    #[test]
+    fn asn1_time_clamps_unrepresentable_timestamps() {
+        // Year 1500 — pre-1601, NOT representable by Windows `SystemTime`.
+        // Pre-fix this panicked on Windows; now it must return a value no
+        // later than the epoch on every platform (clamped to UNIX_EPOCH on
+        // Windows, the real instant on platforms that can represent it).
+        let year_1500 = asn1_time_to_system_time(asn1(-14_831_769_600));
+        assert!(year_1500 <= UNIX_EPOCH);
+        #[cfg(windows)]
+        assert_eq!(year_1500, UNIX_EPOCH);
+
+        // 1601-01-01T00:00:00Z — the exact Windows epoch boundary, which IS
+        // representable everywhere. No clamp, no panic.
+        let year_1601 = asn1_time_to_system_time(asn1(-11_644_473_600));
+        assert!(year_1601 <= UNIX_EPOCH);
+
+        // Mildly negative (pre-1970) stays at-or-before the epoch.
+        assert!(asn1_time_to_system_time(asn1(-2)) <= UNIX_EPOCH);
+
+        // Normal positive timestamps round-trip exactly.
+        assert_eq!(
+            asn1_time_to_system_time(asn1(1_700_000_000)),
+            UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+        );
+
+        // The ASN.1 maximum (9999-12-31) is representable and preserved.
+        let max = i64::try_from(MAX_ASN1_TIMESTAMP_SECS).expect("fits in i64");
+        assert_eq!(
+            asn1_time_to_system_time(asn1(max)),
+            UNIX_EPOCH + Duration::from_secs(MAX_ASN1_TIMESTAMP_SECS)
+        );
     }
 }
