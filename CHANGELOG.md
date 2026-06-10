@@ -8,6 +8,23 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+### Added
+
+- **Opt-in per-IP rate limiting for `with_extra_router` routes** (closes
+  [#10](https://github.com/andrico21/rmcp-server-kit/issues/10)):
+  `McpServerConfig::with_extra_route_rate_limit(per_minute)` and the
+  matching TOML field `server.extra_route_rate_limit`. When set, the
+  application's extra router is wrapped — pre-merge, so the limiter can
+  never leak onto `/mcp`, health, admin, or OAuth endpoints — in a
+  per-source-IP limiter backed by the same memory-bounded machinery as
+  the tool limiter (10,000 tracked keys, 15-minute idle eviction). On
+  limit: `429` with a plain-text body, matching the tool/auth limiters
+  (no `Retry-After`; adding it uniformly across all limiters is tracked
+  separately). Keyed by the direct socket peer (no `X-Forwarded-For`
+  interpretation); fails open when no peer address is present; the
+  value must be greater than zero (validated at startup); startup-only
+  (not hot-reloadable).
+
 ## [1.10.0] - 2026-06-10
 
 ### Added

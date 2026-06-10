@@ -47,7 +47,7 @@ The crate has two transports:
 | Transport          | Function                                            | Auth/RBAC/TLS  | Use case                                         |
 |--------------------|-----------------------------------------------------|----------------|--------------------------------------------------|
 | **Streamable HTTP**| `serve()` — `src/transport.rs:1568`                 | **Yes**        | Production network deployment                    |
-| stdio              | `serve_stdio()` — `src/transport.rs:2944`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
+| stdio              | `serve_stdio()` — `src/transport.rs:3074`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
 
 ---
 
@@ -182,12 +182,12 @@ Open endpoints (no auth):
 
 | Path                                       | Handler                                       |
 |--------------------------------------------|-----------------------------------------------|
-| `GET  /healthz`                            | `healthz` (~`src/transport.rs:2442`) |
-| `GET  /readyz`                             | `readyz`  (~`src/transport.rs:2479`) — runs configured readiness check |
-| `GET  /version`                            | `version_payload` (~`src/transport.rs:2454`) |
+| `GET  /healthz`                            | `healthz` (~`src/transport.rs:2502`) |
+| `GET  /readyz`                             | `readyz`  (~`src/transport.rs:2539`) — runs configured readiness check |
+| `GET  /version`                            | `version_payload` (~`src/transport.rs:2514`) |
 | `GET  /metrics`                            | served by `serve_metrics` on a **separate listener** when `feature = "metrics"` (`src/metrics.rs:110`) |
-| `GET  /.well-known/oauth-protected-resource` | feature = `oauth` (`src/transport.rs:1366`) |
-| `GET  /.well-known/oauth-authorization-server` | feature = `oauth` proxy (`src/transport.rs:1868`) |
+| `GET  /.well-known/oauth-protected-resource` | feature = `oauth` (`src/transport.rs:1354`) |
+| `GET  /.well-known/oauth-authorization-server` | feature = `oauth` proxy (`src/transport.rs:1928`) |
 
 Authenticated endpoints:
 
@@ -214,7 +214,7 @@ Top-level builder-style config consumed by `serve()`. Holds:
 - optional readiness check callback (`Arc<dyn Fn() -> bool + Send + Sync>`)
 - public URL (used in OAuth metadata responses)
 
-### `ReloadHandle` — `src/transport.rs:974`
+### `ReloadHandle` — `src/transport.rs:1018`
 Returned (optionally) from `serve()` when the consumer needs runtime
 hot-reload. Two methods:
 - `reload_auth_keys(new_map)` — atomically swaps `AuthState.api_keys`
@@ -256,6 +256,19 @@ on both listener branches (plain and TLS), extractable via its
 on the auth middleware's private `ConnectInfo<TlsConnInfo>` fallback.
 Direct peer only (no `X-Forwarded-For` interpretation); absent under
 `serve_stdio`; never logged by the framework.
+
+### Extra-route per-IP rate limiter — `src/transport.rs` (opt-in)
+`extra_route_rate_limit` (builder `with_extra_route_rate_limit` / TOML
+`server.extra_route_rate_limit`, requests/min per source IP, must be
+nonzero) installs `extra_route_rate_limit_middleware` as a layer on the
+application's `extra_router` **before** it is merged into the top-level
+router — axum layer-before-merge scoping guarantees it wraps only the
+extra routes, never `/mcp`/health/admin/OAuth endpoints, while outer
+layers (origin check, peer normalization) still run first. Same
+machinery and deny shape as the tool limiter: `BoundedKeyedLimiter<IpAddr>`
+(10k tracked keys, 15 min idle eviction → bounded memory, shared-fate
+under key spray), fail-open without a peer address, 429 plain-text via
+`McpxError::RateLimited`, no `Retry-After`. Startup-only.
 
 ---
 
@@ -412,7 +425,7 @@ Lifecycle (concurrent-acceptor design, since the 1.8.1 review fixes):
 1. `TlsListener::new(...)` reads PEM cert + key, builds a `rustls::ServerConfig`,
    optionally wraps with mTLS verification using configured root CAs, then
    spawns a dedicated background acceptor task (`run_tls_acceptor`,
-   `src/transport.rs:2218`) that owns the `TcpListener`.
+   `src/transport.rs:2290`) that owns the `TcpListener`.
 2. The acceptor task loops: acquires a permit from a semaphore sized by
    `max_concurrent_tls_handshakes` (default 256 via
    `DEFAULT_MAX_CONCURRENT_TLS_HANDSHAKES`; configurable since 1.9.0 via

@@ -716,6 +716,7 @@ tls_cert_path = "/etc/certs/server.crt"
 tls_key_path = "/etc/certs/server.key"
 allowed_origins = ["http://localhost:3000"]
 tool_rate_limit = 120
+extra_route_rate_limit = 60
 ```
 
 | Field | Type | Default | Description |
@@ -1211,6 +1212,39 @@ Caveats:
 - **Privacy**: `PeerAddr` exposes raw peer network metadata. The
   framework deliberately never logs it on its own; whether to log or
   persist peer addresses is application policy.
+
+#### Built-in per-IP rate limiting
+
+For the common case — throttling unauthenticated extra routes (OAuth
+`/authorize`, `/token`, registration, callbacks) — the kit ships an
+opt-in limiter so you don't need third-party middleware:
+
+```rust,ignore
+let config = config
+    .with_extra_router(extra)
+    .with_extra_route_rate_limit(60); // requests/min per source IP
+```
+
+or in TOML: `extra_route_rate_limit = 60` under `[server]`. The limiter
+wraps **only** the extra router (layered before it is merged), responds
+`429 Too Many Requests` with a plain-text body (no `Retry-After`,
+matching the kit's tool/auth limiters), and is startup-only.
+
+Limitations to understand before relying on it:
+
+- **Direct peer keying.** Same semantics as `PeerAddr`: behind a
+  reverse proxy every client collapses into the proxy's bucket, and a
+  hostile IPv6 host rotating addresses within its /64 can evade per-IP
+  keying. This is an abuse speed bump, not tenant isolation.
+- **Bounded memory, shared fate.** At the 10,000 tracked-key cap the
+  limiter prunes idle entries, then LRU-evicts; memory stays bounded
+  under key spray, but quieter legitimate IPs may be churned back to
+  fresh buckets.
+
+Need custom keys (API key, header), burst control, or `Retry-After`?
+Reach for `tower_governor` on your extra router instead — its stock
+`PeerIpKeyExtractor` works on both plain and TLS listeners thanks to
+the `ConnectInfo<SocketAddr>` normalization described above.
 
 ### Customising security headers
 
