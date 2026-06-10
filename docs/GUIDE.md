@@ -751,7 +751,7 @@ metrics_bind = "127.0.0.1:9090"
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `log_level` | `String` | `"info"` | trace, debug, info, warn, error |
-| `log_format` | `String` | `"json"` | json or pretty |
+| `log_format` | `String` | `"json"` | json, pretty, or text |
 | `audit_log_path` | `Option<PathBuf>` | `None` | JSON audit log file |
 | `log_request_headers` | `bool` | `false` | Emit inbound HTTP request headers at DEBUG level (sensitive headers remain redacted) |
 | `metrics_enabled` | `bool` | `false` | Enable Prometheus |

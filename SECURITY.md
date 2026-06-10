@@ -131,7 +131,7 @@ SSRF/DoS amplification even if a CRL host is reachable:
 | `crl_max_response_bytes`        | `5 MiB`       | Body size cap; streams aborted mid-response when exceeded.                                    |
 | `crl_discovery_rate_per_min`    | `60`          | Process-global rate limit on *new* CDP URLs admitted into the fetch pipeline.                  |
 | `crl_fetch_timeout`             | `30 s`        | Per-fetch HTTP timeout.                                                                        |
-| `crl_max_host_semaphores`      | `1024`        | Caps the number of unique CDP hosts tracked for per-host concurrency gating.                  |
+| `crl_max_host_semaphores`      | `1024`        | Caps the number of unique CDP hosts tracked for per-host concurrency gating. At the cap, idle entries (no in-flight fetch) are evicted on demand, so the cap only rejects genuinely concurrent fetch floods — it is never a permanent lockout. |
 | `crl_max_seen_urls`            | `4096`        | Caps the URL-deduplication map to prevent unbounded memory growth from discovery.             |
 | `crl_max_cache_entries`        | `1024`        | Caps the number of parsed CRLs held in memory.                                                |
 
