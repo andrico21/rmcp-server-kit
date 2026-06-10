@@ -2,7 +2,7 @@
 
 This guide shows how to wire the standalone `rmcp-server-kit` crate into a
 downstream project. There is no version-to-version migration history yet -
-`1.8.1` is the current release on crates.io.
+`1.8.2` is the current release on crates.io.
 
 ## 1. Add the dependency
 

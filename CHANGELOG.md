@@ -8,6 +8,8 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+## [1.8.2] - 2026-06-10
+
 ### Security
 
 - **The SSRF IP range guard now classifies IPv6 transition prefixes.**
