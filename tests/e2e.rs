@@ -498,6 +498,104 @@ async fn auth_rate_limit_triggers() {
     assert_eq!(resp.status(), 429, "request 3 should be rate limited");
 }
 
+// ==========================================================================
+// Extra-route per-IP rate limiting (issue #10)
+// ==========================================================================
+
+/// Extra router with a GET probe and a POST token-style endpoint —
+/// the unauthenticated surfaces the limiter is designed to protect.
+fn limited_extra_router() -> axum::Router {
+    axum::Router::new()
+        .route("/ping", axum::routing::get(|| async { "pong" }))
+        .route("/token-like", axum::routing::post(|| async { "issued" }))
+}
+
+#[tokio::test]
+async fn extra_route_rate_limit_triggers() {
+    let port = free_port().await;
+    let cfg = config_on_port(port)
+        .with_extra_router(limited_extra_router())
+        .with_extra_route_rate_limit(2);
+    let base = spawn_server(cfg).await;
+
+    let client = reqwest::Client::new();
+    for i in 0..2 {
+        let resp = client.get(format!("{base}/ping")).send().await.unwrap();
+        assert_eq!(resp.status(), 200, "request {i} should pass");
+    }
+    let resp = client.get(format!("{base}/ping")).send().await.unwrap();
+    assert_eq!(resp.status(), 429, "request 3 should be rate limited");
+    assert!(
+        resp.text()
+            .await
+            .unwrap()
+            .contains("too many requests to application routes")
+    );
+}
+
+#[tokio::test]
+async fn extra_route_rate_limit_applies_to_post() {
+    let port = free_port().await;
+    let cfg = config_on_port(port)
+        .with_extra_router(limited_extra_router())
+        .with_extra_route_rate_limit(2);
+    let base = spawn_server(cfg).await;
+
+    let client = reqwest::Client::new();
+    let url = format!("{base}/token-like");
+    for i in 0..2 {
+        let resp = client.post(&url).body("grant").send().await.unwrap();
+        assert_eq!(resp.status(), 200, "POST {i} should pass");
+    }
+    let resp = client.post(&url).body("grant").send().await.unwrap();
+    assert_eq!(resp.status(), 429, "POST 3 should be rate limited");
+}
+
+#[tokio::test]
+async fn extra_route_rate_limit_scoped_to_extra_routes() {
+    let port = free_port().await;
+    let cfg = config_on_port(port)
+        .with_extra_router(limited_extra_router())
+        .with_extra_route_rate_limit(1);
+    let base = spawn_server(cfg).await;
+
+    let client = reqwest::Client::new();
+    // Exhaust the extra-route budget from this IP.
+    let first = client.get(format!("{base}/ping")).send().await.unwrap();
+    assert_eq!(first.status(), 200);
+    let limited = client.get(format!("{base}/ping")).send().await.unwrap();
+    assert_eq!(limited.status(), 429, "extra route should be exhausted");
+
+    // Built-in routes — health AND the always-present unauthenticated
+    // protected-resource-metadata endpoint — must be unaffected: the
+    // limiter is layered onto the extra router only, pre-merge.
+    let health = client.get(format!("{base}/healthz")).send().await.unwrap();
+    assert_eq!(health.status(), 200, "/healthz must not share the budget");
+    let prm = client
+        .get(format!("{base}/.well-known/oauth-protected-resource"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        prm.status(),
+        200,
+        "built-in PRM route must not share the budget"
+    );
+}
+
+#[tokio::test]
+async fn extra_routes_unlimited_without_knob() {
+    let port = free_port().await;
+    let cfg = config_on_port(port).with_extra_router(limited_extra_router());
+    let base = spawn_server(cfg).await;
+
+    let client = reqwest::Client::new();
+    for i in 0..5 {
+        let resp = client.get(format!("{base}/ping")).send().await.unwrap();
+        assert_eq!(resp.status(), 200, "request {i}: no limiter when unset");
+    }
+}
+
 mod crl_tests {
     use std::{net::IpAddr, path::PathBuf};
 

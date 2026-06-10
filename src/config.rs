@@ -47,6 +47,12 @@ pub struct ServerConfig {
     /// When set, enforced by the RBAC middleware on `tools/call` requests.
     /// Protects against both abuse and runaway LLM loops.
     pub tool_rate_limit: Option<u32>,
+    /// Maximum requests per source IP per minute on application routes
+    /// merged via `McpServerConfig::with_extra_router` (which bypass
+    /// auth/RBAC). Opt-in; must be greater than zero when set.
+    /// Keyed by the direct socket peer — no `X-Forwarded-For`
+    /// interpretation. Startup-only.
+    pub extra_route_rate_limit: Option<u32>,
     /// Idle timeout for MCP sessions. Sessions with no activity for this
     /// duration are closed automatically. Default: 20 minutes.
     #[serde(default = "default_session_idle_timeout")]
@@ -95,6 +101,7 @@ impl Default for ServerConfig {
             allowed_origins: Vec::new(),
             stdio_enabled: false,
             tool_rate_limit: None,
+            extra_route_rate_limit: None,
             session_idle_timeout: default_session_idle_timeout(),
             sse_keep_alive: default_sse_keep_alive(),
             public_url: None,
@@ -169,6 +176,12 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
     if let Some(0) = server.max_concurrent_requests {
         return Err(McpxError::Config(
             "max_concurrent_requests must be nonzero when set".into(),
+        ));
+    }
+
+    if let Some(0) = server.extra_route_rate_limit {
+        return Err(McpxError::Config(
+            "server.extra_route_rate_limit must be greater than zero".into(),
         ));
     }
 
@@ -356,6 +369,16 @@ mod tests {
         };
         let err = validate_server_config(&cfg).unwrap_err();
         assert!(err.to_string().contains("listen_port"));
+    }
+
+    #[test]
+    fn zero_extra_route_rate_limit_rejected() {
+        let cfg = ServerConfig {
+            extra_route_rate_limit: Some(0),
+            ..ServerConfig::default()
+        };
+        let err = validate_server_config(&cfg).unwrap_err();
+        assert!(err.to_string().contains("extra_route_rate_limit"));
     }
 
     #[test]

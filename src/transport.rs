@@ -1,6 +1,6 @@
 use std::{
     future::Future,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
@@ -32,6 +32,7 @@ use crate::{
         AuthConfig, AuthIdentity, AuthState, MtlsConfig, TlsConnInfo, auth_middleware,
         build_rate_limiter, extract_mtls_identity,
     },
+    bounded_limiter::BoundedKeyedLimiter,
     error::McpxError,
     mtls_revocation::{self, CrlSet, DynamicClientCertVerifier},
     rbac::{RbacPolicy, ToolRateLimiter, build_tool_rate_limiter, rbac_middleware},
@@ -276,6 +277,23 @@ pub struct McpServerConfig {
         note = "use McpServerConfig::with_tool_rate_limit(); direct field access will become pub(crate) in a future major release"
     )]
     pub tool_rate_limit: Option<u32>,
+    /// Maximum requests per source IP per minute for routes merged via
+    /// [`with_extra_router`](Self::with_extra_router). Opt-in: `None`
+    /// (the default) installs no limiter. Startup-only (not
+    /// hot-reloadable via [`ReloadHandle`]).
+    ///
+    /// Keyed by the **direct socket peer** ([`PeerAddr`] semantics — no
+    /// `X-Forwarded-For` interpretation): behind a reverse proxy all
+    /// clients share the proxy's bucket, and IPv6 single-host address
+    /// rotation can evade per-IP keying. Treat this as an abuse speed
+    /// bump for unauthenticated application endpoints, not tenant
+    /// isolation. On limit: HTTP 429 with a plain-text body, matching
+    /// the tool/auth limiters.
+    #[deprecated(
+        since = "1.11.0",
+        note = "use McpServerConfig::with_extra_route_rate_limit(); direct field access will become pub(crate) in a future major release"
+    )]
+    pub extra_route_rate_limit: Option<u32>,
     /// Optional readiness probe for `/readyz`.
     /// When `None`, `/readyz` mirrors `/healthz` (always OK).
     #[deprecated(
@@ -570,6 +588,7 @@ impl McpServerConfig {
             security_headers: SecurityHeadersConfig::default(),
             tls_handshake_timeout: DEFAULT_TLS_HANDSHAKE_TIMEOUT,
             max_concurrent_tls_handshakes: DEFAULT_MAX_CONCURRENT_TLS_HANDSHAKES,
+            extra_route_rate_limit: None,
         }
     }
 
@@ -753,6 +772,22 @@ impl McpServerConfig {
         self
     }
 
+    /// Cap requests per source IP per minute on routes merged via
+    /// [`with_extra_router`](Self::with_extra_router) — the natural
+    /// protection for unauthenticated application endpoints (OAuth
+    /// callbacks, registration, …) that bypass auth/RBAC by design.
+    ///
+    /// Must be greater than zero (validated by
+    /// [`validate`](Self::validate)). Startup-only. See the
+    /// `extra_route_rate_limit` field docs for keying semantics and
+    /// caveats (direct peer only, IPv6 rotation, proxy collapse,
+    /// bounded-memory shared-fate under key spray).
+    #[must_use]
+    pub fn with_extra_route_rate_limit(mut self, per_minute: u32) -> Self {
+        self.extra_route_rate_limit = Some(per_minute);
+        self
+    }
+
     /// Register a callback that receives the [`ReloadHandle`] after the
     /// server is built. Use it to wire SIGHUP-style hot reloads of API
     /// keys and RBAC policy.
@@ -902,6 +937,15 @@ impl McpServerConfig {
         if self.max_request_body == 0 {
             return Err(McpxError::Config(
                 "max_request_body must be greater than zero".into(),
+            ));
+        }
+
+        // 6b. extra_route_rate_limit, when set, must be > 0. Unlike the
+        // legacy tool_rate_limit (which clamps 0 to its default at
+        // construction), new knobs fail fast on nonsensical values.
+        if self.extra_route_rate_limit == Some(0) {
+            return Err(McpxError::Config(
+                "extra_route_rate_limit must be greater than zero".into(),
             ));
         }
 
@@ -1329,7 +1373,23 @@ where
         .merge(mcp_router);
 
     // Merge application-specific routes (bypass MCP auth/RBAC middleware).
+    // When configured, wrap them — and only them — in the per-IP rate
+    // limiter BEFORE merging: axum layers wrap only the routes already
+    // present on the sub-router, so the limiter can never leak onto
+    // `/mcp`, health, admin, or OAuth endpoints, while top-level layers
+    // (origin check, peer-address normalization, ...) still run first.
     if let Some(extra) = config.extra_router.take() {
+        let extra = match config.extra_route_rate_limit {
+            Some(per_minute) => {
+                let limiter = build_extra_route_rate_limiter(per_minute);
+                tracing::info!(per_minute, "extra-route per-IP rate limit enabled");
+                extra.layer(axum::middleware::from_fn(move |req, next| {
+                    let l = Arc::clone(&limiter);
+                    extra_route_rate_limit_middleware(l, req, next)
+                }))
+            }
+            None => extra,
+        };
         router = router.merge(extra);
     }
 
@@ -2845,6 +2905,76 @@ async fn normalize_peer_addr_middleware(
     next.run(req).await
 }
 
+/// Per-IP rate limiter for `extra_router` routes, keyed by the direct
+/// socket peer address. Same memory-bounded machinery as the tool
+/// limiter ([`crate::rbac`]).
+pub(crate) type ExtraRouteRateLimiter = BoundedKeyedLimiter<IpAddr>;
+
+/// Cap on distinct source IPs tracked by the extra-route limiter.
+/// Mirrors the tool limiter's bound: memory stays bounded at saturation
+/// via idle-prune + LRU eviction, at the cost of shared-fate fairness
+/// under key spray (an attacker churning many IPs can reset quieter
+/// legitimate IPs to fresh buckets).
+const EXTRA_ROUTE_MAX_TRACKED_KEYS: usize = 10_000;
+
+/// Idle-eviction window for the extra-route limiter (15 minutes),
+/// mirroring the tool limiter.
+const EXTRA_ROUTE_IDLE_EVICTION: Duration = Duration::from_mins(15);
+
+/// Build the per-IP limiter for `extra_router` routes.
+///
+/// `per_minute` is validated to be nonzero by
+/// [`McpServerConfig::validate`]; the underlying `.max(1)` clamp in
+/// [`BoundedKeyedLimiter::with_per_minute`] is therefore unreachable.
+fn build_extra_route_rate_limiter(per_minute: u32) -> Arc<ExtraRouteRateLimiter> {
+    Arc::new(BoundedKeyedLimiter::with_per_minute(
+        per_minute,
+        EXTRA_ROUTE_MAX_TRACKED_KEYS,
+        EXTRA_ROUTE_IDLE_EVICTION,
+    ))
+}
+
+/// Per-IP rate limit middleware for `extra_router` routes.
+///
+/// Applied to the application-supplied router **before** it is merged
+/// into the top-level router, so it wraps exactly the extra routes
+/// (and their fallback, if any) and nothing else — `/mcp`, health,
+/// admin, and OAuth endpoints are never affected. Outer layers (origin
+/// check, peer-address normalization, security headers, metrics) still
+/// wrap these routes and run first, so both `ConnectInfo` forms are
+/// populated by the time this middleware reads them.
+///
+/// Semantics mirror the tool/auth limiters exactly: keyed by the
+/// direct peer `IpAddr` (no `X-Forwarded-For`), fail-open when no peer
+/// address is present (cannot happen under [`serve`]), and on limit a
+/// plain-text 429 via [`McpxError::RateLimited`] — no `Retry-After`
+/// header, consistent with every other limiter in the crate.
+async fn extra_route_rate_limit_middleware(
+    limiter: Arc<ExtraRouteRateLimiter>,
+    req: Request<Body>,
+    next: Next,
+) -> axum::response::Response {
+    let peer_ip: Option<IpAddr> = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip())
+        .or_else(|| {
+            req.extensions()
+                .get::<ConnectInfo<TlsConnInfo>>()
+                .map(|ci| ci.0.addr.ip())
+        });
+    if let Some(ip) = peer_ip
+        && limiter.check_key(&ip).is_err()
+    {
+        tracing::warn!(%ip, "extra route request rate limited");
+        return McpxError::RateLimited(
+            "too many requests to application routes from this source".into(),
+        )
+        .into_response();
+    }
+    next.run(req).await
+}
+
 /// Per the MCP spec: if the Origin header is present and its value is not in
 /// the allowed list, respond with 403 Forbidden. Requests without an Origin
 /// header are allowed through (e.g. non-browser clients like curl, SDKs).
@@ -3283,6 +3413,105 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_string(resp).await, addr.to_string());
+    }
+
+    // -- extra_route_rate_limit_middleware --
+
+    /// Probe router with the extra-route limiter installed, mirroring
+    /// the layer-before-merge wiring in `build_app_router`.
+    fn limited_router(per_minute: u32) -> axum::Router {
+        let limiter = build_extra_route_rate_limiter(per_minute);
+        axum::Router::new()
+            .route("/limited", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(move |req, next| {
+                let l = Arc::clone(&limiter);
+                extra_route_rate_limit_middleware(l, req, next)
+            }))
+    }
+
+    fn limited_req(ip: &str) -> Request<Body> {
+        let addr: SocketAddr = format!("{ip}:40000").parse().unwrap();
+        Request::builder()
+            .uri("/limited")
+            .extension(ConnectInfo(addr))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn extra_route_limiter_denies_over_quota() {
+        let app = limited_router(2);
+        for i in 0..2 {
+            let resp = app.clone().oneshot(limited_req("10.1.1.1")).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "request {i} should pass");
+        }
+        let resp = app.clone().oneshot(limited_req("10.1.1.1")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("too many requests to application routes"),
+            "deny body should match the limiter message, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn extra_route_limiter_isolates_keys() {
+        let app = limited_router(2);
+        for _ in 0..2 {
+            let resp = app.clone().oneshot(limited_req("10.2.2.2")).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        let exhausted = app.clone().oneshot(limited_req("10.2.2.2")).await.unwrap();
+        assert_eq!(exhausted.status(), StatusCode::TOO_MANY_REQUESTS);
+        // A different source IP still has a fresh bucket.
+        let other = app.clone().oneshot(limited_req("10.3.3.3")).await.unwrap();
+        assert_eq!(other.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn extra_route_limiter_fails_open_without_peer() {
+        let app = limited_router(1);
+        for i in 0..3 {
+            let req = Request::builder()
+                .uri("/limited")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "request {i} should fail open"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn extra_route_limiter_extracts_tls_conn_info() {
+        let app = limited_router(2);
+        let mk = || {
+            let addr: SocketAddr = "192.168.9.9:55555".parse().unwrap();
+            Request::builder()
+                .uri("/limited")
+                .extension(ConnectInfo(TlsConnInfo::new(addr, None)))
+                .body(Body::empty())
+                .unwrap()
+        };
+        for _ in 0..2 {
+            assert_eq!(
+                app.clone().oneshot(mk()).await.unwrap().status(),
+                StatusCode::OK
+            );
+        }
+        let resp = app.clone().oneshot(mk()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn validate_rejects_zero_extra_route_rate_limit() {
+        let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
+            .with_extra_route_rate_limit(0);
+        let err = cfg.validate().expect_err("zero extra route rate limit");
+        assert!(err.to_string().contains("extra_route_rate_limit"));
     }
 
     // -- origin_check_middleware --
