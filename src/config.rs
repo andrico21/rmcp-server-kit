@@ -101,7 +101,7 @@ pub struct ObservabilityConfig {
     /// `tracing` log level / env filter string (e.g. `info,rmcp_server_kit=debug`).
     #[serde(default = "default_log_level")]
     pub log_level: String,
-    /// Log output format: `json` or `text`.
+    /// Log output format: `json`, `pretty`, or `text` (default: `pretty`).
     #[serde(default = "default_log_format")]
     pub log_format: String,
     /// Optional path to an append-only audit log file.
@@ -415,8 +415,8 @@ mod tests {
     }
 
     #[test]
-    fn both_log_formats_accepted() {
-        for fmt in &["json", "pretty"] {
+    fn all_log_formats_accepted() {
+        for fmt in &["json", "pretty", "text"] {
             let cfg = ObservabilityConfig {
                 log_format: (*fmt).into(),
                 ..ObservabilityConfig::default()
