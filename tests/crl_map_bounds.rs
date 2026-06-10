@@ -4,10 +4,11 @@
 //!
 //! 1. `seen_urls` is capped at `MtlsConfig::crl_max_seen_urls` (silent
 //!    drop + warn log when exceeded).
-//! 2. `host_semaphores` is capped at `MtlsConfig::crl_max_host_semaphores`
-//!    and returns a **loud** [`McpxError::Config`] whose message contains
-//!    the literal substring `"crl_host_semaphore_cap_exceeded"` when the
-//!    cap is breached on the request hot path.
+//! 2. `host_semaphores` is capped at `MtlsConfig::crl_max_host_semaphores`;
+//!    at the cap, idle entries (no in-flight fetch) are evicted on demand
+//!    so new hosts keep working, and a **loud** [`McpxError::Config`]
+//!    containing the literal substring `"crl_host_semaphore_cap_exceeded"`
+//!    is returned only when every entry has a concurrent in-flight fetch.
 //! 3. `cache` is capped at `MtlsConfig::crl_max_cache_entries` (silent
 //!    drop + warn log — newest-rejected, not LRU-evicted).
 //! 4. Stale-removal path (`refresh_urls` error branch) also clears the
@@ -132,10 +133,16 @@ async fn seen_urls_hard_cap_drops_excess() {
 }
 
 #[tokio::test]
-async fn host_semaphores_hard_cap_returns_error() {
-    // Cap host_semaphores at 2; trigger fetches against 3 distinct
-    // hosts. The third MUST return an Err whose message contains the
-    // literal `crl_host_semaphore_cap_exceeded` substring.
+async fn host_semaphores_hard_cap_evicts_idle_and_recovers() {
+    // Cap host_semaphores at 2; trigger fetches against 3 distinct hosts
+    // sequentially. Earlier entries are idle (no in-flight fetch) by the
+    // time the third fetch runs, so the map MUST self-heal by evicting an
+    // idle entry instead of returning the formerly-sticky
+    // `crl_host_semaphore_cap_exceeded` error (which permanently locked
+    // out new CRL hosts until restart). The map size must never exceed
+    // the cap; the cap error itself remains reachable only when all
+    // entries have genuinely concurrent in-flight fetches (covered by the
+    // `host_semaphore_cap_error_when_all_inflight` unit test).
     let set = empty_crl_set(2, 4096, 1024);
 
     let r1 = set
@@ -152,11 +159,9 @@ async fn host_semaphores_hard_cap_returns_error() {
     let r3 = set
         .__test_trigger_fetch("https://h3.example.test/crl")
         .await;
-    let err = r3.expect_err("third host MUST exceed host_semaphores cap");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("crl_host_semaphore_cap_exceeded"),
-        "error message must contain literal substring `crl_host_semaphore_cap_exceeded`; got: {msg}"
+    assert_not_cap_err(
+        &r3,
+        "third host must evict an idle entry instead of hitting the cap",
     );
 
     assert!(

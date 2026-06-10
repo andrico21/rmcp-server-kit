@@ -482,11 +482,13 @@ pub struct MtlsConfig {
     #[serde(default = "default_crl_discovery_rate_per_min")]
     pub crl_discovery_rate_per_min: u32,
     /// Maximum number of distinct hosts that may hold a CRL fetch
-    /// semaphore at any time. Requests that would grow the map beyond
-    /// this cap return [`McpxError::Config`] containing the literal
-    /// substring `"crl_host_semaphore_cap_exceeded"`. Bounds memory
-    /// growth from attacker-controlled CDP URLs pointing at unique
-    /// hostnames. Default: 1024.
+    /// semaphore at any time. At the cap, idle entries (no in-flight
+    /// fetch) are evicted on demand so new hosts keep working; only when
+    /// every entry has a concurrent in-flight fetch does the request
+    /// return [`McpxError::Config`] containing the literal substring
+    /// `"crl_host_semaphore_cap_exceeded"`. Bounds memory growth from
+    /// attacker-controlled CDP URLs pointing at unique hostnames.
+    /// Default: 1024.
     #[serde(default = "default_crl_max_host_semaphores")]
     pub crl_max_host_semaphores: usize,
     /// Maximum number of distinct URLs tracked in the "seen" set.

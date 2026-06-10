@@ -112,7 +112,10 @@ pub struct CrlSet {
     cached_urls: Mutex<HashSet<String>>,
     /// Global cap on simultaneous CRL HTTP fetches (SSRF amplification guard).
     global_fetch_sem: Arc<Semaphore>,
-    /// Per-host serializer (one in-flight fetch per origin host).
+    /// Per-host serializer (one in-flight fetch per origin host). Bounded
+    /// by `crl_max_host_semaphores`; at the cap, idle entries are evicted
+    /// on demand (see [`acquire_host_semaphore`]), so the cap only rejects
+    /// genuinely concurrent fetch floods and is never a permanent lockout.
     host_semaphores: Arc<tokio::sync::Mutex<HashMap<String, Arc<Semaphore>>>>,
     /// Global rate-limiter on discovery URL submissions; protects against
     /// cert-driven URL flooding by a malicious mTLS peer.
@@ -1148,12 +1151,47 @@ async fn next_refresh_delay(set: &CrlSet) -> Duration {
     next
 }
 
+/// Get-or-insert the per-host fetch semaphore for `host_key`.
+///
+/// When the map is at `max_host_semaphores`, idle entries (no in-flight
+/// fetch) are evicted before rejecting, so the cap only fails when `max`
+/// distinct hosts are *concurrently* fetching — it is never a permanent
+/// lockout. Every clone of a host semaphore is created while holding the
+/// map lock, and a clone outlives the critical section only while a fetch
+/// is in flight, so an entry with `Arc::strong_count == 1` is provably
+/// idle and safe to drop.
+fn acquire_host_semaphore(
+    map: &mut HashMap<String, Arc<Semaphore>>,
+    host_key: &str,
+    max_host_semaphores: usize,
+) -> Result<Arc<Semaphore>, McpxError> {
+    if !map.contains_key(host_key) {
+        if map.len() >= max_host_semaphores {
+            // Self-heal: drop semaphores with no in-flight fetch.
+            map.retain(|_, semaphore| Arc::strong_count(semaphore) > 1);
+        }
+        if map.len() >= max_host_semaphores {
+            return Err(McpxError::Config(
+                "crl_host_semaphore_cap_exceeded: too many distinct CRL hosts in flight".to_owned(),
+            ));
+        }
+        map.insert(host_key.to_owned(), Arc::new(Semaphore::new(1)));
+    }
+    match map.get(host_key) {
+        Some(semaphore) => Ok(Arc::clone(semaphore)),
+        None => Err(McpxError::Tls(
+            "CRL host semaphore missing after insertion".to_owned(),
+        )),
+    }
+}
+
 /// Fetch a single CRL URL through the global + per-host concurrency caps.
 ///
 /// `global_sem` caps total simultaneous CRL fetches process-wide.
 /// `host_semaphores` ensures at most one in-flight fetch per origin host
-/// (an SSRF amplification defense). Both permits are dropped when the
-/// returned future completes (whether `Ok` or `Err`).
+/// (an SSRF amplification defense); at the host cap, idle entries are
+/// evicted on demand. Both permits are dropped when the returned future
+/// completes (whether `Ok` or `Err`).
 async fn gated_fetch(
     client: &reqwest::Client,
     global_sem: &Arc<Semaphore>,
@@ -1170,23 +1208,7 @@ async fn gated_fetch(
 
     let host_sem = {
         let mut map = host_semaphores.lock().await;
-        if !map.contains_key(&host_key) {
-            if map.len() >= max_host_semaphores {
-                return Err(McpxError::Config(
-                    "crl_host_semaphore_cap_exceeded: too many distinct CRL hosts in flight"
-                        .to_owned(),
-                ));
-            }
-            map.insert(host_key.clone(), Arc::new(Semaphore::new(1)));
-        }
-        match map.get(&host_key) {
-            Some(semaphore) => Arc::clone(semaphore),
-            None => {
-                return Err(McpxError::Tls(
-                    "CRL host semaphore missing after insertion".to_owned(),
-                ));
-            }
-        }
+        acquire_host_semaphore(&mut map, &host_key, max_host_semaphores)?
     };
 
     let _global_permit = Arc::clone(global_sem)
@@ -1377,5 +1399,68 @@ mod tests {
             asn1_time_to_system_time(asn1(max)),
             UNIX_EPOCH + Duration::from_secs(MAX_ASN1_TIMESTAMP_SECS)
         );
+    }
+
+    #[test]
+    fn host_semaphore_evicts_idle_at_cap() {
+        let mut map = HashMap::new();
+        for i in 0..4 {
+            // Dropped immediately: only the map holds each semaphore (idle).
+            drop(
+                acquire_host_semaphore(&mut map, &format!("idle-{i}.example"), 4)
+                    .expect("under cap"),
+            );
+        }
+        assert_eq!(map.len(), 4);
+
+        // At the cap, a NEW host must succeed by evicting idle entries —
+        // the cap error is not sticky.
+        let sem = acquire_host_semaphore(&mut map, "new-host.example", 4)
+            .expect("idle eviction frees space for a new host");
+        assert!(map.contains_key("new-host.example"));
+        drop(sem);
+    }
+
+    #[test]
+    fn host_semaphore_keeps_inflight_at_cap() {
+        let mut map = HashMap::new();
+        // Held across the cap check: simulates an in-flight fetch.
+        let inflight = acquire_host_semaphore(&mut map, "busy.example", 3).expect("under cap");
+        for i in 0..2 {
+            drop(
+                acquire_host_semaphore(&mut map, &format!("idle-{i}.example"), 3)
+                    .expect("under cap"),
+            );
+        }
+        assert_eq!(map.len(), 3);
+
+        drop(
+            acquire_host_semaphore(&mut map, "new-host.example", 3)
+                .expect("idle entries evicted while in-flight survives"),
+        );
+        assert!(
+            map.contains_key("busy.example"),
+            "in-flight host must survive eviction"
+        );
+        assert!(map.contains_key("new-host.example"));
+        drop(inflight);
+    }
+
+    #[test]
+    fn host_semaphore_cap_error_when_all_inflight() {
+        let mut map = HashMap::new();
+        let held: Vec<_> = (0..2)
+            .map(|i| {
+                acquire_host_semaphore(&mut map, &format!("busy-{i}.example"), 2)
+                    .expect("under cap")
+            })
+            .collect();
+
+        let result = acquire_host_semaphore(&mut map, "new-host.example", 2);
+        assert!(
+            result.is_err(),
+            "cap must still reject when every entry has an in-flight fetch"
+        );
+        drop(held);
     }
 }
