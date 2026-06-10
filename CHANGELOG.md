@@ -24,6 +24,14 @@ Breaking changes bump the **major** version.
   participate in `ReloadHandle` hot reload. The completed-handshake
   channel capacity remains internal.
 
+### Fixed
+
+- **Removed markdown backticks from the azp-only audience deprecation
+  warning.** The one-shot `tracing::warn!` emitted in
+  `AudienceValidationMode::Warn` carried rustdoc-style backticks into
+  terminal/JSON log output; the message is now plain text, matching the
+  crate's logging style. No behavior change.
+
 ## [1.8.2] - 2026-06-10
 
 ### Security

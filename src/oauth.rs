@@ -2045,11 +2045,11 @@ impl JwksCache {
                         tracing::warn!(
                             expected = %self.expected_audience,
                             azp = ?claims.azp,
-                            "JWT accepted via deprecated `azp`-only audience fallback. \
-                             Configure your IdP to populate `aud`, or set \
-                             `audience_validation_mode = \"strict\"` once tokens carry `aud` correctly. \
+                            "JWT accepted via deprecated azp-only audience fallback. \
+                             Configure your IdP to populate aud, or set \
+                             audience_validation_mode = \"strict\" once tokens carry aud correctly. \
                              To silence this warning without changing acceptance, \
-                             set `audience_validation_mode = \"permissive\"`. \
+                             set audience_validation_mode = \"permissive\". \
                              This warning logs once per process."
                         );
                     }
