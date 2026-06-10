@@ -8,6 +8,20 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+### Added
+
+- **TLS accept-path tuning knobs** (closes
+  [#9](https://github.com/andrico21/rmcp-server-kit/issues/9)):
+  `McpServerConfig::with_tls_handshake_timeout(Duration)` and
+  `McpServerConfig::with_max_concurrent_tls_handshakes(usize)`, plus the
+  matching TOML fields `server.tls_handshake_timeout` (humantime string)
+  and `server.max_concurrent_tls_handshakes`. Defaults are unchanged
+  (10 s / 256). Both values must be greater than zero (validated in
+  `McpServerConfig::validate` and `validate_server_config`) and are
+  **startup-only** — they bind at listener construction and do not
+  participate in `ReloadHandle` hot reload. The completed-handshake
+  channel capacity remains internal.
+
 ## [1.8.2] - 2026-06-10
 
 ### Security

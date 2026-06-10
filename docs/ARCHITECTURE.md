@@ -395,21 +395,28 @@ Lifecycle (concurrent-acceptor design, since the 1.8.1 review fixes):
    optionally wraps with mTLS verification using configured root CAs, then
    spawns a dedicated background acceptor task (`run_tls_acceptor`,
    `src/transport.rs:2026`) that owns the `TcpListener`.
-2. The acceptor task loops: acquires a permit from a
-   `MAX_INFLIGHT_TLS_HANDSHAKES` (256) semaphore **before** accepting (so
-   at saturation, excess connections wait in the kernel backlog), accepts
-   a TCP connection, and spawns a handshake worker.
-3. Each worker performs the TLS handshake under
-   `TLS_HANDSHAKE_TIMEOUT` (10 s). On success it parses the peer cert if
-   present (`x509-parser`), derives `AuthIdentity`, binds it to the stream
-   as `AuthenticatedTlsStream`, and pushes the pair into a bounded mpsc
-   channel (capacity 32). Failures and timeouts are logged at DEBUG and
-   the connection dropped; the permit is released either way.
+2. The acceptor task loops: acquires a permit from a semaphore sized by
+   `max_concurrent_tls_handshakes` (default 256 via
+   `DEFAULT_MAX_CONCURRENT_TLS_HANDSHAKES`; configurable since 1.9.0 via
+   `McpServerConfig::with_max_concurrent_tls_handshakes`) **before**
+   accepting (so at saturation, excess connections wait in the kernel
+   backlog), accepts a TCP connection, and spawns a handshake worker.
+3. Each worker performs the TLS handshake under `tls_handshake_timeout`
+   (default 10 s via `DEFAULT_TLS_HANDSHAKE_TIMEOUT`; configurable since
+   1.9.0 via `McpServerConfig::with_tls_handshake_timeout`). On success it
+   parses the peer cert if present (`x509-parser`), derives
+   `AuthIdentity`, binds it to the stream as `AuthenticatedTlsStream`,
+   and pushes the pair into a bounded mpsc channel (capacity 32,
+   internal). Failures and timeouts are logged at DEBUG and the
+   connection dropped; the permit is released either way.
 4. `TlsListener::accept()` is a cancel-safe `rx.recv()` that just dequeues
    completed handshakes — it never performs handshake work itself, so one
    slow or idle client can no longer stall other connections.
 5. Dropping the listener aborts the acceptor task, releasing the port
    deterministically.
+
+Both tuning knobs are **startup-only**: they bind at listener
+construction and do not participate in [`ReloadHandle`] hot reload.
 
 Configuration toggles:
 - TLS version: TLSv1.2+ (set in `rustls` features).

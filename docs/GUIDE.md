@@ -184,6 +184,8 @@ config.validate().expect("config valid");
 | `version` | `String` | (required) | Server version, returned in `/healthz` |
 | `tls_cert_path` | `Option<PathBuf>` | `None` | PEM certificate for TLS |
 | `tls_key_path` | `Option<PathBuf>` | `None` | PEM private key for TLS |
+| `tls_handshake_timeout` | `Duration` | `10s` | Per-handshake deadline on the TLS accept path (startup-only) |
+| `max_concurrent_tls_handshakes` | `usize` | `256` | Cap on in-flight TLS handshakes (startup-only) |
 | `auth` | `Option<AuthConfig>` | `None` | Authentication config |
 | `rbac` | `Option<Arc<RbacPolicy>>` | `None` | RBAC enforcement policy |
 | `allowed_origins` | `Vec<String>` | `[]` | Allowed Origin header values |
@@ -722,6 +724,8 @@ tool_rate_limit = 120
 | `listen_port` | `u16` | `8443` | Bind port |
 | `tls_cert_path` | `Option<PathBuf>` | `None` | TLS certificate path |
 | `tls_key_path` | `Option<PathBuf>` | `None` | TLS private key path |
+| `tls_handshake_timeout` | `String` | `"10s"` | Humantime duration; per-handshake deadline on the TLS accept path. Startup-only (not hot-reloadable) |
+| `max_concurrent_tls_handshakes` | `usize` | `256` | Cap on concurrently in-flight TLS handshakes; at saturation new connections wait in the kernel backlog. Startup-only |
 | `shutdown_timeout` | `String` | `"30s"` | Humantime duration |
 | `request_timeout` | `String` | `"120s"` | Humantime duration |
 | `allowed_origins` | `Vec<String>` | `[]` | Origin validation |
@@ -1686,6 +1690,23 @@ auth.mtls = Some(MtlsConfig {
 let config = McpServerConfig::new("127.0.0.1:8443", "my-server", "0.1.0")
     .with_auth(auth)
     .with_tls("/etc/certs/server.crt", "/etc/certs/server.key");
+```
+
+The TLS accept path can be tuned for unusual environments (since 1.9.0;
+both values are startup-only — they bind at listener construction and
+are not hot-reloadable):
+
+```rust,ignore
+use std::time::Duration;
+
+let config = McpServerConfig::new("127.0.0.1:8443", "my-server", "0.1.0")
+    .with_tls("/etc/certs/server.crt", "/etc/certs/server.key")
+    // Allow slow mTLS clients up to 30s to complete the handshake
+    // (default: 10s).
+    .with_tls_handshake_timeout(Duration::from_secs(30))
+    // Permit more simultaneous handshakes for bursty fleets
+    // (default: 256).
+    .with_max_concurrent_tls_handshakes(1024);
 ```
 
 ### Recipe 5: Prometheus metrics
