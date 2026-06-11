@@ -719,6 +719,7 @@ tool_rate_limit = 120
 # tool_rate_limit_burst = 240        # optional bucket capacity (default: = rate)
 extra_route_rate_limit = 60
 # extra_route_rate_limit_burst = 120 # optional bucket capacity (default: = rate)
+# extra_route_rate_limit_exempt_paths = ["/.well-known/oauth-authorization-server"]
 ```
 
 | Field | Type | Default | Description |
@@ -1232,6 +1233,27 @@ wraps **only** the extra router (layered before it is merged), responds
 `429 Too Many Requests` with a plain-text body and a `Retry-After`
 header (delta-seconds, like every kit limiter), and is startup-only.
 
+Specific paths can be exempted — typically the RFC 8414 metadata
+document MCP clients fetch on every connect, which would otherwise 429
+behind a shared egress:
+
+```rust,ignore
+let config = config
+    .with_extra_route_rate_limit(60)
+    .with_extra_route_rate_limit_exempt_paths([
+        "/.well-known/oauth-authorization-server",
+    ]);
+```
+
+or in TOML: `extra_route_rate_limit_exempt_paths = [...]`. Matching is
+a **raw exact string comparison** against the request path — no globs,
+no prefixes, no normalization (trailing slashes, percent-encoding, and
+dot-segments must match byte-for-byte). The check is fail-closed
+(anything not listed stays limited) and runs before key extraction, so
+exempt requests consume no limiter budget and never appear in deny
+telemetry. Entries must be non-empty, start with `/`, and require the
+base rate knob (all validated at startup).
+
 ##### Rate limiting across the kit
 
 All four built-in limiters — the auth pre-auth gate, the post-failure
@@ -1256,6 +1278,12 @@ Bursts must be greater than zero; the tool and extra-route bursts also
 require their base knob to be set. The pre-auth burst is valid without
 an explicit pre-auth rate (the gate's base always resolves to
 `max_attempts_per_minute × 10`).
+
+With the `metrics` feature enabled, every limiter deny increments the
+Prometheus counter `rmcp_server_kit_rate_limited_total` with a single
+`limiter` label (`tool`, `auth_pre`, `auth_post`, or `extra_route`),
+alongside the existing warn-level log. Exempted extra-route requests
+increment nothing.
 
 Limitations to understand before relying on it:
 

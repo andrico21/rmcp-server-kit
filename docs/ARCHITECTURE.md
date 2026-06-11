@@ -46,8 +46,8 @@ The crate has two transports:
 
 | Transport          | Function                                            | Auth/RBAC/TLS  | Use case                                         |
 |--------------------|-----------------------------------------------------|----------------|--------------------------------------------------|
-| **Streamable HTTP**| `serve()` — `src/transport.rs:1880`                 | **Yes**        | Production network deployment                    |
-| stdio              | `serve_stdio()` — `src/transport.rs:3375`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
+| **Streamable HTTP**| `serve()` — `src/transport.rs:1954`                 | **Yes**        | Production network deployment                    |
+| stdio              | `serve_stdio()` — `src/transport.rs:3474`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
 
 ---
 
@@ -182,12 +182,12 @@ Open endpoints (no auth):
 
 | Path                                       | Handler                                       |
 |--------------------------------------------|-----------------------------------------------|
-| `GET  /healthz`                            | `healthz` (~`src/transport.rs:2754`) |
-| `GET  /readyz`                             | `readyz`  (~`src/transport.rs:2791`) — runs configured readiness check |
-| `GET  /version`                            | `version_payload` (~`src/transport.rs:2766`) |
-| `GET  /metrics`                            | served by `serve_metrics` on a **separate listener** when `feature = "metrics"` (`src/metrics.rs:110`) |
+| `GET  /healthz`                            | `healthz` (~`src/transport.rs:2834`) |
+| `GET  /readyz`                             | `readyz`  (~`src/transport.rs:2871`) — runs configured readiness check |
+| `GET  /version`                            | `version_payload` (~`src/transport.rs:2846`) |
+| `GET  /metrics`                            | served by `serve_metrics` on a **separate listener** when `feature = "metrics"` (`src/metrics.rs:142`) |
 | `GET  /.well-known/oauth-protected-resource` | feature = `oauth` (`src/transport.rs:1653`) |
-| `GET  /.well-known/oauth-authorization-server` | feature = `oauth` proxy (`src/transport.rs:2180`) |
+| `GET  /.well-known/oauth-authorization-server` | feature = `oauth` proxy (`src/transport.rs:2260`) |
 
 Authenticated endpoints:
 
@@ -214,7 +214,7 @@ Top-level builder-style config consumed by `serve()`. Holds:
 - optional readiness check callback (`Arc<dyn Fn() -> bool + Send + Sync>`)
 - public URL (used in OAuth metadata responses)
 
-### `ReloadHandle` — `src/transport.rs:1243`
+### `ReloadHandle` — `src/transport.rs:1305`
 Returned (optionally) from `serve()` when the consumer needs runtime
 hot-reload. Two methods:
 - `reload_auth_keys(new_map)` — atomically swaps `AuthState.api_keys`
@@ -443,7 +443,7 @@ Lifecycle (concurrent-acceptor design, since the 1.8.1 review fixes):
 1. `TlsListener::new(...)` reads PEM cert + key, builds a `rustls::ServerConfig`,
    optionally wraps with mTLS verification using configured root CAs, then
    spawns a dedicated background acceptor task (`run_tls_acceptor`,
-   `src/transport.rs:2542`) that owns the `TcpListener`.
+   `src/transport.rs:2622`) that owns the `TcpListener`.
 2. The acceptor task loops: acquires a permit from a semaphore sized by
    `max_concurrent_tls_handshakes` (default 256 via
    `DEFAULT_MAX_CONCURRENT_TLS_HANDSHAKES`; configurable since 1.9.0 via
@@ -555,7 +555,7 @@ reachable:
 
 ### Discovery admission ordering
 
-`note_discovered_urls` (`src/mtls_revocation.rs:353`) implements a
+`note_discovered_urls` (`src/mtls_revocation.rs:385`) implements a
 strict commit-after-admission protocol to keep the discovery rate
 limiter from "leaking" URLs:
 
@@ -573,7 +573,7 @@ This ordering matters: a naive "mark seen, then attempt admission"
 implementation would silently drop CDP URLs forever the first time the
 rate limiter engaged, breaking revocation for the affected client
 identities. The current ordering is verified by
-`__test_check_discovery_rate` (`src/mtls_revocation.rs:508`) and by the
+`__test_check_discovery_rate` (`src/mtls_revocation.rs:540`) and by the
 `__test_with_kept_receiver` helper used in unit tests.
 
 Hot-reload: `ReloadHandle::refresh_crls()` (in `src/transport.rs`) sends a
@@ -738,7 +738,7 @@ Two ArcSwaps power runtime reconfiguration:
 | State            | Type                           | Defined at                  |
 |------------------|---------------------------------|-----------------------------|
 | API keys         | `ArcSwap<Vec<ApiKeyEntry>>`     | `src/auth.rs:935`           |
-| RBAC policy      | `ArcSwap<RbacPolicy>`           | `src/transport.rs:1412`      |
+| RBAC policy      | `ArcSwap<RbacPolicy>`           | `src/transport.rs:1474`      |
 
 Procedure:
 1. Consumer calls `reload_handle.reload_auth_keys(new_map)` or
