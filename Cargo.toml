@@ -110,6 +110,11 @@ sha2 = "0.11"
 # Lock-free pointer swap for hot-reload
 arc-swap = "1"
 
+# CIDR parsing/matching for the trusted-proxy allowlist (trusted-forwarder
+# mode). Hand-rolling CIDR logic - especially IPv6 - is riskier than the
+# dependency.
+ipnet = "2"
+
 # Utilities
 humantime = "2"
 humantime-serde = "1"

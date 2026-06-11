@@ -130,6 +130,7 @@ pub mod admin;
 /// Re-exports for the [`secrecy`] crate's secret-wrapper types.
 pub mod secret;
 
+pub(crate) mod forwarded;
 pub(crate) mod ssrf;
 pub(crate) mod ssrf_resolver;
 
