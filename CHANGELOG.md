@@ -8,6 +8,8 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+## [1.13.0] - 2026-06-11
+
 ### Added
 
 - **Trusted-forwarder mode: proxy-aware client IPs for all rate
