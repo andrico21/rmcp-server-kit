@@ -50,23 +50,35 @@ const DEFAULT_TOOL_IDLE_EVICTION: Duration = Duration::from_mins(15);
 /// `DEFAULT_TOOL_IDLE_EVICTION` idle eviction. Use
 /// [`build_tool_rate_limiter_with_bounds`] to override.
 #[must_use]
-pub(crate) fn build_tool_rate_limiter(max_per_minute: u32) -> Arc<ToolRateLimiter> {
+pub(crate) fn build_tool_rate_limiter(
+    max_per_minute: u32,
+    burst: Option<u32>,
+) -> Arc<ToolRateLimiter> {
     build_tool_rate_limiter_with_bounds(
         max_per_minute,
+        burst,
         DEFAULT_TOOL_MAX_TRACKED_KEYS,
         DEFAULT_TOOL_IDLE_EVICTION,
     )
 }
 
 /// Build a per-IP tool rate limiter with explicit memory-bound parameters.
+///
+/// `burst` overrides governor's default bucket capacity (burst = rate);
+/// zero values are rejected at config-validation time, the `NonZeroU32`
+/// filter is defensive only.
 #[must_use]
 pub(crate) fn build_tool_rate_limiter_with_bounds(
     max_per_minute: u32,
+    burst: Option<u32>,
     max_tracked_keys: usize,
     idle_eviction: Duration,
 ) -> Arc<ToolRateLimiter> {
-    let quota =
+    let mut quota =
         governor::Quota::per_minute(NonZeroU32::new(max_per_minute).unwrap_or(DEFAULT_TOOL_RATE));
+    if let Some(b) = burst.and_then(NonZeroU32::new) {
+        quota = quota.allow_burst(b);
+    }
     Arc::new(BoundedKeyedLimiter::new(
         quota,
         max_tracked_keys,
@@ -801,9 +813,15 @@ fn enforce_rate_limit(
 ) -> Option<Response> {
     let limiter = tool_limiter?;
     let ip = peer_ip?;
-    if limiter.check_key(&ip).is_err() {
+    if let Err(wait) = limiter.check_key_wait(&ip) {
         tracing::warn!(%ip, "tool invocation rate limited");
-        return Some(McpxError::RateLimited("too many tool invocations".into()).into_response());
+        return Some(
+            McpxError::RateLimitedFor {
+                message: "too many tool invocations".into(),
+                retry_after: wait,
+            }
+            .into_response(),
+        );
     }
     None
 }
@@ -992,6 +1010,46 @@ fn match_middle(mut text: &str, parts: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- tool rate limiter: burst + Retry-After --
+
+    /// Burst capacity admits an initial spike larger than the sustained
+    /// rate; the next request within the window is denied.
+    #[test]
+    fn tool_limiter_burst_allows_initial_spike() {
+        let limiter = build_tool_rate_limiter(2, Some(4));
+        let ip: IpAddr = "10.9.9.9".parse().unwrap();
+        for i in 0..4 {
+            assert!(
+                limiter.check_key(&ip).is_ok(),
+                "burst request {i} should pass"
+            );
+        }
+        assert!(
+            limiter.check_key(&ip).is_err(),
+            "request 5 must exceed the burst bucket"
+        );
+    }
+
+    /// The tool-limiter deny response carries a Retry-After header.
+    #[test]
+    fn tool_limiter_deny_sets_retry_after() {
+        let limiter = build_tool_rate_limiter(1, None);
+        let ip: IpAddr = "10.8.8.8".parse().unwrap();
+        assert!(enforce_rate_limit(Some(&limiter), Some(ip)).is_none());
+        let resp = enforce_rate_limit(Some(&limiter), Some(ip))
+            .expect("second call within the window must deny");
+        assert_eq!(resp.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        let retry_after = resp
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .expect("Retry-After present")
+            .to_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert!(retry_after >= 1, "delta-seconds must be >= 1");
+    }
 
     fn test_policy() -> RbacPolicy {
         RbacPolicy::new(&RbacConfig {

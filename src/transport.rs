@@ -277,6 +277,16 @@ pub struct McpServerConfig {
         note = "use McpServerConfig::with_tool_rate_limit(); direct field access will become pub(crate) in a future major release"
     )]
     pub tool_rate_limit: Option<u32>,
+    /// Burst capacity for the tool rate limiter: maximum `tools/call`
+    /// requests admitted back-to-back before the sustained
+    /// [`tool_rate_limit`](Self::tool_rate_limit) rate applies. `None`
+    /// (default) keeps governor's default of burst = rate. Requires
+    /// `tool_rate_limit` to be set; must be greater than zero.
+    #[deprecated(
+        since = "1.12.0",
+        note = "use McpServerConfig::with_tool_rate_limit_burst(); direct field access will become pub(crate) in a future major release"
+    )]
+    pub tool_rate_limit_burst: Option<u32>,
     /// Maximum requests per source IP per minute for routes merged via
     /// [`with_extra_router`](Self::with_extra_router). Opt-in: `None`
     /// (the default) installs no limiter. Startup-only (not
@@ -294,6 +304,17 @@ pub struct McpServerConfig {
         note = "use McpServerConfig::with_extra_route_rate_limit(); direct field access will become pub(crate) in a future major release"
     )]
     pub extra_route_rate_limit: Option<u32>,
+    /// Burst capacity for the extra-route limiter: maximum requests
+    /// admitted back-to-back before the sustained
+    /// [`extra_route_rate_limit`](Self::extra_route_rate_limit) rate
+    /// applies. `None` (default) keeps governor's default of
+    /// burst = rate. Requires `extra_route_rate_limit` to be set; must
+    /// be greater than zero.
+    #[deprecated(
+        since = "1.12.0",
+        note = "use McpServerConfig::with_extra_route_rate_limit_burst(); direct field access will become pub(crate) in a future major release"
+    )]
+    pub extra_route_rate_limit_burst: Option<u32>,
     /// Optional readiness probe for `/readyz`.
     /// When `None`, `/readyz` mirrors `/healthz` (always OK).
     #[deprecated(
@@ -589,6 +610,8 @@ impl McpServerConfig {
             tls_handshake_timeout: DEFAULT_TLS_HANDSHAKE_TIMEOUT,
             max_concurrent_tls_handshakes: DEFAULT_MAX_CONCURRENT_TLS_HANDSHAKES,
             extra_route_rate_limit: None,
+            tool_rate_limit_burst: None,
+            extra_route_rate_limit_burst: None,
         }
     }
 
@@ -788,6 +811,27 @@ impl McpServerConfig {
         self
     }
 
+    /// Set the burst capacity for the tool rate limiter (bucket size;
+    /// the sustained rate stays [`with_tool_rate_limit`](Self::with_tool_rate_limit)).
+    /// Requires the tool rate limit to be set; must be greater than zero
+    /// (both validated by [`validate`](Self::validate)).
+    #[must_use]
+    pub fn with_tool_rate_limit_burst(mut self, burst: u32) -> Self {
+        self.tool_rate_limit_burst = Some(burst);
+        self
+    }
+
+    /// Set the burst capacity for the extra-route rate limiter (bucket
+    /// size; the sustained rate stays
+    /// [`with_extra_route_rate_limit`](Self::with_extra_route_rate_limit)).
+    /// Requires the extra-route rate limit to be set; must be greater
+    /// than zero (both validated by [`validate`](Self::validate)).
+    #[must_use]
+    pub fn with_extra_route_rate_limit_burst(mut self, burst: u32) -> Self {
+        self.extra_route_rate_limit_burst = Some(burst);
+        self
+    }
+
     /// Register a callback that receives the [`ReloadHandle`] after the
     /// server is built. Use it to wire SIGHUP-style hot reloads of API
     /// keys and RBAC policy.
@@ -876,6 +920,48 @@ impl McpServerConfig {
         Ok(Validated(self))
     }
 
+    /// Validate the burst knobs: every burst must be greater than zero
+    /// when set, and the two top-level bursts require their base limiter
+    /// to be configured. The auth bursts
+    /// (`RateLimitConfig::{burst, pre_auth_burst}`) have no orphan rule:
+    /// their base rates always resolve (`max_attempts_per_minute` is
+    /// mandatory; the pre-auth base derives from it when unset).
+    fn check_burst_knobs(&self) -> Result<(), McpxError> {
+        if self.tool_rate_limit_burst == Some(0) {
+            return Err(McpxError::Config(
+                "tool_rate_limit_burst must be greater than zero".into(),
+            ));
+        }
+        if self.extra_route_rate_limit_burst == Some(0) {
+            return Err(McpxError::Config(
+                "extra_route_rate_limit_burst must be greater than zero".into(),
+            ));
+        }
+        if self.tool_rate_limit_burst.is_some() && self.tool_rate_limit.is_none() {
+            return Err(McpxError::Config(
+                "tool_rate_limit_burst requires tool_rate_limit to be set".into(),
+            ));
+        }
+        if self.extra_route_rate_limit_burst.is_some() && self.extra_route_rate_limit.is_none() {
+            return Err(McpxError::Config(
+                "extra_route_rate_limit_burst requires extra_route_rate_limit to be set".into(),
+            ));
+        }
+        if let Some(rl) = self.auth.as_ref().and_then(|a| a.rate_limit.as_ref()) {
+            if rl.burst == Some(0) {
+                return Err(McpxError::Config(
+                    "auth rate_limit.burst must be greater than zero".into(),
+                ));
+            }
+            if rl.pre_auth_burst == Some(0) {
+                return Err(McpxError::Config(
+                    "auth rate_limit.pre_auth_burst must be greater than zero".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Run the validation checks without consuming `self`. Used by
     /// internal call sites (e.g. tests) that need to inspect a config
     /// without taking ownership.
@@ -948,6 +1034,9 @@ impl McpServerConfig {
                 "extra_route_rate_limit must be greater than zero".into(),
             ));
         }
+
+        // 6c. Burst knobs (extracted helper).
+        self.check_burst_knobs()?;
 
         // 7. OAuth URL fields enforce HTTPS (unless `allow_http_oauth_urls`)
         #[cfg(feature = "oauth")]
@@ -1246,8 +1335,9 @@ where
     // Always installed: even when RBAC is disabled, tool rate limiting may
     // be active (MCP spec: servers MUST rate limit tool invocations).
     {
-        let tool_limiter: Option<Arc<ToolRateLimiter>> =
-            config.tool_rate_limit.map(build_tool_rate_limiter);
+        let tool_limiter: Option<Arc<ToolRateLimiter>> = config
+            .tool_rate_limit
+            .map(|per_minute| build_tool_rate_limiter(per_minute, config.tool_rate_limit_burst));
 
         if rbac_swap.load().is_enabled() {
             tracing::info!("RBAC enforcement enabled on /mcp");
@@ -1381,7 +1471,8 @@ where
     if let Some(extra) = config.extra_router.take() {
         let extra = match config.extra_route_rate_limit {
             Some(per_minute) => {
-                let limiter = build_extra_route_rate_limiter(per_minute);
+                let limiter =
+                    build_extra_route_rate_limiter(per_minute, config.extra_route_rate_limit_burst);
                 tracing::info!(per_minute, "extra-route per-IP rate limit enabled");
                 extra.layer(axum::middleware::from_fn(move |req, next| {
                     let l = Arc::clone(&limiter);
@@ -2923,12 +3014,21 @@ const EXTRA_ROUTE_IDLE_EVICTION: Duration = Duration::from_mins(15);
 
 /// Build the per-IP limiter for `extra_router` routes.
 ///
-/// `per_minute` is validated to be nonzero by
-/// [`McpServerConfig::validate`]; the underlying `.max(1)` clamp in
-/// [`BoundedKeyedLimiter::with_per_minute`] is therefore unreachable.
-fn build_extra_route_rate_limiter(per_minute: u32) -> Arc<ExtraRouteRateLimiter> {
-    Arc::new(BoundedKeyedLimiter::with_per_minute(
-        per_minute,
+/// `per_minute` and `burst` are validated nonzero by
+/// [`McpServerConfig::validate`]; the `NonZeroU32` fallbacks here are
+/// defensive only. `burst` overrides governor's default bucket capacity
+/// (burst = rate).
+fn build_extra_route_rate_limiter(
+    per_minute: u32,
+    burst: Option<u32>,
+) -> Arc<ExtraRouteRateLimiter> {
+    let rate = std::num::NonZeroU32::new(per_minute.max(1)).unwrap_or(std::num::NonZeroU32::MIN);
+    let mut quota = governor::Quota::per_minute(rate);
+    if let Some(b) = burst.and_then(std::num::NonZeroU32::new) {
+        quota = quota.allow_burst(b);
+    }
+    Arc::new(BoundedKeyedLimiter::new(
+        quota,
         EXTRA_ROUTE_MAX_TRACKED_KEYS,
         EXTRA_ROUTE_IDLE_EVICTION,
     ))
@@ -2947,8 +3047,9 @@ fn build_extra_route_rate_limiter(per_minute: u32) -> Arc<ExtraRouteRateLimiter>
 /// Semantics mirror the tool/auth limiters exactly: keyed by the
 /// direct peer `IpAddr` (no `X-Forwarded-For`), fail-open when no peer
 /// address is present (cannot happen under [`serve`]), and on limit a
-/// plain-text 429 via [`McpxError::RateLimited`] — no `Retry-After`
-/// header, consistent with every other limiter in the crate.
+/// plain-text 429 via [`McpxError::RateLimitedFor`] carrying a
+/// `Retry-After` header (delta-seconds), consistent with every other
+/// limiter in the crate.
 async fn extra_route_rate_limit_middleware(
     limiter: Arc<ExtraRouteRateLimiter>,
     req: Request<Body>,
@@ -2964,12 +3065,13 @@ async fn extra_route_rate_limit_middleware(
                 .map(|ci| ci.0.addr.ip())
         });
     if let Some(ip) = peer_ip
-        && limiter.check_key(&ip).is_err()
+        && let Err(wait) = limiter.check_key_wait(&ip)
     {
         tracing::warn!(%ip, "extra route request rate limited");
-        return McpxError::RateLimited(
-            "too many requests to application routes from this source".into(),
-        )
+        return McpxError::RateLimitedFor {
+            message: "too many requests to application routes from this source".into(),
+            retry_after: wait,
+        }
         .into_response();
     }
     next.run(req).await
@@ -3204,6 +3306,8 @@ mod tests {
             pre_auth_max_per_minute: None,
             max_tracked_keys: 0,
             idle_eviction: Duration::from_secs(15 * 60),
+            burst: None,
+            pre_auth_burst: None,
         };
         let auth_cfg = AuthConfig {
             enabled: true,
@@ -3420,7 +3524,12 @@ mod tests {
     /// Probe router with the extra-route limiter installed, mirroring
     /// the layer-before-merge wiring in `build_app_router`.
     fn limited_router(per_minute: u32) -> axum::Router {
-        let limiter = build_extra_route_rate_limiter(per_minute);
+        limited_router_with_burst(per_minute, None)
+    }
+
+    /// Probe router with an explicit burst capacity.
+    fn limited_router_with_burst(per_minute: u32, burst: Option<u32>) -> axum::Router {
+        let limiter = build_extra_route_rate_limiter(per_minute, burst);
         axum::Router::new()
             .route("/limited", axum::routing::get(|| async { "ok" }))
             .layer(axum::middleware::from_fn(move |req, next| {
@@ -3512,6 +3621,96 @@ mod tests {
             .with_extra_route_rate_limit(0);
         let err = cfg.validate().expect_err("zero extra route rate limit");
         assert!(err.to_string().contains("extra_route_rate_limit"));
+    }
+
+    #[tokio::test]
+    async fn extra_route_limiter_burst_allows_initial_spike() {
+        let app = limited_router_with_burst(1, Some(3));
+        for i in 0..3 {
+            let resp = app.clone().oneshot(limited_req("10.4.4.4")).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "burst request {i}");
+        }
+        let resp = app.clone().oneshot(limited_req("10.4.4.4")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn extra_route_limiter_deny_sets_retry_after() {
+        let app = limited_router(1);
+        let ok = app.clone().oneshot(limited_req("10.5.5.5")).await.unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let denied = app.clone().oneshot(limited_req("10.5.5.5")).await.unwrap();
+        assert_eq!(denied.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry_after = denied
+            .headers()
+            .get(header::RETRY_AFTER)
+            .expect("Retry-After present")
+            .to_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert!(retry_after >= 1, "delta-seconds must be >= 1");
+    }
+
+    #[test]
+    fn validate_rejects_zero_burst_knobs() {
+        let err = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0")
+            .with_tool_rate_limit(10)
+            .with_tool_rate_limit_burst(0)
+            .validate()
+            .expect_err("zero tool burst");
+        assert!(err.to_string().contains("tool_rate_limit_burst"));
+
+        let err = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0")
+            .with_extra_route_rate_limit(10)
+            .with_extra_route_rate_limit_burst(0)
+            .validate()
+            .expect_err("zero extra route burst");
+        assert!(err.to_string().contains("extra_route_rate_limit_burst"));
+    }
+
+    #[test]
+    fn validate_rejects_orphan_burst_knobs() {
+        let err = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0")
+            .with_tool_rate_limit_burst(5)
+            .validate()
+            .expect_err("orphan tool burst");
+        assert!(err.to_string().contains("requires tool_rate_limit"));
+
+        let err = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0")
+            .with_extra_route_rate_limit_burst(5)
+            .validate()
+            .expect_err("orphan extra route burst");
+        assert!(err.to_string().contains("requires extra_route_rate_limit"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_auth_bursts() {
+        let auth = AuthConfig::with_keys(vec![])
+            .with_rate_limit(crate::auth::RateLimitConfig::new(10).with_burst(0));
+        let err = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0")
+            .with_auth(auth)
+            .validate()
+            .expect_err("zero auth burst");
+        assert!(err.to_string().contains("rate_limit.burst"));
+
+        let auth = AuthConfig::with_keys(vec![])
+            .with_rate_limit(crate::auth::RateLimitConfig::new(10).with_pre_auth_burst(0));
+        let err = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0")
+            .with_auth(auth)
+            .validate()
+            .expect_err("zero pre-auth burst");
+        assert!(err.to_string().contains("pre_auth_burst"));
+    }
+
+    /// `pre_auth_burst` without `pre_auth_max_per_minute` is LEGAL: the
+    /// pre-auth base rate always resolves (max_attempts_per_minute x 10).
+    #[test]
+    fn validate_accepts_pre_auth_burst_without_explicit_pre_auth_rate() {
+        let auth = AuthConfig::with_keys(vec![])
+            .with_rate_limit(crate::auth::RateLimitConfig::new(10).with_pre_auth_burst(50));
+        let cfg = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0").with_auth(auth);
+        assert!(cfg.validate().is_ok(), "pre_auth_burst has no orphan rule");
     }
 
     // -- origin_check_middleware --

@@ -583,6 +583,21 @@ pub struct RateLimitConfig {
     /// opportunistic pruning. Default: 15 minutes.
     #[serde(default = "default_idle_eviction", with = "humantime_serde")]
     pub idle_eviction: Duration,
+    /// Burst capacity for the post-failure limiter: the maximum number
+    /// of failed attempts admitted back-to-back before the sustained
+    /// `max_attempts_per_minute` rate applies. `None` (default) keeps
+    /// governor's default of burst = rate. Must be greater than zero
+    /// when set. May be smaller than the rate (smoothing) or larger
+    /// (spike tolerance).
+    #[serde(default)]
+    pub burst: Option<u32>,
+    /// Burst capacity for the pre-auth abuse gate. `None` (default)
+    /// keeps burst = the gate's resolved rate. Legal regardless of
+    /// whether [`Self::pre_auth_max_per_minute`] is set — the gate's
+    /// base rate always resolves (`max_attempts_per_minute * 10` when
+    /// unset). Must be greater than zero when set.
+    #[serde(default)]
+    pub pre_auth_burst: Option<u32>,
 }
 
 impl Default for RateLimitConfig {
@@ -592,6 +607,8 @@ impl Default for RateLimitConfig {
             pre_auth_max_per_minute: None,
             max_tracked_keys: default_max_tracked_keys(),
             idle_eviction: default_idle_eviction(),
+            burst: None,
+            pre_auth_burst: None,
         }
     }
 }
@@ -627,6 +644,22 @@ impl RateLimitConfig {
     #[must_use]
     pub fn with_idle_eviction(mut self, idle: Duration) -> Self {
         self.idle_eviction = idle;
+        self
+    }
+
+    /// Set the burst capacity for the post-failure limiter. Must be
+    /// greater than zero (validated at server-config validation time).
+    #[must_use]
+    pub fn with_burst(mut self, burst: u32) -> Self {
+        self.burst = Some(burst);
+        self
+    }
+
+    /// Set the burst capacity for the pre-auth abuse gate. Must be
+    /// greater than zero (validated at server-config validation time).
+    #[must_use]
+    pub fn with_pre_auth_burst(mut self, burst: u32) -> Self {
+        self.pre_auth_burst = Some(burst);
         self
     }
 }
@@ -971,12 +1004,23 @@ impl AuthState {
 // SAFETY: unwrap() is safe - literal 30 is provably non-zero (const-evaluated).
 const DEFAULT_AUTH_RATE: NonZeroU32 = NonZeroU32::new(30).unwrap();
 
+/// Apply an optional burst capacity to a quota. `None` keeps governor's
+/// default (burst = rate). Zero values are rejected at config-validation
+/// time; the `NonZeroU32` filter here is defensive only.
+fn apply_burst(quota: governor::Quota, burst: Option<u32>) -> governor::Quota {
+    match burst.and_then(NonZeroU32::new) {
+        Some(b) => quota.allow_burst(b),
+        None => quota,
+    }
+}
+
 /// Create a post-failure rate limiter from config.
 #[must_use]
 pub(crate) fn build_rate_limiter(config: &RateLimitConfig) -> Arc<KeyedLimiter> {
     let quota = governor::Quota::per_minute(
         NonZeroU32::new(config.max_attempts_per_minute).unwrap_or(DEFAULT_AUTH_RATE),
     );
+    let quota = apply_burst(quota, config.burst);
     Arc::new(BoundedKeyedLimiter::new(
         quota,
         config.max_tracked_keys,
@@ -999,6 +1043,7 @@ pub(crate) fn build_pre_auth_limiter(config: &RateLimitConfig) -> Arc<KeyedLimit
     });
     let quota =
         governor::Quota::per_minute(NonZeroU32::new(resolved).unwrap_or(DEFAULT_PRE_AUTH_RATE));
+    let quota = apply_burst(quota, config.pre_auth_burst);
     Arc::new(BoundedKeyedLimiter::new(
         quota,
         config.max_tracked_keys,
@@ -1320,17 +1365,20 @@ async fn authenticate_bearer_identity(
 fn pre_auth_gate(state: &AuthState, peer_addr: Option<SocketAddr>) -> Option<Response> {
     let limiter = state.pre_auth_limiter.as_ref()?;
     let addr = peer_addr?;
-    if limiter.check_key(&addr.ip()).is_ok() {
+    let Err(wait) = limiter.check_key_wait(&addr.ip()) else {
         return None;
-    }
+    };
     state.counters.record_failure(AuthFailureClass::PreAuthGate);
     tracing::warn!(
         ip = %addr.ip(),
         "auth rate limited by pre-auth gate (request rejected before credential verification)"
     );
     Some(
-        McpxError::RateLimited("too many unauthenticated requests from this source".into())
-            .into_response(),
+        McpxError::RateLimitedFor {
+            message: "too many unauthenticated requests from this source".into(),
+            retry_after: wait,
+        }
+        .into_response(),
     )
 }
 
@@ -1400,12 +1448,15 @@ pub(crate) async fn auth_middleware(
     // Rate limit check (applied after auth failure only).
     // Successful authentications do not consume rate limit budget.
     if let (Some(limiter), Some(addr)) = (&state.rate_limiter, peer_addr)
-        && limiter.check_key(&addr.ip()).is_err()
+        && let Err(wait) = limiter.check_key_wait(&addr.ip())
     {
         state.counters.record_failure(AuthFailureClass::RateLimited);
         tracing::warn!(ip = %addr.ip(), "auth rate limited after repeated failures");
-        return McpxError::RateLimited("too many failed authentication attempts".into())
-            .into_response();
+        return McpxError::RateLimitedFor {
+            message: "too many failed authentication attempts".into(),
+            retry_after: wait,
+        }
+        .into_response();
     }
 
     state.counters.record_failure(failure_class);
@@ -1699,6 +1750,8 @@ mod tests {
             pre_auth_max_per_minute: None,
             max_tracked_keys: default_max_tracked_keys(),
             idle_eviction: default_idle_eviction(),
+            burst: None,
+            pre_auth_burst: None,
         };
         let limiter = build_rate_limiter(&config);
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
@@ -1718,6 +1771,8 @@ mod tests {
             pre_auth_max_per_minute: None,
             max_tracked_keys: default_max_tracked_keys(),
             idle_eviction: default_idle_eviction(),
+            burst: None,
+            pre_auth_burst: None,
         };
         let limiter = build_rate_limiter(&config);
         let ip1: IpAddr = "10.0.0.1".parse().unwrap();
@@ -1889,6 +1944,8 @@ mod tests {
                 pre_auth_max_per_minute: None,
                 max_tracked_keys: default_max_tracked_keys(),
                 idle_eviction: default_idle_eviction(),
+                burst: None,
+                pre_auth_burst: None,
             })),
             pre_auth_limiter: None,
             #[cfg(feature = "oauth")]
@@ -1925,6 +1982,8 @@ mod tests {
             pre_auth_max_per_minute: None,
             max_tracked_keys: default_max_tracked_keys(),
             idle_eviction: default_idle_eviction(),
+            burst: None,
+            pre_auth_burst: None,
         };
         let limiter = build_rate_limiter(&config);
         let ip: IpAddr = "192.168.1.100".parse().unwrap();
@@ -1968,6 +2027,8 @@ mod tests {
             pre_auth_max_per_minute: None,
             max_tracked_keys: default_max_tracked_keys(),
             idle_eviction: default_idle_eviction(),
+            burst: None,
+            pre_auth_burst: None,
         };
         let limiter = build_pre_auth_limiter(&config);
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
@@ -1995,6 +2056,8 @@ mod tests {
             pre_auth_max_per_minute: Some(2), // but operator caps at 2
             max_tracked_keys: default_max_tracked_keys(),
             idle_eviction: default_idle_eviction(),
+            burst: None,
+            pre_auth_burst: None,
         };
         let limiter = build_pre_auth_limiter(&config);
         let ip: IpAddr = "10.0.0.2".parse().unwrap();
@@ -2004,6 +2067,52 @@ mod tests {
         assert!(
             limiter.check_key(&ip).is_err(),
             "attempt 3 must be blocked (explicit override of 2 wins over 10x default of 1000)"
+        );
+    }
+
+    /// The pre-auth gate's 429 must carry a Retry-After header.
+    #[test]
+    fn pre_auth_gate_deny_sets_retry_after() {
+        let config = RateLimitConfig::new(100).with_pre_auth_max_per_minute(1);
+        let state = AuthState {
+            api_keys: ArcSwap::new(Arc::new(vec![])),
+            rate_limiter: None,
+            pre_auth_limiter: Some(build_pre_auth_limiter(&config)),
+            #[cfg(feature = "oauth")]
+            jwks_cache: None,
+            seen_identities: SeenIdentitySet::new(),
+            counters: AuthCounters::default(),
+        };
+        let addr: SocketAddr = "10.7.7.7:55555".parse().unwrap();
+        assert!(
+            pre_auth_gate(&state, Some(addr)).is_none(),
+            "first request within quota"
+        );
+        let resp = pre_auth_gate(&state, Some(addr)).expect("second request must be gated");
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry_after = resp
+            .headers()
+            .get(header::RETRY_AFTER)
+            .expect("Retry-After present")
+            .to_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert!(retry_after >= 1, "delta-seconds must be >= 1");
+    }
+
+    /// Post-failure limiter honors an explicit burst capacity.
+    #[test]
+    fn post_failure_limiter_burst_allows_initial_spike() {
+        let config = RateLimitConfig::new(1).with_burst(3);
+        let limiter = build_rate_limiter(&config);
+        let ip: IpAddr = "10.6.6.6".parse().unwrap();
+        for i in 0..3 {
+            assert!(limiter.check_key(&ip).is_ok(), "burst attempt {i}");
+        }
+        assert!(
+            limiter.check_key(&ip).is_err(),
+            "attempt 4 must exceed the burst bucket"
         );
     }
 
@@ -2026,6 +2135,8 @@ mod tests {
             pre_auth_max_per_minute: Some(1),
             max_tracked_keys: default_max_tracked_keys(),
             idle_eviction: default_idle_eviction(),
+            burst: None,
+            pre_auth_burst: None,
         };
         let state = Arc::new(AuthState {
             api_keys: ArcSwap::new(Arc::new(keys)),
@@ -2098,6 +2209,8 @@ mod tests {
             pre_auth_max_per_minute: Some(1), // tight: would block 2nd plain request
             max_tracked_keys: default_max_tracked_keys(),
             idle_eviction: default_idle_eviction(),
+            burst: None,
+            pre_auth_burst: None,
         };
         let state = Arc::new(AuthState {
             api_keys: ArcSwap::new(Arc::new(vec![])),

@@ -596,6 +596,78 @@ async fn extra_routes_unlimited_without_knob() {
     }
 }
 
+// ==========================================================================
+// Retry-After + burst (limiter evolution, 1.12.0)
+// ==========================================================================
+
+#[tokio::test]
+async fn auth_rate_limit_sets_retry_after() {
+    let port = free_port().await;
+    let cfg = config_on_port(port)
+        .with_auth(AuthConfig::with_keys(vec![]).with_rate_limit(RateLimitConfig::new(2)));
+    let base = spawn_server(cfg).await;
+
+    let client = reqwest::Client::new();
+    let url = format!("{base}/mcp");
+    for _ in 0..2 {
+        let resp = client.post(&url).body("{}").send().await.unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+    let resp = client.post(&url).body("{}").send().await.unwrap();
+    assert_eq!(resp.status(), 429);
+    let retry_after = resp
+        .headers()
+        .get("retry-after")
+        .expect("Retry-After present on auth 429")
+        .to_str()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert!(retry_after >= 1, "delta-seconds must be >= 1");
+}
+
+#[tokio::test]
+async fn extra_route_rate_limit_sets_retry_after() {
+    let port = free_port().await;
+    let cfg = config_on_port(port)
+        .with_extra_router(limited_extra_router())
+        .with_extra_route_rate_limit(1);
+    let base = spawn_server(cfg).await;
+
+    let client = reqwest::Client::new();
+    let ok = client.get(format!("{base}/ping")).send().await.unwrap();
+    assert_eq!(ok.status(), 200);
+    let denied = client.get(format!("{base}/ping")).send().await.unwrap();
+    assert_eq!(denied.status(), 429);
+    let retry_after = denied
+        .headers()
+        .get("retry-after")
+        .expect("Retry-After present on extra-route 429")
+        .to_str()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert!(retry_after >= 1, "delta-seconds must be >= 1");
+}
+
+#[tokio::test]
+async fn extra_route_burst_allows_initial_spike() {
+    let port = free_port().await;
+    let cfg = config_on_port(port)
+        .with_extra_router(limited_extra_router())
+        .with_extra_route_rate_limit(1)
+        .with_extra_route_rate_limit_burst(3);
+    let base = spawn_server(cfg).await;
+
+    let client = reqwest::Client::new();
+    for i in 0..3 {
+        let resp = client.get(format!("{base}/ping")).send().await.unwrap();
+        assert_eq!(resp.status(), 200, "burst request {i} should pass");
+    }
+    let resp = client.get(format!("{base}/ping")).send().await.unwrap();
+    assert_eq!(resp.status(), 429, "request 4 must exceed the burst bucket");
+}
+
 mod crl_tests {
     use std::{net::IpAddr, path::PathBuf};
 

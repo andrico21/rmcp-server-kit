@@ -47,12 +47,20 @@ pub struct ServerConfig {
     /// When set, enforced by the RBAC middleware on `tools/call` requests.
     /// Protects against both abuse and runaway LLM loops.
     pub tool_rate_limit: Option<u32>,
+    /// Burst capacity for the tool rate limiter (bucket size; sustained
+    /// rate stays `tool_rate_limit`). Requires `tool_rate_limit`; must
+    /// be greater than zero.
+    pub tool_rate_limit_burst: Option<u32>,
     /// Maximum requests per source IP per minute on application routes
     /// merged via `McpServerConfig::with_extra_router` (which bypass
     /// auth/RBAC). Opt-in; must be greater than zero when set.
     /// Keyed by the direct socket peer — no `X-Forwarded-For`
     /// interpretation. Startup-only.
     pub extra_route_rate_limit: Option<u32>,
+    /// Burst capacity for the extra-route rate limiter (bucket size;
+    /// sustained rate stays `extra_route_rate_limit`). Requires
+    /// `extra_route_rate_limit`; must be greater than zero.
+    pub extra_route_rate_limit_burst: Option<u32>,
     /// Idle timeout for MCP sessions. Sessions with no activity for this
     /// duration are closed automatically. Default: 20 minutes.
     #[serde(default = "default_session_idle_timeout")]
@@ -101,7 +109,9 @@ impl Default for ServerConfig {
             allowed_origins: Vec::new(),
             stdio_enabled: false,
             tool_rate_limit: None,
+            tool_rate_limit_burst: None,
             extra_route_rate_limit: None,
+            extra_route_rate_limit_burst: None,
             session_idle_timeout: default_session_idle_timeout(),
             sse_keep_alive: default_sse_keep_alive(),
             public_url: None,
@@ -183,6 +193,39 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
         return Err(McpxError::Config(
             "server.extra_route_rate_limit must be greater than zero".into(),
         ));
+    }
+
+    if let Some(0) = server.tool_rate_limit_burst {
+        return Err(McpxError::Config(
+            "server.tool_rate_limit_burst must be greater than zero".into(),
+        ));
+    }
+    if let Some(0) = server.extra_route_rate_limit_burst {
+        return Err(McpxError::Config(
+            "server.extra_route_rate_limit_burst must be greater than zero".into(),
+        ));
+    }
+    if server.tool_rate_limit_burst.is_some() && server.tool_rate_limit.is_none() {
+        return Err(McpxError::Config(
+            "server.tool_rate_limit_burst requires server.tool_rate_limit".into(),
+        ));
+    }
+    if server.extra_route_rate_limit_burst.is_some() && server.extra_route_rate_limit.is_none() {
+        return Err(McpxError::Config(
+            "server.extra_route_rate_limit_burst requires server.extra_route_rate_limit".into(),
+        ));
+    }
+    if let Some(rl) = server.auth.as_ref().and_then(|a| a.rate_limit.as_ref()) {
+        if rl.burst == Some(0) {
+            return Err(McpxError::Config(
+                "auth.rate_limit.burst must be greater than zero".into(),
+            ));
+        }
+        if rl.pre_auth_burst == Some(0) {
+            return Err(McpxError::Config(
+                "auth.rate_limit.pre_auth_burst must be greater than zero".into(),
+            ));
+        }
     }
 
     if server.admin_enabled {
@@ -379,6 +422,66 @@ mod tests {
         };
         let err = validate_server_config(&cfg).unwrap_err();
         assert!(err.to_string().contains("extra_route_rate_limit"));
+    }
+
+    #[test]
+    fn zero_burst_knobs_rejected() {
+        let cfg = ServerConfig {
+            tool_rate_limit: Some(10),
+            tool_rate_limit_burst: Some(0),
+            ..ServerConfig::default()
+        };
+        let err = validate_server_config(&cfg).unwrap_err();
+        assert!(err.to_string().contains("tool_rate_limit_burst"));
+
+        let cfg = ServerConfig {
+            extra_route_rate_limit: Some(10),
+            extra_route_rate_limit_burst: Some(0),
+            ..ServerConfig::default()
+        };
+        let err = validate_server_config(&cfg).unwrap_err();
+        assert!(err.to_string().contains("extra_route_rate_limit_burst"));
+    }
+
+    #[test]
+    fn orphan_burst_knobs_rejected() {
+        let cfg = ServerConfig {
+            tool_rate_limit_burst: Some(5),
+            ..ServerConfig::default()
+        };
+        let err = validate_server_config(&cfg).unwrap_err();
+        assert!(err.to_string().contains("requires server.tool_rate_limit"));
+
+        let cfg = ServerConfig {
+            extra_route_rate_limit_burst: Some(5),
+            ..ServerConfig::default()
+        };
+        let err = validate_server_config(&cfg).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires server.extra_route_rate_limit")
+        );
+    }
+
+    #[test]
+    fn zero_auth_bursts_rejected() {
+        let auth = crate::auth::AuthConfig::with_keys(vec![])
+            .with_rate_limit(crate::auth::RateLimitConfig::new(10).with_burst(0));
+        let cfg = ServerConfig {
+            auth: Some(auth),
+            ..ServerConfig::default()
+        };
+        let err = validate_server_config(&cfg).unwrap_err();
+        assert!(err.to_string().contains("rate_limit.burst"));
+
+        let auth = crate::auth::AuthConfig::with_keys(vec![])
+            .with_rate_limit(crate::auth::RateLimitConfig::new(10).with_pre_auth_burst(0));
+        let cfg = ServerConfig {
+            auth: Some(auth),
+            ..ServerConfig::default()
+        };
+        let err = validate_server_config(&cfg).unwrap_err();
+        assert!(err.to_string().contains("pre_auth_burst"));
     }
 
     #[test]
