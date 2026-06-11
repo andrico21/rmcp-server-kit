@@ -37,12 +37,18 @@ export NEW_VERSION=1.0.1
 # 3. Bump version in Cargo.toml
 sed -i 's/^version = ".*"$/version = "'$NEW_VERSION'"/' Cargo.toml
 
-# 4. Commit and push
-git add Cargo.toml CHANGELOG.md
+# 4. Refresh the cargo-vet imports lock. The new version is unpublished
+#    until the release workflow runs, so vet must record it as
+#    `audited_as` the previous release — otherwise the CI vet job
+#    (which runs with --locked) fails on the version bump.
+cargo vet
+
+# 5. Commit and push
+git add Cargo.toml CHANGELOG.md supply-chain/imports.lock
 git commit -m "chore: release $NEW_VERSION"
 git push origin main
 
-# 5. Tag
+# 6. Tag
 git tag -a "$NEW_VERSION" -m "rmcp-server-kit $NEW_VERSION"
 git push origin "$NEW_VERSION"
 ```
