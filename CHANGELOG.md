@@ -8,6 +8,8 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-06-11
+
 ### Added
 
 - **`Retry-After` on every rate-limit response.** All four built-in
