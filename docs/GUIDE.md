@@ -505,14 +505,13 @@ which support immediate revocation via the RFC 7009 revocation endpoint
 (`oauth.revocation_endpoint`) or by deleting the API key entry and
 calling `ReloadHandle::reload_auth_keys`.
 
-#### `build_rate_limiter()`
+#### Limiter construction (internal)
 
-```rust
-pub fn build_rate_limiter(config: &RateLimitConfig) -> Arc<KeyedLimiter>
-```
-
-Builds a per-source-IP rate limiter from config. Used internally by
-`serve()`.
+The per-source-IP auth limiters (post-failure backoff and pre-auth
+gate) are built internally by `serve()` from `RateLimitConfig` — the
+constructors are `pub(crate)` and not part of the public API. Configure
+the limiters via the `RateLimitConfig` fields above; there is no public
+constructor to call.
 
 ---
 
@@ -689,14 +688,14 @@ pub enum RbacDecision {
 }
 ```
 
-#### `build_tool_rate_limiter()`
+#### Tool-limiter construction (internal)
 
-```rust
-pub fn build_tool_rate_limiter(max_per_minute: u32) -> Arc<ToolRateLimiter>
-```
-
-Builds a per-source-IP rate limiter for tool invocations. You configure this
-via `McpServerConfig.tool_rate_limit`; the function is used internally.
+The per-source-IP `tools/call` limiter is built internally by `serve()`
+from the configured rate and optional burst — the constructor is
+`pub(crate)` and not part of the public API. Configure it via
+`McpServerConfig::with_tool_rate_limit` /
+`with_tool_rate_limit_burst` (TOML: `tool_rate_limit`,
+`tool_rate_limit_burst`).
 
 ---
 
