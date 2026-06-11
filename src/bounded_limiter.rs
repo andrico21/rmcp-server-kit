@@ -51,7 +51,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
+use governor::{
+    DefaultDirectRateLimiter, Quota, RateLimiter,
+    clock::{Clock as _, DefaultClock},
+};
 
 /// Reason a [`BoundedKeyedLimiter::check_key`] call rejected a request.
 ///
@@ -248,6 +251,24 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
     /// Returns [`BoundedLimiterError::RateLimited`] when `key` has
     /// exceeded its per-key quota for the current window.
     pub fn check_key(&self, key: &K) -> Result<(), BoundedLimiterError> {
+        self.check_key_wait(key)
+            .map_err(|_| BoundedLimiterError::RateLimited)
+    }
+
+    /// Test the per-key quota for `key`, returning the wait time on deny.
+    ///
+    /// Identical admission semantics to [`check_key`](Self::check_key)
+    /// (same `last_seen` refresh, idle-prune, and LRU-eviction behavior);
+    /// the two methods share one code path.
+    ///
+    /// # Errors
+    ///
+    /// On deny, returns the **best-effort current wait** until the next
+    /// request for this key could be admitted, measured against
+    /// governor's default clock at the moment of the failed check. The
+    /// value is a raw [`Duration`]; rounding (e.g. ceiling to whole
+    /// seconds for a `Retry-After` header) is the caller's concern.
+    pub fn check_key_wait(&self, key: &K) -> Result<(), Duration> {
         let mut guard = self
             .inner
             .map
@@ -259,7 +280,7 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
             return entry
                 .limiter
                 .check()
-                .map_err(|_| BoundedLimiterError::RateLimited);
+                .map_err(|not_until| not_until.wait_time_from(DefaultClock::default().now()));
         }
         // New key: make room if necessary, then insert.
         if guard.len() >= self.inner.max_tracked_keys {
@@ -276,7 +297,7 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
         let limiter = RateLimiter::direct(self.inner.quota);
         let result = limiter
             .check()
-            .map_err(|_| BoundedLimiterError::RateLimited);
+            .map_err(|not_until| not_until.wait_time_from(DefaultClock::default().now()));
         guard.insert(
             key.clone(),
             Entry {
@@ -314,6 +335,55 @@ mod tests {
 
     fn ip(n: u32) -> IpAddr {
         IpAddr::from(n.to_be_bytes())
+    }
+
+    /// Deny on the existing-key branch must report a positive,
+    /// quota-bounded wait time.
+    #[test]
+    fn check_key_wait_existing_key_deny_returns_bounded_wait() {
+        let quota = Quota::per_minute(NonZeroU32::new(1).unwrap());
+        let limiter: BoundedKeyedLimiter<IpAddr> =
+            BoundedKeyedLimiter::new(quota, 10, Duration::from_hours(1));
+        assert!(limiter.check_key_wait(&ip(1)).is_ok(), "burst admits first");
+        let wait = limiter
+            .check_key_wait(&ip(1))
+            .expect_err("second call within the window must deny");
+        assert!(wait > Duration::ZERO, "wait must be positive, got {wait:?}");
+        assert!(
+            wait <= Duration::from_secs(60),
+            "per-minute quota wait must be <= 60s, got {wait:?}"
+        );
+    }
+
+    /// The new-key branch always admits the first check: a freshly
+    /// constructed governor limiter starts with a full bucket and burst
+    /// capacity is `NonZeroU32` (>= 1). The deny arm on that branch is
+    /// defensive symmetry, not a reachable path.
+    #[test]
+    fn check_key_wait_new_key_first_check_admits() {
+        let quota = Quota::per_minute(NonZeroU32::new(1).unwrap());
+        let limiter: BoundedKeyedLimiter<IpAddr> =
+            BoundedKeyedLimiter::new(quota, 10, Duration::from_hours(1));
+        for i in 0..5_u32 {
+            assert!(
+                limiter.check_key_wait(&ip(i)).is_ok(),
+                "first check for new key {i} must admit"
+            );
+        }
+    }
+
+    /// `check_key` delegates to `check_key_wait`: identical admission
+    /// decisions, error mapped to the reason-only enum.
+    #[test]
+    fn check_key_delegates_to_wait_path() {
+        let quota = Quota::per_minute(NonZeroU32::new(1).unwrap());
+        let limiter: BoundedKeyedLimiter<IpAddr> =
+            BoundedKeyedLimiter::new(quota, 10, Duration::from_hours(1));
+        assert!(limiter.check_key(&ip(7)).is_ok());
+        assert_eq!(
+            limiter.check_key(&ip(7)),
+            Err(super::BoundedLimiterError::RateLimited)
+        );
     }
 
     /// The hard cap on tracked keys must never be exceeded, even under a
