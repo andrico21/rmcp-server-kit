@@ -25,17 +25,17 @@
 //!
 //! - **Pre-cancel check**: if the token is already cancelled at entry,
 //!   the future is NEVER spawned. Returns
-//!   [`DetachOutcome::Cancelled`](crate::cancel::DetachOutcome::Cancelled)
+//!   [`DetachOutcome::Cancelled`]
 //!   immediately. Avoids starting expensive (often mutating) work for
 //!   requests the client has already abandoned.
 //! - **Completion wins on tie**: if the spawned future and a
 //!   cancel/timeout signal are both ready in the same poll, the
-//!   [`DetachOutcome::Completed`](crate::cancel::DetachOutcome::Completed)
+//!   [`DetachOutcome::Completed`]
 //!   arm wins. This prevents reporting cancel/timeout for an operation
 //!   that actually succeeded (especially harmful for mutating tools
 //!   where the client might then retry).
 //! - **Panic surfacing**: a panic in the spawned future is exposed as
-//!   [`DetachOutcome::Panicked`](crate::cancel::DetachOutcome::Panicked)
+//!   [`DetachOutcome::Panicked`]
 //!   carrying the [`tokio::task::JoinError`]. Callers decide how to
 //!   translate it; the helper does not fold it into Cancelled/TimedOut.
 //!
@@ -47,7 +47,7 @@
 //!    remote side to release resources regardless).
 //!
 //! They are NOT bounded by the request handler that started them, by
-//! [`CancellationToken`](tokio_util::sync::CancellationToken) cancel,
+//! [`CancellationToken`] cancel,
 //! or by any [`tokio::task::JoinHandle`] the caller might hold. That
 //! is the entire point.
 //!

@@ -6,4 +6,11 @@
 # package snapshots that live under `target/`.
 
 include = ["**/*.toml"]
-exclude = ["target/**", "vendor/**", ".git/**"]
+exclude = [
+  "target/**",
+  "vendor/**",
+  ".git/**",
+  # cargo-vet owns and regenerates these; formatting them would churn
+  # against the tool's own output style.
+  "supply-chain/**",
+]

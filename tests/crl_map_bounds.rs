@@ -239,7 +239,7 @@ async fn stale_removal_also_clears_seen() {
 
     // Mark URL as seen via the production path (simulating a prior
     // handshake's discovery).
-    let _ = set.__test_note_discovered_urls(&[url.to_string()]);
+    let _ = set.__test_note_discovered_urls(&[url.to_owned()]);
     assert!(set.__test_is_seen(url), "precondition: URL should be seen");
 
     // Insert a stale cache entry whose next_update + grace is in the

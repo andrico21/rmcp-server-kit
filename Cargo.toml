@@ -1,6 +1,6 @@
 [package]
 name = "rmcp-server-kit"
-version = "1.13.0"
+version = "1.14.0"
 edition = "2024"
 rust-version = "1.95.0"
 license = "MIT OR Apache-2.0"
@@ -196,6 +196,24 @@ unused_qualifications = "warn"
 [lints.clippy]
 all = { level = "deny", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
+# Extra unstable lints that catch patterns pedantic misses (high-signal on
+# AI-touched code, per RUST_GUIDELINES.md §9). Noisy nursery lints may be
+# allowed individually below with a justification comment.
+nursery = { level = "warn", priority = -1 }
+# nursery allow: const-ness on ~40 pub fns is a one-way semver promise
+# (removing `const` later is a breaking change) and the lint is documented
+# as having false positives; opting fns into `const` stays a deliberate,
+# per-fn decision rather than lint-driven churn.
+missing_const_for_fn = "allow"
+# nursery allow: antagonistic to rustc's `unreachable_pub = "warn"` (set in
+# [lints.rust]), which prefers `pub(crate)` over `pub` for crate-internal
+# items; this crate keeps explicit `pub(crate)` visibility markers.
+redundant_pub_crate = "allow"
+# nursery allow: frequently degrades readability here — rewrites would
+# contort the constant-time HMAC fallback (inner #[allow] + SAFETY comment
+# inside a closure), the poisoned-lock `match` idiom used across the crate,
+# and multi-statement tracing arms. Sites are clearer as if/let-else.
+option_if_let_else = "allow"
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
@@ -205,9 +223,13 @@ unreachable = "warn"
 indexing_slicing = "deny"
 string_slice = "warn"
 await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+mem_forget = "deny"
 doc_markdown = "allow"
 duration_suboptimal_units = "allow"
-str_to_string = "allow"
+str_to_string = "warn"
+# `string_to_string` (RUST_GUIDELINES.md §9) is omitted: clippy removed the
+# lint — `implicit_clone` (enabled below) covers those cases.
 fallible_impl_from = "deny"
 wildcard_enum_match_arm = "deny"
 fn_params_excessive_bools = "deny"

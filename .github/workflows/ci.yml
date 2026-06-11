@@ -234,9 +234,25 @@ jobs:
       - name: Generate Cargo.lock (library crate; lockfile is .gitignored)
         run: cargo generate-lockfile
       - name: Run cargo vet
-        # `cargo vet` exits non-zero when audits are missing; treat as
-        # informational until a full audit baseline is committed.
-        run: cargo vet --locked || true
+        # A full exemption baseline is committed under supply-chain/, so
+        # vet passes deterministically for the pinned dependency set.
+        # Dependency bumps will fail this job until exemptions are
+        # regenerated (`cargo vet regenerate exemptions`) or the new
+        # version is audited. Promote to required after a green run.
+        run: cargo vet --locked
+
+  taplo:
+    name: TOML format (taplo)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+      - name: Install taplo
+        run: cargo install taplo-cli --locked
+      - name: Check TOML formatting
+        # Scoping (include/exclude) lives in .taplo.toml at the repo root.
+        run: taplo fmt --check
 
   machete:
     name: cargo-machete (unused deps)

@@ -120,8 +120,8 @@ pub mod rbac;
 /// Memory-bounded keyed rate limiter (LRU + idle eviction).
 pub mod bounded_limiter;
 
-/// Cancellation primitives that detach in-flight async work on
-/// cancel/timeout instead of dropping it mid-`.await`.
+// Module-level docs live in cancel.rs (`//!`); an outer doc here would
+// concatenate into an over-long first rustdoc paragraph.
 pub mod cancel;
 
 /// Admin diagnostic endpoints (status, auth keys metadata, counters, RBAC).
