@@ -8,6 +8,34 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+### Added
+
+- **`Retry-After` on every rate-limit response.** All four built-in
+  limiters (auth pre-auth gate, post-failure auth limiter, `tools/call`
+  limiter, extra-route limiter) now deny with a `Retry-After: n` header
+  (RFC 9110 delta-seconds: best-effort wait rounded **up** to whole
+  seconds, never `0`) alongside the unchanged 429 status and plain-text
+  body. Backed by the new `BoundedKeyedLimiter::check_key_wait` method
+  (returns the wait `Duration` on deny; `check_key` now delegates to it)
+  and the new `McpxError::RateLimitedFor { message, retry_after }`
+  variant. The legacy `McpxError::RateLimited(String)` variant is
+  retained and remains headerless. Completes the first deferred item
+  from [#10](https://github.com/andrico21/rmcp-server-kit/issues/10).
+- **Optional burst knobs on every rate limiter.** Burst sets the bucket
+  capacity (maximum requests admitted back-to-back); the sustained
+  per-minute rate is unchanged, and burst may be smaller or larger than
+  the rate. New surface: `McpServerConfig::with_tool_rate_limit_burst` /
+  `with_extra_route_rate_limit_burst` (+ TOML `tool_rate_limit_burst`,
+  `extra_route_rate_limit_burst`) and
+  `RateLimitConfig::{with_burst, with_pre_auth_burst}` (+ TOML
+  `auth.rate_limit.{burst, pre_auth_burst}`). Bursts must be greater
+  than zero; the tool/extra-route bursts require their base knob, while
+  `pre_auth_burst` is valid without an explicit pre-auth rate (the
+  gate's base always resolves to `max_attempts_per_minute × 10`).
+  Unset = today's behavior (burst = rate). Completes the second
+  deferred item from
+  [#10](https://github.com/andrico21/rmcp-server-kit/issues/10).
+
 ## [1.11.0] - 2026-06-10
 
 ### Added

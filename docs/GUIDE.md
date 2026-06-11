@@ -716,7 +716,9 @@ tls_cert_path = "/etc/certs/server.crt"
 tls_key_path = "/etc/certs/server.key"
 allowed_origins = ["http://localhost:3000"]
 tool_rate_limit = 120
+# tool_rate_limit_burst = 240        # optional bucket capacity (default: = rate)
 extra_route_rate_limit = 60
+# extra_route_rate_limit_burst = 120 # optional bucket capacity (default: = rate)
 ```
 
 | Field | Type | Default | Description |
@@ -1227,8 +1229,33 @@ let config = config
 
 or in TOML: `extra_route_rate_limit = 60` under `[server]`. The limiter
 wraps **only** the extra router (layered before it is merged), responds
-`429 Too Many Requests` with a plain-text body (no `Retry-After`,
-matching the kit's tool/auth limiters), and is startup-only.
+`429 Too Many Requests` with a plain-text body and a `Retry-After`
+header (delta-seconds, like every kit limiter), and is startup-only.
+
+##### Rate limiting across the kit
+
+All four built-in limiters — the auth pre-auth gate, the post-failure
+auth limiter, the `tools/call` limiter, and the extra-route limiter —
+share one deny contract: HTTP `429`, a plain-text body, and a
+`Retry-After: n` header where `n` is the best-effort wait in whole
+seconds (rounded up, never `0`).
+
+Each per-minute rate knob has an optional **burst** companion setting
+the bucket capacity (maximum requests admitted back-to-back); the
+sustained rate is unchanged, and burst may be smaller (smoothing) or
+larger (spike tolerance) than the rate. Unset = burst equals the rate.
+
+| Limiter | Rate (builder / TOML) | Burst |
+|---|---|---|
+| Tool (`tools/call`) | `with_tool_rate_limit` / `tool_rate_limit` | `with_tool_rate_limit_burst` / `tool_rate_limit_burst` |
+| Extra routes | `with_extra_route_rate_limit` / `extra_route_rate_limit` | `with_extra_route_rate_limit_burst` / `extra_route_rate_limit_burst` |
+| Auth post-failure | `RateLimitConfig::new(n)` / `auth.rate_limit.max_attempts_per_minute` | `.with_burst(n)` / `auth.rate_limit.burst` |
+| Auth pre-auth gate | `.with_pre_auth_max_per_minute(n)` / `auth.rate_limit.pre_auth_max_per_minute` | `.with_pre_auth_burst(n)` / `auth.rate_limit.pre_auth_burst` |
+
+Bursts must be greater than zero; the tool and extra-route bursts also
+require their base knob to be set. The pre-auth burst is valid without
+an explicit pre-auth rate (the gate's base always resolves to
+`max_attempts_per_minute × 10`).
 
 Limitations to understand before relying on it:
 
@@ -1241,8 +1268,8 @@ Limitations to understand before relying on it:
   under key spray, but quieter legitimate IPs may be churned back to
   fresh buckets.
 
-Need custom keys (API key, header), burst control, or `Retry-After`?
-Reach for `tower_governor` on your extra router instead — its stock
+Need custom keys (API key, header) or proxy-aware client IPs? Reach
+for `tower_governor` on your extra router instead — its stock
 `PeerIpKeyExtractor` works on both plain and TLS listeners thanks to
 the `ConnectInfo<SocketAddr>` normalization described above.
 
