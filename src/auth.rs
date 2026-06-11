@@ -1420,6 +1420,8 @@ pub(crate) async fn auth_middleware(
     //    verification path runs. Keyed by source IP. mTLS connections (above)
     //    are exempt; this gate only protects the bearer/JWT verification path.
     if let Some(blocked) = pre_auth_gate(&state, client_ip) {
+        #[cfg(feature = "metrics")]
+        crate::metrics::record_rate_limit_deny(req.extensions(), "auth_pre");
         return blocked;
     }
 
@@ -1448,6 +1450,8 @@ pub(crate) async fn auth_middleware(
         && let Err(wait) = limiter.check_key_wait(&ip)
     {
         state.counters.record_failure(AuthFailureClass::RateLimited);
+        #[cfg(feature = "metrics")]
+        crate::metrics::record_rate_limit_deny(req.extensions(), "auth_post");
         tracing::warn!(%ip, "auth rate limited after repeated failures");
         return McpxError::RateLimitedFor {
             message: "too many failed authentication attempts".into(),
@@ -2253,6 +2257,104 @@ mod tests {
             counters.success_mtls, 3,
             "all three mTLS requests must have been counted as successful"
         );
+    }
+
+    /// Pre-auth-gate denial must increment the `auth_pre` deny counter
+    /// via the metrics handle in the request extensions.
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn pre_auth_gate_deny_increments_counter() {
+        let config = RateLimitConfig {
+            max_attempts_per_minute: 100,
+            pre_auth_max_per_minute: Some(1),
+            max_tracked_keys: default_max_tracked_keys(),
+            idle_eviction: default_idle_eviction(),
+            burst: None,
+            pre_auth_burst: None,
+        };
+        let state = Arc::new(AuthState {
+            api_keys: ArcSwap::new(Arc::new(vec![])),
+            rate_limiter: None,
+            pre_auth_limiter: Some(build_pre_auth_limiter(&config)),
+            #[cfg(feature = "oauth")]
+            jwks_cache: None,
+            seen_identities: SeenIdentitySet::new(),
+            counters: AuthCounters::default(),
+        });
+        let app = auth_router(Arc::clone(&state));
+        let metrics = Arc::new(crate::metrics::McpMetrics::new().expect("metrics registry"));
+        let peer: SocketAddr = "10.0.0.30:54321".parse().expect("addr parses");
+        let mk = || {
+            let mut req = Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/mcp")
+                .header("authorization", "Bearer not-a-real-token")
+                .body(Body::empty())
+                .expect("request builds");
+            req.extensions_mut().insert(ConnectInfo(peer));
+            req.extensions_mut().insert(Arc::clone(&metrics));
+            req
+        };
+        let counter = |label: &str| metrics.rate_limited_total.with_label_values(&[label]).get();
+
+        let first = app.clone().oneshot(mk()).await.expect("first request");
+        assert_eq!(first.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(counter("auth_pre"), 0, "un-gated request must not count");
+
+        let gated = app.oneshot(mk()).await.expect("second request");
+        assert_eq!(gated.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(counter("auth_pre"), 1, "gated request must count once");
+        assert_eq!(counter("auth_post"), 0, "post limiter never fired");
+    }
+
+    /// Post-failure limiter denial must increment the `auth_post` deny
+    /// counter via the metrics handle in the request extensions.
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn post_failure_limiter_deny_increments_counter() {
+        let config = RateLimitConfig {
+            max_attempts_per_minute: 1, // tight: 2nd failure trips the limiter
+            pre_auth_max_per_minute: None,
+            max_tracked_keys: default_max_tracked_keys(),
+            idle_eviction: default_idle_eviction(),
+            burst: None,
+            pre_auth_burst: None,
+        };
+        let state = Arc::new(AuthState {
+            api_keys: ArcSwap::new(Arc::new(vec![])),
+            rate_limiter: Some(build_rate_limiter(&config)),
+            pre_auth_limiter: None,
+            #[cfg(feature = "oauth")]
+            jwks_cache: None,
+            seen_identities: SeenIdentitySet::new(),
+            counters: AuthCounters::default(),
+        });
+        let app = auth_router(Arc::clone(&state));
+        let metrics = Arc::new(crate::metrics::McpMetrics::new().expect("metrics registry"));
+        let peer: SocketAddr = "10.0.0.31:54321".parse().expect("addr parses");
+        let mk = || {
+            let mut req = Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/mcp")
+                .header("authorization", "Bearer not-a-real-token")
+                .body(Body::empty())
+                .expect("request builds");
+            req.extensions_mut().insert(ConnectInfo(peer));
+            req.extensions_mut().insert(Arc::clone(&metrics));
+            req
+        };
+        let counter = |label: &str| metrics.rate_limited_total.with_label_values(&[label]).get();
+
+        // First failure consumes the budget but is NOT itself limited.
+        let first = app.clone().oneshot(mk()).await.expect("first request");
+        assert_eq!(first.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(counter("auth_post"), 0);
+
+        // Second failure trips the post-failure limiter.
+        let limited = app.oneshot(mk()).await.expect("second request");
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(counter("auth_post"), 1, "deny must count once");
+        assert_eq!(counter("auth_pre"), 0, "pre-auth gate disabled here");
     }
 
     // -------------------------------------------------------------------

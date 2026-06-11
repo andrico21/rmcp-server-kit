@@ -109,6 +109,7 @@ pub fn current_identity() -> Option<String> {
 }
 
 /// Get the raw bearer token for the current request as a [`SecretString`].
+///
 /// Returns `None` outside a request context or when auth used mTLS/API-key.
 /// Tool handlers use this for downstream token passthrough.
 ///
@@ -146,17 +147,21 @@ pub fn current_sub() -> Option<String> {
 }
 
 /// Run a future with `CURRENT_TOKEN` set so that [`current_token()`] returns
-/// the given value inside the future. Useful when MCP tool handlers need the
-/// raw bearer token but run in a spawned task where the RBAC middleware's
-/// task-local scope is no longer active.
+/// the given value inside the future.
+///
+/// Useful when MCP tool handlers need the raw bearer token but run in a
+/// spawned task where the RBAC middleware's task-local scope is no longer
+/// active.
 pub async fn with_token_scope<F: Future>(token: SecretString, f: F) -> F::Output {
     CURRENT_TOKEN.scope(token, f).await
 }
 
 /// Run a future with all task-locals (`CURRENT_ROLE`, `CURRENT_IDENTITY`,
-/// `CURRENT_TOKEN`, `CURRENT_SUB`) set.  Use this when re-establishing the
-/// full RBAC context in spawned tasks (e.g. rmcp session tasks) where the
-/// middleware's scope is no longer active.
+/// `CURRENT_TOKEN`, `CURRENT_SUB`) set.
+///
+/// Use this when re-establishing the full RBAC context in spawned tasks
+/// (e.g. rmcp session tasks) where the middleware's scope is no longer
+/// active.
 pub async fn with_rbac_scope<F: Future>(
     role: String,
     identity: String,
@@ -726,6 +731,8 @@ pub(crate) async fn rbac_middleware(
         if !tool_calls.is_empty() {
             for params in tool_calls {
                 if let Some(resp) = enforce_rate_limit(tool_limiter.as_deref(), peer_ip) {
+                    #[cfg(feature = "metrics")]
+                    crate::metrics::record_rate_limit_deny(&parts.extensions, "tool");
                     return resp;
                 }
                 if policy.is_enabled()
@@ -944,17 +951,17 @@ fn glob_match(pattern: &str, text: &str) -> bool {
         return pattern == text;
     }
 
-    let mut pos = 0;
-
     // First part must match at the start (unless pattern starts with *).
-    if let Some(&first) = parts.first()
+    let pos = if let Some(&first) = parts.first()
         && !first.is_empty()
     {
         if !text.starts_with(first) {
             return false;
         }
-        pos = first.len();
-    }
+        first.len()
+    } else {
+        0
+    };
 
     // Last part must match at the end (unless pattern ends with *).
     if let Some(&last) = parts.last()
@@ -1647,6 +1654,72 @@ mod tests {
                     }
                 },
             ))
+    }
+
+    /// Tool-limiter deny path must increment the `tool` deny counter via
+    /// the metrics handle in the request extensions — and the increment
+    /// must survive the middleware's body-buffer/`from_parts` rebuild.
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn tool_limiter_deny_increments_counter() {
+        use axum::extract::ConnectInfo;
+
+        let policy = Arc::new(test_policy());
+        let limiter = build_tool_rate_limiter(1, None);
+        let metrics = Arc::new(crate::metrics::McpMetrics::new().unwrap());
+        let identity = AuthIdentity {
+            method: crate::auth::AuthMethod::BearerToken,
+            name: "alice".into(),
+            role: "viewer".into(),
+            raw_token: None,
+            sub: None,
+        };
+        let app = {
+            let metrics = Arc::clone(&metrics);
+            axum::Router::new()
+                .route("/mcp", axum::routing::post(|| async { "ok" }))
+                .layer(axum::middleware::from_fn(
+                    move |mut req: Request<Body>, next: Next| {
+                        let p = Arc::clone(&policy);
+                        let l = Arc::clone(&limiter);
+                        let id = identity.clone();
+                        let m = Arc::clone(&metrics);
+                        async move {
+                            req.extensions_mut().insert(id);
+                            req.extensions_mut().insert(m);
+                            let peer: std::net::SocketAddr =
+                                "10.9.9.1:40000".parse().expect("static socket addr parses");
+                            req.extensions_mut().insert(ConnectInfo(peer));
+                            rbac_middleware(p, Some(l), req, next).await
+                        }
+                    },
+                ))
+        };
+        let mk = || {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/mcp")
+                .header("content-type", "application/json")
+                .body(Body::from(tool_call_body(
+                    "resource_list",
+                    &serde_json::json!({}),
+                )))
+                .unwrap()
+        };
+        let counter = || {
+            metrics
+                .rate_limited_total
+                .with_label_values(&["tool"])
+                .get()
+        };
+
+        let first = app.clone().oneshot(mk()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(counter(), 0, "successful call must not count");
+
+        let denied = app.clone().oneshot(mk()).await.unwrap();
+        assert_eq!(denied.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(counter(), 1, "deny must increment the tool label");
     }
 
     #[tokio::test]

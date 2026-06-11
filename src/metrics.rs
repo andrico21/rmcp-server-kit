@@ -40,6 +40,11 @@ pub struct McpMetrics {
     pub http_requests_total: IntCounterVec,
     /// HTTP request duration in seconds by method and path.
     pub http_request_duration_seconds: HistogramVec,
+    /// Rate-limiter denials by limiter. Label `limiter` is one of
+    /// `tool`, `auth_pre`, `auth_post`, `extra_route` — matching the
+    /// four built-in per-IP limiters. Incremented at each deny site
+    /// alongside the existing warn-level log.
+    pub rate_limited_total: IntCounterVec,
 }
 
 impl McpMetrics {
@@ -74,10 +79,23 @@ impl McpMetrics {
             .register(Box::new(http_request_duration_seconds.clone()))
             .map_err(|e| McpxError::Metrics(e.to_string()))?;
 
+        let rate_limited_total = IntCounterVec::new(
+            opts!(
+                "rmcp_server_kit_rate_limited_total",
+                "Rate-limiter denials by limiter"
+            ),
+            &["limiter"],
+        )
+        .map_err(|e| McpxError::Metrics(e.to_string()))?;
+        registry
+            .register(Box::new(rate_limited_total.clone()))
+            .map_err(|e| McpxError::Metrics(e.to_string()))?;
+
         Ok(Self {
             registry,
             http_requests_total,
             http_request_duration_seconds,
+            rate_limited_total,
         })
     }
 
@@ -94,6 +112,20 @@ impl McpMetrics {
         // TextEncoder always produces valid UTF-8; fall back to empty on
         // the near-impossible chance it doesn't.
         String::from_utf8(buf).unwrap_or_default()
+    }
+}
+
+/// Increment the rate-limiter deny counter for `limiter`, if the shared
+/// [`McpMetrics`] handle is present in the request extensions.
+///
+/// The handle is inserted by the transport's metrics middleware (the
+/// outermost layer on the merged router) only when `metrics_enabled` is
+/// true; absent the extension this is a no-op, so deny sites behave
+/// identically with metrics disabled. `limiter` is one of `tool`,
+/// `auth_pre`, `auth_post`, `extra_route`.
+pub(crate) fn record_rate_limit_deny(ext: &axum::http::Extensions, limiter: &str) {
+    if let Some(m) = ext.get::<Arc<McpMetrics>>() {
+        m.rate_limited_total.with_label_values(&[limiter]).inc();
     }
 }
 
@@ -215,6 +247,36 @@ mod tests {
         // The clone should see the same counter value.
         let output = m2.encode();
         assert!(output.contains(" 1"));
+    }
+
+    #[test]
+    fn rate_limited_counter_registers_and_encodes() {
+        let m = McpMetrics::new().unwrap();
+        m.rate_limited_total.with_label_values(&["tool"]).inc();
+        let output = m.encode();
+        assert!(output.contains("rmcp_server_kit_rate_limited_total"));
+        assert!(output.contains("limiter=\"tool\""));
+        assert!(output.contains(" 1"));
+    }
+
+    #[test]
+    fn record_rate_limit_deny_increments_via_extension() {
+        let m = Arc::new(McpMetrics::new().unwrap());
+        let mut ext = axum::http::Extensions::new();
+        ext.insert(Arc::clone(&m));
+        record_rate_limit_deny(&ext, "auth_pre");
+        record_rate_limit_deny(&ext, "auth_pre");
+        assert_eq!(
+            m.rate_limited_total.with_label_values(&["auth_pre"]).get(),
+            2
+        );
+        // Absent handle: silent no-op (metrics disabled path).
+        let empty = axum::http::Extensions::new();
+        record_rate_limit_deny(&empty, "auth_pre");
+        assert_eq!(
+            m.rate_limited_total.with_label_values(&["auth_pre"]).get(),
+            2
+        );
     }
 
     // M7 regression: cancelling the shutdown token must release the

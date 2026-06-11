@@ -79,7 +79,7 @@ pub type ReadinessCheck =
 /// per-IP rate limiting).
 ///
 /// The same address is also mirrored into
-/// [`axum::extract::ConnectInfo`]`<SocketAddr>` on the TLS listener, so
+/// [`axum::extract::ConnectInfo<SocketAddr>`] on the TLS listener, so
 /// third-party middleware that expects the stock axum extension (e.g.
 /// per-IP rate-limit key extractors) works unmodified under TLS.
 ///
@@ -374,6 +374,23 @@ pub struct McpServerConfig {
         note = "use McpServerConfig::with_extra_route_rate_limit_burst(); direct field access will become pub(crate) in a future major release"
     )]
     pub extra_route_rate_limit_burst: Option<u32>,
+    /// Exact-match request paths exempt from the extra-route rate
+    /// limiter (e.g. `/.well-known/oauth-authorization-server`, which
+    /// MCP clients fetch on every connect — behind a shared egress the
+    /// limiter would otherwise 429 discovery). Matching is a **raw
+    /// exact string comparison** against `req.uri().path()`: no globs,
+    /// no prefixes, no normalization — trailing slashes,
+    /// percent-encoding, and dot-segments must match byte-for-byte.
+    /// Fail-closed: any path not listed stays rate-limited (a mismatch
+    /// can only mean "still limited", never "accidentally exempt").
+    /// Requires [`extra_route_rate_limit`](Self::extra_route_rate_limit);
+    /// each entry must be non-empty and start with `/` (validated).
+    /// Startup-only.
+    #[deprecated(
+        since = "1.14.0",
+        note = "use McpServerConfig::with_extra_route_rate_limit_exempt_paths(); direct field access will become pub(crate) in a future major release"
+    )]
+    pub extra_route_rate_limit_exempt_paths: Vec<String>,
     /// Trusted reverse-proxy networks (CIDRs or bare IPs) for
     /// **trusted-forwarder mode**. Empty (default) = mode off: every
     /// limiter keys by the direct socket peer. Nonempty = requests whose
@@ -449,7 +466,7 @@ pub struct McpServerConfig {
     /// router.  These routes **bypass** the MCP auth and RBAC middleware,
     /// so the application is responsible for its own auth on them.
     /// Handlers can extract [`PeerAddr`] (or
-    /// [`axum::extract::ConnectInfo`]`<SocketAddr>` for third-party
+    /// [`axum::extract::ConnectInfo<SocketAddr>`] for third-party
     /// middleware compatibility) regardless of whether TLS is enabled.
     #[deprecated(
         since = "0.13.0",
@@ -692,6 +709,7 @@ impl McpServerConfig {
             extra_route_rate_limit: None,
             tool_rate_limit_burst: None,
             extra_route_rate_limit_burst: None,
+            extra_route_rate_limit_exempt_paths: Vec::new(),
             trusted_proxies: Vec::new(),
             forwarded_header: None,
         }
@@ -779,7 +797,7 @@ impl McpServerConfig {
     /// unauthenticated endpoints), every request served by [`serve`]
     /// carries the client peer address regardless of whether TLS is
     /// enabled: extract the framework-owned [`PeerAddr`] in your
-    /// handlers, or rely on [`axum::extract::ConnectInfo`]`<SocketAddr>`
+    /// handlers, or rely on [`axum::extract::ConnectInfo<SocketAddr>`]
     /// for stock third-party middleware (e.g. per-IP rate-limit key
     /// extractors). Neither extension exists under [`serve_stdio`],
     /// which has no network peer.
@@ -911,6 +929,35 @@ impl McpServerConfig {
     #[must_use]
     pub fn with_extra_route_rate_limit_burst(mut self, burst: u32) -> Self {
         self.extra_route_rate_limit_burst = Some(burst);
+        self
+    }
+
+    /// Exempt specific request paths from the extra-route rate limiter.
+    ///
+    /// Matching is a **raw exact string comparison** against
+    /// `req.uri().path()` — no globs, no prefixes, no normalization
+    /// (trailing slashes, percent-encoding, and dot-segments must match
+    /// byte-for-byte). The check is fail-closed: anything not listed
+    /// stays rate-limited, so a mismatch can only keep a request
+    /// limited, never accidentally exempt it. The exemption is checked
+    /// before key extraction, so exempt requests consume no limiter
+    /// budget and never appear in deny telemetry.
+    ///
+    /// Typical use: the RFC 8414 authorization-server metadata document
+    /// (`/.well-known/oauth-authorization-server`), fetched by MCP
+    /// clients on every connect.
+    ///
+    /// Requires the extra-route rate limit to be set
+    /// ([`with_extra_route_rate_limit`](Self::with_extra_route_rate_limit));
+    /// each entry must be non-empty and start with `/` (both validated
+    /// by [`validate`](Self::validate)). Startup-only.
+    #[must_use]
+    pub fn with_extra_route_rate_limit_exempt_paths<I, S>(mut self, paths: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.extra_route_rate_limit_exempt_paths = paths.into_iter().map(Into::into).collect();
         self
     }
 
@@ -1060,6 +1107,21 @@ impl McpServerConfig {
                 "extra_route_rate_limit_burst requires extra_route_rate_limit to be set".into(),
             ));
         }
+        if !self.extra_route_rate_limit_exempt_paths.is_empty()
+            && self.extra_route_rate_limit.is_none()
+        {
+            return Err(McpxError::Config(
+                "extra_route_rate_limit_exempt_paths requires extra_route_rate_limit to be set"
+                    .into(),
+            ));
+        }
+        for path in &self.extra_route_rate_limit_exempt_paths {
+            if path.is_empty() || !path.starts_with('/') {
+                return Err(McpxError::Config(format!(
+                    "extra_route_rate_limit_exempt_paths entries must be non-empty and start with '/': {path:?}"
+                )));
+            }
+        }
         if let Some(rl) = self.auth.as_ref().and_then(|a| a.rate_limit.as_ref()) {
             if rl.burst == Some(0) {
                 return Err(McpxError::Config(
@@ -1189,7 +1251,7 @@ impl McpServerConfig {
         // 9. max_concurrent_requests must be > 0 when set. Zero would
         //    deadlock the global concurrency limiter and reject every
         //    request. Mirrors the TOML-side check in `src/config.rs`.
-        if let Some(0) = self.max_concurrent_requests {
+        if self.max_concurrent_requests == Some(0) {
             return Err(McpxError::Config(
                 "max_concurrent_requests must be greater than zero when set".into(),
             ));
@@ -1609,10 +1671,22 @@ where
             Some(per_minute) => {
                 let limiter =
                     build_extra_route_rate_limiter(per_minute, config.extra_route_rate_limit_burst);
-                tracing::info!(per_minute, "extra-route per-IP rate limit enabled");
+                let exempt: Arc<std::collections::HashSet<String>> = Arc::new(
+                    config
+                        .extra_route_rate_limit_exempt_paths
+                        .iter()
+                        .cloned()
+                        .collect(),
+                );
+                tracing::info!(
+                    per_minute,
+                    exempt_paths = exempt.len(),
+                    "extra-route per-IP rate limit enabled"
+                );
                 extra.layer(axum::middleware::from_fn(move |req, next| {
                     let l = Arc::clone(&limiter);
-                    extra_route_rate_limit_middleware(l, req, next)
+                    let e = Arc::clone(&exempt);
+                    extra_route_rate_limit_middleware(l, e, req, next)
                 }))
             }
             None => extra,
@@ -2060,6 +2134,8 @@ async fn run_server(
         let trigger = shutdown_trigger.clone();
         let parent = ct.clone();
         tokio::spawn(async move {
+            // cancel-safe: both arms (signal future, CancellationToken::cancelled)
+            // are cancel-safe; the losing arm holds no state.
             tokio::select! {
                 () = shutdown_signal() => {}
                 () = parent.cancelled() => {}
@@ -2123,6 +2199,8 @@ async fn run_server(
             max_concurrent_tls_handshakes,
         )?;
         let make_svc = router.into_make_service_with_connect_info::<TlsConnInfo>();
+        // cancel-safe: dropping the serve future on force-exit is intentional
+        // forced-shutdown semantics; force_exit_timer is a Sleep chain.
         tokio::select! {
             result = axum::serve(tls_listener, make_svc)
                 .with_graceful_shutdown(graceful) => { result?; }
@@ -2140,6 +2218,8 @@ async fn run_server(
         }
 
         let make_svc = router.into_make_service_with_connect_info::<SocketAddr>();
+        // cancel-safe: dropping the serve future on force-exit is intentional
+        // forced-shutdown semantics; force_exit_timer is a Sleep chain.
         tokio::select! {
             result = axum::serve(listener, make_svc)
                 .with_graceful_shutdown(graceful) => { result?; }
@@ -2373,7 +2453,7 @@ impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, TlsL
     fn connect_info(target: axum::serve::IncomingStream<'_, TlsListener>) -> Self {
         let addr = *target.remote_addr();
         let identity = target.io().identity().cloned();
-        TlsConnInfo::new(addr, identity)
+        Self::new(addr, identity)
     }
 }
 
@@ -2812,6 +2892,8 @@ async fn shutdown_signal() {
     {
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
             Ok(mut term) => {
+                // cancel-safe: signal-listener futures are cancel-safe per
+                // tokio docs; no partial state in either arm.
                 tokio::select! {
                     _ = ctrl_c => {}
                     _ = term.recv() => {}
@@ -2835,16 +2917,22 @@ async fn shutdown_signal() {
 /// Middleware that validates the `Origin` header on incoming HTTP requests.
 ///
 /// Record HTTP request metrics (method, path, status, duration).
+///
+/// Also exposes the shared [`crate::metrics::McpMetrics`] handle to
+/// inner middleware via a request extension, so the rate limiters can
+/// increment `rmcp_server_kit_rate_limited_total` at their deny sites
+/// (see [`crate::metrics::record_rate_limit_deny`]).
 #[cfg(feature = "metrics")]
 async fn metrics_middleware(
     metrics: Arc<crate::metrics::McpMetrics>,
-    req: Request<Body>,
+    mut req: Request<Body>,
     next: Next,
 ) -> axum::response::Response {
     let method = req.method().to_string();
     let path = req.uri().path().to_owned();
     let start = std::time::Instant::now();
 
+    req.extensions_mut().insert(Arc::clone(&metrics));
     let response = next.run(req).await;
 
     let status = response.status().as_u16().to_string();
@@ -3257,15 +3345,26 @@ fn build_extra_route_rate_limiter(
 /// plain-text 429 via [`McpxError::RateLimitedFor`] carrying a
 /// `Retry-After` header (delta-seconds), consistent with every other
 /// limiter in the crate.
+///
+/// `exempt` holds raw exact-match paths (validated at config time)
+/// checked against `req.uri().path()` **before** key extraction:
+/// exempt requests consume no limiter budget and produce no deny
+/// telemetry. Fail-closed — any non-listed path stays limited.
 async fn extra_route_rate_limit_middleware(
     limiter: Arc<ExtraRouteRateLimiter>,
+    exempt: Arc<std::collections::HashSet<String>>,
     req: Request<Body>,
     next: Next,
 ) -> axum::response::Response {
+    if exempt.contains(req.uri().path()) {
+        return next.run(req).await;
+    }
     let peer_ip: Option<IpAddr> = limiter_client_ip(req.extensions());
     if let Some(ip) = peer_ip
         && let Err(wait) = limiter.check_key_wait(&ip)
     {
+        #[cfg(feature = "metrics")]
+        crate::metrics::record_rate_limit_deny(req.extensions(), "extra_route");
         tracing::warn!(%ip, "extra route request rate limited");
         return McpxError::RateLimitedFor {
             message: "too many requests to application routes from this source".into(),
@@ -3730,19 +3829,38 @@ mod tests {
 
     /// Probe router with an explicit burst capacity.
     fn limited_router_with_burst(per_minute: u32, burst: Option<u32>) -> axum::Router {
+        limited_router_full(per_minute, burst, &[])
+    }
+
+    /// Probe router with explicit burst and exempt paths. `/limited`
+    /// and `/exempt` are both registered so exemption interplay can be
+    /// asserted on one limiter instance.
+    fn limited_router_full(
+        per_minute: u32,
+        burst: Option<u32>,
+        exempt_paths: &[&str],
+    ) -> axum::Router {
         let limiter = build_extra_route_rate_limiter(per_minute, burst);
+        let exempt: Arc<std::collections::HashSet<String>> =
+            Arc::new(exempt_paths.iter().map(|s| (*s).to_owned()).collect());
         axum::Router::new()
             .route("/limited", axum::routing::get(|| async { "ok" }))
+            .route("/exempt", axum::routing::get(|| async { "ok" }))
             .layer(axum::middleware::from_fn(move |req, next| {
                 let l = Arc::clone(&limiter);
-                extra_route_rate_limit_middleware(l, req, next)
+                let e = Arc::clone(&exempt);
+                extra_route_rate_limit_middleware(l, e, req, next)
             }))
     }
 
     fn limited_req(ip: &str) -> Request<Body> {
+        limited_req_to(ip, "/limited")
+    }
+
+    fn limited_req_to(ip: &str, path: &str) -> Request<Body> {
         let addr: SocketAddr = format!("{ip}:40000").parse().unwrap();
         Request::builder()
-            .uri("/limited")
+            .uri(path)
             .extension(ConnectInfo(addr))
             .body(Body::empty())
             .unwrap()
@@ -3814,6 +3932,123 @@ mod tests {
         }
         let resp = app.clone().oneshot(mk()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn extra_route_limiter_exempt_path_bypasses_quota() {
+        // rate=1: a single non-exempt request exhausts the bucket, yet
+        // repeated exempt-path requests all pass and consume no budget.
+        let app = limited_router_full(1, None, &["/exempt"]);
+        for i in 0..5 {
+            let resp = app
+                .clone()
+                .oneshot(limited_req_to("10.6.6.6", "/exempt"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "exempt request {i}");
+        }
+        // Budget untouched by exempt traffic: first limited request OK…
+        let resp = app.clone().oneshot(limited_req("10.6.6.6")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // …second is denied (exemption did not leak onto /limited).
+        let resp = app.clone().oneshot(limited_req("10.6.6.6")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn extra_route_limiter_exemption_is_raw_exact_match() {
+        // Trailing-slash and case variants are NOT exempt (fail-closed:
+        // a mismatch keeps the request limited, never the reverse).
+        let app = limited_router_full(1, None, &["/exempt"]);
+        let ok = app
+            .clone()
+            .oneshot(limited_req_to("10.7.7.7", "/exempt/"))
+            .await
+            .unwrap();
+        assert_eq!(
+            ok.status(),
+            StatusCode::NOT_FOUND,
+            "variant path routes 404"
+        );
+        // The variant consumed limiter budget (it was not exempt):
+        let denied = app
+            .clone()
+            .oneshot(limited_req_to("10.7.7.7", "/limited"))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn extra_route_limiter_deny_increments_counter_exempt_does_not() {
+        let metrics = Arc::new(crate::metrics::McpMetrics::new().unwrap());
+        let app = limited_router_full(1, None, &["/exempt"]);
+        let mk = |path: &str| {
+            let addr: SocketAddr = "10.8.8.8:40000".parse().unwrap();
+            Request::builder()
+                .uri(path)
+                .extension(ConnectInfo(addr))
+                .extension(Arc::clone(&metrics))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let counter = || {
+            metrics
+                .rate_limited_total
+                .with_label_values(&["extra_route"])
+                .get()
+        };
+        // Exempt traffic: no budget, no counter.
+        for _ in 0..3 {
+            assert_eq!(
+                app.clone().oneshot(mk("/exempt")).await.unwrap().status(),
+                StatusCode::OK
+            );
+        }
+        assert_eq!(counter(), 0, "exempt requests must not count as denies");
+        // Exhaust then deny: counter increments exactly on the deny.
+        assert_eq!(
+            app.clone().oneshot(mk("/limited")).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(counter(), 0);
+        assert_eq!(
+            app.clone().oneshot(mk("/limited")).await.unwrap().status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(counter(), 1, "deny must increment the extra_route label");
+    }
+
+    #[test]
+    fn validate_rejects_exempt_paths_without_base_knob() {
+        let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
+            .with_extra_route_rate_limit_exempt_paths(["/ok"]);
+        let err = cfg.validate().expect_err("exempt paths without rate limit");
+        assert!(err.to_string().contains("requires extra_route_rate_limit"));
+    }
+
+    #[test]
+    fn validate_rejects_malformed_exempt_paths() {
+        for bad in ["", "no-slash"] {
+            let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
+                .with_extra_route_rate_limit(10)
+                .with_extra_route_rate_limit_exempt_paths([bad]);
+            let err = cfg.validate().expect_err("malformed exempt path");
+            assert!(
+                err.to_string()
+                    .contains("must be non-empty and start with '/'"),
+                "entry {bad:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_wellformed_exempt_paths() {
+        let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
+            .with_extra_route_rate_limit(10)
+            .with_extra_route_rate_limit_exempt_paths(["/.well-known/oauth-authorization-server"]);
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

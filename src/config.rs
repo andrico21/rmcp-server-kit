@@ -61,6 +61,13 @@ pub struct ServerConfig {
     /// sustained rate stays `extra_route_rate_limit`). Requires
     /// `extra_route_rate_limit`; must be greater than zero.
     pub extra_route_rate_limit_burst: Option<u32>,
+    /// Exact-match request paths exempt from the extra-route rate
+    /// limiter. Raw string comparison against the request path — no
+    /// globs, no normalization; fail-closed (anything not listed stays
+    /// limited). Requires `extra_route_rate_limit`; entries must be
+    /// non-empty and start with `/`. Startup-only.
+    #[serde(default)]
+    pub extra_route_rate_limit_exempt_paths: Vec<String>,
     /// Trusted reverse-proxy networks (CIDRs or bare IPs) for
     /// trusted-forwarder mode. Empty (default) = off. When the direct
     /// peer is inside one of these networks, the client IP is resolved
@@ -123,6 +130,7 @@ impl Default for ServerConfig {
             tool_rate_limit_burst: None,
             extra_route_rate_limit: None,
             extra_route_rate_limit_burst: None,
+            extra_route_rate_limit_exempt_paths: Vec::new(),
             trusted_proxies: Vec::new(),
             forwarded_header: None,
             session_idle_timeout: default_session_idle_timeout(),
@@ -196,13 +204,13 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
         _ => {}
     }
 
-    if let Some(0) = server.max_concurrent_requests {
+    if server.max_concurrent_requests == Some(0) {
         return Err(McpxError::Config(
             "max_concurrent_requests must be nonzero when set".into(),
         ));
     }
 
-    if let Some(0) = server.extra_route_rate_limit {
+    if server.extra_route_rate_limit == Some(0) {
         return Err(McpxError::Config(
             "server.extra_route_rate_limit must be greater than zero".into(),
         ));
@@ -272,12 +280,12 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
 fn validate_rate_limit_knobs(server: &ServerConfig) -> crate::error::Result<()> {
     use crate::error::McpxError;
 
-    if let Some(0) = server.tool_rate_limit_burst {
+    if server.tool_rate_limit_burst == Some(0) {
         return Err(McpxError::Config(
             "server.tool_rate_limit_burst must be greater than zero".into(),
         ));
     }
-    if let Some(0) = server.extra_route_rate_limit_burst {
+    if server.extra_route_rate_limit_burst == Some(0) {
         return Err(McpxError::Config(
             "server.extra_route_rate_limit_burst must be greater than zero".into(),
         ));
@@ -291,6 +299,21 @@ fn validate_rate_limit_knobs(server: &ServerConfig) -> crate::error::Result<()> 
         return Err(McpxError::Config(
             "server.extra_route_rate_limit_burst requires server.extra_route_rate_limit".into(),
         ));
+    }
+    if !server.extra_route_rate_limit_exempt_paths.is_empty()
+        && server.extra_route_rate_limit.is_none()
+    {
+        return Err(McpxError::Config(
+            "server.extra_route_rate_limit_exempt_paths requires server.extra_route_rate_limit"
+                .into(),
+        ));
+    }
+    for path in &server.extra_route_rate_limit_exempt_paths {
+        if path.is_empty() || !path.starts_with('/') {
+            return Err(McpxError::Config(format!(
+                "server.extra_route_rate_limit_exempt_paths entries must be non-empty and start with '/': {path:?}"
+            )));
+        }
     }
     if let Some(rl) = server.auth.as_ref().and_then(|a| a.rate_limit.as_ref()) {
         if rl.burst == Some(0) {
@@ -507,6 +530,52 @@ mod tests {
             err.to_string()
                 .contains("requires server.extra_route_rate_limit")
         );
+    }
+
+    #[test]
+    fn exempt_paths_toml_roundtrip_and_validation() {
+        let cfg: ServerConfig = toml::from_str(
+            r#"
+                extra_route_rate_limit = 60
+                extra_route_rate_limit_exempt_paths = ["/.well-known/oauth-authorization-server"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.extra_route_rate_limit_exempt_paths,
+            vec!["/.well-known/oauth-authorization-server".to_owned()]
+        );
+        assert!(validate_server_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn orphan_exempt_paths_rejected() {
+        let cfg = ServerConfig {
+            extra_route_rate_limit_exempt_paths: vec!["/ok".into()],
+            ..ServerConfig::default()
+        };
+        let err = validate_server_config(&cfg).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires server.extra_route_rate_limit")
+        );
+    }
+
+    #[test]
+    fn malformed_exempt_paths_rejected() {
+        for bad in ["", "no-slash"] {
+            let cfg = ServerConfig {
+                extra_route_rate_limit: Some(10),
+                extra_route_rate_limit_exempt_paths: vec![bad.into()],
+                ..ServerConfig::default()
+            };
+            let err = validate_server_config(&cfg).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("must be non-empty and start with '/'"),
+                "entry {bad:?}: {err}"
+            );
+        }
     }
 
     #[test]
