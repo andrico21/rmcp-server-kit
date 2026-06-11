@@ -28,18 +28,43 @@ pub(crate) const CLOUD_METADATA_V6_AWS: Ipv6Addr =
 pub(crate) const CLOUD_METADATA_V6_GCP: Ipv6Addr =
     Ipv6Addr::new(0xfd20, 0x00ce, 0, 0, 0, 0, 0, 0x0254);
 
-/// Validate scheme of a parsed CDP URL.
+/// Validate scheme of a parsed CDP URL and reject embedded credentials.
 ///
 /// Accepts only `https`, plus `http` when `allow_http` is true. Rejects
 /// anything else (`file`, `ldap`, `ftp`, ...). Scheme is matched
 /// case-insensitively per RFC 3986 §3.1, but `Url::parse` already
 /// lowercases it.
+///
+/// URLs carrying userinfo (`https://user:pass@host/...`) are rejected
+/// with `userinfo_forbidden` so embedded credentials can never reach
+/// the fetch machinery, error strings, or logs. This mirrors the
+/// userinfo rule already enforced on OAuth redirect targets by
+/// [`redirect_target_reason_with_allowlist`].
 pub(crate) fn check_scheme(url: &Url, allow_http: bool) -> Result<(), &'static str> {
     match url.scheme() {
-        "https" => Ok(()),
-        "http" if allow_http => Ok(()),
-        "http" => Err("http_scheme_disallowed"),
-        _ => Err("invalid_scheme"),
+        "https" => {}
+        "http" if allow_http => {}
+        "http" => return Err("http_scheme_disallowed"),
+        _ => return Err("invalid_scheme"),
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("userinfo_forbidden");
+    }
+    Ok(())
+}
+
+/// Authority-only rendering of a URL for logs: scheme + host + port.
+///
+/// Strips userinfo, path, query, and fragment — any of which can carry
+/// credentials or other secrets — so rejection sites can name the
+/// offending target without echoing what they rejected. Tolerates
+/// hostless URLs (renders `<no-host>`) without panicking; the port is
+/// included only when explicitly present in the URL.
+pub(crate) fn sanitized_url_for_log(url: &Url) -> String {
+    let host = url.host_str().unwrap_or("<no-host>");
+    match url.port() {
+        Some(port) => format!("{}://{host}:{port}", url.scheme()),
+        None => format!("{}://{host}", url.scheme()),
     }
 }
 
@@ -464,7 +489,7 @@ mod tests {
 
     use url::Url;
 
-    use super::{check_scheme, ip_block_reason};
+    use super::{check_scheme, ip_block_reason, sanitized_url_for_log};
 
     #[test]
     fn https_always_allowed() {
@@ -486,6 +511,38 @@ mod tests {
             let url = Url::parse(raw).expect("parse");
             assert_eq!(check_scheme(&url, true), Err("invalid_scheme"));
         }
+    }
+
+    #[test]
+    fn userinfo_rejected_on_accepted_schemes() {
+        for raw in ["https://user:pass@host/", "https://user@host/"] {
+            let url = Url::parse(raw).expect("parse");
+            assert_eq!(check_scheme(&url, false), Err("userinfo_forbidden"));
+            assert_eq!(check_scheme(&url, true), Err("userinfo_forbidden"));
+        }
+        let url = Url::parse("http://user:pass@host/").expect("parse");
+        assert_eq!(check_scheme(&url, true), Err("userinfo_forbidden"));
+        // Scheme rejection still wins when the scheme itself is refused.
+        assert_eq!(check_scheme(&url, false), Err("http_scheme_disallowed"));
+    }
+
+    #[test]
+    fn sanitized_url_strips_credentials_path_and_query() {
+        let url = Url::parse("https://u:p@h:8443/secret?token=x#frag").expect("parse");
+        let sanitized = sanitized_url_for_log(&url);
+        assert_eq!(sanitized, "https://h:8443");
+        assert!(!sanitized.contains("u:p"));
+        assert!(!sanitized.contains("secret"));
+        assert!(!sanitized.contains("token"));
+    }
+
+    #[test]
+    fn sanitized_url_default_port_and_hostless() {
+        let url = Url::parse("https://crl.example/ca.crl").expect("parse");
+        assert_eq!(sanitized_url_for_log(&url), "https://crl.example");
+        // Hostless URL must not panic and must signal the missing host.
+        let url = Url::parse("data:text/plain,hello").expect("parse");
+        assert_eq!(sanitized_url_for_log(&url), "data://<no-host>");
     }
 
     #[test]

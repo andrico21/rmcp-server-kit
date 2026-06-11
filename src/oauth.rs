@@ -380,9 +380,12 @@ impl OauthHttpClient {
                 match evaluate_oauth_redirect(&attempt, allow_http, &redirect_allowlist) {
                     Ok(()) => attempt.follow(),
                     Err(reason) => {
+                        // Sanitized target: the rejected URL may carry
+                        // userinfo credentials (the rejection reason
+                        // itself is URL-free).
                         tracing::warn!(
                             reason = %reason,
-                            target = %attempt.url(),
+                            target = %crate::ssrf::sanitized_url_for_log(attempt.url()),
                             "oauth redirect rejected"
                         );
                         attempt.error(reason)
@@ -1830,9 +1833,12 @@ impl JwksCache {
                 match evaluate_oauth_redirect(&attempt, allow_http, &redirect_allowlist) {
                     Ok(()) => attempt.follow(),
                     Err(reason) => {
+                        // Sanitized target: the rejected URL may carry
+                        // userinfo credentials (the rejection reason
+                        // itself is URL-free).
                         tracing::warn!(
                             reason = %reason,
-                            target = %attempt.url(),
+                            target = %crate::ssrf::sanitized_url_for_log(attempt.url()),
                             "oauth redirect rejected"
                         );
                         attempt.error(reason)
@@ -2187,6 +2193,7 @@ impl JwksCache {
             fetched_at: Instant::now(),
             ttl: self.ttl,
         });
+        drop(guard);
         Ok(())
     }
 
@@ -2273,6 +2280,7 @@ impl JwksCache {
             fetched_at: Instant::now(),
             ttl: self.ttl,
         });
+        drop(guard);
         Ok(())
     }
 
@@ -4015,8 +4023,8 @@ mod tests {
     /// Helper: compile an allowlist from string literals.
     fn make_allowlist(hosts: &[&str], cidrs: &[&str]) -> crate::ssrf::CompiledSsrfAllowlist {
         let raw = OAuthSsrfAllowlist {
-            hosts: hosts.iter().map(|s| (*s).to_string()).collect(),
-            cidrs: cidrs.iter().map(|s| (*s).to_string()).collect(),
+            hosts: hosts.iter().map(|s| (*s).to_owned()).collect(),
+            cidrs: cidrs.iter().map(|s| (*s).to_owned()).collect(),
         };
         compile_oauth_ssrf_allowlist(&raw).expect("test allowlist compiles")
     }
@@ -4466,6 +4474,46 @@ mod tests {
             logs.contents()
                 .contains("JWKS response exceeded configured size cap"),
             "expected cap-exceeded warning in logs"
+        );
+    }
+
+    /// A redirect to a userinfo-bearing target is rejected, and the
+    /// rejection warn log must not echo the embedded credentials
+    /// (sanitized to scheme+host+port only).
+    #[tokio::test]
+    async fn redirect_rejection_log_does_not_echo_credentials() {
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/jwks.json"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(302)
+                    .insert_header("location", "https://u:p@redirect-target.example/next"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let jwks_uri = format!("{}/jwks.json", mock_server.uri());
+        let config = test_config(&jwks_uri);
+        let cache = test_cache(&config);
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let result = cache.fetch_jwks().await;
+        assert!(result.is_none(), "rejected redirect must fail the fetch");
+        let contents = logs.contents();
+        assert!(
+            contents.contains("oauth redirect rejected"),
+            "expected redirect-rejection warning in logs: {contents}"
+        );
+        assert!(
+            !contents.contains("u:p"),
+            "rejection log must not echo userinfo credentials: {contents}"
         );
     }
 

@@ -168,6 +168,42 @@ IPv6 transition-mechanism prefixes:
   attacker-chosen, and no legitimate JWKS/CRL endpoint is reachable only
   via Teredo.
 
+### CRL discovery under adversarial load
+
+CDP URLs are extracted from client certificates **before** chain
+validation. This ordering is a deliberate, load-bearing invariant: with
+`crl_deny_on_unavailable = true` the verifier must be able to fail
+closed on a never-fetched CDP, which requires discovering the CDP before
+delegating to the inner verifier. No HTTP happens on the handshake path —
+discovery only enqueues onto a bounded, rate-limited channel, and the
+actual fetch runs on a background task behind the full SSRF guard.
+
+The residual cost of that ordering is a bounded griefing window: an
+**unauthenticated** client can present throwaway certificates carrying
+unique CDP URLs and consume the process-global discovery budget
+(`crl_discovery_rate_per_min`) and `crl_max_seen_urls` slots. Memory
+stays bounded — the caps exist precisely for this — but discovery of
+*new legitimate* CDP URLs can be starved while the spray is in progress,
+which under `crl_deny_on_unavailable = true` fails those handshakes
+closed. Per-source-IP discovery budgeting is not possible at this layer:
+`rustls`'s `ClientCertVerifier` callback has no access to the peer
+address.
+
+Operator guidance:
+
+- Alert on `discovery_rate_limited` WARN log lines — they are the
+  observable signature of a discovery spray (or of an undersized budget).
+- Size `crl_max_seen_urls` and `crl_max_cache_entries` to comfortably
+  exceed your CA estate's real CDP count, especially with
+  `crl_deny_on_unavailable = true`: at the cache cap the **newest** entry
+  is rejected (never an existing one — LRU eviction would let an attacker
+  evict the legitimate warm set by spamming throwaway CDP URLs), so a
+  full cache means newly discovered legitimate CDPs cannot enter until
+  capacity frees up.
+- Pre-seed the cache via the startup bootstrap: CDPs present in the
+  configured CA chain are fetched before the listener starts and are
+  immune to runtime discovery contention.
+
 ### OAuth SSRF hardening
 
 When the optional `oauth` feature is enabled, the JWKS fetcher and the

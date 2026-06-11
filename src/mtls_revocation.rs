@@ -57,7 +57,7 @@ use x509_parser::{
 use crate::{
     auth::MtlsConfig,
     error::McpxError,
-    ssrf::{check_scheme, ip_block_reason},
+    ssrf::{check_scheme, ip_block_reason, sanitized_url_for_log},
 };
 
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -232,6 +232,12 @@ impl CrlSet {
     }
 
     async fn insert_cache_entry(&self, url: String, cached: CachedCrl) -> bool {
+        // POLICY: at cap the NEWEST entry is rejected, never an existing
+        // one (no LRU). Under adversarial unique-CDP churn an LRU would
+        // let an attacker evict the legitimate warm set by spamming
+        // throwaway CDP URLs; rejecting newcomers instead preserves
+        // revocation coverage for the established CA estate. Confirmed
+        // by Oracle review of the 1.13.0 rust-review fix plan.
         let inserted = {
             let mut guard = self.cache.write().await;
             if guard.len() >= self.config.crl_max_cache_entries && !guard.contains_key(&url) {
@@ -353,6 +359,7 @@ impl CrlSet {
         if changed {
             self.swap_verifier_from_cache(&cache)?;
         }
+        drop(cache);
 
         Ok(())
     }
@@ -881,8 +888,9 @@ impl ClientCertVerifier for DynamicClientCertVerifier {
 /// Extract CRL Distribution Point URLs from a DER-encoded certificate.
 ///
 /// URLs are validated with `url::Url::parse` (case-insensitive scheme handling)
-/// and filtered through an internal scheme guard. Malformed URLs and URLs
-/// using disallowed schemes are silently dropped. SSRF defenses against private
+/// and filtered through an internal scheme guard. Malformed URLs, URLs
+/// using disallowed schemes, and URLs carrying embedded credentials
+/// (userinfo) are silently dropped. SSRF defenses against private
 /// IP literals and metadata endpoints are applied later, at fetch time, after
 /// DNS resolution.
 #[must_use]
@@ -900,12 +908,15 @@ pub fn extract_cdp_urls(cert_der: &[u8], allow_http: bool) -> Vec<String> {
                         if let GeneralName::URI(uri) = name {
                             let raw = *uri;
                             let Ok(parsed) = Url::parse(raw) else {
-                                tracing::debug!(url = %raw, "CDP URL parse failed; dropped");
+                                // `?raw` (Debug) escapes control characters the
+                                // failed parse may have left in this
+                                // attacker-supplied string.
+                                tracing::debug!(url = ?raw, "CDP URL parse failed; dropped");
                                 continue;
                             };
                             if let Err(reason) = check_scheme(&parsed, allow_http) {
                                 tracing::debug!(
-                                    url = %raw,
+                                    url = %sanitized_url_for_log(&parsed),
                                     reason,
                                     "CDP URL rejected by scheme guard; dropped"
                                 );
@@ -1007,6 +1018,9 @@ pub async fn bootstrap_fetch(
     tokio::pin!(timeout);
 
     while !tasks.is_empty() {
+        // cancel-safe: pinned Sleep and JoinSet::join_next are cancel-safe
+        // (tokio docs); on timeout the loop breaks and dropping the JoinSet
+        // aborts remaining fetches — the intended deadline behavior.
         tokio::select! {
             () = &mut timeout => {
                 tracing::warn!("CRL bootstrap timed out after {:?}", BOOTSTRAP_TIMEOUT);
@@ -1048,6 +1062,9 @@ pub async fn run_crl_refresher(
     let mut refresh_sleep = schedule_next_refresh(&set).await;
 
     loop {
+        // cancel-safe: CancellationToken::cancelled, pinned &mut Sleep, and
+        // mpsc::UnboundedReceiver::recv are all cancel-safe (tokio docs);
+        // refresh work happens inside arm bodies, never in the raced futures.
         tokio::select! {
             () = shutdown.cancelled() => {
                 break;
@@ -1147,6 +1164,7 @@ async fn next_refresh_delay(set: &CrlSet) -> Duration {
             next = next.min(clamp_refresh(duration));
         }
     }
+    drop(cache);
 
     next
 }
@@ -1233,9 +1251,12 @@ async fn fetch_crl(
         Url::parse(url).map_err(|error| McpxError::Tls(format!("CRL URL parse {url}: {error}")))?;
 
     if let Err(reason) = check_scheme(&parsed, allow_http) {
-        tracing::warn!(url = %url, reason, "CRL fetch denied: scheme");
+        // Sanitized: the gate must not echo what it rejects (the URL may
+        // carry userinfo credentials — the very thing being refused).
+        let sanitized = sanitized_url_for_log(&parsed);
+        tracing::warn!(url = %sanitized, reason, "CRL fetch denied: scheme");
         return Err(McpxError::Tls(format!(
-            "CRL scheme rejected ({reason}): {url}"
+            "CRL scheme rejected ({reason}): {sanitized}"
         )));
     }
 
@@ -1366,6 +1387,39 @@ mod tests {
 
     fn asn1(timestamp: i64) -> x509_parser::time::ASN1Time {
         x509_parser::time::ASN1Time::from_timestamp(timestamp).expect("valid ASN.1 timestamp")
+    }
+
+    /// The userinfo gate fires before DNS resolution (no network needed)
+    /// and the surfaced error must not echo the rejected credentials.
+    #[tokio::test]
+    async fn fetch_crl_rejects_userinfo_without_echoing_credentials() {
+        // reqwest with `rustls-no-provider` requires a process-wide crypto
+        // provider before any Client is built (same pattern as the
+        // transport/oauth test suites).
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = reqwest::Client::new();
+        let err = fetch_crl(&client, "https://u:p@crl.example/ca.crl", false, 1024)
+            .await
+            .expect_err("userinfo-bearing CRL URL must be rejected");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("userinfo_forbidden"),
+            "error must carry the rejection reason: {rendered}"
+        );
+        assert!(
+            !rendered.contains("u:p"),
+            "error must not echo the rejected credentials: {rendered}"
+        );
+    }
+
+    /// `extract_cdp_urls`'s scheme/userinfo guard reuses the same gate;
+    /// the sanitizer keeps credentials out of its debug logging too.
+    #[test]
+    fn sanitizer_used_by_rejection_sites_strips_credentials() {
+        let parsed = Url::parse("https://u:p@crl.example/ca.crl").expect("parse");
+        let sanitized = sanitized_url_for_log(&parsed);
+        assert_eq!(sanitized, "https://crl.example");
+        assert!(!sanitized.contains("u:p"));
     }
 
     #[test]
