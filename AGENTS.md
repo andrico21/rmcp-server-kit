@@ -182,9 +182,9 @@ consumer applications and `examples/`.
         Outermost ── Middleware chain ── Innermost     │
         (executed top-to-bottom on request)            │
                                                        │
-        1. Origin check       src/transport.rs:1183    │  spec: MCP origin validation
+        1. Origin check       src/transport.rs:1827    │  spec: MCP origin validation
         2. Peer-addr normalize (normalize_peer_addr_middleware) │  mirrors TLS peer into ConnectInfo<SocketAddr> + public PeerAddr (both branches)
-        3. Security headers   src/transport.rs:1110    │  HSTS, CSP, X-Frame-Options, ...
+        3. Security headers   src/transport.rs:1679    │  HSTS, CSP, X-Frame-Options, ...
         4. CORS / compression / body-size / timeouts   │  tower-http layers
         5. Optional concurrency cap + metrics          │
         6. Auth middleware    src/auth.rs              │  API key (Argon2) | mTLS | OAuth JWT
@@ -296,7 +296,7 @@ The most-violated rules — all `deny`-level in `Cargo.toml`:
 
 ## 10. Common pitfalls (history of bites)
 
-1. **Middleware order matters for security.** Origin check MUST run before auth so unauthenticated callers are rejected by origin first. Rate limit MUST be inside auth so anonymous storms don't amplify. See `src/transport.rs` middleware wiring around lines 1395-1520.
+1. **Middleware order matters for security.** Origin check MUST run before auth so unauthenticated callers are rejected by origin first. Rate limit MUST be inside auth so anonymous storms don't amplify. See `src/transport.rs` middleware wiring around lines 1640-1830.
 2. **JWKS refresh is rate-limited.** Don't remove the `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:1714`) — invalid JWTs would otherwise DoS the JWKS endpoint.
 3. **Task-local RBAC context only exists inside the request scope.** Calling `current_role()` from a `tokio::spawn`ed background task returns `None`. Capture the value before spawning.
 4. **`stdio` transport bypasses everything.** `serve_stdio` does NOT enforce auth, RBAC, TLS, or origin checks. It's intended for trusted local subprocess scenarios only.

@@ -417,19 +417,19 @@ graph TD
 
 | Area                              | Module / file                           | Notable symbols (file:line)                                                  |
 |-----------------------------------|------------------------------------------|-------------------------------------------------------------------------------|
-| Server entry (HTTP)               | `src/transport.rs`                       | `serve` ~L1275, `McpServerConfig` L73-355, `ReloadHandle` ~L712              |
+| Server entry (HTTP)               | `src/transport.rs`                       | `serve` ~L1880, `McpServerConfig` L277-560, `ReloadHandle` ~L1243              |
 | Server entry (stdio, no auth)     | `src/transport.rs`                       | `serve_stdio` ~L3375                                                          |
 | Router builder + middleware wire  | `src/transport.rs`                       | `build_app_router` ~L1349, security headers wired ~L1677, peer-addr normalize wired ~L1812, origin wired ~L1827 |
 | TLS / mTLS acceptor               | `src/transport.rs`                       | `TlsListener` ~L2418                                                          |
 | Origin / security headers (defs)  | `src/transport.rs`                       | `origin_check_middleware` ~L3282, `security_headers_middleware` ~L2876       |
 | Graceful shutdown                 | `src/transport.rs`                       | `shutdown_signal` ~L2808                                                      |
-| API key + mTLS auth               | `src/auth.rs`                            | `AuthIdentity` L40, `AuthState` L621, `auth_middleware` L970                 |
-| RBAC engine                       | `src/rbac.rs`                            | `RbacPolicy` L329, task-locals L83-145, `rbac_middleware` L584-700           |
-| Memory-bounded keyed limiter      | `src/bounded_limiter.rs`                 | `BoundedKeyedLimiter` L93                                                     |
+| API key + mTLS auth               | `src/auth.rs`                            | `AuthIdentity` L47, `AuthState` ~L930, `auth_middleware` L1393               |
+| RBAC engine                       | `src/rbac.rs`                            | `RbacPolicy` L352, task-locals L90-150, `rbac_middleware` L678-825           |
+| Memory-bounded keyed limiter      | `src/bounded_limiter.rs`                 | `BoundedKeyedLimiter` L96                                                     |
 | Trusted-forwarder resolution      | `src/forwarded.rs`                       | `resolve_client_ip`, `FallbackReason` (rightmost-untrusted, fail-safe-to-direct) |
 | OAuth JWT / JWKS                  | `src/oauth.rs` (feature `oauth`)         | `JwksCache` L1677, `JWKS_REFRESH_COOLDOWN` ~L1714, `select_jwks_key` L1997 |
 | SSRF guard (outbound HTTP)        | `src/ssrf.rs`                            | per-hop scheme/userinfo/IP-literal blocks                                     |
-| mTLS revocation (CRL)             | `src/mtls_revocation.rs`                 | `CrlSet` L95, `DynamicClientCertVerifier` L736, `bootstrap_fetch` L889       |
+| mTLS revocation (CRL)             | `src/mtls_revocation.rs`                 | `CrlSet` L100, `DynamicClientCertVerifier` L771, `bootstrap_fetch` L935       |
 | Tool hooks / size cap             | `src/tool_hooks.rs`                      | `HookedHandler` L219                                                          |
 | Admin diagnostics                 | `src/admin.rs`                           | `require_admin_role` L133, `admin_router` L160                                |
 | Tracing / audit log               | `src/observability.rs`                   | `init_tracing_from_config` L39, audit sink L170                              |

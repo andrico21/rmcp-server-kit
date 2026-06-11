@@ -101,12 +101,12 @@ There are **no circular dependencies**.
 
 A complete HTTP request to `/mcp` flows through these layers, top-to-bottom
 (outermost → innermost). The corresponding code lives in
-`src/transport.rs:1068-1480` (middleware wiring inside `build_app_router`) and in each module.
+`src/transport.rs:1349-1830` (middleware wiring inside `build_app_router`) and in each module.
 
 ```
 TCP / TLS handshake                         src/transport.rs:2418  (TlsListener)
    │  - Handshakes run CONCURRENTLY on a background acceptor task
-   │    (run_tls_acceptor, src/transport.rs:2218): 256-permit in-flight
+   │    (run_tls_acceptor, src/transport.rs:2542): 256-permit in-flight
    │    cap, 10 s per-handshake timeout; axum receives only completed
    │    connections via a bounded channel.
    │  - mTLS: client cert verified during the handshake; the resulting
@@ -163,7 +163,7 @@ axum Router                                  src/transport.rs:1349  (build_app_r
    │      governor::RateLimiter keyed by ClientIp (BoundedKeyedLimiter)
    │
    ▼
-rmcp StreamableHttpService                   src/transport.rs:900
+rmcp StreamableHttpService                   src/transport.rs:1362
    └── Your ServerHandler::call_tool(...)
         (optionally wrapped by HookedHandler — src/tool_hooks.rs:361-482)
        │
@@ -202,7 +202,7 @@ Authenticated endpoints:
 
 ## 4. Core types
 
-### `McpServerConfig` — `src/transport.rs:127`
+### `McpServerConfig` — `src/transport.rs:277`
 Top-level builder-style config consumed by `serve()`. Holds:
 - bind address (`SocketAddr`)
 - server name + version
@@ -295,8 +295,8 @@ Startup-only.
 **File**: `src/auth.rs` (~600 LOC).
 
 ### Construction
-`AuthState` is built inside `build_app_router()` at `src/transport.rs:1112`. It contains:
-- `api_keys: ArcSwap<Vec<ApiKeyEntry>>` (`src/auth.rs:902`)
+`AuthState` is built inside `build_app_router()` at `src/transport.rs:1396`. It contains:
+- `api_keys: ArcSwap<Vec<ApiKeyEntry>>` (`src/auth.rs:935`)
 - mTLS identities: stored **per-connection** on the
   `TlsConnInfo` extension (`src/auth.rs:795`), read by `auth_middleware` (`src/auth.rs:1402-1407`).
   No shared `SocketAddr`-keyed map exists — the previous design was replaced
@@ -315,7 +315,7 @@ Startup-only.
   entirely** (the TLS handshake already performed expensive crypto with a
   verified peer, so mTLS callers cannot be used to mount a CPU-spray
   attack).
-- `jwks_cache: Option<Arc<JwksCache>>` (`src/oauth.rs:1260`) when `feature=oauth` is on and `oauth.issuer` is configured
+- `jwks_cache: Option<Arc<JwksCache>>` (`src/auth.rs:943`) when `feature=oauth` is on and `oauth.issuer` is configured
 
 ### API key flow
 1. Client sends `Authorization: Bearer <api-key>`.
@@ -737,7 +737,7 @@ Two ArcSwaps power runtime reconfiguration:
 
 | State            | Type                           | Defined at                  |
 |------------------|---------------------------------|-----------------------------|
-| API keys         | `ArcSwap<Vec<ApiKeyEntry>>`     | `src/auth.rs:902`           |
+| API keys         | `ArcSwap<Vec<ApiKeyEntry>>`     | `src/auth.rs:935`           |
 | RBAC policy      | `ArcSwap<RbacPolicy>`           | `src/transport.rs:1412`      |
 
 Procedure:
