@@ -320,7 +320,7 @@ fn check_doc(doc_name: &str, doc: &str) -> (usize, Vec<String>) {
             .unwrap_or_default()
             .join("\n");
 
-        if !c.anchors.iter().any(|a| window.contains(a.as_str())) {
+        if !c.anchors.iter().any(|a| window_has_anchor(&window, a)) {
             failures.push(format!(
                 "{doc_name}:{} cites {}:{} but none of the anchor symbols {:?} \
                  appear within {TOLERANCE} lines of the cited location \
@@ -334,6 +334,23 @@ fn check_doc(doc_name: &str, doc: &str) -> (usize, Vec<String>) {
     }
 
     (citations.len(), failures)
+}
+
+/// True when `anchor` occurs in `window` as a standalone identifier: the
+/// characters immediately surrounding the match (when present) must not
+/// be identifier characters. Plain substring matching let generic
+/// anchors like `serve` match inside `server` / `observed`, silently
+/// masking stale citations.
+fn window_has_anchor(window: &str, anchor: &str) -> bool {
+    fn is_ident(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_'
+    }
+    let bytes = window.as_bytes();
+    window.match_indices(anchor).any(|(pos, _)| {
+        let before_ok = pos == 0 || !bytes.get(pos - 1).copied().is_some_and(is_ident);
+        let after_ok = !bytes.get(pos + anchor.len()).copied().is_some_and(is_ident);
+        before_ok && after_ok
+    })
 }
 
 fn fmt_range(c: &Citation) -> String {
@@ -375,6 +392,19 @@ fn agents_citations_resolve() {
 #[test]
 fn mindmap_citations_resolve() {
     run_doc_test("docs/MINDMAP.md");
+}
+
+#[test]
+fn anchor_matching_requires_identifier_boundaries() {
+    assert!(window_has_anchor("pub async fn serve<H, F>(", "serve"));
+    assert!(window_has_anchor("calls serve() here", "serve"));
+    assert!(
+        !window_has_anchor("the server observed traffic", "serve"),
+        "substring inside larger identifiers must not match"
+    );
+    assert!(!window_has_anchor("preserved", "serve"));
+    assert!(window_has_anchor("get(healthz)", "healthz"));
+    assert!(!window_has_anchor("healthz_returns_ok", "healthz"));
 }
 
 #[test]
