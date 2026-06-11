@@ -1273,6 +1273,56 @@ for `tower_governor` on your extra router instead — its stock
 `PeerIpKeyExtractor` works on both plain and TLS listeners thanks to
 the `ConnectInfo<SocketAddr>` normalization described above.
 
+#### Trusted-forwarder mode (proxy-aware client IPs)
+
+Behind a reverse proxy, every client shares the proxy's IP — per-IP
+rate limiting collapses into one bucket. **Trusted-forwarder mode**
+fixes that by resolving the real client from the forwarding header,
+but only when it is safe to do so:
+
+```rust,ignore
+let config = config
+    .with_trusted_proxies(["10.0.0.0/8"]) // your proxy fleet (CIDRs or IPs)
+    // optional: read RFC 7239 `Forwarded` instead of X-Forwarded-For
+    .with_forwarded_header(rmcp_server_kit::transport::ForwardedHeaderMode::Forwarded);
+```
+
+TOML: `trusted_proxies = ["10.0.0.0/8"]` and
+`forwarded_header = "forwarded"` (default `"x-forwarded-for"`) under
+`[server]`.
+
+How it resolves (the **rightmost-untrusted** algorithm, as in nginx
+`real_ip` / Envoy):
+
+1. If the **direct socket peer** is not in `trusted_proxies`, the
+   header is ignored entirely — prepending `X-Forwarded-For` from the
+   open internet does nothing (the leftmost-trust anti-pattern is never
+   used).
+2. Otherwise, walk the LAST header instance right-to-left, skip
+   addresses that are themselves trusted proxies, and take the first
+   that is not: that is the client.
+3. Anything ambiguous — malformed entries, RFC 7239 obfuscated
+   identifiers (`unknown`, `_…`), chains that are entirely trusted,
+   more than 16 entries — falls back to the **direct peer**, never to a
+   header value. Only a reason code is logged (`debug`), never raw
+   header contents.
+
+The result is exposed as the `transport::ClientIp` request extension
+(also extractable in your handlers) and is what **all four rate
+limiters key by**. `PeerAddr` is unchanged — it stays the direct socket
+peer, so you can compare the two when you need provenance:
+
+| Extension | Meaning |
+|---|---|
+| `PeerAddr` | Direct socket peer, always (proxy's address behind an LB) |
+| `ClientIp` | Resolved client when trusted-forwarder mode applies, else = direct peer |
+
+**Enable this only when every ingress path traverses the listed
+proxies.** If clients can also reach the server directly, their direct
+IPs and the proxied clients' resolved IPs share one keyspace by design,
+but a direct attacker could choose their own bucket only via their real
+source IP — never via a header.
+
 ### Customising security headers
 
 By default, rmcp-server-kit emits twelve OWASP security headers on every

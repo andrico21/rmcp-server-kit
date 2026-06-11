@@ -8,6 +8,27 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+### Added
+
+- **Trusted-forwarder mode: proxy-aware client IPs for all rate
+  limiters** (completes the final deferred item from
+  [#10](https://github.com/andrico21/rmcp-server-kit/issues/10)):
+  `McpServerConfig::with_trusted_proxies(cidrs)` +
+  `with_forwarded_header(mode)` (TOML `server.trusted_proxies`,
+  `server.forwarded_header` = `"x-forwarded-for"` default /
+  `"forwarded"` for RFC 7239). When the **direct peer** is inside the
+  trusted CIDRs, the client IP is resolved via the rightmost-untrusted
+  walk over the last forwarding-header instance (16-entry scan cap;
+  malformed/obfuscated/all-trusted chains fall back to the direct peer;
+  only reason codes are logged, never header contents). The result is
+  the new public `transport::ClientIp` request extension, and **all
+  four per-IP rate limiters now key by it** — behind a proxy, clients
+  get individual buckets instead of sharing the proxy's. With the
+  feature off (default), `ClientIp` equals the direct peer and behavior
+  is unchanged. `PeerAddr` keeps its direct-socket-peer contract.
+  Headers from untrusted peers are ignored entirely (leftmost-trust is
+  never used). New dependency: `ipnet` (MIT OR Apache-2.0).
+
 ## [1.12.0] - 2026-06-11
 
 ### Added

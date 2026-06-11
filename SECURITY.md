@@ -41,6 +41,14 @@ within **30 days** for confirmed high-severity issues.
   the documented baseline.
 - Any issue in the OWASP Top 10 categories applicable to a server
   library.
+- Bypass of the trusted-forwarder client-IP resolution (e.g. a header
+  shape that makes a non-proxied request resolve to an
+  attacker-controlled IP). The trust model: forwarding headers are
+  consulted **only** when the direct peer is inside the operator's
+  `trusted_proxies` CIDRs, resolution walks the chain
+  rightmost-untrusted, and every ambiguous input falls back to the
+  direct peer. See the "Trusted-forwarder mode" section of
+  [`docs/GUIDE.md`](docs/GUIDE.md) for the full model.
 
 ## Certificate revocation
 
