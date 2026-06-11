@@ -668,6 +668,182 @@ async fn extra_route_burst_allows_initial_spike() {
     assert_eq!(resp.status(), 429, "request 4 must exceed the burst bucket");
 }
 
+// ==========================================================================
+// Trusted-forwarder mode (limiter evolution, 1.13.0)
+// ==========================================================================
+
+#[tokio::test]
+async fn trusted_forwarder_separates_client_buckets() {
+    let port = free_port().await;
+    let cfg = config_on_port(port)
+        .with_extra_router(limited_extra_router())
+        .with_extra_route_rate_limit(1)
+        .with_trusted_proxies(["127.0.0.1/32"]);
+    let base = spawn_server(cfg).await;
+
+    let client = reqwest::Client::new();
+    let url = format!("{base}/ping");
+    let a1 = client
+        .get(&url)
+        .header("x-forwarded-for", "203.0.113.7")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(a1.status(), 200, "client A first request");
+    let a2 = client
+        .get(&url)
+        .header("x-forwarded-for", "203.0.113.7")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(a2.status(), 429, "client A exhausted its own bucket");
+    let b1 = client
+        .get(&url)
+        .header("x-forwarded-for", "203.0.113.8")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(b1.status(), 200, "client B has a separate bucket");
+}
+
+#[tokio::test]
+async fn forwarded_headers_ignored_without_config() {
+    let port = free_port().await;
+    let cfg = config_on_port(port)
+        .with_extra_router(limited_extra_router())
+        .with_extra_route_rate_limit(1);
+    let base = spawn_server(cfg).await;
+
+    let client = reqwest::Client::new();
+    let url = format!("{base}/ping");
+    let first = client
+        .get(&url)
+        .header("x-forwarded-for", "203.0.113.7")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+    // Different spoofed client, same direct peer: must share the bucket.
+    let second = client
+        .get(&url)
+        .header("x-forwarded-for", "203.0.113.8")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        second.status(),
+        429,
+        "without trusted_proxies the spoofed header must be inert"
+    );
+}
+
+#[tokio::test]
+async fn forwarded_headers_ignored_from_untrusted_peer() {
+    let port = free_port().await;
+    // Loopback (the actual direct peer) is NOT in the trusted set.
+    let cfg = config_on_port(port)
+        .with_extra_router(limited_extra_router())
+        .with_extra_route_rate_limit(1)
+        .with_trusted_proxies(["192.0.2.0/24"]);
+    let base = spawn_server(cfg).await;
+
+    let client = reqwest::Client::new();
+    let url = format!("{base}/ping");
+    let first = client
+        .get(&url)
+        .header("x-forwarded-for", "203.0.113.7")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+    let second = client
+        .get(&url)
+        .header("x-forwarded-for", "203.0.113.8")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        second.status(),
+        429,
+        "headers from an untrusted direct peer must be ignored"
+    );
+}
+
+#[tokio::test]
+async fn forwarded_rfc7239_mode_resolves() {
+    let port = free_port().await;
+    let cfg = config_on_port(port)
+        .with_extra_router(limited_extra_router())
+        .with_extra_route_rate_limit(1)
+        .with_trusted_proxies(["127.0.0.1/32"])
+        .with_forwarded_header(rmcp_server_kit::transport::ForwardedHeaderMode::Forwarded);
+    let base = spawn_server(cfg).await;
+
+    let client = reqwest::Client::new();
+    let url = format!("{base}/ping");
+    let a1 = client
+        .get(&url)
+        .header("forwarded", "for=203.0.113.9")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(a1.status(), 200);
+    let a2 = client
+        .get(&url)
+        .header("forwarded", "for=203.0.113.9")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(a2.status(), 429, "same RFC 7239 client shares its bucket");
+    let b1 = client
+        .get(&url)
+        .header("forwarded", "for=203.0.113.10")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(b1.status(), 200, "different RFC 7239 client is isolated");
+}
+
+#[tokio::test]
+async fn trusted_forwarder_keys_auth_limiter() {
+    let port = free_port().await;
+    let cfg = config_on_port(port)
+        .with_auth(AuthConfig::with_keys(vec![]).with_rate_limit(RateLimitConfig::new(1)))
+        .with_trusted_proxies(["127.0.0.1/32"]);
+    let base = spawn_server(cfg).await;
+
+    let client = reqwest::Client::new();
+    let url = format!("{base}/mcp");
+    // Two different forwarded clients: each gets its own post-failure
+    // budget (quota 1 -> first failure passes as 401).
+    let a1 = client
+        .post(&url)
+        .header("x-forwarded-for", "203.0.113.7")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(a1.status(), 401, "client A first failure");
+    let b1 = client
+        .post(&url)
+        .header("x-forwarded-for", "203.0.113.8")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(b1.status(), 401, "client B is a separate bucket");
+    // Client A again: budget exhausted -> 429. Proves the keying switch
+    // applies to the auth limiter, not just extra routes.
+    let a2 = client
+        .post(&url)
+        .header("x-forwarded-for", "203.0.113.7")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(a2.status(), 429, "client A exhausted its auth budget");
+}
+
 mod crl_tests {
     use std::{net::IpAddr, path::PathBuf};
 

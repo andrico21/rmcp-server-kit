@@ -12,7 +12,6 @@ use std::{net::IpAddr, num::NonZeroU32, sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
-    extract::ConnectInfo,
     http::{Method, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -23,11 +22,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use sha2::Sha256;
 
-use crate::{
-    auth::{AuthIdentity, TlsConnInfo},
-    bounded_limiter::BoundedKeyedLimiter,
-    error::McpxError,
-};
+use crate::{auth::AuthIdentity, bounded_limiter::BoundedKeyedLimiter, error::McpxError};
 
 /// Per-source-IP rate limiter for tool invocations. Memory-bounded against
 /// IP-spray `DoS` via [`BoundedKeyedLimiter`].
@@ -691,16 +686,9 @@ pub(crate) async fn rbac_middleware(
         return next.run(req).await;
     }
 
-    // Extract peer IP for rate limiting.
-    let peer_ip: Option<IpAddr> = req
-        .extensions()
-        .get::<ConnectInfo<std::net::SocketAddr>>()
-        .map(|ci| ci.0.ip())
-        .or_else(|| {
-            req.extensions()
-                .get::<ConnectInfo<TlsConnInfo>>()
-                .map(|ci| ci.0.addr.ip())
-        });
+    // Extract the rate-limit key (resolved client IP when trusted-forwarder
+    // mode is active, else the direct peer).
+    let peer_ip: Option<IpAddr> = crate::transport::limiter_client_ip(req.extensions());
 
     // Extract caller identity and role (may be absent when auth is off).
     let identity = req.extensions().get::<AuthIdentity>();

@@ -151,6 +151,65 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerAddr {
     }
 }
 
+/// Resolved client IP of the current request.
+///
+/// Inserted as a request extension on every request served by [`serve`],
+/// right after [`PeerAddr`]. Equals the direct peer's IP unless
+/// **trusted-forwarder mode** is active
+/// ([`McpServerConfig::with_trusted_proxies`]) and the request arrived
+/// through a trusted proxy with a verifiable forwarding chain — in that
+/// case it is the rightmost-untrusted address from `X-Forwarded-For`
+/// (or RFC 7239 `Forwarded`, per
+/// [`McpServerConfig::with_forwarded_header`]).
+///
+/// All built-in per-IP rate limiters key by this value. [`PeerAddr`]
+/// keeps its direct-socket-peer contract unchanged; applications that
+/// need provenance can compare `ClientIp.ip` with `PeerAddr.addr.ip()`.
+///
+/// # Security
+///
+/// Resolution only ever activates when the **direct peer** is inside the
+/// operator's trusted-proxy CIDRs; every ambiguous chain (malformed or
+/// obfuscated entries, all-trusted chains, header bombs) falls back to
+/// the direct peer, never to a header value. The framework never logs
+/// this value outside rate-limit deny paths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct ClientIp {
+    /// Resolved client IP (direct peer unless trusted-forwarder resolution applied).
+    pub ip: IpAddr,
+}
+
+impl ClientIp {
+    /// Construct a new [`ClientIp`]. Framework-internal: downstream code
+    /// receives `ClientIp` via request extensions and never constructs it.
+    #[must_use]
+    pub(crate) const fn new(ip: IpAddr) -> Self {
+        Self { ip }
+    }
+}
+
+/// Which forwarding header trusted-forwarder mode reads.
+///
+/// TOML wire values are kebab-case: `"x-forwarded-for"` (default when
+/// unset) and `"forwarded"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum ForwardedHeaderMode {
+    /// De-facto standard `X-Forwarded-For` list (nginx, HAProxy, CDNs).
+    XForwardedFor,
+    /// RFC 7239 `Forwarded` header (`for=` parameters).
+    Forwarded,
+}
+
+/// Pre-parsed trusted-forwarder configuration captured by the
+/// peer-normalization middleware.
+struct ForwardResolver {
+    trusted: Vec<ipnet::IpNet>,
+    mode: ForwardedHeaderMode,
+}
+
 /// Per-header overrides for the OWASP security headers emitted by the
 /// global response middleware.
 ///
@@ -315,6 +374,27 @@ pub struct McpServerConfig {
         note = "use McpServerConfig::with_extra_route_rate_limit_burst(); direct field access will become pub(crate) in a future major release"
     )]
     pub extra_route_rate_limit_burst: Option<u32>,
+    /// Trusted reverse-proxy networks (CIDRs or bare IPs) for
+    /// **trusted-forwarder mode**. Empty (default) = mode off: every
+    /// limiter keys by the direct socket peer. Nonempty = requests whose
+    /// direct peer is inside one of these networks have their client IP
+    /// resolved from the forwarding header (rightmost-untrusted walk);
+    /// see [`ClientIp`]. Only enable when **all** ingress paths traverse
+    /// the listed proxies. Startup-only.
+    #[deprecated(
+        since = "1.13.0",
+        note = "use McpServerConfig::with_trusted_proxies(); direct field access will become pub(crate) in a future major release"
+    )]
+    pub trusted_proxies: Vec<String>,
+    /// Which forwarding header trusted-forwarder mode reads. `None`
+    /// (default) = `X-Forwarded-For`. Setting this requires
+    /// [`trusted_proxies`](Self::trusted_proxies) to be nonempty
+    /// (validated). Startup-only.
+    #[deprecated(
+        since = "1.13.0",
+        note = "use McpServerConfig::with_forwarded_header(); direct field access will become pub(crate) in a future major release"
+    )]
+    pub forwarded_header: Option<ForwardedHeaderMode>,
     /// Optional readiness probe for `/readyz`.
     /// When `None`, `/readyz` mirrors `/healthz` (always OK).
     #[deprecated(
@@ -612,6 +692,8 @@ impl McpServerConfig {
             extra_route_rate_limit: None,
             tool_rate_limit_burst: None,
             extra_route_rate_limit_burst: None,
+            trusted_proxies: Vec::new(),
+            forwarded_header: None,
         }
     }
 
@@ -832,6 +914,37 @@ impl McpServerConfig {
         self
     }
 
+    /// Enable **trusted-forwarder mode**: requests whose direct peer is
+    /// inside one of these networks (CIDRs or bare IPs) have their
+    /// client IP resolved from the forwarding header via the
+    /// rightmost-untrusted walk; all per-IP rate limiters then key by
+    /// the resolved [`ClientIp`]. Headers from peers outside these
+    /// networks are ignored entirely.
+    ///
+    /// Only enable when **all** ingress paths traverse the listed
+    /// proxies — otherwise direct clients keep their own buckets and
+    /// proxied clients collapse into the proxy's. Entries are validated
+    /// at [`validate`](Self::validate) time. Startup-only.
+    #[must_use]
+    pub fn with_trusted_proxies<I, S>(mut self, proxies: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.trusted_proxies = proxies.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Select which forwarding header trusted-forwarder mode reads
+    /// (default: `X-Forwarded-For`). Requires
+    /// [`with_trusted_proxies`](Self::with_trusted_proxies) to be set
+    /// (validated).
+    #[must_use]
+    pub fn with_forwarded_header(mut self, mode: ForwardedHeaderMode) -> Self {
+        self.forwarded_header = Some(mode);
+        self
+    }
+
     /// Register a callback that receives the [`ReloadHandle`] after the
     /// server is built. Use it to wire SIGHUP-style hot reloads of API
     /// keys and RBAC policy.
@@ -962,6 +1075,26 @@ impl McpServerConfig {
         Ok(())
     }
 
+    /// Validate the trusted-forwarder knobs: every `trusted_proxies`
+    /// entry must parse as a CIDR (`ipnet::IpNet`) or a bare IP
+    /// (normalized to a host network), and `forwarded_header` requires a
+    /// nonempty proxy list (fail-fast over a silent no-op).
+    fn check_trusted_forwarder(&self) -> Result<(), McpxError> {
+        for entry in &self.trusted_proxies {
+            if parse_proxy_net(entry).is_none() {
+                return Err(McpxError::Config(format!(
+                    "trusted_proxies entry {entry:?} is neither a CIDR nor an IP address"
+                )));
+            }
+        }
+        if self.forwarded_header.is_some() && self.trusted_proxies.is_empty() {
+            return Err(McpxError::Config(
+                "forwarded_header requires trusted_proxies to be nonempty".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Run the validation checks without consuming `self`. Used by
     /// internal call sites (e.g. tests) that need to inspect a config
     /// without taking ownership.
@@ -1037,6 +1170,9 @@ impl McpServerConfig {
 
         // 6c. Burst knobs (extracted helper).
         self.check_burst_knobs()?;
+
+        // 6d. Trusted-forwarder knobs (extracted helper).
+        self.check_trusted_forwarder()?;
 
         // 7. OAuth URL fields enforce HTTPS (unless `allow_http_oauth_urls`)
         #[cfg(feature = "oauth")]
@@ -1651,7 +1787,32 @@ where
     // admin endpoints, extra_router, ...) and all inner middleware see a
     // uniform peer-address contract regardless of TLS. Installed just
     // inside the origin check, which stays outermost by design.
-    router = router.layer(axum::middleware::from_fn(normalize_peer_addr_middleware));
+    let forward_resolver: Option<Arc<ForwardResolver>> = if config.trusted_proxies.is_empty() {
+        None
+    } else {
+        // Entries are guaranteed parseable by `check_trusted_forwarder`;
+        // filter_map is defensive only.
+        Some(Arc::new(ForwardResolver {
+            trusted: config
+                .trusted_proxies
+                .iter()
+                .filter_map(|entry| parse_proxy_net(entry))
+                .collect(),
+            mode: config
+                .forwarded_header
+                .unwrap_or(ForwardedHeaderMode::XForwardedFor),
+        }))
+    };
+    if forward_resolver.is_some() {
+        tracing::info!(
+            proxies = config.trusted_proxies.len(),
+            "trusted-forwarder mode enabled: limiters key by resolved client IP"
+        );
+    }
+    router = router.layer(axum::middleware::from_fn(move |req, next| {
+        let r = forward_resolver.clone();
+        normalize_peer_addr_middleware(r, req, next)
+    }));
 
     // Origin validation layer (MCP spec: servers MUST validate the
     // Origin header to prevent DNS rebinding attacks). Installed as the
@@ -2968,14 +3129,20 @@ async fn oauth_token_cache_headers_middleware(
 ///
 /// 1. mirrors the TLS peer address into `ConnectInfo<SocketAddr>` when
 ///    (and only when) it is absent, so stock axum-ecosystem extractors
-///    work unmodified, and
+///    work unmodified,
 /// 2. inserts the framework-owned [`PeerAddr`] extension on both
-///    branches.
+///    branches, and
+/// 3. inserts the resolved [`ClientIp`] extension: the direct peer's IP,
+///    unless trusted-forwarder mode is configured AND the direct peer is
+///    a trusted proxy AND the forwarding chain resolves — every
+///    ambiguous chain falls back to the direct peer with only a reason
+///    code logged at `debug` (never raw header contents).
 ///
 /// Precedence mirrors the auth middleware: an existing
 /// `ConnectInfo<SocketAddr>` always wins and is never overwritten. The
 /// peer address is deliberately not logged here.
 async fn normalize_peer_addr_middleware(
+    resolver: Option<Arc<ForwardResolver>>,
     mut req: Request<Body>,
     next: Next,
 ) -> axum::response::Response {
@@ -2992,8 +3159,48 @@ async fn normalize_peer_addr_middleware(
             req.extensions_mut().insert(ConnectInfo(addr));
         }
         req.extensions_mut().insert(PeerAddr::new(addr));
+        let client_ip = match &resolver {
+            Some(r) => {
+                crate::forwarded::resolve_client_ip(addr.ip(), req.headers(), &r.trusted, r.mode)
+                    .unwrap_or_else(|reason| {
+                        tracing::debug!(
+                            reason = ?reason,
+                            "forwarded-header resolution fell back to direct peer"
+                        );
+                        addr.ip()
+                    })
+            }
+            None => addr.ip(),
+        };
+        req.extensions_mut().insert(ClientIp::new(client_ip));
     }
     next.run(req).await
+}
+
+/// Parse a trusted-proxy entry: a CIDR (`10.0.0.0/8`) or a bare IP
+/// (normalized to a `/32` / `/128` host network).
+fn parse_proxy_net(entry: &str) -> Option<ipnet::IpNet> {
+    if let Ok(net) = entry.parse::<ipnet::IpNet>() {
+        return Some(net);
+    }
+    entry.parse::<IpAddr>().ok().map(ipnet::IpNet::from)
+}
+
+/// Rate-limit key for the current request: the resolved [`ClientIp`]
+/// when present, else the direct peer from either `ConnectInfo` form.
+/// All four built-in limiters key through this helper.
+pub(crate) fn limiter_client_ip(extensions: &axum::http::Extensions) -> Option<IpAddr> {
+    if let Some(client) = extensions.get::<ClientIp>() {
+        return Some(client.ip);
+    }
+    extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip())
+        .or_else(|| {
+            extensions
+                .get::<ConnectInfo<TlsConnInfo>>()
+                .map(|ci| ci.0.addr.ip())
+        })
 }
 
 /// Per-IP rate limiter for `extra_router` routes, keyed by the direct
@@ -3055,15 +3262,7 @@ async fn extra_route_rate_limit_middleware(
     req: Request<Body>,
     next: Next,
 ) -> axum::response::Response {
-    let peer_ip: Option<IpAddr> = req
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ci| ci.0.ip())
-        .or_else(|| {
-            req.extensions()
-                .get::<ConnectInfo<TlsConnInfo>>()
-                .map(|ci| ci.0.addr.ip())
-        });
+    let peer_ip: Option<IpAddr> = limiter_client_ip(req.extensions());
     if let Some(ip) = peer_ip
         && let Err(wait) = limiter.check_key_wait(&ip)
     {
@@ -3425,7 +3624,9 @@ mod tests {
         }
         axum::Router::new()
             .route("/probe", axum::routing::get(probe))
-            .layer(axum::middleware::from_fn(normalize_peer_addr_middleware))
+            .layer(axum::middleware::from_fn(|req, next| {
+                normalize_peer_addr_middleware(None, req, next)
+            }))
     }
 
     async fn body_string(resp: axum::response::Response) -> String {
@@ -3711,6 +3912,148 @@ mod tests {
             .with_rate_limit(crate::auth::RateLimitConfig::new(10).with_pre_auth_burst(50));
         let cfg = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0").with_auth(auth);
         assert!(cfg.validate().is_ok(), "pre_auth_burst has no orphan rule");
+    }
+
+    // -- trusted-forwarder mode (ClientIp / ForwardedHeaderMode) --
+
+    fn forward_resolver(trusted: &[&str], mode: ForwardedHeaderMode) -> Arc<ForwardResolver> {
+        Arc::new(ForwardResolver {
+            trusted: trusted.iter().map(|s| s.parse().unwrap()).collect(),
+            mode,
+        })
+    }
+
+    /// Probe router reporting `"<PeerAddr ip>|<ClientIp>"`.
+    fn forwarded_probe_router(resolver: Option<Arc<ForwardResolver>>) -> axum::Router {
+        async fn probe(req: Request<Body>) -> String {
+            let pa = req
+                .extensions()
+                .get::<PeerAddr>()
+                .map(|p| p.addr.ip().to_string())
+                .unwrap_or_default();
+            let ci = req
+                .extensions()
+                .get::<ClientIp>()
+                .map(|c| c.ip.to_string())
+                .unwrap_or_default();
+            format!("{pa}|{ci}")
+        }
+        axum::Router::new()
+            .route("/probe", axum::routing::get(probe))
+            .layer(axum::middleware::from_fn(move |req, next| {
+                let r = resolver.clone();
+                normalize_peer_addr_middleware(r, req, next)
+            }))
+    }
+
+    fn probe_req(peer: &str, header: Option<(&str, &str)>) -> Request<Body> {
+        let addr: SocketAddr = peer.parse().unwrap();
+        let mut builder = Request::builder()
+            .uri("/probe")
+            .extension(ConnectInfo(addr));
+        if let Some((name, value)) = header {
+            builder = builder.header(name, value);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn client_ip_equals_direct_without_resolver() {
+        let app = forwarded_probe_router(None);
+        let resp = app
+            .oneshot(probe_req(
+                "10.1.2.3:4444",
+                Some(("x-forwarded-for", "203.0.113.7")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            body_string(resp).await,
+            "10.1.2.3|10.1.2.3",
+            "feature off: header ignored, ClientIp == direct"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_ip_resolved_for_trusted_peer() {
+        let app = forwarded_probe_router(Some(forward_resolver(
+            &["10.0.0.0/8"],
+            ForwardedHeaderMode::XForwardedFor,
+        )));
+        let resp = app
+            .oneshot(probe_req(
+                "10.0.0.1:9999",
+                Some(("x-forwarded-for", "203.0.113.7")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            body_string(resp).await,
+            "10.0.0.1|203.0.113.7",
+            "PeerAddr stays direct while ClientIp resolves"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_ip_falls_back_to_direct_on_malformed_header() {
+        let app = forwarded_probe_router(Some(forward_resolver(
+            &["10.0.0.0/8"],
+            ForwardedHeaderMode::XForwardedFor,
+        )));
+        let resp = app
+            .oneshot(probe_req(
+                "10.0.0.1:9999",
+                Some(("x-forwarded-for", "not-an-ip")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            body_string(resp).await,
+            "10.0.0.1|10.0.0.1",
+            "malformed chain falls back to the direct peer"
+        );
+    }
+
+    #[test]
+    fn forwarded_header_mode_deserializes_kebab_case() {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            mode: ForwardedHeaderMode,
+        }
+        let w: Wrapper = toml::from_str(r#"mode = "x-forwarded-for""#).unwrap();
+        assert_eq!(w.mode, ForwardedHeaderMode::XForwardedFor);
+        let w: Wrapper = toml::from_str(r#"mode = "forwarded""#).unwrap();
+        assert_eq!(w.mode, ForwardedHeaderMode::Forwarded);
+        assert!(
+            toml::from_str::<Wrapper>(r#"mode = "XForwardedFor""#).is_err(),
+            "PascalCase wire value must be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_bad_trusted_proxy_entry() {
+        let cfg = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0")
+            .with_trusted_proxies(["not-a-cidr"]);
+        let err = cfg.validate().expect_err("bad CIDR");
+        assert!(err.to_string().contains("trusted_proxies"));
+    }
+
+    #[test]
+    fn validate_accepts_cidr_and_bare_ip_proxy_entries() {
+        let cfg = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0").with_trusted_proxies([
+            "10.0.0.0/8",
+            "192.0.2.1",
+            "2001:db8::1",
+        ]);
+        assert!(cfg.validate().is_ok(), "CIDRs and bare IPs are accepted");
+    }
+
+    #[test]
+    fn validate_rejects_forwarded_header_without_proxies() {
+        let cfg = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0")
+            .with_forwarded_header(ForwardedHeaderMode::Forwarded);
+        let err = cfg.validate().expect_err("mode without proxies");
+        assert!(err.to_string().contains("requires trusted_proxies"));
     }
 
     // -- origin_check_middleware --

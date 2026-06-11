@@ -61,6 +61,17 @@ pub struct ServerConfig {
     /// sustained rate stays `extra_route_rate_limit`). Requires
     /// `extra_route_rate_limit`; must be greater than zero.
     pub extra_route_rate_limit_burst: Option<u32>,
+    /// Trusted reverse-proxy networks (CIDRs or bare IPs) for
+    /// trusted-forwarder mode. Empty (default) = off. When the direct
+    /// peer is inside one of these networks, the client IP is resolved
+    /// from the forwarding header (rightmost-untrusted walk) and all
+    /// per-IP rate limiters key by it. Startup-only.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
+    /// Which forwarding header trusted-forwarder mode reads:
+    /// `"x-forwarded-for"` (default when unset) or `"forwarded"`
+    /// (RFC 7239). Requires `trusted_proxies` to be nonempty.
+    pub forwarded_header: Option<crate::transport::ForwardedHeaderMode>,
     /// Idle timeout for MCP sessions. Sessions with no activity for this
     /// duration are closed automatically. Default: 20 minutes.
     #[serde(default = "default_session_idle_timeout")]
@@ -112,6 +123,8 @@ impl Default for ServerConfig {
             tool_rate_limit_burst: None,
             extra_route_rate_limit: None,
             extra_route_rate_limit_burst: None,
+            trusted_proxies: Vec::new(),
+            forwarded_header: None,
             session_idle_timeout: default_session_idle_timeout(),
             sse_keep_alive: default_sse_keep_alive(),
             public_url: None,
@@ -195,38 +208,8 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
         ));
     }
 
-    if let Some(0) = server.tool_rate_limit_burst {
-        return Err(McpxError::Config(
-            "server.tool_rate_limit_burst must be greater than zero".into(),
-        ));
-    }
-    if let Some(0) = server.extra_route_rate_limit_burst {
-        return Err(McpxError::Config(
-            "server.extra_route_rate_limit_burst must be greater than zero".into(),
-        ));
-    }
-    if server.tool_rate_limit_burst.is_some() && server.tool_rate_limit.is_none() {
-        return Err(McpxError::Config(
-            "server.tool_rate_limit_burst requires server.tool_rate_limit".into(),
-        ));
-    }
-    if server.extra_route_rate_limit_burst.is_some() && server.extra_route_rate_limit.is_none() {
-        return Err(McpxError::Config(
-            "server.extra_route_rate_limit_burst requires server.extra_route_rate_limit".into(),
-        ));
-    }
-    if let Some(rl) = server.auth.as_ref().and_then(|a| a.rate_limit.as_ref()) {
-        if rl.burst == Some(0) {
-            return Err(McpxError::Config(
-                "auth.rate_limit.burst must be greater than zero".into(),
-            ));
-        }
-        if rl.pre_auth_burst == Some(0) {
-            return Err(McpxError::Config(
-                "auth.rate_limit.pre_auth_burst must be greater than zero".into(),
-            ));
-        }
-    }
+    validate_rate_limit_knobs(server)?;
+    validate_trusted_forwarder_config(server)?;
 
     if server.admin_enabled {
         let auth_enabled = server.auth.as_ref().is_some_and(|a| a.enabled);
@@ -280,6 +263,69 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
         ));
     }
 
+    Ok(())
+}
+
+/// Validate the rate-limit burst knobs of a TOML [`ServerConfig`]: zero
+/// bursts and orphan bursts fail fast (mirrors `McpServerConfig::check`;
+/// the auth bursts have no orphan rule — their base rates always resolve).
+fn validate_rate_limit_knobs(server: &ServerConfig) -> crate::error::Result<()> {
+    use crate::error::McpxError;
+
+    if let Some(0) = server.tool_rate_limit_burst {
+        return Err(McpxError::Config(
+            "server.tool_rate_limit_burst must be greater than zero".into(),
+        ));
+    }
+    if let Some(0) = server.extra_route_rate_limit_burst {
+        return Err(McpxError::Config(
+            "server.extra_route_rate_limit_burst must be greater than zero".into(),
+        ));
+    }
+    if server.tool_rate_limit_burst.is_some() && server.tool_rate_limit.is_none() {
+        return Err(McpxError::Config(
+            "server.tool_rate_limit_burst requires server.tool_rate_limit".into(),
+        ));
+    }
+    if server.extra_route_rate_limit_burst.is_some() && server.extra_route_rate_limit.is_none() {
+        return Err(McpxError::Config(
+            "server.extra_route_rate_limit_burst requires server.extra_route_rate_limit".into(),
+        ));
+    }
+    if let Some(rl) = server.auth.as_ref().and_then(|a| a.rate_limit.as_ref()) {
+        if rl.burst == Some(0) {
+            return Err(McpxError::Config(
+                "auth.rate_limit.burst must be greater than zero".into(),
+            ));
+        }
+        if rl.pre_auth_burst == Some(0) {
+            return Err(McpxError::Config(
+                "auth.rate_limit.pre_auth_burst must be greater than zero".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate the trusted-forwarder knobs of a TOML [`ServerConfig`]
+/// (mirrors `McpServerConfig::check_trusted_forwarder`).
+fn validate_trusted_forwarder_config(server: &ServerConfig) -> crate::error::Result<()> {
+    use crate::error::McpxError;
+
+    for entry in &server.trusted_proxies {
+        let is_net = entry.parse::<ipnet::IpNet>().is_ok();
+        let is_ip = entry.parse::<std::net::IpAddr>().is_ok();
+        if !(is_net || is_ip) {
+            return Err(McpxError::Config(format!(
+                "server.trusted_proxies entry {entry:?} is neither a CIDR nor an IP address"
+            )));
+        }
+    }
+    if server.forwarded_header.is_some() && server.trusted_proxies.is_empty() {
+        return Err(McpxError::Config(
+            "server.forwarded_header requires server.trusted_proxies to be nonempty".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -461,6 +507,35 @@ mod tests {
             err.to_string()
                 .contains("requires server.extra_route_rate_limit")
         );
+    }
+
+    #[test]
+    fn bad_trusted_proxy_entry_rejected() {
+        let cfg = ServerConfig {
+            trusted_proxies: vec!["not-a-cidr".into()],
+            ..ServerConfig::default()
+        };
+        let err = validate_server_config(&cfg).unwrap_err();
+        assert!(err.to_string().contains("trusted_proxies"));
+    }
+
+    #[test]
+    fn cidr_and_bare_ip_proxy_entries_accepted() {
+        let cfg = ServerConfig {
+            trusted_proxies: vec!["10.0.0.0/8".into(), "192.0.2.1".into()],
+            ..ServerConfig::default()
+        };
+        assert!(validate_server_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn forwarded_header_without_proxies_rejected() {
+        let cfg = ServerConfig {
+            forwarded_header: Some(crate::transport::ForwardedHeaderMode::Forwarded),
+            ..ServerConfig::default()
+        };
+        let err = validate_server_config(&cfg).unwrap_err();
+        assert!(err.to_string().contains("requires server.trusted_proxies"));
     }
 
     #[test]

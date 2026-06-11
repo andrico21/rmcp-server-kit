@@ -1362,15 +1362,15 @@ async fn authenticate_bearer_identity(
 /// Side effects on rejection: increments the `pre_auth_gate` failure
 /// counter and emits a warn-level log. mTLS-authenticated requests must
 /// be admitted by the caller *before* invoking this helper.
-fn pre_auth_gate(state: &AuthState, peer_addr: Option<SocketAddr>) -> Option<Response> {
+fn pre_auth_gate(state: &AuthState, client_ip: Option<IpAddr>) -> Option<Response> {
     let limiter = state.pre_auth_limiter.as_ref()?;
-    let addr = peer_addr?;
-    let Err(wait) = limiter.check_key_wait(&addr.ip()) else {
+    let ip = client_ip?;
+    let Err(wait) = limiter.check_key_wait(&ip) else {
         return None;
     };
     state.counters.record_failure(AuthFailureClass::PreAuthGate);
     tracing::warn!(
-        ip = %addr.ip(),
+        %ip,
         "auth rate limited by pre-auth gate (request rejected before credential verification)"
     );
     Some(
@@ -1395,16 +1395,13 @@ pub(crate) async fn auth_middleware(
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    // Extract peer address (and any mTLS identity) from ConnectInfo.
-    // Plain TCP: ConnectInfo<SocketAddr>. TLS / mTLS: ConnectInfo<TlsConnInfo>,
-    // which carries the verified identity directly on the connection — no
-    // shared map, no port-reuse aliasing.
+    // Extract the mTLS identity from ConnectInfo (TLS / mTLS:
+    // ConnectInfo<TlsConnInfo> carries the verified identity directly on
+    // the connection — no shared map, no port-reuse aliasing) and the
+    // rate-limit key (resolved client IP when trusted-forwarder mode is
+    // active, else the direct peer; see transport::limiter_client_ip).
     let tls_info = req.extensions().get::<ConnectInfo<TlsConnInfo>>().cloned();
-    let peer_addr = req
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ci| ci.0)
-        .or_else(|| tls_info.as_ref().map(|ci| ci.0.addr));
+    let client_ip = crate::transport::limiter_client_ip(req.extensions());
 
     // 1. Try mTLS identity (extracted by the TLS acceptor during handshake
     //    and attached to the connection itself).
@@ -1422,7 +1419,7 @@ pub(crate) async fn auth_middleware(
     // 2. Pre-auth abuse gate: rejects CPU-spray attacks BEFORE the Argon2id
     //    verification path runs. Keyed by source IP. mTLS connections (above)
     //    are exempt; this gate only protects the bearer/JWT verification path.
-    if let Some(blocked) = pre_auth_gate(&state, peer_addr) {
+    if let Some(blocked) = pre_auth_gate(&state, client_ip) {
         return blocked;
     }
 
@@ -1447,11 +1444,11 @@ pub(crate) async fn auth_middleware(
 
     // Rate limit check (applied after auth failure only).
     // Successful authentications do not consume rate limit budget.
-    if let (Some(limiter), Some(addr)) = (&state.rate_limiter, peer_addr)
-        && let Err(wait) = limiter.check_key_wait(&addr.ip())
+    if let (Some(limiter), Some(ip)) = (&state.rate_limiter, client_ip)
+        && let Err(wait) = limiter.check_key_wait(&ip)
     {
         state.counters.record_failure(AuthFailureClass::RateLimited);
-        tracing::warn!(ip = %addr.ip(), "auth rate limited after repeated failures");
+        tracing::warn!(%ip, "auth rate limited after repeated failures");
         return McpxError::RateLimitedFor {
             message: "too many failed authentication attempts".into(),
             retry_after: wait,
@@ -2083,12 +2080,12 @@ mod tests {
             seen_identities: SeenIdentitySet::new(),
             counters: AuthCounters::default(),
         };
-        let addr: SocketAddr = "10.7.7.7:55555".parse().unwrap();
+        let ip: IpAddr = "10.7.7.7".parse().unwrap();
         assert!(
-            pre_auth_gate(&state, Some(addr)).is_none(),
+            pre_auth_gate(&state, Some(ip)).is_none(),
             "first request within quota"
         );
-        let resp = pre_auth_gate(&state, Some(addr)).expect("second request must be gated");
+        let resp = pre_auth_gate(&state, Some(ip)).expect("second request must be gated");
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         let retry_after = resp
             .headers()
