@@ -27,6 +27,20 @@ pub enum McpxError {
     #[error("rate limited: {0}")]
     RateLimited(String),
 
+    /// Request was rejected by a rate limiter that knows the wait time.
+    ///
+    /// Renders as HTTP 429 with a `Retry-After` header (RFC 9110
+    /// delta-seconds: the duration is rounded **up** to whole seconds,
+    /// minimum `1`) and the message as a plain-text body. The legacy
+    /// [`RateLimited`](Self::RateLimited) variant remains headerless.
+    #[error("rate limited: {message} (retry after {retry_after:?})")]
+    RateLimitedFor {
+        /// Plain-text client-facing message (response body).
+        message: String,
+        /// Best-effort wait until the next request could be admitted.
+        retry_after: std::time::Duration,
+    },
+
     /// Underlying I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -53,12 +67,37 @@ pub enum McpxError {
     Metrics(String),
 }
 
+/// Render a wait [`Duration`](std::time::Duration) as RFC 9110
+/// `Retry-After` delta-seconds: rounded **up** to whole seconds, never
+/// below `1` (a `0` would invite an immediate retry storm).
+fn retry_after_secs(wait: std::time::Duration) -> u64 {
+    let mut secs = wait.as_secs();
+    if wait.subsec_nanos() > 0 {
+        secs = secs.saturating_add(1);
+    }
+    secs.max(1)
+}
+
 impl IntoResponse for McpxError {
     fn into_response(self) -> Response {
         let (status, client_msg) = match self {
             Self::Auth(msg) => (StatusCode::UNAUTHORIZED, msg),
             Self::Rbac(msg) => (StatusCode::FORBIDDEN, msg),
             Self::RateLimited(msg) => (StatusCode::TOO_MANY_REQUESTS, msg),
+            Self::RateLimitedFor {
+                message,
+                retry_after,
+            } => {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(
+                        axum::http::header::RETRY_AFTER,
+                        retry_after_secs(retry_after).to_string(),
+                    )],
+                    message,
+                )
+                    .into_response();
+            }
             // All remaining variants are internal - return a generic 500
             // to avoid leaking implementation details.
             other @ (Self::Config(_)
@@ -122,6 +161,47 @@ mod tests {
         let (status, body) = status_of(McpxError::RateLimited("slow down".into())).await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         assert!(body.contains("slow down"));
+    }
+
+    #[tokio::test]
+    async fn legacy_rate_limited_has_no_retry_after_header() {
+        let resp = McpxError::RateLimited("slow down".into()).into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            !resp.headers().contains_key(axum::http::header::RETRY_AFTER),
+            "legacy variant must stay headerless"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limited_for_sets_retry_after_header() {
+        let resp = McpxError::RateLimitedFor {
+            message: "slow down".into(),
+            retry_after: std::time::Duration::from_millis(1500),
+        }
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let header = resp
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .expect("Retry-After present")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(header, "2", "1.5s must round UP to 2");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"slow down");
+    }
+
+    #[test]
+    fn retry_after_secs_rounds_up_and_never_zero() {
+        use std::time::Duration;
+        assert_eq!(retry_after_secs(Duration::ZERO), 1, "zero floors to 1");
+        assert_eq!(retry_after_secs(Duration::from_millis(1)), 1);
+        assert_eq!(retry_after_secs(Duration::from_millis(999)), 1);
+        assert_eq!(retry_after_secs(Duration::from_secs(1)), 1, "exact stays");
+        assert_eq!(retry_after_secs(Duration::from_millis(1001)), 2, "ceil");
+        assert_eq!(retry_after_secs(Duration::from_secs(60)), 60);
     }
 
     #[tokio::test]
