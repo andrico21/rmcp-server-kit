@@ -8,6 +8,96 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+## [1.14.0] - 2026-06-11
+
+### Added
+
+- **Exempt paths for the extra-route rate limiter**
+  ([#11](https://github.com/andrico21/rmcp-server-kit/issues/11)):
+  `McpServerConfig::with_extra_route_rate_limit_exempt_paths(paths)` +
+  TOML `server.extra_route_rate_limit_exempt_paths`. Entries are matched
+  by **raw exact string comparison** against the request path — no
+  globs, no normalization — and the check is fail-closed (anything not
+  listed stays limited) and runs before key extraction, so exempt
+  requests (e.g. the RFC 8414 metadata document MCP clients fetch on
+  every connect) consume no limiter budget and never appear in deny
+  telemetry. Requires `extra_route_rate_limit`; entries must be
+  non-empty and start with `/` (validated at startup).
+- **Prometheus deny counters for all four built-in rate limiters**
+  ([#11](https://github.com/andrico21/rmcp-server-kit/issues/11),
+  feature `metrics`): new `McpMetrics.rate_limited_total`
+  (`rmcp_server_kit_rate_limited_total`, label `limiter` in `tool` /
+  `auth_pre` / `auth_post` / `extra_route`), incremented at each deny
+  site alongside the existing warn-level log. The shared `McpMetrics`
+  handle now travels to inner middleware via a request extension
+  inserted by the metrics layer; with metrics disabled the deny sites
+  are unchanged. `McpMetrics` is `#[non_exhaustive]`, so the field
+  addition is semver-minor.
+
+### Security
+
+- **CRL URL gate now rejects embedded credentials (userinfo), and
+  rejection sites no longer echo what they reject.** The shared
+  scheme guard used by CDP extraction and the CRL fetcher refuses
+  `https://user:pass@host/...` URLs (`userinfo_forbidden`) — making the
+  userinfo rejection that `SECURITY.md` already documented actually
+  enforced — and both rejection sites log only a sanitized
+  scheme+host+port rendering, so credentials from a CA chain's or client
+  certificate's CDP extension can never reach warn logs or error
+  strings. Found by the 1.13.0 guidelines review; fix design approved by
+  Oracle and Momus review gates.
+- **OAuth redirect-rejection warns no longer echo the rejected target
+  URL.** Both redirect-policy closures (`OauthHttpClient`, `JwksCache`)
+  log the sanitized scheme+host+port instead of the full target, so a
+  malicious IdP redirecting to a userinfo-bearing URL cannot plant
+  credentials in the logs.
+
+### Fixed
+
+- **Unparsed CDP URIs are debug-logged with `Debug` formatting** (`?raw`
+  instead of `%raw`), escaping control characters an attacker could
+  embed in a client certificate's CDP extension to forge log lines or
+  emit terminal escapes (the string only reaches this branch when
+  `Url::parse` fails, which strips none of the original bytes).
+
+### Documentation
+
+- All non-test `tokio::select!` sites now carry explicit
+  `// cancel-safe:` annotations (transport shutdown races, CRL
+  bootstrap/refresher loops), completing the crate's cancel-safety
+  documentation mandate.
+- New `SECURITY.md` subsection "CRL discovery under adversarial load":
+  documents the pre-validation CDP discovery invariant, the bounded
+  griefing residual and why per-source-IP budgeting is impossible at the
+  `ClientCertVerifier` layer, plus operator guidance (alert on
+  `discovery_rate_limited`, size `crl_max_seen_urls` /
+  `crl_max_cache_entries` to the CA estate, rely on bootstrap
+  pre-seeding). The drop-newest-at-cap cache policy rationale (LRU would
+  let an attacker evict the legitimate warm set) is now documented at
+  the policy site and in `SECURITY.md`.
+
+### Tooling
+
+- **`clippy::nursery` enabled crate-wide at `warn`** (promoted to deny in
+  CI via `-D warnings`), with three documented allows:
+  `missing_const_for_fn` (const-ness on pub fns is a one-way semver
+  promise), `redundant_pub_crate` (antagonistic to the enabled
+  `unreachable_pub`), and `option_if_let_else` (readability regressions
+  on the HMAC-fallback / poisoned-lock idioms). ~90 nursery findings
+  fixed across the crate, including explicit early guard drops on the
+  JWKS/CRL cache write paths and doc-link cleanups.
+- **`str_to_string` flipped from `allow` to `warn`** and remaining
+  violations fixed; `string_to_string` documented as removed from clippy
+  (covered by the already-enabled `implicit_clone`).
+- **`await_holding_refcell_ref` and `mem_forget` denied** (declared for
+  future-proofing; the crate has no current usage of either).
+- **`cargo vet` exemption baseline committed** under `supply-chain/`
+  (400 exemptions); the CI vet job now runs without `|| true` and can be
+  promoted to required after a green run.
+- **New `taplo` CI job** (`taplo fmt --check`); all tracked TOML files
+  reformatted to the repo's `.taplo.toml` policy, which now excludes the
+  cargo-vet-owned `supply-chain/` directory.
+
 ## [1.13.0] - 2026-06-11
 
 ### Added
