@@ -4,3 +4,7 @@
 [[unpublished.rmcp-server-kit]]
 version = "1.14.0"
 audited_as = "1.13.0"
+
+[[unpublished.rmcp-server-kit]]
+version = "1.15.0"
+audited_as = "1.14.0"

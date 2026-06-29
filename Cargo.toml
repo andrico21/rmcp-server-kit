@@ -1,6 +1,6 @@
 [package]
 name = "rmcp-server-kit"
-version = "1.14.0"
+version = "1.15.0"
 edition = "2024"
 rust-version = "1.95.0"
 license = "MIT OR Apache-2.0"
@@ -39,7 +39,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 # MCP Protocol - official Rust SDK
-rmcp = { version = "1.7", features = [
+rmcp = { version = "1.8", features = [
   "server",
   "transport-streamable-http-server",
   "transport-io",

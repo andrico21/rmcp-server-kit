@@ -42,7 +42,7 @@ Add rmcp-server-kit to your `Cargo.toml`:
 ```toml
 [dependencies]
 rmcp-server-kit = { version = "1", features = ["oauth"] }
-rmcp = { version = "1.7", features = ["server", "macros"] }
+rmcp = { version = "1.8", features = ["server", "macros"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 ```
 

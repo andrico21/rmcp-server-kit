@@ -95,7 +95,7 @@ Z:\TempPersistent\rmcp-server-kit\
 
 | Concern            | Crate(s)                                                      |
 |--------------------|----------------------------------------------------------------|
-| MCP protocol       | `rmcp` 1.7 (official Rust SDK; streamable-HTTP transport)      |
+| MCP protocol       | `rmcp` 1.8 (official Rust SDK; streamable-HTTP transport)      |
 | Async runtime      | `tokio` 1, `tokio-util`                                        |
 | HTTP framework     | `axum` 0.8, `tower`, `tower-http`, `http-body-util`            |
 | TLS / mTLS         | `rustls` 0.23 (ring), `tokio-rustls`, `x509-parser`            |

@@ -8,6 +8,24 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+## [1.15.0] - 2026-06-29
+
+### Changed
+
+- **Bumped the `rmcp` SDK from 1.7 to 1.8.** Non-breaking for this crate
+  ([rmcp-v1.7.0...rmcp-v1.8.0](https://github.com/modelcontextprotocol/rust-sdk/compare/rmcp-v1.7.0...rmcp-v1.8.0)):
+  `ServerHandler`, `StreamableHttpService`, `call_tool` / `CallToolRequestParams`,
+  and the `handler::server` module are all source-compatible. rmcp 1.8 adds
+  transparent server-side hardening that flows through `serve()` unchanged —
+  `MCP-Protocol-Version` header vs initialize-body validation, stricter tool
+  input/output-schema stripping, and SEP-2164 resource-not-found code
+  selection (peers on `2026-07-28`+ get `INVALID_PARAMS`, older peers keep
+  `RESOURCE_NOT_FOUND`). SEP-2577 deprecates Roots/Sampling/Logging in the SDK;
+  this crate does not use those APIs, so no warnings surface. `tower-http`
+  stays on 0.6 (reqwest 0.13.4 still pins `^0.6.8`; 0.7 would only fork the
+  tree without benefit). Other dependencies refreshed to latest semver-compatible
+  patches (anyhow, rustls, bytes, zeroize, time, uuid, …).
+
 ## [1.14.0] - 2026-06-11
 
 ### Added
