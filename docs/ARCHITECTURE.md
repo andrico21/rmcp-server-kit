@@ -104,7 +104,7 @@ A complete HTTP request to `/mcp` flows through these layers, top-to-bottom
 `src/transport.rs:1349-1830` (middleware wiring inside `build_app_router`) and in each module.
 
 ```
-TCP / TLS handshake                         src/transport.rs:2418  (TlsListener)
+TCP / TLS handshake                         src/transport.rs:2522  (TlsListener)
    │  - Handshakes run CONCURRENTLY on a background acceptor task
    │    (run_tls_acceptor, src/transport.rs:2542): 256-permit in-flight
    │    cap, 10 s per-handshake timeout; axum receives only completed
@@ -435,7 +435,7 @@ an outbound `Authorization` header for downstream token passthrough.
 
 ## 7. TLS / mTLS
 
-**Custom listener**: `TlsListener` in `src/transport.rs:2418`, implementing
+**Custom listener**: `TlsListener` in `src/transport.rs:2522`, implementing
 `axum::serve::Listener` so axum's hyper machinery accepts it as a drop-in
 replacement for `TcpListener`.
 
@@ -597,7 +597,7 @@ recommended.
 
 ### Validation flow
 1. Client sends `Authorization: Bearer <jwt>`.
-2. `JwksCache::validate_token(token)` (`src/oauth.rs:1893`):
+2. `JwksCache::validate_token(token)` (`src/oauth.rs:1925`):
    - Decodes the JWT header to get `kid` and `alg`.
    - `lookup_key()` looks up by `kid` in the cached JWKS
      (`src/oauth.rs:2319`).
@@ -772,7 +772,7 @@ pub enum McpxError {
 }
 ```
 
-`impl IntoResponse for McpxError` (`src/error.rs:56`) maps each
+`impl IntoResponse for McpxError` (`src/error.rs:126`) maps each
 variant to a sanitized HTTP response:
 - Status code (`401`, `403`, `400`, `429`, `413`, `500`)
 - Generic body (no internal details leaked to clients per OWASP)

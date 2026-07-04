@@ -808,6 +808,21 @@ pub enum AudienceValidationMode {
     Strict,
 }
 
+impl AudienceValidationMode {
+    /// Stable lower-case label for logs and diagnostics.
+    ///
+    /// Used so structured log fields render as a plain token
+    /// (e.g. `mode="warn"`) rather than the `Debug` form.
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Permissive => "permissive",
+            Self::Warn => "warn",
+            Self::Strict => "strict",
+        }
+    }
+}
+
 impl Default for OAuthConfig {
     fn default() -> Self {
         Self {
@@ -1716,6 +1731,17 @@ pub struct JwksCache {
 /// Minimum cooldown between JWKS refresh attempts (prevents abuse).
 const JWKS_REFRESH_COOLDOWN: Duration = Duration::from_secs(10);
 
+/// Upper bound on an upstream OAuth proxy response body (`/token`,
+/// `/introspect`, `/revoke`, and RFC 8693 token exchange).
+///
+/// The upstream is the operator-configured, SSRF-screened authorization
+/// server, so this is defense-in-depth rather than an attacker-facing
+/// control — but it keeps the proxy paths symmetric with the bounded JWKS
+/// fetch (`jwks_max_response_bytes`) so a misbehaving or compromised IdP
+/// cannot make the server buffer an unbounded response. 1 MiB comfortably
+/// covers token, introspection, and revocation JSON payloads.
+const OAUTH_PROXY_MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
+
 /// Algorithms we accept from JWKS-served keys.
 const ACCEPTED_ALGS: &[Algorithm] = &[
     Algorithm::RS256,
@@ -1906,6 +1932,9 @@ impl JwksCache {
     ///
     /// Returns [`JwtValidationFailure::Expired`] when the JWT is expired,
     /// or [`JwtValidationFailure::Invalid`] for all other validation failures.
+    // cancel-safe: composed of cancel-safe `decode_claims` (spawn_blocking
+    // decode, no shared state) plus pure, side-effect-free claim checks
+    // (`check_audience`, `resolve_role`). No partial state on cancellation.
     pub async fn validate_token_with_reason(
         &self,
         token: &str,
@@ -1948,6 +1977,10 @@ impl JwksCache {
     /// burst of concurrent JWT validations never starves other tasks on
     /// the multi-threaded runtime's worker pool. The blocking pool absorbs
     /// the verification cost; the async path stays responsive.
+    // cancel-safe: `select_jwks_key` (cancel-safe: read-only lookup + idempotent
+    // refresh) then a `spawn_blocking` decode whose `JoinHandle`, if dropped on
+    // cancellation, detaches the verification (it completes off-task). No shared
+    // state is mutated on this path.
     async fn decode_claims(&self, token: &str) -> Result<Claims, JwtValidationFailure> {
         let (key, alg) = self.select_jwks_key(token).await?;
 
@@ -2050,7 +2083,7 @@ impl JwksCache {
                     if !self.azp_fallback_warned.swap(true, Ordering::Relaxed) {
                         tracing::warn!(
                             expected = %self.expected_audience,
-                            azp = ?claims.azp,
+                            azp = claims.azp.as_deref().unwrap_or("-"),
                             "JWT accepted via deprecated azp-only audience fallback. \
                              Configure your IdP to populate aud, or set \
                              audience_validation_mode = \"strict\" once tokens carry aud correctly. \
@@ -2066,10 +2099,10 @@ impl JwksCache {
         }
         core::hint::cold_path();
         tracing::debug!(
-            aud = ?claims.aud.0,
-            azp = ?claims.azp,
+            aud = %claims.aud.log_display(),
+            azp = claims.azp.as_deref().unwrap_or("-"),
             expected = %self.expected_audience,
-            mode = ?self.audience_mode,
+            mode = self.audience_mode.as_str(),
             "JWT rejected: audience mismatch"
         );
         Err(JwtValidationFailure::Invalid)
@@ -2109,6 +2142,9 @@ impl JwksCache {
 
     /// Look up a decoding key by kid + algorithm. Refreshes JWKS on miss,
     /// subject to cooldown and deduplication constraints.
+    // cancel-safe: reads the key cache under a `tokio::sync::RwLock` and, on a
+    // miss, delegates to the idempotent `refresh_with_cooldown`. Cancellation at
+    // any await leaves the cache in its prior consistent state.
     async fn find_key(&self, kid: Option<&str>, alg: Algorithm) -> Option<DecodingKey> {
         // Try cached keys first.
         {
@@ -2134,6 +2170,21 @@ impl JwksCache {
     ///
     /// - Only one refresh in flight at a time (concurrent waiters share result).
     /// - At most one refresh per [`JWKS_REFRESH_COOLDOWN`] (10 seconds).
+    ///
+    /// # Cancellation
+    ///
+    /// **NOT cancel-safe by design.** `last_refresh_attempt` is committed
+    /// *before* the fetch so that a burst of failing or cancelled refreshes
+    /// cannot hammer the JWKS endpoint (the invalid-JWT → JWKS-refresh DoS
+    /// class; see `AGENTS.md` pitfall #2). The consequence is a deliberate
+    /// trade-off: if this future is cancelled between the timestamp write and
+    /// cache publication, a genuinely-new `kid` may be rejected for up to
+    /// [`JWKS_REFRESH_COOLDOWN`] (10s). Endpoint DoS protection is preferred
+    /// over immediate post-cancellation retriability. Do **not** "fix" this by
+    /// bypassing the cooldown on unknown-`kid` requests — that reopens the
+    /// DoS-amplification vector the cooldown exists to close.
+    // NOT cancel-safe: see the `# Cancellation` section above — cooldown is
+    // committed before the fetch to throttle JWKS-endpoint abuse.
     async fn refresh_with_cooldown(&self) {
         // Acquire the mutex to serialize refresh attempts.
         let _guard = self.refresh_lock.lock().await;
@@ -2168,6 +2219,10 @@ impl JwksCache {
     ///
     /// Internal implementation - callers should use [`Self::refresh_with_cooldown`]
     /// to respect rate limiting.
+    // cancel-safe (cache integrity): the cache is published via a single
+    // `*guard = Some(..)` assignment under the `tokio::sync::RwLock` write lock
+    // at the end. Cancellation before that point leaves the prior cache intact;
+    // it never observes a half-built cache.
     async fn refresh_inner(&self) -> Result<(), String> {
         let Some(jwks) = self.fetch_jwks().await else {
             return Ok(());
@@ -2459,6 +2514,58 @@ impl OneOrMany {
     fn contains(&self, value: &str) -> bool {
         self.0.iter().any(|v| v == value)
     }
+
+    /// Render the audience list as a single comma-separated string for
+    /// structured logging (e.g. `aud="a, b"`), preserving every entry so
+    /// no debugging signal is lost. An empty list renders as `"-"`.
+    fn log_display(&self) -> String {
+        if self.0.is_empty() {
+            "-".to_owned()
+        } else {
+            self.0.join(", ")
+        }
+    }
+}
+
+/// Format a JSON `aud` claim (string OR array of strings) for structured
+/// logging without losing shape.
+///
+/// The `aud` claim is legitimately either a single string or an array
+/// (RFC 7519 §4.1.3). Rendering via `serde_json::Value::as_str()` alone
+/// would drop array audiences (returns `None` → `"-"`), hiding real
+/// values in the log. This joins arrays with `", "`, passes strings
+/// through, and falls back to `"-"` only when the claim is truly absent
+/// or an unexpected JSON type.
+fn fmt_json_aud(value: Option<&serde_json::Value>) -> String {
+    match value {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(items)) => {
+            let joined = items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            if joined.is_empty() {
+                "-".to_owned()
+            } else {
+                joined
+            }
+        }
+        Some(
+            serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::Object(_),
+        )
+        | None => "-".to_owned(),
+    }
+}
+
+/// Render an optional JSON claim as a plain string for logging, without the
+/// `Debug` wrapper/escaping (e.g. `sub="alice"` not `sub=Some(String("alice"))`).
+/// Non-string or absent claims render as `"-"`.
+fn fmt_json_str(value: Option<&serde_json::Value>) -> &str {
+    value.and_then(serde_json::Value::as_str).unwrap_or("-")
 }
 
 impl<'de> Deserialize<'de> for OneOrMany {
@@ -2662,7 +2769,15 @@ pub async fn handle_token(
         Ok(resp) => {
             let status =
                 StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-            let body_bytes = resp.bytes().await.unwrap_or_default();
+            let Ok(body_bytes) =
+                read_response_capped(resp, OAUTH_PROXY_MAX_RESPONSE_BYTES, "oauth/token").await
+            else {
+                return oauth_error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "server_error",
+                    "upstream response too large or unreadable",
+                );
+            };
             (
                 status,
                 [(header::CONTENT_TYPE, "application/json")],
@@ -2794,7 +2909,15 @@ async fn proxy_oauth_admin_request(
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("application/json")
                 .to_owned();
-            let body_bytes = resp.bytes().await.unwrap_or_default();
+            let Ok(body_bytes) =
+                read_response_capped(resp, OAUTH_PROXY_MAX_RESPONSE_BYTES, "oauth/admin").await
+            else {
+                return oauth_error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "server_error",
+                    "upstream response too large or unreadable",
+                );
+            };
             (status, [(header::CONTENT_TYPE, content_type)], body_bytes).into_response()
         }
         Err(e) => {
@@ -2804,6 +2927,46 @@ async fn proxy_oauth_admin_request(
                 "server_error",
                 "upstream endpoint unreachable",
             )
+        }
+    }
+}
+
+/// Read an upstream response body, aborting if it exceeds `max_bytes`.
+///
+/// Mirrors the bounded-streaming read used for JWKS
+/// ([`JwksCache::fetch_jwks`]) so OAuth proxy paths never buffer an
+/// unbounded upstream response. Fails **closed**: on a transport error or
+/// a body that grows past the cap it returns `Err(())` (the caller maps
+/// this to a generic `502`); it never returns a truncated body that a
+/// caller might forward as if complete. `context` is an authority-only
+/// label for logs (never a full URL with credentials).
+async fn read_response_capped(
+    mut resp: reqwest::Response,
+    max_bytes: u64,
+    context: &str,
+) -> Result<Vec<u8>, ()> {
+    let initial_capacity = usize::try_from(max_bytes.min(64 * 1024)).unwrap_or(64 * 1024);
+    let mut body = Vec::with_capacity(initial_capacity);
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let chunk_len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+                let body_len = u64::try_from(body.len()).unwrap_or(u64::MAX);
+                if body_len.saturating_add(chunk_len) > max_bytes {
+                    tracing::warn!(
+                        context = context,
+                        max_bytes = max_bytes,
+                        "upstream OAuth response exceeded size cap; failing closed"
+                    );
+                    return Err(());
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => return Ok(body),
+            Err(error) => {
+                tracing::warn!(context = context, error = %error, "failed to read upstream OAuth response");
+                return Err(());
+            }
         }
     }
 }
@@ -2916,10 +3079,13 @@ pub async fn exchange_token(
         })?;
 
     let status = resp.status();
-    let body_bytes = resp.bytes().await.map_err(|e| {
-        tracing::error!(error = %e, "failed to read token exchange response");
-        crate::error::McpxError::Auth("server_error".into())
-    })?;
+    let body_bytes =
+        read_response_capped(resp, OAUTH_PROXY_MAX_RESPONSE_BYTES, "oauth/token-exchange")
+            .await
+            .map_err(|()| {
+                // read_response_capped already logged the cause (oversize / transport).
+                crate::error::McpxError::Auth("server_error".into())
+            })?;
 
     if !status.is_success() {
         core::hint::cold_path();
@@ -2988,7 +3154,7 @@ fn log_exchanged_token(exchanged: &ExchangedToken) {
     if !looks_like_jwt(&exchanged.access_token) {
         tracing::debug!(
             token_len = exchanged.access_token.len(),
-            issued_token_type = ?exchanged.issued_token_type,
+            issued_token_type = exchanged.issued_token_type.as_deref().unwrap_or("-"),
             expires_in = exchanged.expires_in,
             "exchanged token (opaque)",
         );
@@ -3004,10 +3170,10 @@ fn log_exchanged_token(exchanged: &ExchangedToken) {
         return;
     };
     tracing::debug!(
-        sub = ?claims.get("sub"),
-        aud = ?claims.get("aud"),
-        azp = ?claims.get("azp"),
-        iss = ?claims.get("iss"),
+        sub = fmt_json_str(claims.get("sub")),
+        aud = %fmt_json_aud(claims.get("aud")),
+        azp = fmt_json_str(claims.get("azp")),
+        iss = fmt_json_str(claims.get("iss")),
         expires_in = exchanged.expires_in,
         "exchanged token claims (JWT)",
     );
@@ -4890,6 +5056,87 @@ mod tests {
         let http = test_http_client();
         let resp = handle_introspect(&http, &proxy, "token=abc").await;
         assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn token_proxy_fails_closed_on_oversized_upstream_response() {
+        use http_body_util::BodyExt as _;
+        use wiremock::matchers::{method, path};
+
+        // Upstream returns a body far larger than OAUTH_PROXY_MAX_RESPONSE_BYTES.
+        let oversized = "x"
+            .repeat(usize::try_from(OAUTH_PROXY_MAX_RESPONSE_BYTES).unwrap_or(usize::MAX) + 4096);
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(oversized.clone()))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let proxy = proxy_cfg(&format!("{}/token", mock_server.uri()));
+        let http = test_http_client();
+        let resp = handle_token(&http, &proxy, "grant_type=authorization_code&code=abc").await;
+
+        // Must fail closed with 502, and MUST NOT forward the oversized body.
+        assert_eq!(
+            resp.status(),
+            502,
+            "oversized upstream response must fail closed as 502"
+        );
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes();
+        assert!(
+            body.len() < 1024,
+            "must return the small generic error body, not the oversized upstream body (got {} bytes)",
+            body.len()
+        );
+        assert!(
+            !body.windows(8).any(|w| w == b"xxxxxxxx"),
+            "the oversized upstream payload must not be forwarded to the client"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_proxy_passes_through_normal_response() {
+        use http_body_util::BodyExt as _;
+        use wiremock::matchers::{method, path};
+
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "at-123",
+                    "token_type": "Bearer"
+                })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let proxy = proxy_cfg(&format!("{}/token", mock_server.uri()));
+        let http = test_http_client();
+        let resp = handle_token(&http, &proxy, "grant_type=authorization_code&code=abc").await;
+
+        assert_eq!(
+            resp.status(),
+            200,
+            "a normal-sized response must pass through"
+        );
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes();
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("upstream JSON preserved");
+        assert_eq!(json["access_token"], "at-123");
     }
 
     #[tokio::test]

@@ -8,6 +8,19 @@ use thiserror::Error;
 ///
 /// Application crates should define their own error types and convert
 /// from/into `McpxError` where needed.
+///
+/// # Client-facing message invariant
+///
+/// The `String` payloads of [`Auth`](Self::Auth), [`Rbac`](Self::Rbac),
+/// [`RateLimited`](Self::RateLimited), and the `message` field of
+/// [`RateLimitedFor`](Self::RateLimitedFor) are rendered **verbatim to the
+/// HTTP client** by [`IntoResponse`]. Construction sites MUST keep these
+/// client-safe: no internal error text, source-error chains, file paths, IPs,
+/// SQL, or dependency details. Internal-only variants (`Config`, `Io`, `Json`,
+/// `Toml`, `Tls`, `Startup`, `Metrics`) are collapsed to a generic
+/// `"internal server error"` body and their detail is logged server-side only.
+/// Use [`client_message`](Self::client_message) to obtain the exact body that
+/// will be sent to the client for any variant.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum McpxError {
@@ -76,6 +89,38 @@ fn retry_after_secs(wait: std::time::Duration) -> u64 {
         secs = secs.saturating_add(1);
     }
     secs.max(1)
+}
+
+impl McpxError {
+    /// The exact body this error sends to the HTTP client.
+    ///
+    /// Client-facing variants ([`Auth`](Self::Auth), [`Rbac`](Self::Rbac),
+    /// [`RateLimited`](Self::RateLimited), [`RateLimitedFor`](Self::RateLimitedFor))
+    /// return their message verbatim; all internal variants return the generic
+    /// `"internal server error"` so implementation detail never leaks on the
+    /// wire. This is the single source of truth for the client body — the
+    /// [`IntoResponse`] impl uses it — so callers can assert or reuse the
+    /// client-safe text without duplicating the mapping.
+    ///
+    /// See the type-level "Client-facing message invariant" for the contract
+    /// construction sites must uphold.
+    #[must_use]
+    pub fn client_message(&self) -> std::borrow::Cow<'_, str> {
+        use std::borrow::Cow;
+        match self {
+            Self::Auth(msg) | Self::Rbac(msg) | Self::RateLimited(msg) => Cow::Borrowed(msg),
+            Self::RateLimitedFor { message, .. } => Cow::Borrowed(message),
+            // Internal variants: never leak detail to the client.
+            Self::Config(_)
+            | Self::Io(_)
+            | Self::Json(_)
+            | Self::Toml(_)
+            | Self::Tls(_)
+            | Self::Startup(_) => Cow::Borrowed("internal server error"),
+            #[cfg(feature = "metrics")]
+            Self::Metrics(_) => Cow::Borrowed("internal server error"),
+        }
+    }
 }
 
 impl IntoResponse for McpxError {
@@ -266,5 +311,58 @@ mod tests {
 
         let err = McpxError::RateLimited("throttled".into());
         assert_eq!(err.to_string(), "rate limited: throttled");
+    }
+
+    #[test]
+    fn client_message_exposes_client_facing_text_and_hides_internal_detail() {
+        // Client-facing variants: message passes through verbatim.
+        assert_eq!(
+            McpxError::Auth("bad token".into()).client_message(),
+            "bad token"
+        );
+        assert_eq!(McpxError::Rbac("nope".into()).client_message(), "nope");
+        assert_eq!(
+            McpxError::RateLimited("slow down".into()).client_message(),
+            "slow down"
+        );
+        assert_eq!(
+            McpxError::RateLimitedFor {
+                message: "too many".into(),
+                retry_after: std::time::Duration::from_secs(1),
+            }
+            .client_message(),
+            "too many"
+        );
+
+        // Internal variants: detail is hidden behind a generic body.
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "secret/path/leak");
+        assert_eq!(
+            McpxError::from(io_err).client_message(),
+            "internal server error"
+        );
+        assert_eq!(
+            McpxError::Tls("private key /etc/certs/server.key".into()).client_message(),
+            "internal server error"
+        );
+        assert_eq!(
+            McpxError::Config("bind 10.0.0.5:8443 failed".into()).client_message(),
+            "internal server error"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_message_matches_into_response_body() {
+        // The accessor and the wire body must agree for every variant we test.
+        for err in [
+            McpxError::Auth("a".into()),
+            McpxError::Rbac("b".into()),
+            McpxError::RateLimited("c".into()),
+            McpxError::Config("d".into()),
+            McpxError::Tls("e".into()),
+        ] {
+            let expected = err.client_message().into_owned();
+            let (_status, body) = status_of(err).await;
+            assert_eq!(body, expected, "client_message must equal the wire body");
+        }
     }
 }

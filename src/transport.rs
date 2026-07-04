@@ -1419,7 +1419,7 @@ where
     let ct = CancellationToken::new();
 
     let allowed_hosts = derive_allowed_hosts(&config.bind_addr, config.public_url.as_deref());
-    tracing::info!(allowed_hosts = ?allowed_hosts, "configured Streamable HTTP allowed hosts");
+    tracing::info!(allowed_hosts = %allowed_hosts.join(", "), "configured Streamable HTTP allowed hosts");
 
     let mcp_service = StreamableHttpService::new(
         move || Ok(handler_factory()),
@@ -1740,8 +1740,13 @@ where
         && let Some(ref oauth_config) = auth_config.oauth
         && oauth_config.proxy.is_some()
     {
-        router =
-            install_oauth_proxy_routes(router, &server_url, oauth_config, auth_state.as_ref())?;
+        router = install_oauth_proxy_routes(
+            router,
+            &server_url,
+            oauth_config,
+            auth_state.as_ref(),
+            config.max_request_body,
+        )?;
     }
 
     // OWASP security response headers (applied to all responses).
@@ -2246,6 +2251,7 @@ fn install_oauth_proxy_routes(
     server_url: &str,
     oauth_config: &crate::oauth::OAuthConfig,
     auth_state: Option<&Arc<AuthState>>,
+    max_request_body: usize,
 ) -> Result<axum::Router, McpxError> {
     let Some(ref proxy) = oauth_config.proxy else {
         return Ok(router);
@@ -2255,8 +2261,15 @@ fn install_oauth_proxy_routes(
     // cheap (refcounted) and shares the underlying connection pool.
     let http = crate::oauth::OauthHttpClient::with_config(oauth_config)?;
 
+    // Build the proxy endpoints on a DEDICATED sub-router so the request-body
+    // cap below applies to exactly these routes and cannot leak onto `/mcp`,
+    // health, or `/version`. Without this, the proxy routes would fall back to
+    // axum's 2 MB `DefaultBodyLimit` and silently ignore the operator's
+    // configured `max_request_body` (rust-review MEDIUM finding).
+    let proxy_router = axum::Router::new();
+
     let asm = crate::oauth::authorization_server_metadata(server_url, oauth_config);
-    let router = router.route(
+    let proxy_router = proxy_router.route(
         "/.well-known/oauth-authorization-server",
         axum::routing::get(move || {
             let m = asm.clone();
@@ -2265,7 +2278,7 @@ fn install_oauth_proxy_routes(
     );
 
     let proxy_authorize = proxy.clone();
-    let router = router.route(
+    let proxy_router = proxy_router.route(
         "/authorize",
         axum::routing::get(
             move |axum::extract::RawQuery(query): axum::extract::RawQuery| {
@@ -2277,7 +2290,7 @@ fn install_oauth_proxy_routes(
 
     let proxy_token = proxy.clone();
     let token_http = http.clone();
-    let router = router.route(
+    let proxy_router = proxy_router.route(
         "/token",
         axum::routing::post(move |body: String| {
             let p = proxy_token.clone();
@@ -2290,7 +2303,7 @@ fn install_oauth_proxy_routes(
     );
 
     let proxy_register = proxy.clone();
-    let router = router.route(
+    let proxy_router = proxy_router.route(
         "/register",
         axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
             let p = proxy_register;
@@ -2323,11 +2336,22 @@ fn install_oauth_proxy_routes(
         axum::Router::new()
     };
 
-    let router = router.merge(admin_router);
+    // Merge admin (introspect/revoke) BEFORE applying the body-limit layer so
+    // those routes inherit the cap too. `.layer` only wraps routes already
+    // present on `proxy_router`, so this cannot affect the outer router.
+    let proxy_router =
+        proxy_router
+            .merge(admin_router)
+            .layer(tower_http::limit::RequestBodyLimitLayer::new(
+                max_request_body,
+            ));
+
+    let router = router.merge(proxy_router);
 
     tracing::info!(
         introspect = proxy.expose_admin_endpoints && proxy.introspection_url.is_some(),
         revoke = proxy.expose_admin_endpoints && proxy.revocation_url.is_some(),
+        max_request_body,
         "OAuth 2.1 proxy endpoints enabled (/authorize, /token, /register)"
     );
     Ok(router)

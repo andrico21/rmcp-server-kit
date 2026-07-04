@@ -8,6 +8,60 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-07-05
+
+### Security
+
+- **OAuth proxy endpoints now honor the configured `max_request_body`.**
+  The `/token`, `/register`, `/introspect`, and `/revoke` proxy routes
+  previously fell back to axum's 2 MB `DefaultBodyLimit` because the
+  `RequestBodyLimitLayer` was scoped to `/mcp` only. They are now built on a
+  dedicated sub-router that applies the operator-configured limit (via
+  `RequestBodyLimitLayer`), so a single `max_request_body` value governs all
+  inbound bodies. Oversized requests to these routes now return `413`.
+  (rust-review MEDIUM.)
+- **Upstream OAuth proxy responses are now size-capped.** `handle_token`,
+  the introspect/revoke admin proxy, and the RFC 8693 token-exchange path
+  now read upstream responses through a bounded, fail-closed streaming
+  helper (`OAUTH_PROXY_MAX_RESPONSE_BYTES`, 1 MiB) instead of an unbounded
+  `resp.bytes()`. An oversized or unreadable upstream response yields a
+  generic `502` and is never forwarded to the client — symmetric with the
+  already-bounded JWKS fetch. (rust-review LOW.)
+
+### Added
+
+- **`McpxError::client_message()`** — returns the exact client-facing body
+  for any variant (verbatim message for `Auth`/`Rbac`/`RateLimited`/
+  `RateLimitedFor`; a generic `"internal server error"` for all internal
+  variants). Additive; documents and exposes the client-safe-message
+  invariant that `IntoResponse` already upholds. (rust-review LOW hardening.)
+
+### Changed
+
+- **JSON logs no longer emit escaped `Debug` wrappers for claim/identity
+  fields.** Structured fields that were logged with `?` on quote-bearing
+  types (`Option<String>`, `serde_json::Value`, audience lists) now render
+  as clean native strings — e.g. `"sub":"alice"` instead of
+  `"sub":"Some(String(\"alice\"))"`. Added internal helpers
+  (`fmt_json_aud`, `fmt_json_str`, `OneOrMany::log_display`,
+  `AudienceValidationMode::as_str`); the `aud` claim is formatted so
+  string-or-array audiences are preserved without loss. Log levels, fields,
+  and the (stderr) output stream are unchanged. The deliberate `Debug`
+  rendering of unparseable attacker-supplied CDP URLs (log-injection
+  defense) is intentionally retained.
+
+### Documentation
+
+- Annotated the request-path async fns (`authenticate_bearer_identity`,
+  `validate_token_with_reason`, `decode_claims`, `find_key`,
+  `refresh_with_cooldown`, `refresh_inner`) with mandated cancel-safety
+  comments (RUST_GUIDELINES §5). `JwksCache::refresh_with_cooldown` is
+  documented as **NOT cancel-safe by design**: it commits the refresh
+  cooldown before fetching to throttle JWKS-endpoint abuse, accepting a
+  ≤10 s post-cancellation false-negative window during key rotation rather
+  than reopening the invalid-JWT → JWKS-refresh DoS vector. (rust-review
+  LOW; behavior unchanged.)
+
 ## [2.0.0] - 2026-07-04
 
 ### Changed

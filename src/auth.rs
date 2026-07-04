@@ -1308,6 +1308,11 @@ fn unauthorized_response(state: &AuthState, failure_class: AuthFailureClass) -> 
         .into_response()
 }
 
+// cancel-safe: no shared-state mutation. The Argon2 verification is offloaded
+// to `spawn_blocking`; dropping its `JoinHandle` on cancellation detaches the
+// task (the hash completes off-task, harmlessly) rather than tearing partial
+// state. The OAuth branch delegates to `validate_token_with_reason`, which is
+// itself cancel-safe (read-only JWKS lookup + pure claim checks).
 async fn authenticate_bearer_identity(
     state: &AuthState,
     token: &str,

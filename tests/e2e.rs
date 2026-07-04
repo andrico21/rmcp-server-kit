@@ -1528,6 +1528,92 @@ async fn c3_admin_endpoints_can_require_auth() {
     );
 }
 
+/// rust-review MEDIUM: the OAuth proxy routes (`/token`, `/register`,
+/// `/introspect`, `/revoke`) must honor the operator-configured
+/// `max_request_body`, not fall back to axum's 2 MB `DefaultBodyLimit`.
+///
+/// Sets a 1 KiB cap (well below the 2 MB default) and asserts an oversized
+/// (~4 KiB) POST to each route type — `/token` (String extractor),
+/// `/register` (Json extractor), and `/introspect` (admin-merge route) — is
+/// rejected with 413. The body-limit layer rejects BEFORE the handler runs,
+/// so the unreachable upstream never matters. A small body proves the cap is
+/// not over-tight.
+#[cfg(feature = "oauth")]
+#[tokio::test]
+async fn c3_oauth_proxy_routes_honor_max_request_body() {
+    let mut auth = AuthConfig::with_keys(vec![]);
+    auth.oauth = Some(oauth_cfg_with_proxy(true)); // exposes /introspect + /revoke
+
+    let port = free_port().await;
+    let cfg = config_on_port(port)
+        .with_auth(auth)
+        .with_public_url(format!("http://127.0.0.1:{port}"))
+        .with_max_request_body(1024); // 1 KiB, far below axum's 2 MB default
+    let base = spawn_server(cfg).await;
+
+    let client = reqwest::Client::new();
+    let oversized = "x".repeat(4096); // 4 KiB > 1 KiB cap
+
+    // /token — String extractor.
+    let resp = client
+        .post(format!("{base}/token"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(oversized.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        413,
+        "/token must reject oversized body with 413 (got {})",
+        resp.status()
+    );
+
+    // /register — Json extractor. Send an oversized JSON string value.
+    let big_json = serde_json::json!({ "redirect_uris": [oversized.clone()] }).to_string();
+    let resp = client
+        .post(format!("{base}/register"))
+        .header("content-type", "application/json")
+        .body(big_json)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        413,
+        "/register must reject oversized body with 413 (got {})",
+        resp.status()
+    );
+
+    // /introspect — admin-merge route (proves the admin sub-router inherits
+    // the cap after the merge).
+    let resp = client
+        .post(format!("{base}/introspect"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(oversized.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        413,
+        "/introspect must reject oversized body with 413 (got {})",
+        resp.status()
+    );
+
+    // A small body must NOT be rejected by the limit (proves it isn't
+    // over-tight). Upstream is unreachable so we expect a 5xx/4xx from the
+    // handler — just assert it is NOT 413.
+    let resp = client
+        .post(format!("{base}/token"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body("grant_type=client_credentials")
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(resp.status(), 413, "a small body must pass the size limit");
+}
+
 // ==========================================================================
 // BUG-NEW: shutdown timeout double-signal regression test
 // ==========================================================================
