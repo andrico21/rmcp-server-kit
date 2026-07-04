@@ -41,10 +41,10 @@ use std::{fmt, future::Future, pin::Pin, sync::Arc};
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResult, Content, GetPromptRequestParams, GetPromptResult,
-        InitializeRequestParams, InitializeResult, ListPromptsResult, ListResourceTemplatesResult,
-        ListResourcesResult, ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams,
-        ReadResourceResult, ServerInfo, Tool,
+        CallToolRequestParams, CallToolResult, ContentBlock, GetPromptRequestParams,
+        GetPromptResult, InitializeRequestParams, InitializeResult, ListPromptsResult,
+        ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
+        ReadResourceRequestParams, ReadResourceResult, ServerInfo, Tool,
     },
     service::RequestContext,
 };
@@ -331,7 +331,7 @@ fn too_large_result(limit: usize, actual: usize, tool: &str) -> CallToolResult {
         "limit_bytes": limit,
         "actual_bytes": actual,
     });
-    let mut r = CallToolResult::error(vec![Content::text(body.to_string())]);
+    let mut r = CallToolResult::error(vec![ContentBlock::text(body.to_string())]);
     r.structured_content = None;
     r
 }
@@ -496,7 +496,7 @@ mod tests {
 
     use rmcp::{
         ErrorData, RoleServer, ServerHandler,
-        model::{CallToolRequestParams, CallToolResult, Content, ServerInfo},
+        model::{CallToolRequestParams, CallToolResult, ContentBlock, ServerInfo},
         service::RequestContext,
     };
 
@@ -520,7 +520,7 @@ mod tests {
             _context: RequestContext<RoleServer>,
         ) -> Result<CallToolResult, ErrorData> {
             let body = "x".repeat(self.body_bytes.unwrap_or(4));
-            Ok(CallToolResult::success(vec![Content::text(body)]))
+            Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
         }
     }
 
@@ -547,10 +547,10 @@ mod tests {
         });
         let hooked = with_hooks(inner, hooks);
 
-        let small = CallToolResult::success(vec![Content::text("ok".to_owned())]);
+        let small = CallToolResult::success(vec![ContentBlock::text("ok".to_owned())]);
         assert!(serialized_size(&small) < 256);
 
-        let big = CallToolResult::success(vec![Content::text("x".repeat(8_192))]);
+        let big = CallToolResult::success(vec![ContentBlock::text("x".repeat(8_192))]);
         let size = serialized_size(&big);
         assert!(size > 256);
 
@@ -559,8 +559,8 @@ mod tests {
         assert_eq!(accounted, size);
         assert_eq!(replaced.is_error, Some(true));
         assert!(matches!(
-            &replaced.content[0].raw,
-            rmcp::model::RawContent::Text(t) if t.text.contains("result_too_large")
+            &replaced.content[0],
+            rmcp::model::ContentBlock::Text(t) if t.text.contains("result_too_large")
         ));
 
         // Compile-check that HookedHandler instantiates with the test inner.
@@ -619,7 +619,7 @@ mod tests {
         // CallToolResult directly, with no need for the inner handler.
         let before: BeforeHook = Arc::new(|_ctx| {
             Box::pin(async {
-                HookOutcome::Replace(Box::new(CallToolResult::success(vec![Content::text(
+                HookOutcome::Replace(Box::new(CallToolResult::success(vec![ContentBlock::text(
                     "from-replace".to_owned(),
                 )])))
             })
@@ -642,8 +642,8 @@ mod tests {
         assert!(size > 0);
         assert!(!result.is_error.unwrap_or(false));
         assert!(matches!(
-            &result.content[0].raw,
-            rmcp::model::RawContent::Text(t) if t.text == "from-replace"
+            &result.content[0],
+            rmcp::model::ContentBlock::Text(t) if t.text == "from-replace"
         ));
     }
 
@@ -652,7 +652,7 @@ mod tests {
         // A Replace payload that exceeds max_result_bytes must be rewritten
         // to result_too_large just like an inner-handler result would be,
         // and the disposition must reflect ResultTooLarge.
-        let huge = CallToolResult::success(vec![Content::text("y".repeat(8_192))]);
+        let huge = CallToolResult::success(vec![ContentBlock::text("y".repeat(8_192))]);
         let huge_size = serialized_size(&huge);
         assert!(huge_size > 256);
 
@@ -661,8 +661,8 @@ mod tests {
         assert_eq!(accounted, huge_size);
         assert_eq!(final_result.is_error, Some(true));
         assert!(matches!(
-            &final_result.content[0].raw,
-            rmcp::model::RawContent::Text(t) if t.text.contains("result_too_large")
+            &final_result.content[0],
+            rmcp::model::ContentBlock::Text(t) if t.text.contains("result_too_large")
         ));
     }
 

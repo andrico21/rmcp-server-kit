@@ -44,7 +44,7 @@
 use std::{hint::black_box, sync::Arc};
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp_server_kit::tool_hooks::{
     AfterHook, BeforeHook, HookDisposition, HookOutcome, ToolCallContext, ToolHooks,
 };
@@ -55,7 +55,7 @@ fn make_ctx() -> ToolCallContext {
 }
 
 fn make_result() -> CallToolResult {
-    CallToolResult::success(vec![Content::text("ok".to_owned())])
+    CallToolResult::success(vec![ContentBlock::text("ok".to_owned())])
 }
 
 fn bench_hook_latency_bare(c: &mut Criterion) {

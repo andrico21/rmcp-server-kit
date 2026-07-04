@@ -8,6 +8,53 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-07-04
+
+### Changed
+
+- **BREAKING: Bumped the `rmcp` SDK from 1.8 to 2.1** — a major
+  ([rmcp-v1.8.0...rmcp-v2.1.0](https://github.com/modelcontextprotocol/rust-sdk/compare/rmcp-v1.8.0...rmcp-v2.1.0)).
+  rmcp 2.0 realigns the Rust API with the MCP 2025-11-25 spec. The **JSON
+  wire format is unchanged** (only additive `_meta` / optional fields);
+  all breakage is at the Rust API level. In-crate this touched exactly the
+  unified content model: `rmcp::model::Content` / `RawContent` are replaced
+  by the flat `ContentBlock` (the `Annotated<T>` wrapper and the `.raw`
+  accessor are gone). We updated `Content::text(...)` → `ContentBlock::text(...)`
+  and the `matches!(&result.content[N].raw, RawContent::Text(_))` test
+  assertions → `matches!(&result.content[N], ContentBlock::Text(_))` in
+  `src/tool_hooks.rs`, `tests/e2e.rs`, and `benches/hook_latency.rs`.
+  `ServerHandler`, `ServerInfo` / `ServerCapabilities` (already built via
+  the builder), `StreamableHttpService`, `StreamableHttpServerConfig`,
+  `ServiceExt`, `transport::io::stdio()`, and the requested feature set
+  (`server`, `transport-streamable-http-server`, `transport-io`, `macros`)
+  are all source-compatible and unchanged. rmcp 2.1 (over 2.0) is a
+  drop-in with fixes only (SEP-414 trace-context accessors, SEP-2575 meta
+  helpers, cancel-safe `AsyncRwTransport::receive`, OAuth refresh-token
+  preservation) — none of which this crate consumes directly. No MSRV
+  change (rmcp pins nothing above our Rust 1.95 floor).
+
+  **Why this is a major for `rmcp-server-kit`:** rmcp types appear in this
+  crate's public API (`HookedHandler<H: ServerHandler>` and its
+  `ServerHandler` impl, `HookOutcome::Replace(Box<CallToolResult>)`, and
+  other hook signatures returning/consuming `CallToolResult`). Downstream
+  code that pattern-matches on the re-exported content model must migrate
+  `RawContent`/`.raw` → `ContentBlock`. (`cargo semver-checks` reports no
+  change to *our* signature names, but it cannot see the semantic break in
+  the re-exported rmcp types, so the next release is bumped to **2.0.0**
+  deliberately.)
+
+- **`tower-http` intentionally stays on 0.6** (currently 0.6.11, the latest
+  0.6). 0.7.0 is available but `reqwest` (which we depend on directly) and
+  `axum 0.8` both hard-pin `tower-http = "^0.6.8"`, so upgrading our direct
+  dependency to 0.7 would only fork a second `tower-http` major into the
+  tree with no functional benefit — we use no 0.7-only feature, and the one
+  0.7 API delta that would touch us (`SizeAbove` threshold `u16`→`u64`)
+  is a cost, not a gain. This will be revisited once `reqwest`/`axum`
+  admit `tower-http 0.7`. Other dependencies were refreshed to their latest
+  semver-compatible patches (`humantime` 2.3→2.4, `rand` 0.10.1→0.10.2,
+  `rustls-pki-types` 1.14→1.15, `time` 0.3.51→0.3.53, `num-bigint`
+  0.4.6→0.4.7).
+
 ## [1.15.0] - 2026-06-29
 
 ### Changed
