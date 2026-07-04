@@ -1910,13 +1910,13 @@ async fn hooked_handler_serves_healthz() {
 fn hook_outcome_variants_are_constructible() {
     use rmcp::{
         ErrorData,
-        model::{CallToolResult, Content},
+        model::{CallToolResult, ContentBlock},
     };
     use rmcp_server_kit::tool_hooks::HookOutcome;
 
     let _ = HookOutcome::Continue;
     let _ = HookOutcome::Deny(ErrorData::invalid_request("denied", None));
-    let _ = HookOutcome::Replace(Box::new(CallToolResult::success(vec![Content::text(
+    let _ = HookOutcome::Replace(Box::new(CallToolResult::success(vec![ContentBlock::text(
         "x".to_owned(),
     )])));
 }
