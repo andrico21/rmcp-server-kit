@@ -559,8 +559,8 @@ mod tests {
         assert_eq!(accounted, size);
         assert_eq!(replaced.is_error, Some(true));
         assert!(matches!(
-            &replaced.content[0],
-            rmcp::model::ContentBlock::Text(t) if t.text.contains("result_too_large")
+            replaced.content.first(),
+            Some(rmcp::model::ContentBlock::Text(t)) if t.text.contains("result_too_large")
         ));
 
         // Compile-check that HookedHandler instantiates with the test inner.
@@ -642,8 +642,8 @@ mod tests {
         assert!(size > 0);
         assert!(!result.is_error.unwrap_or(false));
         assert!(matches!(
-            &result.content[0],
-            rmcp::model::ContentBlock::Text(t) if t.text == "from-replace"
+            result.content.first(),
+            Some(rmcp::model::ContentBlock::Text(t)) if t.text == "from-replace"
         ));
     }
 
@@ -661,8 +661,8 @@ mod tests {
         assert_eq!(accounted, huge_size);
         assert_eq!(final_result.is_error, Some(true));
         assert!(matches!(
-            &final_result.content[0],
-            rmcp::model::ContentBlock::Text(t) if t.text.contains("result_too_large")
+            final_result.content.first(),
+            Some(rmcp::model::ContentBlock::Text(t)) if t.text.contains("result_too_large")
         ));
     }
 
