@@ -516,7 +516,7 @@ version = "1.0.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.humantime]]
-version = "2.3.0"
+version = "2.4.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.humantime-serde]]
@@ -700,7 +700,7 @@ version = "0.50.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.num-bigint]]
-version = "0.4.6"
+version = "0.4.7"
 criteria = "safe-to-deploy"
 
 [[exemptions.num-bigint-dig]]
@@ -864,7 +864,7 @@ version = "0.9.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.rand]]
-version = "0.10.1"
+version = "0.10.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.rand_chacha]]
@@ -936,11 +936,11 @@ version = "0.17.14"
 criteria = "safe-to-deploy"
 
 [[exemptions.rmcp]]
-version = "1.8.0"
+version = "2.1.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.rmcp-macros]]
-version = "1.8.0"
+version = "2.1.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.rmcp-server-kit]]
@@ -972,7 +972,7 @@ version = "0.8.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.rustls-pki-types]]
-version = "1.14.1"
+version = "1.15.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.rustls-platform-verifier]]
@@ -1192,7 +1192,7 @@ version = "1.1.9"
 criteria = "safe-to-deploy"
 
 [[exemptions.time]]
-version = "0.3.51"
+version = "0.3.53"
 criteria = "safe-to-deploy"
 
 [[exemptions.time-core]]
@@ -1200,7 +1200,7 @@ version = "0.1.9"
 criteria = "safe-to-deploy"
 
 [[exemptions.time-macros]]
-version = "0.2.30"
+version = "0.2.31"
 criteria = "safe-to-deploy"
 
 [[exemptions.tinystr]]
