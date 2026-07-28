@@ -58,7 +58,7 @@ tower = { version = "0.5", features = [
   "limit",
   "load-shed",
 ] }
-tower-http = { version = "0.6", features = [
+tower-http = { version = "0.7", features = [
   "trace",
   "cors",
   "limit",
@@ -101,7 +101,7 @@ tracing-subscriber = { version = "0.3", features = [
 argon2 = "0.5"
 subtle = "2"
 governor = "0.10"
-base64 = "0.22"
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 rand = "0.10"
 hmac = "0.13"
@@ -132,7 +132,7 @@ shlex = "2"
 prometheus = { version = "0.14", optional = true }
 
 # OAuth 2.1 JWT (optional)
-jsonwebtoken = { version = "10.4", features = ["rust_crypto"], optional = true }
+jsonwebtoken = { version = "11", features = ["rust_crypto"], optional = true }
 reqwest = { version = "0.13.4", default-features = false, features = [
   "rustls-no-provider",
   "json",

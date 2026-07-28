@@ -1787,7 +1787,7 @@ where
     if config.compression_enabled {
         use tower_http::compression::Predicate as _;
         let predicate = tower_http::compression::DefaultPredicate::new().and(
-            tower_http::compression::predicate::SizeAbove::new(config.compression_min_size),
+            tower_http::compression::predicate::SizeAbove::new(u64::from(config.compression_min_size)),
         );
         router = router.layer(
             tower_http::compression::CompressionLayer::new()

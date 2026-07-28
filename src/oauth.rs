@@ -1796,7 +1796,7 @@ impl JwksCache {
 
         let mut validation = Validation::new(Algorithm::RS256);
         // Note: validation.algorithms is overridden per-decode to [header.alg]
-        // because jsonwebtoken 10.x requires all listed algorithms to share
+        // because jsonwebtoken requires all listed algorithms to share
         // the same key family. The ACCEPTED_ALGS whitelist is checked
         // separately before looking up the key.
         //

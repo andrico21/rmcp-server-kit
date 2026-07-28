@@ -8,6 +8,19 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+### Changed
+
+- **Dependency major-version upgrades.**
+  - `tower-http` 0.6 → 0.7. The only call-site change is
+    `compression::predicate::SizeAbove::new`, which now takes `u64`
+    (previously `u16`).
+  - `jsonwebtoken` 10 → 11 (behind the `oauth` feature). `jwk::KeyAlgorithm`
+    is now `#[non_exhaustive]`; already covered by the existing wildcard arm
+    in `jwk_algorithm`.
+  - `base64` 0.22 → 0.23, pinned to `default-features = false,
+    features = ["std"]` so the new default-on `simd-unsafe` engine is not
+    compiled in, preserving the prior std-only, `unsafe`-free behavior.
+
 ## [2.1.0] - 2026-07-05
 
 ### Security
