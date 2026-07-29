@@ -1,22 +1,2 @@
 
 # cargo-vet imports lock
-
-[[unpublished.rmcp-server-kit]]
-version = "1.14.0"
-audited_as = "1.13.0"
-
-[[unpublished.rmcp-server-kit]]
-version = "1.15.0"
-audited_as = "1.14.0"
-
-[[unpublished.rmcp-server-kit]]
-version = "2.0.0"
-audited_as = "1.15.0"
-
-[[unpublished.rmcp-server-kit]]
-version = "2.1.0"
-audited_as = "2.0.0"
-
-[[unpublished.rmcp-server-kit]]
-version = "2.1.1"
-audited_as = "2.1.0"
