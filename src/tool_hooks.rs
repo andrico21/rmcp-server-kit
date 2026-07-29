@@ -41,10 +41,10 @@ use std::{fmt, future::Future, pin::Pin, sync::Arc};
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResult, ContentBlock, GetPromptRequestParams,
-        GetPromptResult, InitializeRequestParams, InitializeResult, ListPromptsResult,
-        ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
-        ReadResourceRequestParams, ReadResourceResult, ServerInfo, Tool,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
+        GetPromptRequestParams, GetPromptResponse, InitializeRequestParams, InitializeResult,
+        ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
+        PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse, ServerInfo, Tool,
     },
     service::RequestContext,
 };
@@ -401,7 +401,7 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         &self,
         request: GetPromptRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<GetPromptResult, ErrorData> {
+    ) -> Result<GetPromptResponse, ErrorData> {
         self.inner.get_prompt(request, context).await
     }
 
@@ -425,15 +425,19 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         &self,
         request: ReadResourceRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, ErrorData> {
+    ) -> Result<ReadResourceResponse, ErrorData> {
         self.inner.read_resource(request, context).await
     }
 
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "CallToolResponse is #[non_exhaustive]; the non-Complete MRTR variants (InputRequired/Task) are passed through unchanged"
+    )]
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
         let req_id = Some(format!("{:?}", context.id));
         let ctx = Self::build_context(&request, req_id);
         let max = self.hooks.max_result_bytes;
@@ -460,24 +464,34 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
                         HookDisposition::ReplacedBefore
                     };
                     Self::spawn_after(after_holder.as_ref(), ctx, disposition, size);
-                    return Ok(final_result);
+                    return Ok(final_result.into());
                 }
             }
         }
 
         // Inner handler.
-        let result = self.inner.call_tool(request, context).await;
-
-        match result {
-            Ok(ok) => {
-                let (final_result, size, capped) = apply_size_cap(ok, max, &ctx.tool_name);
+        match self.inner.call_tool(request, context).await {
+            // Completed tool result: subject to the size cap + after hook.
+            Ok(CallToolResponse::Complete(result)) => {
+                let (final_result, size, capped) = apply_size_cap(result, max, &ctx.tool_name);
                 let disposition = if capped {
                     HookDisposition::ResultTooLarge
                 } else {
                     HookDisposition::InnerExecuted
                 };
                 Self::spawn_after(after_holder.as_ref(), ctx, disposition, size);
-                Ok(final_result)
+                Ok(final_result.into())
+            }
+            // MRTR input-required / task responses (rmcp 3.0): no CallToolResult
+            // to size-cap, so pass them through unchanged.
+            Ok(other) => {
+                Self::spawn_after(
+                    after_holder.as_ref(),
+                    ctx,
+                    HookDisposition::InnerExecuted,
+                    0,
+                );
+                Ok(other)
             }
             Err(e) => {
                 Self::spawn_after(after_holder.as_ref(), ctx, HookDisposition::InnerErrored, 0);
@@ -496,7 +510,9 @@ mod tests {
 
     use rmcp::{
         ErrorData, RoleServer, ServerHandler,
-        model::{CallToolRequestParams, CallToolResult, ContentBlock, ServerInfo},
+        model::{
+            CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ServerInfo,
+        },
         service::RequestContext,
     };
 
@@ -518,9 +534,9 @@ mod tests {
             &self,
             _request: CallToolRequestParams,
             _context: RequestContext<RoleServer>,
-        ) -> Result<CallToolResult, ErrorData> {
+        ) -> Result<CallToolResponse, ErrorData> {
             let body = "x".repeat(self.body_bytes.unwrap_or(4));
-            Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
+            Ok(CallToolResult::success(vec![ContentBlock::text(body)]).into())
         }
     }
 

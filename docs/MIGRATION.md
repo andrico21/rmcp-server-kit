@@ -1,8 +1,47 @@
-# Adopting `rmcp-server-kit`
+# Adopting & migrating `rmcp-server-kit`
 
 This guide shows how to wire the standalone `rmcp-server-kit` crate into a
-downstream project. There is no version-to-version migration history yet -
-`1.9.0` is the current release on crates.io.
+downstream project, and how to migrate across breaking major releases.
+
+## Migrating from 2.x to 3.0
+
+`3.0` upgrades the underlying MCP SDK from `rmcp` 2.x to **`rmcp` 3.0**.
+Because your crate depends on `rmcp` **directly** (you implement
+`rmcp::handler::server::ServerHandler` and use `rmcp::model` types), this is
+a breaking change you must coordinate:
+
+1. **Bump `rmcp` in lockstep.** In your own `Cargo.toml`, change
+   `rmcp = "2"` to `rmcp = "3"` (keep your existing features). Your `rmcp`
+   major must match the one `rmcp-server-kit` links against, or the
+   `ServerHandler` trait will not unify.
+
+2. **Update manual handler return types — only if you override them.**
+   rmcp 3.0 makes `tools/call`, `prompts/get`, and `resources/read`
+   MRTR-aware (SEP-2322). If your `ServerHandler` overrides these methods,
+   change the return type to the new response enum and wrap your existing
+   result with `.into()`:
+
+   ```rust
+   // 2.x
+   async fn call_tool(&self, req: CallToolRequestParams, cx: RequestContext<RoleServer>)
+       -> Result<CallToolResult, ErrorData>
+   { Ok(CallToolResult::success(content)) }
+
+   // 3.0
+   async fn call_tool(&self, req: CallToolRequestParams, cx: RequestContext<RoleServer>)
+       -> Result<CallToolResponse, ErrorData>
+   { Ok(CallToolResult::success(content).into()) }
+   ```
+
+   The same pattern applies to `get_prompt` (`GetPromptResponse`) and
+   `read_resource` (`ReadResourceResponse`). Handlers that only implement
+   `get_info` — the common case — need **no** code change beyond step 1.
+
+3. **MSRV.** rmcp 3.0 requires Rust ≥ 1.88; `rmcp-server-kit` continues to
+   target 1.95, so no action is needed.
+
+The `rmcp-server-kit` public API surface (config, auth, RBAC, transport)
+is otherwise unchanged for 3.0.
 
 ## 1. Add the dependency
 
@@ -12,7 +51,7 @@ Use a caret range so patch and minor releases flow in automatically:
 
 ```toml
 [dependencies]
-rmcp-server-kit = { version = "1", features = ["oauth"] }
+rmcp-server-kit = { version = "3", features = ["oauth"] }
 ```
 
 Avoid the exact-version pin (`version = "=1.6.0"`); it prevents security
@@ -24,7 +63,7 @@ Pin to a tagged release:
 
 ```toml
 [dependencies]
-rmcp-server-kit = { git = "https://github.com/andrico21/rmcp-server-kit", tag = "1.6.0", features = ["oauth"] }
+rmcp-server-kit = { git = "https://github.com/andrico21/rmcp-server-kit", tag = "3.0.0", features = ["oauth"] }
 ```
 
 ## 2. Workspace integration

@@ -18,8 +18,8 @@ handles everything else.
 
 ```toml
 [dependencies]
-rmcp-server-kit = "2"
-rmcp = { version = "2", features = ["server", "macros"] }
+rmcp-server-kit = "3"
+rmcp = { version = "3", features = ["server", "macros"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 ```
 
