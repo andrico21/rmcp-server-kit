@@ -8,6 +8,8 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+## [2.1.1] - 2026-07-29
+
 ### Changed
 
 - **Dependency major-version upgrades.**
