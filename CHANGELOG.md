@@ -20,9 +20,7 @@ Breaking changes bump the **major** version.
   now returns `CallToolResponse` and passes MRTR `InputRequired`/`Task`
   responses through untouched (the result-size cap still applies to
   completed results). rmcp 3.0's MSRV is 1.88 (our 1.95 target is
-  unaffected), and it shares this crate's `base64 0.23` / `jsonwebtoken 11`
-  / `hmac 0.13` / `sha2 0.11`, collapsing the previous transitive
-  `base64 0.22` duplicate. See [`docs/MIGRATION.md`](docs/MIGRATION.md).
+  unaffected). See [`docs/MIGRATION.md`](docs/MIGRATION.md).
 
 ## [2.1.1] - 2026-07-29
 
