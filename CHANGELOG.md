@@ -8,6 +8,20 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING: migrated to `rmcp` 3.0** (was 2.x). Consumers depend on
+  `rmcp` directly, so bump your own `rmcp = "2"` to `rmcp = "3"` in
+  lockstep. Handlers that override `call_tool` / `get_prompt` /
+  `read_resource` must switch their return types to the new MRTR-aware
+  enums (`CallToolResponse` / `GetPromptResponse` / `ReadResourceResponse`)
+  — wrap an existing result with `.into()`; handlers using the default
+  `ServerHandler` need only the version bump. Internally `HookedHandler`
+  now returns `CallToolResponse` and passes MRTR `InputRequired`/`Task`
+  responses through untouched (the result-size cap still applies to
+  completed results). rmcp 3.0's MSRV is 1.88 (our 1.95 target is
+  unaffected). See [`docs/MIGRATION.md`](docs/MIGRATION.md).
+
 ## [2.1.1] - 2026-07-29
 
 ### Changed
