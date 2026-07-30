@@ -8,6 +8,8 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-07-30
+
 ### Changed
 
 - **BREAKING: migrated to `rmcp` 3.0** (was 2.x). Consumers depend on
