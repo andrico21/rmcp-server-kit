@@ -36,17 +36,19 @@
 //! let _wrapped = with_hooks(handler, hooks);
 //! ```
 
-use std::{fmt, future::Future, pin::Pin, sync::Arc};
+use std::{borrow::Cow, fmt, future::Future, pin::Pin, sync::Arc};
 
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
-        GetPromptRequestParams, GetPromptResponse, InitializeRequestParams, InitializeResult,
-        ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
-        PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse, ServerInfo, Tool,
+        CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams, ContentBlock,
+        DiscoverResult, GetPromptRequestParams, GetPromptResponse, GetTaskParams, GetTaskResult,
+        InitializeRequestParams, InitializeResult, ListPromptsResult, ListResourceTemplatesResult,
+        ListResourcesResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
+        ReadResourceRequestParams, ReadResourceResponse, ServerInfo, SubscriptionFilter, Tool,
+        UpdateTaskParams,
     },
-    service::RequestContext,
+    service::{RequestContext, SubscriptionContext},
 };
 
 /// Context passed to before/after hooks for a single tool call.
@@ -498,6 +500,55 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
                 Err(e)
             }
         }
+    }
+
+    // rmcp 3.0 added task/subscription/discovery request handlers with defaults;
+    // delegate them to `inner` so wrapping a handler that implements those stays
+    // transparent (otherwise the default would shadow the inner implementation).
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        self.inner.supported_protocol_versions()
+    }
+
+    async fn discover(
+        &self,
+        context: RequestContext<RoleServer>,
+    ) -> Result<DiscoverResult, ErrorData> {
+        self.inner.discover(context).await
+    }
+
+    fn accepted_subscription_filter(
+        &self,
+        requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
+        self.inner.accepted_subscription_filter(requested)
+    }
+
+    async fn listen(&self, context: SubscriptionContext) -> Result<(), ErrorData> {
+        self.inner.listen(context).await
+    }
+
+    async fn get_task(
+        &self,
+        request: GetTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskResult, ErrorData> {
+        self.inner.get_task(request, context).await
+    }
+
+    async fn update_task(
+        &self,
+        request: UpdateTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        self.inner.update_task(request, context).await
+    }
+
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        self.inner.cancel_task(request, context).await
     }
 }
 
