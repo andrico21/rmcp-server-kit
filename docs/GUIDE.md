@@ -930,8 +930,8 @@ role = "viewer"
 | `max_jwks_keys` | `usize` | `256` | Fail-closed cap on public keys in a JWKS document. |
 | `jwks_max_response_bytes` | `u64` | `1048576` | Fail-closed cap on the JWKS HTTP response body size (1 MiB default). |
 | `allow_http_oauth_urls` | `bool` | `false` | Permit `http://` issuer/JWKS/etc. for local dev only. |
-| `audience_validation_mode` | `String` (`"permissive"` \| `"warn"` \| `"strict"`) | `"warn"` | How the resource server treats the legacy `azp` audience fallback. `"strict"` accepts only `aud` matches (recommended once your IdP populates `aud` reliably); `"warn"` accepts `azp`-only matches but emits a one-shot WARN per process to surface IdPs not populating `aud`; `"permissive"` accepts `azp`-only matches silently (pre-1.7 behavior). |
-| `strict_audience_validation` | `bool` | `false` | **Deprecated since 1.7.0** — superseded by `audience_validation_mode`. Consulted only when `audience_validation_mode` is unset: `true` resolves to `"strict"`, unset/`false` resolves to `"warn"`. |
+| `audience_validation_mode` | `String` (`"permissive"` \| `"warn"` \| `"strict"`) | `"strict"` | How the resource server treats the legacy `azp` audience fallback. `"strict"` (default) accepts only `aud` matches and rejects `azp`-only matches; `"warn"` accepts `azp`-only matches but emits a one-shot WARN per process to surface IdPs not populating `aud`; `"permissive"` accepts `azp`-only matches silently (pre-1.7 behavior). |
+| `strict_audience_validation` | `Option<bool>` | _unset_ | **Deprecated since 1.7.0** — superseded by `audience_validation_mode`. Consulted only when `audience_validation_mode` is unset: `Some(true)` resolves to `"strict"`, `Some(false)` resolves to `"warn"`, and unset resolves to `"strict"` (the secure default). |
 | `ssrf_allowlist` | `table` | _unset_ | Operator opt-in allowlist of `hosts` and/or `cidrs` whose otherwise-blocked addresses (private/loopback/CGNAT/unique-local) the OAuth/JWKS fetcher is allowed to reach. Cloud-metadata addresses remain blocked. See "Allowing in-cluster IdPs" below and the "Operator allowlist" section in [`SECURITY.md`](../SECURITY.md). |
 
 #### SSRF and DoS Hardening (OAuth)
@@ -961,12 +961,13 @@ audience_validation_mode = "strict"   # accept only `aud` matches; reject `azp`-
 jwks_max_response_bytes = 1048576
 ```
 
-The default `audience_validation_mode = "warn"` accepts `azp`-only audience
-matches (preserving pre-1.7 token acceptance) but emits a one-shot WARN per
-process so operators can detect IdPs whose configuration leaves `aud`
-unpopulated. Once your IdP issues tokens carrying `aud` reliably, switch to
-`"strict"`. To silence the warning without changing acceptance, set
-`audience_validation_mode = "permissive"`.
+The default `audience_validation_mode = "strict"` rejects tokens whose
+configured audience appears only in the `azp` claim (not `aud`). **To keep the
+previous behavior** — accepting `azp`-only matches — set
+`audience_validation_mode = "warn"` (accept with a one-shot WARN per process so
+operators can detect IdPs that leave `aud` unpopulated) or `"permissive"`
+(accept silently). Once your IdP issues tokens carrying `aud` reliably, keep the
+`"strict"` default.
 
 The redirect-hop limit (max 2) and per-request HTTP timeouts are enforced
 internally and are not configurable knobs.

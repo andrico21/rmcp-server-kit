@@ -10,6 +10,20 @@ Breaking changes bump the **major** version.
 
 ### Security
 
+- **OAuth audience validation now defaults to `strict`.** A token whose
+  configured audience appears only in the `azp` claim (not `aud`) is now
+  **rejected by default**; previously the default (`warn`) accepted it with a
+  one-shot warning. **Behavioral change.** To keep the previous behavior, set
+  `audience_validation_mode = "warn"` (accept `azp`-only with a one-shot
+  warning) or `"permissive"` (accept silently). The deprecated
+  `strict_audience_validation` flag is now `Option<bool>`: `Some(false)` maps to
+  `warn`, `Some(true)`/unset map to `strict`. (rust-review HIGH / H1.)
+- **OAuth JWKS cache now fails closed when a refresh cannot succeed.** After a
+  failed or cooldown-suppressed JWKS refresh, an expired cache no longer serves
+  a stale (possibly rotated-out) signing key: the post-refresh key lookup now
+  re-applies the same freshness gate as the initial lookup, so a token whose
+  `kid` exists only in the expired cache is rejected rather than accepted.
+  (rust-review HIGH / H2.)
 - **SSRF: cloud-metadata is now unbypassable through IPv6 transition/compatibility
   forms.** `ip_block_reason` re-labels NAT64 (`64:ff9b::/96`) and 6to4
   (`2002::/16`) addresses embedding a cloud-metadata IPv4 (e.g.
@@ -28,7 +42,8 @@ Breaking changes bump the **major** version.
   every peer trusted and lets any client spoof the resolved client IP
   (rate-limit bypass, audit poisoning) via forwarding headers. Both validators
   now reject prefix-0 CIDRs via a shared helper, mirroring the SSRF allowlist
-  parser. **BREAKING** for configurations that relied on a `/0` trusted proxy.
+  parser. **Behavioral change** — a configuration that relied on a `/0` trusted
+  proxy must narrow it to the real proxy CIDRs.
   (rust-review MEDIUM / M1.)
 - **OAuth credential POSTs no longer follow redirects.** `/token`, `/introspect`,
   `/revoke`, and the RFC 8693 token-exchange requests now use a dedicated
@@ -56,8 +71,8 @@ Breaking changes bump the **major** version.
   `require_auth_on_admin_endpoints` is set, these proxy endpoints are gated by
   the configured `admin_role` (default `admin`) in addition to authentication;
   an authenticated non-admin caller now receives `403` instead of reaching the
-  upstream. **BREAKING** behavior change for authenticated non-admin callers
-  who could previously introspect/revoke tokens. (rust-review MEDIUM / M6.)
+  upstream. **Behavioral change** for authenticated non-admin callers who could
+  previously introspect/revoke tokens. (rust-review MEDIUM / M6.)
 
 ### Changed
 

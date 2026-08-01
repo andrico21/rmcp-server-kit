@@ -801,23 +801,24 @@ pub struct OAuthConfig {
     /// Enforce strict audience validation using only the JWT `aud` claim.
     ///
     /// **Deprecated since 1.7.0.** Use [`OAuthConfig::audience_validation_mode`]
-    /// instead. When [`OAuthConfig::audience_validation_mode`] is `None`,
-    /// this flag is consulted: `true` resolves to
-    /// [`AudienceValidationMode::Strict`], `false`/unset resolves to
-    /// [`AudienceValidationMode::Warn`] (the new default — accepts
-    /// `azp`-only matches with a one-shot warn log; previously silent).
+    /// instead. Consulted only when [`OAuthConfig::audience_validation_mode`]
+    /// is `None`: `Some(true)` resolves to [`AudienceValidationMode::Strict`],
+    /// `Some(false)` resolves to [`AudienceValidationMode::Warn`], and `None`
+    /// (the default) resolves to [`AudienceValidationMode::Strict`] — the
+    /// secure default that rejects `azp`-only audience matches.
     #[serde(default)]
     #[deprecated(
         since = "1.7.0",
         note = "use `audience_validation_mode` instead; this field is consulted only when `audience_validation_mode` is None"
     )]
-    pub strict_audience_validation: bool,
+    pub strict_audience_validation: Option<bool>,
     /// How the resource server treats `azp` when validating JWT audience.
     ///
-    /// When `None` (default), resolution falls back to
-    /// [`OAuthConfig::strict_audience_validation`] for backward
-    /// compatibility: `true` ⇒ [`AudienceValidationMode::Strict`],
-    /// `false`/unset ⇒ [`AudienceValidationMode::Warn`].
+    /// When `None` (default), resolution falls back to the deprecated
+    /// [`OAuthConfig::strict_audience_validation`] flag: `Some(true)` ⇒
+    /// [`AudienceValidationMode::Strict`], `Some(false)` ⇒
+    /// [`AudienceValidationMode::Warn`], and `None` ⇒
+    /// [`AudienceValidationMode::Strict`] (the secure default).
     /// Set this field explicitly to make the policy unambiguous.
     #[serde(default)]
     pub audience_validation_mode: Option<AudienceValidationMode>,
@@ -851,11 +852,11 @@ const fn default_jwks_max_bytes() -> u64 {
 /// whether that historic compatibility fallback is honored, surfaced via
 /// a one-shot warning, or refused.
 ///
-/// **Default**: [`AudienceValidationMode::Warn`] — accepts `azp`-only
-/// matches but emits a `tracing::warn!` once per process so operators
-/// can detect and migrate token-issuing IdP configurations toward
-/// populating `aud` correctly. Future major versions may default to
-/// [`AudienceValidationMode::Strict`].
+/// **Default**: [`AudienceValidationMode::Strict`] — rejects `azp`-only
+/// matches so a token whose configured audience appears only in `azp`
+/// is refused. To keep the previous `azp`-accepting behavior, set
+/// `audience_validation_mode = "warn"` (one-shot warning per process) or
+/// `"permissive"` (silent).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -865,13 +866,12 @@ pub enum AudienceValidationMode {
     /// populate `aud`.
     Permissive,
     /// Accept `aud` matches silently. Accept `azp`-only matches with a
-    /// one-shot `tracing::warn!` per process. Reject neither. **Default
-    /// since 1.7.0.**
-    #[default]
+    /// one-shot `tracing::warn!` per process. Reject neither.
     Warn,
     /// Accept only `aud` matches. Reject `azp`-only matches as audience
-    /// mismatch. Recommended for new deployments and any IdP that can
-    /// be configured to populate `aud` reliably.
+    /// mismatch. **Default** — recommended for new deployments and any
+    /// IdP that can be configured to populate `aud` reliably.
+    #[default]
     Strict,
 }
 
@@ -910,7 +910,7 @@ impl Default for OAuthConfig {
                 deprecated,
                 reason = "default-construct deprecated field for backward compat"
             )]
-            strict_audience_validation: false,
+            strict_audience_validation: None,
             audience_validation_mode: None,
             jwks_max_response_bytes: default_jwks_max_bytes(),
             ssrf_allowlist: None,
@@ -923,17 +923,17 @@ impl OAuthConfig {
     ///
     /// Precedence: explicit `audience_validation_mode` overrides the
     /// legacy `strict_audience_validation` flag. When neither is set,
-    /// the default is [`AudienceValidationMode::Warn`].
+    /// the default is [`AudienceValidationMode::Strict`] (secure default;
+    /// `azp`-only matches are rejected).
     #[must_use]
     pub fn effective_audience_validation_mode(&self) -> AudienceValidationMode {
         if let Some(mode) = self.audience_validation_mode {
             return mode;
         }
         #[allow(deprecated, reason = "intentional: legacy flag resolution path")]
-        if self.strict_audience_validation {
-            AudienceValidationMode::Strict
-        } else {
-            AudienceValidationMode::Warn
+        match self.strict_audience_validation {
+            Some(true) | None => AudienceValidationMode::Strict,
+            Some(false) => AudienceValidationMode::Warn,
         }
     }
 
@@ -1401,7 +1401,7 @@ impl OAuthConfigBuilder {
             reason = "intentional: deprecated builder forwards to deprecated field"
         )]
         {
-            self.inner.strict_audience_validation = strict;
+            self.inner.strict_audience_validation = Some(strict);
         }
         self.inner.audience_validation_mode = None;
         self
@@ -1412,7 +1412,7 @@ impl OAuthConfigBuilder {
     /// Takes precedence over the deprecated
     /// [`OAuthConfigBuilder::strict_audience_validation`] flag. See
     /// [`AudienceValidationMode`] for variant semantics. Defaults to
-    /// [`AudienceValidationMode::Warn`] when neither this method nor the
+    /// [`AudienceValidationMode::Strict`] when neither this method nor the
     /// legacy flag is set.
     pub const fn audience_validation_mode(mut self, mode: AudienceValidationMode) -> Self {
         self.inner.audience_validation_mode = Some(mode);
@@ -2245,9 +2245,15 @@ impl JwksCache {
         // Cache miss or expired -- refresh (with cooldown/deduplication).
         self.refresh_with_cooldown().await;
 
+        // Fail closed (H2): a failed or cooled-down refresh leaves the previous
+        // (now-expired) cache in place. Re-apply the freshness gate the first
+        // lookup enforces so a rotated-out key is never served from a stale
+        // cache -- otherwise an attacker who can stall the JWKS endpoint could
+        // keep a revoked signing key valid past its TTL.
         let guard = self.inner.read().await;
         guard
             .as_ref()
+            .filter(|cached| !cached.is_expired())
             .and_then(|cached| lookup_key(cached, kid, alg))
     }
 
@@ -3353,7 +3359,7 @@ mod tests {
                 deprecated,
                 reason = "test fixture: explicit value for the deprecated field"
             )]
-            strict_audience_validation: false,
+            strict_audience_validation: None,
             audience_validation_mode: None,
             jwks_max_response_bytes: default_jwks_max_bytes(),
             ssrf_allowlist: None,
@@ -3843,7 +3849,7 @@ mod tests {
                 deprecated,
                 reason = "test fixture: explicit value for the deprecated field"
             )]
-            strict_audience_validation: false,
+            strict_audience_validation: None,
             audience_validation_mode: None,
             jwks_max_response_bytes: default_jwks_max_bytes(),
             ssrf_allowlist: None,
@@ -3852,6 +3858,106 @@ mod tests {
 
     fn test_cache(config: &OAuthConfig) -> JwksCache {
         JwksCache::new(config).unwrap().__test_allow_loopback_ssrf()
+    }
+
+    // -- H2: expired JWKS cache must fail closed when refresh cannot succeed --
+
+    /// Prime a cache (with `ttl`) from a valid JWKS, confirm the kid landed,
+    /// then repoint the endpoint at a 503 so any later refresh fails. Returns
+    /// the cache, a matching-`aud` token for the primed kid, and the live mock
+    /// server (kept alive by the caller).
+    async fn h2_prime_then_break(ttl: &str) -> (JwksCache, String, wiremock::MockServer) {
+        let kid = "test-h2-stale";
+        let (pem, jwks) = generate_test_keypair(kid);
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/jwks.json"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&jwks))
+            .mount(&mock_server)
+            .await;
+        let jwks_uri = format!("{}/jwks.json", mock_server.uri());
+        let mut config = test_config(&jwks_uri);
+        config.jwks_cache_ttl = ttl.into();
+        let cache = test_cache(&config);
+        cache.__test_refresh_now().await.expect("prime JWKS cache");
+        assert!(cache.__test_has_kid(kid).await, "kid must be primed");
+
+        mock_server.reset().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/jwks.json"))
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .mount(&mock_server)
+            .await;
+
+        let token = mint_token(
+            &pem,
+            kid,
+            "https://auth.test.local",
+            "https://mcp.test.local/mcp",
+            "h2-client",
+            "mcp:read",
+        );
+        (cache, token, mock_server)
+    }
+
+    #[tokio::test]
+    async fn expired_jwks_fails_closed_when_refresh_fails() {
+        let (cache, token, _mock) = h2_prime_then_break("80ms").await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let failure = cache
+            .validate_token_with_reason(&token)
+            .await
+            .expect_err("an expired cache whose refresh fails must not serve the stale key");
+        assert_eq!(failure, JwtValidationFailure::Invalid);
+    }
+
+    #[tokio::test]
+    async fn fresh_jwks_still_validates() {
+        let kid = "test-h2-fresh";
+        let (pem, jwks) = generate_test_keypair(kid);
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/jwks.json"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&jwks))
+            .mount(&mock_server)
+            .await;
+        let jwks_uri = format!("{}/jwks.json", mock_server.uri());
+        let config = test_config(&jwks_uri); // 5m TTL, reachable JWKS
+        let cache = test_cache(&config);
+        let token = mint_token(
+            &pem,
+            kid,
+            "https://auth.test.local",
+            "https://mcp.test.local/mcp",
+            "h2-fresh-client",
+            "mcp:read",
+        );
+        cache
+            .validate_token_with_reason(&token)
+            .await
+            .expect("a reachable JWKS must still validate a matching token");
+    }
+
+    #[tokio::test]
+    async fn cooldown_active_plus_expired_fails_closed() {
+        let (cache, token, _mock) = h2_prime_then_break("80ms").await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // First attempt: no cooldown yet, so this triggers a (503) refresh that
+        // records `last_refresh_attempt` and still fails closed.
+        assert_eq!(
+            cache
+                .validate_token_with_reason(&token)
+                .await
+                .expect_err("first attempt must fail closed"),
+            JwtValidationFailure::Invalid,
+        );
+        // Second attempt: the refresh cooldown is now active, so no refresh is
+        // attempted -- the still-expired cache must not serve the stale key.
+        let failure = cache
+            .validate_token_with_reason(&token)
+            .await
+            .expect_err("cooldown-active + expired cache must still fail closed");
+        assert_eq!(failure, JwtValidationFailure::Invalid);
     }
 
     #[tokio::test]
@@ -4413,7 +4519,7 @@ mod tests {
                 deprecated,
                 reason = "test fixture: explicit value for the deprecated field"
             )]
-            strict_audience_validation: false,
+            strict_audience_validation: None,
             audience_validation_mode: None,
             jwks_max_response_bytes: default_jwks_max_bytes(),
             ssrf_allowlist: None,
@@ -4690,7 +4796,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn audience_falls_back_to_azp_by_default() {
+    async fn audience_default_is_strict() {
         let kid = "test-audience-azp-default";
         let (pem, jwks) = generate_test_keypair(kid);
 
@@ -4720,11 +4826,127 @@ mod tests {
             }),
         );
 
-        let identity = cache
+        let failure = cache
             .validate_token_with_reason(&token)
             .await
-            .expect("azp fallback should remain enabled by default");
-        assert_eq!(identity.role, "viewer");
+            .expect_err("the default policy is Strict and must reject an azp-only match");
+        assert_eq!(failure, JwtValidationFailure::Invalid);
+    }
+
+    #[tokio::test]
+    async fn audience_warn_still_accepts_azp() {
+        let kid = "test-audience-warn-optin";
+        let (pem, jwks) = generate_test_keypair(kid);
+
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/jwks.json"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&jwks))
+            .mount(&mock_server)
+            .await;
+
+        let jwks_uri = format!("{}/jwks.json", mock_server.uri());
+        let mut config = test_config(&jwks_uri);
+        config.audience_validation_mode = Some(AudienceValidationMode::Warn);
+        let cache = test_cache(&config);
+
+        let now = jsonwebtoken::get_current_timestamp();
+        let token = mint_token_with_claims(
+            &pem,
+            kid,
+            &serde_json::json!({
+                "iss": "https://auth.test.local",
+                "aud": "https://some-other-resource.example.com",
+                "azp": "https://mcp.test.local/mcp",
+                "sub": "warn-optin-client",
+                "scope": "mcp:read",
+                "exp": now + 3600,
+                "iat": now,
+            }),
+        );
+
+        cache.validate_token_with_reason(&token).await.expect(
+            "the audience_validation_mode=warn opt-out must still accept an azp-only match",
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_strict_false_maps_to_warn() {
+        let kid = "test-audience-legacy-false";
+        let (pem, jwks) = generate_test_keypair(kid);
+
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/jwks.json"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&jwks))
+            .mount(&mock_server)
+            .await;
+
+        let jwks_uri = format!("{}/jwks.json", mock_server.uri());
+        let mut config = test_config(&jwks_uri);
+        // Legacy opt-out: the deprecated bool set to Some(false) with the enum
+        // unset must resolve to Warn, preserving the pre-3.2 azp-accepting path.
+        #[allow(deprecated, reason = "covers the legacy bool compat mapping")]
+        {
+            config.strict_audience_validation = Some(false);
+        }
+        let cache = test_cache(&config);
+
+        let now = jsonwebtoken::get_current_timestamp();
+        let token = mint_token_with_claims(
+            &pem,
+            kid,
+            &serde_json::json!({
+                "iss": "https://auth.test.local",
+                "aud": "https://some-other-resource.example.com",
+                "azp": "https://mcp.test.local/mcp",
+                "sub": "legacy-false-client",
+                "scope": "mcp:read",
+                "exp": now + 3600,
+                "iat": now,
+            }),
+        );
+
+        cache
+            .validate_token_with_reason(&token)
+            .await
+            .expect("strict_audience_validation=Some(false) must map to Warn and accept azp");
+    }
+
+    #[tokio::test]
+    async fn aud_match_always_accepts() {
+        let kid = "test-audience-aud-match";
+        let (pem, jwks) = generate_test_keypair(kid);
+
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/jwks.json"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&jwks))
+            .mount(&mock_server)
+            .await;
+
+        let jwks_uri = format!("{}/jwks.json", mock_server.uri());
+        let config = test_config(&jwks_uri); // Strict by default
+        let cache = test_cache(&config);
+
+        let now = jsonwebtoken::get_current_timestamp();
+        let token = mint_token_with_claims(
+            &pem,
+            kid,
+            &serde_json::json!({
+                "iss": "https://auth.test.local",
+                "aud": "https://mcp.test.local/mcp",
+                "sub": "aud-match-client",
+                "scope": "mcp:read",
+                "exp": now + 3600,
+                "iat": now,
+            }),
+        );
+
+        cache
+            .validate_token_with_reason(&token)
+            .await
+            .expect("a matching aud must be accepted even under the Strict default");
     }
 
     #[tokio::test]
@@ -4743,7 +4965,7 @@ mod tests {
         let mut config = test_config(&jwks_uri);
         #[allow(deprecated, reason = "covers the legacy bool resolution path")]
         {
-            config.strict_audience_validation = true;
+            config.strict_audience_validation = Some(true);
         }
         let cache = test_cache(&config);
 
@@ -4866,7 +5088,7 @@ mod tests {
         let mut config = OAuthConfig::default();
         #[allow(deprecated, reason = "covers the precedence rule for the legacy bool")]
         {
-            config.strict_audience_validation = false;
+            config.strict_audience_validation = Some(false);
         }
         config.audience_validation_mode = Some(AudienceValidationMode::Strict);
         assert_eq!(
@@ -4878,7 +5100,7 @@ mod tests {
         let mut config = OAuthConfig::default();
         #[allow(deprecated, reason = "covers the precedence rule for the legacy bool")]
         {
-            config.strict_audience_validation = true;
+            config.strict_audience_validation = Some(true);
         }
         config.audience_validation_mode = Some(AudienceValidationMode::Permissive);
         assert_eq!(
@@ -4889,12 +5111,12 @@ mod tests {
     }
 
     #[test]
-    fn audience_validation_mode_default_is_warn_when_unset() {
+    fn audience_validation_mode_default_is_strict_when_unset() {
         let config = OAuthConfig::default();
         assert_eq!(
             config.effective_audience_validation_mode(),
-            AudienceValidationMode::Warn,
-            "unset mode + unset bool must resolve to Warn (the new default)"
+            AudienceValidationMode::Strict,
+            "unset mode + unset bool must resolve to Strict (the secure default)"
         );
     }
 
@@ -4903,7 +5125,7 @@ mod tests {
         let mut config = OAuthConfig::default();
         #[allow(deprecated, reason = "covers the legacy bool resolution path")]
         {
-            config.strict_audience_validation = true;
+            config.strict_audience_validation = Some(true);
         }
         assert_eq!(
             config.effective_audience_validation_mode(),
