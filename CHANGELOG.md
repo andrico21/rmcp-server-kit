@@ -11,6 +11,20 @@ migration note and a config opt-out — see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+## [3.1.1] - 2026-08-01
+
+### Fixed
+
+- **`cargo build --features oauth` no longer fails under `-D warnings`.** In a
+  minimal `oauth` build (without `oauth-mtls-client` or `test-helpers`) the
+  internal screened-redirect HTTP client was constructed but never read,
+  tripping the `dead_code` lint under `RUSTFLAGS="-D warnings"`. The full
+  feature matrix now builds cleanly with warnings denied.
+
+  *Note:* the 3.1.0 tag was never published to crates.io — its release build
+  failed on the issue above — so this is the first published release of the
+  3.1.x line and includes all of the 3.1.0 changes below.
+
 ## [3.1.0] - 2026-08-01
 
 > **⚠️ Behavioral changes — please read before upgrading.** This release hardens
