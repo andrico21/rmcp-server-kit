@@ -46,8 +46,8 @@ The crate has two transports:
 
 | Transport          | Function                                            | Auth/RBAC/TLS  | Use case                                         |
 |--------------------|-----------------------------------------------------|----------------|--------------------------------------------------|
-| **Streamable HTTP**| `serve()` — `src/transport.rs:1954`                 | **Yes**        | Production network deployment                    |
-| stdio              | `serve_stdio()` — `src/transport.rs:3474`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
+| **Streamable HTTP**| `serve()` — `src/transport.rs:1991`                 | **Yes**        | Production network deployment                    |
+| stdio              | `serve_stdio()` — `src/transport.rs:3558`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
 
 ---
 
@@ -182,9 +182,9 @@ Open endpoints (no auth):
 
 | Path                                       | Handler                                       |
 |--------------------------------------------|-----------------------------------------------|
-| `GET  /healthz`                            | `healthz` (~`src/transport.rs:2834`) |
-| `GET  /readyz`                             | `readyz`  (~`src/transport.rs:2871`) — runs configured readiness check |
-| `GET  /version`                            | `version_payload` (~`src/transport.rs:2846`) |
+| `GET  /healthz`                            | `healthz` (~`src/transport.rs:2877`) |
+| `GET  /readyz`                             | `readyz`  (~`src/transport.rs:2934`) — runs configured readiness check |
+| `GET  /version`                            | `version_payload` (~`src/transport.rs:2892`) |
 | `GET  /metrics`                            | served by `serve_metrics` on a **separate listener** when `feature = "metrics"` (`src/metrics.rs:142`) |
 | `GET  /.well-known/oauth-protected-resource` | feature = `oauth` (`src/transport.rs:1653`) |
 | `GET  /.well-known/oauth-authorization-server` | feature = `oauth` proxy (`src/transport.rs:2260`) |
@@ -443,7 +443,7 @@ Lifecycle (concurrent-acceptor design, since the 1.8.1 review fixes):
 1. `TlsListener::new(...)` reads PEM cert + key, builds a `rustls::ServerConfig`,
    optionally wraps with mTLS verification using configured root CAs, then
    spawns a dedicated background acceptor task (`run_tls_acceptor`,
-   `src/transport.rs:2622`) that owns the `TcpListener`.
+   `src/transport.rs:2665`) that owns the `TcpListener`.
 2. The acceptor task loops: acquires a permit from a semaphore sized by
    `max_concurrent_tls_handshakes` (default 256 via
    `DEFAULT_MAX_CONCURRENT_TLS_HANDSHAKES`; configurable since 1.9.0 via
@@ -597,12 +597,12 @@ recommended.
 
 ### Validation flow
 1. Client sends `Authorization: Bearer <jwt>`.
-2. `JwksCache::validate_token(token)` (`src/oauth.rs:1925`):
+2. `JwksCache::validate_token(token)` (`src/oauth.rs:1994`):
    - Decodes the JWT header to get `kid` and `alg`.
    - `lookup_key()` looks up by `kid` in the cached JWKS
-     (`src/oauth.rs:2319`).
-   - If not found, calls `refresh_with_cooldown()` (`src/oauth.rs:2131`):
-     - Enforces `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:1714`) so multiple
+     (`src/oauth.rs:2456`).
+   - If not found, calls `refresh_with_cooldown()` (`src/oauth.rs:2262`):
+     - Enforces `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:1800`) so multiple
        invalid tokens cannot DoS the JWKS endpoint.
      - Deduplicates concurrent refreshes.
    - Validates signature, `iss`, `aud`, `exp`, `nbf` using `jsonwebtoken`.
@@ -847,7 +847,7 @@ itself is at `src/transport.rs:3282`.
    exhaust the rate-limit budget for authenticated callers.
 
 4. **JWKS refresh is rate-limited.** Removing `JWKS_REFRESH_COOLDOWN`
-   (`src/oauth.rs:1714`) creates a DoS vector against the issuer's JWKS endpoint.
+   (`src/oauth.rs:1800`) creates a DoS vector against the issuer's JWKS endpoint.
 
 5. **No symmetric JWT algorithms by default.** `HS*` algorithms with a
    public JWKS would enable algorithm-confusion attacks. Don't add them

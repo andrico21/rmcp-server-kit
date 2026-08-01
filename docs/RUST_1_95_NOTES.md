@@ -183,6 +183,17 @@ Behavioral changes an agent may trip over:
 **No Cargo.toml schema changes** affect this workspace. Resolver stays at
 `"3"`.
 
+### 3.1 `build.warnings` is 1.97+ — CI keeps `RUSTFLAGS="-D warnings"`
+
+Cargo's cache-friendly [`build.warnings`](https://doc.rust-lang.org/cargo/reference/config.html#buildwarnings)
+config (deny rustc warnings for local packages only, without busting the
+build cache) landed in **Rust 1.97**, not 1.95. This crate's MSRV is 1.95, so
+`build.warnings` is unavailable on the MSRV toolchain; CI denies warnings with
+`RUSTFLAGS="-D warnings"` (`.github/workflows/ci.yml`, `.gitlab-ci.yml`).
+
+**Do not "modernize" this to `build.warnings` until the MSRV reaches 1.97** —
+on 1.95/1.96 the key is silently ignored, so warnings would stop failing CI.
+
 ---
 
 ## 4. Clippy 1.95

@@ -336,13 +336,7 @@ fn validate_trusted_forwarder_config(server: &ServerConfig) -> crate::error::Res
     use crate::error::McpxError;
 
     for entry in &server.trusted_proxies {
-        let is_net = entry.parse::<ipnet::IpNet>().is_ok();
-        let is_ip = entry.parse::<std::net::IpAddr>().is_ok();
-        if !(is_net || is_ip) {
-            return Err(McpxError::Config(format!(
-                "server.trusted_proxies entry {entry:?} is neither a CIDR nor an IP address"
-            )));
-        }
+        crate::transport::validate_trusted_proxy_entry(entry).map_err(McpxError::Config)?;
     }
     if server.forwarded_header.is_some() && server.trusted_proxies.is_empty() {
         return Err(McpxError::Config(
@@ -586,6 +580,21 @@ mod tests {
         };
         let err = validate_server_config(&cfg).unwrap_err();
         assert!(err.to_string().contains("trusted_proxies"));
+    }
+
+    #[test]
+    fn zero_prefix_trusted_proxy_rejected() {
+        for entry in ["0.0.0.0/0", "::/0"] {
+            let cfg = ServerConfig {
+                trusted_proxies: vec![entry.into()],
+                ..ServerConfig::default()
+            };
+            let err = validate_server_config(&cfg).unwrap_err();
+            assert!(
+                err.to_string().contains("prefix length 0"),
+                "entry {entry:?}: {err}"
+            );
+        }
     }
 
     #[test]

@@ -244,6 +244,19 @@ mod tests {
     }
 
     #[test]
+    fn rejects_nat64_embedded_metadata_even_with_transition_allowlist() {
+        // NAT64-wrapped 169.254.169.254 must stay blocked even when the
+        // transition prefix is allowlisted (M2 regression).
+        let addrs = vec![sa(IpAddr::V6(Ipv6Addr::new(
+            0x0064, 0xff9b, 0, 0, 0, 0, 0xa9fe, 0xa9fe,
+        )))];
+        let allowlist = allowlist_with(&[], &["64:ff9b::/96"]);
+        let err = screen_addrs(&addrs, &allowlist, "nat64.example", false)
+            .expect_err("nat64-embedded metadata must be unbypassable");
+        assert!(err.contains("cloud_metadata"), "{err}");
+    }
+
+    #[test]
     fn rejects_cloud_metadata_even_with_loopback_bypass() {
         let addrs = vec![sa(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)))];
         let err = screen_addrs(&addrs, &empty_allowlist(), "meta", true)

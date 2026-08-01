@@ -8,6 +8,99 @@ Breaking changes bump the **major** version.
 
 ## [Unreleased]
 
+### Security
+
+- **SSRF: cloud-metadata is now unbypassable through IPv6 transition/compatibility
+  forms.** `ip_block_reason` re-labels NAT64 (`64:ff9b::/96`) and 6to4
+  (`2002::/16`) addresses embedding a cloud-metadata IPv4 (e.g.
+  `64:ff9b::169.254.169.254`) as `cloud_metadata` rather than
+  `nat64_embedded`/`6to4_embedded`, so an operator SSRF allowlist covering a
+  transition prefix can no longer re-allow the metadata endpoint.
+  (rust-review MEDIUM / M2.)
+- **SSRF: deprecated IPv4-compatible IPv6 (`::a.b.c.d`, `::/96`) is now blocked.**
+  These addresses previously fell through the IPv6 classifier as public; they
+  now inherit the embedded IPv4 rule (`::127.0.0.1` → loopback,
+  `::169.254.169.254` → cloud_metadata) with the rest of the deprecated prefix
+  blocked as defence in depth, matching the guarantee already documented in
+  `SECURITY.md`. (rust-review MEDIUM / M3.)
+- **`trusted_proxies` now rejects a `/0` prefix.** `0.0.0.0/0` and `::/0` were
+  accepted by both the TOML and builder validators; a `/0` trusted proxy marks
+  every peer trusted and lets any client spoof the resolved client IP
+  (rate-limit bypass, audit poisoning) via forwarding headers. Both validators
+  now reject prefix-0 CIDRs via a shared helper, mirroring the SSRF allowlist
+  parser. **BREAKING** for configurations that relied on a `/0` trusted proxy.
+  (rust-review MEDIUM / M1.)
+- **OAuth credential POSTs no longer follow redirects.** `/token`, `/introspect`,
+  `/revoke`, and the RFC 8693 token-exchange requests now use a dedicated
+  `redirect::Policy::none()` client, so a 307/308 from a compromised or
+  open-redirecting endpoint can no longer re-send the `client_secret`-bearing
+  body to another host. (rust-review MEDIUM / M7.)
+- **OAuth JWKS key selection is fail-closed on `kid`.** A JWT carrying a `kid`
+  must now match a *named* JWKS key exactly; it no longer falls back to an
+  unnamed key of the same algorithm, closing an unknown-`kid` key-selection
+  vector. **Behavior change** for non-standard IdPs that mint `kid`-bearing
+  tokens against a `kid`-less JWKS. (rust-review LOW / L4.)
+- **OAuth targets: internal hostname suffixes rejected pre-DNS.** OAuth/JWKS
+  targets whose host ends in `.localhost`, `.local`, or `.internal` are rejected
+  before resolution (an exact-host allowlist entry still overrides; a trailing
+  FQDN dot is canonicalized). Exact `localhost` is unaffected — already covered
+  by the post-DNS IP screen. (rust-review LOW / L3.)
+- **Security response headers now cover early and fallback responses.** The
+  OWASP header layer (`X-Content-Type-Options`, `X-Frame-Options`,
+  `Content-Security-Policy`, and — under TLS — `Strict-Transport-Security`) was
+  previously an inner layer, so origin-rejection 403s, CORS-preflight replies,
+  overload 503s, and the 404 fallback were emitted without it. It is now the
+  outermost response layer and decorates every response. (rust-review MEDIUM /
+  M5.)
+- **OAuth `/introspect` and `/revoke` now require the admin role.** When
+  `require_auth_on_admin_endpoints` is set, these proxy endpoints are gated by
+  the configured `admin_role` (default `admin`) in addition to authentication;
+  an authenticated non-admin caller now receives `403` instead of reaching the
+  upstream. **BREAKING** behavior change for authenticated non-admin callers
+  who could previously introspect/revoke tokens. (rust-review MEDIUM / M6.)
+
+### Changed
+
+- **Default `Content-Security-Policy` hardened** to `default-src 'none';
+  form-action 'self'; object-src 'none'; frame-ancestors 'none';
+  upgrade-insecure-requests` (was `default-src 'none'; frame-ancestors 'none'`).
+  Operators that set a custom `content_security_policy` are unaffected.
+  (rust-review LOW / L1.)
+- **`X-Forwarded-For` / `Forwarded` node ports are validated.** A forwarding
+  entry with an empty or non-numeric port (`203.0.113.7:`,
+  `[2001:db8::1]:notaport`) is now treated as malformed, so resolution falls
+  back to the direct peer instead of trusting an ambiguous identifier.
+  (rust-review LOW / L2.)
+- **Lint posture:** added `large_stack_arrays`, `large_stack_frames`,
+  `ptr_as_ptr`, and `cast_lossless` (warn) per RUST_GUIDELINES.md §9, and
+  documented why `RUSTFLAGS="-D warnings"` (not Cargo `build.warnings`, which is
+  Rust 1.97+) is the correct deny-warnings mechanism at MSRV 1.95.
+  (rust-review tooling / T1, T2.)
+
+### Added
+
+- **`OAuthConfig::require_subject`** (opt-in, default `false`). When enabled, a
+  JWT without a `sub` claim is rejected. Leave `false` for OAuth
+  client-credentials / machine-to-machine tokens, which legitimately carry no
+  subject. (rust-review LOW / L4.)
+- **`McpServerConfig::expose_build_metadata`** (opt-in, default `false`). The
+  unauthenticated `/version` endpoint now serves only `name`, `version`, and
+  `mcpx_version` by default; `build_git_sha`, `build_timestamp`, and
+  `rust_version` are included only when this is enabled, so build fingerprints
+  are not leaked to anonymous callers. **Behavior change** to the default
+  `/version` response shape. (rust-review LOW / L5.)
+
+### Removed
+
+- **`OauthHttpClient::__test_get` is no longer present in default builds.** This
+  hidden, test-only accessor was `#[doc(hidden)] pub` but ungated; because a
+  literal-IP target performs no DNS lookup, the `SsrfScreeningResolver` never
+  fired, making it a reachable SSRF vector in production builds. It is now gated
+  behind `#[cfg(any(test, feature = "test-helpers"))]` like its sibling
+  helpers, so it is absent from the default public API and remains available
+  only under the `test-helpers` feature for downstream integration tests.
+  (rust-review MEDIUM / M4.)
+
 ## [3.0.0] - 2026-07-30
 
 ### Changed

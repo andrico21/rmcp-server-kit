@@ -152,7 +152,8 @@ fn parse_node_identifier(token: &str) -> Result<IpAddr, FallbackReason> {
         let Some((inner, after)) = rest.split_once(']') else {
             return Err(FallbackReason::MalformedEntry);
         };
-        if !(after.is_empty() || after.starts_with(':')) {
+        let after_ok = after.is_empty() || after.strip_prefix(':').is_some_and(is_valid_port);
+        if !after_ok {
             return Err(FallbackReason::MalformedEntry);
         }
         return inner
@@ -164,15 +165,26 @@ fn parse_node_identifier(token: &str) -> Result<IpAddr, FallbackReason> {
     if let Ok(ip) = token.parse::<IpAddr>() {
         return Ok(ip);
     }
-    // v4:port — exactly one colon and a v4 on the left.
-    if let Some((host, _port)) = token.rsplit_once(':')
+    // v4:port — exactly one colon and a v4 on the left. The port must be a
+    // non-empty decimal u16, else the node identifier is ambiguous.
+    if let Some((host, port)) = token.rsplit_once(':')
         && !host.contains(':')
     {
+        if !is_valid_port(port) {
+            return Err(FallbackReason::MalformedEntry);
+        }
         return host
             .parse::<IpAddr>()
             .map_err(|_| FallbackReason::MalformedEntry);
     }
     Err(FallbackReason::MalformedEntry)
+}
+
+/// A forwarding-node port must be a non-empty decimal `u16`. An empty or
+/// non-numeric port marks the entry malformed so resolution falls back to
+/// the direct peer rather than trusting an ambiguous node identifier.
+fn is_valid_port(port: &str) -> bool {
+    !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok()
 }
 
 #[cfg(test)]
@@ -281,6 +293,28 @@ mod tests {
         let headers = xff(&["203.0.113.7:5678"]);
         let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), XFF);
         assert_eq!(got, Ok(ip("203.0.113.7")));
+    }
+
+    #[test]
+    fn xff_empty_port_falls_back() {
+        let headers = xff(&["203.0.113.7:"]);
+        let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), XFF);
+        assert_eq!(got, Err(FallbackReason::MalformedEntry));
+    }
+
+    #[test]
+    fn xff_nonnumeric_port_falls_back() {
+        for value in [
+            "[2001:db8::1]:notaport",
+            "203.0.113.7:notaport",
+            "203.0.113.7:99999",
+            "203.0.113.7:+443",
+            "[2001:db8::1]:+443",
+        ] {
+            let headers = xff(&[value]);
+            let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), XFF);
+            assert_eq!(got, Err(FallbackReason::MalformedEntry), "value: {value:?}");
+        }
     }
 
     #[test]

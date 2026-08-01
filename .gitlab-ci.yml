@@ -41,6 +41,8 @@ stages:
 
 variables:
   CARGO_TERM_COLOR: always
+  # RUSTFLAGS="-D warnings" (not Cargo `build.warnings`, which is 1.97+; MSRV
+  # is 1.95). See docs/RUST_1_95_NOTES.md. Do not "upgrade" to build.warnings.
   RUSTFLAGS: "-D warnings"
   CARGO_INCREMENTAL: "0"          # CI cache hit-rate > incremental gain
   CARGO_NET_RETRY: "10"

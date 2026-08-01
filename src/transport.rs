@@ -253,7 +253,7 @@ pub struct SecurityHeadersConfig {
     /// Override for `X-Permitted-Cross-Domain-Policies`. Default: `none`.
     pub x_permitted_cross_domain_policies: Option<String>,
     /// Override for `Content-Security-Policy`. Default:
-    /// `default-src 'none'; frame-ancestors 'none'`.
+    /// `default-src 'none'; form-action 'self'; object-src 'none'; frame-ancestors 'none'; upgrade-insecure-requests`.
     pub content_security_policy: Option<String>,
     /// Override for `X-DNS-Prefetch-Control`. Default: `off`.
     pub x_dns_prefetch_control: Option<String>,
@@ -489,6 +489,13 @@ pub struct McpServerConfig {
         note = "use McpServerConfig::enable_request_header_logging(); direct field access will become pub(crate) in a future major release"
     )]
     pub log_request_headers: bool,
+    /// Expose build metadata (`build_git_sha`, `build_timestamp`,
+    /// `rust_version`) on the unauthenticated `/version` endpoint.
+    /// **Default: `false`** -- only `name`, `version`, and `mcpx_version`
+    /// are served otherwise, so build fingerprints are not leaked to
+    /// anonymous callers. Enable via
+    /// [`McpServerConfig::expose_build_metadata`].
+    pub expose_build_metadata: bool,
     /// Enable gzip/br response compression on MCP responses.
     /// Defaults to `false` to preserve existing behaviour.
     #[deprecated(
@@ -694,6 +701,7 @@ impl McpServerConfig {
             extra_router: None,
             public_url: None,
             log_request_headers: false,
+            expose_build_metadata: false,
             compression_enabled: false,
             compression_min_size: 1024,
             max_concurrent_requests: None,
@@ -1033,6 +1041,16 @@ impl McpServerConfig {
         self
     }
 
+    /// Expose build metadata (`build_git_sha`, `build_timestamp`,
+    /// `rust_version`) on the unauthenticated `/version` endpoint. Off by
+    /// default so `/version` reveals only `name`, `version`, and
+    /// `mcpx_version`.
+    #[must_use]
+    pub fn expose_build_metadata(mut self) -> Self {
+        self.expose_build_metadata = true;
+        self
+    }
+
     /// Enable the Prometheus metrics listener on `bind` (e.g.
     /// `127.0.0.1:9090`). Requires the `metrics` crate feature.
     #[cfg(feature = "metrics")]
@@ -1143,11 +1161,7 @@ impl McpServerConfig {
     /// nonempty proxy list (fail-fast over a silent no-op).
     fn check_trusted_forwarder(&self) -> Result<(), McpxError> {
         for entry in &self.trusted_proxies {
-            if parse_proxy_net(entry).is_none() {
-                return Err(McpxError::Config(format!(
-                    "trusted_proxies entry {entry:?} is neither a CIDR nor an IP address"
-                )));
-            }
+            validate_trusted_proxy_entry(entry).map_err(McpxError::Config)?;
         }
         if self.forwarded_header.is_some() && self.trusted_proxies.is_empty() {
             return Err(McpxError::Config(
@@ -1645,8 +1659,11 @@ where
                 // time. The handler then serves a cheap `Arc::clone` of the
                 // immutable bytes per request, avoiding `serde_json::Value`
                 // allocation + serialization on every `/version` hit.
-                let payload_bytes: Arc<[u8]> =
-                    serialize_version_payload(&config.name, &config.version);
+                let payload_bytes: Arc<[u8]> = serialize_version_payload(
+                    &config.name,
+                    &config.version,
+                    config.expose_build_metadata,
+                );
                 move || {
                     let p = Arc::clone(&payload_bytes);
                     async move {
@@ -1746,17 +1763,14 @@ where
             oauth_config,
             auth_state.as_ref(),
             config.max_request_body,
+            &config.admin_role,
         )?;
     }
 
-    // OWASP security response headers (applied to all responses).
-    // HSTS is conditional on TLS being configured.
-    let is_tls = config.tls_cert_path.is_some();
-    let security_headers_cfg = Arc::new(config.security_headers.clone());
-    router = router.layer(axum::middleware::from_fn(move |req, next| {
-        let cfg = Arc::clone(&security_headers_cfg);
-        security_headers_middleware(is_tls, cfg, req, next)
-    }));
+    // OWASP security response headers are installed LAST (after the origin
+    // layer, below) so they form the OUTERMOST response layer and therefore
+    // also decorate origin-403, CORS-preflight, overload-503, and 404-fallback
+    // responses. See the `security_headers_middleware` install site below.
 
     // CORS preflight layer (required for browser-based MCP clients).
     // Uses the same effective origins as the origin check middleware
@@ -1897,10 +1911,11 @@ where
 
     // Origin validation layer (MCP spec: servers MUST validate the
     // Origin header to prevent DNS rebinding attacks). Installed as the
-    // OUTERMOST layer on the OUTER router so it protects ALL routes
+    // outermost REQUEST-side security layer so it protects ALL routes
     // (`/mcp`, `/healthz`, `/readyz`, `/version`, OAuth proxy endpoints,
     // admin endpoints, extra_router, etc.) and runs BEFORE auth so we
-    // reject cross-origin attackers without spending Argon2 cycles.
+    // reject cross-origin attackers without spending Argon2 cycles. Only
+    // the response-decorating security-headers layer below sits further out.
     //
     // Origin-less requests (e.g. server-to-server probes, curl, native
     // MCP clients) are permitted; only requests with an Origin header
@@ -1908,6 +1923,21 @@ where
     router = router.layer(axum::middleware::from_fn(move |req, next| {
         let origins = Arc::clone(&allowed_origins);
         origin_check_middleware(origins, log_request_headers, req, next)
+    }));
+
+    // OWASP security response headers. Installed LAST, making this the
+    // OUTERMOST response layer: every response -- normal handler output,
+    // origin-403, CORS preflight, the overload-503 (already converted to a
+    // Response by the HandleErrorLayer nested inside the load-shed stack),
+    // and the 404 fallback -- flows back out through it and gains the headers.
+    // This is response-only decoration: on the request path it is a
+    // pass-through, so origin still runs before auth and the rate limiter
+    // still sits inside auth.
+    let is_tls = config.tls_cert_path.is_some();
+    let security_headers_cfg = Arc::new(config.security_headers.clone());
+    router = router.layer(axum::middleware::from_fn(move |req, next| {
+        let cfg = Arc::clone(&security_headers_cfg);
+        security_headers_middleware(is_tls, cfg, req, next)
     }));
 
     let scheme = if config.tls_cert_path.is_some() {
@@ -2254,6 +2284,7 @@ fn install_oauth_proxy_routes(
     oauth_config: &crate::oauth::OAuthConfig,
     auth_state: Option<&Arc<AuthState>>,
     max_request_body: usize,
+    admin_role: &str,
 ) -> Result<axum::Router, McpxError> {
     let Some(ref proxy) = oauth_config.proxy else {
         return Ok(router);
@@ -2333,7 +2364,7 @@ fn install_oauth_proxy_routes(
     }
 
     let admin_router = if admin_routes_enabled {
-        build_oauth_admin_router(proxy, http, auth_state)?
+        build_oauth_admin_router(proxy, http, auth_state, admin_role)?
     } else {
         axum::Router::new()
     };
@@ -2369,6 +2400,7 @@ fn build_oauth_admin_router(
     proxy: &crate::oauth::OAuthProxyConfig,
     http: crate::oauth::OauthHttpClient,
     auth_state: Option<&Arc<AuthState>>,
+    admin_role: &str,
 ) -> Result<axum::Router, McpxError> {
     let mut admin_router = axum::Router::new();
     if proxy.introspection_url.is_some() {
@@ -2407,12 +2439,21 @@ fn build_oauth_admin_router(
             ));
         };
         let state_for_mw = Arc::clone(state);
-        Ok(
-            admin_router.layer(axum::middleware::from_fn(move |req, next| {
+        let required_role: Arc<str> = Arc::from(admin_role);
+        // M6: gate introspect/revoke behind the admin role. Layers are added
+        // inner-first, so the role check is added BEFORE auth in order to run
+        // AFTER it at runtime: auth_middleware (outermost) authenticates and
+        // populates the AuthIdentity, then require_admin_role rejects any
+        // authenticated-but-non-admin caller with 403.
+        Ok(admin_router
+            .layer(axum::middleware::from_fn(move |req, next| {
+                let r = Arc::clone(&required_role);
+                crate::admin::require_admin_role(r, req, next)
+            }))
+            .layer(axum::middleware::from_fn(move |req, next| {
                 let s = Arc::clone(&state_for_mw);
                 auth_middleware(s, req, next)
-            })),
-        )
+            })))
     } else {
         Ok(admin_router)
     }
@@ -2865,19 +2906,39 @@ async fn healthz() -> impl IntoResponse {
 
 /// Build the `/version` JSON payload for a given server name and version.
 ///
-/// Build metadata (`build_git_sha`, `build_timestamp`, `rust_version`) is
-/// read at compile time from the `RMCP_SERVER_KIT_BUILD_SHA`,
-/// `RMCP_SERVER_KIT_BUILD_TIME`, and `RMCP_SERVER_KIT_RUSTC_VERSION` env
-/// vars. Unset values resolve to `"unknown"`.
-fn version_payload(name: &str, version: &str) -> serde_json::Value {
-    serde_json::json!({
-        "name": name,
-        "version": version,
-        "build_git_sha": option_env!("RMCP_SERVER_KIT_BUILD_SHA").unwrap_or("unknown"),
-        "build_timestamp": option_env!("RMCP_SERVER_KIT_BUILD_TIME").unwrap_or("unknown"),
-        "rust_version": option_env!("RMCP_SERVER_KIT_RUSTC_VERSION").unwrap_or("unknown"),
-        "mcpx_version": env!("CARGO_PKG_VERSION"),
-    })
+/// `name`, `version`, and `mcpx_version` are always included. Build
+/// metadata (`build_git_sha`, `build_timestamp`, `rust_version`) is added
+/// only when `expose_build_metadata` is true, so anonymous `/version`
+/// callers do not receive build fingerprints by default. The build values
+/// are read at compile time from `RMCP_SERVER_KIT_BUILD_SHA`,
+/// `RMCP_SERVER_KIT_BUILD_TIME`, and `RMCP_SERVER_KIT_RUSTC_VERSION`;
+/// unset values resolve to `"unknown"`.
+fn version_payload(name: &str, version: &str, expose_build_metadata: bool) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    map.insert("name".into(), name.into());
+    map.insert("version".into(), version.into());
+    map.insert("mcpx_version".into(), env!("CARGO_PKG_VERSION").into());
+    if expose_build_metadata {
+        map.insert(
+            "build_git_sha".into(),
+            option_env!("RMCP_SERVER_KIT_BUILD_SHA")
+                .unwrap_or("unknown")
+                .into(),
+        );
+        map.insert(
+            "build_timestamp".into(),
+            option_env!("RMCP_SERVER_KIT_BUILD_TIME")
+                .unwrap_or("unknown")
+                .into(),
+        );
+        map.insert(
+            "rust_version".into(),
+            option_env!("RMCP_SERVER_KIT_RUSTC_VERSION")
+                .unwrap_or("unknown")
+                .into(),
+        );
+    }
+    serde_json::Value::Object(map)
 }
 
 /// Pre-serialize the `/version` payload to immutable bytes.
@@ -2889,8 +2950,8 @@ fn version_payload(name: &str, version: &str) -> serde_json::Value {
 /// Serialization of a flat `serde_json::Value` of static-string fields
 /// cannot fail in practice; the fallback to `b"{}"` exists only to
 /// satisfy the crate-wide `unwrap_used` / `expect_used` lint policy.
-fn serialize_version_payload(name: &str, version: &str) -> Arc<[u8]> {
-    let value = version_payload(name, version);
+fn serialize_version_payload(name: &str, version: &str, expose_build_metadata: bool) -> Arc<[u8]> {
+    let value = version_payload(name, version, expose_build_metadata);
     serde_json::to_vec(&value).map_or_else(|_| Arc::from(&b"{}"[..]), Arc::from)
 }
 
@@ -3060,7 +3121,7 @@ async fn security_headers_middleware(
         headers,
         HeaderName::from_static("content-security-policy"),
         cfg.content_security_policy.as_deref(),
-        "default-src 'none'; frame-ancestors 'none'",
+        "default-src 'none'; form-action 'self'; object-src 'none'; frame-ancestors 'none'; upgrade-insecure-requests",
     );
     apply_security_header(
         headers,
@@ -3298,6 +3359,27 @@ fn parse_proxy_net(entry: &str) -> Option<ipnet::IpNet> {
         return Some(net);
     }
     entry.parse::<IpAddr>().ok().map(ipnet::IpNet::from)
+}
+
+/// Validate one `trusted_proxies` entry. Accepts a CIDR (`ipnet::IpNet`)
+/// or a bare IP; **rejects a `/0` prefix**, which would mark every peer
+/// trusted and let any client spoof the resolved client IP via forwarding
+/// headers. Shared by the builder ([`McpServerConfig::check_trusted_forwarder`])
+/// and the TOML validator so the two validators cannot drift.
+///
+/// # Errors
+///
+/// Returns a message when the entry is unparseable or carries a `/0` prefix.
+pub(crate) fn validate_trusted_proxy_entry(entry: &str) -> Result<(), String> {
+    match parse_proxy_net(entry) {
+        None => Err(format!(
+            "trusted_proxies entry {entry:?} is neither a CIDR nor an IP address"
+        )),
+        Some(net) if net.prefix_len() == 0 => Err(format!(
+            "trusted_proxies entry {entry:?}: prefix length 0 is forbidden (marks every peer trusted, enabling client-IP spoofing)"
+        )),
+        Some(_) => Ok(()),
+    }
 }
 
 /// Rate-limit key for the current request: the resolved [`ClientIp`]
@@ -4300,6 +4382,19 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_zero_prefix_trusted_proxy() {
+        for entry in ["0.0.0.0/0", "::/0"] {
+            let cfg =
+                McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0").with_trusted_proxies([entry]);
+            let err = cfg.validate().expect_err("zero-prefix CIDR");
+            assert!(
+                err.to_string().contains("prefix length 0"),
+                "entry {entry}: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn validate_accepts_cidr_and_bare_ip_proxy_entries() {
         let cfg = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0").with_trusted_proxies([
             "10.0.0.0/8",
@@ -4444,7 +4539,7 @@ mod tests {
         );
         assert_eq!(
             h.get("content-security-policy").unwrap(),
-            "default-src 'none'; frame-ancestors 'none'"
+            "default-src 'none'; form-action 'self'; object-src 'none'; frame-ancestors 'none'; upgrade-insecure-requests"
         );
         assert_eq!(h.get("x-dns-prefetch-control").unwrap(), "off");
         // No HSTS when TLS is off.
@@ -4461,6 +4556,32 @@ mod tests {
         assert!(
             hsts.to_str().unwrap().contains("max-age=63072000"),
             "HSTS must set 2-year max-age"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_csp_matches_guideline() {
+        let app = security_router(false);
+        let req = Request::builder().uri("/test").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.headers().get("content-security-policy").unwrap(),
+            "default-src 'none'; form-action 'self'; object-src 'none'; frame-ancestors 'none'; upgrade-insecure-requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_csp_override_still_wins() {
+        let cfg = SecurityHeadersConfig {
+            content_security_policy: Some("default-src 'self'".into()),
+            ..SecurityHeadersConfig::default()
+        };
+        let app = security_router_with(false, cfg);
+        let req = Request::builder().uri("/test").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.headers().get("content-security-policy").unwrap(),
+            "default-src 'self'"
         );
     }
 
@@ -4681,10 +4802,22 @@ mod tests {
     // -- version endpoint --
 
     #[test]
-    fn version_payload_contains_expected_fields() {
-        let v = version_payload("my-server", "1.2.3");
+    fn version_omits_build_fingerprint_by_default() {
+        let v = version_payload("my-server", "1.2.3", false);
         assert_eq!(v["name"], "my-server");
         assert_eq!(v["version"], "1.2.3");
+        assert!(v["mcpx_version"].is_string());
+        assert!(
+            v.get("build_git_sha").is_none(),
+            "build sha must be hidden by default"
+        );
+        assert!(v.get("build_timestamp").is_none());
+        assert!(v.get("rust_version").is_none());
+    }
+
+    #[test]
+    fn version_exposes_all_when_enabled() {
+        let v = version_payload("my-server", "1.2.3", true);
         assert!(v["build_git_sha"].is_string());
         assert!(v["build_timestamp"].is_string());
         assert!(v["rust_version"].is_string());
@@ -4811,5 +4944,179 @@ mod tests {
         }
 
         drop(tls);
+    }
+
+    // -- M5: OWASP security headers reach early / fallback responses --
+
+    fn assert_owasp_headers(resp: &axum::response::Response, ctx: &str) {
+        let h = resp.headers();
+        assert!(
+            h.contains_key("x-content-type-options"),
+            "{ctx}: missing X-Content-Type-Options"
+        );
+        assert!(
+            h.contains_key("x-frame-options"),
+            "{ctx}: missing X-Frame-Options"
+        );
+        assert!(
+            h.contains_key("strict-transport-security"),
+            "{ctx}: missing Strict-Transport-Security"
+        );
+        assert!(
+            h.contains_key(header::CONTENT_SECURITY_POLICY),
+            "{ctx}: missing Content-Security-Policy"
+        );
+    }
+
+    fn m5_router(configure: impl FnOnce(&mut McpServerConfig)) -> axum::Router {
+        #[derive(Clone)]
+        struct H;
+        impl ServerHandler for H {}
+        // TLS paths make `is_tls` true so HSTS is emitted. The paths are never
+        // read: these tests drive only the axum router via `oneshot`, not the
+        // TLS listener.
+        let mut config = McpServerConfig::new("127.0.0.1:8080", "test", "0.0.0")
+            .with_allowed_origins(["http://good.example"])
+            .with_tls("unused.crt", "unused.key");
+        configure(&mut config);
+        let (router, _params) = build_app_router(config, || H).expect("build_app_router");
+        router
+    }
+
+    #[tokio::test]
+    async fn headers_on_rejected_origin_403() {
+        let app = m5_router(|_| {});
+        let req = Request::builder()
+            .uri("/healthz")
+            .header(header::ORIGIN, "http://evil.example")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_owasp_headers(&resp, "origin-403");
+    }
+
+    #[tokio::test]
+    async fn headers_on_cors_preflight() {
+        let app = m5_router(|_| {});
+        let req = Request::builder()
+            .method(axum::http::Method::OPTIONS)
+            .uri("/mcp")
+            .header(header::ORIGIN, "http://good.example")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_owasp_headers(&resp, "cors-preflight");
+    }
+
+    #[tokio::test]
+    async fn headers_on_404_fallback() {
+        let app = m5_router(|_| {});
+        let req = Request::builder()
+            .uri("/no-such-route")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_owasp_headers(&resp, "404-fallback");
+    }
+
+    #[tokio::test]
+    async fn headers_on_overload_503() {
+        // A zero-permit concurrency cap sheds every request, so a single
+        // oneshot deterministically surfaces the overload 503.
+        let app = m5_router(|c| c.max_concurrent_requests = Some(0));
+        let req = Request::builder()
+            .uri("/healthz")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_owasp_headers(&resp, "overload-503");
+    }
+
+    // -- M6: OAuth proxy admin endpoints enforce the admin role --
+
+    #[cfg(feature = "oauth")]
+    fn m6_auth_state() -> (Arc<AuthState>, String, String) {
+        let (admin_token, admin_hash) = crate::auth::generate_api_key().unwrap();
+        let (viewer_token, viewer_hash) = crate::auth::generate_api_key().unwrap();
+        let state = Arc::new(AuthState {
+            api_keys: ArcSwap::from_pointee(vec![
+                crate::auth::ApiKeyEntry::new("admin-key", admin_hash, "admin"),
+                crate::auth::ApiKeyEntry::new("viewer-key", viewer_hash, "viewer"),
+            ]),
+            rate_limiter: None,
+            pre_auth_limiter: None,
+            jwks_cache: None,
+            seen_identities: crate::auth::SeenIdentitySet::new(),
+            counters: crate::auth::AuthCounters::default(),
+        });
+        (state, admin_token, viewer_token)
+    }
+
+    #[cfg(feature = "oauth")]
+    fn m6_admin_router(state: &Arc<AuthState>) -> axum::Router {
+        let proxy = crate::oauth::OAuthProxyConfig::builder(
+            "https://idp.example/authorize",
+            "https://idp.example/token",
+            "client",
+        )
+        .introspection_url("http://127.0.0.1:1/introspect")
+        .revocation_url("http://127.0.0.1:1/revoke")
+        .expose_admin_endpoints(true)
+        .require_auth_on_admin_endpoints(true)
+        .build();
+        let http = crate::oauth::OauthHttpClient::new().expect("oauth http client");
+        build_oauth_admin_router(&proxy, http, Some(state), "admin").expect("admin router")
+    }
+
+    #[cfg(feature = "oauth")]
+    fn m6_req(path: &str, token: &str) -> Request<Body> {
+        Request::builder()
+            .method(axum::http::Method::POST)
+            .uri(path)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from("token=abc"))
+            .unwrap()
+    }
+
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn oauth_proxy_admin_requires_admin_role() {
+        let (state, _admin, viewer) = m6_auth_state();
+        for path in ["/introspect", "/revoke"] {
+            let app = m6_admin_router(&state);
+            let resp = app.oneshot(m6_req(path, &viewer)).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "an authenticated viewer must be rejected with 403 on {path}"
+            );
+        }
+    }
+
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn oauth_proxy_admin_allows_admin_role() {
+        let (state, admin, _viewer) = m6_auth_state();
+        for path in ["/introspect", "/revoke"] {
+            let app = m6_admin_router(&state);
+            let resp = app.oneshot(m6_req(path, &admin)).await.unwrap();
+            // The admin identity clears both the auth and role gates; the
+            // downstream introspection call then fails closed (no upstream),
+            // so the only guarantee asserted is that it is neither 401 nor 403.
+            assert_ne!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "an authenticated admin must pass the role gate on {path}"
+            );
+            assert_ne!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "an authenticated admin must pass the auth gate on {path}"
+            );
+        }
     }
 }

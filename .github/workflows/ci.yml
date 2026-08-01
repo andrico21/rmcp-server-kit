@@ -18,6 +18,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # `RUSTFLAGS="-D warnings"` (not Cargo's `build.warnings`): `build.warnings`
+  # is Rust 1.97+, but this crate's MSRV is 1.95, so RUSTFLAGS is the correct
+  # deny-warnings mechanism here. See docs/RUST_1_95_NOTES.md. Do not "upgrade".
   RUSTFLAGS: "-D warnings"
 
 jobs:

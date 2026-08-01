@@ -88,7 +88,11 @@ pub(crate) fn sanitized_url_for_log(url: &Url) -> String {
 /// - IPv6 documentation (`2001:db8::/32`).
 /// - IPv6 Teredo tunneling (`2001::/32`), blocked outright.
 /// - IPv6 NAT64 (`64:ff9b::/96`) and 6to4 (`2002::/16`) when the
-///   embedded IPv4 address is itself blocked by any rule above.
+///   embedded IPv4 address is itself blocked by any rule above; embedded
+///   cloud-metadata is re-labelled `cloud_metadata` so an operator
+///   allowlist covering the transition prefix cannot re-allow it.
+/// - IPv6 IPv4-compatible (`::a.b.c.d`, deprecated `::/96`): the whole
+///   prefix is blocked, inheriting any IPv4 rule for the embedded address.
 /// - IPv4-mapped IPv6 inheriting any of the above.
 ///
 /// **Cloud-metadata addresses are checked BEFORE the generic buckets** so
@@ -171,6 +175,21 @@ fn block_reason_v6(v6: Ipv6Addr) -> Option<&'static str> {
         return Some("multicast");
     }
     let segments = v6.segments();
+    // Deprecated IPv4-compatible IPv6 `::a.b.c.d` (`::/96`, RFC 4291 §2.5.5.1).
+    // `::` (unspecified) and `::1` (loopback) are already handled above, so any
+    // remaining address whose top 96 bits are zero embeds an IPv4 address.
+    // Classify it through the IPv4 rules so loopback / private / link-local /
+    // cloud-metadata are inherited (metadata wins first inside `block_reason_v4`),
+    // and block the rest of the deprecated prefix as defence in depth.
+    if segments[0] == 0
+        && segments[1] == 0
+        && segments[2] == 0
+        && segments[3] == 0
+        && segments[4] == 0
+        && segments[5] == 0
+    {
+        return block_reason_v4(embedded_v4(segments[6], segments[7])).or(Some("ipv4_compatible"));
+    }
     // Link-local fe80::/10.
     if (segments[0] & 0xffc0) == 0xfe80 {
         return Some("link_local");
@@ -203,7 +222,14 @@ fn block_reason_v6(v6: Ipv6Addr) -> Option<&'static str> {
         && segments[4] == 0
         && segments[5] == 0
     {
-        if block_reason_v4(embedded_v4(segments[6], segments[7])).is_some() {
+        if let Some(reason) = block_reason_v4(embedded_v4(segments[6], segments[7])) {
+            // Preserve the unbypassable cloud-metadata classification: an
+            // operator allowlist covering `64:ff9b::/96` must not re-allow
+            // metadata wrapped in a NAT64 address
+            // (e.g. `64:ff9b::169.254.169.254`).
+            if reason == "cloud_metadata" {
+                return Some("cloud_metadata");
+            }
             return Some("nat64_embedded");
         }
         return None;
@@ -211,7 +237,11 @@ fn block_reason_v6(v6: Ipv6Addr) -> Option<&'static str> {
     // 6to4 2002::/16 (RFC 3056): segments 1-2 embed the IPv4 address of
     // the originating site. Same embedded-target policy as NAT64.
     if segments[0] == 0x2002 {
-        if block_reason_v4(embedded_v4(segments[1], segments[2])).is_some() {
+        if let Some(reason) = block_reason_v4(embedded_v4(segments[1], segments[2])) {
+            // Same unbypassable-metadata rule as the NAT64 arm above.
+            if reason == "cloud_metadata" {
+                return Some("cloud_metadata");
+            }
             return Some("6to4_embedded");
         }
         return None;
@@ -590,12 +620,13 @@ mod tests {
             ))),
             None
         );
-        // NAT64 embedding the IPv4 cloud-metadata address -> blocked.
+        // NAT64 embedding the IPv4 cloud-metadata address -> re-labelled
+        // cloud_metadata (M2) so a NAT64-prefix allowlist cannot re-allow it.
         assert_eq!(
             ip_block_reason(IpAddr::V6(Ipv6Addr::new(
                 0x0064, 0xff9b, 0, 0, 0, 0, 0xa9fe, 0xa9fe
             ))),
-            Some("nat64_embedded")
+            Some("cloud_metadata")
         );
         // 6to4 2002::/16 embedding private 10.0.0.1 -> blocked.
         assert_eq!(
@@ -620,6 +651,84 @@ mod tests {
         assert_eq!(
             ip_block_reason(IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1))),
             Some("documentation")
+        );
+    }
+
+    #[test]
+    fn nat64_embedded_metadata_is_cloud_metadata() {
+        // 64:ff9b::169.254.169.254 — NAT64-wrapped AWS metadata (M2).
+        assert_eq!(
+            ip_block_reason(IpAddr::V6(Ipv6Addr::new(
+                0x0064, 0xff9b, 0, 0, 0, 0, 0xa9fe, 0xa9fe
+            ))),
+            Some("cloud_metadata")
+        );
+        // 64:ff9b::100.100.100.200 — NAT64-wrapped Alibaba/Tencent metadata.
+        assert_eq!(
+            ip_block_reason(IpAddr::V6(Ipv6Addr::new(
+                0x0064, 0xff9b, 0, 0, 0, 0, 0x6464, 0x64c8
+            ))),
+            Some("cloud_metadata")
+        );
+    }
+
+    #[test]
+    fn sixto4_embedded_metadata_is_cloud_metadata() {
+        // 2002:a9fe:a9fe:: — 6to4-wrapped 169.254.169.254 (M2).
+        assert_eq!(
+            ip_block_reason(IpAddr::V6(Ipv6Addr::new(
+                0x2002, 0xa9fe, 0xa9fe, 0, 0, 0, 0, 0
+            ))),
+            Some("cloud_metadata")
+        );
+    }
+
+    #[test]
+    fn nat64_embedded_private_keeps_transition_label() {
+        // Non-metadata embedded blocks keep their (allowlist-bypassable) label.
+        assert_eq!(
+            ip_block_reason(IpAddr::V6(Ipv6Addr::new(
+                0x0064, 0xff9b, 0, 0, 0, 0, 0x0a00, 0x0001
+            ))),
+            Some("nat64_embedded")
+        );
+    }
+
+    #[test]
+    fn ipv4_compatible_ipv6_blocked() {
+        // Deprecated ::a.b.c.d (::/96) inherits IPv4 classification (M3).
+        // ::127.0.0.1
+        assert_eq!(
+            ip_block_reason(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0x7f00, 0x0001))),
+            Some("loopback")
+        );
+        // ::10.0.0.1
+        assert_eq!(
+            ip_block_reason(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0x0a00, 0x0001))),
+            Some("private_rfc1918")
+        );
+        // ::169.254.169.254 — metadata wins first.
+        assert_eq!(
+            ip_block_reason(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0xa9fe, 0xa9fe))),
+            Some("cloud_metadata")
+        );
+        // ::8.8.8.8 — public embedded still blocked as deprecated prefix.
+        assert_eq!(
+            ip_block_reason(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0x0808, 0x0808))),
+            Some("ipv4_compatible")
+        );
+    }
+
+    #[test]
+    fn unspecified_and_loopback_v6_carveouts_intact() {
+        // :: and ::1 must NOT be swallowed by the IPv4-compatible arm.
+        assert_eq!(
+            ip_block_reason(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+            Some("unspecified")
+        );
+        assert_eq!(
+            ip_block_reason(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            Some("loopback")
         );
     }
 
@@ -918,6 +1027,21 @@ mod tests {
                 vec![CidrEntry::parse("100.64.0.0/10").expect("parses")],
             );
             let url = Url::parse("https://100.100.100.200/latest/meta-data/").expect("parses");
+            assert_eq!(
+                redirect_target_reason_with_allowlist(&url, &allow),
+                Some("cloud_metadata")
+            );
+        }
+
+        #[test]
+        fn allowlist_cannot_bypass_transition_metadata() {
+            // An allowlist over the NAT64 prefix must NOT re-allow metadata
+            // wrapped in a NAT64 address: 64:ff9b::169.254.169.254 (M2 regression).
+            let allow = CompiledSsrfAllowlist::new(
+                Vec::new(),
+                vec![CidrEntry::parse("64:ff9b::/96").expect("parses")],
+            );
+            let url = Url::parse("https://[64:ff9b::a9fe:a9fe]/latest/meta-data/").expect("parses");
             assert_eq!(
                 redirect_target_reason_with_allowlist(&url, &allow),
                 Some("cloud_metadata")

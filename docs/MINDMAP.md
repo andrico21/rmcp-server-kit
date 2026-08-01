@@ -68,9 +68,9 @@ mindmap
         JwksCache impl L878
         JwksCache::validate_token L974
         JwksCache::validate_token_with_reason L984
-        select_jwks_key L1075
-        refresh_with_cooldown L1185
-        JWKS_REFRESH_COOLDOWN ~L853
+        select_jwks_key L2110
+        refresh_with_cooldown L2262
+        JWKS_REFRESH_COOLDOWN ~L1800
         JWKS key cap (fail-closed default 256)
         Discovery endpoints
         OAuth proxy routes
@@ -418,16 +418,16 @@ graph TD
 | Area                              | Module / file                           | Notable symbols (file:line)                                                  |
 |-----------------------------------|------------------------------------------|-------------------------------------------------------------------------------|
 | Server entry (HTTP)               | `src/transport.rs`                       | `serve` ~L1954, `McpServerConfig` L277-560, `ReloadHandle` ~L1305              |
-| Server entry (stdio, no auth)     | `src/transport.rs`                       | `serve_stdio` ~L3474                                                          |
+| Server entry (stdio, no auth)     | `src/transport.rs`                       | `serve_stdio` ~L3558                                                          |
 | Router builder + middleware wire  | `src/transport.rs`                       | `build_app_router` ~L1349, security headers wired ~L1677, peer-addr normalize wired ~L1812, origin wired ~L1827 |
 | TLS / mTLS acceptor               | `src/transport.rs`                       | `TlsListener` ~L2522                                                          |
-| Origin / security headers (defs)  | `src/transport.rs`                       | `origin_check_middleware` ~L3381, `security_headers_middleware` ~L2876       |
-| Graceful shutdown                 | `src/transport.rs`                       | `shutdown_signal` ~L2888                                                      |
+| Origin / security headers (defs)  | `src/transport.rs`                       | `origin_check_middleware` ~L3465, `security_headers_middleware` ~L3027       |
+| Graceful shutdown                 | `src/transport.rs`                       | `shutdown_signal` ~L2951                                                      |
 | API key + mTLS auth               | `src/auth.rs`                            | `AuthIdentity` L47, `AuthState` ~L930, `auth_middleware` L1393               |
 | RBAC engine                       | `src/rbac.rs`                            | `RbacPolicy` L352, task-locals L90-150, `rbac_middleware` L678-825           |
 | Memory-bounded keyed limiter      | `src/bounded_limiter.rs`                 | `BoundedKeyedLimiter` L96                                                     |
 | Trusted-forwarder resolution      | `src/forwarded.rs`                       | `resolve_client_ip`, `FallbackReason` (rightmost-untrusted, fail-safe-to-direct) |
-| OAuth JWT / JWKS                  | `src/oauth.rs` (feature `oauth`)         | `JwksCache` L1677, `JWKS_REFRESH_COOLDOWN` ~L1714, `select_jwks_key` L1997 |
+| OAuth JWT / JWKS                  | `src/oauth.rs` (feature `oauth`)         | `JwksCache` L1762, `JWKS_REFRESH_COOLDOWN` ~L1800, `select_jwks_key` L2110 |
 | SSRF guard (outbound HTTP)        | `src/ssrf.rs`                            | per-hop scheme/userinfo/IP-literal blocks                                     |
 | mTLS revocation (CRL)             | `src/mtls_revocation.rs`                 | `CrlSet` L100, `DynamicClientCertVerifier` L771, `bootstrap_fetch` L935       |
 | Tool hooks / size cap             | `src/tool_hooks.rs`                      | `HookedHandler` L219                                                          |

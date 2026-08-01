@@ -83,6 +83,33 @@ fn evaluate_oauth_redirect(
     Ok(())
 }
 
+/// True when `host` ends in a well-known internal suffix (`.localhost`,
+/// `.local`, `.internal`) and is not exactly allow-listed. A trailing
+/// FQDN-root dot is canonicalized first so `idp.internal.` cannot bypass
+/// the check. OAuth targets only -- CRL fetches build an empty allowlist
+/// and are out of scope.
+///
+/// Exact `localhost` is deliberately NOT matched here: it resolves to
+/// loopback and is already blocked by the post-DNS IP screen, and an
+/// operator may legitimately reach a local IdP via an explicit loopback
+/// CIDR allowlist.
+#[allow(
+    clippy::case_sensitive_file_extension_comparisons,
+    reason = "these are DNS-name suffixes on an already-lowercased host, not file extensions"
+)]
+fn oauth_internal_suffix_blocked(
+    host: &str,
+    allowlist: &crate::ssrf::CompiledSsrfAllowlist,
+) -> bool {
+    let host_canon = host.strip_suffix('.').unwrap_or(host);
+    let host_lower = host_canon.to_ascii_lowercase();
+    let is_internal = host_lower.ends_with(".localhost")
+        || host_lower.ends_with(".local")
+        || host_lower.ends_with(".internal");
+    // Blocked when internal, unless the exact host is in a non-empty allowlist.
+    is_internal && (allowlist.is_empty() || !allowlist.host_allowed(host_canon))
+}
+
 /// Screen an OAuth/JWKS target before the initial outbound connect.
 ///
 /// This complements the per-redirect-hop guard in
@@ -121,6 +148,11 @@ async fn screen_oauth_target_core(
     let host = parsed.host_str().ok_or_else(|| {
         crate::error::McpxError::Config(format!("OAuth target URL has no host: {url}"))
     })?;
+    if oauth_internal_suffix_blocked(host, allowlist) {
+        return Err(crate::error::McpxError::Config(format!(
+            "OAuth target forbidden (internal hostname suffix): {url}"
+        )));
+    }
     let port = parsed.port_or_known_default().ok_or_else(|| {
         crate::error::McpxError::Config(format!("OAuth target URL has no known port: {url}"))
     })?;
@@ -237,6 +269,13 @@ async fn screen_oauth_target_with_test_override(
 #[derive(Clone)]
 pub struct OauthHttpClient {
     inner: reqwest::Client,
+    /// M7: dedicated client for credential-bearing POSTs (token /
+    /// introspection / revocation / RFC 8693 exchange). Built with
+    /// `redirect::Policy::none()` so a 307/308 from a compromised or
+    /// open-redirecting endpoint cannot re-send the `client_secret`
+    /// body to another host. Shares `inner`'s `no_proxy`,
+    /// `SsrfScreeningResolver`, and CA trust.
+    credential_client: reqwest::Client,
     allow_http: bool,
     /// Compiled SSRF allowlist applied to the initial-target screen and
     /// to literal-IP redirect-hop screening. Wrapped in `Arc` so cloning
@@ -323,6 +362,16 @@ impl OauthHttpClient {
     /// Internal builder shared by [`new`](Self::new) (config = `None`)
     /// and [`with_config`](Self::with_config) (config = `Some`).
     fn build(config: Option<&OAuthConfig>) -> Result<Self, crate::error::McpxError> {
+        // Install the rustls crypto provider before constructing any reqwest
+        // client (idempotent -- `ok()` ignores the error when a provider was
+        // already installed elsewhere in the process). Without this a
+        // standalone `OauthHttpClient::new`/`with_config` built before
+        // `JwksCache::new` or TLS setup would panic inside reqwest with
+        // "no rustls crypto provider is configured".
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+
         let allow_http = config.is_some_and(|c| c.allow_http_oauth_urls);
 
         // Compile the operator SSRF allowlist (if any) up front. Surface
@@ -359,71 +408,82 @@ impl OauthHttpClient {
                 test_bypass.clone(),
             ));
 
-        let mut builder = reqwest::Client::builder()
-            // M-H2/N1: disable reqwest's auto-proxy detection. Without
-            // this, HTTP_PROXY / HTTPS_PROXY env vars route DNS through
-            // the proxy and bypass our SsrfScreeningResolver entirely.
-            .no_proxy()
-            .dns_resolver(Arc::clone(&resolver))
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-                // SECURITY: a redirect from `https` to `http` is *always*
-                // rejected, even when `allow_http_oauth_urls` is true.
-                // The flag controls whether the *original* request URL
-                // may be plain HTTP; it never authorises a downgrade
-                // mid-flight. An `http -> http` redirect is permitted
-                // only when the flag is true (dev-only). The full
-                // policy lives in `evaluate_oauth_redirect` so the
-                // OauthHttpClient and JwksCache closures stay
-                // byte-for-byte identical.
-                match evaluate_oauth_redirect(&attempt, allow_http, &redirect_allowlist) {
-                    Ok(()) => attempt.follow(),
-                    Err(reason) => {
-                        // Sanitized target: the rejected URL may carry
-                        // userinfo credentials (the rejection reason
-                        // itself is URL-free).
-                        tracing::warn!(
-                            reason = %reason,
-                            target = %crate::ssrf::sanitized_url_for_log(attempt.url()),
-                            "oauth redirect rejected"
-                        );
-                        attempt.error(reason)
-                    }
-                }
-            }));
-
-        if let Some(cfg) = config
+        // Read the optional CA bundle once; reused by both clients below.
+        // Pre-startup blocking I/O is intentional -- the constructor is sync
+        // by contract and runs from `serve()`'s pre-startup phase.
+        let ca_pem: Option<Vec<u8>> = if let Some(cfg) = config
             && let Some(ref ca_path) = cfg.ca_cert_path
         {
-            // Pre-startup blocking I/O: this constructor runs from
-            // `serve()`'s pre-startup phase (and from test code), so
-            // synchronous file I/O is intentional. Do not wrap in
-            // `spawn_blocking` -- the constructor is sync by contract.
-            let pem = std::fs::read(ca_path).map_err(|e| {
+            Some(std::fs::read(ca_path).map_err(|e| {
                 crate::error::McpxError::Startup(format!(
                     "oauth http client: read ca_cert_path {}: {e}",
                     ca_path.display()
                 ))
-            })?;
-            let cert = reqwest::tls::Certificate::from_pem(&pem).map_err(|e| {
-                crate::error::McpxError::Startup(format!(
-                    "oauth http client: parse ca_cert_path {}: {e}",
-                    ca_path.display()
-                ))
-            })?;
-            builder = builder.add_root_certificate(cert);
-        }
+            })?)
+        } else {
+            None
+        };
 
-        let inner = builder.build().map_err(|e| {
-            crate::error::McpxError::Startup(format!("oauth http client init: {e}"))
-        })?;
+        // Base builder shared by both clients: `no_proxy` (so HTTP(S)_PROXY
+        // env vars cannot bypass the SsrfScreeningResolver), the SSRF
+        // resolver, timeouts, and CA trust. Only the redirect policy differs.
+        let make_base = || -> Result<reqwest::ClientBuilder, crate::error::McpxError> {
+            let mut b = reqwest::Client::builder()
+                .no_proxy()
+                .dns_resolver(Arc::clone(&resolver))
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(30));
+            if let Some(ref pem) = ca_pem {
+                let cert = reqwest::tls::Certificate::from_pem(pem).map_err(|e| {
+                    crate::error::McpxError::Startup(format!(
+                        "oauth http client: parse ca_cert_path: {e}"
+                    ))
+                })?;
+                b = b.add_root_certificate(cert);
+            }
+            Ok(b)
+        };
+
+        // JWKS / discovery client: follows redirects, but every hop is screened
+        // by `evaluate_oauth_redirect` (https->http downgrade, literal-IP
+        // target, and userinfo are all rejected).
+        let inner =
+            make_base()?
+                .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                    match evaluate_oauth_redirect(&attempt, allow_http, &redirect_allowlist) {
+                        Ok(()) => attempt.follow(),
+                        Err(reason) => {
+                            tracing::warn!(
+                                reason = %reason,
+                                target = %crate::ssrf::sanitized_url_for_log(attempt.url()),
+                                "oauth redirect rejected"
+                            );
+                            attempt.error(reason)
+                        }
+                    }
+                }))
+                .build()
+                .map_err(|e| {
+                    crate::error::McpxError::Startup(format!("oauth http client init: {e}"))
+                })?;
+
+        // M7: credential-POST client -- NEVER follows redirects. A 307/308 from
+        // a compromised or open-redirecting token/introspection/revocation
+        // endpoint must not re-send the `client_secret`-bearing body to another
+        // host (RFC 8705 §2). Mirrors the `Policy::none()` mTLS cert clients.
+        let credential_client = make_base()?
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| {
+                crate::error::McpxError::Startup(format!("oauth credential client init: {e}"))
+            })?;
 
         #[cfg(feature = "oauth-mtls-client")]
         let mtls_clients = build_mtls_clients(config, &allowlist, &test_bypass)?;
 
         Ok(Self {
             inner,
+            credential_client,
             allow_http,
             allowlist,
             #[cfg(feature = "oauth-mtls-client")]
@@ -471,6 +531,7 @@ impl OauthHttpClient {
     /// applied). Used by integration tests to exercise the redirect-
     /// downgrade and CA-trust regressions without going through
     /// `exchange_token`. Not part of the public API.
+    #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     pub async fn __test_get(&self, url: &str) -> reqwest::Result<reqwest::Response> {
         self.inner.get(url).send().await
@@ -489,10 +550,10 @@ impl OauthHttpClient {
     }
 
     /// M-H4: select the cert-bearing `reqwest::Client` cached for
-    /// `cfg.client_cert`'s paths, else the shared `inner` client.
-    /// Defence-in-depth: a missing cache entry falls through to
-    /// `inner`; combined with the Authorization-header skip in
-    /// `exchange_token`, this surfaces as an upstream auth failure
+    /// `cfg.client_cert`'s paths, else the shared no-redirect
+    /// `credential_client`. Defence-in-depth: a missing cache entry falls
+    /// through to `credential_client`; combined with the Authorization-header
+    /// skip in `exchange_token`, this surfaces as an upstream auth failure
     /// rather than silent secret-bearer fallback.
     #[cfg(feature = "oauth-mtls-client")]
     fn client_for(&self, cfg: &TokenExchangeConfig) -> &reqwest::Client {
@@ -505,12 +566,12 @@ impl OauthHttpClient {
                 return client;
             }
         }
-        &self.inner
+        &self.credential_client
     }
 
     #[cfg(not(feature = "oauth-mtls-client"))]
     fn client_for(&self, _cfg: &TokenExchangeConfig) -> &reqwest::Client {
-        &self.inner
+        &self.credential_client
     }
 }
 
@@ -731,6 +792,12 @@ pub struct OAuthConfig {
     /// (cache remains empty / unchanged). Default: 256.
     #[serde(default = "default_max_jwks_keys")]
     pub max_jwks_keys: usize,
+    /// Require the JWT `sub` (subject) claim. **Default: `false`** (current
+    /// behavior). When `true`, a token without `sub` is rejected. Leave
+    /// `false` for OAuth client-credentials / machine-to-machine tokens,
+    /// which legitimately carry no subject.
+    #[serde(default)]
+    pub require_subject: bool,
     /// Enforce strict audience validation using only the JWT `aud` claim.
     ///
     /// **Deprecated since 1.7.0.** Use [`OAuthConfig::audience_validation_mode`]
@@ -838,6 +905,7 @@ impl Default for OAuthConfig {
             ca_cert_path: None,
             allow_http_oauth_urls: false,
             max_jwks_keys: default_max_jwks_keys(),
+            require_subject: false,
             #[allow(
                 deprecated,
                 reason = "default-construct deprecated field for backward compat"
@@ -1351,6 +1419,16 @@ impl OAuthConfigBuilder {
         self
     }
 
+    /// Require the JWT `sub` (subject) claim (opt-in; default `false`).
+    ///
+    /// When `true`, a token without `sub` is rejected. Leave `false` for
+    /// OAuth client-credentials / machine-to-machine tokens, which
+    /// legitimately carry no subject.
+    pub const fn require_subject(mut self, require: bool) -> Self {
+        self.inner.require_subject = require;
+        self
+    }
+
     /// Override the maximum JWKS response body size in bytes.
     pub const fn jwks_max_response_bytes(mut self, bytes: u64) -> Self {
         self.inner.jwks_max_response_bytes = bytes;
@@ -1705,6 +1783,7 @@ pub struct JwksCache {
     /// per `audience_mode`, optionally `azp`.
     expected_audience: String,
     audience_mode: AudienceValidationMode,
+    require_subject: bool,
     /// Set to `true` after the first `azp`-only audience match while in
     /// [`AudienceValidationMode::Warn`], so the deprecation warning logs
     /// at most once per process lifetime.
@@ -1896,6 +1975,7 @@ impl JwksCache {
             validation_template: validation,
             expected_audience: config.audience.clone(),
             audience_mode: config.effective_audience_validation_mode(),
+            require_subject: config.require_subject,
             azp_fallback_warned: AtomicBool::new(false),
             scopes: config.scopes.clone(),
             role_claim: config.role_claim.clone(),
@@ -1941,6 +2021,11 @@ impl JwksCache {
     ) -> Result<AuthIdentity, JwtValidationFailure> {
         let claims = self.decode_claims(token).await?;
 
+        if self.require_subject && claims.sub.is_none() {
+            core::hint::cold_path();
+            tracing::debug!("JWT rejected: require_subject is set but the token has no `sub`");
+            return Err(JwtValidationFailure::Invalid);
+        }
         self.check_audience(&claims)?;
         let role = self.resolve_role(&claims)?;
 
@@ -2380,13 +2465,19 @@ fn build_key_cache(jwks: &JwkSet, max_keys: usize) -> Result<JwksKeyCache, Strin
 
 /// Look up a key from the cache by kid (if present) or by algorithm.
 fn lookup_key(cached: &CachedKeys, kid: Option<&str>, alg: Algorithm) -> Option<DecodingKey> {
-    if let Some(kid) = kid
-        && let Some((cached_alg, key)) = cached.keys.get(kid)
-        && *cached_alg == alg
-    {
-        return Some(key.clone());
+    if let Some(kid) = kid {
+        // A token carrying a `kid` must match a NAMED JWKS key exactly; it
+        // must NOT fall back to an unnamed key. Otherwise an attacker could
+        // present an unknown `kid` and be validated against an unrelated
+        // unnamed key of the same algorithm (L4, fail-closed key selection).
+        if let Some((cached_alg, key)) = cached.keys.get(kid)
+            && *cached_alg == alg
+        {
+            return Some(key.clone());
+        }
+        return None;
     }
-    // Fall back to unnamed keys matching algorithm.
+    // No `kid`: fall back to any unnamed key matching the algorithm.
     cached
         .unnamed_keys
         .iter()
@@ -2758,7 +2849,7 @@ pub async fn handle_token(
     let result = http
         .send_screened(
             &proxy.token_url,
-            http.inner
+            http.credential_client
                 .post(&proxy.token_url)
                 .header("Content-Type", "application/x-www-form-urlencoded")
                 .body(upstream_body),
@@ -2892,7 +2983,7 @@ async fn proxy_oauth_admin_request(
     let result = http
         .send_screened(
             upstream_url,
-            http.inner
+            http.credential_client
                 .post(upstream_url)
                 .header("Content-Type", "application/x-www-form-urlencoded")
                 .body(upstream_body),
@@ -3236,6 +3327,7 @@ mod tests {
     #[test]
     fn protected_resource_metadata_shape() {
         let config = OAuthConfig {
+            require_subject: false,
             issuer: "https://auth.example.com".into(),
             audience: "https://mcp.example.com/mcp".into(),
             jwks_uri: "https://auth.example.com/.well-known/jwks.json".into(),
@@ -3700,8 +3792,32 @@ mod tests {
         jsonwebtoken::encode(&header, &claims, &encoding_key).expect("JWT encoding")
     }
 
+    /// Mint a signed JWT WITHOUT a `sub` claim (for `require_subject` tests).
+    fn mint_token_without_sub(
+        private_pem: &str,
+        kid: &str,
+        issuer: &str,
+        audience: &str,
+        scope: &str,
+    ) -> String {
+        let encoding_key = jsonwebtoken::EncodingKey::from_rsa_pem(private_pem.as_bytes())
+            .expect("encoding key from PEM");
+        let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
+        header.kid = Some(kid.into());
+        let now = jsonwebtoken::get_current_timestamp();
+        let claims = serde_json::json!({
+            "iss": issuer,
+            "aud": audience,
+            "scope": scope,
+            "exp": now + 3600,
+            "iat": now,
+        });
+        jsonwebtoken::encode(&header, &claims, &encoding_key).expect("JWT encoding")
+    }
+
     fn test_config(jwks_uri: &str) -> OAuthConfig {
         OAuthConfig {
+            require_subject: false,
             issuer: "https://auth.test.local".into(),
             audience: "https://mcp.test.local/mcp".into(),
             jwks_uri: jwks_uri.into(),
@@ -3769,6 +3885,196 @@ mod tests {
         assert_eq!(id.name, "ci-bot");
         assert_eq!(id.role, "viewer"); // first matching scope
         assert_eq!(id.method, AuthMethod::OAuthJwt);
+    }
+
+    // -- L4: kid-strict key lookup + require_subject --
+
+    #[test]
+    fn unknown_kid_with_named_keys_rejected() {
+        let mut keys = HashMap::new();
+        keys.insert(
+            "kid-1".to_owned(),
+            (Algorithm::RS256, DecodingKey::from_secret(b"named")),
+        );
+        let cached = CachedKeys {
+            keys,
+            unnamed_keys: vec![(Algorithm::RS256, DecodingKey::from_secret(b"unnamed"))],
+            fetched_at: Instant::now(),
+            ttl: Duration::from_secs(300),
+        };
+        // A matching kid + algorithm resolves to the named key.
+        assert!(lookup_key(&cached, Some("kid-1"), Algorithm::RS256).is_some());
+        // An unknown kid must NOT fall back to the unnamed key (L4 fail-closed):
+        // a token naming an absent key is rejected rather than silently verified
+        // against a keyless JWKS entry.
+        assert!(lookup_key(&cached, Some("unknown"), Algorithm::RS256).is_none());
+        // A known kid paired with the wrong algorithm is rejected too.
+        assert!(lookup_key(&cached, Some("kid-1"), Algorithm::ES256).is_none());
+    }
+
+    #[test]
+    fn no_kid_token_matches_unnamed_key() {
+        let mut keys = HashMap::new();
+        keys.insert(
+            "kid-1".to_owned(),
+            (Algorithm::RS256, DecodingKey::from_secret(b"named")),
+        );
+        let cached = CachedKeys {
+            keys,
+            unnamed_keys: vec![(Algorithm::RS256, DecodingKey::from_secret(b"unnamed"))],
+            fetched_at: Instant::now(),
+            ttl: Duration::from_secs(300),
+        };
+        // A token with no kid falls back to an unnamed key, supporting JWKS
+        // entries that legitimately omit `kid`.
+        assert!(lookup_key(&cached, None, Algorithm::RS256).is_some());
+    }
+
+    #[tokio::test]
+    async fn require_subject_rejects_subject_less() {
+        let kid = "test-key-reqsub";
+        let (pem, jwks) = generate_test_keypair(kid);
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/jwks.json"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&jwks))
+            .mount(&mock_server)
+            .await;
+        let jwks_uri = format!("{}/jwks.json", mock_server.uri());
+        let mut config = test_config(&jwks_uri);
+        config.require_subject = true;
+        let cache = test_cache(&config);
+
+        let no_sub = mint_token_without_sub(
+            &pem,
+            kid,
+            "https://auth.test.local",
+            "https://mcp.test.local/mcp",
+            "mcp:read",
+        );
+        assert!(
+            cache.validate_token(&no_sub).await.is_none(),
+            "require_subject must reject a token with no sub"
+        );
+
+        let with_sub = mint_token(
+            &pem,
+            kid,
+            "https://auth.test.local",
+            "https://mcp.test.local/mcp",
+            "svc",
+            "mcp:read",
+        );
+        assert!(
+            cache.validate_token(&with_sub).await.is_some(),
+            "a token carrying sub must still be accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn subject_less_token_accepted_by_default() {
+        let kid = "test-key-nosub-default";
+        let (pem, jwks) = generate_test_keypair(kid);
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/jwks.json"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&jwks))
+            .mount(&mock_server)
+            .await;
+        let jwks_uri = format!("{}/jwks.json", mock_server.uri());
+        let config = test_config(&jwks_uri); // require_subject defaults to false
+        let cache = test_cache(&config);
+        let no_sub = mint_token_without_sub(
+            &pem,
+            kid,
+            "https://auth.test.local",
+            "https://mcp.test.local/mcp",
+            "mcp:read",
+        );
+        assert!(
+            cache.validate_token(&no_sub).await.is_some(),
+            "the default policy must accept a sub-less (client-credentials) token"
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_post_does_not_follow_redirect() {
+        // M7: a 307 from the token endpoint must NOT be followed, or the
+        // client_secret-bearing body would be re-sent to the redirect host.
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/followed"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0) // verified on MockServer drop: must never be hit
+            .mount(&mock)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/followed", mock.uri()).as_str()),
+            )
+            .mount(&mock)
+            .await;
+
+        let client = OauthHttpClient::build(None).expect("build oauth http client");
+        let resp = client
+            .credential_client
+            .post(format!("{}/token", mock.uri()))
+            .body("grant_type=client_credentials")
+            .send()
+            .await
+            .expect("request sent");
+        assert_eq!(
+            resp.status().as_u16(),
+            307,
+            "credential client must surface the 307 rather than follow it"
+        );
+    }
+
+    #[tokio::test]
+    async fn jwks_get_still_follows_screened_redirect() {
+        // M7 regression: adding the no-redirect credential client must NOT
+        // change the JWKS/discovery client, which still follows a redirect
+        // whose every hop passes the SSRF screen. `allow_http` plus a loopback
+        // allowlist entry let the http->http hop to the wiremock literal IP
+        // clear `evaluate_oauth_redirect`'s scheme and per-hop SSRF checks.
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/jwks.json"))
+            .respond_with(wiremock::ResponseTemplate::new(302).insert_header(
+                "location",
+                format!("{}/jwks-final.json", mock.uri()).as_str(),
+            ))
+            .mount(&mock)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/jwks-final.json"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("reached"))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let mut allowlist = OAuthSsrfAllowlist::default();
+        allowlist.cidrs.push("127.0.0.0/8".into());
+        allowlist.cidrs.push("::1/128".into());
+        let mut config = test_config(&format!("{}/jwks.json", mock.uri()));
+        config.allow_http_oauth_urls = true;
+        config.ssrf_allowlist = Some(allowlist);
+
+        let client = OauthHttpClient::build(Some(&config)).expect("build oauth http client");
+        let resp = client
+            .inner
+            .get(format!("{}/jwks.json", mock.uri()))
+            .send()
+            .await
+            .expect("request sent");
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "JWKS client must follow the screened redirect to the final endpoint"
+        );
+        assert_eq!(resp.text().await.expect("response body"), "reached");
     }
 
     #[tokio::test]
@@ -4090,6 +4396,7 @@ mod tests {
         role_mappings: Vec<RoleMapping>,
     ) -> OAuthConfig {
         OAuthConfig {
+            require_subject: false,
             issuer: "https://auth.test.local".into(),
             audience: "https://mcp.test.local/mcp".into(),
             jwks_uri: jwks_uri.into(),
@@ -4225,6 +4532,41 @@ mod tests {
         };
         let err = compile_oauth_ssrf_allowlist(&raw).expect_err("host:port");
         assert!(err.contains("must be a bare DNS hostname"), "got {err:?}");
+    }
+
+    // -- L3: internal-hostname-suffix pre-DNS denylist --
+
+    #[test]
+    fn internal_suffix_rejected_by_default() {
+        let allow = crate::ssrf::CompiledSsrfAllowlist::default();
+        for h in ["idp.internal", "svc.local", "x.localhost", "idp.internal."] {
+            assert!(oauth_internal_suffix_blocked(h, &allow), "{h}");
+        }
+    }
+
+    #[test]
+    fn exact_allowlisted_internal_permitted() {
+        let allow = make_allowlist(&["idp.internal"], &[]);
+        assert!(!oauth_internal_suffix_blocked("idp.internal", &allow));
+        assert!(!oauth_internal_suffix_blocked("idp.internal.", &allow));
+    }
+
+    #[test]
+    fn subdomain_of_allowlisted_internal_still_rejected() {
+        let allow = make_allowlist(&["idp.internal"], &[]);
+        assert!(oauth_internal_suffix_blocked("sub.idp.internal", &allow));
+    }
+
+    #[test]
+    fn cidr_allowlist_does_not_bypass_suffix_denylist() {
+        let allow = make_allowlist(&[], &["10.0.0.0/8"]);
+        assert!(oauth_internal_suffix_blocked("idp.internal", &allow));
+    }
+
+    #[test]
+    fn public_hostname_not_blocked_by_suffix() {
+        let allow = crate::ssrf::CompiledSsrfAllowlist::default();
+        assert!(!oauth_internal_suffix_blocked("idp.example.com", &allow));
     }
 
     #[test]

@@ -1479,7 +1479,9 @@ async fn c3_admin_endpoints_exposed_when_enabled() {
 #[tokio::test]
 async fn c3_admin_endpoints_can_require_auth() {
     let (token, hash) = rmcp_server_kit::auth::generate_api_key().unwrap();
-    let mut auth = AuthConfig::with_keys(vec![ApiKeyEntry::new("oauth-admin", hash, "ops")]);
+    // M6: `/introspect` and `/revoke` require the admin role, so the
+    // authenticated caller must hold `admin` (the default `admin_role`).
+    let mut auth = AuthConfig::with_keys(vec![ApiKeyEntry::new("oauth-admin", hash, "admin")]);
 
     let mut oauth = oauth_cfg_with_proxy(true);
     if let Some(proxy) = oauth.proxy.as_mut() {

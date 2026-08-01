@@ -249,6 +249,14 @@ exhaustive_enums = "warn"
 exhaustive_structs = "warn"
 cognitive_complexity = "warn"
 too_many_lines = "warn"
+# Additional LLM-generated-code lints (RUST_GUIDELINES.md §9). The
+# pointer-alignment lints (cast_ptr_alignment / transmute_ptr_to_ref /
+# not_unsafe_ptr_arg_deref) are intentionally omitted -- moot under the
+# crate-level `unsafe_code = "forbid"`.
+large_stack_arrays = "warn"
+large_stack_frames = "warn"
+ptr_as_ptr = "warn"
+cast_lossless = "warn"
 
 [profile.release]
 opt-level = 3
