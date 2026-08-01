@@ -268,6 +268,10 @@ async fn screen_oauth_target_with_test_override(
 /// [`with_config`]: Self::with_config
 #[derive(Clone)]
 pub struct OauthHttpClient {
+    #[allow(
+        dead_code,
+        reason = "screened-redirect JWKS/discovery client (every hop SSRF-screened). Post-M7, production credential traffic uses `credential_client` and JWKS fetching uses `JwksCache`, so in a minimal `oauth` build (no `test-helpers`) this field is consumed only by the redirect-policy regression tests (`__test_get`, `__test_inner_client`, `jwks_get_still_follows_screened_redirect`); retained to preserve the screened-redirect contract and its coverage."
+    )]
     inner: reqwest::Client,
     /// M7: dedicated client for credential-bearing POSTs (token /
     /// introspection / revocation / RFC 8693 exchange). Built with
