@@ -4,9 +4,61 @@ All notable changes to `rmcp-server-kit` are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-Breaking changes bump the **major** version.
+**API-breaking** changes bump the **major** version, which tracks the `rmcp` SDK
+major. Security-hardening changes that alter a runtime *default* (without
+removing or retyping public API) ship in a **minor** release with a documented
+migration note and a config opt-out — see the 3.1.0 notes below.
 
 ## [Unreleased]
+
+## [3.1.0] - 2026-08-01
+
+> **⚠️ Behavioral changes — please read before upgrading.** This release hardens
+> several security-relevant runtime *defaults*. Because the crate's major version
+> tracks the `rmcp` SDK, these ship in a minor release; **no public API is removed
+> or retyped** (`cargo-semver-checks` reports no break), but the defaults below
+> change. Each has a config opt-out to restore the prior behavior.
+>
+> **1. OAuth JWT audience validation now defaults to `strict`.** A token whose
+> configured audience appears only in the `azp` claim (not `aud`) is now
+> **rejected**; previously the default (`warn`) accepted it with a one-shot
+> warning. If your IdP issues `azp`-only tokens and cannot yet be reconfigured,
+> restore the pre-3.1 behavior with `audience_validation_mode`:
+>
+> ```toml
+> [server.auth.oauth]
+> issuer   = "https://idp.example.com/"
+> audience = "https://mcp.example.com/mcp"
+> jwks_uri = "https://idp.example.com/.well-known/jwks.json"
+>
+> # Restore pre-3.1 acceptance of azp-only tokens (pick one):
+> audience_validation_mode = "warn"        # accept azp-only, one-shot WARN per process
+> # audience_validation_mode = "permissive" # accept azp-only silently
+> ```
+>
+> The deprecated `strict_audience_validation = false` also still maps to `"warn"`.
+>
+> **2. `/version` no longer exposes build metadata to anonymous callers.**
+> `build_git_sha`, `build_timestamp`, and `rust_version` are suppressed by
+> default. Re-enable them with `[server]` → `expose_build_metadata = true`.
+>
+> **3. `trusted_proxies` rejects a `/0` CIDR.** A `0.0.0.0/0` or `::/0` entry now
+> fails validation at startup — narrow it to your real proxy ranges, e.g.
+> `[server]` → `trusted_proxies = ["10.0.0.0/8"]`.
+>
+> **4. OAuth `/introspect` and `/revoke` require the admin role.** When
+> `[server.auth.oauth.proxy]` → `require_auth_on_admin_endpoints = true`, an
+> authenticated non-admin caller now receives `403`. Grant the caller the
+> configured `[server]` → `admin_role` (default `"admin"`).
+>
+> **5. JWKS key selection is fail-closed on `kid`.** A `kid`-bearing JWT must
+> match a *named* JWKS key; it no longer falls back to an unnamed key of the same
+> algorithm. Affects only non-standard IdPs that mint `kid`-bearing tokens against
+> a `kid`-less JWKS.
+>
+> For mTLS deployments, the CRL cache/verifier fix and the `crl_stale_grace` →
+> `crl_retry_retention` rename (the old key still works as an alias) affect only
+> the opt-in `crl_deny_on_unavailable = true` path.
 
 ### Security
 
