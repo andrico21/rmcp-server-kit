@@ -231,37 +231,82 @@ impl CrlSet {
         }
     }
 
-    async fn insert_cache_entry(&self, url: String, cached: CachedCrl) -> bool {
+    async fn commit_cache_update_atomically(
+        &self,
+        inserts: Vec<(String, CachedCrl)>,
+        removals: &[String],
+    ) -> Result<bool, McpxError> {
+        let mut cache = self.cache.write().await;
+        let mut candidate = cache.clone();
+        let mut admitted_urls = Vec::new();
+
         // POLICY: at cap the NEWEST entry is rejected, never an existing
         // one (no LRU). Under adversarial unique-CDP churn an LRU would
         // let an attacker evict the legitimate warm set by spamming
         // throwaway CDP URLs; rejecting newcomers instead preserves
         // revocation coverage for the established CA estate. Confirmed
         // by Oracle review of the 1.13.0 rust-review fix plan.
-        let inserted = {
-            let mut guard = self.cache.write().await;
-            if guard.len() >= self.config.crl_max_cache_entries && !guard.contains_key(&url) {
-                false
-            } else {
-                guard.insert(url.clone(), cached);
-                true
+        for (url, cached) in inserts {
+            if candidate.len() >= self.config.crl_max_cache_entries && !candidate.contains_key(&url)
+            {
+                self.warn_cap_exceeded_throttled("cache");
+                continue;
             }
-        };
-
-        if inserted {
-            match self.cached_urls.lock() {
-                Ok(mut cached_urls) => {
-                    cached_urls.insert(url);
-                }
-                Err(poisoned) => {
-                    poisoned.into_inner().insert(url);
-                }
-            }
-        } else {
-            self.warn_cap_exceeded_throttled("cache");
+            candidate.insert(url.clone(), cached);
+            admitted_urls.push(url);
         }
 
-        inserted
+        for url in removals {
+            candidate.remove(url);
+        }
+
+        // SECURITY: `cached_urls` is the synchronous fail-closed precheck's
+        // trust hint. It must never get ahead of `inner_verifier`; otherwise a
+        // handshake could skip the unavailable-CRL fast-fail for a URL the live
+        // rustls verifier cannot enforce. Build from the full candidate cache
+        // first, then swap verifier, then publish cache/cached_urls together.
+        let verifier = rebuild_verifier(&self.roots, &self.config, &candidate)?;
+        self.inner_verifier
+            .store(Arc::new(VerifierHandle(verifier)));
+        let changed = !admitted_urls.is_empty() || !removals.is_empty();
+        *cache = candidate;
+        drop(cache);
+
+        match self.cached_urls.lock() {
+            Ok(mut cached_urls) => {
+                for url in admitted_urls {
+                    cached_urls.insert(url);
+                }
+                for url in removals {
+                    cached_urls.remove(url);
+                }
+            }
+            Err(poisoned) => {
+                let mut cached_urls = poisoned.into_inner();
+                for url in admitted_urls {
+                    cached_urls.insert(url);
+                }
+                for url in removals {
+                    cached_urls.remove(url);
+                }
+            }
+        }
+
+        match self.seen_urls.lock() {
+            Ok(mut seen_urls) => {
+                for url in removals {
+                    seen_urls.remove(url);
+                }
+            }
+            Err(poisoned) => {
+                let mut seen_urls = poisoned.into_inner();
+                for url in removals {
+                    seen_urls.remove(url);
+                }
+            }
+        }
+
+        Ok(changed)
     }
 
     /// Force an immediate refresh of all currently known CRL URLs.
@@ -300,29 +345,14 @@ impl CrlSet {
     async fn refresh_urls(&self, urls: Vec<String>) -> Result<(), McpxError> {
         let results = self.fetch_url_results(urls).await;
         let now = SystemTime::now();
-        let mut cache = self.cache.write().await;
-        let mut changed = false;
+        let cache = self.cache.read().await;
+        let mut inserts = Vec::new();
+        let mut removals = Vec::new();
 
         for (url, result) in results {
             match result {
                 Ok(cached) => {
-                    if cache.len() >= self.config.crl_max_cache_entries && !cache.contains_key(&url)
-                    {
-                        drop(cache);
-                        self.warn_cap_exceeded_throttled("cache");
-                        cache = self.cache.write().await;
-                        continue;
-                    }
-                    cache.insert(url.clone(), cached);
-                    changed = true;
-                    match self.cached_urls.lock() {
-                        Ok(mut cached_urls) => {
-                            cached_urls.insert(url);
-                        }
-                        Err(poisoned) => {
-                            poisoned.into_inner().insert(url);
-                        }
-                    }
+                    inserts.push((url, cached));
                 }
                 Err(error) => {
                     let remove_entry = cache.get(&url).is_some_and(|existing| {
@@ -333,33 +363,18 @@ impl CrlSet {
                     });
                     tracing::warn!(url = %url, error = %error, "CRL refresh failed");
                     if remove_entry {
-                        cache.remove(&url);
-                        changed = true;
-                        match self.cached_urls.lock() {
-                            Ok(mut cached_urls) => {
-                                cached_urls.remove(&url);
-                            }
-                            Err(poisoned) => {
-                                poisoned.into_inner().remove(&url);
-                            }
-                        }
-                        match self.seen_urls.lock() {
-                            Ok(mut seen_urls) => {
-                                seen_urls.remove(&url);
-                            }
-                            Err(poisoned) => {
-                                poisoned.into_inner().remove(&url);
-                            }
-                        }
+                        removals.push(url);
                     }
                 }
             }
         }
-
-        if changed {
-            self.swap_verifier_from_cache(&cache)?;
-        }
         drop(cache);
+
+        if !inserts.is_empty() || !removals.is_empty() {
+            let _ = self
+                .commit_cache_update_atomically(inserts, &removals)
+                .await?;
+        }
 
         Ok(())
     }
@@ -375,15 +390,17 @@ impl CrlSet {
             self.config.crl_max_host_semaphores,
         )
         .await?;
-        if !self.insert_cache_entry(url, cached).await {
-            return Ok(());
-        }
-        let cache = self.cache.read().await;
-        self.swap_verifier_from_cache(&cache)?;
+        let _ = self
+            .commit_cache_update_atomically(vec![(url, cached)], &[])
+            .await?;
         Ok(())
     }
 
-    fn note_discovered_urls(&self, urls: &[String]) -> bool {
+    fn note_discovered_urls(
+        &self,
+        end_entity_urls: &[String],
+        intermediate_urls: &[String],
+    ) -> bool {
         // INVARIANT: only called post-handshake from
         // `DynamicClientCertVerifier::verify_client_cert`. The peer has
         // already presented a chain that parses; this method must not panic
@@ -392,7 +409,11 @@ impl CrlSet {
         // SECURITY: see `DynamicClientCertVerifier::verify_client_cert` for
         // the rationale on why accepting URLs from an unverified cert is
         // safe (no HTTP on this path; fetch is off-path and SSRF-gated).
-        let mut missing_cached = false;
+        let mut all_urls = Vec::with_capacity(end_entity_urls.len() + intermediate_urls.len());
+        all_urls.extend_from_slice(end_entity_urls);
+        all_urls.extend_from_slice(intermediate_urls);
+        all_urls.sort();
+        all_urls.dedup();
 
         // Snapshot the dedup set under the lock; do NOT mutate it yet.
         // We promote a URL to "seen" only after it is actually admitted
@@ -405,7 +426,7 @@ impl CrlSet {
         // handshake failures; with fail-open it silently disables CRL
         // discovery for that endpoint forever.
         let candidates: Vec<String> = match self.seen_urls.lock() {
-            Ok(seen) => urls
+            Ok(seen) => all_urls
                 .iter()
                 .filter(|url| !seen.contains(*url))
                 .cloned()
@@ -455,10 +476,16 @@ impl CrlSet {
                 .ok()
                 .map(|guard| guard.clone())
                 .unwrap_or_default();
-            missing_cached = urls.iter().any(|url| !cached.contains(url));
+            let relevant_urls = if self.config.crl_end_entity_only {
+                end_entity_urls
+            } else {
+                all_urls.as_slice()
+            };
+            return !relevant_urls.is_empty()
+                && relevant_urls.iter().all(|url| !cached.contains(url));
         }
 
-        missing_cached
+        false
     }
 
     /// Test helper for constructing a CRL set from in-memory CRLs.
@@ -557,7 +584,7 @@ impl CrlSet {
     /// flag the production verifier uses to decide whether to fail the handshake.
     #[doc(hidden)]
     pub fn __test_note_discovered_urls(&self, urls: &[String]) -> bool {
-        let missing_cached = self.note_discovered_urls(urls);
+        let missing_cached = self.note_discovered_urls(urls, &[]);
         if self.discover_tx.is_closed() {
             match self.seen_urls.lock() {
                 Ok(mut guard) => {
@@ -588,6 +615,18 @@ impl CrlSet {
             }
         }
         missing_cached
+    }
+
+    /// Test-only: invoke the real precheck with separate end-entity and
+    /// intermediate CDP sets.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    pub fn __test_note_discovered_urls_by_cert(
+        &self,
+        end_entity_urls: &[String],
+        intermediate_urls: &[String],
+    ) -> bool {
+        self.note_discovered_urls(end_entity_urls, intermediate_urls)
     }
 
     /// Test-only: report whether a URL has been promoted to the
@@ -626,6 +665,16 @@ impl CrlSet {
         self.cache
             .try_read()
             .is_ok_and(|guard| guard.contains_key(url))
+    }
+
+    /// Test-only: whether a URL is advertised to the fail-closed precheck as
+    /// present in the live verifier.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    pub fn __test_cached_url_contains(&self, url: &str) -> bool {
+        self.cached_urls
+            .lock()
+            .is_ok_and(|guard| guard.contains(url))
     }
 
     /// Test-only: triggers the request-hot-path fetch path for `url`
@@ -675,7 +724,29 @@ impl CrlSet {
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     pub async fn __test_insert_cache(&self, url: &str, cached: CachedCrl) {
-        let _ = self.insert_cache_entry(url.to_owned(), cached).await;
+        let _ = self
+            .commit_cache_update_atomically(vec![(url.to_owned(), cached)], &[])
+            .await;
+    }
+
+    /// Test-only: direct cache insertion that returns verifier rebuild errors.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    pub async fn __test_try_insert_cache(
+        &self,
+        url: &str,
+        cached: CachedCrl,
+    ) -> Result<bool, McpxError> {
+        self.commit_cache_update_atomically(vec![(url.to_owned(), cached)], &[])
+            .await
+    }
+
+    /// Test-only: replace a cache entry without rebuilding the verifier.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    pub async fn __test_replace_cache_entry_unverified(&self, url: &str, cached: CachedCrl) {
+        let mut cache = self.cache.write().await;
+        cache.insert(url.to_owned(), cached);
     }
 
     /// Test-only: trigger a refresh cycle for a single URL. Exercises
@@ -727,17 +798,20 @@ impl CrlSet {
 
         results
     }
-
-    fn swap_verifier_from_cache(
-        &self,
-        cache: &impl std::ops::Deref<Target = HashMap<String, CachedCrl>>,
-    ) -> Result<(), McpxError> {
-        let verifier = rebuild_verifier(&self.roots, &self.config, cache)?;
-        self.inner_verifier
-            .store(Arc::new(VerifierHandle(verifier)));
-        Ok(())
-    }
 }
+
+#[cfg(any(test, feature = "test-helpers"))]
+const SYNTHETIC_TEST_CRL_DER: &[u8] = &[
+    48, 129, 199, 48, 110, 2, 1, 1, 48, 10, 6, 8, 42, 134, 72, 206, 61, 4, 3, 2, 48, 14, 49, 12,
+    48, 10, 6, 3, 85, 4, 3, 12, 3, 99, 114, 108, 23, 13, 50, 54, 48, 49, 48, 49, 48, 48, 48, 48,
+    48, 48, 90, 23, 13, 50, 55, 48, 49, 48, 49, 48, 48, 48, 48, 48, 48, 90, 160, 47, 48, 45, 48,
+    31, 6, 3, 85, 29, 35, 4, 24, 48, 22, 128, 20, 14, 62, 48, 146, 7, 182, 179, 215, 90, 226, 214,
+    90, 201, 83, 149, 116, 34, 31, 26, 255, 48, 10, 6, 3, 85, 29, 20, 4, 3, 2, 1, 1, 48, 10, 6, 8,
+    42, 134, 72, 206, 61, 4, 3, 2, 3, 73, 0, 48, 70, 2, 33, 0, 250, 240, 103, 87, 60, 78, 208, 171,
+    184, 206, 117, 134, 236, 234, 53, 115, 122, 90, 64, 217, 146, 27, 32, 103, 170, 222, 240, 159,
+    137, 187, 116, 6, 2, 33, 0, 188, 23, 204, 232, 130, 84, 135, 249, 43, 208, 224, 220, 202, 57,
+    98, 140, 4, 251, 148, 189, 105, 68, 105, 40, 53, 180, 208, 38, 193, 120, 118, 100,
+];
 
 impl CachedCrl {
     /// Test-only: synthesize a cache entry that looks valid, `next_update`
@@ -748,7 +822,7 @@ impl CachedCrl {
     #[must_use]
     pub fn __test_synthetic(now: SystemTime) -> Self {
         Self {
-            der: CertificateRevocationListDer::from(vec![0x30, 0x00]),
+            der: CertificateRevocationListDer::from(SYNTHETIC_TEST_CRL_DER.to_vec()),
             this_update: now,
             next_update: now.checked_add(Duration::from_hours(24)),
             fetched_at: now,
@@ -831,18 +905,25 @@ impl ClientCertVerifier for DynamicClientCertVerifier {
         // discovery must happen BEFORE delegating to the inner verifier
         // so `crl_deny_on_unavailable = true` can fail-closed on a
         // never-fetched CDP. Do NOT reorder.
-        let mut discovered =
+        let mut end_entity_urls =
             extract_cdp_urls(end_entity.as_ref(), self.inner.config.crl_allow_http);
+        end_entity_urls.sort();
+        end_entity_urls.dedup();
+
+        let mut intermediate_urls = Vec::new();
         for intermediate in intermediates {
-            discovered.extend(extract_cdp_urls(
+            intermediate_urls.extend(extract_cdp_urls(
                 intermediate.as_ref(),
                 self.inner.config.crl_allow_http,
             ));
         }
-        discovered.sort();
-        discovered.dedup();
+        intermediate_urls.sort();
+        intermediate_urls.dedup();
 
-        if self.inner.note_discovered_urls(&discovered) {
+        if self
+            .inner
+            .note_discovered_urls(&end_entity_urls, &intermediate_urls)
+        {
             return Err(TlsError::General(
                 "client certificate revocation status unavailable".to_owned(),
             ));

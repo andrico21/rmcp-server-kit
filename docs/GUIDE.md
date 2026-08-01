@@ -424,10 +424,11 @@ by URL and refreshed on a background task before `nextUpdate`, clamped to
 via `ArcSwap` whenever fresh CRLs land, so handshakes always see the
 latest revocation data without dropping in-flight connections.
 
-**Default behaviour is fail-open**: if a CRL cannot be fetched or has
-expired beyond `crl_stale_grace`, the handshake is still allowed and a
-`WARN` log is emitted. Operators who require fail-closed semantics can set
-`crl_deny_on_unavailable = true`.
+**Default behaviour is fail-open**: if a CRL cannot be fetched, the
+handshake is still allowed and a `WARN` log is emitted. Expired CRLs are
+not trusted when `crl_enforce_expiration = true` (the default); webpki
+rejects them at `nextUpdate`. Operators who require fail-closed semantics
+for unavailable CRLs can set `crl_deny_on_unavailable = true`.
 
 `ReloadHandle::refresh_crls()` forces an immediate refresh of every
 cached CRL — useful from an admin endpoint or a cron-driven probe.
@@ -442,9 +443,10 @@ crl_enabled              = true     # set false to disable revocation entirely
 crl_deny_on_unavailable  = false    # fail-open by default; set true for fail-closed
 crl_allow_http           = true     # allow http:// CDP URLs (CRLs are signed by the CA)
 crl_end_entity_only      = false    # check the full chain, not just the leaf
-crl_enforce_expiration   = true     # reject CRLs whose nextUpdate is in the past (subject to grace)
+crl_enforce_expiration   = true     # reject CRLs whose nextUpdate is in the past
 crl_fetch_timeout        = "30s"    # per-fetch HTTP timeout
-crl_stale_grace          = "24h"    # how long an expired CRL can still be trusted while we keep retrying
+crl_retry_retention      = "24h"    # keep failed-refresh entries for retry only; never stale use
+# crl_stale_grace        = "24h"    # deprecated alias for crl_retry_retention
 # crl_refresh_interval   = "1h"     # override the auto interval derived from nextUpdate
 
 # SSRF / DoS hardening knobs (defaults shown):

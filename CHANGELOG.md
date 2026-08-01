@@ -24,6 +24,16 @@ Breaking changes bump the **major** version.
   re-applies the same freshness gate as the initial lookup, so a token whose
   `kid` exists only in the expired cache is rejected rather than accepted.
   (rust-review HIGH / H2.)
+- **mTLS CRL fail-closed precheck now matches the live verifier cache.** CRL
+  cache updates now rebuild the rustls verifier from a candidate cache before
+  publishing either the cache or `cached_urls`, preventing the fail-closed
+  precheck from advertising CRL URLs the live verifier cannot enforce. The
+  precheck is now any-of-N: a certificate with multiple relevant CDPs fails
+  fast only when none are cached, while webpki remains the authoritative
+  per-certificate revocation decision. `crl_end_entity_only` is respected by
+  the precheck, and `crl_retry_retention` is documented as the preferred TOML
+  key for retry-retention semantics while `crl_stale_grace` remains a
+  backward-compatible alias. (rust-review HIGH / H3.)
 - **SSRF: cloud-metadata is now unbypassable through IPv6 transition/compatibility
   forms.** `ip_block_reason` re-labels NAT64 (`64:ff9b::/96`) and 6to4
   (`2002::/16`) addresses embedding a cloud-metadata IPv4 (e.g.

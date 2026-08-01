@@ -245,7 +245,9 @@ async fn stale_removal_also_clears_seen() {
     // Insert a stale cache entry whose next_update + grace is in the
     // past, so the refresh loop treats fetch-failure as removable.
     let past = SystemTime::now() - Duration::from_secs(60 * 60 * 24 * 30); // 30 days ago
-    set.__test_insert_cache(url, CachedCrl::__test_stale(past))
+    set.__test_insert_cache(url, CachedCrl::__test_synthetic(SystemTime::now()))
+        .await;
+    set.__test_replace_cache_entry_unverified(url, CachedCrl::__test_stale(past))
         .await;
     assert!(
         set.__test_cache_contains(url),

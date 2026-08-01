@@ -428,9 +428,24 @@ pub struct MtlsConfig {
     /// Timeout for individual CRL fetches.
     #[serde(default = "default_crl_fetch_timeout", with = "humantime_serde")]
     pub crl_fetch_timeout: Duration,
-    /// Grace window during which stale CRLs may still be used when refresh
-    /// attempts fail.
-    #[serde(default = "default_crl_stale_grace", with = "humantime_serde")]
+    /// Retry-retention window: how long a CRL whose refresh keeps failing is
+    /// retained in the cache so the background refresher can keep retrying it,
+    /// measured past the CRL's `nextUpdate`.
+    ///
+    /// This does **not** permit use of an expired CRL. When
+    /// `crl_enforce_expiration` is set (the default), webpki rejects any CRL
+    /// past its `nextUpdate` during validation; this window only bounds how
+    /// long a persistently-failing entry is kept for retry before the verifier
+    /// gives up and evicts it (at which point `crl_deny_on_unavailable` governs
+    /// the handshake outcome).
+    ///
+    /// The preferred config key is `crl_retry_retention`; `crl_stale_grace` is
+    /// accepted as a deprecated alias for backward compatibility.
+    #[serde(
+        default = "default_crl_stale_grace",
+        alias = "crl_retry_retention",
+        with = "humantime_serde"
+    )]
     pub crl_stale_grace: Duration,
     /// When true, missing or unavailable CRLs cause revocation checks to fail
     /// closed.

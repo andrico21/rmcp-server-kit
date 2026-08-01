@@ -478,7 +478,7 @@ Configuration toggles:
 `[mtls]` is configured and `crl_enabled = true` (the default).
 
 Lifecycle:
-1. `bootstrap_fetch(roots, config)` (`src/mtls_revocation.rs:935`) is
+1. `bootstrap_fetch(roots, config)` (`src/mtls_revocation.rs:1031`) is
    called from `run_server` *before* the listener is built. It walks the
    configured CA chain, extracts every X.509 CRL Distribution Point (CDP)
    URL via `extract_cdp_urls`, fetches each via `reqwest` under a 10 s
@@ -491,27 +491,30 @@ Lifecycle:
    - `discover_tx: mpsc::UnboundedSender<String>` — channel used by the
      handshake path to register newly observed CDP URLs for fetch.
    - `seen_urls: Mutex<HashSet<String>>` — dedupe of URLs already processed.
-3. `DynamicClientCertVerifier` (`src/mtls_revocation.rs:771`) is the
+3. `DynamicClientCertVerifier` (`src/mtls_revocation.rs:856`) is the
    `Arc<dyn ClientCertVerifier>` handed to `rustls::ServerConfig`. Its
    trait methods delegate to the inner verifier loaded from
    `inner_verifier.load()`. Because `tokio_rustls::TlsAcceptor` clones
    the verifier `Arc` from the `ServerConfig` at construction, the
    dynamic verifier MUST be the Arc handed to rustls; its inner verifier
    then swaps via the internal `ArcSwap`.
-4. `run_crl_refresher(set, rx, shutdown)` (`src/mtls_revocation.rs:1043`)
+4. `run_crl_refresher(set, rx, shutdown)` (`src/mtls_revocation.rs:1142`)
    is spawned by `run_server`. It:
    - Drains the `discover_tx` receiver and fetches any newly observed CDP URLs.
    - Re-fetches each cached CRL before its `nextUpdate`, clamped to
      `[10 min, 24 h]` (overridable via `crl_refresh_interval`).
    - On any successful fetch, rebuilds the inner verifier and `inner_verifier.store()`s it.
-   - Honours `crl_fetch_timeout` per request and `crl_stale_grace` for cache
-     eviction of long-expired CRLs.
+   - Honours `crl_fetch_timeout` per request and `crl_retry_retention`
+     (`crl_stale_grace` deprecated alias) for retry-retention eviction after
+     `nextUpdate`. Expired CRLs are never trusted when expiration enforcement
+     is enabled.
 
 Failure modes:
-- Fetch failure / parse failure / expired-beyond-grace: cache entry is
-  marked stale; if `crl_deny_on_unavailable = false` (default) handshakes
-  continue with a `WARN` log; if `true`, handshakes that depend on the
-  affected CRL are rejected.
+- Fetch failure / parse failure: if `crl_deny_on_unavailable = false`
+  (default) handshakes continue with a `WARN` log; if `true`, handshakes
+  that depend on an unavailable CRL are rejected. A cached CRL whose refresh
+  keeps failing is retained only for retry until `nextUpdate +
+  crl_retry_retention`; webpki still rejects CRL use past `nextUpdate`.
 - `crl_allow_http = false` rejects `http://` CDP URLs.
 - `crl_end_entity_only = true` checks only the leaf, skipping intermediates.
 
@@ -555,7 +558,7 @@ reachable:
 
 ### Discovery admission ordering
 
-`note_discovered_urls` (`src/mtls_revocation.rs:385`) implements a
+`note_discovered_urls` (`src/mtls_revocation.rs:398`) implements a
 strict commit-after-admission protocol to keep the discovery rate
 limiter from "leaking" URLs:
 
@@ -573,7 +576,7 @@ This ordering matters: a naive "mark seen, then attempt admission"
 implementation would silently drop CDP URLs forever the first time the
 rate limiter engaged, breaking revocation for the affected client
 identities. The current ordering is verified by
-`__test_check_discovery_rate` (`src/mtls_revocation.rs:540`) and by the
+`__test_check_discovery_rate` (`src/mtls_revocation.rs:563`) and by the
 `__test_with_kept_receiver` helper used in unit tests.
 
 Hot-reload: `ReloadHandle::refresh_crls()` (in `src/transport.rs`) sends a

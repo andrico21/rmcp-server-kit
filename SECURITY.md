@@ -71,10 +71,11 @@ When mTLS is enabled, rmcp-server-kit:
 4. Hot-swaps the underlying `rustls::ClientCertVerifier` via `ArcSwap` once
    new CRLs land, so handshakes always check the freshest revocation data
    without dropping in-flight connections.
-5. **Fails open by default**: if a CRL cannot be fetched or has expired
-   beyond the configured grace period, the handshake is still allowed and
-   a `WARN` log is emitted. Operators who require fail-closed semantics can
-   set `crl_deny_on_unavailable = true`.
+5. **Fails open by default**: if a CRL cannot be fetched, the handshake is
+   still allowed and a `WARN` log is emitted. Expired CRLs are not trusted
+   when `crl_enforce_expiration = true` (the default); webpki rejects them
+   at `nextUpdate`. Operators who require fail-closed semantics can set
+   `crl_deny_on_unavailable = true`.
 
 `ReloadHandle::refresh_crls()` forces an immediate refresh of every cached
 CRL — useful from an admin endpoint or a cron-driven probe.
@@ -90,9 +91,10 @@ crl_enabled              = true     # set false to disable revocation entirely
 crl_deny_on_unavailable  = false    # fail-open by default; set true for fail-closed
 crl_allow_http           = true     # allow http:// CDP URLs (CRLs are signed by the CA, so plain HTTP is acceptable)
 crl_end_entity_only      = false    # check the full chain, not just the leaf
-crl_enforce_expiration   = true     # reject CRLs whose nextUpdate is in the past (subject to crl_stale_grace)
+crl_enforce_expiration   = true     # reject CRLs whose nextUpdate is in the past
 crl_fetch_timeout        = "30s"    # per-fetch HTTP timeout
-crl_stale_grace          = "24h"    # how long an expired CRL can still be trusted while we keep retrying
+crl_retry_retention      = "24h"    # keep failed-refresh entries for retry only; never stale use
+# crl_stale_grace        = "24h"    # deprecated alias for crl_retry_retention
 # crl_refresh_interval   = "1h"     # override the auto interval derived from nextUpdate
 ```
 
