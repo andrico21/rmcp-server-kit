@@ -11,6 +11,17 @@ migration note and a config opt-out — see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+## [3.1.2] - 2026-08-19
+
+### Changed
+
+- Maintenance release: **no library code or public-API changes since 3.1.1**
+  (`cargo-semver-checks` reports no break). Refreshes the dependency lockfile
+  to the latest semver-compatible versions — notably `ref-cast` 1.0.27 — and
+  re-validates the crate against the current dependency set. Because
+  `Cargo.lock` is not shipped for a library, consumers resolve their own
+  dependency versions, so this release is behaviorally identical to 3.1.1.
+
 ## [3.1.1] - 2026-08-01
 
 ### Fixed
