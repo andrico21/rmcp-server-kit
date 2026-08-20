@@ -11,6 +11,8 @@ migration note and a config opt-out — see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+## [3.1.3] - 2026-08-19
+
 ### Changed
 
 - **`OAuthConfig::{issuer, audience, jwks_uri}` are now `#[serde(default)]`.**
