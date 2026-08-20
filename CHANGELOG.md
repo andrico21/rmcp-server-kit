@@ -11,6 +11,24 @@ migration note and a config opt-out — see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Changed
+
+- **`OAuthConfig::{issuer, audience, jwks_uri}` are now `#[serde(default)]`.**
+  A partially-specified `[server.auth.oauth]` table — e.g. one carrying only
+  `role_claim`/`role_mappings`, with the URL and audience fields supplied by a
+  downstream env-override layer applied after TOML parsing — now deserializes
+  instead of failing at parse time on a serde "missing field" error. The three
+  fields are enforced at [`OAuthConfig::validate`] time instead
+  (parse-don't-validate): empty `issuer` and `jwks_uri` were already rejected by
+  the HTTPS URL check, and `validate()` now **also rejects an empty `audience`**
+  (`oauth.audience must not be empty`). Previously `audience` was not validated,
+  so an empty value passed config validation and then failed closed silently at
+  runtime under the default `AudienceValidationMode::Strict` (nothing matches an
+  empty audience). Purely additive: configs that specify all three fields parse
+  and validate exactly as before; the only observable change is that omitting one
+  from a present `[oauth]` table now surfaces as a clear `validate()` error
+  rather than a serde parse error.
+
 ## [3.1.2] - 2026-08-19
 
 ### Changed

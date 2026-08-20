@@ -605,7 +605,7 @@ recommended.
    - `lookup_key()` looks up by `kid` in the cached JWKS
      (`src/oauth.rs:2456`).
    - If not found, calls `refresh_with_cooldown()` (`src/oauth.rs:2262`):
-     - Enforces `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:1800`) so multiple
+     - Enforces `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:1841`) so multiple
        invalid tokens cannot DoS the JWKS endpoint.
      - Deduplicates concurrent refreshes.
    - Validates signature, `iss`, `aud`, `exp`, `nbf` using `jsonwebtoken`.
@@ -850,7 +850,7 @@ itself is at `src/transport.rs:3282`.
    exhaust the rate-limit budget for authenticated callers.
 
 4. **JWKS refresh is rate-limited.** Removing `JWKS_REFRESH_COOLDOWN`
-   (`src/oauth.rs:1800`) creates a DoS vector against the issuer's JWKS endpoint.
+   (`src/oauth.rs:1841`) creates a DoS vector against the issuer's JWKS endpoint.
 
 5. **No symmetric JWT algorithms by default.** `HS*` algorithms with a
    public JWKS would enable algorithm-confusion attacks. Don't add them

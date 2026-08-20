@@ -720,10 +720,27 @@ fn compile_oauth_ssrf_allowlist(
 #[non_exhaustive]
 pub struct OAuthConfig {
     /// Token issuer (`iss` claim). Must match exactly.
+    ///
+    /// `#[serde(default)]` so a partially-specified `[oauth]` table — one that
+    /// carries only `role_claim`/`role_mappings`, with the URL and audience
+    /// fields supplied by a downstream env-override layer applied after TOML
+    /// parsing — still deserializes. An empty value is rejected at
+    /// [`OAuthConfig::validate`] time (parse-don't-validate): the HTTPS URL
+    /// check fails on an empty string.
+    #[serde(default)]
     pub issuer: String,
     /// Expected audience (`aud` claim). Must match exactly.
+    ///
+    /// Defaulted like [`OAuthConfig::issuer`]. Unlike the URL fields it is not
+    /// a URL, so [`OAuthConfig::validate`] guards it with an explicit
+    /// non-empty check.
+    #[serde(default)]
     pub audience: String,
     /// JWKS endpoint URL (e.g. `https://auth.example.com/.well-known/jwks.json`).
+    ///
+    /// Defaulted like [`OAuthConfig::issuer`]; an empty value is rejected by
+    /// the HTTPS URL check in [`OAuthConfig::validate`].
+    #[serde(default)]
     pub jwks_uri: String,
     /// Scope-to-role mappings. First matching scope wins.
     /// Used when `role_claim` is absent (default behavior).
@@ -989,6 +1006,15 @@ impl OAuthConfig {
             return Err(crate::error::McpxError::Config(format!(
                 "oauth.jwks_uri forbidden ({reason})"
             )));
+        }
+        // `audience` is not a URL, so the `check_oauth_url` calls above do not
+        // cover it. Guard it explicitly: with `#[serde(default)]` an omitted
+        // audience is an empty string that would otherwise pass validation and
+        // then fail-closed silently at runtime (Strict mode matches nothing).
+        if self.audience.is_empty() {
+            return Err(crate::error::McpxError::Config(
+                "oauth.audience must not be empty".into(),
+            ));
         }
         if let Some(proxy) = &self.proxy {
             let url = check_oauth_url(
@@ -3396,6 +3422,39 @@ mod tests {
     fn validate_accepts_all_https_urls() {
         let cfg = validation_https_config();
         cfg.validate().expect("all-HTTPS config must validate");
+    }
+
+    #[test]
+    fn validate_rejects_empty_audience() {
+        let mut cfg = validation_https_config();
+        cfg.audience = String::new();
+        let err = cfg.validate().expect_err("empty audience must be rejected");
+        assert!(
+            err.to_string().contains("oauth.audience"),
+            "error must reference oauth.audience; got {err}"
+        );
+    }
+
+    #[test]
+    fn oauth_config_partial_table_deserializes_then_validate_rejects_empty_fields() {
+        let toml_src = r#"
+role_claim = "realm_access.roles"
+
+[[role_mappings]]
+claim_value = "mcp-admin"
+role = "admin"
+"#;
+        let cfg: OAuthConfig = toml::from_str(toml_src).expect(
+            "partial [oauth] table without issuer/audience/jwks_uri must deserialize via serde(default)",
+        );
+        assert_eq!(cfg.issuer, "", "omitted issuer must default to empty");
+        assert_eq!(cfg.audience, "", "omitted audience must default to empty");
+        assert_eq!(cfg.jwks_uri, "", "omitted jwks_uri must default to empty");
+        assert_eq!(cfg.role_claim.as_deref(), Some("realm_access.roles"));
+        assert_eq!(cfg.role_mappings.len(), 1);
+        cfg.validate().expect_err(
+            "empty issuer/jwks_uri/audience must still fail validate() (parse-don't-validate)",
+        );
     }
 
     #[test]
