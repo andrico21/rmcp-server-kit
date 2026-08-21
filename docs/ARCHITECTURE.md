@@ -47,7 +47,7 @@ The crate has two transports:
 | Transport          | Function                                            | Auth/RBAC/TLS  | Use case                                         |
 |--------------------|-----------------------------------------------------|----------------|--------------------------------------------------|
 | **Streamable HTTP**| `serve()` — `src/transport.rs:1991`                 | **Yes**        | Production network deployment                    |
-| stdio              | `serve_stdio()` — `src/transport.rs:3558`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
+| stdio              | `serve_stdio()` — `src/transport.rs:3650`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
 
 ---
 
@@ -182,12 +182,12 @@ Open endpoints (no auth):
 
 | Path                                       | Handler                                       |
 |--------------------------------------------|-----------------------------------------------|
-| `GET  /healthz`                            | `healthz` (~`src/transport.rs:2877`) |
-| `GET  /readyz`                             | `readyz`  (~`src/transport.rs:2934`) — runs configured readiness check |
-| `GET  /version`                            | `version_payload` (~`src/transport.rs:2892`) |
+| `GET  /healthz`                            | `healthz` (~`src/transport.rs:1668`) |
+| `GET  /readyz`                             | `readyz`  (~`src/transport.rs:1669`) — runs configured readiness check |
+| `GET  /version`                            | `version_payload` (~`src/transport.rs:2937`) |
 | `GET  /metrics`                            | served by `serve_metrics` on a **separate listener** when `feature = "metrics"` (`src/metrics.rs:142`) |
 | `GET  /.well-known/oauth-protected-resource` | feature = `oauth` (`src/transport.rs:1653`) |
-| `GET  /.well-known/oauth-authorization-server` | feature = `oauth` proxy (`src/transport.rs:2260`) |
+| `GET  /.well-known/oauth-authorization-server` | feature = `oauth` proxy (`src/transport.rs:1759`) |
 
 Authenticated endpoints:
 
@@ -443,7 +443,7 @@ Lifecycle (concurrent-acceptor design, since the 1.8.1 review fixes):
 1. `TlsListener::new(...)` reads PEM cert + key, builds a `rustls::ServerConfig`,
    optionally wraps with mTLS verification using configured root CAs, then
    spawns a dedicated background acceptor task (`run_tls_acceptor`,
-   `src/transport.rs:2665`) that owns the `TcpListener`.
+   `src/transport.rs:2711`) that owns the `TcpListener`.
 2. The acceptor task loops: acquires a permit from a semaphore sized by
    `max_concurrent_tls_handshakes` (default 256 via
    `DEFAULT_MAX_CONCURRENT_TLS_HANDSHAKES`; configurable since 1.9.0 via
@@ -478,7 +478,7 @@ Configuration toggles:
 `[mtls]` is configured and `crl_enabled = true` (the default).
 
 Lifecycle:
-1. `bootstrap_fetch(roots, config)` (`src/mtls_revocation.rs:1031`) is
+1. `bootstrap_fetch(roots, config)` (`src/mtls_revocation.rs:1138`) is
    called from `run_server` *before* the listener is built. It walks the
    configured CA chain, extracts every X.509 CRL Distribution Point (CDP)
    URL via `extract_cdp_urls`, fetches each via `reqwest` under a 10 s
@@ -491,14 +491,14 @@ Lifecycle:
    - `discover_tx: mpsc::UnboundedSender<String>` — channel used by the
      handshake path to register newly observed CDP URLs for fetch.
    - `seen_urls: Mutex<HashSet<String>>` — dedupe of URLs already processed.
-3. `DynamicClientCertVerifier` (`src/mtls_revocation.rs:856`) is the
+3. `DynamicClientCertVerifier` (`src/mtls_revocation.rs:963`) is the
    `Arc<dyn ClientCertVerifier>` handed to `rustls::ServerConfig`. Its
    trait methods delegate to the inner verifier loaded from
    `inner_verifier.load()`. Because `tokio_rustls::TlsAcceptor` clones
    the verifier `Arc` from the `ServerConfig` at construction, the
    dynamic verifier MUST be the Arc handed to rustls; its inner verifier
    then swaps via the internal `ArcSwap`.
-4. `run_crl_refresher(set, rx, shutdown)` (`src/mtls_revocation.rs:1142`)
+4. `run_crl_refresher(set, rx, shutdown)` (`src/mtls_revocation.rs:1249`)
    is spawned by `run_server`. It:
    - Drains the `discover_tx` receiver and fetches any newly observed CDP URLs.
    - Re-fetches each cached CRL before its `nextUpdate`, clamped to
@@ -558,7 +558,7 @@ reachable:
 
 ### Discovery admission ordering
 
-`note_discovered_urls` (`src/mtls_revocation.rs:398`) implements a
+`note_discovered_urls` (`src/mtls_revocation.rs:461`) implements a
 strict commit-after-admission protocol to keep the discovery rate
 limiter from "leaking" URLs:
 
@@ -576,7 +576,7 @@ This ordering matters: a naive "mark seen, then attempt admission"
 implementation would silently drop CDP URLs forever the first time the
 rate limiter engaged, breaking revocation for the affected client
 identities. The current ordering is verified by
-`__test_check_discovery_rate` (`src/mtls_revocation.rs:563`) and by the
+`__test_check_discovery_rate` (`src/mtls_revocation.rs:636`) and by the
 `__test_with_kept_receiver` helper used in unit tests.
 
 Hot-reload: `ReloadHandle::refresh_crls()` (in `src/transport.rs`) sends a

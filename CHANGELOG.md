@@ -11,6 +11,59 @@ migration note and a config opt-out — see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Security
+
+- **mTLS: a CRL whose first fetch failed is no longer suppressed for the
+  process lifetime.** A discovered CRL Distribution Point URL was committed to
+  the permanent dedup set as soon as it was queued. If that first fetch then
+  failed, no code path could undo it — `seen_urls` is pruned only for URLs
+  whose CRL was successfully cached and later went stale — so the URL was never
+  re-enqueued and revocation for that CDP was silently disabled under the
+  default `crl_deny_on_unavailable = false` (or the handshake failed forever
+  with it set to `true`). CDP URLs come from the client-presented certificate,
+  so a holder of a revoked-but-chain-valid cert could trigger this deliberately
+  by making the first fetch fail from a host they control. Queued-but-unfetched
+  URLs now occupy a separate in-flight state and are promoted to the permanent
+  set **only once the CRL is confirmed present in the cache** — a fetch error or
+  a `crl_max_cache_entries` rejection clears the marker so a later handshake
+  retries. Retry volume stays bounded by the existing
+  `crl_discovery_rate_per_min` limiter, global fetch concurrency, and per-host
+  semaphores. Cache removal now clears both states.
+
+- **OAuth proxy: caller-supplied client-authentication parameters can no longer
+  be smuggled upstream.** `client_id` was stripped by splitting the raw form on
+  `&` and dropping segments literally starting with `client_id=`. Percent-encoded
+  keys (`%63lient_id=`, `client%5Fid=`) survived that filter but decode upstream
+  to `client_id`, and `client_secret` was never filtered at all — so a caller
+  could ship duplicate client credentials to the IdP alongside the proxy's own
+  injected values, and a first-wins upstream parser would honour the caller's.
+  The query/body is now parsed and re-serialized as
+  `application/x-www-form-urlencoded`, dropping every decoded `client_id`,
+  `client_secret`, `client_assertion`, and `client_assertion_type` before
+  proxy-owned values are injected, across all three proxy call sites. Decoded
+  values and the relative order of non-client parameters (including repeated
+  `scope` / `resource`) are preserved; raw byte encoding is normalized, which is
+  semantically equivalent for form data.
+
+- **RBAC: a non-string `arguments.host` no longer downgrades the host check.**
+  The host was read with `as_str()`, so an array, object, number, bool, or null
+  yielded `None` and routed to `check_operation`, skipping `RoleConfig.hosts`
+  glob evaluation entirely — letting a caller opt out of host restrictions by
+  changing the argument's shape. A present-but-non-string `host` is now denied,
+  matching the existing fail-closed behaviour for non-string allowlisted
+  arguments. An **absent** `host` still routes to `check_operation`, so
+  genuinely hostless tools (`ping`, `list_hosts`) are unaffected.
+
+- **Metrics: HTTP label cardinality is now bounded.** `metrics_middleware` runs
+  outside the auth layer and labelled series with the raw request path and raw
+  HTTP method, so unauthenticated requests to random paths minted a permanent
+  Prometheus time series each, growing in-process state until exhaustion. Labels
+  now come from a closed set: the matched route template where available, `/mcp`
+  for the nested MCP service, `<unmatched>` otherwise, and a fixed method list
+  with `OTHER` for extension verbs. The raw path is never used. Label **names**
+  are unchanged, so existing dashboards keep working; label **values** for
+  previously-unmatched requests change.
+
 ### Fixed
 
 - **`Forwarded` header parsing now requires balanced quotes (RFC 7239 §4).**
@@ -27,6 +80,16 @@ migration note and a config opt-out — see the 3.1.0 notes below.
   rate limiting and operator allowlists. Well-formed quoted values —
   including `for="[2001:db8::1]:443"` and quoted `unknown` / `_obfuscated`
   identifiers — are unaffected.
+
+- **Graceful shutdown no longer cuts MCP sessions at the start of the grace
+  window.** The MCP service received a child of the same cancellation token the
+  shutdown path cancels immediately when the trigger fires, so in-flight
+  sessions and SSE streams could terminate before `shutdown_timeout` elapsed
+  during a normal SIGTERM rollout. The MCP service now holds a dedicated
+  session token, cancelled only after axum finishes draining — or when the
+  force-exit timer wins, so a stuck stream still cannot hang shutdown. The
+  lifecycle token continues to drive the metrics listener, the CRL refresher,
+  and external shutdown wiring unchanged.
 
 ### Changed
 
@@ -73,6 +136,14 @@ migration note and a config opt-out — see the 3.1.0 notes below.
   `AGENTS.md` documents the test-tier taxonomy (unit / property /
   integration-pure / integration-mocked / e2e / perf) together with the
   per-file `#![cfg(...)]` feature gates.
+- The constant-time documentation on `verify_bearer_token` no longer claims
+  full branchlessness. The guarantee the implementation actually provides is
+  exactly one Argon2id verification per configured key regardless of which slot
+  matches or whether one is expired; selecting the verification target and
+  recording the matched index remain ordinary data-dependent branches on
+  locals, dwarfed by the Argon2id cost. No behaviour change.
+- Stale `src/` line-number citations in `AGENTS.md`, `docs/ARCHITECTURE.md`,
+  and `docs/MINDMAP.md` repointed to their current locations.
 
 ## [3.2.0] - 2026-08-21
 

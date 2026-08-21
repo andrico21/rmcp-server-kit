@@ -417,12 +417,12 @@ graph TD
 
 | Area                              | Module / file                           | Notable symbols (file:line)                                                  |
 |-----------------------------------|------------------------------------------|-------------------------------------------------------------------------------|
-| Server entry (HTTP)               | `src/transport.rs`                       | `serve` ~L1954, `McpServerConfig` L277-560, `ReloadHandle` ~L1305              |
-| Server entry (stdio, no auth)     | `src/transport.rs`                       | `serve_stdio` ~L3558                                                          |
+| Server entry (HTTP)               | `src/transport.rs`                       | `serve` ~L2007, `McpServerConfig` L277-560, `ReloadHandle` ~L1305              |
+| Server entry (stdio, no auth)     | `src/transport.rs`                       | `serve_stdio` ~L3650                                                          |
 | Router builder + middleware wire  | `src/transport.rs`                       | `build_app_router` ~L1429, security headers wired ~L1677, peer-addr normalize wired ~L1812, origin wired ~L1827 |
 | TLS / mTLS acceptor               | `src/transport.rs`                       | `TlsListener` ~L2522                                                          |
-| Origin / security headers (defs)  | `src/transport.rs`                       | `origin_check_middleware` ~L3465, `security_headers_middleware` ~L3027       |
-| Graceful shutdown                 | `src/transport.rs`                       | `shutdown_signal` ~L2951                                                      |
+| Origin / security headers (defs)  | `src/transport.rs`                       | `origin_check_middleware` ~L3557, `security_headers_middleware` ~L3119       |
+| Graceful shutdown                 | `src/transport.rs`                       | `shutdown_signal` ~L2996                                                      |
 | API key + mTLS auth               | `src/auth.rs`                            | `AuthIdentity` L47, `AuthState` ~L930, `auth_middleware` L1393               |
 | RBAC engine                       | `src/rbac.rs`                            | `RbacPolicy` L352, task-locals L90-150, `rbac_middleware` L678-825           |
 | Memory-bounded keyed limiter      | `src/bounded_limiter.rs`                 | `BoundedKeyedLimiter` L96                                                     |
