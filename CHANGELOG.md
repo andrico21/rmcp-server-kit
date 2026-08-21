@@ -11,6 +11,8 @@ migration note and a config opt-out — see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+## [3.2.0] - 2026-08-21
+
 ### Changed
 
 - **MSRV raised to Rust 1.98.0** (from 1.95.0). The `rust-version` manifest
