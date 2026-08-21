@@ -11,6 +11,13 @@ migration note and a config opt-out — see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Changed
+
+- **MSRV raised to Rust 1.98.0** (from 1.95.0). The `rust-version` manifest
+  field, the GitHub Actions MSRV gate, and the GitLab CI image now target
+  1.98.0, matching the stable toolchain CI already runs. Per the project's
+  SemVer policy an MSRV bump is a minor-version change. No public API change.
+
 ## [3.1.3] - 2026-08-19
 
 ### Changed

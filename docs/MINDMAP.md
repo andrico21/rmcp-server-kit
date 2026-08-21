@@ -15,7 +15,7 @@ mindmap
       Library crate
       No src/main.rs
       Edition 2024
-      MSRV 1.95.0
+      MSRV 1.98.0
       Dual MIT / Apache-2.0
       Repos
         GitHub andrico21/rmcp-server-kit
@@ -230,7 +230,7 @@ mindmap
       cargo doc --no-deps --all-features
       cargo audit
       cargo deny check
-      cargo +1.95.0 build --all-features
+      cargo +1.98.0 build --all-features
       cargo semver-checks check-release
     CI / policy
       .github/workflows/ci.yml canonical

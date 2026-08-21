@@ -29,7 +29,7 @@ shutdown.
 | Crate name    | `rmcp-server-kit`                                                  |
 | Version       | see [`Cargo.toml`](Cargo.toml) `[package].version`                 |
 | Edition       | `2024`                                                             |
-| MSRV          | Rust **1.95.0**                                                    |
+| MSRV          | Rust **1.98.0**                                                    |
 | License       | `MIT OR Apache-2.0` (dual)                                         |
 | Crate type    | **Library** (no `src/main.rs`; runnable code lives in `examples/`) |
 | Repository    | https://github.com/andrico21/rmcp-server-kit (canonical)           |
@@ -135,7 +135,7 @@ Z:\TempPersistent\rmcp-server-kit\
 | Build docs                       | `cargo +nightly doc --no-deps --all-features`                        |
 | Supply-chain audit               | `cargo audit`                                                        |
 | License/ban policy               | `cargo deny check`                                                   |
-| MSRV check                       | `cargo +1.95.0 build --all-features`                                 |
+| MSRV check                       | `cargo +1.98.0 build --all-features`                                 |
 | Semver check (library)           | `cargo semver-checks check-release`                                  |
 
 **CI definition lives in**:

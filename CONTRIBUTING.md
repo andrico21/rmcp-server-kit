@@ -13,7 +13,7 @@ APIs, MSRV policy), see
 
 ## Development prerequisites
 
-- Rust **1.95 or newer** (stable toolchain) — `edition = "2024"`.
+- Rust **1.98 or newer** (stable toolchain) — `edition = "2024"`.
 - `cargo-deny` (for the `ci deny` step): `cargo install cargo-deny`.
 - `cargo-audit` (for the `ci audit` step): `cargo install cargo-audit`.
 - A nightly toolchain is only required for `cargo fmt` (the `rustfmt.toml`

@@ -18,9 +18,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # `RUSTFLAGS="-D warnings"` (not Cargo's `build.warnings`): `build.warnings`
-  # is Rust 1.97+, but this crate's MSRV is 1.95, so RUSTFLAGS is the correct
-  # deny-warnings mechanism here. See docs/RUST_1_95_NOTES.md. Do not "upgrade".
+  # `RUSTFLAGS="-D warnings"` denies warnings across every job. Cargo's
+  # `build.warnings` (stable since 1.97) is now within our 1.98 MSRV, but
+  # RUSTFLAGS is retained for parity with the GitLab mirror. See
+  # docs/RUST_1_95_NOTES.md.
   RUSTFLAGS: "-D warnings"
 
 jobs:
@@ -183,11 +184,11 @@ jobs:
         run: cargo audit
 
   msrv:
-    name: MSRV (1.95.0)
+    name: MSRV (1.98.0)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.98.0
       - uses: Swatinem/rust-cache@v2.9.1
       - run: cargo build --all-features
 

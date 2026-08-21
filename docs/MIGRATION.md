@@ -37,8 +37,8 @@ a breaking change you must coordinate:
    `read_resource` (`ReadResourceResponse`). Handlers that only implement
    `get_info` — the common case — need **no** code change beyond step 1.
 
-3. **MSRV.** rmcp 3.0 requires Rust ≥ 1.88; `rmcp-server-kit` continues to
-   target 1.95, so no action is needed.
+3. **MSRV.** rmcp 3.0 requires Rust ≥ 1.88; `rmcp-server-kit` targets
+   1.98, so no action is needed.
 
 The `rmcp-server-kit` public API surface (config, auth, RBAC, transport)
 is otherwise unchanged for 3.0.
@@ -111,6 +111,6 @@ Both are opt-in to keep the default dependency footprint small.
 
 ## 6. Minimum supported Rust
 
-`rmcp-server-kit` targets stable Rust **1.95** or newer (`edition = "2024"`).
+`rmcp-server-kit` targets stable Rust **1.98** or newer (`edition = "2024"`).
 Bumping the MSRV is a minor-version change under the project's SemVer
 policy.

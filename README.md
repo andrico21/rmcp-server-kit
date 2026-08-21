@@ -174,7 +174,7 @@ let config = McpServerConfig::new("127.0.0.1:8443", "my-server", "0.1.0")
 
 ## Minimum supported Rust
 
-`rmcp-server-kit` targets stable Rust **1.95** or newer (tracks `edition = "2024"`).
+`rmcp-server-kit` targets stable Rust **1.98** or newer (tracks `edition = "2024"`).
 
 ## Repository
 

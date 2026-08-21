@@ -6,7 +6,7 @@
 #
 # Toolchain image: ci-tools/rust-ci-images (built separately).
 # It pre-installs:
-#   - rustup channels: 1.95.0 (stable pin) + nightly (rustfmt, clippy,
+#   - rustup channels: 1.98.0 (stable pin) + nightly (rustfmt, clippy,
 #     rust-src, llvm-tools-preview)
 #   - cargo subcommands: nextest, llvm-cov, deny, audit, semver-checks,
 #     vet, machete, mutants, msrv, hack, outdated, sort, upgrades, geiger,
@@ -41,15 +41,17 @@ stages:
 
 variables:
   CARGO_TERM_COLOR: always
-  # RUSTFLAGS="-D warnings" (not Cargo `build.warnings`, which is 1.97+; MSRV
-  # is 1.95). See docs/RUST_1_95_NOTES.md. Do not "upgrade" to build.warnings.
+  # RUSTFLAGS="-D warnings" denies warnings across all jobs. Cargo
+  # `build.warnings` (stable 1.97+) is now within our 1.98 MSRV but is not
+  # adopted here; RUSTFLAGS is kept for parity with GitHub CI. See
+  # docs/RUST_1_95_NOTES.md.
   RUSTFLAGS: "-D warnings"
   CARGO_INCREMENTAL: "0"          # CI cache hit-rate > incremental gain
   CARGO_NET_RETRY: "10"
   RUSTUP_MAX_RETRIES: "10"
   # Pin to the rust-ci-images tag matching our MSRV. Bump deliberately
   # together with Cargo.toml `rust-version`.
-  CI_IMAGE: gitlab-ad.andrico.local:5050/ci-tools/rust-ci-images/rust:rust-1.95.0
+  CI_IMAGE: gitlab-ad.andrico.local:5050/ci-tools/rust-ci-images/rust:rust-1.98.0
   # SAST/secret-detection toggles (templates honour these).
   SECRET_DETECTION_ENABLED: "true"
   SAST_EXCLUDED_PATHS: "target,docs"
@@ -158,9 +160,9 @@ msrv:
   stage: check
   needs: []
   script:
-    # Image's stable channel is already pinned to MSRV (1.95.0). If a
+    # Image's stable channel is already pinned to MSRV (1.98.0). If a
     # downstream image bump moves stable forward, switch this to
-    # `cargo +1.95.0 build` and add the toolchain via `rustup install`.
+    # `cargo +1.98.0 build` and add the toolchain via `rustup install`.
     # Library crate: no committed Cargo.lock; do not pass --locked.
     - rtk cargo build --all-features
 
