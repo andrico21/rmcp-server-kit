@@ -108,7 +108,19 @@ pub struct CrlSet {
     /// Fire-and-forget discovery channel for newly-seen CDP URLs.
     pub discover_tx: mpsc::UnboundedSender<String>,
     client: reqwest::Client,
+    /// URLs whose CRL is confirmed present in `cache`. Permanent dedup: a URL
+    /// here is never re-enqueued for discovery.
     seen_urls: Mutex<HashSet<String>>,
+    /// URLs admitted to the discovery channel but not yet confirmed cached.
+    ///
+    /// This exists so a queued URL is not re-enqueued while its fetch is in
+    /// flight, WITHOUT permanently suppressing it. Promotion to `seen_urls`
+    /// happens only once the CRL is actually in the cache; a fetch error or a
+    /// cache-cap rejection clears the entry so a later handshake can retry.
+    /// Merging the two states is exactly the bug this separation fixes: a
+    /// first-fetch failure would otherwise suppress the URL for the process
+    /// lifetime, silently disabling revocation for that CDP.
+    pending_urls: Mutex<HashSet<String>>,
     cached_urls: Mutex<HashSet<String>>,
     /// Global cap on simultaneous CRL HTTP fetches (SSRF amplification guard).
     global_fetch_sem: Arc<Semaphore>,
@@ -192,6 +204,7 @@ impl CrlSet {
             discover_tx,
             client,
             seen_urls: Mutex::new(seen_urls),
+            pending_urls: Mutex::new(HashSet::new()),
             cached_urls: Mutex::new(cached_urls),
             global_fetch_sem,
             host_semaphores,
@@ -292,17 +305,25 @@ impl CrlSet {
             }
         }
 
-        match self.seen_urls.lock() {
-            Ok(mut seen_urls) => {
-                for url in removals {
-                    seen_urls.remove(url);
-                }
+        // A removed CRL must become fully re-discoverable, so clear the URL
+        // from BOTH dedup states. Clearing only `seen_urls` would leave a
+        // stale `pending_urls` entry suppressing re-enqueue forever.
+        {
+            let mut seen = self
+                .seen_urls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for url in removals {
+                seen.remove(url);
             }
-            Err(poisoned) => {
-                let mut seen_urls = poisoned.into_inner();
-                for url in removals {
-                    seen_urls.remove(url);
-                }
+        }
+        {
+            let mut pending = self
+                .pending_urls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for url in removals {
+                pending.remove(url);
             }
         }
 
@@ -379,7 +400,16 @@ impl CrlSet {
         Ok(())
     }
 
-    async fn fetch_and_store_url(&self, url: String) -> Result<(), McpxError> {
+    /// Fetch a CRL and commit it to the cache.
+    ///
+    /// Returns whether the CRL is actually present in the cache afterwards.
+    /// A successful HTTP fetch is NOT sufficient:
+    /// [`Self::commit_cache_update_atomically`] rejects new entries once
+    /// `crl_max_cache_entries` is reached. Only a URL that genuinely landed in
+    /// the cache may be promoted to the permanent `seen_urls` dedup set —
+    /// promoting on fetch success alone would suppress a URL that was never
+    /// cached, which is the same revocation-bypass this state split fixes.
+    async fn fetch_and_store_url(&self, url: String) -> Result<bool, McpxError> {
         let cached = gated_fetch(
             &self.client,
             &self.global_fetch_sem,
@@ -391,9 +421,41 @@ impl CrlSet {
         )
         .await?;
         let _ = self
-            .commit_cache_update_atomically(vec![(url, cached)], &[])
+            .commit_cache_update_atomically(vec![(url.clone(), cached)], &[])
             .await?;
-        Ok(())
+        Ok(self.cache.read().await.contains_key(&url))
+    }
+
+    /// Promote a URL from the in-flight set to the permanent dedup set.
+    /// Called only once its CRL is confirmed present in the cache.
+    fn promote_pending_to_seen(&self, url: &str) {
+        {
+            let mut pending = self
+                .pending_urls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pending.remove(url);
+        }
+        let mut seen = self
+            .seen_urls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if seen.len() >= self.config.crl_max_seen_urls && !seen.contains(url) {
+            self.warn_cap_exceeded_throttled("seen_urls");
+            return;
+        }
+        seen.insert(url.to_owned());
+    }
+
+    /// Clear a URL's in-flight marker without promoting it, so a later
+    /// handshake can re-enqueue it. Used when the fetch failed or the cache
+    /// refused the entry.
+    fn clear_pending(&self, url: &str) {
+        let mut pending = self
+            .pending_urls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.remove(url);
     }
 
     fn note_discovered_urls(
@@ -415,31 +477,36 @@ impl CrlSet {
         all_urls.sort();
         all_urls.dedup();
 
-        // Snapshot the dedup set under the lock; do NOT mutate it yet.
-        // We promote a URL to "seen" only after it is actually admitted
-        // by the rate-limiter and queued on the discover channel.
-        // Otherwise a single rate-limited handshake would permanently
-        // black-hole the URL: every subsequent handshake would see it as
-        // "already known" and skip the limiter entirely, while the
-        // background fetcher would never have received it. With
-        // `crl_deny_on_unavailable = true` that produces persistent
-        // handshake failures; with fail-open it silently disables CRL
-        // discovery for that endpoint forever.
-        let candidates: Vec<String> = match self.seen_urls.lock() {
-            Ok(seen) => all_urls
+        // Snapshot both dedup sets under their locks; do NOT mutate yet.
+        // A URL is skipped if it is already cached (`seen_urls`) or already
+        // queued and awaiting its fetch (`pending_urls`). Promotion to
+        // `seen_urls` happens only after the CRL is confirmed in the cache,
+        // so a URL that loses the limiter race, hits a closed channel, fails
+        // to fetch, or is rejected by the cache cap stays retriable. Marking
+        // "seen" any earlier permanently black-holes the URL: every later
+        // handshake would treat it as known and skip discovery, while no CRL
+        // was ever cached. With `crl_deny_on_unavailable = true` that is a
+        // persistent handshake failure; with fail-open it silently disables
+        // revocation checking for that CDP for the process lifetime.
+        let candidates: Vec<String> = {
+            let seen = self
+                .seen_urls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let pending = self
+                .pending_urls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            all_urls
                 .iter()
-                .filter(|url| !seen.contains(*url))
+                .filter(|url| !seen.contains(*url) && !pending.contains(*url))
                 .cloned()
-                .collect(),
-            Err(_) => Vec::new(),
+                .collect()
         };
 
         // Rate-limit gate: drop excess submissions on the floor with a WARN.
         // The mTLS verifier must remain non-blocking, so we use the
-        // synchronous `check()` API and never await here. Only on a
-        // successful `check()` AND a successful `send()` do we commit
-        // the URL to `seen_urls`; this guarantees retriability of any
-        // URL that lost the limiter race.
+        // synchronous `check()` API and never await here.
         for url in candidates {
             if self.discovery_limiter.check().is_err() {
                 tracing::warn!(
@@ -449,21 +516,22 @@ impl CrlSet {
                 continue;
             }
             if self.discover_tx.send(url.clone()).is_err() {
-                // Receiver gone (shutdown). Do NOT mark as seen so the
+                // Receiver gone (shutdown). Do NOT mark pending so the
                 // URL can be retried after a reload / restart.
                 tracing::debug!(
                     url = %url,
-                    "discover channel closed; dropping CDP URL without marking seen"
+                    "discover channel closed; dropping CDP URL without marking pending"
                 );
                 continue;
             }
-            // Admission succeeded: now safe to dedup permanently.
+            // Queued for fetch. Mark pending (not seen) so concurrent
+            // handshakes do not re-enqueue it while the fetch is in flight.
             let mut guard = self
-                .seen_urls
+                .pending_urls
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if guard.len() >= self.config.crl_max_seen_urls {
-                self.warn_cap_exceeded_throttled("seen_urls");
+                self.warn_cap_exceeded_throttled("pending_urls");
                 break;
             }
             guard.insert(url);
@@ -582,36 +650,38 @@ impl CrlSet {
     /// Test-only: invoke the real `note_discovered_urls` so dedup + rate-limit
     /// + cached-fallback paths are all exercised. Returns the `missing_cached`
     /// flag the production verifier uses to decide whether to fail the handshake.
+    ///
+    /// When no receiver is attached (the usual unit-test setup), the send fails
+    /// and production correctly records nothing, so this mirrors the admission
+    /// bookkeeping by marking the URL **pending** — matching what a live
+    /// refresher would observe between enqueue and fetch.
     #[doc(hidden)]
     pub fn __test_note_discovered_urls(&self, urls: &[String]) -> bool {
         let missing_cached = self.note_discovered_urls(urls, &[]);
         if self.discover_tx.is_closed() {
-            match self.seen_urls.lock() {
-                Ok(mut guard) => {
-                    for url in urls {
-                        if guard.contains(url) {
-                            continue;
-                        }
-                        if guard.len() >= self.config.crl_max_seen_urls {
-                            self.warn_cap_exceeded_throttled("seen_urls");
-                            break;
-                        }
-                        guard.insert(url.clone());
-                    }
+            let already_seen: HashSet<String> = {
+                let seen = self
+                    .seen_urls
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                urls.iter()
+                    .filter(|url| seen.contains(*url))
+                    .cloned()
+                    .collect()
+            };
+            let mut pending = self
+                .pending_urls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for url in urls {
+                if already_seen.contains(url) || pending.contains(url) {
+                    continue;
                 }
-                Err(poisoned) => {
-                    let mut guard = poisoned.into_inner();
-                    for url in urls {
-                        if guard.contains(url) {
-                            continue;
-                        }
-                        if guard.len() >= self.config.crl_max_seen_urls {
-                            self.warn_cap_exceeded_throttled("seen_urls");
-                            break;
-                        }
-                        guard.insert(url.clone());
-                    }
+                if pending.len() >= self.config.crl_max_seen_urls {
+                    self.warn_cap_exceeded_throttled("pending_urls");
+                    break;
                 }
+                pending.insert(url.clone());
             }
         }
         missing_cached
@@ -629,15 +699,56 @@ impl CrlSet {
         self.note_discovered_urls(end_entity_urls, intermediate_urls)
     }
 
-    /// Test-only: report whether a URL has been promoted to the
-    /// permanent dedup set. Used by the B2 retriability regression
-    /// test to assert that rate-limited URLs are NOT marked seen.
-    /// Not part of the public API.
+    /// Test-only: report whether a URL is currently suppressed from
+    /// re-discovery — i.e. present in EITHER dedup state.
+    ///
+    /// This is the property callers actually care about: "will a future
+    /// handshake re-enqueue this URL?". Use
+    /// [`Self::__test_is_permanently_seen`] when the distinction between
+    /// in-flight and confirmed-cached matters.
     #[doc(hidden)]
     pub fn __test_is_seen(&self, url: &str) -> bool {
-        match self.seen_urls.lock() {
-            Ok(seen) => seen.contains(url),
-            Err(_) => false,
+        let in_seen = {
+            let seen = self
+                .seen_urls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            seen.contains(url)
+        };
+        if in_seen {
+            return true;
+        }
+        let pending = self
+            .pending_urls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.contains(url)
+    }
+
+    /// Test-only: report whether a URL reached the PERMANENT dedup set,
+    /// which happens only after its CRL is confirmed present in the cache.
+    /// A URL that was merely queued, or whose fetch failed, is not counted.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    pub fn __test_is_permanently_seen(&self, url: &str) -> bool {
+        let seen = self
+            .seen_urls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        seen.contains(url)
+    }
+
+    /// Test-only: drive the post-fetch bookkeeping without performing HTTP.
+    /// `admitted` mirrors [`Self::fetch_and_store_url`]'s return value:
+    /// `true` when the CRL landed in the cache, `false` when the fetch
+    /// failed or the cache cap refused it.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    pub fn __test_settle_pending(&self, url: &str, admitted: bool) {
+        if admitted {
+            self.promote_pending_to_seen(url);
+        } else {
+            self.clear_pending(url);
         }
     }
 
@@ -1160,8 +1271,28 @@ pub async fn run_crl_refresher(
                 let Some(url) = maybe_url else {
                     break;
                 };
-                if let Err(error) = set.fetch_and_store_url(url.clone()).await {
-                    tracing::warn!(url = %url, error = %error, "CRL discovery fetch failed");
+                match set.fetch_and_store_url(url.clone()).await {
+                    // Cached: safe to suppress this URL permanently.
+                    Ok(true) => set.promote_pending_to_seen(&url),
+                    // Fetched but refused by the cache cap. Clear the
+                    // in-flight marker so a later handshake can retry;
+                    // suppressing it here would disable revocation for
+                    // this CDP even though no CRL was ever cached.
+                    Ok(false) => {
+                        set.clear_pending(&url);
+                        tracing::warn!(
+                            url = %url,
+                            "CRL fetched but not admitted to cache (cap reached); will retry on a later handshake"
+                        );
+                    }
+                    Err(error) => {
+                        set.clear_pending(&url);
+                        tracing::warn!(
+                            url = %url,
+                            error = %error,
+                            "CRL discovery fetch failed; will retry on a later handshake"
+                        );
+                    }
                 }
                 refresh_sleep = schedule_next_refresh(&set).await;
             }

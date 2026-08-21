@@ -268,3 +268,124 @@ async fn stale_removal_also_clears_seen() {
         "stale refresh failure must also clear seen_urls (1.3.0 invariant)"
     );
 }
+
+// -- F1 regression: first-fetch failure permanently suppressed retry --
+//
+// A discovered CDP URL was committed to the permanent dedup set as soon as
+// it was queued. When that first fetch failed, no code path could ever undo
+// that: `seen_urls` is pruned only for URLs whose CRL was successfully
+// cached and later went stale. The URL was therefore never re-enqueued for
+// the process lifetime, so revocation for that CDP was silently disabled
+// under the default `crl_deny_on_unavailable = false`, or the handshake
+// failed forever with it set to `true`.
+//
+// CDP URLs come from the client-presented certificate, so a holder of a
+// revoked cert could trigger this deliberately by making the first fetch
+// fail from a host they control.
+
+/// Build a `CrlSet` whose discovery receiver stays alive, so
+/// `note_discovered_urls` exercises the real limiter + send + mark path
+/// instead of the closed-channel fallback in `__test_note_discovered_urls`.
+/// The receiver must be held for the duration of the test.
+fn crl_set_with_receiver(
+    max_seen_urls: usize,
+    max_cache_entries: usize,
+) -> (Arc<CrlSet>, tokio::sync::mpsc::UnboundedReceiver<String>) {
+    install_ring_provider();
+    let mut roots = RootCertStore::empty();
+    roots.add(build_ca_root()).expect("add ca root");
+    CrlSet::__test_with_kept_receiver(
+        Arc::new(roots),
+        bounded_config(1024, max_seen_urls, max_cache_entries),
+        vec![],
+    )
+    .expect("crl set with receiver")
+}
+
+#[tokio::test]
+async fn failed_first_fetch_does_not_permanently_suppress_url() {
+    let (set, _rx) = crl_set_with_receiver(4096, 1024);
+    let url = "https://retry.example.test/crl";
+
+    let _ = set.__test_note_discovered_urls_by_cert(&[url.to_owned()], &[]);
+    assert!(set.__test_is_seen(url), "queued URL must be in flight");
+    assert!(
+        !set.__test_is_permanently_seen(url),
+        "queueing alone must not promote to the permanent dedup set"
+    );
+
+    set.__test_settle_pending(url, false);
+
+    assert!(
+        !set.__test_is_permanently_seen(url),
+        "a failed fetch must never reach the permanent dedup set"
+    );
+    assert!(
+        !set.__test_is_seen(url),
+        "a failed fetch must leave the URL retriable"
+    );
+
+    let _ = set.__test_note_discovered_urls_by_cert(&[url.to_owned()], &[]);
+    assert!(
+        set.__test_is_seen(url),
+        "URL must be re-enqueued by a subsequent handshake"
+    );
+}
+
+#[tokio::test]
+async fn fetch_rejected_by_cache_cap_does_not_permanently_suppress_url() {
+    // Promoting on "HTTP fetch succeeded" rather than "cache admitted"
+    // recreates the bug through a second route: commit_cache_update_atomically
+    // silently refuses new entries once `crl_max_cache_entries` is reached.
+    let (set, _rx) = crl_set_with_receiver(4096, 1024);
+    let url = "https://capped.example.test/crl";
+
+    let _ = set.__test_note_discovered_urls_by_cert(&[url.to_owned()], &[]);
+    assert!(set.__test_is_seen(url));
+
+    set.__test_settle_pending(url, false);
+
+    assert!(
+        !set.__test_is_permanently_seen(url),
+        "a cache-rejected CRL must not be permanently suppressed"
+    );
+    let _ = set.__test_note_discovered_urls_by_cert(&[url.to_owned()], &[]);
+    assert!(
+        set.__test_is_seen(url),
+        "a cache-rejected URL must remain retriable"
+    );
+}
+
+#[tokio::test]
+async fn successfully_cached_url_is_permanently_deduped() {
+    let (set, _rx) = crl_set_with_receiver(4096, 1024);
+    let url = "https://cached.example.test/crl";
+
+    let _ = set.__test_note_discovered_urls_by_cert(&[url.to_owned()], &[]);
+    set.__test_settle_pending(url, true);
+
+    assert!(
+        set.__test_is_permanently_seen(url),
+        "a cached CRL must be promoted to the permanent dedup set"
+    );
+    assert!(
+        set.__test_is_seen(url),
+        "a cached CRL must stay suppressed from re-discovery"
+    );
+}
+
+#[tokio::test]
+async fn in_flight_state_respects_the_configured_cap() {
+    let (set, _rx) = crl_set_with_receiver(4, 1024);
+    let urls: Vec<String> = (0..8)
+        .map(|i| format!("https://flood-{i}.example.test/crl"))
+        .collect();
+
+    let _ = set.__test_note_discovered_urls_by_cert(&urls, &[]);
+
+    let suppressed = urls.iter().filter(|u| set.__test_is_seen(u)).count();
+    assert!(
+        suppressed <= 4,
+        "in-flight set must respect crl_max_seen_urls; {suppressed} suppressed"
+    );
+}
