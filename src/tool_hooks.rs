@@ -581,6 +581,10 @@ mod tests {
             ServerInfo::default()
         }
 
+        #[allow(
+            clippy::unused_async_trait_impl,
+            reason = "async is mandated by the rmcp ServerHandler trait signature; this test handler does not await"
+        )]
         async fn call_tool(
             &self,
             _request: CallToolRequestParams,

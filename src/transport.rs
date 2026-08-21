@@ -140,6 +140,10 @@ impl PeerAddr {
 impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerAddr {
     type Rejection = (axum::http::StatusCode, &'static str);
 
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "async is mandated by the axum FromRequestParts trait signature; this impl only reads a request extension synchronously"
+    )]
     async fn from_request_parts(
         parts: &mut axum::http::request::Parts,
         _state: &S,
