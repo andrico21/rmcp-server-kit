@@ -182,6 +182,20 @@ feature-matrix:build:
   script:
     - rtk cargo build $FEATURES
 
+# Mirrors the `Clippy (...)` step in .github/workflows/ci.yml's
+# features-matrix job. The `clippy` job above lints `--all-features` only,
+# so lints that fire exclusively in a narrower configuration went unseen:
+# `TestLoopbackBypass` aliases to `()` outside test builds, so
+# `--features oauth` alone tripped `clone_on_copy` + `unit_arg` while
+# `--all-features` stayed green. Lint every combination we ship.
+feature-matrix:clippy:
+  extends: .feature-build
+  needs:
+    - job: feature-matrix:build
+      artifacts: false
+  script:
+    - rtk cargo clippy --all-targets $FEATURES -- -D warnings
+
 feature-matrix:test:
   extends: .feature-build
   needs:

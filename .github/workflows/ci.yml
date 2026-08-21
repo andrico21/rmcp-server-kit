@@ -81,9 +81,18 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2.9.1
       - name: Build (${{ matrix.features }})
         run: cargo build ${{ matrix.features }}
+      # The top-level `clippy` job only lints `--all-features`, so lints that
+      # fire exclusively in a narrower configuration went unseen. Real example:
+      # `TestLoopbackBypass` aliases to `()` outside test builds, so
+      # `--features oauth` alone tripped `clone_on_copy` + `unit_arg` while
+      # `--all-features` stayed green. Lint every combination we ship.
+      - name: Clippy (${{ matrix.features }})
+        run: cargo clippy --all-targets ${{ matrix.features }} -- -D warnings
       - name: Test (${{ matrix.features }})
         run: cargo test ${{ matrix.features }}
 
