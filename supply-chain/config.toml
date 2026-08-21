@@ -160,7 +160,7 @@ version = "0.3.0"
 criteria = "safe-to-run"
 
 [[exemptions.cc]]
-version = "1.4.3"
+version = "1.4.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.cfg-if]]
@@ -352,7 +352,7 @@ version = "2.2.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.either]]
-version = "1.17.0"
+version = "1.18.0"
 criteria = "safe-to-run"
 
 [[exemptions.elliptic-curve]]
@@ -464,7 +464,7 @@ version = "0.13.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.h2]]
-version = "0.4.17"
+version = "0.4.18"
 criteria = "safe-to-deploy"
 
 [[exemptions.half]]
@@ -576,7 +576,7 @@ version = "2.3.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.icu_provider]]
-version = "2.3.0"
+version = "2.3.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.ident_case]]
@@ -1544,7 +1544,7 @@ version = "0.11.8"
 criteria = "safe-to-deploy"
 
 [[exemptions.zerovec-derive]]
-version = "0.11.5"
+version = "0.11.6"
 criteria = "safe-to-deploy"
 
 [[exemptions.zmij]]
