@@ -113,7 +113,7 @@ TCP / TLS handshake                         src/transport.rs:2522  (TlsListener)
    │    AuthIdentity is attached to the **per-connection** TlsConnInfo
    │    extension (no shared SocketAddr-keyed map).
    ▼
-axum Router                                  src/transport.rs:1349  (build_app_router)
+axum Router                                  src/transport.rs:1429  (build_app_router)
    │
    ├── 1. Origin check                       src/transport.rs:2836
    │      Rejects 403 if Origin/Host not allowed (MCP spec requirement)
@@ -839,7 +839,7 @@ These are **non-negotiable**. Breaking any of them is a security regression.
 
 1. **Origin check runs before auth.** Reordering would allow unauthenticated
    browser-origin requests to hit the auth path and amplify timing oracles.
-Wired in `build_app_router` (`src/transport.rs:1349`); the middleware
+Wired in `build_app_router` (`src/transport.rs:1429`); the middleware
 itself is at `src/transport.rs:3282`.
 
 2. **Auth runs before RBAC.** Without an `AuthIdentity`, RBAC has no role
