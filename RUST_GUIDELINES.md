@@ -275,6 +275,67 @@ let display_on = bool::try_from(nvs_byte)
 Keep the plain `!= 0` form when you specifically mean "any nonzero is
 truthy" (e.g. a C-style int from a library that documents that contract).
 
+### DO: Use `bool::ok_or` / `ok_or_else` for guard clauses (Rust 1.98+)
+
+Rust 1.98 stabilized `bool::ok_or` and `bool::ok_or_else`, which turn a
+predicate into a `Result<(), E>`. They collapse the ubiquitous
+"check-then-early-return" guard into a single `?`-able expression, which reads
+better and keeps validation chains flat.
+
+```rust
+// BAD: four lines of ceremony per invariant, and the happy path drifts
+// further right with every added check
+fn validate(cfg: &Config) -> Result<(), ConfigError> {
+    if cfg.port == 0 {
+        return Err(ConfigError::InvalidPort);
+    }
+    if cfg.max_body > HARD_CAP {
+        return Err(ConfigError::BodyTooLarge);
+    }
+    Ok(())
+}
+
+// GOOD: one line per invariant, uniform shape, easy to add to
+fn validate(cfg: &Config) -> Result<(), ConfigError> {
+    (cfg.port != 0).ok_or(ConfigError::InvalidPort)?;
+    (cfg.max_body <= HARD_CAP).ok_or(ConfigError::BodyTooLarge)?;
+    Ok(())
+}
+```
+
+Use `ok_or_else` when constructing the error is non-trivial (allocates,
+formats, or captures context), so the cost is paid only on the failure path:
+
+```rust
+(cfg.max_body <= HARD_CAP)
+    .ok_or_else(|| ConfigError::BodyTooLarge { got: cfg.max_body, cap: HARD_CAP })?;
+```
+
+Note the polarity: the receiver is the condition that must hold for success.
+`true` yields `Ok(())`, `false` yields `Err(e)` -- the same convention as
+`Option::ok_or`. Write the predicate as the *invariant*, not as the failure
+condition.
+
+### DO: Use `NonZero::from_str_radix` to parse directly into a non-zero type (Rust 1.98+)
+
+Rust 1.98 stabilized `NonZero<{integer}>::from_str_radix` (`const`-stable). It
+collapses parse-then-narrow into one fallible step, so the zero case is a parse
+error rather than a second failure mode you have to remember to handle.
+
+```rust
+// BAD: two failure modes, two error types to reconcile
+let n: u32 = s.parse()?;
+let rate = NonZeroU32::new(n).ok_or(ConfigError::ZeroRate)?;
+
+// GOOD: one step, one error type; invalid and zero both surface as ParseIntError
+let rate = NonZeroU32::from_str_radix(s, 10)?;
+```
+
+This matters wherever a domain type is inherently non-zero -- rate limits,
+capacities, retry counts, connection-pool sizes, timer periods. Parsing
+straight into `NonZero` means the invalid state is unrepresentable from the
+boundary inward (Section 3), instead of being re-checked at each use site.
+
 ---
 
 ## 3. Type Safety and Defensive Programming
@@ -327,6 +388,38 @@ pub struct Config {
     pub retries: u32,
 }
 ```
+
+**Caution (Rust 1.98+): `#[non_exhaustive]` now conflicts with `#[repr(transparent)]`.**
+[Rust 1.98 made `repr(transparent)` stricter about which fields count as having
+"trivial" layout](https://github.com/rust-lang/rust/pull/155299). Three
+categories are **no longer trivial**:
+
+- `repr(C)` types
+- types with private fields
+- `#[non_exhaustive]` types
+
+This collides with two other rules in this section. The newtype pattern often
+reaches for `#[repr(transparent)]` to guarantee zero-cost layout, while
+validated constructors mandate **private fields** and library hygiene mandates
+`#[non_exhaustive]` (enforced by `exhaustive_structs` / `exhaustive_enums`,
+Section 9). A transparent newtype wrapping any of the three is now rejected.
+
+```rust
+// BAD (Rust 1.98+): the wrapped type is #[non_exhaustive], so it no longer
+// has "trivial" layout and cannot satisfy repr(transparent).
+#[repr(transparent)]
+pub struct Wrapper(InnerNonExhaustive);
+
+// GOOD: drop repr(transparent) unless you genuinely need the ABI guarantee
+// (FFI, transmute-compatibility). A plain newtype is already zero-cost for
+// ordinary Rust-to-Rust use -- repr(transparent) only matters at an ABI boundary.
+pub struct Wrapper(InnerNonExhaustive);
+```
+
+Rule of thumb: reach for `#[repr(transparent)]` **only** when you need a
+guaranteed identical ABI (FFI declarations, `transmute` compatibility). For
+pure-Rust domain newtypes it buys nothing the optimizer does not already give
+you, and on 1.98+ it actively fights `#[non_exhaustive]` and private fields.
 
 ### DO: Use `#[must_use]` on important return types
 
@@ -464,6 +557,71 @@ impl PartialEq for Order {
 }
 // Adding a new field will cause a compile error until addressed
 ```
+
+### DON'T: Mix manual and derived comparison impls (Rust 1.98+)
+
+The destructuring technique above deliberately *ignores* fields (`timestamp: _`).
+That is fine on its own, but it becomes a correctness hazard the moment the
+same type also **derives** an ordering or equality trait, because the derive
+compares **every** field. Rust 1.98 made two changes that turn this
+previously-latent inconsistency into observable behaviour change:
+
+- [Rust 1.98 implements a fast path for `derive(PartialOrd)` when `Ord` is also
+  derived](https://github.com/rust-lang/rust/pull/155598). The release notes
+  state plainly that this "can break crates where a type's `PartialOrd` and
+  `Ord` impls were inconsistent." Code that limped along on 1.97 with a
+  hand-written `PartialOrd` disagreeing with a derived `Ord` may now take a
+  different branch.
+- Rust 1.98 closed a hole in pattern-matching
+  [structural equality](https://doc.rust-lang.org/reference/patterns.html#constant-patterns),
+  rejecting matches on constants where a manual `PartialEq` disagrees with an
+  existing `derive(PartialEq)` impl.
+
+```rust
+// BAD: manual PartialEq ignores `timestamp`, but the derives order by it.
+// `a == b` can be true while `a.cmp(&b) != Ordering::Equal`. This violates
+// the Ord contract, and 1.98's derive fast path can now expose it.
+#[derive(PartialOrd, Ord, Eq)]
+struct Order { item: String, quantity: u32, timestamp: Instant }
+
+impl PartialEq for Order {
+    fn eq(&self, other: &Self) -> bool {
+        let Self { item, quantity, timestamp: _ } = self;
+        let Self { item: other_item, quantity: other_qty, timestamp: _ } = other;
+        item == other_item && quantity == other_qty
+    }
+}
+
+// GOOD: hand-write the whole comparison family, consistently, from the same
+// destructured field set. The compiler still forces you to revisit every impl
+// when a field is added.
+impl PartialEq for Order { /* compares item, quantity */ }
+impl Eq for Order {}
+impl Ord for Order {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let Self { item, quantity, timestamp: _ } = self;
+        let Self { item: other_item, quantity: other_qty, timestamp: _ } = other;
+        item.cmp(other_item).then(quantity.cmp(other_qty))
+    }
+}
+impl PartialOrd for Order {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
+}
+```
+
+Rules:
+
+- Comparison traits are **all-manual or all-derived**. Never split the family.
+  If `PartialEq` is hand-written, then `Eq`, `PartialOrd`, and `Ord` must be
+  hand-written too, over the **same** field set.
+- The invariant to preserve: `a == b` **iff** `a.cmp(&b) == Ordering::Equal`,
+  and `partial_cmp` must agree with `cmp`. Deriving `Ord` while hand-writing
+  `PartialEq` breaks this silently.
+- A type with a manual `PartialEq` must **not** be used in a constant pattern
+  (`match x { MY_CONST => ... }`) -- 1.98 rejects this.
+- If you only want to ignore a field for *equality* and have no ordering
+  requirement, do not derive `PartialOrd`/`Ord` at all. Deriving traits you do
+  not need is what creates the inconsistency.
 
 ### DO: Name unused destructured variables descriptively
 
@@ -613,6 +771,59 @@ let data = {
 // `data` is now immutable -- no accidental modification
 ```
 
+### DON'T: Use algebraic float methods where the result must be reproducible (Rust 1.98+)
+
+Rust 1.98 stabilized `algebraic_add`, `algebraic_sub`, `algebraic_mul`,
+`algebraic_div`, and `algebraic_rem` on `f32` and `f64` (all `const`-stable).
+They permit the optimizer to apply the algebraic properties of *real* numbers
+-- associativity, distributivity, reassociation -- even though those properties
+do **not** hold for IEEE-754 floats. The effect is comparable to `-ffast-math`
+in C, and it unlocks loop vectorization that ordinary float ops block.
+
+The critical property: **they are non-deterministic.** The exact set of
+optimizations is unspecified, and the compiler is free to choose differently
+across call sites, optimization levels, targets, and compiler versions. They
+never cause undefined behaviour, but they do not produce a single defined
+answer.
+
+```rust
+// Ordinary float addition is not associative, so this is pinned to
+// left-associative evaluation: ((a + b) + c) + d
+let total = a + b + c + d;
+
+// algebraic_add lets the compiler reassociate, e.g. (a + b) + (c + d),
+// evaluating partial sums in parallel. Faster, but a different result.
+let total = a.algebraic_add(b).algebraic_add(c).algebraic_add(d);
+```
+
+Never use `algebraic_*` for a value that is:
+
+- **compared** for equality or ordering (including sort keys and dedup)
+- **hashed**, or used as a map key
+- **serialized**, persisted, or sent over the wire
+- **asserted on** in a test (results may differ between debug and release)
+- part of **billing, quota, rate-limit, or audit** accounting
+- fed into an **alerting threshold** or any control-flow decision that must be
+  reproducible across nodes
+
+Acceptable uses are throughput-oriented numeric kernels where the result is
+already approximate and no consumer depends on bit-exactness: DSP filters,
+sensor smoothing, audio/graphics mixing, ML inference, physics integration.
+
+**Server note.** For an HTTP/MCP server this rule is close to absolute. Metrics
+that feed alerting, rate-limit accounting, and timing budgets must all be
+reproducible; two replicas computing different values from the same inputs is a
+debugging nightmare. Prefer integer or fixed-point arithmetic for anything
+resembling accounting.
+
+**ESP32 firmware note.** This is where `algebraic_*` genuinely pays off. Sensor
+fusion, IIR/FIR filtering, FFT bins, and PID loops are all approximate by
+nature, and the reassociation frequently enables vectorization or lets the
+compiler fold a division into a reciprocal multiply -- a real win on a
+microcontroller. Use them there, but keep them out of any value that is
+reported over MQTT, persisted to NVS, or compared against a setpoint that
+triggers actuation.
+
 ### DO: Prefer std bit-manipulation methods over hand-rolled equivalents (Rust 1.97+)
 
 Rust 1.97 stabilized a family of `const fn` bit helpers on every integer
@@ -644,9 +855,109 @@ Note the two shapes: `isolate_*_one` returns the **bit itself** (a mask),
 while `highest_one` / `lowest_one` return the **index** as `Option<u32>`
 (`None` when the input is zero -- no `u32::BITS` sentinel to special-case).
 
+**Now lint-enforced (Clippy 1.98+).** This was prose-only guidance when it was
+introduced. Clippy 1.98 added
+[`manual_isolate_lowest_one`](https://github.com/rust-lang/rust-clippy/pull/17037),
+which flags the hand-rolled `x & x.wrapping_neg()` and `x & -x` forms and
+suggests `x.isolate_lowest_one()`. It is a **`complexity`-tier** lint, so it is
+already covered by `clippy::all = "deny"` -- no separate declaration needed. The
+lint is MSRV-aware via the `msrv` key in `clippy.toml` (or `package.rust-version`),
+so it stays quiet on crates pinned below 1.97.
+
 MSRV note: these are 1.97 APIs. Adopting them raises your minimum toolchain
-to 1.97 -- honor your MSRV policy (Section 12) before using them in a crate
-that pins an older `rust-toolchain.toml`.
+to 1.97 -- honor your MSRV policy (Section 12). This is a non-issue for any
+crate already on `rust-version = "1.98.0"` or later; check before using them
+in a crate that pins an older toolchain (notably `no_std` / ESP32 crates,
+which often lag stable to match a vendor HAL release).
+
+### DO: Format integers with `format_into` + `NumBuffer` instead of allocating (Rust 1.98+)
+
+Rust 1.98 stabilized `core::fmt::NumBuffer<T>` and `<{integer}>::format_into`.
+`NumBuffer::<T>::new()` is `const`-stable and sized to hold the decimal form of
+any value of `T`; `format_into` writes into it and returns a `&str` borrowed
+from the buffer. It also bypasses most of the dynamic dispatch that buffered
+`write!` formatting incurs.
+
+```rust
+use core::fmt::NumBuffer;
+
+// BAD: heap allocation per call, in a hot path
+let s = value.to_string();
+let s = format!("{value}");
+
+// GOOD: no allocation, buffer reusable across iterations
+let mut buf = NumBuffer::<u64>::new();
+for value in values {
+    let s: &str = value.format_into(&mut buf);
+    sink.write_str(s)?;
+}
+```
+
+Two consequences worth acting on:
+
+- **Supply chain (Section 10).** The
+  [`itoa-benchmark`](https://github.com/dtolnay/itoa-benchmark) repo now shows
+  `format_into` performing on par with `itoa` itself. That makes `itoa` -- and
+  similar integer-formatting micro-crates -- a removable dependency. Fewer
+  transitive deps is less audit surface. Check with `cargo machete` /
+  `cargo tree` after migrating.
+- **ESP32 / `no_std` relevance.** `NumBuffer` lives in `core`, not `alloc`.
+  This is the idiomatic way to render integers into a log line, a display
+  buffer, or an MQTT payload on a target with no allocator, replacing
+  `heapless::String` + `write!` juggling and hand-sized `[u8; 20]` scratch
+  arrays.
+
+### DO: Use `substr_range` / `subslice_range` to recover offsets, never pointer arithmetic (Rust 1.98+)
+
+Recovering "where did this sub-slice come from in the parent buffer?" was
+previously done with raw address subtraction, which requires `unsafe`, is easy
+to get wrong under provenance rules, and is silently incorrect if the sub-slice
+did not actually originate from that parent. Rust 1.98 stabilized
+`str::substr_range` and `[T]::subslice_range` for exactly this.
+
+```rust
+// BAD: unsafe, provenance-hostile, and forbidden under `unsafe_code = "forbid"`
+let offset = unsafe { sub.as_ptr().offset_from(parent.as_ptr()) as usize };
+let range = offset..offset + sub.len();
+
+// GOOD: safe, returns None when `sub` is not a subslice of `parent`
+let range: Option<Range<usize>> = parent.substr_range(sub);   // &str
+let range: Option<Range<usize>> = parent.subslice_range(sub); // &[T]
+```
+
+Both return `Option`, so the "not actually a subslice" case is handled rather
+than producing a garbage offset. Neither performs a search -- they are pure
+address math on a slice you already hold.
+
+Caveat: `subslice_range` **panics if `T` is a zero-sized type**. Guard generic
+code, or restrict the call to concrete element types.
+
+This is the safe replacement for a pattern that previously forced an `unsafe`
+block, which makes it directly useful in crates running `unsafe_code = "forbid"`
+-- tokenizers, header parsers, and span-tracking error reporters no longer need
+an escape hatch.
+
+### DO: Use `Atomic<T>::from_mut` family instead of transmuting to atomics (Rust 1.98+)
+
+Rust 1.98 stabilized `Atomic<T>::from_mut`, `Atomic<T>::from_mut_slice`, and
+`Atomic<T>::get_mut_slice`. These convert between exclusively-borrowed plain
+storage and an atomic view. Because `&mut` proves there is no concurrent
+access, the conversion is sound and requires no `unsafe`.
+
+```rust
+// BAD: unsafe slice transmute, easy to get wrong and forbidden under
+// `unsafe_code = "forbid"`
+let atomics: &mut [AtomicU32] =
+    unsafe { core::slice::from_raw_parts_mut(v.as_mut_ptr().cast(), v.len()) };
+
+// GOOD: safe, checked conversion
+let atomics: &mut [Atomic<u32>] = Atomic::from_mut_slice(&mut v);
+```
+
+Typical use: build or initialize a buffer single-threaded through plain `&mut`
+access, then hand out an atomic view to worker threads -- without paying for
+atomic operations during the initialization phase and without an `unsafe` block
+at the boundary.
 
 ### DO: Use `ptr::read_unaligned` (or `from_le_bytes`) for multi-byte reads from `&[u8]`
 
@@ -669,7 +980,11 @@ let value: u16 = unsafe { *(buf.as_ptr().add(2) as *const u16) };
 let value: u16 = unsafe { core::ptr::read(buf.as_ptr().add(2) as *const u16) };
 
 // GOOD: safe, no `unsafe`, optimizer emits one load on platforms that allow it.
-let value = u16::from_le_bytes(buf[2..4].try_into().unwrap());
+// Note: no `unwrap()` and no `buf[2..4]` indexing -- both are deny-level in
+// Section 9 (`unwrap_used`, `indexing_slicing`). Propagate the error instead.
+let bytes: [u8; 2] = buf.get(2..4).ok_or(FrameError::Truncated)?
+    .try_into().map_err(|_| FrameError::Truncated)?;
+let value = u16::from_le_bytes(bytes);
 
 // GOOD: when slice-to-array conversion is awkward (e.g. C FFI struct copy-out),
 // `read_unaligned` is the unsafe escape hatch. It explicitly tolerates any
@@ -680,15 +995,36 @@ let value: u16 = unsafe { core::ptr::read_unaligned(buf.as_ptr().add(2) as *cons
 
 Rules:
 
+- **Applicability.** This whole section only bites in crates that permit
+  `unsafe`. Under `unsafe_code = "forbid"` (Section 9) the hazardous forms are
+  unrepresentable, so the rule is moot -- server/library crates can skip it.
+  Firmware crates should be on `unsafe_code = "deny"` with justified per-item
+  `#[allow(unsafe_code)]`, which is exactly where this applies.
 - For multi-byte reads out of `&[u8]` buffers, prefer the safe idiom:
-  `u16::from_le_bytes(slice.try_into().unwrap())` (or `from_be_bytes`).
-  Bounds-check the slice once and reuse it.
+  `u16::from_le_bytes(...)` (or `from_be_bytes`) over a bounds-checked slice.
+  Bounds-check once and reuse the result. Note that `slice.try_into().unwrap()`
+  appears in a lot of sample code but violates `unwrap_used = "deny"` --
+  propagate the `TryFromSliceError` instead:
+
+  ```rust
+  // GOOD: no unwrap, no unsafe, error is propagated
+  let bytes: [u8; 2] = buf.get(2..4).ok_or(ParseError::Truncated)?
+      .try_into().map_err(|_| ParseError::Truncated)?;
+  let value = u16::from_le_bytes(bytes);
+  ```
+
 - If you must use raw pointers (FFI struct read-out, `repr(C)` overlay),
   use `core::ptr::read_unaligned` -- never `ptr::read` or `*ptr` on a
   cast pointer.
+- **Rust 1.98+ removed two former excuses for reaching into `unsafe` here.**
+  If the goal was recovering a sub-slice's offset in its parent, use
+  `subslice_range` / `substr_range`. If the goal was viewing a plain buffer as
+  atomics, use `Atomic::from_mut_slice`. Both are documented above in this
+  section and are safe.
 - This bug class is **invisible on x86 CI**. Unaligned loads succeed
   silently on host machines. The trap only fires on the target hardware,
-  so code review and the guideline are the primary defenses.
+  so code review and the guideline are the primary defenses. Miri does not
+  help here either -- it targets the host (Section 12).
 - Hot sites in this workspace: `haier.rs` UART frame parsing (u16
   power/current/PM2.5 fields out of `&[u8]` payloads), `ota.rs` ESP32
   image header parsing (u32 segment count out of streamed firmware
@@ -970,6 +1306,23 @@ cfg_select! {
 }
 ```
 
+**Formatting note (Rust 1.98+):**
+[rustfmt now discovers module files declared inside `cfg_select!`](https://github.com/rust-lang/rust/pull/158372).
+Previously those `mod` declarations were invisible to rustfmt and the modules
+behind them went unformatted. On 1.98 they are picked up, so "this may cause
+more code to be formatted which was previously ignored."
+
+Practical consequence: if your CI runs `cargo fmt --all -- --check` as a
+blocking gate (Section 12), introducing `cfg_select!` -- or simply upgrading to
+1.98 with existing `cfg_select!` usage -- can fail the gate on files nobody
+touched. Run `cargo fmt --all` once at the upgrade and commit the result as a
+separate formatting-only change, so the reformat does not contaminate a
+feature diff.
+
+This is most likely to bite `no_std` / ESP32 crates, where platform- and
+peripheral-gated module trees are common and `cfg_select!` is the natural
+replacement for `cfg-if`.
+
 ### `Default` + `new()` Constructors
 
 Implement both. `Default` enables use with `unwrap_or_default()` and generic
@@ -1159,12 +1512,53 @@ Add to your `Cargo.toml`:
 
 ```toml
 [lints.clippy]
-all = "deny"
-pedantic = "warn"
-nursery = "warn"           # AI-generated code: extra unstable lints catch
-                           # patterns pedantic misses. Expect noise; allow
-                           # specific lints in `clippy.toml` if needed.
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# AI-generated code: extra unstable lints catch patterns pedantic misses.
+# Expect noise; allow specific lints individually below with a justification.
+nursery = { level = "warn", priority = -1 }
 ```
+
+**`priority = -1` is mandatory on group entries.** Cargo evaluates `[lints]`
+in priority order, and entries at equal priority conflict when a group and an
+individual lint overlap. Without the lower priority on the groups, a
+per-lint override such as `missing_const_for_fn = "allow"` fights the
+`nursery` group entry and Cargo rejects the manifest. The bare
+`all = "deny"` form only works if you never override a single lint from that
+group -- which is not a realistic end state.
+
+Group-level `allow`s should always carry a comment saying *why*, e.g.:
+
+```toml
+# nursery allow: opting fns into `const` is a one-way semver promise
+# (removing `const` later is breaking), and the lint has known false
+# positives. Keep it a deliberate per-fn decision, not lint-driven churn.
+missing_const_for_fn = "allow"
+```
+
+### Clippy Thresholds (`clippy.toml`)
+
+Several lints below are threshold-driven and are near-useless at their
+defaults. Pin the thresholds in a `clippy.toml` at the crate (or workspace)
+root so the numbers are reviewable and consistent:
+
+```toml
+# clippy.toml
+cognitive-complexity-threshold = 25   # drives `cognitive_complexity`
+too-many-lines-threshold = 100        # drives `too_many_lines`
+max-fn-params-bools = 3               # drives `fn_params_excessive_bools`
+enum-variant-size-threshold = 200     # drives `large_enum_variant`
+```
+
+Note the split: **lint levels** live in `Cargo.toml` under `[lints.clippy]`,
+**lint configuration** lives in `clippy.toml`. They are different files and
+neither can express the other.
+
+`clippy.toml` also accepts an `msrv` key, which falls back to
+`package.rust-version`. MSRV-aware lints (including 1.98's
+`manual_isolate_lowest_one`, Section 4) stay silent when the suggested API
+postdates your MSRV -- so keep `rust-version` accurate rather than setting
+`msrv` twice.
 
 ### Defensive Programming Lints
 
@@ -1183,6 +1577,14 @@ cast_ptr_alignment = "deny"        # *const u8 as *const u16 -- UB on RISC-V
                                    # (see Section 4 "ptr::read_unaligned")
 ```
 
+**Omit the pointer lints when the crate sets `unsafe_code = "forbid"`.**
+`cast_ptr_alignment`, `transmute_ptr_to_ref`, and `not_unsafe_ptr_arg_deref`
+all describe hazards that are unreachable without an `unsafe` block. In a
+crate that forbids `unsafe` outright they are dead configuration -- keep them
+for firmware and FFI crates (which run `unsafe_code = "deny"`), drop them
+elsewhere and say so in a comment so the omission reads as deliberate rather
+than forgotten.
+
 ### Panic Prevention Lints
 
 A server process must never panic in production. These lints enforce
@@ -1191,12 +1593,47 @@ compile-time prevention of runtime panics.
 ```toml
 [lints.clippy]
 unwrap_used = "deny"               # No .unwrap() anywhere - use ?, unwrap_or, etc.
-expect_used = "warn"               # .expect() is marginally better but still panics
+expect_used = "deny"               # .expect() is marginally better but still panics
 panic = "deny"                     # No intentional panic!() in production paths
 todo = "deny"                      # No todo!() - these panic at runtime
 unimplemented = "deny"             # No unimplemented!() - same as todo
 unreachable = "warn"               # Prefer compiler-proven unreachable via match
 ```
+
+`expect_used = "deny"` (not `"warn"`): a panic is a panic regardless of whether
+it carries a message. The message improves the postmortem but does not keep the
+process alive. Denying both makes the exception path explicit -- an
+`#[allow(clippy::expect_used)]` with a justification comment -- rather than
+letting `expect` accumulate silently as warnings nobody clears.
+
+The one broadly defensible exception is a `const` initializer, where the
+"panic" is a compile-time evaluation failure and cannot occur at runtime:
+
+```rust
+// SAFETY/INVARIANT: 30 is a non-zero literal; this is evaluated at compile
+// time, so a failure here is a build error, never a runtime panic.
+const DEFAULT_AUTH_RATE: NonZeroU32 = NonZeroU32::new(30).unwrap();
+```
+
+Note that Rust 1.98's `NonZero::from_str_radix` (Section 2) removes the need
+for this shape when the value comes from a string rather than a literal.
+
+**Liveness, not just panics (Clippy 1.98+).** A server can also be taken down
+by a loop that never terminates. Clippy 1.98 added
+[`for_unbounded_range`](https://github.com/rust-lang/rust-clippy/pull/16257),
+which flags `for` loops over unbounded integer or `char` ranges that may wrap,
+panic, or spin forever:
+
+```rust
+// BAD: wraps or panics at u8::MAX depending on profile; never terminates cleanly
+for i in 250u8.. { }
+
+// GOOD: bounded
+for i in 250u8..=u8::MAX { }
+```
+
+It is a **`suspicious`-tier** lint, so `clippy::all = "deny"` already covers it
+-- no separate declaration needed.
 
 Note: `unwrap_used = "deny"` is stricter than the Section 2 guidance
 ("no unwrap in library code"). For a server binary, panics in *any* code
@@ -1239,9 +1676,24 @@ Catch unnecessary string conversions and allocations.
 
 ```toml
 [lints.clippy]
-string_to_string = "warn"         # String::to_string() - already a String
 str_to_string = "warn"            # Prefer .to_owned() or .into()
 ```
+
+**Removed: `string_to_string`.** This lint no longer exists -- Clippy
+deprecated it, and
+[`implicit_clone`](https://github.com/rust-lang/rust-clippy/blob/master/clippy_lints/src/deprecated_lints.rs)
+(already enabled under "Performance-Related Clippy Lints" below) covers the
+same `String::to_string()` cases. Declaring it now produces an
+`unknown_lints` warning. Delete it from existing manifests.
+
+**`with_capacity_zero` (Clippy 1.98+).** Flags
+`Vec::with_capacity(0)`, `String::with_capacity(0)`, `PathBuf::with_capacity(0)`,
+`OsString::with_capacity(0)`, and the equivalent collection constructors, all of
+which are just a more expensive spelling of `new()`. It is a **`pedantic`-tier**
+lint, so it is **not** covered by `clippy::all = "deny"` -- but it *is* active
+for anyone running `pedantic = "warn"` as recommended above. Usually just follow
+the suggestion; the exception is a capacity computed at runtime that happens to
+be zero, where the literal-zero form is not what you wrote anyway.
 
 ### Library Crate Hygiene Lints
 
@@ -1264,8 +1716,14 @@ needless_pass_by_value = "warn"   # Pass by ref instead of by value
 large_enum_variant = "warn"       # Consider boxing large variants
 box_collection = "warn"           # Box<Vec<T>> -> Vec<T>
 rc_buffer = "warn"                # Rc<String> -> Rc<str>
-clone_on_ref_ptr = "warn"         # Arc::clone(&x) over x.clone()
+clone_on_ref_ptr = "deny"         # Arc::clone(&x) over x.clone()
 ```
+
+`clone_on_ref_ptr = "deny"` (not `"warn"`): `x.clone()` on an `Arc`/`Rc` is
+indistinguishable at a glance from a deep clone of the pointee. Forcing the
+explicit `Arc::clone(&x)` spelling makes "this is a refcount bump, not an
+allocation" visible at every call site -- which is precisely the distinction
+Section 1 relies on when it says cloning an `Arc` is acceptable.
 
 Clippy 1.95 added two `complexity`-tier lints that are already covered by
 `clippy::all = "deny"` and do not need separate declarations:
@@ -1274,6 +1732,106 @@ Clippy 1.95 added two `complexity`-tier lints that are already covered by
   over hand-rolled overflow checks.
 - `manual_take` - prefer `std::mem::take(&mut x)` over
   `mem::replace(&mut x, Default::default())`.
+
+### Clippy 1.98 New Lints
+
+Clippy 1.98 added seven lints. **Five require no action** -- they land in tiers
+already covered by `clippy::all = "deny"`. Two are `pedantic` and therefore
+need an explicit decision from anyone running `pedantic = "warn"`.
+
+| Lint | Tier | Covered by `all = "deny"`? | Action |
+|------|------|----------------------------|--------|
+| [`for_unbounded_range`](https://github.com/rust-lang/rust-clippy/pull/16257) | suspicious | yes | none -- see "Panic Prevention" above |
+| [`by_ref_peekable_peek`](https://github.com/rust-lang/rust-clippy/pull/17042) | suspicious | yes | none -- real bug class, see below |
+| [`manual_isolate_lowest_one`](https://github.com/rust-lang/rust-clippy/pull/17037) | complexity | yes | none -- enforces the Section 4 bit-ops rule |
+| [`unnecessary_unwrap_unchecked`](https://github.com/rust-lang/rust-clippy/pull/16252) | complexity | yes | none -- moot under `unsafe_code = "forbid"` |
+| [`chunks_exact_to_as_chunks`](https://github.com/rust-lang/rust-clippy/pull/16931) | style | yes | none |
+| [`with_capacity_zero`](https://github.com/rust-lang/rust-clippy/pull/17192) | **pedantic** | **no** | decide -- see "String Handling" above |
+| [`unused_async_trait_impl`](https://github.com/rust-lang/rust-clippy/pull/16244) | **pedantic** | **no** | **decide -- see below** |
+
+`by_ref_peekable_peek` is worth knowing on sight because it is a genuine
+silent-data-loss bug, not a style nit. `.by_ref().peekable()` builds a
+*temporary* `Peekable` adapter; peeking pulls an item out of the underlying
+iterator, and when the temporary is dropped that item is gone:
+
+```rust
+// BAD: consumes an item from `iter` and then discards it
+let first = iter.by_ref().peekable().peek();
+
+// GOOD: if you meant to consume, say so
+let first = iter.next();
+// GOOD: if you meant to peek, keep the Peekable alive
+let mut peekable = iter.by_ref().peekable();
+let first = peekable.peek();
+```
+
+**`unused_async_trait_impl` needs a deliberate decision.** It fires on an
+`async fn` in a trait impl whose body never `.await`s, and suggests rewriting
+the signature to `fn … -> impl Future` returning `std::future::ready(..)`.
+
+```rust
+// Lint fires: no .await in the body
+impl ServerHandler for MyHandler {
+    async fn get_info(&self) -> ServerInfo { ServerInfo::default() }
+}
+
+// Suggested rewrite
+impl ServerHandler for MyHandler {
+    fn get_info(&self) -> impl Future<Output = ServerInfo> {
+        std::future::ready(ServerInfo::default())
+    }
+}
+```
+
+The suggestion is technically correct -- it avoids a state machine for a value
+that is immediately ready -- but the rewrite is often **impossible**, not merely
+undesirable: when you are *implementing* a foreign trait, the `async fn`
+signature is dictated by that trait and cannot be changed from your side.
+
+**Prefer a per-item `#[allow]` with a `reason`, not a crate-level allow.** A
+blanket `unused_async_trait_impl = "allow"` in `Cargo.toml` also silences the
+cases where the lint is right (a genuinely unnecessary `async fn` you *could*
+desugar, or a forgotten `.await`). Scope the exemption to the impls where the
+trait forces your hand:
+
+```rust
+#[expect(
+    clippy::unused_async_trait_impl,
+    reason = "async is mandated by the ServerHandler trait signature; the \
+              impl cannot drop it without failing to satisfy the trait"
+)]
+impl ServerHandler for MyHandler {
+    async fn get_info(&self) -> ServerInfo { ServerInfo::default() }
+}
+```
+
+Real-world instances of exactly this in a `-D warnings` build: axum's
+`FromRequestParts::from_request_parts` and rmcp's `ServerHandler::call_tool`.
+Both are foreign traits whose async signature is fixed, so the lint's suggested
+rewrite would simply not compile.
+
+Prefer `#[expect(...)]` over `#[allow(...)]` where your MSRV permits: it warns
+if the lint *stops* firing, so the exemption is removed automatically once the
+upstream trait changes or the impl grows a real `.await`.
+
+Reserve a crate-level `unused_async_trait_impl = "allow"` for the case where the
+noise is genuinely pervasive across many first-party impls -- and say so in a
+comment, because it is the blunter instrument.
+
+### Clippy 1.98 Removals and Moves
+
+- **`from_iter_instead_of_collect` was removed.** Previously `pedantic`; Clippy
+  [deprecated it](https://github.com/rust-lang/rust-clippy/pull/17208) as
+  "proved problematic". Delete any explicit declaration.
+- **`empty_enums` moved `pedantic` → `nursery`**
+  ([PR #17298](https://github.com/rust-lang/rust-clippy/pull/17298)). No effect
+  if you run both groups at `warn` as recommended; it silently disappears if
+  you run `pedantic` without `nursery`.
+- **`result_large_err` / `result_unit_err` now fire on `async fn`**
+  ([PR #17130](https://github.com/rust-lang/rust-clippy/pull/17130)). Both are
+  in `clippy::all`, so async-heavy crates may see **new** denials on upgrade
+  from previously-exempt async signatures. This is the most likely source of a
+  surprise `-D warnings` failure when moving to 1.98.
 
 ### General Quality Lints
 
@@ -1304,6 +1862,61 @@ dead_code_pub_in_binary = "warn"   # Rust 1.97+: unused `pub` items in a binary
 `unsafe`. For crates that require specific `unsafe` blocks, use
 `unsafe_code = "deny"` at crate level and `#[allow(unsafe_code)]` on the
 individual items with a safety comment explaining the invariant.
+
+**Rust 1.98+: the lint now covers unsafe *attributes*, not just unsafe blocks.**
+[Rust 1.98 made `UNSAFE_CODE` fire consistently for all unsafe
+attributes](https://github.com/rust-lang/rust/pull/157201). In edition 2024
+these carry an explicit `unsafe(...)` wrapper:
+
+```rust
+#[unsafe(no_mangle)]        // now trips unsafe_code
+#[unsafe(export_name = "…")] // now trips unsafe_code
+#[unsafe(link_section = "…")] // now trips unsafe_code
+#[unsafe(naked)]             // now trips unsafe_code
+```
+
+Consequences:
+
+- A crate with `unsafe_code = "forbid"` that used any of these attributes
+  **compiled on 1.97 and fails on 1.98**. This is the most likely 1.98 upgrade
+  break for an otherwise `unsafe`-free crate. `forbid` cannot be locally
+  overridden -- you must downgrade to `deny` + a justified per-item
+  `#[allow(unsafe_code)]`, or remove the attribute.
+- ESP32 / embedded relevance: `#[unsafe(link_section)]` and
+  `#[unsafe(no_mangle)]` are common in firmware for placing data in specific
+  memory regions and for exporting interrupt/entry symbols. Firmware crates
+  should be on `unsafe_code = "deny"` (not `forbid`) precisely so these
+  attributes remain expressible with a `// SAFETY:` justification.
+- `unsafe_code` is **allow-by-default**, so it is not in the `warnings` lint
+  group. Neither `RUSTFLAGS="-D warnings"` nor Cargo's `build.warnings`
+  (Section 7) will enable it. It must be set explicitly in `[lints.rust]` --
+  which is exactly why it appears in the table above.
+
+### Runtime Symbol Definition Lints (Rust 1.98+)
+
+Rust 1.98 added two lints that flag definitions of symbols the Rust runtime
+reserves for itself -- currently `core` runtime symbols such as `memcmp`,
+`memset`, and `strlen`, with coverage
+[planned to expand in the next few releases](https://github.com/rust-lang/rust/pull/155521).
+It also added a lint for `core::ffi::c_void` used as a return type.
+
+| Lint | Default | In `warnings` group? | Covered by `-D warnings` / `build.warnings`? |
+|------|---------|----------------------|-----------------------------------------------|
+| `invalid_runtime_symbol_definitions` | **deny** | **no** | n/a -- already error-level |
+| `suspicious_runtime_symbol_definitions` | warn | yes | yes |
+| `c_void_returns` | warn | yes | yes |
+
+Sources: [PR #155521](https://github.com/rust-lang/rust/pull/155521),
+[PR #156379](https://github.com/rust-lang/rust/pull/156379).
+
+These matter mainly for `no_std` / firmware crates and anything doing FFI:
+defining your own `memcpy`/`memset` (a real pattern in bare-metal Rust) or
+returning `c_void` from an `extern "C"` shim. Pure-Rust server crates with
+`unsafe_code = "forbid"` will never trip them. Note the same
+`warnings`-group asymmetry documented for `linker_messages` below:
+`invalid_runtime_symbol_definitions` is deny-by-default and sits **outside**
+the `warnings` group, so its level must be changed explicitly rather than via
+a blanket warnings policy.
 
 For library crates, `missing_docs = "warn"` ensures every public item
 has documentation. Promote to `"deny"` once existing docs are complete.
@@ -1551,6 +2164,60 @@ fn validate_id(id: &str) -> Result<&str, Error> {
 let path = format!("/containers/{}/json", validate_id(user_input)?);
 ```
 
+### DO: Use `strip_circumfix` for delimiter-wrapped input (Rust 1.98+)
+
+Boundary parsers constantly need to remove a matching prefix *and* suffix:
+quoted header values, bracketed IPv6 literals, `<...>` message IDs, fenced
+tokens. The chained form is easy to get subtly wrong -- most commonly by
+accepting input that has only one of the two delimiters. Rust 1.98 stabilized
+`str::strip_circumfix` and `[T]::strip_circumfix`, which strip both atomically
+or return `None`.
+
+```rust
+// BAD: two independent steps; a lone leading quote silently falls through
+// to the `unwrap_or` and is treated as valid unquoted input.
+let value = raw.strip_prefix('"')
+    .and_then(|s| s.strip_suffix('"'))
+    .unwrap_or(raw);
+
+// GOOD: all-or-nothing, and the "malformed" case is explicit
+let value = match raw.strip_circumfix("\"", "\"") {
+    Some(inner) => inner,          // was properly quoted
+    None if !raw.contains('"') => raw,  // legitimately unquoted
+    None => return Err(ParseError::UnbalancedQuote),
+};
+```
+
+Directly applicable to `Forwarded` header parsing (RFC 7239), which uses
+quoted strings for `for=` / `by=` values and square brackets around IPv6
+literals -- e.g. `for="[2001:db8::1]:4711"`. Stripping quotes and brackets
+independently is how port-parsing and IP-parsing bugs get introduced into
+client-IP resolution, which is security-relevant when that IP feeds rate
+limiting or an allowlist.
+
+### DO: Decode UTF-16 with explicit endianness at boundaries (Rust 1.98+)
+
+Rust 1.98 stabilized `String::from_utf16le`, `from_utf16le_lossy`,
+`from_utf16be`, and `from_utf16be_lossy`. These take `&[u8]` directly and
+decode with a **stated** byte order.
+
+```rust
+// BAD: manual byte-pair assembly, endianness implicit in the shift order,
+// and an intermediate Vec<u16> allocation
+let units: Vec<u16> = bytes.chunks_exact(2)
+    .map(|c| u16::from_le_bytes([c[0], c[1]]))   // also: indexing_slicing
+    .collect();
+let s = String::from_utf16(&units)?;
+
+// GOOD: endianness is in the function name, no intermediate allocation
+let s = String::from_utf16le(bytes)?;
+```
+
+Use the fallible (non-`_lossy`) form for anything security-relevant. Silent
+U+FFFD substitution can collapse two distinct malformed inputs into the same
+string, which is exactly the kind of normalization that defeats an allowlist
+comparison. Reserve `_lossy` for display and logging.
+
 ### DO: Prevent SSRF (Server-Side Request Forgery)
 
 When the server makes HTTP requests based on user-supplied URLs:
@@ -1709,6 +2376,49 @@ For a security-sensitive server handling auth and credentials, `cargo vet`
 is the difference between "no known CVEs" and "someone actually read this
 dependency's source code."
 
+### DO: Document every accepted advisory, never silently ignore one
+
+`cargo audit` and `cargo deny` both support an `ignore` list. An ignore entry
+with no rationale is indistinguishable from an unreviewed vulnerability six
+months later. Every entry must name the advisory, state why it does not apply
+to this crate, and note whether an upstream fix exists.
+
+```toml
+# .cargo/audit.toml
+[advisories]
+# RUSTSEC-2023-0071: Marvin timing sidechannel in `rsa` 0.9.x. No upstream
+# fix. This crate validates JWTs with public keys only and never decrypts
+# RSA payloads, so the timing sidechannel does not apply.
+ignore = ["RUSTSEC-2023-0071"]
+```
+
+Keep `deny.toml` and `.cargo/audit.toml` in sync -- they are read by different
+tools and an advisory suppressed in one will still fail the other in CI.
+
+### WATCH: publish-age-aware resolution (`-Zmin-publish-age`, nightly)
+
+A meaningful share of supply-chain attacks are *fresh* releases of an otherwise
+reputable crate published from a compromised maintainer account, and caught
+within days. Neither `cargo audit` (needs an advisory to exist) nor `cargo vet`
+(needs a human review) reacts quickly to that window.
+
+Cargo 1.98 added an **unstable** feature that does:
+[`-Zmin-publish-age`](https://github.com/rust-lang/cargo/pull/17012) makes the
+resolver skip versions published more recently than a configured age.
+
+```toml
+# nightly only -- do NOT depend on this in CI yet
+[registry]
+global-min-publish-age = "14 days"
+
+[resolver]
+incompatible-publish-age = "deny"   # ignore too-new versions unless already in Cargo.lock
+```
+
+Not usable on stable and therefore **not** a current requirement. Track it for
+stabilization; a 7-14 day quarantine is a cheap, high-leverage control for a
+crate handling auth and credentials.
+
 ### DO: Implement proper logging and monitoring
 
 - Log authentication attempts (success and failure) with source IP.
@@ -1737,6 +2447,7 @@ Use this when reviewing code:
 - [ ] No `unwrap()` / `expect()` in library code (only tests or proven invariants)
 - [ ] Errors propagated with `?`, not swallowed or panicked
 - [ ] `TryFrom` used when conversion can fail (not `From` with hidden fallbacks)
+- [ ] Guard clauses use `bool::ok_or` / `ok_or_else` rather than four-line `if … return Err` blocks (Rust 1.98+)
 
 **Type Safety**
 - [ ] Newtypes used for domain concepts (IDs, amounts, durations)
@@ -1744,6 +2455,10 @@ Use this when reviewing code:
 - [ ] `match` arms are exhaustive -- no wildcard `_` catch-all on owned enums
 - [ ] Struct fields private with validated constructors (for library types)
 - [ ] `#[must_use]` on types/functions where ignoring the result is a bug
+- [ ] Comparison traits are all-manual or all-derived -- never a manual `PartialEq` alongside a derived `Ord`/`PartialOrd` (Rust 1.98+ can expose the inconsistency)
+- [ ] Types with a manual `PartialEq` are not used in constant patterns (rejected on Rust 1.98+)
+- [ ] `#[repr(transparent)]` not applied over `#[non_exhaustive]`, `repr(C)`, or private-field types (Rust 1.98+ rejects these)
+- [ ] Non-zero domain values parsed via `NonZero::from_str_radix` rather than parse-then-`NonZero::new` (Rust 1.98+)
 
 **Performance**
 - [ ] No `Box<Vec<T>>`, `Box<String>`, `Arc<String>`
@@ -1751,7 +2466,10 @@ Use this when reviewing code:
 - [ ] No `String::from("...")` where `&str` is accepted
 - [ ] HashMap lookups use `&str`, not cloned `String` keys
 - [ ] `core::hint::cold_path()` marks genuinely unlikely branches (Rust 1.95+); perf hint only, never correctness
-- [ ] Prefer std bit ops `bit_width` / `isolate_highest_one` / `isolate_lowest_one` / `highest_one` / `lowest_one` over hand-rolled shift/mask arithmetic (Rust 1.97+)
+- [ ] Prefer std bit ops `bit_width` / `isolate_highest_one` / `isolate_lowest_one` / `highest_one` / `lowest_one` over hand-rolled shift/mask arithmetic (Rust 1.97+; `isolate_lowest_one` now lint-enforced by Clippy 1.98 `manual_isolate_lowest_one`)
+- [ ] No `algebraic_*` float methods on any value that is compared, hashed, serialized, persisted, or asserted on -- they are non-deterministic (Rust 1.98+)
+- [ ] Integer formatting in hot / `no_std` paths uses `format_into` + `NumBuffer` instead of `to_string()` / `format!` (Rust 1.98+)
+- [ ] Sub-slice offsets recovered with `substr_range` / `subslice_range`, never pointer arithmetic (Rust 1.98+)
 
 **Async**
 - [ ] No `std::fs` / `std::net` in async functions
@@ -1786,6 +2504,9 @@ Use this when reviewing code:
 - [ ] TLS enabled with certificate validation; min TLS 1.2
 - [ ] `cargo audit` and `cargo deny` run in CI
 - [ ] Auth attempts and RBAC denials logged with structured tracing
+- [ ] Delimiter-wrapped input (quoted header values, bracketed IPv6) stripped with `strip_circumfix`, not chained `strip_prefix`/`strip_suffix` (Rust 1.98+)
+- [ ] UTF-16 boundary decoding uses the endian-explicit, non-`_lossy` `String::from_utf16{le,be}` (Rust 1.98+); `_lossy` reserved for display
+- [ ] Every `cargo audit` / `cargo deny` ignore entry documents the advisory, why it does not apply, and upstream fix status
 
 **Runtime Safety**
 - [ ] No `unwrap()` / `expect()` / `panic!()` / `todo!()` / `unimplemented!()` in production paths
@@ -1795,6 +2516,8 @@ Use this when reviewing code:
 - [ ] Prefer `Atomic*::update` / `try_update` over hand-rolled `compare_exchange` loops (Rust 1.95+)
 - [ ] Prefer `Vec::push_mut` / `VecDeque::push_{front,back}_mut` / `LinkedList::push_{front,back}_mut` over `push` + `last_mut().unwrap()` (Rust 1.95+)
 - [ ] `linker_messages` lint (Rust 1.97+) triaged; escalated or `allow`-ed explicitly (it is NOT in the `warnings` group, so `-D warnings` / `build.warnings` don't cover it)
+- [ ] No unsafe *attributes* (`#[unsafe(no_mangle)]`, `#[unsafe(link_section)]`, `#[unsafe(export_name)]`, `#[unsafe(naked)]`) under `unsafe_code = "forbid"` -- Rust 1.98+ now flags these; firmware crates needing them must use `deny` + justified `#[allow]`
+- [ ] `invalid_runtime_symbol_definitions` (Rust 1.98+, deny-by-default, NOT in the `warnings` group) considered for `no_std`/FFI crates that define runtime symbols
 
 **Supply Chain**
 - [ ] `deny.toml` configured with license allowlist, banned crates, source restrictions
@@ -1808,6 +2531,8 @@ Use this when reviewing code:
 - [ ] Mutation testing confirms tests catch real bugs (not just coverage theater)
 - [ ] Test tiers documented: unit (autonomous) vs integration (mocked) vs e2e (live)
 - [ ] No deleted or skipped tests to make the build pass
+- [ ] No assertions on `{:?}` output as a stable format -- Rust 1.98+ escapes more characters (re-check audit-log / redaction tests on upgrade)
+- [ ] Guards/locks inside `assert_eq!` / `assert_ne!` bound to a `let` rather than created inline (Rust 1.98+ changed macro temporary scope)
 
 **Tooling**
 - [ ] `cargo fmt --check` in CI
@@ -1816,7 +2541,12 @@ Use this when reviewing code:
 - [ ] `cargo audit` and `cargo deny check` in CI
 - [ ] `cargo semver-checks` in CI for library crates
 - [ ] `rustfmt.toml` with `imports_granularity` and `group_imports` configured
-- [ ] `cargo miri` run (nightly job) against pure-Rust modules with `unsafe`; HAL/FFI-touching crates exempted with a note
+- [ ] `cargo miri` run (nightly job) against pure-Rust modules with `unsafe`; HAL/FFI-touching crates exempted with a note; crates on `unsafe_code = "forbid"` legitimately have no Miri job
+- [ ] `[lints.clippy]` group entries carry `priority = -1` so per-lint overrides do not conflict
+- [ ] `clippy.toml` pins `cognitive-complexity-threshold`, `too-many-lines-threshold`, `max-fn-params-bools`, `enum-variant-size-threshold` (levels live in `Cargo.toml`, config lives here)
+- [ ] Deprecated `string_to_string` and `from_iter_instead_of_collect` removed from `[lints.clippy]` (both no longer exist)
+- [ ] `unused_async_trait_impl` (Clippy 1.98 `pedantic`) handled per-impl via `#[expect(..., reason = ...)]` where a foreign trait mandates the async signature -- not silenced crate-wide; it is not covered by `all = "deny"`
+- [ ] One-time `cargo fmt --all` committed separately after adopting `cfg_select!` (Rust 1.98 rustfmt now formats modules declared inside it)
 
 ---
 
@@ -1842,6 +2572,21 @@ workspace in a cache-friendly, toggleable way, prefer Cargo's stabilized
 ```bash
 CARGO_BUILD_WARNINGS=deny cargo check --workspace --all-features --keep-going
 ```
+
+**Cargo 1.98:** no action required. The
+[1.98 changelog](https://doc.rust-lang.org/nightly/cargo/CHANGELOG.html)
+has **empty `Added` and `Changed` sections** -- no new stable config keys,
+manifest fields, or CLI flags. The 1.97 `build.warnings` guidance above
+remains current. Two footnotes:
+
+- A [credential-provider fix](https://github.com/rust-lang/cargo/pull/17081)
+  strips a trailing `\r` from `cargo:token-from-stdout` tokens, resolving a
+  1.96 **Windows** regression that surfaced as a confusing
+  `failed to parse header value` during authenticated registry operations
+  including `cargo publish`. Relevant if you publish from a Windows
+  workstation or runner.
+- Everything else in 1.98 is nightly-gated (`-Zmin-publish-age`,
+  `-Zhint-msrv`, `-Zcargo-lints`) and must not be relied on in CI.
 
 ### Recommended CI Tools
 
@@ -1873,6 +2618,13 @@ consumers upgrade. Run it on every PR that touches the library crate.
 
 **Miri caveats -- read before pushing back on a reviewer who asks for it:**
 
+- **It only applies to crates that contain `unsafe` at all.** Miri detects
+  undefined behaviour, and safe Rust cannot exhibit UB. A crate with
+  `unsafe_code = "forbid"` (Section 9) has nothing for Miri to find, and the
+  absence of a Miri job in its CI is correct rather than a gap. Check the
+  crate-level lint before treating "no Miri" as a finding. Note that any
+  `unsafe` reachable through a *dependency* is that dependency's
+  responsibility -- use `cargo-geiger` to see the transitive picture instead.
 - **FFI support is experimental and incomplete.** Miri added partial FFI via
   `-Zmiri-native-lib` (Unix-only, 2024-2025). It can pass integer/pointer
   arguments to C functions and trace some memory accesses, but does NOT
@@ -1982,6 +2734,48 @@ Prioritize mutation testing on:
 - Error handling paths
 - Business logic (tool handlers)
 
+### DON'T: Assert on `Debug` output as a stable format (Rust 1.98+)
+
+[Rust 1.98 escapes more characters when printing strings and
+chars](https://github.com/rust-lang/rust/pull/155527). Any test that compares
+against a literal `{:?}` rendering can newly fail without a code change, and
+any log consumer parsing `Debug` output can newly mis-parse.
+
+```rust
+// BAD: couples the test to std's Debug formatting, which is not a stable API
+assert_eq!(format!("{:?}", value), r#"Config { name: "a\u{7}b" }"#);
+
+// GOOD: assert on the data
+assert_eq!(value.name, "a\u{7}b");
+
+// GOOD: if you must snapshot a rendering, own the format
+assert_eq!(value.render_redacted(), "Config(name=<redacted>)");
+```
+
+This is highest-risk for **audit-log and redaction tests**: those deliberately
+feed hostile, control-character-laden identifiers through the formatter and
+assert on the result. Re-run them on a 1.98 upgrade specifically. The
+underlying rule is unchanged and predates 1.98 -- `Debug` is a debugging aid,
+not a wire format -- but 1.98 is when latent violations start failing.
+
+### DO: Re-check borrows inside `assert_eq!` / `assert_ne!` on upgrade (Rust 1.98+)
+
+[Rust 1.98 added a temporary scope to `assert_eq!` and
+`assert_ne!`](https://github.com/rust-lang/rust/pull/155739). Temporaries
+created inside the macro arguments are now dropped at the end of the assertion
+rather than living to the end of the enclosing statement. This is the correct
+behaviour and usually invisible, but it can change borrow-checker outcomes for
+assertions that lock a mutex, borrow a `RefCell`, or hold a guard inline:
+
+```rust
+// May now behave differently: the guard temporary's scope changed
+assert_eq!(*shared.lock().unwrap(), expected);
+
+// Robust: bind the guard explicitly so its scope is yours, not the macro's
+let guard = shared.lock().map_err(|_| TestError::Poisoned)?;
+assert_eq!(*guard, expected);
+```
+
 ### DON'T: Delete or skip failing tests to make the build pass
 
 Fix the code, not the tests. If a test is genuinely wrong (testing the
@@ -2006,12 +2800,42 @@ tests they can run autonomously vs which require human-assisted setup.
 
 ## References
 
+- [Rust 1.98.0 release notes](https://doc.rust-lang.org/stable/releases.html#version-1980-2026-08-20)
+  and [announcement](https://blog.rust-lang.org/2026/08/20/Rust-1.98.0/) -- basis for
+  the "(Rust 1.98+)" annotations. **This document tracks stable Rust through 1.98.**
+  The 1.98 items reflected above are:
+  - *Behaviour changes that can break existing code:* the
+    [`derive(PartialOrd)` fast path](https://github.com/rust-lang/rust/pull/155598)
+    and the closed pattern-matching structural-equality hole (Section 3);
+    [`UNSAFE_CODE` now firing on unsafe attributes](https://github.com/rust-lang/rust/pull/157201)
+    (Section 9); [stricter `repr(transparent)` layout rules](https://github.com/rust-lang/rust/pull/155299)
+    (Section 3); [expanded character escaping in `Debug` output](https://github.com/rust-lang/rust/pull/155527)
+    and the [`assert_eq!`/`assert_ne!` temporary scope](https://github.com/rust-lang/rust/pull/155739)
+    (Section 13); [rustfmt discovering `cfg_select!` modules](https://github.com/rust-lang/rust/pull/158372)
+    (Section 6).
+  - *New rustc lints:* `invalid_runtime_symbol_definitions` (deny, **not** in the
+    `warnings` group), `suspicious_runtime_symbol_definitions`, and
+    `c_void_returns` (Section 9).
+  - *New APIs adopted as idioms:* `bool::ok_or`/`ok_or_else` and
+    `NonZero::from_str_radix` (Section 2); `f32`/`f64` `algebraic_*`,
+    `format_into` + `NumBuffer`, `substr_range`/`subslice_range`, and the
+    `Atomic<T>::from_mut` family (Section 4); `strip_circumfix` and
+    `String::from_utf16{le,be}` (Section 10).
+- [Clippy 1.98 changelog](https://github.com/rust-lang/rust-clippy/blob/master/CHANGELOG.md#rust-198)
+  -- seven new lints (five auto-covered by `clippy::all = "deny"`;
+  `with_capacity_zero` and `unused_async_trait_impl` are `pedantic` and need an
+  explicit decision), the removal of `from_iter_instead_of_collect`, the
+  `empty_enums` move to `nursery`, and `result_large_err`/`result_unit_err` now
+  firing on `async fn` (Section 9).
+- [Cargo 1.98 changelog](https://doc.rust-lang.org/nightly/cargo/CHANGELOG.html)
+  -- **no stable `Added` or `Changed` entries.** Everything new is nightly-gated
+  (`-Zmin-publish-age`, `-Zhint-msrv`, `-Zcargo-lints`); see Sections 10 and 12.
 - [Rust 1.97.0 release notes](https://doc.rust-lang.org/stable/releases.html#version-1970-2026-07-09)
   and [announcement](https://blog.rust-lang.org/2026/07/09/Rust-1.97.0/) -- basis for
   the "(Rust 1.97+)" annotations: Cargo `build.warnings`, the `linker_messages` lint,
   `dead_code_pub_in_binary`, v0 symbol mangling by default, the `must_use` uninhabited-`Result`
   refinement, and the `bit_width` / `isolate_highest_one` / `isolate_lowest_one` /
-  `highest_one` / `lowest_one` integer methods. This document tracks stable Rust through 1.97.
+  `highest_one` / `lowest_one` integer methods.
 - [Rust Design Patterns](https://rust-unofficial.github.io/patterns/) -- idioms, design patterns, and guidelines
 - [Rust Anti-Patterns](https://rust-unofficial.github.io/patterns/anti_patterns/) -- common solutions that create more problems
 - [7 Rust Anti-Patterns Killing Your Performance](https://medium.com/solo-devs/the-7-rust-anti-patterns-that-are-secretly-killing-your-performance-and-how-to-fix-them-in-2025-dcebfdef7b54) -- clone epidemic, blocking async, unwrap addiction
