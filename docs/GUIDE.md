@@ -613,6 +613,40 @@ extracts the argument value, takes the first whitespace-delimited token (or
 `/`-basename), and checks it against the allowlist. If not found, the request
 is rejected with 403.
 
+By default this constrains the value **only when the argument is present** — a
+caller that omits the key entirely passes unchecked. That is safe when the
+tool's input schema already marks the argument required, but it fails open if
+the handler substitutes a default for a missing value. Opt into presence
+enforcement with `with_required`:
+
+```rust
+use rmcp_server_kit::rbac::ArgumentAllowlist;
+
+let allowlist = ArgumentAllowlist::new(
+    "container_exec",
+    "cmd",
+    vec!["ls".into(), "cat".into()],
+)
+.with_required(true);   // omitting `cmd` is now a 403
+```
+
+Or in TOML:
+
+```toml
+[[roles.argument_allowlists]]
+tool = "container_exec"
+argument = "cmd"
+allowed = ["ls", "cat"]
+required = true          # optional; defaults to false
+```
+
+With `required = true` the argument must be present **and** string-valued;
+a missing key, a non-string value, or a missing `arguments` object are all
+rejected with 403. Combining `required = true` with an empty `allowed` list
+means "must be supplied as a string, any value accepted". Omitting `required`
+preserves the previous behaviour exactly, so existing configurations are
+unaffected.
+
 #### `RbacPolicy`
 
 Compiled policy for fast lookups. Built from `RbacConfig` at startup.

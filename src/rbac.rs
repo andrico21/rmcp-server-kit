@@ -233,21 +233,29 @@ impl RoleConfig {
 /// string value at `argument` from the call's arguments object and checks
 /// its first token against `allowed`. If the token is not in the list
 /// the call is rejected with 403.
+///
+/// By default this constrains the value only **when the argument is
+/// present** -- omitting it entirely skips the check. Set
+/// [`required`](Self::required) to also demand the argument be supplied.
 //
 // NOTE(future-pr): typed pre-tokenized argument matcher (CHANGELOG.md
 // "future release" promise).
 // Scope (Oracle-approved, internal-only, patch-safe):
 //   - Keep `ArgumentAllowlist` public shape UNCHANGED (wire/config stability).
+//     (The later addition of `required` is additive and serde-defaulted, so
+//     it preserves that property; the compiled IR must carry it through.)
 //   - In `RbacPolicy::new`, compile each allowlist once into a private
 //     `CompiledArgumentAllowlist` IR:
 //       * pre-resolve the `tool` selector: exact vs glob.
 //       * pre-tokenize first-token allowlists.
 //       * pre-tokenize basename allowlists.
+//       * carry the `required` flag so presence enforcement survives.
 //   - At request time (`has_argument_allowlist` / `argument_allowed`),
 //     `shlex::split` each constrained argument once, then lookup in the
 //     compiled IR.
 //   - Required equivalence test matrix: exact tool names, globbed tool
-//     names, basename matches, quoted paths, fail-closed parse errors.
+//     names, basename matches, quoted paths, fail-closed parse errors,
+//     required-present / required-absent.
 //   - Profile before merge; justify by maintainability if perf delta <5%.
 #[derive(Debug, Clone, Deserialize)]
 #[non_exhaustive]
@@ -259,17 +267,42 @@ pub struct ArgumentAllowlist {
     /// Permitted first-token values. Empty means unrestricted.
     #[serde(default)]
     pub allowed: Vec<String>,
+    /// Require the argument to be present and string-valued.
+    ///
+    /// Defaults to `false`, preserving the historical semantics: an
+    /// allowlist constrains the value when the argument is supplied, and a
+    /// caller omitting it passes unchecked. That is safe when the tool's
+    /// input schema already marks the argument required, but fails open
+    /// when the handler substitutes a default for a missing value.
+    ///
+    /// When `true`, a call that omits the argument -- or supplies a
+    /// non-string -- is denied with 403, independently of `allowed`. Setting
+    /// `required` with an empty `allowed` therefore means "must be supplied
+    /// as a string, any value accepted".
+    #[serde(default)]
+    pub required: bool,
 }
 
 impl ArgumentAllowlist {
     /// Create an argument allowlist for a tool.
+    ///
+    /// The argument is optional by default; use
+    /// [`with_required`](Self::with_required) to demand its presence.
     #[must_use]
     pub fn new(tool: impl Into<String>, argument: impl Into<String>, allowed: Vec<String>) -> Self {
         Self {
             tool: tool.into(),
             argument: argument.into(),
             allowed,
+            required: false,
         }
+    }
+
+    /// Require the argument to be present and string-valued.
+    #[must_use]
+    pub const fn with_required(mut self, required: bool) -> Self {
+        self.required = required;
+        self
     }
 }
 
@@ -587,6 +620,43 @@ impl RbacPolicy {
         self.roles.iter().find(|r| r.name == name)
     }
 
+    /// Name of the first `required` argument that `args` fails to supply as a
+    /// JSON string, or `None` when every requirement is met.
+    ///
+    /// `args` is `None` when the call carried no `arguments` object at all (or
+    /// carried a non-object); that must still be evaluated, otherwise omitting
+    /// the object would skip every requirement.
+    ///
+    /// Kept private: this is middleware-internal enforcement, unlike
+    /// [`Self::has_argument_allowlist`] / [`Self::argument_allowed`], which
+    /// expose value-policy evaluation to consumers.
+    fn missing_required_argument(
+        &self,
+        role: &str,
+        tool: &str,
+        args: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Option<&str> {
+        if !self.enabled {
+            return None;
+        }
+        let role_cfg = self.find_role(role)?;
+        role_cfg
+            .argument_allowlists
+            .iter()
+            .filter(|al| al.required)
+            // Same exact-or-glob selector as `argument_allowed` /
+            // `has_argument_allowlist`; diverging here would make a globbed
+            // tool pattern enforce values but not presence.
+            .filter(|al| al.tool == tool || glob_match(&al.tool, tool))
+            .find(|al| {
+                !args.is_some_and(|a| {
+                    a.get(&al.argument)
+                        .is_some_and(serde_json::Value::is_string)
+                })
+            })
+            .map(|al| al.argument.as_str())
+    }
+
     /// Check if a host name matches any of the given glob patterns.
     fn host_matches(patterns: &[String], host: &str) -> bool {
         patterns.iter().any(|p| glob_match(p, host))
@@ -884,14 +954,47 @@ fn enforce_tool_policy(
         );
     }
 
-    let args = params.get("arguments").and_then(|a| a.as_object())?;
-    for (arg_key, arg_val) in args {
-        if let Some(resp) = check_argument(policy, identity_name, role, tool_name, arg_key, arg_val)
-        {
-            return Some(resp);
+    let args = params.get("arguments").and_then(|a| a.as_object());
+    if let Some(args) = args {
+        for (arg_key, arg_val) in args {
+            if let Some(resp) =
+                check_argument(policy, identity_name, role, tool_name, arg_key, arg_val)
+            {
+                return Some(resp);
+            }
         }
     }
-    None
+    check_required_arguments(policy, identity_name, role, tool_name, args)
+}
+
+/// Deny when a `required` argument is missing or not string-valued.
+///
+/// Absence can only be judged here: [`check_argument`] is keyed by a present
+/// argument and structurally cannot observe a missing one. This runs even when
+/// `args` is `None` -- i.e. the call carried no `arguments` object, or a
+/// non-object -- because returning early on that would let a caller skip every
+/// `required` constraint by omitting the object entirely.
+fn check_required_arguments(
+    policy: &RbacPolicy,
+    identity_name: &str,
+    role: &str,
+    tool_name: &str,
+    args: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<Response> {
+    let missing = policy.missing_required_argument(role, tool_name, args)?;
+    tracing::warn!(
+        user = %identity_name,
+        role = %role,
+        tool = tool_name,
+        argument = missing,
+        "required argument missing"
+    );
+    Some(
+        McpxError::Rbac(format!(
+            "argument '{missing}' is required for tool '{tool_name}'"
+        ))
+        .into_response(),
+    )
 }
 
 fn check_argument(
@@ -1130,6 +1233,7 @@ mod tests {
                             "ls".into(),
                             "ps".into(),
                         ],
+                        required: false,
                     }],
                 },
             ],
@@ -2351,5 +2455,179 @@ mod tests {
     async fn absent_host_still_routes_to_check_operation() {
         let args = serde_json::json!({ "cmd": "sh" });
         assert_ne!(exec_status(&args).await, StatusCode::FORBIDDEN);
+    }
+
+    // -- F5: opt-in `required` on ArgumentAllowlist --
+    //
+    // An allowlist constrains a value only when the argument is present, so a
+    // caller could skip it entirely by omitting the key. That is safe when the
+    // tool's input schema marks the argument required, but fails open when the
+    // handler substitutes a default. `required` is opt-in so existing configs
+    // are untouched.
+
+    fn required_policy(allowed: Vec<String>, required: bool) -> RbacPolicy {
+        let role = RoleConfig::new("viewer", vec!["run".into()], vec!["*".into()])
+            .with_argument_allowlists(vec![
+                ArgumentAllowlist::new("run", "cmd", allowed).with_required(required),
+            ]);
+        let mut config = RbacConfig::with_roles(vec![role]);
+        config.enabled = true;
+        RbacPolicy::new(&config)
+    }
+
+    fn viewer_identity() -> AuthIdentity {
+        AuthIdentity {
+            method: crate::auth::AuthMethod::BearerToken,
+            name: "viewer-1".into(),
+            role: "viewer".into(),
+            raw_token: None,
+            sub: None,
+        }
+    }
+
+    async fn run_status(policy: RbacPolicy, params: &serde_json::Value) -> StatusCode {
+        let app = rbac_router_with_identity(Arc::new(policy), viewer_identity());
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": params
+        })
+        .to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn required_false_still_allows_omitting_the_argument() {
+        let params = serde_json::json!({ "name": "run", "arguments": {} });
+        assert_ne!(
+            run_status(required_policy(vec!["ls".into()], false), &params).await,
+            StatusCode::FORBIDDEN,
+            "default behaviour must be unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn required_true_denies_omitted_argument() {
+        let params = serde_json::json!({ "name": "run", "arguments": {} });
+        assert_eq!(
+            run_status(required_policy(vec!["ls".into()], true), &params).await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn required_true_allows_permitted_value() {
+        let params = serde_json::json!({ "name": "run", "arguments": { "cmd": "ls -la" } });
+        assert_ne!(
+            run_status(required_policy(vec!["ls".into()], true), &params).await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn required_true_still_denies_disallowed_value() {
+        let params = serde_json::json!({ "name": "run", "arguments": { "cmd": "rm -rf /" } });
+        assert_eq!(
+            run_status(required_policy(vec!["ls".into()], true), &params).await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn required_true_denies_non_string_value() {
+        let params = serde_json::json!({ "name": "run", "arguments": { "cmd": ["ls"] } });
+        assert_eq!(
+            run_status(required_policy(vec!["ls".into()], true), &params).await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn required_true_denies_absent_or_non_object_arguments() {
+        for params in [
+            serde_json::json!({ "name": "run" }),
+            serde_json::json!({ "name": "run", "arguments": "not-an-object" }),
+            serde_json::json!({ "name": "run", "arguments": null }),
+        ] {
+            assert_eq!(
+                run_status(required_policy(vec!["ls".into()], true), &params).await,
+                StatusCode::FORBIDDEN,
+                "omitting the arguments object must not skip `required`: {params:?}"
+            );
+        }
+    }
+
+    // Empty `allowed` means "unrestricted value". Combined with `required`
+    // that is "must be supplied as a string, any value accepted".
+    #[tokio::test]
+    async fn required_true_with_empty_allowed_accepts_any_string() {
+        let params =
+            serde_json::json!({ "name": "run", "arguments": { "cmd": "anything at all" } });
+        assert_ne!(
+            run_status(required_policy(vec![], true), &params).await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn required_true_with_empty_allowed_denies_omitted_argument() {
+        let params = serde_json::json!({ "name": "run", "arguments": {} });
+        assert_eq!(
+            run_status(required_policy(vec![], true), &params).await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn required_true_with_empty_allowed_denies_non_string() {
+        let params = serde_json::json!({ "name": "run", "arguments": { "cmd": 42 } });
+        assert_eq!(
+            run_status(required_policy(vec![], true), &params).await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn required_honours_globbed_tool_patterns() {
+        let role = RoleConfig::new("viewer", vec!["*".into()], vec!["*".into()])
+            .with_argument_allowlists(vec![
+                ArgumentAllowlist::new("run-*", "cmd", vec!["ls".into()]).with_required(true),
+            ]);
+        let mut config = RbacConfig::with_roles(vec![role]);
+        config.enabled = true;
+        let params = serde_json::json!({ "name": "run-foo", "arguments": {} });
+        assert_eq!(
+            run_status(RbacPolicy::new(&config), &params).await,
+            StatusCode::FORBIDDEN,
+            "a globbed tool pattern must enforce presence, not just value"
+        );
+    }
+
+    #[test]
+    fn required_defaults_to_false_when_absent_from_toml() {
+        let cfg: RbacConfig = toml::from_str(
+            r#"
+            enabled = true
+            [[roles]]
+            name = "viewer"
+            allow = ["run"]
+            [[roles.argument_allowlists]]
+            tool = "run"
+            argument = "cmd"
+            allowed = ["ls"]
+            "#,
+        )
+        .expect("config without `required` must still deserialize");
+        assert!(
+            !cfg.roles[0].argument_allowlists[0].required,
+            "omitted `required` must default to false so existing configs are unchanged"
+        );
     }
 }

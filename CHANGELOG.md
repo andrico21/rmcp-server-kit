@@ -11,6 +11,25 @@ migration note and a config opt-out — see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Added
+
+- **`ArgumentAllowlist::required`** (default `false`) — opt into requiring that
+  a constrained argument actually be supplied. An allowlist has always
+  constrained the value *only when the argument is present*, so a caller could
+  skip it entirely by omitting the key. That is safe when the tool's input
+  schema marks the argument required, but fails open when the handler
+  substitutes a default for a missing value. With `required = true` the
+  argument must be present **and** string-valued; a missing key, a non-string
+  value, or an absent/non-object `arguments` object are all rejected with 403.
+  Combining `required = true` with an empty `allowed` list means "must be
+  supplied as a string, any value accepted". Set it via
+  `ArgumentAllowlist::with_required(true)` or `required = true` in TOML.
+
+  This is purely additive: the field is `#[serde(default)]` on an
+  already-`#[non_exhaustive]` struct and `ArgumentAllowlist::new` is unchanged,
+  so existing configurations parse identically and behave exactly as before
+  unless they opt in.
+
 ### Security
 
 - **mTLS: a CRL whose first fetch failed is no longer suppressed for the
