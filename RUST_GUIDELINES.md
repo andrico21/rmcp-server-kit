@@ -1677,6 +1677,24 @@ Catch unnecessary string conversions and allocations.
 ```toml
 [lints.clippy]
 str_to_string = "warn"            # Prefer .to_owned() or .into()
+string_slice = "warn"             # `&s[a..b]` panics on non-char-boundary
+```
+
+`string_slice` is the string-specific companion to `indexing_slicing`
+(Defensive Programming Lints, above). Byte-range slicing of a `str` panics
+when an index falls inside a multi-byte UTF-8 sequence -- and that is
+attacker-reachable wherever the slice bounds derive from external input.
+Non-ASCII input is a realistic trigger for anything parsing headers, tokens,
+tool arguments, or identifiers.
+
+```rust
+// BAD: panics if byte 8 is not a char boundary (e.g. "naïve-token")
+let prefix = &token[..8];
+
+// GOOD: never panics, and the truncation point is explicit
+let prefix = token.get(..8).unwrap_or(token);
+// GOOD: iterate by chars when you mean "first 8 characters"
+let prefix: String = token.chars().take(8).collect();
 ```
 
 **Removed: `string_to_string`.** This lint no longer exists -- Clippy
@@ -1732,6 +1750,90 @@ Clippy 1.95 added two `complexity`-tier lints that are already covered by
   over hand-rolled overflow checks.
 - `manual_take` - prefer `std::mem::take(&mut x)` over
   `mem::replace(&mut x, Default::default())`.
+
+### Numeric and Pointer Cast Lints
+
+`as` casts are silent. They truncate, wrap, and change signedness without a
+diagnostic, which makes them a poor fit for a codebase that otherwise denies
+`unwrap`. These two lints push every cast toward an explicit, checked form.
+
+```toml
+[lints.clippy]
+cast_lossless = "warn"            # `x as u64` where `u64::from(x)` is infallible
+ptr_as_ptr = "warn"               # `p as *const T` -> `p.cast::<T>()`
+```
+
+- `cast_lossless` catches *widening* casts that cannot fail and should be
+  spelled as a `From` conversion, so the reader can tell at a glance that no
+  data is lost. It pairs with `clippy::all`'s existing coverage of the
+  *narrowing* direction (`cast_possible_truncation` under `pedantic`), where
+  the fix is `TryFrom` and a real error path (Section 2).
+- `ptr_as_ptr` is worth keeping even under `unsafe_code = "forbid"`: `.cast()`
+  preserves mutability and constness in the type system, whereas an `as` cast
+  will happily convert `*const T` to `*mut T` if you typo the target type.
+
+```rust
+// BAD: `as` hides which conversions are lossless and which are not
+let total = count as u64;
+let p = raw as *const Header;
+
+// GOOD: infallible widening is explicit; narrowing gets a real error path
+let total = u64::from(count);
+let port = u16::try_from(raw_port).map_err(|_| ConfigError::PortOutOfRange)?;
+let p = raw.cast::<Header>();
+```
+
+### Documentation Lints
+
+```toml
+[lints.clippy]
+doc_markdown = "allow"            # see rationale below
+duration_suboptimal_units = "allow"
+```
+
+Both are **deliberate opt-outs**, listed here so their absence reads as a
+decision rather than an oversight:
+
+- `doc_markdown` (pedantic) demands backticks around anything resembling an
+  identifier in prose. On docs that legitimately discuss protocol and product
+  names -- `OAuth`, `JWKS`, `RFC 7239`, `PowerShell` -- it produces a
+  steady stream of false positives, and the churn of backticking proper nouns
+  degrades readability. Turn it back on only if you also maintain a
+  `doc-valid-idents` list in `clippy.toml`.
+- `duration_suboptimal_units` (pedantic) rewrites e.g.
+  `Duration::from_millis(5000)` into `from_secs(5)`. That is fine in
+  isolation, but harmful where a family of related constants is deliberately
+  expressed in one unit so they can be compared by eye
+  (`from_millis(500)` / `from_millis(5_000)` / `from_millis(30_000)`).
+
+### Group-Level Allows Must Carry a Reason
+
+Enabling `pedantic` and `nursery` at `warn` (plus CI's `-D warnings`) means
+some lints will need to be switched off. Each one is a standing decision and
+must say why, in the manifest, next to the `allow`:
+
+```toml
+[lints.clippy]
+# nursery allow: opting fns into `const` is a one-way semver promise
+# (removing `const` later is breaking) and the lint has documented false
+# positives; keep it a deliberate per-fn decision, not lint-driven churn.
+missing_const_for_fn = "allow"
+
+# nursery allow: antagonistic to rustc's `unreachable_pub = "warn"`, which
+# prefers `pub(crate)` for crate-internal items. Two lints, opposite advice.
+redundant_pub_crate = "allow"
+
+# nursery allow: frequently degrades readability -- the rewrite contorts
+# poisoned-lock `match` idioms and multi-statement tracing arms that are
+# clearer as `if let` / `let ... else`.
+option_if_let_else = "allow"
+```
+
+An `allow` without a reason is indistinguishable from a lint someone
+silenced to make CI green. Rust's `reason = "..."` attribute field
+(usable on `#[allow]` / `#[expect]` in code) is the in-source equivalent and
+should be used at every suppression site -- see the "Panic Prevention Lints"
+exception policy above.
 
 ### Clippy 1.98 New Lints
 
@@ -2545,6 +2647,9 @@ Use this when reviewing code:
 - [ ] `[lints.clippy]` group entries carry `priority = -1` so per-lint overrides do not conflict
 - [ ] `clippy.toml` pins `cognitive-complexity-threshold`, `too-many-lines-threshold`, `max-fn-params-bools`, `enum-variant-size-threshold` (levels live in `Cargo.toml`, config lives here)
 - [ ] Deprecated `string_to_string` and `from_iter_instead_of_collect` removed from `[lints.clippy]` (both no longer exist)
+- [ ] `string_slice` enabled -- no `&s[a..b]` on `str` with externally-derived bounds (panics on non-char-boundary)
+- [ ] Widening casts use `From`/`u64::from`, narrowing casts use `TryFrom` with a real error path -- not bare `as` (`cast_lossless`)
+- [ ] Every `allow` in `[lints.clippy]` and every `#[allow]`/`#[expect]` in source carries a `reason` explaining the decision
 - [ ] `unused_async_trait_impl` (Clippy 1.98 `pedantic`) handled per-impl via `#[expect(..., reason = ...)]` where a foreign trait mandates the async signature -- not silenced crate-wide; it is not covered by `all = "deny"`
 - [ ] One-time `cargo fmt --all` committed separately after adopting `cfg_select!` (Rust 1.98 rustfmt now formats modules declared inside it)
 
