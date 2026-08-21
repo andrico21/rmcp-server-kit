@@ -268,10 +268,14 @@ async fn screen_oauth_target_with_test_override(
 /// [`with_config`]: Self::with_config
 #[derive(Clone)]
 pub struct OauthHttpClient {
-    #[allow(
-        dead_code,
-        reason = "screened-redirect JWKS/discovery client (every hop SSRF-screened). Post-M7, production credential traffic uses `credential_client` and JWKS fetching uses `JwksCache`, so in a minimal `oauth` build (no `test-helpers`) this field is consumed only by the redirect-policy regression tests (`__test_get`, `__test_inner_client`, `jwks_get_still_follows_screened_redirect`); retained to preserve the screened-redirect contract and its coverage."
-    )]
+    /// Screened-redirect JWKS/discovery client: follows redirects, but every
+    /// hop passes `evaluate_oauth_redirect`. Post-M7 production credential
+    /// traffic uses `credential_client` and JWKS fetching uses `JwksCache`,
+    /// so nothing in a production build reads this field; it exists only to
+    /// back the redirect-policy regression tests (`__test_get`,
+    /// `__test_inner_client`, `jwks_get_still_follows_screened_redirect`),
+    /// which are themselves `cfg`-gated to the same predicate.
+    #[cfg(any(test, feature = "test-helpers"))]
     inner: reqwest::Client,
     /// M7: dedicated client for credential-bearing POSTs (token /
     /// introspection / revocation / RFC 8693 exchange). Built with
@@ -390,7 +394,10 @@ impl OauthHttpClient {
         };
 
         // Clone an Arc into the redirect closure so the policy can
-        // consult the operator allowlist without re-parsing.
+        // consult the operator allowlist without re-parsing. Only the
+        // screened-redirect `inner` client needs it, so it shares that
+        // client's cfg gate.
+        #[cfg(any(test, feature = "test-helpers"))]
         let redirect_allowlist = Arc::clone(&allowlist);
 
         // M-H2: shared bypass holder created BEFORE the resolver so
@@ -402,13 +409,19 @@ impl OauthHttpClient {
         #[cfg(not(any(test, feature = "test-helpers")))]
         let test_bypass: crate::ssrf_resolver::TestLoopbackBypass = ();
 
+        // M-H2/B1: TestLoopbackBypass aliases to Arc<AtomicBool> in test
+        // builds and to `()` in production. The `.clone()` is required in
+        // test builds; in production the alias is a unit, which is why the
+        // unit-value lints are allowed alongside the Arc one.
+        #[allow(
+            clippy::clone_on_ref_ptr,
+            clippy::clone_on_copy,
+            clippy::unit_arg,
+            reason = "TestLoopbackBypass aliases to Arc<AtomicBool> under cfg(test)/test-helpers and to `()` otherwise; each cfg trips a different clone/arg lint"
+        )]
         let resolver: Arc<dyn reqwest::dns::Resolve> =
             Arc::new(crate::ssrf_resolver::SsrfScreeningResolver::new(
                 Arc::clone(&allowlist),
-                // M-H2/B1: TestLoopbackBypass aliases to Arc<AtomicBool> in test
-                // builds and to `()` in production. Value clone is required
-                // because the type vanishes outside test cfg.
-                #[allow(clippy::clone_on_ref_ptr, reason = "type alias varies per feature")]
                 test_bypass.clone(),
             ));
 
@@ -450,7 +463,11 @@ impl OauthHttpClient {
 
         // JWKS / discovery client: follows redirects, but every hop is screened
         // by `evaluate_oauth_redirect` (https->http downgrade, literal-IP
-        // target, and userinfo are all rejected).
+        // target, and userinfo are all rejected). Production reads JWKS via
+        // `JwksCache` and credentials via `credential_client`, so this client
+        // backs only the redirect-policy regression tests and is not built in
+        // a minimal `oauth` build.
+        #[cfg(any(test, feature = "test-helpers"))]
         let inner =
             make_base()?
                 .redirect(reqwest::redirect::Policy::custom(move |attempt| {
@@ -475,17 +492,26 @@ impl OauthHttpClient {
         // a compromised or open-redirecting token/introspection/revocation
         // endpoint must not re-send the `client_secret`-bearing body to another
         // host (RFC 8705 §2). Mirrors the `Policy::none()` mTLS cert clients.
+        //
+        // Shares the "oauth http client init" error label with the gated
+        // `inner` build above: both consume the same `make_base()` config, so
+        // a `ClientBuilder::build()` failure is a shared TLS-backend fault
+        // rather than a property of either client. Using one label keeps the
+        // operator-visible startup error identical whether or not `inner` is
+        // compiled in. Genuine misconfiguration (allowlist, ca_cert_path read
+        // and parse) is already reported by `make_base()` itself.
         let credential_client = make_base()?
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| {
-                crate::error::McpxError::Startup(format!("oauth credential client init: {e}"))
+                crate::error::McpxError::Startup(format!("oauth http client init: {e}"))
             })?;
 
         #[cfg(feature = "oauth-mtls-client")]
         let mtls_clients = build_mtls_clients(config, &allowlist, &test_bypass)?;
 
         Ok(Self {
+            #[cfg(any(test, feature = "test-helpers"))]
             inner,
             credential_client,
             allow_http,
@@ -632,6 +658,7 @@ impl std::fmt::Debug for OauthHttpClient {
 /// ```no_run
 /// use rmcp_server_kit::oauth::{OAuthConfig, OAuthSsrfAllowlist};
 ///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let mut allowlist = OAuthSsrfAllowlist::default();
 /// allowlist.hosts.push("rhbk.ops.example.com".into());
 /// allowlist.cidrs.push("10.0.0.0/8".into());
@@ -642,7 +669,9 @@ impl std::fmt::Debug for OauthHttpClient {
 /// )
 /// .ssrf_allowlist(allowlist)
 /// .build();
-/// cfg.validate().expect("operator allowlist parses");
+/// cfg.validate()?;
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone, Default, Deserialize)]
 #[non_exhaustive]
@@ -1942,10 +1971,15 @@ impl JwksCache {
         #[cfg(not(any(test, feature = "test-helpers")))]
         let test_bypass: crate::ssrf_resolver::TestLoopbackBypass = ();
 
+        #[allow(
+            clippy::clone_on_ref_ptr,
+            clippy::clone_on_copy,
+            clippy::unit_arg,
+            reason = "TestLoopbackBypass aliases to Arc<AtomicBool> under cfg(test)/test-helpers and to `()` otherwise; each cfg trips a different clone/arg lint"
+        )]
         let resolver: Arc<dyn reqwest::dns::Resolve> =
             Arc::new(crate::ssrf_resolver::SsrfScreeningResolver::new(
                 Arc::clone(&allowlist),
-                #[allow(clippy::clone_on_ref_ptr, reason = "type alias varies per feature")]
                 test_bypass.clone(),
             ));
 

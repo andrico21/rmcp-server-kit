@@ -129,7 +129,22 @@ fn parse_forwarded_entry(raw: &str) -> Result<IpAddr, FallbackReason> {
         if !name.trim().eq_ignore_ascii_case("for") {
             continue;
         }
-        let value = value.trim().trim_matches('"');
+        // RFC 7239 §4: a parameter value is `token / quoted-string`, and a
+        // quoted-string requires BALANCED `DQUOTE`. Strip the pair atomically
+        // rather than trimming each end independently: `"1.2.3.4`, `1.2.3.4"`
+        // and `"""1.2.3.4"""` are all malformed, and normalizing them into a
+        // valid address would create a parser differential with the upstream
+        // proxy whose decision we are supposed to be mirroring.
+        let value = value.trim();
+        let Some(value) = (match value.strip_circumfix("\"", "\"") {
+            Some(inner) => Some(inner),
+            // Bare token: legitimately unquoted, so no `"` may appear at all.
+            None if !value.contains('"') => Some(value),
+            // Unbalanced or repeated quotes: neither token nor quoted-string.
+            None => None,
+        }) else {
+            return Err(FallbackReason::MalformedEntry);
+        };
         // RFC 7239 §6: obfuscated identifiers start with '_'; "unknown"
         // means the previous hop could not be identified. Either way the
         // chain cannot be verified past this point.
@@ -388,5 +403,54 @@ mod tests {
         let headers = fwd(&["for=203.0.113.9, for=10.0.0.2"]);
         let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), FWD);
         assert_eq!(got, Ok(ip("203.0.113.9")));
+    }
+
+    #[test]
+    fn forwarded_unbalanced_quotes_fall_back() {
+        // RFC 7239 §4: a value is `token / quoted-string`; a quoted-string
+        // needs balanced DQUOTE. Trimming each end independently would
+        // normalize all of these into a valid address, producing a parser
+        // differential with the upstream proxy.
+        for value in [
+            r#"for="203.0.113.9"#,
+            r#"for=203.0.113.9""#,
+            r#"for="""203.0.113.9""""#,
+            r#"for="[2001:db8::1]:443"#,
+            r#"for=2"03.0.113.9"#,
+        ] {
+            let headers = fwd(&[value]);
+            let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), FWD);
+            assert_eq!(
+                got,
+                Err(FallbackReason::MalformedEntry),
+                "unbalanced-quote value must not resolve: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn forwarded_balanced_quotes_still_resolve() {
+        for (value, want) in [
+            (r#"for="203.0.113.9""#, ip("203.0.113.9")),
+            ("for=203.0.113.9", ip("203.0.113.9")),
+            (r#"for="203.0.113.9:443""#, ip("203.0.113.9")),
+            (r#"for="[2001:db8::1]""#, ip("2001:db8::1")),
+        ] {
+            let headers = fwd(&[value]);
+            let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), FWD);
+            assert_eq!(got, Ok(want), "well-formed value must resolve: {value:?}");
+        }
+    }
+
+    #[test]
+    fn forwarded_quoted_obfuscated_still_detected() {
+        // The quote strip must run before the obfuscation check, so a quoted
+        // `unknown` / `_secret` still reports Obfuscated rather than being
+        // misclassified as a malformed entry.
+        for value in [r#"for="unknown""#, r#"for="_secret""#] {
+            let headers = fwd(&[value]);
+            let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), FWD);
+            assert_eq!(got, Err(FallbackReason::Obfuscated), "value: {value:?}");
+        }
     }
 }

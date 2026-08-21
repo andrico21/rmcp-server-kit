@@ -139,8 +139,38 @@ Z:\TempPersistent\rmcp-server-kit\
 | Semver check (library)           | `cargo semver-checks check-release`                                  |
 
 **CI definition lives in**:
+
 - `.github/workflows/ci.yml` (canonical)
 - `.gitlab-ci.yml` (mirror)
+
+### Test tiers
+
+Per [`RUST_GUIDELINES.md`](RUST_GUIDELINES.md) §13 ("DO: Separate test tiers"),
+tiers here are expressed by **file name and cfg gate** rather than by directory.
+Every tier below is autonomous — no test requires a live external service or
+human-assisted setup; outbound HTTP is faked with `wiremock` and servers bind
+ephemeral loopback ports.
+
+| Tier | Where | Needs | Run |
+|------|-------|-------|-----|
+| **Unit** | `#[cfg(test)] mod tests` inside `src/*.rs` | nothing | `cargo test --all-features --lib` |
+| **Property** | `tests/properties.rs` | `proptest` | `cargo test --all-features --test properties` |
+| **Integration (pure)** | `tests/crl_discovery_ratelimit.rs`, `crl_h3_regression.rs`, `crl_map_bounds.rs`, `oauth_url_validation.rs` | nothing | `cargo test --all-features` |
+| **Integration (mocked HTTP)** | `tests/crl_ssrf.rs`, `jwks_key_cap.rs`, `jwks_redirect_ssrf.rs`, `oauth_http_client.rs` | `wiremock` | `cargo test --all-features` |
+| **E2E (binds sockets)** | `tests/e2e.rs`, `e2e_oauth_mtls.rs`, `ssrf_resolver.rs`, `docs_citations.rs` | ephemeral loopback ports | `cargo test --all-features --test e2e` |
+| **Perf / bounded-memory** | `tests/limiter_memory.rs` | `#[ignore]`d — too heavy for shared runners | `cargo test --release --all-features --test limiter_memory -- --ignored --nocapture` |
+| **Benches** | `benches/rbac_redaction.rs`, `hook_latency.rs` | — | `cargo bench` |
+
+**Feature gates matter.** Several files are `#![cfg(...)]`-gated and compile to
+nothing without the right features, so a bare `cargo test` silently skips them:
+
+- `test-helpers`: `crl_h3_regression`, `crl_map_bounds`
+- `oauth`: `oauth_url_validation`
+- `oauth` **and** `test-helpers`: `jwks_key_cap`, `jwks_redirect_ssrf`,
+  `oauth_http_client`, `ssrf_resolver`, `e2e_oauth_mtls`
+
+Always use `--all-features` locally; CI additionally runs a feature matrix so
+the default-feature build is covered too.
 
 ---
 

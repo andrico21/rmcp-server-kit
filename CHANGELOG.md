@@ -11,6 +11,69 @@ migration note and a config opt-out — see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`Forwarded` header parsing now requires balanced quotes (RFC 7239 §4).**
+  `for=` values were previously unquoted with `trim_matches('"')`, which strips
+  leading and trailing quotes *independently*. Malformed values such as
+  `for="203.0.113.9` (lone leading quote), `for=203.0.113.9"` (lone trailing),
+  and `for="""203.0.113.9"""` were silently normalized into a valid address
+  instead of being rejected. A value is now parsed strictly as RFC 7239
+  `token / quoted-string`: a bare token must contain no `"` at all, and a
+  quoted-string must be balanced; anything else yields
+  `FallbackReason::MalformedEntry` and resolution falls back to the direct
+  peer. This removes a parser differential between `rmcp-server-kit` and an
+  upstream proxy, which matters because the resolved client IP feeds per-IP
+  rate limiting and operator allowlists. Well-formed quoted values —
+  including `for="[2001:db8::1]:443"` and quoted `unknown` / `_obfuscated`
+  identifiers — are unaffected.
+
+### Changed
+
+- **Metrics middleware no longer allocates a `String` per request** for the
+  HTTP status label. It now renders the status code into a stack
+  `core::fmt::NumBuffer` via `u16::format_into` (both stable in Rust 1.98,
+  already the crate MSRV). Behavior and emitted label values are unchanged;
+  only the `metrics` feature path is affected.
+- **The screened-redirect JWKS/discovery `reqwest::Client` is no longer built
+  in production OAuth builds.** `OauthHttpClient::inner` is read only by the
+  `cfg`-gated redirect-policy regression helpers (`__test_get`,
+  `__test_inner_client`), so the private field and its construction now share
+  the same `cfg(any(test, feature = "test-helpers"))` gate, replacing an
+  `#[allow(dead_code)]`. A minimal `oauth` build allocates one fewer HTTP
+  client and connection pool. **No observable behavior change:** every
+  misconfiguration error (SSRF allowlist compile, `ca_cert_path` read,
+  `ca_cert_path` parse) is raised by the shared pre-work and `make_base()`,
+  which the credential client still executes. The two
+  `ClientBuilder::build()` failure labels were unified to
+  `"oauth http client init: {e}"` so the startup error text is identical
+  whether or not `inner` is compiled in; `"oauth credential client init"`
+  is retired and was never independently reachable, since both clients
+  consume the same base configuration.
+
+### Fixed (tooling)
+
+- **`cargo clippy --features oauth` (without `test-helpers`) now passes.**
+  It previously failed with four `-D warnings` errors — two
+  `clippy::clone_on_copy` and two `clippy::unit_arg` — because
+  `TestLoopbackBypass` aliases to `()` outside test builds and the existing
+  `#[allow]` covered only `clippy::clone_on_ref_ptr`. CI did not catch this:
+  the `clippy` job runs `--all-features` only, and the `features-matrix` job
+  runs `cargo build`/`cargo test` but not `cargo clippy`.
+- **CI now lints every shipped feature combination.** A
+  `cargo clippy --all-targets $FEATURES -- -D warnings` step was added to the
+  feature matrix in both `.github/workflows/ci.yml` and `.gitlab-ci.yml`
+  (as `feature-matrix:clippy`), covering default, `--no-default-features`,
+  `--features oauth`, `--features metrics`, and `--all-features`. This closes
+  the blind spot that allowed the lint failure above to go unnoticed.
+
+### Documentation
+
+- `RUST_GUIDELINES.md` now tracks stable Rust through **1.98**, and
+  `AGENTS.md` documents the test-tier taxonomy (unit / property /
+  integration-pure / integration-mocked / e2e / perf) together with the
+  per-file `#![cfg(...)]` feature gates.
+
 ## [3.2.0] - 2026-08-21
 
 ### Changed

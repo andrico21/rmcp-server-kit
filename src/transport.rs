@@ -3026,12 +3026,13 @@ async fn metrics_middleware(
     req.extensions_mut().insert(Arc::clone(&metrics));
     let response = next.run(req).await;
 
-    let status = response.status().as_u16().to_string();
+    let mut status_buf = core::fmt::NumBuffer::<u16>::new();
+    let status = response.status().as_u16().format_into(&mut status_buf);
     let duration = start.elapsed().as_secs_f64();
 
     metrics
         .http_requests_total
-        .with_label_values(&[&method, &path, &status])
+        .with_label_values(&[&method, &path, status])
         .inc();
     metrics
         .http_request_duration_seconds
