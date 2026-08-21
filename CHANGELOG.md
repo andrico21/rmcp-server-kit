@@ -11,6 +11,8 @@ migration note and a config opt-out — see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+## [3.3.0] - 2026-08-21
+
 ### Added
 
 - **`ArgumentAllowlist::required`** (default `false`) — opt into requiring that

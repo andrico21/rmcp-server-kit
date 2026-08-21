@@ -1,6 +1,6 @@
 [package]
 name = "rmcp-server-kit"
-version = "3.2.0"
+version = "3.3.0"
 edition = "2024"
 rust-version = "1.98.0"
 license = "MIT OR Apache-2.0"
@@ -23,6 +23,11 @@ exclude = [
   "tests/artifacts/",
   ".github/",
   ".gitlab-ci.yml",
+  # Agent planning scratchpads. Untracked, so a clean CI checkout never sees
+  # them, but `cargo publish --allow-dirty` from a working tree would package
+  # them -- they contain internal review notes and session identifiers.
+  ".omo/",
+  ".sisyphus/",
 ]
 
 [lib]

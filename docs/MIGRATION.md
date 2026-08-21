@@ -3,6 +3,85 @@
 This guide shows how to wire the standalone `rmcp-server-kit` crate into a
 downstream project, and how to migrate across breaking major releases.
 
+## Migrating from 3.2 to 3.3
+
+`3.3` is additive at the API level — `cargo semver-checks` reports no breaking
+change, and no code change is required to upgrade. It does, however, tighten
+three **runtime behaviours** as part of a security-hardening pass. Each is a
+deliberate fail-closed change with no opt-out: an escape hatch would simply be
+the original weakness behind a config flag.
+
+Review these before rolling out.
+
+### 1. Prometheus `path` label values changed (`metrics` feature only)
+
+Most likely to affect you, and the only one that can break silently.
+
+`http_requests_total` and `http_request_duration_seconds` previously used the
+**raw request path** as the `path` label. Any unauthenticated client could
+therefore mint an unbounded number of Prometheus time series by requesting
+random paths, growing in-process memory until exhaustion.
+
+Label values now come from a closed set:
+
+| Request | Old `path` label | New `path` label |
+|---------|------------------|------------------|
+| `GET /healthz` | `/healthz` | `/healthz` |
+| `POST /mcp` | `/mcp` | `/mcp` |
+| `POST /mcp/<session>` | `/mcp/<session>` | `/mcp` |
+| `GET /does-not-exist` | `/does-not-exist` | `<unmatched>` |
+| `FROBNICATE /healthz` | `FROBNICATE` (method label) | `OTHER` |
+
+Label **names** are unchanged, so panels keyed on `path` or `method` keep
+working. **Action:** if any dashboard, recording rule, or alert matches on a
+raw unmatched path, update it to `<unmatched>`, and update anything matching
+per-session `/mcp/...` paths to `/mcp`.
+
+### 2. `Forwarded` header parsing requires balanced quotes
+
+RFC 7239 §4 defines a parameter value as `token / quoted-string`, and a
+quoted-string requires balanced `DQUOTE`. Values such as `for="203.0.113.9`
+(lone leading quote), `for=203.0.113.9"` (lone trailing), and
+`for="""203.0.113.9"""` were previously normalised into a valid address; they
+are now rejected as malformed and client-IP resolution falls back to the direct
+peer.
+
+This removes a parser differential between `rmcp-server-kit` and the upstream
+proxy, which matters because the resolved client IP feeds per-IP rate limiting
+and operator allowlists.
+
+**Action:** none, if your proxy emits RFC-compliant headers — well-formed
+quoted values including `for="[2001:db8::1]:443"` are unaffected. If you see a
+rise in fallback-to-peer resolution after upgrading, your proxy is emitting
+malformed `Forwarded` values and should be fixed.
+
+### 3. RBAC rejects a non-string `arguments.host`
+
+The host was previously read with `as_str()`, so an array, object, number,
+bool, or null yielded `None` and the request was evaluated **without** the
+role's `hosts` glob restrictions. A caller could opt out of host restrictions
+simply by changing the argument's shape.
+
+A present-but-non-string `host` is now denied with 403.
+
+**Action:** none for well-behaved clients. A client sending
+`"host": ["prod-1"]` and receiving 200 before will now receive 403 — which was
+the vulnerability. An **absent** `host` is unchanged and still evaluated
+without host restrictions, so genuinely hostless tools (`ping`, `list_hosts`)
+continue to work.
+
+### Also in 3.3 (no action required)
+
+- `ArgumentAllowlist::required` — new opt-in field, defaults to `false`.
+  Existing configurations parse and behave identically. See
+  [`GUIDE.md`](GUIDE.md) for when to enable it.
+- mTLS CRL distribution points whose first fetch fails are now retried on a
+  later handshake instead of being suppressed for the process lifetime.
+- OAuth proxy requests drop caller-supplied client-authentication parameters
+  before injecting the configured ones.
+- Graceful shutdown lets in-flight MCP sessions finish within
+  `shutdown_timeout` instead of cancelling them when the drain begins.
+
 ## Migrating from 2.x to 3.0
 
 `3.0` upgrades the underlying MCP SDK from `rmcp` 2.x to **`rmcp` 3.0**.

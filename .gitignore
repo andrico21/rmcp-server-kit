@@ -33,5 +33,6 @@ Thumbs.db
 
 # Agent / planning scratchpad (not part of the crate)
 /.sisyphus/
+/.omo/
 # Local code-review reports (working artifacts; not shipped in the crate)
 /docs/reviews/
