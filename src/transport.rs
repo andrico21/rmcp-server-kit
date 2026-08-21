@@ -1399,10 +1399,20 @@ struct AppRunParams {
     rbac_swap: Arc<ArcSwap<RbacPolicy>>,
     /// Optional callback that receives the final [`ReloadHandle`].
     on_reload_ready: Option<Box<dyn FnOnce(ReloadHandle) + Send>>,
-    /// Server-internal cancellation token. Cancelled by [`run_server`]
-    /// once the shutdown trigger fires (so rmcp's child token also
-    /// fires, terminating in-flight MCP sessions).
+    /// Server-internal lifecycle cancellation token. Cancelled by
+    /// [`run_server`] once the shutdown trigger fires, stopping the metrics
+    /// listener, the CRL refresher, and any external shutdown wiring.
     ct: CancellationToken,
+    /// Cancellation token handed to the MCP service, kept SEPARATE from
+    /// [`Self::ct`].
+    ///
+    /// Cancelling it terminates in-flight MCP sessions and SSE streams, so it
+    /// must not fire at the *start* of the grace period — that truncates
+    /// responses a normal SIGTERM rollout is supposed to let finish. It is
+    /// cancelled only after axum has drained, or when the force-exit timer
+    /// wins. The force-exit path must still cancel it, or a stuck stream turns
+    /// a truncation bug into a shutdown hang.
+    session_ct: CancellationToken,
     /// `"http"` or `"https"` -- used only for boot-time logging.
     scheme: &'static str,
     /// Server name -- used only for boot-time logging.
@@ -1435,6 +1445,7 @@ where
     F: Fn() -> H + Send + Sync + Clone + 'static,
 {
     let ct = CancellationToken::new();
+    let session_ct = CancellationToken::new();
 
     let allowed_hosts = derive_allowed_hosts(&config.bind_addr, config.public_url.as_deref());
     tracing::info!(allowed_hosts = %allowed_hosts.join(", "), "configured Streamable HTTP allowed hosts");
@@ -1449,7 +1460,7 @@ where
         StreamableHttpServerConfig::default()
             .with_allowed_hosts(allowed_hosts)
             .with_sse_keep_alive(Some(config.sse_keep_alive))
-            .with_cancellation_token(ct.child_token()),
+            .with_cancellation_token(session_ct.clone()),
     );
 
     // Build the MCP route, optionally wrapped with auth and RBAC middleware.
@@ -1970,6 +1981,7 @@ where
             rbac_swap,
             on_reload_ready: config.on_reload_ready.take(),
             ct,
+            session_ct,
             scheme,
             name: config.name.clone(),
         },
@@ -2025,6 +2037,7 @@ where
         params.rbac_swap,
         params.on_reload_ready,
         params.ct,
+        params.session_ct,
     )
     .await
     .map_err(anyhow_to_startup)
@@ -2109,6 +2122,7 @@ where
         params.rbac_swap,
         params.on_reload_ready,
         params.ct,
+        params.session_ct,
     )
     .await
     .map_err(anyhow_to_startup)
@@ -2166,6 +2180,7 @@ async fn run_server(
     rbac_swap: Arc<ArcSwap<RbacPolicy>>,
     mut on_reload_ready: Option<Box<dyn FnOnce(ReloadHandle) + Send>>,
     ct: CancellationToken,
+    session_ct: CancellationToken,
 ) -> anyhow::Result<()> {
     // `shutdown_trigger` fires when the FIRST source resolves: either
     // an OS signal (Ctrl-C / SIGTERM) or external cancellation of `ct`
@@ -2244,9 +2259,10 @@ async fn run_server(
         // forced-shutdown semantics; force_exit_timer is a Sleep chain.
         tokio::select! {
             result = axum::serve(tls_listener, make_svc)
-                .with_graceful_shutdown(graceful) => { result?; }
+                .with_graceful_shutdown(graceful) => { session_ct.cancel(); result?; }
             () = force_exit_timer => {
                 tracing::warn!("shutdown timeout exceeded, forcing exit");
+                session_ct.cancel();
             }
         }
     } else {
@@ -2263,9 +2279,10 @@ async fn run_server(
         // forced-shutdown semantics; force_exit_timer is a Sleep chain.
         tokio::select! {
             result = axum::serve(listener, make_svc)
-                .with_graceful_shutdown(graceful) => { result?; }
+                .with_graceful_shutdown(graceful) => { session_ct.cancel(); result?; }
             () = force_exit_timer => {
                 tracing::warn!("shutdown timeout exceeded, forcing exit");
+                session_ct.cancel();
             }
         }
     }
@@ -3007,6 +3024,53 @@ async fn shutdown_signal() {
 
 /// Middleware that validates the `Origin` header on incoming HTTP requests.
 ///
+/// Collapse a request into a bounded set of Prometheus label values.
+///
+/// Prometheus retains one time series per distinct label set, and this
+/// middleware runs OUTSIDE the auth layer, so any label derived from raw
+/// request input is an unauthenticated memory-growth primitive. Both label
+/// values must therefore come from a closed set.
+///
+/// `MatchedPath` yields the route template for ordinary registered routes,
+/// but it is not available everywhere: `/mcp` is mounted with `nest_service`,
+/// whose tail match may carry `MatchedNestedPath` instead, and unmatched
+/// requests that hit the 404 fallback carry neither. The raw URI path is
+/// never used as a fallback -- that is precisely the unbounded input.
+#[cfg(feature = "metrics")]
+fn metrics_labels(req: &Request<Body>) -> (&'static str, String) {
+    let method = match *req.method() {
+        axum::http::Method::GET => "GET",
+        axum::http::Method::POST => "POST",
+        axum::http::Method::PUT => "PUT",
+        axum::http::Method::PATCH => "PATCH",
+        axum::http::Method::DELETE => "DELETE",
+        axum::http::Method::HEAD => "HEAD",
+        axum::http::Method::OPTIONS => "OPTIONS",
+        axum::http::Method::TRACE => "TRACE",
+        axum::http::Method::CONNECT => "CONNECT",
+        // HTTP permits extension methods, so anything else collapses to a
+        // single bucket rather than minting a series per invented verb.
+        _ => "OTHER",
+    };
+
+    let path = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map_or_else(
+            || {
+                let raw = req.uri().path();
+                if raw == "/mcp" || raw.starts_with("/mcp/") {
+                    "/mcp".to_owned()
+                } else {
+                    "<unmatched>".to_owned()
+                }
+            },
+            |matched| matched.as_str().to_owned(),
+        );
+
+    (method, path)
+}
+
 /// Record HTTP request metrics (method, path, status, duration).
 ///
 /// Also exposes the shared [`crate::metrics::McpMetrics`] handle to
@@ -3019,8 +3083,7 @@ async fn metrics_middleware(
     mut req: Request<Body>,
     next: Next,
 ) -> axum::response::Response {
-    let method = req.method().to_string();
-    let path = req.uri().path().to_owned();
+    let (method, path) = metrics_labels(&req);
     let start = std::time::Instant::now();
 
     req.extensions_mut().insert(Arc::clone(&metrics));
@@ -3032,11 +3095,11 @@ async fn metrics_middleware(
 
     metrics
         .http_requests_total
-        .with_label_values(&[&method, &path, status])
+        .with_label_values(&[method, &path, status])
         .inc();
     metrics
         .http_request_duration_seconds
-        .with_label_values(&[&method, &path])
+        .with_label_values(&[method, &path])
         .observe(duration);
 
     response
@@ -4774,7 +4837,7 @@ mod tests {
                 axum::routing::post(|| async {
                     axum::response::Response::builder()
                         .header("vary", "Accept-Encoding")
-                        .body(axum::body::Body::from("{}"))
+                        .body(Body::from("{}"))
                         .unwrap()
                 }),
             )
@@ -5121,6 +5184,86 @@ mod tests {
                 resp.status(),
                 StatusCode::UNAUTHORIZED,
                 "an authenticated admin must pass the auth gate on {path}"
+            );
+        }
+    }
+
+    // -- F3 regression: unbounded Prometheus label cardinality --
+    //
+    // `metrics_middleware` runs outside the auth layer, so it observes
+    // unauthenticated traffic. Labelling with the raw URI path and raw HTTP
+    // method let any client mint a permanent time series per request, growing
+    // in-process metric state until OOM. Both labels must now come from a
+    // closed set.
+    #[cfg(feature = "metrics")]
+    mod metrics_labels_bounded {
+        use super::*;
+
+        fn labels_for(method: &str, uri: &str) -> (&'static str, String) {
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            metrics_labels(&req)
+        }
+
+        #[test]
+        fn many_unmatched_paths_collapse_to_one_label() {
+            let mut seen = std::collections::HashSet::new();
+            for i in 0..500 {
+                let (_, path) = labels_for("GET", &format!("/nonexistent-{i}"));
+                seen.insert(path);
+            }
+            assert_eq!(
+                seen.len(),
+                1,
+                "unmatched paths must collapse to a single label, got {seen:?}"
+            );
+            assert!(seen.contains("<unmatched>"));
+        }
+
+        #[test]
+        fn nested_mcp_paths_collapse_to_the_mount_point() {
+            let mut seen = std::collections::HashSet::new();
+            for i in 0..200 {
+                let (_, path) = labels_for("POST", &format!("/mcp/{i}"));
+                seen.insert(path);
+            }
+            let (_, root) = labels_for("POST", "/mcp");
+            seen.insert(root);
+            assert_eq!(
+                seen.len(),
+                1,
+                "nested /mcp paths must collapse to one label, got {seen:?}"
+            );
+            assert!(seen.contains("/mcp"));
+        }
+
+        #[test]
+        fn unusual_methods_collapse_to_one_bucket() {
+            let mut seen = std::collections::HashSet::new();
+            for verb in ["FROBNICATE", "WIBBLE", "QUUX", "M-SEARCH"] {
+                let (method, _) = labels_for(verb, "/healthz");
+                seen.insert(method);
+            }
+            assert_eq!(seen, std::collections::HashSet::from(["OTHER"]));
+        }
+
+        #[test]
+        fn known_methods_keep_their_identity() {
+            for verb in ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] {
+                let (method, _) = labels_for(verb, "/healthz");
+                assert_eq!(method, verb);
+            }
+        }
+
+        #[test]
+        fn raw_path_never_leaks_into_a_label() {
+            let (_, path) = labels_for("GET", "/secret-token-abc123");
+            assert!(
+                !path.contains("secret-token"),
+                "raw request path must never become a label value: {path}"
             );
         }
     }

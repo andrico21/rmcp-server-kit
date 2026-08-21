@@ -1170,8 +1170,16 @@ fn extract_bearer(value: &str) -> Option<&str> {
 /// closing the first-match latency oracle (CWE-208) and the expired-slot
 /// timing leak.
 ///
-/// `subtle::ConstantTimeEq` is used to fold per-slot match bits into the
-/// final result so the compiler cannot reintroduce a data-dependent branch.
+/// `subtle::ConstantTimeEq` folds each slot's match bit into the running
+/// result without comparing the token bytes in short-circuiting fashion.
+///
+/// The guarantee this function provides is the Argon2 count, not full
+/// branchlessness: selecting `verify_against` and recording `matched_index`
+/// are both ordinary data-dependent branches. They are cheap, predictable,
+/// and operate on locals, so they are dwarfed by the Argon2id verification
+/// that dominates every iteration -- but the timing claim stops at
+/// "one verification per configured key". Do not read this as a
+/// constant-time selection routine.
 ///
 /// # Panics
 ///
