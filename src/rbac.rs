@@ -836,10 +836,35 @@ fn enforce_tool_policy(
     params: &serde_json::Value,
 ) -> Option<Response> {
     let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
-    let host = params
-        .get("arguments")
-        .and_then(|a| a.get("host"))
-        .and_then(|h| h.as_str());
+    let host_value = params.get("arguments").and_then(|a| a.get("host"));
+
+    // M2 precedent (see `check_argument`): a caller-supplied `host` of the
+    // wrong JSON type must not silently downgrade the host-glob check to an
+    // operation-only check. `as_str()` on an array/object/number/bool/null
+    // yields `None`, which would route to `check_operation` and skip
+    // `RoleConfig.hosts` entirely -- letting a caller opt out of host
+    // restrictions by changing the argument's shape. Fail closed, and log
+    // the type rather than the value so no caller input is leaked.
+    if let Some(value) = host_value
+        && !value.is_string()
+    {
+        tracing::warn!(
+            user = %identity_name,
+            role = %role,
+            tool = tool_name,
+            value_type = json_value_type(value),
+            "non-string host argument rejected"
+        );
+        return Some(
+            McpxError::Rbac(format!(
+                "argument 'host' must be a string for tool '{tool_name}'"
+            ))
+            .into_response(),
+        );
+    }
+    // Absent `host` still routes to `check_operation` by design: hostless
+    // tools (`ping`, `list_hosts`) legitimately carry no host argument.
+    let host = host_value.and_then(|h| h.as_str());
 
     let decision = if let Some(host) = host {
         policy.check(role, tool_name, host)
@@ -2266,5 +2291,65 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // -- F4 regression: non-string `host` downgraded the host-glob check --
+    //
+    // `restricted-exec` is scoped to `hosts: ["dev-*"]`. Before the fix,
+    // `arguments.host` was read with `as_str()`, so any non-string shape
+    // yielded `None` and routed to `check_operation`, skipping the host
+    // globs entirely -- letting a caller reach `prod-1` by sending the
+    // host as an array. Each case below returned 200 before the fix.
+
+    async fn exec_status(args: &serde_json::Value) -> StatusCode {
+        let policy = Arc::new(test_policy());
+        let app = rbac_router_with_identity(policy, restricted_exec_identity());
+        let body = tool_call_body("resource_exec", args);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn non_string_host_is_denied_for_every_json_type() {
+        for host in [
+            serde_json::json!(["prod-1"]),
+            serde_json::json!({ "name": "prod-1" }),
+            serde_json::json!(42),
+            serde_json::json!(true),
+            serde_json::json!(null),
+        ] {
+            let args = serde_json::json!({ "host": host, "cmd": "sh" });
+            assert_eq!(
+                exec_status(&args).await,
+                StatusCode::FORBIDDEN,
+                "non-string host must not bypass host globs: {host:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn string_host_outside_globs_still_denied() {
+        let args = serde_json::json!({ "host": "prod-1", "cmd": "sh" });
+        assert_eq!(exec_status(&args).await, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn string_host_inside_globs_still_allowed() {
+        let args = serde_json::json!({ "host": "dev-1", "cmd": "sh" });
+        assert_ne!(exec_status(&args).await, StatusCode::FORBIDDEN);
+    }
+
+    /// Asserts the deliberate scope boundary: an absent `host` still routes
+    /// to `check_operation` so hostless tools keep working. Requiring a host
+    /// unconditionally would break `ping` / `list_hosts`.
+    #[tokio::test]
+    async fn absent_host_still_routes_to_check_operation() {
+        let args = serde_json::json!({ "cmd": "sh" });
+        assert_ne!(exec_status(&args).await, StatusCode::FORBIDDEN);
     }
 }
