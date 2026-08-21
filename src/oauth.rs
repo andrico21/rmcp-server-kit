@@ -2880,7 +2880,7 @@ pub fn handle_authorize(proxy: &OAuthProxyConfig, query: &str) -> axum::response
     };
 
     // Replace the client_id in the query with the upstream client_id.
-    let upstream_query = replace_client_id(query, &proxy.client_id);
+    let upstream_query = rewrite_client_auth_params(query, &proxy.client_id);
     let redirect_url = format!("{}?{upstream_query}", proxy.authorize_url);
 
     (StatusCode::FOUND, [(header::LOCATION, redirect_url)]).into_response()
@@ -2902,7 +2902,7 @@ pub async fn handle_token(
     };
 
     // Replace client_id in the form body with the upstream client_id.
-    let mut upstream_body = replace_client_id(body, &proxy.client_id);
+    let mut upstream_body = rewrite_client_auth_params(body, &proxy.client_id);
 
     // For confidential clients, inject the client_secret.
     if let Some(ref secret) = proxy.client_secret {
@@ -3038,7 +3038,7 @@ async fn proxy_oauth_admin_request(
         response::IntoResponse,
     };
 
-    let mut upstream_body = replace_client_id(body, &proxy.client_id);
+    let mut upstream_body = rewrite_client_auth_params(body, &proxy.client_id);
     if let Some(ref secret) = proxy.client_secret {
         use std::fmt::Write;
 
@@ -3340,16 +3340,49 @@ fn log_exchanged_token(exchanged: &ExchangedToken) {
     );
 }
 
-/// Replace or inject the `client_id` parameter in a query/form string.
-fn replace_client_id(params: &str, upstream_client_id: &str) -> String {
-    let encoded_id = urlencoding::encode(upstream_client_id);
-    let mut parts: Vec<String> = params
-        .split('&')
-        .filter(|p| !p.starts_with("client_id="))
-        .map(String::from)
-        .collect();
-    parts.push(format!("client_id={encoded_id}"));
-    parts.join("&")
+/// Form/query parameters that carry OAuth client authentication.
+///
+/// Every one of these is proxy-owned: the upstream client identity and its
+/// credentials are configured server-side and must never be influenced by the
+/// downstream caller.
+const CLIENT_AUTH_PARAMS: [&str; 4] = [
+    "client_id",
+    "client_secret",
+    "client_assertion",
+    "client_assertion_type",
+];
+
+/// Re-serialize an `application/x-www-form-urlencoded` query or body with every
+/// caller-supplied client-authentication parameter removed, then inject the
+/// proxy's `client_id`.
+///
+/// This parses and re-serializes rather than rewriting the raw string. The
+/// previous implementation split on `&` and dropped segments literally starting
+/// with `client_id=`, which let a caller smuggle client credentials past the
+/// proxy two ways:
+///
+/// - percent-encoded keys (`%63lient_id=...`, `client%5Fid=...`) do not match the
+///   literal prefix but decode upstream to `client_id`; and
+/// - `client_secret` was never filtered at all, so a caller-supplied secret
+///   survived alongside the proxy's own injected one on credential-bearing POSTs.
+///
+/// Either way the upstream IdP received duplicate decoded parameters, and a
+/// first-wins parser would honour the caller's value over the proxy's.
+///
+/// Decoded values and the relative order of non-client parameters are preserved
+/// (OAuth permits repeated `scope` / `resource`). The raw byte encoding is *not*
+/// preserved: `form_urlencoded` normalizes `+` and percent-escapes on
+/// re-serialization, which is semantically equivalent for form data.
+fn rewrite_client_auth_params(params: &str, upstream_client_id: &str) -> String {
+    let mut out = url::form_urlencoded::Serializer::new(String::new());
+    for (key, value) in url::form_urlencoded::parse(params.as_bytes()) {
+        if CLIENT_AUTH_PARAMS.contains(&key.as_ref()) {
+            continue;
+        }
+        out.append_pair(&key, &value);
+    }
+    out.append_pair("client_id", upstream_client_id);
+    out.finish()
 }
 
 #[cfg(test)]
@@ -3359,6 +3392,126 @@ mod tests {
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
     use super::*;
+
+    // -- F2 regression: client-auth parameter smuggling in the OAuth proxy --
+    //
+    // The previous `replace_client_id` split on `&` and dropped segments
+    // literally starting with `client_id=`. Percent-encoded keys survived that
+    // filter but decode upstream to `client_id`, and `client_secret` was never
+    // filtered at all, so a caller could ship duplicate client credentials to
+    // the IdP alongside the proxy's own. Every case below forwarded the
+    // attacker value before the fix.
+
+    /// Decode a rewritten form back into `(key, value)` pairs. Assertions run
+    /// on decoded pairs, never on raw bytes: `form_urlencoded` normalizes `+`
+    /// and percent-escapes on re-serialization, so byte equality is not a
+    /// meaningful contract here.
+    fn decoded_pairs(form: &str) -> Vec<(String, String)> {
+        url::form_urlencoded::parse(form.as_bytes())
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn rewrite_drops_percent_encoded_client_id_key() {
+        let out = rewrite_client_auth_params("%63lient_id=attacker&scope=read", "proxy-id");
+        let pairs = decoded_pairs(&out);
+        let client_ids: Vec<&String> = pairs
+            .iter()
+            .filter(|(k, _)| k == "client_id")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(client_ids, vec!["proxy-id"], "smuggled client_id survived");
+    }
+
+    #[test]
+    fn rewrite_drops_underscore_encoded_client_id_key() {
+        let out = rewrite_client_auth_params("client%5Fid=attacker&scope=read", "proxy-id");
+        let pairs = decoded_pairs(&out);
+        assert!(
+            !pairs.iter().any(|(_, v)| v == "attacker"),
+            "smuggled client_id survived: {pairs:?}"
+        );
+    }
+
+    #[test]
+    fn rewrite_drops_caller_supplied_client_secret() {
+        let out =
+            rewrite_client_auth_params("client_secret=attacker-secret&scope=read", "proxy-id");
+        let pairs = decoded_pairs(&out);
+        assert!(
+            !pairs.iter().any(|(k, _)| k == "client_secret"),
+            "caller client_secret survived: {pairs:?}"
+        );
+    }
+
+    #[test]
+    fn rewrite_drops_caller_supplied_client_assertion() {
+        let out = rewrite_client_auth_params(
+            "client_assertion=ey.evil&client_assertion_type=urn:evil&scope=read",
+            "proxy-id",
+        );
+        let pairs = decoded_pairs(&out);
+        assert!(
+            !pairs
+                .iter()
+                .any(|(k, _)| k == "client_assertion" || k == "client_assertion_type"),
+            "caller client assertion survived: {pairs:?}"
+        );
+    }
+
+    #[test]
+    fn rewrite_collapses_duplicate_client_id_to_proxy_value() {
+        let out = rewrite_client_auth_params("client_id=a&client_id=b&scope=read", "proxy-id");
+        let pairs = decoded_pairs(&out);
+        let client_ids: Vec<&String> = pairs
+            .iter()
+            .filter(|(k, _)| k == "client_id")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(client_ids, vec!["proxy-id"]);
+    }
+
+    #[test]
+    fn rewrite_preserves_non_client_params_in_order_with_duplicates() {
+        let out = rewrite_client_auth_params(
+            "scope=read&resource=a&state=xyz&resource=b&code_verifier=v",
+            "proxy-id",
+        );
+        let pairs = decoded_pairs(&out);
+        let non_client: Vec<(String, String)> = pairs
+            .into_iter()
+            .filter(|(k, _)| k != "client_id")
+            .collect();
+        assert_eq!(
+            non_client,
+            vec![
+                ("scope".to_owned(), "read".to_owned()),
+                ("resource".to_owned(), "a".to_owned()),
+                ("state".to_owned(), "xyz".to_owned()),
+                ("resource".to_owned(), "b".to_owned()),
+                ("code_verifier".to_owned(), "v".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn rewrite_roundtrips_values_with_special_characters() {
+        let input = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("state", "a&b=c+d")
+            .append_pair("scope", "réad ✓")
+            .finish();
+        let out = rewrite_client_auth_params(&input, "proxy-id");
+        let pairs = decoded_pairs(&out);
+        assert!(pairs.contains(&("state".to_owned(), "a&b=c+d".to_owned())));
+        assert!(pairs.contains(&("scope".to_owned(), "réad ✓".to_owned())));
+    }
+
+    #[test]
+    fn rewrite_injects_client_id_when_absent() {
+        let out = rewrite_client_auth_params("scope=read", "proxy-id");
+        assert!(decoded_pairs(&out).contains(&("client_id".to_owned(), "proxy-id".to_owned())));
+    }
 
     #[test]
     fn looks_like_jwt_valid() {
