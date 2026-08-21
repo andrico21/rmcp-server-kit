@@ -104,13 +104,24 @@ jobs:
   semver-checks:
     name: cargo-semver-checks
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    # Also runs on push to main: this repo commits directly to main, so
+    # gating on pull_request alone meant the job never executed and public
+    # API changes shipped without a semver check.
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.9.1
+      # `--force` and the floor matter together: rust-cache can restore an
+      # older cargo-semver-checks from ~/.cargo/bin, and `cargo install`
+      # would then skip the upgrade. Versions before 0.50 cannot parse the
+      # rustdoc JSON v60 emitted by Rust 1.98 and fail with
+      # "unsupported rustdoc format v60" -- a tooling error indistinguishable
+      # from a real semver break in the CI log.
       - name: Install cargo-semver-checks
-        run: cargo install cargo-semver-checks --locked
+        run: cargo install cargo-semver-checks --locked --force --version '^0.50'
       - name: Check release semver
         run: cargo semver-checks check-release
 
