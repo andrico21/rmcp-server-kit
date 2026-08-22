@@ -11,6 +11,8 @@ migration note and a config opt-out — see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+## [3.3.1] - 2026-08-22
+
 ### Changed
 
 - **`cargo vet` no longer audits this crate against itself.**
