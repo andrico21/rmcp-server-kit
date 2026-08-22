@@ -37,6 +37,46 @@ impl ServerHandler for TestHandler {
     }
 }
 
+/// Handler whose `call_tool` blocks until the test releases it.
+///
+/// Needed for the graceful-shutdown regression test: the shutdown session
+/// token is only wired into the `/mcp` `StreamableHttpService`, so the work
+/// held open across shutdown has to be a real MCP tool call. A route added via
+/// `with_extra_router` is merged into the outer axum router and never reaches
+/// that service, so it would be drained by axum's own graceful shutdown and
+/// prove nothing.
+#[derive(Clone)]
+struct BlockingToolHandler {
+    /// Fires once, when `call_tool` begins, so the test can be sure the call
+    /// is genuinely in flight before triggering shutdown.
+    started: Arc<std::sync::Mutex<Option<oneshot::Sender<()>>>>,
+    /// Held by the test until it wants the call to return.
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl ServerHandler for BlockingToolHandler {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    }
+
+    async fn call_tool(
+        &self,
+        _request: rmcp::model::CallToolRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        if let Ok(mut guard) = self.started.lock()
+            && let Some(tx) = guard.take()
+        {
+            let _ = tx.send(());
+        }
+        self.release.notified().await;
+        Ok(
+            rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text("released")])
+                .into(),
+        )
+    }
+}
+
 // -- Test helpers --
 
 /// Find a free ephemeral port. Retained for legacy call-sites that
@@ -113,6 +153,15 @@ impl std::fmt::Display for ServerHarness {
 /// races and removing the need for `config_on_port` to know the port
 /// ahead of time.
 async fn spawn_server(config: McpServerConfig) -> ServerHarness {
+    spawn_server_with(config, || TestHandler).await
+}
+
+/// [`spawn_server`], but with a caller-supplied handler factory.
+async fn spawn_server_with<H, F>(config: McpServerConfig, handler_factory: F) -> ServerHarness
+where
+    H: ServerHandler + 'static,
+    F: Fn() -> H + Send + Sync + Clone + 'static,
+{
     // Ensure ring crypto provider is available for reqwest's TLS.
     rustls::crypto::ring::default_provider()
         .install_default()
@@ -134,7 +183,7 @@ async fn spawn_server(config: McpServerConfig) -> ServerHarness {
         rmcp_server_kit::transport::serve_with_listener(
             listener,
             config.validate().expect("test config valid"),
-            || TestHandler,
+            handler_factory,
             Some(ready_tx),
             Some(shutdown_for_server),
         )
@@ -2200,4 +2249,162 @@ mod peer_addr_tests {
 
         harness.shutdown().await.expect("shutdown tls server");
     }
+}
+
+// ==========================================================================
+// F8 regression: graceful shutdown must not cancel in-flight MCP sessions
+// at the START of the grace window
+// ==========================================================================
+
+/// An in-flight MCP tool call that finishes inside `shutdown_timeout` must
+/// complete successfully when shutdown is triggered.
+///
+/// Before the fix, the MCP service was handed `ct.child_token()`, and the
+/// graceful path cancels `ct` the moment the shutdown trigger fires -- i.e. at
+/// the *start* of the grace window. rmcp ends the SSE response stream on that
+/// cancellation, so a tool call still running was cut off even though the
+/// drain window had barely opened. The service now holds a dedicated session
+/// token cancelled only after axum finishes draining.
+///
+/// The test is event-gated rather than duration-gated: it waits for the
+/// handler to signal that the call is genuinely in flight, triggers shutdown,
+/// and only then releases the handler. Nothing depends on elapsed time
+/// thresholds, so it does not become flaky under CI scheduling.
+///
+/// It must exercise `/mcp` specifically -- `with_extra_router` routes never
+/// reach `StreamableHttpService`, which is the sole consumer of the session
+/// token, so a test built that way would pass against the bug.
+#[tokio::test]
+async fn in_flight_mcp_call_completes_within_grace_window() {
+    let (started_tx, started_rx) = oneshot::channel::<()>();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let handler = BlockingToolHandler {
+        started: Arc::new(std::sync::Mutex::new(Some(started_tx))),
+        release: Arc::clone(&release),
+    };
+
+    // Generous grace window: the tool returns immediately once released, so
+    // the call finishes well inside it. Anything cut short is the bug.
+    let cfg = McpServerConfig::new("127.0.0.1:0", "test-rmcp-server-kit", "0.0.1")
+        .with_shutdown_timeout(Duration::from_secs(10));
+
+    let mut harness = spawn_server_with(cfg, move || handler.clone()).await;
+    let base = harness.base.clone();
+    let client = reqwest::Client::new();
+
+    // A bare `tools/call` without a session is rejected by rmcp before it ever
+    // reaches the handler, so the full handshake is required.
+    let session_id = mcp_initialize(&client, &base).await;
+
+    let call = tokio::spawn({
+        let client = client.clone();
+        let base = base.clone();
+        let session_id = session_id.clone();
+        async move {
+            client
+                .post(format!("{base}/mcp"))
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-session-id", session_id)
+                .body(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": { "name": "slow", "arguments": {} }
+                    })
+                    .to_string(),
+                )
+                .send()
+                .await
+        }
+    });
+
+    // The call is now genuinely in flight inside the MCP service.
+    tokio::time::timeout(Duration::from_secs(10), started_rx)
+        .await
+        .expect("tool handler did not start within 10s")
+        .expect("started signal dropped");
+
+    // Trigger shutdown while it is still blocked, then let it finish.
+    // The join handle is taken so the harness `Drop` does not also try to
+    // shut down, and so the server task can be awaited after the call.
+    let server_task = harness.join.take().expect("server join handle");
+    harness.shutdown.cancel();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    release.notify_waiters();
+
+    let resp = tokio::time::timeout(Duration::from_secs(10), call)
+        .await
+        .expect("tool call did not return within 10s")
+        .expect("tool call task panicked")
+        .expect("tool call transport error -- the session was cancelled mid-flight");
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "in-flight MCP call must survive the grace window"
+    );
+    let body = resp.text().await.expect("read tool response body");
+    assert!(
+        body.contains("released"),
+        "tool response must carry the handler's payload, got: {body}"
+    );
+
+    tokio::time::timeout(Duration::from_secs(10), server_task)
+        .await
+        .expect("server did not shut down within 10s")
+        .expect("server task panicked")
+        .expect("server shutdown returned an error");
+}
+
+/// Perform the MCP `initialize` handshake and return the negotiated
+/// `Mcp-Session-Id`.
+async fn mcp_initialize(client: &reqwest::Client, base: &str) -> String {
+    let resp = client
+        .post(format!("{base}/mcp"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": { "name": "e2e", "version": "0.0.1" }
+                }
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("initialize request");
+    assert_eq!(resp.status(), 200, "initialize must succeed");
+    let session_id = resp
+        .headers()
+        .get("mcp-session-id")
+        .expect("server must return Mcp-Session-Id")
+        .to_str()
+        .expect("session id is ascii")
+        .to_owned();
+
+    client
+        .post(format!("{base}/mcp"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-session-id", &session_id)
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("initialized notification");
+
+    session_id
 }

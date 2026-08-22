@@ -11,6 +11,41 @@ migration note and a config opt-out — see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Changed
+
+- **`cargo vet` no longer audits this crate against itself.**
+  `supply-chain/config.toml` set `audit-as-crates-io = true` for
+  `rmcp-server-kit`, asking cargo-vet to audit our own package as though it
+  were a third-party crates.io dependency. That requirement was satisfied with
+  a self-exemption — an explicit trust-without-audit marker — so it asserted no
+  security property, while pinning an exact version meant every release
+  orphaned it. The `cargo vet` CI job consequently sat red from the 3.2.0
+  release until the 3.3.0 cycle without anyone noticing, because it was
+  `continue-on-error: true`.
+
+  The policy is now `audit-as-crates-io = false`, which is the correct setting
+  for a first-party crate you author and publish. The self-exemption and the
+  `unpublished` marker are removed, the per-release refresh step in
+  `docs/RELEASING.md` is gone, and the CI job is now **blocking** rather than
+  advisory. Third-party audit coverage is unchanged (385 exemptions, was 386 —
+  the difference is the self-entry).
+
+### Testing
+
+- **Regression test for the graceful-shutdown grace window.** The 3.3.0 fix
+  that stopped in-flight MCP sessions being cancelled when the drain window
+  opens shipped without a timing test. Added one that performs a real MCP
+  `initialize` handshake, blocks inside `call_tool` until the test releases it,
+  triggers shutdown while the call is in flight, and asserts the tool response
+  still arrives.
+
+  It is event-gated rather than duration-gated, so it does not depend on
+  elapsed-time thresholds. It exercises `/mcp` specifically: routes registered
+  through `with_extra_router` never reach `StreamableHttpService`, the sole
+  consumer of the shutdown session token, so a test built that way would pass
+  against the bug. Verified by reverting the wiring to `ct.child_token()`, at
+  which point the assertion fails with an empty SSE frame.
+
 ## [3.3.0] - 2026-08-21
 
 ### Added
