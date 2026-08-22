@@ -246,9 +246,13 @@ jobs:
   # ---------------------------------------------------------------------------
 
   vet:
-    name: cargo-vet (advisory)
+    name: cargo-vet
     runs-on: ubuntu-latest
-    continue-on-error: true
+    # Blocking, not advisory. While this was `continue-on-error: true` it sat
+    # red from the 3.2.0 release through the 3.3.0 cycle without anyone
+    # noticing, because the crate's own version bump orphaned a self-exemption
+    # on every release. That policy is gone (see docs/RELEASING.md), so the job
+    # is now stable enough to gate merges.
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -262,7 +266,7 @@ jobs:
         # vet passes deterministically for the pinned dependency set.
         # Dependency bumps will fail this job until exemptions are
         # regenerated (`cargo vet regenerate exemptions`) or the new
-        # version is audited. Promote to required after a green run.
+        # version is audited.
         run: cargo vet --locked
 
   taplo:

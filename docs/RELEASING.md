@@ -37,21 +37,47 @@ export NEW_VERSION=1.0.1
 # 3. Bump version in Cargo.toml
 sed -i 's/^version = ".*"$/version = "'$NEW_VERSION'"/' Cargo.toml
 
-# 4. Refresh the cargo-vet imports lock. The new version is unpublished
-#    until the release workflow runs, so vet must record it as
-#    `audited_as` the previous release — otherwise the CI vet job
-#    (which runs with --locked) fails on the version bump.
-cargo vet
-
-# 5. Commit and push
-git add Cargo.toml CHANGELOG.md supply-chain/imports.lock
+# 4. Commit and push
+git add Cargo.toml CHANGELOG.md
 git commit -m "chore: release $NEW_VERSION"
 git push origin main
 
-# 6. Tag
+# 5. Tag
 git tag -a "$NEW_VERSION" -m "rmcp-server-kit $NEW_VERSION"
 git push origin "$NEW_VERSION"
 ```
+
+> **Tag the canonical remote only.** `.gitlab-ci.yml` fires its own
+> `cargo publish` on any `MAJOR.MINOR.PATCH` tag, so pushing the tag to the
+> GitLab mirror as well would attempt a duplicate upload.
+
+### A note on `cargo vet` and the version bump
+
+Releases used to require an extra step here: run `cargo vet` so
+`supply-chain/imports.lock` recorded the new version as
+`audited_as` the previous one. That existed because
+`supply-chain/config.toml` set `audit-as-crates-io = true` for this crate,
+which asked cargo-vet to audit **our own package** as though it were a
+third-party crates.io dependency. The requirement was then satisfied with a
+self-exemption — an explicit trust-without-audit marker — so it asserted no
+security property at all.
+
+Worse, exemptions pin an exact version, so every release orphaned it and the
+`cargo vet` CI job went red until somebody regenerated the entry. Because the
+job was `continue-on-error: true`, that failure was invisible; it stayed red
+from the 3.2.0 release until it was noticed during the 3.3.0 cycle.
+
+The policy is now `audit-as-crates-io = false`, which is the correct setting
+for a first-party crate you author and publish — the `true` variant exists for
+a local path/git crate that shadows a crates.io crate of the same name and
+should inherit its audit requirements. The self-exemption and the
+`unpublished` marker are gone, the per-release chore is gone, and the CI job
+is blocking rather than advisory.
+
+`supply-chain/config.toml` is rewritten by cargo-vet and does not preserve
+comments, which is why this rationale lives here. Do not set the policy back
+to `true` without reading this section.
+
 
 The `release.yml` workflow then:
 

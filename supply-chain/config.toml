@@ -5,7 +5,7 @@
 version = "0.10"
 
 [policy.rmcp-server-kit]
-audit-as-crates-io = true
+audit-as-crates-io = false
 
 [[exemptions.adler2]]
 version = "2.0.1"
@@ -945,10 +945,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.rmcp-macros]]
 version = "3.1.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.rmcp-server-kit]]
-version = "3.2.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.rsa]]
