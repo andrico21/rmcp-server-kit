@@ -46,6 +46,22 @@ migration note and a config opt-out — see the 3.1.0 notes below.
   against the bug. Verified by reverting the wiring to `ct.child_token()`, at
   which point the assertion fails with an empty SSE frame.
 
+- **Regression test for the force-exit shutdown arm.** The session token is
+  cancelled in both arms of the shutdown `select!` — after axum drains, and
+  when the force-exit timer wins — but only the first was covered.
+
+  The assertion is on the client-side response body, not on the server task
+  completing: when force-exit wins, the `axum::serve` future is dropped and
+  `serve_with_listener` returns whether or not the token was cancelled, so a
+  join-handle assertion could never fail. What the cancellation changes is that
+  rmcp ends the SSE stream, so the body reaches EOF instead of hanging.
+  Awaiting only `send()` would be equally useless, since the response headers
+  are established before the tool result exists.
+
+  Verified by removing the force-exit `session_ct.cancel()` while leaving the
+  graceful-drain one intact: the body then never terminates and the test fails
+  on its timeout.
+
 ## [3.3.0] - 2026-08-21
 
 ### Added

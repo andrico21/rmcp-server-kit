@@ -2408,3 +2408,100 @@ async fn mcp_initialize(client: &reqwest::Client, base: &str) -> String {
 
     session_id
 }
+
+/// A tool call still running when `shutdown_timeout` expires must have its
+/// response stream terminated by the force-exit path.
+///
+/// `session_ct` is cancelled in BOTH arms of the shutdown `select!`: after
+/// axum drains, and when the force-exit timer wins. This covers the second
+/// arm, which the grace-window test above never reaches.
+///
+/// The assertion is deliberately on the **client-side response body**, not on
+/// the server task completing. When force-exit wins the `select!` the
+/// `axum::serve` future is simply dropped, so `serve_with_listener` returns
+/// whether or not the session token was cancelled -- asserting on the join
+/// handle would produce a test that cannot fail. What the cancellation
+/// actually changes is that rmcp ends the SSE stream, so the body reaches EOF
+/// instead of hanging until some unrelated timeout.
+///
+/// Awaiting only `send()` would also be useless: the SSE response headers are
+/// established before the tool result exists, so `send()` resolves either way.
+/// The body read is the observation point.
+#[tokio::test]
+async fn in_flight_mcp_call_terminated_when_grace_window_expires() {
+    let (started_tx, started_rx) = oneshot::channel::<()>();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let handler = BlockingToolHandler {
+        started: Arc::new(std::sync::Mutex::new(Some(started_tx))),
+        release: Arc::clone(&release),
+    };
+
+    // Short grace window; the handler is never released, so the call cannot
+    // finish inside it and force-exit must be what ends the stream.
+    let cfg = McpServerConfig::new("127.0.0.1:0", "test-rmcp-server-kit", "0.0.1")
+        .with_shutdown_timeout(Duration::from_millis(300));
+
+    let mut harness = spawn_server_with(cfg, move || handler.clone()).await;
+    let base = harness.base.clone();
+    let client = reqwest::Client::new();
+    let session_id = mcp_initialize(&client, &base).await;
+
+    let call = tokio::spawn({
+        let client = client.clone();
+        let base = base.clone();
+        let session_id = session_id.clone();
+        async move {
+            client
+                .post(format!("{base}/mcp"))
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-session-id", session_id)
+                .body(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": { "name": "slow", "arguments": {} }
+                    })
+                    .to_string(),
+                )
+                .send()
+                .await
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(10), started_rx)
+        .await
+        .expect("tool handler did not start within 10s")
+        .expect("started signal dropped");
+
+    let server_task = harness.join.take().expect("server join handle");
+    harness.shutdown.cancel();
+
+    let resp = tokio::time::timeout(Duration::from_secs(10), call)
+        .await
+        .expect("response headers did not arrive within 10s")
+        .expect("tool call task panicked")
+        .expect("tool call transport error");
+
+    // The regression manifests here as a hang, caught by the timeout, rather
+    // than as an elapsed-time comparison.
+    let body = tokio::time::timeout(Duration::from_secs(10), resp.text())
+        .await
+        .expect("response body never terminated -- force-exit did not cancel the session token")
+        .expect("read response body");
+
+    assert!(
+        !body.contains("released"),
+        "the tool never completed, so its payload must not appear: {body}"
+    );
+
+    // Let the blocked handler unwind rather than leaving it parked.
+    release.notify_waiters();
+
+    tokio::time::timeout(Duration::from_secs(10), server_task)
+        .await
+        .expect("server did not shut down within 10s")
+        .expect("server task panicked")
+        .expect("server shutdown returned an error");
+}
