@@ -54,6 +54,163 @@ const MCP_SERVER_CONFIG_RUNTIME_ONLY_FIELDS: &[&str] = &[
     "metrics_bind",
 ];
 
+/// One environment override applied to a configuration struct.
+///
+/// Secret-typed targets redact their value by setting [`Self::value`] to
+/// `None`; non-secret targets carry the parsed string value that was applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct EnvOverride {
+    /// Environment variable name that supplied the override.
+    pub env_var: String,
+    /// Dotted TOML path that was overridden, such as `server.listen_port`.
+    pub target_field: String,
+    /// Source of the override value.
+    pub source: EnvOverrideSource,
+    /// Applied non-secret value, or `None` for secret-typed targets.
+    pub value: Option<String>,
+}
+
+/// Source kind for an applied environment override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EnvOverrideSource {
+    /// Read directly from an environment variable.
+    Env,
+    /// Read from the file named by a `_FILE`-suffixed environment variable.
+    File,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+#[cfg(test)]
+pub(crate) struct EnvOverrideSpec {
+    pub(crate) env_var: &'static str,
+    pub(crate) target_field: &'static str,
+    pub(crate) value_type: &'static str,
+    pub(crate) required_feature: Option<&'static str>,
+    pub(crate) redacted: bool,
+}
+
+#[cfg(test)]
+pub(crate) const ENV_OVERRIDE_SPECS: &[EnvOverrideSpec] = &[
+    EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__SERVER__LISTEN_ADDR",
+        target_field: "server.listen_addr",
+        value_type: "String",
+        required_feature: None,
+        redacted: false,
+    },
+    EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__SERVER__LISTEN_PORT",
+        target_field: "server.listen_port",
+        value_type: "u16",
+        required_feature: None,
+        redacted: false,
+    },
+    EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__SERVER__PUBLIC_URL",
+        target_field: "server.public_url",
+        value_type: "String",
+        required_feature: None,
+        redacted: false,
+    },
+    EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__SERVER__TLS_CERT_PATH",
+        target_field: "server.tls_cert_path",
+        value_type: "Path",
+        required_feature: None,
+        redacted: false,
+    },
+    EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__SERVER__TLS_KEY_PATH",
+        target_field: "server.tls_key_path",
+        value_type: "Path",
+        required_feature: None,
+        redacted: false,
+    },
+    EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__SERVER__ADMIN_ENABLED",
+        target_field: "server.admin_enabled",
+        value_type: "bool",
+        required_feature: None,
+        redacted: false,
+    },
+    EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ISSUER",
+        target_field: "server.auth.oauth.issuer",
+        value_type: "String",
+        required_feature: Some("oauth"),
+        redacted: false,
+    },
+    EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__AUDIENCE",
+        target_field: "server.auth.oauth.audience",
+        value_type: "String",
+        required_feature: Some("oauth"),
+        redacted: false,
+    },
+    EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__JWKS_URI",
+        target_field: "server.auth.oauth.jwks_uri",
+        value_type: "String",
+        required_feature: Some("oauth"),
+        redacted: false,
+    },
+    EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__OBSERVABILITY__LOG_FORMAT",
+        target_field: "observability.log_format",
+        value_type: "String",
+        required_feature: None,
+        redacted: false,
+    },
+    EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__OBSERVABILITY__METRICS_ENABLED",
+        target_field: "observability.metrics_enabled",
+        value_type: "bool",
+        required_feature: None,
+        redacted: false,
+    },
+    EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__OBSERVABILITY__METRICS_BIND",
+        target_field: "observability.metrics_bind",
+        value_type: "String",
+        required_feature: None,
+        redacted: false,
+    },
+    EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__RBAC__REDACTION_SALT",
+        target_field: "rbac.redaction_salt",
+        value_type: "SecretString",
+        required_feature: None,
+        redacted: true,
+    },
+    EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__RBAC__REDACTION_SALT_FILE",
+        target_field: "rbac.redaction_salt",
+        value_type: "Path",
+        required_feature: None,
+        redacted: true,
+    },
+];
+
+pub(crate) const SERVER_LISTEN_ADDR_ENV: &str = "RMCP_SERVER_KIT__SERVER__LISTEN_ADDR";
+pub(crate) const SERVER_LISTEN_PORT_ENV: &str = "RMCP_SERVER_KIT__SERVER__LISTEN_PORT";
+pub(crate) const SERVER_PUBLIC_URL_ENV: &str = "RMCP_SERVER_KIT__SERVER__PUBLIC_URL";
+pub(crate) const SERVER_TLS_CERT_PATH_ENV: &str = "RMCP_SERVER_KIT__SERVER__TLS_CERT_PATH";
+pub(crate) const SERVER_TLS_KEY_PATH_ENV: &str = "RMCP_SERVER_KIT__SERVER__TLS_KEY_PATH";
+pub(crate) const SERVER_ADMIN_ENABLED_ENV: &str = "RMCP_SERVER_KIT__SERVER__ADMIN_ENABLED";
+pub(crate) const SERVER_OAUTH_ISSUER_ENV: &str = "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ISSUER";
+pub(crate) const SERVER_OAUTH_AUDIENCE_ENV: &str = "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__AUDIENCE";
+pub(crate) const SERVER_OAUTH_JWKS_URI_ENV: &str = "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__JWKS_URI";
+pub(crate) const OBSERVABILITY_LOG_FORMAT_ENV: &str = "RMCP_SERVER_KIT__OBSERVABILITY__LOG_FORMAT";
+pub(crate) const OBSERVABILITY_METRICS_ENABLED_ENV: &str =
+    "RMCP_SERVER_KIT__OBSERVABILITY__METRICS_ENABLED";
+pub(crate) const OBSERVABILITY_METRICS_BIND_ENV: &str =
+    "RMCP_SERVER_KIT__OBSERVABILITY__METRICS_BIND";
+pub(crate) const RBAC_REDACTION_SALT_ENV: &str = "RMCP_SERVER_KIT__RBAC__REDACTION_SALT";
+pub(crate) const RBAC_REDACTION_SALT_FILE_ENV: &str = "RMCP_SERVER_KIT__RBAC__REDACTION_SALT_FILE";
+
 /// Server listener configuration (reusable across MCP projects).
 #[derive(Debug, Deserialize)]
 #[allow(
@@ -215,6 +372,127 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
+    /// Applies `RMCP_SERVER_KIT__SERVER__*` environment overrides onto this config.
+    ///
+    /// Includes the nested OAuth variables under
+    /// `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__*`. This method is opt-in:
+    /// constructors, validators, and server startup do not call it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpxError::Config`] when an override cannot be parsed, when an
+    /// OAuth override lacks a declared `[server.auth.oauth]` parent, or when an
+    /// OAuth override is used in a build without the `oauth` feature.
+    pub fn apply_env_overrides(&mut self) -> Result<Vec<EnvOverride>, McpxError> {
+        let mut applied = Vec::new();
+        apply_string_env(
+            SERVER_LISTEN_ADDR_ENV,
+            "server.listen_addr",
+            &mut self.listen_addr,
+            &mut applied,
+        )?;
+        if let Some(raw) = read_env(SERVER_LISTEN_PORT_ENV)? {
+            self.listen_port = parse_env_value(SERVER_LISTEN_PORT_ENV, &raw, "u16")?;
+            applied.push(env_report(
+                SERVER_LISTEN_PORT_ENV,
+                "server.listen_port",
+                raw,
+            ));
+        }
+        apply_optional_string_env(
+            SERVER_PUBLIC_URL_ENV,
+            "server.public_url",
+            &mut self.public_url,
+            &mut applied,
+        )?;
+        apply_optional_path_env(
+            SERVER_TLS_CERT_PATH_ENV,
+            "server.tls_cert_path",
+            &mut self.tls_cert_path,
+            &mut applied,
+        )?;
+        apply_optional_path_env(
+            SERVER_TLS_KEY_PATH_ENV,
+            "server.tls_key_path",
+            &mut self.tls_key_path,
+            &mut applied,
+        )?;
+        if let Some(raw) = read_env(SERVER_ADMIN_ENABLED_ENV)? {
+            self.admin_enabled = parse_env_bool(SERVER_ADMIN_ENABLED_ENV, &raw)?;
+            applied.push(env_report(
+                SERVER_ADMIN_ENABLED_ENV,
+                "server.admin_enabled",
+                raw,
+            ));
+        }
+        self.apply_oauth_env_overrides(&mut applied)?;
+        Ok(applied)
+    }
+
+    fn apply_oauth_env_overrides(
+        &mut self,
+        applied: &mut Vec<EnvOverride>,
+    ) -> Result<(), McpxError> {
+        let issuer = read_env(SERVER_OAUTH_ISSUER_ENV)?;
+        let audience = read_env(SERVER_OAUTH_AUDIENCE_ENV)?;
+        let jwks_uri = read_env(SERVER_OAUTH_JWKS_URI_ENV)?;
+        if issuer.is_none() && audience.is_none() && jwks_uri.is_none() {
+            return Ok(());
+        }
+
+        #[cfg(not(feature = "oauth"))]
+        {
+            let _ = applied;
+            let var = first_set_oauth_env(issuer.as_ref(), audience.as_ref(), jwks_uri.as_ref());
+            return Err(McpxError::Config(format!(
+                "{var} requires the `oauth` feature"
+            )));
+        }
+
+        #[cfg(feature = "oauth")]
+        {
+            let Some(auth) = self.auth.as_mut() else {
+                let var =
+                    first_set_oauth_env(issuer.as_ref(), audience.as_ref(), jwks_uri.as_ref());
+                return Err(McpxError::Config(format!(
+                    "{var} requires declaring [server.auth.oauth] before applying env overrides"
+                )));
+            };
+            let Some(oauth) = auth.oauth.as_mut() else {
+                let var =
+                    first_set_oauth_env(issuer.as_ref(), audience.as_ref(), jwks_uri.as_ref());
+                return Err(McpxError::Config(format!(
+                    "{var} requires declaring [server.auth.oauth] before applying env overrides"
+                )));
+            };
+            if let Some(raw) = issuer {
+                applied.push(env_report(
+                    SERVER_OAUTH_ISSUER_ENV,
+                    "server.auth.oauth.issuer",
+                    raw.clone(),
+                ));
+                oauth.issuer = raw;
+            }
+            if let Some(raw) = audience {
+                applied.push(env_report(
+                    SERVER_OAUTH_AUDIENCE_ENV,
+                    "server.auth.oauth.audience",
+                    raw.clone(),
+                ));
+                oauth.audience = raw;
+            }
+            if let Some(raw) = jwks_uri {
+                applied.push(env_report(
+                    SERVER_OAUTH_JWKS_URI_ENV,
+                    "server.auth.oauth.jwks_uri",
+                    raw.clone(),
+                ));
+                oauth.jwks_uri = raw;
+            }
+            Ok(())
+        }
+    }
+
     /// Apply this TOML server schema to a programmatic MCP server base.
     ///
     /// Replacement semantics are used for every bridgeable transport field:
@@ -279,6 +557,140 @@ impl ServerConfig {
             .with_security_headers(self.security_headers.clone());
 
         Ok(config)
+    }
+}
+
+impl ObservabilityConfig {
+    /// Applies `RMCP_SERVER_KIT__OBSERVABILITY__*` environment overrides.
+    ///
+    /// This method is opt-in and only mutates this struct; it does not update
+    /// tracing subscribers or server metrics configuration by itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpxError::Config`] when a boolean override cannot be parsed.
+    pub fn apply_env_overrides(&mut self) -> Result<Vec<EnvOverride>, McpxError> {
+        let mut applied = Vec::new();
+        apply_string_env(
+            OBSERVABILITY_LOG_FORMAT_ENV,
+            "observability.log_format",
+            &mut self.log_format,
+            &mut applied,
+        )?;
+        if let Some(raw) = read_env(OBSERVABILITY_METRICS_ENABLED_ENV)? {
+            self.metrics_enabled = parse_env_bool(OBSERVABILITY_METRICS_ENABLED_ENV, &raw)?;
+            applied.push(env_report(
+                OBSERVABILITY_METRICS_ENABLED_ENV,
+                "observability.metrics_enabled",
+                raw,
+            ));
+        }
+        apply_string_env(
+            OBSERVABILITY_METRICS_BIND_ENV,
+            "observability.metrics_bind",
+            &mut self.metrics_bind,
+            &mut applied,
+        )?;
+        Ok(applied)
+    }
+}
+
+pub(crate) fn read_env(var: &str) -> Result<Option<String>, McpxError> {
+    match std::env::var(var) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(McpxError::Config(format!("{var} must contain valid UTF-8")))
+        }
+    }
+}
+
+fn env_report(env_var: &str, target_field: &str, value: String) -> EnvOverride {
+    EnvOverride {
+        env_var: env_var.to_owned(),
+        target_field: target_field.to_owned(),
+        source: EnvOverrideSource::Env,
+        value: Some(value),
+    }
+}
+
+pub(crate) fn secret_env_report(
+    env_var: &str,
+    target_field: &str,
+    source: EnvOverrideSource,
+) -> EnvOverride {
+    EnvOverride {
+        env_var: env_var.to_owned(),
+        target_field: target_field.to_owned(),
+        source,
+        value: None,
+    }
+}
+
+fn parse_env_value<T>(env_var: &str, raw: &str, expected: &str) -> Result<T, McpxError>
+where
+    T: std::str::FromStr,
+{
+    raw.parse::<T>()
+        .map_err(|_| McpxError::Config(format!("invalid value for {env_var}: expected {expected}")))
+}
+
+pub(crate) fn parse_env_bool(env_var: &str, raw: &str) -> Result<bool, McpxError> {
+    parse_env_value(env_var, raw, "bool")
+}
+
+fn apply_string_env(
+    env_var: &str,
+    target_field: &str,
+    target: &mut String,
+    applied: &mut Vec<EnvOverride>,
+) -> Result<(), McpxError> {
+    if let Some(raw) = read_env(env_var)? {
+        applied.push(env_report(env_var, target_field, raw.clone()));
+        *target = raw;
+    }
+    Ok(())
+}
+
+fn apply_optional_string_env(
+    env_var: &str,
+    target_field: &str,
+    target: &mut Option<String>,
+    applied: &mut Vec<EnvOverride>,
+) -> Result<(), McpxError> {
+    if let Some(raw) = read_env(env_var)? {
+        *target = Some(raw.clone());
+        applied.push(env_report(env_var, target_field, raw));
+    }
+    Ok(())
+}
+
+fn apply_optional_path_env(
+    env_var: &str,
+    target_field: &str,
+    target: &mut Option<PathBuf>,
+    applied: &mut Vec<EnvOverride>,
+) -> Result<(), McpxError> {
+    if let Some(raw) = read_env(env_var)? {
+        *target = Some(PathBuf::from(&raw));
+        applied.push(env_report(env_var, target_field, raw));
+    }
+    Ok(())
+}
+
+fn first_set_oauth_env(
+    issuer: Option<&String>,
+    audience: Option<&String>,
+    jwks_uri: Option<&String>,
+) -> &'static str {
+    if issuer.is_some() {
+        SERVER_OAUTH_ISSUER_ENV
+    } else if audience.is_some() {
+        SERVER_OAUTH_AUDIENCE_ENV
+    } else if jwks_uri.is_some() {
+        SERVER_OAUTH_JWKS_URI_ENV
+    } else {
+        SERVER_OAUTH_ISSUER_ENV
     }
 }
 
@@ -1305,5 +1717,446 @@ mod tests {
         assert_eq!(cfg.log_format, "pretty");
         assert!(!cfg.log_request_headers);
         assert!(!cfg.metrics_enabled);
+    }
+
+    fn all_env_vars() -> Vec<&'static str> {
+        ENV_OVERRIDE_SPECS.iter().map(|spec| spec.env_var).collect()
+    }
+
+    fn with_env_vars<R>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> R) -> R {
+        let mut all = all_env_vars()
+            .into_iter()
+            .map(|var| (var, None::<&str>))
+            .collect::<Vec<_>>();
+        all.extend(vars.iter().copied());
+        temp_env::with_vars(all, f)
+    }
+
+    #[test]
+    fn e1_server_env_overrides_absent_keeps_defaults() {
+        with_env_vars(&[], || {
+            let mut cfg = ServerConfig::default();
+            let report = cfg.apply_env_overrides().unwrap();
+            assert!(report.is_empty());
+            assert_eq!(cfg.listen_addr, "127.0.0.1");
+            assert_eq!(cfg.listen_port, 8443);
+            assert!(cfg.tls_cert_path.is_none());
+            assert!(cfg.tls_key_path.is_none());
+            assert!(cfg.public_url.is_none());
+            assert!(!cfg.admin_enabled);
+            assert!(cfg.auth.is_none());
+        });
+    }
+
+    #[test]
+    fn e2_listen_port_env_override_applies_and_reports() {
+        with_env_vars(&[(SERVER_LISTEN_PORT_ENV, Some("9000"))], || {
+            let mut cfg = ServerConfig::default();
+            let report = cfg.apply_env_overrides().unwrap();
+            assert_eq!(cfg.listen_port, 9000);
+            assert_eq!(report.len(), 1);
+            assert_eq!(report[0].env_var, SERVER_LISTEN_PORT_ENV);
+            assert_eq!(report[0].target_field, "server.listen_port");
+            assert_eq!(report[0].source, EnvOverrideSource::Env);
+            assert_eq!(report[0].value.as_deref(), Some("9000"));
+        });
+    }
+
+    #[test]
+    fn e3_bad_listen_port_env_fails_closed() {
+        with_env_vars(&[(SERVER_LISTEN_PORT_ENV, Some("not-a-number"))], || {
+            let mut cfg = ServerConfig::default();
+            let err = cfg.apply_env_overrides().unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains(SERVER_LISTEN_PORT_ENV));
+            assert!(msg.contains("u16"));
+        });
+    }
+
+    #[test]
+    fn e4_oauth_env_without_auth_parent_fails_closed() {
+        with_env_vars(&[(SERVER_OAUTH_ISSUER_ENV, Some("https://idp/"))], || {
+            let mut cfg = ServerConfig::default();
+            let err = cfg.apply_env_overrides().unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains(SERVER_OAUTH_ISSUER_ENV));
+            #[cfg(feature = "oauth")]
+            assert!(msg.contains("[server.auth.oauth]"));
+            #[cfg(not(feature = "oauth"))]
+            assert!(msg.contains("oauth` feature"));
+        });
+    }
+
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn e5_oauth_env_populates_declared_parent_and_validates() {
+        with_env_vars(
+            &[
+                (SERVER_OAUTH_ISSUER_ENV, Some("https://idp.example/")),
+                (SERVER_OAUTH_AUDIENCE_ENV, Some("mcp")),
+                (
+                    SERVER_OAUTH_JWKS_URI_ENV,
+                    Some("https://idp.example/.well-known/jwks.json"),
+                ),
+            ],
+            || {
+                let mut auth = crate::auth::AuthConfig::with_keys(vec![]);
+                auth.oauth = Some(crate::oauth::OAuthConfig {
+                    role_claim: Some("roles".into()),
+                    ..crate::oauth::OAuthConfig::default()
+                });
+                let mut cfg = ServerConfig {
+                    auth: Some(auth),
+                    ..ServerConfig::default()
+                };
+
+                let report = cfg.apply_env_overrides().unwrap();
+                let oauth = cfg
+                    .auth
+                    .as_ref()
+                    .and_then(|auth| auth.oauth.as_ref())
+                    .unwrap();
+                assert_eq!(oauth.issuer, "https://idp.example/");
+                assert_eq!(oauth.audience, "mcp");
+                assert_eq!(oauth.jwks_uri, "https://idp.example/.well-known/jwks.json");
+                assert!(oauth.validate().is_ok());
+                assert_eq!(report.len(), 3);
+            },
+        );
+    }
+
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn e5b_oauth_env_missing_audience_fails_validate() {
+        with_env_vars(
+            &[
+                (SERVER_OAUTH_ISSUER_ENV, Some("https://idp.example/")),
+                (
+                    SERVER_OAUTH_JWKS_URI_ENV,
+                    Some("https://idp.example/.well-known/jwks.json"),
+                ),
+            ],
+            || {
+                let mut auth = crate::auth::AuthConfig::with_keys(vec![]);
+                auth.oauth = Some(crate::oauth::OAuthConfig {
+                    role_claim: Some("roles".into()),
+                    ..crate::oauth::OAuthConfig::default()
+                });
+                let mut cfg = ServerConfig {
+                    auth: Some(auth),
+                    ..ServerConfig::default()
+                };
+
+                cfg.apply_env_overrides().unwrap();
+                let oauth = cfg
+                    .auth
+                    .as_ref()
+                    .and_then(|auth| auth.oauth.as_ref())
+                    .unwrap();
+                let err = oauth.validate().unwrap_err();
+                assert!(err.to_string().contains("oauth.audience must not be empty"));
+            },
+        );
+    }
+
+    #[test]
+    fn e9_bad_observability_bool_env_fails_closed() {
+        with_env_vars(
+            &[(OBSERVABILITY_METRICS_ENABLED_ENV, Some("maybe"))],
+            || {
+                let mut cfg = ObservabilityConfig::default();
+                let err = cfg.apply_env_overrides().unwrap_err();
+                let msg = err.to_string();
+                assert!(msg.contains(OBSERVABILITY_METRICS_ENABLED_ENV));
+                assert!(msg.contains("bool"));
+            },
+        );
+    }
+
+    #[test]
+    fn e10_env_port_reaches_mcp_bridge() {
+        with_env_vars(&[(SERVER_LISTEN_PORT_ENV, Some("9100"))], || {
+            let mut server: ServerConfig = toml::from_str(r#"listen_addr = "127.0.0.2""#).unwrap();
+            server.apply_env_overrides().unwrap();
+            let mcp = server
+                .apply_to_mcp_config(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0"))
+                .unwrap();
+            assert_eq!(mcp.bind_addr, "127.0.0.2:9100");
+            assert!(mcp.validate().is_ok());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_env_value_fails_closed() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        let bad = OsString::from_vec(vec![0x66, 0x80, 0x6f]);
+        temp_env::with_var(SERVER_LISTEN_ADDR_ENV, Some(bad), || {
+            let mut cfg = ServerConfig::default();
+            let err = cfg.apply_env_overrides().unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains(SERVER_LISTEN_ADDR_ENV));
+            assert!(msg.contains("UTF-8"));
+        });
+    }
+
+    #[cfg(not(feature = "oauth"))]
+    #[test]
+    fn e11_oauth_env_feature_off_fails_closed() {
+        with_env_vars(&[(SERVER_OAUTH_ISSUER_ENV, Some("https://idp/"))], || {
+            let mut cfg = ServerConfig {
+                auth: Some(crate::auth::AuthConfig::with_keys(vec![])),
+                ..ServerConfig::default()
+            };
+            let err = cfg.apply_env_overrides().unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains(SERVER_OAUTH_ISSUER_ENV));
+            assert!(msg.contains("oauth` feature"));
+        });
+    }
+
+    #[test]
+    fn env_override_spec_contains_exact_fourteen_vars() {
+        let vars = ENV_OVERRIDE_SPECS
+            .iter()
+            .map(|spec| {
+                (
+                    spec.env_var,
+                    spec.target_field,
+                    spec.required_feature,
+                    spec.redacted,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(vars.len(), 14);
+        assert!(vars.contains(&(SERVER_LISTEN_ADDR_ENV, "server.listen_addr", None, false)));
+        assert!(vars.contains(&(SERVER_LISTEN_PORT_ENV, "server.listen_port", None, false)));
+        assert!(vars.contains(&(SERVER_PUBLIC_URL_ENV, "server.public_url", None, false)));
+        assert!(vars.contains(&(
+            SERVER_TLS_CERT_PATH_ENV,
+            "server.tls_cert_path",
+            None,
+            false
+        )));
+        assert!(vars.contains(&(SERVER_TLS_KEY_PATH_ENV, "server.tls_key_path", None, false)));
+        assert!(vars.contains(&(
+            SERVER_ADMIN_ENABLED_ENV,
+            "server.admin_enabled",
+            None,
+            false
+        )));
+        assert!(vars.contains(&(
+            SERVER_OAUTH_ISSUER_ENV,
+            "server.auth.oauth.issuer",
+            Some("oauth"),
+            false
+        )));
+        assert!(vars.contains(&(
+            SERVER_OAUTH_AUDIENCE_ENV,
+            "server.auth.oauth.audience",
+            Some("oauth"),
+            false
+        )));
+        assert!(vars.contains(&(
+            SERVER_OAUTH_JWKS_URI_ENV,
+            "server.auth.oauth.jwks_uri",
+            Some("oauth"),
+            false
+        )));
+        assert!(vars.contains(&(
+            OBSERVABILITY_LOG_FORMAT_ENV,
+            "observability.log_format",
+            None,
+            false
+        )));
+        assert!(vars.contains(&(
+            OBSERVABILITY_METRICS_ENABLED_ENV,
+            "observability.metrics_enabled",
+            None,
+            false
+        )));
+        assert!(vars.contains(&(
+            OBSERVABILITY_METRICS_BIND_ENV,
+            "observability.metrics_bind",
+            None,
+            false
+        )));
+        assert!(vars.contains(&(RBAC_REDACTION_SALT_ENV, "rbac.redaction_salt", None, true)));
+        assert!(vars.contains(&(
+            RBAC_REDACTION_SALT_FILE_ENV,
+            "rbac.redaction_salt",
+            None,
+            true
+        )));
+        assert_eq!(
+            ENV_OVERRIDE_SPECS
+                .iter()
+                .filter(|spec| spec.value_type == "Path")
+                .count(),
+            3
+        );
+    }
+
+    #[derive(Debug)]
+    struct GuideEnvRow {
+        env_var: String,
+        target_field: String,
+        value_type: String,
+        notes: String,
+    }
+
+    // Guards the public operator table against drifting from the code-side
+    // env spec, and guards the reverse direction by parsing `*_ENV` consts
+    // from source text. Source parsing is deliberate: it catches a newly added
+    // env variable constant even if no Rust code references the spec table yet.
+    #[test]
+    fn guide_env_override_table_matches_code_spec() {
+        let rows = parse_guide_env_override_table();
+        assert_eq!(
+            rows.len(),
+            ENV_OVERRIDE_SPECS.len(),
+            "GUIDE env override table row count {} must match ENV_OVERRIDE_SPECS row count {}",
+            rows.len(),
+            ENV_OVERRIDE_SPECS.len()
+        );
+
+        for (idx, (row, spec)) in rows.iter().zip(ENV_OVERRIDE_SPECS.iter()).enumerate() {
+            assert_eq!(
+                row.env_var, spec.env_var,
+                "row {idx} env var mismatch: GUIDE has {:?}, code has {:?}",
+                row.env_var, spec.env_var
+            );
+            assert_eq!(
+                row.target_field, spec.target_field,
+                "{} target mismatch: GUIDE has {:?}, code has {:?}",
+                spec.env_var, row.target_field, spec.target_field
+            );
+            assert_eq!(
+                row.value_type, spec.value_type,
+                "{} type mismatch: GUIDE has {:?}, code has {:?}",
+                spec.env_var, row.value_type, spec.value_type
+            );
+
+            let notes_lower = row.notes.to_ascii_lowercase();
+            if let Some(feature) = spec.required_feature {
+                assert!(
+                    notes_lower.contains(feature),
+                    "{} notes must mention required feature {:?}; notes were {:?}",
+                    spec.env_var,
+                    feature,
+                    row.notes
+                );
+            } else {
+                assert!(
+                    !notes_lower.contains("requires") && !notes_lower.contains("feature"),
+                    "{} notes must not mention a required feature; notes were {:?}",
+                    spec.env_var,
+                    row.notes
+                );
+            }
+
+            if spec.redacted {
+                assert!(
+                    notes_lower.contains("secret") && notes_lower.contains("redacted"),
+                    "{} notes must indicate secret/redacted handling; notes were {:?}",
+                    spec.env_var,
+                    row.notes
+                );
+            } else {
+                assert!(
+                    !notes_lower.contains("secret") && !notes_lower.contains("redacted"),
+                    "{} notes must not indicate secret/redacted handling; notes were {:?}",
+                    spec.env_var,
+                    row.notes
+                );
+            }
+        }
+
+        let spec_vars = ENV_OVERRIDE_SPECS
+            .iter()
+            .map(|spec| spec.env_var)
+            .collect::<HashSet<_>>();
+        for env_var in parse_rmcp_env_constants_from_config_source() {
+            assert!(
+                spec_vars.contains(env_var.as_str()),
+                "env const {env_var} is defined in src/config.rs but missing from ENV_OVERRIDE_SPECS"
+            );
+        }
+    }
+
+    fn parse_guide_env_override_table() -> Vec<GuideEnvRow> {
+        let guide = include_str!("../docs/GUIDE.md");
+        let (_, after_begin) = guide
+            .split_once("<!-- BEGIN ENV_OVERRIDE_TABLE -->")
+            .expect("docs/GUIDE.md is missing <!-- BEGIN ENV_OVERRIDE_TABLE --> marker");
+        let (table, _) = after_begin
+            .split_once("<!-- END ENV_OVERRIDE_TABLE -->")
+            .expect("docs/GUIDE.md is missing <!-- END ENV_OVERRIDE_TABLE --> marker");
+        let rows = table
+            .lines()
+            .filter_map(parse_guide_env_override_row)
+            .collect::<Vec<_>>();
+        assert!(
+            !rows.is_empty(),
+            "docs/GUIDE.md ENV_OVERRIDE_TABLE markers were found but no data rows parsed"
+        );
+        rows
+    }
+
+    fn parse_guide_env_override_row(line: &str) -> Option<GuideEnvRow> {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('|')
+            || trimmed.contains("|---")
+            || trimmed.contains("Environment variable")
+        {
+            return None;
+        }
+        let cells = trimmed
+            .trim_matches('|')
+            .split('|')
+            .map(str::trim)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cells.len(),
+            4,
+            "env override GUIDE table row must have four cells, got {} in line {:?}",
+            cells.len(),
+            line
+        );
+        Some(GuideEnvRow {
+            env_var: unwrap_markdown_code(cells[0], "Environment variable", line),
+            target_field: unwrap_markdown_code(cells[1], "Target TOML path", line),
+            value_type: cells[2].trim().to_owned(),
+            notes: cells[3].trim().to_owned(),
+        })
+    }
+
+    fn unwrap_markdown_code(cell: &str, column: &str, row: &str) -> String {
+        let inner = cell
+            .strip_prefix('`')
+            .and_then(|value| value.strip_suffix('`'))
+            .unwrap_or_else(|| panic!("{column} cell must be backtick-wrapped in row {row:?}"));
+        inner.trim().to_owned()
+    }
+
+    fn parse_rmcp_env_constants_from_config_source() -> Vec<String> {
+        include_str!("config.rs")
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                trimmed.starts_with("pub(crate) const ")
+                    && trimmed
+                        .strip_prefix("pub(crate) const ")
+                        .and_then(|rest| rest.split_once(':'))
+                        .is_some_and(|(name, _)| name.ends_with("_ENV"))
+                    && trimmed.contains("RMCP_SERVER_KIT__")
+            })
+            .filter_map(|line| {
+                line.split_once('"')
+                    .and_then(|(_, rest)| rest.split_once('"'))
+                    .map(|(value, _)| value.to_owned())
+            })
+            .collect()
     }
 }

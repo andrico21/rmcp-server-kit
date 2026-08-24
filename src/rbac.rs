@@ -8,7 +8,7 @@
 //! and enforces RBAC and per-IP tool rate limiting before the request
 //! reaches the handler.
 
-use std::{net::IpAddr, num::NonZeroU32, sync::Arc, time::Duration};
+use std::{net::IpAddr, num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
@@ -1130,9 +1130,222 @@ fn match_middle(mut text: &str, parts: &[&str]) -> bool {
     true
 }
 
+impl RbacConfig {
+    /// Applies `RMCP_SERVER_KIT__RBAC__*` environment overrides.
+    ///
+    /// Supports direct `redaction_salt` and `_FILE` secret indirection. Report
+    /// entries for the secret target always redact the value. File-based
+    /// secrets are treated as text: exactly one terminal line ending is removed
+    /// (`\r\n`, `\n`, or `\r`) while other whitespace is preserved.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpxError::Config`] when both direct and file-based salt
+    /// variables are set or when the `_FILE` target cannot be read.
+    pub fn apply_env_overrides(&mut self) -> Result<Vec<crate::config::EnvOverride>, McpxError> {
+        let direct = crate::config::read_env(crate::config::RBAC_REDACTION_SALT_ENV)?;
+        let file = crate::config::read_env(crate::config::RBAC_REDACTION_SALT_FILE_ENV)?;
+        match (direct, file) {
+            (None, None) => Ok(Vec::new()),
+            (Some(_), Some(_)) => Err(McpxError::Config(format!(
+                "{} and {} must not both be set",
+                crate::config::RBAC_REDACTION_SALT_ENV,
+                crate::config::RBAC_REDACTION_SALT_FILE_ENV
+            ))),
+            (Some(value), None) => {
+                reject_blank_redaction_salt(crate::config::RBAC_REDACTION_SALT_ENV, &value)?;
+                self.redaction_salt = Some(SecretString::from(value));
+                Ok(vec![crate::config::secret_env_report(
+                    crate::config::RBAC_REDACTION_SALT_ENV,
+                    "rbac.redaction_salt",
+                    crate::config::EnvOverrideSource::Env,
+                )])
+            }
+            (None, Some(path)) => {
+                let secret = std::fs::read_to_string(PathBuf::from(&path)).map_err(|error| {
+                    McpxError::Config(format!(
+                        "failed to read {} file {path:?}: {error}",
+                        crate::config::RBAC_REDACTION_SALT_FILE_ENV
+                    ))
+                })?;
+                let secret = normalize_text_secret_file(secret);
+                reject_blank_redaction_salt(crate::config::RBAC_REDACTION_SALT_FILE_ENV, &secret)?;
+                self.redaction_salt = Some(SecretString::from(secret));
+                Ok(vec![crate::config::secret_env_report(
+                    crate::config::RBAC_REDACTION_SALT_FILE_ENV,
+                    "rbac.redaction_salt",
+                    crate::config::EnvOverrideSource::File,
+                )])
+            }
+        }
+    }
+}
+
+fn normalize_text_secret_file(mut secret: String) -> String {
+    if secret.ends_with("\r\n") {
+        secret.truncate(secret.len() - 2);
+    } else if secret.ends_with('\n') || secret.ends_with('\r') {
+        secret.truncate(secret.len() - 1);
+    }
+    secret
+}
+
+fn reject_blank_redaction_salt(env_var: &str, value: &str) -> Result<(), McpxError> {
+    if value.trim().is_empty() {
+        return Err(McpxError::Config(format!(
+            "{env_var} must not be empty or whitespace-only"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn with_rbac_env<R>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> R) -> R {
+        temp_env::with_vars(
+            [
+                (crate::config::RBAC_REDACTION_SALT_ENV, None::<&str>),
+                (crate::config::RBAC_REDACTION_SALT_FILE_ENV, None::<&str>),
+            ]
+            .into_iter()
+            .chain(vars.iter().copied())
+            .collect::<Vec<_>>(),
+            f,
+        )
+    }
+
+    #[test]
+    fn e6_redaction_salt_env_applies_and_report_redacts_value() {
+        with_rbac_env(
+            &[(crate::config::RBAC_REDACTION_SALT_ENV, Some("s3cret"))],
+            || {
+                let mut cfg = RbacConfig::default();
+                let report = cfg.apply_env_overrides().unwrap();
+                assert!(cfg.redaction_salt.is_some());
+                assert_eq!(report.len(), 1);
+                assert_eq!(report[0].env_var, crate::config::RBAC_REDACTION_SALT_ENV);
+                assert_eq!(report[0].target_field, "rbac.redaction_salt");
+                assert_eq!(report[0].source, crate::config::EnvOverrideSource::Env);
+                assert!(report[0].value.is_none());
+                assert!(!format!("{report:?}").contains("s3cret"));
+            },
+        );
+    }
+
+    #[test]
+    fn e7_redaction_salt_value_and_file_conflict_fails() {
+        with_rbac_env(
+            &[
+                (crate::config::RBAC_REDACTION_SALT_ENV, Some("direct")),
+                (
+                    crate::config::RBAC_REDACTION_SALT_FILE_ENV,
+                    Some("/tmp/secret-file"),
+                ),
+            ],
+            || {
+                let mut cfg = RbacConfig::default();
+                let err = cfg.apply_env_overrides().unwrap_err();
+                let msg = err.to_string();
+                assert!(msg.contains(crate::config::RBAC_REDACTION_SALT_ENV));
+                assert!(msg.contains(crate::config::RBAC_REDACTION_SALT_FILE_ENV));
+            },
+        );
+    }
+
+    #[test]
+    fn e8_redaction_salt_file_env_reads_secret_and_reports_file_source() {
+        let (file_redaction, report) = redaction_from_file("same-salt\n").expect("file salt");
+        let direct_redaction = redaction_from_direct_salt("same-salt");
+
+        assert_eq!(file_redaction, direct_redaction);
+        assert_eq!(report.len(), 1);
+        assert_eq!(
+            report[0].env_var,
+            crate::config::RBAC_REDACTION_SALT_FILE_ENV
+        );
+        assert_eq!(report[0].target_field, "rbac.redaction_salt");
+        assert_eq!(report[0].source, crate::config::EnvOverrideSource::File);
+        assert!(report[0].value.is_none());
+    }
+
+    #[test]
+    fn redaction_salt_file_normalizes_crlf_and_preserves_spaces() {
+        let (crlf_redaction, _) = redaction_from_file("same-salt\r\n").expect("crlf salt");
+        assert_eq!(crlf_redaction, redaction_from_direct_salt("same-salt"));
+
+        let (spaced_redaction, _) = redaction_from_file("  same-salt  \n").expect("spaced salt");
+        assert_eq!(
+            spaced_redaction,
+            redaction_from_direct_salt("  same-salt  ")
+        );
+        assert_ne!(spaced_redaction, redaction_from_direct_salt("same-salt"));
+    }
+
+    #[test]
+    fn blank_redaction_salt_env_values_fail_closed() {
+        for value in ["", "\n", "   "] {
+            with_rbac_env(
+                &[(crate::config::RBAC_REDACTION_SALT_ENV, Some(value))],
+                || {
+                    let mut cfg = RbacConfig::default();
+                    let err = cfg.apply_env_overrides().unwrap_err();
+                    assert!(
+                        err.to_string()
+                            .contains(crate::config::RBAC_REDACTION_SALT_ENV)
+                    );
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn blank_redaction_salt_file_values_fail_closed() {
+        for value in ["", "\n", "\r\n", "   \n"] {
+            let err = redaction_from_file(value).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains(crate::config::RBAC_REDACTION_SALT_FILE_ENV)
+            );
+        }
+    }
+
+    fn redaction_from_direct_salt(salt: &str) -> String {
+        RbacPolicy::new(&RbacConfig {
+            redaction_salt: Some(SecretString::from(salt.to_owned())),
+            ..RbacConfig::default()
+        })
+        .redact_arg("same-argument")
+    }
+
+    fn redaction_from_file(
+        content: &str,
+    ) -> Result<(String, Vec<crate::config::EnvOverride>), McpxError> {
+        let path = std::env::temp_dir().join(format!(
+            "rmcp-server-kit-redaction-salt-{}.txt",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::write(&path, content).expect("write salt file");
+        let path_string = path.to_string_lossy().to_string();
+        let result = with_rbac_env(
+            &[(
+                crate::config::RBAC_REDACTION_SALT_FILE_ENV,
+                Some(path_string.as_str()),
+            )],
+            || {
+                let mut cfg = RbacConfig::default();
+                let report = cfg.apply_env_overrides()?;
+                let redaction = RbacPolicy::new(&cfg).redact_arg("same-argument");
+                Ok((redaction, report))
+            },
+        );
+        std::fs::remove_file(path).expect("remove salt file");
+        result
+    }
 
     // -- tool rate limiter: burst + Retry-After --
 

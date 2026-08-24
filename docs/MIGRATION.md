@@ -3,6 +3,37 @@
 This guide shows how to wire the standalone `rmcp-server-kit` crate into a
 downstream project, and how to migrate across breaking major releases.
 
+## Migrating from 3.4 to 3.5
+
+`3.5` is additive at the API level -- `cargo semver-checks` reports no breaking
+change, no default values were altered, and no code change is required to
+upgrade. Existing configurations parse and behave identically to 3.4.x unless
+you opt in to the new features.
+
+### No action required
+
+Upgrade by bumping the version constraint:
+
+```toml
+rmcp-server-kit = "3"
+```
+
+Run `cargo update -p rmcp-server-kit` and verify the full test suite passes.
+Nothing else is needed.
+
+### Opting in to environment variable overrides
+
+3.5 adds three opt-in methods that layer env overrides onto already-constructed
+config structs: `ServerConfig::apply_env_overrides`,
+`ObservabilityConfig::apply_env_overrides`, and `RbacConfig::apply_env_overrides`.
+None are called automatically by `serve()` or `validate()`.
+
+To opt in, call the methods after TOML deserialization and before
+`apply_to_mcp_config`. See
+[Environment variable overrides (opt-in)](GUIDE.md#environment-variable-overrides-opt-in)
+in the guide for the full call order, the 14-variable reference table, secret
+handling rules, and the metrics-wiring caveat.
+
 ## Migrating from 3.3 to 3.4
 
 `3.4` is additive at the API level — `cargo semver-checks` reports no breaking

@@ -11,6 +11,44 @@ migration note and a config opt-out — see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Added
+
+- **Three opt-in `apply_env_overrides` methods** for environment-driven configuration overlay.
+  `ServerConfig::apply_env_overrides`, `ObservabilityConfig::apply_env_overrides`, and
+  `RbacConfig::apply_env_overrides` each apply a named set of `RMCP_SERVER_KIT__*` env vars
+  onto the corresponding struct and return a `Vec<EnvOverride>` audit report. No existing
+  code path calls these methods automatically: `serve()`, `validate()`, and every config
+  constructor are unaffected. This release is purely additive.
+
+- **`EnvOverride` and `EnvOverrideSource`** -- public, `#[non_exhaustive]` types that
+  describe each applied override. `EnvOverride::value` is `None` for secret-typed targets
+  so secrets are never exposed in report output or `Debug` formatting.
+
+- **14 curated environment variables** across three config structs:
+  - `ServerConfig`: listen address and port, public URL, TLS certificate/key paths, admin
+    toggle, and OAuth issuer/audience/JWKS URI (the three OAuth variables require
+    `--features oauth`).
+  - `ObservabilityConfig`: log format, metrics-enabled flag, and metrics bind address.
+  - `RbacConfig`: redaction salt (direct string or `_FILE` path indirection).
+
+  All variables follow the `RMCP_SERVER_KIT__<SECTION>__<FIELD>` naming convention with `__`
+  as the nesting delimiter.
+
+- **`_FILE` secret indirection for `rbac.redaction_salt`.** Set
+  `RMCP_SERVER_KIT__RBAC__REDACTION_SALT_FILE` to a file path to read the salt from a
+  Kubernetes Secret volume mount. Setting both the direct variable and the `_FILE` variable
+  simultaneously is a hard startup error. Exactly one terminal line ending is stripped from
+  the file contents (`\r\n`, `\n`, or `\r`); all other whitespace is preserved, so the same
+  logical secret produces the same salt whether supplied inline or via a file.
+
+- **Fail-closed parsing.** An env var set to an unparseable value causes `apply_env_overrides`
+  to return `McpxError::Config` naming the exact variable and the expected type. There is no
+  warn-and-ignore path.
+
+No default values changed. `serve()`, `validate()`, and every constructor read no process
+environment automatically. Existing code that does not call `apply_env_overrides` is
+unaffected.
+
 ## [3.4.0] - 2026-08-24
 
 ### Added

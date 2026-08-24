@@ -2199,6 +2199,149 @@ selects the separate `serve_stdio()` entry point, which bypasses auth, RBAC,
 TLS, and origin checks entirely. Routing between `serve()` and `serve_stdio()`
 is the caller's responsibility; the bridge covers `serve()` only.
 
+### Environment variable overrides (opt-in)
+
+Environment reading is never automatic. `serve()`, `validate()`, and every config constructor read no process environment. Three opt-in methods layer env overrides onto already-constructed config structs:
+
+- `ServerConfig::apply_env_overrides` reads `RMCP_SERVER_KIT__SERVER__*`
+- `ObservabilityConfig::apply_env_overrides` reads `RMCP_SERVER_KIT__OBSERVABILITY__*`
+- `RbacConfig::apply_env_overrides` reads `RMCP_SERVER_KIT__RBAC__*` (implemented in `src/rbac.rs`)
+
+**Why three methods instead of one?** The crate has no root config struct. Each downstream composes these three structs differently into its own root type, so a single kit-level method would collide with the downstream's own root. Each method mutates only its own struct; the caller concatenates the returned audit reports.
+
+**Precedence chain:**
+
+> struct defaults < TOML deserialization < `apply_env_overrides` < application builder methods after `apply_to_mcp_config` < `validate()`
+
+#### Worked example
+
+```rust,ignore
+use rmcp_server_kit::config::{ObservabilityConfig, RbacConfig, ServerConfig, validate_server_config};
+use rmcp_server_kit::rbac::RbacPolicy;
+use rmcp_server_kit::transport::{McpServerConfig, serve};
+use std::sync::Arc;
+
+// 1. Parse TOML.
+let raw = std::fs::read_to_string("config.toml")?;
+let root: YourRootConfig = toml::from_str(&raw)?;
+let mut server_cfg: ServerConfig = root.server;
+let mut obs_cfg: ObservabilityConfig = root.observability;
+let mut rbac_cfg: RbacConfig = root.rbac;
+
+// 2. Apply env overrides. Concatenate the audit reports.
+let mut report = server_cfg.apply_env_overrides()?;
+report.extend(obs_cfg.apply_env_overrides()?);
+report.extend(rbac_cfg.apply_env_overrides()?);
+
+// 3. Init tracing first, then log the report so env-shadowing-TOML leaves a trail.
+rmcp_server_kit::observability::init_tracing_from_config(&obs_cfg);
+for entry in &report {
+    tracing::info!(
+        env_var = %entry.env_var,
+        target = %entry.target_field,
+        source = ?entry.source,
+        value = ?entry.value,  // None for secret targets
+        "env override applied"
+    );
+}
+
+// 4. Validate and bridge TOML into McpServerConfig.
+validate_server_config(&server_cfg)?;
+let mcp_cfg = server_cfg.apply_to_mcp_config(
+    McpServerConfig::new("placeholder:0", "my-server", env!("CARGO_PKG_VERSION")),
+)?;
+
+// 5. Wire application-level state the bridge cannot hold.
+let rbac_policy = Arc::new(RbacPolicy::new(&rbac_cfg));
+let mcp_cfg = mcp_cfg.with_rbac(rbac_policy);
+
+// 6. Wire metrics explicitly -- see "Metrics caveat" below.
+let mcp_cfg = if obs_cfg.metrics_enabled {
+    mcp_cfg.with_metrics(obs_cfg.metrics_bind.parse()?)
+} else {
+    mcp_cfg
+};
+
+// 7. Validate and serve.
+serve(mcp_cfg.validate()?, || MyHandler).await
+```
+
+#### Variable reference
+
+<!-- BEGIN ENV_OVERRIDE_TABLE -->
+| Environment variable | Target TOML path | Type | Notes |
+|---|---|---|---|
+| `RMCP_SERVER_KIT__SERVER__LISTEN_ADDR` | `server.listen_addr` | String | |
+| `RMCP_SERVER_KIT__SERVER__LISTEN_PORT` | `server.listen_port` | u16 | |
+| `RMCP_SERVER_KIT__SERVER__PUBLIC_URL` | `server.public_url` | String | |
+| `RMCP_SERVER_KIT__SERVER__TLS_CERT_PATH` | `server.tls_cert_path` | Path | |
+| `RMCP_SERVER_KIT__SERVER__TLS_KEY_PATH` | `server.tls_key_path` | Path | |
+| `RMCP_SERVER_KIT__SERVER__ADMIN_ENABLED` | `server.admin_enabled` | bool | |
+| `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ISSUER` | `server.auth.oauth.issuer` | String | requires `oauth` feature |
+| `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__AUDIENCE` | `server.auth.oauth.audience` | String | requires `oauth` feature |
+| `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__JWKS_URI` | `server.auth.oauth.jwks_uri` | String | requires `oauth` feature |
+| `RMCP_SERVER_KIT__OBSERVABILITY__LOG_FORMAT` | `observability.log_format` | String | |
+| `RMCP_SERVER_KIT__OBSERVABILITY__METRICS_ENABLED` | `observability.metrics_enabled` | bool | |
+| `RMCP_SERVER_KIT__OBSERVABILITY__METRICS_BIND` | `observability.metrics_bind` | String | |
+| `RMCP_SERVER_KIT__RBAC__REDACTION_SALT` | `rbac.redaction_salt` | SecretString | secret; redacted in report |
+| `RMCP_SERVER_KIT__RBAC__REDACTION_SALT_FILE` | `rbac.redaction_salt` | Path | secret; redacted in report |
+<!-- END ENV_OVERRIDE_TABLE -->
+
+#### Naming convention
+
+All variables share the `RMCP_SERVER_KIT` prefix. The nesting delimiter is `__` (double underscore). Single underscores appear within field names themselves (`listen_addr`, `jwks_uri`, `redaction_salt`), so a single-underscore delimiter would be ambiguous: `RMCP_SERVER_KIT_SERVER_LISTEN_ADDR` reads equally as `SERVER` + `LISTEN_ADDR` or `SERVER_LISTEN` + `ADDR`. The `__` convention is unambiguous and mirrors the dotted TOML path directly.
+
+#### Failure semantics
+
+Every parse failure fails closed. If a variable is present but unparseable (e.g. `RMCP_SERVER_KIT__SERVER__LISTEN_PORT=not-a-number`), `apply_env_overrides` immediately returns `Err(McpxError::Config)` naming the exact variable and the expected type. No partial mutation occurs. There is no warn-and-ignore path.
+
+#### Secret handling
+
+`RMCP_SERVER_KIT__RBAC__REDACTION_SALT` accepts the salt value directly as a string. For Kubernetes Secret volume mounts, set `RMCP_SERVER_KIT__RBAC__REDACTION_SALT_FILE` to the path of the mounted file; `RbacConfig::apply_env_overrides` reads the file and uses its contents as the salt.
+
+Setting both the direct variable and the `_FILE` variable simultaneously is a hard startup error: `apply_env_overrides` returns `McpxError::Config` naming both variables.
+
+An empty or whitespace-only salt (either form) is rejected with `McpxError::Config`.
+
+**File normalization.** Exactly one terminal line ending is stripped from the file contents: `\r\n` (CRLF), a lone `\n` (LF), or a lone `\r` (CR). All other content is preserved exactly, including leading and trailing spaces and any internal newlines. The same logical secret therefore produces the same redaction salt whether supplied inline (no trailing newline) or written to a file with a standard trailing newline (`echo "my-salt" > salt.txt` produces `my-salt\n`, which normalizes to `my-salt`). Spaces surrounding the value are significant: `"  my-salt  "` and `"my-salt"` hash differently.
+
+#### Audit report
+
+Each method returns `Vec<EnvOverride>`. Each entry carries:
+
+- `env_var` -- the name of the variable applied
+- `target_field` -- the dotted TOML path overridden (e.g. `server.listen_port`)
+- `source` -- `EnvOverrideSource::Env` (value read directly from the variable) or `EnvOverrideSource::File` (value read from the file named by a `_FILE` variable)
+- `value` -- the applied string for non-secret targets; `None` for secret-typed targets
+
+Secret-typed targets (`rbac.redaction_salt`) always carry `value: None`. The secret never appears in `EnvOverride::value` or in its `Debug` output. Log the report after initializing tracing so any env variable that shadowed a TOML value leaves a structured trail at startup, as shown in the worked example.
+
+#### `oauth` feature interaction
+
+The three `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__*` variables require the `oauth` Cargo feature. Setting any one of them in a binary built without `--features oauth` is a startup error, never a silent no-op: `ServerConfig::apply_env_overrides` returns `McpxError::Config` naming the variable and stating it requires the `oauth` feature.
+
+When the `oauth` feature is enabled, `[server.auth.oauth]` must already be declared in TOML. The method cannot create the table; it only populates fields within an existing one. If the table is absent, the call fails with `McpxError::Config` instructing the operator to declare `[server.auth.oauth]` first.
+
+The intended Kubernetes pattern: declare a minimal `[server.auth.oauth]` stub in a ConfigMap (with `role_claim` and other static RBAC-mapping config), and supply the environment-specific `issuer`, `audience`, and `jwks_uri` via Secrets or Deployment env vars.
+
+#### `RUST_LOG` and log level
+
+`RUST_LOG` remains the log-level control, read directly by `init_tracing` and `init_tracing_from_config` via `tracing-subscriber`'s env filter. There is deliberately no `RMCP_SERVER_KIT__` prefixed alias: `RUST_LOG` is the established convention across the Rust ecosystem, and a parallel alias would create two sources of truth for the same setting.
+
+#### Metrics caveat
+
+`ObservabilityConfig::apply_env_overrides` mutates `obs_cfg.metrics_enabled` and `obs_cfg.metrics_bind` on the `ObservabilityConfig` struct. These fields do not reach `serve()` automatically: `init_tracing_from_config` reads only the logging and audit-log fields; metrics configuration lives on `McpServerConfig` and must be wired there explicitly. The conditional `with_metrics` call in the worked example above is the reference pattern.
+
+#### What is not env-configurable
+
+These fields are intentionally absent from the env path:
+
+- **`auth.enabled`** -- disabling authentication via a single env var is too consequential and too easy to set accidentally.
+- **`security_headers`** -- semicolon-heavy CSP values are brittle in env and trivially weakened by accident; review them in a config-file diff.
+- **`max_request_body`** and **`expose_build_metadata`** -- best reviewed alongside related infrastructure settings in a config file.
+- **API key lists and RBAC roles** -- security policy belongs in a structured, version-controlled config file.
+- **OAuth proxy and token-exchange internals, SSRF allowlists, rate-limit tuning, `trusted_proxies`** -- consequential enough to warrant the full config-file review path.
+
 ---
 
 ## Testing Your Server

@@ -323,6 +323,7 @@ The most-violated rules — all `deny`-level in `Cargo.toml`:
 | Origin / security headers / CORS               | `src/transport.rs` — `origin_check_middleware`, `security_headers_middleware` |
 | Graceful shutdown (Ctrl-C / SIGTERM)           | `src/transport.rs` — `shutdown_signal()` (~line 2996) |
 | Hot-reload of keys / RBAC                      | `src/transport.rs` — `ReloadHandle` (~line 1305)       |
+| Environment variable override mapping          | `src/config.rs` — `ServerConfig::apply_env_overrides`, `ObservabilityConfig::apply_env_overrides`; `src/rbac.rs` — `RbacConfig::apply_env_overrides` |
 
 ---
 
