@@ -44,6 +44,18 @@ migration note and a config opt-out — see the 3.1.0 notes below.
   An example is covered by `cargo build --examples` and
   `cargo clippy --all-targets`, so it cannot rot silently.
 
+- **Every config-pipeline code sample is now compiled.** The four public config
+  entry points - `ServerConfig::{apply_env_overrides, apply_to_mcp_config}`,
+  `ObservabilityConfig::apply_env_overrides` and
+  `RbacConfig::apply_env_overrides` - gained rustdoc examples, so they are
+  covered by `cargo test --doc` (doctest count 7 -> 11) and render on docs.rs.
+  The two long `rust,ignore` pipeline snippets in the guide, which nothing
+  compiled and which had already drifted to referencing a nonexistent
+  `YourRootConfig` type, are replaced by a call-order outline plus pointers to
+  the compiled rustdoc and to `examples/config_file_server.rs`. Also repaired
+  two rustdoc-style intra-doc links in the guide that plain Markdown cannot
+  resolve, so they rendered as literal bracketed text rather than links.
+
 ## [3.5.0] - 2026-08-24
 
 ### Added

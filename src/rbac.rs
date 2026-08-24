@@ -1142,6 +1142,27 @@ impl RbacConfig {
     ///
     /// Returns [`McpxError::Config`] when both direct and file-based salt
     /// variables are set or when the `_FILE` target cannot be read.
+    ///
+    /// # Examples
+    ///
+    /// The full config-file pipeline lives in
+    /// [`examples/config_file_server.rs`](https://github.com/andrico21/rmcp-server-kit/blob/main/examples/config_file_server.rs).
+    ///
+    /// ```no_run
+    /// use rmcp_server_kit::rbac::RbacConfig;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut rbac = RbacConfig::default();
+    /// // Do not set process env in doctests: rustdoc examples share a process.
+    /// let report = rbac.apply_env_overrides()?;
+    /// let _secret_targets: Vec<&str> = report
+    ///     .iter()
+    ///     .filter(|entry| entry.value.is_none())
+    ///     .map(|entry| entry.target_field.as_str())
+    ///     .collect();
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn apply_env_overrides(&mut self) -> Result<Vec<crate::config::EnvOverride>, McpxError> {
         let direct = crate::config::read_env(crate::config::RBAC_REDACTION_SALT_ENV)?;
         let file = crate::config::read_env(crate::config::RBAC_REDACTION_SALT_FILE_ENV)?;

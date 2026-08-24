@@ -1449,7 +1449,7 @@ deliberately strict.
 
 For deployments that need to relax or tighten any of them, supply a
 `SecurityHeadersConfig` to
-[`McpServerConfig::with_security_headers`]. Each field follows a
+[`McpServerConfig::with_security_headers`](https://docs.rs/rmcp-server-kit/latest/rmcp_server_kit/transport/struct.McpServerConfig.html#method.with_security_headers). Each field follows a
 three-state semantic:
 
 | Value           | Behaviour                                                 |
@@ -2204,29 +2204,12 @@ had to hand-wire every field manually.
 
 `ServerConfig::apply_to_mcp_config` closes that gap. Call it with a bare
 `McpServerConfig::new(...)` and it returns a new `McpServerConfig` with every
-TOML-controlled transport field applied:
-
-```rust,ignore
-use rmcp_server_kit::config::{ServerConfig, validate_server_config};
-use rmcp_server_kit::transport::{McpServerConfig, serve};
-
-// Load and validate config.toml.
-let raw = std::fs::read_to_string("config.toml")?;
-let server_cfg: ServerConfig = toml::from_str::<YourRootConfig>(&raw)?.server;
-validate_server_config(&server_cfg)?;
-
-// Bridge TOML config into McpServerConfig.
-// Name and version come from the binary, not TOML.
-let mcp_cfg = server_cfg.apply_to_mcp_config(
-    McpServerConfig::new("placeholder:0", "my-server", env!("CARGO_PKG_VERSION")),
-)?;
-
-// Chain any builder calls that must take precedence over TOML.
-// For example, supply the RBAC policy, which TOML cannot hold:
-let mcp_cfg = mcp_cfg.with_rbac(Arc::clone(&rbac_policy));
-
-serve(mcp_cfg.validate()?, || MyHandler).await
-```
+TOML-controlled transport field applied. See the compiled rustdoc example on
+[`ServerConfig::apply_to_mcp_config`](https://docs.rs/rmcp-server-kit/latest/rmcp_server_kit/config/struct.ServerConfig.html#method.apply_to_mcp_config) for the API-local call shape, and
+[`examples/config_file_server.rs`](../examples/config_file_server.rs) for the
+complete runnable pipeline. Name and version come from the binary, not TOML;
+chain application builder calls after the bridge when they must take precedence
+over TOML.
 
 **Replacement semantics.** The bridge uses replacement semantics for every
 field it covers: `None` and `false` values from TOML overwrite whatever was on
@@ -2266,61 +2249,23 @@ Environment reading is never automatic. `serve()`, `validate()`, and every confi
 
 > struct defaults < TOML deserialization < `apply_env_overrides` < application builder methods after `apply_to_mcp_config` < `validate()`
 
-#### Worked example
+#### Call-order skeleton
 
-See [`examples/config_file_server.rs`](../examples/config_file_server.rs) for a
-compiled, runnable version of this config pipeline.
+The complete, compiled, runnable version of this pipeline is
+[`examples/config_file_server.rs`](../examples/config_file_server.rs). Keep that
+example as the source of truth for imports, the downstream root config type,
+handler wiring, and feature-gated metrics handling. Inline here, the minimal
+call order is:
 
-```rust,ignore
-use rmcp_server_kit::config::{ObservabilityConfig, RbacConfig, ServerConfig, validate_server_config};
-use rmcp_server_kit::rbac::RbacPolicy;
-use rmcp_server_kit::transport::{McpServerConfig, serve};
-use std::sync::Arc;
-
-// 1. Parse TOML.
-let raw = std::fs::read_to_string("config.toml")?;
-let root: YourRootConfig = toml::from_str(&raw)?;
-let mut server_cfg: ServerConfig = root.server;
-let mut obs_cfg: ObservabilityConfig = root.observability;
-let mut rbac_cfg: RbacConfig = root.rbac;
-
-// 2. Apply env overrides. Concatenate the audit reports.
-let mut report = server_cfg.apply_env_overrides()?;
-report.extend(obs_cfg.apply_env_overrides()?);
-report.extend(rbac_cfg.apply_env_overrides()?);
-
-// 3. Init tracing first, then log the report so env-shadowing-TOML leaves a trail.
-rmcp_server_kit::observability::init_tracing_from_config(&obs_cfg);
-for entry in &report {
-    tracing::info!(
-        env_var = %entry.env_var,
-        target = %entry.target_field,
-        source = ?entry.source,
-        value = ?entry.value,  // None for secret targets
-        "env override applied"
-    );
-}
-
-// 4. Validate and bridge TOML into McpServerConfig.
-validate_server_config(&server_cfg)?;
-let mcp_cfg = server_cfg.apply_to_mcp_config(
-    McpServerConfig::new("placeholder:0", "my-server", env!("CARGO_PKG_VERSION")),
-)?;
-
-// 5. Wire application-level state the bridge cannot hold.
-let rbac_policy = Arc::new(RbacPolicy::new(&rbac_cfg));
-let mcp_cfg = mcp_cfg.with_rbac(rbac_policy);
-
-// 6. Wire metrics explicitly -- see "Metrics caveat" below.
-let mcp_cfg = if obs_cfg.metrics_enabled {
-    mcp_cfg.with_metrics(obs_cfg.metrics_bind.parse()?)
-} else {
-    mcp_cfg
-};
-
-// 7. Validate and serve.
-serve(mcp_cfg.validate()?, || MyHandler).await
-```
+1. Parse TOML into your downstream root config.
+2. Call `ServerConfig::apply_env_overrides`.
+3. Call `ObservabilityConfig::apply_env_overrides`.
+4. Call `RbacConfig::apply_env_overrides`.
+5. Initialize tracing from the final `ObservabilityConfig`, then log the reports.
+6. Call `validate_server_config(&server_cfg)`.
+7. Call `server_cfg.apply_to_mcp_config(McpServerConfig::new(...))`.
+8. Attach runtime-only state after the bridge: RBAC policy, metrics, handlers.
+9. Call `mcp_cfg.validate()`, then `serve(...)`.
 
 #### Variable reference
 
@@ -2370,7 +2315,7 @@ Each method returns `Vec<EnvOverride>`. Each entry carries:
 - `source` -- `EnvOverrideSource::Env` (value read directly from the variable) or `EnvOverrideSource::File` (value read from the file named by a `_FILE` variable)
 - `value` -- the applied string for non-secret targets; `None` for secret-typed targets
 
-Secret-typed targets (`rbac.redaction_salt`) always carry `value: None`. The secret never appears in `EnvOverride::value` or in its `Debug` output. Log the report after initializing tracing so any env variable that shadowed a TOML value leaves a structured trail at startup, as shown in the worked example.
+Secret-typed targets (`rbac.redaction_salt`) always carry `value: None`. The secret never appears in `EnvOverride::value` or in its `Debug` output. Log the report after initializing tracing so any env variable that shadowed a TOML value leaves a structured trail at startup, as shown in [`examples/config_file_server.rs`](../examples/config_file_server.rs).
 
 #### `oauth` feature interaction
 
@@ -2386,7 +2331,7 @@ The intended Kubernetes pattern: declare a minimal `[server.auth.oauth]` stub in
 
 #### Metrics caveat
 
-`ObservabilityConfig::apply_env_overrides` mutates `obs_cfg.metrics_enabled` and `obs_cfg.metrics_bind` on the `ObservabilityConfig` struct. These fields do not reach `serve()` automatically: `init_tracing_from_config` reads only the logging and audit-log fields; metrics configuration lives on `McpServerConfig` and must be wired there explicitly. The conditional `with_metrics` call in the worked example above is the reference pattern.
+`ObservabilityConfig::apply_env_overrides` mutates `obs_cfg.metrics_enabled` and `obs_cfg.metrics_bind` on the `ObservabilityConfig` struct. These fields do not reach `serve()` automatically: `init_tracing_from_config` reads only the logging and audit-log fields; metrics configuration lives on `McpServerConfig` and must be wired there explicitly. The conditional `with_metrics` call in [`examples/config_file_server.rs`](../examples/config_file_server.rs) is the reference pattern.
 
 #### What is not env-configurable
 

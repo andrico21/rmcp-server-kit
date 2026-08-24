@@ -383,6 +383,26 @@ impl ServerConfig {
     /// Returns [`McpxError::Config`] when an override cannot be parsed, when an
     /// OAuth override lacks a declared `[server.auth.oauth]` parent, or when an
     /// OAuth override is used in a build without the `oauth` feature.
+    ///
+    /// # Examples
+    ///
+    /// The full config-file pipeline lives in
+    /// [`examples/config_file_server.rs`](https://github.com/andrico21/rmcp-server-kit/blob/main/examples/config_file_server.rs).
+    ///
+    /// ```no_run
+    /// use rmcp_server_kit::config::ServerConfig;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut server = ServerConfig::default();
+    /// // Do not set process env in doctests: rustdoc examples share a process.
+    /// let report = server.apply_env_overrides()?;
+    /// let _applied_fields: Vec<&str> = report
+    ///     .iter()
+    ///     .map(|entry| entry.target_field.as_str())
+    ///     .collect();
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn apply_env_overrides(&mut self) -> Result<Vec<EnvOverride>, McpxError> {
         let mut applied = Vec::new();
         apply_string_env(
@@ -508,6 +528,28 @@ impl ServerConfig {
     /// # Errors
     ///
     /// Returns [`McpxError::Config`] when a duration string cannot be parsed.
+    ///
+    /// # Examples
+    ///
+    /// The full config-file pipeline lives in
+    /// [`examples/config_file_server.rs`](https://github.com/andrico21/rmcp-server-kit/blob/main/examples/config_file_server.rs).
+    ///
+    /// ```
+    /// use rmcp_server_kit::config::{ServerConfig, validate_server_config};
+    /// use rmcp_server_kit::transport::McpServerConfig;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let server = ServerConfig::default();
+    /// validate_server_config(&server)?;
+    /// let config = server.apply_to_mcp_config(McpServerConfig::new(
+    ///     "placeholder:0",
+    ///     "my-server",
+    ///     "0.1.0",
+    /// ))?;
+    /// let _validated = config.validate()?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn apply_to_mcp_config(&self, base: McpServerConfig) -> Result<McpServerConfig, McpxError> {
         let config = base
             .with_bind_addr(format!("{}:{}", self.listen_addr, self.listen_port))
@@ -569,6 +611,32 @@ impl ObservabilityConfig {
     /// # Errors
     ///
     /// Returns [`McpxError::Config`] when a boolean override cannot be parsed.
+    ///
+    /// # Examples
+    ///
+    /// The full config-file pipeline lives in
+    /// [`examples/config_file_server.rs`](https://github.com/andrico21/rmcp-server-kit/blob/main/examples/config_file_server.rs).
+    ///
+    /// ```no_run
+    /// use rmcp_server_kit::config::ObservabilityConfig;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut observability = ObservabilityConfig::default();
+    /// // Do not set process env in doctests: rustdoc examples share a process.
+    /// let report = observability.apply_env_overrides()?;
+    /// let _report_shape: Vec<(&str, &str, Option<&str>)> = report
+    ///     .iter()
+    ///     .map(|entry| {
+    ///         (
+    ///             entry.env_var.as_str(),
+    ///             entry.target_field.as_str(),
+    ///             entry.value.as_deref(),
+    ///         )
+    ///     })
+    ///     .collect();
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn apply_env_overrides(&mut self) -> Result<Vec<EnvOverride>, McpxError> {
         let mut applied = Vec::new();
         apply_string_env(
