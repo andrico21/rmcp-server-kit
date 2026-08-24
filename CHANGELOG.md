@@ -11,6 +11,56 @@ migration note and a config opt-out — see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Added
+
+- **TOML controls for `server.max_request_body` and `server.expose_build_metadata`.**
+  Both `ServerConfig` fields were already defined but had no route into `serve()`.
+  They are now bridged via `ServerConfig::apply_to_mcp_config`. `max_request_body`
+  caps the request body in bytes (default 1 MiB; must be greater than zero, validated
+  by `McpServerConfig::validate()`). `expose_build_metadata` controls whether
+  `build_git_sha`, `build_timestamp`, and `rust_version` appear in the unauthenticated
+  `/version` response (default `false`, unchanged from 3.1.0).
+
+- **`[server.security_headers]` TOML table — all twelve OWASP headers configurable
+  from TOML.** `SecurityHeadersConfig` now derives `serde::Deserialize` with
+  `#[serde(default)]`. Every one of the twelve fields is configurable under
+  `[server.security_headers]` without any change to built-in defaults. The
+  existing three-state semantic is preserved: an absent key keeps the built-in
+  default; `""` omits the header from every response; a non-empty string is used
+  verbatim and validated at startup. At startup the server emits a `warn`-level
+  log entry for every header that is overridden or omitted, so a weakened policy is
+  visible in logs rather than only in a config diff. HSTS `preload` (any case)
+  remains rejected by the validator. Unknown keys under `[server.security_headers]`
+  are silently ignored (no `deny_unknown_fields`).
+
+- **`ServerConfig::apply_to_mcp_config`** — the bridge between the TOML schema and
+  `serve()`. Accepts a `base: McpServerConfig` and returns `McpServerConfig` with
+  every bridgeable transport field replaced by the TOML-sourced value. Uses
+  replacement semantics throughout: `None` and `false` in TOML clear the
+  corresponding field on `base`, so there is no partial-merge ambiguity. The
+  runtime-only fields preserved from `base` unchanged are `name`, `version`, `rbac`,
+  `readiness_check`, `extra_router`, `on_reload_ready`, `metrics_enabled`, and
+  `metrics_bind`. Returns `McpxError::Config` when any duration string cannot be
+  parsed by `humantime`. The method is side-effect free and never reads process
+  environment variables.
+
+- **New clearing-capable `McpServerConfig` builder setters** added to support the
+  replacement-semantics bridge: `with_bind_addr`, `with_tls_paths`,
+  `with_optional_auth`, `with_max_request_body`, `with_expose_build_metadata`,
+  `with_session_idle_timeout`, `with_sse_keep_alive`, `with_tls_handshake_timeout`,
+  `with_max_concurrent_tls_handshakes`, `with_allowed_origins`,
+  `with_extra_route_rate_limit_exempt_paths`, `with_trusted_proxies`,
+  `with_optional_tool_rate_limit`, `with_optional_tool_rate_limit_burst`,
+  `with_optional_extra_route_rate_limit`, `with_optional_extra_route_rate_limit_burst`,
+  `with_optional_forwarded_header`, `with_optional_public_url`,
+  `with_compression_enabled`, `with_compression_min_size`,
+  `with_optional_max_concurrent_requests`, `with_admin_enabled`, and `with_admin_role`.
+  All are additive; no existing builder method is changed or removed.
+
+No default values changed. This release is purely additive — existing configurations
+that do not opt in to `[server.security_headers]`, `max_request_body`, or
+`expose_build_metadata` parse and behave identically to 3.3.x.
+
 ## [3.3.1] - 2026-08-22
 
 ### Changed

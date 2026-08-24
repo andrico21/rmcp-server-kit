@@ -1430,6 +1430,55 @@ let config = McpServerConfig::new("127.0.0.1:8443", "my-server", "0.1.0")
     .with_security_headers(headers);
 ```
 
+All twelve headers are also configurable from TOML under
+`[server.security_headers]`. The same three-state semantics apply: omit a key
+to keep the built-in default; set it to `""` to drop that header entirely from
+every response; set it to a non-empty string to use that value verbatim
+(validated at startup by `validate()`).
+
+| TOML key | Header | Built-in default |
+|---|---|---|
+| `content_security_policy` | `Content-Security-Policy` | `default-src 'none'; form-action 'self'; object-src 'none'; frame-ancestors 'none'; upgrade-insecure-requests` |
+| `strict_transport_security` | `Strict-Transport-Security` | `max-age=63072000; includeSubDomains` (TLS only) |
+| `cross_origin_embedder_policy` | `Cross-Origin-Embedder-Policy` | `require-corp` |
+| `cross_origin_resource_policy` | `Cross-Origin-Resource-Policy` | `same-origin` |
+| `cross_origin_opener_policy` | `Cross-Origin-Opener-Policy` | `same-origin` |
+| `permissions_policy` | `Permissions-Policy` | `accelerometer=(), camera=(), geolocation=(), microphone=()` |
+| `referrer_policy` | `Referrer-Policy` | `no-referrer` |
+| `x_frame_options` | `X-Frame-Options` | `deny` |
+| `cache_control` | `Cache-Control` | `no-store, max-age=0` |
+| `x_content_type_options` | `X-Content-Type-Options` | `nosniff` |
+| `x_dns_prefetch_control` | `X-DNS-Prefetch-Control` | `off` |
+| `x_permitted_cross_domain_policies` | `X-Permitted-Cross-Domain-Policies` | `none` |
+
+```toml
+[server.security_headers]
+# Relax CSP for a panel that embeds responses in an iframe.
+content_security_policy = "default-src 'self'; frame-ancestors https://admin.example.com"
+# Shorten HSTS during initial rollout (TLS only; preload is rejected).
+strict_transport_security = "max-age=600; includeSubDomains"
+# Omit COEP if a third-party script requires cross-origin resources.
+cross_origin_embedder_policy = ""
+```
+
+**HSTS is only emitted under TLS.** On plaintext deployments the
+`strict_transport_security` override is silently ignored, matching the Rust
+builder behaviour.
+
+**CSP and HSTS at the edge.** When a reverse proxy or ingress controller
+already injects `Content-Security-Policy` or `Strict-Transport-Security`,
+manage them there and clear the kit's copies with `""` to avoid duplicate
+headers reaching clients.
+
+**Startup warnings.** Every header that is overridden or omitted via TOML or
+the Rust builder is named in a structured `warn`-level log entry at startup,
+so a weakened policy appears in logs rather than only in a config diff.
+
+**Unknown keys are silently ignored.** `[server.security_headers]` does not
+use `deny_unknown_fields`, so a typo such as `contnet_security_policy` will
+parse without error while leaving the intended header at its default. Check
+key spellings against the table above.
+
 **HSTS preload caveat.** The validator deliberately rejects any
 `strict_transport_security` value containing the substring `preload`
 (case-insensitive). Committing a domain to the public HSTS preload list
@@ -1980,7 +2029,7 @@ serve(config.validate()?, handler_factory).await
 
 ---
 
-
+### Complete TOML configuration reference
 
 rmcp-server-kit config structs derive `Deserialize`, so you can load them directly from
 TOML. A complete example:
@@ -1995,6 +2044,14 @@ shutdown_timeout = "30s"
 request_timeout = "120s"
 allowed_origins = ["http://localhost:3000", "https://myapp.example.com"]
 tool_rate_limit = 120
+max_request_body = 1048576
+expose_build_metadata = false
+
+[server.security_headers]
+# Customise any of the twelve OWASP headers; omit a key to keep the built-in default.
+content_security_policy = "default-src 'self'; frame-ancestors https://admin.example.com"
+strict_transport_security = "max-age=600; includeSubDomains"
+cross_origin_embedder_policy = ""   # omit this header entirely
 
 [server.auth]
 enabled = true
@@ -2082,6 +2139,65 @@ audit_log_path = "/var/log/my-server/audit.log"
 metrics_enabled = true
 metrics_bind = "127.0.0.1:9090"
 ```
+
+### Bridging TOML config to `McpServerConfig`
+
+`ServerConfig` is a TOML schema — it deserializes cleanly from your config file
+but cannot reach `serve()` on its own. `serve()` takes `McpServerConfig`, which
+holds runtime-only state that cannot be expressed in TOML: callbacks, RBAC
+policy objects, metrics listeners, and extra routers. The `ServerConfig`
+existed before this bridge, but nothing in the kit consumed it, so downstreams
+had to hand-wire every field manually.
+
+`ServerConfig::apply_to_mcp_config` closes that gap. Call it with a bare
+`McpServerConfig::new(...)` and it returns a new `McpServerConfig` with every
+TOML-controlled transport field applied:
+
+```rust,ignore
+use rmcp_server_kit::config::{ServerConfig, validate_server_config};
+use rmcp_server_kit::transport::{McpServerConfig, serve};
+
+// Load and validate config.toml.
+let raw = std::fs::read_to_string("config.toml")?;
+let server_cfg: ServerConfig = toml::from_str::<YourRootConfig>(&raw)?.server;
+validate_server_config(&server_cfg)?;
+
+// Bridge TOML config into McpServerConfig.
+// Name and version come from the binary, not TOML.
+let mcp_cfg = server_cfg.apply_to_mcp_config(
+    McpServerConfig::new("placeholder:0", "my-server", env!("CARGO_PKG_VERSION")),
+)?;
+
+// Chain any builder calls that must take precedence over TOML.
+// For example, supply the RBAC policy, which TOML cannot hold:
+let mcp_cfg = mcp_cfg.with_rbac(Arc::clone(&rbac_policy));
+
+serve(mcp_cfg.validate()?, || MyHandler).await
+```
+
+**Replacement semantics.** The bridge uses replacement semantics for every
+field it covers: `None` and `false` values from TOML overwrite whatever was on
+`base`, including options you set programmatically before calling the bridge.
+The full precedence chain is:
+
+> built-in defaults < TOML `ServerConfig` < application builder methods chained
+> **after** `apply_to_mcp_config` < `validate()`
+
+Fields preserved from `base` unchanged are the runtime-only ones TOML cannot
+express: `name`, `version`, `rbac`, `readiness_check`, `extra_router`,
+`on_reload_ready`, `metrics_enabled`, and `metrics_bind`.
+
+**Fallibility.** `apply_to_mcp_config` returns
+`Result<McpServerConfig, McpxError>`. It fails with `McpxError::Config` when
+any duration string in the config cannot be parsed by `humantime` — for
+example `request_timeout = "not-a-duration"`. Calling `validate_server_config`
+first catches common structural errors before the bridge runs, giving cleaner
+diagnostics.
+
+**`stdio_enabled` is not bridged.** The `[server]` TOML field `stdio_enabled`
+selects the separate `serve_stdio()` entry point, which bypasses auth, RBAC,
+TLS, and origin checks entirely. Routing between `serve()` and `serve_stdio()`
+is the caller's responsibility; the bridge covers `serve()` only.
 
 ---
 

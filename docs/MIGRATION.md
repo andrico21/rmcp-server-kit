@@ -3,6 +3,38 @@
 This guide shows how to wire the standalone `rmcp-server-kit` crate into a
 downstream project, and how to migrate across breaking major releases.
 
+## Migrating from 3.3 to 3.4
+
+`3.4` is additive at the API level — `cargo semver-checks` reports no breaking
+change, no default values were altered, and no code change is required to
+upgrade. Existing configurations parse and behave identically to 3.3.x unless
+you opt in to the new features.
+
+### No action required
+
+Upgrade by bumping the version constraint:
+
+```toml
+rmcp-server-kit = "3"
+```
+
+Run `cargo update -p rmcp-server-kit` and verify the full test suite passes.
+Nothing else is needed.
+
+### Opting in to TOML-driven transport configuration
+
+3.4 adds `ServerConfig::apply_to_mcp_config`, which bridges the existing TOML
+schema into `serve()`. To use it, replace your manual field-wiring code with a
+single bridge call. See
+[Bridging TOML config to `McpServerConfig`](GUIDE.md#bridging-toml-config-to-mcpserverconfig)
+in the guide for a worked example and a description of replacement semantics.
+
+If you use the `[server.security_headers]` TOML table for the first time, review
+the twelve available keys and their built-in defaults in the
+[Customising security headers](GUIDE.md#customising-security-headers) section.
+Any header you do not mention keeps its current default, so you can opt in
+incrementally.
+
 ## Migrating from 3.2 to 3.3
 
 `3.3` is additive at the API level — `cargo semver-checks` reports no breaking

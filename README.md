@@ -53,8 +53,10 @@ async fn main() -> rmcp_server_kit::Result<()> {
 ```
 
 Full API documentation and worked examples live in
-[docs/GUIDE.md](docs/GUIDE.md). Two runnable end-to-end examples ship in
-the repository:
+[docs/GUIDE.md](docs/GUIDE.md). For loading configuration from a TOML file and
+bridging it into `McpServerConfig` via `ServerConfig::apply_to_mcp_config`, see
+the [TOML configuration reference](docs/GUIDE.md#complete-toml-configuration-reference).
+Two runnable end-to-end examples ship in the repository:
 
 ```bash
 cargo run --example minimal_server

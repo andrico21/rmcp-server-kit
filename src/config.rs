@@ -1,9 +1,65 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use serde::Deserialize;
 
+use crate::{
+    error::McpxError,
+    transport::{McpServerConfig, SecurityHeadersConfig},
+};
+
+#[cfg(test)]
+const SERVER_CONFIG_BRIDGED_FIELDS: &[&str] = &[
+    "listen_addr",
+    "listen_port",
+    "tls_cert_path",
+    "tls_key_path",
+    "tls_handshake_timeout",
+    "max_concurrent_tls_handshakes",
+    "shutdown_timeout",
+    "request_timeout",
+    "allowed_origins",
+    "tool_rate_limit",
+    "tool_rate_limit_burst",
+    "extra_route_rate_limit",
+    "extra_route_rate_limit_burst",
+    "extra_route_rate_limit_exempt_paths",
+    "trusted_proxies",
+    "forwarded_header",
+    "session_idle_timeout",
+    "sse_keep_alive",
+    "public_url",
+    "compression_enabled",
+    "compression_min_size",
+    "max_concurrent_requests",
+    "admin_enabled",
+    "admin_role",
+    "auth",
+    "max_request_body",
+    "expose_build_metadata",
+    "security_headers",
+];
+
+#[cfg(test)]
+const SERVER_CONFIG_NOT_BRIDGED_FIELDS: &[&str] = &["stdio_enabled"];
+
+#[cfg(test)]
+const MCP_SERVER_CONFIG_RUNTIME_ONLY_FIELDS: &[&str] = &[
+    "name",
+    "version",
+    "rbac",
+    "readiness_check",
+    "extra_router",
+    "on_reload_ready",
+    "metrics_enabled",
+    "metrics_bind",
+];
+
 /// Server listener configuration (reusable across MCP projects).
 #[derive(Debug, Deserialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "server configuration is a flat TOML schema with independent boolean feature flags"
+)]
 #[non_exhaustive]
 pub struct ServerConfig {
     /// Listen address (IP or hostname). Default: `127.0.0.1`.
@@ -34,6 +90,9 @@ pub struct ServerConfig {
     /// Per-request timeout, parsed via `humantime`.
     #[serde(default = "default_request_timeout")]
     pub request_timeout: String,
+    /// Maximum request body size in bytes. Default: 1 MiB.
+    #[serde(default = "default_max_request_body")]
+    pub max_request_body: usize,
     /// Allowed Origin header values for DNS rebinding protection (MCP spec).
     /// Requests with an Origin not in this list are rejected with 403.
     /// Requests without an Origin header are always allowed (non-browser).
@@ -111,6 +170,12 @@ pub struct ServerConfig {
     pub admin_role: String,
     /// Authentication configuration (API keys, mTLS, OAuth).
     pub auth: Option<crate::auth::AuthConfig>,
+    /// Expose build metadata on the unauthenticated `/version` endpoint.
+    #[serde(default = "default_expose_build_metadata")]
+    pub expose_build_metadata: bool,
+    /// Per-header OWASP security-header overrides.
+    #[serde(default = "default_security_headers")]
+    pub security_headers: SecurityHeadersConfig,
 }
 
 impl Default for ServerConfig {
@@ -124,6 +189,7 @@ impl Default for ServerConfig {
             max_concurrent_tls_handshakes: default_max_concurrent_tls_handshakes(),
             shutdown_timeout: default_shutdown_timeout(),
             request_timeout: default_request_timeout(),
+            max_request_body: default_max_request_body(),
             allowed_origins: Vec::new(),
             stdio_enabled: false,
             tool_rate_limit: None,
@@ -142,8 +208,84 @@ impl Default for ServerConfig {
             admin_enabled: false,
             admin_role: default_admin_role(),
             auth: None,
+            expose_build_metadata: default_expose_build_metadata(),
+            security_headers: default_security_headers(),
         }
     }
+}
+
+impl ServerConfig {
+    /// Apply this TOML server schema to a programmatic MCP server base.
+    ///
+    /// Replacement semantics are used for every bridgeable transport field:
+    /// `None` and `false` values in TOML clear the corresponding value from
+    /// `base`. Only runtime-only fields such as `name`, `version`, RBAC,
+    /// readiness callbacks, extra routers, reload callbacks, and metrics
+    /// listener settings are preserved from `base`.
+    ///
+    /// Chain application-code builder overrides after this method when those
+    /// overrides should take precedence over TOML. This method is side-effect
+    /// free and never reads process environment variables.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpxError::Config`] when a duration string cannot be parsed.
+    pub fn apply_to_mcp_config(&self, base: McpServerConfig) -> Result<McpServerConfig, McpxError> {
+        let config = base
+            .with_bind_addr(format!("{}:{}", self.listen_addr, self.listen_port))
+            .with_tls_paths(self.tls_cert_path.clone(), self.tls_key_path.clone())
+            .with_optional_auth(self.auth.clone())
+            .with_max_request_body(self.max_request_body)
+            .with_request_timeout(parse_duration_field(
+                "server.request_timeout",
+                &self.request_timeout,
+            )?)
+            .with_shutdown_timeout(parse_duration_field(
+                "server.shutdown_timeout",
+                &self.shutdown_timeout,
+            )?)
+            .with_session_idle_timeout(parse_duration_field(
+                "server.session_idle_timeout",
+                &self.session_idle_timeout,
+            )?)
+            .with_sse_keep_alive(parse_duration_field(
+                "server.sse_keep_alive",
+                &self.sse_keep_alive,
+            )?)
+            .with_tls_handshake_timeout(parse_duration_field(
+                "server.tls_handshake_timeout",
+                &self.tls_handshake_timeout,
+            )?)
+            .with_max_concurrent_tls_handshakes(self.max_concurrent_tls_handshakes)
+            .with_allowed_origins(self.allowed_origins.iter().map(String::as_str))
+            .with_extra_route_rate_limit_exempt_paths(
+                self.extra_route_rate_limit_exempt_paths
+                    .iter()
+                    .map(String::as_str),
+            )
+            .with_trusted_proxies(self.trusted_proxies.iter().map(String::as_str))
+            .with_optional_tool_rate_limit(self.tool_rate_limit)
+            .with_optional_tool_rate_limit_burst(self.tool_rate_limit_burst)
+            .with_optional_extra_route_rate_limit(self.extra_route_rate_limit)
+            .with_optional_extra_route_rate_limit_burst(self.extra_route_rate_limit_burst)
+            .with_optional_forwarded_header(self.forwarded_header)
+            .with_optional_public_url(self.public_url.clone())
+            .with_compression_enabled(self.compression_enabled)
+            .with_compression_min_size(self.compression_min_size)
+            .with_optional_max_concurrent_requests(self.max_concurrent_requests)
+            .with_admin_enabled(self.admin_enabled)
+            .with_admin_role(&self.admin_role)
+            .with_expose_build_metadata(self.expose_build_metadata)
+            .with_security_headers(self.security_headers.clone());
+
+        Ok(config)
+    }
+}
+
+fn parse_duration_field(field: &str, value: &str) -> Result<Duration, McpxError> {
+    humantime::parse_duration(value).map_err(|error| {
+        McpxError::Config(format!("invalid duration for {field}: {value:?}: {error}"))
+    })
 }
 
 /// Observability settings (reusable across MCP projects).
@@ -254,9 +396,7 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
     // The handshake deadline must be a positive duration: a zero value
     // would reap every TLS handshake before it could complete. Mirrors
     // check #11 in `McpServerConfig::check`.
-    if humantime::parse_duration(&server.tls_handshake_timeout)
-        .is_ok_and(|d| d == std::time::Duration::ZERO)
-    {
+    if humantime::parse_duration(&server.tls_handshake_timeout).is_ok_and(|d| d == Duration::ZERO) {
         return Err(McpxError::Config(
             "server.tls_handshake_timeout must be greater than zero".into(),
         ));
@@ -387,6 +527,15 @@ fn default_shutdown_timeout() -> String {
 fn default_request_timeout() -> String {
     "120s".into()
 }
+const fn default_max_request_body() -> usize {
+    1024 * 1024
+}
+const fn default_expose_build_metadata() -> bool {
+    false
+}
+fn default_security_headers() -> SecurityHeadersConfig {
+    SecurityHeadersConfig::default()
+}
 fn default_log_level() -> String {
     "info,rmcp=warn".into()
 }
@@ -425,9 +574,22 @@ mod tests {
         clippy::unwrap_in_result,
         clippy::print_stdout,
         clippy::print_stderr,
+        deprecated,
         reason = "test-only relaxations; production code uses ? and tracing"
     )]
+    use std::{collections::HashSet, time::Duration};
+
     use super::*;
+    use crate::transport::McpServerConfig;
+
+    #[derive(Deserialize)]
+    struct RootConfig {
+        server: ServerConfig,
+    }
+
+    fn server_from_root_toml(toml: &str) -> ServerConfig {
+        toml::from_str::<RootConfig>(toml).unwrap().server
+    }
 
     // -- ServerConfig defaults --
 
@@ -790,6 +952,350 @@ mod tests {
         assert_eq!(cfg.listen_addr, "127.0.0.1");
         assert_eq!(cfg.tls_handshake_timeout, "10s");
         assert_eq!(cfg.max_concurrent_tls_handshakes, 256);
+    }
+
+    #[test]
+    fn t1_existing_server_example_deserializes_with_new_defaults() {
+        let server = server_from_root_toml(
+            r#"
+                [server]
+                listen_addr = "0.0.0.0"
+                listen_port = 8443
+                tls_cert_path = "/etc/certs/server.crt"
+                tls_key_path = "/etc/certs/server.key"
+                shutdown_timeout = "30s"
+                request_timeout = "120s"
+                allowed_origins = ["http://localhost:3000", "https://myapp.example.com"]
+                tool_rate_limit = 120
+            "#,
+        );
+
+        assert_eq!(server.max_request_body, 1024 * 1024);
+        assert!(!server.expose_build_metadata);
+        assert_eq!(server.security_headers, SecurityHeadersConfig::default());
+    }
+
+    #[test]
+    fn t2_default_bridge_is_no_op_for_mcp_defaults() {
+        let actual = ServerConfig::default()
+            .apply_to_mcp_config(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0"))
+            .unwrap();
+        let expected = McpServerConfig::new("127.0.0.1:8443", "t", "0.0.0");
+
+        assert_default_bridge_core_fields(&actual, &expected);
+        assert_default_bridge_limit_fields(&actual, &expected);
+        assert_default_bridge_metadata_fields(&actual, &expected);
+    }
+
+    fn assert_default_bridge_core_fields(actual: &McpServerConfig, expected: &McpServerConfig) {
+        assert_eq!(actual.bind_addr, expected.bind_addr);
+        assert_eq!(actual.tls_cert_path, expected.tls_cert_path);
+        assert_eq!(actual.tls_key_path, expected.tls_key_path);
+        assert!(actual.auth.is_none());
+        assert_eq!(actual.allowed_origins, expected.allowed_origins);
+        assert_eq!(actual.trusted_proxies, expected.trusted_proxies);
+        assert_eq!(actual.forwarded_header, expected.forwarded_header);
+        assert_eq!(actual.public_url, expected.public_url);
+        assert_eq!(actual.name, expected.name);
+        assert_eq!(actual.version, expected.version);
+    }
+
+    fn assert_default_bridge_limit_fields(actual: &McpServerConfig, expected: &McpServerConfig) {
+        assert_eq!(actual.tool_rate_limit, expected.tool_rate_limit);
+        assert_eq!(actual.tool_rate_limit_burst, expected.tool_rate_limit_burst);
+        assert_eq!(
+            actual.extra_route_rate_limit,
+            expected.extra_route_rate_limit
+        );
+        assert_eq!(
+            actual.extra_route_rate_limit_burst,
+            expected.extra_route_rate_limit_burst
+        );
+        assert_eq!(
+            actual.extra_route_rate_limit_exempt_paths,
+            expected.extra_route_rate_limit_exempt_paths
+        );
+        assert_eq!(actual.max_request_body, expected.max_request_body);
+        assert_eq!(
+            actual.max_concurrent_requests,
+            expected.max_concurrent_requests
+        );
+    }
+
+    fn assert_default_bridge_metadata_fields(actual: &McpServerConfig, expected: &McpServerConfig) {
+        assert_eq!(actual.session_idle_timeout, expected.session_idle_timeout);
+        assert_eq!(actual.sse_keep_alive, expected.sse_keep_alive);
+        assert_eq!(actual.request_timeout, expected.request_timeout);
+        assert_eq!(actual.shutdown_timeout, expected.shutdown_timeout);
+        assert_eq!(actual.tls_handshake_timeout, expected.tls_handshake_timeout);
+        assert_eq!(
+            actual.max_concurrent_tls_handshakes,
+            expected.max_concurrent_tls_handshakes
+        );
+        assert_eq!(actual.compression_enabled, expected.compression_enabled);
+        assert_eq!(actual.compression_min_size, expected.compression_min_size);
+        assert_eq!(actual.admin_enabled, expected.admin_enabled);
+        assert_eq!(actual.admin_role, expected.admin_role);
+        assert_eq!(actual.expose_build_metadata, expected.expose_build_metadata);
+        assert_eq!(actual.security_headers, expected.security_headers);
+    }
+
+    #[test]
+    fn t5_hsts_preload_from_toml_rejected_by_mcp_validate() {
+        let cfg = server_from_root_toml(
+            r#"
+                [server.security_headers]
+                strict_transport_security = "max-age=1; preload"
+            "#,
+        );
+        let mcp = cfg
+            .apply_to_mcp_config(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0"))
+            .unwrap();
+
+        let err = mcp.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("preload"), "error must mention preload: {msg}");
+    }
+
+    #[test]
+    fn t6_bad_security_header_from_toml_rejected_by_mcp_validate() {
+        let cfg = server_from_root_toml(
+            r#"
+                [server.security_headers]
+                content_security_policy = "bad\nvalue"
+            "#,
+        );
+        let mcp = cfg
+            .apply_to_mcp_config(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0"))
+            .unwrap();
+
+        let err = mcp.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid security_headers.content_security_policy"),
+            "error must name invalid header field: {msg}"
+        );
+    }
+
+    #[test]
+    fn t7_zero_max_request_body_rejected_by_mcp_validate() {
+        let cfg: ServerConfig = toml::from_str("max_request_body = 0").unwrap();
+        let mcp = cfg
+            .apply_to_mcp_config(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0"))
+            .unwrap();
+
+        let err = mcp.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("max_request_body must be greater than zero")
+        );
+    }
+
+    #[test]
+    fn t9_unknown_security_header_key_is_ignored() {
+        let cfg = server_from_root_toml(
+            r#"
+                [server.security_headers]
+                typo_content_security_policy = "default-src 'self'"
+            "#,
+        );
+
+        assert_eq!(cfg.security_headers, SecurityHeadersConfig::default());
+    }
+
+    #[test]
+    fn all_twelve_security_header_keys_deserialize_from_server_toml() {
+        let cfg = server_from_root_toml(
+            r#"
+                [server.security_headers]
+                content_security_policy = "csp"
+                strict_transport_security = "max-age=1"
+                cross_origin_embedder_policy = "coep"
+                cross_origin_resource_policy = "corp"
+                cross_origin_opener_policy = "coop"
+                permissions_policy = "permissions"
+                referrer_policy = "referrer"
+                x_frame_options = "frame"
+                cache_control = "cache"
+                x_content_type_options = "content-type"
+                x_dns_prefetch_control = "dns"
+                x_permitted_cross_domain_policies = "cross-domain"
+            "#,
+        );
+
+        let headers = cfg.security_headers;
+        assert_eq!(headers.content_security_policy.as_deref(), Some("csp"));
+        assert_eq!(
+            headers.strict_transport_security.as_deref(),
+            Some("max-age=1")
+        );
+        assert_eq!(
+            headers.cross_origin_embedder_policy.as_deref(),
+            Some("coep")
+        );
+        assert_eq!(
+            headers.cross_origin_resource_policy.as_deref(),
+            Some("corp")
+        );
+        assert_eq!(headers.cross_origin_opener_policy.as_deref(), Some("coop"));
+        assert_eq!(headers.permissions_policy.as_deref(), Some("permissions"));
+        assert_eq!(headers.referrer_policy.as_deref(), Some("referrer"));
+        assert_eq!(headers.x_frame_options.as_deref(), Some("frame"));
+        assert_eq!(headers.cache_control.as_deref(), Some("cache"));
+        assert_eq!(
+            headers.x_content_type_options.as_deref(),
+            Some("content-type")
+        );
+        assert_eq!(headers.x_dns_prefetch_control.as_deref(), Some("dns"));
+        assert_eq!(
+            headers.x_permitted_cross_domain_policies.as_deref(),
+            Some("cross-domain")
+        );
+    }
+
+    #[test]
+    fn t10_every_server_config_field_is_classified_for_bridge() {
+        let source = include_str!("config.rs");
+        let (_, after_struct_start) = source
+            .split_once("pub struct ServerConfig {")
+            .expect("ServerConfig struct start marker");
+        let (struct_body, _) = after_struct_start
+            .split_once("\n}\n\nimpl ServerConfig")
+            .expect("ServerConfig struct end marker");
+        let actual_fields: HashSet<&str> = struct_body
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix("pub ")
+                    .and_then(|rest| rest.split_once(':').map(|(name, _)| name.trim()))
+            })
+            .collect();
+        let bridged_fields: HashSet<&str> = SERVER_CONFIG_BRIDGED_FIELDS.iter().copied().collect();
+        let not_bridged_fields: HashSet<&str> =
+            SERVER_CONFIG_NOT_BRIDGED_FIELDS.iter().copied().collect();
+        let runtime_only_fields: HashSet<&str> = MCP_SERVER_CONFIG_RUNTIME_ONLY_FIELDS
+            .iter()
+            .copied()
+            .collect();
+        let classified_fields: HashSet<&str> =
+            bridged_fields.union(&not_bridged_fields).copied().collect();
+
+        assert_eq!(actual_fields, classified_fields);
+        assert!(bridged_fields.is_disjoint(&not_bridged_fields));
+        assert!(runtime_only_fields.is_disjoint(&actual_fields));
+        assert!(SERVER_CONFIG_NOT_BRIDGED_FIELDS.contains(&"stdio_enabled"));
+        assert!(MCP_SERVER_CONFIG_RUNTIME_ONLY_FIELDS.contains(&"rbac"));
+        assert!(MCP_SERVER_CONFIG_RUNTIME_ONLY_FIELDS.contains(&"metrics_bind"));
+    }
+
+    #[test]
+    fn replacement_semantics_clear_base_option_and_false_bool_fields() {
+        let (_token, hash) = crate::auth::generate_api_key().unwrap();
+        let base = McpServerConfig::new("127.0.0.1:0", "t", "0.0.0")
+            .with_tls("/tmp/base.crt", "/tmp/base.key")
+            .with_auth(crate::auth::AuthConfig::with_keys(vec![
+                crate::auth::ApiKeyEntry::new("base-key", hash, "admin"),
+            ]))
+            .with_tool_rate_limit(10)
+            .with_tool_rate_limit_burst(20)
+            .with_extra_route_rate_limit(30)
+            .with_extra_route_rate_limit_burst(40)
+            .with_trusted_proxies(["127.0.0.1/32"])
+            .with_forwarded_header(crate::transport::ForwardedHeaderMode::Forwarded)
+            .with_public_url("https://base.example")
+            .enable_compression(512)
+            .with_max_concurrent_requests(99)
+            .enable_admin("admin")
+            .expose_build_metadata();
+
+        let actual = ServerConfig::default().apply_to_mcp_config(base).unwrap();
+
+        assert!(actual.tls_cert_path.is_none());
+        assert!(actual.tls_key_path.is_none());
+        assert!(actual.auth.is_none());
+        assert!(actual.tool_rate_limit.is_none());
+        assert!(actual.tool_rate_limit_burst.is_none());
+        assert!(actual.extra_route_rate_limit.is_none());
+        assert!(actual.extra_route_rate_limit_burst.is_none());
+        assert!(actual.forwarded_header.is_none());
+        assert!(actual.public_url.is_none());
+        assert!(!actual.compression_enabled);
+        assert_eq!(actual.compression_min_size, 1024);
+        assert!(actual.max_concurrent_requests.is_none());
+        assert!(!actual.admin_enabled);
+        assert_eq!(actual.admin_role, "admin");
+        assert!(!actual.expose_build_metadata);
+    }
+
+    #[test]
+    fn partial_tls_toml_does_not_inherit_base_key() {
+        let cfg = ServerConfig {
+            tls_cert_path: Some("/tmp/toml.crt".into()),
+            tls_key_path: None,
+            ..ServerConfig::default()
+        };
+        let mcp = cfg
+            .apply_to_mcp_config(
+                McpServerConfig::new("127.0.0.1:0", "t", "0.0.0")
+                    .with_tls("/tmp/base.crt", "/tmp/base.key"),
+            )
+            .unwrap();
+
+        assert_eq!(mcp.tls_cert_path, Some(PathBuf::from("/tmp/toml.crt")));
+        assert!(mcp.tls_key_path.is_none());
+        let err = mcp.validate().unwrap_err();
+        assert!(err.to_string().contains("tls_key_path"));
+    }
+
+    #[test]
+    fn partial_tls_toml_does_not_inherit_base_cert() {
+        let cfg = ServerConfig {
+            tls_cert_path: None,
+            tls_key_path: Some("/tmp/toml.key".into()),
+            ..ServerConfig::default()
+        };
+        let mcp = cfg
+            .apply_to_mcp_config(
+                McpServerConfig::new("127.0.0.1:0", "t", "0.0.0")
+                    .with_tls("/tmp/base.crt", "/tmp/base.key"),
+            )
+            .unwrap();
+
+        assert!(mcp.tls_cert_path.is_none());
+        assert_eq!(mcp.tls_key_path, Some(PathBuf::from("/tmp/toml.key")));
+        let err = mcp.validate().unwrap_err();
+        assert!(err.to_string().contains("tls_cert_path"));
+    }
+
+    #[test]
+    fn t11_bridge_maps_bind_addr_and_request_timeout() {
+        let cfg: ServerConfig = toml::from_str(
+            r#"
+                listen_addr = "127.0.0.2"
+                listen_port = 9000
+                request_timeout = "5s"
+            "#,
+        )
+        .unwrap();
+
+        let mcp = cfg
+            .apply_to_mcp_config(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0"))
+            .unwrap();
+
+        assert_eq!(mcp.bind_addr, "127.0.0.2:9000");
+        assert_eq!(mcp.request_timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn t12_bridge_rejects_invalid_request_timeout() {
+        let cfg: ServerConfig = toml::from_str(r#"request_timeout = "not-a-duration""#).unwrap();
+
+        let Err(err) = cfg.apply_to_mcp_config(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0"))
+        else {
+            panic!("invalid request_timeout must fail");
+        };
+
+        assert!(err.to_string().contains("request_timeout"));
     }
 
     #[test]

@@ -317,6 +317,8 @@ The most-violated rules — all `deny`-level in `Cargo.toml`:
 | Tracing init / audit log                       | `src/observability.rs`                                |
 | Prometheus registry / `/metrics`               | `src/metrics.rs`                                      |
 | Configuration struct (TOML schema)             | `src/config.rs` + `McpServerConfig` in `src/transport.rs` |
+| TOML → `serve()` bridge                        | `src/config.rs` — `ServerConfig::apply_to_mcp_config`; `src/transport.rs` — `McpServerConfig` clearing-capable setters |
+| Security-header TOML controls                  | `src/transport.rs` — `SecurityHeadersConfig`; `src/config.rs` — `ServerConfig::security_headers` |
 | Error type → HTTP status mapping               | `src/error.rs` — `McpxError::into_response`           |
 | Origin / security headers / CORS               | `src/transport.rs` — `origin_check_middleware`, `security_headers_middleware` |
 | Graceful shutdown (Ctrl-C / SIGTERM)           | `src/transport.rs` — `shutdown_signal()` (~line 2996) |

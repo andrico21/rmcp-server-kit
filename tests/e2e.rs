@@ -20,6 +20,7 @@ use rmcp::{
 };
 use rmcp_server_kit::{
     auth::{ApiKeyEntry, AuthConfig, RateLimitConfig},
+    config::ServerConfig,
     rbac::{ArgumentAllowlist, RbacConfig, RbacPolicy, RoleConfig},
     transport::McpServerConfig,
 };
@@ -258,6 +259,168 @@ async fn readyz_returns_503_when_not_ready() {
 
     let resp = reqwest::get(&format!("{base}/readyz")).await.unwrap();
     assert_eq!(resp.status(), 503);
+}
+
+#[derive(serde::Deserialize)]
+struct E2eRootConfig {
+    server: ServerConfig,
+}
+
+fn toml_backed_config(toml: &str) -> McpServerConfig {
+    let root: E2eRootConfig = toml::from_str(toml).expect("server TOML parses");
+    root.server
+        .apply_to_mcp_config(McpServerConfig::new(
+            "127.0.0.1:0",
+            "test-rmcp-server-kit",
+            "0.0.1",
+        ))
+        .expect("server TOML bridges to MCP config")
+}
+
+fn default_security_header_values() -> [(&'static str, &'static str); 11] {
+    [
+        ("x-content-type-options", "nosniff"),
+        ("x-frame-options", "deny"),
+        ("cache-control", "no-store, max-age=0"),
+        ("referrer-policy", "no-referrer"),
+        ("cross-origin-opener-policy", "same-origin"),
+        ("cross-origin-resource-policy", "same-origin"),
+        ("cross-origin-embedder-policy", "require-corp"),
+        (
+            "permissions-policy",
+            "accelerometer=(), camera=(), geolocation=(), microphone=()",
+        ),
+        ("x-permitted-cross-domain-policies", "none"),
+        (
+            "content-security-policy",
+            "default-src 'none'; form-action 'self'; object-src 'none'; frame-ancestors 'none'; upgrade-insecure-requests",
+        ),
+        ("x-dns-prefetch-control", "off"),
+    ]
+}
+
+fn assert_security_header_defaults_except(
+    headers: &reqwest::header::HeaderMap,
+    context: &str,
+    omitted: &[&str],
+) {
+    for (header, value) in default_security_header_values() {
+        if omitted.contains(&header) {
+            assert!(headers.get(header).is_none(), "{context}: {header} present");
+        } else {
+            assert_eq!(
+                headers.get(header).and_then(|v| v.to_str().ok()),
+                Some(value),
+                "{context}: {header} default mismatch"
+            );
+        }
+    }
+    assert!(
+        headers.get("strict-transport-security").is_none(),
+        "{context}: HSTS must remain absent on plaintext"
+    );
+}
+
+fn assert_security_header_defaults(headers: &reqwest::header::HeaderMap, context: &str) {
+    assert_security_header_defaults_except(headers, context, &[]);
+}
+
+fn assert_security_header_defaults_with_override(
+    headers: &reqwest::header::HeaderMap,
+    context: &str,
+    override_header: &str,
+    override_value: &str,
+) {
+    for (header, value) in default_security_header_values() {
+        let expected = if header == override_header {
+            override_value
+        } else {
+            value
+        };
+        assert_eq!(
+            headers.get(header).and_then(|v| v.to_str().ok()),
+            Some(expected),
+            "{context}: {header} mismatch"
+        );
+    }
+    assert!(
+        headers.get("strict-transport-security").is_none(),
+        "{context}: HSTS must remain absent on plaintext"
+    );
+}
+
+#[tokio::test]
+async fn t3_toml_csp_override_applies_to_real_healthz_response() {
+    let cfg = toml_backed_config(
+        r#"
+            [server.security_headers]
+            content_security_policy = "default-src 'self'"
+        "#,
+    );
+    let base = spawn_server(cfg).await;
+
+    let resp = reqwest::get(&format!("{base}/healthz")).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_security_header_defaults_with_override(
+        resp.headers(),
+        "T3 healthz",
+        "content-security-policy",
+        "default-src 'self'",
+    );
+}
+
+#[tokio::test]
+async fn t4_toml_empty_security_header_omits_only_that_header() {
+    let cfg = toml_backed_config(
+        r#"
+            [server.security_headers]
+            cross_origin_embedder_policy = ""
+        "#,
+    );
+    let base = spawn_server(cfg).await;
+
+    let resp = reqwest::get(&format!("{base}/healthz")).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_security_header_defaults_except(
+        resp.headers(),
+        "T4 healthz",
+        &["cross-origin-embedder-policy"],
+    );
+}
+
+#[tokio::test]
+async fn t8_toml_expose_build_metadata_controls_version_payload() {
+    let exposed = spawn_server(toml_backed_config(
+        r"
+            [server]
+            expose_build_metadata = true
+        ",
+    ))
+    .await;
+    let hidden = spawn_server(toml_backed_config(
+        r"
+            [server]
+            expose_build_metadata = false
+        ",
+    ))
+    .await;
+
+    let exposed_body: serde_json::Value = reqwest::get(&format!("{exposed}/version"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(exposed_body.get("build_git_sha").is_some());
+    assert!(exposed_body.get("build_timestamp").is_some());
+    assert!(exposed_body.get("rust_version").is_some());
+
+    let hidden_resp = reqwest::get(&format!("{hidden}/version")).await.unwrap();
+    assert_security_header_defaults(hidden_resp.headers(), "hidden /version");
+    let hidden_body: serde_json::Value = hidden_resp.json().await.unwrap();
+    assert!(hidden_body.get("build_git_sha").is_none());
+    assert!(hidden_body.get("build_timestamp").is_none());
+    assert!(hidden_body.get("rust_version").is_none());
 }
 
 // ==========================================================================

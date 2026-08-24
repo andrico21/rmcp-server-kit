@@ -234,7 +234,8 @@ struct ForwardResolver {
 /// `preload` (case-insensitive) is rejected. Operators who want to
 /// commit to the HSTS preload list must do so via a future explicit
 /// builder method, not by smuggling it through this knob.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct SecurityHeadersConfig {
     /// Override for `X-Content-Type-Options`. Default: `nosniff`.
@@ -1949,6 +1950,7 @@ where
     // pass-through, so origin still runs before auth and the rate limiter
     // still sits inside auth.
     let is_tls = config.tls_cert_path.is_some();
+    warn_security_header_overrides(&config.security_headers);
     let security_headers_cfg = Arc::new(config.security_headers.clone());
     router = router.layer(axum::middleware::from_fn(move |req, next| {
         let cfg = Arc::clone(&security_headers_cfg);
@@ -3668,6 +3670,194 @@ where
     }
     tracing::info!("stdio session ended");
     Ok(())
+}
+
+#[allow(
+    deprecated,
+    reason = "builder methods are the sanctioned transition layer for deprecated public fields"
+)]
+impl McpServerConfig {
+    /// Replace the TLS certificate/key paths exactly, including `None`
+    /// values. Configuration bridges use this to preserve partial TLS
+    /// configuration so validation reports the missing half.
+    #[must_use]
+    pub fn with_tls_paths(mut self, cert_path: Option<PathBuf>, key_path: Option<PathBuf>) -> Self {
+        self.tls_cert_path = cert_path;
+        self.tls_key_path = key_path;
+        self
+    }
+
+    /// Set only the TLS certificate path. Intended for configuration
+    /// bridges that must preserve partial TLS configuration so validation
+    /// can report the missing key path.
+    #[must_use]
+    pub fn with_tls_cert_path(mut self, cert_path: impl Into<PathBuf>) -> Self {
+        self.tls_cert_path = Some(cert_path.into());
+        self
+    }
+
+    /// Set only the TLS private-key path. Intended for configuration
+    /// bridges that must preserve partial TLS configuration so validation
+    /// can report the missing certificate path.
+    #[must_use]
+    pub fn with_tls_key_path(mut self, key_path: impl Into<PathBuf>) -> Self {
+        self.tls_key_path = Some(key_path.into());
+        self
+    }
+
+    /// Replace the optional authentication configuration exactly.
+    #[must_use]
+    pub fn with_optional_auth(mut self, auth: Option<AuthConfig>) -> Self {
+        self.auth = auth;
+        self
+    }
+
+    /// Replace the optional tool rate limit exactly.
+    #[must_use]
+    pub fn with_optional_tool_rate_limit(mut self, per_minute: Option<u32>) -> Self {
+        self.tool_rate_limit = per_minute;
+        self
+    }
+
+    /// Replace the optional tool rate-limit burst exactly.
+    #[must_use]
+    pub fn with_optional_tool_rate_limit_burst(mut self, burst: Option<u32>) -> Self {
+        self.tool_rate_limit_burst = burst;
+        self
+    }
+
+    /// Replace the optional extra-route rate limit exactly.
+    #[must_use]
+    pub fn with_optional_extra_route_rate_limit(mut self, per_minute: Option<u32>) -> Self {
+        self.extra_route_rate_limit = per_minute;
+        self
+    }
+
+    /// Replace the optional extra-route rate-limit burst exactly.
+    #[must_use]
+    pub fn with_optional_extra_route_rate_limit_burst(mut self, burst: Option<u32>) -> Self {
+        self.extra_route_rate_limit_burst = burst;
+        self
+    }
+
+    /// Replace the optional forwarded-header mode exactly.
+    #[must_use]
+    pub fn with_optional_forwarded_header(mut self, mode: Option<ForwardedHeaderMode>) -> Self {
+        self.forwarded_header = mode;
+        self
+    }
+
+    /// Replace the optional public URL exactly.
+    #[must_use]
+    pub fn with_optional_public_url(mut self, url: Option<String>) -> Self {
+        self.public_url = url;
+        self
+    }
+
+    /// Override the compression minimum response size without enabling
+    /// compression. This keeps configuration bridges able to carry the
+    /// inert threshold independently from the enable flag.
+    #[must_use]
+    pub fn with_compression_min_size(mut self, min_size: u16) -> Self {
+        self.compression_min_size = min_size;
+        self
+    }
+
+    /// Replace the compression enabled flag exactly.
+    #[must_use]
+    pub fn with_compression_enabled(mut self, enabled: bool) -> Self {
+        self.compression_enabled = enabled;
+        self
+    }
+
+    /// Replace the optional global in-flight request cap exactly.
+    #[must_use]
+    pub fn with_optional_max_concurrent_requests(mut self, limit: Option<usize>) -> Self {
+        self.max_concurrent_requests = limit;
+        self
+    }
+
+    /// Replace the admin endpoint enabled flag exactly.
+    #[must_use]
+    pub fn with_admin_enabled(mut self, enabled: bool) -> Self {
+        self.admin_enabled = enabled;
+        self
+    }
+
+    /// Override the RBAC role required by admin-gated endpoints without
+    /// enabling `/admin/*` diagnostics.
+    #[must_use]
+    pub fn with_admin_role(mut self, role: impl Into<String>) -> Self {
+        self.admin_role = role.into();
+        self
+    }
+
+    /// Replace the build-metadata exposure flag exactly.
+    #[must_use]
+    pub fn with_expose_build_metadata(mut self, enabled: bool) -> Self {
+        self.expose_build_metadata = enabled;
+        self
+    }
+}
+
+fn warn_security_header_overrides(cfg: &SecurityHeadersConfig) {
+    for (field, value) in security_header_overrides(cfg) {
+        let action = if value.is_empty() {
+            "omitted"
+        } else {
+            "overridden"
+        };
+        tracing::warn!(
+            security_header = field,
+            action,
+            "security header configured; inspect server.security_headers.<security_header>"
+        );
+    }
+}
+
+fn security_header_overrides(
+    cfg: &SecurityHeadersConfig,
+) -> impl Iterator<Item = (&'static str, &str)> {
+    [
+        (
+            "x_content_type_options",
+            cfg.x_content_type_options.as_deref(),
+        ),
+        ("x_frame_options", cfg.x_frame_options.as_deref()),
+        ("cache_control", cfg.cache_control.as_deref()),
+        ("referrer_policy", cfg.referrer_policy.as_deref()),
+        (
+            "cross_origin_opener_policy",
+            cfg.cross_origin_opener_policy.as_deref(),
+        ),
+        (
+            "cross_origin_resource_policy",
+            cfg.cross_origin_resource_policy.as_deref(),
+        ),
+        (
+            "cross_origin_embedder_policy",
+            cfg.cross_origin_embedder_policy.as_deref(),
+        ),
+        ("permissions_policy", cfg.permissions_policy.as_deref()),
+        (
+            "x_permitted_cross_domain_policies",
+            cfg.x_permitted_cross_domain_policies.as_deref(),
+        ),
+        (
+            "content_security_policy",
+            cfg.content_security_policy.as_deref(),
+        ),
+        (
+            "x_dns_prefetch_control",
+            cfg.x_dns_prefetch_control.as_deref(),
+        ),
+        (
+            "strict_transport_security",
+            cfg.strict_transport_security.as_deref(),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(field, value)| value.map(|v| (field, v)))
 }
 
 #[cfg(test)]
