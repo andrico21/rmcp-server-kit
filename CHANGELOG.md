@@ -11,6 +11,8 @@ migration note and a config opt-out — see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+## [3.4.0] - 2026-08-24
+
 ### Added
 
 - **TOML controls for `server.max_request_body` and `server.expose_build_metadata`.**
