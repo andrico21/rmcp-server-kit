@@ -56,11 +56,12 @@ Full API documentation and worked examples live in
 [docs/GUIDE.md](docs/GUIDE.md). For loading configuration from a TOML file and
 bridging it into `McpServerConfig` via `ServerConfig::apply_to_mcp_config`, see
 the [TOML configuration reference](docs/GUIDE.md#complete-toml-configuration-reference).
-Two runnable end-to-end examples ship in the repository:
+Runnable end-to-end examples ship in the repository:
 
 ```bash
 cargo run --example minimal_server
 cargo run --example api_key_rbac
+cargo run --example config_file_server
 cargo run --example oauth_server --features oauth
 ```
 

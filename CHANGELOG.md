@@ -34,6 +34,16 @@ migration note and a config opt-out — see the 3.1.0 notes below.
   with its non-`_FILE` sibling. Verified non-vacuous against a wrong-key
   attachment, a typo, and a deletion.
 
+- **New runnable example `examples/config_file_server.rs`** covering the whole
+  config pipeline: a downstream-owned root struct, TOML deserialization,
+  `apply_env_overrides` with the audit report, `validate_server_config`,
+  `apply_to_mcp_config`, the runtime-only wiring the bridge cannot carry
+  (`RbacPolicy`, metrics), and a builder override chained after the bridge.
+  The TOML-file path shipped in 3.4.0/3.5.0 previously had no runnable
+  example - only a `rust,ignore` guide snippet, which nothing compiles.
+  An example is covered by `cargo build --examples` and
+  `cargo clippy --all-targets`, so it cannot rot silently.
+
 ## [3.5.0] - 2026-08-24
 
 ### Added

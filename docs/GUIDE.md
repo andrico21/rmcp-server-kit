@@ -2268,6 +2268,9 @@ Environment reading is never automatic. `serve()`, `validate()`, and every confi
 
 #### Worked example
 
+See [`examples/config_file_server.rs`](../examples/config_file_server.rs) for a
+compiled, runnable version of this config pipeline.
+
 ```rust,ignore
 use rmcp_server_kit::config::{ObservabilityConfig, RbacConfig, ServerConfig, validate_server_config};
 use rmcp_server_kit::rbac::RbacPolicy;
