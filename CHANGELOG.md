@@ -11,6 +11,8 @@ migration note and a config opt-out — see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+## [3.5.0] - 2026-08-24
+
 ### Added
 
 - **Three opt-in `apply_env_overrides` methods** for environment-driven configuration overlay.
