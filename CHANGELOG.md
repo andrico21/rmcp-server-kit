@@ -11,6 +11,29 @@ migration note and a config opt-out — see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Documentation
+
+- **Every TOML-configurable parameter is now documented.** An exhaustive diff of
+  the `Deserialize` structs against [`docs/GUIDE.md`](docs/GUIDE.md) found five
+  keys with no coverage anywhere in the guide: `oauth.require_subject`,
+  `oauth.role_mappings`, the `claim_value` field of `RoleMapping`, and
+  `rate_limit.{max_tracked_keys, idle_eviction}`. All are now documented with
+  type and default, `RateLimitConfig` gained a full parameter table, and
+  `role_claim` / `role_mappings` gained a worked example - `[[server.auth.oauth.role_mappings]]`
+  was previously undiscoverable. `forwarded_header` now documents its accepted
+  values (`"x-forwarded-for"`, `"forwarded"`) and `trusted_proxies` pairing.
+
+- **The complete TOML example now names the environment variable that overrides
+  each key**, as trailing `# env: RMCP_SERVER_KIT__...` comments, so the mapping
+  is visible at the point of use rather than only in the reference table.
+
+  A second drift guard covers these annotations: it asserts each one names a
+  real variable, is attached to the TOML key that variable actually targets,
+  appears at most once, and that every variable is annotated exactly once apart
+  from a documented exemption for `..._REDACTION_SALT_FILE`, which shares a key
+  with its non-`_FILE` sibling. Verified non-vacuous against a wrong-key
+  attachment, a typo, and a deletion.
+
 ## [3.5.0] - 2026-08-24
 
 ### Added

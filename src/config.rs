@@ -2006,6 +2006,17 @@ mod tests {
         notes: String,
     }
 
+    #[derive(Debug)]
+    struct GuideEnvAnnotation {
+        env_var: String,
+        key: String,
+    }
+
+    // `_FILE` is documented next to its sibling because both target the same
+    // TOML key (`rbac.redaction_salt`); duplicating the inline annotation on
+    // the key would be ambiguous rather than helpful.
+    const INLINE_ENV_ANNOTATION_EXEMPTIONS: &[&str] = &[RBAC_REDACTION_SALT_FILE_ENV];
+
     // Guards the public operator table against drifting from the code-side
     // env spec, and guards the reverse direction by parsing `*_ENV` consts
     // from source text. Source parsing is deliberate: it catches a newly added
@@ -2085,8 +2096,82 @@ mod tests {
         }
     }
 
+    // Sibling guard for the canonical TOML example's inline `# env:` comments.
+    // It is kept separate from the table test so failures name which public
+    // copy drifted. Extraction is scoped to the canonical TOML example by the
+    // surrounding headings: scanning the whole guide would let unrelated future
+    // snippets accidentally satisfy this count/order contract.
+    #[test]
+    fn guide_toml_example_env_annotations_match_code_spec() {
+        let annotations = parse_guide_toml_env_annotations();
+        assert!(
+            !annotations.is_empty(),
+            "canonical TOML example contains no `# env:` annotations"
+        );
+
+        let spec_by_var = ENV_OVERRIDE_SPECS
+            .iter()
+            .map(|spec| (spec.env_var, spec))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut seen = HashSet::new();
+
+        for annotation in &annotations {
+            let Some(spec) = spec_by_var.get(annotation.env_var.as_str()) else {
+                panic!(
+                    "GUIDE inline env annotation {:?} is not present in ENV_OVERRIDE_SPECS",
+                    annotation.env_var
+                );
+            };
+            assert!(
+                seen.insert(annotation.env_var.as_str()),
+                "GUIDE inline env annotation {:?} appears more than once",
+                annotation.env_var
+            );
+            let expected_key = spec
+                .target_field
+                .rsplit('.')
+                .next()
+                .expect("target_field has at least one segment");
+            assert_eq!(
+                annotation.key, expected_key,
+                "{} inline annotation is attached to TOML key {:?}, but code spec target {:?} ends in {:?}",
+                annotation.env_var, annotation.key, spec.target_field, expected_key
+            );
+        }
+
+        let expected_count = ENV_OVERRIDE_SPECS.len() - INLINE_ENV_ANNOTATION_EXEMPTIONS.len();
+        assert_eq!(
+            annotations.len(),
+            expected_count,
+            "GUIDE inline env annotation count {} must equal ENV_OVERRIDE_SPECS count {} minus exemptions {:?}",
+            annotations.len(),
+            ENV_OVERRIDE_SPECS.len(),
+            INLINE_ENV_ANNOTATION_EXEMPTIONS
+        );
+
+        for spec in ENV_OVERRIDE_SPECS {
+            if INLINE_ENV_ANNOTATION_EXEMPTIONS.contains(&spec.env_var) {
+                assert!(
+                    !seen.contains(spec.env_var),
+                    "{} is deliberately exempt from inline annotation but was annotated",
+                    spec.env_var
+                );
+            } else {
+                assert!(
+                    seen.contains(spec.env_var),
+                    "{} is missing from GUIDE canonical TOML inline `# env:` annotations",
+                    spec.env_var
+                );
+            }
+        }
+    }
+
+    fn guide_markdown() -> &'static str {
+        include_str!("../docs/GUIDE.md")
+    }
+
     fn parse_guide_env_override_table() -> Vec<GuideEnvRow> {
-        let guide = include_str!("../docs/GUIDE.md");
+        let guide = guide_markdown();
         let (_, after_begin) = guide
             .split_once("<!-- BEGIN ENV_OVERRIDE_TABLE -->")
             .expect("docs/GUIDE.md is missing <!-- BEGIN ENV_OVERRIDE_TABLE --> marker");
@@ -2138,6 +2223,49 @@ mod tests {
             .and_then(|value| value.strip_suffix('`'))
             .unwrap_or_else(|| panic!("{column} cell must be backtick-wrapped in row {row:?}"));
         inner.trim().to_owned()
+    }
+
+    fn parse_guide_toml_env_annotations() -> Vec<GuideEnvAnnotation> {
+        let guide = guide_markdown();
+        let (_, after_heading) = guide
+            .split_once("### Complete TOML configuration reference")
+            .expect("docs/GUIDE.md is missing canonical TOML configuration heading");
+        let (section, _) = after_heading
+            .split_once("### Bridging TOML config to `McpServerConfig`")
+            .expect("docs/GUIDE.md is missing bridge heading after canonical TOML example");
+        let (_, after_fence_start) = section
+            .split_once("```toml")
+            .expect("canonical TOML section is missing opening ```toml fence");
+        let (toml_block, _) = after_fence_start
+            .split_once("```")
+            .expect("canonical TOML section is missing closing code fence");
+
+        toml_block
+            .lines()
+            .filter_map(parse_guide_toml_env_annotation_line)
+            .collect()
+    }
+
+    fn parse_guide_toml_env_annotation_line(line: &str) -> Option<GuideEnvAnnotation> {
+        let (before_marker, after_marker) = line.split_once("# env: ")?;
+        let env_var = after_marker
+            .split_whitespace()
+            .next()
+            .unwrap_or_else(|| panic!("missing env var after `# env:` in line {line:?}"));
+        let key_source = before_marker
+            .trim_end()
+            .strip_prefix('#')
+            .map_or_else(|| before_marker.trim_end(), str::trim);
+        let key = key_source
+            .split_once('=')
+            .unwrap_or_else(|| panic!("missing TOML key before `# env:` in line {line:?}"))
+            .0
+            .trim();
+
+        Some(GuideEnvAnnotation {
+            env_var: env_var.to_owned(),
+            key: key.to_owned(),
+        })
     }
 
     fn parse_rmcp_env_constants_from_config_source() -> Vec<String> {

@@ -345,6 +345,17 @@ let rate_limit = RateLimitConfig::new(30).with_pre_auth_max_per_minute(60);
 
 When exceeded, the middleware returns HTTP 429 Too Many Requests.
 
+##### Parameters
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_attempts_per_minute` | `u32` | `30` | Max failed auth attempts per source IP per minute. Successful authentications do not consume this budget. |
+| `pre_auth_max_per_minute` | `Option<u32>` | `None` (defaults to `max_attempts_per_minute × 10`) | Max unauthenticated requests per source IP per minute admitted to the password-hash path. mTLS callers bypass this gate entirely. |
+| `max_tracked_keys` | `usize` | `10_000` | Hard cap on distinct source IPs tracked per limiter. When the cap is reached, idle entries are pruned first; if still full, the LRU entry is evicted. Bounds memory under IP-spray attacks. |
+| `idle_eviction` | humantime duration | `"15m"` | Per-IP entries idle longer than this duration are eligible for opportunistic pruning. |
+| `burst` | `Option<u32>` | `None` (= rate) | Burst capacity for the post-failure limiter. Must be greater than zero when set. |
+| `pre_auth_burst` | `Option<u32>` | `None` (= gate rate) | Burst capacity for the pre-auth gate. Valid even when `pre_auth_max_per_minute` is not explicitly set. |
+
 #### `generate_api_key()`
 
 ```rust
@@ -779,6 +790,8 @@ extra_route_rate_limit = 60
 | `admin_enabled` | `bool` | `false` | Enable `/admin/*` diagnostic endpoints |
 | `admin_role` | `String` | `"admin"` | RBAC role required to access `/admin/*` |
 | `auth` | `Option<AuthConfig>` | `None` | Inline `[server.auth]` block selecting API-key / mTLS / OAuth — see [auth](#auth) |
+| `trusted_proxies` | `Vec<String>` | `[]` | CIDRs or IPs whose forwarding headers are trusted for client-IP resolution. When non-empty, enables trusted-forwarder mode. Pairs with `forwarded_header`. |
+| `forwarded_header` | `String` | `"x-forwarded-for"` | Which forwarding header to read when trusted-forwarder mode is active. Accepted values: `"x-forwarded-for"` (de-facto standard; nginx, HAProxy, CDNs) or `"forwarded"` (RFC 7239 `Forwarded` header). Ignored when `trusted_proxies` is empty. |
 
 #### `ObservabilityConfig`
 
@@ -969,6 +982,45 @@ role = "viewer"
 | `audience_validation_mode` | `String` (`"permissive"` \| `"warn"` \| `"strict"`) | `"strict"` | How the resource server treats the legacy `azp` audience fallback. `"strict"` (default) accepts only `aud` matches and rejects `azp`-only matches; `"warn"` accepts `azp`-only matches but emits a one-shot WARN per process to surface IdPs not populating `aud`; `"permissive"` accepts `azp`-only matches silently (pre-1.7 behavior). |
 | `strict_audience_validation` | `Option<bool>` | _unset_ | **Deprecated since 1.7.0** — superseded by `audience_validation_mode`. Consulted only when `audience_validation_mode` is unset: `Some(true)` resolves to `"strict"`, `Some(false)` resolves to `"warn"`, and unset resolves to `"strict"` (the secure default). |
 | `ssrf_allowlist` | `table` | _unset_ | Operator opt-in allowlist of `hosts` and/or `cidrs` whose otherwise-blocked addresses (private/loopback/CGNAT/unique-local) the OAuth/JWKS fetcher is allowed to reach. Cloud-metadata addresses remain blocked. See "Allowing in-cluster IdPs" below and the "Operator allowlist" section in [`SECURITY.md`](../SECURITY.md). |
+| `role_claim` | `Option<String>` | `None` | JWT claim path (dot-notation for nested claims) to extract role values from; e.g. `"roles"` or `"realm_access.roles"`. When set, claim values are matched against `role_mappings` instead of `scopes`. Supports space-separated string claims and JSON array claims. Pairs with `role_mappings`. |
+| `role_mappings` | `Vec<RoleMapping>` | `[]` | Claim-value-to-role mappings used when `role_claim` is set. First matching entry wins. See the worked example below. |
+| `require_subject` | `bool` | `false` | Reject tokens that lack a `sub` (subject) claim. Leave `false` for client-credentials / machine-to-machine tokens, which legitimately carry no subject. |
+
+##### `ScopeMapping`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `scope` | `String` | OAuth scope string matched against the token's `scope` claim. |
+| `role` | `String` | RBAC role granted when this scope is present. |
+
+##### `RoleMapping`
+
+Used with `role_claim` for non-scope-based role extraction (e.g. Keycloak `realm_access.roles`, Azure AD `roles`).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `claim_value` | `String` | Expected value of the claim named by `role_claim` (e.g. a Keycloak role name or an Azure AD role string). |
+| `role` | `String` | RBAC role granted when `claim_value` is present in the claim. |
+
+**Worked example — Keycloak `realm_access.roles` claim:**
+
+```toml
+[server.auth.oauth]
+issuer = "https://keycloak.example.com/realms/my-realm"
+audience = "my-mcp-server"
+jwks_uri = "https://keycloak.example.com/realms/my-realm/protocol/openid-connect/certs"
+role_claim = "realm_access.roles"
+
+[[server.auth.oauth.role_mappings]]
+claim_value = "mcp-admin"   # Keycloak role name
+role = "admin"              # RBAC role in rmcp-server-kit
+
+[[server.auth.oauth.role_mappings]]
+claim_value = "mcp-viewer"
+role = "viewer"
+```
+
+`role_claim` accepts dot-notation for nested JWT claims (`"realm_access.roles"`) and handles both space-separated string claims (`"read write"`) and JSON array claims (`["read", "write"]`). When `role_claim` is set, `scopes` is ignored.
 
 #### SSRF and DoS Hardening (OAuth)
 
@@ -1351,9 +1403,7 @@ let config = config
     .with_forwarded_header(rmcp_server_kit::transport::ForwardedHeaderMode::Forwarded);
 ```
 
-TOML: `trusted_proxies = ["10.0.0.0/8"]` and
-`forwarded_header = "forwarded"` (default `"x-forwarded-for"`) under
-`[server]`.
+TOML under `[server]`: set `trusted_proxies = ["10.0.0.0/8"]` (list of CIDRs or individual IPs) to declare your proxy fleet, and optionally `forwarded_header = "forwarded"` to read the RFC 7239 `Forwarded` header instead of the default. Accepted values for `forwarded_header` are `"x-forwarded-for"` (default; de-facto standard used by nginx, HAProxy, CDNs) and `"forwarded"` (RFC 7239). Trusted-forwarder mode is inactive when `trusted_proxies` is empty; `forwarded_header` is ignored in that case.
 
 How it resolves (the **rightmost-untrusted** algorithm, as in nginx
 `real_ip` / Envoy):
@@ -2032,20 +2082,22 @@ serve(config.validate()?, handler_factory).await
 ### Complete TOML configuration reference
 
 rmcp-server-kit config structs derive `Deserialize`, so you can load them directly from
-TOML. A complete example:
+TOML. Keys annotated with `# env: VAR` can be overridden at runtime via `apply_env_overrides`; see [Environment variable overrides](#environment-variable-overrides-opt-in) for full semantics.
 
 ```toml
 [server]
-listen_addr = "0.0.0.0"
-listen_port = 8443
-tls_cert_path = "/etc/certs/server.crt"
-tls_key_path = "/etc/certs/server.key"
+listen_addr = "0.0.0.0"  # env: RMCP_SERVER_KIT__SERVER__LISTEN_ADDR
+listen_port = 8443  # env: RMCP_SERVER_KIT__SERVER__LISTEN_PORT
+tls_cert_path = "/etc/certs/server.crt"  # env: RMCP_SERVER_KIT__SERVER__TLS_CERT_PATH
+tls_key_path = "/etc/certs/server.key"  # env: RMCP_SERVER_KIT__SERVER__TLS_KEY_PATH
 shutdown_timeout = "30s"
 request_timeout = "120s"
 allowed_origins = ["http://localhost:3000", "https://myapp.example.com"]
 tool_rate_limit = 120
 max_request_body = 1048576
 expose_build_metadata = false
+# public_url = "https://mcp.example.com"  # env: RMCP_SERVER_KIT__SERVER__PUBLIC_URL
+admin_enabled = false  # env: RMCP_SERVER_KIT__SERVER__ADMIN_ENABLED
 
 [server.security_headers]
 # Customise any of the twelve OWASP headers; omit a key to keep the built-in default.
@@ -2082,9 +2134,9 @@ max_attempts_per_minute = 30
 
 # OAuth 2.1 (requires 'oauth' feature)
 [server.auth.oauth]
-issuer = "https://auth.example.com"
-audience = "my-mcp-server"
-jwks_uri = "https://auth.example.com/.well-known/jwks.json"
+issuer = "https://auth.example.com"  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ISSUER
+audience = "my-mcp-server"  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__AUDIENCE
+jwks_uri = "https://auth.example.com/.well-known/jwks.json"  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__JWKS_URI
 jwks_cache_ttl = "10m"
 
 [[server.auth.oauth.scopes]]
@@ -2104,7 +2156,8 @@ enabled = true
 # secret. When omitted, a random per-process salt is used (so the same
 # input hashes differently across restarts). Set this to a long random
 # string from your secret manager if you want stable correlation.
-# redaction_salt = "replace-with-long-random-string-from-secrets-manager"
+# redaction_salt = "replace-with-long-random-string-from-secrets-manager"  # env: RMCP_SERVER_KIT__RBAC__REDACTION_SALT
+# (Kubernetes: use RMCP_SERVER_KIT__RBAC__REDACTION_SALT_FILE to supply the salt from a mounted Secret file.)
 
 [[rbac.roles]]
 name = "admin"
@@ -2134,10 +2187,10 @@ allowed = ["ls", "cat", "ps", "df", "top"]
 
 [observability]
 log_level = "info"
-log_format = "json"
+log_format = "json"  # env: RMCP_SERVER_KIT__OBSERVABILITY__LOG_FORMAT
 audit_log_path = "/var/log/my-server/audit.log"
-metrics_enabled = true
-metrics_bind = "127.0.0.1:9090"
+metrics_enabled = true  # env: RMCP_SERVER_KIT__OBSERVABILITY__METRICS_ENABLED
+metrics_bind = "127.0.0.1:9090"  # env: RMCP_SERVER_KIT__OBSERVABILITY__METRICS_BIND
 ```
 
 ### Bridging TOML config to `McpServerConfig`
