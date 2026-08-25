@@ -1715,7 +1715,7 @@ be zero, where the literal-zero form is not what you wrote anyway.
 
 ### Library Crate Hygiene Lints
 
-For library crates (e.g. `mcpx`), public API surface must be
+For library crates (e.g. `rmcp-server-kit`), public API surface must be
 future-proof and documented.
 
 ```toml

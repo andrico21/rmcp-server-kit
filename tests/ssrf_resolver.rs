@@ -122,7 +122,7 @@ async fn resolver_contract_always_err_loopback_blocked() {
 async fn resolver_contract_empty_dns_failure_not_classified_as_ssrf() {
     let client = build_client(false);
     let err = client
-        .__test_get("http://nonexistent-host-for-mcpx-tests.invalid/")
+        .__test_get("http://nonexistent-host-for-server-kit-tests.invalid/")
         .await
         .expect_err("unresolvable host must surface as error");
     let chain = render_chain(&err);
