@@ -11,6 +11,49 @@ migration note and a config opt-out — see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+## [3.6.0] - 2026-08-25
+
+> **First published release since 3.3.1.** The `3.4.0` and `3.5.0` tags exist in
+> git but were never published to crates.io: `release.yml` is gated on `CI` via
+> `workflow_run`, CI was red on both tags, so the publish job was skipped and
+> nobody noticed. 3.6.0 carries everything from both, plus the fixes that
+> unblocked the pipeline. Consumers upgrading from 3.3.1 get the 3.4.0 and
+> 3.5.0 sections below as well as this one. A minor bump rather than a patch,
+> because relative to the last *published* version this adds public API.
+
+### Fixed
+
+- **Clippy failures on every feature combination except `--all-features`.**
+  `apply_oauth_env_overrides` took `&mut self` and `&mut Vec<EnvOverride>` that
+  the `#[cfg(not(feature = "oauth"))]` path never used mutably, tripping
+  `needless_pass_by_ref_mut` twice and `needless_return` once. Invisible under
+  `--all-features`, which cannot see inside `cfg(not(...))`. Reading the three
+  OAuth variables now lives in an ungated helper so detection stays
+  feature-independent - a set variable on a non-`oauth` build is still a hard
+  error, never a silent no-op - while only the mutating half is cfg-gated. No
+  behaviour or error-message change.
+
+- **`t10_every_server_config_field_is_classified_for_bridge` failing on
+  `windows-latest`.** It split on a literal `"\n}\n\nimpl ServerConfig"`; with
+  `core.autocrlf` the Windows runner checks out CRLF and the marker could not
+  match. Normalized before splitting. The rest of the suite was swept for the
+  same class; the two `docs/GUIDE.md` parsers already use `.lines()`, which
+  strips `\r`.
+
+- **`cargo vet` exemptions refreshed** for `crc32fast`, `h2`, `log`, `syn` and
+  `uuid`. `Cargo.lock` is gitignored, so CI resolves dependencies fresh while
+  exemptions pin exact versions; any transitive release fails the blocking vet
+  job until regenerated.
+
+### Changed
+
+- [`docs/RELEASING.md`](docs/RELEASING.md) pre-flight now matches what CI
+  actually enforces: clippy across the whole feature matrix, `cargo test` with
+  and without default features, and `cargo vet --locked` against a freshly
+  generated lockfile. It also requires confirming CI is green *before* tagging
+  and verifying `max_version` on crates.io afterwards, since a pushed tag is
+  not a release.
+
 ### Documentation
 
 - **Every TOML-configurable parameter is now documented.** An exhaustive diff of
@@ -56,7 +99,7 @@ migration note and a config opt-out — see the 3.1.0 notes below.
   two rustdoc-style intra-doc links in the guide that plain Markdown cannot
   resolve, so they rendered as literal bracketed text rather than links.
 
-## [3.5.0] - 2026-08-24
+## [3.5.0] - 2026-08-24 (tagged, never published)
 
 ### Added
 
@@ -96,7 +139,7 @@ No default values changed. `serve()`, `validate()`, and every constructor read n
 environment automatically. Existing code that does not call `apply_env_overrides` is
 unaffected.
 
-## [3.4.0] - 2026-08-24
+## [3.4.0] - 2026-08-24 (tagged, never published)
 
 ### Added
 
