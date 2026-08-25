@@ -118,6 +118,19 @@ update required). Two runtime behaviours change; both are noted below.
 
 ### Internal
 
+- The client-facing-message invariant on `RmcpServerKitError` now has a
+  regression guard. A test walks `src/` and fails when `Auth`, `Rbac`,
+  `RateLimited`, or `RateLimitedFor.message` is constructed with an
+  interpolated error-shaped binding (`{e}`, `{err}`, `{error}`, `{source}`, or
+  the positional form) -- the exact shape of the defect fixed above.
+
+  It is a **tripwire, not a proof**: it does not catch an error bound to a
+  differently-named variable, an error stringified before interpolation, or a
+  non-error internal detail such as a file path. The invariant still rests on
+  review; the guard exists so the known failure mode cannot recur silently. It
+  carries its own positive and negative self-tests so a broken matcher cannot
+  degrade into a no-op that always passes.
+
 - `host_matches` lowercases the host once per call rather than once per
   pattern, and only when a wildcard pattern is present -- an all-exact host
   pattern list stays allocation-free.

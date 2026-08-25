@@ -21,6 +21,15 @@ use thiserror::Error;
 /// `"internal server error"` body and their detail is logged server-side only.
 /// Use [`client_message`](Self::client_message) to obtain the exact body that
 /// will be sent to the client for any variant.
+///
+/// The recurring mistake is interpolating an upstream error into one of these
+/// variants — `map_err(|e| Auth(format!("... {e}")))`. That publishes a
+/// dependency's error chain to unauthenticated callers, and usually attaches
+/// the wrong status besides (a crypto or I/O fault is a `500`, not a `401`).
+/// Route such failures to [`Internal`](Self::Internal) instead. A heuristic
+/// regression test in this module's test suite scans `src/` for that specific
+/// shape; it is a tripwire, not a proof, so the invariant still rests on
+/// review.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum RmcpServerKitError {
@@ -409,5 +418,160 @@ mod tests {
                 .client_message(),
             "internal server error"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Heuristic regression guard for the client-facing message invariant.
+    //
+    // This is a TRIPWIRE, NOT A PROOF. It catches one specific shape: an
+    // upstream error interpolated into a client-facing variant, which is
+    // the defect that actually shipped (`generate_api_key` embedded a
+    // `password_hash::Error` chain in `Auth`).
+    //
+    // It does NOT catch: an error bound to a differently-named variable;
+    // an error stringified first (`let s = e.to_string()`); a non-error
+    // internal detail such as a file path or upstream URL; or anything
+    // constructed by a downstream crate. Do not read a pass here as the
+    // invariant being enforced -- it is still upheld by review.
+    // -----------------------------------------------------------------
+
+    /// Variant constructors whose payload reaches the HTTP client verbatim.
+    /// `RateLimited` also substring-matches `RateLimitedFor`, which is
+    /// intended -- its `message` field has the same exposure.
+    const CLIENT_FACING_CTORS: &[&str] = &[
+        "RmcpServerKitError::Auth",
+        "RmcpServerKitError::Rbac",
+        "RmcpServerKitError::RateLimited",
+    ];
+
+    /// Binding names that conventionally hold an upstream error. Kept
+    /// deliberately narrow: broadening to `cause`/`detail`/`msg` would
+    /// produce false positives on legitimate caller-known echoes.
+    const ERROR_BINDINGS: &[&str] = &["e", "err", "error", "source"];
+
+    /// Drop comment lines and everything from the `#[cfg(test)]` test
+    /// module onward.
+    ///
+    /// Comments are stripped so documenting the anti-pattern cannot make
+    /// this guard flag its own prose. The test-module cut anchors on
+    /// `#[cfg(test)]` *followed by* `mod tests`, because `config.rs`
+    /// applies `#[cfg(test)]` to several consts near the top of the file
+    /// and cutting at the first occurrence would silently skip the module.
+    fn production_source(src: &str) -> String {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut out = String::with_capacity(src.len());
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed == "#[cfg(test)]"
+                && lines
+                    .get(i + 1)
+                    .is_some_and(|next| next.trim_start().starts_with("mod tests"))
+            {
+                break;
+            }
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Return a snippet for every client-facing construction that
+    /// interpolates an error-shaped binding.
+    fn find_error_interpolations(src: &str) -> Vec<String> {
+        let scanned = production_source(src);
+        let mut hits = Vec::new();
+        for ctor in CLIENT_FACING_CTORS {
+            let mut from = 0_usize;
+            while let Some(rel) = scanned.get(from..).and_then(|s| s.find(ctor)) {
+                let start = from + rel;
+                let rest = scanned.get(start..).unwrap_or_default();
+                // The construction ends at the statement terminator; cap the
+                // window so a missing `;` cannot bleed into later code.
+                let end = rest.find(';').map_or(400, |i| i.min(400));
+                let window = rest.get(..end).unwrap_or(rest);
+                if ERROR_BINDINGS.iter().any(|b| {
+                    window.contains(&format!("{{{b}}}"))
+                        || window.contains(&format!("{{{b}:"))
+                        || window.contains(&format!(", {b})"))
+                }) {
+                    hits.push(window.split_whitespace().collect::<Vec<_>>().join(" "));
+                }
+                from = start + ctor.len();
+            }
+        }
+        hits
+    }
+
+    #[test]
+    fn client_facing_variants_do_not_interpolate_upstream_errors() {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let entries = std::fs::read_dir(&src_dir).expect("src/ is readable");
+        let mut offenders: Vec<String> = Vec::new();
+        let mut scanned_files = 0_usize;
+        for entry in entries {
+            let path = entry.expect("dir entry").path();
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("source file is readable");
+            scanned_files += 1;
+            for hit in find_error_interpolations(&src) {
+                offenders.push(format!("{}: {hit}", path.display()));
+            }
+        }
+        assert!(
+            scanned_files > 10,
+            "guard scanned only {scanned_files} files; the walk is broken"
+        );
+        assert!(
+            offenders.is_empty(),
+            "client-facing error variants must not carry upstream error text \
+             (see the invariant on RmcpServerKitError); use Internal instead:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::literal_string_with_formatting_args,
+        reason = "the format-shaped text is the fixture under test, not a format call"
+    )]
+    fn guard_detects_a_synthetic_violation() {
+        // Without this, a broken matcher would be indistinguishable from a
+        // clean codebase and the guard would rot into a no-op.
+        let offending = "fn f() { RmcpServerKitError::Auth(format!(\"hashing failed: {e}\")); }";
+        assert_eq!(find_error_interpolations(offending).len(), 1);
+
+        let positional = "fn f() { RmcpServerKitError::Rbac(format!(\"bad: {}\", err)); }";
+        assert_eq!(find_error_interpolations(positional).len(), 1);
+
+        let debug_spec = "fn f() { RmcpServerKitError::RateLimited(format!(\"x {error:?}\")); }";
+        assert_eq!(find_error_interpolations(debug_spec).len(), 1);
+    }
+
+    #[test]
+    fn guard_allows_caller_known_interpolation() {
+        // The five real rbac.rs sites echo caller-supplied names on purpose.
+        let allowed = "fn f() { RmcpServerKitError::Rbac(format!(\"{tool_name} denied for role '{role}'\")); }";
+        assert!(find_error_interpolations(allowed).is_empty());
+
+        let arg = "fn f() { RmcpServerKitError::Rbac(format!(\"argument '{arg_key}' must be a string for tool '{tool_name}'\")); }";
+        assert!(find_error_interpolations(arg).is_empty());
+    }
+
+    #[test]
+    fn guard_ignores_comments_and_test_modules() {
+        let in_comment = "/// BAD: RmcpServerKitError::Auth(format!(\"{e}\"))\nfn f() {}";
+        assert!(find_error_interpolations(in_comment).is_empty());
+
+        let in_tests = "fn ok() {}\n#[cfg(test)]\nmod tests {\n    RmcpServerKitError::Auth(format!(\"{e}\"));\n}";
+        assert!(find_error_interpolations(in_tests).is_empty());
+
+        // A `#[cfg(test)]` const must NOT truncate the scan (config.rs shape).
+        let const_then_code = "#[cfg(test)]\nconst X: &[&str] = &[];\nfn f() { RmcpServerKitError::Auth(format!(\"{e}\")); }";
+        assert_eq!(find_error_interpolations(const_then_code).len(), 1);
     }
 }
