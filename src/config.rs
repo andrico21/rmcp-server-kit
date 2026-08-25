@@ -445,72 +445,61 @@ impl ServerConfig {
                 raw,
             ));
         }
-        self.apply_oauth_env_overrides(&mut applied)?;
+        let oauth_env = OAuthEnvOverrides::read()?;
+        #[cfg(feature = "oauth")]
+        self.apply_oauth_env_overrides(oauth_env, &mut applied)?;
+        #[cfg(not(feature = "oauth"))]
+        reject_oauth_env_overrides(&oauth_env)?;
         Ok(applied)
     }
 
+    #[cfg(feature = "oauth")]
     fn apply_oauth_env_overrides(
         &mut self,
+        oauth_env: OAuthEnvOverrides,
         applied: &mut Vec<EnvOverride>,
     ) -> Result<(), McpxError> {
-        let issuer = read_env(SERVER_OAUTH_ISSUER_ENV)?;
-        let audience = read_env(SERVER_OAUTH_AUDIENCE_ENV)?;
-        let jwks_uri = read_env(SERVER_OAUTH_JWKS_URI_ENV)?;
-        if issuer.is_none() && audience.is_none() && jwks_uri.is_none() {
+        if !oauth_env.is_set() {
             return Ok(());
         }
 
-        #[cfg(not(feature = "oauth"))]
-        {
-            let _ = applied;
-            let var = first_set_oauth_env(issuer.as_ref(), audience.as_ref(), jwks_uri.as_ref());
+        let Some(auth) = self.auth.as_mut() else {
+            let var = oauth_env.first_set_var();
             return Err(McpxError::Config(format!(
-                "{var} requires the `oauth` feature"
+                "{var} requires declaring [server.auth.oauth] before applying env overrides"
             )));
+        };
+        let Some(oauth) = auth.oauth.as_mut() else {
+            let var = oauth_env.first_set_var();
+            return Err(McpxError::Config(format!(
+                "{var} requires declaring [server.auth.oauth] before applying env overrides"
+            )));
+        };
+        if let Some(raw) = oauth_env.issuer {
+            applied.push(env_report(
+                SERVER_OAUTH_ISSUER_ENV,
+                "server.auth.oauth.issuer",
+                raw.clone(),
+            ));
+            oauth.issuer = raw;
         }
-
-        #[cfg(feature = "oauth")]
-        {
-            let Some(auth) = self.auth.as_mut() else {
-                let var =
-                    first_set_oauth_env(issuer.as_ref(), audience.as_ref(), jwks_uri.as_ref());
-                return Err(McpxError::Config(format!(
-                    "{var} requires declaring [server.auth.oauth] before applying env overrides"
-                )));
-            };
-            let Some(oauth) = auth.oauth.as_mut() else {
-                let var =
-                    first_set_oauth_env(issuer.as_ref(), audience.as_ref(), jwks_uri.as_ref());
-                return Err(McpxError::Config(format!(
-                    "{var} requires declaring [server.auth.oauth] before applying env overrides"
-                )));
-            };
-            if let Some(raw) = issuer {
-                applied.push(env_report(
-                    SERVER_OAUTH_ISSUER_ENV,
-                    "server.auth.oauth.issuer",
-                    raw.clone(),
-                ));
-                oauth.issuer = raw;
-            }
-            if let Some(raw) = audience {
-                applied.push(env_report(
-                    SERVER_OAUTH_AUDIENCE_ENV,
-                    "server.auth.oauth.audience",
-                    raw.clone(),
-                ));
-                oauth.audience = raw;
-            }
-            if let Some(raw) = jwks_uri {
-                applied.push(env_report(
-                    SERVER_OAUTH_JWKS_URI_ENV,
-                    "server.auth.oauth.jwks_uri",
-                    raw.clone(),
-                ));
-                oauth.jwks_uri = raw;
-            }
-            Ok(())
+        if let Some(raw) = oauth_env.audience {
+            applied.push(env_report(
+                SERVER_OAUTH_AUDIENCE_ENV,
+                "server.auth.oauth.audience",
+                raw.clone(),
+            ));
+            oauth.audience = raw;
         }
+        if let Some(raw) = oauth_env.jwks_uri {
+            applied.push(env_report(
+                SERVER_OAUTH_JWKS_URI_ENV,
+                "server.auth.oauth.jwks_uri",
+                raw.clone(),
+            ));
+            oauth.jwks_uri = raw;
+        }
+        Ok(())
     }
 
     /// Apply this TOML server schema to a programmatic MCP server base.
@@ -746,10 +735,50 @@ fn apply_optional_path_env(
     Ok(())
 }
 
+struct OAuthEnvOverrides {
+    issuer: Option<String>,
+    audience: Option<String>,
+    jwks_uri: Option<String>,
+}
+
+impl OAuthEnvOverrides {
+    fn read() -> Result<Self, McpxError> {
+        Ok(Self {
+            issuer: read_env(SERVER_OAUTH_ISSUER_ENV)?,
+            audience: read_env(SERVER_OAUTH_AUDIENCE_ENV)?,
+            jwks_uri: read_env(SERVER_OAUTH_JWKS_URI_ENV)?,
+        })
+    }
+
+    fn is_set(&self) -> bool {
+        self.issuer.is_some() || self.audience.is_some() || self.jwks_uri.is_some()
+    }
+
+    fn first_set_var(&self) -> &'static str {
+        first_set_oauth_env(
+            self.issuer.as_deref(),
+            self.audience.as_deref(),
+            self.jwks_uri.as_deref(),
+        )
+    }
+}
+
+#[cfg(not(feature = "oauth"))]
+fn reject_oauth_env_overrides(oauth_env: &OAuthEnvOverrides) -> Result<(), McpxError> {
+    if oauth_env.is_set() {
+        let var = oauth_env.first_set_var();
+        Err(McpxError::Config(format!(
+            "{var} requires the `oauth` feature"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 fn first_set_oauth_env(
-    issuer: Option<&String>,
-    audience: Option<&String>,
-    jwks_uri: Option<&String>,
+    issuer: Option<&str>,
+    audience: Option<&str>,
+    jwks_uri: Option<&str>,
 ) -> &'static str {
     if issuer.is_some() {
         SERVER_OAUTH_ISSUER_ENV
@@ -1635,7 +1664,7 @@ mod tests {
 
     #[test]
     fn t10_every_server_config_field_is_classified_for_bridge() {
-        let source = include_str!("config.rs");
+        let source = include_str!("config.rs").replace("\r\n", "\n");
         let (_, after_struct_start) = source
             .split_once("pub struct ServerConfig {")
             .expect("ServerConfig struct start marker");
