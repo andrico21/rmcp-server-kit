@@ -240,7 +240,7 @@ version = "0.3.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.crc32fast]]
-version = "1.5.0"
+version = "1.5.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.criterion]]
@@ -464,7 +464,7 @@ version = "0.13.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.h2]]
-version = "0.4.18"
+version = "0.4.19"
 criteria = "safe-to-deploy"
 
 [[exemptions.half]]
@@ -656,7 +656,7 @@ version = "0.4.14"
 criteria = "safe-to-deploy"
 
 [[exemptions.log]]
-version = "0.4.33"
+version = "0.4.34"
 criteria = "safe-to-deploy"
 
 [[exemptions.matchers]]
@@ -1156,7 +1156,7 @@ version = "2.0.119"
 criteria = "safe-to-deploy"
 
 [[exemptions.syn]]
-version = "3.0.3"
+version = "3.0.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.sync_wrapper]]
@@ -1328,7 +1328,7 @@ version = "1.0.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.uuid]]
-version = "1.24.1"
+version = "1.25.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.valuable]]
