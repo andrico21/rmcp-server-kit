@@ -67,6 +67,13 @@ update required). Two runtime behaviours change; both are noted below.
 
 ### Documentation
 
+- **`docs/GUIDE.md`'s `RmcpServerKitError` reference was stale and is now
+  accurate.** It listed an `Other(anyhow::Error)` variant that does not exist,
+  and omitted `RateLimitedFor`, `Tls`, `Startup`, `Metrics`, and the new
+  `Internal`. The variants are now grouped by exposure -- client-facing
+  (rendered verbatim) versus internal-only (collapsed to
+  `"internal server error"`) -- and the `#[non_exhaustive]` contract is stated.
+
 - `RbacPolicy::argument_allowed` now documents that token comparison is
   byte-exact with no Unicode normalization, and the consequence on
   normalizing filesystems.

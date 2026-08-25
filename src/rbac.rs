@@ -678,6 +678,17 @@ impl RbacPolicy {
     /// Normalization deliberately lives here rather than in [`glob_match`],
     /// which is shared with tool-name matching where case *is* significant.
     /// Lowercasing there would silently widen every tool allowlist.
+    ///
+    /// Pre-compiling normalized host patterns at [`RbacPolicy::new`] was
+    /// evaluated and **rejected**. It would remove the remaining per-wildcard
+    /// allocation, but [`RbacPolicy::host_patterns`] is public and must keep
+    /// returning the operator's original casing, and the normalized copy would
+    /// have to be rebuilt on every `ArcSwap` hot reload — where getting it
+    /// wrong means a reloaded policy silently stops matching
+    /// case-insensitively. That risk is not worth an allocation count on a
+    /// path already bounded by Argon2 verification and JSON parsing. Reopen
+    /// only if profiling shows wildcard host matching dominating a real
+    /// workload (e.g. `list_hosts` filtering over many wildcard patterns).
     fn host_matches(patterns: &[String], host: &str) -> bool {
         // Lowercased once per call rather than once per pattern, and only
         // when a wildcard pattern will actually consume it -- an all-exact

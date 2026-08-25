@@ -840,20 +840,39 @@ Returns `RmcpServerKitError::Config` with a descriptive message on failure.
 Central error type with automatic HTTP status code mapping:
 
 ```rust
+#[non_exhaustive]
 pub enum RmcpServerKitError {
-    Config(String),          // -> 500 Internal Server Error
+    // Client-facing: the String is rendered VERBATIM to the HTTP client.
+    // Construction sites must keep these free of internal detail.
     Auth(String),            // -> 401 Unauthorized
     Rbac(String),            // -> 403 Forbidden
     RateLimited(String),     // -> 429 Too Many Requests
+    RateLimitedFor {         // -> 429 + Retry-After (RFC 9110 delta-seconds)
+        message: String,
+        retry_after: std::time::Duration,
+    },
+
+    // Internal-only: detail is logged server-side and the client receives
+    // a generic "internal server error" body.
+    Config(String),          // -> 500
     Io(std::io::Error),      // -> 500
     Json(serde_json::Error), // -> 500
     Toml(toml::de::Error),   // -> 500
-    Other(anyhow::Error),    // -> 500
+    Tls(String),             // -> 500
+    Startup(String),         // -> 500
+    Internal(String),        // -> 500
+    Metrics(String),         // -> 500 (feature = "metrics")
 }
 ```
 
 Implements `IntoResponse` for axum, so you can return `RmcpServerKitError` directly
-from handlers and middleware.
+from handlers and middleware. Use
+[`client_message`](https://docs.rs/rmcp-server-kit/latest/rmcp_server_kit/error/enum.RmcpServerKitError.html#method.client_message)
+to obtain the exact body a given error will send.
+
+The enum is `#[non_exhaustive]`, so a `match` on it in downstream code must
+carry a wildcard arm; new variants can therefore be added without a breaking
+change.
 
 #### `Result<T>`
 
