@@ -46,8 +46,8 @@ The crate has two transports:
 
 | Transport          | Function                                            | Auth/RBAC/TLS  | Use case                                         |
 |--------------------|-----------------------------------------------------|----------------|--------------------------------------------------|
-| **Streamable HTTP**| `serve()` — `src/transport.rs:1991`                 | **Yes**        | Production network deployment                    |
-| stdio              | `serve_stdio()` — `src/transport.rs:3718`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
+| **Streamable HTTP**| `serve()` — `src/transport.rs:2070`                 | **Yes**        | Production network deployment                    |
+| stdio              | `serve_stdio()` — `src/transport.rs:3775`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
 
 ---
 
@@ -104,7 +104,7 @@ A complete HTTP request to `/mcp` flows through these layers, top-to-bottom
 `src/transport.rs:1349-1830` (middleware wiring inside `build_app_router`) and in each module.
 
 ```
-TCP / TLS handshake                         src/transport.rs:2522  (TlsListener)
+TCP / TLS handshake                         src/transport.rs:2649  (TlsListener)
    │  - Handshakes run CONCURRENTLY on a background acceptor task
    │    (run_tls_acceptor, src/transport.rs:2542): 256-permit in-flight
    │    cap, 10 s per-handshake timeout; axum receives only completed
@@ -150,7 +150,7 @@ axum Router                                  src/transport.rs:1429  (build_app_r
    │      (see `extract_bearer` in src/auth.rs).
    │      On success: sets task-locals via `current_role`, `current_identity`, …
    │
-   ├── 8. RBAC middleware                    src/rbac.rs:753  (rbac_middleware) + 819 (enforce_tool_policy)
+   ├── 8. RBAC middleware                    src/rbac.rs:788  (rbac_middleware) + 819 (enforce_tool_policy)
    │      For POSTs to /mcp:
    │        - Reads body up to limit
    │        - Parses JSON-RPC envelope
@@ -182,12 +182,12 @@ Open endpoints (no auth):
 
 | Path                                       | Handler                                       |
 |--------------------------------------------|-----------------------------------------------|
-| `GET  /healthz`                            | `healthz` (~`src/transport.rs:1668`) |
-| `GET  /readyz`                             | `readyz`  (~`src/transport.rs:1669`) — runs configured readiness check |
-| `GET  /version`                            | `version_payload` (~`src/transport.rs:2937`) |
+| `GET  /healthz`                            | `healthz` (~`src/transport.rs:1729`) |
+| `GET  /readyz`                             | `readyz`  (~`src/transport.rs:1730`) — runs configured readiness check |
+| `GET  /version`                            | `version_payload` (~`src/transport.rs:3000`) |
 | `GET  /metrics`                            | served by `serve_metrics` on a **separate listener** when `feature = "metrics"` (`src/metrics.rs:142`) |
 | `GET  /.well-known/oauth-protected-resource` | feature = `oauth` (`src/transport.rs:1653`) |
-| `GET  /.well-known/oauth-authorization-server` | feature = `oauth` proxy (`src/transport.rs:1759`) |
+| `GET  /.well-known/oauth-authorization-server` | feature = `oauth` proxy (`src/transport.rs:1820`) |
 
 Authenticated endpoints:
 
@@ -214,7 +214,7 @@ Top-level builder-style config consumed by `serve()`. Holds:
 - optional readiness check callback (`Arc<dyn Fn() -> bool + Send + Sync>`)
 - public URL (used in OAuth metadata responses)
 
-### `ReloadHandle` — `src/transport.rs:1305`
+### `ReloadHandle` — `src/transport.rs:1376`
 Returned (optionally) from `serve()` when the consumer needs runtime
 hot-reload. Two methods:
 - `reload_auth_keys(new_map)` — atomically swaps `AuthState.api_keys`
@@ -388,7 +388,7 @@ ArgumentAllowlist {                       // src/rbac.rs:226
   installed *after* enforcement (see "Task-locals" below).
 
 ### Middleware
-`rbac_middleware` (`src/rbac.rs:753`):
+`rbac_middleware` (`src/rbac.rs:788`):
 1. Extracts the role + identity name from the `AuthIdentity` request
    extension (set by the auth middleware).
 2. For `POST /mcp`, reads the body (bounded by body-size layer), parses
@@ -435,7 +435,7 @@ an outbound `Authorization` header for downstream token passthrough.
 
 ## 7. TLS / mTLS
 
-**Custom listener**: `TlsListener` in `src/transport.rs:2522`, implementing
+**Custom listener**: `TlsListener` in `src/transport.rs:2649`, implementing
 `axum::serve::Listener` so axum's hyper machinery accepts it as a drop-in
 replacement for `TcpListener`.
 
@@ -443,7 +443,7 @@ Lifecycle (concurrent-acceptor design, since the 1.8.1 review fixes):
 1. `TlsListener::new(...)` reads PEM cert + key, builds a `rustls::ServerConfig`,
    optionally wraps with mTLS verification using configured root CAs, then
    spawns a dedicated background acceptor task (`run_tls_acceptor`,
-   `src/transport.rs:2711`) that owns the `TcpListener`.
+   `src/transport.rs:2086`) that owns the `TcpListener`.
 2. The acceptor task loops: acquires a permit from a semaphore sized by
    `max_concurrent_tls_handshakes` (default 256 via
    `DEFAULT_MAX_CONCURRENT_TLS_HANDSHAKES`; configurable since 1.9.0 via

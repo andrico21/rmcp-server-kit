@@ -1855,6 +1855,9 @@ pub struct JwksCache {
     /// [`AudienceValidationMode::Warn`], so the deprecation warning logs
     /// at most once per process lifetime.
     azp_fallback_warned: AtomicBool,
+    /// Separate from [Self::azp_fallback_warned] on purpose: sharing one
+    /// flag would let whichever mode logged first suppress the other.
+    azp_permissive_logged: AtomicBool,
     scopes: Vec<ScopeMapping>,
     role_claim: Option<String>,
     role_mappings: Vec<RoleMapping>,
@@ -2049,6 +2052,7 @@ impl JwksCache {
             audience_mode: config.effective_audience_validation_mode(),
             require_subject: config.require_subject,
             azp_fallback_warned: AtomicBool::new(false),
+            azp_permissive_logged: AtomicBool::new(false),
             scopes: config.scopes.clone(),
             role_claim: config.role_claim.clone(),
             role_mappings: config.role_mappings.clone(),
@@ -2235,7 +2239,18 @@ impl JwksCache {
             .is_some_and(|azp| azp == self.expected_audience);
         if azp_match {
             match self.audience_mode {
-                AudienceValidationMode::Permissive => return Ok(()),
+                AudienceValidationMode::Permissive => {
+                    if !self.azp_permissive_logged.swap(true, Ordering::Relaxed) {
+                        tracing::info!(
+                            expected = %self.expected_audience,
+                            "JWT accepted via azp-only audience fallback because \
+                             audience_validation_mode = \"permissive\". Acceptance is \
+                             intentionally wider than the spec; set \"warn\" or \"strict\" \
+                             to tighten it. This message logs once per process."
+                        );
+                    }
+                    return Ok(());
+                }
                 AudienceValidationMode::Warn => {
                     if !self.azp_fallback_warned.swap(true, Ordering::Relaxed) {
                         tracing::warn!(
@@ -2358,7 +2373,7 @@ impl JwksCache {
             if let Some(ts) = *last
                 && ts.elapsed() < JWKS_REFRESH_COOLDOWN
             {
-                tracing::debug!(
+                tracing::info!(
                     elapsed_ms = ts.elapsed().as_millis(),
                     cooldown_ms = JWKS_REFRESH_COOLDOWN.as_millis(),
                     "JWKS refresh skipped (cooldown active)"
@@ -2524,12 +2539,12 @@ const MAX_LOGGED_KID_CHARS: usize = 64;
 /// `kid` is remote-controlled text of unbounded length, so logging it raw
 /// lets a hostile or misconfigured issuer inflate log volume. Truncation is
 /// on a char boundary to keep the output valid UTF-8.
-fn truncate_kid_for_log(kid: &str) -> String {
+fn truncate_kid_for_log(kid: &str) -> (String, bool) {
     if kid.chars().count() <= MAX_LOGGED_KID_CHARS {
-        return kid.to_owned();
+        return (kid.to_owned(), false);
     }
     let head: String = kid.chars().take(MAX_LOGGED_KID_CHARS).collect();
-    format!("{head}...(truncated)")
+    (format!("{head}...(truncated)"), true)
 }
 
 fn build_key_cache(jwks: &JwkSet, max_keys: usize) -> Result<JwksKeyCache, String> {
@@ -2551,8 +2566,10 @@ fn build_key_cache(jwks: &JwkSet, max_keys: usize) -> Result<JwksKeyCache, Strin
         };
         if let Some(ref kid) = jwk.common.key_id {
             if keys.insert(kid.clone(), (alg, decoding_key)).is_some() {
+                let (kid_log, kid_truncated) = truncate_kid_for_log(kid);
                 tracing::warn!(
-                    kid = %truncate_kid_for_log(kid),
+                    kid = %kid_log,
+                    kid_truncated,
                     "duplicate kid in JWKS; later entry wins"
                 );
             }
@@ -4197,10 +4214,11 @@ role = "admin"
     #[test]
     fn truncate_kid_for_log_bounds_hostile_input() {
         let short = "kid-1";
-        assert_eq!(truncate_kid_for_log(short), short);
+        assert_eq!(truncate_kid_for_log(short), (short.to_owned(), false));
 
         let long = "k".repeat(4096);
-        let truncated = truncate_kid_for_log(&long);
+        let (truncated, was_truncated) = truncate_kid_for_log(&long);
+        assert!(was_truncated);
         assert!(truncated.ends_with("...(truncated)"));
         assert_eq!(
             truncated.chars().count(),
@@ -4211,9 +4229,18 @@ role = "admin"
     #[test]
     fn truncate_kid_for_log_splits_on_char_boundary() {
         let multibyte = "\u{1f512}".repeat(MAX_LOGGED_KID_CHARS + 10);
-        let truncated = truncate_kid_for_log(&multibyte);
+        let (truncated, was_truncated) = truncate_kid_for_log(&multibyte);
+        assert!(was_truncated);
         assert!(truncated.starts_with('\u{1f512}'));
         assert!(truncated.ends_with("...(truncated)"));
+    }
+
+    #[test]
+    fn truncate_kid_for_log_flag_marks_exact_boundary_as_untruncated() {
+        let exact = "k".repeat(MAX_LOGGED_KID_CHARS);
+        let (out, was_truncated) = truncate_kid_for_log(&exact);
+        assert!(!was_truncated, "a kid exactly at the cap is not truncated");
+        assert_eq!(out, exact);
     }
 
     #[tokio::test]
@@ -5396,6 +5423,10 @@ role = "admin"
         assert!(
             !cache.azp_fallback_warned.load(Ordering::Relaxed),
             "permissive mode must not flip the warn-once flag"
+        );
+        assert!(
+            cache.azp_permissive_logged.load(Ordering::Relaxed),
+            "permissive mode must record its own once-per-process log flag"
         );
     }
 

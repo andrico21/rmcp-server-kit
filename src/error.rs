@@ -17,7 +17,7 @@ use thiserror::Error;
 /// HTTP client** by [`IntoResponse`]. Construction sites MUST keep these
 /// client-safe: no internal error text, source-error chains, file paths, IPs,
 /// SQL, or dependency details. Internal-only variants (`Config`, `Io`, `Json`,
-/// `Toml`, `Tls`, `Startup`, `Metrics`) are collapsed to a generic
+/// `Toml`, `Tls`, `Startup`, `Internal`, `Metrics`) are collapsed to a generic
 /// `"internal server error"` body and their detail is logged server-side only.
 /// Use [`client_message`](Self::client_message) to obtain the exact body that
 /// will be sent to the client for any variant.
@@ -74,6 +74,15 @@ pub enum RmcpServerKitError {
     #[error("server startup error: {0}")]
     Startup(String),
 
+    /// Internal failure with no client-actionable cause.
+    ///
+    /// Detail is logged server-side and collapsed to `"internal server error"`
+    /// on the wire. Use this for runtime faults that are neither configuration
+    /// nor startup problems -- e.g. a cryptographic primitive failing -- rather
+    /// than reaching for a client-facing variant.
+    #[error("internal error: {0}")]
+    Internal(String),
+
     /// Metrics registration failure (e.g. Prometheus duplicate or invalid metric).
     #[cfg(feature = "metrics")]
     #[error("metrics error: {0}")]
@@ -123,7 +132,8 @@ impl RmcpServerKitError {
             | Self::Json(_)
             | Self::Toml(_)
             | Self::Tls(_)
-            | Self::Startup(_) => Cow::Borrowed("internal server error"),
+            | Self::Startup(_)
+            | Self::Internal(_) => Cow::Borrowed("internal server error"),
             #[cfg(feature = "metrics")]
             Self::Metrics(_) => Cow::Borrowed("internal server error"),
         }
@@ -157,7 +167,8 @@ impl IntoResponse for RmcpServerKitError {
             | Self::Json(_)
             | Self::Toml(_)
             | Self::Tls(_)
-            | Self::Startup(_)) => {
+            | Self::Startup(_)
+            | Self::Internal(_)) => {
                 tracing::error!(error = %other, "internal error");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -369,10 +380,34 @@ mod tests {
             RmcpServerKitError::RateLimited("c".into()),
             RmcpServerKitError::Config("d".into()),
             RmcpServerKitError::Tls("e".into()),
+            RmcpServerKitError::Internal("f".into()),
         ] {
             let expected = err.client_message().into_owned();
             let (_status, body) = status_of(err).await;
             assert_eq!(body, expected, "client_message must equal the wire body");
         }
+    }
+
+    #[tokio::test]
+    async fn internal_variant_is_500_and_leaks_nothing() {
+        let (status, body) = status_of(RmcpServerKitError::Internal(
+            "argon2id hashing failed: oom".into(),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, "internal server error");
+        assert!(
+            !body.contains("argon2"),
+            "upstream error detail must never reach the client body"
+        );
+    }
+
+    #[test]
+    fn internal_client_message_is_generic() {
+        assert_eq!(
+            RmcpServerKitError::Internal("salt encoding failed: bad length".into())
+                .client_message(),
+            "internal server error"
+        );
     }
 }

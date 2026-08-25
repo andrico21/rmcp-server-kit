@@ -1303,10 +1303,10 @@ pub fn generate_api_key() -> Result<(String, String), RmcpServerKitError> {
     let mut salt_bytes = [0u8; 16];
     rand::fill(&mut salt_bytes);
     let salt = SaltString::encode_b64(&salt_bytes)
-        .map_err(|e| RmcpServerKitError::Auth(format!("salt encoding failed: {e}")))?;
+        .map_err(|e| RmcpServerKitError::Internal(format!("salt encoding failed: {e}")))?;
     let hash = Argon2::default()
         .hash_password(token.as_bytes(), &salt)
-        .map_err(|e| RmcpServerKitError::Auth(format!("argon2id hashing failed: {e}")))?
+        .map_err(|e| RmcpServerKitError::Internal(format!("argon2id hashing failed: {e}")))?
         .to_string();
 
     Ok((token, hash))

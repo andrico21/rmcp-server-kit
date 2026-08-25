@@ -24,6 +24,7 @@ const SERVER_CONFIG_BRIDGED_FIELDS: &[&str] = &[
     "extra_route_rate_limit_burst",
     "extra_route_rate_limit_exempt_paths",
     "trusted_proxies",
+    "trusted_forwarder_max_entries",
     "forwarded_header",
     "session_idle_timeout",
     "sse_keep_alive",
@@ -291,6 +292,12 @@ pub struct ServerConfig {
     /// per-IP rate limiters key by it. Startup-only.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+    /// Maximum forwarding-chain entries scanned per request in
+    /// trusted-forwarder mode. Longer chains are treated as a header bomb
+    /// and resolution falls back to the direct peer. Default `16`, valid
+    /// range `1..=64`. Startup-only.
+    #[serde(default = "default_trusted_forwarder_max_entries")]
+    pub trusted_forwarder_max_entries: usize,
     /// Which forwarding header trusted-forwarder mode reads:
     /// `"x-forwarded-for"` (default when unset) or `"forwarded"`
     /// (RFC 7239). Requires `trusted_proxies` to be nonempty.
@@ -355,6 +362,7 @@ impl Default for ServerConfig {
             extra_route_rate_limit_burst: None,
             extra_route_rate_limit_exempt_paths: Vec::new(),
             trusted_proxies: Vec::new(),
+            trusted_forwarder_max_entries: default_trusted_forwarder_max_entries(),
             forwarded_header: None,
             session_idle_timeout: default_session_idle_timeout(),
             sse_keep_alive: default_sse_keep_alive(),
@@ -576,6 +584,7 @@ impl ServerConfig {
                     .map(String::as_str),
             )
             .with_trusted_proxies(self.trusted_proxies.iter().map(String::as_str))
+            .with_trusted_forwarder_max_entries(self.trusted_forwarder_max_entries)
             .with_optional_tool_rate_limit(self.tool_rate_limit)
             .with_optional_tool_rate_limit_burst(self.tool_rate_limit_burst)
             .with_optional_extra_route_rate_limit(self.extra_route_rate_limit)
@@ -1001,6 +1010,15 @@ fn validate_trusted_forwarder_config(server: &ServerConfig) -> crate::error::Res
             "server.forwarded_header requires server.trusted_proxies to be nonempty".into(),
         ));
     }
+    if server.trusted_forwarder_max_entries == 0
+        || server.trusted_forwarder_max_entries > crate::forwarded::MAX_CONFIGURABLE_SCANNED_ENTRIES
+    {
+        return Err(RmcpServerKitError::Config(format!(
+            "server.trusted_forwarder_max_entries must be in 1..={}, got {}",
+            crate::forwarded::MAX_CONFIGURABLE_SCANNED_ENTRIES,
+            server.trusted_forwarder_max_entries
+        )));
+    }
     Ok(())
 }
 
@@ -1047,6 +1065,9 @@ fn default_request_timeout() -> String {
 }
 const fn default_max_request_body() -> usize {
     1024 * 1024
+}
+const fn default_trusted_forwarder_max_entries() -> usize {
+    crate::forwarded::MAX_SCANNED_ENTRIES
 }
 const fn default_expose_build_metadata() -> bool {
     false
@@ -1275,6 +1296,33 @@ mod tests {
                 "entry {entry:?}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn toml_trusted_forwarder_max_entries_bounds_are_enforced() {
+        let parse = |v: usize| -> crate::error::Result<()> {
+            let cfg: ServerConfig =
+                toml::from_str(&format!("trusted_forwarder_max_entries = {v}")).unwrap();
+            validate_server_config(&cfg)
+        };
+        assert!(parse(0).is_err());
+        assert!(parse(crate::forwarded::MAX_CONFIGURABLE_SCANNED_ENTRIES + 1).is_err());
+        assert!(parse(1).is_ok());
+        assert!(parse(crate::forwarded::MAX_CONFIGURABLE_SCANNED_ENTRIES).is_ok());
+    }
+
+    #[test]
+    fn toml_trusted_forwarder_max_entries_defaults_and_bridges() {
+        let cfg: ServerConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            cfg.trusted_forwarder_max_entries,
+            crate::forwarded::MAX_SCANNED_ENTRIES
+        );
+        let base = crate::transport::McpServerConfig::new("127.0.0.1:8080", "t", "0");
+        let src: ServerConfig =
+            toml::from_str("trusted_forwarder_max_entries = 32").expect("parses");
+        let bridged = src.apply_to_mcp_config(base).expect("bridges");
+        assert_eq!(bridged.trusted_forwarder_max_entries, 32);
     }
 
     #[test]

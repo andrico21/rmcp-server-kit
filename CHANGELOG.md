@@ -71,6 +71,62 @@ update required). Two runtime behaviours change; both are noted below.
   byte-exact with no Unicode normalization, and the consequence on
   normalizing filesystems.
 
+- `McpServerConfig::with_extra_router` now documents how path collisions are
+  handled. A route that **exactly overlaps** a framework route panics at
+  startup inside `axum::Router::merge`; a path merely *under* a framework
+  prefix (`/admin/custom` alongside `/admin/status`) does **not** panic and is
+  **not** validated. `axum::Router` exposes no route-enumeration API, so the
+  framework cannot inspect these paths -- avoiding such collisions is the
+  caller's responsibility. Both behaviours are now pinned by tests.
+
+### Added
+
+- `RmcpServerKitError::Internal` -- an internal-failure variant whose detail is
+  logged server-side and collapsed to `"internal server error"` on the wire.
+  Additive: the enum is `#[non_exhaustive]`.
+
+- `McpServerConfig::with_trusted_forwarder_max_entries` and the
+  `server.trusted_forwarder_max_entries` TOML key expose the
+  forwarding-chain scan cap used in trusted-forwarder mode. Default `16`
+  (unchanged). Validated to `1..=64`: `0` would pin every client to the proxy
+  address, and an unbounded value would re-open the header-bomb vector the cap
+  exists to close.
+
+### Changed
+
+- **`generate_api_key` now returns `RmcpServerKitError::Internal` instead of
+  `Auth` when salt encoding or Argon2 hashing fails.** The `Auth` variant is
+  declared client-facing and is rendered verbatim to HTTP clients, so embedding
+  an upstream `password_hash::Error` chain in it violated that contract; it
+  also mapped a server-side fault to `401` rather than `500`. Not a compile
+  break -- the enum is `#[non_exhaustive]`, so downstream matches already carry
+  a wildcard arm -- but the observable variant and HTTP status change.
+
+- OAuth `audience_validation_mode = "permissive"` now logs once per process
+  when it accepts a token via the `azp`-only fallback. Acceptance behaviour is
+  unchanged; previously this mode was entirely silent, so a deployment running
+  wider-than-spec audience validation left no trace. The `"warn"` mode's
+  existing once-per-process warning is untouched.
+
+- The JWKS "refresh skipped (cooldown active)" message moved from `debug` to
+  `info`, so a key rotation stalled behind the refresh cooldown is visible at
+  default log levels.
+
+- A duplicate `kid` warning now carries a structured `kid_truncated` boolean
+  alongside the truncated value, so log pipelines can detect truncation without
+  substring-matching.
+
+### Internal
+
+- `host_matches` lowercases the host once per call rather than once per
+  pattern, and only when a wildcard pattern is present -- an all-exact host
+  pattern list stays allocation-free.
+
+- Numeric IPv4 literal forms (decimal, hex, octal) and IPv4-mapped IPv6 are now
+  pinned by tests as unreachable-as-hostnames through the OAuth literal-IP
+  guard. No behaviour change: the `url` crate already normalizes these to
+  `Host::Ipv4` before the guard sees them, but nothing asserted it.
+
 ## [3.7.0] - 2026-08-25
 
 Retires the `mcpx` naming that outlived the crate rename.

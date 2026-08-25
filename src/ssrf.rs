@@ -543,6 +543,42 @@ mod tests {
         }
     }
 
+    /// Numeric IPv4 literals must never reach the fetch path as an allowed
+    /// DNS name. The WHATWG URL parser normalizes decimal, hex, and octal
+    /// forms to `Host::Ipv4` before `check_url_literal_ip` sees them, so the
+    /// literal-IP guard covers them -- but nothing in this crate pins that,
+    /// and it is exactly the shape an SSRF filter bypass takes.
+    ///
+    /// The invariant asserted is "not reachable as a `Domain`": either the
+    /// URL fails to parse at all, or the literal-IP guard rejects it.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn numeric_ipv4_literal_forms_never_pass_as_hostnames() {
+        for raw in [
+            "https://127.0.0.1/",
+            "https://2130706433/",
+            "https://0x7f000001/",
+            "https://0177.0.0.1/",
+            "https://[::ffff:127.0.0.1]/",
+            "https://[::1]/",
+        ] {
+            match Url::parse(raw) {
+                Err(_) => {}
+                Ok(url) => assert!(
+                    super::check_url_literal_ip(&url).is_some(),
+                    "{raw} was accepted as a DNS hostname; the literal-IP guard did not fire"
+                ),
+            }
+        }
+    }
+
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn dns_hostname_still_passes_the_literal_ip_guard() {
+        let url = Url::parse("https://idp.example.com/realms/main").expect("parse");
+        assert!(super::check_url_literal_ip(&url).is_none());
+    }
+
     #[test]
     fn userinfo_rejected_on_accepted_schemes() {
         for raw in ["https://user:pass@host/", "https://user@host/"] {

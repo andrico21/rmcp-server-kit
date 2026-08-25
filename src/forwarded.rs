@@ -25,7 +25,15 @@ use crate::transport::ForwardedHeaderMode;
 /// Hard cap on forwarding-chain entries scanned per request. Chains
 /// longer than this are treated as hostile (header bomb) and resolution
 /// falls back to the direct peer.
-const MAX_SCANNED_ENTRIES: usize = 16;
+pub(crate) const MAX_SCANNED_ENTRIES: usize = 16;
+
+/// Hard ceiling on the operator-configurable scan cap.
+///
+/// [`MAX_SCANNED_ENTRIES`] exists to close header-bomb scanning, so exposing
+/// the knob without a ceiling would let an operator disable the protection.
+/// 64 is four times the default -- ample for any real proxy chain -- while
+/// keeping per-request parsing work finite.
+pub(crate) const MAX_CONFIGURABLE_SCANNED_ENTRIES: usize = 64;
 
 /// Why trusted-forwarder resolution fell back to the direct peer.
 ///
@@ -62,6 +70,7 @@ pub(crate) fn resolve_client_ip(
     headers: &HeaderMap,
     trusted: &[IpNet],
     mode: ForwardedHeaderMode,
+    max_scanned_entries: usize,
 ) -> Result<IpAddr, FallbackReason> {
     if !is_trusted(direct, trusted) {
         return Ok(direct);
@@ -84,7 +93,7 @@ pub(crate) fn resolve_client_ip(
     let mut scanned = 0_usize;
     for raw_entry in value.split(',').rev() {
         scanned += 1;
-        if scanned > MAX_SCANNED_ENTRIES {
+        if scanned > max_scanned_entries {
             return Err(FallbackReason::TooManyEntries);
         }
         let candidate = match mode {
@@ -223,6 +232,19 @@ mod tests {
         s.parse().unwrap()
     }
 
+    #[test]
+    fn scan_cap_is_honoured_from_the_parameter_not_the_constant() {
+        // 3 entries, cap of 2: the walk aborts and the caller falls back to
+        // the direct peer rather than trusting a truncated chain.
+        let headers = xff(&["1.1.1.1, 10.0.0.2, 10.0.0.3"]);
+        let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), XFF, 2);
+        assert_eq!(got, Err(FallbackReason::TooManyEntries));
+
+        // Same chain, cap of 3: the untrusted client IP is resolved.
+        let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), XFF, 3);
+        assert_eq!(got, Ok(ip("1.1.1.1")));
+    }
+
     fn xff(values: &[&str]) -> HeaderMap {
         let mut h = HeaderMap::new();
         for v in values {
@@ -245,14 +267,26 @@ mod tests {
     #[test]
     fn untrusted_direct_peer_ignores_header() {
         let headers = xff(&["203.0.113.7"]);
-        let got = resolve_client_ip(ip("198.51.100.9"), &headers, &nets(&["10.0.0.0/8"]), XFF);
+        let got = resolve_client_ip(
+            ip("198.51.100.9"),
+            &headers,
+            &nets(&["10.0.0.0/8"]),
+            XFF,
+            MAX_SCANNED_ENTRIES,
+        );
         assert_eq!(got, Ok(ip("198.51.100.9")), "header must be ignored");
     }
 
     #[test]
     fn trusted_peer_single_entry_resolves() {
         let headers = xff(&["203.0.113.7"]);
-        let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), XFF);
+        let got = resolve_client_ip(
+            ip("10.0.0.1"),
+            &headers,
+            &nets(&["10.0.0.0/8"]),
+            XFF,
+            MAX_SCANNED_ENTRIES,
+        );
         assert_eq!(got, Ok(ip("203.0.113.7")));
     }
 
@@ -260,28 +294,52 @@ mod tests {
     fn multi_hop_chain_skips_trusted_right_to_left() {
         // client -> proxy A (10.0.0.2) -> proxy B (10.0.0.1) -> us
         let headers = xff(&["203.0.113.7, 10.0.0.2"]);
-        let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), XFF);
+        let got = resolve_client_ip(
+            ip("10.0.0.1"),
+            &headers,
+            &nets(&["10.0.0.0/8"]),
+            XFF,
+            MAX_SCANNED_ENTRIES,
+        );
         assert_eq!(got, Ok(ip("203.0.113.7")));
     }
 
     #[test]
     fn all_entries_trusted_falls_back() {
         let headers = xff(&["10.0.0.3, 10.0.0.2"]);
-        let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), XFF);
+        let got = resolve_client_ip(
+            ip("10.0.0.1"),
+            &headers,
+            &nets(&["10.0.0.0/8"]),
+            XFF,
+            MAX_SCANNED_ENTRIES,
+        );
         assert_eq!(got, Err(FallbackReason::AllEntriesTrusted));
     }
 
     #[test]
     fn missing_header_falls_back() {
         let headers = HeaderMap::new();
-        let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), XFF);
+        let got = resolve_client_ip(
+            ip("10.0.0.1"),
+            &headers,
+            &nets(&["10.0.0.0/8"]),
+            XFF,
+            MAX_SCANNED_ENTRIES,
+        );
         assert_eq!(got, Err(FallbackReason::NoHeader));
     }
 
     #[test]
     fn malformed_entry_at_decision_point_falls_back() {
         let headers = xff(&["not-an-ip"]);
-        let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), XFF);
+        let got = resolve_client_ip(
+            ip("10.0.0.1"),
+            &headers,
+            &nets(&["10.0.0.0/8"]),
+            XFF,
+            MAX_SCANNED_ENTRIES,
+        );
         assert_eq!(got, Err(FallbackReason::MalformedEntry));
     }
 
@@ -289,7 +347,13 @@ mod tests {
     fn empty_and_whitespace_tokens_fall_back() {
         for value in ["203.0.113.7,,10.0.0.2", "203.0.113.7,   ,10.0.0.2"] {
             let headers = xff(&[value]);
-            let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), XFF);
+            let got = resolve_client_ip(
+                ip("10.0.0.1"),
+                &headers,
+                &nets(&["10.0.0.0/8"]),
+                XFF,
+                MAX_SCANNED_ENTRIES,
+            );
             // Rightmost-first walk hits 10.0.0.2 (trusted, skipped), then
             // the empty token at the decision point.
             assert_eq!(got, Err(FallbackReason::MalformedEntry), "value: {value:?}");
@@ -299,21 +363,39 @@ mod tests {
     #[test]
     fn ows_around_entries_is_trimmed() {
         let headers = xff(&["  203.0.113.7  ,  10.0.0.2  "]);
-        let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), XFF);
+        let got = resolve_client_ip(
+            ip("10.0.0.1"),
+            &headers,
+            &nets(&["10.0.0.0/8"]),
+            XFF,
+            MAX_SCANNED_ENTRIES,
+        );
         assert_eq!(got, Ok(ip("203.0.113.7")));
     }
 
     #[test]
     fn xff_v4_with_port_parses() {
         let headers = xff(&["203.0.113.7:5678"]);
-        let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), XFF);
+        let got = resolve_client_ip(
+            ip("10.0.0.1"),
+            &headers,
+            &nets(&["10.0.0.0/8"]),
+            XFF,
+            MAX_SCANNED_ENTRIES,
+        );
         assert_eq!(got, Ok(ip("203.0.113.7")));
     }
 
     #[test]
     fn xff_empty_port_falls_back() {
         let headers = xff(&["203.0.113.7:"]);
-        let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), XFF);
+        let got = resolve_client_ip(
+            ip("10.0.0.1"),
+            &headers,
+            &nets(&["10.0.0.0/8"]),
+            XFF,
+            MAX_SCANNED_ENTRIES,
+        );
         assert_eq!(got, Err(FallbackReason::MalformedEntry));
     }
 
@@ -327,7 +409,13 @@ mod tests {
             "[2001:db8::1]:+443",
         ] {
             let headers = xff(&[value]);
-            let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), XFF);
+            let got = resolve_client_ip(
+                ip("10.0.0.1"),
+                &headers,
+                &nets(&["10.0.0.0/8"]),
+                XFF,
+                MAX_SCANNED_ENTRIES,
+            );
             assert_eq!(got, Err(FallbackReason::MalformedEntry), "value: {value:?}");
         }
     }
@@ -335,11 +423,23 @@ mod tests {
     #[test]
     fn xff_bracketed_v6_with_port_and_bare_v6_parse() {
         let headers = xff(&["[2001:db8::1]:443"]);
-        let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), XFF);
+        let got = resolve_client_ip(
+            ip("10.0.0.1"),
+            &headers,
+            &nets(&["10.0.0.0/8"]),
+            XFF,
+            MAX_SCANNED_ENTRIES,
+        );
         assert_eq!(got, Ok(ip("2001:db8::1")));
 
         let headers = xff(&["2001:db8::2"]);
-        let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), XFF);
+        let got = resolve_client_ip(
+            ip("10.0.0.1"),
+            &headers,
+            &nets(&["10.0.0.0/8"]),
+            XFF,
+            MAX_SCANNED_ENTRIES,
+        );
         assert_eq!(got, Ok(ip("2001:db8::2")));
     }
 
@@ -348,14 +448,26 @@ mod tests {
         // The first instance is attacker-supplied; only the last was
         // appended by our trusted proxy.
         let headers = xff(&["6.6.6.6", "203.0.113.7"]);
-        let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), XFF);
+        let got = resolve_client_ip(
+            ip("10.0.0.1"),
+            &headers,
+            &nets(&["10.0.0.0/8"]),
+            XFF,
+            MAX_SCANNED_ENTRIES,
+        );
         assert_eq!(got, Ok(ip("203.0.113.7")));
     }
 
     #[test]
     fn multiple_forwarded_header_instances_last_wins() {
         let headers = fwd(&["for=6.6.6.6", "for=203.0.113.9"]);
-        let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), FWD);
+        let got = resolve_client_ip(
+            ip("10.0.0.1"),
+            &headers,
+            &nets(&["10.0.0.0/8"]),
+            FWD,
+            MAX_SCANNED_ENTRIES,
+        );
         assert_eq!(got, Ok(ip("203.0.113.9")));
     }
 
@@ -364,14 +476,26 @@ mod tests {
         let mut entries: Vec<String> = (0..17).map(|i| format!("10.0.{i}.1")).collect();
         entries.insert(0, "203.0.113.7".into());
         let headers = xff(&[entries.join(", ").as_str()]);
-        let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), XFF);
+        let got = resolve_client_ip(
+            ip("10.0.0.1"),
+            &headers,
+            &nets(&["10.0.0.0/8"]),
+            XFF,
+            MAX_SCANNED_ENTRIES,
+        );
         assert_eq!(got, Err(FallbackReason::TooManyEntries));
     }
 
     #[test]
     fn forwarded_quoted_bracketed_v6_resolves() {
         let headers = fwd(&[r#"for="[2001:db8::1]:443";proto=https"#]);
-        let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), FWD);
+        let got = resolve_client_ip(
+            ip("10.0.0.1"),
+            &headers,
+            &nets(&["10.0.0.0/8"]),
+            FWD,
+            MAX_SCANNED_ENTRIES,
+        );
         assert_eq!(got, Ok(ip("2001:db8::1")));
     }
 
@@ -379,7 +503,13 @@ mod tests {
     fn forwarded_obfuscated_identifiers_fall_back() {
         for value in ["for=_hidden", "for=unknown", "For=UNKNOWN"] {
             let headers = fwd(&[value]);
-            let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), FWD);
+            let got = resolve_client_ip(
+                ip("10.0.0.1"),
+                &headers,
+                &nets(&["10.0.0.0/8"]),
+                FWD,
+                MAX_SCANNED_ENTRIES,
+            );
             assert_eq!(got, Err(FallbackReason::Obfuscated), "value: {value:?}");
         }
     }
@@ -387,21 +517,39 @@ mod tests {
     #[test]
     fn forwarded_param_name_is_case_insensitive() {
         let headers = fwd(&["By=10.0.0.1;FOR=203.0.113.9;proto=https"]);
-        let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), FWD);
+        let got = resolve_client_ip(
+            ip("10.0.0.1"),
+            &headers,
+            &nets(&["10.0.0.0/8"]),
+            FWD,
+            MAX_SCANNED_ENTRIES,
+        );
         assert_eq!(got, Ok(ip("203.0.113.9")));
     }
 
     #[test]
     fn forwarded_stanza_without_for_falls_back() {
         let headers = fwd(&["by=10.0.0.1;proto=https"]);
-        let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), FWD);
+        let got = resolve_client_ip(
+            ip("10.0.0.1"),
+            &headers,
+            &nets(&["10.0.0.0/8"]),
+            FWD,
+            MAX_SCANNED_ENTRIES,
+        );
         assert_eq!(got, Err(FallbackReason::MalformedEntry));
     }
 
     #[test]
     fn forwarded_multi_stanza_skips_trusted() {
         let headers = fwd(&["for=203.0.113.9, for=10.0.0.2"]);
-        let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), FWD);
+        let got = resolve_client_ip(
+            ip("10.0.0.1"),
+            &headers,
+            &nets(&["10.0.0.0/8"]),
+            FWD,
+            MAX_SCANNED_ENTRIES,
+        );
         assert_eq!(got, Ok(ip("203.0.113.9")));
     }
 
@@ -419,7 +567,13 @@ mod tests {
             r#"for=2"03.0.113.9"#,
         ] {
             let headers = fwd(&[value]);
-            let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), FWD);
+            let got = resolve_client_ip(
+                ip("10.0.0.1"),
+                &headers,
+                &nets(&["10.0.0.0/8"]),
+                FWD,
+                MAX_SCANNED_ENTRIES,
+            );
             assert_eq!(
                 got,
                 Err(FallbackReason::MalformedEntry),
@@ -437,7 +591,13 @@ mod tests {
             (r#"for="[2001:db8::1]""#, ip("2001:db8::1")),
         ] {
             let headers = fwd(&[value]);
-            let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), FWD);
+            let got = resolve_client_ip(
+                ip("10.0.0.1"),
+                &headers,
+                &nets(&["10.0.0.0/8"]),
+                FWD,
+                MAX_SCANNED_ENTRIES,
+            );
             assert_eq!(got, Ok(want), "well-formed value must resolve: {value:?}");
         }
     }
@@ -449,7 +609,13 @@ mod tests {
         // misclassified as a malformed entry.
         for value in [r#"for="unknown""#, r#"for="_secret""#] {
             let headers = fwd(&[value]);
-            let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), FWD);
+            let got = resolve_client_ip(
+                ip("10.0.0.1"),
+                &headers,
+                &nets(&["10.0.0.0/8"]),
+                FWD,
+                MAX_SCANNED_ENTRIES,
+            );
             assert_eq!(got, Err(FallbackReason::Obfuscated), "value: {value:?}");
         }
     }

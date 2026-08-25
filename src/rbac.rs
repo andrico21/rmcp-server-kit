@@ -679,9 +679,18 @@ impl RbacPolicy {
     /// which is shared with tool-name matching where case *is* significant.
     /// Lowercasing there would silently widen every tool allowlist.
     fn host_matches(patterns: &[String], host: &str) -> bool {
+        // Lowercased once per call rather than once per pattern, and only
+        // when a wildcard pattern will actually consume it -- an all-exact
+        // pattern list stays allocation-free via `eq_ignore_ascii_case`.
+        let host_lower = patterns
+            .iter()
+            .any(|p| p.contains('*'))
+            .then(|| host.to_ascii_lowercase());
         patterns.iter().any(|p| {
             if p.contains('*') {
-                glob_match(&p.to_ascii_lowercase(), &host.to_ascii_lowercase())
+                host_lower
+                    .as_deref()
+                    .is_some_and(|h| glob_match(&p.to_ascii_lowercase(), h))
             } else {
                 p.eq_ignore_ascii_case(host)
             }

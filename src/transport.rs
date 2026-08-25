@@ -212,6 +212,7 @@ pub enum ForwardedHeaderMode {
 struct ForwardResolver {
     trusted: Vec<ipnet::IpNet>,
     mode: ForwardedHeaderMode,
+    max_scanned_entries: usize,
 }
 
 /// Per-header overrides for the OWASP security headers emitted by the
@@ -396,6 +397,14 @@ pub struct McpServerConfig {
         note = "use McpServerConfig::with_extra_route_rate_limit_exempt_paths(); direct field access will become pub(crate) in a future major release"
     )]
     pub extra_route_rate_limit_exempt_paths: Vec<String>,
+
+    /// Maximum forwarding-chain entries scanned per request in
+    /// trusted-forwarder mode. Chains longer than this are treated as a
+    /// header bomb and resolution falls back to the direct peer.
+    ///
+    /// Defaults to `16`. Valid range is `1..=64`; the ceiling exists because
+    /// an unbounded value would disable the header-bomb protection entirely.
+    pub trusted_forwarder_max_entries: usize,
     /// Trusted reverse-proxy networks (CIDRs or bare IPs) for
     /// **trusted-forwarder mode**. Empty (default) = mode off: every
     /// limiter keys by the direct socket peer. Nonempty = requests whose
@@ -723,6 +732,7 @@ impl McpServerConfig {
             tool_rate_limit_burst: None,
             extra_route_rate_limit_burst: None,
             extra_route_rate_limit_exempt_paths: Vec::new(),
+            trusted_forwarder_max_entries: crate::forwarded::MAX_SCANNED_ENTRIES,
             trusted_proxies: Vec::new(),
             forwarded_header: None,
         }
@@ -814,9 +824,40 @@ impl McpServerConfig {
     /// for stock third-party middleware (e.g. per-IP rate-limit key
     /// extractors). Neither extension exists under [`serve_stdio`],
     /// which has no network peer.
+    ///
+    /// # Path collisions are only partially detected
+    ///
+    /// These routes are merged into the framework router. A route whose path
+    /// **exactly overlaps** a framework route (`/mcp`, `/healthz`, `/readyz`,
+    /// `/version`, and, when enabled, `/admin/status` and the OAuth
+    /// `/.well-known/*` endpoints) causes `axum::Router::merge` to **panic at
+    /// startup**. That panic is intentional upstream behaviour and is not
+    /// converted into a [`RmcpServerKitError`]: the release profile builds
+    /// with `panic = "abort"`, so catching it is not possible.
+    ///
+    /// A path that merely sits *under* a framework prefix without exactly
+    /// overlapping an existing route -- `/admin/custom` alongside
+    /// `/admin/status`, say -- does **not** panic and is **not** validated.
+    /// `axum::Router` exposes no route-enumeration API, so the framework
+    /// cannot inspect these paths. Avoiding such collisions is the caller's
+    /// responsibility.
+    ///
+    /// The Prometheus `/metrics` endpoint is unaffected: it is served on its
+    /// own listener, not merged here.
     #[must_use]
     pub fn with_extra_router(mut self, router: axum::Router) -> Self {
         self.extra_router = Some(router);
+        self
+    }
+
+    /// Override the forwarding-chain scan cap for trusted-forwarder mode.
+    ///
+    /// Defaults to 16. Validated to `1..=64` by [`Self::validate`]: `0` would
+    /// pin every client to the proxy address, and an unbounded value would
+    /// re-open the header-bomb vector the cap exists to close.
+    #[must_use]
+    pub const fn with_trusted_forwarder_max_entries(mut self, max_entries: usize) -> Self {
+        self.trusted_forwarder_max_entries = max_entries;
         self
     }
 
@@ -1119,6 +1160,16 @@ impl McpServerConfig {
             return Err(RmcpServerKitError::Config(
                 "extra_route_rate_limit_burst must be greater than zero".into(),
             ));
+        }
+        if self.trusted_forwarder_max_entries == 0
+            || self.trusted_forwarder_max_entries
+                > crate::forwarded::MAX_CONFIGURABLE_SCANNED_ENTRIES
+        {
+            return Err(RmcpServerKitError::Config(format!(
+                "trusted_forwarder_max_entries must be in 1..={}, got {}",
+                crate::forwarded::MAX_CONFIGURABLE_SCANNED_ENTRIES,
+                self.trusted_forwarder_max_entries
+            )));
         }
         if self.tool_rate_limit_burst.is_some() && self.tool_rate_limit.is_none() {
             return Err(RmcpServerKitError::Config(
@@ -1920,6 +1971,7 @@ where
             mode: config
                 .forwarded_header
                 .unwrap_or(ForwardedHeaderMode::XForwardedFor),
+            max_scanned_entries: config.trusted_forwarder_max_entries,
         }))
     };
     if forward_resolver.is_some() {
@@ -3416,16 +3468,20 @@ async fn normalize_peer_addr_middleware(
         }
         req.extensions_mut().insert(PeerAddr::new(addr));
         let client_ip = match &resolver {
-            Some(r) => {
-                crate::forwarded::resolve_client_ip(addr.ip(), req.headers(), &r.trusted, r.mode)
-                    .unwrap_or_else(|reason| {
-                        tracing::debug!(
-                            reason = ?reason,
-                            "forwarded-header resolution fell back to direct peer"
-                        );
-                        addr.ip()
-                    })
-            }
+            Some(r) => crate::forwarded::resolve_client_ip(
+                addr.ip(),
+                req.headers(),
+                &r.trusted,
+                r.mode,
+                r.max_scanned_entries,
+            )
+            .unwrap_or_else(|reason| {
+                tracing::debug!(
+                    reason = ?reason,
+                    "forwarded-header resolution fell back to direct peer"
+                );
+                addr.ip()
+            }),
             None => addr.ip(),
         };
         req.extensions_mut().insert(ClientIp::new(client_ip));
@@ -4621,10 +4677,37 @@ mod tests {
 
     // -- trusted-forwarder mode (ClientIp / ForwardedHeaderMode) --
 
+    #[test]
+    fn trusted_forwarder_max_entries_bounds_are_enforced() {
+        let cfg = |n: usize| {
+            McpServerConfig::new("127.0.0.1:8080", "t", "0")
+                .with_trusted_forwarder_max_entries(n)
+                .validate()
+        };
+        assert!(cfg(0).is_err(), "0 would pin every client to the proxy");
+        assert!(
+            cfg(crate::forwarded::MAX_CONFIGURABLE_SCANNED_ENTRIES + 1).is_err(),
+            "above the ceiling would re-open the header-bomb vector"
+        );
+        assert!(cfg(1).is_ok());
+        assert!(cfg(crate::forwarded::MAX_SCANNED_ENTRIES).is_ok());
+        assert!(cfg(crate::forwarded::MAX_CONFIGURABLE_SCANNED_ENTRIES).is_ok());
+    }
+
+    #[test]
+    fn trusted_forwarder_max_entries_defaults_to_the_module_constant() {
+        let cfg = McpServerConfig::new("127.0.0.1:8080", "t", "0");
+        assert_eq!(
+            cfg.trusted_forwarder_max_entries,
+            crate::forwarded::MAX_SCANNED_ENTRIES
+        );
+    }
+
     fn forward_resolver(trusted: &[&str], mode: ForwardedHeaderMode) -> Arc<ForwardResolver> {
         Arc::new(ForwardResolver {
             trusted: trusted.iter().map(|s| s.parse().unwrap()).collect(),
             mode,
+            max_scanned_entries: crate::forwarded::MAX_SCANNED_ENTRIES,
         })
     }
 
@@ -5345,6 +5428,39 @@ mod tests {
         configure(&mut config);
         let (router, _params) = build_app_router(config, || H).expect("build_app_router");
         router
+    }
+
+    /// An `extra_router` route that exactly overlaps a framework route makes
+    /// `axum::Router::merge` panic during `build_app_router`. This pins that
+    /// upstream behaviour so the documented contract on `with_extra_router`
+    /// cannot silently stop holding.
+    #[test]
+    #[should_panic(expected = "Overlapping method route")]
+    fn extra_router_exact_overlap_with_framework_route_panics() {
+        #[derive(Clone)]
+        struct H;
+        impl ServerHandler for H {}
+        let config = McpServerConfig::new("127.0.0.1:8080", "test", "0.0.0").with_extra_router(
+            axum::Router::new().route("/healthz", axum::routing::get(|| async { "mine" })),
+        );
+        let _ = build_app_router(config, || H);
+    }
+
+    /// The complement: a path *under* a framework prefix that does not exactly
+    /// overlap an existing route is accepted without complaint. Documented as
+    /// the caller's responsibility on `with_extra_router`.
+    #[test]
+    fn extra_router_non_overlapping_path_under_framework_prefix_is_accepted() {
+        #[derive(Clone)]
+        struct H;
+        impl ServerHandler for H {}
+        let config = McpServerConfig::new("127.0.0.1:8080", "test", "0.0.0").with_extra_router(
+            axum::Router::new().route("/admin/custom", axum::routing::get(|| async { "mine" })),
+        );
+        assert!(
+            build_app_router(config, || H).is_ok(),
+            "non-overlapping path under a framework prefix must merge cleanly"
+        );
     }
 
     #[tokio::test]

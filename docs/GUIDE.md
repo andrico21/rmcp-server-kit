@@ -792,6 +792,7 @@ extra_route_rate_limit = 60
 | `auth` | `Option<AuthConfig>` | `None` | Inline `[server.auth]` block selecting API-key / mTLS / OAuth — see [auth](#auth) |
 | `trusted_proxies` | `Vec<String>` | `[]` | CIDRs or IPs whose forwarding headers are trusted for client-IP resolution. When non-empty, enables trusted-forwarder mode. Pairs with `forwarded_header`. |
 | `forwarded_header` | `String` | `"x-forwarded-for"` | Which forwarding header to read when trusted-forwarder mode is active. Accepted values: `"x-forwarded-for"` (de-facto standard; nginx, HAProxy, CDNs) or `"forwarded"` (RFC 7239 `Forwarded` header). Ignored when `trusted_proxies` is empty. |
+| `trusted_forwarder_max_entries` | `usize` | `16` | Maximum forwarding-chain entries scanned per request in trusted-forwarder mode. Longer chains are treated as a header bomb and resolution falls back to the direct socket peer. Valid range `1..=64`; the ceiling exists because an unbounded value would disable the header-bomb protection. Ignored when `trusted_proxies` is empty. |
 
 #### `ObservabilityConfig`
 
