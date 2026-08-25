@@ -788,22 +788,61 @@ clippy lint enforces this.
 
 ## 15. Configuration
 
-Two configuration surfaces:
+Three layers, applied in a fixed order.
 
 **Programmatic** — `McpServerConfig::new(addr, name, version)` builder
-(`src/transport.rs:127`). The consumer can set every field directly.
+(`src/transport.rs:684`). Holds everything `serve()` needs, including the
+runtime-only fields TOML cannot express: `rbac`, `readiness_check`,
+`extra_router`, `on_reload_ready`, and the metrics listener. Deliberately does
+**not** derive `Deserialize` — it carries callbacks and an `axum::Router`, and
+deriving serde would freeze the deprecated public field surface the crate is
+retiring.
 
-**TOML** — `src/config.rs` defines deserializable structs
-(`AuthConfig`, `RbacConfigToml`, `OAuthConfigToml`, etc.) consumers can
-load from a file. See [`docs/GUIDE.md`](GUIDE.md) for full schema and
-examples.
+**TOML** — the deserializable sections:
+
+- `ServerConfig` — `src/config.rs:221`
+- `ObservabilityConfig` — `src/config.rs:803`
+- `SecurityHeadersConfig` — `src/transport.rs:240`
+- `AuthConfig`, `MtlsConfig`, `RateLimitConfig` — `src/auth.rs`
+- `RbacConfig` — `src/rbac.rs`
+- `OAuthConfig` — `src/oauth.rs`
+
+There is **no kit-owned root config struct**; each downstream composes these
+sections into its own root type. `[server]`, `[rbac]` and `[observability]`
+are a convention from [`docs/GUIDE.md`](GUIDE.md), not a type.
+
+`ServerConfig` was schema-only until 3.4.0 — nothing in the crate consumed it.
+`ServerConfig::apply_to_mcp_config` (`src/config.rs:542`) is the bridge that
+makes it reachable. It uses **replacement semantics**: authoritative for every
+bridgeable transport field, with `None`/`false` clearing whatever the base
+held. Only the runtime-only fields above survive from the base. It is fallible
+(duration strings parse here) and never reads the environment.
+
+**Environment (opt-in)** — three inherent methods, one per section owning
+targeted fields: `ServerConfig::apply_env_overrides` (`src/config.rs:406`),
+`ObservabilityConfig::apply_env_overrides` (`src/config.rs:629`) and
+`RbacConfig::apply_env_overrides` (`src/rbac.rs:1166`). Each returns
+`Vec<EnvOverride>` (`src/config.rs:63`) for audit logging, with `value: None`
+for secret targets. Fourteen curated variables under the `RMCP_SERVER_KIT__`
+prefix; `__` separates TOML path segments because field names already contain
+single underscores.
+
+Nothing reads the environment implicitly — `serve()`, `validate()` and every
+constructor are env-free. `RUST_LOG` remains the one exception, honoured by
+`init_tracing_from_config` per tracing convention.
+
+Precedence: **struct defaults < TOML < `apply_env_overrides` < application
+builder calls after the bridge < `validate()`**.
+[`examples/config_file_server.rs`](../examples/config_file_server.rs) is the
+compiled, runnable walkthrough.
 
 Defaults (chosen for safe production posture):
 - max body size: **1 MiB**
-- request timeout: **30 s**
-- TLS: required when not `127.0.0.1` (heuristic; can be overridden)
-- admin role: `"admin"`
-- security headers: full OWASP defaults applied
+- request timeout: **120 s**
+- session idle timeout: **20 m**
+- admin role: `"admin"`, admin endpoints **off**
+- build metadata on `/version`: **hidden**
+- security headers: full OWASP defaults applied, HSTS `preload` rejected
 
 ---
 

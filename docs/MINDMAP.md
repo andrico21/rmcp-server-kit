@@ -110,6 +110,9 @@ mindmap
       config.rs
         TOML schema
         Validation
+        apply_to_mcp_config bridge
+        apply_env_overrides (opt-in)
+        EnvOverride audit report
       error.rs
         McpxError
         IntoResponse mapping
@@ -367,7 +370,7 @@ graph TD
     hooks[tool_hooks.rs<br/>HookedHandler]
     obs[observability.rs<br/>tracing + audit]
     metrics["metrics.rs<br/>Prometheus<br/>(feature=metrics)"]
-    config[config.rs<br/>TOML schema]
+    config[config.rs<br/>TOML schema<br/>+ bridge + env overrides]
     error[error.rs<br/>McpxError]
     secret[secret.rs<br/>secrecy re-exports]
 
