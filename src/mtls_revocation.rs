@@ -56,7 +56,7 @@ use x509_parser::{
 
 use crate::{
     auth::MtlsConfig,
-    error::McpxError,
+    error::RmcpServerKitError,
     ssrf::{check_scheme, ip_block_reason, sanitized_url_for_log},
 };
 
@@ -152,7 +152,7 @@ impl CrlSet {
         config: MtlsConfig,
         discover_tx: mpsc::UnboundedSender<String>,
         initial_cache: HashMap<String, CachedCrl>,
-    ) -> Result<Arc<Self>, McpxError> {
+    ) -> Result<Arc<Self>, RmcpServerKitError> {
         // M-H2: install the SSRF screening resolver on the CRL fetcher.
         // CRL CDP URLs come from attacker-controllable client certs and
         // their hosts are re-resolved per fetch -- exactly the TOCTOU
@@ -180,7 +180,9 @@ impl CrlSet {
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(format!("rmcp-server-kit/{}", env!("CARGO_PKG_VERSION")))
             .build()
-            .map_err(|error| McpxError::Startup(format!("CRL HTTP client init: {error}")))?;
+            .map_err(|error| {
+                RmcpServerKitError::Startup(format!("CRL HTTP client init: {error}"))
+            })?;
 
         let initial_verifier = rebuild_verifier(&roots, &config, &initial_cache)?;
         let seen_urls = initial_cache.keys().cloned().collect::<HashSet<_>>();
@@ -248,7 +250,7 @@ impl CrlSet {
         &self,
         inserts: Vec<(String, CachedCrl)>,
         removals: &[String],
-    ) -> Result<bool, McpxError> {
+    ) -> Result<bool, RmcpServerKitError> {
         let mut cache = self.cache.write().await;
         let mut candidate = cache.clone();
         let mut admitted_urls = Vec::new();
@@ -335,7 +337,7 @@ impl CrlSet {
     /// # Errors
     ///
     /// Returns an error if rebuilding the inner verifier fails.
-    pub async fn force_refresh(&self) -> Result<(), McpxError> {
+    pub async fn force_refresh(&self) -> Result<(), RmcpServerKitError> {
         let urls = {
             let cache = self.cache.read().await;
             cache.keys().cloned().collect::<Vec<_>>()
@@ -343,7 +345,7 @@ impl CrlSet {
         self.refresh_urls(urls).await
     }
 
-    async fn refresh_due_urls(&self) -> Result<(), McpxError> {
+    async fn refresh_due_urls(&self) -> Result<(), RmcpServerKitError> {
         let now = SystemTime::now();
         let urls = {
             let cache = self.cache.read().await;
@@ -363,7 +365,7 @@ impl CrlSet {
         self.refresh_urls(urls).await
     }
 
-    async fn refresh_urls(&self, urls: Vec<String>) -> Result<(), McpxError> {
+    async fn refresh_urls(&self, urls: Vec<String>) -> Result<(), RmcpServerKitError> {
         let results = self.fetch_url_results(urls).await;
         let now = SystemTime::now();
         let cache = self.cache.read().await;
@@ -409,7 +411,7 @@ impl CrlSet {
     /// the cache may be promoted to the permanent `seen_urls` dedup set —
     /// promoting on fetch success alone would suppress a URL that was never
     /// cached, which is the same revocation-bypass this state split fixes.
-    async fn fetch_and_store_url(&self, url: String) -> Result<bool, McpxError> {
+    async fn fetch_and_store_url(&self, url: String) -> Result<bool, RmcpServerKitError> {
         let cached = gated_fetch(
             &self.client,
             &self.global_fetch_sem,
@@ -566,7 +568,7 @@ impl CrlSet {
         roots: Arc<RootCertStore>,
         config: MtlsConfig,
         prefilled_crls: Vec<CertificateRevocationListDer<'static>>,
-    ) -> Result<Arc<Self>, McpxError> {
+    ) -> Result<Arc<Self>, RmcpServerKitError> {
         let (discover_tx, discover_rx) = mpsc::unbounded_channel();
         drop(discover_rx);
 
@@ -605,7 +607,7 @@ impl CrlSet {
         roots: Arc<RootCertStore>,
         config: MtlsConfig,
         prefilled_crls: Vec<CertificateRevocationListDer<'static>>,
-    ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<String>), McpxError> {
+    ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<String>), RmcpServerKitError> {
         let (discover_tx, discover_rx) = mpsc::unbounded_channel();
 
         let mut initial_cache = HashMap::new();
@@ -796,7 +798,7 @@ impl CrlSet {
     /// resolve — the cap must fire BEFORE network I/O).
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
-    pub async fn __test_trigger_fetch(&self, url: &str) -> Result<(), McpxError> {
+    pub async fn __test_trigger_fetch(&self, url: &str) -> Result<(), RmcpServerKitError> {
         if let Err(error) = gated_fetch(
             &self.client,
             &self.global_fetch_sem,
@@ -847,7 +849,7 @@ impl CrlSet {
         &self,
         url: &str,
         cached: CachedCrl,
-    ) -> Result<bool, McpxError> {
+    ) -> Result<bool, RmcpServerKitError> {
         self.commit_cache_update_atomically(vec![(url.to_owned(), cached)], &[])
             .await
     }
@@ -866,14 +868,14 @@ impl CrlSet {
     /// because they assert post-state, not the transient error.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
-    pub async fn __test_trigger_refresh_url(&self, url: &str) -> Result<(), McpxError> {
+    pub async fn __test_trigger_refresh_url(&self, url: &str) -> Result<(), RmcpServerKitError> {
         self.refresh_urls(vec![url.to_owned()]).await
     }
 
     async fn fetch_url_results(
         &self,
         urls: Vec<String>,
-    ) -> Vec<(String, Result<CachedCrl, McpxError>)> {
+    ) -> Vec<(String, Result<CachedCrl, RmcpServerKitError>)> {
         let mut tasks = JoinSet::new();
         for url in urls {
             let client = self.client.clone();
@@ -1139,7 +1141,7 @@ pub async fn bootstrap_fetch(
     roots: Arc<RootCertStore>,
     ca_certs: &[CertificateDer<'static>],
     config: MtlsConfig,
-) -> Result<(Arc<CrlSet>, mpsc::UnboundedReceiver<String>), McpxError> {
+) -> Result<(Arc<CrlSet>, mpsc::UnboundedReceiver<String>), RmcpServerKitError> {
     let (discover_tx, discover_rx) = mpsc::unbounded_channel();
 
     let mut urls = ca_certs
@@ -1172,7 +1174,7 @@ pub async fn bootstrap_fetch(
         .redirect(reqwest::redirect::Policy::none())
         .user_agent(format!("rmcp-server-kit/{}", env!("CARGO_PKG_VERSION")))
         .build()
-        .map_err(|error| McpxError::Startup(format!("CRL HTTP client init: {error}")))?;
+        .map_err(|error| RmcpServerKitError::Startup(format!("CRL HTTP client init: {error}")))?;
 
     // Bootstrap shares the same global concurrency + per-host cap as the
     // hot-path verifier so a maliciously broad CA chain cannot overwhelm
@@ -1309,7 +1311,7 @@ pub fn rebuild_verifier<S: std::hash::BuildHasher>(
     roots: &Arc<RootCertStore>,
     config: &MtlsConfig,
     cache: &HashMap<String, CachedCrl, S>,
-) -> Result<Arc<dyn ClientCertVerifier>, McpxError> {
+) -> Result<Arc<dyn ClientCertVerifier>, RmcpServerKitError> {
     let mut builder = WebPkiClientVerifier::builder(Arc::clone(roots));
 
     if !cache.is_empty() {
@@ -1334,7 +1336,7 @@ pub fn rebuild_verifier<S: std::hash::BuildHasher>(
 
     builder
         .build()
-        .map_err(|error| McpxError::Tls(format!("mTLS verifier error: {error}")))
+        .map_err(|error| RmcpServerKitError::Tls(format!("mTLS verifier error: {error}")))
 }
 
 /// Parse `thisUpdate` and `nextUpdate` metadata from a DER-encoded CRL.
@@ -1342,9 +1344,11 @@ pub fn rebuild_verifier<S: std::hash::BuildHasher>(
 /// # Errors
 ///
 /// Returns an error if the CRL cannot be parsed.
-pub fn parse_crl_metadata(der: &[u8]) -> Result<(SystemTime, Option<SystemTime>), McpxError> {
+pub fn parse_crl_metadata(
+    der: &[u8],
+) -> Result<(SystemTime, Option<SystemTime>), RmcpServerKitError> {
     let (_, crl) = CertificateRevocationList::from_der(der)
-        .map_err(|error| McpxError::Tls(format!("invalid CRL DER: {error:?}")))?;
+        .map_err(|error| RmcpServerKitError::Tls(format!("invalid CRL DER: {error:?}")))?;
 
     Ok((
         asn1_time_to_system_time(crl.last_update()),
@@ -1394,14 +1398,14 @@ fn acquire_host_semaphore(
     map: &mut HashMap<String, Arc<Semaphore>>,
     host_key: &str,
     max_host_semaphores: usize,
-) -> Result<Arc<Semaphore>, McpxError> {
+) -> Result<Arc<Semaphore>, RmcpServerKitError> {
     if !map.contains_key(host_key) {
         if map.len() >= max_host_semaphores {
             // Self-heal: drop semaphores with no in-flight fetch.
             map.retain(|_, semaphore| Arc::strong_count(semaphore) > 1);
         }
         if map.len() >= max_host_semaphores {
-            return Err(McpxError::Config(
+            return Err(RmcpServerKitError::Config(
                 "crl_host_semaphore_cap_exceeded: too many distinct CRL hosts in flight".to_owned(),
             ));
         }
@@ -1409,7 +1413,7 @@ fn acquire_host_semaphore(
     }
     match map.get(host_key) {
         Some(semaphore) => Ok(Arc::clone(semaphore)),
-        None => Err(McpxError::Tls(
+        None => Err(RmcpServerKitError::Tls(
             "CRL host semaphore missing after insertion".to_owned(),
         )),
     }
@@ -1430,7 +1434,7 @@ async fn gated_fetch(
     allow_http: bool,
     max_bytes: u64,
     max_host_semaphores: usize,
-) -> Result<CachedCrl, McpxError> {
+) -> Result<CachedCrl, RmcpServerKitError> {
     let host_key = Url::parse(url)
         .ok()
         .and_then(|u| u.host_str().map(str::to_owned))
@@ -1444,11 +1448,13 @@ async fn gated_fetch(
     let _global_permit = Arc::clone(global_sem)
         .acquire_owned()
         .await
-        .map_err(|error| McpxError::Tls(format!("CRL global semaphore closed: {error}")))?;
+        .map_err(|error| {
+            RmcpServerKitError::Tls(format!("CRL global semaphore closed: {error}"))
+        })?;
     let _host_permit = host_sem
         .acquire_owned()
         .await
-        .map_err(|error| McpxError::Tls(format!("CRL host semaphore closed: {error}")))?;
+        .map_err(|error| RmcpServerKitError::Tls(format!("CRL host semaphore closed: {error}")))?;
 
     fetch_crl(client, url, allow_http, max_bytes).await
 }
@@ -1458,30 +1464,30 @@ async fn fetch_crl(
     url: &str,
     allow_http: bool,
     max_bytes: u64,
-) -> Result<CachedCrl, McpxError> {
-    let parsed =
-        Url::parse(url).map_err(|error| McpxError::Tls(format!("CRL URL parse {url}: {error}")))?;
+) -> Result<CachedCrl, RmcpServerKitError> {
+    let parsed = Url::parse(url)
+        .map_err(|error| RmcpServerKitError::Tls(format!("CRL URL parse {url}: {error}")))?;
 
     if let Err(reason) = check_scheme(&parsed, allow_http) {
         // Sanitized: the gate must not echo what it rejects (the URL may
         // carry userinfo credentials — the very thing being refused).
         let sanitized = sanitized_url_for_log(&parsed);
         tracing::warn!(url = %sanitized, reason, "CRL fetch denied: scheme");
-        return Err(McpxError::Tls(format!(
+        return Err(RmcpServerKitError::Tls(format!(
             "CRL scheme rejected ({reason}): {sanitized}"
         )));
     }
 
     let host = parsed
         .host_str()
-        .ok_or_else(|| McpxError::Tls(format!("CRL URL has no host: {url}")))?;
+        .ok_or_else(|| RmcpServerKitError::Tls(format!("CRL URL has no host: {url}")))?;
     let port = parsed
         .port_or_known_default()
-        .ok_or_else(|| McpxError::Tls(format!("CRL URL has no known port: {url}")))?;
+        .ok_or_else(|| RmcpServerKitError::Tls(format!("CRL URL has no known port: {url}")))?;
 
     let addrs = lookup_host((host, port))
         .await
-        .map_err(|error| McpxError::Tls(format!("CRL DNS resolution {url}: {error}")))?;
+        .map_err(|error| RmcpServerKitError::Tls(format!("CRL DNS resolution {url}: {error}")))?;
 
     let mut any_addr = false;
     for addr in addrs {
@@ -1493,13 +1499,13 @@ async fn fetch_crl(
                 reason,
                 "CRL fetch denied: blocked IP"
             );
-            return Err(McpxError::Tls(format!(
+            return Err(RmcpServerKitError::Tls(format!(
                 "CRL host resolved to blocked IP ({reason}): {url}"
             )));
         }
     }
     if !any_addr {
-        return Err(McpxError::Tls(format!(
+        return Err(RmcpServerKitError::Tls(format!(
             "CRL DNS resolution returned no addresses: {url}"
         )));
     }
@@ -1508,9 +1514,9 @@ async fn fetch_crl(
         .get(url)
         .send()
         .await
-        .map_err(|error| McpxError::Tls(format!("CRL fetch {url}: {error}")))?
+        .map_err(|error| RmcpServerKitError::Tls(format!("CRL fetch {url}: {error}")))?
         .error_for_status()
-        .map_err(|error| McpxError::Tls(format!("CRL fetch {url}: {error}")))?;
+        .map_err(|error| RmcpServerKitError::Tls(format!("CRL fetch {url}: {error}")))?;
 
     // Enforce body cap by streaming chunk-by-chunk; a malicious or
     // misconfigured server cannot allocate more than `max_bytes` of memory.
@@ -1519,12 +1525,12 @@ async fn fetch_crl(
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|error| McpxError::Tls(format!("CRL read {url}: {error}")))?
+        .map_err(|error| RmcpServerKitError::Tls(format!("CRL read {url}: {error}")))?
     {
         let chunk_len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
         let body_len = u64::try_from(body.len()).unwrap_or(u64::MAX);
         if body_len.saturating_add(chunk_len) > max_bytes {
-            return Err(McpxError::Tls(format!(
+            return Err(RmcpServerKitError::Tls(format!(
                 "CRL body exceeded cap of {max_bytes} bytes: {url}"
             )));
         }

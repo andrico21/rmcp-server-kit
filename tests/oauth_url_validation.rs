@@ -5,7 +5,7 @@
 //! passing once the following is implemented:
 //!
 //! * `check_oauth_url` rejects any URL whose `username()` is non-empty or
-//!   whose `password()` is `Some(_)`, returning [`McpxError::Config`].
+//!   whose `password()` is `Some(_)`, returning [`RmcpServerKitError::Config`].
 //! * `OAuthConfig::validate` additionally runs a new
 //!   `crate::ssrf::check_url_literal_ip` guard that rejects any literal
 //!   IPv4 or IPv6 host in the URL string (any canonical form parsed by

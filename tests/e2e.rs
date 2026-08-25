@@ -2034,7 +2034,7 @@ async fn builder_matches_direct_field_assignment() {
 }
 
 /// `enable_admin` without a corresponding `with_auth(...).enabled = true`
-/// must be rejected by `validate()` as `McpxError::Config`. With the
+/// must be rejected by `validate()` as `RmcpServerKitError::Config`. With the
 /// typestate `Validated<McpServerConfig>` proof token, `serve()` cannot
 /// even be called with an invalid config -- the rejection happens at
 /// `validate()` time, statically preventing exposing `/admin/*` without
@@ -2044,8 +2044,8 @@ async fn validate_rejects_admin_without_auth() {
     let cfg = McpServerConfig::new("127.0.0.1:0", "test", "0.0.1").enable_admin("admin");
     let err = cfg.validate().expect_err("must reject admin without auth");
     assert!(
-        matches!(err, rmcp_server_kit::McpxError::Config(ref msg) if msg.contains("admin")),
-        "expected McpxError::Config mentioning admin, got: {err}"
+        matches!(err, rmcp_server_kit::RmcpServerKitError::Config(ref msg) if msg.contains("admin")),
+        "expected RmcpServerKitError::Config mentioning admin, got: {err}"
     );
 }
 
@@ -2062,7 +2062,9 @@ async fn validate_rejects_partial_tls_pair() {
     let err = cfg
         .validate()
         .expect_err("cert without key must be rejected");
-    assert!(matches!(err, rmcp_server_kit::McpxError::Config(ref m) if m.contains("tls_key_path")));
+    assert!(
+        matches!(err, rmcp_server_kit::RmcpServerKitError::Config(ref m) if m.contains("tls_key_path"))
+    );
 
     let mut cfg = McpServerConfig::new("127.0.0.1:0", "test", "0.0.1");
     cfg.tls_key_path = Some(std::path::PathBuf::from("/tmp/key.pem"));
@@ -2070,7 +2072,7 @@ async fn validate_rejects_partial_tls_pair() {
         .validate()
         .expect_err("key without cert must be rejected");
     assert!(
-        matches!(err, rmcp_server_kit::McpxError::Config(ref m) if m.contains("tls_cert_path"))
+        matches!(err, rmcp_server_kit::RmcpServerKitError::Config(ref m) if m.contains("tls_cert_path"))
     );
 
     // Both set together: only the *file existence* matters at startup,
@@ -2081,13 +2083,15 @@ async fn validate_rejects_partial_tls_pair() {
 }
 
 /// Bad `bind_addr` / `public_url` / origin / zero body cap must each be
-/// rejected with a descriptive `McpxError::Config`.
+/// rejected with a descriptive `RmcpServerKitError::Config`.
 #[tokio::test]
 async fn validate_rejects_other_misconfig() {
     // Unparseable bind_addr
     let cfg = McpServerConfig::new("not-a-socket-addr", "t", "0");
     let err = cfg.validate().expect_err("must reject bad bind_addr");
-    assert!(matches!(err, rmcp_server_kit::McpxError::Config(ref m) if m.contains("bind_addr")));
+    assert!(
+        matches!(err, rmcp_server_kit::RmcpServerKitError::Config(ref m) if m.contains("bind_addr"))
+    );
 
     // public_url without scheme
     let cfg =
@@ -2095,20 +2099,22 @@ async fn validate_rejects_other_misconfig() {
     let err = cfg
         .validate()
         .expect_err("must reject schemeless public_url");
-    assert!(matches!(err, rmcp_server_kit::McpxError::Config(ref m) if m.contains("public_url")));
+    assert!(
+        matches!(err, rmcp_server_kit::RmcpServerKitError::Config(ref m) if m.contains("public_url"))
+    );
 
     // origin without scheme
     let cfg = McpServerConfig::new("127.0.0.1:0", "t", "0").with_allowed_origins(["localhost"]);
     let err = cfg.validate().expect_err("must reject schemeless origin");
     assert!(
-        matches!(err, rmcp_server_kit::McpxError::Config(ref m) if m.contains("allowed_origins"))
+        matches!(err, rmcp_server_kit::RmcpServerKitError::Config(ref m) if m.contains("allowed_origins"))
     );
 
     // zero body cap
     let cfg = McpServerConfig::new("127.0.0.1:0", "t", "0").with_max_request_body(0);
     let err = cfg.validate().expect_err("must reject zero body cap");
     assert!(
-        matches!(err, rmcp_server_kit::McpxError::Config(ref m) if m.contains("max_request_body"))
+        matches!(err, rmcp_server_kit::RmcpServerKitError::Config(ref m) if m.contains("max_request_body"))
     );
 }
 

@@ -134,31 +134,35 @@ async fn screen_oauth_target_core(
     allow_http: bool,
     allowlist: &crate::ssrf::CompiledSsrfAllowlist,
     test_allow_loopback_ssrf: bool,
-) -> Result<(), crate::error::McpxError> {
+) -> Result<(), crate::error::RmcpServerKitError> {
     let parsed = check_oauth_url("oauth target", url, allow_http)?;
     if test_allow_loopback_ssrf {
         return Ok(());
     }
     if let Some(reason) = crate::ssrf::check_url_literal_ip(&parsed) {
-        return Err(crate::error::McpxError::Config(format!(
+        return Err(crate::error::RmcpServerKitError::Config(format!(
             "OAuth target forbidden ({reason}): {url}"
         )));
     }
 
     let host = parsed.host_str().ok_or_else(|| {
-        crate::error::McpxError::Config(format!("OAuth target URL has no host: {url}"))
+        crate::error::RmcpServerKitError::Config(format!("OAuth target URL has no host: {url}"))
     })?;
     if oauth_internal_suffix_blocked(host, allowlist) {
-        return Err(crate::error::McpxError::Config(format!(
+        return Err(crate::error::RmcpServerKitError::Config(format!(
             "OAuth target forbidden (internal hostname suffix): {url}"
         )));
     }
     let port = parsed.port_or_known_default().ok_or_else(|| {
-        crate::error::McpxError::Config(format!("OAuth target URL has no known port: {url}"))
+        crate::error::RmcpServerKitError::Config(format!(
+            "OAuth target URL has no known port: {url}"
+        ))
     })?;
 
     let addrs = lookup_host((host, port)).await.map_err(|error| {
-        crate::error::McpxError::Config(format!("OAuth target DNS resolution {url}: {error}"))
+        crate::error::RmcpServerKitError::Config(format!(
+            "OAuth target DNS resolution {url}: {error}"
+        ))
     })?;
 
     let host_allowed = !allowlist.is_empty() && allowlist.host_allowed(host);
@@ -170,7 +174,7 @@ async fn screen_oauth_target_core(
             // Cloud-metadata is unbypassable. Use the strict message
             // that does NOT advertise the allowlist knob.
             if reason == "cloud_metadata" {
-                return Err(crate::error::McpxError::Config(format!(
+                return Err(crate::error::RmcpServerKitError::Config(format!(
                     "OAuth target resolved to blocked IP ({reason}): {url}"
                 )));
             }
@@ -178,7 +182,7 @@ async fn screen_oauth_target_core(
             // message verbatim so existing tests continue to pass and
             // operators get the same diagnostic they had before.
             if allowlist.is_empty() {
-                return Err(crate::error::McpxError::Config(format!(
+                return Err(crate::error::RmcpServerKitError::Config(format!(
                     "OAuth target resolved to blocked IP ({reason}): {url}"
                 )));
             }
@@ -186,7 +190,7 @@ async fn screen_oauth_target_core(
             if host_allowed || allowlist.ip_allowed(ip) {
                 continue;
             }
-            return Err(crate::error::McpxError::Config(format!(
+            return Err(crate::error::RmcpServerKitError::Config(format!(
                 "OAuth target blocked: hostname {host} resolved to {ip} ({reason}). \
                  To allow, add the hostname to oauth.ssrf_allowlist.hosts or the CIDR \
                  to oauth.ssrf_allowlist.cidrs (operators only -- see SECURITY.md). \
@@ -195,7 +199,7 @@ async fn screen_oauth_target_core(
         }
     }
     if !any_addr {
-        return Err(crate::error::McpxError::Config(format!(
+        return Err(crate::error::RmcpServerKitError::Config(format!(
             "OAuth target DNS resolution returned no addresses: {url}"
         )));
     }
@@ -209,7 +213,7 @@ async fn screen_oauth_target(
     url: &str,
     allow_http: bool,
     allowlist: &crate::ssrf::CompiledSsrfAllowlist,
-) -> Result<(), crate::error::McpxError> {
+) -> Result<(), crate::error::RmcpServerKitError> {
     screen_oauth_target_core(url, allow_http, allowlist, false).await
 }
 
@@ -222,7 +226,7 @@ async fn screen_oauth_target_with_test_override(
     allow_http: bool,
     allowlist: &crate::ssrf::CompiledSsrfAllowlist,
     test_allow_loopback_ssrf: bool,
-) -> Result<(), crate::error::McpxError> {
+) -> Result<(), crate::error::RmcpServerKitError> {
     screen_oauth_target_core(url, allow_http, allowlist, test_allow_loopback_ssrf).await
 }
 
@@ -330,10 +334,10 @@ impl OauthHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::error::McpxError::Startup`] if the configured
+    /// Returns [`crate::error::RmcpServerKitError::Startup`] if the configured
     /// `ca_cert_path` cannot be read or parsed, or if the underlying
     /// HTTP client cannot be constructed (e.g. TLS backend init failure).
-    pub fn with_config(config: &OAuthConfig) -> Result<Self, crate::error::McpxError> {
+    pub fn with_config(config: &OAuthConfig) -> Result<Self, crate::error::RmcpServerKitError> {
         Self::build(Some(config))
     }
 
@@ -357,19 +361,19 @@ impl OauthHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::error::McpxError::Startup`] if the underlying
+    /// Returns [`crate::error::RmcpServerKitError::Startup`] if the underlying
     /// HTTP client cannot be constructed (e.g. TLS backend init failure).
     #[deprecated(
         since = "1.2.1",
         note = "use OauthHttpClient::with_config(&OAuthConfig) so token/introspect/revoke/exchange traffic inherits ca_cert_path and the allow_http_oauth_urls toggle"
     )]
-    pub fn new() -> Result<Self, crate::error::McpxError> {
+    pub fn new() -> Result<Self, crate::error::RmcpServerKitError> {
         Self::build(None)
     }
 
     /// Internal builder shared by [`new`](Self::new) (config = `None`)
     /// and [`with_config`](Self::with_config) (config = `Some`).
-    fn build(config: Option<&OAuthConfig>) -> Result<Self, crate::error::McpxError> {
+    fn build(config: Option<&OAuthConfig>) -> Result<Self, crate::error::RmcpServerKitError> {
         // Install the rustls crypto provider before constructing any reqwest
         // client (idempotent -- `ok()` ignores the error when a provider was
         // already installed elsewhere in the process). Without this a
@@ -388,7 +392,7 @@ impl OauthHttpClient {
         // surfaces them as Config errors.
         let allowlist = match config.and_then(|c| c.ssrf_allowlist.as_ref()) {
             Some(raw) => Arc::new(compile_oauth_ssrf_allowlist(raw).map_err(|e| {
-                crate::error::McpxError::Startup(format!("oauth http client: {e}"))
+                crate::error::RmcpServerKitError::Startup(format!("oauth http client: {e}"))
             })?),
             None => Arc::new(crate::ssrf::CompiledSsrfAllowlist::default()),
         };
@@ -432,7 +436,7 @@ impl OauthHttpClient {
             && let Some(ref ca_path) = cfg.ca_cert_path
         {
             Some(std::fs::read(ca_path).map_err(|e| {
-                crate::error::McpxError::Startup(format!(
+                crate::error::RmcpServerKitError::Startup(format!(
                     "oauth http client: read ca_cert_path {}: {e}",
                     ca_path.display()
                 ))
@@ -444,7 +448,7 @@ impl OauthHttpClient {
         // Base builder shared by both clients: `no_proxy` (so HTTP(S)_PROXY
         // env vars cannot bypass the SsrfScreeningResolver), the SSRF
         // resolver, timeouts, and CA trust. Only the redirect policy differs.
-        let make_base = || -> Result<reqwest::ClientBuilder, crate::error::McpxError> {
+        let make_base = || -> Result<reqwest::ClientBuilder, crate::error::RmcpServerKitError> {
             let mut b = reqwest::Client::builder()
                 .no_proxy()
                 .dns_resolver(Arc::clone(&resolver))
@@ -452,7 +456,7 @@ impl OauthHttpClient {
                 .timeout(Duration::from_secs(30));
             if let Some(ref pem) = ca_pem {
                 let cert = reqwest::tls::Certificate::from_pem(pem).map_err(|e| {
-                    crate::error::McpxError::Startup(format!(
+                    crate::error::RmcpServerKitError::Startup(format!(
                         "oauth http client: parse ca_cert_path: {e}"
                     ))
                 })?;
@@ -485,7 +489,9 @@ impl OauthHttpClient {
                 }))
                 .build()
                 .map_err(|e| {
-                    crate::error::McpxError::Startup(format!("oauth http client init: {e}"))
+                    crate::error::RmcpServerKitError::Startup(format!(
+                        "oauth http client init: {e}"
+                    ))
                 })?;
 
         // M7: credential-POST client -- NEVER follows redirects. A 307/308 from
@@ -504,7 +510,7 @@ impl OauthHttpClient {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| {
-                crate::error::McpxError::Startup(format!("oauth http client init: {e}"))
+                crate::error::RmcpServerKitError::Startup(format!("oauth http client init: {e}"))
             })?;
 
         #[cfg(feature = "oauth-mtls-client")]
@@ -527,7 +533,7 @@ impl OauthHttpClient {
         &self,
         url: &str,
         request: reqwest::RequestBuilder,
-    ) -> Result<reqwest::Response, crate::error::McpxError> {
+    ) -> Result<reqwest::Response, crate::error::RmcpServerKitError> {
         #[cfg(any(test, feature = "test-helpers"))]
         if self.test_allow_loopback_ssrf.load(Ordering::Relaxed) {
             screen_oauth_target_with_test_override(url, self.allow_http, &self.allowlist, true)
@@ -538,7 +544,7 @@ impl OauthHttpClient {
         #[cfg(not(any(test, feature = "test-helpers")))]
         screen_oauth_target(url, self.allow_http, &self.allowlist).await?;
         request.send().await.map_err(|error| {
-            crate::error::McpxError::Config(format!("oauth request {url}: {error}"))
+            crate::error::RmcpServerKitError::Config(format!("oauth request {url}: {error}"))
         })
     }
 
@@ -696,7 +702,7 @@ pub struct OAuthSsrfAllowlist {
 /// Lowercases hostnames, rejects literal-IP and ill-formed host
 /// entries, parses + validates each CIDR (see [`crate::ssrf::CidrEntry::parse`]).
 /// Returns a `String` error suitable for embedding in
-/// [`crate::error::McpxError::Config`] / [`crate::error::McpxError::Startup`].
+/// [`crate::error::RmcpServerKitError::Config`] / [`crate::error::RmcpServerKitError::Startup`].
 fn compile_oauth_ssrf_allowlist(
     raw: &OAuthSsrfAllowlist,
 ) -> Result<crate::ssrf::CompiledSsrfAllowlist, String> {
@@ -1020,19 +1026,19 @@ impl OAuthConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::error::McpxError::Config`] when any field fails
+    /// Returns [`crate::error::RmcpServerKitError::Config`] when any field fails
     /// to parse or violates the scheme policy.
-    pub fn validate(&self) -> Result<(), crate::error::McpxError> {
+    pub fn validate(&self) -> Result<(), crate::error::RmcpServerKitError> {
         let allow_http = self.allow_http_oauth_urls;
         let url = check_oauth_url("oauth.issuer", &self.issuer, allow_http)?;
         if let Some(reason) = crate::ssrf::check_url_literal_ip(&url) {
-            return Err(crate::error::McpxError::Config(format!(
+            return Err(crate::error::RmcpServerKitError::Config(format!(
                 "oauth.issuer forbidden ({reason})"
             )));
         }
         let url = check_oauth_url("oauth.jwks_uri", &self.jwks_uri, allow_http)?;
         if let Some(reason) = crate::ssrf::check_url_literal_ip(&url) {
-            return Err(crate::error::McpxError::Config(format!(
+            return Err(crate::error::RmcpServerKitError::Config(format!(
                 "oauth.jwks_uri forbidden ({reason})"
             )));
         }
@@ -1041,7 +1047,7 @@ impl OAuthConfig {
         // audience is an empty string that would otherwise pass validation and
         // then fail-closed silently at runtime (Strict mode matches nothing).
         if self.audience.is_empty() {
-            return Err(crate::error::McpxError::Config(
+            return Err(crate::error::RmcpServerKitError::Config(
                 "oauth.audience must not be empty".into(),
             ));
         }
@@ -1052,20 +1058,20 @@ impl OAuthConfig {
                 allow_http,
             )?;
             if let Some(reason) = crate::ssrf::check_url_literal_ip(&url) {
-                return Err(crate::error::McpxError::Config(format!(
+                return Err(crate::error::RmcpServerKitError::Config(format!(
                     "oauth.proxy.authorize_url forbidden ({reason})"
                 )));
             }
             let url = check_oauth_url("oauth.proxy.token_url", &proxy.token_url, allow_http)?;
             if let Some(reason) = crate::ssrf::check_url_literal_ip(&url) {
-                return Err(crate::error::McpxError::Config(format!(
+                return Err(crate::error::RmcpServerKitError::Config(format!(
                     "oauth.proxy.token_url forbidden ({reason})"
                 )));
             }
             if let Some(url) = &proxy.introspection_url {
                 let parsed = check_oauth_url("oauth.proxy.introspection_url", url, allow_http)?;
                 if let Some(reason) = crate::ssrf::check_url_literal_ip(&parsed) {
-                    return Err(crate::error::McpxError::Config(format!(
+                    return Err(crate::error::RmcpServerKitError::Config(format!(
                         "oauth.proxy.introspection_url forbidden ({reason})"
                     )));
                 }
@@ -1073,7 +1079,7 @@ impl OAuthConfig {
             if let Some(url) = &proxy.revocation_url {
                 let parsed = check_oauth_url("oauth.proxy.revocation_url", url, allow_http)?;
                 if let Some(reason) = crate::ssrf::check_url_literal_ip(&parsed) {
-                    return Err(crate::error::McpxError::Config(format!(
+                    return Err(crate::error::RmcpServerKitError::Config(format!(
                         "oauth.proxy.revocation_url forbidden ({reason})"
                     )));
                 }
@@ -1088,7 +1094,7 @@ impl OAuthConfig {
                 && !proxy.require_auth_on_admin_endpoints
                 && !proxy.allow_unauthenticated_admin_endpoints
             {
-                return Err(crate::error::McpxError::Config(
+                return Err(crate::error::RmcpServerKitError::Config(
                     "oauth.proxy: expose_admin_endpoints = true requires \
                      require_auth_on_admin_endpoints = true (recommended) \
                      or allow_unauthenticated_admin_endpoints = true \
@@ -1101,7 +1107,7 @@ impl OAuthConfig {
         if let Some(tx) = &self.token_exchange {
             let url = check_oauth_url("oauth.token_exchange.token_url", &tx.token_url, allow_http)?;
             if let Some(reason) = crate::ssrf::check_url_literal_ip(&url) {
-                return Err(crate::error::McpxError::Config(format!(
+                return Err(crate::error::RmcpServerKitError::Config(format!(
                     "oauth.token_exchange.token_url forbidden ({reason})"
                 )));
             }
@@ -1114,7 +1120,7 @@ impl OAuthConfig {
         // outbound HTTP client is ever built.
         if let Some(raw) = &self.ssrf_allowlist {
             let compiled = compile_oauth_ssrf_allowlist(raw).map_err(|e| {
-                crate::error::McpxError::Config(format!("oauth.ssrf_allowlist: {e}"))
+                crate::error::RmcpServerKitError::Config(format!("oauth.ssrf_allowlist: {e}"))
             })?;
             if !compiled.is_empty() {
                 tracing::warn!(
@@ -1129,7 +1135,7 @@ impl OAuthConfig {
         // Validate jwks_cache_ttl parses as a humantime duration so the
         // limiter constructor can rely on a non-fallback value (M5).
         humantime::parse_duration(&self.jwks_cache_ttl).map_err(|e| {
-            crate::error::McpxError::Config(format!(
+            crate::error::RmcpServerKitError::Config(format!(
                 "oauth.jwks_cache_ttl {:?} is not a valid humantime duration (e.g. \"10m\", \"1h30m\"): {e}",
                 self.jwks_cache_ttl
             ))
@@ -1145,14 +1151,14 @@ impl OAuthConfig {
 /// simply omits the Authorization header).
 fn validate_token_exchange_client_auth(
     tx: &TokenExchangeConfig,
-) -> Result<(), crate::error::McpxError> {
+) -> Result<(), crate::error::RmcpServerKitError> {
     match (&tx.client_cert, tx.client_secret.is_some()) {
-        (Some(_), true) => Err(crate::error::McpxError::Config(
+        (Some(_), true) => Err(crate::error::RmcpServerKitError::Config(
             "oauth.token_exchange: client_cert and client_secret are mutually \
              exclusive (RFC 8705 §2). Set exactly one."
                 .into(),
         )),
-        (None, false) => Err(crate::error::McpxError::Config(
+        (None, false) => Err(crate::error::RmcpServerKitError::Config(
             "oauth.token_exchange: token exchange requires client authentication. \
              Set either client_secret (RFC 6749 §2.3.1) or client_cert (RFC 8705 §2)."
                 .into(),
@@ -1165,7 +1171,7 @@ fn validate_token_exchange_client_auth(
 /// Validate a [`ClientCertConfig`] for RFC 8705 §2 mTLS client auth.
 ///
 /// Without the `oauth-mtls-client` cargo feature this fails closed with
-/// a [`crate::error::McpxError::Config`] (M-H4: a `client_cert`-only
+/// a [`crate::error::RmcpServerKitError::Config`] (M-H4: a `client_cert`-only
 /// config previously silently disabled client authentication). With the
 /// feature on, this performs the same PEM read + parse the runtime path
 /// would do, so missing files / malformed PEM / mismatched key&cert /
@@ -1174,11 +1180,13 @@ fn validate_token_exchange_client_auth(
 ///
 /// The returned error message includes the file path; the underlying
 /// IO / parse error stays in a `tracing::warn!` log line.
-fn validate_client_cert_config(cc: &ClientCertConfig) -> Result<(), crate::error::McpxError> {
+fn validate_client_cert_config(
+    cc: &ClientCertConfig,
+) -> Result<(), crate::error::RmcpServerKitError> {
     #[cfg(not(feature = "oauth-mtls-client"))]
     {
         let _ = cc;
-        Err(crate::error::McpxError::Config(
+        Err(crate::error::RmcpServerKitError::Config(
             "oauth.token_exchange.client_cert requires the `oauth-mtls-client` cargo feature; \
              rebuild rmcp-server-kit with --features oauth-mtls-client (or have your \
              application crate enable it via `rmcp-server-kit/oauth-mtls-client`), or remove \
@@ -1190,14 +1198,14 @@ fn validate_client_cert_config(cc: &ClientCertConfig) -> Result<(), crate::error
     {
         let cert_bytes = std::fs::read(&cc.cert_path).map_err(|e| {
             tracing::warn!(error = %e, path = %cc.cert_path.display(), "client cert read failed");
-            crate::error::McpxError::Config(format!(
+            crate::error::RmcpServerKitError::Config(format!(
                 "oauth.token_exchange.client_cert.cert_path unreadable: {}",
                 cc.cert_path.display()
             ))
         })?;
         let key_bytes = std::fs::read(&cc.key_path).map_err(|e| {
             tracing::warn!(error = %e, path = %cc.key_path.display(), "client cert key read failed");
-            crate::error::McpxError::Config(format!(
+            crate::error::RmcpServerKitError::Config(format!(
                 "oauth.token_exchange.client_cert.key_path unreadable: {}",
                 cc.key_path.display()
             ))
@@ -1215,7 +1223,7 @@ fn validate_client_cert_config(cc: &ClientCertConfig) -> Result<(), crate::error
                 key_path = %cc.key_path.display(),
                 "client cert PEM parse failed"
             );
-            crate::error::McpxError::Config(format!(
+            crate::error::RmcpServerKitError::Config(format!(
                 "oauth.token_exchange.client_cert: PEM parse failed (cert={}, key={})",
                 cc.cert_path.display(),
                 cc.key_path.display()
@@ -1237,7 +1245,7 @@ fn build_mtls_clients(
     config: Option<&OAuthConfig>,
     allowlist: &Arc<crate::ssrf::CompiledSsrfAllowlist>,
     test_bypass: &crate::ssrf_resolver::TestLoopbackBypass,
-) -> Result<Arc<HashMap<MtlsClientKey, reqwest::Client>>, crate::error::McpxError> {
+) -> Result<Arc<HashMap<MtlsClientKey, reqwest::Client>>, crate::error::RmcpServerKitError> {
     let mut map: HashMap<MtlsClientKey, reqwest::Client> = HashMap::new();
     let Some(cfg) = config else {
         return Ok(Arc::new(map));
@@ -1250,13 +1258,13 @@ fn build_mtls_clients(
     };
 
     let cert_bytes = std::fs::read(&cc.cert_path).map_err(|e| {
-        crate::error::McpxError::Startup(format!(
+        crate::error::RmcpServerKitError::Startup(format!(
             "oauth http client mTLS: read cert_path {}: {e}",
             cc.cert_path.display()
         ))
     })?;
     let key_bytes = std::fs::read(&cc.key_path).map_err(|e| {
-        crate::error::McpxError::Startup(format!(
+        crate::error::RmcpServerKitError::Startup(format!(
             "oauth http client mTLS: read key_path {}: {e}",
             cc.key_path.display()
         ))
@@ -1268,7 +1276,7 @@ fn build_mtls_clients(
     }
     combined.extend_from_slice(&key_bytes);
     let identity = reqwest::Identity::from_pem(&combined).map_err(|e| {
-        crate::error::McpxError::Startup(format!(
+        crate::error::RmcpServerKitError::Startup(format!(
             "oauth http client mTLS: PEM parse (cert={}, key={}): {e}",
             cc.cert_path.display(),
             cc.key_path.display()
@@ -1297,13 +1305,13 @@ fn build_mtls_clients(
 
     if let Some(ref ca_path) = cfg.ca_cert_path {
         let pem = std::fs::read(ca_path).map_err(|e| {
-            crate::error::McpxError::Startup(format!(
+            crate::error::RmcpServerKitError::Startup(format!(
                 "oauth http client mTLS: read ca_cert_path {}: {e}",
                 ca_path.display()
             ))
         })?;
         let cert = reqwest::tls::Certificate::from_pem(&pem).map_err(|e| {
-            crate::error::McpxError::Startup(format!(
+            crate::error::RmcpServerKitError::Startup(format!(
                 "oauth http client mTLS: parse ca_cert_path {}: {e}",
                 ca_path.display()
             ))
@@ -1312,7 +1320,7 @@ fn build_mtls_clients(
     }
 
     let client = builder.build().map_err(|e| {
-        crate::error::McpxError::Startup(format!("oauth http client mTLS init: {e}"))
+        crate::error::RmcpServerKitError::Startup(format!("oauth http client mTLS init: {e}"))
     })?;
     map.insert(
         MtlsClientKey {
@@ -1328,29 +1336,29 @@ fn build_mtls_clients(
 ///
 /// Returns `Ok(())` for `https://...`, and also for `http://...` when
 /// `allow_http` is `true`. All other schemes (and parse failures) are
-/// rejected with a [`crate::error::McpxError::Config`] referencing the
+/// rejected with a [`crate::error::RmcpServerKitError::Config`] referencing the
 /// caller-supplied `field` name for diagnostics.
 fn check_oauth_url(
     field: &str,
     raw: &str,
     allow_http: bool,
-) -> Result<url::Url, crate::error::McpxError> {
+) -> Result<url::Url, crate::error::RmcpServerKitError> {
     let parsed = url::Url::parse(raw).map_err(|e| {
-        crate::error::McpxError::Config(format!("{field}: invalid URL {raw:?}: {e}"))
+        crate::error::RmcpServerKitError::Config(format!("{field}: invalid URL {raw:?}: {e}"))
     })?;
     if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(crate::error::McpxError::Config(format!(
+        return Err(crate::error::RmcpServerKitError::Config(format!(
             "{field} rejected: URL contains userinfo (credentials in URL are forbidden)"
         )));
     }
     match parsed.scheme() {
         "https" => Ok(parsed),
         "http" if allow_http => Ok(parsed),
-        "http" => Err(crate::error::McpxError::Config(format!(
+        "http" => Err(crate::error::RmcpServerKitError::Config(format!(
             "{field}: must use https scheme (got http; set allow_http_oauth_urls=true \
              to override - strongly discouraged in production)"
         ))),
-        other => Err(crate::error::McpxError::Config(format!(
+        other => Err(crate::error::RmcpServerKitError::Config(format!(
             "{field}: must use https scheme (got {other:?})"
         ))),
     }
@@ -3199,7 +3207,7 @@ pub async fn exchange_token(
     http: &OauthHttpClient,
     config: &TokenExchangeConfig,
     subject_token: &str,
-) -> Result<ExchangedToken, crate::error::McpxError> {
+) -> Result<ExchangedToken, crate::error::RmcpServerKitError> {
     use secrecy::ExposeSecret;
 
     let client = http.client_for(config);
@@ -3236,7 +3244,7 @@ pub async fn exchange_token(
         .map_err(|e| {
             tracing::error!(error = %e, "token exchange request failed");
             // Do NOT leak upstream URL, reqwest internals, or DNS detail to clients.
-            crate::error::McpxError::Auth("server_error".into())
+            crate::error::RmcpServerKitError::Auth("server_error".into())
         })?;
 
     let status = resp.status();
@@ -3245,7 +3253,7 @@ pub async fn exchange_token(
             .await
             .map_err(|()| {
                 // read_response_capped already logged the cause (oversize / transport).
-                crate::error::McpxError::Auth("server_error".into())
+                crate::error::RmcpServerKitError::Auth("server_error".into())
             })?;
 
     if !status.is_success() {
@@ -3271,14 +3279,14 @@ pub async fn exchange_token(
                 "token exchange rejected (unparseable upstream body)",
             );
         }
-        return Err(crate::error::McpxError::Auth(short_code.into()));
+        return Err(crate::error::RmcpServerKitError::Auth(short_code.into()));
     }
 
     let exchanged = serde_json::from_slice::<ExchangedToken>(&body_bytes).map_err(|e| {
         tracing::error!(error = %e, "failed to parse token exchange response");
         // Avoid surfacing serde internals; map to sanitized short code so
-        // McpxError::into_response cannot leak parser detail to the client.
-        crate::error::McpxError::Auth("server_error".into())
+        // RmcpServerKitError::into_response cannot leak parser detail to the client.
+        crate::error::RmcpServerKitError::Auth("server_error".into())
     })?;
 
     log_exchanged_token(&exchanged);

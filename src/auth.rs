@@ -32,7 +32,7 @@ use secrecy::SecretString;
 use serde::Deserialize;
 use x509_parser::prelude::*;
 
-use crate::{bounded_limiter::BoundedKeyedLimiter, error::McpxError};
+use crate::{bounded_limiter::BoundedKeyedLimiter, error::RmcpServerKitError};
 
 /// Identity of an authenticated caller.
 ///
@@ -500,7 +500,7 @@ pub struct MtlsConfig {
     /// semaphore at any time. At the cap, idle entries (no in-flight
     /// fetch) are evicted on demand so new hosts keep working; only when
     /// every entry has a concurrent in-flight fetch does the request
-    /// return [`McpxError::Config`] containing the literal substring
+    /// return [`RmcpServerKitError::Config`] containing the literal substring
     /// `"crl_host_semaphore_cap_exceeded"`. Bounds memory growth from
     /// attacker-controlled CDP URLs pointing at unique hostnames.
     /// Default: 1024.
@@ -1276,7 +1276,7 @@ static DUMMY_PHC_HASH: LazyLock<String> = LazyLock::new(|| {
 ///
 /// Returns an error if salt encoding or Argon2id hashing fails
 /// (should not happen with valid inputs, but we avoid panicking).
-pub fn generate_api_key() -> Result<(String, String), McpxError> {
+pub fn generate_api_key() -> Result<(String, String), RmcpServerKitError> {
     let mut token_bytes = [0u8; 32];
     rand::fill(&mut token_bytes);
     let token = URL_SAFE_NO_PAD.encode(token_bytes);
@@ -1285,10 +1285,10 @@ pub fn generate_api_key() -> Result<(String, String), McpxError> {
     let mut salt_bytes = [0u8; 16];
     rand::fill(&mut salt_bytes);
     let salt = SaltString::encode_b64(&salt_bytes)
-        .map_err(|e| McpxError::Auth(format!("salt encoding failed: {e}")))?;
+        .map_err(|e| RmcpServerKitError::Auth(format!("salt encoding failed: {e}")))?;
     let hash = Argon2::default()
         .hash_password(token.as_bytes(), &salt)
-        .map_err(|e| McpxError::Auth(format!("argon2id hashing failed: {e}")))?
+        .map_err(|e| RmcpServerKitError::Auth(format!("argon2id hashing failed: {e}")))?
         .to_string();
 
     Ok((token, hash))
@@ -1402,7 +1402,7 @@ fn pre_auth_gate(state: &AuthState, client_ip: Option<IpAddr>) -> Option<Respons
         "auth rate limited by pre-auth gate (request rejected before credential verification)"
     );
     Some(
-        McpxError::RateLimitedFor {
+        RmcpServerKitError::RateLimitedFor {
             message: "too many unauthenticated requests from this source".into(),
             retry_after: wait,
         }
@@ -1481,7 +1481,7 @@ pub(crate) async fn auth_middleware(
         #[cfg(feature = "metrics")]
         crate::metrics::record_rate_limit_deny(req.extensions(), "auth_post");
         tracing::warn!(%ip, "auth rate limited after repeated failures");
-        return McpxError::RateLimitedFor {
+        return RmcpServerKitError::RateLimitedFor {
             message: "too many failed authentication attempts".into(),
             retry_after: wait,
         }

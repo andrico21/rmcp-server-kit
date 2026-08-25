@@ -114,7 +114,7 @@ mindmap
         apply_env_overrides (opt-in)
         EnvOverride audit report
       error.rs
-        McpxError
+        RmcpServerKitError
         IntoResponse mapping
       secret.rs
         secrecy re-exports
@@ -251,7 +251,7 @@ mindmap
       No clone to dodge borrowck
       No std::sync::Mutex across await
       Use tracing macros
-      Use Result + McpxError
+      Use Result + RmcpServerKitError
       Use Rust 1.95 idioms
         Vec::push_mut
         Atomic::update
@@ -371,7 +371,7 @@ graph TD
     obs[observability.rs<br/>tracing + audit]
     metrics["metrics.rs<br/>Prometheus<br/>(feature=metrics)"]
     config[config.rs<br/>TOML schema<br/>+ bridge + env overrides]
-    error[error.rs<br/>McpxError]
+    error[error.rs<br/>RmcpServerKitError]
     secret[secret.rs<br/>secrecy re-exports]
 
     lib --> transport
@@ -438,7 +438,7 @@ graph TD
 | Tracing / audit log               | `src/observability.rs`                   | `init_tracing_from_config` L39, audit sink L170                              |
 | Prometheus metrics                | `src/metrics.rs` (feature `metrics`)     | `McpMetrics` L26, `serve_metrics` L95                                         |
 | Configuration (TOML)              | `src/config.rs` + `src/transport.rs`     | TOML schema + `McpServerConfig`                                               |
-| Error → HTTP mapping              | `src/error.rs`                           | `McpxError` L13, `IntoResponse` L56                                           |
+| Error → HTTP mapping              | `src/error.rs`                           | `RmcpServerKitError` L13, `IntoResponse` L56                                           |
 | E2E reference                     | `tests/e2e.rs`                           | `spawn_server` L115                                                           |
 | Runnable examples                 | `examples/`                              | `minimal_server.rs`, `api_key_rbac.rs`, `oauth_server.rs`                    |
 

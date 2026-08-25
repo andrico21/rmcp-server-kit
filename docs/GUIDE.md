@@ -112,7 +112,7 @@ rmcp-server-kit = { version = "1", features = ["oauth", "metrics"] }
                     | auth            |   Bearer, mTLS, OAuth JWT
                     | rbac            |   Role-based access control
                     | config          |   Server/observability config
-                    | error           |   McpxError -> HTTP status codes
+                    | error           |   RmcpServerKitError -> HTTP status codes
                     | metrics         |   Prometheus (optional)
                     | oauth           |   JWT/JWKS validation (optional)
                     +-----------------+
@@ -302,7 +302,7 @@ Represents a single API key. The `hash` field stores an Argon2id PHC string.
 ```rust
 use rmcp_server_kit::auth::{generate_api_key, ApiKeyEntry};
 
-// Generate a new key pair (returns Result<_, McpxError>)
+// Generate a new key pair (returns Result<_, RmcpServerKitError>)
 let (plaintext_token, argon2id_hash) = generate_api_key()?;
 // plaintext_token: 43-char base64url string (give to client)
 // argon2id_hash:   PHC format string (store in config)
@@ -359,7 +359,7 @@ When exceeded, the middleware returns HTTP 429 Too Many Requests.
 #### `generate_api_key()`
 
 ```rust
-pub fn generate_api_key() -> Result<(String, String), McpxError>
+pub fn generate_api_key() -> Result<(String, String), RmcpServerKitError>
 ```
 
 Returns `Ok((plaintext_token, argon2id_hash))`. The token is 256-bit random,
@@ -828,18 +828,18 @@ let obs: ObservabilityConfig = toml::from_str(&config_str)?;
 validate_observability_config(&obs)?;  // Checks log levels, formats
 ```
 
-Returns `McpxError::Config` with a descriptive message on failure.
+Returns `RmcpServerKitError::Config` with a descriptive message on failure.
 
 ---
 
 ### error
 
-#### `McpxError`
+#### `RmcpServerKitError`
 
 Central error type with automatic HTTP status code mapping:
 
 ```rust
-pub enum McpxError {
+pub enum RmcpServerKitError {
     Config(String),          // -> 500 Internal Server Error
     Auth(String),            // -> 401 Unauthorized
     Rbac(String),            // -> 403 Forbidden
@@ -851,13 +851,13 @@ pub enum McpxError {
 }
 ```
 
-Implements `IntoResponse` for axum, so you can return `McpxError` directly
+Implements `IntoResponse` for axum, so you can return `RmcpServerKitError` directly
 from handlers and middleware.
 
 #### `Result<T>`
 
 ```rust
-pub type Result<T> = std::result::Result<T, McpxError>;
+pub type Result<T> = std::result::Result<T, RmcpServerKitError>;
 ```
 
 ---
@@ -1238,7 +1238,7 @@ describing the running binary:
   "build_sha": "abcdef0",
   "build_time": "2025-01-15T12:00:00Z",
   "rust_version": "rustc 1.98.0",
-  "mcpx_version": "1.0.0"
+  "rmcp_server_kit_version": "1.0.0"
 }
 ```
 
@@ -2224,7 +2224,7 @@ express: `name`, `version`, `rbac`, `readiness_check`, `extra_router`,
 `on_reload_ready`, `metrics_enabled`, and `metrics_bind`.
 
 **Fallibility.** `apply_to_mcp_config` returns
-`Result<McpServerConfig, McpxError>`. It fails with `McpxError::Config` when
+`Result<McpServerConfig, RmcpServerKitError>`. It fails with `RmcpServerKitError::Config` when
 any duration string in the config cannot be parsed by `humantime` — for
 example `request_timeout = "not-a-duration"`. Calling `validate_server_config`
 first catches common structural errors before the bridge runs, giving cleaner
@@ -2294,15 +2294,15 @@ All variables share the `RMCP_SERVER_KIT` prefix. The nesting delimiter is `__` 
 
 #### Failure semantics
 
-Every parse failure fails closed. If a variable is present but unparseable (e.g. `RMCP_SERVER_KIT__SERVER__LISTEN_PORT=not-a-number`), `apply_env_overrides` immediately returns `Err(McpxError::Config)` naming the exact variable and the expected type. No partial mutation occurs. There is no warn-and-ignore path.
+Every parse failure fails closed. If a variable is present but unparseable (e.g. `RMCP_SERVER_KIT__SERVER__LISTEN_PORT=not-a-number`), `apply_env_overrides` immediately returns `Err(RmcpServerKitError::Config)` naming the exact variable and the expected type. No partial mutation occurs. There is no warn-and-ignore path.
 
 #### Secret handling
 
 `RMCP_SERVER_KIT__RBAC__REDACTION_SALT` accepts the salt value directly as a string. For Kubernetes Secret volume mounts, set `RMCP_SERVER_KIT__RBAC__REDACTION_SALT_FILE` to the path of the mounted file; `RbacConfig::apply_env_overrides` reads the file and uses its contents as the salt.
 
-Setting both the direct variable and the `_FILE` variable simultaneously is a hard startup error: `apply_env_overrides` returns `McpxError::Config` naming both variables.
+Setting both the direct variable and the `_FILE` variable simultaneously is a hard startup error: `apply_env_overrides` returns `RmcpServerKitError::Config` naming both variables.
 
-An empty or whitespace-only salt (either form) is rejected with `McpxError::Config`.
+An empty or whitespace-only salt (either form) is rejected with `RmcpServerKitError::Config`.
 
 **File normalization.** Exactly one terminal line ending is stripped from the file contents: `\r\n` (CRLF), a lone `\n` (LF), or a lone `\r` (CR). All other content is preserved exactly, including leading and trailing spaces and any internal newlines. The same logical secret therefore produces the same redaction salt whether supplied inline (no trailing newline) or written to a file with a standard trailing newline (`echo "my-salt" > salt.txt` produces `my-salt\n`, which normalizes to `my-salt`). Spaces surrounding the value are significant: `"  my-salt  "` and `"my-salt"` hash differently.
 
@@ -2319,9 +2319,9 @@ Secret-typed targets (`rbac.redaction_salt`) always carry `value: None`. The sec
 
 #### `oauth` feature interaction
 
-The three `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__*` variables require the `oauth` Cargo feature. Setting any one of them in a binary built without `--features oauth` is a startup error, never a silent no-op: `ServerConfig::apply_env_overrides` returns `McpxError::Config` naming the variable and stating it requires the `oauth` feature.
+The three `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__*` variables require the `oauth` Cargo feature. Setting any one of them in a binary built without `--features oauth` is a startup error, never a silent no-op: `ServerConfig::apply_env_overrides` returns `RmcpServerKitError::Config` naming the variable and stating it requires the `oauth` feature.
 
-When the `oauth` feature is enabled, `[server.auth.oauth]` must already be declared in TOML. The method cannot create the table; it only populates fields within an existing one. If the table is absent, the call fails with `McpxError::Config` instructing the operator to declare `[server.auth.oauth]` first.
+When the `oauth` feature is enabled, `[server.auth.oauth]` must already be declared in TOML. The method cannot create the table; it only populates fields within an existing one. If the table is absent, the call fails with `RmcpServerKitError::Config` instructing the operator to declare `[server.auth.oauth]` first.
 
 The intended Kubernetes pattern: declare a minimal `[server.auth.oauth]` stub in a ConfigMap (with `role_claim` and other static RBAC-mapping config), and supply the environment-specific `issuer`, `audience`, and `jwks_uri` via Secrets or Deployment env vars.
 

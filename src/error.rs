@@ -7,7 +7,7 @@ use thiserror::Error;
 /// Generic MCP server error type.
 ///
 /// Application crates should define their own error types and convert
-/// from/into `McpxError` where needed.
+/// from/into `RmcpServerKitError` where needed.
 ///
 /// # Client-facing message invariant
 ///
@@ -23,7 +23,7 @@ use thiserror::Error;
 /// will be sent to the client for any variant.
 #[derive(Debug, Error)]
 #[non_exhaustive]
-pub enum McpxError {
+pub enum RmcpServerKitError {
     /// Configuration parsing or validation failed.
     #[error("configuration error: {0}")]
     Config(String),
@@ -80,6 +80,13 @@ pub enum McpxError {
     Metrics(String),
 }
 
+/// Deprecated compatibility alias for the pre-rename public error type.
+#[deprecated(
+    since = "3.7.0",
+    note = "renamed to `RmcpServerKitError`; the `mcpx` name predates the crate rename"
+)]
+pub type McpxError = RmcpServerKitError;
+
 /// Render a wait [`Duration`](std::time::Duration) as RFC 9110
 /// `Retry-After` delta-seconds: rounded **up** to whole seconds, never
 /// below `1` (a `0` would invite an immediate retry storm).
@@ -91,7 +98,7 @@ fn retry_after_secs(wait: std::time::Duration) -> u64 {
     secs.max(1)
 }
 
-impl McpxError {
+impl RmcpServerKitError {
     /// The exact body this error sends to the HTTP client.
     ///
     /// Client-facing variants ([`Auth`](Self::Auth), [`Rbac`](Self::Rbac),
@@ -123,7 +130,7 @@ impl McpxError {
     }
 }
 
-impl IntoResponse for McpxError {
+impl IntoResponse for RmcpServerKitError {
     fn into_response(self) -> Response {
         let (status, client_msg) = match self {
             Self::Auth(msg) => (StatusCode::UNAUTHORIZED, msg),
@@ -170,8 +177,8 @@ impl IntoResponse for McpxError {
     }
 }
 
-/// Convenience `Result` alias bound to [`McpxError`].
-pub type Result<T> = std::result::Result<T, McpxError>;
+/// Convenience `Result` alias bound to [`RmcpServerKitError`].
+pub type Result<T> = std::result::Result<T, RmcpServerKitError>;
 
 #[cfg(test)]
 mod tests {
@@ -180,7 +187,7 @@ mod tests {
 
     use super::*;
 
-    async fn status_of(err: McpxError) -> (StatusCode, String) {
+    async fn status_of(err: RmcpServerKitError) -> (StatusCode, String) {
         let resp = err.into_response();
         let status = resp.status();
         let body = resp.into_body().collect().await.unwrap().to_bytes();
@@ -189,28 +196,28 @@ mod tests {
 
     #[tokio::test]
     async fn auth_error_returns_401() {
-        let (status, body) = status_of(McpxError::Auth("bad token".into())).await;
+        let (status, body) = status_of(RmcpServerKitError::Auth("bad token".into())).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert!(body.contains("bad token"));
     }
 
     #[tokio::test]
     async fn rbac_error_returns_403() {
-        let (status, body) = status_of(McpxError::Rbac("denied".into())).await;
+        let (status, body) = status_of(RmcpServerKitError::Rbac("denied".into())).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(body.contains("denied"));
     }
 
     #[tokio::test]
     async fn rate_limited_error_returns_429() {
-        let (status, body) = status_of(McpxError::RateLimited("slow down".into())).await;
+        let (status, body) = status_of(RmcpServerKitError::RateLimited("slow down".into())).await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         assert!(body.contains("slow down"));
     }
 
     #[tokio::test]
     async fn legacy_rate_limited_has_no_retry_after_header() {
-        let resp = McpxError::RateLimited("slow down".into()).into_response();
+        let resp = RmcpServerKitError::RateLimited("slow down".into()).into_response();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(
             !resp.headers().contains_key(axum::http::header::RETRY_AFTER),
@@ -220,7 +227,7 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limited_for_sets_retry_after_header() {
-        let resp = McpxError::RateLimitedFor {
+        let resp = RmcpServerKitError::RateLimitedFor {
             message: "slow down".into(),
             retry_after: std::time::Duration::from_millis(1500),
         }
@@ -251,7 +258,7 @@ mod tests {
 
     #[tokio::test]
     async fn config_error_returns_500() {
-        let (status, body) = status_of(McpxError::Config("bad".into())).await;
+        let (status, body) = status_of(RmcpServerKitError::Config("bad".into())).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(
             body, "internal server error",
@@ -262,7 +269,7 @@ mod tests {
     #[tokio::test]
     async fn io_error_returns_500() {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "gone");
-        let (status, body) = status_of(McpxError::from(io_err)).await;
+        let (status, body) = status_of(RmcpServerKitError::from(io_err)).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(
             body, "internal server error",
@@ -272,7 +279,7 @@ mod tests {
 
     #[tokio::test]
     async fn tls_error_returns_500() {
-        let (status, body) = status_of(McpxError::Tls("bad cert".into())).await;
+        let (status, body) = status_of(RmcpServerKitError::Tls("bad cert".into())).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(
             body, "internal server error",
@@ -282,7 +289,7 @@ mod tests {
 
     #[tokio::test]
     async fn startup_error_returns_500() {
-        let (status, body) = status_of(McpxError::Startup("bind failed".into())).await;
+        let (status, body) = status_of(RmcpServerKitError::Startup("bind failed".into())).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(
             body, "internal server error",
@@ -293,7 +300,7 @@ mod tests {
     #[cfg(feature = "metrics")]
     #[tokio::test]
     async fn metrics_error_returns_500() {
-        let (status, body) = status_of(McpxError::Metrics("dup metric".into())).await;
+        let (status, body) = status_of(RmcpServerKitError::Metrics("dup metric".into())).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(
             body, "internal server error",
@@ -303,13 +310,13 @@ mod tests {
 
     #[test]
     fn display_preserves_message() {
-        let err = McpxError::Auth("unauthorized".into());
+        let err = RmcpServerKitError::Auth("unauthorized".into());
         assert_eq!(err.to_string(), "authentication failed: unauthorized");
 
-        let err = McpxError::Rbac("forbidden".into());
+        let err = RmcpServerKitError::Rbac("forbidden".into());
         assert_eq!(err.to_string(), "authorization denied: forbidden");
 
-        let err = McpxError::RateLimited("throttled".into());
+        let err = RmcpServerKitError::RateLimited("throttled".into());
         assert_eq!(err.to_string(), "rate limited: throttled");
     }
 
@@ -317,16 +324,19 @@ mod tests {
     fn client_message_exposes_client_facing_text_and_hides_internal_detail() {
         // Client-facing variants: message passes through verbatim.
         assert_eq!(
-            McpxError::Auth("bad token".into()).client_message(),
+            RmcpServerKitError::Auth("bad token".into()).client_message(),
             "bad token"
         );
-        assert_eq!(McpxError::Rbac("nope".into()).client_message(), "nope");
         assert_eq!(
-            McpxError::RateLimited("slow down".into()).client_message(),
+            RmcpServerKitError::Rbac("nope".into()).client_message(),
+            "nope"
+        );
+        assert_eq!(
+            RmcpServerKitError::RateLimited("slow down".into()).client_message(),
             "slow down"
         );
         assert_eq!(
-            McpxError::RateLimitedFor {
+            RmcpServerKitError::RateLimitedFor {
                 message: "too many".into(),
                 retry_after: std::time::Duration::from_secs(1),
             }
@@ -337,15 +347,15 @@ mod tests {
         // Internal variants: detail is hidden behind a generic body.
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "secret/path/leak");
         assert_eq!(
-            McpxError::from(io_err).client_message(),
+            RmcpServerKitError::from(io_err).client_message(),
             "internal server error"
         );
         assert_eq!(
-            McpxError::Tls("private key /etc/certs/server.key".into()).client_message(),
+            RmcpServerKitError::Tls("private key /etc/certs/server.key".into()).client_message(),
             "internal server error"
         );
         assert_eq!(
-            McpxError::Config("bind 10.0.0.5:8443 failed".into()).client_message(),
+            RmcpServerKitError::Config("bind 10.0.0.5:8443 failed".into()).client_message(),
             "internal server error"
         );
     }
@@ -354,11 +364,11 @@ mod tests {
     async fn client_message_matches_into_response_body() {
         // The accessor and the wire body must agree for every variant we test.
         for err in [
-            McpxError::Auth("a".into()),
-            McpxError::Rbac("b".into()),
-            McpxError::RateLimited("c".into()),
-            McpxError::Config("d".into()),
-            McpxError::Tls("e".into()),
+            RmcpServerKitError::Auth("a".into()),
+            RmcpServerKitError::Rbac("b".into()),
+            RmcpServerKitError::RateLimited("c".into()),
+            RmcpServerKitError::Config("d".into()),
+            RmcpServerKitError::Tls("e".into()),
         ] {
             let expected = err.client_message().into_owned();
             let (_status, body) = status_of(err).await;

@@ -18,7 +18,7 @@ use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounterVec, Registry, TextEncoder, opts,
 };
 
-use crate::error::McpxError;
+use crate::error::RmcpServerKitError;
 
 /// Default Prometheus histogram buckets for HTTP request latency
 /// (seconds). Tuned for low-latency service work: sub-millisecond
@@ -52,19 +52,19 @@ impl McpMetrics {
     ///
     /// # Errors
     ///
-    /// Returns [`McpxError::Metrics`] if counter registration fails (should
+    /// Returns [`RmcpServerKitError::Metrics`] if counter registration fails (should
     /// not happen unless duplicate registrations occur).
-    pub fn new() -> Result<Self, McpxError> {
+    pub fn new() -> Result<Self, RmcpServerKitError> {
         let registry = Registry::new();
 
         let http_requests_total = IntCounterVec::new(
             opts!("rmcp_server_kit_http_requests_total", "Total HTTP requests"),
             &["method", "path", "status"],
         )
-        .map_err(|e| McpxError::Metrics(e.to_string()))?;
+        .map_err(|e| RmcpServerKitError::Metrics(e.to_string()))?;
         registry
             .register(Box::new(http_requests_total.clone()))
-            .map_err(|e| McpxError::Metrics(e.to_string()))?;
+            .map_err(|e| RmcpServerKitError::Metrics(e.to_string()))?;
 
         let http_request_duration_seconds = HistogramVec::new(
             HistogramOpts::new(
@@ -74,10 +74,10 @@ impl McpMetrics {
             .buckets(HTTP_DURATION_BUCKETS.to_vec()),
             &["method", "path"],
         )
-        .map_err(|e| McpxError::Metrics(e.to_string()))?;
+        .map_err(|e| RmcpServerKitError::Metrics(e.to_string()))?;
         registry
             .register(Box::new(http_request_duration_seconds.clone()))
-            .map_err(|e| McpxError::Metrics(e.to_string()))?;
+            .map_err(|e| RmcpServerKitError::Metrics(e.to_string()))?;
 
         let rate_limited_total = IntCounterVec::new(
             opts!(
@@ -86,10 +86,10 @@ impl McpMetrics {
             ),
             &["limiter"],
         )
-        .map_err(|e| McpxError::Metrics(e.to_string()))?;
+        .map_err(|e| RmcpServerKitError::Metrics(e.to_string()))?;
         registry
             .register(Box::new(rate_limited_total.clone()))
-            .map_err(|e| McpxError::Metrics(e.to_string()))?;
+            .map_err(|e| RmcpServerKitError::Metrics(e.to_string()))?;
 
         Ok(Self {
             registry,
@@ -137,13 +137,13 @@ pub(crate) fn record_rate_limit_deny(ext: &axum::http::Extensions, limiter: &str
 ///
 /// # Errors
 ///
-/// Returns [`McpxError::Startup`] if the TCP listener cannot bind or the
+/// Returns [`RmcpServerKitError::Startup`] if the TCP listener cannot bind or the
 /// underlying axum server fails.
 pub async fn serve_metrics(
     bind: String,
     metrics: Arc<McpMetrics>,
     shutdown: tokio_util::sync::CancellationToken,
-) -> Result<(), McpxError> {
+) -> Result<(), RmcpServerKitError> {
     let app = axum::Router::new().route(
         "/metrics",
         axum::routing::get(move || {
@@ -154,12 +154,12 @@ pub async fn serve_metrics(
 
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
-        .map_err(|e| McpxError::Startup(format!("metrics bind {bind}: {e}")))?;
+        .map_err(|e| RmcpServerKitError::Startup(format!("metrics bind {bind}: {e}")))?;
     tracing::info!("metrics endpoint listening on http://{bind}/metrics");
     axum::serve(listener, app)
         .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await
-        .map_err(|e| McpxError::Startup(format!("metrics serve: {e}")))?;
+        .map_err(|e| RmcpServerKitError::Startup(format!("metrics serve: {e}")))?;
     Ok(())
 }
 

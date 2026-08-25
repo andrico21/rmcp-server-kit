@@ -56,7 +56,7 @@ Z:\TempPersistent\rmcp-server-kit\
 │   ├── observability.rs        Tracing/JSON logging + audit-file sink
 │   ├── metrics.rs              Prometheus registry + /metrics listener (feature = "metrics")
 │   ├── config.rs               TOML configuration structs + validation
-│   ├── error.rs                McpxError + IntoResponse mapping
+│   ├── error.rs                RmcpServerKitError + IntoResponse mapping
 │   └── secret.rs               Re-exports of `secrecy` wrappers
 ├── tests/
 │   └── e2e.rs                Integration / E2E tests - spawns serve() on ephemeral ports
@@ -245,7 +245,7 @@ The most-violated rules — all `deny`-level in `Cargo.toml`:
 | Forbidden                                   | Use instead                                                       |
 |---------------------------------------------|--------------------------------------------------------------------|
 | `unwrap()` / `expect()` in production paths | `?`, `unwrap_or`, `unwrap_or_else`, `match`                        |
-| `panic!()`, `todo!()`, `unimplemented!()`   | Return `Result<_, McpxError>` (see `src/error.rs`)                 |
+| `panic!()`, `todo!()`, `unimplemented!()`   | Return `Result<_, RmcpServerKitError>` (see `src/error.rs`)                 |
 | `println!()` / `eprintln!()` / `dbg!()`     | `tracing::{info,warn,error,debug}!` macros                         |
 | `as any` ish casts                          | `TryFrom`, explicit conversion with error                          |
 | `unsafe` code                               | Forbidden (`unsafe_code = "forbid"` at crate level)                |
@@ -319,7 +319,7 @@ The most-violated rules — all `deny`-level in `Cargo.toml`:
 | Configuration struct (TOML schema)             | `src/config.rs` + `McpServerConfig` in `src/transport.rs` |
 | TOML → `serve()` bridge                        | `src/config.rs` — `ServerConfig::apply_to_mcp_config`; `src/transport.rs` — `McpServerConfig` clearing-capable setters |
 | Security-header TOML controls                  | `src/transport.rs` — `SecurityHeadersConfig`; `src/config.rs` — `ServerConfig::security_headers` |
-| Error type → HTTP status mapping               | `src/error.rs` — `McpxError::into_response`           |
+| Error type → HTTP status mapping               | `src/error.rs` — `RmcpServerKitError::into_response`           |
 | Origin / security headers / CORS               | `src/transport.rs` — `origin_check_middleware`, `security_headers_middleware` |
 | Graceful shutdown (Ctrl-C / SIGTERM)           | `src/transport.rs` — `shutdown_signal()` (~line 2996) |
 | Hot-reload of keys / RBAC                      | `src/transport.rs` — `ReloadHandle` (~line 1305)       |
@@ -330,7 +330,7 @@ The most-violated rules — all `deny`-level in `Cargo.toml`:
 ## 10. Common pitfalls (history of bites)
 
 1. **Middleware order matters for security.** Origin check MUST run before auth so unauthenticated callers are rejected by origin first. Rate limit MUST be inside auth so anonymous storms don't amplify. See `src/transport.rs` middleware wiring around lines 1640-1830.
-2. **JWKS refresh is rate-limited.** Don't remove the `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:1841`) — invalid JWTs would otherwise DoS the JWKS endpoint.
+2. **JWKS refresh is rate-limited.** Don't remove the `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:1878`) — invalid JWTs would otherwise DoS the JWKS endpoint.
 3. **Task-local RBAC context only exists inside the request scope.** Calling `current_role()` from a `tokio::spawn`ed background task returns `None`. Capture the value before spawning.
 4. **`stdio` transport bypasses everything.** `serve_stdio` does NOT enforce auth, RBAC, TLS, or origin checks. It's intended for trusted local subprocess scenarios only.
 5. **mTLS identity is bound to the connection stream (`TlsConnInfo`), not to a shared `SocketAddr` map.** If a load balancer terminates TCP and rewrites peer addresses you must terminate TLS at the LB and use a different identity-binding strategy; the in-process binding itself is immune to port-reuse aliasing.

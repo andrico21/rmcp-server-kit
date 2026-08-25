@@ -6,7 +6,7 @@
 //!    drop + warn log when exceeded).
 //! 2. `host_semaphores` is capped at `MtlsConfig::crl_max_host_semaphores`;
 //!    at the cap, idle entries (no in-flight fetch) are evicted on demand
-//!    so new hosts keep working, and a **loud** [`McpxError::Config`]
+//!    so new hosts keep working, and a **loud** [`RmcpServerKitError::Config`]
 //!    containing the literal substring `"crl_host_semaphore_cap_exceeded"`
 //!    is returned only when every entry has a concurrent in-flight fetch.
 //! 3. `cache` is capped at `MtlsConfig::crl_max_cache_entries` (silent
@@ -20,7 +20,7 @@
 //! * `CrlSet::__test_host_semaphore_count(&self) -> usize`
 //! * `CrlSet::__test_cache_len(&self) -> usize`
 //! * `CrlSet::__test_cache_contains(&self, &str) -> bool`
-//! * `CrlSet::__test_trigger_fetch(&self, &str) -> Result<(), McpxError>`
+//! * `CrlSet::__test_trigger_fetch(&self, &str) -> Result<(), RmcpServerKitError>`
 
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
@@ -171,7 +171,7 @@ async fn host_semaphores_hard_cap_evicts_idle_and_recovers() {
     );
 }
 
-fn assert_not_cap_err(r: &Result<(), rmcp_server_kit::error::McpxError>, ctx: &str) {
+fn assert_not_cap_err(r: &Result<(), rmcp_server_kit::error::RmcpServerKitError>, ctx: &str) {
     if let Err(e) = r {
         assert!(
             !e.to_string().contains("crl_host_semaphore_cap_exceeded"),

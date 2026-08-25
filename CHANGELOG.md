@@ -11,6 +11,49 @@ migration note and a config opt-out — see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+## [3.7.0] - 2026-08-25
+
+Retires the `mcpx` naming that outlived the crate rename.
+
+### Changed
+
+- **BREAKING (wire, not API): the `/version` response field `mcpx_version` is
+  renamed to `rmcp_server_kit_version`.** The old key is **removed**, not
+  duplicated. Anything scraping `/version` for `mcpx_version` must be updated.
+  No Rust API is removed or retyped, so per this file's versioning policy - and
+  matching the 3.1.0 precedent, which also altered the `/version` response
+  shape - this ships in a minor release with a migration note.
+
+  The name is deliberate: it matches the crate name and the convention already
+  set by `RMCP_SERVER_KIT_BUILD_SHA` (1.8.1) and the `RMCP_SERVER_KIT__*` env
+  overrides (3.5.0). It is **not** `rmcp_version`, which would read as the
+  version of the `rmcp` SDK - a real, separate dependency of this crate.
+
+- **`McpxError` is renamed to `RmcpServerKitError`.** A deprecated type alias
+  keeps the old name compiling:
+
+  ```rust
+  #[deprecated(since = "3.7.0", note = "renamed to `RmcpServerKitError`; ...")]
+  pub type McpxError = RmcpServerKitError;
+  ```
+
+  Downstream code using `McpxError` continues to build and gets a deprecation
+  warning naming the replacement; verified against an external test crate.
+  `cargo-semver-checks` confirms the change is additive against the published
+  3.6.0 baseline (223 checks, "no semver update required").
+
+  An alias rather than a hard rename because the major version **tracks the
+  `rmcp` SDK major** (see the header of this file). Bumping to 4.0.0 for a
+  rename would falsely signal an `rmcp` 4 upgrade. The alias is removed
+  whenever an `rmcp` major forces the next 4.0.0.
+
+### Migration
+
+- Replace `McpxError` with `RmcpServerKitError`. The old name still works for
+  now; the compiler will point at each site.
+- If you parse `/version`, read `rmcp_server_kit_version` instead of
+  `mcpx_version`.
+
 ## [3.6.0] - 2026-08-25
 
 > **First published release since 3.3.1.** The `3.4.0` and `3.5.0` tags exist in

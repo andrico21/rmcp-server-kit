@@ -33,24 +33,24 @@ use crate::{
         build_rate_limiter, extract_mtls_identity,
     },
     bounded_limiter::BoundedKeyedLimiter,
-    error::McpxError,
+    error::RmcpServerKitError,
     mtls_revocation::{self, CrlSet, DynamicClientCertVerifier},
     rbac::{RbacPolicy, ToolRateLimiter, build_tool_rate_limiter, rbac_middleware},
 };
 
-/// Map an internal `anyhow::Error` chain into a public [`McpxError::Startup`]
+/// Map an internal `anyhow::Error` chain into a public [`RmcpServerKitError::Startup`]
 /// at the public API boundary, flattening the chain via the alternate
 /// formatter so callers see the full causal path.
 #[allow(
     clippy::needless_pass_by_value,
     reason = "consumed at .map_err(anyhow_to_startup) call sites; by-value matches the closure shape"
 )]
-fn anyhow_to_startup(e: anyhow::Error) -> McpxError {
-    McpxError::Startup(format!("{e:#}"))
+fn anyhow_to_startup(e: anyhow::Error) -> RmcpServerKitError {
+    RmcpServerKitError::Startup(format!("{e:#}"))
 }
 
 /// Map a `std::io::Error` produced during server startup into a public
-/// [`McpxError::Startup`]. We deliberately do not use the [`McpxError::Io`]
+/// [`RmcpServerKitError::Startup`]. We deliberately do not use the [`RmcpServerKitError::Io`]
 /// `From` impl here because startup-phase IO errors (bind, listener) are
 /// semantically distinct from request-time IO errors and should surface
 /// the originating operation in the message.
@@ -58,8 +58,8 @@ fn anyhow_to_startup(e: anyhow::Error) -> McpxError {
     clippy::needless_pass_by_value,
     reason = "consumed at .map_err(|e| io_to_startup(...)) call sites; by-value matches the closure shape"
 )]
-fn io_to_startup(op: &str, e: std::io::Error) -> McpxError {
-    McpxError::Startup(format!("{op}: {e}"))
+fn io_to_startup(op: &str, e: std::io::Error) -> RmcpServerKitError {
+    RmcpServerKitError::Startup(format!("{op}: {e}"))
 }
 
 /// Async readiness check callback for the `/readyz` endpoint.
@@ -496,7 +496,7 @@ pub struct McpServerConfig {
     pub log_request_headers: bool,
     /// Expose build metadata (`build_git_sha`, `build_timestamp`,
     /// `rust_version`) on the unauthenticated `/version` endpoint.
-    /// **Default: `false`** -- only `name`, `version`, and `mcpx_version`
+    /// **Default: `false`** -- only `name`, `version`, and `rmcp_server_kit_version`
     /// are served otherwise, so build fingerprints are not leaked to
     /// anonymous callers. Enable via
     /// [`McpServerConfig::expose_build_metadata`].
@@ -1049,7 +1049,7 @@ impl McpServerConfig {
     /// Expose build metadata (`build_git_sha`, `build_timestamp`,
     /// `rust_version`) on the unauthenticated `/version` endpoint. Off by
     /// default so `/version` reveals only `name`, `version`, and
-    /// `mcpx_version`.
+    /// `rmcp_server_kit_version`.
     #[must_use]
     pub fn expose_build_metadata(mut self) -> Self {
         self.expose_build_metadata = true;
@@ -1096,9 +1096,9 @@ impl McpServerConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`McpxError::Config`] with a human-readable message on
+    /// Returns [`RmcpServerKitError::Config`] with a human-readable message on
     /// the first validation failure.
-    pub fn validate(self) -> Result<Validated<Self>, McpxError> {
+    pub fn validate(self) -> Result<Validated<Self>, RmcpServerKitError> {
         self.check()?;
         Ok(Validated(self))
     }
@@ -1109,50 +1109,50 @@ impl McpServerConfig {
     /// (`RateLimitConfig::{burst, pre_auth_burst}`) have no orphan rule:
     /// their base rates always resolve (`max_attempts_per_minute` is
     /// mandatory; the pre-auth base derives from it when unset).
-    fn check_burst_knobs(&self) -> Result<(), McpxError> {
+    fn check_burst_knobs(&self) -> Result<(), RmcpServerKitError> {
         if self.tool_rate_limit_burst == Some(0) {
-            return Err(McpxError::Config(
+            return Err(RmcpServerKitError::Config(
                 "tool_rate_limit_burst must be greater than zero".into(),
             ));
         }
         if self.extra_route_rate_limit_burst == Some(0) {
-            return Err(McpxError::Config(
+            return Err(RmcpServerKitError::Config(
                 "extra_route_rate_limit_burst must be greater than zero".into(),
             ));
         }
         if self.tool_rate_limit_burst.is_some() && self.tool_rate_limit.is_none() {
-            return Err(McpxError::Config(
+            return Err(RmcpServerKitError::Config(
                 "tool_rate_limit_burst requires tool_rate_limit to be set".into(),
             ));
         }
         if self.extra_route_rate_limit_burst.is_some() && self.extra_route_rate_limit.is_none() {
-            return Err(McpxError::Config(
+            return Err(RmcpServerKitError::Config(
                 "extra_route_rate_limit_burst requires extra_route_rate_limit to be set".into(),
             ));
         }
         if !self.extra_route_rate_limit_exempt_paths.is_empty()
             && self.extra_route_rate_limit.is_none()
         {
-            return Err(McpxError::Config(
+            return Err(RmcpServerKitError::Config(
                 "extra_route_rate_limit_exempt_paths requires extra_route_rate_limit to be set"
                     .into(),
             ));
         }
         for path in &self.extra_route_rate_limit_exempt_paths {
             if path.is_empty() || !path.starts_with('/') {
-                return Err(McpxError::Config(format!(
+                return Err(RmcpServerKitError::Config(format!(
                     "extra_route_rate_limit_exempt_paths entries must be non-empty and start with '/': {path:?}"
                 )));
             }
         }
         if let Some(rl) = self.auth.as_ref().and_then(|a| a.rate_limit.as_ref()) {
             if rl.burst == Some(0) {
-                return Err(McpxError::Config(
+                return Err(RmcpServerKitError::Config(
                     "auth rate_limit.burst must be greater than zero".into(),
                 ));
             }
             if rl.pre_auth_burst == Some(0) {
-                return Err(McpxError::Config(
+                return Err(RmcpServerKitError::Config(
                     "auth rate_limit.pre_auth_burst must be greater than zero".into(),
                 ));
             }
@@ -1164,12 +1164,12 @@ impl McpServerConfig {
     /// entry must parse as a CIDR (`ipnet::IpNet`) or a bare IP
     /// (normalized to a host network), and `forwarded_header` requires a
     /// nonempty proxy list (fail-fast over a silent no-op).
-    fn check_trusted_forwarder(&self) -> Result<(), McpxError> {
+    fn check_trusted_forwarder(&self) -> Result<(), RmcpServerKitError> {
         for entry in &self.trusted_proxies {
-            validate_trusted_proxy_entry(entry).map_err(McpxError::Config)?;
+            validate_trusted_proxy_entry(entry).map_err(RmcpServerKitError::Config)?;
         }
         if self.forwarded_header.is_some() && self.trusted_proxies.is_empty() {
-            return Err(McpxError::Config(
+            return Err(RmcpServerKitError::Config(
                 "forwarded_header requires trusted_proxies to be nonempty".into(),
             ));
         }
@@ -1179,14 +1179,14 @@ impl McpServerConfig {
     /// Run the validation checks without consuming `self`. Used by
     /// internal call sites (e.g. tests) that need to inspect a config
     /// without taking ownership.
-    fn check(&self) -> Result<(), McpxError> {
+    fn check(&self) -> Result<(), RmcpServerKitError> {
         // 1. admin <-> auth dependency. Mirrors the runtime check in
         //    `build_app_router`: admin endpoints require an auth state,
         //    which is built only when `auth` is `Some` *and* `enabled`.
         if self.admin_enabled {
             let auth_enabled = self.auth.as_ref().is_some_and(|a| a.enabled);
             if !auth_enabled {
-                return Err(McpxError::Config(
+                return Err(RmcpServerKitError::Config(
                     "admin_enabled=true requires auth to be configured and enabled".into(),
                 ));
             }
@@ -1195,12 +1195,12 @@ impl McpServerConfig {
         // 2. TLS cert / key must be paired
         match (&self.tls_cert_path, &self.tls_key_path) {
             (Some(_), None) => {
-                return Err(McpxError::Config(
+                return Err(RmcpServerKitError::Config(
                     "tls_cert_path is set but tls_key_path is missing".into(),
                 ));
             }
             (None, Some(_)) => {
-                return Err(McpxError::Config(
+                return Err(RmcpServerKitError::Config(
                     "tls_key_path is set but tls_cert_path is missing".into(),
                 ));
             }
@@ -1209,7 +1209,7 @@ impl McpServerConfig {
 
         // 3. bind_addr parses
         if self.bind_addr.parse::<SocketAddr>().is_err() {
-            return Err(McpxError::Config(format!(
+            return Err(RmcpServerKitError::Config(format!(
                 "bind_addr {:?} is not a valid socket address (expected e.g. 127.0.0.1:8080)",
                 self.bind_addr
             )));
@@ -1219,7 +1219,7 @@ impl McpServerConfig {
         if let Some(ref url) = self.public_url
             && !(url.starts_with("http://") || url.starts_with("https://"))
         {
-            return Err(McpxError::Config(format!(
+            return Err(RmcpServerKitError::Config(format!(
                 "public_url {url:?} must start with http:// or https://"
             )));
         }
@@ -1227,7 +1227,7 @@ impl McpServerConfig {
         // 5. allowed_origins scheme
         for origin in &self.allowed_origins {
             if !(origin.starts_with("http://") || origin.starts_with("https://")) {
-                return Err(McpxError::Config(format!(
+                return Err(RmcpServerKitError::Config(format!(
                     "allowed_origins entry {origin:?} must start with http:// or https://"
                 )));
             }
@@ -1235,7 +1235,7 @@ impl McpServerConfig {
 
         // 6. max_request_body > 0
         if self.max_request_body == 0 {
-            return Err(McpxError::Config(
+            return Err(RmcpServerKitError::Config(
                 "max_request_body must be greater than zero".into(),
             ));
         }
@@ -1244,7 +1244,7 @@ impl McpServerConfig {
         // legacy tool_rate_limit (which clamps 0 to its default at
         // construction), new knobs fail fast on nonsensical values.
         if self.extra_route_rate_limit == Some(0) {
-            return Err(McpxError::Config(
+            return Err(RmcpServerKitError::Config(
                 "extra_route_rate_limit must be greater than zero".into(),
             ));
         }
@@ -1271,7 +1271,7 @@ impl McpServerConfig {
         //    deadlock the global concurrency limiter and reject every
         //    request. Mirrors the TOML-side check in `src/config.rs`.
         if self.max_concurrent_requests == Some(0) {
-            return Err(McpxError::Config(
+            return Err(RmcpServerKitError::Config(
                 "max_concurrent_requests must be greater than zero when set".into(),
             ));
         }
@@ -1283,7 +1283,7 @@ impl McpServerConfig {
             && let Some(rl) = &auth_cfg.rate_limit
             && rl.max_tracked_keys == 0
         {
-            return Err(McpxError::Config(
+            return Err(RmcpServerKitError::Config(
                 "auth.rate_limit.max_tracked_keys must be greater than zero".into(),
             ));
         }
@@ -1293,7 +1293,7 @@ impl McpServerConfig {
         //     all TLS connections. Mirrors the TOML-side check in
         //     `src/config.rs`.
         if self.tls_handshake_timeout == Duration::ZERO {
-            return Err(McpxError::Config(
+            return Err(RmcpServerKitError::Config(
                 "tls_handshake_timeout must be greater than zero".into(),
             ));
         }
@@ -1303,7 +1303,7 @@ impl McpServerConfig {
         //     TLS accept path. Mirrors the TOML-side check in
         //     `src/config.rs`.
         if self.max_concurrent_tls_handshakes == 0 {
-            return Err(McpxError::Config(
+            return Err(RmcpServerKitError::Config(
                 "max_concurrent_tls_handshakes must be greater than zero".into(),
             ));
         }
@@ -1348,9 +1348,9 @@ impl ReloadHandle {
     /// # Errors
     ///
     /// Returns an error if CRL refresh is unavailable or verifier rebuild fails.
-    pub async fn refresh_crls(&self) -> Result<(), McpxError> {
+    pub async fn refresh_crls(&self) -> Result<(), RmcpServerKitError> {
         let Some(ref crl_set) = self.crl_set else {
-            return Err(McpxError::Config(
+            return Err(RmcpServerKitError::Config(
                 "CRL refresh requested but mTLS CRL support is not configured".into(),
             ));
         };
@@ -2004,12 +2004,12 @@ where
 ///
 /// # Errors
 ///
-/// Returns [`McpxError::Startup`] if binding to `config.bind_addr`
+/// Returns [`RmcpServerKitError::Startup`] if binding to `config.bind_addr`
 /// fails, or if the underlying axum server returns an error.
 pub async fn serve<H, F>(
     config: Validated<McpServerConfig>,
     handler_factory: F,
-) -> Result<(), McpxError>
+) -> Result<(), RmcpServerKitError>
 where
     H: ServerHandler + 'static,
     F: Fn() -> H + Send + Sync + Clone + 'static,
@@ -2071,7 +2071,7 @@ where
 ///
 /// # Errors
 ///
-/// Returns [`McpxError::Startup`] if router construction fails, if reading
+/// Returns [`RmcpServerKitError::Startup`] if router construction fails, if reading
 /// the listener's `local_addr()` fails, or if the underlying axum
 /// server returns an error.
 pub async fn serve_with_listener<H, F>(
@@ -2080,7 +2080,7 @@ pub async fn serve_with_listener<H, F>(
     handler_factory: F,
     ready_tx: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
     shutdown: Option<CancellationToken>,
-) -> Result<(), McpxError>
+) -> Result<(), RmcpServerKitError>
 where
     H: ServerHandler + 'static,
     F: Fn() -> H + Send + Sync + Clone + 'static,
@@ -2298,7 +2298,7 @@ async fn run_server(
 ///
 /// # Errors
 ///
-/// Returns [`McpxError::Startup`] if the shared
+/// Returns [`RmcpServerKitError::Startup`] if the shared
 /// [`crate::oauth::OauthHttpClient`] cannot be initialized.
 #[cfg(feature = "oauth")]
 fn install_oauth_proxy_routes(
@@ -2308,7 +2308,7 @@ fn install_oauth_proxy_routes(
     auth_state: Option<&Arc<AuthState>>,
     max_request_body: usize,
     admin_role: &str,
-) -> Result<axum::Router, McpxError> {
+) -> Result<axum::Router, RmcpServerKitError> {
     let Some(ref proxy) = oauth_config.proxy else {
         return Ok(router);
     };
@@ -2424,7 +2424,7 @@ fn build_oauth_admin_router(
     http: crate::oauth::OauthHttpClient,
     auth_state: Option<&Arc<AuthState>>,
     admin_role: &str,
-) -> Result<axum::Router, McpxError> {
+) -> Result<axum::Router, RmcpServerKitError> {
     let mut admin_router = axum::Router::new();
     if proxy.introspection_url.is_some() {
         let proxy_introspect = proxy.clone();
@@ -2457,7 +2457,7 @@ fn build_oauth_admin_router(
 
     if proxy.require_auth_on_admin_endpoints {
         let Some(state) = auth_state else {
-            return Err(McpxError::Startup(
+            return Err(RmcpServerKitError::Startup(
                 "oauth proxy admin endpoints require auth state".into(),
             ));
         };
@@ -2929,7 +2929,7 @@ async fn healthz() -> impl IntoResponse {
 
 /// Build the `/version` JSON payload for a given server name and version.
 ///
-/// `name`, `version`, and `mcpx_version` are always included. Build
+/// `name`, `version`, and `rmcp_server_kit_version` are always included. Build
 /// metadata (`build_git_sha`, `build_timestamp`, `rust_version`) is added
 /// only when `expose_build_metadata` is true, so anonymous `/version`
 /// callers do not receive build fingerprints by default. The build values
@@ -2940,7 +2940,10 @@ fn version_payload(name: &str, version: &str, expose_build_metadata: bool) -> se
     let mut map = serde_json::Map::new();
     map.insert("name".into(), name.into());
     map.insert("version".into(), version.into());
-    map.insert("mcpx_version".into(), env!("CARGO_PKG_VERSION").into());
+    map.insert(
+        "rmcp_server_kit_version".into(),
+        env!("CARGO_PKG_VERSION").into(),
+    );
     if expose_build_metadata {
         map.insert(
             "build_git_sha".into(),
@@ -3263,7 +3266,7 @@ fn apply_security_header(
 ///   want to commit to the HSTS preload list must do so via a future
 ///   explicit `with_hsts_preload(true)` builder, not by smuggling
 ///   `preload` through this knob.
-fn validate_security_headers(cfg: &SecurityHeadersConfig) -> Result<(), McpxError> {
+fn validate_security_headers(cfg: &SecurityHeadersConfig) -> Result<(), RmcpServerKitError> {
     use axum::http::HeaderValue;
 
     let fields: &[(&str, Option<&str>)] = &[
@@ -3311,7 +3314,7 @@ fn validate_security_headers(cfg: &SecurityHeadersConfig) -> Result<(), McpxErro
             continue;
         }
         if let Err(err) = HeaderValue::from_str(v) {
-            return Err(McpxError::Config(format!(
+            return Err(RmcpServerKitError::Config(format!(
                 "invalid security_headers.{field}: {err}"
             )));
         }
@@ -3321,7 +3324,7 @@ fn validate_security_headers(cfg: &SecurityHeadersConfig) -> Result<(), McpxErro
         && !v.is_empty()
         && v.to_ascii_lowercase().contains("preload")
     {
-        return Err(McpxError::Config(format!(
+        return Err(RmcpServerKitError::Config(format!(
             "invalid security_headers.strict_transport_security: {v:?} contains the `preload` directive; \
              HSTS preload must be opted into explicitly via a dedicated builder, not via this knob"
         )));
@@ -3520,7 +3523,7 @@ fn build_extra_route_rate_limiter(
 /// Semantics mirror the tool/auth limiters exactly: keyed by the
 /// direct peer `IpAddr` (no `X-Forwarded-For`), fail-open when no peer
 /// address is present (cannot happen under [`serve`]), and on limit a
-/// plain-text 429 via [`McpxError::RateLimitedFor`] carrying a
+/// plain-text 429 via [`RmcpServerKitError::RateLimitedFor`] carrying a
 /// `Retry-After` header (delta-seconds), consistent with every other
 /// limiter in the crate.
 ///
@@ -3544,7 +3547,7 @@ async fn extra_route_rate_limit_middleware(
         #[cfg(feature = "metrics")]
         crate::metrics::record_rate_limit_deny(req.extensions(), "extra_route");
         tracing::warn!(%ip, "extra route request rate limited");
-        return McpxError::RateLimitedFor {
+        return RmcpServerKitError::RateLimitedFor {
             message: "too many requests to application routes from this source".into(),
             retry_after: wait,
         }
@@ -3640,7 +3643,7 @@ fn format_request_headers_for_log(headers: &axum::http::HeaderMap) -> String {
 ///
 /// # Errors
 ///
-/// Returns [`McpxError::Startup`] if the handler fails to initialize or the
+/// Returns [`RmcpServerKitError::Startup`] if the handler fails to initialize or the
 /// transport disconnects unexpectedly.
 // NOTE: reported complexity 32/25 is driven entirely by `tracing::*!`
 // macro expansion in this 18-line function (info/warn/info + two matches).
@@ -3649,7 +3652,7 @@ fn format_request_headers_for_log(headers: &axum::http::HeaderMap) -> String {
     clippy::cognitive_complexity,
     reason = "complexity is purely tracing macro expansion (info/warn + match arms); 18 lines of straight-line code, nothing meaningful to extract"
 )]
-pub async fn serve_stdio<H>(handler: H) -> Result<(), McpxError>
+pub async fn serve_stdio<H>(handler: H) -> Result<(), RmcpServerKitError>
 where
     H: ServerHandler + 'static,
 {
@@ -3663,7 +3666,7 @@ where
     let service = handler
         .serve(transport)
         .await
-        .map_err(|e| McpxError::Startup(format!("stdio initialize failed: {e}")))?;
+        .map_err(|e| RmcpServerKitError::Startup(format!("stdio initialize failed: {e}")))?;
 
     if let Err(e) = service.waiting().await {
         tracing::warn!(error = %e, "stdio session ended with error");
@@ -4848,7 +4851,9 @@ mod tests {
     /// Build a minimal config with a custom SecurityHeadersConfig and
     /// drive it through `check()`. Returns the result so individual
     /// tests can assert on success or specific error messages.
-    fn check_with_security_headers(headers: SecurityHeadersConfig) -> Result<(), McpxError> {
+    fn check_with_security_headers(
+        headers: SecurityHeadersConfig,
+    ) -> Result<(), RmcpServerKitError> {
         let cfg =
             McpServerConfig::new("127.0.0.1:8080", "test", "0.0.0").with_security_headers(headers);
         cfg.check()
@@ -5064,7 +5069,7 @@ mod tests {
         let v = version_payload("my-server", "1.2.3", false);
         assert_eq!(v["name"], "my-server");
         assert_eq!(v["version"], "1.2.3");
-        assert!(v["mcpx_version"].is_string());
+        assert!(v["rmcp_server_kit_version"].is_string());
         assert!(
             v.get("build_git_sha").is_none(),
             "build sha must be hidden by default"
@@ -5079,7 +5084,7 @@ mod tests {
         assert!(v["build_git_sha"].is_string());
         assert!(v["build_timestamp"].is_string());
         assert!(v["rust_version"].is_string());
-        assert!(v["mcpx_version"].is_string());
+        assert!(v["rmcp_server_kit_version"].is_string());
     }
 
     // -- concurrency limit layer --

@@ -57,7 +57,7 @@ Verification summary:
 
 ## 2. SHOULD-FIX — Architecture & correctness
 
-### 2.1 `JwksCache::new` returns `Box<dyn Error>` instead of `McpxError`
+### 2.1 `JwksCache::new` returns `Box<dyn Error>` instead of `RmcpServerKitError`
 **File**: `src/oauth.rs:554`
 **Guideline**: §2 Error handling — “use the crate-wide error type for public APIs”.
 
@@ -65,26 +65,26 @@ Verification summary:
 pub fn new(config: &OAuthConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>>
 ```
 
-Every other public constructor in the crate returns `Result<_, McpxError>`.
+Every other public constructor in the crate returns `Result<_, RmcpServerKitError>`.
 This single outlier forces consumers into `Box<dyn>` plumbing, defeats
 `?`-conversion in caller code, and breaks API hygiene.
 
 **Remediation** (next major — public signature change):
 
 ```rust,ignore
-pub fn new(config: &OAuthConfig) -> Result<Self, McpxError>
+pub fn new(config: &OAuthConfig) -> Result<Self, RmcpServerKitError>
 ```
 
 Map the underlying `std::io::Error` (CA bundle read), `reqwest::Error`
 (client build), and `rustls::Error` (provider install) to existing
-`McpxError` variants (`Io`, `Config`, or a new `OAuth` variant — see §2.2).
+`RmcpServerKitError` variants (`Io`, `Config`, or a new `OAuth` variant — see §2.2).
 
 ### 2.2 `oauth.rs::exchange_token` leaks upstream IdP `error_description` to the HTTP client (P1)
 **Files**: `src/oauth.rs:1407–1422` ; `src/error.rs:56–85`
 
 ```rust,ignore
 // oauth.rs (caller-visible message)
-return Err(crate::error::McpxError::Auth(format!(
+return Err(crate::error::RmcpServerKitError::Auth(format!(
     "token exchange failed: {detail}"  // detail includes error_description verbatim
 )));
 
@@ -106,7 +106,7 @@ trace IDs in `error_description`. This is a P1 information disclosure.
    ```rust,ignore
    let short_code = serde_json::from_slice::<OAuthErrorResponse>(&body_bytes)
        .map_or("server_error", |e| classify(&e.error));
-   return Err(crate::error::McpxError::Auth(format!(
+   return Err(crate::error::RmcpServerKitError::Auth(format!(
        "token exchange failed: {short_code}"
    )));
    ```
@@ -366,7 +366,7 @@ refactor” PRs from creating noise.
 10. §4.4 — add proptest dev-dep + first property tests.
 
 **Major release (2.0.0 — breaking)**:
-11. §2.1 — change `JwksCache::new` signature to return `Result<_, McpxError>`.
+11. §2.1 — change `JwksCache::new` signature to return `Result<_, RmcpServerKitError>`.
 
 ---
 

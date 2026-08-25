@@ -68,7 +68,7 @@ src/
 ├── observability.rs     tracing init, JSON logging, audit-file sink
 ├── metrics.rs           prometheus registry + /metrics (feature = "metrics")
 ├── config.rs            TOML config structs and validation
-├── error.rs             McpxError + axum IntoResponse
+├── error.rs             RmcpServerKitError + axum IntoResponse
 └── secret.rs            re-exports of `secrecy::Secret`
 ```
 
@@ -281,7 +281,7 @@ layers (origin check, peer normalization) still run first. Same
 machinery and deny shape as the tool limiter: `BoundedKeyedLimiter<IpAddr>`
 (10k tracked keys, 15 min idle eviction → bounded memory, shared-fate
 under key spray), fail-open without a peer address, 429 plain-text via
-`McpxError::RateLimitedFor` with a `Retry-After` header (delta-seconds;
+`RmcpServerKitError::RateLimitedFor` with a `Retry-After` header (delta-seconds;
 all four kit limiters share this deny contract since 1.12.0, computed
 from `BoundedKeyedLimiter::check_key_wait`). Optional burst knobs set
 the bucket capacity per limiter (`*_burst` builder/TOML fields;
@@ -605,7 +605,7 @@ recommended.
    - `lookup_key()` looks up by `kid` in the cached JWKS
      (`src/oauth.rs:2456`).
    - If not found, calls `refresh_with_cooldown()` (`src/oauth.rs:2310`):
-     - Enforces `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:1841`) so multiple
+     - Enforces `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:1878`) so multiple
        invalid tokens cannot DoS the JWKS endpoint.
      - Deduplicates concurrent refreshes.
    - Validates signature, `iss`, `aud`, `exp`, `nbf` using `jsonwebtoken`.
@@ -651,9 +651,9 @@ to intended, authenticated Identity Providers.
 ```rust
 pub trait ToolHooks: Send + Sync + 'static {
     fn before_call(&self, name: &str, args: &Value, identity: Option<&AuthIdentity>)
-        -> Result<Value, McpxError>;
+        -> Result<Value, RmcpServerKitError>;
     fn after_call(&self, name: &str, result: &Value, identity: Option<&AuthIdentity>)
-        -> Result<Value, McpxError>;
+        -> Result<Value, RmcpServerKitError>;
 }
 ```
 
@@ -764,7 +764,7 @@ Why `arc-swap` and not `RwLock`?
 
 ```rust
 #[derive(thiserror::Error, Debug)]
-pub enum McpxError {
+pub enum RmcpServerKitError {
     Unauthorized(String),
     Forbidden(String),
     BadRequest(String),
@@ -775,7 +775,7 @@ pub enum McpxError {
 }
 ```
 
-`impl IntoResponse for McpxError` (`src/error.rs:126`) maps each
+`impl IntoResponse for RmcpServerKitError` (`src/error.rs:126`) maps each
 variant to a sanitized HTTP response:
 - Status code (`401`, `403`, `400`, `429`, `413`, `500`)
 - Generic body (no internal details leaked to clients per OWASP)
@@ -889,7 +889,7 @@ itself is at `src/transport.rs:3282`.
    exhaust the rate-limit budget for authenticated callers.
 
 4. **JWKS refresh is rate-limited.** Removing `JWKS_REFRESH_COOLDOWN`
-   (`src/oauth.rs:1841`) creates a DoS vector against the issuer's JWKS endpoint.
+   (`src/oauth.rs:1878`) creates a DoS vector against the issuer's JWKS endpoint.
 
 5. **No symmetric JWT algorithms by default.** `HS*` algorithms with a
    public JWKS would enable algorithm-confusion attacks. Don't add them
@@ -912,7 +912,7 @@ itself is at `src/transport.rs:3282`.
 
 9. **No panics in production code paths.** `unwrap_used = "deny"`,
    `panic = "deny"`, `todo = "deny"`, `unimplemented = "deny"` are set
-   in `Cargo.toml`. Use `Result<T, McpxError>`.
+   in `Cargo.toml`. Use `Result<T, RmcpServerKitError>`.
 
 10. **`unsafe_code = "forbid"`** at the crate level. There is no `unsafe`
     in this codebase and there should never be.

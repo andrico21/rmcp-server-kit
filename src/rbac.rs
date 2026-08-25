@@ -22,7 +22,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use sha2::Sha256;
 
-use crate::{auth::AuthIdentity, bounded_limiter::BoundedKeyedLimiter, error::McpxError};
+use crate::{auth::AuthIdentity, bounded_limiter::BoundedKeyedLimiter, error::RmcpServerKitError};
 
 /// Per-source-IP rate limiter for tool invocations. Memory-bounded against
 /// IP-spray `DoS` via [`BoundedKeyedLimiter`].
@@ -778,7 +778,7 @@ pub(crate) async fn rbac_middleware(
 
     // RBAC requires an authenticated identity.
     if policy.is_enabled() && identity.is_none() {
-        return McpxError::Rbac("no authenticated identity".into()).into_response();
+        return RmcpServerKitError::Rbac("no authenticated identity".into()).into_response();
     }
 
     // Read the body for JSON-RPC inspection.
@@ -881,7 +881,7 @@ fn enforce_rate_limit(
     if let Err(wait) = limiter.check_key_wait(&ip) {
         tracing::warn!(%ip, "tool invocation rate limited");
         return Some(
-            McpxError::RateLimitedFor {
+            RmcpServerKitError::RateLimitedFor {
                 message: "too many tool invocations".into(),
                 retry_after: wait,
             }
@@ -926,7 +926,7 @@ fn enforce_tool_policy(
             "non-string host argument rejected"
         );
         return Some(
-            McpxError::Rbac(format!(
+            RmcpServerKitError::Rbac(format!(
                 "argument 'host' must be a string for tool '{tool_name}'"
             ))
             .into_response(),
@@ -950,7 +950,8 @@ fn enforce_tool_policy(
             "RBAC denied"
         );
         return Some(
-            McpxError::Rbac(format!("{tool_name} denied for role '{role}'")).into_response(),
+            RmcpServerKitError::Rbac(format!("{tool_name} denied for role '{role}'"))
+                .into_response(),
         );
     }
 
@@ -990,7 +991,7 @@ fn check_required_arguments(
         "required argument missing"
     );
     Some(
-        McpxError::Rbac(format!(
+        RmcpServerKitError::Rbac(format!(
             "argument '{missing}' is required for tool '{tool_name}'"
         ))
         .into_response(),
@@ -1023,7 +1024,7 @@ fn check_argument(
             "non-string argument rejected by allowlist"
         );
         return Some(
-            McpxError::Rbac(format!(
+            RmcpServerKitError::Rbac(format!(
                 "argument '{arg_key}' must be a string for tool '{tool_name}'"
             ))
             .into_response(),
@@ -1045,7 +1046,7 @@ fn check_argument(
         "argument not in allowlist"
     );
     Some(
-        McpxError::Rbac(format!(
+        RmcpServerKitError::Rbac(format!(
             "argument '{arg_key}' value not in allowlist for tool '{tool_name}'"
         ))
         .into_response(),
@@ -1140,7 +1141,7 @@ impl RbacConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`McpxError::Config`] when both direct and file-based salt
+    /// Returns [`RmcpServerKitError::Config`] when both direct and file-based salt
     /// variables are set or when the `_FILE` target cannot be read.
     ///
     /// # Examples
@@ -1163,12 +1164,14 @@ impl RbacConfig {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn apply_env_overrides(&mut self) -> Result<Vec<crate::config::EnvOverride>, McpxError> {
+    pub fn apply_env_overrides(
+        &mut self,
+    ) -> Result<Vec<crate::config::EnvOverride>, RmcpServerKitError> {
         let direct = crate::config::read_env(crate::config::RBAC_REDACTION_SALT_ENV)?;
         let file = crate::config::read_env(crate::config::RBAC_REDACTION_SALT_FILE_ENV)?;
         match (direct, file) {
             (None, None) => Ok(Vec::new()),
-            (Some(_), Some(_)) => Err(McpxError::Config(format!(
+            (Some(_), Some(_)) => Err(RmcpServerKitError::Config(format!(
                 "{} and {} must not both be set",
                 crate::config::RBAC_REDACTION_SALT_ENV,
                 crate::config::RBAC_REDACTION_SALT_FILE_ENV
@@ -1184,7 +1187,7 @@ impl RbacConfig {
             }
             (None, Some(path)) => {
                 let secret = std::fs::read_to_string(PathBuf::from(&path)).map_err(|error| {
-                    McpxError::Config(format!(
+                    RmcpServerKitError::Config(format!(
                         "failed to read {} file {path:?}: {error}",
                         crate::config::RBAC_REDACTION_SALT_FILE_ENV
                     ))
@@ -1211,9 +1214,9 @@ fn normalize_text_secret_file(mut secret: String) -> String {
     secret
 }
 
-fn reject_blank_redaction_salt(env_var: &str, value: &str) -> Result<(), McpxError> {
+fn reject_blank_redaction_salt(env_var: &str, value: &str) -> Result<(), RmcpServerKitError> {
     if value.trim().is_empty() {
-        return Err(McpxError::Config(format!(
+        return Err(RmcpServerKitError::Config(format!(
             "{env_var} must not be empty or whitespace-only"
         )));
     }
@@ -1342,7 +1345,7 @@ mod tests {
 
     fn redaction_from_file(
         content: &str,
-    ) -> Result<(String, Vec<crate::config::EnvOverride>), McpxError> {
+    ) -> Result<(String, Vec<crate::config::EnvOverride>), RmcpServerKitError> {
         let path = std::env::temp_dir().join(format!(
             "rmcp-server-kit-redaction-salt-{}.txt",
             std::time::SystemTime::now()

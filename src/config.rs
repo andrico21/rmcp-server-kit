@@ -3,7 +3,7 @@ use std::{path::PathBuf, time::Duration};
 use serde::Deserialize;
 
 use crate::{
-    error::McpxError,
+    error::RmcpServerKitError,
     transport::{McpServerConfig, SecurityHeadersConfig},
 };
 
@@ -380,7 +380,7 @@ impl ServerConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`McpxError::Config`] when an override cannot be parsed, when an
+    /// Returns [`RmcpServerKitError::Config`] when an override cannot be parsed, when an
     /// OAuth override lacks a declared `[server.auth.oauth]` parent, or when an
     /// OAuth override is used in a build without the `oauth` feature.
     ///
@@ -403,7 +403,7 @@ impl ServerConfig {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn apply_env_overrides(&mut self) -> Result<Vec<EnvOverride>, McpxError> {
+    pub fn apply_env_overrides(&mut self) -> Result<Vec<EnvOverride>, RmcpServerKitError> {
         let mut applied = Vec::new();
         apply_string_env(
             SERVER_LISTEN_ADDR_ENV,
@@ -458,20 +458,20 @@ impl ServerConfig {
         &mut self,
         oauth_env: OAuthEnvOverrides,
         applied: &mut Vec<EnvOverride>,
-    ) -> Result<(), McpxError> {
+    ) -> Result<(), RmcpServerKitError> {
         if !oauth_env.is_set() {
             return Ok(());
         }
 
         let Some(auth) = self.auth.as_mut() else {
             let var = oauth_env.first_set_var();
-            return Err(McpxError::Config(format!(
+            return Err(RmcpServerKitError::Config(format!(
                 "{var} requires declaring [server.auth.oauth] before applying env overrides"
             )));
         };
         let Some(oauth) = auth.oauth.as_mut() else {
             let var = oauth_env.first_set_var();
-            return Err(McpxError::Config(format!(
+            return Err(RmcpServerKitError::Config(format!(
                 "{var} requires declaring [server.auth.oauth] before applying env overrides"
             )));
         };
@@ -516,7 +516,7 @@ impl ServerConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`McpxError::Config`] when a duration string cannot be parsed.
+    /// Returns [`RmcpServerKitError::Config`] when a duration string cannot be parsed.
     ///
     /// # Examples
     ///
@@ -539,7 +539,10 @@ impl ServerConfig {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn apply_to_mcp_config(&self, base: McpServerConfig) -> Result<McpServerConfig, McpxError> {
+    pub fn apply_to_mcp_config(
+        &self,
+        base: McpServerConfig,
+    ) -> Result<McpServerConfig, RmcpServerKitError> {
         let config = base
             .with_bind_addr(format!("{}:{}", self.listen_addr, self.listen_port))
             .with_tls_paths(self.tls_cert_path.clone(), self.tls_key_path.clone())
@@ -599,7 +602,7 @@ impl ObservabilityConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`McpxError::Config`] when a boolean override cannot be parsed.
+    /// Returns [`RmcpServerKitError::Config`] when a boolean override cannot be parsed.
     ///
     /// # Examples
     ///
@@ -626,7 +629,7 @@ impl ObservabilityConfig {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn apply_env_overrides(&mut self) -> Result<Vec<EnvOverride>, McpxError> {
+    pub fn apply_env_overrides(&mut self) -> Result<Vec<EnvOverride>, RmcpServerKitError> {
         let mut applied = Vec::new();
         apply_string_env(
             OBSERVABILITY_LOG_FORMAT_ENV,
@@ -652,13 +655,13 @@ impl ObservabilityConfig {
     }
 }
 
-pub(crate) fn read_env(var: &str) -> Result<Option<String>, McpxError> {
+pub(crate) fn read_env(var: &str) -> Result<Option<String>, RmcpServerKitError> {
     match std::env::var(var) {
         Ok(value) => Ok(Some(value)),
         Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            Err(McpxError::Config(format!("{var} must contain valid UTF-8")))
-        }
+        Err(std::env::VarError::NotUnicode(_)) => Err(RmcpServerKitError::Config(format!(
+            "{var} must contain valid UTF-8"
+        ))),
     }
 }
 
@@ -684,15 +687,16 @@ pub(crate) fn secret_env_report(
     }
 }
 
-fn parse_env_value<T>(env_var: &str, raw: &str, expected: &str) -> Result<T, McpxError>
+fn parse_env_value<T>(env_var: &str, raw: &str, expected: &str) -> Result<T, RmcpServerKitError>
 where
     T: std::str::FromStr,
 {
-    raw.parse::<T>()
-        .map_err(|_| McpxError::Config(format!("invalid value for {env_var}: expected {expected}")))
+    raw.parse::<T>().map_err(|_| {
+        RmcpServerKitError::Config(format!("invalid value for {env_var}: expected {expected}"))
+    })
 }
 
-pub(crate) fn parse_env_bool(env_var: &str, raw: &str) -> Result<bool, McpxError> {
+pub(crate) fn parse_env_bool(env_var: &str, raw: &str) -> Result<bool, RmcpServerKitError> {
     parse_env_value(env_var, raw, "bool")
 }
 
@@ -701,7 +705,7 @@ fn apply_string_env(
     target_field: &str,
     target: &mut String,
     applied: &mut Vec<EnvOverride>,
-) -> Result<(), McpxError> {
+) -> Result<(), RmcpServerKitError> {
     if let Some(raw) = read_env(env_var)? {
         applied.push(env_report(env_var, target_field, raw.clone()));
         *target = raw;
@@ -714,7 +718,7 @@ fn apply_optional_string_env(
     target_field: &str,
     target: &mut Option<String>,
     applied: &mut Vec<EnvOverride>,
-) -> Result<(), McpxError> {
+) -> Result<(), RmcpServerKitError> {
     if let Some(raw) = read_env(env_var)? {
         *target = Some(raw.clone());
         applied.push(env_report(env_var, target_field, raw));
@@ -727,7 +731,7 @@ fn apply_optional_path_env(
     target_field: &str,
     target: &mut Option<PathBuf>,
     applied: &mut Vec<EnvOverride>,
-) -> Result<(), McpxError> {
+) -> Result<(), RmcpServerKitError> {
     if let Some(raw) = read_env(env_var)? {
         *target = Some(PathBuf::from(&raw));
         applied.push(env_report(env_var, target_field, raw));
@@ -742,7 +746,7 @@ struct OAuthEnvOverrides {
 }
 
 impl OAuthEnvOverrides {
-    fn read() -> Result<Self, McpxError> {
+    fn read() -> Result<Self, RmcpServerKitError> {
         Ok(Self {
             issuer: read_env(SERVER_OAUTH_ISSUER_ENV)?,
             audience: read_env(SERVER_OAUTH_AUDIENCE_ENV)?,
@@ -764,10 +768,10 @@ impl OAuthEnvOverrides {
 }
 
 #[cfg(not(feature = "oauth"))]
-fn reject_oauth_env_overrides(oauth_env: &OAuthEnvOverrides) -> Result<(), McpxError> {
+fn reject_oauth_env_overrides(oauth_env: &OAuthEnvOverrides) -> Result<(), RmcpServerKitError> {
     if oauth_env.is_set() {
         let var = oauth_env.first_set_var();
-        Err(McpxError::Config(format!(
+        Err(RmcpServerKitError::Config(format!(
             "{var} requires the `oauth` feature"
         )))
     } else {
@@ -791,9 +795,9 @@ fn first_set_oauth_env(
     }
 }
 
-fn parse_duration_field(field: &str, value: &str) -> Result<Duration, McpxError> {
+fn parse_duration_field(field: &str, value: &str) -> Result<Duration, RmcpServerKitError> {
     humantime::parse_duration(value).map_err(|error| {
-        McpxError::Config(format!("invalid duration for {field}: {value:?}: {error}"))
+        RmcpServerKitError::Config(format!("invalid duration for {field}: {value:?}: {error}"))
     })
 }
 
@@ -838,17 +842,19 @@ impl Default for ObservabilityConfig {
 ///
 /// # Errors
 ///
-/// Returns `McpxError::Config` on invalid values.
+/// Returns `RmcpServerKitError::Config` on invalid values.
 pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()> {
-    use crate::error::McpxError;
+    use crate::error::RmcpServerKitError;
 
     if server.listen_port == 0 {
-        return Err(McpxError::Config("listen_port must be nonzero".into()));
+        return Err(RmcpServerKitError::Config(
+            "listen_port must be nonzero".into(),
+        ));
     }
 
     match (&server.tls_cert_path, &server.tls_key_path) {
         (Some(_), None) | (None, Some(_)) => {
-            return Err(McpxError::Config(
+            return Err(RmcpServerKitError::Config(
                 "tls_cert_path and tls_key_path must both be set or both omitted".into(),
             ));
         }
@@ -856,13 +862,13 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
     }
 
     if server.max_concurrent_requests == Some(0) {
-        return Err(McpxError::Config(
+        return Err(RmcpServerKitError::Config(
             "max_concurrent_requests must be nonzero when set".into(),
         ));
     }
 
     if server.extra_route_rate_limit == Some(0) {
-        return Err(McpxError::Config(
+        return Err(RmcpServerKitError::Config(
             "server.extra_route_rate_limit must be greater than zero".into(),
         ));
     }
@@ -873,12 +879,14 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
     if server.admin_enabled {
         let auth_enabled = server.auth.as_ref().is_some_and(|a| a.enabled);
         if !auth_enabled {
-            return Err(McpxError::Config(
+            return Err(RmcpServerKitError::Config(
                 "admin_enabled=true requires auth to be configured and enabled".into(),
             ));
         }
         if server.admin_role.trim().is_empty() {
-            return Err(McpxError::Config("admin_role must not be empty".into()));
+            return Err(RmcpServerKitError::Config(
+                "admin_role must not be empty".into(),
+            ));
         }
     }
 
@@ -896,7 +904,7 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
         ),
     ] {
         if humantime::parse_duration(value).is_err() {
-            return Err(McpxError::Config(format!(
+            return Err(RmcpServerKitError::Config(format!(
                 "invalid duration for {field}: {value:?}"
             )));
         }
@@ -906,7 +914,7 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
     // would reap every TLS handshake before it could complete. Mirrors
     // check #11 in `McpServerConfig::check`.
     if humantime::parse_duration(&server.tls_handshake_timeout).is_ok_and(|d| d == Duration::ZERO) {
-        return Err(McpxError::Config(
+        return Err(RmcpServerKitError::Config(
             "server.tls_handshake_timeout must be greater than zero".into(),
         ));
     }
@@ -915,7 +923,7 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
     // deadlocking the TLS accept path. Mirrors check #12 in
     // `McpServerConfig::check`.
     if server.max_concurrent_tls_handshakes == 0 {
-        return Err(McpxError::Config(
+        return Err(RmcpServerKitError::Config(
             "server.max_concurrent_tls_handshakes must be greater than zero".into(),
         ));
     }
@@ -927,51 +935,51 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
 /// bursts and orphan bursts fail fast (mirrors `McpServerConfig::check`;
 /// the auth bursts have no orphan rule — their base rates always resolve).
 fn validate_rate_limit_knobs(server: &ServerConfig) -> crate::error::Result<()> {
-    use crate::error::McpxError;
+    use crate::error::RmcpServerKitError;
 
     if server.tool_rate_limit_burst == Some(0) {
-        return Err(McpxError::Config(
+        return Err(RmcpServerKitError::Config(
             "server.tool_rate_limit_burst must be greater than zero".into(),
         ));
     }
     if server.extra_route_rate_limit_burst == Some(0) {
-        return Err(McpxError::Config(
+        return Err(RmcpServerKitError::Config(
             "server.extra_route_rate_limit_burst must be greater than zero".into(),
         ));
     }
     if server.tool_rate_limit_burst.is_some() && server.tool_rate_limit.is_none() {
-        return Err(McpxError::Config(
+        return Err(RmcpServerKitError::Config(
             "server.tool_rate_limit_burst requires server.tool_rate_limit".into(),
         ));
     }
     if server.extra_route_rate_limit_burst.is_some() && server.extra_route_rate_limit.is_none() {
-        return Err(McpxError::Config(
+        return Err(RmcpServerKitError::Config(
             "server.extra_route_rate_limit_burst requires server.extra_route_rate_limit".into(),
         ));
     }
     if !server.extra_route_rate_limit_exempt_paths.is_empty()
         && server.extra_route_rate_limit.is_none()
     {
-        return Err(McpxError::Config(
+        return Err(RmcpServerKitError::Config(
             "server.extra_route_rate_limit_exempt_paths requires server.extra_route_rate_limit"
                 .into(),
         ));
     }
     for path in &server.extra_route_rate_limit_exempt_paths {
         if path.is_empty() || !path.starts_with('/') {
-            return Err(McpxError::Config(format!(
+            return Err(RmcpServerKitError::Config(format!(
                 "server.extra_route_rate_limit_exempt_paths entries must be non-empty and start with '/': {path:?}"
             )));
         }
     }
     if let Some(rl) = server.auth.as_ref().and_then(|a| a.rate_limit.as_ref()) {
         if rl.burst == Some(0) {
-            return Err(McpxError::Config(
+            return Err(RmcpServerKitError::Config(
                 "auth.rate_limit.burst must be greater than zero".into(),
             ));
         }
         if rl.pre_auth_burst == Some(0) {
-            return Err(McpxError::Config(
+            return Err(RmcpServerKitError::Config(
                 "auth.rate_limit.pre_auth_burst must be greater than zero".into(),
             ));
         }
@@ -982,13 +990,14 @@ fn validate_rate_limit_knobs(server: &ServerConfig) -> crate::error::Result<()> 
 /// Validate the trusted-forwarder knobs of a TOML [`ServerConfig`]
 /// (mirrors `McpServerConfig::check_trusted_forwarder`).
 fn validate_trusted_forwarder_config(server: &ServerConfig) -> crate::error::Result<()> {
-    use crate::error::McpxError;
+    use crate::error::RmcpServerKitError;
 
     for entry in &server.trusted_proxies {
-        crate::transport::validate_trusted_proxy_entry(entry).map_err(McpxError::Config)?;
+        crate::transport::validate_trusted_proxy_entry(entry)
+            .map_err(RmcpServerKitError::Config)?;
     }
     if server.forwarded_header.is_some() && server.trusted_proxies.is_empty() {
-        return Err(McpxError::Config(
+        return Err(RmcpServerKitError::Config(
             "server.forwarded_header requires server.trusted_proxies to be nonempty".into(),
         ));
     }
@@ -999,21 +1008,21 @@ fn validate_trusted_forwarder_config(server: &ServerConfig) -> crate::error::Res
 ///
 /// # Errors
 ///
-/// Returns `McpxError::Config` on invalid values.
+/// Returns `RmcpServerKitError::Config` on invalid values.
 pub fn validate_observability_config(obs: &ObservabilityConfig) -> crate::error::Result<()> {
     use tracing_subscriber::EnvFilter;
 
-    use crate::error::McpxError;
+    use crate::error::RmcpServerKitError;
 
     if EnvFilter::try_new(&obs.log_level).is_err() {
-        return Err(McpxError::Config(format!(
+        return Err(RmcpServerKitError::Config(format!(
             "invalid log_level: {:?} (expected a valid tracing filter directive, e.g. \"info\", \"debug,hyper=warn\")",
             obs.log_level
         )));
     }
     let valid_formats = ["json", "pretty", "text"];
     if !valid_formats.contains(&obs.log_format.as_str()) {
-        return Err(McpxError::Config(format!(
+        return Err(RmcpServerKitError::Config(format!(
             "invalid log_format: {:?} (expected one of: {valid_formats:?})",
             obs.log_format
         )));

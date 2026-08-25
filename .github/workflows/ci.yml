@@ -100,7 +100,7 @@ jobs:
   # break is now the published baseline on crates.io, so cargo-semver-checks
   # compares HEAD against that baseline going forward. Re-enable was deferred
   # to the first additive release post-1.6.0 (1.7.4 added the `cancel` module
-  # and `McpxError::RetryableTimeout` variant — both purely additive).
+  # and `RmcpServerKitError::RetryableTimeout` variant — both purely additive).
   semver-checks:
     name: cargo-semver-checks
     runs-on: ubuntu-latest
