@@ -1451,6 +1451,14 @@ where
     let allowed_hosts = derive_allowed_hosts(&config.bind_addr, config.public_url.as_deref());
     tracing::info!(allowed_hosts = %allowed_hosts.join(", "), "configured Streamable HTTP allowed hosts");
 
+    if config.max_concurrent_requests.is_none() {
+        tracing::warn!(
+            "max_concurrent_requests is unset: in-flight HTTP requests are unlimited; \
+             set McpServerConfig::with_max_concurrent_requests or front the server with \
+             an external concurrency limit"
+        );
+    }
+
     let mcp_service = StreamableHttpService::new(
         move || Ok(handler_factory()),
         {
@@ -3472,10 +3480,67 @@ pub(crate) fn limiter_client_ip(extensions: &axum::http::Extensions) -> Option<I
         })
 }
 
+/// Rate-limit bucket identity for a request.
+///
+/// A request whose source address cannot be resolved must not become
+/// *exempt* from rate limiting, so such requests share one bounded
+/// [`RateLimitKey::Unattributed`] bucket instead.
+///
+/// This is an enum rather than a sentinel `IpAddr` (e.g. `0.0.0.0`)
+/// because [`limiter_client_ip`] consults [`ClientIp`] first, and in
+/// trusted-forwarder mode that value is header-derived:
+/// [`crate::forwarded`] does not filter unspecified or reserved
+/// addresses, so a forwarded `0.0.0.0` would collide with the sentinel
+/// and share a bucket with genuinely unattributable traffic.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum RateLimitKey {
+    /// A resolved client address.
+    Ip(IpAddr),
+    /// Source address could not be determined.
+    Unattributed,
+}
+
+impl std::fmt::Display for RateLimitKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ip(ip) => write!(f, "{ip}"),
+            Self::Unattributed => f.write_str("unattributed"),
+        }
+    }
+}
+
+/// Emitted at most once per process; see [`limiter_client_key`].
+static UNATTRIBUTED_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Rate-limit key for the current request.
+///
+/// Falls back to [`RateLimitKey::Unattributed`] when no address can be
+/// resolved, which cannot happen for a request served by [`serve`] (the
+/// peer-address normalisation layer inserts `ConnectInfo` on both the TLS
+/// and plaintext paths) but is reachable if this crate's middleware is
+/// composed into a router built elsewhere. The warning fires once per
+/// process rather than per request: a broken invariant holds for *every*
+/// request, so per-request logging would amplify it into its own denial
+/// of service.
+pub(crate) fn limiter_client_key(extensions: &axum::http::Extensions) -> RateLimitKey {
+    if let Some(ip) = limiter_client_ip(extensions) {
+        return RateLimitKey::Ip(ip);
+    }
+    if !UNATTRIBUTED_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            "request carries no resolvable client address; rate limiting is \
+             falling back to a single shared bucket. This indicates \
+             rmcp-server-kit middleware composed outside serve()."
+        );
+    }
+    RateLimitKey::Unattributed
+}
+
 /// Per-IP rate limiter for `extra_router` routes, keyed by the direct
 /// socket peer address. Same memory-bounded machinery as the tool
 /// limiter ([`crate::rbac`]).
-pub(crate) type ExtraRouteRateLimiter = BoundedKeyedLimiter<IpAddr>;
+pub(crate) type ExtraRouteRateLimiter = BoundedKeyedLimiter<RateLimitKey>;
 
 /// Cap on distinct source IPs tracked by the extra-route limiter.
 /// Mirrors the tool limiter's bound: memory stays bounded at saturation
@@ -3540,13 +3605,11 @@ async fn extra_route_rate_limit_middleware(
     if exempt.contains(req.uri().path()) {
         return next.run(req).await;
     }
-    let peer_ip: Option<IpAddr> = limiter_client_ip(req.extensions());
-    if let Some(ip) = peer_ip
-        && let Err(wait) = limiter.check_key_wait(&ip)
-    {
+    let peer_key = limiter_client_key(req.extensions());
+    if let Err(wait) = limiter.check_key_wait(&peer_key) {
         #[cfg(feature = "metrics")]
         crate::metrics::record_rate_limit_deny(req.extensions(), "extra_route");
-        tracing::warn!(%ip, "extra route request rate limited");
+        tracing::warn!(rate_limit_key = %peer_key, "extra route request rate limited");
         return RmcpServerKitError::RateLimitedFor {
             message: "too many requests to application routes from this source".into(),
             retry_after: wait,
@@ -4266,20 +4329,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn extra_route_limiter_fails_open_without_peer() {
+    async fn extra_route_limiter_bounds_requests_without_peer() {
+        // Was `fails_open_without_peer`. A request whose source address
+        // cannot be resolved must NOT be exempt from rate limiting; such
+        // requests share one bounded `Unattributed` bucket.
         let app = limited_router(1);
-        for i in 0..3 {
-            let req = Request::builder()
+        let mk = || {
+            Request::builder()
                 .uri("/limited")
                 .body(Body::empty())
-                .unwrap();
-            let resp = app.clone().oneshot(req).await.unwrap();
-            assert_eq!(
-                resp.status(),
-                StatusCode::OK,
-                "request {i} should fail open"
-            );
-        }
+                .unwrap()
+        };
+        let first = app.clone().oneshot(mk()).await.unwrap();
+        assert_eq!(
+            first.status(),
+            StatusCode::OK,
+            "first request consumes quota"
+        );
+        let second = app.clone().oneshot(mk()).await.unwrap();
+        assert_eq!(
+            second.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "unattributable requests must share a bounded bucket, not bypass the limiter"
+        );
+    }
+
+    #[test]
+    fn limiter_client_key_falls_back_to_unattributed() {
+        let empty = axum::http::Extensions::new();
+        assert_eq!(limiter_client_key(&empty), RateLimitKey::Unattributed);
+    }
+
+    #[test]
+    fn unattributed_key_is_distinct_from_unspecified_ip() {
+        // Regression guard: a sentinel `0.0.0.0` would collide here,
+        // because trusted-forwarder mode derives ClientIp from a header
+        // and `crate::forwarded` does not filter unspecified addresses.
+        let unspecified = RateLimitKey::Ip("0.0.0.0".parse::<IpAddr>().unwrap());
+        assert_ne!(unspecified, RateLimitKey::Unattributed);
+
+        let mut set = std::collections::HashSet::new();
+        set.insert(unspecified);
+        set.insert(RateLimitKey::Unattributed);
+        assert_eq!(set.len(), 2, "the two keys must hash to distinct buckets");
+    }
+
+    #[test]
+    fn rate_limit_key_display_does_not_fabricate_an_ip() {
+        assert_eq!(
+            RateLimitKey::Ip("10.1.2.3".parse::<IpAddr>().unwrap()).to_string(),
+            "10.1.2.3"
+        );
+        assert_eq!(RateLimitKey::Unattributed.to_string(), "unattributed");
     }
 
     #[tokio::test]

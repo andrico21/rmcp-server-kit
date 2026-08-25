@@ -8,7 +8,7 @@
 
 use std::{
     collections::HashSet,
-    net::{IpAddr, SocketAddr},
+    net::SocketAddr,
     num::NonZeroU32,
     path::PathBuf,
     sync::{
@@ -32,7 +32,9 @@ use secrecy::SecretString;
 use serde::Deserialize;
 use x509_parser::prelude::*;
 
-use crate::{bounded_limiter::BoundedKeyedLimiter, error::RmcpServerKitError};
+use crate::{
+    bounded_limiter::BoundedKeyedLimiter, error::RmcpServerKitError, transport::RateLimitKey,
+};
 
 /// Identity of an authenticated caller.
 ///
@@ -794,7 +796,7 @@ impl AuthConfig {
 
 /// Keyed rate limiter type (per source IP). Memory-bounded by
 /// [`RateLimitConfig::max_tracked_keys`] to defend against IP-spray `DoS`.
-pub(crate) type KeyedLimiter = BoundedKeyedLimiter<IpAddr>;
+pub(crate) type KeyedLimiter = BoundedKeyedLimiter<RateLimitKey>;
 
 /// Connection info for TLS connections, carrying the peer socket address
 /// and (when mTLS is configured) the verified client identity extracted
@@ -1136,18 +1138,34 @@ pub fn extract_mtls_identity(cert_der: &[u8], default_role: &str) -> Option<Auth
 ///
 /// Returns `None` if the header value:
 /// - does not contain a space (no scheme/credentials boundary), or
-/// - uses a scheme other than `Bearer` (case-insensitively).
+/// - uses a scheme other than `Bearer` (case-insensitively), or
+/// - carries a credential containing embedded whitespace.
 ///
-/// The caller is responsible for token-level validation (length, charset,
-/// signature, etc.); this helper only handles the scheme prefix.
+/// # Why whitespace only, and not full `token68`
+///
+/// RFC 7235 §2.1 defines the credential as `token68`, which excludes
+/// whitespace. Accepting an embedded SP/HTAB creates a parser differential
+/// against a fronting proxy that splits on any whitespace.
+///
+/// Enforcing the whole `token68` character class would be a breaking
+/// change: [`ApiKeyEntry::new`] accepts an arbitrary caller-supplied hash
+/// and [`verify_bearer_token`] verifies the raw presented string, so
+/// consumers may have hashed opaque tokens containing punctuation outside
+/// `token68`. Those must keep authenticating -- do not "complete" this
+/// check without a major-version note.
+///
+/// ASCII semantics suffice because [`http::HeaderValue::to_str`] rejects
+/// every non-visible byte before this helper runs.
 fn extract_bearer(value: &str) -> Option<&str> {
     let (scheme, rest) = value.split_once(' ')?;
-    if scheme.eq_ignore_ascii_case("Bearer") {
-        let token = rest.trim_start_matches(' ');
-        if token.is_empty() { None } else { Some(token) }
-    } else {
-        None
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        return None;
     }
+    let token = rest.trim_start_matches(' ');
+    if token.is_empty() || token.bytes().any(|b| b.is_ascii_whitespace()) {
+        return None;
+    }
+    Some(token)
 }
 
 /// Verify a bearer token against configured API keys.
@@ -1390,15 +1408,15 @@ async fn authenticate_bearer_identity(
 /// Side effects on rejection: increments the `pre_auth_gate` failure
 /// counter and emits a warn-level log. mTLS-authenticated requests must
 /// be admitted by the caller *before* invoking this helper.
-fn pre_auth_gate(state: &AuthState, client_ip: Option<IpAddr>) -> Option<Response> {
+fn pre_auth_gate(state: &AuthState, client_key: Option<&RateLimitKey>) -> Option<Response> {
     let limiter = state.pre_auth_limiter.as_ref()?;
-    let ip = client_ip?;
-    let Err(wait) = limiter.check_key_wait(&ip) else {
+    let key = client_key?;
+    let Err(wait) = limiter.check_key_wait(key) else {
         return None;
     };
     state.counters.record_failure(AuthFailureClass::PreAuthGate);
     tracing::warn!(
-        %ip,
+        rate_limit_key = %key,
         "auth rate limited by pre-auth gate (request rejected before credential verification)"
     );
     Some(
@@ -1429,7 +1447,10 @@ pub(crate) async fn auth_middleware(
     // rate-limit key (resolved client IP when trusted-forwarder mode is
     // active, else the direct peer; see transport::limiter_client_ip).
     let tls_info = req.extensions().get::<ConnectInfo<TlsConnInfo>>().cloned();
-    let client_ip = crate::transport::limiter_client_ip(req.extensions());
+    // Resolved only when a limiter will actually consult it, so servers
+    // with no rate limiting never trip the unattributed-fallback warning.
+    let client_key = (state.pre_auth_limiter.is_some() || state.rate_limiter.is_some())
+        .then(|| crate::transport::limiter_client_key(req.extensions()));
 
     // 1. Try mTLS identity (extracted by the TLS acceptor during handshake
     //    and attached to the connection itself).
@@ -1447,7 +1468,7 @@ pub(crate) async fn auth_middleware(
     // 2. Pre-auth abuse gate: rejects CPU-spray attacks BEFORE the Argon2id
     //    verification path runs. Keyed by source IP. mTLS connections (above)
     //    are exempt; this gate only protects the bearer/JWT verification path.
-    if let Some(blocked) = pre_auth_gate(&state, client_ip) {
+    if let Some(blocked) = pre_auth_gate(&state, client_key.as_ref()) {
         #[cfg(feature = "metrics")]
         crate::metrics::record_rate_limit_deny(req.extensions(), "auth_pre");
         return blocked;
@@ -1474,13 +1495,13 @@ pub(crate) async fn auth_middleware(
 
     // Rate limit check (applied after auth failure only).
     // Successful authentications do not consume rate limit budget.
-    if let (Some(limiter), Some(ip)) = (&state.rate_limiter, client_ip)
-        && let Err(wait) = limiter.check_key_wait(&ip)
+    if let (Some(limiter), Some(key)) = (&state.rate_limiter, client_key.as_ref())
+        && let Err(wait) = limiter.check_key_wait(key)
     {
         state.counters.record_failure(AuthFailureClass::RateLimited);
         #[cfg(feature = "metrics")]
         crate::metrics::record_rate_limit_deny(req.extensions(), "auth_post");
-        tracing::warn!(%ip, "auth rate limited after repeated failures");
+        tracing::warn!(rate_limit_key = %key, "auth rate limited after repeated failures");
         return RmcpServerKitError::RateLimitedFor {
             message: "too many failed authentication attempts".into(),
             retry_after: wait,
@@ -1494,7 +1515,10 @@ pub(crate) async fn auth_middleware(
 
 #[cfg(test)]
 mod tests {
+    use std::net::IpAddr;
+
     use super::*;
+    use crate::transport::RateLimitKey;
 
     #[test]
     fn generate_and_verify_api_key() {
@@ -1783,7 +1807,7 @@ mod tests {
             pre_auth_burst: None,
         };
         let limiter = build_rate_limiter(&config);
-        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let ip = RateLimitKey::Ip("10.0.0.1".parse::<IpAddr>().unwrap());
 
         // First 5 should succeed.
         for _ in 0..5 {
@@ -1804,8 +1828,8 @@ mod tests {
             pre_auth_burst: None,
         };
         let limiter = build_rate_limiter(&config);
-        let ip1: IpAddr = "10.0.0.1".parse().unwrap();
-        let ip2: IpAddr = "10.0.0.2".parse().unwrap();
+        let ip1 = RateLimitKey::Ip("10.0.0.1".parse::<IpAddr>().unwrap());
+        let ip2 = RateLimitKey::Ip("10.0.0.2".parse::<IpAddr>().unwrap());
 
         // Exhaust ip1's quota.
         assert!(limiter.check_key(&ip1).is_ok());
@@ -2015,7 +2039,7 @@ mod tests {
             pre_auth_burst: None,
         };
         let limiter = build_rate_limiter(&config);
-        let ip: IpAddr = "192.168.1.100".parse().unwrap();
+        let ip = RateLimitKey::Ip("192.168.1.100".parse::<IpAddr>().unwrap());
 
         // Simulate: 3 failed attempts should exhaust quota.
         assert!(
@@ -2060,7 +2084,7 @@ mod tests {
             pre_auth_burst: None,
         };
         let limiter = build_pre_auth_limiter(&config);
-        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let ip = RateLimitKey::Ip("10.0.0.1".parse::<IpAddr>().unwrap());
 
         // Quota should be 50 (5 * 10), not 5. We expect the first 50 to pass.
         for i in 0..50 {
@@ -2089,7 +2113,7 @@ mod tests {
             pre_auth_burst: None,
         };
         let limiter = build_pre_auth_limiter(&config);
-        let ip: IpAddr = "10.0.0.2".parse().unwrap();
+        let ip = RateLimitKey::Ip("10.0.0.2".parse::<IpAddr>().unwrap());
 
         assert!(limiter.check_key(&ip).is_ok(), "attempt 1 allowed");
         assert!(limiter.check_key(&ip).is_ok(), "attempt 2 allowed");
@@ -2112,12 +2136,12 @@ mod tests {
             seen_identities: SeenIdentitySet::new(),
             counters: AuthCounters::default(),
         };
-        let ip: IpAddr = "10.7.7.7".parse().unwrap();
+        let ip = RateLimitKey::Ip("10.7.7.7".parse::<IpAddr>().unwrap());
         assert!(
-            pre_auth_gate(&state, Some(ip)).is_none(),
+            pre_auth_gate(&state, Some(&ip)).is_none(),
             "first request within quota"
         );
-        let resp = pre_auth_gate(&state, Some(ip)).expect("second request must be gated");
+        let resp = pre_auth_gate(&state, Some(&ip)).expect("second request must be gated");
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         let retry_after = resp
             .headers()
@@ -2135,7 +2159,7 @@ mod tests {
     fn post_failure_limiter_burst_allows_initial_spike() {
         let config = RateLimitConfig::new(1).with_burst(3);
         let limiter = build_rate_limiter(&config);
-        let ip: IpAddr = "10.6.6.6".parse().unwrap();
+        let ip = RateLimitKey::Ip("10.6.6.6".parse::<IpAddr>().unwrap());
         for i in 0..3 {
             assert!(limiter.check_key(&ip).is_ok(), "burst attempt {i}");
         }
@@ -2434,6 +2458,38 @@ mod tests {
         // Some non-conformant clients emit two spaces; we should still parse.
         assert_eq!(extract_bearer("Bearer  abc123"), Some("abc123"));
         assert_eq!(extract_bearer("Bearer   abc123"), Some("abc123"));
+    }
+
+    #[test]
+    fn extract_bearer_rejects_embedded_whitespace() {
+        assert_eq!(extract_bearer("Bearer abc 123"), None);
+        assert_eq!(extract_bearer("Bearer abc\t123"), None);
+        assert_eq!(extract_bearer("Bearer abc123 "), None);
+        assert_eq!(extract_bearer("Bearer abc123\r\n"), None);
+    }
+
+    #[test]
+    fn extract_bearer_still_accepts_opaque_non_token68_credentials() {
+        // Compatibility guard. `ApiKeyEntry::new` accepts an arbitrary
+        // caller-supplied hash, so consumers may have hashed opaque tokens
+        // using punctuation outside RFC 7235 `token68`. Narrowing this to a
+        // strict token68 charset would silently 401 them on upgrade.
+        assert_eq!(
+            extract_bearer("Bearer aBc!@#$%^&*()"),
+            Some("aBc!@#$%^&*()")
+        );
+        assert_eq!(extract_bearer("Bearer tok{en}|v1"), Some("tok{en}|v1"));
+    }
+
+    #[test]
+    fn extract_bearer_accepts_generated_key_and_jwt_shapes() {
+        let (token, _hash) = generate_api_key().unwrap();
+        let header = format!("Bearer {token}");
+        assert_eq!(extract_bearer(&header), Some(token.as_str()));
+
+        let jwt = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln-_bmF0dXJl";
+        let jwt_header = format!("Bearer {jwt}");
+        assert_eq!(extract_bearer(&jwt_header), Some(jwt));
     }
 
     // -------------------------------------------------------------------

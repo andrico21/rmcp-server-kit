@@ -8,7 +8,7 @@
 //! and enforces RBAC and per-IP tool rate limiting before the request
 //! reaches the handler.
 
-use std::{net::IpAddr, num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
+use std::{num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
@@ -26,7 +26,7 @@ use crate::{auth::AuthIdentity, bounded_limiter::BoundedKeyedLimiter, error::Rmc
 
 /// Per-source-IP rate limiter for tool invocations. Memory-bounded against
 /// IP-spray `DoS` via [`BoundedKeyedLimiter`].
-pub(crate) type ToolRateLimiter = BoundedKeyedLimiter<IpAddr>;
+pub(crate) type ToolRateLimiter = BoundedKeyedLimiter<crate::transport::RateLimitKey>;
 
 /// Default tool rate limit: 120 invocations per minute per source IP.
 // SAFETY: unwrap() is safe - literal 120 is provably non-zero (const-evaluated).
@@ -476,7 +476,8 @@ impl RbacPolicy {
     /// Evaluation order:
     /// 1. If RBAC is disabled, allow.
     /// 2. Check operation permission (deny overrides allow).
-    /// 3. Check host visibility via glob matching.
+    /// 3. Check host visibility via glob matching (ASCII-case-insensitive;
+    ///    operation names above remain case-sensitive).
     #[must_use]
     pub fn check(&self, role: &str, operation: &str, host: &str) -> RbacDecision {
         if !self.enabled {
@@ -498,6 +499,8 @@ impl RbacPolicy {
     }
 
     /// Check whether `role` can see `host` at all (for `list_hosts` filtering).
+    ///
+    /// Host matching is ASCII-case-insensitive.
     #[must_use]
     pub fn host_visible(&self, role: &str, host: &str) -> bool {
         if !self.enabled {
@@ -532,6 +535,16 @@ impl RbacPolicy {
     /// Windows command-line tokenization (`CommandLineToArgvW`,
     /// `cmd.exe`, PowerShell). Consumers in those regimes remain subject
     /// to a parser differential and must validate at their own boundary.
+    ///
+    /// **No Unicode normalization.** Token comparison is byte-exact. A
+    /// value that is canonically equivalent to an allowlist entry but
+    /// encoded differently (NFC vs NFD, or a homoglyph) does **not**
+    /// match, and is therefore denied -- this direction is fail-closed.
+    /// The residual hazard runs the other way: on a normalizing filesystem
+    /// (e.g. macOS APFS, which folds NFD) an allowlisted NFC entry can
+    /// resolve to a different file than the policy author intended.
+    /// Express allowlist entries in the same normalization form the
+    /// consumer will use.
     ///
     /// **Fail-closed cases (all return `false` when a matching allowlist
     /// entry exists):**
@@ -658,8 +671,21 @@ impl RbacPolicy {
     }
 
     /// Check if a host name matches any of the given glob patterns.
+    ///
+    /// Matching is **ASCII-case-insensitive**: `host` is a DNS name or an
+    /// IP literal, and both are case-insensitive by specification.
+    ///
+    /// Normalization deliberately lives here rather than in [`glob_match`],
+    /// which is shared with tool-name matching where case *is* significant.
+    /// Lowercasing there would silently widen every tool allowlist.
     fn host_matches(patterns: &[String], host: &str) -> bool {
-        patterns.iter().any(|p| glob_match(p, host))
+        patterns.iter().any(|p| {
+            if p.contains('*') {
+                glob_match(&p.to_ascii_lowercase(), &host.to_ascii_lowercase())
+            } else {
+                p.eq_ignore_ascii_case(host)
+            }
+        })
     }
 
     /// HMAC-SHA256 the given argument value with this policy's redaction
@@ -763,7 +789,12 @@ pub(crate) async fn rbac_middleware(
 
     // Extract the rate-limit key (resolved client IP when trusted-forwarder
     // mode is active, else the direct peer).
-    let peer_ip: Option<IpAddr> = crate::transport::limiter_client_ip(req.extensions());
+    // Resolved only when the tool limiter will actually consult it, so
+    // servers without tool rate limiting never trip the
+    // unattributed-fallback warning.
+    let peer_key = tool_limiter
+        .is_some()
+        .then(|| crate::transport::limiter_client_key(req.extensions()));
 
     // Extract caller identity and role (may be absent when auth is off).
     let identity = req.extensions().get::<AuthIdentity>();
@@ -800,7 +831,7 @@ pub(crate) async fn rbac_middleware(
         let tool_calls = extract_tool_calls(&json);
         if !tool_calls.is_empty() {
             for params in tool_calls {
-                if let Some(resp) = enforce_rate_limit(tool_limiter.as_deref(), peer_ip) {
+                if let Some(resp) = enforce_rate_limit(tool_limiter.as_deref(), peer_key.as_ref()) {
                     #[cfg(feature = "metrics")]
                     crate::metrics::record_rate_limit_deny(&parts.extensions, "tool");
                     return resp;
@@ -874,12 +905,12 @@ fn extract_tool_calls(value: &serde_json::Value) -> Vec<&serde_json::Value> {
 /// if the caller should be rejected.
 fn enforce_rate_limit(
     tool_limiter: Option<&ToolRateLimiter>,
-    peer_ip: Option<IpAddr>,
+    peer_key: Option<&crate::transport::RateLimitKey>,
 ) -> Option<Response> {
     let limiter = tool_limiter?;
-    let ip = peer_ip?;
-    if let Err(wait) = limiter.check_key_wait(&ip) {
-        tracing::warn!(%ip, "tool invocation rate limited");
+    let key = peer_key?;
+    if let Err(wait) = limiter.check_key_wait(key) {
+        tracing::warn!(rate_limit_key = %key, "tool invocation rate limited");
         return Some(
             RmcpServerKitError::RateLimitedFor {
                 message: "too many tool invocations".into(),
@@ -1225,7 +1256,10 @@ fn reject_blank_redaction_salt(env_var: &str, value: &str) -> Result<(), RmcpSer
 
 #[cfg(test)]
 mod tests {
+    use std::net::IpAddr;
+
     use super::*;
+    use crate::transport::RateLimitKey;
 
     fn with_rbac_env<R>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> R) -> R {
         temp_env::with_vars(
@@ -1378,7 +1412,7 @@ mod tests {
     #[test]
     fn tool_limiter_burst_allows_initial_spike() {
         let limiter = build_tool_rate_limiter(2, Some(4));
-        let ip: IpAddr = "10.9.9.9".parse().unwrap();
+        let ip = RateLimitKey::Ip("10.9.9.9".parse::<IpAddr>().unwrap());
         for i in 0..4 {
             assert!(
                 limiter.check_key(&ip).is_ok(),
@@ -1395,9 +1429,9 @@ mod tests {
     #[test]
     fn tool_limiter_deny_sets_retry_after() {
         let limiter = build_tool_rate_limiter(1, None);
-        let ip: IpAddr = "10.8.8.8".parse().unwrap();
-        assert!(enforce_rate_limit(Some(&limiter), Some(ip)).is_none());
-        let resp = enforce_rate_limit(Some(&limiter), Some(ip))
+        let ip = RateLimitKey::Ip("10.8.8.8".parse::<IpAddr>().unwrap());
+        assert!(enforce_rate_limit(Some(&limiter), Some(&ip)).is_none());
+        let resp = enforce_rate_limit(Some(&limiter), Some(&ip))
             .expect("second call within the window must deny");
         assert_eq!(resp.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
         let retry_after = resp
@@ -1734,6 +1768,58 @@ mod tests {
     fn host_visible_unknown_role() {
         let policy = test_policy();
         assert!(!policy.host_visible("unknown", "web-prod-1"));
+    }
+
+    #[test]
+    fn host_matching_is_ascii_case_insensitive() {
+        let policy = test_policy();
+        assert!(policy.host_visible("deploy", "WEB-PROD-1"));
+        assert!(policy.host_visible("deploy", "Web-Prod-1"));
+        assert!(policy.host_visible("deploy", "API-Staging"));
+        assert!(!policy.host_visible("deploy", "DB-PROD-1"));
+    }
+
+    #[test]
+    fn check_host_matching_is_ascii_case_insensitive() {
+        let policy = test_policy();
+        assert_eq!(
+            policy.check("deploy", "resource_run", "WEB-PROD-1"),
+            RbacDecision::Allow
+        );
+        assert_eq!(
+            policy.check("deploy", "resource_run", "DB-PROD-1"),
+            RbacDecision::Deny
+        );
+    }
+
+    #[test]
+    fn check_operation_names_remain_case_sensitive() {
+        let policy = test_policy();
+        assert_eq!(
+            policy.check("deploy", "RESOURCE_RUN", "web-prod-1"),
+            RbacDecision::Deny,
+            "host normalization must not leak into operation matching"
+        );
+    }
+
+    #[test]
+    fn tool_glob_matching_remains_case_sensitive() {
+        // Regression guard for the host-normalization change: lowercasing
+        // inside `glob_match` would silently widen every tool allowlist.
+        let role = RoleConfig::new("viewer", vec!["*".into()], vec!["*".into()])
+            .with_argument_allowlists(vec![ArgumentAllowlist::new(
+                "resource_*",
+                "cmd",
+                vec!["ls".into()],
+            )]);
+        let policy = RbacPolicy::new(&RbacConfig::with_roles(vec![role]));
+
+        assert!(policy.has_argument_allowlist("viewer", "resource_exec", "cmd"));
+        assert!(
+            !policy.has_argument_allowlist("viewer", "RESOURCE_EXEC", "cmd"),
+            "tool patterns must not match case-insensitively"
+        );
+        assert!(!policy.argument_allowed("viewer", "resource_exec", "cmd", "rm"));
     }
 
     // -- argument_allowed tests --

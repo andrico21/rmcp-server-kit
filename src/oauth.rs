@@ -2515,6 +2515,23 @@ impl JwksCache {
 }
 
 /// Partition a JWKS into a kid-indexed map plus a list of unnamed keys.
+/// Longest `kid` prefix emitted to logs.
+const MAX_LOGGED_KID_CHARS: usize = 64;
+
+/// Truncate an issuer-supplied `kid` to [`MAX_LOGGED_KID_CHARS`] before it
+/// reaches a log line.
+///
+/// `kid` is remote-controlled text of unbounded length, so logging it raw
+/// lets a hostile or misconfigured issuer inflate log volume. Truncation is
+/// on a char boundary to keep the output valid UTF-8.
+fn truncate_kid_for_log(kid: &str) -> String {
+    if kid.chars().count() <= MAX_LOGGED_KID_CHARS {
+        return kid.to_owned();
+    }
+    let head: String = kid.chars().take(MAX_LOGGED_KID_CHARS).collect();
+    format!("{head}...(truncated)")
+}
+
 fn build_key_cache(jwks: &JwkSet, max_keys: usize) -> Result<JwksKeyCache, String> {
     if jwks.keys.len() > max_keys {
         return Err(format!(
@@ -2533,7 +2550,12 @@ fn build_key_cache(jwks: &JwkSet, max_keys: usize) -> Result<JwksKeyCache, Strin
             continue;
         };
         if let Some(ref kid) = jwk.common.key_id {
-            keys.insert(kid.clone(), (alg, decoding_key));
+            if keys.insert(kid.clone(), (alg, decoding_key)).is_some() {
+                tracing::warn!(
+                    kid = %truncate_kid_for_log(kid),
+                    "duplicate kid in JWKS; later entry wins"
+                );
+            }
         } else {
             unnamed_keys.push((alg, decoding_key));
         }
@@ -4156,6 +4178,42 @@ role = "admin"
             "mcp:read",
         );
         (cache, token, mock_server)
+    }
+
+    #[test]
+    fn build_key_cache_last_duplicate_kid_wins() {
+        let (_pem, jwks_json) = generate_test_keypair("dup-kid");
+        let entry = jwks_json["keys"][0].clone();
+        let merged = serde_json::json!({ "keys": [entry.clone(), entry] });
+        let jwks: JwkSet = serde_json::from_value(merged).expect("merged jwks parses");
+        assert_eq!(jwks.keys.len(), 2, "fixture must carry two colliding kids");
+
+        let (keys, unnamed) = build_key_cache(&jwks, 16).expect("under key cap");
+        assert_eq!(keys.len(), 1, "colliding kids collapse to one entry");
+        assert!(keys.contains_key("dup-kid"));
+        assert!(unnamed.is_empty());
+    }
+
+    #[test]
+    fn truncate_kid_for_log_bounds_hostile_input() {
+        let short = "kid-1";
+        assert_eq!(truncate_kid_for_log(short), short);
+
+        let long = "k".repeat(4096);
+        let truncated = truncate_kid_for_log(&long);
+        assert!(truncated.ends_with("...(truncated)"));
+        assert_eq!(
+            truncated.chars().count(),
+            MAX_LOGGED_KID_CHARS + "...(truncated)".chars().count()
+        );
+    }
+
+    #[test]
+    fn truncate_kid_for_log_splits_on_char_boundary() {
+        let multibyte = "\u{1f512}".repeat(MAX_LOGGED_KID_CHARS + 10);
+        let truncated = truncate_kid_for_log(&multibyte);
+        assert!(truncated.starts_with('\u{1f512}'));
+        assert!(truncated.ends_with("...(truncated)"));
     }
 
     #[tokio::test]

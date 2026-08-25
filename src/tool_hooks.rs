@@ -323,23 +323,65 @@ struct AfterHookHolder {
 }
 
 /// Structured error body returned when a result exceeds `max_result_bytes`.
-fn too_large_result(limit: usize, actual: usize, tool: &str) -> CallToolResult {
+///
+/// `actual` is `None` when the result could not be serialized, so its true
+/// size is unknown. It is rendered as `"unknown"` rather than a fabricated
+/// number -- operators read `actual_bytes` as a measurement.
+fn too_large_result(limit: usize, actual: Option<usize>, tool: &str) -> CallToolResult {
+    let actual_desc =
+        actual.map_or_else(|| "an unmeasurable number of".to_owned(), |n| n.to_string());
     let body = serde_json::json!({
         "error": "result_too_large",
         "message": format!(
-            "tool '{tool}' result of {actual} bytes exceeds the configured \
+            "tool '{tool}' result of {actual_desc} bytes exceeds the configured \
              max_result_bytes={limit}; ask for a narrower query"
         ),
         "limit_bytes": limit,
-        "actual_bytes": actual,
+        "actual_bytes": actual.map_or_else(
+            || serde_json::Value::from("unknown"),
+            serde_json::Value::from,
+        ),
     });
     let mut r = CallToolResult::error(vec![ContentBlock::text(body.to_string())]);
     r.structured_content = None;
     r
 }
 
-fn serialized_size(result: &CallToolResult) -> usize {
-    serde_json::to_vec(result).map_or(0, |v| v.len())
+/// Serialized byte length, or `None` when the result cannot be serialized.
+fn serialized_size(result: &CallToolResult) -> Option<usize> {
+    serde_json::to_vec(result).ok().map(|v| v.len())
+}
+
+/// Outcome of the `max_result_bytes` policy for a measured -- or
+/// unmeasurable -- result.
+#[derive(Debug, PartialEq, Eq)]
+enum SizeVerdict {
+    /// Within the cap, or no cap configured. Carries the measured size.
+    Pass { size: usize },
+    /// Over the cap, or unmeasurable while a cap is configured.
+    Replace { limit: usize, actual: Option<usize> },
+    /// Unmeasurable and no cap configured: nothing to enforce.
+    PassUnmeasured,
+}
+
+/// Decide what the size cap does, given a possibly-unmeasurable size.
+///
+/// An unmeasurable result **fails closed** when a cap is configured: a
+/// serialization failure must not become a silent bypass of the only
+/// control bounding tool-result size.
+const fn decide_size(size: Option<usize>, max: Option<usize>) -> SizeVerdict {
+    match (size, max) {
+        (Some(size), Some(limit)) if size > limit => SizeVerdict::Replace {
+            limit,
+            actual: Some(size),
+        },
+        (Some(size), _) => SizeVerdict::Pass { size },
+        (None, Some(limit)) => SizeVerdict::Replace {
+            limit,
+            actual: None,
+        },
+        (None, None) => SizeVerdict::PassUnmeasured,
+    }
 }
 
 /// Apply the `max_result_bytes` cap to a result.  Returns the (possibly
@@ -351,19 +393,29 @@ fn apply_size_cap(
     tool: &str,
 ) -> (CallToolResult, usize, bool) {
     let size = serialized_size(&result);
-    if let Some(limit) = max
-        && size > limit
-    {
-        tracing::warn!(
+    if size.is_none() {
+        tracing::error!(
             tool = %tool,
-            size_bytes = size,
-            limit_bytes = limit,
-            "tool result exceeds max_result_bytes; replacing with structured error"
+            "tool result failed to serialize; size cannot be measured"
         );
-        let replaced = too_large_result(limit, size, tool);
-        return (replaced, size, true);
     }
-    (result, size, false)
+    match decide_size(size, max) {
+        SizeVerdict::Pass { size } => (result, size, false),
+        SizeVerdict::PassUnmeasured => (result, 0, false),
+        SizeVerdict::Replace { limit, actual } => {
+            tracing::warn!(
+                tool = %tool,
+                size_bytes = actual.unwrap_or_default(),
+                size_measured = actual.is_some(),
+                limit_bytes = limit,
+                "tool result exceeds max_result_bytes; replacing with structured error"
+            );
+            // Over-limit accounting sentinel, not a measurement: an
+            // unmeasurable result is charged just past the cap.
+            let accounted = actual.unwrap_or_else(|| limit.saturating_add(1));
+            (too_large_result(limit, actual, tool), accounted, true)
+        }
+    }
 }
 
 impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
@@ -619,10 +671,10 @@ mod tests {
         let hooked = with_hooks(inner, hooks);
 
         let small = CallToolResult::success(vec![ContentBlock::text("ok".to_owned())]);
-        assert!(serialized_size(&small) < 256);
+        assert!(serialized_size(&small).expect("ordinary result serializes") < 256);
 
         let big = CallToolResult::success(vec![ContentBlock::text("x".repeat(8_192))]);
-        let size = serialized_size(&big);
+        let size = serialized_size(&big).expect("ordinary result serializes");
         assert!(size > 256);
 
         let (replaced, accounted, capped) = apply_size_cap(big, Some(256), "whatever");
@@ -676,12 +728,57 @@ mod tests {
 
     #[test]
     fn too_large_result_mentions_limit_and_actual() {
-        let r = too_large_result(100, 500, "my_tool");
+        let r = too_large_result(100, Some(500), "my_tool");
         let body = serde_json::to_string(&r).unwrap();
         assert!(body.contains("result_too_large"));
         assert!(body.contains("my_tool"));
         assert!(body.contains("100"));
         assert!(body.contains("500"));
+    }
+
+    #[test]
+    fn decide_size_truth_table() {
+        assert_eq!(
+            decide_size(Some(10), Some(100)),
+            SizeVerdict::Pass { size: 10 }
+        );
+        assert_eq!(
+            decide_size(Some(100), Some(100)),
+            SizeVerdict::Pass { size: 100 },
+            "cap is inclusive: size == limit passes"
+        );
+        assert_eq!(
+            decide_size(Some(101), Some(100)),
+            SizeVerdict::Replace {
+                limit: 100,
+                actual: Some(101)
+            }
+        );
+        assert_eq!(
+            decide_size(Some(999), None),
+            SizeVerdict::Pass { size: 999 }
+        );
+        assert_eq!(
+            decide_size(None, Some(100)),
+            SizeVerdict::Replace {
+                limit: 100,
+                actual: None
+            },
+            "unmeasurable result must fail closed when a cap is configured"
+        );
+        assert_eq!(decide_size(None, None), SizeVerdict::PassUnmeasured);
+    }
+
+    #[test]
+    fn too_large_result_does_not_fabricate_a_size_when_unmeasurable() {
+        let r = too_large_result(100, None, "my_tool");
+        let body = serde_json::to_string(&r).unwrap();
+        assert!(body.contains("result_too_large"));
+        assert!(body.contains("unknown"));
+        assert!(
+            !body.contains("101"),
+            "the over-limit accounting sentinel must not leak into the client payload"
+        );
     }
 
     #[tokio::test]
@@ -724,7 +821,7 @@ mod tests {
         // to result_too_large just like an inner-handler result would be,
         // and the disposition must reflect ResultTooLarge.
         let huge = CallToolResult::success(vec![ContentBlock::text("y".repeat(8_192))]);
-        let huge_size = serialized_size(&huge);
+        let huge_size = serialized_size(&huge).expect("ordinary result serializes");
         assert!(huge_size > 256);
 
         let (final_result, accounted, capped) = apply_size_cap(huge, Some(256), "replaced_tool");

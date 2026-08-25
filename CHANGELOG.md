@@ -11,6 +11,66 @@ migration note and a config opt-out — see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+Hardening pass from a full review against `RUST_GUIDELINES.md`. No public API
+is added, removed, or retyped (`cargo semver-checks`: 223 checks, no semver
+update required). Two runtime behaviours change; both are noted below.
+
+### Security
+
+- **Requests with an unresolvable source address are no longer exempt from rate
+  limiting.** All four built-in per-IP limiters previously skipped enforcement
+  entirely when no client address could be determined. They now fall back to a
+  single bounded shared bucket via an internal `RateLimitKey::Unattributed`
+  key, and log once per process. This is unreachable for a server started by
+  `serve()` (the peer-address normalisation layer always inserts `ConnectInfo`),
+  but was reachable when this crate's middleware was composed into a
+  externally-built router.
+
+  A typed key is used rather than a sentinel address: `limiter_client_ip`
+  consults the trusted-forwarder-derived `ClientIp` first, and `crate::forwarded`
+  does not filter unspecified addresses, so a forwarded `0.0.0.0` would have
+  collided with a `0.0.0.0` sentinel.
+
+- **Tool results that fail to serialize now fail closed against
+  `max_result_bytes`.** `serialized_size` previously reported a serialization
+  failure as `0` bytes, so the size cap silently did not fire and the result was
+  recorded as zero-length. An unmeasurable result is now replaced when a cap is
+  configured. When no cap is configured the result still passes through, since
+  there is no policy to enforce; the failure is logged either way.
+
+  The client-visible `actual_bytes` field renders `"unknown"` for unmeasurable
+  results rather than a fabricated number.
+
+- **Bearer credentials containing embedded whitespace are rejected.** RFC 7235
+  §2.1 defines the credential as `token68`, which excludes whitespace; accepting
+  it created a parser differential against a fronting proxy that splits on any
+  whitespace. Only whitespace is rejected -- the full `token68` character class
+  is deliberately **not** enforced, because `ApiKeyEntry::new` accepts an
+  arbitrary caller-supplied hash and consumers may have hashed externally-issued
+  opaque tokens containing other punctuation. Those continue to authenticate.
+
+### Changed
+
+- **RBAC host matching is now ASCII-case-insensitive.** `RbacPolicy::check` and
+  `RbacPolicy::host_visible` previously compared hosts byte-exactly, so
+  `Example.COM` did not match a `hosts = ["example.com"]` pattern. Since DNS
+  names and IP literals are case-insensitive by specification, this corrects
+  false denials. Operation names and tool-name patterns remain **case-sensitive**
+  -- normalization is scoped to host matching only.
+
+- Servers started with `max_concurrent_requests` unset now log one startup
+  warning. No default is imposed; behaviour is unchanged.
+
+- A duplicate `kid` in a JWKS document now logs a warning (last entry wins, as
+  before). The logged `kid` is truncated, since it is issuer-controlled text of
+  unbounded length.
+
+### Documentation
+
+- `RbacPolicy::argument_allowed` now documents that token comparison is
+  byte-exact with no Unicode normalization, and the consequence on
+  normalizing filesystems.
+
 ## [3.7.0] - 2026-08-25
 
 Retires the `mcpx` naming that outlived the crate rename.
