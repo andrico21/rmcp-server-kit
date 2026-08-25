@@ -9,9 +9,19 @@
 *.swo
 *.log
 
-# Cargo.lock is intentionally not committed for library crates.
-# See: https://doc.rust-lang.org/cargo/faq.html#why-do-binaries-have-cargolock-in-version-control-but-not-libraries
-/Cargo.lock
+# Cargo.lock IS committed, despite this being a library.
+#
+# The usual advice (cargo FAQ) is that libraries omit it, because downstream
+# consumers ignore it anyway. That advice assumes CI has nothing that pins
+# exact dependency versions. This repo does: `cargo vet` is a *blocking* job
+# and its exemptions in supply-chain/ pin exact versions. With no committed
+# lockfile CI resolved dependencies fresh on every run, so any transitive
+# release turned vet red at a moment nobody chose -- twice in one hour during
+# the 3.6.0 release alone.
+#
+# Committing the lockfile makes dependency updates deliberate: `cargo update`
+# and the matching `cargo vet regenerate exemptions` land in the same reviewed
+# commit. Downstream consumers are unaffected.
 
 # Local test / coverage output
 /coverage

@@ -38,17 +38,10 @@ onward.
    `include_str!` content must be line-ending agnostic or they pass locally and
    fail on `windows-latest` (`core.autocrlf` gives CI a CRLF checkout).
 5. `cargo deny check` and `cargo audit` clean.
-6. `cargo vet --locked` clean **against a freshly generated lockfile**, since
-   that is what CI does:
-
-   ```bash
-   cargo generate-lockfile && cargo vet --locked
-   ```
-
-   `Cargo.lock` is gitignored for this library, so CI resolves dependencies
-   fresh on every run while exemptions pin exact versions. Any transitive
-   dependency release fails the job until you run
-   `cargo vet regenerate exemptions`.
+6. `cargo vet --locked` clean. `Cargo.lock` **is committed** (see `.gitignore`
+   for why), so this is deterministic and no longer depends on what upstream
+   published today. When you bump dependencies, run `cargo update` and
+   `cargo vet regenerate exemptions` together in the same reviewed commit.
 7. `cargo doc --no-deps --all-features` — no broken intra-doc links.
 8. `cargo publish --dry-run --all-features` succeeds.
 

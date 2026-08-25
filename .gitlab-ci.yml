@@ -118,9 +118,8 @@ clippy:
   stage: lint
   needs: []
   script:
-    # Library crate: no committed Cargo.lock (it's .gitignored). Don't
-    # pass --locked here; let cargo resolve as it does for downstream
-    # consumers.
+    # Deliberately no --locked: lint against the resolution downstream
+    # consumers get, not only the committed lockfile.
     - rtk cargo clippy --all-targets --all-features -- -D warnings
 
 taplo:
@@ -148,8 +147,6 @@ audit:
   stage: lint
   needs: []
   script:
-    # Library crate has no committed Cargo.lock; generate one for audit.
-    - cargo generate-lockfile
     - rtk cargo audit
 
 # ---------------------------------------------------------------------------
@@ -163,7 +160,7 @@ msrv:
     # Image's stable channel is already pinned to MSRV (1.98.0). If a
     # downstream image bump moves stable forward, switch this to
     # `cargo +1.98.0 build` and add the toolchain via `rustup install`.
-    # Library crate: no committed Cargo.lock; do not pass --locked.
+    # Deliberately no --locked, as above.
     - rtk cargo build --all-features
 
 .feature-build:
@@ -328,9 +325,7 @@ vet:
   needs: []
   allow_failure: true
   script:
-    - cargo generate-lockfile
-    # `cargo vet` exits non-zero until a baseline is committed; treat as
-    # informational (matches GitHub job's `|| true`).
+    # Mirror job stays advisory; the canonical GitHub vet job is blocking.
     - rtk cargo vet --locked || true
 
 # ---------------------------------------------------------------------------

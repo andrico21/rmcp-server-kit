@@ -198,8 +198,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.1
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
-      - name: Generate Cargo.lock (library crate; lockfile is .gitignored)
-        run: cargo generate-lockfile
       - name: Run cargo audit
         run: cargo audit
 
@@ -259,14 +257,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.1
       - name: Install cargo-vet
         run: cargo install cargo-vet --locked
-      - name: Generate Cargo.lock (library crate; lockfile is .gitignored)
-        run: cargo generate-lockfile
       - name: Run cargo vet
-        # A full exemption baseline is committed under supply-chain/, so
-        # vet passes deterministically for the pinned dependency set.
-        # Dependency bumps will fail this job until exemptions are
-        # regenerated (`cargo vet regenerate exemptions`) or the new
-        # version is audited.
+        # Exemptions under supply-chain/ pin exact versions, and Cargo.lock is
+        # committed, so this is deterministic: it can only go red when a
+        # dependency change lands in a reviewed commit, not when an upstream
+        # crate happens to publish. Bump dependencies and run
+        # `cargo vet regenerate exemptions` in the same commit.
         run: cargo vet --locked
 
   taplo:
