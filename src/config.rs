@@ -214,6 +214,7 @@ pub(crate) const RBAC_REDACTION_SALT_FILE_ENV: &str = "RMCP_SERVER_KIT__RBAC__RE
 
 /// Server listener configuration (reusable across MCP projects).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[allow(
     clippy::struct_excessive_bools,
     reason = "server configuration is a flat TOML schema with independent boolean feature flags"
@@ -812,6 +813,7 @@ fn parse_duration_field(field: &str, value: &str) -> Result<Duration, RmcpServer
 
 /// Observability settings (reusable across MCP projects).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ObservabilityConfig {
     /// `tracing` log level / env filter string (e.g. `info,rmcp_server_kit=debug`).
@@ -883,6 +885,7 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
     }
 
     validate_rate_limit_knobs(server)?;
+    validate_mtls_knobs(server)?;
     validate_trusted_forwarder_config(server)?;
 
     if server.admin_enabled {
@@ -981,7 +984,15 @@ fn validate_rate_limit_knobs(server: &ServerConfig) -> crate::error::Result<()> 
             )));
         }
     }
+    if let Some(auth) = server.auth.as_ref() {
+        auth.check_oauth_feature()?;
+    }
     if let Some(rl) = server.auth.as_ref().and_then(|a| a.rate_limit.as_ref()) {
+        (rl.max_attempts_per_minute != 0).ok_or_else(|| {
+            RmcpServerKitError::Config(
+                "auth.rate_limit.max_attempts_per_minute must be nonzero".into(),
+            )
+        })?;
         if rl.burst == Some(0) {
             return Err(RmcpServerKitError::Config(
                 "auth.rate_limit.burst must be greater than zero".into(),
@@ -992,6 +1003,48 @@ fn validate_rate_limit_knobs(server: &ServerConfig) -> crate::error::Result<()> 
                 "auth.rate_limit.pre_auth_burst must be greater than zero".into(),
             ));
         }
+        // `0` here does not mean "unlimited" -- `build_pre_auth_limiter`
+        // falls back to DEFAULT_PRE_AUTH_RATE, so a typo silently *raises*
+        // the pre-auth quota (e.g. 1/min + 0 yields 300/min, not 10/min)
+        // and weakens the gate that shields Argon2 from CPU-spray.
+        (rl.pre_auth_max_per_minute != Some(0)).ok_or_else(|| {
+            RmcpServerKitError::Config(
+                "auth.rate_limit.pre_auth_max_per_minute must be nonzero when set".into(),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_mtls_knobs(server: &ServerConfig) -> crate::error::Result<()> {
+    use crate::error::RmcpServerKitError;
+
+    if let Some(mtls) = server.auth.as_ref().and_then(|a| a.mtls.as_ref()) {
+        (mtls.crl_max_concurrent_fetches != 0).ok_or_else(|| {
+            RmcpServerKitError::Config(
+                "auth.mtls.crl_max_concurrent_fetches must be nonzero".into(),
+            )
+        })?;
+        (mtls.crl_discovery_rate_per_min != 0).ok_or_else(|| {
+            RmcpServerKitError::Config(
+                "auth.mtls.crl_discovery_rate_per_min must be nonzero".into(),
+            )
+        })?;
+        (mtls.crl_max_host_semaphores != 0).ok_or_else(|| {
+            RmcpServerKitError::Config("auth.mtls.crl_max_host_semaphores must be nonzero".into())
+        })?;
+        (mtls.crl_max_seen_urls != 0).ok_or_else(|| {
+            RmcpServerKitError::Config("auth.mtls.crl_max_seen_urls must be nonzero".into())
+        })?;
+        (mtls.crl_max_cache_entries != 0).ok_or_else(|| {
+            RmcpServerKitError::Config("auth.mtls.crl_max_cache_entries must be nonzero".into())
+        })?;
+        // `0` rejects every non-empty CRL body at the streaming cap, so CRL
+        // fetching never succeeds. With the default `crl_deny_on_unavailable =
+        // false` that degrades revocation checking silently rather than loudly.
+        (mtls.crl_max_response_bytes != 0).ok_or_else(|| {
+            RmcpServerKitError::Config("auth.mtls.crl_max_response_bytes must be nonzero".into())
+        })?;
     }
     Ok(())
 }
@@ -1121,7 +1174,8 @@ mod tests {
     use super::*;
     use crate::transport::McpServerConfig;
 
-    #[derive(Deserialize)]
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct RootConfig {
         server: ServerConfig,
     }
@@ -1363,6 +1417,136 @@ mod tests {
         };
         let err = validate_server_config(&cfg).unwrap_err();
         assert!(err.to_string().contains("pre_auth_burst"));
+    }
+
+    fn valid_mtls_config() -> crate::auth::MtlsConfig {
+        crate::auth::MtlsConfig {
+            ca_cert_path: "memory://ca.pem".into(),
+            required: true,
+            default_role: "viewer".into(),
+            crl_enabled: true,
+            crl_refresh_interval: None,
+            crl_fetch_timeout: Duration::from_secs(30),
+            crl_stale_grace: Duration::from_secs(24 * 60 * 60),
+            crl_deny_on_unavailable: false,
+            crl_end_entity_only: false,
+            crl_allow_http: true,
+            crl_enforce_expiration: true,
+            crl_max_concurrent_fetches: 4,
+            crl_max_response_bytes: 5 * 1024 * 1024,
+            crl_discovery_rate_per_min: 60,
+            crl_max_host_semaphores: 1024,
+            crl_max_seen_urls: 4096,
+            crl_max_cache_entries: 1024,
+        }
+    }
+
+    fn assert_config_nonzero_error(err: RmcpServerKitError, field: &str) {
+        let RmcpServerKitError::Config(msg) = err else {
+            panic!("expected Config error for {field}");
+        };
+        assert!(
+            msg.contains(field) && msg.contains("must be nonzero"),
+            "error must name {field} and say must be nonzero; got {msg:?}"
+        );
+    }
+
+    fn server_config_with_mtls(mtls: crate::auth::MtlsConfig) -> ServerConfig {
+        ServerConfig {
+            auth: Some(crate::auth::AuthConfig {
+                enabled: true,
+                api_keys: Vec::new(),
+                mtls: Some(mtls),
+                rate_limit: None,
+                #[cfg(feature = "oauth")]
+                oauth: None,
+                #[cfg(not(feature = "oauth"))]
+                oauth: None,
+            }),
+            ..ServerConfig::default()
+        }
+    }
+
+    #[test]
+    fn rejects_zero_crl_max_cache_entries() {
+        let mut mtls = valid_mtls_config();
+        mtls.crl_max_cache_entries = 0;
+        let err = validate_server_config(&server_config_with_mtls(mtls))
+            .expect_err("zero crl_max_cache_entries must be rejected");
+        assert_config_nonzero_error(err, "auth.mtls.crl_max_cache_entries");
+    }
+
+    #[test]
+    fn rejects_zero_crl_max_concurrent_fetches() {
+        let mut mtls = valid_mtls_config();
+        mtls.crl_max_concurrent_fetches = 0;
+        let err = validate_server_config(&server_config_with_mtls(mtls))
+            .expect_err("zero crl_max_concurrent_fetches must be rejected");
+        assert_config_nonzero_error(err, "auth.mtls.crl_max_concurrent_fetches");
+    }
+
+    #[test]
+    fn rejects_zero_crl_discovery_rate_per_min() {
+        let mut mtls = valid_mtls_config();
+        mtls.crl_discovery_rate_per_min = 0;
+        let err = validate_server_config(&server_config_with_mtls(mtls))
+            .expect_err("zero crl_discovery_rate_per_min must be rejected");
+        assert_config_nonzero_error(err, "auth.mtls.crl_discovery_rate_per_min");
+    }
+
+    #[test]
+    fn rejects_zero_crl_max_host_semaphores() {
+        let mut mtls = valid_mtls_config();
+        mtls.crl_max_host_semaphores = 0;
+        let err = validate_server_config(&server_config_with_mtls(mtls))
+            .expect_err("zero crl_max_host_semaphores must be rejected");
+        assert_config_nonzero_error(err, "auth.mtls.crl_max_host_semaphores");
+    }
+
+    #[test]
+    fn rejects_zero_crl_max_seen_urls() {
+        let mut mtls = valid_mtls_config();
+        mtls.crl_max_seen_urls = 0;
+        let err = validate_server_config(&server_config_with_mtls(mtls))
+            .expect_err("zero crl_max_seen_urls must be rejected");
+        assert_config_nonzero_error(err, "auth.mtls.crl_max_seen_urls");
+    }
+
+    #[test]
+    fn rejects_zero_crl_max_response_bytes() {
+        let mut mtls = valid_mtls_config();
+        mtls.crl_max_response_bytes = 0;
+        let err = validate_server_config(&server_config_with_mtls(mtls))
+            .expect_err("zero crl_max_response_bytes must be rejected");
+        assert_config_nonzero_error(err, "auth.mtls.crl_max_response_bytes");
+    }
+
+    #[test]
+    fn rejects_zero_auth_rate_limit() {
+        let auth = crate::auth::AuthConfig::with_keys(vec![])
+            .with_rate_limit(crate::auth::RateLimitConfig::new(0));
+        let cfg = ServerConfig {
+            auth: Some(auth),
+            ..ServerConfig::default()
+        };
+        let err = validate_server_config(&cfg).expect_err("zero auth rate limit must be rejected");
+        assert_config_nonzero_error(err, "auth.rate_limit.max_attempts_per_minute");
+    }
+
+    #[test]
+    fn rejects_zero_pre_auth_max_per_minute() {
+        // Regression guard: `0` is NOT "unlimited" here. The limiter builder
+        // falls back to DEFAULT_PRE_AUTH_RATE, so accepting `0` would raise
+        // the pre-auth quota instead of tightening it.
+        let mut rl = crate::auth::RateLimitConfig::new(30);
+        rl.pre_auth_max_per_minute = Some(0);
+        let cfg = ServerConfig {
+            auth: Some(crate::auth::AuthConfig::with_keys(vec![]).with_rate_limit(rl)),
+            ..ServerConfig::default()
+        };
+        let err = validate_server_config(&cfg)
+            .expect_err("zero pre_auth_max_per_minute must be rejected");
+        assert_config_nonzero_error(err, "auth.rate_limit.pre_auth_max_per_minute");
     }
 
     #[test]
@@ -1658,15 +1842,66 @@ mod tests {
     }
 
     #[test]
-    fn t9_unknown_security_header_key_is_ignored() {
-        let cfg = server_from_root_toml(
+    fn t9_unknown_security_header_key_is_rejected() {
+        let err = toml::from_str::<RootConfig>(
             r#"
                 [server.security_headers]
                 typo_content_security_policy = "default-src 'self'"
             "#,
-        );
+        )
+        .unwrap_err();
 
-        assert_eq!(cfg.security_headers, SecurityHeadersConfig::default());
+        let msg = err.to_string();
+        assert!(
+            msg.contains("typo_content_security_policy"),
+            "error must name the offending key: {msg}"
+        );
+    }
+
+    #[test]
+    fn unknown_server_config_key_is_rejected() {
+        let err = toml::from_str::<ServerConfig>(
+            r#"
+                tls_keypath = "/etc/certs/server.key"
+            "#,
+        )
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("tls_keypath"),
+            "error must name the offending key: {msg}"
+        );
+    }
+
+    #[cfg(not(feature = "oauth"))]
+    #[test]
+    fn oauth_table_without_oauth_feature_is_rejected_with_actionable_message() {
+        // `deny_unknown_fields` on `AuthConfig` would otherwise surface this as
+        // `unknown field \`oauth\``, which never mentions the cargo feature.
+        // Failing closed matters: silently dropping the table starts a server
+        // whose config says OAuth is on while no token validation is compiled in.
+        let server = toml::from_str::<ServerConfig>(
+            r#"
+                listen_port = 8080
+
+                [auth]
+                enabled = true
+
+                [auth.oauth]
+                issuer = "https://auth.example.com"
+            "#,
+        )
+        .expect("[auth.oauth] must parse so validation can produce the real message");
+
+        let msg = validate_server_config(&server)
+            .expect_err("auth.oauth without the oauth feature must be rejected")
+            .to_string();
+
+        assert!(
+            msg.contains("oauth") && msg.contains("--features oauth"),
+            "error must name the missing cargo feature and how to fix it: {msg}"
+        );
     }
 
     #[test]

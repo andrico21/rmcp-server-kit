@@ -62,7 +62,15 @@ pub(crate) struct SsrfScreeningResolver {
     /// without re-validating the policy.
     allowlist: Arc<CompiledSsrfAllowlist>,
     /// Test-only loopback bypass; see `TestLoopbackBypass` doc.
-    #[cfg_attr(not(any(test, feature = "test-helpers")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(test, feature = "test-helpers")),
+        allow(
+            dead_code,
+            reason = "`TestLoopbackBypass` aliases to `()` outside test/test-helpers \
+                      builds, so this field is never read there; it is retained so the \
+                      resolver has one construction shape across every cfg"
+        )
+    )]
     test_bypass: TestLoopbackBypass,
 }
 

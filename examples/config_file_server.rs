@@ -32,6 +32,7 @@ use rmcp::{
 };
 use rmcp_server_kit::{
     config::{ObservabilityConfig, ServerConfig, validate_server_config},
+    observability::init_tracing_from_config_strict,
     rbac::{RbacConfig, RbacPolicy},
     transport::{McpServerConfig, serve},
 };
@@ -73,7 +74,14 @@ hosts = ["*"]
 ///
 /// rmcp-server-kit deliberately provides reusable sections, not a kit-owned
 /// root type. Real applications compose these sections into their own schema.
+///
+/// Note the `deny_unknown_fields`: every kit-provided section struct sets it,
+/// so a misspelled key *inside* `[server]` is rejected. Only the application's
+/// own root type can reject a misspelled *table name* such as `[serverr]`, so
+/// applications should set it here too -- otherwise a mistyped section is
+/// silently dropped and the server starts with defaults for it.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AppConfig {
     server: ServerConfig,
     observability: ObservabilityConfig,
@@ -108,7 +116,7 @@ async fn main() -> rmcp_server_kit::Result<()> {
 
     // Initialize tracing first, then log the override report so env-shadowing
     // leaves a startup trail. Secret targets report `value = None`.
-    let _ = rmcp_server_kit::observability::init_tracing_from_config(&app_config.observability);
+    let _tracing_guard = init_tracing_from_config_strict(&app_config.observability)?;
     for entry in &override_report {
         tracing::info!(
             env_var = %entry.env_var,

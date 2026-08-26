@@ -22,7 +22,11 @@ use rmcp::{
     handler::server::ServerHandler,
     model::{ServerCapabilities, ServerInfo},
 };
-use rmcp_server_kit::transport::{McpServerConfig, serve};
+use rmcp_server_kit::{
+    config::ObservabilityConfig,
+    observability::init_tracing_from_config_strict,
+    transport::{McpServerConfig, serve},
+};
 
 #[derive(Clone)]
 struct MinimalHandler;
@@ -35,10 +39,9 @@ impl ServerHandler for MinimalHandler {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> rmcp_server_kit::Result<()> {
-    // Ignore the error: the only failure mode is "a global tracing
-    // subscriber was already installed", which is harmless for an example
-    // that owns the entire process.
-    let _ = rmcp_server_kit::observability::init_tracing("info,rmcp_server_kit=debug");
+    let mut observability = ObservabilityConfig::default();
+    observability.log_level = "info,rmcp_server_kit=debug".into();
+    let _tracing_guard = init_tracing_from_config_strict(&observability)?;
 
     let config = McpServerConfig::new(
         "127.0.0.1:8080",

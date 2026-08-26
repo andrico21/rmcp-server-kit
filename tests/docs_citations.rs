@@ -36,6 +36,12 @@
 
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
+use rmcp_server_kit::{
+    config::{ObservabilityConfig, ServerConfig},
+    rbac::RbacConfig,
+};
+use serde::Deserialize;
+
 /// How far (in lines, each direction) an anchor symbol may sit from the
 /// cited line/range. The doc headers promise "approximate" citations;
 /// this is the enforced meaning of approximate.
@@ -63,6 +69,20 @@ struct Citation {
     /// Symbol candidates extracted from the same doc line. Empty means
     /// "length-check only".
     anchors: Vec<String>,
+}
+
+#[derive(Debug)]
+struct TomlFence {
+    line: usize,
+    info: String,
+    body: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GuideOperatorConfig {
+    server: Option<ServerConfig>,
+    rbac: Option<RbacConfig>,
+    observability: Option<ObservabilityConfig>,
 }
 
 fn workspace_root() -> PathBuf {
@@ -376,6 +396,168 @@ fn run_doc_test(doc_rel_path: &str) {
         "{} stale citation(s) in {doc_rel_path} (out of {total} total):\n{}",
         failures.len(),
         failures.join("\n")
+    );
+}
+
+fn extract_toml_fences(doc: &str) -> Vec<TomlFence> {
+    let mut fences = Vec::new();
+    let mut open: Option<TomlFence> = None;
+
+    for (idx, line) in doc.lines().enumerate() {
+        let line_no = idx + 1;
+        let trimmed = line.trim_start();
+
+        if let Some(mut fence) = open.take() {
+            if trimmed == "```" {
+                fences.push(fence);
+            } else {
+                fence.body.push_str(line);
+                fence.body.push('\n');
+                open = Some(fence);
+            }
+            continue;
+        }
+
+        if let Some(info) = trimmed.strip_prefix("```") {
+            let info = info.trim();
+            if info == "toml" || info.starts_with("toml,") {
+                open = Some(TomlFence {
+                    line: line_no,
+                    info: info.to_owned(),
+                    body: String::new(),
+                });
+            }
+        }
+    }
+
+    fences
+}
+
+fn assert_operator_root_keys(block: &TomlFence, table: &toml::Table) {
+    for key in table.keys() {
+        assert!(
+            matches!(key.as_str(), "server" | "rbac" | "observability"),
+            "docs/GUIDE.md:{} has unknown operator-config root table/key `{key}`",
+            block.line
+        );
+    }
+}
+
+fn assert_operator_config_block_parses(block: &TomlFence) {
+    let table: toml::Table = toml::from_str(&block.body).unwrap_or_else(|error| {
+        panic!(
+            "docs/GUIDE.md:{} operator TOML is not valid TOML: {error}\n{}",
+            block.line, block.body
+        )
+    });
+    assert_operator_root_keys(block, &table);
+
+    let parsed: GuideOperatorConfig = toml::from_str(&block.body).unwrap_or_else(|error| {
+        panic!(
+            "docs/GUIDE.md:{} operator TOML does not match rmcp-server-kit config schema: {error}\n{}",
+            block.line, block.body
+        )
+    });
+    assert!(
+        parsed.server.is_some() || parsed.rbac.is_some() || parsed.observability.is_some(),
+        "docs/GUIDE.md:{} operator TOML block must contain server, rbac, or observability config",
+        block.line
+    );
+}
+
+fn assert_cargo_toml_block_parses(block: &TomlFence) {
+    toml::from_str::<toml::Value>(&block.body).unwrap_or_else(|error| {
+        panic!(
+            "docs/GUIDE.md:{} Cargo TOML is not valid TOML: {error}\n{}",
+            block.line, block.body
+        )
+    });
+}
+
+fn assert_toml_fragment_parses(block: &TomlFence) {
+    toml::from_str::<toml::Value>(&block.body).unwrap_or_else(|error| {
+        panic!(
+            "docs/GUIDE.md:{} TOML fragment is not valid TOML: {error}\n{}",
+            block.line, block.body
+        )
+    });
+}
+
+fn extract_embedded_config(source: &str) -> &str {
+    let Some((_, tail)) = source.split_once("const EMBEDDED_CONFIG: &str = r#\"") else {
+        panic!("examples/config_file_server.rs no longer declares EMBEDDED_CONFIG")
+    };
+    let Some((config, _)) = tail.split_once("\"#;") else {
+        panic!("examples/config_file_server.rs EMBEDDED_CONFIG raw string is not terminated")
+    };
+    config
+}
+
+#[test]
+fn guide_toml_fences_parse() {
+    let root = workspace_root();
+    let doc = fs::read_to_string(root.join("docs/GUIDE.md")).expect("read GUIDE.md");
+    let fences = extract_toml_fences(&doc);
+
+    assert_eq!(fences.len(), 16, "GUIDE.md TOML fence count drifted");
+    for block in &fences {
+        match block.info.as_str() {
+            "toml" => assert_operator_config_block_parses(block),
+            "toml,cargo" => assert_cargo_toml_block_parses(block),
+            "toml,fragment" => assert_toml_fragment_parses(block),
+            other => panic!(
+                "docs/GUIDE.md:{} uses unsupported TOML fence info string `{other}`; use `toml` for complete operator config, `toml,cargo` for Cargo snippets, or `toml,fragment` for intentionally incomplete excerpts",
+                block.line
+            ),
+        }
+    }
+}
+
+#[test]
+fn config_file_server_embedded_toml_parses() {
+    let root = workspace_root();
+    let source = fs::read_to_string(root.join("examples/config_file_server.rs"))
+        .expect("read config_file_server.rs");
+    let config = extract_embedded_config(&source);
+    let parsed: GuideOperatorConfig = toml::from_str(config).unwrap_or_else(|error| {
+        panic!(
+            "examples/config_file_server.rs EMBEDDED_CONFIG does not match rmcp-server-kit config schema: {error}\n{config}"
+        )
+    });
+    assert!(
+        parsed.server.is_some(),
+        "embedded config must include [server]"
+    );
+    assert!(
+        parsed.observability.is_some(),
+        "embedded config must include [observability]"
+    );
+    assert!(parsed.rbac.is_some(), "embedded config must include [rbac]");
+}
+
+/// The kit's section structs reject unknown *keys*, but only an
+/// application-owned root type can reject a misspelled *table name*
+/// (`[serverr]`). `config_file_server` is the canonical consumer example, so
+/// it must keep modelling that; without the attribute a mistyped section is
+/// silently dropped and the server starts with defaults for it.
+#[test]
+fn config_file_server_root_denies_unknown_tables() {
+    let root = workspace_root();
+    let source = fs::read_to_string(root.join("examples/config_file_server.rs"))
+        .expect("read config_file_server.rs");
+
+    let struct_pos = source
+        .find("struct AppConfig")
+        .expect("examples/config_file_server.rs must define the AppConfig root type");
+    let preamble = source
+        .get(..struct_pos)
+        .expect("struct_pos is a char boundary returned by find");
+
+    assert!(
+        preamble.contains("#[serde(deny_unknown_fields)]"),
+        "examples/config_file_server.rs: the application-owned `AppConfig` root must carry \
+         #[serde(deny_unknown_fields)] so a misspelled table name is rejected rather than \
+         silently ignored"
     );
 }
 

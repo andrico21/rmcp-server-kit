@@ -60,8 +60,8 @@ pub(crate) fn build_tool_rate_limiter(
 /// Build a per-IP tool rate limiter with explicit memory-bound parameters.
 ///
 /// `burst` overrides governor's default bucket capacity (burst = rate);
-/// zero values are rejected at config-validation time, the `NonZeroU32`
-/// filter is defensive only.
+/// zero rate/cap values are rejected at config-validation time; the
+/// `NonZero*` fallbacks here are defensive only.
 #[must_use]
 pub(crate) fn build_tool_rate_limiter_with_bounds(
     max_per_minute: u32,
@@ -76,7 +76,7 @@ pub(crate) fn build_tool_rate_limiter_with_bounds(
     }
     Arc::new(BoundedKeyedLimiter::new(
         quota,
-        max_tracked_keys,
+        std::num::NonZeroUsize::new(max_tracked_keys).unwrap_or(std::num::NonZeroUsize::MIN),
         idle_eviction,
     ))
 }
@@ -182,6 +182,7 @@ pub async fn with_rbac_scope<F: Future>(
 
 /// A single role definition.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct RoleConfig {
     /// Role identifier referenced from identities (API keys, mTLS, JWT claims).
@@ -258,6 +259,7 @@ impl RoleConfig {
 //     required-present / required-absent.
 //   - Profile before merge; justify by maintainability if perf delta <5%.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ArgumentAllowlist {
     /// Tool name to match (exact or glob, e.g. `"run_query"`).
@@ -312,6 +314,7 @@ fn default_hosts() -> Vec<String> {
 
 /// Top-level RBAC configuration (deserializable from TOML).
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct RbacConfig {
     /// Master switch -- when false, the RBAC middleware is not installed.
@@ -796,6 +799,9 @@ fn redact_with_salt(salt: &[u8], value: &str) -> String {
     clippy::too_many_lines,
     reason = "linear request lifecycle (body collect → JSON-RPC parse → policy dispatch) kept inline for security review visibility; helpers already extracted"
 )]
+// cancel-safe: `TimeoutLayer` may drop during `body.collect` or `next.run`;
+// buffered body/task-local scopes are request-local, and tool limiter checks
+// deliberately price attempted tool calls even if the handler times out.
 pub(crate) async fn rbac_middleware(
     policy: Arc<RbacPolicy>,
     tool_limiter: Option<Arc<ToolRateLimiter>>,
@@ -2971,6 +2977,23 @@ mod tests {
         assert!(
             !cfg.roles[0].argument_allowlists[0].required,
             "omitted `required` must default to false so existing configs are unchanged"
+        );
+    }
+
+    #[test]
+    fn unknown_rbac_config_key_is_rejected() {
+        let err = toml::from_str::<RbacConfig>(
+            "
+            enabled = true
+            typo_roles = []
+            ",
+        )
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("typo_roles"),
+            "error must name the offending key: {msg}"
         );
     }
 }

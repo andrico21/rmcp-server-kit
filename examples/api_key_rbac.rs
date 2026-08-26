@@ -28,6 +28,8 @@ use rmcp::{
 };
 use rmcp_server_kit::{
     auth::{ApiKeyEntry, AuthConfig, generate_api_key},
+    config::ObservabilityConfig,
+    observability::init_tracing_from_config_strict,
     rbac::{ArgumentAllowlist, RbacConfig, RbacPolicy, RoleConfig},
     transport::{McpServerConfig, serve},
 };
@@ -43,7 +45,9 @@ impl ServerHandler for DemoHandler {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> rmcp_server_kit::Result<()> {
-    let _ = rmcp_server_kit::observability::init_tracing("info,rmcp_server_kit=debug");
+    let mut observability = ObservabilityConfig::default();
+    observability.log_level = "info,rmcp_server_kit=debug".into();
+    let _tracing_guard = init_tracing_from_config_strict(&observability)?;
 
     // 1. Generate two API keys. `generate_api_key` returns the plaintext token
     //    (give to the client) and an Argon2id PHC hash (store in config).

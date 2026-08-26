@@ -11,9 +11,9 @@ migration note and a config opt-out — see the 3.1.0 notes below.
 
 ## [Unreleased]
 
-Hardening pass from a full review against `RUST_GUIDELINES.md`. No public API
-is added, removed, or retyped (`cargo semver-checks`: 223 checks, no semver
-update required). Two runtime behaviours change; both are noted below.
+Hardening pass from a full review against `RUST_GUIDELINES.md`. Public API
+changes are additive except for one deprecation that requires a minor-version
+release (`cargo semver-checks`); runtime behaviour changes are noted below.
 
 ### Security
 
@@ -49,6 +49,49 @@ update required). Two runtime behaviours change; both are noted below.
   arbitrary caller-supplied hash and consumers may have hashed externally-issued
   opaque tokens containing other punctuation. Those continue to authenticate.
 
+- **Zero-valued capacity knobs now fail config validation instead of being
+  silently clamped or defaulted.** `oauth.max_jwks_keys`,
+  `oauth.jwks_max_response_bytes`, the mTLS CRL capacity knobs
+  (`crl_max_concurrent_fetches`, `crl_discovery_rate_per_min`,
+  `crl_max_host_semaphores`, `crl_max_seen_urls`, `crl_max_cache_entries`,
+  `crl_max_response_bytes`), and `auth.rate_limit.max_attempts_per_minute` now
+  return `RmcpServerKitError::Config` with a `must be nonzero` message during
+  startup validation.
+
+  `auth.rate_limit.pre_auth_max_per_minute` is also rejected when explicitly set
+  to `0`. That value never meant "unlimited": the limiter fell back to the
+  built-in pre-auth default, so a `0` *raised* the quota rather than tightening
+  it (`max_attempts_per_minute = 1` plus `pre_auth_max_per_minute = 0` yielded
+  300/min instead of the derived 10/min), weakening the gate that shields Argon2
+  verification from CPU-spray. Leaving the key unset still derives the quota as
+  before.
+
+  `auth.mtls.crl_max_response_bytes = 0` was likewise accepted and made every
+  non-empty CRL body exceed the streaming cap, so CRL fetching could never
+  succeed; with the default `crl_deny_on_unavailable = false` that degraded
+  revocation checking silently.
+
+
+- **The internal bounded-limiter hard cap now uses `NonZeroUsize`.** This makes
+  a zero tracked-key cap unrepresentable in the crate-internal constructor;
+  public `with_per_minute` and `with_per_second` constructor signatures are
+  unchanged and continue to clamp a direct `0` cap to `1` as defense-in-depth.
+
+- **Configured audit logs now fail closed through
+  `init_tracing_from_config_strict`.** When `audit_log_path` is set but the
+  parent directory cannot be created or the file cannot be opened, strict
+  tracing initialization returns `RmcpServerKitError::Startup` instead of
+  silently running without an audit trail.
+
+- **BREAKING: operator TOML config now rejects unknown keys.** The reusable
+  TOML schemas now derive `serde(deny_unknown_fields)` for `[server]`,
+  `[server.security_headers]`, `[server.auth]` (including `api_keys`, `mtls`,
+  `rate_limit`, and OAuth sub-tables), `[rbac]` (including `roles` and
+  `argument_allowlists`), and `[observability]`. Previously ignored stray or
+  misspelled keys such as `tls_keypath` or `typo_content_security_policy` now
+  abort deserialization/startup so hardened defaults are not accidentally used
+  in place of the operator's intended setting.
+
 ### Changed
 
 - **RBAC host matching is now ASCII-case-insensitive.** `RbacPolicy::check` and
@@ -60,6 +103,14 @@ update required). Two runtime behaviours change; both are noted below.
 
 - Servers started with `max_concurrent_requests` unset now log one startup
   warning. No default is imposed; behaviour is unchanged.
+
+- Audit-file logging now uses a bounded non-blocking channel drained by a
+  dedicated writer thread, so tracing call sites on tokio worker threads no
+  longer perform synchronous file writes. If the channel is full, newest audit
+  entries are dropped and the writer records the aggregate dropped count when it
+  catches up. Runtime audit-file write or flush failures remain non-fatal but
+  now increment an internal failure counter and emit a throttled warning directly
+  to process stderr, avoiding recursive re-entry through the tracing subscriber.
 
 - A duplicate `kid` in a JWKS document now logs a warning (last entry wins, as
   before). The logged `kid` is truncated, since it is issuer-controlled text of
@@ -99,6 +150,13 @@ update required). Two runtime behaviours change; both are noted below.
   address, and an unbounded value would re-open the header-bomb vector the cap
   exists to close.
 
+- `observability::TracingGuard` and
+  `observability::init_tracing_from_config_strict` provide fail-closed audit-log
+  setup with best-effort, time-bounded (5s) audit writer drain/flush on guard
+  drop. The legacy
+  `init_tracing_from_config` entry point is deprecated but remains fail-open for
+  source compatibility.
+
 ### Changed
 
 - **`generate_api_key` now returns `RmcpServerKitError::Internal` instead of
@@ -124,6 +182,19 @@ update required). Two runtime behaviours change; both are noted below.
   substring-matching.
 
 ### Internal
+
+- Every production async fn that can run inside `select!`, `timeout`, or an
+  abortable task now carries a `// cancel-safe:` or `// NOT cancel-safe:`
+  annotation, per `RUST_GUIDELINES.md` 5. Documentation only -- no behaviour
+  change. Auditing the bodies surfaced two paths that are genuinely **not**
+  cancel-safe and are annotated as such pending a follow-up fix:
+
+  - `oauth::OAuthTokenExchange::exchange_token` -- cancellation after the
+    upstream request is sent can mint a token at the IdP that never reaches the
+    caller, leaving an orphaned credential.
+  - `mtls_revocation::run_crl_refresher` -- aborting during `fetch_and_store_url`
+    can strand entries in `pending_urls`. Shutdown via the cancellation token is
+    unaffected; only an abort mid-fetch is exposed.
 
 - The client-facing-message invariant on `RmcpServerKitError` now has a
   regression guard. A test walks `src/` and fails when `Auth`, `Rbac`,

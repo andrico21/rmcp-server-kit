@@ -1,6 +1,7 @@
 use std::{
     future::Future,
     net::{IpAddr, SocketAddr},
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
@@ -237,6 +238,7 @@ struct ForwardResolver {
 /// builder method, not by smuggling it through this knob.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct SecurityHeadersConfig {
     /// Override for `X-Content-Type-Options`. Default: `nosniff`.
@@ -1339,6 +1341,8 @@ impl McpServerConfig {
             ));
         }
 
+        check_auth_capacity_knobs(self.auth.as_ref())?;
+
         // 11. tls_handshake_timeout must be > 0. A zero deadline would
         //     reap every handshake before it could complete, rejecting
         //     all TLS connections. Mirrors the TOML-side check in
@@ -2066,6 +2070,9 @@ where
 ///
 /// Returns [`RmcpServerKitError::Startup`] if binding to `config.bind_addr`
 /// fails, or if the underlying axum server returns an error.
+// NOT cancel-safe: dropping after `build_app_router` starts metrics, or after
+// `run_server` spawns shutdown/CRL tasks, can detach them; use OS signal or
+// `serve_with_listener`'s shutdown token for cooperative shutdown.
 pub async fn serve<H, F>(
     config: Validated<McpServerConfig>,
     handler_factory: F,
@@ -2134,6 +2141,9 @@ where
 /// Returns [`RmcpServerKitError::Startup`] if router construction fails, if reading
 /// the listener's `local_addr()` fails, or if the underlying axum
 /// server returns an error.
+// NOT cancel-safe: the `shutdown` token is the cancellation boundary. Dropping
+// after readiness fires or `run_server` starts can detach shutdown/metrics
+// tasks while callers believe the listener lifetime ended.
 pub async fn serve_with_listener<H, F>(
     listener: TcpListener,
     config: Validated<McpServerConfig>,
@@ -2230,6 +2240,9 @@ fn log_listening(name: &str, scheme: &str, addr: &str) {
     clippy::cognitive_complexity,
     reason = "server start-up threads TLS, reload state, and graceful shutdown through one flow"
 )]
+// NOT cancel-safe: external cancellation is modeled by `ct`. Dropping/aborting
+// can skip `session_ct.cancel()` and leave the spawned shutdown trigger or CRL
+// refresher running with cloned cancellation tokens.
 async fn run_server(
     router: axum::Router,
     listener: TcpListener,
@@ -2769,6 +2782,9 @@ impl TlsListener {
 /// `handshake_timeout` deadline. Completed handshakes are pushed to `tx`;
 /// failures and timeouts are logged at DEBUG and the connection dropped.
 /// The loop exits when the owning [`TlsListener`] is dropped.
+// cancel-safe: aborted from `TlsListener::drop`; `accept` is cancel-safe,
+// semaphore permits are RAII, and spawned handshake workers own streams and
+// discard completed sends when `rx` is closed.
 async fn run_tls_acceptor(
     listener: TcpListener,
     acceptor: tokio_rustls::TlsAcceptor,
@@ -3624,9 +3640,14 @@ fn build_extra_route_rate_limiter(
     if let Some(b) = burst.and_then(std::num::NonZeroU32::new) {
         quota = quota.allow_burst(b);
     }
+    // Defense in depth: Phase-1 config validation rejects `0` upstream; this
+    // constant is nonzero, but keeping the conversion fallible preserves the
+    // invariant if the constant is edited later.
+    let max_tracked_keys =
+        NonZeroUsize::new(EXTRA_ROUTE_MAX_TRACKED_KEYS).unwrap_or(NonZeroUsize::MIN);
     Arc::new(BoundedKeyedLimiter::new(
         quota,
-        EXTRA_ROUTE_MAX_TRACKED_KEYS,
+        max_tracked_keys,
         EXTRA_ROUTE_IDLE_EVICTION,
     ))
 }
@@ -3982,6 +4003,57 @@ fn security_header_overrides(
     .filter_map(|(field, value)| value.map(|v| (field, v)))
 }
 
+fn check_auth_capacity_knobs(auth: Option<&AuthConfig>) -> Result<(), RmcpServerKitError> {
+    if let Some(auth_cfg) = auth {
+        if let Some(rl) = &auth_cfg.rate_limit {
+            (rl.max_attempts_per_minute != 0).ok_or_else(|| {
+                RmcpServerKitError::Config(
+                    "auth.rate_limit.max_attempts_per_minute must be nonzero".into(),
+                )
+            })?;
+            // `0` here does not mean "unlimited" -- `build_pre_auth_limiter`
+            // falls back to DEFAULT_PRE_AUTH_RATE, so a typo silently *raises*
+            // the pre-auth quota (e.g. 1/min + 0 yields 300/min, not 10/min)
+            // and weakens the gate that shields Argon2 from CPU-spray.
+            (rl.pre_auth_max_per_minute != Some(0)).ok_or_else(|| {
+                RmcpServerKitError::Config(
+                    "auth.rate_limit.pre_auth_max_per_minute must be nonzero when set".into(),
+                )
+            })?;
+        }
+        if let Some(mtls) = &auth_cfg.mtls {
+            check_mtls_capacity_knobs(mtls)?;
+        }
+        auth_cfg.check_oauth_feature()?;
+    }
+    Ok(())
+}
+
+fn check_mtls_capacity_knobs(mtls: &MtlsConfig) -> Result<(), RmcpServerKitError> {
+    (mtls.crl_max_concurrent_fetches != 0).ok_or_else(|| {
+        RmcpServerKitError::Config("auth.mtls.crl_max_concurrent_fetches must be nonzero".into())
+    })?;
+    (mtls.crl_discovery_rate_per_min != 0).ok_or_else(|| {
+        RmcpServerKitError::Config("auth.mtls.crl_discovery_rate_per_min must be nonzero".into())
+    })?;
+    (mtls.crl_max_host_semaphores != 0).ok_or_else(|| {
+        RmcpServerKitError::Config("auth.mtls.crl_max_host_semaphores must be nonzero".into())
+    })?;
+    (mtls.crl_max_seen_urls != 0).ok_or_else(|| {
+        RmcpServerKitError::Config("auth.mtls.crl_max_seen_urls must be nonzero".into())
+    })?;
+    (mtls.crl_max_cache_entries != 0).ok_or_else(|| {
+        RmcpServerKitError::Config("auth.mtls.crl_max_cache_entries must be nonzero".into())
+    })?;
+    // `0` rejects every non-empty CRL body at the streaming cap, so CRL
+    // fetching never succeeds. With the default `crl_deny_on_unavailable =
+    // false` that degrades revocation checking silently rather than loudly.
+    (mtls.crl_max_response_bytes != 0).ok_or_else(|| {
+        RmcpServerKitError::Config("auth.mtls.crl_max_response_bytes must be nonzero".into())
+    })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -4101,6 +4173,8 @@ mod tests {
             mtls: None,
             rate_limit: Some(rl),
             #[cfg(feature = "oauth")]
+            oauth: None,
+            #[cfg(not(feature = "oauth"))]
             oauth: None,
         };
         let cfg = McpServerConfig::new("127.0.0.1:8080", "test", "1.0.0").with_auth(auth_cfg);
@@ -4663,6 +4737,53 @@ mod tests {
             .validate()
             .expect_err("zero pre-auth burst");
         assert!(err.to_string().contains("pre_auth_burst"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_pre_auth_max_per_minute() {
+        let auth = AuthConfig::with_keys(vec![])
+            .with_rate_limit(crate::auth::RateLimitConfig::new(10).with_pre_auth_max_per_minute(0));
+        let err = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0")
+            .with_auth(auth)
+            .validate()
+            .expect_err("zero pre-auth rate");
+        assert!(err.to_string().contains("pre_auth_max_per_minute"));
+    }
+
+    fn valid_mtls_config() -> MtlsConfig {
+        MtlsConfig {
+            ca_cert_path: "memory://ca.pem".into(),
+            required: true,
+            default_role: "viewer".into(),
+            crl_enabled: true,
+            crl_refresh_interval: None,
+            crl_fetch_timeout: Duration::from_secs(30),
+            crl_stale_grace: Duration::from_secs(24 * 60 * 60),
+            crl_deny_on_unavailable: false,
+            crl_end_entity_only: false,
+            crl_allow_http: true,
+            crl_enforce_expiration: true,
+            crl_max_concurrent_fetches: 4,
+            crl_max_response_bytes: 5 * 1024 * 1024,
+            crl_discovery_rate_per_min: 60,
+            crl_max_host_semaphores: 1024,
+            crl_max_seen_urls: 4096,
+            crl_max_cache_entries: 1024,
+        }
+    }
+
+    #[test]
+    fn validate_rejects_zero_crl_max_response_bytes() {
+        let mut mtls = valid_mtls_config();
+        mtls.crl_max_response_bytes = 0;
+        let mut auth = AuthConfig::with_keys(vec![]);
+        auth.mtls = Some(mtls);
+
+        let err = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0")
+            .with_auth(auth)
+            .validate()
+            .expect_err("zero CRL response cap");
+        assert!(err.to_string().contains("crl_max_response_bytes"));
     }
 
     /// `pre_auth_burst` without `pre_auth_max_per_minute` is LEGAL: the

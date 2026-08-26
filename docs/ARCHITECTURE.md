@@ -138,7 +138,7 @@ axum Router                                  src/transport.rs:1429  (build_app_r
    ├── 6. Optional metrics middleware        src/metrics.rs (records
    │      request count, duration histograms, in-flight gauge)
    │
-   ├── 7. Auth middleware                    src/auth.rs:1439 (auth_middleware)
+   ├── 7. Auth middleware                    src/auth.rs:1499 (auth_middleware)
    │      Determines AuthIdentity from one of:
    │        a) Authorization: Bearer <api-key>  → Argon2 verify against
    │           AuthState.api_keys (ArcSwap<HashMap>)
@@ -234,7 +234,7 @@ pub struct AuthIdentity {
 }
 ```
 
-### `RbacPolicy` — `src/rbac.rs:329`
+### `RbacPolicy` — `src/rbac.rs:393`
 Holds:
 - `roles: HashMap<String, RoleConfig>` — per-role tool allow/deny rules
 - default-deny semantics with explicit overrides
@@ -296,9 +296,9 @@ Startup-only.
 
 ### Construction
 `AuthState` is built inside `build_app_router()` at `src/transport.rs:1396`. It contains:
-- `api_keys: ArcSwap<Vec<ApiKeyEntry>>` (`src/auth.rs:935`)
+- `api_keys: ArcSwap<Vec<ApiKeyEntry>>` (`src/auth.rs:999`)
 - mTLS identities: stored **per-connection** on the
-  `TlsConnInfo` extension (`src/auth.rs:795`), read by `auth_middleware` (`src/auth.rs:1449-1454`).
+  `TlsConnInfo` extension (`src/auth.rs:859`), read by `auth_middleware` (`src/auth.rs:1509-1514`).
   No shared `SocketAddr`-keyed map exists — the previous design was replaced
   to avoid identity-binding races behind load balancers and to remove a
   `RwLock` from the request hot path.
@@ -315,11 +315,11 @@ Startup-only.
   entirely** (the TLS handshake already performed expensive crypto with a
   verified peer, so mTLS callers cannot be used to mount a CPU-spray
   attack).
-- `jwks_cache: Option<Arc<JwksCache>>` (`src/auth.rs:943`) when `feature=oauth` is on and `oauth.issuer` is configured
+- `jwks_cache: Option<Arc<JwksCache>>` (`src/auth.rs:1007`) when `feature=oauth` is on and `oauth.issuer` is configured
 
 ### API key flow
 1. Client sends `Authorization: Bearer <api-key>`.
-2. `auth_middleware` (`src/auth.rs:1439`) first runs the **pre-auth abuse
+2. `auth_middleware` (`src/auth.rs:1499`) first runs the **pre-auth abuse
    gate** keyed by the request's source IP. If the gate is exhausted the
    middleware returns `429` immediately, *without* touching Argon2id.
 3. Otherwise the middleware looks up the key by an indexed prefix
@@ -478,7 +478,7 @@ Configuration toggles:
 `[mtls]` is configured and `crl_enabled = true` (the default).
 
 Lifecycle:
-1. `bootstrap_fetch(roots, config)` (`src/mtls_revocation.rs:1138`) is
+1. `bootstrap_fetch(roots, config)` (`src/mtls_revocation.rs:1169`) is
    called from `run_server` *before* the listener is built. It walks the
    configured CA chain, extracts every X.509 CRL Distribution Point (CDP)
    URL via `extract_cdp_urls`, fetches each via `reqwest` under a 10 s
@@ -498,7 +498,7 @@ Lifecycle:
    the verifier `Arc` from the `ServerConfig` at construction, the
    dynamic verifier MUST be the Arc handed to rustls; its inner verifier
    then swaps via the internal `ArcSwap`.
-4. `run_crl_refresher(set, rx, shutdown)` (`src/mtls_revocation.rs:1249`)
+4. `run_crl_refresher(set, rx, shutdown)` (`src/mtls_revocation.rs:1285`)
    is spawned by `run_server`. It:
    - Drains the `discover_tx` receiver and fetches any newly observed CDP URLs.
    - Re-fetches each cached CRL before its `nextUpdate`, clamped to
@@ -604,8 +604,8 @@ recommended.
    - Decodes the JWT header to get `kid` and `alg`.
    - `lookup_key()` looks up by `kid` in the cached JWKS
      (`src/oauth.rs:2456`).
-   - If not found, calls `refresh_with_cooldown()` (`src/oauth.rs:2310`):
-     - Enforces `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:1878`) so multiple
+   - If not found, calls `refresh_with_cooldown()` (`src/oauth.rs:2392`):
+      - Enforces `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:1907`) so multiple
        invalid tokens cannot DoS the JWKS endpoint.
      - Deduplicates concurrent refreshes.
    - Validates signature, `iss`, `aud`, `exp`, `nbf` using `jsonwebtoken`.
@@ -740,7 +740,7 @@ Two ArcSwaps power runtime reconfiguration:
 
 | State            | Type                           | Defined at                  |
 |------------------|---------------------------------|-----------------------------|
-| API keys         | `ArcSwap<Vec<ApiKeyEntry>>`     | `src/auth.rs:935`           |
+| API keys         | `ArcSwap<Vec<ApiKeyEntry>>`     | `src/auth.rs:999`           |
 | RBAC policy      | `ArcSwap<RbacPolicy>`           | `src/transport.rs:1474`      |
 
 Procedure:

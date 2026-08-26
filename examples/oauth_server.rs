@@ -27,7 +27,9 @@ use rmcp::{
 };
 use rmcp_server_kit::{
     auth::AuthConfig,
+    config::ObservabilityConfig,
     oauth::OAuthConfig,
+    observability::init_tracing_from_config_strict,
     rbac::{RbacConfig, RbacPolicy, RoleConfig},
     transport::{McpServerConfig, serve},
 };
@@ -43,7 +45,9 @@ impl ServerHandler for OAuthHandler {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> rmcp_server_kit::Result<()> {
-    let _ = rmcp_server_kit::observability::init_tracing("info,rmcp_server_kit=debug");
+    let mut observability = ObservabilityConfig::default();
+    observability.log_level = "info,rmcp_server_kit=debug".into();
+    let _tracing_guard = init_tracing_from_config_strict(&observability)?;
 
     // 1. Build the OAuth resource-server config. The audience must match the
     //    `aud` claim your IdP issues for this MCP server.

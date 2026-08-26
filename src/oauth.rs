@@ -529,6 +529,9 @@ impl OauthHttpClient {
         })
     }
 
+    // cancel-safe: SSRF screening only reads allowlist/config; `reqwest` owns
+    // the request during `send`, so cancellation abandons upstream I/O without
+    // mutating OAuth client or JWKS cache state.
     async fn send_screened(
         &self,
         url: &str,
@@ -680,6 +683,7 @@ impl std::fmt::Debug for OauthHttpClient {
 /// # }
 /// ```
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct OAuthSsrfAllowlist {
     /// Hostnames allowed to resolve into otherwise-blocked address
@@ -752,6 +756,7 @@ fn compile_oauth_ssrf_allowlist(
 
 /// OAuth 2.1 JWT configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct OAuthConfig {
     /// Token issuer (`iss` claim). Must match exactly.
@@ -1029,6 +1034,8 @@ impl OAuthConfig {
     /// Returns [`crate::error::RmcpServerKitError::Config`] when any field fails
     /// to parse or violates the scheme policy.
     pub fn validate(&self) -> Result<(), crate::error::RmcpServerKitError> {
+        validate_oauth_capacity_knobs(self)?;
+
         let allow_http = self.allow_http_oauth_urls;
         let url = check_oauth_url("oauth.issuer", &self.issuer, allow_http)?;
         if let Some(reason) = crate::ssrf::check_url_literal_ip(&url) {
@@ -1364,6 +1371,20 @@ fn check_oauth_url(
     }
 }
 
+fn validate_oauth_capacity_knobs(
+    config: &OAuthConfig,
+) -> Result<(), crate::error::RmcpServerKitError> {
+    (config.max_jwks_keys != 0).ok_or_else(|| {
+        crate::error::RmcpServerKitError::Config("oauth.max_jwks_keys must be nonzero".into())
+    })?;
+    (config.jwks_max_response_bytes != 0).ok_or_else(|| {
+        crate::error::RmcpServerKitError::Config(
+            "oauth.jwks_max_response_bytes must be nonzero".into(),
+        )
+    })?;
+    Ok(())
+}
+
 /// Builder for [`OAuthConfig`].
 ///
 /// Obtain via [`OAuthConfig::builder`]. All setters consume `self` and
@@ -1523,6 +1544,7 @@ impl OAuthConfigBuilder {
 
 /// Maps an OAuth scope string to an RBAC role name.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ScopeMapping {
     /// OAuth scope string to match against the token's `scope` claim.
@@ -1535,6 +1557,7 @@ pub struct ScopeMapping {
 /// Used with `OAuthConfig::role_claim` for non-scope-based role extraction
 /// (e.g. Keycloak `realm_access.roles`, Azure AD `roles`).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct RoleMapping {
     /// Expected value of the configured role claim (e.g. `admin`).
@@ -1550,6 +1573,7 @@ pub struct RoleMapping {
 /// the upstream API the application calls) via the authorization
 /// server's token endpoint.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct TokenExchangeConfig {
     /// Authorization server token endpoint used for the exchange
@@ -1605,6 +1629,7 @@ impl TokenExchangeConfig {
 /// authentication at the token exchange endpoint. Requires the
 /// `oauth-mtls-client` cargo feature.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ClientCertConfig {
     /// Path to the PEM-encoded client certificate (X.509, single
@@ -1649,6 +1674,7 @@ pub struct ExchangedToken {
 /// (e.g. Keycloak). MCP clients see this server as the authorization
 /// server and perform a standard Authorization Code + PKCE flow.
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct OAuthProxyConfig {
     /// Upstream authorization endpoint (e.g.
@@ -2435,6 +2461,9 @@ impl JwksCache {
         clippy::cognitive_complexity,
         reason = "screening, bounded streaming, and parse logging are intentionally kept in one fetch path"
     )]
+    // cancel-safe (cache integrity): screening, `send`, chunk reads, and JSON
+    // parse build only a local body/JWK set; cache publication happens later
+    // via one `refresh_inner` write-lock assignment, so old cache stays intact.
     async fn fetch_jwks(&self) -> Option<JwkSet> {
         #[cfg(any(test, feature = "test-helpers"))]
         let screening = if self.test_allow_loopback_ssrf.load(Ordering::Relaxed) {
@@ -3074,6 +3103,9 @@ pub async fn handle_revoke(
 /// Shared proxy for introspection/revocation: injects `client_id` and
 /// `client_secret` (when configured) and forwards the form-encoded body
 /// upstream, returning the upstream status/body verbatim.
+// cancel-safe for local state: credential rewriting is local, and
+// `send_screened`/`read_response_capped` publish no server state. A repeated
+// revocation cannot restore a token; introspection is read-only.
 async fn proxy_oauth_admin_request(
     http: &OauthHttpClient,
     proxy: &OAuthProxyConfig,
@@ -3148,6 +3180,9 @@ async fn proxy_oauth_admin_request(
 /// this to a generic `502`); it never returns a truncated body that a
 /// caller might forward as if complete. `context` is an authority-only
 /// label for logs (never a full URL with credentials).
+// cancel-safe: the response body is accumulated in a local `Vec` and returned
+// only after EOF; cancellation during `resp.chunk()` drops the partial buffer
+// and never forwards a truncated OAuth response.
 async fn read_response_capped(
     mut resp: reqwest::Response,
     max_bytes: u64,
@@ -3242,6 +3277,9 @@ fn sanitize_oauth_error_code(raw: &str) -> &'static str {
 ///
 /// Returns an error if the HTTP request fails, the authorization
 /// server rejects the exchange, or the response cannot be parsed.
+// NOT cancel-safe: dropping after `send_screened` puts the RFC 8693 request on
+// the wire can mint a downstream token without returning it to the caller. No
+// local cache is torn, but retries may duplicate upstream issuance.
 pub async fn exchange_token(
     http: &OauthHttpClient,
     config: &TokenExchangeConfig,
@@ -3667,6 +3705,36 @@ mod tests {
             err.to_string().contains("oauth.audience"),
             "error must reference oauth.audience; got {err}"
         );
+    }
+
+    fn assert_config_nonzero_error(err: crate::error::RmcpServerKitError, field: &str) {
+        let crate::error::RmcpServerKitError::Config(msg) = err else {
+            panic!("expected Config error for {field}");
+        };
+        assert!(
+            msg.contains(field) && msg.contains("must be nonzero"),
+            "error must name {field} and say must be nonzero; got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_max_jwks_keys() {
+        let mut cfg = validation_https_config();
+        cfg.max_jwks_keys = 0;
+        let err = cfg
+            .validate()
+            .expect_err("zero max_jwks_keys must be rejected");
+        assert_config_nonzero_error(err, "oauth.max_jwks_keys");
+    }
+
+    #[test]
+    fn rejects_zero_jwks_max_response_bytes() {
+        let mut cfg = validation_https_config();
+        cfg.jwks_max_response_bytes = 0;
+        let err = cfg
+            .validate()
+            .expect_err("zero jwks_max_response_bytes must be rejected");
+        assert_config_nonzero_error(err, "oauth.jwks_max_response_bytes");
     }
 
     #[test]

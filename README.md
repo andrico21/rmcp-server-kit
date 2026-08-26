@@ -29,7 +29,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 > [Cargo features](#cargo-features) table below.
 
 ```rust
-use rmcp_server_kit::transport::{McpServerConfig, serve};
+use rmcp_server_kit::{
+    config::ObservabilityConfig,
+    observability::init_tracing_from_config_strict,
+    transport::{McpServerConfig, serve},
+};
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{ServerCapabilities, ServerInfo};
 
@@ -44,7 +48,10 @@ impl ServerHandler for MyHandler {
 
 #[tokio::main]
 async fn main() -> rmcp_server_kit::Result<()> {
-    let _ = rmcp_server_kit::observability::init_tracing("info,my_server=debug");
+    let mut observability = ObservabilityConfig::default();
+    observability.log_level = "info,my_server=debug".into();
+    let _tracing_guard = init_tracing_from_config_strict(&observability)?;
+
     let config = McpServerConfig::new("127.0.0.1:8080", "my-server", "0.1.0")
         .with_request_timeout(std::time::Duration::from_secs(30))
         .enable_request_header_logging();

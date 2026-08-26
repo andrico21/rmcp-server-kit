@@ -188,10 +188,15 @@ impl CrlSet {
         let seen_urls = initial_cache.keys().cloned().collect::<HashSet<_>>();
         let cached_urls = seen_urls.clone();
 
+        // Defense in depth: normal server startup reaches this only through
+        // `Validated<McpServerConfig>`, but the public `bootstrap_fetch` helper
+        // and test-helper constructors accept a raw `MtlsConfig` directly.
         let concurrency = config.crl_max_concurrent_fetches.max(1);
         let global_fetch_sem = Arc::new(Semaphore::new(concurrency));
         let host_semaphores = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
+        // Same raw-`MtlsConfig` bypass as above; keep a one-token minimum even
+        // when callers skip the startup validator.
         let rate =
             NonZeroU32::new(config.crl_discovery_rate_per_min.max(1)).unwrap_or(NonZeroU32::MIN);
         let discovery_limiter = Arc::new(RateLimiter::direct(Quota::per_minute(rate)));
@@ -551,6 +556,24 @@ impl CrlSet {
             } else {
                 all_urls.as_slice()
             };
+            // `all(..not cached..)` -- deny only when EVERY relevant CDP URL is
+            // uncached, not when any single one is. RFC 5280 4.2.1.13: "If the
+            // DistributionPointName contains multiple values, each name
+            // describes a different mechanism to obtain the same CRL." The
+            // URLs are therefore mirrors, and one successful fetch is
+            // sufficient revocation coverage; failing on a single unreachable
+            // mirror would let an attacker who can DoS one CDP host deny
+            // service to every client.
+            //
+            // Known limitation: multiple `DistributionPoint` *entries* (as
+            // opposed to multiple URIs inside one entry) may in principle be
+            // reason-partitioned scopes rather than mirrors, and this flattens
+            // them into a single URL set. That is safe against RFC-conforming
+            // issuers, because the same section requires "a conforming CA ...
+            // MUST include at least one DistributionPoint that points to a CRL
+            // that covers the certificate for all reasons", and the profile
+            // "RECOMMENDS against segmenting CRLs by reason code". Reason-code
+            // partitioning is not otherwise modelled here.
             return !relevant_urls.is_empty()
                 && relevant_urls.iter().all(|url| !cached.contains(url));
         }
@@ -872,6 +895,9 @@ impl CrlSet {
         self.refresh_urls(vec![url.to_owned()]).await
     }
 
+    // cancel-safe (cache integrity): `join_next` fills a local `Vec`; dropping
+    // the `JoinSet` aborts unfinished `gated_fetch` before any cache commit.
+    // A cancelled fetch leaves at most an idle bounded host semaphore.
     async fn fetch_url_results(
         &self,
         urls: Vec<String>,
@@ -1137,6 +1163,9 @@ pub fn extract_cdp_urls(cert_der: &[u8], allow_http: bool) -> Vec<String> {
     clippy::cognitive_complexity,
     reason = "bootstrap coordinates timeout, parallel fetches, and partial-cache recovery"
 )]
+// cancel-safe: CRL cache state is local until final `CrlSet::new`; timeout or
+// cancellation drops the `JoinSet`, aborting in-flight `gated_fetch` before
+// publication. Bootstrap host semaphores are local and drop with this future.
 pub async fn bootstrap_fetch(
     roots: Arc<RootCertStore>,
     ca_certs: &[CertificateDer<'static>],
@@ -1179,6 +1208,8 @@ pub async fn bootstrap_fetch(
     // Bootstrap shares the same global concurrency + per-host cap as the
     // hot-path verifier so a maliciously broad CA chain cannot overwhelm
     // the network at startup.
+    // Defense in depth: this public helper accepts raw `MtlsConfig` directly,
+    // so callers can bypass `McpServerConfig::validate`.
     let bootstrap_concurrency = config.crl_max_concurrent_fetches.max(1);
     let global_sem = Arc::new(Semaphore::new(bootstrap_concurrency));
     let host_semaphores = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
@@ -1248,6 +1279,9 @@ pub async fn bootstrap_fetch(
     clippy::cognitive_complexity,
     reason = "refresher loop intentionally handles shutdown, timer, and discovery in one select"
 )]
+// NOT cancel-safe under abort/drop: cooperative `shutdown` is safe, but aborting
+// while `fetch_and_store_url` awaits can leave a discovered URL in
+// `pending_urls` without promotion/clear. Do not abort; cancel via token.
 pub async fn run_crl_refresher(
     set: Arc<CrlSet>,
     mut discover_rx: mpsc::UnboundedReceiver<String>,
@@ -1426,6 +1460,9 @@ fn acquire_host_semaphore(
 /// (an SSRF amplification defense); at the host cap, idle entries are
 /// evicted on demand. Both permits are dropped when the returned future
 /// completes (whether `Ok` or `Err`).
+// cancel-safe for permits: cancelling queued `acquire_owned` loses only queue
+// position, acquired global/host permits RAII-drop, and host-map insertion can
+// leave only an idle bounded semaphore entry that later self-heals.
 async fn gated_fetch(
     client: &reqwest::Client,
     global_sem: &Arc<Semaphore>,
@@ -1459,6 +1496,9 @@ async fn gated_fetch(
     fetch_crl(client, url, allow_http, max_bytes).await
 }
 
+// cancel-safe: DNS lookup, request send, chunk reads, DER parse, and metadata
+// extraction build only a local `CachedCrl`; CRL cache/verifier state changes
+// happen later, when callers commit the returned value.
 async fn fetch_crl(
     client: &reqwest::Client,
     url: &str,

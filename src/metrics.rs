@@ -139,6 +139,9 @@ pub(crate) fn record_rate_limit_deny(ext: &axum::http::Extensions, limiter: &str
 ///
 /// Returns [`RmcpServerKitError::Startup`] if the TCP listener cannot bind or the
 /// underlying axum server fails.
+// cancel-safe: the parent server cancels via `shutdown.cancelled()` inside
+// axum graceful shutdown; dropping this future directly only drops the
+// listener/app, with no metrics registry mutation or detached work.
 pub async fn serve_metrics(
     bind: String,
     metrics: Arc<McpMetrics>,

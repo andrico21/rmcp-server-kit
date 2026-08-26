@@ -9,7 +9,7 @@
 use std::{
     collections::HashSet,
     net::SocketAddr,
-    num::NonZeroU32,
+    num::{NonZeroU32, NonZeroUsize},
     path::PathBuf,
     sync::{
         Arc, LazyLock, Mutex,
@@ -335,6 +335,7 @@ impl From<chrono::DateTime<chrono::FixedOffset>> for RfcTimestamp {
 /// prevents offline brute-force attempts from leaked logs and matches the
 /// defense-in-depth posture used for [`AuthIdentity`].
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ApiKeyEntry {
     /// Human-readable key label (used in logs and audit records).
@@ -403,6 +404,7 @@ impl ApiKeyEntry {
 
 /// mTLS client certificate authentication configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[allow(
     clippy::struct_excessive_bools,
     reason = "mTLS CRL behavior is intentionally configured as independent booleans"
@@ -575,6 +577,7 @@ const fn default_crl_max_cache_entries() -> usize {
 ///    *after* an authentication attempt fails. Provides explicit backpressure
 ///    on bad credentials.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct RateLimitConfig {
     /// Maximum failed authentication attempts per source IP per minute.
@@ -695,6 +698,7 @@ fn default_idle_eviction() -> Duration {
 
 /// Authentication configuration.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct AuthConfig {
     /// Master switch - when false, all requests are allowed through.
@@ -710,6 +714,19 @@ pub struct AuthConfig {
     /// OAuth 2.1 JWT bearer token authentication.
     #[cfg(feature = "oauth")]
     pub oauth: Option<crate::oauth::OAuthConfig>,
+    /// Presence-only placeholder for `auth.oauth` in builds without the
+    /// `oauth` cargo feature.
+    ///
+    /// `deny_unknown_fields` (above) would otherwise reject an `[auth.oauth]`
+    /// table with `unknown field \`oauth\``, which never mentions the feature
+    /// flag and sends operators hunting for a typo that does not exist.
+    /// Accepting the key here and rejecting it in
+    /// [`AuthConfig::check_oauth_feature`] turns that into an actionable
+    /// message. `IgnoredAny` records presence without retaining the value, so
+    /// no OAuth secret is held in memory by a build that cannot use it.
+    #[cfg(not(feature = "oauth"))]
+    #[serde(default)]
+    pub(crate) oauth: Option<serde::de::IgnoredAny>,
 }
 
 impl AuthConfig {
@@ -723,6 +740,8 @@ impl AuthConfig {
             rate_limit: None,
             #[cfg(feature = "oauth")]
             oauth: None,
+            #[cfg(not(feature = "oauth"))]
+            oauth: None,
         }
     }
 
@@ -731,6 +750,34 @@ impl AuthConfig {
     pub fn with_rate_limit(mut self, rate_limit: RateLimitConfig) -> Self {
         self.rate_limit = Some(rate_limit);
         self
+    }
+
+    /// Reject an `[auth.oauth]` table in a build compiled without the `oauth`
+    /// cargo feature.
+    ///
+    /// Fails closed on purpose. Ignoring the table would start the server with
+    /// OAuth silently disabled while the operator's configuration says it is
+    /// on -- for a bearer-token deployment that is an unauthenticated server.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RmcpServerKitError::Config`] when `auth.oauth` is present and
+    /// the `oauth` feature is disabled. Always `Ok` when the feature is
+    /// enabled, where the table is parsed into
+    /// [`oauth::OAuthConfig`](crate::oauth::OAuthConfig) instead.
+    pub fn check_oauth_feature(&self) -> Result<(), RmcpServerKitError> {
+        #[cfg(not(feature = "oauth"))]
+        {
+            (self.oauth.is_none()).ok_or_else(|| {
+                RmcpServerKitError::Config(
+                    "auth.oauth is configured but this build of rmcp-server-kit was compiled \
+                     without the `oauth` cargo feature; rebuild with `--features oauth` or \
+                     remove the [auth.oauth] table"
+                        .into(),
+                )
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -1034,13 +1081,20 @@ fn apply_burst(quota: governor::Quota, burst: Option<u32>) -> governor::Quota {
 /// Create a post-failure rate limiter from config.
 #[must_use]
 pub(crate) fn build_rate_limiter(config: &RateLimitConfig) -> Arc<KeyedLimiter> {
+    // Defense in depth: `serve()` and `serve_with_listener()` require a
+    // `Validated<McpServerConfig>` and reject zero before startup, but
+    // `auth::tests` construct limiters directly from raw `RateLimitConfig`
+    // values to exercise limiter behavior without building a full server.
     let quota = governor::Quota::per_minute(
         NonZeroU32::new(config.max_attempts_per_minute).unwrap_or(DEFAULT_AUTH_RATE),
     );
     let quota = apply_burst(quota, config.burst);
+    // Defense in depth: Phase-1 config validation rejects `0` upstream, but
+    // tests can still exercise this helper directly with raw config values.
+    let max_tracked_keys = NonZeroUsize::new(config.max_tracked_keys).unwrap_or(NonZeroUsize::MIN);
     Arc::new(BoundedKeyedLimiter::new(
         quota,
-        config.max_tracked_keys,
+        max_tracked_keys,
         config.idle_eviction,
     ))
 }
@@ -1061,9 +1115,12 @@ pub(crate) fn build_pre_auth_limiter(config: &RateLimitConfig) -> Arc<KeyedLimit
     let quota =
         governor::Quota::per_minute(NonZeroU32::new(resolved).unwrap_or(DEFAULT_PRE_AUTH_RATE));
     let quota = apply_burst(quota, config.pre_auth_burst);
+    // Defense in depth: Phase-1 config validation rejects `0` upstream, but
+    // tests can still exercise this helper directly with raw config values.
+    let max_tracked_keys = NonZeroUsize::new(config.max_tracked_keys).unwrap_or(NonZeroUsize::MIN);
     Arc::new(BoundedKeyedLimiter::new(
         quota,
-        config.max_tracked_keys,
+        max_tracked_keys,
         config.idle_eviction,
     ))
 }
@@ -1436,6 +1493,9 @@ fn pre_auth_gate(state: &AuthState, client_key: Option<&RateLimitKey>) -> Option
 ///
 /// Failed authentication attempts are rate-limited per source IP.
 /// Successful authentications do not consume rate limit budget.
+// cancel-safe: `TimeoutLayer` may drop this future, but limiter mutations are
+// deliberate attempt accounting: pre-auth prices bearer/JWT verification,
+// post-failure prices failed auth, and identity extensions die with the request.
 pub(crate) async fn auth_middleware(
     state: Arc<AuthState>,
     req: Request<Body>,

@@ -47,7 +47,11 @@
 //!     handler::server::ServerHandler,
 //!     model::{ServerCapabilities, ServerInfo},
 //! };
-//! use rmcp_server_kit::transport::{McpServerConfig, serve};
+//! use rmcp_server_kit::{
+//!     config::ObservabilityConfig,
+//!     observability::init_tracing_from_config_strict,
+//!     transport::{McpServerConfig, serve},
+//! };
 //!
 //! #[derive(Clone)]
 //! struct MyHandler;
@@ -60,7 +64,9 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> rmcp_server_kit::Result<()> {
-//!     let _ = rmcp_server_kit::observability::init_tracing("info");
+//!     let mut observability = ObservabilityConfig::default();
+//!     observability.log_level = "info".into();
+//!     let _tracing_guard = init_tracing_from_config_strict(&observability)?;
 //!
 //!     let config = McpServerConfig::new(
 //!         "127.0.0.1:8080",
@@ -148,4 +154,16 @@ pub mod metrics;
 /// CDP-driven CRL revocation support for mTLS.
 pub mod mtls_revocation;
 
-pub use crate::error::*;
+// Explicit re-exports rather than a glob. A `pub use crate::error::*;` would
+// silently promote every future `pub` item added to `error.rs` into the crate
+// root's stable API surface -- `cargo-semver-checks` flags removals, not
+// accidental additions, so the mistake would ship unnoticed. Listing the three
+// items keeps the root surface a deliberate choice.
+#[allow(
+    deprecated,
+    reason = "`McpxError` is itself deprecated but must stay re-exported at the \
+              crate root until its removal in the next major; re-exporting it \
+              is not itself a use of the deprecated path"
+)]
+pub use crate::error::McpxError;
+pub use crate::error::{Result, RmcpServerKitError};

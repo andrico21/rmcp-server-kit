@@ -46,7 +46,7 @@
 use std::{
     collections::HashMap,
     hash::Hash,
-    num::NonZeroU32,
+    num::{NonZeroU32, NonZeroUsize},
     sync::{Arc, Mutex, PoisonError, Weak},
     time::{Duration, Instant},
 };
@@ -129,15 +129,15 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
     /// pruning happens lazily on every full-table insert. Both behaviours
     /// are correct.
     #[must_use]
-    pub(crate) fn new(quota: Quota, max_tracked_keys: usize, idle_eviction: Duration) -> Self {
-        debug_assert!(
-            max_tracked_keys > 0,
-            "max_tracked_keys must be > 0; validated by McpServerConfig::check"
-        );
+    pub(crate) fn new(
+        quota: Quota,
+        max_tracked_keys: NonZeroUsize,
+        idle_eviction: Duration,
+    ) -> Self {
         let inner = Arc::new(Inner {
             map: Mutex::new(HashMap::new()),
             quota,
-            max_tracked_keys,
+            max_tracked_keys: max_tracked_keys.get(),
             idle_eviction,
         });
         Self::spawn_prune_task(&inner);
@@ -151,7 +151,9 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
     /// request/min so a misconfigured `0` does not panic at startup.
     ///
     /// * `requests_per_minute` -- per-key rate, clamped to `>= 1`.
-    /// * `max_tracked_keys` -- hard cap on simultaneously tracked keys.
+    /// * `max_tracked_keys` -- hard cap on simultaneously tracked keys,
+    ///   clamped to `>= 1`. `McpServerConfig` validation rejects `0`
+    ///   upstream, so the clamp is defense-in-depth for direct callers.
     ///   When reached, an insert first prunes idle entries then falls
     ///   back to LRU eviction.
     /// * `idle_eviction` -- entries whose `last_seen` is older than this
@@ -163,6 +165,7 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
         idle_eviction: Duration,
     ) -> Self {
         let rate = NonZeroU32::new(requests_per_minute.max(1)).unwrap_or(NonZeroU32::MIN);
+        let max_tracked_keys = NonZeroUsize::new(max_tracked_keys).unwrap_or(NonZeroUsize::MIN);
         Self::new(Quota::per_minute(rate), max_tracked_keys, idle_eviction)
     }
 
@@ -173,7 +176,9 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
     /// request/sec so a misconfigured `0` does not panic at startup.
     ///
     /// * `requests_per_second` -- per-key rate, clamped to `>= 1`.
-    /// * `max_tracked_keys` -- hard cap on simultaneously tracked keys.
+    /// * `max_tracked_keys` -- hard cap on simultaneously tracked keys,
+    ///   clamped to `>= 1`. `McpServerConfig` validation rejects `0`
+    ///   upstream, so the clamp is defense-in-depth for direct callers.
     ///   When reached, an insert first prunes idle entries then falls
     ///   back to LRU eviction.
     /// * `idle_eviction` -- entries whose `last_seen` is older than this
@@ -185,6 +190,7 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
         idle_eviction: Duration,
     ) -> Self {
         let rate = NonZeroU32::new(requests_per_second.max(1)).unwrap_or(NonZeroU32::MIN);
+        let max_tracked_keys = NonZeroUsize::new(max_tracked_keys).unwrap_or(NonZeroUsize::MIN);
         Self::new(Quota::per_second(rate), max_tracked_keys, idle_eviction)
     }
 
@@ -327,7 +333,11 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::IpAddr, num::NonZeroU32, time::Duration};
+    use std::{
+        net::IpAddr,
+        num::{NonZeroU32, NonZeroUsize},
+        time::Duration,
+    };
 
     use governor::Quota;
 
@@ -337,13 +347,17 @@ mod tests {
         IpAddr::from(n.to_be_bytes())
     }
 
+    fn cap(n: usize) -> NonZeroUsize {
+        NonZeroUsize::new(n).unwrap_or(NonZeroUsize::MIN)
+    }
+
     /// Deny on the existing-key branch must report a positive,
     /// quota-bounded wait time.
     #[test]
     fn check_key_wait_existing_key_deny_returns_bounded_wait() {
         let quota = Quota::per_minute(NonZeroU32::new(1).unwrap());
         let limiter: BoundedKeyedLimiter<IpAddr> =
-            BoundedKeyedLimiter::new(quota, 10, Duration::from_hours(1));
+            BoundedKeyedLimiter::new(quota, cap(10), Duration::from_hours(1));
         assert!(limiter.check_key_wait(&ip(1)).is_ok(), "burst admits first");
         let wait = limiter
             .check_key_wait(&ip(1))
@@ -363,7 +377,7 @@ mod tests {
     fn check_key_wait_new_key_first_check_admits() {
         let quota = Quota::per_minute(NonZeroU32::new(1).unwrap());
         let limiter: BoundedKeyedLimiter<IpAddr> =
-            BoundedKeyedLimiter::new(quota, 10, Duration::from_hours(1));
+            BoundedKeyedLimiter::new(quota, cap(10), Duration::from_hours(1));
         for i in 0..5_u32 {
             assert!(
                 limiter.check_key_wait(&ip(i)).is_ok(),
@@ -378,7 +392,7 @@ mod tests {
     fn check_key_delegates_to_wait_path() {
         let quota = Quota::per_minute(NonZeroU32::new(1).unwrap());
         let limiter: BoundedKeyedLimiter<IpAddr> =
-            BoundedKeyedLimiter::new(quota, 10, Duration::from_hours(1));
+            BoundedKeyedLimiter::new(quota, cap(10), Duration::from_hours(1));
         assert!(limiter.check_key(&ip(7)).is_ok());
         assert_eq!(
             limiter.check_key(&ip(7)),
@@ -392,7 +406,7 @@ mod tests {
     fn never_exceeds_max_tracked_keys() {
         let quota = Quota::per_minute(NonZeroU32::new(10).unwrap());
         let limiter: BoundedKeyedLimiter<IpAddr> =
-            BoundedKeyedLimiter::new(quota, 100, Duration::from_hours(1));
+            BoundedKeyedLimiter::new(quota, cap(100), Duration::from_hours(1));
         for i in 0..10_000_u32 {
             let _ = limiter.check_key(&ip(i));
             assert!(
@@ -411,7 +425,7 @@ mod tests {
     fn evicted_keys_get_fresh_quota() {
         let quota = Quota::per_minute(NonZeroU32::new(2).unwrap());
         let limiter: BoundedKeyedLimiter<IpAddr> =
-            BoundedKeyedLimiter::new(quota, 2, Duration::from_hours(1));
+            BoundedKeyedLimiter::new(quota, cap(2), Duration::from_hours(1));
 
         let target = ip(1);
         // Burn the quota for `target`.
@@ -456,7 +470,7 @@ mod tests {
     fn active_over_quota_key_not_evicted() {
         let quota = Quota::per_minute(NonZeroU32::new(2).unwrap());
         let limiter: BoundedKeyedLimiter<IpAddr> =
-            BoundedKeyedLimiter::new(quota, 3, Duration::from_hours(1));
+            BoundedKeyedLimiter::new(quota, cap(3), Duration::from_hours(1));
 
         // Seed the table with three idle entries so cap is reached.
         for i in 100..103_u32 {

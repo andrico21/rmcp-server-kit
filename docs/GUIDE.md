@@ -39,7 +39,7 @@ You supply a `ServerHandler` implementation; rmcp-server-kit handles everything 
 
 Add rmcp-server-kit to your `Cargo.toml`:
 
-```toml
+```toml,cargo
 [dependencies]
 rmcp-server-kit = { version = "3", features = ["oauth"] }
 rmcp = { version = "3", features = ["server", "macros"] }
@@ -49,7 +49,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 Implement `ServerHandler` and call `serve()`:
 
 ```rust
-use rmcp_server_kit::transport::{McpServerConfig, serve};
+use rmcp_server_kit::{
+    config::ObservabilityConfig,
+    observability::init_tracing_from_config_strict,
+    transport::{McpServerConfig, serve},
+};
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{ServerCapabilities, ServerInfo};
 
@@ -64,7 +68,9 @@ impl ServerHandler for MyHandler {
 
 #[tokio::main]
 async fn main() -> rmcp_server_kit::Result<()> {
-    let _ = rmcp_server_kit::observability::init_tracing("info,my_server=debug");
+    let mut observability = ObservabilityConfig::default();
+    observability.log_level = "info,my_server=debug".into();
+    let _tracing_guard = init_tracing_from_config_strict(&observability)?;
 
     let config = McpServerConfig::new("127.0.0.1:8080", "my-server", "0.1.0")
         .with_request_timeout(std::time::Duration::from_secs(30))
@@ -88,7 +94,7 @@ This gives you `/healthz`, `/readyz`, and `/mcp` endpoints out of the box.
 
 Enable in `Cargo.toml`:
 
-```toml
+```toml,cargo
 rmcp-server-kit = { version = "1", features = ["oauth", "metrics"] }
 ```
 
@@ -447,7 +453,7 @@ cached CRL — useful from an admin endpoint or a cron-driven probe.
 ##### CRL configuration (TOML, all defaults shown)
 
 ```toml
-[mtls]
+[server.auth.mtls]
 ca_cert_path = "/etc/certs/clients-ca.pem"
 
 crl_enabled              = true     # set false to disable revocation entirely
@@ -644,7 +650,15 @@ let allowlist = ArgumentAllowlist::new(
 Or in TOML:
 
 ```toml
-[[roles.argument_allowlists]]
+[rbac]
+enabled = true
+
+[[rbac.roles]]
+name = "restricted"
+allow = ["container_exec"]
+hosts = ["*"]
+
+[[rbac.roles.argument_allowlists]]
 tool = "container_exec"
 argument = "cmd"
 allowed = ["ls", "cat"]
@@ -899,22 +913,35 @@ The `Err` variant indicates that a global tracing subscriber was already
 installed; production binaries can propagate the error, while embedders
 that tolerate double-initialization can ignore it (`let _ = init_tracing(..)`).
 
-#### `init_tracing_from_config(config)`
+#### `init_tracing_from_config_strict(config)`
 
-Full initialization from `ObservabilityConfig`. Same `Result` semantics
-as [`init_tracing`]:
+Full initialization from `ObservabilityConfig`. Returns a `TracingGuard` that
+must be held for the process lifetime so the audit writer thread can keep
+draining queued events. Dropping the guard signals shutdown and makes a
+best-effort, time-bounded (5s) attempt to drain queued audit entries, flush the
+file, and join the writer thread. Events emitted after drop are lost; if the
+writer thread is blocked on a slow or stuck filesystem past the timeout, drop
+returns and remaining queued entries may never reach disk.
 
 ```rust
 use rmcp_server_kit::config::ObservabilityConfig;
 
 let obs: ObservabilityConfig = toml::from_str(&config_toml)?;
-rmcp_server_kit::observability::init_tracing_from_config(&obs)?;
+let _tracing_guard = rmcp_server_kit::observability::init_tracing_from_config_strict(&obs)?;
 ```
 
 Features:
 - JSON or pretty-printed output
 - Optional JSON audit log file (append mode, auto-creates parent dirs)
 - `RUST_LOG` env var takes precedence
+
+When `audit_log_path` is configured, strict initialization fails startup if the
+file or parent directory cannot be opened. Audit writes use a bounded
+non-blocking channel plus a dedicated writer thread so tracing calls on tokio
+worker threads do not perform synchronous file I/O.
+
+The deprecated `init_tracing_from_config(config)` compatibility entry point
+keeps the old fail-open audit-log behaviour and returns `Result<(), TryInitError>`.
 
 ---
 
@@ -1544,10 +1571,29 @@ headers reaching clients.
 the Rust builder is named in a structured `warn`-level log entry at startup,
 so a weakened policy appears in logs rather than only in a config diff.
 
-**Unknown keys are silently ignored.** `[server.security_headers]` does not
-use `deny_unknown_fields`, so a typo such as `contnet_security_policy` will
-parse without error while leaving the intended header at its default. Check
-key spellings against the table above.
+**Unknown keys are rejected.** Operator TOML config structs use
+`deny_unknown_fields`, so a typo such as `contnet_security_policy` aborts
+config loading instead of silently leaving the intended header at its default.
+Check key spellings against the table above.
+
+> **Harden your own root type too.** rmcp-server-kit ships reusable *sections*
+> (`[server]`, `[observability]`, `[rbac]`, ...), not a kit-owned root type —
+> your application composes them into its own struct. The kit's sections reject
+> unknown **keys**, but only your root type can reject a misspelled **table
+> name**: without `deny_unknown_fields` on it, `[serverr]` is silently dropped
+> and the server starts with defaults for that whole section. See
+> `examples/config_file_server.rs`:
+>
+> ```rust,ignore
+> #[derive(Debug, Deserialize)]
+> #[serde(deny_unknown_fields)]
+> struct AppConfig {
+>     server: ServerConfig,
+>     observability: ObservabilityConfig,
+>     rbac: RbacConfig,
+> }
+> ```
+
 
 **HSTS preload caveat.** The validator deliberately rejects any
 `strict_transport_security` value containing the substring `preload`
@@ -1595,7 +1641,7 @@ will expose matching local proxies:
 For backward compatibility these endpoints are mounted unauthenticated unless
 you opt in with:
 
-```toml
+```toml,fragment
 [server.auth.oauth.proxy]
 expose_admin_endpoints = true
 require_auth_on_admin_endpoints = true
@@ -1717,7 +1763,9 @@ impl ServerHandler for MyHandler {
 
 #[tokio::main]
 async fn main() -> rmcp_server_kit::Result<()> {
-    let _ = rmcp_server_kit::observability::init_tracing("info");
+    let mut observability = rmcp_server_kit::config::ObservabilityConfig::default();
+    observability.log_level = "info".into();
+    let _tracing_guard = rmcp_server_kit::observability::init_tracing_from_config_strict(&observability)?;
 
     // Generate API keys (in production, store hashes in a config file)
     let (admin_token, admin_hash) = generate_api_key()?;
@@ -2103,6 +2151,10 @@ serve(config.validate()?, handler_factory).await
 
 rmcp-server-kit config structs derive `Deserialize`, so you can load them directly from
 TOML. Keys annotated with `# env: VAR` can be overridden at runtime via `apply_env_overrides`; see [Environment variable overrides](#environment-variable-overrides-opt-in) for full semantics.
+TOML fences in this guide are parsed by CI: `toml` fences are complete operator
+configuration and must match the strict rmcp-server-kit schema; `toml,cargo`
+fences are Cargo manifest snippets; `toml,fragment` fences are intentionally
+incomplete excerpts and are syntax-checked only.
 
 ```toml
 [server]
@@ -2347,11 +2399,11 @@ The intended Kubernetes pattern: declare a minimal `[server.auth.oauth]` stub in
 
 #### `RUST_LOG` and log level
 
-`RUST_LOG` remains the log-level control, read directly by `init_tracing` and `init_tracing_from_config` via `tracing-subscriber`'s env filter. There is deliberately no `RMCP_SERVER_KIT__` prefixed alias: `RUST_LOG` is the established convention across the Rust ecosystem, and a parallel alias would create two sources of truth for the same setting.
+`RUST_LOG` remains the log-level control, read directly by `init_tracing` and `init_tracing_from_config_strict` via `tracing-subscriber`'s env filter. There is deliberately no `RMCP_SERVER_KIT__` prefixed alias: `RUST_LOG` is the established convention across the Rust ecosystem, and a parallel alias would create two sources of truth for the same setting.
 
 #### Metrics caveat
 
-`ObservabilityConfig::apply_env_overrides` mutates `obs_cfg.metrics_enabled` and `obs_cfg.metrics_bind` on the `ObservabilityConfig` struct. These fields do not reach `serve()` automatically: `init_tracing_from_config` reads only the logging and audit-log fields; metrics configuration lives on `McpServerConfig` and must be wired there explicitly. The conditional `with_metrics` call in [`examples/config_file_server.rs`](../examples/config_file_server.rs) is the reference pattern.
+`ObservabilityConfig::apply_env_overrides` mutates `obs_cfg.metrics_enabled` and `obs_cfg.metrics_bind` on the `ObservabilityConfig` struct. These fields do not reach `serve()` automatically: `init_tracing_from_config_strict` reads only the logging and audit-log fields; metrics configuration lives on `McpServerConfig` and must be wired there explicitly. The conditional `with_metrics` call in [`examples/config_file_server.rs`](../examples/config_file_server.rs) is the reference pattern.
 
 #### What is not env-configurable
 
