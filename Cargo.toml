@@ -52,7 +52,7 @@ rmcp = { version = "3", features = [
 ] }
 
 # Async runtime
-tokio = { version = "1", features = ["net", "signal", "macros", "rt", "fs"] }
+tokio = { version = "1", features = ["net", "signal", "macros", "rt", "fs", "sync"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 
 # HTTP server

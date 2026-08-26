@@ -1279,9 +1279,12 @@ pub async fn bootstrap_fetch(
     clippy::cognitive_complexity,
     reason = "refresher loop intentionally handles shutdown, timer, and discovery in one select"
 )]
-// NOT cancel-safe under abort/drop: cooperative `shutdown` is safe, but aborting
-// while `fetch_and_store_url` awaits can leave a discovered URL in
-// `pending_urls` without promotion/clear. Do not abort; cancel via token.
+// cancel-safe, including under abort: cooperative `shutdown` breaks the loop at
+// a settlement point, and the discovery arm holds a `PendingUrlGuard` across
+// `fetch_and_store_url`, so a `JoinHandle::abort` that drops the future mid-await
+// still clears the transient `pending_urls` marker via `Drop`. Without that
+// guard a stale marker would suppress re-enqueue forever (see the note above
+// `seen_urls`/`pending_urls` clearing) and silently narrow revocation coverage.
 pub async fn run_crl_refresher(
     set: Arc<CrlSet>,
     mut discover_rx: mpsc::UnboundedReceiver<String>,
@@ -1307,31 +1310,78 @@ pub async fn run_crl_refresher(
                 let Some(url) = maybe_url else {
                     break;
                 };
-                match set.fetch_and_store_url(url.clone()).await {
-                    // Cached: safe to suppress this URL permanently.
-                    Ok(true) => set.promote_pending_to_seen(&url),
-                    // Fetched but refused by the cache cap. Clear the
-                    // in-flight marker so a later handshake can retry;
-                    // suppressing it here would disable revocation for
-                    // this CDP even though no CRL was ever cached.
-                    Ok(false) => {
-                        set.clear_pending(&url);
-                        tracing::warn!(
-                            url = %url,
-                            "CRL fetched but not admitted to cache (cap reached); will retry on a later handshake"
-                        );
-                    }
-                    Err(error) => {
-                        set.clear_pending(&url);
-                        tracing::warn!(
-                            url = %url,
-                            error = %error,
-                            "CRL discovery fetch failed; will retry on a later handshake"
-                        );
-                    }
-                }
+                let pending_guard = PendingUrlGuard::armed(Arc::clone(&set), url.clone());
+                let result = set.fetch_and_store_url(url).await;
+                settle_discovered_url(pending_guard, result);
                 refresh_sleep = schedule_next_refresh(&set).await;
             }
+        }
+    }
+}
+
+// Abort-safety guard for the discovery arm in `run_crl_refresher`. Cooperative
+// shutdown already leaves `pending_urls` consistent because the arm body runs to
+// a normal `Ok`/`Err` settlement point, but `JoinHandle::abort` drops the future
+// at whatever `.await` it is currently suspended on. Holding this owned guard
+// across `fetch_and_store_url` makes that hard-abort path deterministic too: if
+// the fetch future is dropped before a CRL is confirmed cached, `Drop` removes
+// the transient in-flight marker so the CDP can be retried by a later handshake.
+struct PendingUrlGuard {
+    set: Arc<CrlSet>,
+    url: String,
+    armed: bool,
+}
+
+impl PendingUrlGuard {
+    fn armed(set: Arc<CrlSet>, url: String) -> Self {
+        Self {
+            set,
+            url,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingUrlGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.set.clear_pending(&self.url);
+        }
+    }
+}
+
+fn settle_discovered_url(
+    mut pending_guard: PendingUrlGuard,
+    result: Result<bool, RmcpServerKitError>,
+) {
+    match result {
+        // Cached: safe to suppress this URL permanently.
+        Ok(true) => {
+            pending_guard.disarm();
+            pending_guard
+                .set
+                .promote_pending_to_seen(&pending_guard.url);
+        }
+        // Fetched but refused by the cache cap. Keep the guard armed so scope
+        // exit clears the in-flight marker before refresh rescheduling, and a
+        // later handshake can retry; suppressing it here would disable
+        // revocation for this CDP even though no CRL was ever cached.
+        Ok(false) => {
+            tracing::warn!(
+                url = %pending_guard.url,
+                "CRL fetched but not admitted to cache (cap reached); will retry on a later handshake"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                url = %pending_guard.url,
+                error = %error,
+                "CRL discovery fetch failed; will retry on a later handshake"
+            );
         }
     }
 }
@@ -1641,10 +1691,296 @@ fn asn1_time_to_system_time(time: x509_parser::time::ASN1Time) -> SystemTime {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex as StdMutex;
+
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertifiedIssuer, DnType, IsCa, KeyPair,
+        KeyUsagePurpose,
+    };
+
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<StdMutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            let guard = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            String::from_utf8_lossy(&guard).into_owned()
+        }
+    }
+
+    struct CapturedLogsWriter(Arc<StdMutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogsWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            {
+                let mut guard = self
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.extend_from_slice(buf);
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedLogs {
+        type Writer = CapturedLogsWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            CapturedLogsWriter(Arc::clone(&self.0))
+        }
+    }
 
     fn asn1(timestamp: i64) -> x509_parser::time::ASN1Time {
         x509_parser::time::ASN1Time::from_timestamp(timestamp).expect("valid ASN.1 timestamp")
+    }
+
+    fn install_ring_provider() {
+        // `CrlSet::new` builds a reqwest client whose rustls backend is compiled
+        // with `rustls-no-provider`; installing the provider is idempotent and
+        // keeps these unit tests independent from whichever integration test
+        // happens to initialize crypto first.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    fn test_ca_root() -> CertificateDer<'static> {
+        let mut params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "mtls-revocation-unit-test-ca");
+        let key = KeyPair::generate().expect("ca key");
+        let issuer: CertifiedIssuer<'static, KeyPair> =
+            CertifiedIssuer::self_signed(params, key).expect("ca self-signed");
+        issuer.der().clone()
+    }
+
+    fn test_mtls_config() -> MtlsConfig {
+        serde_json::from_value(serde_json::json!({
+            "ca_cert_path": "memory://ca.pem",
+            "required": true,
+            "default_role": "viewer",
+            "crl_enabled": true,
+            "crl_deny_on_unavailable": false,
+            "crl_allow_http": true,
+            "crl_enforce_expiration": true,
+            "crl_end_entity_only": false,
+            "crl_fetch_timeout": "30s",
+            "crl_stale_grace": "24h",
+            "crl_max_concurrent_fetches": 1,
+            "crl_max_response_bytes": 5_242_880,
+            "crl_discovery_rate_per_min": 60,
+            "crl_max_host_semaphores": 16,
+            "crl_max_seen_urls": 16,
+            "crl_max_cache_entries": 16,
+        }))
+        .expect("verifier mtls config")
+    }
+
+    fn test_crl_set_with_receiver() -> (Arc<CrlSet>, mpsc::UnboundedReceiver<String>) {
+        install_ring_provider();
+        let mut roots = RootCertStore::empty();
+        roots.add(test_ca_root()).expect("add ca root");
+        CrlSet::__test_with_kept_receiver(Arc::new(roots), test_mtls_config(), vec![])
+            .expect("empty CRL set with kept receiver")
+    }
+
+    fn pending_contains(set: &CrlSet, url: &str) -> bool {
+        set.pending_urls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(url)
+    }
+
+    fn seen_contains(set: &CrlSet, url: &str) -> bool {
+        set.seen_urls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(url)
+    }
+
+    fn mark_pending(set: &CrlSet, url: &str) {
+        let mut pending = set
+            .pending_urls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.insert(url.to_owned());
+    }
+
+    async fn wait_for_host_fetch_to_block_on_global_permit(set: &CrlSet, host: &str) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if set.host_semaphores.lock().await.contains_key(host) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("refresher must reach the CRL fetch path before abort");
+    }
+
+    #[tokio::test]
+    async fn aborted_refresher_does_not_strand_pending_url() {
+        let (set, discover_rx) = test_crl_set_with_receiver();
+        let url = "http://abort.example.test/crl";
+        let host = "abort.example.test";
+        let held_global_permit = Arc::clone(&set.global_fetch_sem)
+            .acquire_owned()
+            .await
+            .expect("test semaphore is open");
+
+        assert!(!pending_contains(&set, url));
+        assert!(!seen_contains(&set, url));
+
+        let _ = set.__test_note_discovered_urls_by_cert(&[url.to_owned()], &[]);
+        assert!(
+            pending_contains(&set, url),
+            "queued URL must be marked in-flight before the fetch starts"
+        );
+        assert!(
+            !seen_contains(&set, url),
+            "queueing alone must not promote to the permanent dedup set"
+        );
+
+        let handle = tokio::spawn(run_crl_refresher(
+            Arc::clone(&set),
+            discover_rx,
+            CancellationToken::new(),
+        ));
+
+        wait_for_host_fetch_to_block_on_global_permit(&set, host).await;
+        handle.abort();
+        let join_error = handle
+            .await
+            .expect_err("aborted refresher must not complete normally");
+        assert!(join_error.is_cancelled());
+        drop(held_global_permit);
+
+        assert!(
+            !pending_contains(&set, url),
+            "aborting while fetch_and_store_url awaits must clear the in-flight marker"
+        );
+        assert!(
+            !seen_contains(&set, url),
+            "an aborted fetch must not promote the URL to the permanent dedup set"
+        );
+
+        let _ = set.__test_note_discovered_urls(&[url.to_owned()]);
+        assert!(
+            pending_contains(&set, url),
+            "once the stale marker is gone, the same URL can be queued again"
+        );
+        assert!(
+            !seen_contains(&set, url),
+            "retry admission must still be pending-only, not permanent suppression"
+        );
+    }
+
+    #[test]
+    fn discovered_url_settlement_promotes_only_confirmed_cache_admission() {
+        let (set, _discover_rx) = test_crl_set_with_receiver();
+        let url = "http://settle-ok.example.test/crl";
+        mark_pending(&set, url);
+
+        let pending_guard = PendingUrlGuard::armed(Arc::clone(&set), url.to_owned());
+        settle_discovered_url(pending_guard, Ok(true));
+
+        assert!(
+            seen_contains(&set, url),
+            "Ok(true) means the CRL is cached and must permanently dedup the URL"
+        );
+        assert!(
+            !pending_contains(&set, url),
+            "promotion must remove the transient in-flight marker"
+        );
+    }
+
+    #[test]
+    fn discovered_url_settlement_clears_cache_cap_rejection_and_warns() {
+        let (set, _discover_rx) = test_crl_set_with_receiver();
+        let url = "http://settle-cap.example.test/crl";
+        mark_pending(&set, url);
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let pending_guard = PendingUrlGuard::armed(Arc::clone(&set), url.to_owned());
+        settle_discovered_url(pending_guard, Ok(false));
+
+        assert!(
+            !pending_contains(&set, url),
+            "cache-cap rejection must leave the URL retriable"
+        );
+        assert!(
+            !seen_contains(&set, url),
+            "cache-cap rejection must not promote permanent suppression"
+        );
+        let contents = logs.contents();
+        assert!(
+            contents.contains(
+                "CRL fetched but not admitted to cache (cap reached); will retry on a later handshake"
+            ),
+            "existing cache-cap warning must still be emitted: {contents}"
+        );
+    }
+
+    #[test]
+    fn discovered_url_settlement_clears_fetch_failure_and_warns() {
+        let (set, _discover_rx) = test_crl_set_with_receiver();
+        let url = "http://settle-error.example.test/crl";
+        mark_pending(&set, url);
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let pending_guard = PendingUrlGuard::armed(Arc::clone(&set), url.to_owned());
+        settle_discovered_url(
+            pending_guard,
+            Err(RmcpServerKitError::Tls("test-fetch-failed".to_owned())),
+        );
+
+        assert!(
+            !pending_contains(&set, url),
+            "fetch failure must leave the URL retriable"
+        );
+        assert!(
+            !seen_contains(&set, url),
+            "fetch failure must not promote permanent suppression"
+        );
+        let contents = logs.contents();
+        assert!(
+            contents.contains("CRL discovery fetch failed; will retry on a later handshake"),
+            "existing fetch-failure warning must still be emitted: {contents}"
+        );
+        assert!(
+            contents.contains("test-fetch-failed"),
+            "existing warning must still include the fetch error: {contents}"
+        );
     }
 
     /// The userinfo gate fires before DNS resolution (no network needed)

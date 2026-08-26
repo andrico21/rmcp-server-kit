@@ -26,6 +26,7 @@ use std::{
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
 use serde::Deserialize;
 use tokio::{net::lookup_host, sync::RwLock};
+use tracing::Instrument;
 
 use crate::auth::{AuthIdentity, AuthMethod};
 
@@ -135,33 +136,34 @@ async fn screen_oauth_target_core(
     allowlist: &crate::ssrf::CompiledSsrfAllowlist,
     test_allow_loopback_ssrf: bool,
 ) -> Result<(), crate::error::RmcpServerKitError> {
+    let target = oauth_request_target_for_log(url);
     let parsed = check_oauth_url("oauth target", url, allow_http)?;
     if test_allow_loopback_ssrf {
         return Ok(());
     }
     if let Some(reason) = crate::ssrf::check_url_literal_ip(&parsed) {
         return Err(crate::error::RmcpServerKitError::Config(format!(
-            "OAuth target forbidden ({reason}): {url}"
+            "OAuth target forbidden ({reason}): {target}"
         )));
     }
 
     let host = parsed.host_str().ok_or_else(|| {
-        crate::error::RmcpServerKitError::Config(format!("OAuth target URL has no host: {url}"))
+        crate::error::RmcpServerKitError::Config(format!("OAuth target URL has no host: {target}"))
     })?;
     if oauth_internal_suffix_blocked(host, allowlist) {
         return Err(crate::error::RmcpServerKitError::Config(format!(
-            "OAuth target forbidden (internal hostname suffix): {url}"
+            "OAuth target forbidden (internal hostname suffix): {target}"
         )));
     }
     let port = parsed.port_or_known_default().ok_or_else(|| {
         crate::error::RmcpServerKitError::Config(format!(
-            "OAuth target URL has no known port: {url}"
+            "OAuth target URL has no known port: {target}"
         ))
     })?;
 
     let addrs = lookup_host((host, port)).await.map_err(|error| {
         crate::error::RmcpServerKitError::Config(format!(
-            "OAuth target DNS resolution {url}: {error}"
+            "OAuth target DNS resolution {target}: {error}"
         ))
     })?;
 
@@ -175,7 +177,7 @@ async fn screen_oauth_target_core(
             // that does NOT advertise the allowlist knob.
             if reason == "cloud_metadata" {
                 return Err(crate::error::RmcpServerKitError::Config(format!(
-                    "OAuth target resolved to blocked IP ({reason}): {url}"
+                    "OAuth target resolved to blocked IP ({reason}): {target}"
                 )));
             }
             // Default-empty-allowlist path: preserve the historical
@@ -183,7 +185,7 @@ async fn screen_oauth_target_core(
             // operators get the same diagnostic they had before.
             if allowlist.is_empty() {
                 return Err(crate::error::RmcpServerKitError::Config(format!(
-                    "OAuth target resolved to blocked IP ({reason}): {url}"
+                    "OAuth target resolved to blocked IP ({reason}): {target}"
                 )));
             }
             // Allowlist-configured path: consult host + per-IP allowlist.
@@ -194,13 +196,13 @@ async fn screen_oauth_target_core(
                 "OAuth target blocked: hostname {host} resolved to {ip} ({reason}). \
                  To allow, add the hostname to oauth.ssrf_allowlist.hosts or the CIDR \
                  to oauth.ssrf_allowlist.cidrs (operators only -- see SECURITY.md). \
-                 URL: {url}"
+                 URL: {target}"
             )));
         }
     }
     if !any_addr {
         return Err(crate::error::RmcpServerKitError::Config(format!(
-            "OAuth target DNS resolution returned no addresses: {url}"
+            "OAuth target DNS resolution returned no addresses: {target}"
         )));
     }
 
@@ -547,7 +549,9 @@ impl OauthHttpClient {
         #[cfg(not(any(test, feature = "test-helpers")))]
         screen_oauth_target(url, self.allow_http, &self.allowlist).await?;
         request.send().await.map_err(|error| {
-            crate::error::RmcpServerKitError::Config(format!("oauth request {url}: {error}"))
+            let target = oauth_request_target_for_log(url);
+            let error = error.without_url();
+            crate::error::RmcpServerKitError::Config(format!("oauth request {target}: {error}"))
         })
     }
 
@@ -618,6 +622,13 @@ impl std::fmt::Debug for OauthHttpClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OauthHttpClient").finish_non_exhaustive()
     }
+}
+
+fn oauth_request_target_for_log(raw: &str) -> String {
+    url::Url::parse(raw).map_or_else(
+        |_| "<unparseable-url>".to_owned(),
+        |url| crate::ssrf::sanitized_url_for_log(&url),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1351,7 +1362,9 @@ fn check_oauth_url(
     allow_http: bool,
 ) -> Result<url::Url, crate::error::RmcpServerKitError> {
     let parsed = url::Url::parse(raw).map_err(|e| {
-        crate::error::RmcpServerKitError::Config(format!("{field}: invalid URL {raw:?}: {e}"))
+        crate::error::RmcpServerKitError::Config(format!(
+            "{field}: invalid URL <unparseable-url>: {e}"
+        ))
     })?;
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(crate::error::RmcpServerKitError::Config(format!(
@@ -2481,14 +2494,22 @@ impl JwksCache {
         let screening = screen_oauth_target(&self.jwks_uri, self.allow_http, &self.allowlist).await;
 
         if let Err(error) = screening {
-            tracing::warn!(error = %error, uri = %self.jwks_uri, "failed to screen JWKS target");
+            tracing::warn!(
+                error = %error,
+                uri = %oauth_request_target_for_log(&self.jwks_uri),
+                "failed to screen JWKS target"
+            );
             return None;
         }
 
         let mut resp = match self.http.get(&self.jwks_uri).send().await {
             Ok(resp) => resp,
             Err(e) => {
-                tracing::warn!(error = %e, uri = %self.jwks_uri, "failed to fetch JWKS");
+                tracing::warn!(
+                    error = %e.without_url(),
+                    uri = %oauth_request_target_for_log(&self.jwks_uri),
+                    "failed to fetch JWKS"
+                );
                 return None;
             }
         };
@@ -2499,7 +2520,11 @@ impl JwksCache {
         while let Some(chunk) = match resp.chunk().await {
             Ok(chunk) => chunk,
             Err(error) => {
-                tracing::warn!(error = %error, uri = %self.jwks_uri, "failed to read JWKS response");
+                tracing::warn!(
+                    error = %error.without_url(),
+                    uri = %oauth_request_target_for_log(&self.jwks_uri),
+                    "failed to read JWKS response"
+                );
                 return None;
             }
         } {
@@ -2507,7 +2532,7 @@ impl JwksCache {
             let body_len = u64::try_from(body.len()).unwrap_or(u64::MAX);
             if body_len.saturating_add(chunk_len) > self.max_response_bytes {
                 tracing::warn!(
-                    uri = %self.jwks_uri,
+                    uri = %oauth_request_target_for_log(&self.jwks_uri),
                     max_bytes = self.max_response_bytes,
                     "JWKS response exceeded configured size cap"
                 );
@@ -2519,7 +2544,11 @@ impl JwksCache {
         match serde_json::from_slice::<JwkSet>(&body) {
             Ok(jwks) => Some(jwks),
             Err(error) => {
-                tracing::warn!(error = %error, uri = %self.jwks_uri, "failed to parse JWKS");
+                tracing::warn!(
+                    error = %error,
+                    uri = %oauth_request_target_for_log(&self.jwks_uri),
+                    "failed to parse JWKS"
+                );
                 None
             }
         }
@@ -3161,7 +3190,11 @@ async fn proxy_oauth_admin_request(
             (status, [(header::CONTENT_TYPE, content_type)], body_bytes).into_response()
         }
         Err(e) => {
-            tracing::error!(error = %e, url = %upstream_url, "OAuth admin proxy request failed");
+            tracing::error!(
+                error = %e,
+                url = %oauth_request_target_for_log(upstream_url),
+                "OAuth admin proxy request failed"
+            );
             oauth_error_response(
                 StatusCode::BAD_GATEWAY,
                 "server_error",
@@ -3277,13 +3310,35 @@ fn sanitize_oauth_error_code(raw: &str) -> &'static str {
 ///
 /// Returns an error if the HTTP request fails, the authorization
 /// server rejects the exchange, or the response cannot be parsed.
-// NOT cancel-safe: dropping after `send_screened` puts the RFC 8693 request on
-// the wire can mint a downstream token without returning it to the caller. No
-// local cache is torn, but retries may duplicate upstream issuance.
+// NOT cancel-safe, and NOT fixable at this layer: once `send_screened` puts the
+// RFC 8693 POST on the wire, dropping this future cannot un-send it. The
+// authorization server may mint a downstream token that never reaches the
+// caller and that nothing here records. No local cache is torn, but retries may
+// duplicate upstream issuance.
+//
+// Callers that can be cancelled should use `exchange_token_with_cancel`, which
+// pre-checks the token, detaches the in-flight exchange rather than dropping it,
+// and audits a token minted after the caller went away. That is a mitigation,
+// not a guarantee -- see its docs for what remains unattainable.
 pub async fn exchange_token(
     http: &OauthHttpClient,
     config: &TokenExchangeConfig,
     subject_token: &str,
+) -> Result<ExchangedToken, crate::error::RmcpServerKitError> {
+    exchange_token_inner(http, config, subject_token, SuccessLogMode::Normal).await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SuccessLogMode {
+    Normal,
+    Suppress,
+}
+
+async fn exchange_token_inner(
+    http: &OauthHttpClient,
+    config: &TokenExchangeConfig,
+    subject_token: &str,
+    success_log: SuccessLogMode,
 ) -> Result<ExchangedToken, crate::error::RmcpServerKitError> {
     use secrecy::ExposeSecret;
 
@@ -3366,9 +3421,153 @@ pub async fn exchange_token(
         crate::error::RmcpServerKitError::Auth("server_error".into())
     })?;
 
-    log_exchanged_token(&exchanged);
+    match success_log {
+        SuccessLogMode::Normal => log_exchanged_token(&exchanged),
+        SuccessLogMode::Suppress => {}
+    }
 
     Ok(exchanged)
+}
+
+/// Exchange an inbound access token while preserving post-send observability
+/// if the caller cancels or times out.
+///
+/// This wrapper does **not** make RFC 8693 token exchange strictly
+/// cancel-safe. Once the POST reaches the authorization server, this process
+/// cannot un-send it or prove whether the server minted a downstream token.
+/// Instead it provides the three local guarantees that are achievable: work is
+/// not started when `ct` is already cancelled, the in-flight exchange future is
+/// not dropped while reading the response, and an abandoned successful exchange
+/// emits a sanitized warning so the orphaned downstream credential is
+/// observable.
+///
+/// On cancellation or timeout after the spawned exchange starts, the exchange
+/// task is deliberately detached and allowed to finish under the existing
+/// [`OauthHttpClient`] request budgets. The task is **not** aborted. If it later
+/// receives a successful [`ExchangedToken`] after the caller has gone away, it
+/// discards the token and logs only bounded metadata (`expires_in` and a
+/// truncated `issued_token_type`); token material and endpoint details are never
+/// logged.
+///
+/// # Resource caveat
+///
+/// Detaching is unbounded in *count* under a cancel storm: every detached task
+/// is time-bounded by the HTTP client's connect/total timeouts, but this helper
+/// does not cap how many detached exchanges can exist at once. Use it only
+/// behind the crate's existing authentication, rate-limit, and concurrency
+/// controls (or equivalent caller-side controls).
+///
+/// # Errors
+///
+/// The completed outcome carries the exact [`Result`] returned by
+/// [`exchange_token`]. Cancellation and timeout are reported structurally via
+/// [`crate::cancel::DetachOutcome`] and do not construct client-visible error
+/// strings.
+#[must_use = "DetachOutcome must be inspected to distinguish completion from cancel/timeout"]
+pub async fn exchange_token_with_cancel(
+    http: &OauthHttpClient,
+    config: &TokenExchangeConfig,
+    subject_token: &str,
+    ct: &tokio_util::sync::CancellationToken,
+    timeout: Option<Duration>,
+) -> crate::cancel::DetachOutcome<Result<ExchangedToken, crate::error::RmcpServerKitError>> {
+    // Pre-cancel check FIRST: do not clone config, client, or subject token for
+    // an already-abandoned request. In particular, cloning the subject token
+    // would allocate and keep credential-adjacent material alive for work that
+    // the caller has already told us not to start.
+    if ct.is_cancelled() {
+        return crate::cancel::DetachOutcome::Cancelled;
+    }
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let http = http.clone();
+    let config = config.clone();
+    let subject_token = subject_token.to_owned();
+
+    // This task is intentionally detached on caller cancel/timeout. A plain
+    // `run_with_cancel_and_timeout(exchange_token(...))` would drop the
+    // JoinHandle in those arms, but it would not keep a result sink. The
+    // `oneshot::Sender` is the sink: if the receiver is gone, `send` returns
+    // the result to this task so an abandoned success can be audited without
+    // logging token material.
+    tokio::spawn(
+        async move {
+            let result =
+                exchange_token_inner(&http, &config, &subject_token, SuccessLogMode::Suppress)
+                    .await;
+            if let Err(result) = tx.send(result) {
+                audit_abandoned_exchange_result(result);
+            }
+        }
+        .instrument(tracing::Span::current()),
+    );
+
+    receive_exchange_result_with_cancel(rx, ct, timeout).await
+}
+
+async fn receive_exchange_result_with_cancel(
+    rx: tokio::sync::oneshot::Receiver<Result<ExchangedToken, crate::error::RmcpServerKitError>>,
+    ct: &tokio_util::sync::CancellationToken,
+    timeout: Option<Duration>,
+) -> crate::cancel::DetachOutcome<Result<ExchangedToken, crate::error::RmcpServerKitError>> {
+    // `biased;` is deliberate and matches `cancel::run_with_cancel_and_timeout`:
+    // the receiver arm comes first so a ready completion wins over a
+    // simultaneously-ready cancellation or timeout. Dropping the receiver on
+    // the other arms is not a leak; it is the signal that tells the spawned task
+    // to audit an eventual success via `Sender::send`'s returned value.
+    if let Some(t) = timeout {
+        tokio::select! {
+            biased;
+            received = rx => map_exchange_receiver(received),
+            () = ct.cancelled() => crate::cancel::DetachOutcome::Cancelled,
+            () = tokio::time::sleep(t) => crate::cancel::DetachOutcome::TimedOut,
+        }
+    } else {
+        tokio::select! {
+            biased;
+            received = rx => map_exchange_receiver(received),
+            () = ct.cancelled() => crate::cancel::DetachOutcome::Cancelled,
+        }
+    }
+}
+
+fn map_exchange_receiver(
+    received: Result<
+        Result<ExchangedToken, crate::error::RmcpServerKitError>,
+        tokio::sync::oneshot::error::RecvError,
+    >,
+) -> crate::cancel::DetachOutcome<Result<ExchangedToken, crate::error::RmcpServerKitError>> {
+    match received {
+        Ok(result) => crate::cancel::DetachOutcome::Completed(result),
+        Err(error) => {
+            tracing::error!(error = %error, "token exchange task ended before returning a result");
+            crate::cancel::DetachOutcome::Completed(Err(
+                crate::error::RmcpServerKitError::Internal("server_error".into()),
+            ))
+        }
+    }
+}
+
+fn audit_abandoned_exchange_result(
+    result: Result<ExchangedToken, crate::error::RmcpServerKitError>,
+) {
+    match result {
+        Ok(token) => {
+            let (issued_token_type, issued_token_type_truncated) = token
+                .issued_token_type
+                .as_deref()
+                .map_or_else(|| ("-".to_owned(), false), truncate_kid_for_log);
+            tracing::warn!(
+                expires_in = token.expires_in,
+                issued_token_type = %issued_token_type,
+                issued_token_type_truncated,
+                "token exchange minted downstream token after caller detached; discarded token material"
+            );
+        }
+        Err(error) => {
+            tracing::debug!(error = %error, "token exchange failed after caller detached");
+        }
+    }
 }
 
 /// Build the RFC 8693 token-exchange form body. Adds `client_id` when the
@@ -3472,7 +3671,7 @@ fn rewrite_client_auth_params(params: &str, upstream_client_id: &str) -> String 
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Instant};
 
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
@@ -4547,6 +4746,409 @@ role = "admin"
             307,
             "credential client must surface the 307 rather than follow it"
         );
+    }
+
+    fn test_token_exchange_config(token_url: String) -> TokenExchangeConfig {
+        TokenExchangeConfig::new(
+            token_url,
+            "mcp-client".into(),
+            Some(secrecy::SecretString::new("test-client-secret".into())),
+            None,
+            "downstream-api".into(),
+        )
+    }
+
+    fn exchange_response(access_token: &str, issued_token_type: &str) -> serde_json::Value {
+        serde_json::json!({
+            "access_token": access_token,
+            "expires_in": 3600_u64,
+            "issued_token_type": issued_token_type,
+        })
+    }
+
+    fn unsigned_jwt_with_claims(claims: &serde_json::Value) -> String {
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).expect("claims json"));
+        format!("{header}.{payload}.signature")
+    }
+
+    fn test_exchange_client() -> OauthHttpClient {
+        let config = OAuthConfig::builder(
+            "http://auth.test.local",
+            "mcp",
+            "http://auth.test.local/jwks.json",
+        )
+        .allow_http_oauth_urls(true)
+        .build();
+        OauthHttpClient::build(Some(&config))
+            .expect("build oauth http client")
+            .__test_allow_loopback_ssrf()
+    }
+
+    fn unavailable_loopback_token_url() -> String {
+        "http://127.0.0.1:1/token?client_secret=super-secret".to_owned()
+    }
+
+    async fn recorded_request_count(mock: &wiremock::MockServer) -> usize {
+        mock.received_requests()
+            .await
+            .expect("wiremock request recording is enabled")
+            .len()
+    }
+
+    async fn wait_for_recorded_request(mock: &wiremock::MockServer) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if recorded_request_count(mock).await > 0 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("token endpoint must record the in-flight request before cancellation");
+    }
+
+    async fn wait_for_log_contains(logs: &CapturedLogs, needle: &str) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if logs.contents().contains(needle) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("detached token exchange must eventually emit its audit log");
+    }
+
+    #[tokio::test]
+    async fn send_screened_request_failure_sanitizes_url_and_reqwest_error() {
+        let client = test_exchange_client();
+        let screened_url = unavailable_loopback_token_url();
+        let request_url = screened_url.replacen("//", "//u:p@", 1);
+
+        let error = client
+            .send_screened(
+                &screened_url,
+                client
+                    .credential_client
+                    .post(&request_url)
+                    .body("grant_type=test"),
+            )
+            .await
+            .expect_err("closed loopback port must fail the request");
+
+        let rendered = error.to_string();
+        let sanitized = oauth_request_target_for_log(&screened_url);
+        assert!(
+            rendered.contains(&format!("oauth request {sanitized}")),
+            "request failure must identify only the sanitized origin: {rendered}"
+        );
+        for leaked in ["u:p", "/token", "client_secret", "super-secret"] {
+            assert!(
+                !rendered.contains(leaked),
+                "request failure must not echo raw URL component {leaked}: {rendered}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn exchange_token_request_failure_log_sanitizes_token_url() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::ERROR)
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let client = test_exchange_client();
+        let token_url = unavailable_loopback_token_url();
+        let config = test_token_exchange_config(token_url);
+        let error = exchange_token(&client, &config, "subject-token")
+            .await
+            .expect_err("closed loopback port must fail exchange");
+
+        assert!(
+            error.to_string().contains("server_error"),
+            "client-visible exchange error must remain sanitized: {error}"
+        );
+        let contents = logs.contents();
+        assert!(
+            contents.contains("token exchange request failed"),
+            "exchange failure must still be logged: {contents}"
+        );
+        assert!(
+            contents.contains("oauth request http://127.0.0.1:1"),
+            "exchange failure log must include only sanitized origin: {contents}"
+        );
+        for leaked in ["/token", "client_secret", "super-secret", "subject-token"] {
+            assert!(
+                !contents.contains(leaked),
+                "exchange failure log must not echo raw URL/token component {leaked}: {contents}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn exchange_token_with_cancel_precancel_does_not_send() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(exchange_response(
+                    "downstream-token",
+                    "urn:ietf:params:oauth:token-type:access_token",
+                )),
+            )
+            .mount(&mock)
+            .await;
+
+        let client = test_exchange_client();
+        let config = test_token_exchange_config(format!("{}/token", mock.uri()));
+        let ct = tokio_util::sync::CancellationToken::new();
+        ct.cancel();
+
+        let outcome =
+            exchange_token_with_cancel(&client, &config, "subject-token", &ct, None).await;
+
+        assert!(
+            matches!(outcome, crate::cancel::DetachOutcome::Cancelled),
+            "pre-cancelled exchanges must not start work"
+        );
+        assert_eq!(
+            recorded_request_count(&mock).await,
+            0,
+            "pre-cancel check must happen before cloning/spawning/sending"
+        );
+    }
+
+    #[tokio::test]
+    async fn exchange_token_with_cancel_completes_normally() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(exchange_response(
+                    "downstream-token",
+                    "urn:ietf:params:oauth:token-type:access_token",
+                )),
+            )
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let client = test_exchange_client();
+        let config = test_token_exchange_config(format!("{}/token", mock.uri()));
+        let ct = tokio_util::sync::CancellationToken::new();
+
+        let outcome =
+            exchange_token_with_cancel(&client, &config, "subject-token", &ct, None).await;
+
+        let crate::cancel::DetachOutcome::Completed(Ok(token)) = outcome else {
+            panic!("uncancelled exchange must complete successfully")
+        };
+        assert_eq!(token.access_token, "downstream-token");
+        mock.verify().await;
+    }
+
+    #[tokio::test]
+    async fn exchange_token_with_cancel_detaches_and_audits_abandoned_token() {
+        let mock = wiremock::MockServer::start().await;
+        let long_issued_token_type = format!(
+            "urn:ietf:params:oauth:token-type:{}",
+            "x".repeat(MAX_LOGGED_KID_CHARS + 32)
+        );
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(150))
+                    .set_body_json(exchange_response(
+                        "abandoned-downstream-token",
+                        &long_issued_token_type,
+                    )),
+            )
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let token_url = format!("{}/token", mock.uri());
+        let token_url_host = url::Url::parse(&token_url)
+            .expect("mock token URL parses")
+            .host_str()
+            .expect("mock token URL has host")
+            .to_owned();
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("rmcp_server_kit=debug"))
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let client = test_exchange_client();
+        let config = test_token_exchange_config(token_url);
+        let ct = tokio_util::sync::CancellationToken::new();
+        let task_ct = ct.clone();
+        let handle = tokio::spawn(async move {
+            exchange_token_with_cancel(&client, &config, "subject-token", &task_ct, None).await
+        });
+
+        wait_for_recorded_request(&mock).await;
+        let cancelled_at = Instant::now();
+        ct.cancel();
+        let outcome = handle.await.expect("wrapper task must not panic");
+
+        assert!(
+            matches!(outcome, crate::cancel::DetachOutcome::Cancelled),
+            "caller must get an immediate cancellation outcome"
+        );
+        assert!(
+            cancelled_at.elapsed() < Duration::from_millis(100),
+            "wrapper must detach instead of waiting for the delayed upstream response"
+        );
+
+        wait_for_log_contains(
+            &logs,
+            "token exchange minted downstream token after caller detached",
+        )
+        .await;
+        mock.verify().await;
+        let contents = logs.contents();
+        assert!(
+            contents.contains("issued_token_type_truncated=true"),
+            "audit log must mark issuer-controlled token type truncation: {contents}"
+        );
+        assert!(
+            !contents.contains("abandoned-downstream-token"),
+            "audit log must not include downstream token material: {contents}"
+        );
+        assert!(
+            !contents.contains("token_len="),
+            "DEBUG success log must be suppressed on abandoned exchanges: {contents}"
+        );
+        assert!(
+            !contents.contains(&long_issued_token_type),
+            "detached logs must not include unbounded issued token type: {contents}"
+        );
+        for field in ["sub=", "aud=", "azp=", "iss="] {
+            assert!(
+                !contents.contains(field),
+                "detached logs must not include JWT claim field {field}: {contents}"
+            );
+        }
+        assert!(
+            !contents.contains(&token_url_host),
+            "detached success logs must not include token endpoint host: {contents}"
+        );
+        assert!(
+            !contents.contains("subject-token"),
+            "audit log must not include subject token material: {contents}"
+        );
+        assert!(
+            !contents.contains("test-client-secret"),
+            "audit log must not include client secret material: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exchange_token_with_cancel_detached_jwt_success_does_not_log_claims() {
+        let mock = wiremock::MockServer::start().await;
+        let jwt = unsigned_jwt_with_claims(&serde_json::json!({
+            "sub": "detached-subject",
+            "aud": "detached-audience",
+            "azp": "detached-client",
+            "iss": "https://issuer.example.test/realm",
+        }));
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(150))
+                    .set_body_json(exchange_response(
+                        &jwt,
+                        "urn:ietf:params:oauth:token-type:access_token",
+                    )),
+            )
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("rmcp_server_kit=debug"))
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let client = test_exchange_client();
+        let config = test_token_exchange_config(format!("{}/token", mock.uri()));
+        let ct = tokio_util::sync::CancellationToken::new();
+        let task_ct = ct.clone();
+        let handle = tokio::spawn(async move {
+            exchange_token_with_cancel(&client, &config, "subject-token", &task_ct, None).await
+        });
+
+        wait_for_recorded_request(&mock).await;
+        ct.cancel();
+        let outcome = handle.await.expect("wrapper task must not panic");
+        assert!(
+            matches!(outcome, crate::cancel::DetachOutcome::Cancelled),
+            "caller must get cancellation while spawned JWT exchange continues"
+        );
+
+        wait_for_log_contains(
+            &logs,
+            "token exchange minted downstream token after caller detached",
+        )
+        .await;
+        mock.verify().await;
+        let contents = logs.contents();
+        assert!(
+            !contents.contains(&jwt),
+            "detached JWT success must not log token material: {contents}"
+        );
+        for leaked in [
+            "sub=",
+            "aud=",
+            "azp=",
+            "iss=",
+            "detached-subject",
+            "detached-audience",
+            "detached-client",
+            "issuer.example.test",
+        ] {
+            assert!(
+                !contents.contains(leaked),
+                "detached JWT success must not log claim material {leaked}: {contents}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn exchange_token_with_cancel_completion_wins_tie() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(Ok(ExchangedToken {
+            access_token: "tie-winner".into(),
+            expires_in: Some(3600),
+            issued_token_type: Some("urn:ietf:params:oauth:token-type:access_token".into()),
+        }))
+        .expect("test receiver is alive");
+        let ct = tokio_util::sync::CancellationToken::new();
+        ct.cancel();
+
+        let outcome = receive_exchange_result_with_cancel(rx, &ct, None).await;
+
+        let crate::cancel::DetachOutcome::Completed(Ok(token)) = outcome else {
+            panic!("ready completion must win over ready cancellation under biased select")
+        };
+        assert_eq!(token.access_token, "tie-winner");
     }
 
     #[tokio::test]
@@ -5660,6 +6262,42 @@ role = "admin"
             !contents.contains("u:p"),
             "rejection log must not echo userinfo credentials: {contents}"
         );
+    }
+
+    #[tokio::test]
+    async fn jwks_fetch_failure_log_sanitizes_url_and_reqwest_error() {
+        let config = test_config("http://127.0.0.1:1/jwks.json?client_secret=super-secret");
+        let cache = test_cache(&config);
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let result = cache.fetch_jwks().await;
+        assert!(
+            result.is_none(),
+            "closed loopback port must fail JWKS fetch"
+        );
+        let contents = logs.contents();
+        assert!(
+            contents.contains("failed to fetch JWKS"),
+            "JWKS failure must still be logged: {contents}"
+        );
+        assert!(
+            contents.contains("uri=http://127.0.0.1:1"),
+            "JWKS failure log must include only sanitized origin: {contents}"
+        );
+        for leaked in ["/jwks.json", "client_secret", "super-secret"] {
+            assert!(
+                !contents.contains(leaked),
+                "JWKS failure log must not echo raw URL component {leaked}: {contents}"
+            );
+        }
     }
 
     #[tokio::test]

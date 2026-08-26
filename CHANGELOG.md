@@ -17,6 +17,16 @@ release (`cargo semver-checks`); runtime behaviour changes are noted below.
 
 ### Security
 
+- **A hard-aborted CRL refresher no longer strands a CDP URL, silently narrowing
+  revocation coverage.** `mtls_revocation::run_crl_refresher`'s discovery arm
+  marks a URL in-flight in `pending_urls`, then awaits `fetch_and_store_url`.
+  Every normal exit promoted or cleared that marker, but `JoinHandle::abort`
+  drops the future mid-await so neither ran, and a stale `pending_urls` entry
+  suppresses re-enqueue permanently -- that CDP was then never retried until
+  process restart. The arm now holds an owned RAII guard across the await whose
+  `Drop` clears the marker on every path, including abort. Cooperative shutdown
+  via the cancellation token was already safe and is unchanged.
+
 - **Requests with an unresolvable source address are no longer exempt from rate
   limiting.** All four built-in per-IP limiters previously skipped enforcement
   entirely when no client address could be determined. They now fall back to a
@@ -139,6 +149,33 @@ release (`cargo semver-checks`); runtime behaviour changes are noted below.
 
 ### Added
 
+- `oauth::exchange_token_with_cancel` -- a cancel-aware wrapper around
+  `exchange_token` (feature `oauth`). It pre-checks the cancellation token so an
+  already-abandoned request never reaches the wire, detaches the in-flight
+  exchange instead of dropping it, and returns `cancel::DetachOutcome`. If the
+  caller goes away and the exchange later succeeds, the detached task emits one
+  `warn` recording that a downstream token was minted and discarded -- metadata
+  only (`expires_in`, truncated `issued_token_type`); no token material, subject
+  token, form body, client secret, or endpoint details are logged on that
+  abandoned-success path. Additive; `exchange_token` is unchanged.
+
+  Abandoned failures may log the error at `debug`, but outbound OAuth request
+  failures sanitize the configured endpoint down to scheme/host/port and strip
+  reqwest's embedded URL before formatting, so userinfo, path, query, and
+  fragment are not logged.
+
+  **This is a mitigation, not a guarantee.** Once the RFC 8693 request is on the
+  wire, nothing local can un-send it: if the process dies, the runtime shuts
+  down, or the response is lost after the authorization server minted a token,
+  an orphaned downstream credential can still exist and this crate cannot know
+  about it or revoke it. Outbound revocation of orphaned tokens is deliberately
+  not implemented.
+
+  Note also that detaching is unbounded in *count*: each detached exchange is
+  time-bounded by the HTTP client's connect/total timeouts, but nothing caps how
+  many can be in flight during a cancel storm. Use it behind the crate's
+  existing authentication, rate-limit, and concurrency controls.
+
 - `RmcpServerKitError::Internal` -- an internal-failure variant whose detail is
   logged server-side and collapsed to `"internal server error"` on the wire.
   Additive: the enum is `#[non_exhaustive]`.
@@ -186,15 +223,9 @@ release (`cargo semver-checks`); runtime behaviour changes are noted below.
 - Every production async fn that can run inside `select!`, `timeout`, or an
   abortable task now carries a `// cancel-safe:` or `// NOT cancel-safe:`
   annotation, per `RUST_GUIDELINES.md` 5. Documentation only -- no behaviour
-  change. Auditing the bodies surfaced two paths that are genuinely **not**
-  cancel-safe and are annotated as such pending a follow-up fix:
-
-  - `oauth::OAuthTokenExchange::exchange_token` -- cancellation after the
-    upstream request is sent can mint a token at the IdP that never reaches the
-    caller, leaving an orphaned credential.
-  - `mtls_revocation::run_crl_refresher` -- aborting during `fetch_and_store_url`
-    can strand entries in `pending_urls`. Shutdown via the cancellation token is
-    unaffected; only an abort mid-fetch is exposed.
+  change. Auditing the bodies surfaced two paths that were genuinely **not**
+  cancel-safe; both are now addressed -- `mtls_revocation::run_crl_refresher`
+  under *Security*, and `oauth::exchange_token` under *Added*.
 
 - The client-facing-message invariant on `RmcpServerKitError` now has a
   regression guard. A test walks `src/` and fails when `Auth`, `Rbac`,
