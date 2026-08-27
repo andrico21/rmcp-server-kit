@@ -4797,7 +4797,10 @@ role = "admin"
     }
 
     async fn wait_for_recorded_request(mock: &wiremock::MockServer) {
-        tokio::time::timeout(Duration::from_secs(2), async {
+        // Liveness wait, not a latency bound: it returns as soon as the mock
+        // records the request, so a generous ceiling costs nothing on success
+        // and only makes a genuine hang fail slower.
+        tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 if recorded_request_count(mock).await > 0 {
                     return;

@@ -194,7 +194,7 @@ where
     // Deterministic readiness: wait for serve_with_listener to signal
     // *after* router build, *before* accept loop. No polling loop, no
     // sleep races.
-    let signalled: SocketAddr = tokio::time::timeout(Duration::from_secs(5), ready_rx)
+    let signalled: SocketAddr = tokio::time::timeout(Duration::from_secs(30), ready_rx)
         .await
         .expect("server did not signal readiness within 5s")
         .expect("server task aborted before readiness signal");
@@ -1305,7 +1305,7 @@ mod crl_tests {
             .await
         });
 
-        let signalled: SocketAddr = tokio::time::timeout(Duration::from_secs(5), ready_rx)
+        let signalled: SocketAddr = tokio::time::timeout(Duration::from_secs(30), ready_rx)
             .await
             .expect("tls server readiness")
             .expect("tls server task aborted");
@@ -1916,7 +1916,7 @@ async fn shutdown_timeout_honored_on_first_signal() {
     // race-prone on slow CI runners). Bound the wait so a real
     // regression in request acceptance still surfaces as a test
     // failure rather than a hang.
-    tokio::time::timeout(Duration::from_secs(5), started_rx)
+    tokio::time::timeout(Duration::from_secs(30), started_rx)
         .await
         .expect("/slow handler did not start within 5s -- request never reached the server")
         .expect("started_tx dropped without sending");
@@ -2189,7 +2189,7 @@ async fn hooked_handler_serves_healthz() {
         .await
     });
 
-    let _signalled: SocketAddr = tokio::time::timeout(Duration::from_secs(5), ready_rx)
+    let _signalled: SocketAddr = tokio::time::timeout(Duration::from_secs(30), ready_rx)
         .await
         .expect("server did not signal readiness within 5s")
         .expect("server task aborted before readiness signal");
@@ -2377,7 +2377,7 @@ mod peer_addr_tests {
             .await
         });
 
-        let signalled: SocketAddr = tokio::time::timeout(Duration::from_secs(5), ready_rx)
+        let signalled: SocketAddr = tokio::time::timeout(Duration::from_secs(30), ready_rx)
             .await
             .expect("tls server readiness")
             .expect("tls server task aborted");

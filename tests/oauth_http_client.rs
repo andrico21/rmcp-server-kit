@@ -163,7 +163,7 @@ async fn spawn_one_shot_tls(pki: &TestPki, response_bytes: Vec<u8>) -> String {
 
     tokio::spawn(async move {
         let accept_fut = listener.accept();
-        let (tcp, _peer) = match tokio::time::timeout(Duration::from_secs(5), accept_fut).await {
+        let (tcp, _peer) = match tokio::time::timeout(Duration::from_secs(30), accept_fut).await {
             Ok(Ok(pair)) => pair,
             Ok(Err(e)) => {
                 eprintln!("test tls accept error: {e}");

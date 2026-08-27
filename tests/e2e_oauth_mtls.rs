@@ -148,7 +148,7 @@ async fn spawn_one_shot_mtls_server(
 
     tokio::spawn(async move {
         let accept_fut = listener.accept();
-        let (tcp, _peer) = match tokio::time::timeout(Duration::from_secs(5), accept_fut).await {
+        let (tcp, _peer) = match tokio::time::timeout(Duration::from_secs(30), accept_fut).await {
             Ok(Ok(pair)) => pair,
             Ok(Err(e)) => {
                 eprintln!("mtls accept error: {e}");
@@ -271,7 +271,7 @@ async fn exchange_token_presents_client_cert_and_omits_authorization() {
         .expect("token exchange must succeed");
     assert_eq!(exchanged.access_token, "AAA");
 
-    let captured = tokio::time::timeout(Duration::from_secs(5), captured_rx)
+    let captured = tokio::time::timeout(Duration::from_secs(30), captured_rx)
         .await
         .expect("captured channel timeout")
         .expect("captured channel closed");

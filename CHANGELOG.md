@@ -81,7 +81,6 @@ release (`cargo semver-checks`); runtime behaviour changes are noted below.
   succeed; with the default `crl_deny_on_unavailable = false` that degraded
   revocation checking silently.
 
-
 - **The internal bounded-limiter hard cap now uses `NonZeroUsize`.** This makes
   a zero tracked-key cap unrepresentable in the crate-internal constructor;
   public `with_per_minute` and `with_per_second` constructor signatures are
@@ -101,51 +100,6 @@ release (`cargo semver-checks`); runtime behaviour changes are noted below.
   misspelled keys such as `tls_keypath` or `typo_content_security_policy` now
   abort deserialization/startup so hardened defaults are not accidentally used
   in place of the operator's intended setting.
-
-### Changed
-
-- **RBAC host matching is now ASCII-case-insensitive.** `RbacPolicy::check` and
-  `RbacPolicy::host_visible` previously compared hosts byte-exactly, so
-  `Example.COM` did not match a `hosts = ["example.com"]` pattern. Since DNS
-  names and IP literals are case-insensitive by specification, this corrects
-  false denials. Operation names and tool-name patterns remain **case-sensitive**
-  -- normalization is scoped to host matching only.
-
-- Servers started with `max_concurrent_requests` unset now log one startup
-  warning. No default is imposed; behaviour is unchanged.
-
-- Audit-file logging now uses a bounded non-blocking channel drained by a
-  dedicated writer thread, so tracing call sites on tokio worker threads no
-  longer perform synchronous file writes. If the channel is full, newest audit
-  entries are dropped and the writer records the aggregate dropped count when it
-  catches up. Runtime audit-file write or flush failures remain non-fatal but
-  now increment an internal failure counter and emit a throttled warning directly
-  to process stderr, avoiding recursive re-entry through the tracing subscriber.
-
-- A duplicate `kid` in a JWKS document now logs a warning (last entry wins, as
-  before). The logged `kid` is truncated, since it is issuer-controlled text of
-  unbounded length.
-
-### Documentation
-
-- **`docs/GUIDE.md`'s `RmcpServerKitError` reference was stale and is now
-  accurate.** It listed an `Other(anyhow::Error)` variant that does not exist,
-  and omitted `RateLimitedFor`, `Tls`, `Startup`, `Metrics`, and the new
-  `Internal`. The variants are now grouped by exposure -- client-facing
-  (rendered verbatim) versus internal-only (collapsed to
-  `"internal server error"`) -- and the `#[non_exhaustive]` contract is stated.
-
-- `RbacPolicy::argument_allowed` now documents that token comparison is
-  byte-exact with no Unicode normalization, and the consequence on
-  normalizing filesystems.
-
-- `McpServerConfig::with_extra_router` now documents how path collisions are
-  handled. A route that **exactly overlaps** a framework route panics at
-  startup inside `axum::Router::merge`; a path merely *under* a framework
-  prefix (`/admin/custom` alongside `/admin/status`) does **not** panic and is
-  **not** validated. `axum::Router` exposes no route-enumeration API, so the
-  framework cannot inspect these paths -- avoiding such collisions is the
-  caller's responsibility. Both behaviours are now pinned by tests.
 
 ### Added
 
@@ -196,6 +150,13 @@ release (`cargo semver-checks`); runtime behaviour changes are noted below.
 
 ### Changed
 
+- **RBAC host matching is now ASCII-case-insensitive.** `RbacPolicy::check` and
+  `RbacPolicy::host_visible` previously compared hosts byte-exactly, so
+  `Example.COM` did not match a `hosts = ["example.com"]` pattern. Since DNS
+  names and IP literals are case-insensitive by specification, this corrects
+  false denials. Operation names and tool-name patterns remain **case-sensitive**
+  -- normalization is scoped to host matching only.
+
 - **`generate_api_key` now returns `RmcpServerKitError::Internal` instead of
   `Auth` when salt encoding or Argon2 hashing fails.** The `Auth` variant is
   declared client-facing and is rendered verbatim to HTTP clients, so embedding
@@ -203,6 +164,17 @@ release (`cargo semver-checks`); runtime behaviour changes are noted below.
   also mapped a server-side fault to `401` rather than `500`. Not a compile
   break -- the enum is `#[non_exhaustive]`, so downstream matches already carry
   a wildcard arm -- but the observable variant and HTTP status change.
+
+- Servers started with `max_concurrent_requests` unset now log one startup
+  warning. No default is imposed; behaviour is unchanged.
+
+- Audit-file logging now uses a bounded non-blocking channel drained by a
+  dedicated writer thread, so tracing call sites on tokio worker threads no
+  longer perform synchronous file writes. If the channel is full, newest audit
+  entries are dropped and the writer records the aggregate dropped count when it
+  catches up. Runtime audit-file write or flush failures remain non-fatal but
+  now increment an internal failure counter and emit a throttled warning directly
+  to process stderr, avoiding recursive re-entry through the tracing subscriber.
 
 - OAuth `audience_validation_mode = "permissive"` now logs once per process
   when it accepts a token via the `azp`-only fallback. Acceptance behaviour is
@@ -214,9 +186,34 @@ release (`cargo semver-checks`); runtime behaviour changes are noted below.
   `info`, so a key rotation stalled behind the refresh cooldown is visible at
   default log levels.
 
+- A duplicate `kid` in a JWKS document now logs a warning (last entry wins, as
+  before). The logged `kid` is truncated, since it is issuer-controlled text of
+  unbounded length.
+
 - A duplicate `kid` warning now carries a structured `kid_truncated` boolean
   alongside the truncated value, so log pipelines can detect truncation without
   substring-matching.
+
+### Documentation
+
+- **`docs/GUIDE.md`'s `RmcpServerKitError` reference was stale and is now
+  accurate.** It listed an `Other(anyhow::Error)` variant that does not exist,
+  and omitted `RateLimitedFor`, `Tls`, `Startup`, `Metrics`, and the new
+  `Internal`. The variants are now grouped by exposure -- client-facing
+  (rendered verbatim) versus internal-only (collapsed to
+  `"internal server error"`) -- and the `#[non_exhaustive]` contract is stated.
+
+- `RbacPolicy::argument_allowed` now documents that token comparison is
+  byte-exact with no Unicode normalization, and the consequence on
+  normalizing filesystems.
+
+- `McpServerConfig::with_extra_router` now documents how path collisions are
+  handled. A route that **exactly overlaps** a framework route panics at
+  startup inside `axum::Router::merge`; a path merely *under* a framework
+  prefix (`/admin/custom` alongside `/admin/status`) does **not** panic and is
+  **not** validated. `axum::Router` exposes no route-enumeration API, so the
+  framework cannot inspect these paths -- avoiding such collisions is the
+  caller's responsibility. Both behaviours are now pinned by tests.
 
 ### Internal
 
