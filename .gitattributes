@@ -1,0 +1,29 @@
+# Normalize line endings so a Windows checkout cannot produce unrunnable files.
+#
+# The repository already stores every tracked file with LF (verified via
+# `git ls-files --eol`: i/lf across the board). Without this file, a clone with
+# `core.autocrlf=true` materialises CRLF in the working tree, which silently
+# breaks the shell scripts the CI bench gates invoke -- `set -o pipefail\r`
+# fails with "invalid option name". Working trees had already drifted apart
+# (some scripts CRLF, others LF), so this pins the intent rather than relying
+# on each contributor's git configuration.
+
+# Let git decide for anything not listed below, but always store LF.
+* text=auto eol=lf
+
+# Executable / parsed-by-a-shell files MUST be LF in the working tree too.
+*.sh text eol=lf
+
+# Rust toolchain and config formats: keep diffs stable across platforms.
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Binary assets: never touch.
+*.png binary
+*.jpg binary
+*.ico binary
+*.der binary
+*.crl binary
