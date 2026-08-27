@@ -57,6 +57,14 @@ const MCP_SERVER_CONFIG_RUNTIME_ONLY_FIELDS: &[&str] = &[
     "metrics_bind",
 ];
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharedCheck {
+    AdminAuth,
+    TlsPairing,
+    MtlsRequiresTls,
+}
+
 /// One environment override applied to a configuration struct.
 ///
 /// Secret-typed targets redact their value by setting [`Self::value`] to
@@ -1371,6 +1379,251 @@ mod tests {
             err.contains("admin_enabled=true requires auth"),
             "admin/auth must fire before TLS and mTLS checks; got {err}"
         );
+    }
+
+    fn classify_shared_check(err: RmcpServerKitError) -> SharedCheck {
+        match err {
+            RmcpServerKitError::Config(msg) => {
+                if msg.contains("admin_enabled=true requires auth") {
+                    SharedCheck::AdminAuth
+                } else if msg.contains("must both be set or both omitted")
+                    || msg.contains("tls_cert_path is set but tls_key_path is missing")
+                    || msg.contains("tls_key_path is set but tls_cert_path is missing")
+                {
+                    SharedCheck::TlsPairing
+                } else if msg.contains("auth.mtls requires TLS") {
+                    SharedCheck::MtlsRequiresTls
+                } else {
+                    panic!("unclassified shared-check config error: {msg}");
+                }
+            }
+            RmcpServerKitError::Auth(msg) => {
+                panic!("expected Config error, got Auth({msg})");
+            }
+            RmcpServerKitError::Rbac(msg) => {
+                panic!("expected Config error, got Rbac({msg})");
+            }
+            RmcpServerKitError::RateLimited(msg) => {
+                panic!("expected Config error, got RateLimited({msg})");
+            }
+            RmcpServerKitError::RateLimitedFor {
+                message,
+                retry_after,
+            } => {
+                panic!("expected Config error, got RateLimitedFor({message}, {retry_after:?})");
+            }
+            RmcpServerKitError::Io(error) => {
+                panic!("expected Config error, got Io({error})");
+            }
+            RmcpServerKitError::Json(error) => {
+                panic!("expected Config error, got Json({error})");
+            }
+            RmcpServerKitError::Toml(error) => {
+                panic!("expected Config error, got Toml({error})");
+            }
+            RmcpServerKitError::Tls(msg) => {
+                panic!("expected Config error, got Tls({msg})");
+            }
+            RmcpServerKitError::Startup(msg) => {
+                panic!("expected Config error, got Startup({msg})");
+            }
+            RmcpServerKitError::Internal(msg) => {
+                panic!("expected Config error, got Internal({msg})");
+            }
+            #[cfg(feature = "metrics")]
+            RmcpServerKitError::Metrics(msg) => {
+                panic!("expected Config error, got Metrics({msg})");
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum AdminSetting {
+        Valid,
+        EnabledWithDisabledAuth,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum TlsSetting {
+        Absent,
+        CertOnly,
+        KeyOnly,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum MtlsSetting {
+        Absent,
+        WithoutTls,
+        WithoutTlsAndInvalidCapacity,
+    }
+
+    #[derive(Debug)]
+    struct SharedCheckCase {
+        name: &'static str,
+        admin: AdminSetting,
+        tls_variants: &'static [TlsSetting],
+        mtls: MtlsSetting,
+        expected: SharedCheck,
+    }
+
+    const ABSENT_TLS: &[TlsSetting] = &[TlsSetting::Absent];
+    const BOTH_PARTIAL_TLS_DIRECTIONS: &[TlsSetting] = &[TlsSetting::CertOnly, TlsSetting::KeyOnly];
+
+    #[test]
+    fn toml_and_builder_validators_report_the_expected_shared_check_order() {
+        let cases = [
+            SharedCheckCase {
+                name: "case 1: admin/auth dependency only",
+                admin: AdminSetting::EnabledWithDisabledAuth,
+                tls_variants: ABSENT_TLS,
+                mtls: MtlsSetting::Absent,
+                expected: SharedCheck::AdminAuth,
+            },
+            SharedCheckCase {
+                name: "case 2: TLS pairing only",
+                admin: AdminSetting::Valid,
+                tls_variants: BOTH_PARTIAL_TLS_DIRECTIONS,
+                mtls: MtlsSetting::Absent,
+                expected: SharedCheck::TlsPairing,
+            },
+            SharedCheckCase {
+                name: "case 3: mTLS without TLS only",
+                admin: AdminSetting::Valid,
+                tls_variants: ABSENT_TLS,
+                mtls: MtlsSetting::WithoutTls,
+                expected: SharedCheck::MtlsRequiresTls,
+            },
+            SharedCheckCase {
+                name: "case 4: admin/auth dependency before TLS pairing",
+                admin: AdminSetting::EnabledWithDisabledAuth,
+                tls_variants: BOTH_PARTIAL_TLS_DIRECTIONS,
+                mtls: MtlsSetting::Absent,
+                expected: SharedCheck::AdminAuth,
+            },
+            SharedCheckCase {
+                name: "case 5: admin/auth dependency before mTLS without TLS",
+                admin: AdminSetting::EnabledWithDisabledAuth,
+                tls_variants: ABSENT_TLS,
+                mtls: MtlsSetting::WithoutTls,
+                expected: SharedCheck::AdminAuth,
+            },
+            SharedCheckCase {
+                name: "case 6: TLS pairing before mTLS without TLS",
+                admin: AdminSetting::Valid,
+                tls_variants: BOTH_PARTIAL_TLS_DIRECTIONS,
+                mtls: MtlsSetting::WithoutTls,
+                expected: SharedCheck::TlsPairing,
+            },
+            SharedCheckCase {
+                name: "case 7: admin/auth dependency before TLS pairing and mTLS without TLS",
+                admin: AdminSetting::EnabledWithDisabledAuth,
+                tls_variants: BOTH_PARTIAL_TLS_DIRECTIONS,
+                mtls: MtlsSetting::WithoutTls,
+                expected: SharedCheck::AdminAuth,
+            },
+            SharedCheckCase {
+                name: "case 8: mTLS without TLS before mTLS capacity knobs",
+                admin: AdminSetting::Valid,
+                tls_variants: ABSENT_TLS,
+                mtls: MtlsSetting::WithoutTlsAndInvalidCapacity,
+                expected: SharedCheck::MtlsRequiresTls,
+            },
+        ];
+
+        for case in cases {
+            for tls in case.tls_variants {
+                let config = shared_check_config(case.admin, *tls, case.mtls);
+
+                let toml_class = classify_toml_validator_error(&config);
+                assert_eq!(
+                    toml_class, case.expected,
+                    "{} with {:?} must fail TOML validation at {:?}",
+                    case.name, tls, case.expected
+                );
+
+                let builder_class = classify_builder_validator_error(&config);
+                assert_eq!(
+                    builder_class, case.expected,
+                    "{} with {:?} must fail builder validation at {:?}",
+                    case.name, tls, case.expected
+                );
+            }
+        }
+    }
+
+    fn classify_toml_validator_error(config: &ServerConfig) -> SharedCheck {
+        let err = validate_server_config(config).expect_err("config must fail TOML validation");
+        classify_shared_check(err)
+    }
+
+    fn classify_builder_validator_error(config: &ServerConfig) -> SharedCheck {
+        let builder_config = config
+            .apply_to_mcp_config(McpServerConfig::new("127.0.0.1:1", "t", "0.0.0"))
+            .expect("valid durations must bridge into McpServerConfig");
+        let err = builder_config
+            .validate()
+            .expect_err("config must fail builder validation");
+        classify_shared_check(err)
+    }
+
+    fn shared_check_config(
+        admin: AdminSetting,
+        tls: TlsSetting,
+        mtls: MtlsSetting,
+    ) -> ServerConfig {
+        let mut config = ServerConfig::default();
+        apply_admin_setting(&mut config, admin);
+        apply_tls_setting(&mut config, tls);
+        apply_mtls_setting(&mut config, admin, mtls);
+        config
+    }
+
+    fn apply_admin_setting(config: &mut ServerConfig, admin: AdminSetting) {
+        match admin {
+            AdminSetting::Valid => {}
+            AdminSetting::EnabledWithDisabledAuth => {
+                config.admin_enabled = true;
+                let auth = config
+                    .auth
+                    .get_or_insert_with(|| crate::auth::AuthConfig::with_keys(vec![]));
+                auth.enabled = false;
+            }
+        }
+    }
+
+    fn apply_tls_setting(config: &mut ServerConfig, tls: TlsSetting) {
+        match tls {
+            TlsSetting::Absent => {}
+            TlsSetting::CertOnly => {
+                config.tls_cert_path = Some("/tmp/cert.pem".into());
+            }
+            TlsSetting::KeyOnly => {
+                config.tls_key_path = Some("/tmp/key.pem".into());
+            }
+        }
+    }
+
+    fn apply_mtls_setting(config: &mut ServerConfig, admin: AdminSetting, mtls: MtlsSetting) {
+        match mtls {
+            MtlsSetting::Absent => {}
+            MtlsSetting::WithoutTls => {
+                let enabled = matches!(admin, AdminSetting::Valid);
+                let auth = config
+                    .auth
+                    .get_or_insert_with(|| crate::auth::AuthConfig::with_keys(vec![]));
+                auth.enabled = enabled;
+                auth.mtls = Some(valid_mtls_config());
+            }
+            MtlsSetting::WithoutTlsAndInvalidCapacity => {
+                let auth = config
+                    .auth
+                    .get_or_insert_with(|| crate::auth::AuthConfig::with_keys(vec![]));
+                auth.enabled = true;
+                let mut mtls_config = valid_mtls_config();
+                mtls_config.crl_max_concurrent_fetches = 0;
+                auth.mtls = Some(mtls_config);
+            }
+        }
     }
 
     #[test]
