@@ -144,7 +144,7 @@ mindmap
           reqwest fetcher + in-memory cache
           nextUpdate refresh clamped 10min..24h
           Hot-swap verifier via ArcSwap
-          Fail-open default; fail-closed opt-in
+          Fail-closed default; fail-open opt-out
           SSRF guard
             scheme allowlist http/https only
             userinfo rejected

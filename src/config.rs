@@ -1005,6 +1005,21 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
         }
     }
 
+    // Mirrors `McpServerConfig::check`. Kept in both validators deliberately:
+    // a consumer calling only `validate_server_config` on TOML would otherwise
+    // be told the config is valid while client-certificate authentication is
+    // silently inert, because a plaintext listener never performs a handshake
+    // and so never extracts an identity.
+    if server.auth.as_ref().is_some_and(|a| a.mtls.is_some())
+        && (server.tls_cert_path.is_none() || server.tls_key_path.is_none())
+    {
+        return Err(RmcpServerKitError::Config(
+            "auth.mtls requires TLS: set both tls_cert_path and tls_key_path \
+             (mTLS client certificates cannot be verified on a plaintext listener)"
+                .into(),
+        ));
+    }
+
     for (field, value) in [
         ("server.shutdown_timeout", server.shutdown_timeout.as_str()),
         ("server.request_timeout", server.request_timeout.as_str()),
@@ -1143,8 +1158,9 @@ fn validate_mtls_knobs(server: &ServerConfig) -> crate::error::Result<()> {
             RmcpServerKitError::Config("auth.mtls.crl_max_cache_entries must be nonzero".into())
         })?;
         // `0` rejects every non-empty CRL body at the streaming cap, so CRL
-        // fetching never succeeds. With the default `crl_deny_on_unavailable =
-        // false` that degrades revocation checking silently rather than loudly.
+        // fetching never succeeds. Under the default `crl_deny_on_unavailable
+        // = true` that fails every CDP-bearing handshake rather than loudly
+        // reporting the misconfiguration.
         (mtls.crl_max_response_bytes != 0).ok_or_else(|| {
             RmcpServerKitError::Config("auth.mtls.crl_max_response_bytes must be nonzero".into())
         })?;
@@ -1326,6 +1342,37 @@ mod tests {
     #[test]
     fn valid_server_config_passes() {
         let cfg = ServerConfig::default();
+        assert!(validate_server_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn mtls_without_tls_rejected() {
+        let mut auth = crate::auth::AuthConfig::with_keys(vec![]);
+        auth.mtls = Some(valid_mtls_config());
+        let cfg = ServerConfig {
+            auth: Some(auth),
+            tls_cert_path: None,
+            tls_key_path: None,
+            ..ServerConfig::default()
+        };
+        let err = validate_server_config(&cfg).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("tls_cert_path") && msg.contains("tls_key_path"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn mtls_with_tls_accepted() {
+        let mut auth = crate::auth::AuthConfig::with_keys(vec![]);
+        auth.mtls = Some(valid_mtls_config());
+        let cfg = ServerConfig {
+            auth: Some(auth),
+            tls_cert_path: Some("cert.pem".into()),
+            tls_key_path: Some("key.pem".into()),
+            ..ServerConfig::default()
+        };
         assert!(validate_server_config(&cfg).is_ok());
     }
 

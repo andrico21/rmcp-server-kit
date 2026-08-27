@@ -4134,8 +4134,9 @@ fn check_mtls_capacity_knobs(mtls: &MtlsConfig) -> Result<(), RmcpServerKitError
         RmcpServerKitError::Config("auth.mtls.crl_max_cache_entries must be nonzero".into())
     })?;
     // `0` rejects every non-empty CRL body at the streaming cap, so CRL
-    // fetching never succeeds. With the default `crl_deny_on_unavailable =
-    // false` that degrades revocation checking silently rather than loudly.
+    // fetching never succeeds. Under the default `crl_deny_on_unavailable
+    // = true` that fails every CDP-bearing handshake rather than loudly
+    // reporting the misconfiguration.
     (mtls.crl_max_response_bytes != 0).ok_or_else(|| {
         RmcpServerKitError::Config("auth.mtls.crl_max_response_bytes must be nonzero".into())
     })?;

@@ -510,9 +510,10 @@ Lifecycle:
      is enabled.
 
 Failure modes:
-- Fetch failure / parse failure: if `crl_deny_on_unavailable = false`
-  (default) handshakes continue with a `WARN` log; if `true`, handshakes
-  that depend on an unavailable CRL are rejected. A cached CRL whose refresh
+- Fetch failure / parse failure: if `crl_deny_on_unavailable = true`
+  (default) handshakes that depend on an unavailable CRL are rejected, and
+  only when *every* relevant CDP is uncached; if `false`, handshakes continue
+  with a `WARN` log. A cached CRL whose refresh
   keeps failing is retained only for retry until `nextUpdate +
   crl_retry_retention`; webpki still rejects CRL use past `nextUpdate`.
 - `crl_allow_http = false` rejects `http://` CDP URLs.

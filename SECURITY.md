@@ -71,11 +71,15 @@ When mTLS is enabled, rmcp-server-kit:
 4. Hot-swaps the underlying `rustls::ClientCertVerifier` via `ArcSwap` once
    new CRLs land, so handshakes always check the freshest revocation data
    without dropping in-flight connections.
-5. **Fails open by default**: if a CRL cannot be fetched, the handshake is
-   still allowed and a `WARN` log is emitted. Expired CRLs are not trusted
-   when `crl_enforce_expiration = true` (the default); webpki rejects them
-   at `nextUpdate`. Operators who require fail-closed semantics can set
-   `crl_deny_on_unavailable = true`.
+5. **Fails closed by default** (since 3.9): a certificate advertising CRL
+   distribution points is rejected when *every* relevant CDP is uncached and
+   unfetchable, per RFC 5280 §6.3. Denial requires all relevant CDPs to be
+   unavailable, not merely one, so blocking a single mirror cannot be used to
+   deny service. Expired CRLs are not trusted when
+   `crl_enforce_expiration = true` (the default); webpki rejects them at
+   `nextUpdate`. Operators who need the previous fail-open behaviour can set
+   `crl_deny_on_unavailable = false`, accepting that a revoked certificate is
+   then admitted whenever its CRL is unreachable.
 
 `ReloadHandle::refresh_crls()` forces an immediate refresh of every cached
 CRL — useful from an admin endpoint or a cron-driven probe.
