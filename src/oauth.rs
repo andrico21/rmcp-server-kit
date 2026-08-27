@@ -560,6 +560,11 @@ impl OauthHttpClient {
     /// fixtures. This is unreachable from normal production builds and exists
     /// only so tests can exercise higher-level OAuth flows against local mock
     /// servers.
+    ///
+    /// # ⚠️ Security
+    ///
+    /// Disables the OAuth SSRF guard's loopback rejection, allowing requests to
+    /// loopback-backed targets that production OAuth screening would reject.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     #[must_use]
@@ -575,6 +580,11 @@ impl OauthHttpClient {
     /// applied). Used by integration tests to exercise the redirect-
     /// downgrade and CA-trust regressions without going through
     /// `exchange_token`. Not part of the public API.
+    ///
+    /// # ⚠️ Security
+    ///
+    /// Calls `self.inner.get(url).send()` directly, bypassing `send_screened`
+    /// and its initial-target SSRF and scheme checks for caller-supplied URLs.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     pub async fn __test_get(&self, url: &str) -> reqwest::Result<reqwest::Response> {
@@ -586,6 +596,11 @@ impl OauthHttpClient {
     /// drive `.get(...).send()` directly and observe whether the
     /// SsrfScreeningResolver fired (vs. the proxy short-circuiting
     /// the request). Not part of the public API.
+    ///
+    /// # ⚠️ Security
+    ///
+    /// Exposes the raw `reqwest::Client`, enabling callers to bypass
+    /// `send_screened` and its initial-target SSRF and scheme checks.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     #[must_use]
@@ -2128,6 +2143,11 @@ impl JwksCache {
     /// Test-only: disable initial-target SSRF screening for loopback-backed
     /// fixtures. This is unreachable from normal production builds and exists
     /// only so tests can fetch JWKS from local mock servers.
+    ///
+    /// # ⚠️ Security
+    ///
+    /// Disables the JWKS fetcher's SSRF guard loopback rejection, allowing
+    /// loopback JWKS targets that production OAuth screening would reject.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     #[must_use]
@@ -2578,6 +2598,12 @@ impl JwksCache {
 
     /// Test-only: drive `refresh_inner` now, surfacing the
     /// `build_key_cache` error string. Used by `tests/jwks_key_cap.rs`.
+    ///
+    /// # ⚠️ Security
+    ///
+    /// Bypasses `refresh_with_cooldown` and therefore `JWKS_REFRESH_COOLDOWN`,
+    /// the DoS protection that prevents invalid-JWT floods from hammering the
+    /// identity provider's JWKS endpoint.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     pub async fn __test_refresh_now(&self) -> Result<(), String> {

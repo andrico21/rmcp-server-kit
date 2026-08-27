@@ -596,7 +596,8 @@ impl CrlSet {
         false
     }
 
-    /// Test helper for constructing a CRL set from in-memory CRLs.
+    /// Test helper for constructing a CRL set from in-memory CRLs. Benign but
+    /// ungated public leak; test-only despite not requiring `test-helpers`.
     ///
     /// # Errors
     ///
@@ -629,13 +630,9 @@ impl CrlSet {
         Self::new(roots, config, discover_tx, initial_cache)
     }
 
-    /// Test-only: same as [`Self::__test_with_prepopulated_crls`] but
-    /// returns the discover-channel receiver to the caller so the
-    /// background channel `send`s succeed (the receiver stays alive
-    /// for the duration of the test). Required by the B2 dedup
-    /// regression test, which must observe URLs being committed to
-    /// `seen_urls` after a successful limiter+send sequence. Not part
-    /// of the public API.
+    /// Test-only: same as [`Self::__test_with_prepopulated_crls`] but keeps and
+    /// returns the discover receiver. Benign but ungated public leak; test-only
+    /// despite not requiring `test-helpers`.
     ///
     /// # Errors
     ///
@@ -668,10 +665,11 @@ impl CrlSet {
         Ok((crl_set, discover_rx))
     }
 
-    /// Test-only: directly invoke the discovery rate-limiter on a batch of URLs
-    /// and return `(accepted, dropped)`. Bypasses the dedup `seen_urls` set so
-    /// callers can deterministically saturate the limiter; mutates the limiter
-    /// state in place. Not part of the public API.
+    /// # ⚠️ Security
+    ///
+    /// Availability hazard: bypasses discovery deduplication, consumes CDP
+    /// discovery quota, and enqueues arbitrary URLs. Fetch-side SSRF, scheme,
+    /// and concurrency caps still apply. Ungated public leak.
     #[doc(hidden)]
     pub fn __test_check_discovery_rate(&self, urls: &[String]) -> (usize, usize) {
         let mut accepted = 0usize;
@@ -687,14 +685,11 @@ impl CrlSet {
         (accepted, dropped)
     }
 
-    /// Test-only: invoke the real `note_discovered_urls` so dedup + rate-limit
-    /// + cached-fallback paths are all exercised. Returns the `missing_cached`
-    /// flag the production verifier uses to decide whether to fail the handshake.
+    /// # ⚠️ Security
     ///
-    /// When no receiver is attached (the usual unit-test setup), the send fails
-    /// and production correctly records nothing, so this mirrors the admission
-    /// bookkeeping by marking the URL **pending** — matching what a live
-    /// refresher would observe between enqueue and fetch.
+    /// State hazard: mutates discovery state; its closed-channel pending shim
+    /// differs from production behaviour and can create state a real closed
+    /// discovery channel would not record. Ungated public leak.
     #[doc(hidden)]
     pub fn __test_note_discovered_urls(&self, urls: &[String]) -> bool {
         let missing_cached = self.note_discovered_urls(urls, &[]);
@@ -739,13 +734,9 @@ impl CrlSet {
         self.note_discovered_urls(end_entity_urls, intermediate_urls)
     }
 
-    /// Test-only: report whether a URL is currently suppressed from
-    /// re-discovery — i.e. present in EITHER dedup state.
-    ///
-    /// This is the property callers actually care about: "will a future
-    /// handshake re-enqueue this URL?". Use
-    /// [`Self::__test_is_permanently_seen`] when the distinction between
-    /// in-flight and confirmed-cached matters.
+    /// Test-only: report whether a URL is suppressed from re-discovery. Benign
+    /// inspection helper, but an ungated public leak available without
+    /// `test-helpers`; use only in tests.
     #[doc(hidden)]
     pub fn __test_is_seen(&self, url: &str) -> bool {
         let in_seen = {
@@ -778,10 +769,11 @@ impl CrlSet {
         seen.contains(url)
     }
 
-    /// Test-only: drive the post-fetch bookkeeping without performing HTTP.
-    /// `admitted` mirrors [`Self::fetch_and_store_url`]'s return value:
-    /// `true` when the CRL landed in the cache, `false` when the fetch
-    /// failed or the cache cap refused it.
+    /// # ⚠️ Security
+    ///
+    /// Caller-supplied `admitted = true` promotes to `seen_urls` without
+    /// verifying the CRL is cached; a wrongly promoted URL is never re-enqueued
+    /// for the process lifetime.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     pub fn __test_settle_pending(&self, url: &str, admitted: bool) {
@@ -828,12 +820,11 @@ impl CrlSet {
             .is_ok_and(|guard| guard.contains(url))
     }
 
-    /// Test-only: triggers the request-hot-path fetch path for `url`
-    /// WITHOUT going through the TLS handshake. Returns any error the
-    /// host-semaphore cap check produces. A network-unreachable
-    /// failure for the fetch itself is treated as `Ok(())` (test only
-    /// cares about the cap; real tests use mock hosts that won't
-    /// resolve — the cap must fire BEFORE network I/O).
+    /// # ⚠️ Security
+    ///
+    /// Calls `gated_fetch` directly, bypassing `note_discovered_urls` and
+    /// therefore `discovery_limiter.check()`, the per-minute CDP discovery cap.
+    /// SSRF, scheme, and concurrency caps still apply.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     pub async fn __test_trigger_fetch(&self, url: &str) -> Result<(), RmcpServerKitError> {
@@ -861,17 +852,9 @@ impl CrlSet {
         }
     }
 
-    /// Test-only: directly insert `cached` under `url` into both
-    /// `cache` and `cached_urls`, bypassing HTTP. Does NOT enforce
-    /// `crl_max_cache_entries` when called pre-cap — the test uses it
-    /// to stage preconditions. For cap-breach coverage, tests invoke
-    /// the real production insertion path.
-    ///
-    /// Wait — the `cache_hard_cap_drops_newest` test DOES use this
-    /// helper to assert the cap fires. Therefore this helper MUST
-    /// enforce the hard cap (silent drop with warn!) the same way the
-    /// production code does. The helper is a thin wrapper around the
-    /// same internal insertion fn the production path uses.
+    /// Test-only: insert through `commit_cache_update_atomically`, preserving
+    /// normal cache/verifier publication. Best-effort: discards verifier
+    /// rebuild errors, so an invalid CRL is a silent no-op.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     pub async fn __test_insert_cache(&self, url: &str, cached: CachedCrl) {
@@ -892,7 +875,14 @@ impl CrlSet {
             .await
     }
 
-    /// Test-only: replace a cache entry without rebuilding the verifier.
+    /// # ⚠️ Security
+    ///
+    /// Writes into `cache` directly, bypassing `commit_cache_update_atomically`
+    /// and publication ordering at lines 283-291. This can desynchronise
+    /// `cached_urls` from `inner_verifier`; with default
+    /// `crl_deny_on_unavailable = true`, the lines 547-579 precheck trusts
+    /// `cached_urls` and can admit a certificate whose revocation status is
+    /// unenforceable.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     pub async fn __test_replace_cache_entry_unverified(&self, url: &str, cached: CachedCrl) {
@@ -900,10 +890,11 @@ impl CrlSet {
         cache.insert(url.to_owned(), cached);
     }
 
-    /// Test-only: trigger a refresh cycle for a single URL. Exercises
-    /// the same stale-grace / fetch-failure path as `refresh_urls()`.
-    /// Returns the refresh error (if any) — most tests ignore it
-    /// because they assert post-state, not the transient error.
+    /// # ⚠️ Security
+    ///
+    /// Lets a caller-supplied URL reach `refresh_urls` and then `gated_fetch`,
+    /// bypassing normal CDP discovery admission, deduplication, and rate-limit
+    /// checks.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     pub async fn __test_trigger_refresh_url(&self, url: &str) -> Result<(), RmcpServerKitError> {

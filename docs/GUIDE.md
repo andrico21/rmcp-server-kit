@@ -90,7 +90,7 @@ This gives you `/healthz`, `/readyz`, and `/mcp` endpoints out of the box.
 | `oauth`   | No      | OAuth 2.1 JWT validation via JWKS. Adds `jsonwebtoken` and `reqwest`. |
 | `oauth-mtls-client` | No | RFC 8705 §2 mTLS client authentication for the OAuth token-exchange endpoint. Implies `oauth`. Without this feature, configurations that set `TokenExchangeConfig::client_cert` are rejected at startup by `OAuthConfig::validate`. See Recipe 2 for usage. |
 | `metrics` | No      | Prometheus metrics endpoint on a separate listener. Adds `prometheus`. |
-| `test-helpers` | No | Exposes test-only helpers from `bounded_limiter` and `mtls_revocation` for downstream integration tests. **Not part of the stable API surface** -- no semver guarantees across minor releases. |
+| `test-helpers` | No | Exposes test-only helpers from `mtls_revocation` and, when `oauth` is also enabled, `oauth`, for downstream integration tests. **Not part of the stable API surface** -- no semver guarantees across minor releases. **never enable in a production build:** some helpers deliberately bypass SSRF screening, the JWKS refresh cooldown, the CDP discovery rate limiter, and CRL verifier publication. |
 
 Enable in `Cargo.toml`:
 

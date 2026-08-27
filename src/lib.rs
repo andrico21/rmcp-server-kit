@@ -96,9 +96,12 @@
 //!   [`oauth::TokenExchangeConfig::client_cert`].
 //! - `metrics` — Prometheus registry and `/metrics` listener. Pulls in
 //!   the [`prometheus`] crate. Required to use the [`metrics`] module.
-//! - `test-helpers` — exposes test-only helpers from [`bounded_limiter`] and
-//!   [`mtls_revocation`] for downstream integration tests. **Not part of the
-//!   stable API surface** — no semver guarantees across minor releases.
+//! - `test-helpers` — exposes test-only helpers from [`mtls_revocation`] and,
+//!   when `oauth` is also enabled, [`oauth`], for downstream integration tests.
+//!   **Not part of the stable API surface** — no semver guarantees across minor
+//!   releases. **never enable in a production build:** some helpers deliberately
+//!   bypass SSRF screening, the JWKS refresh cooldown, the CDP discovery rate
+//!   limiter, and CRL verifier publication.
 //!
 //! # ⚠️ stdio transport is unauthenticated
 //!

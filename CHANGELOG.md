@@ -17,6 +17,10 @@ release (`cargo semver-checks`); runtime behaviour changes are noted below.
 
 ### Security
 
+- Documented the hazards of the `test-helpers` feature at the crate, guide, and
+  manifest level: the helpers are for downstream integration tests only, are not
+  stable API, and can deliberately bypass SSRF screening, the JWKS refresh
+  cooldown, the CDP discovery rate limiter, and CRL verifier publication.
 - **CRL revocation now fails closed by default.** `auth.mtls.crl_deny_on_unavailable`
   defaults to `true` (was `false`). A client certificate advertising CRL
   distribution points is rejected when *every* relevant CDP is uncached and

@@ -156,6 +156,10 @@ default = []
 oauth = ["dep:jsonwebtoken", "dep:urlencoding"]
 oauth-mtls-client = ["oauth"]
 metrics = ["dep:prometheus"]
+# Test-only helpers from mtls_revocation and oauth for downstream integration
+# tests. never enable in a production build: some helpers deliberately bypass
+# SSRF screening, the JWKS refresh cooldown, the CDP discovery rate limiter,
+# and CRL verifier publication.
 test-helpers = []
 
 [dev-dependencies]
