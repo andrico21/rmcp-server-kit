@@ -1922,6 +1922,30 @@ mod tests {
         }
     }
 
+    /// Covers the cap-before-publication invariant directly rather than by
+    /// driving `bootstrap_fetch`, because `bootstrap_fetch` cannot be reached
+    /// from a test without weakening production SSRF screening.
+    ///
+    /// `fetch_crl` performs its own DNS precheck -- `tokio::net::lookup_host`
+    /// followed by `ip_block_reason` -- *before* handing the request to
+    /// `reqwest`. That precheck is independent of the `dns_resolver` injected
+    /// into the client, so a custom resolver cannot redirect a fetch to a
+    /// local mock: a `wiremock` server on loopback is rejected as a blocked IP
+    /// before `reqwest` is ever invoked.
+    ///
+    /// Reaching `bootstrap_fetch` end to end would therefore require either a
+    /// test-only bypass of that precheck, or a CRL served from a public
+    /// non-private address. The first is deliberately not done -- a bypass
+    /// seam next to CRL fetching is a worse security liability than the
+    /// coverage it would buy -- and the second is not available offline.
+    ///
+    /// This test asserts the property that actually matters: the cap is
+    /// applied *before* `CrlSet::new`, so `cache`, `cached_urls`, and
+    /// `inner_verifier` are all derived from one already-bounded map. Post-hoc
+    /// mutation would violate the publication ordering documented above.
+    ///
+    /// If you are here to "improve" this by making it drive `bootstrap_fetch`:
+    /// do not add a precheck bypass to `fetch_crl` to do it.
     #[tokio::test]
     async fn bootstrap_cache_cap_is_applied_before_crl_set_publication() {
         let cap = 4usize;
