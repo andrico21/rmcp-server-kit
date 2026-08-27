@@ -966,6 +966,19 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
         ));
     }
 
+    // The next three checks are ordered to match `McpServerConfig::check`
+    // (admin/auth dependency, then TLS pairing, then mTLS-requires-TLS) so
+    // that a config which is invalid in more than one of these ways reports
+    // the same first error whichever validator a consumer reaches for.
+    // Checks outside this group are not ordered against the builder: the two
+    // types accept different inputs (`listen_port` has no builder analog),
+    // so full first-error parity is neither achievable nor claimed.
+    if server.admin_enabled && !server.auth.as_ref().is_some_and(|a| a.enabled) {
+        return Err(RmcpServerKitError::Config(
+            "admin_enabled=true requires auth to be configured and enabled".into(),
+        ));
+    }
+
     match (&server.tls_cert_path, &server.tls_key_path) {
         (Some(_), None) | (None, Some(_)) => {
             return Err(RmcpServerKitError::Config(
@@ -975,13 +988,12 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
         _ => {}
     }
 
-    // Mirrors `McpServerConfig::check`, and must stay immediately after the
-    // TLS pairing check so both validators reject the same input with the
-    // same first error. Kept duplicated deliberately: a consumer calling only
-    // `validate_server_config` on TOML would otherwise be told the config is
-    // valid while client-certificate authentication is silently inert,
-    // because a plaintext listener never performs a handshake and so never
-    // extracts an identity.
+    // Kept duplicated from `McpServerConfig::check` deliberately, and must
+    // stay in this position: a consumer calling only `validate_server_config`
+    // on TOML would otherwise be told the config is valid while
+    // client-certificate authentication is silently inert, because a
+    // plaintext listener never performs a handshake and so never extracts an
+    // identity.
     if server.auth.as_ref().is_some_and(|a| a.mtls.is_some())
         && (server.tls_cert_path.is_none() || server.tls_key_path.is_none())
     {
@@ -1008,18 +1020,10 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
     validate_mtls_knobs(server)?;
     validate_trusted_forwarder_config(server)?;
 
-    if server.admin_enabled {
-        let auth_enabled = server.auth.as_ref().is_some_and(|a| a.enabled);
-        if !auth_enabled {
-            return Err(RmcpServerKitError::Config(
-                "admin_enabled=true requires auth to be configured and enabled".into(),
-            ));
-        }
-        if server.admin_role.trim().is_empty() {
-            return Err(RmcpServerKitError::Config(
-                "admin_role must not be empty".into(),
-            ));
-        }
+    if server.admin_enabled && server.admin_role.trim().is_empty() {
+        return Err(RmcpServerKitError::Config(
+            "admin_role must not be empty".into(),
+        ));
     }
 
     for (field, value) in [
@@ -1345,6 +1349,28 @@ mod tests {
     fn valid_server_config_passes() {
         let cfg = ServerConfig::default();
         assert!(validate_server_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn admin_auth_check_precedes_tls_and_mtls_like_the_builder() {
+        // A config invalid in all three ordered ways must report the same
+        // first error here as `McpServerConfig::check` does, otherwise the
+        // TOML and builder paths disagree about what is wrong.
+        let mut auth = crate::auth::AuthConfig::with_keys(vec![]);
+        auth.enabled = false;
+        auth.mtls = Some(valid_mtls_config());
+        let cfg = ServerConfig {
+            admin_enabled: true,
+            auth: Some(auth),
+            tls_cert_path: None,
+            tls_key_path: None,
+            ..ServerConfig::default()
+        };
+        let err = validate_server_config(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("admin_enabled=true requires auth"),
+            "admin/auth must fire before TLS and mTLS checks; got {err}"
+        );
     }
 
     #[test]
