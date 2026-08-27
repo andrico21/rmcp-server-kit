@@ -276,8 +276,8 @@ async fn stale_removal_also_clears_seen() {
 // that: `seen_urls` is pruned only for URLs whose CRL was successfully
 // cached and later went stale. The URL was therefore never re-enqueued for
 // the process lifetime, so revocation for that CDP was silently disabled
-// under the default `crl_deny_on_unavailable = false`, or the handshake
-// failed forever with it set to `true`.
+// under the pre-3.9 default `crl_deny_on_unavailable = false`, or the
+// handshake failed forever with it set to `true` -- which is now the default.
 //
 // CDP URLs come from the client-presented certificate, so a holder of a
 // revoked cert could trigger this deliberately by making the first fetch

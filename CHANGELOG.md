@@ -116,8 +116,8 @@ release (`cargo semver-checks`); runtime behaviour changes are noted below.
 
   `auth.mtls.crl_max_response_bytes = 0` was likewise accepted and made every
   non-empty CRL body exceed the streaming cap, so CRL fetching could never
-  succeed; with the default `crl_deny_on_unavailable = false` that degraded
-  revocation checking silently.
+  succeed; under the new default `crl_deny_on_unavailable = true` that fails
+  every CDP-bearing handshake instead of reporting the misconfiguration.
 
 - **The internal bounded-limiter hard cap now uses `NonZeroUsize`.** This makes
   a zero tracked-key cap unrepresentable in the crate-internal constructor;

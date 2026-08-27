@@ -975,6 +975,23 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
         _ => {}
     }
 
+    // Mirrors `McpServerConfig::check`, and must stay immediately after the
+    // TLS pairing check so both validators reject the same input with the
+    // same first error. Kept duplicated deliberately: a consumer calling only
+    // `validate_server_config` on TOML would otherwise be told the config is
+    // valid while client-certificate authentication is silently inert,
+    // because a plaintext listener never performs a handshake and so never
+    // extracts an identity.
+    if server.auth.as_ref().is_some_and(|a| a.mtls.is_some())
+        && (server.tls_cert_path.is_none() || server.tls_key_path.is_none())
+    {
+        return Err(RmcpServerKitError::Config(
+            "auth.mtls requires TLS: set both tls_cert_path and tls_key_path \
+             (mTLS client certificates cannot be verified on a plaintext listener)"
+                .into(),
+        ));
+    }
+
     if server.max_concurrent_requests == Some(0) {
         return Err(RmcpServerKitError::Config(
             "max_concurrent_requests must be nonzero when set".into(),
@@ -1003,21 +1020,6 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
                 "admin_role must not be empty".into(),
             ));
         }
-    }
-
-    // Mirrors `McpServerConfig::check`. Kept in both validators deliberately:
-    // a consumer calling only `validate_server_config` on TOML would otherwise
-    // be told the config is valid while client-certificate authentication is
-    // silently inert, because a plaintext listener never performs a handshake
-    // and so never extracts an identity.
-    if server.auth.as_ref().is_some_and(|a| a.mtls.is_some())
-        && (server.tls_cert_path.is_none() || server.tls_key_path.is_none())
-    {
-        return Err(RmcpServerKitError::Config(
-            "auth.mtls requires TLS: set both tls_cert_path and tls_key_path \
-             (mTLS client certificates cannot be verified on a plaintext listener)"
-                .into(),
-        ));
     }
 
     for (field, value) in [
@@ -1617,6 +1619,11 @@ mod tests {
                 #[cfg(not(feature = "oauth"))]
                 oauth: None,
             }),
+            // mTLS requires TLS, and that check runs before the capacity
+            // knobs. Without these paths every caller of this helper would
+            // fail on the TLS pairing error and never reach what it asserts.
+            tls_cert_path: Some("cert.pem".into()),
+            tls_key_path: Some("key.pem".into()),
             ..ServerConfig::default()
         }
     }
