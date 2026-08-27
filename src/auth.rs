@@ -108,7 +108,14 @@ pub enum AuthMethod {
 enum AuthFailureClass {
     MissingCredential,
     InvalidCredential,
-    #[cfg_attr(not(feature = "oauth"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "oauth"),
+        allow(
+            dead_code,
+            reason = "only OAuth JWT validation can report an expired credential; \
+                      the variant is unconstructed in builds without that feature"
+        )
+    )]
     ExpiredCredential,
     /// Source IP exceeded the post-failure backoff limit.
     RateLimited,
@@ -1390,7 +1397,15 @@ fn auth_method_label(method: AuthMethod) -> &'static str {
     }
 }
 
-#[cfg_attr(not(feature = "oauth"), allow(unused_variables))]
+#[cfg_attr(
+    not(feature = "oauth"),
+    allow(
+        unused_variables,
+        reason = "`state` is only read to decide whether to advertise OAuth \
+                  protected-resource metadata; without the `oauth` feature that \
+                  decision is a compile-time `false`"
+    )
+)]
 fn unauthorized_response(state: &AuthState, failure_class: AuthFailureClass) -> Response {
     #[cfg(feature = "oauth")]
     let advertise_resource_metadata = state.jwks_cache.is_some();

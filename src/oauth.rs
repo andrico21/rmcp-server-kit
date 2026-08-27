@@ -4810,7 +4810,11 @@ role = "admin"
     }
 
     async fn wait_for_log_contains(logs: &CapturedLogs, needle: &str) {
-        tokio::time::timeout(Duration::from_secs(2), async {
+        // Must comfortably exceed the mock response delay: the detached task
+        // cannot emit its audit line until the upstream exchange completes, so
+        // this bound is `mock delay + slack`, not a latency expectation. It is
+        // a bounded wait -- on success it returns as soon as the line appears.
+        tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 if logs.contents().contains(needle) {
                     return;
@@ -4965,7 +4969,13 @@ role = "admin"
             .and(wiremock::matchers::path("/token"))
             .respond_with(
                 wiremock::ResponseTemplate::new(200)
-                    .set_delay(Duration::from_millis(150))
+                    // Long enough that the completion arm cannot plausibly win
+                    // the `biased;` race before the caller cancels. A tight
+                    // delay would make the outcome assertion depend on machine
+                    // load rather than on the detach behaviour it proves. The
+                    // test never waits this out -- returning without waiting is
+                    // precisely the point.
+                    .set_delay(Duration::from_secs(2))
                     .set_body_json(exchange_response(
                         "abandoned-downstream-token",
                         &long_issued_token_type,
@@ -5068,7 +5078,10 @@ role = "admin"
             .and(wiremock::matchers::path("/token"))
             .respond_with(
                 wiremock::ResponseTemplate::new(200)
-                    .set_delay(Duration::from_millis(150))
+                    // See the opaque-token variant of this test: the delay is a
+                    // race margin, not a wait. It keeps the completion arm from
+                    // winning the `biased;` race under load.
+                    .set_delay(Duration::from_secs(2))
                     .set_body_json(exchange_response(
                         &jwt,
                         "urn:ietf:params:oauth:token-type:access_token",

@@ -1727,7 +1727,11 @@ where
         axum::routing::get(healthz)
     };
 
-    #[allow(unused_mut)] // mut needed when oauth feature adds PRM route
+    #[allow(
+        unused_mut,
+        reason = "the binding is only reassigned when the `oauth` feature adds the \
+                  protected-resource-metadata route below"
+    )]
     let mut router = axum::Router::new()
         .route("/healthz", axum::routing::get(healthz))
         .route("/readyz", readyz_route)

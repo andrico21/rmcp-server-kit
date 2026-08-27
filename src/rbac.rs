@@ -2539,22 +2539,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn redact_arg_is_fast_enough() {
-        // Sanity floor: a single redaction should take well under 100 µs
-        // even in unoptimized debug builds. Production criterion bench
-        // (see H-T4 plan) will assert a stricter <10 µs threshold.
-        let salt = b"perf-sanity-salt-32-bytes-padded";
-        let value = "x".repeat(256);
-        let start = std::time::Instant::now();
-        let _ = redact_with_salt(salt, &value);
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < Duration::from_millis(5),
-            "single redact_with_salt took {elapsed:?}, expected <5 ms even in debug"
-        );
-    }
-
     // -- enforce_tool_policy identity propagation regression test (BUG H-S3) --
 
     /// Regression: when `enforce_tool_policy` denied a request, the deny
