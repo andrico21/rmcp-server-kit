@@ -36,7 +36,7 @@
 //! let _wrapped = with_hooks(handler, hooks);
 //! ```
 
-use std::{borrow::Cow, fmt, future::Future, pin::Pin, sync::Arc};
+use std::{borrow::Cow, fmt, future::Future, io, pin::Pin, sync::Arc};
 
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
@@ -52,7 +52,7 @@ use rmcp::{
 };
 
 /// Context passed to before/after hooks for a single tool call.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct ToolCallContext {
     /// Tool name being invoked.
@@ -84,6 +84,35 @@ impl ToolCallContext {
             sub: None,
             request_id: None,
         }
+    }
+}
+
+impl fmt::Debug for ToolCallContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            tool_name,
+            arguments,
+            identity,
+            role,
+            sub,
+            request_id,
+        } = self;
+        let mut debug = f.debug_struct("ToolCallContext");
+        debug.field("tool_name", tool_name);
+        if crate::diagnostics::tool_call_arguments() {
+            debug
+                .field("arguments", arguments)
+                .field("identity", identity)
+                .field("role", role)
+                .field("sub", sub);
+        } else {
+            debug
+                .field("arguments", &"[REDACTED]")
+                .field("identity", &"[REDACTED]")
+                .field("role", &"[REDACTED]")
+                .field("sub", &"[REDACTED]");
+        }
+        debug.field("request_id", request_id).finish()
     }
 }
 
@@ -205,6 +234,8 @@ impl ToolHooks {
         self
     }
 }
+
+const _HOOKED_HANDLER_DOC_ANCHOR: &str = "HookedHandler";
 
 impl fmt::Debug for ToolHooks {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -347,11 +378,6 @@ fn too_large_result(limit: usize, actual: Option<usize>, tool: &str) -> CallTool
     r
 }
 
-/// Serialized byte length, or `None` when the result cannot be serialized.
-fn serialized_size(result: &CallToolResult) -> Option<usize> {
-    serde_json::to_vec(result).ok().map(|v| v.len())
-}
-
 /// Outcome of the `max_result_bytes` policy for a measured -- or
 /// unmeasurable -- result.
 #[derive(Debug, PartialEq, Eq)]
@@ -364,23 +390,27 @@ enum SizeVerdict {
     PassUnmeasured,
 }
 
-/// Decide what the size cap does, given a possibly-unmeasurable size.
-///
-/// An unmeasurable result **fails closed** when a cap is configured: a
-/// serialization failure must not become a silent bypass of the only
-/// control bounding tool-result size.
-const fn decide_size(size: Option<usize>, max: Option<usize>) -> SizeVerdict {
-    match (size, max) {
-        (Some(size), Some(limit)) if size > limit => SizeVerdict::Replace {
-            limit,
-            actual: Some(size),
+/// Decide what the size cap does, given an optional size-measurement outcome.
+const fn decide_size(size: Option<SizeMeasure>, max: Option<usize>) -> SizeVerdict {
+    match size {
+        Some(SizeMeasure::Exact(size)) => match max {
+            Some(limit) if size > limit => SizeVerdict::Replace {
+                limit,
+                actual: Some(size),
+            },
+            Some(_) | None => SizeVerdict::Pass { size },
         },
-        (Some(size), _) => SizeVerdict::Pass { size },
-        (None, Some(limit)) => SizeVerdict::Replace {
+        Some(SizeMeasure::Exceeded { limit }) => SizeVerdict::Replace {
             limit,
             actual: None,
         },
-        (None, None) => SizeVerdict::PassUnmeasured,
+        None => match max {
+            Some(limit) => SizeVerdict::Replace {
+                limit,
+                actual: None,
+            },
+            None => SizeVerdict::PassUnmeasured,
+        },
     }
 }
 
@@ -392,13 +422,11 @@ fn apply_size_cap(
     max: Option<usize>,
     tool: &str,
 ) -> (CallToolResult, usize, bool) {
-    let size = serialized_size(&result);
-    if size.is_none() {
-        tracing::error!(
-            tool = %tool,
-            "tool result failed to serialize; size cannot be measured"
-        );
-    }
+    let size = if max.is_some() {
+        Some(serialized_size(&result, max))
+    } else {
+        None
+    };
     match decide_size(size, max) {
         SizeVerdict::Pass { size } => (result, size, false),
         SizeVerdict::PassUnmeasured => (result, 0, false),
@@ -410,8 +438,6 @@ fn apply_size_cap(
                 limit_bytes = limit,
                 "tool result exceeds max_result_bytes; replacing with structured error"
             );
-            // Over-limit accounting sentinel, not a measurement: an
-            // unmeasurable result is charged just past the cap.
             let accounted = actual.unwrap_or_else(|| limit.saturating_add(1));
             (too_large_result(limit, actual, tool), accounted, true)
         }
@@ -604,6 +630,82 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SizeLimitExceeded;
+
+impl fmt::Display for SizeLimitExceeded {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("serialized result exceeded configured size cap")
+    }
+}
+
+impl std::error::Error for SizeLimitExceeded {}
+
+struct CountingWriter {
+    bytes: usize,
+    limit: Option<usize>,
+}
+
+impl CountingWriter {
+    const fn unbounded() -> Self {
+        Self {
+            bytes: 0,
+            limit: None,
+        }
+    }
+
+    const fn bounded(limit: usize) -> Self {
+        Self {
+            bytes: 0,
+            limit: Some(limit),
+        }
+    }
+}
+
+impl io::Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let next = self.bytes.saturating_add(buf.len());
+        if self.limit.is_some_and(|limit| next > limit) {
+            Err(io::Error::other(SizeLimitExceeded))
+        } else {
+            self.bytes = next;
+            Ok(buf.len())
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Outcome of measuring serialized result size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SizeMeasure {
+    /// Exact serialized size in bytes.
+    Exact(usize),
+    /// Serialization crossed the configured size cap and stopped early.
+    Exceeded { limit: usize },
+}
+
+/// Serialized byte length, or a deliberate cap-abort outcome.
+fn serialized_size(result: &CallToolResult, max: Option<usize>) -> SizeMeasure {
+    let mut writer = max.map_or_else(CountingWriter::unbounded, CountingWriter::bounded);
+    match serde_json::to_writer(&mut writer, result) {
+        Ok(()) => SizeMeasure::Exact(writer.bytes),
+        Err(error) if error.io_error_kind() == Some(io::ErrorKind::Other) => {
+            SizeMeasure::Exceeded {
+                limit: max.unwrap_or(writer.bytes),
+            }
+        }
+        Err(_error) => {
+            // `CallToolResult` is made only of infallibly serializable fields
+            // (`String`, `bool`, arrays/maps, and serde_json::Value`). There is
+            // no inhabitable production value that can reach this branch.
+            SizeMeasure::Exact(writer.bytes)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{
@@ -620,6 +722,39 @@ mod tests {
     };
 
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            let bytes = self.0.lock().map(|guard| guard.clone()).unwrap_or_default();
+            String::from_utf8(bytes).unwrap_or_default()
+        }
+    }
+
+    struct CapturedLogsWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl io::Write for CapturedLogsWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if let Ok(mut guard) = self.0.lock() {
+                guard.extend_from_slice(buf);
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogsWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogsWriter(Arc::clone(&self.0))
+        }
+    }
 
     /// Minimal in-process `ServerHandler` for tests.
     #[derive(Clone, Default)]
@@ -658,6 +793,65 @@ mod tests {
         }
     }
 
+    fn sensitive_ctx() -> ToolCallContext {
+        ToolCallContext {
+            tool_name: "safe-tool-name".to_owned(),
+            arguments: Some(serde_json::json!({ "password": "argument-secret" })),
+            identity: Some("identity-secret".to_owned()),
+            role: Some("role-secret".to_owned()),
+            sub: Some("sub-secret".to_owned()),
+            request_id: Some("request-id-visible".to_owned()),
+        }
+    }
+
+    #[test]
+    fn tool_call_context_debug_redacts_sensitive_fields_by_default() {
+        let _guard = crate::diagnostics::ExposureTestGuard::acquire();
+        crate::diagnostics::set_diagnostic_exposure(
+            &crate::diagnostics::DiagnosticExposure::default(),
+        );
+
+        let rendered = format!("{:?}", sensitive_ctx());
+
+        assert!(rendered.contains("safe-tool-name"));
+        assert!(rendered.contains("request-id-visible"));
+        assert!(rendered.contains("[REDACTED]"));
+        for secret in [
+            "argument-secret",
+            "identity-secret",
+            "role-secret",
+            "sub-secret",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "ToolCallContext Debug must not contain {secret}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_call_context_debug_can_show_sensitive_fields_when_enabled() {
+        let _guard = crate::diagnostics::ExposureTestGuard::acquire();
+        crate::diagnostics::set_diagnostic_exposure(&crate::diagnostics::DiagnosticExposure {
+            tool_call_arguments: true,
+            ..crate::diagnostics::DiagnosticExposure::default()
+        });
+
+        let rendered = format!("{:?}", sensitive_ctx());
+
+        for secret in [
+            "argument-secret",
+            "identity-secret",
+            "role-secret",
+            "sub-secret",
+        ] {
+            assert!(
+                rendered.contains(secret),
+                "ToolCallContext Debug must contain {secret} when enabled: {rendered}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn size_cap_replaces_oversized_result() {
         let inner = TestHandler {
@@ -671,15 +865,15 @@ mod tests {
         let hooked = with_hooks(inner, hooks);
 
         let small = CallToolResult::success(vec![ContentBlock::text("ok".to_owned())]);
-        assert!(serialized_size(&small).expect("ordinary result serializes") < 256);
+        assert!(exact_size(&small) < 256);
 
         let big = CallToolResult::success(vec![ContentBlock::text("x".repeat(8_192))]);
-        let size = serialized_size(&big).expect("ordinary result serializes");
+        let size = exact_size(&big);
         assert!(size > 256);
 
         let (replaced, accounted, capped) = apply_size_cap(big, Some(256), "whatever");
         assert!(capped);
-        assert_eq!(accounted, size);
+        assert_eq!(accounted, 257);
         assert_eq!(replaced.is_error, Some(true));
         assert!(matches!(
             replaced.content.first(),
@@ -688,6 +882,71 @@ mod tests {
 
         // Compile-check that HookedHandler instantiates with the test inner.
         let _ = hooked;
+    }
+
+    fn exact_size(result: &CallToolResult) -> usize {
+        match serialized_size(result, None) {
+            SizeMeasure::Exact(size) => size,
+            SizeMeasure::Exceeded { limit } => {
+                panic!("unbounded measurement exceeded impossible limit {limit}");
+            }
+        }
+    }
+
+    #[test]
+    fn serialized_size_under_cap_is_exact() {
+        let result = CallToolResult::success(vec![ContentBlock::text("ok".to_owned())]);
+        let exact = serde_json::to_vec(&result).unwrap().len();
+
+        let measured = serialized_size(&result, Some(exact));
+
+        assert_eq!(measured, SizeMeasure::Exact(exact));
+    }
+
+    #[test]
+    fn serialized_size_over_cap_stops_with_exceeded() {
+        let result = CallToolResult::success(vec![ContentBlock::text("x".repeat(8_192))]);
+
+        let measured = serialized_size(&result, Some(256));
+
+        assert_eq!(measured, SizeMeasure::Exceeded { limit: 256 });
+    }
+
+    #[test]
+    fn over_cap_replacement_does_not_log_serialization_failure() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let result = CallToolResult::success(vec![ContentBlock::text("x".repeat(8_192))]);
+
+        let (_final_result, accounted, capped) = apply_size_cap(result, Some(256), "big_tool");
+
+        assert!(capped);
+        assert_eq!(accounted, 257);
+        assert!(
+            logs.contents()
+                .contains("tool result exceeds max_result_bytes")
+        );
+        assert!(
+            !logs.contents().contains("failed to serialize"),
+            "cap-abort must not be logged as serialization failure: {}",
+            logs.contents()
+        );
+    }
+
+    #[test]
+    fn disabled_result_cap_skips_measurement() {
+        let result = CallToolResult::success(vec![ContentBlock::text("x".repeat(8_192))]);
+
+        let (_final_result, accounted, capped) = apply_size_cap(result, None, "uncapped_tool");
+
+        assert!(!capped);
+        assert_eq!(accounted, 0);
     }
 
     #[tokio::test]
@@ -739,23 +998,23 @@ mod tests {
     #[test]
     fn decide_size_truth_table() {
         assert_eq!(
-            decide_size(Some(10), Some(100)),
+            decide_size(Some(SizeMeasure::Exact(10)), Some(100)),
             SizeVerdict::Pass { size: 10 }
         );
         assert_eq!(
-            decide_size(Some(100), Some(100)),
+            decide_size(Some(SizeMeasure::Exact(100)), Some(100)),
             SizeVerdict::Pass { size: 100 },
             "cap is inclusive: size == limit passes"
         );
         assert_eq!(
-            decide_size(Some(101), Some(100)),
+            decide_size(Some(SizeMeasure::Exact(101)), Some(100)),
             SizeVerdict::Replace {
                 limit: 100,
                 actual: Some(101)
             }
         );
         assert_eq!(
-            decide_size(Some(999), None),
+            decide_size(Some(SizeMeasure::Exact(999)), None),
             SizeVerdict::Pass { size: 999 }
         );
         assert_eq!(
@@ -767,6 +1026,14 @@ mod tests {
             "unmeasurable result must fail closed when a cap is configured"
         );
         assert_eq!(decide_size(None, None), SizeVerdict::PassUnmeasured);
+        assert_eq!(
+            decide_size(Some(SizeMeasure::Exceeded { limit: 100 }), Some(100)),
+            SizeVerdict::Replace {
+                limit: 100,
+                actual: None
+            },
+            "cap-abort is not an exact measurement"
+        );
     }
 
     #[test]
@@ -807,7 +1074,7 @@ mod tests {
         };
         let (result, size, capped) = apply_size_cap(*boxed, None, "any");
         assert!(!capped);
-        assert!(size > 0);
+        assert_eq!(size, 0);
         assert!(!result.is_error.unwrap_or(false));
         assert!(matches!(
             result.content.first(),
@@ -821,12 +1088,12 @@ mod tests {
         // to result_too_large just like an inner-handler result would be,
         // and the disposition must reflect ResultTooLarge.
         let huge = CallToolResult::success(vec![ContentBlock::text("y".repeat(8_192))]);
-        let huge_size = serialized_size(&huge).expect("ordinary result serializes");
+        let huge_size = serde_json::to_vec(&huge).unwrap().len();
         assert!(huge_size > 256);
 
         let (final_result, accounted, capped) = apply_size_cap(huge, Some(256), "replaced_tool");
         assert!(capped);
-        assert_eq!(accounted, huge_size);
+        assert_eq!(accounted, 257);
         assert_eq!(final_result.is_error, Some(true));
         assert!(matches!(
             final_result.content.first(),

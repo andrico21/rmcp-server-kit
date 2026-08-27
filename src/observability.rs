@@ -18,7 +18,11 @@ use tracing_subscriber::{
     util::{SubscriberInitExt, TryInitError},
 };
 
-use crate::{config::ObservabilityConfig, error::RmcpServerKitError};
+use crate::{
+    config::ObservabilityConfig,
+    diagnostics::{DiagnosticExposure, set_diagnostic_exposure},
+    error::RmcpServerKitError,
+};
 
 const AUDIT_LOG_CHANNEL_CAPACITY: usize = 1024;
 const AUDIT_WRITER_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -117,6 +121,18 @@ impl fmt::Debug for TracingGuard {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TracingGuard")
             .field("audit_enabled", &self.audit.is_some())
+            .field(
+                "diagnostic_plaintext_oauth_tokens",
+                &crate::diagnostics::plaintext_oauth_tokens(),
+            )
+            .field(
+                "diagnostic_oauth_claim_values",
+                &crate::diagnostics::oauth_claim_values(),
+            )
+            .field(
+                "diagnostic_tool_call_arguments",
+                &crate::diagnostics::tool_call_arguments(),
+            )
             .finish()
     }
 }
@@ -158,6 +174,11 @@ impl Drop for TracingGuard {
 pub fn init_tracing_from_config_strict(
     config: &ObservabilityConfig,
 ) -> Result<TracingGuard, RmcpServerKitError> {
+    set_diagnostic_exposure(&DiagnosticExposure {
+        plaintext_oauth_tokens: config.log_plaintext_oauth_tokens,
+        oauth_claim_values: config.log_oauth_claim_values,
+        tool_call_arguments: config.log_tool_call_arguments,
+    });
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.log_level));
     let audit_setup = prepare_tracing_audit_strict(config)?;
@@ -644,6 +665,9 @@ mod tests {
             log_request_headers: false,
             metrics_enabled: false,
             metrics_bind: "127.0.0.1:9090".into(),
+            log_plaintext_oauth_tokens: false,
+            log_oauth_claim_values: false,
+            log_tool_call_arguments: false,
         };
         assert!(config.log_format == "json" || config.log_format == "pretty");
     }
@@ -680,6 +704,9 @@ mod tests {
             log_request_headers: false,
             metrics_enabled: false,
             metrics_bind: "127.0.0.1:9090".into(),
+            log_plaintext_oauth_tokens: false,
+            log_oauth_claim_values: false,
+            log_tool_call_arguments: false,
         };
         #[allow(
             deprecated,
@@ -705,6 +732,31 @@ mod tests {
             matches!(result, Err(RmcpServerKitError::Startup(_))),
             "unopenable audit path must fail closed with Startup"
         );
+        std::fs::remove_file(&root_file).expect("remove parent file fixture");
+    }
+
+    #[test]
+    fn strict_init_applies_diagnostic_exposure_before_startup_failure() {
+        let _guard = crate::diagnostics::ExposureTestGuard::acquire();
+        crate::diagnostics::set_diagnostic_exposure(
+            &crate::diagnostics::DiagnosticExposure::default(),
+        );
+        let root_file = unique_temp_path("audit-parent-file-diagnostics");
+        std::fs::write(&root_file, b"not a directory").expect("create parent file fixture");
+        let mut config = observability_config(Some(root_file.join("audit.log")));
+        config.log_plaintext_oauth_tokens = true;
+        config.log_oauth_claim_values = true;
+        config.log_tool_call_arguments = true;
+
+        let result = super::init_tracing_from_config_strict(&config);
+
+        assert!(
+            matches!(result, Err(RmcpServerKitError::Startup(_))),
+            "unopenable audit path must keep subscriber initialization out of this test"
+        );
+        assert!(crate::diagnostics::plaintext_oauth_tokens());
+        assert!(crate::diagnostics::oauth_claim_values());
+        assert!(crate::diagnostics::tool_call_arguments());
         std::fs::remove_file(&root_file).expect("remove parent file fixture");
     }
 
@@ -797,6 +849,9 @@ mod tests {
             log_request_headers: false,
             metrics_enabled: false,
             metrics_bind: "127.0.0.1:9090".into(),
+            log_plaintext_oauth_tokens: false,
+            log_oauth_claim_values: false,
+            log_tool_call_arguments: false,
         }
     }
 

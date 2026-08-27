@@ -420,15 +420,15 @@ graph TD
 
 | Area                              | Module / file                           | Notable symbols (file:line)                                                  |
 |-----------------------------------|------------------------------------------|-------------------------------------------------------------------------------|
-| Server entry (HTTP)               | `src/transport.rs`                       | `serve` ~L2070, `McpServerConfig` L277-560, `ReloadHandle` ~L1305              |
-| Server entry (stdio, no auth)     | `src/transport.rs`                       | `serve_stdio` ~L3775                                                          |
-| Router builder + middleware wire  | `src/transport.rs`                       | `build_app_router` ~L1429, security headers wired ~L1677, peer-addr normalize wired ~L1812, origin wired ~L1827 |
-| TLS / mTLS acceptor               | `src/transport.rs`                       | `TlsListener` ~L2649                                                          |
-| Origin / security headers (defs)  | `src/transport.rs`                       | `origin_check_middleware` ~L3682, `security_headers_middleware` ~L3132       |
-| Graceful shutdown                 | `src/transport.rs`                       | `shutdown_signal` ~L3062                                                      |
-| API key + mTLS auth               | `src/auth.rs`                            | `AuthIdentity` L49, `AuthState` ~L997, `auth_middleware` L1499               |
+| Server entry (HTTP)               | `src/transport.rs`                       | `serve` ~L2154, `McpServerConfig` L285-560, `ReloadHandle` ~L1405              |
+| Server entry (stdio, no auth)     | `src/transport.rs`                       | `serve_stdio` ~L3883                                                          |
+| Router builder + middleware wire  | `src/transport.rs`                       | `build_app_router` ~L1521, security headers wired ~L3276, peer-addr normalize wired ~L1812, origin wired ~L3790 |
+| TLS / mTLS acceptor               | `src/transport.rs`                       | `TlsListener` ~L2737                                                          |
+| Origin / security headers (defs)  | `src/transport.rs`                       | `origin_check_middleware` ~L3790, `security_headers_middleware` ~L3276       |
+| Graceful shutdown                 | `src/transport.rs`                       | `shutdown_signal` ~L3132                                                      |
+| API key + mTLS auth               | `src/auth.rs`                            | `AuthIdentity` L51, `AuthState` ~L1031, `auth_middleware` L1593              |
 | RBAC engine                       | `src/rbac.rs`                            | `RbacPolicy` L352, task-locals L90-150, `rbac_middleware` L678-825           |
-| Memory-bounded keyed limiter      | `src/bounded_limiter.rs`                 | `BoundedKeyedLimiter` L96                                                     |
+| Memory-bounded keyed limiter      | `src/bounded_limiter.rs`                 | `BoundedKeyedLimiter` L134                                                    |
 | Trusted-forwarder resolution      | `src/forwarded.rs`                       | `resolve_client_ip`, `FallbackReason` (rightmost-untrusted, fail-safe-to-direct) |
 | OAuth JWT / JWKS                  | `src/oauth.rs` (feature `oauth`)         | `JwksCache` L1866, `JWKS_REFRESH_COOLDOWN` ~L1907, `select_jwks_key` L2223 |
 | SSRF guard (outbound HTTP)        | `src/ssrf.rs`                            | per-hop scheme/userinfo/IP-literal blocks                                     |

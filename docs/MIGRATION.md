@@ -3,6 +3,92 @@
 This guide shows how to wire the standalone `rmcp-server-kit` crate into a
 downstream project, and how to migrate across breaking major releases.
 
+## Migrating to 3.9: CRL fail-closed by default
+
+`3.9` is additive at the API level -- `cargo semver-checks` reports no breaking
+change -- but it **alters two runtime defaults**. `cargo semver-checks` cannot
+detect a behavioural default change, so read this section before upgrading.
+
+### 1. `crl_deny_on_unavailable` now defaults to `true`
+
+Previously, a client certificate advertising CRL distribution points was
+**accepted** when its CRL could not be fetched or was not yet cached. That is
+the exact condition an attacker holding a revoked certificate can induce, by
+blocking reachability to the CA's CDP host.
+
+From `3.9`, such a handshake is **rejected**, per RFC 5280 §6.3. Denial requires
+*every* relevant CDP to be unavailable, not merely one -- otherwise blocking a
+single mirror would become a denial-of-service vector.
+
+**Who is affected:** deployments using mTLS with `crl_enabled = true` (the
+default) whose client or CA certificates carry CDP extensions.
+
+**Before upgrading, verify:**
+
+- The CDP hosts in your client and CA certificates are reachable from the
+  server's network, including through any egress proxy or firewall.
+- `crl_max_cache_entries` (default `1024`) is large enough for your PKI.
+  Fail-closed makes this cap **operationally visible**: a CDP that fetches
+  successfully can still be rejected at the cache cap, leaving those
+  handshakes denied. Large PKIs should raise it.
+- The CRL SSRF guard permits your CDP hosts. Private, loopback, link-local,
+  and cloud-metadata addresses are always rejected.
+
+**To retain the previous behaviour**, opt out explicitly:
+
+```toml
+[server.auth.mtls]
+crl_deny_on_unavailable = false
+```
+
+This is strongly discouraged: it accepts a revoked certificate whenever its
+CRL is unreachable.
+
+### 2. Secrets are redacted in `Debug` and log output by default
+
+`ExchangedToken` (OAuth access tokens), the token-exchange claim log (`sub`,
+`aud`, `azp`, `iss`), and `ToolCallContext` (tool arguments, identity, role,
+`sub`) previously rendered their contents in plaintext. They now redact.
+
+If you relied on that output for debugging, re-enable it per category:
+
+```toml
+[observability]
+log_plaintext_oauth_tokens = false  # OAuth access tokens
+log_oauth_claim_values     = false  # JWT sub / aud / azp / iss
+log_tool_call_arguments    = false  # tool arguments and identity fields
+```
+
+or via `RMCP_SERVER_KIT__OBSERVABILITY__LOG_PLAINTEXT_OAUTH_TOKENS` and
+friends.
+
+> These switches are **process-wide, not per-server**. A process hosting more
+> than one server shares one set. Enabling one writes secrets to your logs;
+> intended for short-lived local debugging only.
+
+### 3. `auth.mtls` without TLS is now a validation error
+
+Configuring `auth.mtls` without both `tls_cert_path` and `tls_key_path` used to
+start successfully with client-certificate authentication **silently disabled** --
+a plaintext listener never performs a TLS handshake, so no client identity is
+ever extracted. This combination is now rejected by
+`McpServerConfig::validate()`. Supply both TLS paths, or remove `auth.mtls`.
+
+### 4. Argument allowlists warn when `required = false`
+
+An `ArgumentAllowlist` with a non-empty `allowed` list and `required = false`
+constrains the argument only when the caller supplies it. If your tool
+substitutes a default for a missing argument, a caller can bypass the allowlist
+by omitting it. This now emits a startup warning naming the tool and argument.
+
+Behaviour is unchanged in `3.9`. Prefer the new constructor:
+
+```rust
+ArgumentAllowlist::new_required("tool", "arg", vec!["allowed".into()]);
+```
+
+`required` will default to `true` in `4.0`.
+
 ## Migrating from 3.4 to 3.5
 
 `3.5` is additive at the API level -- `cargo semver-checks` reports no breaking

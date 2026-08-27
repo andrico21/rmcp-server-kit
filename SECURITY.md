@@ -88,7 +88,7 @@ ca_cert_path = "/etc/certs/clients-ca.pem"
 
 # CRL fields (all defaults shown)
 crl_enabled              = true     # set false to disable revocation entirely
-crl_deny_on_unavailable  = false    # fail-open by default; set true for fail-closed
+crl_deny_on_unavailable  = true     # fail-closed by default (RFC 5280 6.3); set false to fail open
 crl_allow_http           = true     # allow http:// CDP URLs (CRLs are signed by the CA, so plain HTTP is acceptable)
 crl_end_entity_only      = false    # check the full chain, not just the leaf
 crl_enforce_expiration   = true     # reject CRLs whose nextUpdate is in the past
@@ -112,9 +112,13 @@ crl_retry_retention      = "24h"    # keep failed-refresh entries for retry only
   [CRL fetch SSRF hardening](#crl-fetch-ssrf-hardening) below).
   Operators must still ensure their issuing CA's CDP host is reachable
   from the server's network.
-- **Default is fail-open.** This protects availability over confidentiality;
-  set `crl_deny_on_unavailable = true` if your threat model inverts that
-  trade-off.
+- **Default is fail-closed** (since 3.9). A certificate whose revocation
+  status cannot be determined is rejected, per RFC 5280 6.3. Denial requires
+  *every* relevant CDP to be unavailable, so blocking a single mirror cannot
+  be used to deny service. Set `crl_deny_on_unavailable = false` to restore
+  the previous fail-open behaviour, which prioritises availability over
+  confidentiality and accepts a revoked certificate whenever its CRL is
+  unreachable.
 
 ### CRL fetch SSRF hardening
 

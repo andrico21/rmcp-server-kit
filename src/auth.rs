@@ -23,7 +23,7 @@ use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_ha
 use axum::{
     body::Body,
     extract::ConnectInfo,
-    http::{Request, header},
+    http::{Request, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -33,7 +33,9 @@ use serde::Deserialize;
 use x509_parser::prelude::*;
 
 use crate::{
-    bounded_limiter::BoundedKeyedLimiter, error::RmcpServerKitError, transport::RateLimitKey,
+    bounded_limiter::{BoundedKeyedLimiter, BoundedLimiterDeny, KeyEvictionPolicy},
+    error::RmcpServerKitError,
+    transport::RateLimitKey,
 };
 
 /// Identity of an authenticated caller.
@@ -460,7 +462,20 @@ pub struct MtlsConfig {
     pub crl_stale_grace: Duration,
     /// When true, missing or unavailable CRLs cause revocation checks to fail
     /// closed.
-    #[serde(default)]
+    ///
+    /// Defaults to `true`. RFC 5280 §6.3 treats a certificate whose
+    /// revocation status cannot be determined as unverified, so a client
+    /// certificate advertising CRL distribution points is rejected when
+    /// *every* relevant CDP is uncached and unfetchable. Denial requires all
+    /// relevant CDPs to be unavailable, not merely one -- otherwise an
+    /// attacker who blocks a single mirror could deny service.
+    ///
+    /// Set to `false` to restore the pre-3.9 fail-open behaviour, in which an
+    /// unreachable CRL lets the handshake proceed. That is strongly
+    /// discouraged: a revoked certificate is then accepted whenever its CRL
+    /// is unreachable, which is precisely the condition an attacker holding a
+    /// revoked certificate can induce.
+    #[serde(default = "default_true")]
     pub crl_deny_on_unavailable: bool,
     /// When true, apply revocation checks only to the end-entity certificate.
     #[serde(default)]
@@ -625,6 +640,10 @@ pub struct RateLimitConfig {
     /// unset). Must be greater than zero when set.
     #[serde(default)]
     pub pre_auth_burst: Option<u32>,
+    /// Full-table policy when a rate limiter sees a new source IP after
+    /// reaching [`Self::max_tracked_keys`]. Default: [`KeyEvictionPolicy::EvictLru`].
+    #[serde(default)]
+    pub key_eviction_policy: KeyEvictionPolicy,
 }
 
 impl Default for RateLimitConfig {
@@ -636,6 +655,7 @@ impl Default for RateLimitConfig {
             idle_eviction: default_idle_eviction(),
             burst: None,
             pre_auth_burst: None,
+            key_eviction_policy: KeyEvictionPolicy::default(),
         }
     }
 }
@@ -687,6 +707,13 @@ impl RateLimitConfig {
     #[must_use]
     pub fn with_pre_auth_burst(mut self, burst: u32) -> Self {
         self.pre_auth_burst = Some(burst);
+        self
+    }
+
+    /// Set the tracked-key full-table policy for auth limiters.
+    #[must_use]
+    pub const fn with_key_eviction_policy(mut self, policy: KeyEvictionPolicy) -> Self {
+        self.key_eviction_policy = policy;
         self
     }
 }
@@ -1099,10 +1126,11 @@ pub(crate) fn build_rate_limiter(config: &RateLimitConfig) -> Arc<KeyedLimiter> 
     // Defense in depth: Phase-1 config validation rejects `0` upstream, but
     // tests can still exercise this helper directly with raw config values.
     let max_tracked_keys = NonZeroUsize::new(config.max_tracked_keys).unwrap_or(NonZeroUsize::MIN);
-    Arc::new(BoundedKeyedLimiter::new(
+    Arc::new(BoundedKeyedLimiter::new_with_policy(
         quota,
         max_tracked_keys,
         config.idle_eviction,
+        config.key_eviction_policy,
     ))
 }
 
@@ -1125,10 +1153,11 @@ pub(crate) fn build_pre_auth_limiter(config: &RateLimitConfig) -> Arc<KeyedLimit
     // Defense in depth: Phase-1 config validation rejects `0` upstream, but
     // tests can still exercise this helper directly with raw config values.
     let max_tracked_keys = NonZeroUsize::new(config.max_tracked_keys).unwrap_or(NonZeroUsize::MIN);
-    Arc::new(BoundedKeyedLimiter::new(
+    Arc::new(BoundedKeyedLimiter::new_with_policy(
         quota,
         max_tracked_keys,
         config.idle_eviction,
+        config.key_eviction_policy,
     ))
 }
 
@@ -1414,7 +1443,7 @@ fn unauthorized_response(state: &AuthState, failure_class: AuthFailureClass) -> 
 
     let challenge = build_www_authenticate_value(advertise_resource_metadata, failure_class);
     (
-        axum::http::StatusCode::UNAUTHORIZED,
+        StatusCode::UNAUTHORIZED,
         [(header::WWW_AUTHENTICATE, challenge)],
         failure_class.response_body(),
     )
@@ -1483,21 +1512,71 @@ async fn authenticate_bearer_identity(
 fn pre_auth_gate(state: &AuthState, client_key: Option<&RateLimitKey>) -> Option<Response> {
     let limiter = state.pre_auth_limiter.as_ref()?;
     let key = client_key?;
-    let Err(wait) = limiter.check_key_wait(key) else {
-        return None;
-    };
-    state.counters.record_failure(AuthFailureClass::PreAuthGate);
-    tracing::warn!(
-        rate_limit_key = %key,
-        "auth rate limited by pre-auth gate (request rejected before credential verification)"
-    );
-    Some(
-        RmcpServerKitError::RateLimitedFor {
-            message: "too many unauthenticated requests from this source".into(),
-            retry_after: wait,
+    match limiter.check_key_detailed(key) {
+        Ok(()) => None,
+        Err(BoundedLimiterDeny::RateLimited(wait)) => {
+            state.counters.record_failure(AuthFailureClass::PreAuthGate);
+            tracing::warn!(
+                rate_limit_key = %key,
+                "auth rate limited by pre-auth gate (request rejected before credential verification)"
+            );
+            Some(
+                RmcpServerKitError::RateLimitedFor {
+                    message: "too many unauthenticated requests from this source".into(),
+                    retry_after: wait,
+                }
+                .into_response(),
+            )
         }
-        .into_response(),
-    )
+        Err(BoundedLimiterDeny::CapacityFull) => {
+            tracing::warn!(
+                rate_limit_key = %key,
+                "auth pre-auth gate rejected unseen key because tracked-key capacity is full"
+            );
+            Some(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "rate limiter capacity exhausted",
+                )
+                    .into_response(),
+            )
+        }
+    }
+}
+
+fn post_failure_rate_limit_response(
+    limiter: &KeyedLimiter,
+    key: &RateLimitKey,
+    extensions: &axum::http::Extensions,
+) -> Option<Response> {
+    match limiter.check_key_detailed(key) {
+        Ok(()) => None,
+        Err(BoundedLimiterDeny::RateLimited(wait)) => {
+            #[cfg(feature = "metrics")]
+            crate::metrics::record_rate_limit_deny(extensions, "auth_post");
+            tracing::warn!(rate_limit_key = %key, "auth rate limited after repeated failures");
+            Some(
+                RmcpServerKitError::RateLimitedFor {
+                    message: "too many failed authentication attempts".into(),
+                    retry_after: wait,
+                }
+                .into_response(),
+            )
+        }
+        Err(BoundedLimiterDeny::CapacityFull) => {
+            tracing::warn!(
+                rate_limit_key = %key,
+                "auth post-failure limiter rejected unseen key because tracked-key capacity is full"
+            );
+            Some(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "rate limiter capacity exhausted",
+                )
+                    .into_response(),
+            )
+        }
+    }
 }
 
 /// Axum middleware that enforces authentication.
@@ -1571,17 +1650,12 @@ pub(crate) async fn auth_middleware(
     // Rate limit check (applied after auth failure only).
     // Successful authentications do not consume rate limit budget.
     if let (Some(limiter), Some(key)) = (&state.rate_limiter, client_key.as_ref())
-        && let Err(wait) = limiter.check_key_wait(key)
+        && let Some(resp) = post_failure_rate_limit_response(limiter, key, req.extensions())
     {
-        state.counters.record_failure(AuthFailureClass::RateLimited);
-        #[cfg(feature = "metrics")]
-        crate::metrics::record_rate_limit_deny(req.extensions(), "auth_post");
-        tracing::warn!(rate_limit_key = %key, "auth rate limited after repeated failures");
-        return RmcpServerKitError::RateLimitedFor {
-            message: "too many failed authentication attempts".into(),
-            retry_after: wait,
+        if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+            state.counters.record_failure(AuthFailureClass::RateLimited);
         }
-        .into_response();
+        return resp;
     }
 
     state.counters.record_failure(failure_class);
@@ -1806,6 +1880,34 @@ mod tests {
     }
 
     #[test]
+    fn mtls_crl_deny_on_unavailable_defaults_to_fail_closed() {
+        // Every in-crate test helper builds MtlsConfig via a struct literal,
+        // which bypasses serde defaults entirely. Only a deserialization from
+        // TOML that omits the key exercises the shipped default.
+        let toml = r#"
+            ca_cert_path = "/etc/certs/clients-ca.pem"
+        "#;
+        let cfg: MtlsConfig = toml::from_str(toml).expect("minimal mtls config must deserialize");
+        assert!(
+            cfg.crl_deny_on_unavailable,
+            "omitting crl_deny_on_unavailable must fail closed (RFC 5280 6.3)"
+        );
+    }
+
+    #[test]
+    fn mtls_crl_deny_on_unavailable_opt_out_is_honoured() {
+        let toml = r#"
+            ca_cert_path = "/etc/certs/clients-ca.pem"
+            crl_deny_on_unavailable = false
+        "#;
+        let cfg: MtlsConfig = toml::from_str(toml).expect("opt-out config must deserialize");
+        assert!(
+            !cfg.crl_deny_on_unavailable,
+            "an explicit false must still select fail-open"
+        );
+    }
+
+    #[test]
     fn try_with_expiry_rejects_malformed() {
         let entry = ApiKeyEntry::new("k", "hash", "viewer");
         assert!(entry.try_with_expiry("not-a-date").is_err());
@@ -1880,6 +1982,7 @@ mod tests {
             idle_eviction: default_idle_eviction(),
             burst: None,
             pre_auth_burst: None,
+            key_eviction_policy: KeyEvictionPolicy::default(),
         };
         let limiter = build_rate_limiter(&config);
         let ip = RateLimitKey::Ip("10.0.0.1".parse::<IpAddr>().unwrap());
@@ -1901,6 +2004,7 @@ mod tests {
             idle_eviction: default_idle_eviction(),
             burst: None,
             pre_auth_burst: None,
+            key_eviction_policy: KeyEvictionPolicy::default(),
         };
         let limiter = build_rate_limiter(&config);
         let ip1 = RateLimitKey::Ip("10.0.0.1".parse::<IpAddr>().unwrap());
@@ -2074,6 +2178,7 @@ mod tests {
                 idle_eviction: default_idle_eviction(),
                 burst: None,
                 pre_auth_burst: None,
+                key_eviction_policy: KeyEvictionPolicy::default(),
             })),
             pre_auth_limiter: None,
             #[cfg(feature = "oauth")]
@@ -2112,6 +2217,7 @@ mod tests {
             idle_eviction: default_idle_eviction(),
             burst: None,
             pre_auth_burst: None,
+            key_eviction_policy: KeyEvictionPolicy::default(),
         };
         let limiter = build_rate_limiter(&config);
         let ip = RateLimitKey::Ip("192.168.1.100".parse::<IpAddr>().unwrap());
@@ -2157,6 +2263,7 @@ mod tests {
             idle_eviction: default_idle_eviction(),
             burst: None,
             pre_auth_burst: None,
+            key_eviction_policy: KeyEvictionPolicy::default(),
         };
         let limiter = build_pre_auth_limiter(&config);
         let ip = RateLimitKey::Ip("10.0.0.1".parse::<IpAddr>().unwrap());
@@ -2186,6 +2293,7 @@ mod tests {
             idle_eviction: default_idle_eviction(),
             burst: None,
             pre_auth_burst: None,
+            key_eviction_policy: KeyEvictionPolicy::default(),
         };
         let limiter = build_pre_auth_limiter(&config);
         let ip = RateLimitKey::Ip("10.0.0.2".parse::<IpAddr>().unwrap());
@@ -2229,6 +2337,31 @@ mod tests {
         assert!(retry_after >= 1, "delta-seconds must be >= 1");
     }
 
+    #[test]
+    fn pre_auth_gate_capacity_full_returns_503_without_retry_after() {
+        let config = RateLimitConfig::new(100)
+            .with_pre_auth_max_per_minute(10)
+            .with_max_tracked_keys(1)
+            .with_key_eviction_policy(KeyEvictionPolicy::RejectNew);
+        let state = AuthState {
+            api_keys: ArcSwap::new(Arc::new(vec![])),
+            rate_limiter: None,
+            pre_auth_limiter: Some(build_pre_auth_limiter(&config)),
+            #[cfg(feature = "oauth")]
+            jwks_cache: None,
+            seen_identities: SeenIdentitySet::new(),
+            counters: AuthCounters::default(),
+        };
+        let established = RateLimitKey::Ip("10.7.7.7".parse::<IpAddr>().unwrap());
+        let unseen = RateLimitKey::Ip("10.7.7.8".parse::<IpAddr>().unwrap());
+        assert!(pre_auth_gate(&state, Some(&established)).is_none());
+
+        let resp = pre_auth_gate(&state, Some(&unseen)).expect("unseen key must be rejected");
+
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(resp.headers().get(header::RETRY_AFTER).is_none());
+    }
+
     /// Post-failure limiter honors an explicit burst capacity.
     #[test]
     fn post_failure_limiter_burst_allows_initial_spike() {
@@ -2265,6 +2398,7 @@ mod tests {
             idle_eviction: default_idle_eviction(),
             burst: None,
             pre_auth_burst: None,
+            key_eviction_policy: KeyEvictionPolicy::default(),
         };
         let state = Arc::new(AuthState {
             api_keys: ArcSwap::new(Arc::new(keys)),
@@ -2339,6 +2473,7 @@ mod tests {
             idle_eviction: default_idle_eviction(),
             burst: None,
             pre_auth_burst: None,
+            key_eviction_policy: KeyEvictionPolicy::default(),
         };
         let state = Arc::new(AuthState {
             api_keys: ArcSwap::new(Arc::new(vec![])),
@@ -2398,6 +2533,7 @@ mod tests {
             idle_eviction: default_idle_eviction(),
             burst: None,
             pre_auth_burst: None,
+            key_eviction_policy: KeyEvictionPolicy::default(),
         };
         let state = Arc::new(AuthState {
             api_keys: ArcSwap::new(Arc::new(vec![])),
@@ -2446,6 +2582,7 @@ mod tests {
             idle_eviction: default_idle_eviction(),
             burst: None,
             pre_auth_burst: None,
+            key_eviction_policy: KeyEvictionPolicy::default(),
         };
         let state = Arc::new(AuthState {
             api_keys: ArcSwap::new(Arc::new(vec![])),

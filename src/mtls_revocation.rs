@@ -17,9 +17,14 @@
 //! for the full rationale before changing the discovery ordering.
 //!
 //! Semantics:
-//! - `crl_deny_on_unavailable = false` => fail open with warn logs.
-//! - `crl_deny_on_unavailable = true` => fail closed when a certificate
-//!   advertises CDP URLs whose revocation status is not yet available.
+//! - `crl_deny_on_unavailable = true` (default) => fail closed when a
+//!   certificate advertises CDP URLs whose revocation status is not yet
+//!   available. Denial requires *every* relevant CDP to be uncached, per
+//!   RFC 5280 6.3; denying on a single unavailable mirror would let an
+//!   attacker who blocks one CDP deny service.
+//! - `crl_deny_on_unavailable = false` => fail open with warn logs. Restores
+//!   the pre-3.9 behaviour and is strongly discouraged: a revoked
+//!   certificate is accepted whenever its CRL is unreachable.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -522,26 +527,36 @@ impl CrlSet {
                 );
                 continue;
             }
+            let inserted = {
+                // Invariant: while a URL is observable by the refresher, its
+                // transient in-flight marker already exists, so every fetch
+                // settlement path can remove or promote the same marker.
+                let mut guard = self
+                    .pending_urls
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if guard.contains(&url) {
+                    false
+                } else {
+                    if guard.len() >= self.config.crl_max_seen_urls {
+                        self.warn_cap_exceeded_throttled("pending_urls");
+                        break;
+                    }
+                    guard.insert(url.clone())
+                }
+            };
+            if !inserted {
+                continue;
+            }
             if self.discover_tx.send(url.clone()).is_err() {
                 // Receiver gone (shutdown). Do NOT mark pending so the
                 // URL can be retried after a reload / restart.
+                self.clear_pending(&url);
                 tracing::debug!(
                     url = %url,
                     "discover channel closed; dropping CDP URL without marking pending"
                 );
-                continue;
             }
-            // Queued for fetch. Mark pending (not seen) so concurrent
-            // handshakes do not re-enqueue it while the fetch is in flight.
-            let mut guard = self
-                .pending_urls
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if guard.len() >= self.config.crl_max_seen_urls {
-                self.warn_cap_exceeded_throttled("pending_urls");
-                break;
-            }
-            guard.insert(url);
         }
 
         if self.config.crl_deny_on_unavailable {
@@ -1270,8 +1285,33 @@ pub async fn bootstrap_fetch(
         }
     }
 
-    let set = CrlSet::new(roots, config, discover_tx, initial_cache)?;
+    let set = new_crl_set_from_bootstrap_cache(roots, config, discover_tx, initial_cache)?;
     Ok((set, discover_rx))
+}
+
+fn new_crl_set_from_bootstrap_cache(
+    roots: Arc<RootCertStore>,
+    config: MtlsConfig,
+    discover_tx: mpsc::UnboundedSender<String>,
+    mut initial_cache: HashMap<String, CachedCrl>,
+) -> Result<Arc<CrlSet>, RmcpServerKitError> {
+    apply_bootstrap_cache_cap(&mut initial_cache, config.crl_max_cache_entries);
+    CrlSet::new(roots, config, discover_tx, initial_cache)
+}
+
+fn apply_bootstrap_cache_cap(
+    initial_cache: &mut HashMap<String, CachedCrl>,
+    max_cache_entries: usize,
+) {
+    if initial_cache.len() <= max_cache_entries {
+        return;
+    }
+
+    let mut urls = initial_cache.keys().cloned().collect::<Vec<_>>();
+    urls.sort();
+    for url in urls.into_iter().skip(max_cache_entries) {
+        initial_cache.remove(&url);
+    }
 }
 
 /// Run the CRL refresher loop until shutdown.
@@ -1691,7 +1731,13 @@ fn asn1_time_to_system_time(time: x509_parser::time::ASN1Time) -> SystemTime {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex as StdMutex;
+    use std::{
+        sync::{
+            Mutex as StdMutex,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread,
+    };
 
     use rcgen::{
         BasicConstraints, CertificateParams, CertifiedIssuer, DnType, IsCa, KeyPair,
@@ -1792,10 +1838,16 @@ mod tests {
     }
 
     fn test_crl_set_with_receiver() -> (Arc<CrlSet>, mpsc::UnboundedReceiver<String>) {
+        test_crl_set_with_receiver_config(test_mtls_config())
+    }
+
+    fn test_crl_set_with_receiver_config(
+        config: MtlsConfig,
+    ) -> (Arc<CrlSet>, mpsc::UnboundedReceiver<String>) {
         install_ring_provider();
         let mut roots = RootCertStore::empty();
         roots.add(test_ca_root()).expect("add ca root");
-        CrlSet::__test_with_kept_receiver(Arc::new(roots), test_mtls_config(), vec![])
+        CrlSet::__test_with_kept_receiver(Arc::new(roots), config, vec![])
             .expect("empty CRL set with kept receiver")
     }
 
@@ -1819,6 +1871,118 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         pending.insert(url.to_owned());
+    }
+
+    #[test]
+    fn discovery_does_not_send_before_pending_marker_exists() {
+        let mut config = test_mtls_config();
+        config.crl_discovery_rate_per_min = 10_000;
+        config.crl_max_seen_urls = 512;
+        let (set, mut discover_rx) = test_crl_set_with_receiver_config(config);
+
+        for attempt in 0..200 {
+            let url = format!("http://pending-race-{attempt}.example.test/crl");
+            let stop_contention = Arc::new(AtomicBool::new(false));
+
+            let contender_set = Arc::clone(&set);
+            let contender_stop = Arc::clone(&stop_contention);
+            let contender = thread::spawn(move || {
+                while !contender_stop.load(Ordering::Relaxed) {
+                    let guard = contender_set
+                        .pending_urls
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    thread::sleep(Duration::from_micros(100));
+                    drop(guard);
+                    thread::yield_now();
+                }
+            });
+
+            let receiver_set = Arc::clone(&set);
+            let receiver_url = url.clone();
+            thread::scope(|scope| {
+                let receiver_rx = &mut discover_rx;
+                let receiver = scope.spawn(move || {
+                    if receiver_rx.blocking_recv().as_deref() == Some(receiver_url.as_str()) {
+                        receiver_set.__test_settle_pending(&receiver_url, false);
+                    }
+                });
+
+                let note_set = Arc::clone(&set);
+                let note_url = url.clone();
+                let note = scope.spawn(move || {
+                    let _ = note_set.__test_note_discovered_urls_by_cert(&[note_url], &[]);
+                });
+
+                note.join().expect("discovery admission must complete");
+                receiver.join().expect("settlement helper must complete");
+            });
+            stop_contention.store(true, Ordering::Relaxed);
+            contender.join().expect("contention helper must complete");
+
+            assert!(
+                !pending_contains(&set, &url),
+                "settling a fetch before the old post-send marker write must not strand pending URL {url}"
+            );
+            assert!(
+                !set.__test_is_seen(&url),
+                "settling a failed fetch must leave URL {url} discoverable again"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_cache_cap_is_applied_before_crl_set_publication() {
+        let cap = 4usize;
+        let mut config = test_mtls_config();
+        config.crl_max_cache_entries = cap;
+        let (discover_tx, _discover_rx) = mpsc::unbounded_channel();
+        install_ring_provider();
+        let mut roots = RootCertStore::empty();
+        roots.add(test_ca_root()).expect("add ca root");
+        let roots = Arc::new(roots);
+        let now = SystemTime::now();
+        let initial_cache: HashMap<String, CachedCrl> = (0..cap + 3)
+            .rev()
+            .map(|index| format!("https://bootstrap-{index:02}.example.test/crl"))
+            .map(|url| {
+                let mut cached = CachedCrl::__test_synthetic(now);
+                cached.source_url = url.clone();
+                (url, cached)
+            })
+            .collect();
+
+        let set = new_crl_set_from_bootstrap_cache(roots, config, discover_tx, initial_cache)
+            .expect("bootstrap cache should build CRL set");
+        let cache_keys = {
+            let cache = set.cache.read().await;
+            assert_eq!(cache.len(), cap, "bootstrap cache len must be capped");
+            cache.keys().cloned().collect::<HashSet<_>>()
+        };
+        let cached_url_keys = {
+            let cached_urls = set
+                .cached_urls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                cached_urls.len(),
+                cap,
+                "cached_urls len must match capped bootstrap cache"
+            );
+            cached_urls.iter().cloned().collect::<HashSet<_>>()
+        };
+        let expected: HashSet<String> = (0..cap)
+            .map(|index| format!("https://bootstrap-{index:02}.example.test/crl"))
+            .collect();
+
+        assert_eq!(
+            cache_keys, cached_url_keys,
+            "bootstrap cache and cached_urls must publish the same key set"
+        );
+        assert_eq!(
+            cache_keys, expected,
+            "bootstrap admission must keep the first cap URLs in sort order"
+        );
     }
 
     async fn wait_for_host_fetch_to_block_on_global_permit(set: &CrlSet, host: &str) {

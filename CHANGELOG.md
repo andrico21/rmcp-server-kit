@@ -17,6 +17,44 @@ release (`cargo semver-checks`); runtime behaviour changes are noted below.
 
 ### Security
 
+- **CRL revocation now fails closed by default.** `auth.mtls.crl_deny_on_unavailable`
+  defaults to `true` (was `false`). A client certificate advertising CRL
+  distribution points is rejected when *every* relevant CDP is uncached and
+  unfetchable, per RFC 5280 §6.3. Denial deliberately requires all relevant
+  CDPs to be unavailable rather than any single one, so blocking one mirror
+  cannot be used to deny service. **Opt out with
+  `crl_deny_on_unavailable = false`.** See [`docs/MIGRATION.md`](docs/MIGRATION.md#migrating-to-39-crl-fail-closed-by-default).
+- **A CRL distribution point can no longer be stranded by a fast-settling fetch.**
+  `note_discovered_urls` published the pending marker *after* handing the URL
+  to the refresher, so a fetch that completed first left a stale marker that
+  permanently suppressed rediscovery of that CDP. Under the new fail-closed
+  default this would have become a persistent handshake failure.
+- **OAuth access tokens, JWT claim values, and tool-call arguments are now
+  redacted in `Debug` and log output by default.** `ExchangedToken` and
+  `ToolCallContext` previously derived `Debug` over live secrets. Plaintext
+  can be re-enabled per category for local debugging via the new
+  `observability.log_plaintext_oauth_tokens`, `observability.log_oauth_claim_values`,
+  and `observability.log_tool_call_arguments` knobs (and their
+  `RMCP_SERVER_KIT__OBSERVABILITY__*` environment equivalents). These switches
+  are **process-wide**, not per-server.
+- **mTLS configured without TLS is now rejected at validation.** `auth.mtls`
+  without both `tls_cert_path` and `tls_key_path` silently disabled client
+  certificate authentication, because a plaintext listener never performs a
+  handshake and so never extracts an identity.
+- **Startup failures no longer leak background listeners.** A failure after
+  `build_app_router` — a main-bind `AddrInUse`, an unreadable TLS key — left
+  the Prometheus metrics listener and the CRL refresher running with their
+  ports bound. The external-shutdown bridge additionally parked forever on a
+  caller token that might never be cancelled.
+- **Bootstrap CRL fetches now respect `crl_max_cache_entries`**, which they
+  previously bypassed.
+- An `ArgumentAllowlist` with a non-empty `allowed` list but `required = false`
+  now emits a startup warning. Such an allowlist constrains the argument only
+  when it is present, so a caller who omits it bypasses the check entirely if
+  the tool substitutes a default. The new `ArgumentAllowlist::new_required`
+  constructor is the recommended form; `required` will default to `true` in
+  4.0.
+
 - **A hard-aborted CRL refresher no longer strands a CDP URL, silently narrowing
   revocation coverage.** `mtls_revocation::run_crl_refresher`'s discovery arm
   marks a URL in-flight in `pending_urls`, then awaits `fetch_and_store_url`.

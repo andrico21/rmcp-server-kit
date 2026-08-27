@@ -15,6 +15,7 @@
 
 use std::{
     collections::HashMap,
+    fmt,
     path::PathBuf,
     sync::{
         Arc,
@@ -618,8 +619,8 @@ impl OauthHttpClient {
     }
 }
 
-impl std::fmt::Debug for OauthHttpClient {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for OauthHttpClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OauthHttpClient").finish_non_exhaustive()
     }
 }
@@ -1668,7 +1669,7 @@ impl ClientCertConfig {
 }
 
 /// Successful response from an RFC 8693 token exchange.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[non_exhaustive]
 pub struct ExchangedToken {
     /// The newly issued access token.
@@ -1678,6 +1679,26 @@ pub struct ExchangedToken {
     /// Token type identifier (e.g.
     /// `urn:ietf:params:oauth:token-type:access_token`).
     pub issued_token_type: Option<String>,
+}
+
+impl fmt::Debug for ExchangedToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            access_token,
+            expires_in,
+            issued_token_type,
+        } = self;
+        let access_token = if crate::diagnostics::plaintext_oauth_tokens() {
+            access_token.as_str()
+        } else {
+            "[REDACTED]"
+        };
+        f.debug_struct("ExchangedToken")
+            .field("access_token", &access_token)
+            .field("expires_in", expires_in)
+            .field("issued_token_type", issued_token_type)
+            .finish()
+    }
 }
 
 /// Configuration for proxying OAuth 2.1 flows to an upstream identity provider.
@@ -1857,6 +1878,8 @@ struct CachedKeys {
     ttl: Duration,
 }
 
+const _JWKS_REFRESH_COOLDOWN_DOC_ANCHOR: &str = "JWKS_REFRESH_COOLDOWN";
+
 impl CachedKeys {
     fn is_expired(&self) -> bool {
         self.fetched_at.elapsed() >= self.ttl
@@ -1916,7 +1939,6 @@ pub struct JwksCache {
     test_allow_loopback_ssrf: crate::ssrf_resolver::TestLoopbackBypass,
 }
 
-/// Minimum cooldown between JWKS refresh attempts (prevents abuse).
 const JWKS_REFRESH_COOLDOWN: Duration = Duration::from_secs(10);
 
 /// Upper bound on an upstream OAuth proxy response body (`/token`,
@@ -2841,7 +2863,7 @@ impl<'de> Deserialize<'de> for OneOrMany {
         struct Visitor;
         impl<'de> de::Visitor<'de> for Visitor {
             type Value = OneOrMany;
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str("a string or array of strings")
             }
             fn visit_str<E: de::Error>(self, v: &str) -> Result<OneOrMany, E> {
@@ -3614,14 +3636,35 @@ fn log_exchanged_token(exchanged: &ExchangedToken) {
     let Ok(claims) = serde_json::from_slice::<serde_json::Value>(&decoded) else {
         return;
     };
+    let expose_claims = crate::diagnostics::oauth_claim_values();
+    let sub = gated_claim_str(claims.get("sub"), expose_claims);
+    let aud = gated_claim_aud(claims.get("aud"), expose_claims);
+    let azp = gated_claim_str(claims.get("azp"), expose_claims);
+    let iss = gated_claim_str(claims.get("iss"), expose_claims);
     tracing::debug!(
-        sub = fmt_json_str(claims.get("sub")),
-        aud = %fmt_json_aud(claims.get("aud")),
-        azp = fmt_json_str(claims.get("azp")),
-        iss = fmt_json_str(claims.get("iss")),
+        sub = sub,
+        aud = %aud,
+        azp = azp,
+        iss = iss,
         expires_in = exchanged.expires_in,
         "exchanged token claims (JWT)",
     );
+}
+
+fn gated_claim_str(value: Option<&serde_json::Value>, expose: bool) -> &str {
+    if expose {
+        fmt_json_str(value)
+    } else {
+        "[REDACTED]"
+    }
+}
+
+fn gated_claim_aud(value: Option<&serde_json::Value>, expose: bool) -> String {
+    if expose {
+        fmt_json_aud(value)
+    } else {
+        "[REDACTED]".to_owned()
+    }
 }
 
 /// Form/query parameters that carry OAuth client authentication.
@@ -6197,6 +6240,120 @@ role = "admin"
 
         fn make_writer(&'a self) -> Self::Writer {
             CapturedLogsWriter(Arc::clone(&self.0))
+        }
+    }
+
+    fn exchanged_token_for_debug(secret: &str) -> ExchangedToken {
+        ExchangedToken {
+            access_token: secret.to_owned(),
+            expires_in: Some(3600),
+            issued_token_type: Some("urn:ietf:params:oauth:token-type:access_token".to_owned()),
+        }
+    }
+
+    fn exchanged_jwt_with_sensitive_claims() -> ExchangedToken {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(
+            br#"{"sub":"subject-secret","aud":["aud-secret"],"azp":"azp-secret","iss":"issuer-secret"}"#,
+        );
+        exchanged_token_for_debug(&format!("{header}.{payload}.signature"))
+    }
+
+    #[test]
+    fn exchanged_token_debug_redacts_access_token_by_default() {
+        let _guard = crate::diagnostics::ExposureTestGuard::acquire();
+        crate::diagnostics::set_diagnostic_exposure(
+            &crate::diagnostics::DiagnosticExposure::default(),
+        );
+        let secret = "oauth-access-token-secret";
+
+        let rendered = format!("{:?}", exchanged_token_for_debug(secret));
+
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(
+            !rendered.contains(secret),
+            "Debug output must not contain plaintext access token: {rendered}"
+        );
+        assert!(rendered.contains("expires_in"));
+        assert!(rendered.contains("issued_token_type"));
+    }
+
+    #[test]
+    fn exchanged_token_debug_can_show_access_token_when_enabled() {
+        let _guard = crate::diagnostics::ExposureTestGuard::acquire();
+        crate::diagnostics::set_diagnostic_exposure(&crate::diagnostics::DiagnosticExposure {
+            plaintext_oauth_tokens: true,
+            ..crate::diagnostics::DiagnosticExposure::default()
+        });
+        let secret = "oauth-access-token-secret";
+
+        let rendered = format!("{:?}", exchanged_token_for_debug(secret));
+
+        assert!(rendered.contains(secret));
+    }
+
+    #[test]
+    fn exchanged_token_claim_log_redacts_claim_values_by_default() {
+        let _guard = crate::diagnostics::ExposureTestGuard::acquire();
+        crate::diagnostics::set_diagnostic_exposure(
+            &crate::diagnostics::DiagnosticExposure::default(),
+        );
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        log_exchanged_token(&exchanged_jwt_with_sensitive_claims());
+
+        let contents = logs.contents();
+        assert!(contents.contains("[REDACTED]"));
+        for secret in [
+            "subject-secret",
+            "aud-secret",
+            "azp-secret",
+            "issuer-secret",
+        ] {
+            assert!(
+                !contents.contains(secret),
+                "claim log must not contain {secret}: {contents}"
+            );
+        }
+        assert!(contents.contains("expires_in"));
+    }
+
+    #[test]
+    fn exchanged_token_claim_log_can_show_claim_values_when_enabled() {
+        let _guard = crate::diagnostics::ExposureTestGuard::acquire();
+        crate::diagnostics::set_diagnostic_exposure(&crate::diagnostics::DiagnosticExposure {
+            oauth_claim_values: true,
+            ..crate::diagnostics::DiagnosticExposure::default()
+        });
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        log_exchanged_token(&exchanged_jwt_with_sensitive_claims());
+
+        let contents = logs.contents();
+        for secret in [
+            "subject-secret",
+            "aud-secret",
+            "azp-secret",
+            "issuer-secret",
+        ] {
+            assert!(
+                contents.contains(secret),
+                "claim log must contain {secret} when enabled: {contents}"
+            );
         }
     }
 

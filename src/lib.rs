@@ -111,6 +111,8 @@
 
 /// Reusable server and observability configuration primitives.
 pub mod config;
+/// Process-global switches controlling plaintext-vs-redacted diagnostics.
+pub mod diagnostics;
 /// Generic error type and `Result` alias for server-side code.
 pub mod error;
 /// Tracing / JSON logs / audit file initialization.

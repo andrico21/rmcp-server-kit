@@ -3,6 +3,7 @@ use std::{path::PathBuf, time::Duration};
 use serde::Deserialize;
 
 use crate::{
+    bounded_limiter::KeyEvictionPolicy,
     error::RmcpServerKitError,
     transport::{McpServerConfig, SecurityHeadersConfig},
 };
@@ -23,6 +24,7 @@ const SERVER_CONFIG_BRIDGED_FIELDS: &[&str] = &[
     "extra_route_rate_limit",
     "extra_route_rate_limit_burst",
     "extra_route_rate_limit_exempt_paths",
+    "key_eviction_policy",
     "trusted_proxies",
     "trusted_forwarder_max_entries",
     "forwarded_header",
@@ -138,6 +140,13 @@ pub(crate) const ENV_OVERRIDE_SPECS: &[EnvOverrideSpec] = &[
         redacted: false,
     },
     EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__SERVER__KEY_EVICTION_POLICY",
+        target_field: "server.key_eviction_policy",
+        value_type: "KeyEvictionPolicy",
+        required_feature: None,
+        redacted: false,
+    },
+    EnvOverrideSpec {
         env_var: "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ISSUER",
         target_field: "server.auth.oauth.issuer",
         value_type: "String",
@@ -180,6 +189,27 @@ pub(crate) const ENV_OVERRIDE_SPECS: &[EnvOverrideSpec] = &[
         redacted: false,
     },
     EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__OBSERVABILITY__LOG_PLAINTEXT_OAUTH_TOKENS",
+        target_field: "observability.log_plaintext_oauth_tokens",
+        value_type: "bool",
+        required_feature: None,
+        redacted: false,
+    },
+    EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__OBSERVABILITY__LOG_OAUTH_CLAIM_VALUES",
+        target_field: "observability.log_oauth_claim_values",
+        value_type: "bool",
+        required_feature: None,
+        redacted: false,
+    },
+    EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__OBSERVABILITY__LOG_TOOL_CALL_ARGUMENTS",
+        target_field: "observability.log_tool_call_arguments",
+        value_type: "bool",
+        required_feature: None,
+        redacted: false,
+    },
+    EnvOverrideSpec {
         env_var: "RMCP_SERVER_KIT__RBAC__REDACTION_SALT",
         target_field: "rbac.redaction_salt",
         value_type: "SecretString",
@@ -201,6 +231,8 @@ pub(crate) const SERVER_PUBLIC_URL_ENV: &str = "RMCP_SERVER_KIT__SERVER__PUBLIC_
 pub(crate) const SERVER_TLS_CERT_PATH_ENV: &str = "RMCP_SERVER_KIT__SERVER__TLS_CERT_PATH";
 pub(crate) const SERVER_TLS_KEY_PATH_ENV: &str = "RMCP_SERVER_KIT__SERVER__TLS_KEY_PATH";
 pub(crate) const SERVER_ADMIN_ENABLED_ENV: &str = "RMCP_SERVER_KIT__SERVER__ADMIN_ENABLED";
+pub(crate) const SERVER_KEY_EVICTION_POLICY_ENV: &str =
+    "RMCP_SERVER_KIT__SERVER__KEY_EVICTION_POLICY";
 pub(crate) const SERVER_OAUTH_ISSUER_ENV: &str = "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ISSUER";
 pub(crate) const SERVER_OAUTH_AUDIENCE_ENV: &str = "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__AUDIENCE";
 pub(crate) const SERVER_OAUTH_JWKS_URI_ENV: &str = "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__JWKS_URI";
@@ -209,6 +241,12 @@ pub(crate) const OBSERVABILITY_METRICS_ENABLED_ENV: &str =
     "RMCP_SERVER_KIT__OBSERVABILITY__METRICS_ENABLED";
 pub(crate) const OBSERVABILITY_METRICS_BIND_ENV: &str =
     "RMCP_SERVER_KIT__OBSERVABILITY__METRICS_BIND";
+pub(crate) const OBSERVABILITY_LOG_PLAINTEXT_OAUTH_TOKENS_ENV: &str =
+    "RMCP_SERVER_KIT__OBSERVABILITY__LOG_PLAINTEXT_OAUTH_TOKENS";
+pub(crate) const OBSERVABILITY_LOG_OAUTH_CLAIM_VALUES_ENV: &str =
+    "RMCP_SERVER_KIT__OBSERVABILITY__LOG_OAUTH_CLAIM_VALUES";
+pub(crate) const OBSERVABILITY_LOG_TOOL_CALL_ARGUMENTS_ENV: &str =
+    "RMCP_SERVER_KIT__OBSERVABILITY__LOG_TOOL_CALL_ARGUMENTS";
 pub(crate) const RBAC_REDACTION_SALT_ENV: &str = "RMCP_SERVER_KIT__RBAC__REDACTION_SALT";
 pub(crate) const RBAC_REDACTION_SALT_FILE_ENV: &str = "RMCP_SERVER_KIT__RBAC__REDACTION_SALT_FILE";
 
@@ -286,6 +324,9 @@ pub struct ServerConfig {
     /// non-empty and start with `/`. Startup-only.
     #[serde(default)]
     pub extra_route_rate_limit_exempt_paths: Vec<String>,
+    /// Full-table policy for per-IP rate limiters. Default: `evict_lru`.
+    #[serde(default)]
+    pub key_eviction_policy: KeyEvictionPolicy,
     /// Trusted reverse-proxy networks (CIDRs or bare IPs) for
     /// trusted-forwarder mode. Empty (default) = off. When the direct
     /// peer is inside one of these networks, the client IP is resolved
@@ -362,6 +403,7 @@ impl Default for ServerConfig {
             extra_route_rate_limit: None,
             extra_route_rate_limit_burst: None,
             extra_route_rate_limit_exempt_paths: Vec::new(),
+            key_eviction_policy: KeyEvictionPolicy::default(),
             trusted_proxies: Vec::new(),
             trusted_forwarder_max_entries: default_trusted_forwarder_max_entries(),
             forwarded_header: None,
@@ -451,6 +493,15 @@ impl ServerConfig {
             applied.push(env_report(
                 SERVER_ADMIN_ENABLED_ENV,
                 "server.admin_enabled",
+                raw,
+            ));
+        }
+        if let Some(raw) = read_env(SERVER_KEY_EVICTION_POLICY_ENV)? {
+            self.key_eviction_policy =
+                parse_env_value(SERVER_KEY_EVICTION_POLICY_ENV, &raw, "KeyEvictionPolicy")?;
+            applied.push(env_report(
+                SERVER_KEY_EVICTION_POLICY_ENV,
+                "server.key_eviction_policy",
                 raw,
             ));
         }
@@ -590,6 +641,7 @@ impl ServerConfig {
             .with_optional_tool_rate_limit_burst(self.tool_rate_limit_burst)
             .with_optional_extra_route_rate_limit(self.extra_route_rate_limit)
             .with_optional_extra_route_rate_limit_burst(self.extra_route_rate_limit_burst)
+            .with_key_eviction_policy(self.key_eviction_policy)
             .with_optional_forwarded_header(self.forwarded_header)
             .with_optional_public_url(self.public_url.clone())
             .with_compression_enabled(self.compression_enabled)
@@ -652,6 +704,33 @@ impl ObservabilityConfig {
             applied.push(env_report(
                 OBSERVABILITY_METRICS_ENABLED_ENV,
                 "observability.metrics_enabled",
+                raw,
+            ));
+        }
+        if let Some(raw) = read_env(OBSERVABILITY_LOG_PLAINTEXT_OAUTH_TOKENS_ENV)? {
+            self.log_plaintext_oauth_tokens =
+                parse_env_bool(OBSERVABILITY_LOG_PLAINTEXT_OAUTH_TOKENS_ENV, &raw)?;
+            applied.push(env_report(
+                OBSERVABILITY_LOG_PLAINTEXT_OAUTH_TOKENS_ENV,
+                "observability.log_plaintext_oauth_tokens",
+                raw,
+            ));
+        }
+        if let Some(raw) = read_env(OBSERVABILITY_LOG_OAUTH_CLAIM_VALUES_ENV)? {
+            self.log_oauth_claim_values =
+                parse_env_bool(OBSERVABILITY_LOG_OAUTH_CLAIM_VALUES_ENV, &raw)?;
+            applied.push(env_report(
+                OBSERVABILITY_LOG_OAUTH_CLAIM_VALUES_ENV,
+                "observability.log_oauth_claim_values",
+                raw,
+            ));
+        }
+        if let Some(raw) = read_env(OBSERVABILITY_LOG_TOOL_CALL_ARGUMENTS_ENV)? {
+            self.log_tool_call_arguments =
+                parse_env_bool(OBSERVABILITY_LOG_TOOL_CALL_ARGUMENTS_ENV, &raw)?;
+            applied.push(env_report(
+                OBSERVABILITY_LOG_TOOL_CALL_ARGUMENTS_ENV,
+                "observability.log_tool_call_arguments",
                 raw,
             ));
         }
@@ -777,6 +856,8 @@ impl OAuthEnvOverrides {
     }
 }
 
+const _OBSERVABILITY_CONFIG_DOC_ANCHOR: &str = "ObservabilityConfig";
+
 #[cfg(not(feature = "oauth"))]
 fn reject_oauth_env_overrides(oauth_env: &OAuthEnvOverrides) -> Result<(), RmcpServerKitError> {
     if oauth_env.is_set() {
@@ -814,6 +895,10 @@ fn parse_duration_field(field: &str, value: &str) -> Result<Duration, RmcpServer
 /// Observability settings (reusable across MCP projects).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "observability configuration is a flat TOML schema with independent boolean feature flags"
+)]
 #[non_exhaustive]
 pub struct ObservabilityConfig {
     /// `tracing` log level / env filter string (e.g. `info,rmcp_server_kit=debug`).
@@ -834,6 +919,21 @@ pub struct ObservabilityConfig {
     /// Bind address for the Prometheus metrics listener.
     #[serde(default = "default_metrics_bind")]
     pub metrics_bind: String,
+    /// Log OAuth access tokens in plaintext. Defaults to redacted; enabling
+    /// writes secrets to logs and is for local debugging only. Process-wide,
+    /// not per-server.
+    #[serde(default)]
+    pub log_plaintext_oauth_tokens: bool,
+    /// Log OAuth claim values in plaintext. Defaults to redacted; enabling
+    /// writes secrets to logs and is for local debugging only. Process-wide,
+    /// not per-server.
+    #[serde(default)]
+    pub log_oauth_claim_values: bool,
+    /// Log tool-call arguments and identity fields in plaintext. Defaults to
+    /// redacted; enabling writes secrets to logs and is for local debugging
+    /// only. Process-wide, not per-server.
+    #[serde(default)]
+    pub log_tool_call_arguments: bool,
 }
 
 impl Default for ObservabilityConfig {
@@ -845,6 +945,9 @@ impl Default for ObservabilityConfig {
             log_request_headers: false,
             metrics_enabled: false,
             metrics_bind: default_metrics_bind(),
+            log_plaintext_oauth_tokens: false,
+            log_oauth_claim_values: false,
+            log_tool_call_arguments: false,
         }
     }
 }
@@ -1198,6 +1301,7 @@ mod tests {
         assert!(cfg.allowed_origins.is_empty());
         assert!(!cfg.stdio_enabled);
         assert!(cfg.tool_rate_limit.is_none());
+        assert_eq!(cfg.key_eviction_policy, KeyEvictionPolicy::EvictLru);
         assert_eq!(cfg.session_idle_timeout, "20m");
         assert_eq!(cfg.sse_keep_alive, "15s");
         assert!(cfg.public_url.is_none());
@@ -1212,6 +1316,9 @@ mod tests {
         assert!(!cfg.log_request_headers);
         assert!(!cfg.metrics_enabled);
         assert_eq!(cfg.metrics_bind, "127.0.0.1:9090");
+        assert!(!cfg.log_plaintext_oauth_tokens);
+        assert!(!cfg.log_oauth_claim_values);
+        assert!(!cfg.log_tool_call_arguments);
     }
 
     // -- validate_server_config --
@@ -1765,6 +1872,7 @@ mod tests {
             actual.extra_route_rate_limit_exempt_paths,
             expected.extra_route_rate_limit_exempt_paths
         );
+        assert_eq!(actual.key_eviction_policy, expected.key_eviction_policy);
         assert_eq!(actual.max_request_body, expected.max_request_body);
         assert_eq!(
             actual.max_concurrent_requests,
@@ -2018,6 +2126,7 @@ mod tests {
         assert!(actual.tool_rate_limit_burst.is_none());
         assert!(actual.extra_route_rate_limit.is_none());
         assert!(actual.extra_route_rate_limit_burst.is_none());
+        assert_eq!(actual.key_eviction_policy, KeyEvictionPolicy::EvictLru);
         assert!(actual.forwarded_header.is_none());
         assert!(actual.public_url.is_none());
         assert!(!actual.compression_enabled);
@@ -2088,6 +2197,20 @@ mod tests {
     }
 
     #[test]
+    fn key_eviction_policy_toml_defaults_and_overrides() {
+        let default_cfg: ServerConfig = toml::from_str("").unwrap();
+        assert_eq!(default_cfg.key_eviction_policy, KeyEvictionPolicy::EvictLru);
+
+        let reject_new: ServerConfig = toml::from_str(r#"key_eviction_policy = "reject_new""#)
+            .expect("reject_new policy parses");
+        assert_eq!(reject_new.key_eviction_policy, KeyEvictionPolicy::RejectNew);
+        let bridged = reject_new
+            .apply_to_mcp_config(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0"))
+            .unwrap();
+        assert_eq!(bridged.key_eviction_policy, KeyEvictionPolicy::RejectNew);
+    }
+
+    #[test]
     fn t12_bridge_rejects_invalid_request_timeout() {
         let cfg: ServerConfig = toml::from_str(r#"request_timeout = "not-a-duration""#).unwrap();
 
@@ -2106,6 +2229,25 @@ mod tests {
         assert_eq!(cfg.log_format, "pretty");
         assert!(!cfg.log_request_headers);
         assert!(!cfg.metrics_enabled);
+        assert!(!cfg.log_plaintext_oauth_tokens);
+        assert!(!cfg.log_oauth_claim_values);
+        assert!(!cfg.log_tool_call_arguments);
+    }
+
+    #[test]
+    fn observability_diagnostic_knobs_deserialize_true() {
+        let cfg: ObservabilityConfig = toml::from_str(
+            r"
+                log_plaintext_oauth_tokens = true
+                log_oauth_claim_values = true
+                log_tool_call_arguments = true
+            ",
+        )
+        .unwrap();
+
+        assert!(cfg.log_plaintext_oauth_tokens);
+        assert!(cfg.log_oauth_claim_values);
+        assert!(cfg.log_tool_call_arguments);
     }
 
     fn all_env_vars() -> Vec<&'static str> {
@@ -2263,6 +2405,66 @@ mod tests {
     }
 
     #[test]
+    fn observability_diagnostic_env_overrides_win_over_toml() {
+        with_env_vars(
+            &[
+                (OBSERVABILITY_LOG_PLAINTEXT_OAUTH_TOKENS_ENV, Some("false")),
+                (OBSERVABILITY_LOG_OAUTH_CLAIM_VALUES_ENV, Some("false")),
+                (OBSERVABILITY_LOG_TOOL_CALL_ARGUMENTS_ENV, Some("false")),
+            ],
+            || {
+                let mut cfg: ObservabilityConfig = toml::from_str(
+                    r"
+                        log_plaintext_oauth_tokens = true
+                        log_oauth_claim_values = true
+                        log_tool_call_arguments = true
+                    ",
+                )
+                .unwrap();
+
+                let report = cfg.apply_env_overrides().unwrap();
+
+                assert!(!cfg.log_plaintext_oauth_tokens);
+                assert!(!cfg.log_oauth_claim_values);
+                assert!(!cfg.log_tool_call_arguments);
+                assert_eq!(report.len(), 3);
+                assert!(report.iter().any(|entry| {
+                    entry.env_var == OBSERVABILITY_LOG_PLAINTEXT_OAUTH_TOKENS_ENV
+                        && entry.target_field == "observability.log_plaintext_oauth_tokens"
+                        && entry.value.as_deref() == Some("false")
+                }));
+                assert!(report.iter().any(|entry| {
+                    entry.env_var == OBSERVABILITY_LOG_OAUTH_CLAIM_VALUES_ENV
+                        && entry.target_field == "observability.log_oauth_claim_values"
+                        && entry.value.as_deref() == Some("false")
+                }));
+                assert!(report.iter().any(|entry| {
+                    entry.env_var == OBSERVABILITY_LOG_TOOL_CALL_ARGUMENTS_ENV
+                        && entry.target_field == "observability.log_tool_call_arguments"
+                        && entry.value.as_deref() == Some("false")
+                }));
+            },
+        );
+    }
+
+    #[test]
+    fn bad_observability_diagnostic_bool_env_fails_closed() {
+        for env_var in [
+            OBSERVABILITY_LOG_PLAINTEXT_OAUTH_TOKENS_ENV,
+            OBSERVABILITY_LOG_OAUTH_CLAIM_VALUES_ENV,
+            OBSERVABILITY_LOG_TOOL_CALL_ARGUMENTS_ENV,
+        ] {
+            with_env_vars(&[(env_var, Some("notabool"))], || {
+                let mut cfg = ObservabilityConfig::default();
+                let err = cfg.apply_env_overrides().unwrap_err();
+                let msg = err.to_string();
+                assert!(msg.contains(env_var));
+                assert!(msg.contains("bool"));
+            });
+        }
+    }
+
+    #[test]
     fn e10_env_port_reaches_mcp_bridge() {
         with_env_vars(&[(SERVER_LISTEN_PORT_ENV, Some("9100"))], || {
             let mut server: ServerConfig = toml::from_str(r#"listen_addr = "127.0.0.2""#).unwrap();
@@ -2273,6 +2475,37 @@ mod tests {
             assert_eq!(mcp.bind_addr, "127.0.0.2:9100");
             assert!(mcp.validate().is_ok());
         });
+    }
+
+    #[test]
+    fn key_eviction_policy_env_override_applies_and_reports() {
+        with_env_vars(
+            &[(SERVER_KEY_EVICTION_POLICY_ENV, Some("reject_new"))],
+            || {
+                let mut cfg: ServerConfig = toml::from_str(r#"key_eviction_policy = "evict_lru""#)
+                    .expect("TOML policy parses");
+                let report = cfg.apply_env_overrides().unwrap();
+                assert_eq!(cfg.key_eviction_policy, KeyEvictionPolicy::RejectNew);
+                assert_eq!(report.len(), 1);
+                assert_eq!(report[0].env_var, SERVER_KEY_EVICTION_POLICY_ENV);
+                assert_eq!(report[0].target_field, "server.key_eviction_policy");
+                assert_eq!(report[0].value.as_deref(), Some("reject_new"));
+            },
+        );
+    }
+
+    #[test]
+    fn bad_key_eviction_policy_env_fails_closed() {
+        with_env_vars(
+            &[(SERVER_KEY_EVICTION_POLICY_ENV, Some("drop_random"))],
+            || {
+                let mut cfg = ServerConfig::default();
+                let err = cfg.apply_env_overrides().unwrap_err();
+                let msg = err.to_string();
+                assert!(msg.contains(SERVER_KEY_EVICTION_POLICY_ENV));
+                assert!(msg.contains("KeyEvictionPolicy"));
+            },
+        );
     }
 
     #[cfg(unix)]
@@ -2306,7 +2539,7 @@ mod tests {
     }
 
     #[test]
-    fn env_override_spec_contains_exact_fourteen_vars() {
+    fn env_override_spec_contains_exact_eighteen_vars() {
         let vars = ENV_OVERRIDE_SPECS
             .iter()
             .map(|spec| {
@@ -2318,66 +2551,10 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        assert_eq!(vars.len(), 14);
-        assert!(vars.contains(&(SERVER_LISTEN_ADDR_ENV, "server.listen_addr", None, false)));
-        assert!(vars.contains(&(SERVER_LISTEN_PORT_ENV, "server.listen_port", None, false)));
-        assert!(vars.contains(&(SERVER_PUBLIC_URL_ENV, "server.public_url", None, false)));
-        assert!(vars.contains(&(
-            SERVER_TLS_CERT_PATH_ENV,
-            "server.tls_cert_path",
-            None,
-            false
-        )));
-        assert!(vars.contains(&(SERVER_TLS_KEY_PATH_ENV, "server.tls_key_path", None, false)));
-        assert!(vars.contains(&(
-            SERVER_ADMIN_ENABLED_ENV,
-            "server.admin_enabled",
-            None,
-            false
-        )));
-        assert!(vars.contains(&(
-            SERVER_OAUTH_ISSUER_ENV,
-            "server.auth.oauth.issuer",
-            Some("oauth"),
-            false
-        )));
-        assert!(vars.contains(&(
-            SERVER_OAUTH_AUDIENCE_ENV,
-            "server.auth.oauth.audience",
-            Some("oauth"),
-            false
-        )));
-        assert!(vars.contains(&(
-            SERVER_OAUTH_JWKS_URI_ENV,
-            "server.auth.oauth.jwks_uri",
-            Some("oauth"),
-            false
-        )));
-        assert!(vars.contains(&(
-            OBSERVABILITY_LOG_FORMAT_ENV,
-            "observability.log_format",
-            None,
-            false
-        )));
-        assert!(vars.contains(&(
-            OBSERVABILITY_METRICS_ENABLED_ENV,
-            "observability.metrics_enabled",
-            None,
-            false
-        )));
-        assert!(vars.contains(&(
-            OBSERVABILITY_METRICS_BIND_ENV,
-            "observability.metrics_bind",
-            None,
-            false
-        )));
-        assert!(vars.contains(&(RBAC_REDACTION_SALT_ENV, "rbac.redaction_salt", None, true)));
-        assert!(vars.contains(&(
-            RBAC_REDACTION_SALT_FILE_ENV,
-            "rbac.redaction_salt",
-            None,
-            true
-        )));
+        assert_eq!(vars.len(), EXPECTED_ENV_OVERRIDE_SPECS.len());
+        for expected in EXPECTED_ENV_OVERRIDE_SPECS {
+            assert!(vars.contains(expected), "missing env spec {expected:?}");
+        }
         assert_eq!(
             ENV_OVERRIDE_SPECS
                 .iter()
@@ -2405,6 +2582,94 @@ mod tests {
     // TOML key (`rbac.redaction_salt`); duplicating the inline annotation on
     // the key would be ambiguous rather than helpful.
     const INLINE_ENV_ANNOTATION_EXEMPTIONS: &[&str] = &[RBAC_REDACTION_SALT_FILE_ENV];
+
+    type EnvSpecTuple = (&'static str, &'static str, Option<&'static str>, bool);
+
+    const EXPECTED_ENV_OVERRIDE_SPECS: &[EnvSpecTuple] = &[
+        (SERVER_LISTEN_ADDR_ENV, "server.listen_addr", None, false),
+        (SERVER_LISTEN_PORT_ENV, "server.listen_port", None, false),
+        (SERVER_PUBLIC_URL_ENV, "server.public_url", None, false),
+        (
+            SERVER_TLS_CERT_PATH_ENV,
+            "server.tls_cert_path",
+            None,
+            false,
+        ),
+        (SERVER_TLS_KEY_PATH_ENV, "server.tls_key_path", None, false),
+        (
+            SERVER_ADMIN_ENABLED_ENV,
+            "server.admin_enabled",
+            None,
+            false,
+        ),
+        (
+            SERVER_KEY_EVICTION_POLICY_ENV,
+            "server.key_eviction_policy",
+            None,
+            false,
+        ),
+        (
+            SERVER_OAUTH_ISSUER_ENV,
+            "server.auth.oauth.issuer",
+            Some("oauth"),
+            false,
+        ),
+        (
+            SERVER_OAUTH_AUDIENCE_ENV,
+            "server.auth.oauth.audience",
+            Some("oauth"),
+            false,
+        ),
+        (
+            SERVER_OAUTH_JWKS_URI_ENV,
+            "server.auth.oauth.jwks_uri",
+            Some("oauth"),
+            false,
+        ),
+        (
+            OBSERVABILITY_LOG_FORMAT_ENV,
+            "observability.log_format",
+            None,
+            false,
+        ),
+        (
+            OBSERVABILITY_METRICS_ENABLED_ENV,
+            "observability.metrics_enabled",
+            None,
+            false,
+        ),
+        (
+            OBSERVABILITY_METRICS_BIND_ENV,
+            "observability.metrics_bind",
+            None,
+            false,
+        ),
+        (
+            OBSERVABILITY_LOG_PLAINTEXT_OAUTH_TOKENS_ENV,
+            "observability.log_plaintext_oauth_tokens",
+            None,
+            false,
+        ),
+        (
+            OBSERVABILITY_LOG_OAUTH_CLAIM_VALUES_ENV,
+            "observability.log_oauth_claim_values",
+            None,
+            false,
+        ),
+        (
+            OBSERVABILITY_LOG_TOOL_CALL_ARGUMENTS_ENV,
+            "observability.log_tool_call_arguments",
+            None,
+            false,
+        ),
+        (RBAC_REDACTION_SALT_ENV, "rbac.redaction_salt", None, true),
+        (
+            RBAC_REDACTION_SALT_FILE_ENV,
+            "rbac.redaction_salt",
+            None,
+            true,
+        ),
+    ];
 
     // Guards the public operator table against drifting from the code-side
     // env spec, and guards the reverse direction by parsing `*_ENV` consts

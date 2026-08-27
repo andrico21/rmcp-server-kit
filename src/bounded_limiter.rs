@@ -2,8 +2,8 @@
 //!
 //! [`crate::bounded_limiter::BoundedKeyedLimiter`] wraps a map of per-key
 //! [`governor::DefaultDirectRateLimiter`] instances behind a hard cap on the
-//! number of tracked keys, with an idle-eviction policy and an LRU fallback
-//! when the cap is reached.
+//! number of tracked keys, with an idle-eviction policy and configurable
+//! full-table behaviour when the cap is reached.
 //!
 //! # Why
 //!
@@ -21,10 +21,9 @@
 //!    timestamp.
 //! 2. Capping the map at `max_tracked_keys` entries.
 //! 3. On insert when the map is full, first pruning entries whose
-//!    `last_seen` is older than `idle_eviction`, then -- if still full --
-//!    evicting the entry with the oldest `last_seen` ("LRU eviction").
-//!    The new key is **always** inserted; honest new clients are never
-//!    rejected because the table is full.
+//!    `last_seen` is older than `idle_eviction`, then applying
+//!    [`KeyEvictionPolicy`](crate::bounded_limiter::KeyEvictionPolicy). The default policy evicts the entry with the
+//!    oldest `last_seen` ("LRU eviction") so the new key is inserted.
 //! 4. Updating `last_seen` on **every** check (including rate-limit
 //!    rejections) so an actively-firing attacker cannot dodge eviction by
 //!    appearing idle.
@@ -47,6 +46,7 @@ use std::{
     collections::HashMap,
     hash::Hash,
     num::{NonZeroU32, NonZeroUsize},
+    str::FromStr,
     sync::{Arc, Mutex, PoisonError, Weak},
     time::{Duration, Instant},
 };
@@ -69,6 +69,43 @@ pub enum BoundedLimiterError {
     RateLimited,
 }
 
+/// Reason a detailed bounded-limiter check denied a request.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum BoundedLimiterDeny {
+    /// The key has exceeded its per-key quota for the current window.
+    #[error("rate limit exceeded; retry after {0:?}")]
+    RateLimited(Duration),
+    /// The limiter is at its tracked-key capacity and the configured policy
+    /// rejects unseen keys instead of evicting an existing bucket.
+    #[error("tracked-key capacity is full")]
+    CapacityFull,
+}
+
+/// Behaviour when a new key arrives after the tracked-key table reaches capacity.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyEvictionPolicy {
+    /// Evict the least-recently-seen key and admit the new key.
+    #[default]
+    EvictLru,
+    /// Reject unseen keys while preserving buckets for already-tracked keys.
+    RejectNew,
+}
+
+impl FromStr for KeyEvictionPolicy {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "evict_lru" => Ok(Self::EvictLru),
+            "reject_new" => Ok(Self::RejectNew),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Per-key limiter entry: the underlying direct limiter plus the wall-clock
 /// timestamp of the most recent admission attempt for this key.
 struct Entry {
@@ -84,6 +121,7 @@ struct Inner<K: Eq + Hash + Clone> {
     quota: Quota,
     max_tracked_keys: usize,
     idle_eviction: Duration,
+    key_eviction_policy: KeyEvictionPolicy,
 }
 
 /// Memory-bounded keyed rate limiter.
@@ -134,11 +172,28 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
         max_tracked_keys: NonZeroUsize,
         idle_eviction: Duration,
     ) -> Self {
+        Self::new_with_policy(
+            quota,
+            max_tracked_keys,
+            idle_eviction,
+            KeyEvictionPolicy::default(),
+        )
+    }
+
+    /// Create a new bounded keyed limiter with explicit full-table behaviour.
+    #[must_use]
+    pub(crate) fn new_with_policy(
+        quota: Quota,
+        max_tracked_keys: NonZeroUsize,
+        idle_eviction: Duration,
+        key_eviction_policy: KeyEvictionPolicy,
+    ) -> Self {
         let inner = Arc::new(Inner {
             map: Mutex::new(HashMap::new()),
             quota,
             max_tracked_keys: max_tracked_keys.get(),
             idle_eviction,
+            key_eviction_policy,
         });
         Self::spawn_prune_task(&inner);
         Self { inner }
@@ -169,6 +224,24 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
         Self::new(Quota::per_minute(rate), max_tracked_keys, idle_eviction)
     }
 
+    /// Construct a [`BoundedKeyedLimiter`] with a per-minute quota and policy.
+    #[must_use]
+    pub fn with_per_minute_and_policy(
+        requests_per_minute: u32,
+        max_tracked_keys: usize,
+        idle_eviction: Duration,
+        key_eviction_policy: KeyEvictionPolicy,
+    ) -> Self {
+        let rate = NonZeroU32::new(requests_per_minute.max(1)).unwrap_or(NonZeroU32::MIN);
+        let max_tracked_keys = NonZeroUsize::new(max_tracked_keys).unwrap_or(NonZeroUsize::MIN);
+        Self::new_with_policy(
+            Quota::per_minute(rate),
+            max_tracked_keys,
+            idle_eviction,
+            key_eviction_policy,
+        )
+    }
+
     /// Construct a [`BoundedKeyedLimiter`] with a per-second quota.
     ///
     /// Convenience constructor that builds a per-second [`Quota`] from
@@ -192,6 +265,24 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
         let rate = NonZeroU32::new(requests_per_second.max(1)).unwrap_or(NonZeroU32::MIN);
         let max_tracked_keys = NonZeroUsize::new(max_tracked_keys).unwrap_or(NonZeroUsize::MIN);
         Self::new(Quota::per_second(rate), max_tracked_keys, idle_eviction)
+    }
+
+    /// Construct a [`BoundedKeyedLimiter`] with a per-second quota and policy.
+    #[must_use]
+    pub fn with_per_second_and_policy(
+        requests_per_second: u32,
+        max_tracked_keys: usize,
+        idle_eviction: Duration,
+        key_eviction_policy: KeyEvictionPolicy,
+    ) -> Self {
+        let rate = NonZeroU32::new(requests_per_second.max(1)).unwrap_or(NonZeroU32::MIN);
+        let max_tracked_keys = NonZeroUsize::new(max_tracked_keys).unwrap_or(NonZeroUsize::MIN);
+        Self::new_with_policy(
+            Quota::per_second(rate),
+            max_tracked_keys,
+            idle_eviction,
+            key_eviction_policy,
+        )
     }
 
     /// Spawn the optional background prune task. No-op if there is no
@@ -314,6 +405,60 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
         result
     }
 
+    /// Test the per-key quota for `key`, preserving capacity-denial details.
+    ///
+    /// Unlike [`check_key_wait`](Self::check_key_wait), this method honors the
+    /// configured [`KeyEvictionPolicy`] and can report full-table rejection via
+    /// [`BoundedLimiterDeny::CapacityFull`]. Existing callers that need legacy
+    /// always-evict behaviour can keep using [`check_key`](Self::check_key) or
+    /// [`check_key_wait`](Self::check_key_wait).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BoundedLimiterDeny::RateLimited`] when an established bucket is
+    /// over quota, or [`BoundedLimiterDeny::CapacityFull`] when an unseen key is
+    /// rejected by [`KeyEvictionPolicy::RejectNew`].
+    pub fn check_key_detailed(&self, key: &K) -> Result<(), BoundedLimiterDeny> {
+        let mut guard = self
+            .inner
+            .map
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
+        if let Some(entry) = guard.get_mut(key) {
+            entry.last_seen = now;
+            return entry.limiter.check().map_err(|not_until| {
+                BoundedLimiterDeny::RateLimited(
+                    not_until.wait_time_from(DefaultClock::default().now()),
+                )
+            });
+        }
+        if guard.len() >= self.inner.max_tracked_keys {
+            let cutoff = now
+                .checked_sub(self.inner.idle_eviction)
+                .unwrap_or_else(Instant::now);
+            guard.retain(|_, entry| entry.last_seen >= cutoff);
+            if guard.len() >= self.inner.max_tracked_keys {
+                match self.inner.key_eviction_policy {
+                    KeyEvictionPolicy::EvictLru => Self::evict_lru(&mut guard),
+                    KeyEvictionPolicy::RejectNew => return Err(BoundedLimiterDeny::CapacityFull),
+                }
+            }
+        }
+        let limiter = RateLimiter::direct(self.inner.quota);
+        let result = limiter.check().map_err(|not_until| {
+            BoundedLimiterDeny::RateLimited(not_until.wait_time_from(DefaultClock::default().now()))
+        });
+        guard.insert(
+            key.clone(),
+            Entry {
+                limiter,
+                last_seen: now,
+            },
+        );
+        result
+    }
+
     /// Number of currently tracked keys. Used by tests and admin endpoints.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -341,7 +486,7 @@ mod tests {
 
     use governor::Quota;
 
-    use super::BoundedKeyedLimiter;
+    use super::{BoundedKeyedLimiter, BoundedLimiterDeny, BoundedLimiterError, KeyEvictionPolicy};
 
     fn ip(n: u32) -> IpAddr {
         IpAddr::from(n.to_be_bytes())
@@ -396,8 +541,29 @@ mod tests {
         assert!(limiter.check_key(&ip(7)).is_ok());
         assert_eq!(
             limiter.check_key(&ip(7)),
-            Err(super::BoundedLimiterError::RateLimited)
+            Err(BoundedLimiterError::RateLimited)
         );
+    }
+
+    #[test]
+    fn check_key_detailed_reports_rate_limit_wait_under_default_policy() {
+        let quota = Quota::per_minute(NonZeroU32::new(1).unwrap());
+        let limiter: BoundedKeyedLimiter<IpAddr> =
+            BoundedKeyedLimiter::new(quota, cap(10), Duration::from_hours(1));
+        assert!(limiter.check_key_detailed(&ip(7)).is_ok());
+        let deny = limiter
+            .check_key_detailed(&ip(7))
+            .expect_err("second call within the window must deny");
+        match deny {
+            BoundedLimiterDeny::RateLimited(wait) => {
+                assert!(wait > Duration::ZERO, "wait must be positive, got {wait:?}");
+                assert!(
+                    wait <= Duration::from_secs(60),
+                    "per-minute quota wait must be <= 60s, got {wait:?}"
+                );
+            }
+            BoundedLimiterDeny::CapacityFull => panic!("default policy must not reject capacity"),
+        }
     }
 
     /// The hard cap on tracked keys must never be exceeded, even under a
@@ -416,6 +582,54 @@ mod tests {
             );
         }
         assert_eq!(limiter.len(), 100, "table should be full at the cap");
+    }
+
+    #[test]
+    fn reject_new_at_cap_denies_unseen_key_but_keeps_established_key() {
+        let quota = Quota::per_minute(NonZeroU32::new(2).unwrap());
+        let limiter: BoundedKeyedLimiter<IpAddr> = BoundedKeyedLimiter::new_with_policy(
+            quota,
+            cap(1),
+            Duration::from_hours(1),
+            KeyEvictionPolicy::RejectNew,
+        );
+        let established = ip(10);
+        assert!(limiter.check_key_detailed(&established).is_ok());
+        assert_eq!(limiter.len(), 1);
+
+        let unseen = ip(11);
+        assert_eq!(
+            limiter.check_key_detailed(&unseen),
+            Err(BoundedLimiterDeny::CapacityFull)
+        );
+        assert_eq!(limiter.len(), 1);
+        assert!(
+            limiter.check_key_detailed(&established).is_ok(),
+            "established key keeps its existing bucket and remaining quota"
+        );
+    }
+
+    #[test]
+    fn evict_lru_policy_at_cap_admits_new_key_and_evicts_lru() {
+        let quota = Quota::per_minute(NonZeroU32::new(2).unwrap());
+        let limiter: BoundedKeyedLimiter<IpAddr> = BoundedKeyedLimiter::new_with_policy(
+            quota,
+            cap(1),
+            Duration::from_hours(1),
+            KeyEvictionPolicy::EvictLru,
+        );
+        let first = ip(20);
+        assert!(limiter.check_key_detailed(&first).is_ok());
+        assert!(limiter.check_key_detailed(&first).is_ok());
+        assert!(limiter.check_key_detailed(&first).is_err());
+
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(limiter.check_key_detailed(&ip(21)).is_ok());
+        assert_eq!(limiter.len(), 1);
+        assert!(
+            limiter.check_key_detailed(&first).is_ok(),
+            "LRU-evicted key returns with fresh quota under EvictLru"
+        );
     }
 
     /// When a previously-evicted key reappears, it must get a fresh quota.

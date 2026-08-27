@@ -33,10 +33,10 @@ use crate::{
         AuthConfig, AuthIdentity, AuthState, MtlsConfig, TlsConnInfo, auth_middleware,
         build_rate_limiter, extract_mtls_identity,
     },
-    bounded_limiter::BoundedKeyedLimiter,
+    bounded_limiter::{BoundedKeyedLimiter, BoundedLimiterDeny, KeyEvictionPolicy},
     error::RmcpServerKitError,
     mtls_revocation::{self, CrlSet, DynamicClientCertVerifier},
-    rbac::{RbacPolicy, ToolRateLimiter, build_tool_rate_limiter, rbac_middleware},
+    rbac::{RbacPolicy, ToolRateLimiter, build_tool_rate_limiter_with_policy, rbac_middleware},
 };
 
 /// Map an internal `anyhow::Error` chain into a public [`RmcpServerKitError::Startup`]
@@ -400,6 +400,9 @@ pub struct McpServerConfig {
     )]
     pub extra_route_rate_limit_exempt_paths: Vec<String>,
 
+    /// Full-table policy for per-IP rate limiters. Default: evict LRU.
+    pub key_eviction_policy: KeyEvictionPolicy,
+
     /// Maximum forwarding-chain entries scanned per request in
     /// trusted-forwarder mode. Chains longer than this are treated as a
     /// header bomb and resolution falls back to the direct peer.
@@ -734,6 +737,7 @@ impl McpServerConfig {
             tool_rate_limit_burst: None,
             extra_route_rate_limit_burst: None,
             extra_route_rate_limit_exempt_paths: Vec::new(),
+            key_eviction_policy: KeyEvictionPolicy::default(),
             trusted_forwarder_max_entries: crate::forwarded::MAX_SCANNED_ENTRIES,
             trusted_proxies: Vec::new(),
             forwarded_header: None,
@@ -1017,6 +1021,13 @@ impl McpServerConfig {
         self
     }
 
+    /// Set the tracked-key full-table policy for all per-IP rate limiters.
+    #[must_use]
+    pub const fn with_key_eviction_policy(mut self, policy: KeyEvictionPolicy) -> Self {
+        self.key_eviction_policy = policy;
+        self
+    }
+
     /// Enable **trusted-forwarder mode**: requests whose direct peer is
     /// inside one of these networks (CIDRs or bare IPs) have their
     /// client IP resolved from the forwarding header via the
@@ -1258,6 +1269,21 @@ impl McpServerConfig {
                 ));
             }
             _ => {}
+        }
+
+        // 2b. mTLS requires TLS. The plaintext listener never performs a TLS
+        //     handshake, so it cannot populate `ConnectInfo<TlsConnInfo>` and
+        //     the client-certificate identity is never extracted. Accepting
+        //     this combination silently disables client-cert authentication
+        //     for an operator who believes it is switched on.
+        if self.auth.as_ref().is_some_and(|a| a.mtls.is_some())
+            && (self.tls_cert_path.is_none() || self.tls_key_path.is_none())
+        {
+            return Err(RmcpServerKitError::Config(
+                "auth.mtls requires TLS: set both tls_cert_path and tls_key_path \
+                 (mTLS client certificates cannot be verified on a plaintext listener)"
+                    .into(),
+            ));
         }
 
         // 3. bind_addr parses
@@ -1626,9 +1652,13 @@ where
     // Always installed: even when RBAC is disabled, tool rate limiting may
     // be active (MCP spec: servers MUST rate limit tool invocations).
     {
-        let tool_limiter: Option<Arc<ToolRateLimiter>> = config
-            .tool_rate_limit
-            .map(|per_minute| build_tool_rate_limiter(per_minute, config.tool_rate_limit_burst));
+        let tool_limiter: Option<Arc<ToolRateLimiter>> = config.tool_rate_limit.map(|per_minute| {
+            build_tool_rate_limiter_with_policy(
+                per_minute,
+                config.tool_rate_limit_burst,
+                config.key_eviction_policy,
+            )
+        });
 
         if rbac_swap.load().is_enabled() {
             tracing::info!("RBAC enforcement enabled on /mcp");
@@ -1769,8 +1799,14 @@ where
     if let Some(extra) = config.extra_router.take() {
         let extra = match config.extra_route_rate_limit {
             Some(per_minute) => {
-                let limiter =
-                    build_extra_route_rate_limiter(per_minute, config.extra_route_rate_limit_burst);
+                let max_tracked_keys =
+                    NonZeroUsize::new(EXTRA_ROUTE_MAX_TRACKED_KEYS).unwrap_or(NonZeroUsize::MIN);
+                let limiter = build_extra_route_rate_limiter_with_policy(
+                    per_minute,
+                    config.extra_route_rate_limit_burst,
+                    config.key_eviction_policy,
+                    max_tracked_keys,
+                );
                 let exempt: Arc<std::collections::HashSet<String>> = Arc::new(
                     config
                         .extra_route_rate_limit_exempt_paths
@@ -2058,6 +2094,44 @@ where
     ))
 }
 
+/// Cancels the held [`CancellationToken`] when dropped.
+///
+/// Startup spawns background tasks (the Prometheus metrics listener, the CRL
+/// refresher, the external-shutdown bridge) before every fallible step has
+/// completed. Without this guard a later failure -- a main-bind `AddrInUse`,
+/// an unreadable TLS key -- returns `Err` while those tasks keep running and
+/// keep their ports bound for the lifetime of the process.
+///
+/// The guard is deliberately never disarmed: once the serve function returns,
+/// by success or by failure, the server is finished and its background tasks
+/// must stop. On the success path the token has already been cancelled by the
+/// shutdown signal, and cancelling twice is a no-op.
+struct CancelOnDrop(CancellationToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// Forwards an externally-supplied shutdown token into the server-internal one.
+///
+/// Returns the task handle so the wiring can be exercised directly in tests.
+fn spawn_external_shutdown_bridge(
+    external: CancellationToken,
+    internal: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // The second arm is load-bearing: without it this task parks forever
+        // on a caller token that may never be cancelled, outliving a failed
+        // startup even though the internal token was already cancelled.
+        tokio::select! {
+            () = external.cancelled() => internal.cancel(),
+            () = internal.cancelled() => {}
+        }
+    })
+}
+
 /// Run the MCP HTTP server, binding to `config.bind_addr` and serving
 /// until an OS shutdown signal (Ctrl-C / SIGTERM) is received.
 ///
@@ -2092,6 +2166,7 @@ where
     )]
     let bind_addr = config.bind_addr.clone();
     let (router, params) = build_app_router(config, handler_factory).map_err(anyhow_to_startup)?;
+    let _cancel_guard = CancelOnDrop(params.ct.clone());
 
     let listener = TcpListener::bind(&bind_addr)
         .await
@@ -2164,6 +2239,7 @@ where
         .local_addr()
         .map_err(|e| io_to_startup("listener.local_addr", e))?;
     let (router, params) = build_app_router(config, handler_factory).map_err(anyhow_to_startup)?;
+    let _cancel_guard = CancelOnDrop(params.ct.clone());
 
     log_listening(&params.name, params.scheme, &local_addr.to_string());
 
@@ -2171,11 +2247,7 @@ where
     // token so `run_server`'s shutdown trigger picks it up alongside
     // any real OS signal.
     if let Some(external) = shutdown {
-        let internal = params.ct.clone();
-        tokio::spawn(async move {
-            external.cancelled().await;
-            internal.cancel();
-        });
+        let _bridge_task = spawn_external_shutdown_bridge(external, params.ct.clone());
     }
 
     // Signal readiness *after* the router is fully built and external
@@ -3635,24 +3707,22 @@ const EXTRA_ROUTE_IDLE_EVICTION: Duration = Duration::from_mins(15);
 /// [`McpServerConfig::validate`]; the `NonZeroU32` fallbacks here are
 /// defensive only. `burst` overrides governor's default bucket capacity
 /// (burst = rate).
-fn build_extra_route_rate_limiter(
+fn build_extra_route_rate_limiter_with_policy(
     per_minute: u32,
     burst: Option<u32>,
+    key_eviction_policy: KeyEvictionPolicy,
+    max_tracked_keys: NonZeroUsize,
 ) -> Arc<ExtraRouteRateLimiter> {
     let rate = std::num::NonZeroU32::new(per_minute.max(1)).unwrap_or(std::num::NonZeroU32::MIN);
     let mut quota = governor::Quota::per_minute(rate);
     if let Some(b) = burst.and_then(std::num::NonZeroU32::new) {
         quota = quota.allow_burst(b);
     }
-    // Defense in depth: Phase-1 config validation rejects `0` upstream; this
-    // constant is nonzero, but keeping the conversion fallible preserves the
-    // invariant if the constant is edited later.
-    let max_tracked_keys =
-        NonZeroUsize::new(EXTRA_ROUTE_MAX_TRACKED_KEYS).unwrap_or(NonZeroUsize::MIN);
-    Arc::new(BoundedKeyedLimiter::new(
+    Arc::new(BoundedKeyedLimiter::new_with_policy(
         quota,
         max_tracked_keys,
         EXTRA_ROUTE_IDLE_EVICTION,
+        key_eviction_policy,
     ))
 }
 
@@ -3687,15 +3757,29 @@ async fn extra_route_rate_limit_middleware(
         return next.run(req).await;
     }
     let peer_key = limiter_client_key(req.extensions());
-    if let Err(wait) = limiter.check_key_wait(&peer_key) {
-        #[cfg(feature = "metrics")]
-        crate::metrics::record_rate_limit_deny(req.extensions(), "extra_route");
-        tracing::warn!(rate_limit_key = %peer_key, "extra route request rate limited");
-        return RmcpServerKitError::RateLimitedFor {
-            message: "too many requests to application routes from this source".into(),
-            retry_after: wait,
+    match limiter.check_key_detailed(&peer_key) {
+        Ok(()) => {}
+        Err(BoundedLimiterDeny::RateLimited(wait)) => {
+            #[cfg(feature = "metrics")]
+            crate::metrics::record_rate_limit_deny(req.extensions(), "extra_route");
+            tracing::warn!(rate_limit_key = %peer_key, "extra route request rate limited");
+            return RmcpServerKitError::RateLimitedFor {
+                message: "too many requests to application routes from this source".into(),
+                retry_after: wait,
+            }
+            .into_response();
         }
-        .into_response();
+        Err(BoundedLimiterDeny::CapacityFull) => {
+            tracing::warn!(
+                rate_limit_key = %peer_key,
+                "extra route limiter rejected unseen key because tracked-key capacity is full"
+            );
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "rate limiter capacity exhausted",
+            )
+                .into_response();
+        }
     }
     next.run(req).await
 }
@@ -4083,6 +4167,90 @@ mod tests {
 
     use super::*;
 
+    // -- startup task lifecycle --
+
+    #[tokio::test]
+    async fn external_shutdown_bridge_exits_when_internal_token_cancels() {
+        let external = CancellationToken::new();
+        let internal = CancellationToken::new();
+        let bridge = spawn_external_shutdown_bridge(external.clone(), internal.clone());
+
+        // The caller's token is never cancelled; only the server-internal one
+        // is, as happens when startup fails after the bridge is spawned.
+        internal.cancel();
+
+        let joined = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+        assert!(
+            joined.is_ok(),
+            "bridge task must exit once the internal token is cancelled, \
+             otherwise it leaks for the lifetime of the process"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_shutdown_bridge_still_forwards_external_cancel() {
+        let external = CancellationToken::new();
+        let internal = CancellationToken::new();
+        let bridge = spawn_external_shutdown_bridge(external.clone(), internal.clone());
+
+        external.cancel();
+
+        let joined = tokio::time::timeout(Duration::from_secs(2), bridge).await;
+        assert!(joined.is_ok(), "bridge task must exit on external cancel");
+        assert!(
+            internal.is_cancelled(),
+            "external cancellation must still propagate to the internal token"
+        );
+    }
+
+    #[test]
+    fn cancel_on_drop_cancels_its_token() {
+        let ct = CancellationToken::new();
+        {
+            let _guard = CancelOnDrop(ct.clone());
+            assert!(!ct.is_cancelled());
+        }
+        assert!(
+            ct.is_cancelled(),
+            "dropping the guard must cancel background startup tasks"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_mtls_without_tls() {
+        for (cert, key) in [
+            (None, None),
+            (Some("cert.pem"), None),
+            (None, Some("key.pem")),
+        ] {
+            let mut auth = AuthConfig::with_keys(vec![]);
+            auth.mtls = Some(valid_mtls_config());
+            let mut cfg = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0").with_auth(auth);
+            cfg.tls_cert_path = cert.map(Into::into);
+            cfg.tls_key_path = key.map(Into::into);
+
+            let err = cfg
+                .validate()
+                .expect_err("mTLS without both TLS paths must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("tls_cert_path") && msg.contains("tls_key_path"),
+                "cert={cert:?} key={key:?}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_mtls_with_tls() {
+        let mut auth = AuthConfig::with_keys(vec![]);
+        auth.mtls = Some(valid_mtls_config());
+        let mut cfg = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0").with_auth(auth);
+        cfg.tls_cert_path = Some("cert.pem".into());
+        cfg.tls_key_path = Some("key.pem".into());
+
+        assert!(cfg.validate().is_ok(), "mTLS with both TLS paths is valid");
+    }
+
     // -- McpServerConfig --
 
     #[test]
@@ -4170,6 +4338,7 @@ mod tests {
             idle_eviction: Duration::from_secs(15 * 60),
             burst: None,
             pre_auth_burst: None,
+            key_eviction_policy: KeyEvictionPolicy::default(),
         };
         let auth_cfg = AuthConfig {
             enabled: true,
@@ -4406,7 +4575,12 @@ mod tests {
         burst: Option<u32>,
         exempt_paths: &[&str],
     ) -> axum::Router {
-        let limiter = build_extra_route_rate_limiter(per_minute, burst);
+        let limiter = build_extra_route_rate_limiter_with_policy(
+            per_minute,
+            burst,
+            KeyEvictionPolicy::default(),
+            NonZeroUsize::new(EXTRA_ROUTE_MAX_TRACKED_KEYS).unwrap_or(NonZeroUsize::MIN),
+        );
         let exempt: Arc<std::collections::HashSet<String>> =
             Arc::new(exempt_paths.iter().map(|s| (*s).to_owned()).collect());
         axum::Router::new()
@@ -4446,6 +4620,35 @@ mod tests {
             body.contains("too many requests to application routes"),
             "deny body should match the limiter message, got: {body}"
         );
+    }
+
+    fn one_tracked_key() -> NonZeroUsize {
+        NonZeroUsize::new(1).unwrap_or(NonZeroUsize::MIN)
+    }
+
+    #[tokio::test]
+    async fn extra_route_limiter_capacity_full_returns_503_without_retry_after() {
+        let limiter = build_extra_route_rate_limiter_with_policy(
+            10,
+            None,
+            KeyEvictionPolicy::RejectNew,
+            one_tracked_key(),
+        );
+        let exempt = Arc::new(std::collections::HashSet::new());
+        let app = axum::Router::new()
+            .route("/limited", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(move |req, next| {
+                let l = Arc::clone(&limiter);
+                let e = Arc::clone(&exempt);
+                extra_route_rate_limit_middleware(l, e, req, next)
+            }));
+        let established = app.clone().oneshot(limited_req("10.1.1.1")).await.unwrap();
+        assert_eq!(established.status(), StatusCode::OK);
+
+        let denied = app.clone().oneshot(limited_req("10.1.1.2")).await.unwrap();
+
+        assert_eq!(denied.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(denied.headers().get(header::RETRY_AFTER).is_none());
     }
 
     #[tokio::test]
@@ -4783,10 +4986,13 @@ mod tests {
         let mut auth = AuthConfig::with_keys(vec![]);
         auth.mtls = Some(mtls);
 
-        let err = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0")
-            .with_auth(auth)
-            .validate()
-            .expect_err("zero CRL response cap");
+        // TLS paths are required alongside mTLS, else validation reports that
+        // pairing error first and never reaches the capacity knobs.
+        let mut cfg = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0").with_auth(auth);
+        cfg.tls_cert_path = Some("cert.pem".into());
+        cfg.tls_key_path = Some("key.pem".into());
+
+        let err = cfg.validate().expect_err("zero CRL response cap");
         assert!(err.to_string().contains("crl_max_response_bytes"));
     }
 

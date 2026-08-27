@@ -441,11 +441,20 @@ by URL and refreshed on a background task before `nextUpdate`, clamped to
 via `ArcSwap` whenever fresh CRLs land, so handshakes always see the
 latest revocation data without dropping in-flight connections.
 
-**Default behaviour is fail-open**: if a CRL cannot be fetched, the
-handshake is still allowed and a `WARN` log is emitted. Expired CRLs are
-not trusted when `crl_enforce_expiration = true` (the default); webpki
-rejects them at `nextUpdate`. Operators who require fail-closed semantics
-for unavailable CRLs can set `crl_deny_on_unavailable = true`.
+**Default behaviour is fail-closed** (since 3.9): if a certificate advertises
+CRL distribution points and *none* of them is cached or fetchable, the
+handshake is rejected, per RFC 5280 §6.3. Denial requires every relevant CDP
+to be unavailable, so an attacker who blocks a single mirror cannot deny
+service. Expired CRLs are not trusted when `crl_enforce_expiration = true`
+(the default); webpki rejects them at `nextUpdate`. Operators who need the
+previous fail-open behaviour — where an unfetchable CRL still permits the
+handshake with a `WARN` log — can set `crl_deny_on_unavailable = false`, at
+the cost of accepting a revoked certificate whenever its CRL is unreachable.
+
+> **Upgrading to 3.9:** fail-closed makes a low `crl_max_cache_entries`
+> operationally visible. A CDP that fetches successfully can still be
+> rejected by the cache cap, leaving those handshakes denied. Raise
+> `crl_max_cache_entries` for large PKIs, or opt out explicitly.
 
 `ReloadHandle::refresh_crls()` forces an immediate refresh of every
 cached CRL — useful from an admin endpoint or a cron-driven probe.
@@ -457,7 +466,7 @@ cached CRL — useful from an admin endpoint or a cron-driven probe.
 ca_cert_path = "/etc/certs/clients-ca.pem"
 
 crl_enabled              = true     # set false to disable revocation entirely
-crl_deny_on_unavailable  = false    # fail-open by default; set true for fail-closed
+crl_deny_on_unavailable  = true     # fail-closed by default (RFC 5280 6.3); set false to fail open
 crl_allow_http           = true     # allow http:// CDP URLs (CRLs are signed by the CA)
 crl_end_entity_only      = false    # check the full chain, not just the leaf
 crl_enforce_expiration   = true     # reject CRLs whose nextUpdate is in the past
@@ -777,6 +786,7 @@ tls_key_path = "/etc/certs/server.key"
 allowed_origins = ["http://localhost:3000"]
 tool_rate_limit = 120
 # tool_rate_limit_burst = 240        # optional bucket capacity (default: = rate)
+key_eviction_policy = "evict_lru"
 extra_route_rate_limit = 60
 # extra_route_rate_limit_burst = 120 # optional bucket capacity (default: = rate)
 # extra_route_rate_limit_exempt_paths = ["/.well-known/oauth-authorization-server"]
@@ -795,6 +805,7 @@ extra_route_rate_limit = 60
 | `allowed_origins` | `Vec<String>` | `[]` | Origin validation |
 | `stdio_enabled` | `bool` | `false` | Enable stdio transport (bypasses auth/RBAC/TLS — see warning in `transport`) |
 | `tool_rate_limit` | `Option<u32>` | `None` | Tool calls/min per IP |
+| `key_eviction_policy` | `KeyEvictionPolicy` | `"evict_lru"` | Full-table policy for per-IP limiter key maps; accepted values: `"evict_lru"`, `"reject_new"` |
 | `session_idle_timeout` | `String` | `"20m"` | Humantime duration; idle MCP sessions are closed after this period |
 | `sse_keep_alive` | `String` | `"15s"` | Humantime duration; SSE keep-alive ping interval |
 | `public_url` | `Option<String>` | `None` | Externally reachable base URL (e.g. `https://mcp.example.com`); required when `listen_addr` is `0.0.0.0` behind a reverse proxy or container |
@@ -817,6 +828,9 @@ log_format = "json"
 audit_log_path = "/var/log/my-server/audit.log"
 metrics_enabled = true
 metrics_bind = "127.0.0.1:9090"
+log_plaintext_oauth_tokens = false
+log_oauth_claim_values = false
+log_tool_call_arguments = false
 ```
 
 | Field | Type | Default | Description |
@@ -827,6 +841,9 @@ metrics_bind = "127.0.0.1:9090"
 | `log_request_headers` | `bool` | `false` | Emit inbound HTTP request headers at DEBUG level (sensitive headers remain redacted) |
 | `metrics_enabled` | `bool` | `false` | Enable Prometheus |
 | `metrics_bind` | `String` | `"127.0.0.1:9090"` | Metrics listener |
+| `log_plaintext_oauth_tokens` | `bool` | `false` | Defaults to redacted; enabling writes secrets to logs, is for local debugging only, and is process-wide, not per-server |
+| `log_oauth_claim_values` | `bool` | `false` | Defaults to redacted; enabling writes secrets to logs, is for local debugging only, and is process-wide, not per-server |
+| `log_tool_call_arguments` | `bool` | `false` | Defaults to redacted; enabling writes secrets to logs, is for local debugging only, and is process-wide, not per-server |
 
 #### Validation
 
@@ -2166,6 +2183,7 @@ shutdown_timeout = "30s"
 request_timeout = "120s"
 allowed_origins = ["http://localhost:3000", "https://myapp.example.com"]
 tool_rate_limit = 120
+key_eviction_policy = "evict_lru"  # env: RMCP_SERVER_KIT__SERVER__KEY_EVICTION_POLICY
 max_request_body = 1048576
 expose_build_metadata = false
 # public_url = "https://mcp.example.com"  # env: RMCP_SERVER_KIT__SERVER__PUBLIC_URL
@@ -2263,6 +2281,9 @@ log_format = "json"  # env: RMCP_SERVER_KIT__OBSERVABILITY__LOG_FORMAT
 audit_log_path = "/var/log/my-server/audit.log"
 metrics_enabled = true  # env: RMCP_SERVER_KIT__OBSERVABILITY__METRICS_ENABLED
 metrics_bind = "127.0.0.1:9090"  # env: RMCP_SERVER_KIT__OBSERVABILITY__METRICS_BIND
+log_plaintext_oauth_tokens = false  # env: RMCP_SERVER_KIT__OBSERVABILITY__LOG_PLAINTEXT_OAUTH_TOKENS
+log_oauth_claim_values = false  # env: RMCP_SERVER_KIT__OBSERVABILITY__LOG_OAUTH_CLAIM_VALUES
+log_tool_call_arguments = false  # env: RMCP_SERVER_KIT__OBSERVABILITY__LOG_TOOL_CALL_ARGUMENTS
 ```
 
 ### Bridging TOML config to `McpServerConfig`
@@ -2350,12 +2371,16 @@ call order is:
 | `RMCP_SERVER_KIT__SERVER__TLS_CERT_PATH` | `server.tls_cert_path` | Path | |
 | `RMCP_SERVER_KIT__SERVER__TLS_KEY_PATH` | `server.tls_key_path` | Path | |
 | `RMCP_SERVER_KIT__SERVER__ADMIN_ENABLED` | `server.admin_enabled` | bool | |
+| `RMCP_SERVER_KIT__SERVER__KEY_EVICTION_POLICY` | `server.key_eviction_policy` | KeyEvictionPolicy | |
 | `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ISSUER` | `server.auth.oauth.issuer` | String | requires `oauth` feature |
 | `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__AUDIENCE` | `server.auth.oauth.audience` | String | requires `oauth` feature |
 | `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__JWKS_URI` | `server.auth.oauth.jwks_uri` | String | requires `oauth` feature |
 | `RMCP_SERVER_KIT__OBSERVABILITY__LOG_FORMAT` | `observability.log_format` | String | |
 | `RMCP_SERVER_KIT__OBSERVABILITY__METRICS_ENABLED` | `observability.metrics_enabled` | bool | |
 | `RMCP_SERVER_KIT__OBSERVABILITY__METRICS_BIND` | `observability.metrics_bind` | String | |
+| `RMCP_SERVER_KIT__OBSERVABILITY__LOG_PLAINTEXT_OAUTH_TOKENS` | `observability.log_plaintext_oauth_tokens` | bool | |
+| `RMCP_SERVER_KIT__OBSERVABILITY__LOG_OAUTH_CLAIM_VALUES` | `observability.log_oauth_claim_values` | bool | |
+| `RMCP_SERVER_KIT__OBSERVABILITY__LOG_TOOL_CALL_ARGUMENTS` | `observability.log_tool_call_arguments` | bool | |
 | `RMCP_SERVER_KIT__RBAC__REDACTION_SALT` | `rbac.redaction_salt` | SecretString | secret; redacted in report |
 | `RMCP_SERVER_KIT__RBAC__REDACTION_SALT_FILE` | `rbac.redaction_salt` | Path | secret; redacted in report |
 <!-- END ENV_OVERRIDE_TABLE -->

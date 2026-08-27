@@ -22,7 +22,11 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use sha2::Sha256;
 
-use crate::{auth::AuthIdentity, bounded_limiter::BoundedKeyedLimiter, error::RmcpServerKitError};
+use crate::{
+    auth::AuthIdentity,
+    bounded_limiter::{BoundedKeyedLimiter, BoundedLimiterDeny, KeyEvictionPolicy},
+    error::RmcpServerKitError,
+};
 
 /// Per-source-IP rate limiter for tool invocations. Memory-bounded against
 /// IP-spray `DoS` via [`BoundedKeyedLimiter`].
@@ -45,15 +49,17 @@ const DEFAULT_TOOL_IDLE_EVICTION: Duration = Duration::from_mins(15);
 /// `DEFAULT_TOOL_IDLE_EVICTION` idle eviction. Use
 /// [`build_tool_rate_limiter_with_bounds`] to override.
 #[must_use]
-pub(crate) fn build_tool_rate_limiter(
+pub(crate) fn build_tool_rate_limiter_with_policy(
     max_per_minute: u32,
     burst: Option<u32>,
+    key_eviction_policy: KeyEvictionPolicy,
 ) -> Arc<ToolRateLimiter> {
     build_tool_rate_limiter_with_bounds(
         max_per_minute,
         burst,
         DEFAULT_TOOL_MAX_TRACKED_KEYS,
         DEFAULT_TOOL_IDLE_EVICTION,
+        key_eviction_policy,
     )
 }
 
@@ -68,16 +74,18 @@ pub(crate) fn build_tool_rate_limiter_with_bounds(
     burst: Option<u32>,
     max_tracked_keys: usize,
     idle_eviction: Duration,
+    key_eviction_policy: KeyEvictionPolicy,
 ) -> Arc<ToolRateLimiter> {
     let mut quota =
         governor::Quota::per_minute(NonZeroU32::new(max_per_minute).unwrap_or(DEFAULT_TOOL_RATE));
     if let Some(b) = burst.and_then(NonZeroU32::new) {
         quota = quota.allow_burst(b);
     }
-    Arc::new(BoundedKeyedLimiter::new(
+    Arc::new(BoundedKeyedLimiter::new_with_policy(
         quota,
         std::num::NonZeroUsize::new(max_tracked_keys).unwrap_or(std::num::NonZeroUsize::MIN),
         idle_eviction,
+        key_eviction_policy,
     ))
 }
 
@@ -238,6 +246,9 @@ impl RoleConfig {
 /// By default this constrains the value only **when the argument is
 /// present** -- omitting it entirely skips the check. Set
 /// [`required`](Self::required) to also demand the argument be supplied.
+/// This compatibility default is expected to flip to `true` in the next
+/// major version; prefer [`ArgumentAllowlist::new_required`] for new
+/// policies that should fail closed when the argument is omitted.
 //
 // NOTE(future-pr): typed pre-tokenized argument matcher (CHANGELOG.md
 // "future release" promise).
@@ -288,8 +299,9 @@ pub struct ArgumentAllowlist {
 impl ArgumentAllowlist {
     /// Create an argument allowlist for a tool.
     ///
-    /// The argument is optional by default; use
-    /// [`with_required`](Self::with_required) to demand its presence.
+    /// The argument is optional by default for backward compatibility; prefer
+    /// [`new_required`](Self::new_required) for new policies that should fail
+    /// closed when the argument is omitted.
     #[must_use]
     pub fn new(tool: impl Into<String>, argument: impl Into<String>, allowed: Vec<String>) -> Self {
         Self {
@@ -298,6 +310,19 @@ impl ArgumentAllowlist {
             allowed,
             required: false,
         }
+    }
+
+    /// Create an argument allowlist that requires the argument to be present.
+    ///
+    /// This is the recommended constructor for new policies because it fails
+    /// closed when the caller omits the constrained argument.
+    #[must_use]
+    pub fn new_required(
+        tool: impl Into<String>,
+        argument: impl Into<String>,
+        allowed: Vec<String>,
+    ) -> Self {
+        Self::new(tool, argument, allowed).with_required(true)
     }
 
     /// Require the argument to be present and string-valued.
@@ -403,6 +428,7 @@ impl RbacPolicy {
     /// checks return [`RbacDecision::Allow`].
     #[must_use]
     pub fn new(config: &RbacConfig) -> Self {
+        warn_on_optional_value_allowlists(&config.roles);
         let salt = config
             .redaction_salt
             .clone()
@@ -725,6 +751,21 @@ impl RbacPolicy {
     }
 }
 
+fn warn_on_optional_value_allowlists(roles: &[RoleConfig]) {
+    for role in roles {
+        for allowlist in &role.argument_allowlists {
+            if !allowlist.allowed.is_empty() && !allowlist.required {
+                tracing::warn!(
+                    role = %role.name,
+                    tool = %allowlist.tool,
+                    argument = %allowlist.argument,
+                    "optional argument allowlist may fail open"
+                );
+            }
+        }
+    }
+}
+
 /// Process-wide random redaction salt, lazily generated on first use.
 /// Used when [`RbacConfig::redaction_salt`] is `None`.
 fn process_redaction_salt() -> &'static SecretString {
@@ -935,17 +976,32 @@ fn enforce_rate_limit(
 ) -> Option<Response> {
     let limiter = tool_limiter?;
     let key = peer_key?;
-    if let Err(wait) = limiter.check_key_wait(key) {
-        tracing::warn!(rate_limit_key = %key, "tool invocation rate limited");
-        return Some(
-            RmcpServerKitError::RateLimitedFor {
-                message: "too many tool invocations".into(),
-                retry_after: wait,
-            }
-            .into_response(),
-        );
+    match limiter.check_key_detailed(key) {
+        Ok(()) => None,
+        Err(BoundedLimiterDeny::RateLimited(wait)) => {
+            tracing::warn!(rate_limit_key = %key, "tool invocation rate limited");
+            Some(
+                RmcpServerKitError::RateLimitedFor {
+                    message: "too many tool invocations".into(),
+                    retry_after: wait,
+                }
+                .into_response(),
+            )
+        }
+        Err(BoundedLimiterDeny::CapacityFull) => {
+            tracing::warn!(
+                rate_limit_key = %key,
+                "tool invocation limiter rejected unseen key because tracked-key capacity is full"
+            );
+            Some(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "rate limiter capacity exhausted",
+                )
+                    .into_response(),
+            )
+        }
     }
-    None
 }
 
 /// Apply RBAC tool/host + argument-allowlist checks. Returns `Some(response)`
@@ -1367,6 +1423,116 @@ mod tests {
         assert_ne!(spaced_redaction, redaction_from_direct_salt("same-salt"));
     }
 
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            let bytes = self.0.lock().map(|guard| guard.clone()).unwrap_or_default();
+            String::from_utf8(bytes).unwrap_or_default()
+        }
+    }
+
+    struct CapturedLogsWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogsWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Ok(mut guard) = self.0.lock() {
+                guard.extend_from_slice(buf);
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogsWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogsWriter(Arc::clone(&self.0))
+        }
+    }
+
+    fn allowlist_warning_policy(allowlist: ArgumentAllowlist) -> RbacConfig {
+        RbacConfig::with_roles(vec![
+            RoleConfig::new("viewer", vec!["run".into()], vec!["*".into()])
+                .with_argument_allowlists(vec![allowlist]),
+        ])
+    }
+
+    fn capture_policy_construction_logs(config: &RbacConfig) -> String {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let _policy = RbacPolicy::new(config);
+        logs.contents()
+    }
+
+    #[test]
+    fn optional_non_empty_argument_allowlist_warns_once_at_policy_construction() {
+        let config =
+            allowlist_warning_policy(ArgumentAllowlist::new("run", "cmd", vec!["ls".into()]));
+
+        let logs = capture_policy_construction_logs(&config);
+
+        assert_eq!(
+            logs.matches("optional argument allowlist may fail open")
+                .count(),
+            1,
+            "exactly one warning expected for one optional non-empty allowlist: {logs}"
+        );
+        assert!(logs.contains("run"), "warning must name the tool: {logs}");
+        assert!(
+            logs.contains("cmd"),
+            "warning must name the argument: {logs}"
+        );
+    }
+
+    #[test]
+    fn required_argument_allowlist_does_not_warn_at_policy_construction() {
+        let config = allowlist_warning_policy(
+            ArgumentAllowlist::new("run", "cmd", vec!["ls".into()]).with_required(true),
+        );
+
+        let logs = capture_policy_construction_logs(&config);
+
+        assert!(
+            !logs.contains("optional argument allowlist may fail open"),
+            "required allowlist must not warn: {logs}"
+        );
+    }
+
+    #[test]
+    fn new_required_sets_required_and_preserves_value_allowlist_behavior() {
+        let optional = ArgumentAllowlist::new("run", "cmd", vec!["ls".into()]);
+        let required = ArgumentAllowlist::new_required("run", "cmd", vec!["ls".into()]);
+
+        assert_eq!(required.tool, optional.tool);
+        assert_eq!(required.argument, optional.argument);
+        assert_eq!(required.allowed, optional.allowed);
+        assert!(required.required);
+        assert!(!optional.required);
+
+        let optional_policy = RbacPolicy::new(&allowlist_warning_policy(optional));
+        let required_policy = RbacPolicy::new(&allowlist_warning_policy(required));
+        assert_eq!(
+            optional_policy.argument_allowed("viewer", "run", "cmd", "ls -la"),
+            required_policy.argument_allowed("viewer", "run", "cmd", "ls -la")
+        );
+        assert_eq!(
+            optional_policy.argument_allowed("viewer", "run", "cmd", "rm -rf /"),
+            required_policy.argument_allowed("viewer", "run", "cmd", "rm -rf /")
+        );
+    }
+
     #[test]
     fn blank_redaction_salt_env_values_fail_closed() {
         for value in ["", "\n", "   "] {
@@ -1437,7 +1603,7 @@ mod tests {
     /// rate; the next request within the window is denied.
     #[test]
     fn tool_limiter_burst_allows_initial_spike() {
-        let limiter = build_tool_rate_limiter(2, Some(4));
+        let limiter = build_tool_rate_limiter_with_policy(2, Some(4), KeyEvictionPolicy::default());
         let ip = RateLimitKey::Ip("10.9.9.9".parse::<IpAddr>().unwrap());
         for i in 0..4 {
             assert!(
@@ -1454,7 +1620,7 @@ mod tests {
     /// The tool-limiter deny response carries a Retry-After header.
     #[test]
     fn tool_limiter_deny_sets_retry_after() {
-        let limiter = build_tool_rate_limiter(1, None);
+        let limiter = build_tool_rate_limiter_with_policy(1, None, KeyEvictionPolicy::default());
         let ip = RateLimitKey::Ip("10.8.8.8".parse::<IpAddr>().unwrap());
         assert!(enforce_rate_limit(Some(&limiter), Some(&ip)).is_none());
         let resp = enforce_rate_limit(Some(&limiter), Some(&ip))
@@ -1469,6 +1635,30 @@ mod tests {
             .parse::<u64>()
             .unwrap();
         assert!(retry_after >= 1, "delta-seconds must be >= 1");
+    }
+
+    #[test]
+    fn tool_limiter_capacity_full_returns_503_without_retry_after() {
+        let limiter = build_tool_rate_limiter_with_bounds(
+            10,
+            None,
+            1,
+            Duration::from_hours(1),
+            KeyEvictionPolicy::RejectNew,
+        );
+        let established = RateLimitKey::Ip("10.8.8.8".parse::<IpAddr>().unwrap());
+        let unseen = RateLimitKey::Ip("10.8.8.9".parse::<IpAddr>().unwrap());
+        assert!(enforce_rate_limit(Some(&limiter), Some(&established)).is_none());
+
+        let resp = enforce_rate_limit(Some(&limiter), Some(&unseen))
+            .expect("unseen key must be rejected at capacity");
+
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_none()
+        );
     }
 
     fn test_policy() -> RbacPolicy {
@@ -2143,7 +2333,7 @@ mod tests {
         use axum::extract::ConnectInfo;
 
         let policy = Arc::new(test_policy());
-        let limiter = build_tool_rate_limiter(1, None);
+        let limiter = build_tool_rate_limiter_with_policy(1, None, KeyEvictionPolicy::default());
         let metrics = Arc::new(crate::metrics::McpMetrics::new().unwrap());
         let identity = AuthIdentity {
             method: crate::auth::AuthMethod::BearerToken,
