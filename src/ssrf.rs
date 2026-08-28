@@ -74,7 +74,11 @@ pub(crate) fn sanitized_url_for_log(url: &Url) -> String {
 /// Blocked classes:
 /// - Cloud metadata service (IPv4 `169.254.169.254`, Alibaba/Tencent
 ///   `100.100.100.200`, AWS IPv6 `fd00:ec2::254`, GCP IPv6 `fd20:ce::254`).
-/// - IPv4 loopback (127.0.0.0/8), unspecified (0.0.0.0), broadcast.
+/// - IPv4 "this network" / unspecified (0.0.0.0/8, RFC 1122 3.2.1.3):
+///   the WHOLE prefix, not just `0.0.0.0`. Linux (>= 5.3) treats nonzero
+///   `0/8` as valid unicast and will route it, so the prefix cannot be
+///   assumed unreachable-by-construction.
+/// - IPv4 loopback (127.0.0.0/8), broadcast.
 /// - IPv4 RFC 1918 private (10/8, 172.16/12, 192.168/16).
 /// - IPv4 link-local (169.254/16).
 /// - IPv4 CGNAT (100.64/10).
@@ -117,11 +121,16 @@ fn block_reason_v4(v4: Ipv4Addr) -> Option<&'static str> {
     if v4 == CLOUD_METADATA_V4 || v4 == CLOUD_METADATA_V4_ALIBABA {
         return Some("cloud_metadata");
     }
+    let octets = v4.octets();
+    // SECURITY: reject the whole 0.0.0.0/8 "this network" prefix (RFC 1122
+    // 3.2.1.3), not just the unspecified address. `Ipv4Addr::is_unspecified`
+    // matches ONLY 0.0.0.0, and Linux >= 5.3 accepts nonzero 0/8 as valid
+    // unicast, so 0.1.2.3 would otherwise pass screening and be routed.
+    if octets[0] == 0 {
+        return Some("this_network");
+    }
     if v4.is_loopback() {
         return Some("loopback");
-    }
-    if v4.is_unspecified() {
-        return Some("unspecified");
     }
     if v4.is_broadcast() {
         return Some("broadcast");
@@ -135,7 +144,6 @@ fn block_reason_v4(v4: Ipv4Addr) -> Option<&'static str> {
     if v4.is_multicast() {
         return Some("multicast");
     }
-    let octets = v4.octets();
     // CGNAT 100.64.0.0/10 (RFC 6598).
     if octets[0] == 100 && (octets[1] & 0b1100_0000) == 0b0100_0000 {
         return Some("cgnat");
@@ -765,6 +773,37 @@ mod tests {
         assert_eq!(
             ip_block_reason(IpAddr::V6(Ipv6Addr::LOCALHOST)),
             Some("loopback")
+        );
+    }
+
+    #[test]
+    fn this_network_v4_prefix_blocked_not_just_unspecified() {
+        // Regression: `Ipv4Addr::is_unspecified` matches ONLY 0.0.0.0, so the
+        // rest of 0.0.0.0/8 used to pass screening. Linux >= 5.3 routes
+        // nonzero 0/8 as valid unicast, so the whole prefix must be blocked.
+        for ip in [
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::new(0, 0, 0, 1),
+            Ipv4Addr::new(0, 1, 2, 3),
+            Ipv4Addr::new(0, 255, 255, 255),
+        ] {
+            assert_eq!(
+                ip_block_reason(IpAddr::V4(ip)),
+                Some("this_network"),
+                "{ip} must be blocked as this_network"
+            );
+        }
+        // The first address outside the prefix stays reachable.
+        assert_eq!(ip_block_reason(IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1))), None);
+    }
+
+    #[test]
+    fn this_network_blocked_through_ipv4_mapped_v6() {
+        assert_eq!(
+            ip_block_reason(IpAddr::V6(Ipv6Addr::new(
+                0, 0, 0, 0, 0, 0xffff, 0x0001, 0x0203
+            ))),
+            Some("this_network")
         );
     }
 

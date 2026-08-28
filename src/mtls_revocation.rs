@@ -461,6 +461,11 @@ impl CrlSet {
         }
     }
 
+    // cancel-safe: `commit_lock` is held across awaits, but every mutation
+    // before publication builds a local candidate. The cache swap and the
+    // `verifier_state.store` publication are adjacent with NO await between
+    // them, so a cancelled commit leaves either the old or the new generation
+    // -- never a half-applied mix.
     async fn commit_cache_update_atomically(
         &self,
         inserts: Vec<(String, CachedCrl)>,
@@ -566,6 +571,8 @@ impl CrlSet {
         self.refresh_urls(urls).await
     }
 
+    // cancel-safe: selects due URLs and delegates to efresh_urls, which
+    // stages results locally before a single atomic commit.
     async fn refresh_due_urls(&self) -> Result<(), RmcpServerKitError> {
         let now = SystemTime::now();
         let urls = {
@@ -586,6 +593,9 @@ impl CrlSet {
         self.refresh_urls(urls).await
     }
 
+    // cancel-safe: fetch results accumulate in local insert/remove vectors and
+    // are applied only by commit_cache_update_atomically. Cancelling before
+    // that commit discards the batch and leaves the cache untouched.
     async fn refresh_urls(&self, urls: Vec<String>) -> Result<(), RmcpServerKitError> {
         let results = self.fetch_url_results(urls).await;
         let now = SystemTime::now();
@@ -632,6 +642,8 @@ impl CrlSet {
     /// the cache may be promoted to the permanent `seen_urls` dedup set —
     /// promoting on fetch success alone would suppress a URL that was never
     /// cached, which is the same revocation-bypass this state split fixes.
+    // cancel-safe: commits only after gated_fetch returns, so cancellation
+    // during the fetch cannot promote a URL into the seen_urls dedup set.
     async fn fetch_and_store_url(&self, url: String) -> Result<bool, RmcpServerKitError> {
         let cached = gated_fetch(
             &self.client,

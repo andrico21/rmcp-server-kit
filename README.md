@@ -86,7 +86,7 @@ let auth = AuthConfig::with_keys(vec![
     ApiKeyEntry::new("viewer-key", hash, "viewer"),
 ]);
 let viewer = RoleConfig::new("viewer", vec!["echo".into()], vec!["*".into()])
-    .with_argument_allowlists(vec![ArgumentAllowlist::new(
+    .with_argument_allowlists(vec![ArgumentAllowlist::new_required(
         "echo", "message", vec!["hello".into(), "ping".into()],
     )]);
 let rbac = Arc::new(RbacPolicy::new(&RbacConfig::with_roles(vec![viewer])));

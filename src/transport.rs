@@ -1429,6 +1429,10 @@ impl ReloadHandle {
     /// # Errors
     ///
     /// Returns an error if CRL refresh is unavailable or verifier rebuild fails.
+    // cancel-safe: delegates to `CrlSet::force_refresh`, which stages every
+    // fetch locally and publishes the cache and verifier state together under
+    // `commit_lock` with no await between them. Cancellation therefore leaves
+    // either the previous or the new generation, never a mixed one.
     pub async fn refresh_crls(&self) -> Result<(), RmcpServerKitError> {
         let Some(ref crl_set) = self.crl_set else {
             return Err(RmcpServerKitError::Config(
@@ -3069,6 +3073,7 @@ fn load_key(path: &Path) -> anyhow::Result<rustls::pki_types::PrivateKeyDer<'sta
         .map_err(|e| anyhow::anyhow!("failed to read key from {}: {e}", path.display()))
 }
 
+// cancel-safe: builds a constant JSON body with no awaits and no shared state.
 #[allow(
     clippy::unused_async,
     reason = "axum route handler signature requires `async fn` even when the body is synchronous"
@@ -3133,6 +3138,10 @@ fn serialize_version_payload(name: &str, version: &str, expose_build_metadata: b
     serde_json::to_vec(&value).map_or_else(|_| Arc::from(&b"{}"[..]), Arc::from)
 }
 
+// NOT cancel-safe in general: the kit itself mutates no state here, but this
+// awaits a consumer-supplied readiness future. Cancellation drops that future
+// at whatever await it is parked on, so cancel safety is the callback author's
+// contract -- a readiness probe must not leave partial state behind.
 async fn readyz(check: ReadinessCheck) -> impl IntoResponse {
     let status = check().await;
     let ready = status
@@ -3234,6 +3243,9 @@ fn metrics_labels(req: &Request<Body>) -> (&'static str, String) {
 /// inner middleware via a request extension, so the rate limiters can
 /// increment `rmcp_server_kit_rate_limited_total` at their deny sites
 /// (see [`crate::metrics::record_rate_limit_deny`]).
+// cancel-safe: counters are incremented synchronously around the single
+// `next.run(req)` await, so cancellation loses the observation rather than
+// leaving a half-updated metric.
 #[cfg(feature = "metrics")]
 async fn metrics_middleware(
     metrics: Arc<crate::metrics::McpMetrics>,
@@ -3273,6 +3285,8 @@ async fn metrics_middleware(
 /// Each header's value can be customised via [`SecurityHeadersConfig`]
 /// on [`McpServerConfig`]. See that type for the three-state semantic
 /// (`None` = default, `Some("")` = omit, `Some(v)` = override).
+// cancel-safe: the only await is `next.run(req)`; header mutation afterwards is
+// synchronous, so cancellation simply drops the response before it is sent.
 async fn security_headers_middleware(
     is_tls: bool,
     cfg: Arc<SecurityHeadersConfig>,
@@ -3541,6 +3555,8 @@ async fn oauth_token_cache_headers_middleware(
 /// Precedence mirrors the auth middleware: an existing
 /// `ConnectInfo<SocketAddr>` always wins and is never overwritten. The
 /// peer address is deliberately not logged here.
+// cancel-safe: inserts request extensions synchronously before the single
+// `next.run(req)` await; the extensions die with the dropped request.
 async fn normalize_peer_addr_middleware(
     resolver: Option<Arc<ForwardResolver>>,
     mut req: Request<Body>,
@@ -3747,6 +3763,9 @@ fn build_extra_route_rate_limiter_with_policy(
 /// checked against `req.uri().path()` **before** key extraction:
 /// exempt requests consume no limiter budget and produce no deny
 /// telemetry. Fail-closed — any non-listed path stays limited.
+// cancel-safe: the limiter is charged synchronously before the `next.run(req)`
+// await. Charging an attempt that a later timeout cancels is deliberate -- the
+// request was admitted, so it must cost budget (same posture as auth/rbac).
 async fn extra_route_rate_limit_middleware(
     limiter: Arc<ExtraRouteRateLimiter>,
     exempt: Arc<std::collections::HashSet<String>>,
@@ -3787,6 +3806,8 @@ async fn extra_route_rate_limit_middleware(
 /// Per the MCP spec: if the Origin header is present and its value is not in
 /// the allowed list, respond with 403 Forbidden. Requests without an Origin
 /// header are allowed through (e.g. non-browser clients like curl, SDKs).
+// cancel-safe: origin validation and request logging are synchronous and happen
+// before the single `next.run(req)` await; nothing is published on cancellation.
 async fn origin_check_middleware(
     allowed: Arc<[String]>,
     log_request_headers: bool,

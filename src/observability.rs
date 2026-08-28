@@ -174,11 +174,6 @@ impl Drop for TracingGuard {
 pub fn init_tracing_from_config_strict(
     config: &ObservabilityConfig,
 ) -> Result<TracingGuard, RmcpServerKitError> {
-    set_diagnostic_exposure(&DiagnosticExposure {
-        plaintext_oauth_tokens: config.log_plaintext_oauth_tokens,
-        oauth_claim_values: config.log_oauth_claim_values,
-        tool_call_arguments: config.log_tool_call_arguments,
-    });
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.log_level));
     let audit_setup = prepare_tracing_audit_strict(config)?;
@@ -204,6 +199,17 @@ pub fn init_tracing_from_config_strict(
     result.map_err(|error| {
         RmcpServerKitError::Startup(format!("failed to initialize tracing subscriber: {error}"))
     })?;
+
+    // SECURITY: arm the process-global plaintext diagnostic switches only
+    // AFTER every fallible step has succeeded. Setting them first meant a
+    // failed strict init returned `Err` with secret logging left enabled
+    // process-wide, so an embedder that ignored the error (or fell back to
+    // the deprecated lenient initializer) would log tokens and claims.
+    set_diagnostic_exposure(&DiagnosticExposure {
+        plaintext_oauth_tokens: config.log_plaintext_oauth_tokens,
+        oauth_claim_values: config.log_oauth_claim_values,
+        tool_call_arguments: config.log_tool_call_arguments,
+    });
 
     for warning in audit_setup.warnings {
         tracing::warn!(warning = %warning, "audit logging initialization warning");
@@ -736,7 +742,10 @@ mod tests {
     }
 
     #[test]
-    fn strict_init_applies_diagnostic_exposure_before_startup_failure() {
+    fn strict_init_leaves_diagnostic_exposure_disarmed_on_startup_failure() {
+        // SECURITY regression: exposure used to be armed before the fallible
+        // audit setup, so a failed strict init returned Err with plaintext
+        // token/claim logging enabled process-wide.
         let _guard = crate::diagnostics::ExposureTestGuard::acquire();
         crate::diagnostics::set_diagnostic_exposure(
             &crate::diagnostics::DiagnosticExposure::default(),
@@ -754,9 +763,9 @@ mod tests {
             matches!(result, Err(RmcpServerKitError::Startup(_))),
             "unopenable audit path must keep subscriber initialization out of this test"
         );
-        assert!(crate::diagnostics::plaintext_oauth_tokens());
-        assert!(crate::diagnostics::oauth_claim_values());
-        assert!(crate::diagnostics::tool_call_arguments());
+        assert!(!crate::diagnostics::plaintext_oauth_tokens());
+        assert!(!crate::diagnostics::oauth_claim_values());
+        assert!(!crate::diagnostics::tool_call_arguments());
         std::fs::remove_file(&root_file).expect("remove parent file fixture");
     }
 

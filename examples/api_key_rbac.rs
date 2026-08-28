@@ -65,12 +65,18 @@ async fn main() -> rmcp_server_kit::Result<()> {
 
     // 2. RBAC: admin can call anything; viewer is restricted to `echo` and
     //    `resource_list`, and `echo`'s `message` argument is allowlisted.
+    //
+    //    `new_required` (not `new`) is deliberate: it also denies a call that
+    //    OMITS `message`. With the compatibility default (`required = false`)
+    //    an allowlist only constrains the argument when it is supplied, so a
+    //    caller omitting it passes unchecked and any handler-side default
+    //    value is used instead -- a fail-open surprise.
     let viewer = RoleConfig::new(
         "viewer",
         vec!["echo".into(), "resource_list".into()],
         vec!["*".into()],
     )
-    .with_argument_allowlists(vec![ArgumentAllowlist::new(
+    .with_argument_allowlists(vec![ArgumentAllowlist::new_required(
         "echo",
         "message",
         vec!["hello".into(), "ping".into()],
