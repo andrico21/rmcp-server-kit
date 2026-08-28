@@ -89,6 +89,51 @@ ArgumentAllowlist::new_required("tool", "arg", vec!["allowed".into()]);
 
 `required` will default to `true` in `4.0`.
 
+### 5. Certificates advertising more than 64 CDP URLs are rejected
+
+**Impact:** a client certificate carrying more than **64** distinct CRL
+distribution point URLs is now rejected as malformed.
+
+**This applies in both fail-open and fail-closed modes and has no opt-out.**
+`crl_deny_on_unavailable = false` opts out of *revocation-unavailability*
+denials; it does not opt out of malformed-certificate rejection, because the
+amplification being bounded is paid identically in fail-open mode.
+
+**Action required:** none for conforming certificates. RFC 5280
+[4.2.1.13](https://www.rfc-editor.org/rfc/rfc5280#section-4.2.1.13) treats
+multiple URIs inside one `DistributionPoint` as alternative ways to obtain the
+same CRL, so a conforming certificate needs only a handful. If you genuinely
+issue client certificates with more than 64 distinct CDP URLs, they will now be
+rejected; reduce the count or use CRL partitioning.
+
+**Observable signature:** a throttled `crl_cdp_url_cap_exceeded` WARN naming
+the observed count and the cap.
+
+### 6. `CrlSet::cache` and the ungated test constructors are deprecated
+
+**Impact:** `CrlSet::cache`, `CrlSet::__test_with_prepopulated_crls`, and
+`CrlSet::__test_with_kept_receiver` now carry `#[deprecated(since = "3.9.0")]`.
+
+> **This is not a semver-breaking change, but it CAN break your build.** A
+> downstream crate compiling with `-D warnings` (or `#![deny(warnings)]`) will
+> fail until it adds `#[allow(deprecated)]` at the call sites. This is a
+> deliberate, documented cost of signalling the 4.0 change early.
+
+**Action required:**
+
+- **Reading** `CrlSet::cache` remains safe and behaves as before.
+- **Mutating** `CrlSet::cache` out of band is now *detected and denies
+  handshakes* when `crl_deny_on_unavailable = true`. Use
+  `force_refresh` or the normal discovery/refresh path instead. If you were
+  mutating the cache directly in tests, expect handshake denials and a
+  throttled `crl_cache_out_of_band_mutation` WARN.
+- If you call the `__test_*` constructors from your own integration tests, add
+  a file-level `#![allow(deprecated, reason = "...")]`.
+
+**Planned for 4.0:** `cache` becomes `pub(crate)`, and both `__test_*`
+constructors become gated behind the `test-helpers` feature. Deprecating them
+now is the only non-breaking way to give downstream users notice.
+
 ## Migrating from 3.4 to 3.5
 
 `3.5` is additive at the API level -- `cargo semver-checks` reports no breaking

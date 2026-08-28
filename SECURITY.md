@@ -214,6 +214,95 @@ Operator guidance:
   configured CA chain are fetched before the listener starts and are
   immune to runtime discovery contention.
 
+### Out-of-band CRL cache mutation
+
+`CrlSet::cache` is a `pub` field (deprecated since 3.9, private in 4.0).
+Writing through it bypasses the atomic commit path, which publishes the
+rustls verifier, the `cached_urls` coverage hint, and a per-entry identity
+index together as one immutable snapshot. A same-key replacement or a direct
+removal performed out of band would otherwise leave the coverage hint
+claiming revocation coverage the live verifier cannot enforce.
+
+Since 3.9 the synchronous mTLS precheck compares the live cache against the
+committed identity index before trusting `cached_urls`. A relevant CDP URL
+whose entry is missing, whose identity is missing, or whose identity differs
+**fails the handshake closed** and emits a throttled
+`crl_cache_out_of_band_mutation` WARN, distinct from the ordinary
+unavailable-CRL denial.
+
+**What this does and does not guarantee.** This detects **API misuse by
+non-adversarial code** - the hazard the `pub` field creates. It is **not** a
+cryptographic integrity check against a same-process adversary, and must not
+be relied on as one: code able to take the cache write lock is already inside
+the trust boundary. The identity is a constant-cost tuple (DER address and
+length, a 32-byte head and tail sample, the timestamps, and the source URL);
+a caller that deliberately drops an entry and reallocates a replacement at the
+same address with the same length and samples would not be detected.
+
+Comparing a cryptographic digest of the DER instead was implemented and
+measured, then rejected: at the 5 MiB `crl_max_response_bytes` default it cost
+**56.3 ms p95 per relevant cached CRL** (900.9 ms for a single handshake
+advertising 16 cached CDP URLs), scaling linearly in both CRL size and an
+attacker-chosen URL count, on the **unauthenticated** handshake path. That
+trades a local misuse tripwire for a remote CPU-amplification vulnerability.
+The shipped identity comparison is independent of CRL size - measured at
+7.1 us (64 KiB) versus 20.1 us (5 MiB) at 16 URLs - and
+`benches/crl_precheck.rs` gates that invariance so a full-DER scan cannot be
+reintroduced unnoticed.
+
+### Per-handshake CDP URL cap
+
+A client certificate advertising more than **64** distinct CDP URLs is
+rejected as malformed, before CDP discovery and **in both fail-open and
+fail-closed modes**, with a throttled `crl_cdp_url_cap_exceeded` WARN. Every
+step of CDP handling is linear in this peer-chosen count, so an unbounded
+count is an amplification primitive.
+
+There is deliberately **no opt-out**. Setting `crl_deny_on_unavailable = false`
+opts out of *revocation-unavailability* denials; it does not opt out of
+malformed-certificate rejection, and the same amplification is paid in
+fail-open mode.
+
+RFC 5280 [4.2.1.13](https://www.rfc-editor.org/rfc/rfc5280#section-4.2.1.13)
+treats multiple URIs inside one `DistributionPoint` as alternative ways to
+obtain *the same* CRL, so a conforming certificate needs only a handful.
+
+### Why `crl_max_response_bytes` stays at 5 MiB
+
+Lowering the fetch cap is **not** a legitimate way to bound revocation-checking
+cost, and 3.9 deliberately does not do it.
+
+- **RFC 5280 is silent on CRL size.** It specifies no maximum CRL size, no
+  recommended byte size, and no client fetch cap
+  ([3.3](https://www.rfc-editor.org/rfc/rfc5280#section-3.3),
+  [5](https://www.rfc-editor.org/rfc/rfc5280#section-5),
+  [6.3.3](https://www.rfc-editor.org/rfc/rfc5280#section-6.3.3)). Neither do
+  RFC 2585, RFC 4387, RFC 6960, or the CA/Browser Forum Baseline Requirements.
+  Any client-side cap is purely an implementation defence.
+- **The standard bounds size by partitioning, and clients need not support it.**
+  `issuingDistributionPoint`
+  ([5.2.5](https://www.rfc-editor.org/rfc/rfc5280#section-5.2.5)) and delta CRLs
+  ([5.2.4](https://www.rfc-editor.org/rfc/rfc5280#section-5.2.4)) are the
+  RFC's answers to large CRLs, but conforming implementations are explicitly
+  **not required** to support either, so neither can be assumed to bound what a
+  server must be able to fetch.
+- **Real CRLs already exceed 5 MiB.** Public-CA CRLs of ~9.5 MB and ~12 MB have
+  been measured in the wild, and Let's Encrypt's sharding design was sized for
+  ~70 MB per shard worst case across 128 shards.
+- **Comparable implementations cap far higher.** OpenSSL's
+  `OSSL_HTTP_DEFAULT_MAX_CRL_LEN` is 32 MiB and OpenJDK's
+  `com.sun.security.crl.maxSize` defaults to 20 MiB; rustls/rustls-webpki does
+  no fetching at all. The only numeric size guidance found in any root program
+  is CA-side: Microsoft asks that a CRL be under 10 MB when the end-entity
+  certificate carries no OCSP URL.
+
+5 MiB is therefore already the most conservative cap among implementations that
+fetch, and already below deployed real-world CRLs. Operators serving a CA estate
+with larger CRLs should **raise** it. Operators facing handshake floods should
+prefer `crl_deny_on_unavailable = false` (accepting the documented revocation
+risk) over lowering the cap, which silently disables revocation for any CA whose
+CRL exceeds it.
+
 ### OAuth SSRF hardening
 
 When the optional `oauth` feature is enabled, the JWKS fetcher and the

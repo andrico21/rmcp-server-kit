@@ -15,8 +15,41 @@ Hardening pass from a full review against `RUST_GUIDELINES.md`. Public API
 changes are additive except for one deprecation that requires a minor-version
 release (`cargo semver-checks`); runtime behaviour changes are noted below.
 
+### Deprecated
+
+- `CrlSet::cache` is deprecated. Reading it remains safe; **mutating** it
+  bypasses the atomic commit path and is now detected and denied. The field
+  becomes private in 4.0.
+- `CrlSet::__test_with_prepopulated_crls` and `CrlSet::__test_with_kept_receiver`
+  are deprecated. Both are test-only constructors that are ungated in 3.x by
+  accident; they become feature-gated behind `test-helpers` in 4.0.
+
+  Note for downstream: these deprecations are **not** semver-breaking, but a
+  crate building with `-D warnings` will fail until it adds
+  `#[allow(deprecated)]` at the call sites. See
+  [`docs/MIGRATION.md`](docs/MIGRATION.md#6-crlsetcache-and-the-ungated-test-constructors-are-deprecated).
+
 ### Security
 
+- **Out-of-band mutation of the public `CrlSet::cache` field is now detected and
+  fails the handshake closed.** Every legitimate commit records a constant-cost
+  identity for each cached CRL and publishes it atomically with the verifier and
+  the coverage hint; the synchronous mTLS precheck compares the live cache
+  against that index before trusting `cached_urls`. A same-key replacement or a
+  direct removal performed through the `pub` field previously left the coverage
+  hint claiming revocation coverage the live verifier could not enforce. This
+  detects **API misuse, not a same-process adversary** - code able to take the
+  cache write lock is already inside the trust boundary. **Opt out with
+  `crl_deny_on_unavailable = false`.**
+- **A client certificate advertising more than 64 distinct CRL distribution
+  point URLs is now rejected as malformed, in BOTH fail-open and fail-closed
+  modes, with no opt-out.** Every step of CDP handling is linear in this
+  peer-chosen count, so leaving it unbounded is an amplification primitive on
+  the unauthenticated TLS handshake path. RFC 5280 4.2.1.13 treats multiple URIs
+  in one distribution point as mirrors of the same CRL, so a conforming
+  certificate needs far fewer. `crl_deny_on_unavailable = false` opts out of
+  *revocation-unavailability* denials, not out of malformed-certificate
+  rejection. See [`docs/MIGRATION.md`](docs/MIGRATION.md#5-certificates-advertising-more-than-64-cdp-urls-are-rejected).
 - Documented the hazards of the `test-helpers` feature at the crate, guide, and
   manifest level: the helpers are for downstream integration tests only, are not
   stable API, and can deliberately bypass SSRF screening, the JWKS refresh
