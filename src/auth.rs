@@ -1544,6 +1544,15 @@ fn pre_auth_gate(state: &AuthState, client_key: Option<&RateLimitKey>) -> Option
     }
 }
 
+#[cfg_attr(
+    not(feature = "metrics"),
+    allow(
+        unused_variables,
+        reason = "`extensions` is read only to record the \
+                  `rmcp_server_kit_rate_limited_total` metric; without the \
+                  `metrics` feature there is no recording site"
+    )
+)]
 fn post_failure_rate_limit_response(
     limiter: &KeyedLimiter,
     key: &RateLimitKey,
