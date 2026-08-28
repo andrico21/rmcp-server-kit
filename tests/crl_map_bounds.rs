@@ -22,6 +22,10 @@
 //! * `CrlSet::__test_cache_contains(&self, &str) -> bool`
 //! * `CrlSet::__test_trigger_fetch(&self, &str) -> Result<(), RmcpServerKitError>`
 
+#![allow(
+    deprecated,
+    reason = "exercises the deprecated ungated test constructors and the out-of-band cache write path on purpose"
+)]
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::panic)]

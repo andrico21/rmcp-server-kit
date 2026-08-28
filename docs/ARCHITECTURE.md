@@ -478,7 +478,7 @@ Configuration toggles:
 `[mtls]` is configured and `crl_enabled = true` (the default).
 
 Lifecycle:
-1. `bootstrap_fetch(roots, config)` (`src/mtls_revocation.rs:1169`) is
+1. `bootstrap_fetch(roots, config)` (`src/mtls_revocation.rs:1450`) is
    called from `run_server` *before* the listener is built. It walks the
    configured CA chain, extracts every X.509 CRL Distribution Point (CDP)
    URL via `extract_cdp_urls`, fetches each via `reqwest` under a 10 s
@@ -491,7 +491,7 @@ Lifecycle:
    - `discover_tx: mpsc::UnboundedSender<String>` — channel used by the
      handshake path to register newly observed CDP URLs for fetch.
    - `seen_urls: Mutex<HashSet<String>>` — dedupe of URLs already processed.
-3. `DynamicClientCertVerifier` (`src/mtls_revocation.rs:1001`) is the
+3. `DynamicClientCertVerifier` (`src/mtls_revocation.rs:1273`) is the
    `Arc<dyn ClientCertVerifier>` handed to `rustls::ServerConfig`. Its
    trait methods delegate to the inner verifier loaded from
    `inner_verifier.load()`. Because `tokio_rustls::TlsAcceptor` clones
@@ -559,7 +559,7 @@ reachable:
 
 ### Discovery admission ordering
 
-`note_discovered_urls` (`src/mtls_revocation.rs:461`) implements a
+`note_discovered_urls` (`src/mtls_revocation.rs:694`) implements a
 strict commit-after-admission protocol to keep the discovery rate
 limiter from "leaking" URLs:
 
@@ -577,7 +577,7 @@ This ordering matters: a naive "mark seen, then attempt admission"
 implementation would silently drop CDP URLs forever the first time the
 rate limiter engaged, breaking revocation for the affected client
 identities. The current ordering is verified by
-`__test_check_discovery_rate` (`src/mtls_revocation.rs:671`) and by the
+`__test_check_discovery_rate` (`src/mtls_revocation.rs:951`) and by the
 `__test_with_kept_receiver` helper used in unit tests.
 
 Hot-reload: `ReloadHandle::refresh_crls()` (in `src/transport.rs`) sends a

@@ -7,6 +7,10 @@
     clippy::print_stdout,
     clippy::print_stderr
 )]
+#![allow(
+    deprecated,
+    reason = "exercises the deprecated ungated test constructors on purpose"
+)]
 //! End-to-end tests for the rmcp-server-kit HTTP server stack.
 //!
 //! Spins up a real `serve()` instance on an ephemeral port with a minimal

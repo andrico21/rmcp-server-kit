@@ -71,6 +71,15 @@ const MAX_AUTO_REFRESH: Duration = Duration::from_hours(24);
 /// Connection timeout for CRL HTTP fetches. Independent of overall fetch
 /// timeout to bound time spent on unreachable hosts.
 const CRL_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Most distinct CDP URLs a single handshake will consider.
+///
+/// RFC 5280 4.2.1.13 treats multiple URIs inside one `DistributionPoint` as
+/// mirrors of the same CRL, so a conforming certificate needs only a handful.
+/// 64 sits far above any plausible legitimate certificate while bounding the
+/// work a peer can demand on the unauthenticated handshake path. Deliberately
+/// a private constant rather than a config field: no operator should need to
+/// tune it, and widening the public config surface for it would be worse.
+const MAX_RELEVANT_CDP_URLS_PER_HANDSHAKE: usize = 64;
 
 /// Parsed CRL cached in memory and keyed by its source URL.
 #[derive(Clone, Debug)]
@@ -88,12 +97,142 @@ pub struct CachedCrl {
     pub source_url: String,
 }
 
-pub(crate) struct VerifierHandle(pub Arc<dyn ClientCertVerifier>);
+/// One atomically-published verifier generation.
+///
+/// SECURITY: `verifier`, `cached_urls`, and `committed_identities` are
+/// published together as a single immutable snapshot behind one [`ArcSwap`].
+/// Publishing them separately would let a handshake observe the coverage hint
+/// from one commit against the verifier of another — a mixed-generation read
+/// the fail-closed precheck cannot distinguish from out-of-band mutation.
+/// Readers load this state exactly once per handshake and both pre-check and
+/// enforce against it.
+pub(crate) struct VerifierState {
+    /// What rustls actually enforces for this generation.
+    verifier: Arc<dyn ClientCertVerifier>,
+    /// URLs whose CRL this generation's `verifier` genuinely enforces.
+    cached_urls: HashSet<String>,
+    /// Constant-cost identity of every committed [`CachedCrl`], keyed by URL.
+    ///
+    /// The precheck compares the live public `cache` against this index, so an
+    /// out-of-band write through the `pub` cache field is detected and denied
+    /// instead of silently claiming coverage the verifier does not provide.
+    committed_identities: HashMap<String, EntryIdentity>,
+}
 
-impl std::fmt::Debug for VerifierHandle {
+impl std::fmt::Debug for VerifierState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("VerifierHandle").finish_non_exhaustive()
+        f.debug_struct("VerifierState")
+            .field("cached_urls_len", &self.cached_urls.len())
+            .field("committed_identities_len", &self.committed_identities.len())
+            .finish_non_exhaustive()
     }
+}
+
+/// Constant-cost fingerprint of a cached CRL entry, recorded at commit time.
+///
+/// # What this does and does not guarantee
+///
+/// This detects **out-of-band mutation of the public [`CrlSet::cache`] field by
+/// non-adversarial code** — the API-misuse hazard that field creates. It is
+/// deliberately **not** a cryptographic integrity check and must never be
+/// described as one.
+///
+/// Hashing the DER instead would be a stronger check, but it was measured
+/// (`benches/crl_precheck.rs`) at 56 ms p95 per relevant cached CRL at the
+/// 5 MiB `crl_max_response_bytes` default, scaling linearly with an
+/// attacker-chosen CDP-URL count on the *unauthenticated* handshake path. That
+/// trades a local misuse tripwire for a remote CPU-amplification vulnerability,
+/// so identity comparison is used instead and the DER is never rescanned.
+///
+/// Known limit: a same-process caller that deliberately drops an entry and
+/// reallocates a replacement at the same address, with the same length and the
+/// same 32-byte head and tail, would not be detected. Such a caller already
+/// holds the cache write lock and is inside the trust boundary. The real fix is
+/// making `cache` private, which is a 4.0 change.
+#[derive(Clone, PartialEq, Eq)]
+struct EntryIdentity {
+    der_ptr: usize,
+    der_len: usize,
+    head: [u8; 32],
+    tail: [u8; 32],
+    this_update: SystemTime,
+    next_update: Option<SystemTime>,
+    fetched_at: SystemTime,
+    source_url: String,
+}
+
+/// Fingerprint one cache entry. Reads at most 64 bytes of DER regardless of
+/// CRL size, so handshake cost does not scale with `crl_max_response_bytes`.
+fn entry_identity(entry: &CachedCrl) -> EntryIdentity {
+    // Exhaustive destructuring is load-bearing: adding a field to `CachedCrl`
+    // must fail compilation here so someone decides whether it belongs in the
+    // identity, rather than silently falling outside mutation detection.
+    let CachedCrl {
+        der,
+        this_update,
+        next_update,
+        fetched_at,
+        source_url,
+    } = entry;
+
+    let bytes = der.as_ref();
+    let mut head = [0u8; 32];
+    let mut tail = [0u8; 32];
+    let sample = bytes.len().min(32);
+    if let Some(source) = bytes.get(..sample)
+        && let Some(target) = head.get_mut(..sample)
+    {
+        target.copy_from_slice(source);
+    }
+    if let Some(source) = bytes.get(bytes.len().saturating_sub(sample)..)
+        && let Some(target) = tail.get_mut(..sample)
+    {
+        target.copy_from_slice(source);
+    }
+
+    EntryIdentity {
+        der_ptr: bytes.as_ptr().addr(),
+        der_len: bytes.len(),
+        head,
+        tail,
+        this_update: *this_update,
+        next_update: *next_update,
+        fetched_at: *fetched_at,
+        source_url: source_url.clone(),
+    }
+}
+
+/// Fingerprint every entry of a cache map.
+fn crl_cache_identities<S: std::hash::BuildHasher>(
+    cache: &HashMap<String, CachedCrl, S>,
+) -> HashMap<String, EntryIdentity> {
+    cache
+        .iter()
+        .map(|(url, entry)| (url.clone(), entry_identity(entry)))
+        .collect()
+}
+
+/// Confirm the live cache still matches what `state` committed, for the CDP
+/// URLs this handshake would rely on.
+///
+/// SECURITY: the scope is `relevant_urls ∩ state.cached_urls` — the only URLs
+/// whose coverage claim can admit the handshake. A relevant URL missing from
+/// the live cache, missing an identity, or whose identity differs has had its
+/// entry mutated out of band: coverage is claimed but unproven.
+fn cache_matches_committed_identities(
+    cache: &HashMap<String, CachedCrl>,
+    state: &VerifierState,
+    relevant_urls: &[String],
+) -> bool {
+    relevant_urls
+        .iter()
+        .filter(|url| state.cached_urls.contains(*url))
+        .all(
+            |url| match (cache.get(url), state.committed_identities.get(url)) {
+                (Some(entry), Some(expected)) => entry_identity(entry) == *expected,
+                _ => false,
+            },
+        )
 }
 
 /// Shared CRL state backing the dynamic mTLS verifier.
@@ -103,8 +242,33 @@ impl std::fmt::Debug for VerifierHandle {
 )]
 #[non_exhaustive]
 pub struct CrlSet {
-    inner_verifier: ArcSwap<VerifierHandle>,
+    /// Single atomically-published generation of verifier + coverage hint +
+    /// digest index. See [`VerifierState`].
+    verifier_state: ArcSwap<VerifierState>,
+    /// Serializes commits end to end.
+    ///
+    /// SECURITY: the cache write lock is deliberately NOT the commit
+    /// transaction lock — holding it across `rebuild_verifier` would make the
+    /// verifier path's non-blocking `try_read` fail under ordinary refresh
+    /// load, turning a legitimate refresh into a spurious handshake denial.
+    /// Without this mutex, two commits could each snapshot the same old cache
+    /// and publish states whose `cached_urls` omit the other's URL, which is
+    /// exactly the desynchronisation the digest index exists to prevent.
+    commit_lock: tokio::sync::Mutex<()>,
     /// Cached CRLs keyed by URL.
+    ///
+    /// # ⚠️ Deprecated
+    ///
+    /// Writing through this field bypasses the atomic commit path and
+    /// desynchronises the published coverage hint from the live verifier.
+    /// Since 3.9 such a write is **detected and fails the handshake closed**
+    /// rather than silently admitting a certificate whose revocation status
+    /// cannot be enforced. Reads remain safe but are not part of the supported
+    /// surface. The field becomes private in 4.0.
+    #[deprecated(
+        since = "3.9.0",
+        note = "mutating the CRL cache out of band is detected and denies handshakes; this field becomes private in 4.0"
+    )]
     pub cache: RwLock<HashMap<String, CachedCrl>>,
     /// Immutable client-auth root store.
     pub roots: Arc<RootCertStore>,
@@ -126,7 +290,6 @@ pub struct CrlSet {
     /// first-fetch failure would otherwise suppress the URL for the process
     /// lifetime, silently disabling revocation for that CDP.
     pending_urls: Mutex<HashSet<String>>,
-    cached_urls: Mutex<HashSet<String>>,
     /// Global cap on simultaneous CRL HTTP fetches (SSRF amplification guard).
     global_fetch_sem: Arc<Semaphore>,
     /// Per-host serializer (one in-flight fetch per origin host). Bounded
@@ -191,7 +354,15 @@ impl CrlSet {
 
         let initial_verifier = rebuild_verifier(&roots, &config, &initial_cache)?;
         let seen_urls = initial_cache.keys().cloned().collect::<HashSet<_>>();
-        let cached_urls = seen_urls.clone();
+        // SECURITY: identities MUST be seeded here, not only on commit. `new`
+        // receives the bootstrap-fetched cache, so an index populated only by
+        // `commit_cache_update_atomically` would read every bootstrapped CRL
+        // as mutated out of band and fail mTLS closed at startup.
+        let initial_state = VerifierState {
+            verifier: initial_verifier,
+            cached_urls: seen_urls.clone(),
+            committed_identities: crl_cache_identities(&initial_cache),
+        };
 
         // Defense in depth: normal server startup reaches this only through
         // `Validated<McpServerConfig>`, but the public `bootstrap_fetch` helper
@@ -208,8 +379,13 @@ impl CrlSet {
 
         let max_response_bytes = config.crl_max_response_bytes;
 
+        #[allow(
+            deprecated,
+            reason = "constructing the struct necessarily names the deprecated field; the deprecation targets downstream mutation, not construction"
+        )]
         Ok(Arc::new(Self {
-            inner_verifier: ArcSwap::from_pointee(VerifierHandle(initial_verifier)),
+            verifier_state: ArcSwap::from_pointee(initial_state),
+            commit_lock: tokio::sync::Mutex::new(()),
             cache: RwLock::new(initial_cache),
             roots,
             config,
@@ -217,7 +393,6 @@ impl CrlSet {
             client,
             seen_urls: Mutex::new(seen_urls),
             pending_urls: Mutex::new(HashSet::new()),
-            cached_urls: Mutex::new(cached_urls),
             global_fetch_sem,
             host_semaphores,
             discovery_limiter,
@@ -226,33 +401,63 @@ impl CrlSet {
         }))
     }
 
-    fn warn_cap_exceeded_throttled(&self, which: &'static str) {
+    fn should_warn_throttled(&self, which: &'static str) -> bool {
         let now = Instant::now();
         let cooldown = Duration::from_mins(1);
-        let should_warn = match self.last_cap_warn.lock() {
-            Ok(mut guard) => {
-                let should_emit = guard
-                    .get(which)
-                    .is_none_or(|last| now.saturating_duration_since(*last) >= cooldown);
-                if should_emit {
-                    guard.insert(which, now);
-                }
-                should_emit
-            }
-            Err(poisoned) => {
-                let mut guard = poisoned.into_inner();
-                let should_emit = guard
-                    .get(which)
-                    .is_none_or(|last| now.saturating_duration_since(*last) >= cooldown);
-                if should_emit {
-                    guard.insert(which, now);
-                }
-                should_emit
-            }
-        };
+        let mut guard = self
+            .last_cap_warn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let should_emit = guard
+            .get(which)
+            .is_none_or(|last| now.saturating_duration_since(*last) >= cooldown);
+        if should_emit {
+            guard.insert(which, now);
+        }
+        should_emit
+    }
 
-        if should_warn {
+    fn warn_cap_exceeded_throttled(&self, which: &'static str) {
+        if self.should_warn_throttled(which) {
             tracing::warn!(which = which, "CRL map cap exceeded; dropping newest entry");
+        }
+    }
+
+    /// Report a rejected certificate that advertised more distinct CDP URLs
+    /// than [`MAX_RELEVANT_CDP_URLS_PER_HANDSHAKE`]. Distinct from both the
+    /// unavailable-CRL and the out-of-band-mutation denials, because this one
+    /// applies in fail-open mode too and has no opt-out.
+    /// Single in-crate entry point to the deprecated public `cache` field.
+    ///
+    /// Routing every internal use through here keeps the deprecation honest for
+    /// downstream callers while confining the `allow` to one site instead of
+    /// scattering it across every read.
+    #[allow(
+        deprecated,
+        reason = "the deprecation targets downstream out-of-band mutation; in-crate reads and the atomic commit path are the supported users of this field"
+    )]
+    fn cache_lock(&self) -> &RwLock<HashMap<String, CachedCrl>> {
+        &self.cache
+    }
+
+    fn warn_cdp_cap_exceeded_throttled(&self, observed: usize) {
+        if self.should_warn_throttled("cdp_url_cap") {
+            tracing::warn!(
+                observed = observed,
+                cap = MAX_RELEVANT_CDP_URLS_PER_HANDSHAKE,
+                "crl_cdp_url_cap_exceeded: client certificate advertises more distinct CDP URLs than the per-handshake cap; rejecting as malformed"
+            );
+        }
+    }
+
+    /// Report a fail-closed denial caused by out-of-band mutation of the public
+    /// `cache` field, distinct from the ordinary unavailable-CRL denial so
+    /// operators can tell a mutated entry from a missing mirror.
+    fn warn_cache_tamper_throttled(&self) {
+        if self.should_warn_throttled("cache_entry_mismatch") {
+            tracing::warn!(
+                "crl_cache_out_of_band_mutation: live CRL cache does not match the committed identity index; denying handshake"
+            );
         }
     }
 
@@ -261,8 +466,16 @@ impl CrlSet {
         inserts: Vec<(String, CachedCrl)>,
         removals: &[String],
     ) -> Result<bool, RmcpServerKitError> {
-        let mut cache = self.cache.write().await;
-        let mut candidate = cache.clone();
+        // SECURITY (lock order, load-bearing): hold `commit_lock` across the
+        // whole transaction — snapshot, rebuild, publish. The cache write lock
+        // is taken only for the paired `*cache = candidate` +
+        // `verifier_state.store(..)` publication, so readers synchronising on
+        // that same `RwLock` can never observe a commit half-applied, while
+        // `rebuild_verifier` and digesting stay off-lock and out of the
+        // verifier path's way.
+        let _commit = self.commit_lock.lock().await;
+
+        let mut candidate = self.cache_lock().read().await.clone();
         let mut admitted_urls = Vec::new();
 
         // POLICY: at cap the NEWEST entry is rejected, never an existing
@@ -285,36 +498,34 @@ impl CrlSet {
             candidate.remove(url);
         }
 
-        // SECURITY: `cached_urls` is the synchronous fail-closed precheck's
-        // trust hint. It must never get ahead of `inner_verifier`; otherwise a
-        // handshake could skip the unavailable-CRL fast-fail for a URL the live
-        // rustls verifier cannot enforce. Build from the full candidate cache
-        // first, then swap verifier, then publish cache/cached_urls together.
         let verifier = rebuild_verifier(&self.roots, &self.config, &candidate)?;
-        self.inner_verifier
-            .store(Arc::new(VerifierHandle(verifier)));
-        let changed = !admitted_urls.is_empty() || !removals.is_empty();
-        *cache = candidate;
-        drop(cache);
 
-        match self.cached_urls.lock() {
-            Ok(mut cached_urls) => {
-                for url in admitted_urls {
-                    cached_urls.insert(url);
-                }
-                for url in removals {
-                    cached_urls.remove(url);
-                }
-            }
-            Err(poisoned) => {
-                let mut cached_urls = poisoned.into_inner();
-                for url in admitted_urls {
-                    cached_urls.insert(url);
-                }
-                for url in removals {
-                    cached_urls.remove(url);
-                }
-            }
+        // SECURITY: identities are recomputed for EVERY entry, not only for
+        // what this commit wrote. `candidate` is a clone of the live cache and
+        // cloning a `CachedCrl` reallocates its DER, so every carried-forward
+        // entry has a new address. Carrying identities forward would make an
+        // unrelated commit invalidate every other URL and deny every later
+        // handshake. Recomputation is O(entries) pointer and scalar reads with
+        // no hashing, so there is nothing to gain by being incremental.
+        let new_state = Arc::new(VerifierState {
+            verifier,
+            cached_urls: candidate.keys().cloned().collect(),
+            committed_identities: crl_cache_identities(&candidate),
+        });
+        let changed = !admitted_urls.is_empty() || !removals.is_empty();
+
+        {
+            let mut cache = self.cache_lock().write().await;
+            let superseded = std::mem::replace(&mut *cache, candidate);
+            self.verifier_state.store(new_state);
+            drop(cache);
+            // Free the superseded map only AFTER releasing the write lock.
+            // Dropping it in place would deallocate one `String` and one DER
+            // buffer per cached CRL inside the publication window, which is
+            // precisely the window the verifier path's non-blocking `try_read`
+            // has to get through. Measured at 256 entries: ~15% of reader
+            // attempts blocked with the in-place drop, under 1% without it.
+            drop(superseded);
         }
 
         // A removed CRL must become fully re-discoverable, so clear the URL
@@ -349,7 +560,7 @@ impl CrlSet {
     /// Returns an error if rebuilding the inner verifier fails.
     pub async fn force_refresh(&self) -> Result<(), RmcpServerKitError> {
         let urls = {
-            let cache = self.cache.read().await;
+            let cache = self.cache_lock().read().await;
             cache.keys().cloned().collect::<Vec<_>>()
         };
         self.refresh_urls(urls).await
@@ -358,7 +569,7 @@ impl CrlSet {
     async fn refresh_due_urls(&self) -> Result<(), RmcpServerKitError> {
         let now = SystemTime::now();
         let urls = {
-            let cache = self.cache.read().await;
+            let cache = self.cache_lock().read().await;
             cache
                 .iter()
                 .filter(|(_, cached)| {
@@ -378,7 +589,7 @@ impl CrlSet {
     async fn refresh_urls(&self, urls: Vec<String>) -> Result<(), RmcpServerKitError> {
         let results = self.fetch_url_results(urls).await;
         let now = SystemTime::now();
-        let cache = self.cache.read().await;
+        let cache = self.cache_lock().read().await;
         let mut inserts = Vec::new();
         let mut removals = Vec::new();
 
@@ -435,7 +646,7 @@ impl CrlSet {
         let _ = self
             .commit_cache_update_atomically(vec![(url.clone(), cached)], &[])
             .await?;
-        Ok(self.cache.read().await.contains_key(&url))
+        Ok(self.cache_lock().read().await.contains_key(&url))
     }
 
     /// Promote a URL from the in-flight set to the permanent dedup set.
@@ -470,11 +681,21 @@ impl CrlSet {
         pending.remove(url);
     }
 
+    /// Enqueue newly-seen CDP URLs and run the synchronous fail-closed
+    /// precheck.
+    ///
+    /// Returns `(deny, state)`. The caller MUST enforce with the returned
+    /// `state.verifier` rather than re-loading: pre-check and enforcement have
+    /// to observe the same verifier generation.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the cache read guard is deliberately acquired BEFORE loading VerifierState and is released by the match that consumes it; tightening as the lint suggests would invert the lock order this precheck's generation-coherence depends on"
+    )]
     fn note_discovered_urls(
         &self,
         end_entity_urls: &[String],
         intermediate_urls: &[String],
-    ) -> bool {
+    ) -> (bool, Arc<VerifierState>) {
         // INVARIANT: only called post-handshake from
         // `DynamicClientCertVerifier::verify_client_cert`. The peer has
         // already presented a chain that parses; this method must not panic
@@ -488,6 +709,29 @@ impl CrlSet {
         all_urls.extend_from_slice(intermediate_urls);
         all_urls.sort();
         all_urls.dedup();
+
+        let relevant_urls = if self.config.crl_end_entity_only {
+            end_entity_urls
+        } else {
+            all_urls.as_slice()
+        };
+
+        // SECURITY: reject a certificate advertising an implausible number of
+        // distinct CDP URLs, BEFORE the discovery loop and BEFORE the
+        // fail-open branch. Every later step is linear in this peer-chosen
+        // count, so leaving it unbounded is the amplification primitive this
+        // cap exists to remove; and the sort/dedup/rate-limiter work is paid
+        // identically under `crl_deny_on_unavailable = false`, so capping only
+        // the fail-closed path would leave the amplifier fully intact.
+        //
+        // This is a MALFORMED-CERTIFICATE rejection, not a revocation-status
+        // denial: an operator who set `crl_deny_on_unavailable = false` opted
+        // out of unavailability denials, not out of this. It therefore has no
+        // opt-out and carries its own distinct log message.
+        if relevant_urls.len() > MAX_RELEVANT_CDP_URLS_PER_HANDSHAKE {
+            self.warn_cdp_cap_exceeded_throttled(relevant_urls.len());
+            return (true, self.verifier_state.load_full());
+        }
 
         // Snapshot both dedup sets under their locks; do NOT mutate yet.
         // A URL is skipped if it is already cached (`seen_urls`) or already
@@ -559,41 +803,66 @@ impl CrlSet {
             }
         }
 
-        if self.config.crl_deny_on_unavailable {
-            let cached = self
-                .cached_urls
-                .lock()
-                .ok()
-                .map(|guard| guard.clone())
-                .unwrap_or_default();
-            let relevant_urls = if self.config.crl_end_entity_only {
-                end_entity_urls
-            } else {
-                all_urls.as_slice()
-            };
-            // `all(..not cached..)` -- deny only when EVERY relevant CDP URL is
-            // uncached, not when any single one is. RFC 5280 4.2.1.13: "If the
-            // DistributionPointName contains multiple values, each name
-            // describes a different mechanism to obtain the same CRL." The
-            // URLs are therefore mirrors, and one successful fetch is
-            // sufficient revocation coverage; failing on a single unreachable
-            // mirror would let an attacker who can DoS one CDP host deny
-            // service to every client.
-            //
-            // Known limitation: multiple `DistributionPoint` *entries* (as
-            // opposed to multiple URIs inside one entry) may in principle be
-            // reason-partitioned scopes rather than mirrors, and this flattens
-            // them into a single URL set. That is safe against RFC-conforming
-            // issuers, because the same section requires "a conforming CA ...
-            // MUST include at least one DistributionPoint that points to a CRL
-            // that covers the certificate for all reasons", and the profile
-            // "RECOMMENDS against segmenting CRLs by reason code". Reason-code
-            // partitioning is not otherwise modelled here.
-            return !relevant_urls.is_empty()
-                && relevant_urls.iter().all(|url| !cached.contains(url));
+        if !self.config.crl_deny_on_unavailable {
+            return (false, self.verifier_state.load_full());
         }
 
-        false
+        if relevant_urls.is_empty() {
+            return (false, self.verifier_state.load_full());
+        }
+
+        // SECURITY (lock order — must match `commit_cache_update_atomically`):
+        // take the cache read guard FIRST, then load the verifier state while
+        // still holding it. Commits publish `cache` and `verifier_state` under
+        // the same write lock, so this ordering makes a legitimate commit
+        // atomic to this reader; loading the state first could pair a new
+        // identity index with a pre-commit cache view and report a routine
+        // refresh as out-of-band mutation.
+        //
+        // `try_read` is mandatory: this runs inside the synchronous rustls
+        // verifier callback, where blocking and awaiting are forbidden.
+        let cache_guard = self.cache_lock().try_read();
+        let state = self.verifier_state.load_full();
+
+        // SECURITY: a failed `try_read` is NOT evidence of tampering, and must
+        // not deny on its own. `tokio::sync::RwLock` is write-preferring, so an
+        // ordinary refresh commit makes `try_read` fail — denying here would
+        // turn every legitimate CRL refresh into a self-inflicted handshake
+        // outage. It also buys no security: the handshake is enforced by the
+        // immutable `state.verifier` that was committed with `cached_urls`, not
+        // by the live map, so an unreadable cache simply means the public
+        // mirror could not be audited this time. Out-of-band mutation is still
+        // caught on every handshake that does get the lock.
+        if let Ok(cache) = cache_guard
+            && !cache_matches_committed_identities(&cache, &state, relevant_urls)
+        {
+            drop(cache);
+            self.warn_cache_tamper_throttled();
+            return (true, state);
+        }
+
+        // `all(..not cached..)` -- deny only when EVERY relevant CDP URL is
+        // uncached, not when any single one is. RFC 5280 4.2.1.13: "If the
+        // DistributionPointName contains multiple values, each name
+        // describes a different mechanism to obtain the same CRL." The
+        // URLs are therefore mirrors, and one successful fetch is
+        // sufficient revocation coverage; failing on a single unreachable
+        // mirror would let an attacker who can DoS one CDP host deny
+        // service to every client.
+        //
+        // Known limitation: multiple `DistributionPoint` *entries* (as
+        // opposed to multiple URIs inside one entry) may in principle be
+        // reason-partitioned scopes rather than mirrors, and this flattens
+        // them into a single URL set. That is safe against RFC-conforming
+        // issuers, because the same section requires "a conforming CA ...
+        // MUST include at least one DistributionPoint that points to a CRL
+        // that covers the certificate for all reasons", and the profile
+        // "RECOMMENDS against segmenting CRLs by reason code". Reason-code
+        // partitioning is not otherwise modelled here.
+        let deny = relevant_urls
+            .iter()
+            .all(|url| !state.cached_urls.contains(url));
+        (deny, state)
     }
 
     /// Test helper for constructing a CRL set from in-memory CRLs. Benign but
@@ -603,6 +872,10 @@ impl CrlSet {
     ///
     /// Returns an error if the verifier cannot be built from the provided CRLs.
     #[doc(hidden)]
+    #[deprecated(
+        since = "3.9.0",
+        note = "test-only constructor that is ungated in 3.x by accident; it becomes feature-gated in 4.0"
+    )]
     pub fn __test_with_prepopulated_crls(
         roots: Arc<RootCertStore>,
         config: MtlsConfig,
@@ -638,6 +911,10 @@ impl CrlSet {
     ///
     /// Returns an error if the verifier cannot be built from the provided CRLs.
     #[doc(hidden)]
+    #[deprecated(
+        since = "3.9.0",
+        note = "test-only constructor that is ungated in 3.x by accident; it becomes feature-gated in 4.0"
+    )]
     pub fn __test_with_kept_receiver(
         roots: Arc<RootCertStore>,
         config: MtlsConfig,
@@ -692,7 +969,7 @@ impl CrlSet {
     /// discovery channel would not record. Ungated public leak.
     #[doc(hidden)]
     pub fn __test_note_discovered_urls(&self, urls: &[String]) -> bool {
-        let missing_cached = self.note_discovered_urls(urls, &[]);
+        let (missing_cached, _state) = self.note_discovered_urls(urls, &[]);
         if self.discover_tx.is_closed() {
             let already_seen: HashSet<String> = {
                 let seen = self
@@ -732,6 +1009,7 @@ impl CrlSet {
         intermediate_urls: &[String],
     ) -> bool {
         self.note_discovered_urls(end_entity_urls, intermediate_urls)
+            .0
     }
 
     /// Test-only: report whether a URL is suppressed from re-discovery. Benign
@@ -798,14 +1076,14 @@ impl CrlSet {
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     pub fn __test_cache_len(&self) -> usize {
-        self.cache.try_read().map_or(0, |guard| guard.len())
+        self.cache_lock().try_read().map_or(0, |guard| guard.len())
     }
 
     /// Test-only: whether a specific URL is currently cached.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     pub fn __test_cache_contains(&self, url: &str) -> bool {
-        self.cache
+        self.cache_lock()
             .try_read()
             .is_ok_and(|guard| guard.contains_key(url))
     }
@@ -815,9 +1093,7 @@ impl CrlSet {
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     pub fn __test_cached_url_contains(&self, url: &str) -> bool {
-        self.cached_urls
-            .lock()
-            .is_ok_and(|guard| guard.contains(url))
+        self.verifier_state.load().cached_urls.contains(url)
     }
 
     /// # ⚠️ Security
@@ -886,7 +1162,7 @@ impl CrlSet {
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     pub async fn __test_replace_cache_entry_unverified(&self, url: &str, cached: CachedCrl) {
-        let mut cache = self.cache.write().await;
+        let mut cache = self.cache_lock().write().await;
         cache.insert(url.to_owned(), cached);
     }
 
@@ -1020,13 +1296,13 @@ impl std::fmt::Debug for DynamicClientCertVerifier {
 
 impl ClientCertVerifier for DynamicClientCertVerifier {
     fn offer_client_auth(&self) -> bool {
-        let verifier = self.inner.inner_verifier.load();
-        verifier.0.offer_client_auth()
+        let state = self.inner.verifier_state.load();
+        state.verifier.offer_client_auth()
     }
 
     fn client_auth_mandatory(&self) -> bool {
-        let verifier = self.inner.inner_verifier.load();
-        verifier.0.client_auth_mandatory()
+        let state = self.inner.verifier_state.load();
+        state.verifier.client_auth_mandatory()
     }
 
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
@@ -1065,18 +1341,17 @@ impl ClientCertVerifier for DynamicClientCertVerifier {
         intermediate_urls.sort();
         intermediate_urls.dedup();
 
-        if self
+        let (revocation_unavailable, state) = self
             .inner
-            .note_discovered_urls(&end_entity_urls, &intermediate_urls)
-        {
+            .note_discovered_urls(&end_entity_urls, &intermediate_urls);
+        if revocation_unavailable {
             return Err(TlsError::General(
                 "client certificate revocation status unavailable".to_owned(),
             ));
         }
 
-        let verifier = self.inner.inner_verifier.load();
-        verifier
-            .0
+        state
+            .verifier
             .verify_client_cert(end_entity, intermediates, now)
     }
 
@@ -1086,8 +1361,8 @@ impl ClientCertVerifier for DynamicClientCertVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TlsError> {
-        let verifier = self.inner.inner_verifier.load();
-        verifier.0.verify_tls12_signature(message, cert, dss)
+        let state = self.inner.verifier_state.load();
+        state.verifier.verify_tls12_signature(message, cert, dss)
     }
 
     fn verify_tls13_signature(
@@ -1096,18 +1371,18 @@ impl ClientCertVerifier for DynamicClientCertVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TlsError> {
-        let verifier = self.inner.inner_verifier.load();
-        verifier.0.verify_tls13_signature(message, cert, dss)
+        let state = self.inner.verifier_state.load();
+        state.verifier.verify_tls13_signature(message, cert, dss)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        let verifier = self.inner.inner_verifier.load();
-        verifier.0.supported_verify_schemes()
+        let state = self.inner.verifier_state.load();
+        state.verifier.supported_verify_schemes()
     }
 
     fn requires_raw_public_keys(&self) -> bool {
-        let verifier = self.inner.inner_verifier.load();
-        verifier.0.requires_raw_public_keys()
+        let state = self.inner.verifier_state.load();
+        state.verifier.requires_raw_public_keys()
     }
 }
 
@@ -1486,7 +1761,7 @@ async fn next_refresh_delay(set: &CrlSet) -> Duration {
     }
 
     let now = SystemTime::now();
-    let cache = set.cache.read().await;
+    let cache = set.cache_lock().read().await;
     let mut next = MAX_AUTO_REFRESH;
 
     for cached in cache.values() {
@@ -1722,6 +1997,11 @@ fn asn1_time_to_system_time(time: x509_parser::time::ASN1Time) -> SystemTime {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        deprecated,
+        reason = "these tests deliberately exercise the deprecated out-of-band cache surface and the ungated test constructors; that is precisely the behaviour under test"
+    )]
+
     use std::{
         sync::{
             Mutex as StdMutex,
@@ -1970,15 +2250,12 @@ mod tests {
         let set = new_crl_set_from_bootstrap_cache(roots, config, discover_tx, initial_cache)
             .expect("bootstrap cache should build CRL set");
         let cache_keys = {
-            let cache = set.cache.read().await;
+            let cache = set.cache_lock().read().await;
             assert_eq!(cache.len(), cap, "bootstrap cache len must be capped");
             cache.keys().cloned().collect::<HashSet<_>>()
         };
         let cached_url_keys = {
-            let cached_urls = set
-                .cached_urls
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let cached_urls = &set.verifier_state.load().cached_urls;
             assert_eq!(
                 cached_urls.len(),
                 cap,
@@ -2289,5 +2566,615 @@ mod tests {
             "cap must still reject when every entry has an in-flight fetch"
         );
         drop(held);
+    }
+
+    // ---- CrlSet cache invariant (A1/A2/A3) --------------------------------
+
+    fn tamper_test_config() -> MtlsConfig {
+        let mut config = test_mtls_config();
+        config.crl_deny_on_unavailable = true;
+        config.crl_end_entity_only = false;
+        config.crl_discovery_rate_per_min = 10_000;
+        config.crl_max_seen_urls = 4096;
+        config.crl_max_cache_entries = 4096;
+        config
+    }
+
+    fn synthetic_entry(now: SystemTime) -> CachedCrl {
+        CachedCrl::__test_synthetic(now)
+    }
+
+    fn identity_of(set: &CrlSet, url: &str) -> Option<EntryIdentity> {
+        set.verifier_state
+            .load()
+            .committed_identities
+            .get(url)
+            .cloned()
+    }
+
+    fn warned(set: &CrlSet, which: &str) -> bool {
+        set.last_cap_warn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(which)
+    }
+
+    /// A replacement that is indistinguishable from `entry` on every cheap
+    /// field: same DER length, same 32-byte head and tail, same scalars, same
+    /// `source_url`. Only a middle byte differs, so only the reallocation can
+    /// betray it. An implementation comparing anything less than the full
+    /// identity tuple fails the tests that use this.
+    fn same_shape_replacement(entry: &CachedCrl) -> CachedCrl {
+        let mut bytes = entry.der.as_ref().to_vec();
+        let middle = bytes.len() / 2;
+        if let Some(byte) = bytes.get_mut(middle) {
+            *byte ^= 0xFF;
+        }
+        CachedCrl {
+            der: CertificateRevocationListDer::from(bytes),
+            this_update: entry.this_update,
+            next_update: entry.next_update,
+            fetched_at: entry.fetched_at,
+            source_url: entry.source_url.clone(),
+        }
+    }
+
+    fn crl_set_with_cached_urls(config: MtlsConfig, count: usize) -> (Arc<CrlSet>, Vec<String>) {
+        install_ring_provider();
+        let mut roots = RootCertStore::empty();
+        roots.add(test_ca_root()).expect("add ca root");
+        let now = SystemTime::now();
+        let mut initial_cache = HashMap::new();
+        let mut urls = Vec::with_capacity(count);
+        for index in 0..count {
+            let url = format!("https://cdp-{index:03}.example.test/crl");
+            initial_cache.insert(url.clone(), synthetic_entry(now));
+            urls.push(url);
+        }
+        let (discover_tx, discover_rx) = mpsc::unbounded_channel();
+        drop(discover_rx);
+        let set = CrlSet::new(Arc::new(roots), config, discover_tx, initial_cache)
+            .expect("crl set with prepopulated cache");
+        urls.sort();
+        (set, urls)
+    }
+
+    #[tokio::test]
+    async fn identity_index_is_seeded_by_new_and_maintained_by_commit() {
+        let boot = "https://cdp-000.example.test/crl";
+        let (set, _urls) = crl_set_with_cached_urls(tamper_test_config(), 1);
+
+        // Blocker 1 regression: identities seeded only on commit would read
+        // every bootstrap-fetched CRL as mutated and fail mTLS closed at
+        // startup.
+        assert!(
+            identity_of(&set, boot).is_some(),
+            "CrlSet::new must record identities for the bootstrap cache"
+        );
+
+        let added = "https://added.example.test/crl";
+        let now = SystemTime::now();
+        set.__test_insert_cache(added, synthetic_entry(now)).await;
+        let added_identity = identity_of(&set, added).expect("commit must record an identity");
+
+        set.__test_insert_cache(added, synthetic_entry(now + Duration::from_secs(3_600)))
+            .await;
+        assert!(
+            identity_of(&set, added).as_ref() != Some(&added_identity),
+            "legitimate replacement must change the recorded identity"
+        );
+
+        set.commit_cache_update_atomically(Vec::new(), &[added.to_owned()])
+            .await
+            .expect("removal commit");
+        assert!(
+            identity_of(&set, added).is_none(),
+            "removal must drop the identity in the same publication"
+        );
+    }
+
+    #[test]
+    fn identity_covers_der_bytes_beyond_the_sampled_head_and_tail() {
+        let entry = synthetic_entry(SystemTime::now());
+        assert!(
+            entry.der.as_ref().len() > 64,
+            "fixture must be longer than head+tail so the middle is unsampled"
+        );
+        assert!(
+            entry_identity(&entry) != entry_identity(&same_shape_replacement(&entry)),
+            "a same-length middle-byte edit must still change the identity"
+        );
+    }
+
+    #[test]
+    fn identity_covers_every_scalar_field() {
+        let now = SystemTime::now();
+        let base = synthetic_entry(now);
+        let baseline = entry_identity(&base);
+
+        let mut this_update = base.clone();
+        this_update.this_update = now + Duration::from_secs(1);
+        let mut next_update = base.clone();
+        next_update.next_update = None;
+        let mut fetched_at = base.clone();
+        fetched_at.fetched_at = now + Duration::from_secs(1);
+        let mut source_url = base;
+        source_url.source_url = "test://other".to_owned();
+
+        for (label, mutated) in [
+            ("this_update", this_update),
+            ("next_update", next_update),
+            ("fetched_at", fetched_at),
+            ("source_url", source_url),
+        ] {
+            assert!(
+                entry_identity(&mutated) != baseline,
+                "mutating {label} alone must change the identity"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn precheck_denies_after_same_key_replace_through_public_cache() {
+        let (set, _rx) = test_crl_set_with_receiver_config(tamper_test_config());
+        let url = "https://replace.example.test/crl".to_owned();
+        let now = SystemTime::now();
+
+        let committed = synthetic_entry(now);
+        set.__test_insert_cache(&url, committed.clone()).await;
+        assert!(
+            !set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&url), &[]),
+            "a legitimately committed CRL must admit the handshake"
+        );
+
+        // The replacement matches on DER length, head, tail, every scalar and
+        // `source_url`. An implementation that compares anything less than the
+        // full identity tuple admits here and fails this test.
+        set.__test_replace_cache_entry_unverified(&url, same_shape_replacement(&committed))
+            .await;
+
+        assert!(
+            set.verifier_state.load().cached_urls.contains(&url),
+            "precondition: cached_urls must still claim coverage, or the denial proves nothing"
+        );
+        assert!(
+            set.cache_lock().read().await.contains_key(&url),
+            "precondition: the entry must still be present, so this is a REPLACE and not a removal"
+        );
+        assert!(
+            set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&url), &[]),
+            "REPLACE through the public cache leaves cached_urls claiming coverage the verifier does not enforce; it must deny"
+        );
+    }
+
+    #[tokio::test]
+    async fn precheck_denies_after_direct_removal_through_public_cache() {
+        let (set, _rx) = test_crl_set_with_receiver_config(tamper_test_config());
+        let url = "https://remove.example.test/crl".to_owned();
+
+        set.__test_insert_cache(&url, synthetic_entry(SystemTime::now()))
+            .await;
+        assert!(!set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&url), &[]));
+
+        set.cache_lock().write().await.remove(&url);
+
+        assert!(
+            set.verifier_state.load().cached_urls.contains(&url),
+            "precondition: cached_urls must still claim the removed URL"
+        );
+        assert!(
+            !set.cache_lock().read().await.contains_key(&url),
+            "precondition: the live entry must actually be gone"
+        );
+        assert!(
+            set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&url), &[]),
+            "cached_urls still claims a URL whose entry was removed out of band; it must deny"
+        );
+    }
+
+    #[tokio::test]
+    async fn precheck_uses_committed_state_when_cache_lock_is_temporarily_unavailable() {
+        let (set, _rx) = test_crl_set_with_receiver_config(tamper_test_config());
+        let cached = "https://locked.example.test/crl".to_owned();
+        let uncached = "https://locked-uncached.example.test/crl".to_owned();
+
+        set.__test_insert_cache(&cached, synthetic_entry(SystemTime::now()))
+            .await;
+        assert!(!set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&cached), &[]));
+
+        // Contention is not tamper. `tokio::sync::RwLock` is write-preferring,
+        // so denying here would make every legitimate refresh commit deny
+        // concurrent handshakes; enforcement still runs against the immutable
+        // committed state, which is what makes falling through sound.
+        let guard = set.cache_lock().write().await;
+        assert!(
+            !set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&cached), &[]),
+            "temporary lock contention must not create a spurious denial"
+        );
+        assert!(
+            set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&uncached), &[]),
+            "lock contention must not invent coverage absent from the committed cached_urls"
+        );
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn precheck_clean_path_is_unchanged() {
+        let (set, _rx) = test_crl_set_with_receiver_config(tamper_test_config());
+        let cached = "https://cached.example.test/crl".to_owned();
+        let uncached = "https://uncached.example.test/crl".to_owned();
+
+        set.__test_insert_cache(&cached, synthetic_entry(SystemTime::now()))
+            .await;
+
+        assert!(
+            !set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&cached), &[]),
+            "an untampered cached CDP must still admit"
+        );
+        assert!(
+            set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&uncached), &[]),
+            "an uncached CDP must still follow the all(not cached) predicate"
+        );
+        assert!(
+            !set.__test_note_discovered_urls_by_cert(&[cached, uncached], &[]),
+            "one cached mirror is sufficient coverage (RFC 5280 4.2.1.13)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_commits_lose_no_url_and_publish_a_matching_coverage_hint() {
+        let (set, _rx) = test_crl_set_with_receiver_config(tamper_test_config());
+        let now = SystemTime::now();
+        let total = 64usize;
+
+        // Without `commit_lock` these commits each snapshot the same old cache
+        // and clobber one another, so URLs are silently lost.
+        let mut tasks = JoinSet::new();
+        for index in 0..total {
+            let set = Arc::clone(&set);
+            tasks.spawn(async move {
+                set.__test_insert_cache(
+                    &format!("https://concurrent-{index:03}.example.test/crl"),
+                    synthetic_entry(now),
+                )
+                .await;
+            });
+        }
+        while tasks.join_next().await.is_some() {}
+
+        let cache_keys = set
+            .cache_lock()
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            cache_keys.len(),
+            total,
+            "concurrent commits must not lose entries"
+        );
+        assert_eq!(
+            cache_keys,
+            set.verifier_state.load().cached_urls.clone(),
+            "the published coverage hint must exactly match the committed cache"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn legitimate_refresh_is_never_observed_as_tampering() {
+        let (set, _rx) = test_crl_set_with_receiver_config(tamper_test_config());
+        let url = "https://coherent.example.test/crl".to_owned();
+        set.__test_insert_cache(&url, synthetic_entry(SystemTime::now()))
+            .await;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer_set = Arc::clone(&set);
+        let writer_url = url.clone();
+        let writer_stop = Arc::clone(&stop);
+        let writer = tokio::spawn(async move {
+            for round in 0..400u64 {
+                if writer_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                writer_set
+                    .__test_insert_cache(
+                        &writer_url,
+                        synthetic_entry(SystemTime::now() + Duration::from_secs(round)),
+                    )
+                    .await;
+                tokio::task::yield_now().await;
+            }
+            writer_stop.store(true, Ordering::Relaxed);
+        });
+
+        let reader_set = Arc::clone(&set);
+        let reader_url = url.clone();
+        let reader_stop = Arc::clone(&stop);
+        let (denials, checks) = tokio::task::spawn_blocking(move || {
+            let mut denials = 0usize;
+            let mut checks = 0usize;
+            while !reader_stop.load(Ordering::Relaxed) || checks < 1_000 {
+                if reader_set
+                    .__test_note_discovered_urls_by_cert(std::slice::from_ref(&reader_url), &[])
+                {
+                    denials += 1;
+                }
+                checks += 1;
+                if checks > 200_000 {
+                    break;
+                }
+            }
+            (denials, checks)
+        })
+        .await
+        .expect("reader task");
+
+        writer.await.expect("writer task");
+        assert_eq!(
+            denials, 0,
+            "a legitimate refresh must never be reported as tampering, and must never be observed half-applied"
+        );
+        assert!(
+            checks >= 1_000,
+            "the reader must actually exercise the precheck: only {checks} checks ran"
+        );
+        assert!(
+            !set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&url), &[]),
+            "the URL must still admit once churn stops"
+        );
+        assert_eq!(
+            set.cache_lock()
+                .read()
+                .await
+                .keys()
+                .cloned()
+                .collect::<HashSet<_>>(),
+            set.verifier_state.load().cached_urls.clone(),
+            "cache and published coverage hint must agree after churn"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn commit_does_not_hold_the_cache_write_lock_across_the_verifier_rebuild() {
+        let (set, _rx) = test_crl_set_with_receiver_config(tamper_test_config());
+        let now = SystemTime::now();
+        // A warm cache makes the off-lock clone + `rebuild_verifier` phase the
+        // dominant cost, so a reader starved by that phase is clearly visible.
+        for index in 0..256usize {
+            set.__test_insert_cache(
+                &format!("https://warm-{index:03}.example.test/crl"),
+                synthetic_entry(now),
+            )
+            .await;
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader_set = Arc::clone(&set);
+        let reader_stop = Arc::clone(&stop);
+        let reader = tokio::task::spawn_blocking(move || {
+            let mut acquired = 0usize;
+            let mut blocked = 0usize;
+            while !reader_stop.load(Ordering::Relaxed) {
+                if reader_set.cache_lock().try_read().is_ok() {
+                    acquired += 1;
+                } else {
+                    blocked += 1;
+                }
+            }
+            (acquired, blocked)
+        });
+
+        for round in 0..64usize {
+            set.__test_insert_cache(
+                &format!("https://churn-{round:03}.example.test/crl"),
+                synthetic_entry(now),
+            )
+            .await;
+            // Model refresh cadence rather than a 100%-duty-cycle writer. Real
+            // commits are bounded by MIN_AUTO_REFRESH and the discovery
+            // limiter; a back-to-back loop keeps a writer permanently queued
+            // on this write-preferring lock and measures scheduler fairness
+            // instead of the lock-window property under test.
+            tokio::time::sleep(Duration::from_micros(200)).await;
+        }
+        stop.store(true, Ordering::Relaxed);
+        let (acquired, blocked) = reader.await.expect("reader task");
+
+        // The write lock covers only the two-statement publication, which is
+        // orders of magnitude shorter than the inter-commit gap, so a
+        // non-blocking reader wins overwhelmingly. Holding it across the clone
+        // and `rebuild_verifier` (the pre-fix shape) costs milliseconds per
+        // commit and inverts this ratio.
+        //
+        // Calibration, measured on this codebase:
+        //   write lock held across clone + rebuild:  73k acquired / 6.44M blocked  (0.011x)
+        //   publication-only, superseded map dropped in place:      1.28x then 5.5x
+        //   publication-only, superseded map dropped off-lock:      10.9x
+        // The threshold is 2x: ~5x below the passing value and ~180x above the
+        // failing one. It is deliberately NOT pushed nearer the observed pass
+        // value. `tokio::sync::RwLock` is write-preferring, so `try_read` also
+        // fails while a writer is merely QUEUED, and a spinning reader
+        // dominates that queueing latency; the residual blocked share is a
+        // property of the lock's fairness, not of the critical-section length,
+        // and cannot be shortened away. Raising the threshold would only make
+        // the test tune itself to the scheduler.
+        assert!(
+            acquired > blocked.saturating_mul(2),
+            "verifier-path readers must not be starved by commits: {acquired} acquired vs {blocked} blocked"
+        );
+    }
+
+    // ---- B3: per-handshake CDP URL cap ------------------------------------
+
+    fn fail_open_config() -> MtlsConfig {
+        let mut config = tamper_test_config();
+        config.crl_deny_on_unavailable = false;
+        config
+    }
+
+    #[test]
+    fn cdp_cap_admits_at_the_cap_and_denies_above_it_fail_closed() {
+        let (at_cap, urls) =
+            crl_set_with_cached_urls(tamper_test_config(), MAX_RELEVANT_CDP_URLS_PER_HANDSHAKE);
+        assert!(
+            !at_cap.__test_note_discovered_urls_by_cert(&urls, &[]),
+            "exactly the cap must admit; all URLs are cached so nothing else can deny"
+        );
+
+        let (over_cap, urls) = crl_set_with_cached_urls(
+            tamper_test_config(),
+            MAX_RELEVANT_CDP_URLS_PER_HANDSHAKE + 1,
+        );
+        assert!(
+            over_cap.__test_note_discovered_urls_by_cert(&urls, &[]),
+            "one URL past the cap must deny even though every URL is cached"
+        );
+        assert!(
+            warned(&over_cap, "cdp_url_cap"),
+            "the cap denial must be attributable to the cap, not to some other condition"
+        );
+    }
+
+    #[test]
+    fn cdp_cap_applies_in_fail_open_mode_too() {
+        // The decision recorded in the rev-7 plan: this is a malformed-cert
+        // rejection, not a revocation-unavailability denial, so opting out of
+        // fail-closed does NOT opt out of the cap. An implementation that puts
+        // the cap check inside the fail-closed branch admits here.
+        let (over_cap, urls) =
+            crl_set_with_cached_urls(fail_open_config(), MAX_RELEVANT_CDP_URLS_PER_HANDSHAKE + 1);
+        assert!(
+            over_cap.__test_note_discovered_urls_by_cert(&urls, &[]),
+            "the cap must deny in fail-open mode, where the same amplification is paid"
+        );
+
+        let (at_cap, urls) =
+            crl_set_with_cached_urls(fail_open_config(), MAX_RELEVANT_CDP_URLS_PER_HANDSHAKE);
+        assert!(
+            !at_cap.__test_note_discovered_urls_by_cert(&urls, &[]),
+            "the cap must not become a blanket fail-open denial"
+        );
+    }
+
+    #[test]
+    fn cdp_cap_is_evaluated_before_out_of_band_mutation_detection() {
+        let (set, urls) = crl_set_with_cached_urls(
+            tamper_test_config(),
+            MAX_RELEVANT_CDP_URLS_PER_HANDSHAKE + 1,
+        );
+        let target = urls.first().expect("at least one url").clone();
+        let committed = set
+            .cache_lock()
+            .try_read()
+            .expect("uncontended")
+            .get(&target)
+            .cloned()
+            .expect("entry present");
+        set.cache_lock()
+            .try_write()
+            .expect("uncontended")
+            .insert(target, same_shape_replacement(&committed));
+
+        assert!(set.__test_note_discovered_urls_by_cert(&urls, &[]));
+        assert!(
+            warned(&set, "cdp_url_cap"),
+            "over-cap must be reported as the cap, so operators are not misdirected"
+        );
+        assert!(
+            !warned(&set, "cache_entry_mismatch"),
+            "the cap must short-circuit before any per-entry auditing runs"
+        );
+    }
+
+    // ---- B4-4 / B2: remaining precheck semantics --------------------------
+
+    #[tokio::test]
+    async fn unrelated_commit_does_not_invalidate_other_urls() {
+        // RELEASE-CRITICAL. `commit_cache_update_atomically` clones the live
+        // cache, and cloning a `CachedCrl` reallocates its DER, so every
+        // carried-forward entry gets a new address. An implementation that
+        // carries identities forward instead of recomputing them denies every
+        // handshake after any unrelated refresh.
+        let (set, _rx) = test_crl_set_with_receiver_config(tamper_test_config());
+        let first = "https://first.example.test/crl".to_owned();
+        let second = "https://second.example.test/crl".to_owned();
+        let now = SystemTime::now();
+
+        set.__test_insert_cache(&first, synthetic_entry(now)).await;
+        assert!(!set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&first), &[]));
+
+        set.__test_insert_cache(&second, synthetic_entry(now)).await;
+
+        assert!(
+            !set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&first), &[]),
+            "committing an unrelated URL must not invalidate an existing URL's identity"
+        );
+        assert!(
+            !set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&second), &[]),
+            "the newly committed URL must admit too"
+        );
+    }
+
+    #[tokio::test]
+    async fn lock_contention_is_not_reported_as_out_of_band_mutation() {
+        let (set, _rx) = test_crl_set_with_receiver_config(tamper_test_config());
+        let url = "https://contended.example.test/crl".to_owned();
+        set.__test_insert_cache(&url, synthetic_entry(SystemTime::now()))
+            .await;
+
+        let guard = set.cache_lock().write().await;
+        assert!(
+            !set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&url), &[]),
+            "contention must fall through to the committed state, not deny"
+        );
+        assert!(
+            !warned(&set, "cache_entry_mismatch"),
+            "contention must not be logged as out-of-band mutation, or operators chase a phantom"
+        );
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn mutation_detection_only_ever_adds_a_denial() {
+        let (set, _rx) = test_crl_set_with_receiver_config(tamper_test_config());
+        let cached = "https://audited.example.test/crl".to_owned();
+        let uncached = "https://never-cached.example.test/crl".to_owned();
+        let now = SystemTime::now();
+
+        let committed = synthetic_entry(now);
+        set.__test_insert_cache(&cached, committed.clone()).await;
+        assert!(
+            set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&uncached), &[]),
+            "an all-uncached certificate denies under all(not cached) before any mutation"
+        );
+
+        set.__test_replace_cache_entry_unverified(&cached, same_shape_replacement(&committed))
+            .await;
+
+        assert!(
+            set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&uncached), &[]),
+            "mutating an unrelated cached URL must not flip an all-uncached deny into an admit"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_open_mode_still_admits_a_mutated_entry() {
+        // Operators who set `crl_deny_on_unavailable = false` accepted that a
+        // revoked cert is admitted when its CRL cannot be trusted. Silently
+        // re-enabling denial for them would be a behaviour change they did not
+        // opt into; only the malformed-cert cap applies in this mode.
+        let (set, _rx) = test_crl_set_with_receiver_config(fail_open_config());
+        let url = "https://fail-open.example.test/crl".to_owned();
+        let committed = synthetic_entry(SystemTime::now());
+
+        set.__test_insert_cache(&url, committed.clone()).await;
+        set.__test_replace_cache_entry_unverified(&url, same_shape_replacement(&committed))
+            .await;
+
+        assert!(
+            !set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&url), &[]),
+            "fail-open must stay fail-open for out-of-band mutation"
+        );
     }
 }

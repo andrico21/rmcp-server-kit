@@ -186,6 +186,11 @@ harness = false
 name = "hook_latency"
 harness = false
 
+[[bench]]
+name = "crl_precheck"
+harness = false
+required-features = ["test-helpers"]
+
 # cargo-machete config: dependencies machete cannot detect via static
 # analysis but that ARE used at runtime.
 #
