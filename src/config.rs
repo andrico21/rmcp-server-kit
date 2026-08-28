@@ -176,6 +176,13 @@ pub(crate) const ENV_OVERRIDE_SPECS: &[EnvOverrideSpec] = &[
         redacted: false,
     },
     EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__STRIP_RESOURCE_PARAM",
+        target_field: "server.auth.oauth.proxy.strip_resource_param",
+        value_type: "bool",
+        required_feature: Some("oauth"),
+        redacted: false,
+    },
+    EnvOverrideSpec {
         env_var: "RMCP_SERVER_KIT__OBSERVABILITY__LOG_FORMAT",
         target_field: "observability.log_format",
         value_type: "String",
@@ -244,6 +251,8 @@ pub(crate) const SERVER_KEY_EVICTION_POLICY_ENV: &str =
 pub(crate) const SERVER_OAUTH_ISSUER_ENV: &str = "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ISSUER";
 pub(crate) const SERVER_OAUTH_AUDIENCE_ENV: &str = "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__AUDIENCE";
 pub(crate) const SERVER_OAUTH_JWKS_URI_ENV: &str = "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__JWKS_URI";
+pub(crate) const SERVER_OAUTH_PROXY_STRIP_RESOURCE_PARAM_ENV: &str =
+    "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__STRIP_RESOURCE_PARAM";
 pub(crate) const OBSERVABILITY_LOG_FORMAT_ENV: &str = "RMCP_SERVER_KIT__OBSERVABILITY__LOG_FORMAT";
 pub(crate) const OBSERVABILITY_METRICS_ENABLED_ENV: &str =
     "RMCP_SERVER_KIT__OBSERVABILITY__METRICS_ENABLED";
@@ -567,6 +576,24 @@ impl ServerConfig {
             ));
             oauth.jwks_uri = raw;
         }
+        if let Some(raw) = oauth_env.proxy_strip_resource_param {
+            let value = parse_env_bool(SERVER_OAUTH_PROXY_STRIP_RESOURCE_PARAM_ENV, &raw)?;
+            // Fail closed, mirroring the parent-table rule above: this variable
+            // can only populate a field on an existing proxy, never create one,
+            // because `authorize_url`/`token_url`/`client_id` have no env source.
+            let Some(proxy) = oauth.proxy.as_mut() else {
+                return Err(RmcpServerKitError::Config(format!(
+                    "{SERVER_OAUTH_PROXY_STRIP_RESOURCE_PARAM_ENV} requires declaring \
+                     [server.auth.oauth.proxy] before applying env overrides"
+                )));
+            };
+            applied.push(env_report(
+                SERVER_OAUTH_PROXY_STRIP_RESOURCE_PARAM_ENV,
+                "server.auth.oauth.proxy.strip_resource_param",
+                raw,
+            ));
+            proxy.strip_resource_param = value;
+        }
         Ok(())
     }
 
@@ -840,6 +867,7 @@ struct OAuthEnvOverrides {
     issuer: Option<String>,
     audience: Option<String>,
     jwks_uri: Option<String>,
+    proxy_strip_resource_param: Option<String>,
 }
 
 impl OAuthEnvOverrides {
@@ -848,11 +876,15 @@ impl OAuthEnvOverrides {
             issuer: read_env(SERVER_OAUTH_ISSUER_ENV)?,
             audience: read_env(SERVER_OAUTH_AUDIENCE_ENV)?,
             jwks_uri: read_env(SERVER_OAUTH_JWKS_URI_ENV)?,
+            proxy_strip_resource_param: read_env(SERVER_OAUTH_PROXY_STRIP_RESOURCE_PARAM_ENV)?,
         })
     }
 
     fn is_set(&self) -> bool {
-        self.issuer.is_some() || self.audience.is_some() || self.jwks_uri.is_some()
+        self.issuer.is_some()
+            || self.audience.is_some()
+            || self.jwks_uri.is_some()
+            || self.proxy_strip_resource_param.is_some()
     }
 
     fn first_set_var(&self) -> &'static str {
@@ -860,6 +892,7 @@ impl OAuthEnvOverrides {
             self.issuer.as_deref(),
             self.audience.as_deref(),
             self.jwks_uri.as_deref(),
+            self.proxy_strip_resource_param.as_deref(),
         )
     }
 }
@@ -882,6 +915,7 @@ fn first_set_oauth_env(
     issuer: Option<&str>,
     audience: Option<&str>,
     jwks_uri: Option<&str>,
+    proxy_strip_resource_param: Option<&str>,
 ) -> &'static str {
     if issuer.is_some() {
         SERVER_OAUTH_ISSUER_ENV
@@ -889,6 +923,8 @@ fn first_set_oauth_env(
         SERVER_OAUTH_AUDIENCE_ENV
     } else if jwks_uri.is_some() {
         SERVER_OAUTH_JWKS_URI_ENV
+    } else if proxy_strip_resource_param.is_some() {
+        SERVER_OAUTH_PROXY_STRIP_RESOURCE_PARAM_ENV
     } else {
         SERVER_OAUTH_ISSUER_ENV
     }
@@ -2723,6 +2759,100 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn e5c_oauth_proxy_env_applies_to_declared_proxy() {
+        with_env_vars(
+            &[(SERVER_OAUTH_PROXY_STRIP_RESOURCE_PARAM_ENV, Some("true"))],
+            || {
+                let mut auth = crate::auth::AuthConfig::with_keys(vec![]);
+                auth.oauth = Some(crate::oauth::OAuthConfig {
+                    proxy: Some(
+                        crate::oauth::OAuthProxyConfig::builder(
+                            "https://idp.example/authorize",
+                            "https://idp.example/token",
+                            "mcp",
+                        )
+                        .build(),
+                    ),
+                    ..crate::oauth::OAuthConfig::default()
+                });
+                let mut cfg = ServerConfig {
+                    auth: Some(auth),
+                    ..ServerConfig::default()
+                };
+
+                let report = cfg.apply_env_overrides().unwrap();
+                let proxy = cfg
+                    .auth
+                    .as_ref()
+                    .and_then(|auth| auth.oauth.as_ref())
+                    .and_then(|oauth| oauth.proxy.as_ref())
+                    .unwrap();
+                assert!(proxy.strip_resource_param);
+                assert_eq!(report.len(), 1);
+                assert_eq!(
+                    report[0].env_var,
+                    SERVER_OAUTH_PROXY_STRIP_RESOURCE_PARAM_ENV
+                );
+            },
+        );
+    }
+
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn e5d_oauth_proxy_env_without_declared_proxy_fails_closed() {
+        // The var can only populate a field on an existing proxy: the three
+        // required proxy fields have no env source, so creating one here would
+        // yield a half-configured proxy.
+        with_env_vars(
+            &[(SERVER_OAUTH_PROXY_STRIP_RESOURCE_PARAM_ENV, Some("true"))],
+            || {
+                let mut auth = crate::auth::AuthConfig::with_keys(vec![]);
+                auth.oauth = Some(crate::oauth::OAuthConfig::default());
+                let mut cfg = ServerConfig {
+                    auth: Some(auth),
+                    ..ServerConfig::default()
+                };
+
+                let err = cfg.apply_env_overrides().unwrap_err();
+                let msg = err.to_string();
+                assert!(msg.contains(SERVER_OAUTH_PROXY_STRIP_RESOURCE_PARAM_ENV));
+                assert!(msg.contains("[server.auth.oauth.proxy]"));
+            },
+        );
+    }
+
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn e5e_oauth_proxy_env_rejects_non_bool() {
+        with_env_vars(
+            &[(SERVER_OAUTH_PROXY_STRIP_RESOURCE_PARAM_ENV, Some("maybe"))],
+            || {
+                let mut auth = crate::auth::AuthConfig::with_keys(vec![]);
+                auth.oauth = Some(crate::oauth::OAuthConfig {
+                    proxy: Some(
+                        crate::oauth::OAuthProxyConfig::builder(
+                            "https://idp.example/authorize",
+                            "https://idp.example/token",
+                            "mcp",
+                        )
+                        .build(),
+                    ),
+                    ..crate::oauth::OAuthConfig::default()
+                });
+                let mut cfg = ServerConfig {
+                    auth: Some(auth),
+                    ..ServerConfig::default()
+                };
+
+                let msg = cfg.apply_env_overrides().unwrap_err().to_string();
+                assert!(msg.contains(SERVER_OAUTH_PROXY_STRIP_RESOURCE_PARAM_ENV));
+                assert!(msg.contains("bool"));
+            },
+        );
+    }
+
     #[test]
     fn e9_bad_observability_bool_env_fails_closed() {
         with_env_vars(
@@ -2872,7 +3002,7 @@ mod tests {
     }
 
     #[test]
-    fn env_override_spec_contains_exact_eighteen_vars() {
+    fn env_override_spec_matches_expected_set() {
         let vars = ENV_OVERRIDE_SPECS
             .iter()
             .map(|spec| {
@@ -2956,6 +3086,12 @@ mod tests {
         (
             SERVER_OAUTH_JWKS_URI_ENV,
             "server.auth.oauth.jwks_uri",
+            Some("oauth"),
+            false,
+        ),
+        (
+            SERVER_OAUTH_PROXY_STRIP_RESOURCE_PARAM_ENV,
+            "server.auth.oauth.proxy.strip_resource_param",
             Some("oauth"),
             false,
         ),

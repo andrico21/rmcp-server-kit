@@ -97,6 +97,35 @@ release (`cargo semver-checks`); runtime behaviour changes are noted below.
   `#[cfg_attr(not(feature = ...), allow(unused_variables, reason = ...))]` idiom
   already used by `unauthorized_response`.
 
+### Added
+
+- **`OAuthProxyConfig::strip_resource_param` — opt-in workaround for Microsoft
+  Entra ID ([#17](https://github.com/andrico21/rmcp-server-kit/issues/17)).**
+  Entra v2.0 rejects an RFC 8707 `resource` parameter carried alongside a
+  differing `api://` scope with `AADSTS9010010`, but MCP clients send `resource`
+  because the MCP specification requires it — so an Entra-backed proxy could not
+  complete an authorization-code flow without hand-rolling a replacement proxy.
+
+  Set `strip_resource_param = true` to drop `resource` when forwarding
+  `/authorize` and `/token` upstream. **Default `false`**, which preserves spec
+  behaviour.
+
+  Deliberately a narrow boolean rather than a general parameter strip-list: a
+  free-form list would let an operator strip `code_challenge`/`code_verifier`
+  (silently disabling PKCE) or `state` (enabling CSRF). Only `resource` is ever
+  dropped; `response_type`, `redirect_uri`, `state`, `code_challenge`,
+  `code_challenge_method`, `nonce`, `scope`, `grant_type`, `code`, and
+  `refresh_token` are always forwarded. The comparison happens post-decode, so
+  `%72esource` cannot smuggle the parameter through. The `/introspect` and
+  `/revoke` proxy path is unaffected — `resource` is not a parameter of RFC 7662
+  or RFC 7009 requests.
+
+  Configurable via TOML (`[server.auth.oauth.proxy] strip_resource_param`), the
+  builder (`OAuthProxyConfigBuilder::strip_resource_param`), or the environment
+  (`RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__STRIP_RESOURCE_PARAM`). The env
+  override fails closed when `[server.auth.oauth.proxy]` is not declared, since
+  the three required proxy fields have no env source.
+
 ### Changed
 
 - `tool_hooks::with_hooks` is now `#[must_use]`. Dropping the returned

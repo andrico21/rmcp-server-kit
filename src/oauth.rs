@@ -1730,6 +1730,10 @@ impl fmt::Debug for ExchangedToken {
 /// server and perform a standard Authorization Code + PKCE flow.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "flat TOML sub-table of independent operator toggles; collapsing them into an enum would break both the public API and the deserialized schema"
+)]
 #[non_exhaustive]
 pub struct OAuthProxyConfig {
     /// Upstream authorization endpoint (e.g.
@@ -1784,6 +1788,28 @@ pub struct OAuthProxyConfig {
     /// `require_auth_on_admin_endpoints = true`.
     #[serde(default)]
     pub allow_unauthenticated_admin_endpoints: bool,
+    /// Drop the RFC 8707 `resource` parameter from proxied `/authorize`
+    /// and `/token` requests before forwarding them upstream.
+    ///
+    /// **Default: `false`**, which forwards the parameter unchanged and is
+    /// the spec-preserving behaviour.
+    ///
+    /// Set this to `true` for Microsoft Entra ID (Azure AD) v2.0, which
+    /// rejects a `resource` parameter carried alongside a differing
+    /// `api://` scope with error `AADSTS9010010`. MCP clients send
+    /// `resource` because the MCP specification requires it, so without
+    /// this opt-out an Entra-backed proxy cannot complete an
+    /// authorization-code flow.
+    ///
+    /// Only `resource` is ever dropped. Parameters that carry security
+    /// meaning -- `state`, `code_challenge`, `code_challenge_method`,
+    /// `code_verifier`, `redirect_uri`, `nonce`, `scope` -- are always
+    /// forwarded, so enabling this cannot silently disable PKCE or CSRF
+    /// protection. The upstream `/introspect` and `/revoke` proxy path is
+    /// unaffected: `resource` is not a parameter of RFC 7662 or RFC 7009
+    /// requests.
+    #[serde(default)]
+    pub strip_resource_param: bool,
 }
 
 impl OAuthProxyConfig {
@@ -1868,6 +1894,15 @@ impl OAuthProxyConfigBuilder {
     /// [`OAuthProxyConfig::allow_unauthenticated_admin_endpoints`].
     pub const fn allow_unauthenticated_admin_endpoints(mut self, allow: bool) -> Self {
         self.inner.allow_unauthenticated_admin_endpoints = allow;
+        self
+    }
+
+    /// Drop the RFC 8707 `resource` parameter when proxying `/authorize`
+    /// and `/token` upstream. Required for Microsoft Entra v2.0
+    /// (`AADSTS9010010`). See
+    /// [`OAuthProxyConfig::strip_resource_param`].
+    pub const fn strip_resource_param(mut self, strip: bool) -> Self {
+        self.inner.strip_resource_param = strip;
         self
     }
 
@@ -3244,7 +3279,8 @@ pub fn handle_authorize(proxy: &OAuthProxyConfig, query: &str) -> axum::response
     };
 
     // Replace the client_id in the query with the upstream client_id.
-    let upstream_query = rewrite_client_auth_params(query, &proxy.client_id);
+    let upstream_query =
+        rewrite_client_auth_params(query, &proxy.client_id, proxy.strip_resource_param);
     let redirect_url = format!("{}?{upstream_query}", proxy.authorize_url);
 
     (StatusCode::FOUND, [(header::LOCATION, redirect_url)]).into_response()
@@ -3270,7 +3306,8 @@ pub async fn handle_token(
     };
 
     // Replace client_id in the form body with the upstream client_id.
-    let mut upstream_body = rewrite_client_auth_params(body, &proxy.client_id);
+    let mut upstream_body =
+        rewrite_client_auth_params(body, &proxy.client_id, proxy.strip_resource_param);
 
     // For confidential clients, inject the client_secret.
     if let Some(ref secret) = proxy.client_secret {
@@ -3414,7 +3451,10 @@ async fn proxy_oauth_admin_request(
         response::IntoResponse,
     };
 
-    let mut upstream_body = rewrite_client_auth_params(body, &proxy.client_id);
+    // `false`: `resource` is not a parameter of RFC 7662 introspection or
+    // RFC 7009 revocation requests, so the strip flag -- which exists purely
+    // to satisfy Entra's authorization-code flow -- must not reach this path.
+    let mut upstream_body = rewrite_client_auth_params(body, &proxy.client_id, false);
     if let Some(ref secret) = proxy.client_secret {
         use std::fmt::Write;
 
@@ -3946,10 +3986,20 @@ const CLIENT_AUTH_PARAMS: [&str; 4] = [
 /// (OAuth permits repeated `scope` / `resource`). The raw byte encoding is *not*
 /// preserved: `form_urlencoded` normalizes `+` and percent-escapes on
 /// re-serialization, which is semantically equivalent for form data.
-fn rewrite_client_auth_params(params: &str, upstream_client_id: &str) -> String {
+fn rewrite_client_auth_params(
+    params: &str,
+    upstream_client_id: &str,
+    strip_resource: bool,
+) -> String {
     let mut out = url::form_urlencoded::Serializer::new(String::new());
     for (key, value) in url::form_urlencoded::parse(params.as_bytes()) {
         if CLIENT_AUTH_PARAMS.contains(&key.as_ref()) {
+            continue;
+        }
+        // SECURITY: `resource` is the ONLY caller parameter this flag drops.
+        // Comparison happens post-decode, so `%72esource` cannot smuggle past
+        // it -- the same property that protects CLIENT_AUTH_PARAMS above.
+        if strip_resource && key.as_ref() == "resource" {
             continue;
         }
         out.append_pair(&key, &value);
@@ -3987,7 +4037,7 @@ mod tests {
 
     #[test]
     fn rewrite_drops_percent_encoded_client_id_key() {
-        let out = rewrite_client_auth_params("%63lient_id=attacker&scope=read", "proxy-id");
+        let out = rewrite_client_auth_params("%63lient_id=attacker&scope=read", "proxy-id", false);
         let pairs = decoded_pairs(&out);
         let client_ids: Vec<&String> = pairs
             .iter()
@@ -3999,7 +4049,7 @@ mod tests {
 
     #[test]
     fn rewrite_drops_underscore_encoded_client_id_key() {
-        let out = rewrite_client_auth_params("client%5Fid=attacker&scope=read", "proxy-id");
+        let out = rewrite_client_auth_params("client%5Fid=attacker&scope=read", "proxy-id", false);
         let pairs = decoded_pairs(&out);
         assert!(
             !pairs.iter().any(|(_, v)| v == "attacker"),
@@ -4009,8 +4059,11 @@ mod tests {
 
     #[test]
     fn rewrite_drops_caller_supplied_client_secret() {
-        let out =
-            rewrite_client_auth_params("client_secret=attacker-secret&scope=read", "proxy-id");
+        let out = rewrite_client_auth_params(
+            "client_secret=attacker-secret&scope=read",
+            "proxy-id",
+            false,
+        );
         let pairs = decoded_pairs(&out);
         assert!(
             !pairs.iter().any(|(k, _)| k == "client_secret"),
@@ -4023,6 +4076,7 @@ mod tests {
         let out = rewrite_client_auth_params(
             "client_assertion=ey.evil&client_assertion_type=urn:evil&scope=read",
             "proxy-id",
+            false,
         );
         let pairs = decoded_pairs(&out);
         assert!(
@@ -4035,7 +4089,8 @@ mod tests {
 
     #[test]
     fn rewrite_collapses_duplicate_client_id_to_proxy_value() {
-        let out = rewrite_client_auth_params("client_id=a&client_id=b&scope=read", "proxy-id");
+        let out =
+            rewrite_client_auth_params("client_id=a&client_id=b&scope=read", "proxy-id", false);
         let pairs = decoded_pairs(&out);
         let client_ids: Vec<&String> = pairs
             .iter()
@@ -4050,6 +4105,7 @@ mod tests {
         let out = rewrite_client_auth_params(
             "scope=read&resource=a&state=xyz&resource=b&code_verifier=v",
             "proxy-id",
+            false,
         );
         let pairs = decoded_pairs(&out);
         let non_client: Vec<(String, String)> = pairs
@@ -4069,12 +4125,81 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_strips_every_resource_param_when_enabled() {
+        // Issue #17: Entra rejects `resource` alongside a differing api://
+        // scope (AADSTS9010010). All occurrences must go, and everything else
+        // must survive in order.
+        let out = rewrite_client_auth_params(
+            "scope=read&resource=a&state=xyz&resource=b&code_verifier=v",
+            "proxy-id",
+            true,
+        );
+        let non_client: Vec<(String, String)> = decoded_pairs(&out)
+            .into_iter()
+            .filter(|(k, _)| k != "client_id")
+            .collect();
+        assert_eq!(
+            non_client,
+            vec![
+                ("scope".to_owned(), "read".to_owned()),
+                ("state".to_owned(), "xyz".to_owned()),
+                ("code_verifier".to_owned(), "v".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn rewrite_strips_percent_encoded_resource_key() {
+        // The strip filter compares post-decode, so an encoded key cannot
+        // smuggle `resource` upstream -- same property that protects
+        // CLIENT_AUTH_PARAMS.
+        let out = rewrite_client_auth_params("%72esource=sneaky&scope=read", "proxy-id", true);
+        let pairs = decoded_pairs(&out);
+        assert!(
+            !pairs.iter().any(|(k, _)| k == "resource"),
+            "percent-encoded resource survived: {pairs:?}"
+        );
+        assert!(pairs.contains(&("scope".to_owned(), "read".to_owned())));
+    }
+
+    #[test]
+    fn rewrite_never_strips_security_params_when_resource_stripping_enabled() {
+        // SECURITY: stripping must never reach PKCE, CSRF, or redirect
+        // binding. If this ever fails, an operator enabling the Entra
+        // workaround would silently lose those protections.
+        let input = "response_type=code&redirect_uri=https%3A%2F%2Fapp%2Fcb&state=s1\
+                     &code_challenge=cc&code_challenge_method=S256&nonce=n1&scope=read\
+                     &code_verifier=cv&grant_type=authorization_code&code=abc\
+                     &refresh_token=rt&resource=https%3A%2F%2Fapi";
+        let pairs = decoded_pairs(&rewrite_client_auth_params(input, "proxy-id", true));
+        for key in [
+            "response_type",
+            "redirect_uri",
+            "state",
+            "code_challenge",
+            "code_challenge_method",
+            "nonce",
+            "scope",
+            "code_verifier",
+            "grant_type",
+            "code",
+            "refresh_token",
+        ] {
+            assert!(
+                pairs.iter().any(|(k, _)| k == key),
+                "{key} must never be stripped: {pairs:?}"
+            );
+        }
+        assert!(!pairs.iter().any(|(k, _)| k == "resource"));
+    }
+
+    #[test]
     fn rewrite_roundtrips_values_with_special_characters() {
         let input = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("state", "a&b=c+d")
             .append_pair("scope", "réad ✓")
             .finish();
-        let out = rewrite_client_auth_params(&input, "proxy-id");
+        let out = rewrite_client_auth_params(&input, "proxy-id", false);
         let pairs = decoded_pairs(&out);
         assert!(pairs.contains(&("state".to_owned(), "a&b=c+d".to_owned())));
         assert!(pairs.contains(&("scope".to_owned(), "réad ✓".to_owned())));
@@ -4082,7 +4207,7 @@ mod tests {
 
     #[test]
     fn rewrite_injects_client_id_when_absent() {
-        let out = rewrite_client_auth_params("scope=read", "proxy-id");
+        let out = rewrite_client_auth_params("scope=read", "proxy-id", false);
         assert!(decoded_pairs(&out).contains(&("client_id".to_owned(), "proxy-id".to_owned())));
     }
 
@@ -7306,6 +7431,7 @@ role = "admin"
             expose_admin_endpoints: false,
             require_auth_on_admin_endpoints: false,
             allow_unauthenticated_admin_endpoints: false,
+            strip_resource_param: false,
         }
     }
 

@@ -1270,6 +1270,7 @@ introspection_url = "https://auth.example.com/oauth/introspect"
 revocation_url = "https://auth.example.com/oauth/revoke"
 expose_admin_endpoints = true
 require_auth_on_admin_endpoints = true                   # recommended for new deployments
+strip_resource_param = false                             # set true for Microsoft Entra v2.0
 ```
 
 | Field | Type | Default | Description |
@@ -1283,6 +1284,7 @@ require_auth_on_admin_endpoints = true                   # recommended for new d
 | `expose_admin_endpoints` | `bool` | `false` | Mount `/introspect` and `/revoke`, and advertise them in the authorization-server metadata document. When `false` both endpoints return 404. |
 | `require_auth_on_admin_endpoints` | `bool` | `false` | Run the normal authentication middleware before `/introspect` and `/revoke`. **Recommended `true` for new deployments.** Pre-1.6 default of `false` is preserved for backward compatibility. |
 | `allow_unauthenticated_admin_endpoints` | `bool` | `false` | Operator opt-out for the M3 startup check that rejects `expose_admin_endpoints = true` combined with `require_auth_on_admin_endpoints = false`. Set `true` only when an authenticated reverse proxy / ingress screens `/introspect` and `/revoke` itself. Production should leave this `false` and set `require_auth_on_admin_endpoints = true` instead. |
+| `strip_resource_param` | `bool` | `false` | Drop the RFC 8707 `resource` parameter when forwarding `/authorize` and `/token` upstream. Set `true` for **Microsoft Entra ID (Azure AD) v2.0**, which rejects `resource` carried alongside a differing `api://` scope with `AADSTS9010010`; MCP clients send it because the MCP spec requires it. Only `resource` is ever dropped -- `state`, `code_challenge`, `code_challenge_method`, `code_verifier`, `redirect_uri`, `nonce`, and `scope` are always forwarded, so this cannot disable PKCE or CSRF protection. `/introspect` and `/revoke` are unaffected. Env: `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__STRIP_RESOURCE_PARAM`. |
 
 #### `TokenExchangeConfig` (optional)
 
@@ -2309,6 +2311,18 @@ role = "admin"
 scope = "mcp:read"
 role = "viewer"
 
+# Optional OAuth 2.1 proxy: exposes /authorize, /token, /register on this
+# server and forwards them to the upstream IdP.
+[server.auth.oauth.proxy]
+authorize_url = "https://auth.example.com/authorize"
+token_url = "https://auth.example.com/token"
+client_id = "my-mcp-server"
+# Drop the RFC 8707 `resource` parameter when forwarding /authorize and
+# /token upstream. Required for Microsoft Entra v2.0, which rejects it
+# alongside a differing api:// scope (AADSTS9010010). Leave false to
+# preserve spec behaviour. Never strips PKCE/state/redirect_uri.
+strip_resource_param = false  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__STRIP_RESOURCE_PARAM
+
 [rbac]
 enabled = true
 # Optional: stable HMAC key used to redact argument values in deny logs.
@@ -2447,6 +2461,7 @@ call order is:
 | `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ISSUER` | `server.auth.oauth.issuer` | String | requires `oauth` feature |
 | `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__AUDIENCE` | `server.auth.oauth.audience` | String | requires `oauth` feature |
 | `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__JWKS_URI` | `server.auth.oauth.jwks_uri` | String | requires `oauth` feature |
+| `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__STRIP_RESOURCE_PARAM` | `server.auth.oauth.proxy.strip_resource_param` | bool | requires `oauth` feature; also requires `[server.auth.oauth.proxy]` to be declared |
 | `RMCP_SERVER_KIT__OBSERVABILITY__LOG_FORMAT` | `observability.log_format` | String | |
 | `RMCP_SERVER_KIT__OBSERVABILITY__METRICS_ENABLED` | `observability.metrics_enabled` | bool | |
 | `RMCP_SERVER_KIT__OBSERVABILITY__METRICS_BIND` | `observability.metrics_bind` | String | |
