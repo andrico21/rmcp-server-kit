@@ -131,6 +131,8 @@ fn oauth_internal_suffix_blocked(
 /// callers go through [`screen_oauth_target`], which hardcodes
 /// `test_allow_loopback_ssrf = false`; the test-only bypass wrapper is
 /// [`screen_oauth_target_with_test_override`].
+// cancel-safe: performs DNS resolution and pure screening, publishing no
+// shared state; cancellation just discards the verdict.
 async fn screen_oauth_target_core(
     url: &str,
     allow_http: bool,
@@ -861,8 +863,12 @@ pub struct OAuthConfig {
     /// signing keys (forging arbitrary tokens), or MITM the token / proxy
     /// endpoints to steal credentials and codes. Enable only for
     /// development against a local `IdP` without TLS, ideally bound to
-    /// `127.0.0.1`. JWKS-cache redirects to non-HTTPS targets are still
-    /// rejected even when this flag is `true`.
+    /// `127.0.0.1`.
+    ///
+    /// Redirect handling when this flag is `true`: an HTTPS → HTTP
+    /// *downgrade* is always rejected, but an HTTP → HTTP redirect is
+    /// permitted (the target must still pass SSRF screening). When the flag
+    /// is `false`, every non-HTTPS redirect target is rejected.
     #[serde(default)]
     pub allow_http_oauth_urls: bool,
     /// Operator-trusted SSRF allowlist for OAuth/JWKS targets.
@@ -1876,19 +1882,92 @@ impl OAuthProxyConfigBuilder {
 // JWKS cache
 // ---------------------------------------------------------------------------
 
+/// Key-type family used to decide which JWS algorithms an `alg`-less JWK may
+/// verify.
+///
+/// RFC 7517 4.4 makes the JWK `alg` member OPTIONAL, and real issuers omit it
+/// (Microsoft Entra v2.0 publishes every signing key without `alg`). When it is
+/// absent the algorithm is inferred from the key material instead, so the key
+/// stays usable without ever consulting the untrusted token header.
+///
+/// **`P-521`/`ES512` is deliberately absent.** `jsonwebtoken` 11's
+/// `Algorithm` enum has no `ES512` variant at all -- it defines only `ES256`
+/// and `ES384` for ECDSA -- so a `P-521` family could not name an algorithm to
+/// map to. It is likewise absent from [`ACCEPTED_ALGS`]. Supporting P-521 would
+/// require upstream `jsonwebtoken` support first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JwkKeyFamily {
+    /// RSA key: any RSASSA-PKCS1-v1_5 or RSASSA-PSS algorithm.
+    Rsa,
+    /// NIST P-256 EC key: `ES256` only.
+    EcP256,
+    /// NIST P-384 EC key: `ES384` only.
+    EcP384,
+    /// Ed25519 octet key pair: `EdDSA` only.
+    Ed25519,
+}
+
+/// How a cached JWK constrains the JWS algorithm it may verify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JwkAlg {
+    /// The JWK declared `alg`; exactly that algorithm is accepted.
+    Explicit(Algorithm),
+    /// The JWK omitted `alg`; the algorithms implied by its key type are
+    /// accepted (see [`family_accepts`]).
+    Family(JwkKeyFamily),
+}
+
+impl JwkAlg {
+    /// Whether this cached key may verify a token whose header declares `alg`.
+    ///
+    /// SECURITY: the candidate `alg` has already been screened against
+    /// [`ACCEPTED_ALGS`] before key lookup, so `HS*` and `none` can never reach
+    /// here. This is the second, key-bound half of that check: it prevents a
+    /// token from selecting a key whose material cannot produce its algorithm.
+    fn accepts(self, alg: Algorithm) -> bool {
+        match self {
+            Self::Explicit(declared) => declared == alg,
+            Self::Family(family) => family_accepts(family, alg),
+        }
+    }
+}
+
+/// Algorithms an `alg`-less JWK of the given family may verify.
+///
+/// INVARIANT: every algorithm returned here is a member of [`ACCEPTED_ALGS`];
+/// `family_accepts_is_subset_of_accepted_algs` locks that down. Widening this
+/// beyond [`ACCEPTED_ALGS`] would let an inferred key bypass the pre-lookup
+/// algorithm screen.
+const fn family_accepts(family: JwkKeyFamily, alg: Algorithm) -> bool {
+    match family {
+        JwkKeyFamily::Rsa => matches!(
+            alg,
+            Algorithm::RS256
+                | Algorithm::RS384
+                | Algorithm::RS512
+                | Algorithm::PS256
+                | Algorithm::PS384
+                | Algorithm::PS512
+        ),
+        JwkKeyFamily::EcP256 => matches!(alg, Algorithm::ES256),
+        JwkKeyFamily::EcP384 => matches!(alg, Algorithm::ES384),
+        JwkKeyFamily::Ed25519 => matches!(alg, Algorithm::EdDSA),
+    }
+}
+
 /// `kid`-indexed map of (algorithm, decoding key) pairs plus a list of
 /// unnamed keys. Produced by [`build_key_cache`] and consumed by
 /// [`JwksCache::refresh_inner`].
 type JwksKeyCache = (
-    HashMap<String, (Algorithm, DecodingKey)>,
-    Vec<(Algorithm, DecodingKey)>,
+    HashMap<String, (JwkAlg, DecodingKey)>,
+    Vec<(JwkAlg, DecodingKey)>,
 );
 
 struct CachedKeys {
-    /// `kid` -> (Algorithm, `DecodingKey`)
-    keys: HashMap<String, (Algorithm, DecodingKey)>,
+    /// `kid` -> (`JwkAlg`, `DecodingKey`)
+    keys: HashMap<String, (JwkAlg, DecodingKey)>,
     /// Keys without a kid, indexed by algorithm family.
-    unnamed_keys: Vec<(Algorithm, DecodingKey)>,
+    unnamed_keys: Vec<(JwkAlg, DecodingKey)>,
     fetched_at: Instant,
     ttl: Duration,
 }
@@ -2271,6 +2350,10 @@ impl JwksCache {
     // failure is observable. Collapsing them into a combinator chain
     // would lose those structured-field log sites without reducing
     // real cognitive load.
+    // NOT cancel-safe: on a cache miss this delegates to `find_key`, which can
+    // enter `refresh_with_cooldown`. That commits `last_refresh_attempt` before
+    // fetching, so a cancellation mid-refresh still consumes the cooldown slot
+    // and the next caller may be refused a refresh for the cooldown window.
     #[allow(
         clippy::cognitive_complexity,
         reason = "each failure arm pairs `cold_path()` with a distinct `tracing::debug!` site for observability; collapsing into combinators would lose structured-field log sites without reducing real complexity"
@@ -2351,14 +2434,35 @@ impl JwksCache {
             }
         }
         core::hint::cold_path();
+        self.log_audience_mismatch(claims);
+        Err(JwtValidationFailure::Invalid)
+    }
+
+    /// Log an audience-mismatch rejection.
+    ///
+    /// The token's own claim values (`aud`, `azp`) are gated behind the
+    /// operator diagnostic switch, matching `log_exchanged_token`.
+    /// `expected` and `mode` are local configuration rather than token
+    /// material, so they stay visible for debuggability.
+    fn log_audience_mismatch(&self, claims: &Claims) {
+        let expose = crate::diagnostics::oauth_claim_values();
+        let aud = if expose {
+            claims.aud.log_display()
+        } else {
+            "[REDACTED]".to_owned()
+        };
+        let azp = if expose {
+            claims.azp.as_deref().unwrap_or("-")
+        } else {
+            "[REDACTED]"
+        };
         tracing::debug!(
-            aud = %claims.aud.log_display(),
-            azp = claims.azp.as_deref().unwrap_or("-"),
+            aud = %aud,
+            azp = azp,
             expected = %self.expected_audience,
             mode = self.audience_mode.as_str(),
             "JWT rejected: audience mismatch"
         );
-        Err(JwtValidationFailure::Invalid)
     }
 
     /// Resolve the role for this token.
@@ -2653,6 +2757,43 @@ fn truncate_kid_for_log(kid: &str) -> (String, bool) {
     (format!("{head}...(truncated)"), true)
 }
 
+/// Render a JWK's `kid` for logging, bounded, with a placeholder when absent.
+fn jwk_kid_for_log(jwk: &jsonwebtoken::jwk::Jwk) -> (String, bool) {
+    jwk.common
+        .key_id
+        .as_deref()
+        .map_or_else(|| ("<no-kid>".to_owned(), false), truncate_kid_for_log)
+}
+
+/// Classify a single JWK into a cacheable (algorithm-constraint, key) pair.
+///
+/// Returns `None` for every fail-closed case: a key whose declared `use`/
+/// `key_ops` forbid signature verification, a key `jsonwebtoken` cannot decode,
+/// and a key whose algorithm can be neither read nor inferred.
+fn classify_jwk(jwk: &jsonwebtoken::jwk::Jwk) -> Option<(JwkAlg, DecodingKey)> {
+    if !jwk_permits_signature_verification(jwk) {
+        let (kid_log, kid_truncated) = jwk_kid_for_log(jwk);
+        tracing::debug!(
+            kid = %kid_log,
+            kid_truncated,
+            "skipping JWKS key not permitted for signature verification (use/key_ops)"
+        );
+        return None;
+    }
+    let decoding_key = DecodingKey::from_jwk(jwk).ok()?;
+    let alg = jwk_algorithm(jwk)?;
+    if let JwkAlg::Family(family) = alg {
+        let (kid_log, kid_truncated) = jwk_kid_for_log(jwk);
+        tracing::debug!(
+            kid = %kid_log,
+            kid_truncated,
+            family = ?family,
+            "JWKS key omits `alg`; inferring permitted algorithms from key type (RFC 7517 4.4)"
+        );
+    }
+    Some((alg, decoding_key))
+}
+
 fn build_key_cache(jwks: &JwkSet, max_keys: usize) -> Result<JwksKeyCache, String> {
     if jwks.keys.len() > max_keys {
         return Err(format!(
@@ -2664,10 +2805,7 @@ fn build_key_cache(jwks: &JwkSet, max_keys: usize) -> Result<JwksKeyCache, Strin
     let mut keys = HashMap::new();
     let mut unnamed_keys = Vec::new();
     for jwk in &jwks.keys {
-        let Ok(decoding_key) = DecodingKey::from_jwk(jwk) else {
-            continue;
-        };
-        let Some(alg) = jwk_algorithm(jwk) else {
+        let Some((alg, decoding_key)) = classify_jwk(jwk) else {
             continue;
         };
         if let Some(ref kid) = jwk.common.key_id {
@@ -2694,27 +2832,70 @@ fn lookup_key(cached: &CachedKeys, kid: Option<&str>, alg: Algorithm) -> Option<
         // present an unknown `kid` and be validated against an unrelated
         // unnamed key of the same algorithm (L4, fail-closed key selection).
         if let Some((cached_alg, key)) = cached.keys.get(kid)
-            && *cached_alg == alg
+            && cached_alg.accepts(alg)
         {
             return Some(key.clone());
         }
         return None;
     }
-    // No `kid`: fall back to any unnamed key matching the algorithm.
+    // No `kid`: fall back to any unnamed key that permits this algorithm.
     cached
         .unnamed_keys
         .iter()
-        .find(|(a, _)| *a == alg)
+        .find(|(a, _)| a.accepts(alg))
         .map(|(_, k)| k.clone())
 }
 
-/// Extract the algorithm from a JWK's common parameters.
+/// Whether a JWK is permitted to act as a JWT **signature verification**
+/// key, per its declared intent.
+///
+/// SECURITY (key-use separation, RFC 7517 4.2/4.3): `DecodingKey::from_jwk`
+/// does NOT enforce `use` or `key_ops`, so without this gate an issuer that
+/// publishes signing and encryption keys in one JWKS would have its
+/// encryption keys silently accepted as verification keys. Anyone holding
+/// such a key's private half could then mint tokens this server trusts.
+///
+/// Both parameters are optional; absent means unconstrained and is accepted
+/// (RFC 7517 says `use` is optional unless the application requires it).
+/// When present they are enforced fail-closed.
+fn jwk_permits_signature_verification(jwk: &jsonwebtoken::jwk::Jwk) -> bool {
+    use jsonwebtoken::jwk::{KeyOperations, PublicKeyUse};
+
+    let use_ok = match jwk.common.public_key_use {
+        None | Some(PublicKeyUse::Signature) => true,
+        Some(PublicKeyUse::Encryption | PublicKeyUse::Other(_)) => false,
+    };
+    // RFC 7517 4.3: when key_ops is present it enumerates the permitted
+    // operations exhaustively, so a key without "verify" must be refused.
+    let ops_ok = jwk
+        .common
+        .key_operations
+        .as_ref()
+        .is_none_or(|ops| ops.contains(&KeyOperations::Verify));
+
+    use_ok && ops_ok
+}
+
+/// Determine how a JWK constrains the algorithms it may verify.
+///
+/// An explicit `alg` pins exactly one algorithm (unchanged behaviour). When
+/// `alg` is absent -- which RFC 7517 4.4 explicitly permits, and which Entra
+/// v2.0 always does -- the key type implies the family instead. Returning
+/// `None` drops the key, so unknown or symmetric key types stay fail-closed.
+fn jwk_algorithm(jwk: &jsonwebtoken::jwk::Jwk) -> Option<JwkAlg> {
+    match jwk.common.key_algorithm {
+        Some(declared) => explicit_jwk_algorithm(declared).map(JwkAlg::Explicit),
+        None => infer_jwk_family(jwk).map(JwkAlg::Family),
+    }
+}
+
+/// Map a declared JWK `alg` onto a supported JWS algorithm.
 #[allow(
     clippy::wildcard_enum_match_arm,
     reason = "jsonwebtoken KeyAlgorithm is a large external enum; only the JWT-signing variants are mappable to `Algorithm`"
 )]
-fn jwk_algorithm(jwk: &jsonwebtoken::jwk::Jwk) -> Option<Algorithm> {
-    jwk.common.key_algorithm.and_then(|ka| match ka {
+fn explicit_jwk_algorithm(declared: jsonwebtoken::jwk::KeyAlgorithm) -> Option<Algorithm> {
+    match declared {
         jsonwebtoken::jwk::KeyAlgorithm::RS256 => Some(Algorithm::RS256),
         jsonwebtoken::jwk::KeyAlgorithm::RS384 => Some(Algorithm::RS384),
         jsonwebtoken::jwk::KeyAlgorithm::RS512 => Some(Algorithm::RS512),
@@ -2725,7 +2906,37 @@ fn jwk_algorithm(jwk: &jsonwebtoken::jwk::Jwk) -> Option<Algorithm> {
         jsonwebtoken::jwk::KeyAlgorithm::PS512 => Some(Algorithm::PS512),
         jsonwebtoken::jwk::KeyAlgorithm::EdDSA => Some(Algorithm::EdDSA),
         _ => None,
-    })
+    }
+}
+
+/// Infer the algorithm family of a JWK that omitted `alg`, from its key type.
+///
+/// SECURITY: inference reads only the JWK's own key material, never the token
+/// header, so it cannot be steered by an attacker. `OctetKey` (symmetric) is
+/// deliberately never inferred -- an `HS*` secret must not become a
+/// verification key -- and `P-521` yields `None` because `jsonwebtoken` 11
+/// defines no `ES512` variant (its own `EllipticCurve::P521` doc notes the
+/// curve is unsupported by `ring`).
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "jsonwebtoken AlgorithmParameters and EllipticCurve are both #[non_exhaustive] external enums, so an exhaustive match is impossible; unmatched variants must fail closed to None"
+)]
+fn infer_jwk_family(jwk: &jsonwebtoken::jwk::Jwk) -> Option<JwkKeyFamily> {
+    use jsonwebtoken::jwk::{AlgorithmParameters, EllipticCurve};
+
+    match jwk.algorithm {
+        AlgorithmParameters::RSA(_) => Some(JwkKeyFamily::Rsa),
+        AlgorithmParameters::EllipticCurve(ref ec) => match ec.curve {
+            EllipticCurve::P256 => Some(JwkKeyFamily::EcP256),
+            EllipticCurve::P384 => Some(JwkKeyFamily::EcP384),
+            _ => None,
+        },
+        AlgorithmParameters::OctetKeyPair(ref okp) => match okp.curve {
+            EllipticCurve::Ed25519 => Some(JwkKeyFamily::Ed25519),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3044,6 +3255,10 @@ pub fn handle_authorize(proxy: &OAuthProxyConfig, query: &str) -> axum::response
 /// Forwards the request body (authorization code exchange or refresh token
 /// grant) to the upstream token endpoint, injecting client credentials
 /// when configured (confidential client). Returns the upstream response as-is.
+// NOT cancel-safe: once the upstream POST is in flight the authorization
+// code may be consumed or a token minted upstream. Cancelling between send
+// and response-forwarding loses the token while the grant is spent, so the
+// client must retry with a fresh code rather than replay this one.
 pub async fn handle_token(
     http: &OauthHttpClient,
     proxy: &OAuthProxyConfig,
@@ -3141,6 +3356,8 @@ pub fn handle_register(proxy: &OAuthProxyConfig, body: &serde_json::Value) -> se
 /// Forwards the request body to the upstream introspection endpoint,
 /// injecting client credentials when configured. Returns the upstream
 /// response as-is.  Requires `proxy.introspection_url` to be `Some`.
+// cancel-safe: introspection is a read-only upstream query; cancelling only
+// discards the answer and leaves no upstream state change.
 pub async fn handle_introspect(
     http: &OauthHttpClient,
     proxy: &OAuthProxyConfig,
@@ -3162,6 +3379,9 @@ pub async fn handle_introspect(
 /// injecting client credentials when configured. Returns the upstream
 /// response as-is (per RFC 7009, typically 200 with empty body).
 /// Requires `proxy.revocation_url` to be `Some`.
+// cancel-safe for security purposes: cancellation cannot un-revoke a token.
+// The caller may lose the confirmation response while the revocation still
+// takes effect upstream, which fails in the safe direction.
 pub async fn handle_revoke(
     http: &OauthHttpClient,
     proxy: &OAuthProxyConfig,
@@ -4548,6 +4768,212 @@ role = "admin"
     }
 
     #[test]
+    fn build_key_cache_rejects_keys_not_marked_for_signature_verification() {
+        // SECURITY (key-use separation, RFC 7517 4.2/4.3): DecodingKey::from_jwk
+        // ignores `use`/`key_ops`, so an issuer publishing an encryption key in
+        // the same JWKS must not have it accepted as a verification key.
+        let (_pem, jwks_json) = generate_test_keypair("enc-only");
+
+        let mut enc = jwks_json["keys"][0].clone();
+        enc["use"] = serde_json::json!("enc");
+        let jwks: JwkSet =
+            serde_json::from_value(serde_json::json!({ "keys": [enc] })).expect("jwks parses");
+        let (keys, unnamed) = build_key_cache(&jwks, 16).expect("under key cap");
+        assert!(
+            keys.is_empty(),
+            "use=enc key must not be a verification key"
+        );
+        assert!(unnamed.is_empty());
+
+        let mut wrap_only = jwks_json["keys"][0].clone();
+        wrap_only["key_ops"] = serde_json::json!(["wrapKey"]);
+        let jwks: JwkSet = serde_json::from_value(serde_json::json!({ "keys": [wrap_only] }))
+            .expect("jwks parses");
+        let (keys, unnamed) = build_key_cache(&jwks, 16).expect("under key cap");
+        assert!(keys.is_empty(), "key_ops without verify must be rejected");
+        assert!(unnamed.is_empty());
+    }
+
+    #[test]
+    fn build_key_cache_accepts_sig_and_unconstrained_keys() {
+        let (_pem, jwks_json) = generate_test_keypair("sig-key");
+
+        // Absent `use`/`key_ops` stays accepted (RFC 7517: both are optional).
+        let jwks: JwkSet = serde_json::from_value(jwks_json.clone()).expect("jwks parses");
+        let (keys, _) = build_key_cache(&jwks, 16).expect("under key cap");
+        assert!(keys.contains_key("sig-key"));
+
+        let mut sig = jwks_json["keys"][0].clone();
+        sig["use"] = serde_json::json!("sig");
+        sig["key_ops"] = serde_json::json!(["verify"]);
+        let jwks: JwkSet =
+            serde_json::from_value(serde_json::json!({ "keys": [sig] })).expect("jwks parses");
+        let (keys, _) = build_key_cache(&jwks, 16).expect("under key cap");
+        assert!(keys.contains_key("sig-key"));
+    }
+
+    // -- Issue #17: JWKS keys that omit the OPTIONAL `alg` member (RFC 7517 4.4) --
+    //
+    // Microsoft Entra v2.0 publishes every signing key without `alg`
+    // (verified against login.microsoftonline.com/common/discovery/v2.0/keys:
+    // 9 keys, 0 with `alg`, all kty=RSA use=sig). Requiring `alg` dropped every
+    // key and produced a silent, total authentication outage.
+
+    /// Strip the `alg` member from a generated fixture, reproducing Entra shape.
+    fn jwks_without_alg(jwks: &serde_json::Value) -> JwkSet {
+        let mut key = jwks["keys"][0].clone();
+        if let Some(obj) = key.as_object_mut() {
+            obj.remove("alg");
+        }
+        serde_json::from_value(serde_json::json!({ "keys": [key] })).expect("alg-less jwks parses")
+    }
+
+    #[test]
+    fn alg_less_rsa_key_is_cached_as_rsa_family() {
+        let (_pem, jwks_json) = generate_test_keypair("entra-kid");
+        let jwks = jwks_without_alg(&jwks_json);
+        assert!(
+            jwks.keys[0].common.key_algorithm.is_none(),
+            "fixture must omit `alg`"
+        );
+
+        let (keys, unnamed) = build_key_cache(&jwks, 16).expect("under key cap");
+        assert!(unnamed.is_empty());
+        let (cached_alg, _) = keys.get("entra-kid").expect("alg-less key must be cached");
+        assert_eq!(*cached_alg, JwkAlg::Family(JwkKeyFamily::Rsa));
+    }
+
+    #[test]
+    fn alg_less_rsa_key_accepts_rsa_family_and_rejects_others() {
+        let (_pem, jwks_json) = generate_test_keypair("entra-kid");
+        let cached = CachedKeys {
+            keys: build_key_cache(&jwks_without_alg(&jwks_json), 16)
+                .expect("under key cap")
+                .0,
+            unnamed_keys: vec![],
+            fetched_at: Instant::now(),
+            ttl: Duration::from_secs(300),
+        };
+
+        for alg in [
+            Algorithm::RS256,
+            Algorithm::RS384,
+            Algorithm::RS512,
+            Algorithm::PS256,
+            Algorithm::PS384,
+            Algorithm::PS512,
+        ] {
+            assert!(
+                lookup_key(&cached, Some("entra-kid"), alg).is_some(),
+                "{alg:?} is producible by an RSA key and must resolve"
+            );
+        }
+        // An RSA key cannot produce an EC signature.
+        assert!(lookup_key(&cached, Some("entra-kid"), Algorithm::ES256).is_none());
+        // The kid-strict rule still holds for inferred keys.
+        assert!(lookup_key(&cached, Some("unknown"), Algorithm::RS256).is_none());
+    }
+
+    #[test]
+    fn alg_less_key_never_accepts_hmac_algorithm_confusion() {
+        // Regression guard: the classic attack is to present alg=HS256 and use
+        // the issuer's PUBLIC RSA modulus as the HMAC secret. Family inference
+        // must never widen an RSA key to a symmetric algorithm. (ACCEPTED_ALGS
+        // also screens HS* before lookup; this asserts the key-bound layer.)
+        assert!(!family_accepts(JwkKeyFamily::Rsa, Algorithm::HS256));
+        assert!(!family_accepts(JwkKeyFamily::Rsa, Algorithm::HS384));
+        assert!(!family_accepts(JwkKeyFamily::Rsa, Algorithm::HS512));
+        assert!(!family_accepts(JwkKeyFamily::EcP256, Algorithm::HS256));
+        assert!(!family_accepts(JwkKeyFamily::Ed25519, Algorithm::HS256));
+    }
+
+    #[test]
+    fn family_accepts_is_subset_of_accepted_algs() {
+        // INVARIANT: family inference must never admit an algorithm that the
+        // pre-lookup `ACCEPTED_ALGS` screen would reject.
+        let every_alg = [
+            Algorithm::HS256,
+            Algorithm::HS384,
+            Algorithm::HS512,
+            Algorithm::RS256,
+            Algorithm::RS384,
+            Algorithm::RS512,
+            Algorithm::ES256,
+            Algorithm::ES384,
+            Algorithm::PS256,
+            Algorithm::PS384,
+            Algorithm::PS512,
+            Algorithm::EdDSA,
+        ];
+        for family in [
+            JwkKeyFamily::Rsa,
+            JwkKeyFamily::EcP256,
+            JwkKeyFamily::EcP384,
+            JwkKeyFamily::Ed25519,
+        ] {
+            for alg in every_alg {
+                if family_accepts(family, alg) {
+                    assert!(
+                        ACCEPTED_ALGS.contains(&alg),
+                        "{family:?} admits {alg:?}, which is outside ACCEPTED_ALGS"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_alg_still_pins_exactly_one_algorithm() {
+        // The JWK declares RS256, so an RS384 token must NOT be accepted even
+        // though both are producible by the same RSA key.
+        let (_pem, jwks_json) = generate_test_keypair("pinned");
+        let jwks: JwkSet = serde_json::from_value(jwks_json).expect("jwks parses");
+        let cached = CachedKeys {
+            keys: build_key_cache(&jwks, 16).expect("under key cap").0,
+            unnamed_keys: vec![],
+            fetched_at: Instant::now(),
+            ttl: Duration::from_secs(300),
+        };
+        assert!(lookup_key(&cached, Some("pinned"), Algorithm::RS256).is_some());
+        assert!(lookup_key(&cached, Some("pinned"), Algorithm::RS384).is_none());
+    }
+
+    #[test]
+    fn alg_less_key_still_subject_to_use_and_key_ops_gate() {
+        // Ordering guard: `jwk_permits_signature_verification` runs BEFORE the
+        // algorithm step, so inference must not resurrect a key excluded by
+        // key-use separation. Covers both branches of that gate.
+        let (_pem, jwks_json) = generate_test_keypair("gated");
+
+        let mut enc = jwks_json["keys"][0].clone();
+        if let Some(obj) = enc.as_object_mut() {
+            obj.remove("alg");
+        }
+        enc["use"] = serde_json::json!("enc");
+        let jwks: JwkSet =
+            serde_json::from_value(serde_json::json!({ "keys": [enc] })).expect("jwks parses");
+        let (keys, unnamed) = build_key_cache(&jwks, 16).expect("under key cap");
+        assert!(
+            keys.is_empty() && unnamed.is_empty(),
+            "use=enc must be dropped"
+        );
+
+        let mut wrap = jwks_json["keys"][0].clone();
+        if let Some(obj) = wrap.as_object_mut() {
+            obj.remove("alg");
+            obj.remove("use");
+        }
+        wrap["key_ops"] = serde_json::json!(["wrapKey"]);
+        let jwks: JwkSet =
+            serde_json::from_value(serde_json::json!({ "keys": [wrap] })).expect("jwks parses");
+        let (keys, unnamed) = build_key_cache(&jwks, 16).expect("under key cap");
+        assert!(
+            keys.is_empty() && unnamed.is_empty(),
+            "key_ops without verify must be dropped"
+        );
+    }
+
+    #[test]
     fn truncate_kid_for_log_bounds_hostile_input() {
         let short = "kid-1";
         assert_eq!(truncate_kid_for_log(short), (short.to_owned(), false));
@@ -4679,11 +5105,17 @@ role = "admin"
         let mut keys = HashMap::new();
         keys.insert(
             "kid-1".to_owned(),
-            (Algorithm::RS256, DecodingKey::from_secret(b"named")),
+            (
+                JwkAlg::Explicit(Algorithm::RS256),
+                DecodingKey::from_secret(b"named"),
+            ),
         );
         let cached = CachedKeys {
             keys,
-            unnamed_keys: vec![(Algorithm::RS256, DecodingKey::from_secret(b"unnamed"))],
+            unnamed_keys: vec![(
+                JwkAlg::Explicit(Algorithm::RS256),
+                DecodingKey::from_secret(b"unnamed"),
+            )],
             fetched_at: Instant::now(),
             ttl: Duration::from_secs(300),
         };
@@ -4702,11 +5134,17 @@ role = "admin"
         let mut keys = HashMap::new();
         keys.insert(
             "kid-1".to_owned(),
-            (Algorithm::RS256, DecodingKey::from_secret(b"named")),
+            (
+                JwkAlg::Explicit(Algorithm::RS256),
+                DecodingKey::from_secret(b"named"),
+            ),
         );
         let cached = CachedKeys {
             keys,
-            unnamed_keys: vec![(Algorithm::RS256, DecodingKey::from_secret(b"unnamed"))],
+            unnamed_keys: vec![(
+                JwkAlg::Explicit(Algorithm::RS256),
+                DecodingKey::from_secret(b"unnamed"),
+            )],
             fetched_at: Instant::now(),
             ttl: Duration::from_secs(300),
         };
@@ -5463,6 +5901,49 @@ role = "admin"
             .expect("should authenticate");
         assert_eq!(id.role, "ops");
         assert_eq!(id.name, "admin-bot");
+    }
+
+    #[tokio::test]
+    async fn entra_shaped_alg_less_jwks_authenticates_end_to_end() {
+        // Issue #17: the reported Entra failure, reproduced end-to-end. The
+        // JWKS omits `alg` exactly as login.microsoftonline.com does; before
+        // family inference the key was dropped and this returned None.
+        let kid = "entra-e2e";
+        let (pem, jwks) = generate_test_keypair(kid);
+        let mut alg_less = jwks;
+        if let Some(key) = alg_less["keys"][0].as_object_mut() {
+            key.remove("alg");
+        }
+        assert!(
+            alg_less["keys"][0].get("alg").is_none(),
+            "fixture must reproduce Entra's alg-less shape"
+        );
+
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/jwks.json"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&alg_less))
+            .mount(&mock_server)
+            .await;
+
+        let jwks_uri = format!("{}/jwks.json", mock_server.uri());
+        let config = test_config(&jwks_uri);
+        let cache = test_cache(&config);
+
+        let token = mint_token(
+            &pem,
+            kid,
+            "https://auth.test.local",
+            "https://mcp.test.local/mcp",
+            "entra-user",
+            "mcp:admin",
+        );
+
+        let id = cache
+            .validate_token(&token)
+            .await
+            .expect("an alg-less JWKS key must still authenticate (issue #17)");
+        assert_eq!(id.name, "entra-user");
     }
 
     #[tokio::test]

@@ -602,14 +602,16 @@ let config = RbacConfig::with_roles(vec![
         vec!["prod-*".into()],
     ),
 
-    // Restricted exec: can run only safe commands
+    // Restricted exec: can run only safe commands.
+    // `new_required` also denies a call that omits `cmd` entirely; plain
+    // `new` would let such a call through to the handler's default.
     RoleConfig::new(
         "restricted",
         vec!["container_exec".into()],
         vec!["*".into()],
     )
     .with_argument_allowlists(vec![
-        ArgumentAllowlist::new(
+        ArgumentAllowlist::new_required(
             "container_exec",
             "cmd",
             vec!["ls".into(), "cat".into(), "ps".into(), "df".into()],
@@ -1116,6 +1118,45 @@ role = "viewer"
 ```
 
 `role_claim` accepts dot-notation for nested JWT claims (`"realm_access.roles"`) and handles both space-separated string claims (`"read write"`) and JSON array claims (`["read", "write"]`). When `role_claim` is set, `scopes` is ignored.
+
+#### JWKS keys without an `alg` member
+
+RFC 7517 §4.4 makes the JWK `alg` member **OPTIONAL**, and several identity
+providers omit it. Microsoft Entra ID (Azure AD) v2.0 is the most prominent:
+every key at
+`https://login.microsoftonline.com/common/discovery/v2.0/keys` is published as
+`kty=RSA`, `use=sig`, with **no `alg` field**.
+
+Such keys are accepted. When `alg` is present it pins exactly one algorithm.
+When it is absent, the permitted algorithms are inferred from the key material
+itself — never from the token header — as follows:
+
+| JWK key type | Permitted algorithms |
+|---|---|
+| `RSA` | `RS256`, `RS384`, `RS512`, `PS256`, `PS384`, `PS512` |
+| `EC`, `crv=P-256` | `ES256` |
+| `EC`, `crv=P-384` | `ES384` |
+| `OKP`, `crv=Ed25519` | `EdDSA` |
+| `oct` (symmetric) | *none — key is dropped* |
+
+Inference is deliberately constrained:
+
+- It reads only the JWK's own key type, so an attacker cannot steer it via the
+  token header.
+- Symmetric (`oct`) keys are never inferred, so an `HS*` secret can never become
+  a verification key. `HS*` and `none` are additionally rejected before key
+  lookup even reaches this stage.
+- The inferred set is always a subset of the algorithms the server accepts, so
+  inference can never widen the policy.
+
+> **`EC` keys on curve `P-521` are not supported**, with or without an `alg`
+> member. The [`jsonwebtoken`](https://docs.rs/jsonwebtoken) crate that performs
+> signature verification defines no `ES512` variant in its `Algorithm` enum — it
+> implements only `ES256` and `ES384` for ECDSA — and its own
+> `EllipticCurve::P521` documentation notes the curve is unsupported by `ring`,
+> the backing cryptography provider. A `P-521` key is therefore dropped from the
+> JWKS cache rather than cached as unusable. Supporting it requires upstream
+> `jsonwebtoken` support first.
 
 #### SSRF and DoS Hardening (OAuth)
 
@@ -2094,7 +2135,7 @@ let viewer = RoleConfig::new(
     vec!["echo".into(), "resource_list".into()],
     vec!["*".into()],
 )
-.with_argument_allowlists(vec![ArgumentAllowlist::new(
+.with_argument_allowlists(vec![ArgumentAllowlist::new_required(
     "echo", "message", vec!["hello".into(), "ping".into()],
 )]);
 

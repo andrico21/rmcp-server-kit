@@ -31,6 +31,97 @@ release (`cargo semver-checks`); runtime behaviour changes are noted below.
 
 ### Security
 
+- **SSRF: the whole `0.0.0.0/8` "this network" prefix is now blocked, not just
+  `0.0.0.0`.** `Ipv4Addr::is_unspecified()` matches only the single unspecified
+  address, so literals such as `0.1.2.3` previously passed outbound screening
+  for JWKS, CRL, and OAuth fetches. Linux (>= 5.3) treats nonzero `0/8` as valid
+  unicast and will route it, so the prefix cannot be assumed
+  unreachable-by-construction. Blocked addresses now report the reason
+  `this_network` (previously `unspecified` for `0.0.0.0` only).
+- **JWKS keys that declare a non-verification intent are no longer accepted as
+  JWT signature-verification keys.** `DecodingKey::from_jwk` does not enforce
+  the JWK `use` (RFC 7517 4.2) or `key_ops` (4.3) parameters, so an issuer
+  publishing signing and encryption keys in one JWKS previously had its
+  encryption keys silently installed as verification keys. Keys with
+  `"use":"enc"` (or any non-`sig` value), or with a `key_ops` list that omits
+  `verify`, are now skipped. Absent `use`/`key_ops` remains accepted, since both
+  parameters are optional per RFC 7517.
+- **Plaintext diagnostic exposure is now armed only after tracing
+  initialization fully succeeds.** `init_tracing_from_config_strict` previously
+  set the process-global `log_plaintext_oauth_tokens` /
+  `log_oauth_claim_values` / `log_tool_call_arguments` switches *before* the
+  fallible audit-log setup, so a failed strict init returned `Err` with secret
+  logging left enabled process-wide.
+- **The audience-mismatch rejection log now honours `log_oauth_claim_values`.**
+  `aud` and `azp` were logged verbatim at DEBUG regardless of the diagnostic
+  switch that gates every other claim-value log site. `expected` and `mode` are
+  local configuration and remain visible.
+
+### Fixed
+
+- **JWKS keys that omit the OPTIONAL `alg` member are no longer dropped
+  ([#17](https://github.com/andrico21/rmcp-server-kit/issues/17)).** RFC 7517
+  §4.4 makes `alg` optional, but the key cache required it, so every key was
+  discarded and authentication failed with "no matching JWKS key found".
+  This broke **Microsoft Entra ID (Azure AD) v2.0 completely**: all nine keys at
+  `login.microsoftonline.com/common/discovery/v2.0/keys` are published as
+  `kty=RSA`, `use=sig`, with no `alg`.
+
+  When `alg` is absent the permitted algorithms are now inferred from the key
+  material — `RSA` → `RS256`/`RS384`/`RS512`/`PS256`/`PS384`/`PS512`,
+  `P-256` → `ES256`, `P-384` → `ES384`, `Ed25519` → `EdDSA`. An explicit `alg`
+  continues to pin exactly one algorithm.
+
+  The inference reads only the JWK's key type, never the token header, so it
+  cannot be steered by an attacker; symmetric (`oct`) keys are never inferred,
+  so an `HS*` secret can never become a verification key; and the inferred set
+  is always a subset of the algorithms accepted before key lookup. `P-521`
+  remains unsupported because `jsonwebtoken`'s `Algorithm` enum defines no
+  `ES512` variant (see [`docs/GUIDE.md`](docs/GUIDE.md) "JWKS keys without an
+  `alg` member").
+
+- **Bumped the yanked `chacha20` 0.10.1 to 0.10.2 in `Cargo.lock`.** The yanked
+  release was reached transitively via `rand` 0.10.2 (from both this crate and
+  `rmcp`). `deny.toml` sets `yanked = "deny"`, so the `cargo-deny` CI job was
+  failing on `error[yanked]`; `cargo audit` only warned, because
+  `.cargo/audit.toml` does not escalate yanked crates. The `chacha20`
+  `safe-to-deploy` exemption in `supply-chain/config.toml` was regenerated in
+  the same change (`cargo vet regenerate exemptions`) so `cargo vet --locked`
+  stays green — the regeneration touched only that one version line.
+- **Restored the default-feature and `--features oauth` builds.**
+  `post_failure_rate_limit_response` binds `extensions` but reads it only inside
+  a `#[cfg(feature = "metrics")]` block, so any build without `metrics` tripped
+  `unused_variables` under the workspace's `-D warnings`. This broke the
+  `features-matrix` CI job for the `""` and `--features oauth` cells while
+  `--all-features` stayed green. Annotated with the same
+  `#[cfg_attr(not(feature = ...), allow(unused_variables, reason = ...))]` idiom
+  already used by `unauthorized_response`.
+
+### Changed
+
+- `tool_hooks::with_hooks` is now `#[must_use]`. Dropping the returned
+  `HookedHandler` silently disables every supplied hook, so ignoring it is
+  always a bug. This was deferred from the 1.7.x patch line to avoid downstream
+  `-D warnings` churn and lands here at a minor boundary. Downstream code that
+  discards the return value (rather than binding or wiring it) will now warn.
+- `allow_http_oauth_urls` documentation corrected: HTTPS -> HTTP redirect
+  *downgrades* are always rejected, but HTTP -> HTTP redirects are permitted
+  when the flag is `true` (the target must still pass SSRF screening). The
+  previous wording claimed all non-HTTPS redirect targets were rejected, which
+  did not match `evaluate_oauth_redirect`.
+- Examples and cookbook snippets that present a *restricted* RBAC role now use
+  `ArgumentAllowlist::new_required` instead of `ArgumentAllowlist::new`. With
+  the compatibility default (`required = false`) an allowlist constrains an
+  argument only when it is supplied, so a caller omitting the key passes
+  unchecked and the handler's default value is used — the shipped examples were
+  demonstrating a fail-open policy. The default itself is unchanged and still
+  flips in 4.0.
+- Cancel-safety annotations added to the async request-path functions that were
+  missing them (`RUST_GUIDELINES.md` §5), including `readyz`, `call_tool`,
+  `handle_token`, `select_jwks_key`, and the CRL refresh/commit helpers. No
+  behaviour change; `handle_token`, `readyz`, `call_tool`, and `select_jwks_key`
+  are documented as **NOT** cancel-safe with the specific consequence.
+
 - **Out-of-band mutation of the public `CrlSet::cache` field is now detected and
   fails the handshake closed.** Every legitimate commit records a constant-cost
   identity for each cached CRL and publishes it atomically with the verifier and

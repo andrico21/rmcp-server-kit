@@ -605,8 +605,8 @@ recommended.
    - Decodes the JWT header to get `kid` and `alg`.
    - `lookup_key()` looks up by `kid` in the cached JWKS
      (`src/oauth.rs:2456`).
-   - If not found, calls `refresh_with_cooldown()` (`src/oauth.rs:2392`):
-      - Enforces `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:1907`) so multiple
+   - If not found, calls `refresh_with_cooldown()` (`src/oauth.rs:2478`):
+      - Enforces `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:1975`) so multiple
        invalid tokens cannot DoS the JWKS endpoint.
      - Deduplicates concurrent refreshes.
    - Validates signature, `iss`, `aud`, `exp`, `nbf` using `jsonwebtoken`.
@@ -624,8 +624,16 @@ These let downstream MCP clients discover OAuth via the same origin as
 
 ### Hardening defaults
 - Allowed algorithms: configured per `OAuthConfig` (default: `RS256`, `ES256`).
-- Symmetric keys (`HS*`) are rejected by default — protects against
+- Symmetric keys (`HS*`) are rejected by default - protects against
   algorithm-confusion attacks.
+- **JWKS keys omitting the OPTIONAL `alg` member (RFC 7517 4.4) are accepted.**
+  `jwk_algorithm()` returns a `JwkAlg`: `Explicit(alg)` pins one algorithm,
+  `Family(..)` infers the permitted set from the key type (`RSA` -> RS*/PS*,
+  `P-256` -> ES256, `P-384` -> ES384, `Ed25519` -> EdDSA). Inference reads only
+  key material, never the token header, and never yields `HS*`/`none`.
+  `P-521`/`ES512` is unsupported because `jsonwebtoken`'s `Algorithm` enum has
+  no `ES512` variant. Required by Microsoft Entra v2.0, which publishes every
+  key without `alg` (issue #17).
 - JWKS responses cached with TTL; stale-while-revalidate semantics.
 - HTTPS-downgrade-rejecting redirect policy on `OauthHttpClient`.
 - **SSRF guard**: per-hop DNS/private-IP blocklist and URL validation
@@ -659,7 +667,7 @@ pub trait ToolHooks: Send + Sync + 'static {
 ```
 
 `HookedHandler<H>` implements `rmcp::ServerHandler` for any inner `H: ServerHandler`,
-delegating most calls but intercepting `call_tool` (`src/tool_hooks.rs:490`):
+delegating most calls but intercepting `call_tool` (`src/tool_hooks.rs:517`):
 1. Captures current identity from task-locals.
 2. Calls `before_call` — may rewrite args, may return early with an error.
 3. Calls inner handler.
