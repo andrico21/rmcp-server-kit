@@ -1,0 +1,49 @@
+# Editor-side counterpart to .gitattributes and rustfmt.toml.
+#
+# Three layers keep this repository LF on every platform, because each one
+# alone has a hole:
+#
+#   .gitattributes  - governs what git stores and checks out. Cannot stop an
+#                     editor or a script from rewriting a file with CRLF after
+#                     checkout; it only normalises again on the next `git add`.
+#   rustfmt.toml    - `newline_style = "Unix"` enforces LF for *.rs and makes
+#                     `cargo fmt --check` fail on drift. Covers Rust only.
+#   this file       - covers everything else (md, toml, yml, sh) at the moment
+#                     of editing, so drift never gets written in the first
+#                     place.
+#
+# The drift is real and has bitten this repo: `git ls-files --eol` has shown
+# tracked files sitting at w/crlf and w/mixed while the index was uniformly
+# i/lf. Windows tooling defaults are the usual cause -- Python's text mode and
+# PowerShell's Out-File both emit CRLF unless told otherwise.
+
+root = true
+
+[*]
+end_of_line = lf
+charset = utf-8
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+
+[*.rs]
+# rustfmt is authoritative for Rust; these only apply before it runs.
+indent_size = 4
+
+[*.{toml,yml,yaml,json}]
+indent_size = 2
+
+[*.md]
+# Markdown uses two trailing spaces as a hard line break, so trimming them
+# would silently change rendering.
+trim_trailing_whitespace = false
+
+[*.sh]
+# CI bench gates invoke these directly; a CR would make the shell fail with
+# "invalid option name" on `set -o pipefail`.
+indent_size = 2
+
+[*.{png,jpg,ico,der,crl}]
+# Binary assets: never rewrite.
+insert_final_newline = false
+trim_trailing_whitespace = false
