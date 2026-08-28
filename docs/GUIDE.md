@@ -456,6 +456,28 @@ the cost of accepting a revoked certificate whenever its CRL is unreachable.
 > rejected by the cache cap, leaving those handshakes denied. Raise
 > `crl_max_cache_entries` for large PKIs, or opt out explicitly.
 
+**A certificate advertising more than 64 distinct CDP URLs is rejected as
+malformed** (since 3.9). Every step of CDP handling is linear in that
+peer-chosen count, so an unbounded count is an amplification lever on the
+unauthenticated handshake path. RFC 5280 4.2.1.13 treats multiple URIs inside
+one distribution point as mirrors of the *same* CRL, so a conforming
+certificate needs only a handful.
+
+This one is **not** governed by `crl_deny_on_unavailable`: it applies in
+fail-open mode too and has no opt-out, because the same cost is paid either
+way. It is a malformed-certificate rejection, not a revocation-status denial.
+Its observable signature is a throttled `crl_cdp_url_cap_exceeded` WARN naming
+the observed count and the cap.
+
+**Mutating the CRL cache out of band is detected and denies handshakes**
+(since 3.9). `CrlSet::cache` is a public field (deprecated in 3.9, private in
+4.0); writing through it bypasses the atomic commit path and would otherwise
+leave the server claiming revocation coverage its verifier cannot enforce.
+Such a write now fails closed with a throttled
+`crl_cache_out_of_band_mutation` WARN. Reading the field remains safe. This
+detects API misuse, not a same-process adversary -- see
+[SECURITY.md](../SECURITY.md#out-of-band-crl-cache-mutation).
+
 `ReloadHandle::refresh_crls()` forces an immediate refresh of every
 cached CRL — useful from an admin endpoint or a cron-driven probe.
 
@@ -491,12 +513,21 @@ crl_max_cache_entries      = 1024      # caps parsed CRLs held in memory
 > single-tenant deployment. Raise `crl_discovery_rate_per_min` when you
 > expect bursts of *distinct* client identities pointing at many
 > distinct CDP URLs (e.g. multi-PKI federations); leave it conservative
-> when CDPs are few and stable. Lower `crl_max_response_bytes` if your
-> CA publishes only small CRLs; raise it cautiously for very large
-> revocation lists. `crl_max_concurrent_fetches` is the global SSRF
-> blast-radius bound — keep it low. Raise `crl_max_seen_urls` and
+> when CDPs are few and stable. `crl_max_concurrent_fetches` is the global
+> SSRF blast-radius bound - keep it low. Raise `crl_max_seen_urls` and
 > `crl_max_cache_entries` if your PKI hierarchy is unusually deep
 > or diverse.
+>
+> **On `crl_max_response_bytes`, raise before you lower.** A CRL larger
+> than the cap is never fetched, so under the fail-closed default every
+> certificate relying on it is *denied*. Real public-CA CRLs of ~9.5 MB and
+> ~12 MB have been measured, and RFC 5280 specifies no maximum CRL size at
+> all - the 5 MiB default is already stricter than OpenSSL (32 MiB) and
+> OpenJDK (20 MiB). Lower it only if you control the issuing CA and know its
+> CRLs stay small. It is **not** a lever for bounding per-handshake cost:
+> that cost is independent of CRL size by design. See
+> [SECURITY.md](../SECURITY.md#why-crl_max_response_bytes-stays-at-5-mib).
+
 
 ##### Defence-in-depth (still recommended even with CRL enabled)
 
