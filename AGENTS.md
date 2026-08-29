@@ -330,7 +330,7 @@ The most-violated rules — all `deny`-level in `Cargo.toml`:
 ## 10. Common pitfalls (history of bites)
 
 1. **Middleware order matters for security.** Origin check MUST run before auth so unauthenticated callers are rejected by origin first. Rate limit MUST be inside auth so anonymous storms don't amplify. See `src/transport.rs` middleware wiring around lines 1640-1830.
-2. **JWKS refresh is rate-limited.** Don't remove the `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:2116`) — invalid JWTs would otherwise DoS the JWKS endpoint.
+2. **JWKS refresh is rate-limited.** Don't remove the `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:2341`) — invalid JWTs would otherwise DoS the JWKS endpoint.
 3. **Task-local RBAC context only exists inside the request scope.** Calling `current_role()` from a `tokio::spawn`ed background task returns `None`. Capture the value before spawning.
 4. **`stdio` transport bypasses everything.** `serve_stdio` does NOT enforce auth, RBAC, TLS, or origin checks. It's intended for trusted local subprocess scenarios only.
 5. **mTLS identity is bound to the connection stream (`TlsConnInfo`), not to a shared `SocketAddr` map.** If a load balancer terminates TCP and rewrites peer addresses you must terminate TLS at the LB and use a different identity-binding strategy; the in-process binding itself is immune to port-reuse aliasing.

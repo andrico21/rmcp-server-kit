@@ -1220,6 +1220,7 @@ impl OAuthConfig {
             // M-H4: enforce RFC 8705 §2 mutual exclusion + feature gate
             // for token-exchange client authentication. See helper.
             validate_token_exchange_client_auth(tx)?;
+            validate_token_exchange_optional_params(tx)?;
         }
         // Compile the operator allowlist (if any) at config-validate
         // time so misconfiguration is rejected up-front, before any
@@ -1272,6 +1273,54 @@ fn validate_token_exchange_client_auth(
         (Some(cc), false) => validate_client_cert_config(cc),
         (None, true) => Ok(()),
     }
+}
+
+/// Validate the RFC 8693 §2.1 OPTIONAL token-exchange parameters.
+///
+/// An empty value is rejected because it is a malformed request parameter,
+/// semantically distinct from omission — omission is expressed by `None` (or
+/// [`RequestedTokenType::Omit`]) and is what RFC 8693 §2.1 actually permits.
+/// Sending `audience=` would otherwise reach the authorization server.
+///
+/// `resource` is additionally held to RFC 8707 §2, which requires an absolute
+/// URI with no fragment; both are uppercase MUSTs.
+fn validate_token_exchange_optional_params(
+    tx: &TokenExchangeConfig,
+) -> Result<(), crate::error::RmcpServerKitError> {
+    fn empty_field(field: &str) -> crate::error::RmcpServerKitError {
+        crate::error::RmcpServerKitError::Config(format!(
+            "oauth.token_exchange.{field} must not be empty; omit the key entirely \
+             to leave the RFC 8693 §2.1 parameter out of the request"
+        ))
+    }
+
+    if tx.audience.as_deref().is_some_and(str::is_empty) {
+        return Err(empty_field("audience"));
+    }
+    if tx.scope.as_deref().is_some_and(str::is_empty) {
+        return Err(empty_field("scope"));
+    }
+    if matches!(tx.requested_token_type, RequestedTokenType::Custom(ref uri) if uri.is_empty()) {
+        return Err(empty_field("requested_token_type"));
+    }
+    if let Some(resource) = tx.resource.as_deref() {
+        if resource.is_empty() {
+            return Err(empty_field("resource"));
+        }
+        let parsed = url::Url::parse(resource).map_err(|e| {
+            crate::error::RmcpServerKitError::Config(format!(
+                "oauth.token_exchange.resource must be an absolute URI (RFC 8707 §2): {e}"
+            ))
+        })?;
+        if parsed.fragment().is_some() {
+            return Err(crate::error::RmcpServerKitError::Config(
+                "oauth.token_exchange.resource must not include a fragment component \
+                 (RFC 8707 §2)"
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Validate a [`ClientCertConfig`] for RFC 8705 §2 mTLS client auth.
@@ -1709,6 +1758,56 @@ pub struct RoleMapping {
     pub role: String,
 }
 
+const TOKEN_TYPE_ACCESS_TOKEN: &str = "urn:ietf:params:oauth:token-type:access_token";
+
+/// RFC 8693 §2.1 `requested_token_type` — an OPTIONAL request parameter.
+///
+/// The RFC states that when the requested type is unspecified, "the issued
+/// token type is at the discretion of the authorization server". [`Self::Omit`]
+/// expresses that, which is otherwise unreachable.
+///
+/// Deserialised from a plain TOML string: `"access_token"` and `"omit"` map to
+/// the corresponding variants, and any other string becomes [`Self::Custom`].
+/// A misspelling such as `"acess_token"` is therefore accepted as a custom
+/// token-type URI and sent verbatim rather than rejected — unavoidable, since
+/// RFC 8693 §3 permits arbitrary URIs here.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(from = "String")]
+#[non_exhaustive]
+pub enum RequestedTokenType {
+    /// Send `urn:ietf:params:oauth:token-type:access_token`.
+    ///
+    /// Default, preserving the behaviour of every release before 3.8.0, which
+    /// always sent this value.
+    #[default]
+    AccessToken,
+    /// Omit `requested_token_type`, letting the authorization server choose.
+    Omit,
+    /// Send a specific token-type URI (RFC 8693 §3).
+    Custom(String),
+}
+
+impl From<String> for RequestedTokenType {
+    fn from(value: String) -> Self {
+        match value.as_str() {
+            "access_token" => Self::AccessToken,
+            "omit" => Self::Omit,
+            _ => Self::Custom(value),
+        }
+    }
+}
+
+impl RequestedTokenType {
+    /// The wire value, or `None` when the parameter must be omitted.
+    fn wire_value(&self) -> Option<&str> {
+        match *self {
+            Self::AccessToken => Some(TOKEN_TYPE_ACCESS_TOKEN),
+            Self::Omit => None,
+            Self::Custom(ref uri) => Some(uri.as_str()),
+        }
+    }
+}
+
 /// Configuration for RFC 8693 token exchange.
 ///
 /// The MCP server uses this to exchange an inbound user access token
@@ -1742,29 +1841,86 @@ pub struct TokenExchangeConfig {
     /// bearer token once minted. In-place certificate rotation is
     /// not picked up without restart.
     pub client_cert: Option<ClientCertConfig>,
-    /// Target audience - the `client_id` of the downstream API
-    /// (e.g. `upstream-api`).  The exchanged token will have this
-    /// value in its `aud` claim.
-    pub audience: String,
+    /// RFC 8693 §2.1 `audience` — OPTIONAL. The logical name of the
+    /// downstream API (e.g. `upstream-api`); the exchanged token carries
+    /// it in the `aud` claim. `None` omits the parameter.
+    ///
+    /// Distinct from [`OAuthConfig::audience`], which is the `aud` claim
+    /// this server *expects* on inbound tokens.
+    #[serde(default)]
+    pub audience: Option<String>,
+    /// RFC 8693 §2.1 `resource` — OPTIONAL. An RFC 8707 resource
+    /// indicator: an absolute URI, without a fragment, naming the target
+    /// service. `None` omits the parameter.
+    ///
+    /// Unrelated to `oauth.proxy.strip_resource_param`, which governs the
+    /// OAuth *proxy* endpoints, not token exchange.
+    #[serde(default)]
+    pub resource: Option<String>,
+    /// RFC 8693 §2.1 `scope` — OPTIONAL. Space-delimited scopes requested
+    /// for the exchanged token. `None` omits the parameter.
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// RFC 8693 §2.1 `requested_token_type` — OPTIONAL.
+    ///
+    /// `#[serde(default)]` is load-bearing: without it, every existing
+    /// `[server.auth.oauth.token_exchange]` table — none of which contain
+    /// this key — would fail to parse.
+    #[serde(default)]
+    pub requested_token_type: RequestedTokenType,
 }
 
 impl TokenExchangeConfig {
     /// Create a new token exchange configuration.
+    ///
+    /// The RFC 8693 OPTIONAL parameters (`audience`, `resource`, `scope`,
+    /// `requested_token_type`) default to omitted and are set with the
+    /// `with_*` methods.
     #[must_use]
     pub fn new(
         token_url: String,
         client_id: String,
         client_secret: Option<secrecy::SecretString>,
         client_cert: Option<ClientCertConfig>,
-        audience: String,
     ) -> Self {
         Self {
             token_url,
             client_id,
             client_secret,
             client_cert,
-            audience,
+            audience: None,
+            resource: None,
+            scope: None,
+            requested_token_type: RequestedTokenType::default(),
         }
+    }
+
+    /// Set the RFC 8693 `audience` parameter.
+    #[must_use]
+    pub fn with_audience(mut self, audience: impl Into<String>) -> Self {
+        self.audience = Some(audience.into());
+        self
+    }
+
+    /// Set the RFC 8693 / RFC 8707 `resource` parameter.
+    #[must_use]
+    pub fn with_resource(mut self, resource: impl Into<String>) -> Self {
+        self.resource = Some(resource.into());
+        self
+    }
+
+    /// Set the RFC 8693 `scope` parameter.
+    #[must_use]
+    pub fn with_scope(mut self, scope: impl Into<String>) -> Self {
+        self.scope = Some(scope.into());
+        self
+    }
+
+    /// Set the RFC 8693 `requested_token_type` parameter.
+    #[must_use]
+    pub fn with_requested_token_type(mut self, requested_token_type: RequestedTokenType) -> Self {
+        self.requested_token_type = requested_token_type;
+        self
     }
 }
 
@@ -4124,25 +4280,43 @@ fn audit_abandoned_exchange_result(
     }
 }
 
-/// Build the RFC 8693 token-exchange form body. Adds `client_id` when the
-/// client is public (no `client_secret`).
+fn push_form_param(body: &mut String, name: &str, value: &str) {
+    body.push('&');
+    body.push_str(name);
+    body.push('=');
+    body.push_str(&urlencoding::encode(value));
+}
+
+/// Build the RFC 8693 token-exchange form body.
+///
+/// Emits the three REQUIRED parameters (RFC 8693 §2.1) unconditionally, then
+/// each OPTIONAL parameter only when configured. Parameter ORDER is fixed and
+/// load-bearing: `resource` and `scope` are appended after `audience` and
+/// before `client_id` so that a config predating 3.8.0 — where both are
+/// necessarily `None` — produces a byte-identical body to earlier releases.
 fn build_exchange_form(config: &TokenExchangeConfig, subject_token: &str) -> String {
-    let body = format!(
-        "grant_type={}&subject_token={}&subject_token_type={}&requested_token_type={}&audience={}",
+    let mut body = format!(
+        "grant_type={}&subject_token={}&subject_token_type={}",
         urlencoding::encode("urn:ietf:params:oauth:grant-type:token-exchange"),
         urlencoding::encode(subject_token),
-        urlencoding::encode("urn:ietf:params:oauth:token-type:access_token"),
-        urlencoding::encode("urn:ietf:params:oauth:token-type:access_token"),
-        urlencoding::encode(&config.audience),
+        urlencoding::encode(TOKEN_TYPE_ACCESS_TOKEN),
     );
-    if config.client_secret.is_none() {
-        format!(
-            "{body}&client_id={}",
-            urlencoding::encode(&config.client_id)
-        )
-    } else {
-        body
+    if let Some(value) = config.requested_token_type.wire_value() {
+        push_form_param(&mut body, "requested_token_type", value);
     }
+    if let Some(audience) = config.audience.as_deref() {
+        push_form_param(&mut body, "audience", audience);
+    }
+    if let Some(resource) = config.resource.as_deref() {
+        push_form_param(&mut body, "resource", resource);
+    }
+    if let Some(scope) = config.scope.as_deref() {
+        push_form_param(&mut body, "scope", scope);
+    }
+    if config.client_secret.is_none() {
+        push_form_param(&mut body, "client_id", &config.client_id);
+    }
+    body
 }
 
 /// Debug-log the exchanged token. For JWTs, decode and log claim summary;
@@ -4931,13 +5105,15 @@ role = "admin"
     #[test]
     fn validate_rejects_http_token_exchange_url() {
         let mut cfg = validation_https_config();
-        cfg.token_exchange = Some(TokenExchangeConfig::new(
-            "http://idp.example.com/token".into(), // <-- HTTP
-            "client".into(),
-            None,
-            None,
-            "downstream".into(),
-        ));
+        cfg.token_exchange = Some(
+            TokenExchangeConfig::new(
+                "http://idp.example.com/token".into(), // <-- HTTP
+                "client".into(),
+                None,
+                None,
+            )
+            .with_audience("downstream"),
+        );
         let err = cfg
             .validate()
             .expect_err("http token_exchange.token_url must be rejected");
@@ -4992,13 +5168,15 @@ role = "admin"
             .revocation_url("http://idp.local/revoke")
             .build(),
         );
-        cfg.token_exchange = Some(TokenExchangeConfig::new(
-            "http://idp.local/token".into(),
-            "client".into(),
-            Some(secrecy::SecretString::new("dev-secret".into())),
-            None,
-            "downstream".into(),
-        ));
+        cfg.token_exchange = Some(
+            TokenExchangeConfig::new(
+                "http://idp.local/token".into(),
+                "client".into(),
+                Some(secrecy::SecretString::new("dev-secret".into())),
+                None,
+            )
+            .with_audience("downstream"),
+        );
         cfg.validate()
             .expect("escape hatch must permit http on all URL fields");
     }
@@ -5881,8 +6059,109 @@ role = "admin"
             "mcp-client".into(),
             Some(secrecy::SecretString::new("test-client-secret".into())),
             None,
-            "downstream-api".into(),
         )
+        .with_audience("downstream-api")
+    }
+
+    const ENC_GRANT: &str = "urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange";
+    const ENC_ACCESS: &str = "urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token";
+
+    #[test]
+    fn build_exchange_form_is_byte_identical_to_pre_3_8_0_output() {
+        let config = test_token_exchange_config("https://idp.example.com/token".into());
+        let body = build_exchange_form(&config, "subj-token");
+        assert_eq!(
+            body,
+            format!(
+                "grant_type={ENC_GRANT}&subject_token=subj-token\
+                 &subject_token_type={ENC_ACCESS}&requested_token_type={ENC_ACCESS}\
+                 &audience=downstream-api"
+            ),
+            "a config predating 3.8.0 must produce an unchanged request body"
+        );
+    }
+
+    #[test]
+    fn build_exchange_form_emits_only_required_params_when_all_optional_omitted() {
+        let config = TokenExchangeConfig::new(
+            "https://idp.example.com/token".into(),
+            "public-client".into(),
+            None,
+            None,
+        )
+        .with_requested_token_type(RequestedTokenType::Omit);
+        let body = build_exchange_form(&config, "subj");
+        assert_eq!(
+            body,
+            format!(
+                "grant_type={ENC_GRANT}&subject_token=subj\
+                 &subject_token_type={ENC_ACCESS}&client_id=public-client"
+            ),
+            "only the three RFC 8693 §2.1 REQUIRED params plus the public-client id"
+        );
+    }
+
+    #[test]
+    fn build_exchange_form_keeps_rfc_parameter_order() {
+        let config = test_token_exchange_config("https://idp.example.com/token".into())
+            .with_resource("https://api.example.com/v1")
+            .with_scope("read write")
+            .with_requested_token_type(RequestedTokenType::Custom("urn:example:token".into()));
+        let body = build_exchange_form(&config, "subj");
+        let keys: Vec<&str> = body
+            .split('&')
+            .filter_map(|kv| kv.split('=').next())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "grant_type",
+                "subject_token",
+                "subject_token_type",
+                "requested_token_type",
+                "audience",
+                "resource",
+                "scope",
+            ]
+        );
+        assert!(
+            body.contains("&requested_token_type=urn%3Aexample%3Atoken"),
+            "custom token type must be sent verbatim: {body}"
+        );
+    }
+
+    #[test]
+    fn token_exchange_toml_omitting_new_keys_still_deserializes() {
+        let cfg: TokenExchangeConfig = toml::from_str(
+            "token_url = \"https://idp.example.com/token\"\n\
+             client_id = \"client\"\n\
+             audience = \"downstream\"\n",
+        )
+        .expect("a token_exchange table predating 3.8.0 must still parse");
+        assert_eq!(cfg.audience.as_deref(), Some("downstream"));
+        assert_eq!(cfg.resource, None);
+        assert_eq!(cfg.scope, None);
+        assert_eq!(cfg.requested_token_type, RequestedTokenType::AccessToken);
+    }
+
+    #[test]
+    fn requested_token_type_deserializes_from_plain_strings() {
+        for (raw, expected) in [
+            ("access_token", RequestedTokenType::AccessToken),
+            ("omit", RequestedTokenType::Omit),
+            (
+                "urn:example:token",
+                RequestedTokenType::Custom("urn:example:token".into()),
+            ),
+        ] {
+            let cfg: TokenExchangeConfig = toml::from_str(&format!(
+                "token_url = \"https://idp.example.com/token\"\n\
+                 client_id = \"client\"\n\
+                 requested_token_type = \"{raw}\"\n"
+            ))
+            .expect("requested_token_type must accept any string");
+            assert_eq!(cfg.requested_token_type, expected, "input {raw}");
+        }
     }
 
     fn exchange_response(access_token: &str, issued_token_type: &str) -> serde_json::Value {
@@ -8160,8 +8439,61 @@ role = "admin"
             "client".into(),
             client_secret.map(|s| secrecy::SecretString::new(s.into())),
             client_cert,
-            "downstream".into(),
         )
+        .with_audience("downstream")
+    }
+
+    #[test]
+    fn validate_rejects_empty_optional_token_exchange_params() {
+        let base = || tx_with(Some("s"), None);
+        let cases = [
+            (base().with_audience(""), "audience"),
+            (base().with_resource(""), "resource"),
+            (base().with_scope(""), "scope"),
+            (
+                base().with_requested_token_type(RequestedTokenType::Custom(String::new())),
+                "requested_token_type",
+            ),
+        ];
+        for (tx, field) in cases {
+            let cfg = https_cfg_with_tx(tx);
+            let err = cfg
+                .validate()
+                .expect_err("an empty optional parameter must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(field) && msg.contains("must not be empty"),
+                "error must name {field} and explain emptiness; got {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_non_conformant_resource_uri() {
+        for (value, expected) in [
+            ("not-an-absolute-uri", "absolute URI"),
+            ("https://api.example.com/v1#frag", "fragment"),
+        ] {
+            let cfg = https_cfg_with_tx(tx_with(Some("s"), None).with_resource(value));
+            let err = cfg
+                .validate()
+                .expect_err("resource must satisfy RFC 8707 §2");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(expected),
+                "error for {value:?} must mention {expected:?}; got {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_token_exchange_with_all_optional_params_omitted() {
+        let mut tx = tx_with(Some("s"), None);
+        tx.audience = None;
+        tx.requested_token_type = RequestedTokenType::Omit;
+        https_cfg_with_tx(tx)
+            .validate()
+            .expect("omitting every RFC 8693 §2.1 OPTIONAL parameter must be valid");
     }
 
     #[test]

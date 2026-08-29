@@ -1296,7 +1296,13 @@ Optional sub-table that performs an RFC 8693 token exchange after authentication
 token_url = "https://downstream.example.com/oauth/token"
 client_id = "downstream-client-id"
 client_secret = "..."                                    # exactly one of client_secret / client_cert
+
+# All four below are RFC 8693 §2.1 OPTIONAL -- omit the key to leave the
+# parameter out of the exchange request entirely.
 audience = "downstream-audience"
+resource = "https://api.example.com/v1"                  # RFC 8707 absolute URI, no fragment
+scope = "read write"
+requested_token_type = "access_token"                    # or "omit", or any token-type URI
 
 # OR -- RFC 8705 §2 mTLS client authentication (requires the `oauth-mtls-client` cargo feature):
 [server.auth.oauth.token_exchange.client_cert]
@@ -1310,7 +1316,13 @@ key_path  = "/etc/certs/oauth-client.key"
 | `client_id` | `String` | -- | OAuth `client_id` of the MCP server (the requester). |
 | `client_secret` | `Option<SecretString>` | `None` | RFC 6749 §2.3.1 HTTP-Basic client secret. **Mutually exclusive with `client_cert`** -- `OAuthConfig::validate` rejects configs that set both, or neither. |
 | `client_cert` | `Option<ClientCertConfig>` | `None` | RFC 8705 §2 mTLS client authentication. **Requires the `oauth-mtls-client` cargo feature**; without it, `OAuthConfig::validate` fails closed at startup. See `ClientCertConfig` below. |
-| `audience` | `String` | -- | Target audience -- the `client_id` of the downstream API. The exchanged token will have this value in its `aud` claim. |
+| `audience` | `Option<String>` | `None` (omitted) | RFC 8693 §2.1 **OPTIONAL**. Logical name of the downstream API; the exchanged token carries it in `aud`. Omit the key to leave the parameter out. Distinct from `oauth.audience`, which is the `aud` this server *expects* on inbound tokens. |
+| `resource` | `Option<String>` | `None` (omitted) | RFC 8693 §2.1 **OPTIONAL**; an RFC 8707 resource indicator. Must be an absolute URI with no fragment. **Unrelated to `oauth.proxy.strip_resource_param`**, which governs the OAuth *proxy* endpoints, not token exchange. |
+| `scope` | `Option<String>` | `None` (omitted) | RFC 8693 §2.1 **OPTIONAL**. Space-delimited scopes requested for the exchanged token. |
+| `requested_token_type` | `String` | `"access_token"` | RFC 8693 §2.1 **OPTIONAL**. `"access_token"` sends `urn:ietf:params:oauth:token-type:access_token`; `"omit"` leaves the parameter out so the authorization server chooses; any other string is sent verbatim as a token-type URI. |
+
+> Empty strings are rejected at startup: `audience = ""` is a malformed request
+> parameter, not an omission. Omit the key instead.
 
 #### `ClientCertConfig` (sub-table of `TokenExchangeConfig.client_cert`)
 
@@ -2071,8 +2083,8 @@ let token_exchange = TokenExchangeConfig::new(
     "downstream-client-id".to_string(),
     Some(SecretString::new("downstream-secret".into())),  // RFC 6749 §2.3.1 client_secret
     None,                                                 // RFC 8705 §2 client_cert (mTLS) -- see below
-    "downstream-audience".to_string(),
-);
+)
+.with_audience("downstream-audience");                    // RFC 8693 §2.1 OPTIONAL
 
 let oauth = OAuthConfig::builder(
     "https://auth.example.com/",
@@ -2100,8 +2112,8 @@ let token_exchange = TokenExchangeConfig::new(
         PathBuf::from("/etc/certs/oauth-client.pem"),     // PEM cert (leaf or full chain)
         PathBuf::from("/etc/certs/oauth-client.key"),     // PEM private key (PKCS#8 or RSA / EC; unencrypted)
     )),
-    "downstream-audience".to_string(),
-);
+)
+.with_audience("downstream-audience");
 ```
 
 Without the `oauth-mtls-client` feature enabled, a `client_cert`-bearing config fails closed at `OAuthConfig::validate` time. Cert + key paths are PEM-validated at startup (missing files, malformed PEM, and encrypted keys all surface before the first request). The token-exchange request authenticates by presenting the configured certificate at TLS handshake -- no `Authorization` header is sent -- and uses `redirect::Policy::none()` so an attacker-controlled 3xx from the token endpoint cannot re-present the client cert to a different host. Issued access tokens behave as bearer tokens once minted (`cnf.x5t#S256` certificate-binding per RFC 8705 §3 is out of scope). In-place certificate rotation requires server restart.

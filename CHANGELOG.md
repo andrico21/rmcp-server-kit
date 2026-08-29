@@ -13,8 +13,7 @@ migration note and a config opt-out — see the 3.1.0 notes below.
 
 Hardening pass from a full review against `RUST_GUIDELINES.md`, plus the fixes
 for [#17](https://github.com/andrico21/rmcp-server-kit/issues/17) (Microsoft
-Entra compatibility). Public API changes are additive except for one
-deprecation that requires a minor-version release (`cargo semver-checks`).
+Entra compatibility) and RFC 8693 token-exchange conformance.
 
 > **Read first if you use the `oauth` feature.** OAuth *discovery metadata* is
 > now RFC 9728 / RFC 8414 conformant, which changes two published values.
@@ -22,6 +21,58 @@ deprecation that requires a minor-version release (`cargo semver-checks`).
 > and exactly one topology needs action: an application that mounts its own
 > `/authorize` + `/token` via `with_extra_router` *without* `oauth.proxy` must
 > set `oauth.authorization_servers = ["<its public URL>"]`. See **Changed**.
+
+> **Read first if you use `oauth.token_exchange`.** This release contains one
+> **source-breaking API change** (`TokenExchangeConfig`), described under
+> **Breaking** below. **Existing TOML configuration files continue to work
+> unchanged, and the request sent on the wire is byte-identical.**
+
+### Breaking
+
+- **`TokenExchangeConfig::audience` is now `Option<String>`, and
+  `TokenExchangeConfig::new` no longer takes an `audience` argument.**
+
+  RFC 8693 §2.1 marks `audience` **OPTIONAL** (only `grant_type`,
+  `subject_token`, and `subject_token_type` are REQUIRED), but the crate made it
+  mandatory and always emitted it. Omission was unrepresentable, so an
+  authorization server that rejects `audience` — or that expects RFC 8707
+  `resource` instead — could not be configured at all.
+
+  Migration is mechanical:
+
+  ```rust
+  // before
+  TokenExchangeConfig::new(token_url, client_id, secret, cert, "downstream".into())
+  // after
+  TokenExchangeConfig::new(token_url, client_id, secret, cert)
+      .with_audience("downstream")
+  ```
+
+  **TOML configs need no change**; `audience` remains an accepted key and
+  behaves identically. Setting `audience = ""` is now rejected at startup as a
+  malformed parameter — omit the key to leave the parameter out.
+
+  This break deliberately ships in a **minor** release rather than 4.0.0, as a
+  documented exception to the versioning policy stated at the top of this file.
+  The `semver-checks` CI job carries `--release-type major` for this release
+  only; the flag is removed once 3.8.0 is published and the break is part of the
+  crates.io baseline.
+
+### Added
+
+- `oauth.token_exchange` now supports the remaining RFC 8693 §2.1 OPTIONAL
+  request parameters, each omitted by default:
+  - `resource` — an RFC 8707 resource indicator, validated as an absolute URI
+    with no fragment. **Unrelated to `oauth.proxy.strip_resource_param`**, which
+    governs the OAuth proxy endpoints rather than token exchange.
+  - `scope` — space-delimited scopes for the exchanged token.
+  - `requested_token_type` — `"access_token"` (default, unchanged behaviour),
+    `"omit"` to let the authorization server choose per RFC 8693 §2.1, or any
+    token-type URI sent verbatim.
+
+  Builder methods `with_audience`, `with_resource`, `with_scope`, and
+  `with_requested_token_type` set them, matching the existing `McpServerConfig`
+  constructor-plus-setters convention.
 
 ### Deprecated
 

@@ -3,6 +3,52 @@
 This guide shows how to wire the standalone `rmcp-server-kit` crate into a
 downstream project, and how to migrate across breaking major releases.
 
+## Migrating to 3.8: RFC 8693 token-exchange optionality
+
+`3.8` contains **one source-breaking API change**, shipped in a minor release as
+a deliberate, documented exception to the "breaking changes bump major" policy.
+It affects only code that constructs `TokenExchangeConfig` in Rust.
+
+**TOML configuration files require no change, and the token-exchange request
+sent on the wire is byte-identical for any pre-3.8 configuration.**
+
+### `TokenExchangeConfig::audience` is now `Option<String>`
+
+RFC 8693 §2.1 marks `audience` OPTIONAL — only `grant_type`, `subject_token`,
+and `subject_token_type` are REQUIRED. The crate previously made it mandatory
+and always emitted it, so omission was unrepresentable and an authorization
+server that rejects `audience`, or expects RFC 8707 `resource` instead, could
+not be configured.
+
+`audience` therefore left the constructor and became a setter:
+
+```rust
+// before
+let tx = TokenExchangeConfig::new(
+    token_url, client_id, Some(secret), None, "downstream-api".to_string(),
+);
+
+// after
+let tx = TokenExchangeConfig::new(token_url, client_id, Some(secret), None)
+    .with_audience("downstream-api");
+```
+
+To omit the parameter entirely, simply do not call `.with_audience(..)`.
+
+`audience = ""` is now **rejected at startup**: an empty value is a malformed
+request parameter, distinct from omission. Omit the key instead.
+
+### New optional parameters
+
+`with_resource`, `with_scope`, and `with_requested_token_type` expose the
+remaining RFC 8693 §2.1 OPTIONAL parameters. All default to omitted except
+`requested_token_type`, which defaults to `access_token` — exactly what every
+release before 3.8 always sent.
+
+`resource` is validated as an RFC 8707 absolute URI with no fragment. It is
+**unrelated** to `oauth.proxy.strip_resource_param`, which governs the OAuth
+proxy endpoints, not token exchange.
+
 ## Migrating to 3.9: CRL fail-closed by default
 
 `3.9` is additive at the API level -- `cargo semver-checks` reports no breaking

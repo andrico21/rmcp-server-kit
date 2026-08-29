@@ -123,7 +123,23 @@ jobs:
       - name: Install cargo-semver-checks
         run: cargo install cargo-semver-checks --locked --force --version '^0.50'
       - name: Check release semver
-        run: cargo semver-checks check-release
+        run: |
+          # 3.8.0 intentionally ships ONE breaking change, as a documented
+          # exception to the "breaking bumps major" policy in CHANGELOG.md:
+          #   - TokenExchangeConfig::audience  String -> Option<String>
+          #   - TokenExchangeConfig::new       drops the `audience` argument
+          # Rationale: RFC 8693 2.1 marks `audience` OPTIONAL, and the old
+          # mandatory field made omission unrepresentable.
+          #
+          # cargo-semver-checks derives the release type from the version
+          # number, so against the 3.7.0 crates.io baseline it would demand a
+          # major bump. --release-type major states the intent explicitly.
+          #
+          # REMOVE THIS FLAG once 3.8.0 is published. The baseline then already
+          # contains the break and the gate re-arms by itself. Leaving it in
+          # permanently would silently accept ALL future breaking changes --
+          # see the prior relax-then-restore cycle noted in this job's header.
+          cargo semver-checks check-release --release-type major
 
   publish-dryrun:
     name: cargo publish --dry-run
