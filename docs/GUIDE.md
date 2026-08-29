@@ -1074,6 +1074,7 @@ role = "viewer"
 | `scopes` | `Vec<ScopeMapping>` | `[]` | OAuth scope -> RBAC role mapping. |
 | `jwks_cache_ttl` | `String` | `"10m"` | JWKS cache refresh interval. |
 | `max_jwks_keys` | `usize` | `256` | Fail-closed cap on public keys in a JWKS document. |
+| `allowed_algorithms` | `Option<Vec<String>>` | _unset_ | Pin the accepted JWT signing algorithms. When unset, the built-in set applies: `RS256`, `RS384`, `RS512`, `ES256`, `ES384`, `PS256`, `PS384`, `PS512`, `EdDSA`. When set, it must be a non-empty **subset** of that set; names are case-insensitive. This can only **narrow** the accepted algorithms -- `HS256`/`HS384`/`HS512` and `none` are never selectable, so it cannot be used to open an algorithm-confusion hole. An empty list is rejected (it would reject every token). Env: `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ALLOWED_ALGORITHMS` (comma-separated). |
 | `jwks_max_response_bytes` | `u64` | `1048576` | Fail-closed cap on the JWKS HTTP response body size (1 MiB default). |
 | `allow_http_oauth_urls` | `bool` | `false` | Permit `http://` issuer/JWKS/etc. for local dev only. |
 | `audience_validation_mode` | `String` (`"permissive"` \| `"warn"` \| `"strict"`) | `"strict"` | How the resource server treats the legacy `azp` audience fallback. `"strict"` (default) accepts only `aud` matches and rejects `azp`-only matches; `"warn"` accepts `azp`-only matches but emits a one-shot WARN per process to surface IdPs not populating `aud`; `"permissive"` accepts `azp`-only matches silently (pre-1.7 behavior). |
@@ -2301,6 +2302,10 @@ max_attempts_per_minute = 30
 issuer = "https://auth.example.com"  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ISSUER
 audience = "my-mcp-server"  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__AUDIENCE
 jwks_uri = "https://auth.example.com/.well-known/jwks.json"  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__JWKS_URI
+# Optional: pin the accepted JWT signing algorithms. Omit to accept the
+# built-in set (RS256/384/512, ES256/384, PS256/384/512, EdDSA). May only
+# narrow that set -- HS* and `none` are never selectable.
+allowed_algorithms = ["RS256"]  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ALLOWED_ALGORITHMS
 jwks_cache_ttl = "10m"
 
 [[server.auth.oauth.scopes]]
@@ -2461,6 +2466,7 @@ call order is:
 | `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ISSUER` | `server.auth.oauth.issuer` | String | requires `oauth` feature |
 | `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__AUDIENCE` | `server.auth.oauth.audience` | String | requires `oauth` feature |
 | `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__JWKS_URI` | `server.auth.oauth.jwks_uri` | String | requires `oauth` feature |
+| `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ALLOWED_ALGORITHMS` | `server.auth.oauth.allowed_algorithms` | comma-separated algorithm list | requires `oauth` feature; may only narrow the built-in set |
 | `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__STRIP_RESOURCE_PARAM` | `server.auth.oauth.proxy.strip_resource_param` | bool | requires `oauth` feature; also requires `[server.auth.oauth.proxy]` to be declared |
 | `RMCP_SERVER_KIT__OBSERVABILITY__LOG_FORMAT` | `observability.log_format` | String | |
 | `RMCP_SERVER_KIT__OBSERVABILITY__METRICS_ENABLED` | `observability.metrics_enabled` | bool | |

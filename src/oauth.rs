@@ -886,6 +886,22 @@ pub struct OAuthConfig {
     /// (cache remains empty / unchanged). Default: 256.
     #[serde(default = "default_max_jwks_keys")]
     pub max_jwks_keys: usize,
+    /// Optional allowlist of accepted JWT signing algorithms.
+    ///
+    /// **Default `None`**, which accepts the crate's built-in set:
+    /// `RS256`, `RS384`, `RS512`, `ES256`, `ES384`, `PS256`, `PS384`,
+    /// `PS512`, `EdDSA`.
+    ///
+    /// When set, it must be a non-empty **subset** of that built-in set;
+    /// anything else fails [`OAuthConfig::validate`]. Names are matched
+    /// case-insensitively. This knob can only ever NARROW the accepted
+    /// algorithms -- it cannot re-enable `HS*` or `none`, so an operator
+    /// cannot use it to open an algorithm-confusion hole.
+    ///
+    /// Use it to pin a deployment to exactly what its identity provider
+    /// signs with, e.g. `["RS256"]` for Microsoft Entra v2.0.
+    #[serde(default)]
+    pub allowed_algorithms: Option<Vec<String>>,
     /// Require the JWT `sub` (subject) claim. **Default: `false`** (current
     /// behavior). When `true`, a token without `sub` is rejected. Leave
     /// `false` for OAuth client-credentials / machine-to-machine tokens,
@@ -999,6 +1015,7 @@ impl Default for OAuthConfig {
             ca_cert_path: None,
             allow_http_oauth_urls: false,
             max_jwks_keys: default_max_jwks_keys(),
+            allowed_algorithms: None,
             require_subject: false,
             #[allow(
                 deprecated,
@@ -1068,6 +1085,7 @@ impl OAuthConfig {
     /// to parse or violates the scheme policy.
     pub fn validate(&self) -> Result<(), crate::error::RmcpServerKitError> {
         validate_oauth_capacity_knobs(self)?;
+        resolve_allowed_algorithms(self.allowed_algorithms.as_ref())?;
 
         let allow_http = self.allow_http_oauth_urls;
         let url = check_oauth_url("oauth.issuer", &self.issuer, allow_http)?;
@@ -1432,6 +1450,20 @@ pub struct OAuthConfigBuilder {
 }
 
 impl OAuthConfigBuilder {
+    /// Restrict the accepted JWT signing algorithms.
+    ///
+    /// Must be a non-empty subset of the built-in set; validated by
+    /// [`OAuthConfig::validate`]. See
+    /// [`OAuthConfig::allowed_algorithms`].
+    pub fn allowed_algorithms(
+        mut self,
+        algorithms: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.inner.allowed_algorithms =
+            Some(algorithms.into_iter().map(Into::into).collect::<Vec<_>>());
+        self
+    }
+
     /// Replace the scope-to-role mappings.
     pub fn scopes(mut self, scopes: Vec<ScopeMapping>) -> Self {
         self.inner.scopes = scopes;
@@ -2032,6 +2064,9 @@ pub struct JwksCache {
     jwks_uri: String,
     ttl: Duration,
     max_jwks_keys: usize,
+    /// Algorithms this cache will verify with. Defaults to [`ACCEPTED_ALGS`];
+    /// [`OAuthConfig::allowed_algorithms`] may narrow it but never widen it.
+    allowed_algorithms: Vec<Algorithm>,
     max_response_bytes: u64,
     allow_http: bool,
     inner: RwLock<Option<CachedKeys>>,
@@ -2082,6 +2117,12 @@ const JWKS_REFRESH_COOLDOWN: Duration = Duration::from_secs(10);
 const OAUTH_PROXY_MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 
 /// Algorithms we accept from JWKS-served keys.
+///
+/// This is the crate-wide ceiling. `HS*` and `none` are deliberately absent:
+/// a JWKS publishes public keys, so a symmetric secret must never become a
+/// verification key, and RFC 9068 2.1 forbids `none` for access tokens.
+/// [`OAuthConfig::allowed_algorithms`] may only NARROW this set, never widen
+/// it.
 const ACCEPTED_ALGS: &[Algorithm] = &[
     Algorithm::RS256,
     Algorithm::RS384,
@@ -2093,6 +2134,88 @@ const ACCEPTED_ALGS: &[Algorithm] = &[
     Algorithm::PS512,
     Algorithm::EdDSA,
 ];
+
+/// The JWA name of an accepted algorithm, or `None` if it is not accepted.
+///
+/// Single source of truth for the strings operators write in
+/// [`OAuthConfig::allowed_algorithms`], so config parsing and error messages
+/// can never drift from [`ACCEPTED_ALGS`]. `accepted_algorithm_names_cover_accepted_algs`
+/// asserts the two stay in lockstep.
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "jsonwebtoken Algorithm is #[non_exhaustive], so an exhaustive match is impossible; HS*, `none`, and any future variant must fail closed to None"
+)]
+fn accepted_algorithm_name(alg: Algorithm) -> Option<&'static str> {
+    match alg {
+        Algorithm::RS256 => Some("RS256"),
+        Algorithm::RS384 => Some("RS384"),
+        Algorithm::RS512 => Some("RS512"),
+        Algorithm::ES256 => Some("ES256"),
+        Algorithm::ES384 => Some("ES384"),
+        Algorithm::PS256 => Some("PS256"),
+        Algorithm::PS384 => Some("PS384"),
+        Algorithm::PS512 => Some("PS512"),
+        Algorithm::EdDSA => Some("EdDSA"),
+        _ => None,
+    }
+}
+
+/// Parse an operator-supplied algorithm name.
+///
+/// Case-insensitive so `rs256` and `RS256` both work. Returns `None` for any
+/// name outside [`ACCEPTED_ALGS`] -- including `HS256` and `none` -- which is
+/// what enforces the narrow-only rule at config-validation time.
+fn accepted_algorithm_from_name(name: &str) -> Option<Algorithm> {
+    ACCEPTED_ALGS
+        .iter()
+        .copied()
+        .find(|alg| accepted_algorithm_name(*alg).is_some_and(|n| n.eq_ignore_ascii_case(name)))
+}
+
+/// Comma-separated list of every accepted algorithm name, for error messages.
+fn accepted_algorithm_names() -> String {
+    ACCEPTED_ALGS
+        .iter()
+        .filter_map(|alg| accepted_algorithm_name(*alg))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Resolve the configured algorithm allowlist into concrete algorithms.
+///
+/// SECURITY (narrow-only): every name must resolve inside [`ACCEPTED_ALGS`].
+/// `accepted_algorithm_from_name` returns `None` for `HS*` and `none`, so an
+/// operator can never re-enable a symmetric or unsigned algorithm through
+/// config. An empty list is rejected because it would silently reject every
+/// token -- almost certainly an operator mistake rather than an intent to
+/// disable OAuth.
+pub(crate) fn resolve_allowed_algorithms(
+    configured: Option<&Vec<String>>,
+) -> Result<Vec<Algorithm>, crate::error::RmcpServerKitError> {
+    let Some(names) = configured else {
+        return Ok(ACCEPTED_ALGS.to_vec());
+    };
+    if names.is_empty() {
+        return Err(crate::error::RmcpServerKitError::Config(
+            "oauth.allowed_algorithms must not be empty; omit the field to accept the default set"
+                .into(),
+        ));
+    }
+    let mut resolved = Vec::with_capacity(names.len());
+    for name in names {
+        let Some(alg) = accepted_algorithm_from_name(name) else {
+            return Err(crate::error::RmcpServerKitError::Config(format!(
+                "oauth.allowed_algorithms contains unsupported algorithm {name:?}; \
+                 permitted values are: {}",
+                accepted_algorithm_names()
+            )));
+        };
+        if !resolved.contains(&alg) {
+            resolved.push(alg);
+        }
+    }
+    Ok(resolved)
+}
 
 /// Coarse JWT validation failure classification for auth diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2233,6 +2356,7 @@ impl JwksCache {
             jwks_uri: config.jwks_uri.clone(),
             ttl,
             max_jwks_keys: config.max_jwks_keys,
+            allowed_algorithms: resolve_allowed_algorithms(config.allowed_algorithms.as_ref())?,
             max_response_bytes: config.jwks_max_response_bytes,
             allow_http,
             inner: RwLock::new(None),
@@ -2405,7 +2529,7 @@ impl JwksCache {
         let kid = header.kid.as_deref();
         tracing::debug!(alg = ?header.alg, kid = kid.unwrap_or("-"), "JWT header decoded");
 
-        if !ACCEPTED_ALGS.contains(&header.alg) {
+        if !self.allowed_algorithms.contains(&header.alg) {
             core::hint::cold_path();
             tracing::debug!(alg = ?header.alg, "JWT algorithm not accepted");
             return Err(JwtValidationFailure::Invalid);
@@ -4270,6 +4394,7 @@ mod tests {
             ca_cert_path: None,
             allow_http_oauth_urls: false,
             max_jwks_keys: default_max_jwks_keys(),
+            allowed_algorithms: None,
             #[allow(
                 deprecated,
                 reason = "test fixture: explicit value for the deprecated field"
@@ -4823,6 +4948,7 @@ role = "admin"
             ca_cert_path: None,
             allow_http_oauth_urls: true,
             max_jwks_keys: default_max_jwks_keys(),
+            allowed_algorithms: None,
             #[allow(
                 deprecated,
                 reason = "test fixture: explicit value for the deprecated field"
@@ -5095,6 +5221,119 @@ role = "admin"
         assert!(
             keys.is_empty() && unnamed.is_empty(),
             "key_ops without verify must be dropped"
+        );
+    }
+
+    // -- allowed_algorithms: operator narrowing of the accepted algorithm set --
+
+    #[test]
+    fn accepted_algorithm_names_cover_accepted_algs() {
+        // Lockstep contract: every accepted algorithm must have a name an
+        // operator can write, and every name must round-trip back.
+        for alg in ACCEPTED_ALGS {
+            let name = accepted_algorithm_name(*alg)
+                .unwrap_or_else(|| panic!("{alg:?} is accepted but has no configurable name"));
+            assert_eq!(accepted_algorithm_from_name(name), Some(*alg));
+        }
+        assert_eq!(
+            accepted_algorithm_names().split(", ").count(),
+            ACCEPTED_ALGS.len()
+        );
+    }
+
+    #[test]
+    fn allowed_algorithms_cannot_widen_beyond_accepted_algs() {
+        // SECURITY: the whole point of the narrow-only rule. An operator must
+        // not be able to re-enable a symmetric or unsigned algorithm and open
+        // an algorithm-confusion hole.
+        for name in ["HS256", "HS384", "HS512", "none", "ES512", "RS1"] {
+            assert!(
+                accepted_algorithm_from_name(name).is_none(),
+                "{name} must not be resolvable"
+            );
+            let err = resolve_allowed_algorithms(Some(&vec![name.to_owned()]))
+                .expect_err("must reject non-accepted algorithm");
+            assert!(err.to_string().contains("unsupported algorithm"));
+        }
+    }
+
+    #[test]
+    fn allowed_algorithms_rejects_empty_list() {
+        let err = resolve_allowed_algorithms(Some(&Vec::new()))
+            .expect_err("empty list would reject every token");
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn allowed_algorithms_defaults_to_full_accepted_set() {
+        assert_eq!(
+            resolve_allowed_algorithms(None).expect("default resolves"),
+            ACCEPTED_ALGS.to_vec()
+        );
+    }
+
+    #[test]
+    fn allowed_algorithms_narrows_and_dedups_case_insensitively() {
+        let resolved = resolve_allowed_algorithms(Some(&vec![
+            "rs256".to_owned(),
+            "RS256".to_owned(),
+            "ES384".to_owned(),
+        ]))
+        .expect("valid subset");
+        assert_eq!(resolved, vec![Algorithm::RS256, Algorithm::ES384]);
+    }
+
+    #[test]
+    fn allowed_algorithms_surfaces_through_config_validate() {
+        let mut cfg = test_config("https://idp.test.local/jwks.json");
+        cfg.allowed_algorithms = Some(vec!["HS256".to_owned()]);
+        let err = cfg.validate().expect_err("HS256 must fail validation");
+        assert!(err.to_string().contains("unsupported algorithm"));
+
+        cfg.allowed_algorithms = Some(vec!["RS256".to_owned()]);
+        cfg.validate().expect("a valid subset must validate");
+    }
+
+    #[tokio::test]
+    async fn narrowed_allowed_algorithms_rejects_excluded_but_otherwise_valid_token() {
+        // The token is signed RS256 by a key the JWKS serves, so it would
+        // normally authenticate; narrowing to ES384 must reject it at the
+        // pre-lookup algorithm gate.
+        let kid = "narrowing-kid";
+        let (pem, jwks) = generate_test_keypair(kid);
+
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/jwks.json"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&jwks))
+            .mount(&mock_server)
+            .await;
+
+        let jwks_uri = format!("{}/jwks.json", mock_server.uri());
+        let token = mint_token(
+            &pem,
+            kid,
+            "https://auth.test.local",
+            "https://mcp.test.local/mcp",
+            "narrow-user",
+            "mcp:admin",
+        );
+
+        let mut permissive = test_config(&jwks_uri);
+        permissive.allowed_algorithms = Some(vec!["RS256".to_owned()]);
+        assert!(
+            test_cache(&permissive)
+                .validate_token(&token)
+                .await
+                .is_some(),
+            "RS256 token must authenticate when RS256 is allowed"
+        );
+
+        let mut narrowed = test_config(&jwks_uri);
+        narrowed.allowed_algorithms = Some(vec!["ES384".to_owned()]);
+        assert!(
+            test_cache(&narrowed).validate_token(&token).await.is_none(),
+            "RS256 token must be rejected when only ES384 is allowed"
         );
     }
 
@@ -6219,6 +6458,7 @@ role = "admin"
             ca_cert_path: None,
             allow_http_oauth_urls: true,
             max_jwks_keys: default_max_jwks_keys(),
+            allowed_algorithms: None,
             #[allow(
                 deprecated,
                 reason = "test fixture: explicit value for the deprecated field"

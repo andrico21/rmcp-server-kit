@@ -605,8 +605,8 @@ recommended.
    - Decodes the JWT header to get `kid` and `alg`.
    - `lookup_key()` looks up by `kid` in the cached JWKS
      (`src/oauth.rs:2456`).
-   - If not found, calls `refresh_with_cooldown()` (`src/oauth.rs:2586`):
-      - Enforces `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:2010`) so multiple
+   - If not found, calls `refresh_with_cooldown()` (`src/oauth.rs:2710`):
+      - Enforces `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:2042`) so multiple
        invalid tokens cannot DoS the JWKS endpoint.
      - Deduplicates concurrent refreshes.
    - Validates signature, `iss`, `aud`, `exp`, `nbf` using `jsonwebtoken`.
@@ -810,7 +810,7 @@ retiring.
 **TOML** — the deserializable sections:
 
 - `ServerConfig` — `src/config.rs:261`
-- `ObservabilityConfig` — `src/config.rs:902`
+- `ObservabilityConfig` — `src/config.rs:935`
 - `SecurityHeadersConfig` — `src/transport.rs:239`
 - `AuthConfig`, `MtlsConfig`, `RateLimitConfig` — `src/auth.rs`
 - `RbacConfig` — `src/rbac.rs`
@@ -821,7 +821,7 @@ sections into its own root type. `[server]`, `[rbac]` and `[observability]`
 are a convention from [`docs/GUIDE.md`](GUIDE.md), not a type.
 
 `ServerConfig` was schema-only until 3.4.0 — nothing in the crate consumed it.
-`ServerConfig::apply_to_mcp_config` (`src/config.rs:602`) is the bridge that
+`ServerConfig::apply_to_mcp_config` (`src/config.rs:668`) is the bridge that
 makes it reachable. It uses **replacement semantics**: authoritative for every
 bridgeable transport field, with `None`/`false` clearing whatever the base
 held. Only the runtime-only fields above survive from the base. It is fallible

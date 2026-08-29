@@ -99,6 +99,29 @@ release (`cargo semver-checks`); runtime behaviour changes are noted below.
 
 ### Added
 
+- **`OAuthConfig::allowed_algorithms` — operator-configurable JWT signing
+  algorithm allowlist.** Previously the accepted set was a compile-time
+  constant, so a deployment could not pin validation to exactly what its
+  identity provider signs with (for example `["RS256"]` for Microsoft Entra).
+
+  When unset (the default) the built-in set applies: `RS256`, `RS384`, `RS512`,
+  `ES256`, `ES384`, `PS256`, `PS384`, `PS512`, `EdDSA`.
+
+  **The knob can only NARROW that set, never widen it.** `HS256`/`HS384`/
+  `HS512` and `none` are not resolvable names, so an operator cannot re-enable
+  a symmetric or unsigned algorithm and open an algorithm-confusion hole; a
+  regression test asserts this directly. An empty list is rejected because it
+  would silently reject every token. Names are matched case-insensitively and
+  de-duplicated. Invalid values fail `OAuthConfig::validate` with the list of
+  permitted names.
+
+  Configurable via TOML (`[server.auth.oauth] allowed_algorithms`), the builder
+  (`OAuthConfigBuilder::allowed_algorithms`), or the environment
+  (`RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ALLOWED_ALGORITHMS`, comma-separated).
+  This is the repository's first list-valued environment override; the value is
+  resolved eagerly at override time so an unusable list is reported against the
+  variable that set it.
+
 - **`OAuthProxyConfig::strip_resource_param` — opt-in workaround for Microsoft
   Entra ID ([#17](https://github.com/andrico21/rmcp-server-kit/issues/17)).**
   Entra v2.0 rejects an RFC 8707 `resource` parameter carried alongside a

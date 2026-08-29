@@ -176,6 +176,13 @@ pub(crate) const ENV_OVERRIDE_SPECS: &[EnvOverrideSpec] = &[
         redacted: false,
     },
     EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ALLOWED_ALGORITHMS",
+        target_field: "server.auth.oauth.allowed_algorithms",
+        value_type: "comma-separated algorithm list",
+        required_feature: Some("oauth"),
+        redacted: false,
+    },
+    EnvOverrideSpec {
         env_var: "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__STRIP_RESOURCE_PARAM",
         target_field: "server.auth.oauth.proxy.strip_resource_param",
         value_type: "bool",
@@ -253,6 +260,8 @@ pub(crate) const SERVER_OAUTH_AUDIENCE_ENV: &str = "RMCP_SERVER_KIT__SERVER__AUT
 pub(crate) const SERVER_OAUTH_JWKS_URI_ENV: &str = "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__JWKS_URI";
 pub(crate) const SERVER_OAUTH_PROXY_STRIP_RESOURCE_PARAM_ENV: &str =
     "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__STRIP_RESOURCE_PARAM";
+pub(crate) const SERVER_OAUTH_ALLOWED_ALGORITHMS_ENV: &str =
+    "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ALLOWED_ALGORITHMS";
 pub(crate) const OBSERVABILITY_LOG_FORMAT_ENV: &str = "RMCP_SERVER_KIT__OBSERVABILITY__LOG_FORMAT";
 pub(crate) const OBSERVABILITY_METRICS_ENABLED_ENV: &str =
     "RMCP_SERVER_KIT__OBSERVABILITY__METRICS_ENABLED";
@@ -576,6 +585,28 @@ impl ServerConfig {
             ));
             oauth.jwks_uri = raw;
         }
+        if let Some(raw) = oauth_env.allowed_algorithms {
+            // First list-valued env override: split on `,`, trim, and drop
+            // empty segments so `RS256, ES256` and `RS256,,ES256` both work.
+            let names: Vec<String> = raw
+                .split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+            // Resolve eagerly so an unusable value is reported against the
+            // env var that set it, rather than surfacing later as an opaque
+            // `oauth.allowed_algorithms` config error.
+            crate::oauth::resolve_allowed_algorithms(Some(&names)).map_err(|err| {
+                RmcpServerKitError::Config(format!("{SERVER_OAUTH_ALLOWED_ALGORITHMS_ENV}: {err}"))
+            })?;
+            applied.push(env_report(
+                SERVER_OAUTH_ALLOWED_ALGORITHMS_ENV,
+                "server.auth.oauth.allowed_algorithms",
+                raw,
+            ));
+            oauth.allowed_algorithms = Some(names);
+        }
         if let Some(raw) = oauth_env.proxy_strip_resource_param {
             let value = parse_env_bool(SERVER_OAUTH_PROXY_STRIP_RESOURCE_PARAM_ENV, &raw)?;
             // Fail closed, mirroring the parent-table rule above: this variable
@@ -867,6 +898,7 @@ struct OAuthEnvOverrides {
     issuer: Option<String>,
     audience: Option<String>,
     jwks_uri: Option<String>,
+    allowed_algorithms: Option<String>,
     proxy_strip_resource_param: Option<String>,
 }
 
@@ -876,6 +908,7 @@ impl OAuthEnvOverrides {
             issuer: read_env(SERVER_OAUTH_ISSUER_ENV)?,
             audience: read_env(SERVER_OAUTH_AUDIENCE_ENV)?,
             jwks_uri: read_env(SERVER_OAUTH_JWKS_URI_ENV)?,
+            allowed_algorithms: read_env(SERVER_OAUTH_ALLOWED_ALGORITHMS_ENV)?,
             proxy_strip_resource_param: read_env(SERVER_OAUTH_PROXY_STRIP_RESOURCE_PARAM_ENV)?,
         })
     }
@@ -884,6 +917,7 @@ impl OAuthEnvOverrides {
         self.issuer.is_some()
             || self.audience.is_some()
             || self.jwks_uri.is_some()
+            || self.allowed_algorithms.is_some()
             || self.proxy_strip_resource_param.is_some()
     }
 
@@ -892,6 +926,7 @@ impl OAuthEnvOverrides {
             self.issuer.as_deref(),
             self.audience.as_deref(),
             self.jwks_uri.as_deref(),
+            self.allowed_algorithms.as_deref(),
             self.proxy_strip_resource_param.as_deref(),
         )
     }
@@ -915,6 +950,7 @@ fn first_set_oauth_env(
     issuer: Option<&str>,
     audience: Option<&str>,
     jwks_uri: Option<&str>,
+    allowed_algorithms: Option<&str>,
     proxy_strip_resource_param: Option<&str>,
 ) -> &'static str {
     if issuer.is_some() {
@@ -923,6 +959,8 @@ fn first_set_oauth_env(
         SERVER_OAUTH_AUDIENCE_ENV
     } else if jwks_uri.is_some() {
         SERVER_OAUTH_JWKS_URI_ENV
+    } else if allowed_algorithms.is_some() {
+        SERVER_OAUTH_ALLOWED_ALGORITHMS_ENV
     } else if proxy_strip_resource_param.is_some() {
         SERVER_OAUTH_PROXY_STRIP_RESOURCE_PARAM_ENV
     } else {
@@ -2853,6 +2891,56 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn e5f_oauth_allowed_algorithms_env_parses_comma_separated_list() {
+        with_env_vars(
+            &[(SERVER_OAUTH_ALLOWED_ALGORITHMS_ENV, Some("RS256, ES384"))],
+            || {
+                let mut auth = crate::auth::AuthConfig::with_keys(vec![]);
+                auth.oauth = Some(crate::oauth::OAuthConfig::default());
+                let mut cfg = ServerConfig {
+                    auth: Some(auth),
+                    ..ServerConfig::default()
+                };
+
+                let report = cfg.apply_env_overrides().unwrap();
+                let oauth = cfg
+                    .auth
+                    .as_ref()
+                    .and_then(|auth| auth.oauth.as_ref())
+                    .unwrap();
+                assert_eq!(
+                    oauth.allowed_algorithms.as_deref(),
+                    Some(["RS256".to_owned(), "ES384".to_owned()].as_slice())
+                );
+                assert_eq!(report.len(), 1);
+            },
+        );
+    }
+
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn e5g_oauth_allowed_algorithms_env_rejects_non_narrowing_value() {
+        // SECURITY: the env path must enforce the same narrow-only rule as
+        // TOML, and the error must name the variable that caused it.
+        with_env_vars(
+            &[(SERVER_OAUTH_ALLOWED_ALGORITHMS_ENV, Some("HS256"))],
+            || {
+                let mut auth = crate::auth::AuthConfig::with_keys(vec![]);
+                auth.oauth = Some(crate::oauth::OAuthConfig::default());
+                let mut cfg = ServerConfig {
+                    auth: Some(auth),
+                    ..ServerConfig::default()
+                };
+
+                let msg = cfg.apply_env_overrides().unwrap_err().to_string();
+                assert!(msg.contains(SERVER_OAUTH_ALLOWED_ALGORITHMS_ENV));
+                assert!(msg.contains("unsupported algorithm"));
+            },
+        );
+    }
+
     #[test]
     fn e9_bad_observability_bool_env_fails_closed() {
         with_env_vars(
@@ -3086,6 +3174,12 @@ mod tests {
         (
             SERVER_OAUTH_JWKS_URI_ENV,
             "server.auth.oauth.jwks_uri",
+            Some("oauth"),
+            false,
+        ),
+        (
+            SERVER_OAUTH_ALLOWED_ALGORITHMS_ENV,
+            "server.auth.oauth.allowed_algorithms",
             Some("oauth"),
             false,
         ),
