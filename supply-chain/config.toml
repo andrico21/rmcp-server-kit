@@ -208,7 +208,7 @@ version = "0.5.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.combine]]
-version = "4.6.7"
+version = "4.6.8"
 criteria = "safe-to-deploy"
 
 [[exemptions.compression-codecs]]
@@ -240,7 +240,7 @@ version = "0.2.17"
 criteria = "safe-to-deploy"
 
 [[exemptions.cpufeatures]]
-version = "0.3.0"
+version = "0.3.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.crc32fast]]
@@ -388,7 +388,7 @@ version = "0.1.11"
 criteria = "safe-to-deploy"
 
 [[exemptions.flate2]]
-version = "1.1.9"
+version = "1.1.10"
 criteria = "safe-to-deploy"
 
 [[exemptions.fnv]]
@@ -536,7 +536,7 @@ version = "0.4.14"
 criteria = "safe-to-deploy"
 
 [[exemptions.hyper]]
-version = "1.11.0"
+version = "1.11.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.hyper-rustls]]
@@ -596,7 +596,7 @@ version = "1.2.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.indexmap]]
-version = "2.14.0"
+version = "2.14.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.ipnet]]
@@ -688,7 +688,7 @@ version = "0.2.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.miniz_oxide]]
-version = "0.8.9"
+version = "0.9.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.mio]]
@@ -782,6 +782,10 @@ criteria = "safe-to-deploy"
 [[exemptions.pem]]
 version = "3.0.6"
 criteria = "safe-to-deploy"
+
+[[exemptions.pem]]
+version = "4.0.0"
+criteria = "safe-to-run"
 
 [[exemptions.pem-rfc7468]]
 version = "0.7.0"
@@ -904,7 +908,7 @@ version = "11.6.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.rcgen]]
-version = "0.14.9"
+version = "0.14.10"
 criteria = "safe-to-run"
 
 [[exemptions.redox_syscall]]
@@ -1332,7 +1336,7 @@ version = "1.0.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.uuid]]
-version = "1.25.0"
+version = "1.26.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.valuable]]
@@ -1549,6 +1553,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.zerovec-derive]]
 version = "0.11.6"
+criteria = "safe-to-deploy"
+
+[[exemptions.zlib-rs]]
+version = "0.6.7"
 criteria = "safe-to-deploy"
 
 [[exemptions.zmij]]
