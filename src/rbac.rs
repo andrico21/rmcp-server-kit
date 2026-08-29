@@ -294,6 +294,21 @@ pub struct ArgumentAllowlist {
     /// as a string, any value accepted".
     #[serde(default)]
     pub required: bool,
+    /// Reject any top-level argument that no allowlist for this `(role, tool)`
+    /// names.
+    ///
+    /// Defaults to `false`, preserving the historical semantics: allowlists
+    /// constrain only the arguments they name, so `{"cmd":"ls","danger":true}`
+    /// passes when only `cmd` is allowlisted. That is safe when the tool's
+    /// input schema rejects unknown keys, and fails open when it does not.
+    ///
+    /// When `true` on ANY allowlist matching a `(role, tool)` pair, the
+    /// permitted argument names become the union of every matching allowlist's
+    /// [`argument`](Self::argument), and any other top-level key is denied
+    /// with 403. Object- and array-valued arguments are also denied, because
+    /// this crate has no nested-path allowlist to constrain their contents.
+    #[serde(default)]
+    pub deny_unknown_arguments: bool,
 }
 
 impl ArgumentAllowlist {
@@ -309,6 +324,7 @@ impl ArgumentAllowlist {
             argument: argument.into(),
             allowed,
             required: false,
+            deny_unknown_arguments: false,
         }
     }
 
@@ -329,6 +345,16 @@ impl ArgumentAllowlist {
     #[must_use]
     pub const fn with_required(mut self, required: bool) -> Self {
         self.required = required;
+        self
+    }
+
+    /// Confine the tool to only the arguments its allowlists name.
+    ///
+    /// Applies to the whole `(role, tool)` pair, not just this entry: see
+    /// [`deny_unknown_arguments`](Self::deny_unknown_arguments).
+    #[must_use]
+    pub const fn with_deny_unknown_arguments(mut self, deny: bool) -> Self {
+        self.deny_unknown_arguments = deny;
         self
     }
 }
@@ -655,6 +681,32 @@ impl RbacPolicy {
                 && al.argument == argument
                 && !al.allowed.is_empty()
         })
+    }
+
+    /// Return the top-level argument names permitted for `(role, tool)` when
+    /// strict confinement is enabled, or `None` when it is not.
+    ///
+    /// Strict mode is enabled by ANY matching allowlist setting
+    /// `deny_unknown_arguments`, and the permitted set is then the union of
+    /// every matching entry's `argument`. A single strict entry therefore
+    /// confines the whole tool rather than only its own argument, which is
+    /// what makes the flag meaningful: confining one argument while leaving
+    /// its siblings unconstrained would not close the bypass.
+    fn strict_argument_names(&self, role: &str, tool: &str) -> Option<Vec<&str>> {
+        if !self.enabled {
+            return None;
+        }
+        let role_cfg = self.find_role(role)?;
+        let matching = || {
+            role_cfg
+                .argument_allowlists
+                .iter()
+                .filter(|al| al.tool == tool || glob_match(&al.tool, tool))
+        };
+        if !matching().any(|al| al.deny_unknown_arguments) {
+            return None;
+        }
+        Some(matching().map(|al| al.argument.as_str()).collect())
     }
 
     /// Return the role config for a given role name.
@@ -1069,8 +1121,21 @@ fn enforce_tool_policy(
     }
 
     let args = params.get("arguments").and_then(|a| a.as_object());
+    let strict = policy.strict_argument_names(role, tool_name);
     if let Some(args) = args {
         for (arg_key, arg_val) in args {
+            if let Some(ref permitted) = strict
+                && let Some(resp) = check_strict_argument(
+                    identity_name,
+                    role,
+                    tool_name,
+                    permitted,
+                    arg_key,
+                    arg_val,
+                )
+            {
+                return Some(resp);
+            }
             if let Some(resp) =
                 check_argument(policy, identity_name, role, tool_name, arg_key, arg_val)
             {
@@ -1079,6 +1144,52 @@ fn enforce_tool_policy(
         }
     }
     check_required_arguments(policy, identity_name, role, tool_name, args)
+}
+
+/// Deny arguments outside the allowlisted set when strict confinement is on.
+///
+/// Object and array values are denied outright: their contents cannot be
+/// constrained, so admitting them would reopen the bypass one level down.
+fn check_strict_argument(
+    identity_name: &str,
+    role: &str,
+    tool_name: &str,
+    permitted: &[&str],
+    arg_key: &str,
+    arg_val: &serde_json::Value,
+) -> Option<Response> {
+    if !permitted.contains(&arg_key) {
+        tracing::warn!(
+            user = %identity_name,
+            role = %role,
+            tool = tool_name,
+            argument = arg_key,
+            "unknown argument rejected by strict allowlist"
+        );
+        return Some(
+            RmcpServerKitError::Rbac(format!(
+                "argument '{arg_key}' is not permitted for tool '{tool_name}'"
+            ))
+            .into_response(),
+        );
+    }
+    if arg_val.is_object() || arg_val.is_array() {
+        tracing::warn!(
+            user = %identity_name,
+            role = %role,
+            tool = tool_name,
+            argument = arg_key,
+            value_type = json_value_type(arg_val),
+            "structured argument rejected by strict allowlist"
+        );
+        return Some(
+            RmcpServerKitError::Rbac(format!(
+                "argument '{arg_key}' must not be an object or array for tool '{tool_name}'"
+            ))
+            .into_response(),
+        );
+    }
+    None
 }
 
 /// Deny when a `required` argument is missing or not string-valued.
@@ -1721,6 +1832,7 @@ mod tests {
                             "ps".into(),
                         ],
                         required: false,
+                        deny_unknown_arguments: false,
                     }],
                 },
             ],
@@ -2094,6 +2206,92 @@ mod tests {
     fn argument_denied_unknown_role() {
         let policy = test_policy();
         assert!(!policy.argument_allowed("unknown", "resource_exec", "cmd", "sh"));
+    }
+
+    // -- M7: strict argument confinement (`deny_unknown_arguments`) --
+
+    fn strict_test_policy(allowlists: Vec<ArgumentAllowlist>) -> RbacPolicy {
+        let role = RoleConfig::new("viewer", vec!["run".into()], vec!["*".into()])
+            .with_argument_allowlists(allowlists);
+        let mut config = RbacConfig::with_roles(vec![role]);
+        config.enabled = true;
+        RbacPolicy::new(&config)
+    }
+
+    fn tool_call(args: serde_json::Value) -> serde_json::Value {
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "name".to_owned(),
+            serde_json::Value::String("run".to_owned()),
+        );
+        params.insert("arguments".to_owned(), args);
+        serde_json::Value::Object(params)
+    }
+
+    #[test]
+    fn unknown_arguments_are_admitted_when_strict_mode_is_off() {
+        let policy = strict_test_policy(vec![ArgumentAllowlist::new(
+            "run",
+            "cmd",
+            vec!["ls".into()],
+        )]);
+        let params = tool_call(serde_json::json!({ "cmd": "ls", "danger": true }));
+        assert!(
+            enforce_tool_policy(&policy, "u", "viewer", &params).is_none(),
+            "default behaviour must be unchanged: unnamed arguments pass"
+        );
+    }
+
+    #[test]
+    fn strict_mode_rejects_unknown_arguments() {
+        let policy = strict_test_policy(vec![
+            ArgumentAllowlist::new("run", "cmd", vec!["ls".into()])
+                .with_deny_unknown_arguments(true),
+        ]);
+        let params = tool_call(serde_json::json!({ "cmd": "ls", "danger": true }));
+        assert!(
+            enforce_tool_policy(&policy, "u", "viewer", &params).is_some(),
+            "an argument no allowlist names must be denied under strict mode"
+        );
+
+        let permitted = tool_call(serde_json::json!({ "cmd": "ls" }));
+        assert!(
+            enforce_tool_policy(&policy, "u", "viewer", &permitted).is_none(),
+            "an allowlisted argument must still pass"
+        );
+    }
+
+    #[test]
+    fn strict_mode_rejects_structured_argument_values() {
+        let policy = strict_test_policy(vec![
+            ArgumentAllowlist::new("run", "cmd", vec![]).with_deny_unknown_arguments(true),
+        ]);
+        for shape in [
+            serde_json::json!({ "nested": "x" }),
+            serde_json::json!(["x"]),
+        ] {
+            let params = tool_call(serde_json::json!({ "cmd": shape }));
+            assert!(
+                enforce_tool_policy(&policy, "u", "viewer", &params).is_some(),
+                "object/array values cannot be constrained and must be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_mode_permits_the_union_of_matching_allowlists() {
+        // Only the first entry sets the flag, yet both arguments stay usable:
+        // strict mode confines the whole `(role, tool)` pair, not one entry.
+        let policy = strict_test_policy(vec![
+            ArgumentAllowlist::new("run", "cmd", vec!["ls".into()])
+                .with_deny_unknown_arguments(true),
+            ArgumentAllowlist::new("run", "host", vec![]),
+        ]);
+        let params = tool_call(serde_json::json!({ "cmd": "ls", "host": "dev-1" }));
+        assert!(
+            enforce_tool_policy(&policy, "u", "viewer", &params).is_none(),
+            "every matching allowlist's argument must remain permitted"
+        );
     }
 
     // -- shlex-tokenization regression tests (1.4.1) --

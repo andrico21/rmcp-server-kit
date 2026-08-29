@@ -704,7 +704,8 @@ hosts = ["*"]
 tool = "container_exec"
 argument = "cmd"
 allowed = ["ls", "cat"]
-required = true          # optional; defaults to false
+required = true                  # optional; defaults to false
+deny_unknown_arguments = true    # optional; defaults to false
 ```
 
 With `required = true` the argument must be present **and** string-valued;
@@ -713,6 +714,22 @@ rejected with 403. Combining `required = true` with an empty `allowed` list
 means "must be supplied as a string, any value accepted". Omitting `required`
 preserves the previous behaviour exactly, so existing configurations are
 unaffected.
+
+`deny_unknown_arguments` closes a wider gap: by default an allowlist constrains
+only the argument it names, so with just `cmd` allowlisted a call carrying
+`{"cmd": "ls", "danger": true}` is admitted and `danger` reaches the handler
+unreviewed. That is safe when the tool's input schema rejects unknown keys, and
+fails open when it does not.
+
+Setting it on **any** allowlist matching a `(role, tool)` pair confines the
+whole tool: the permitted argument names become the union of every matching
+entry's `argument`, and any other top-level key is rejected with 403.
+Object- and array-valued arguments are rejected too, because there is no
+nested-path allowlist to constrain their contents.
+
+> Note the scope: the flag applies to the `(role, tool)` pair, not only to the
+> entry that sets it. If the tool also takes a `host` argument for host-glob
+> matching, add an allowlist entry naming `host` or strict mode will reject it.
 
 #### `RbacPolicy`
 
@@ -864,6 +881,7 @@ metrics_bind = "127.0.0.1:9090"
 log_plaintext_oauth_tokens = false
 log_oauth_claim_values = false
 log_tool_call_arguments = false
+log_upstream_error_bodies = false
 ```
 
 | Field | Type | Default | Description |
@@ -877,6 +895,7 @@ log_tool_call_arguments = false
 | `log_plaintext_oauth_tokens` | `bool` | `false` | Defaults to redacted; enabling writes secrets to logs, is for local debugging only, and is process-wide, not per-server |
 | `log_oauth_claim_values` | `bool` | `false` | Defaults to redacted; enabling writes secrets to logs, is for local debugging only, and is process-wide, not per-server |
 | `log_tool_call_arguments` | `bool` | `false` | Defaults to redacted; enabling writes secrets to logs, is for local debugging only, and is process-wide, not per-server |
+| `log_upstream_error_bodies` | `bool` | `false` | Defaults to redacted. Logs the `error_description` an authorization server returns on a failed RFC 8693 token exchange; that text is chosen upstream and may echo request parameters back. Process-wide, not per-server |
 
 #### Validation
 
@@ -2387,6 +2406,7 @@ metrics_bind = "127.0.0.1:9090"  # env: RMCP_SERVER_KIT__OBSERVABILITY__METRICS_
 log_plaintext_oauth_tokens = false  # env: RMCP_SERVER_KIT__OBSERVABILITY__LOG_PLAINTEXT_OAUTH_TOKENS
 log_oauth_claim_values = false  # env: RMCP_SERVER_KIT__OBSERVABILITY__LOG_OAUTH_CLAIM_VALUES
 log_tool_call_arguments = false  # env: RMCP_SERVER_KIT__OBSERVABILITY__LOG_TOOL_CALL_ARGUMENTS
+log_upstream_error_bodies = false  # env: RMCP_SERVER_KIT__OBSERVABILITY__LOG_UPSTREAM_ERROR_BODIES
 ```
 
 ### Bridging TOML config to `McpServerConfig`
@@ -2486,6 +2506,7 @@ call order is:
 | `RMCP_SERVER_KIT__OBSERVABILITY__LOG_PLAINTEXT_OAUTH_TOKENS` | `observability.log_plaintext_oauth_tokens` | bool | |
 | `RMCP_SERVER_KIT__OBSERVABILITY__LOG_OAUTH_CLAIM_VALUES` | `observability.log_oauth_claim_values` | bool | |
 | `RMCP_SERVER_KIT__OBSERVABILITY__LOG_TOOL_CALL_ARGUMENTS` | `observability.log_tool_call_arguments` | bool | |
+| `RMCP_SERVER_KIT__OBSERVABILITY__LOG_UPSTREAM_ERROR_BODIES` | `observability.log_upstream_error_bodies` | bool | |
 | `RMCP_SERVER_KIT__RBAC__REDACTION_SALT` | `rbac.redaction_salt` | SecretString | secret; redacted in report |
 | `RMCP_SERVER_KIT__RBAC__REDACTION_SALT_FILE` | `rbac.redaction_salt` | Path | secret; redacted in report |
 <!-- END ENV_OVERRIDE_TABLE -->

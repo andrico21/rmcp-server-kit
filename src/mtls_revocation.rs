@@ -312,7 +312,20 @@ pub struct CrlSet {
     /// hot path doesn't re-read the (rarely changing) config struct.
     max_response_bytes: u64,
     last_cap_warn: Mutex<HashMap<&'static str, Instant>>,
+    /// Test-only hook fired immediately before a discovered URL becomes
+    /// observable on `discover_tx`.
+    ///
+    /// Exists because the "pending marker is inserted before the URL is
+    /// published" invariant cannot otherwise be observed deterministically:
+    /// the previous test raced a spinning thread against the scheduler and
+    /// could pass without ever exercising the interleaving.
+    #[cfg(any(test, feature = "test-helpers"))]
+    discovery_send_probe: Mutex<Option<DiscoverySendProbe>>,
 }
+
+/// Callback fired immediately before a discovered URL is published.
+#[cfg(any(test, feature = "test-helpers"))]
+type DiscoverySendProbe = Arc<dyn Fn(&CrlSet, &str) + Send + Sync>;
 
 impl CrlSet {
     fn new(
@@ -398,7 +411,45 @@ impl CrlSet {
             discovery_limiter,
             max_response_bytes,
             last_cap_warn: Mutex::new(HashMap::new()),
+            #[cfg(any(test, feature = "test-helpers"))]
+            discovery_send_probe: Mutex::new(None),
         }))
+    }
+
+    /// Fire the test-only pre-publication probe, if one is installed.
+    ///
+    /// The `Arc` is cloned out and the lock released before the callback runs,
+    /// so a probe may re-enter `CrlSet` state (`pending_urls`, `seen_urls`)
+    /// without deadlocking against this non-reentrant `std::sync::Mutex`.
+    #[cfg(any(test, feature = "test-helpers"))]
+    fn fire_discovery_send_probe(&self, url: &str) {
+        let probe = self
+            .discovery_send_probe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(probe) = probe {
+            probe(self, url);
+        }
+    }
+
+    #[cfg(not(any(test, feature = "test-helpers")))]
+    #[inline]
+    #[allow(
+        clippy::unused_self,
+        reason = "the receiver keeps the call site identical across cfgs; production builds compile this to nothing"
+    )]
+    fn fire_discovery_send_probe(&self, _url: &str) {}
+
+    /// Test-only: observe every URL at the instant before it is published to
+    /// the discovery channel.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
+    pub fn __test_set_discovery_send_probe(&self, probe: DiscoverySendProbe) {
+        *self
+            .discovery_send_probe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(probe);
     }
 
     fn should_warn_throttled(&self, which: &'static str) -> bool {
@@ -756,6 +807,11 @@ impl CrlSet {
         // was ever cached. With `crl_deny_on_unavailable = true` that is a
         // persistent handshake failure; with fail-open it silently disables
         // revocation checking for that CDP for the process lifetime.
+        // SECURITY: discover only from `relevant_urls`, the same set the cap
+        // above governs. Reading `all_urls` here instead would let a peer with
+        // `crl_end_entity_only = true` drive discovery, pending-set growth, and
+        // limiter consumption from uncapped intermediate CDPs -- the exact
+        // amplification the cap exists to remove.
         let candidates: Vec<String> = {
             let seen = self
                 .seen_urls
@@ -765,7 +821,7 @@ impl CrlSet {
                 .pending_urls
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            all_urls
+            relevant_urls
                 .iter()
                 .filter(|url| !seen.contains(*url) && !pending.contains(*url))
                 .cloned()
@@ -804,6 +860,7 @@ impl CrlSet {
             if !inserted {
                 continue;
             }
+            self.fire_discovery_send_probe(&url);
             if self.discover_tx.send(url.clone()).is_err() {
                 // Receiver gone (shutdown). Do NOT mark pending so the
                 // URL can be retried after a reload / restart.
@@ -1446,6 +1503,30 @@ pub fn extract_cdp_urls(cert_der: &[u8], allow_http: bool) -> Vec<String> {
     urls
 }
 
+/// Bound the startup CDP fan-out to the same limit the steady-state cache obeys.
+///
+/// SECURITY: `bootstrap_fetch` is a public helper taking a raw [`MtlsConfig`]
+/// and raw CA certificates, so it is reachable without
+/// `McpServerConfig::validate`. A broad CA bundle would otherwise spawn one
+/// fetch task and one cache entry per distinct CDP URL, unbounded by the cap
+/// that governs every other cache write.
+///
+/// Extracted from `bootstrap_fetch` so the bound is testable at all: that
+/// function cannot be driven from a test without weakening production SSRF
+/// screening, which `bootstrap_cache_cap_is_applied_before_crl_set_publication`
+/// documents at length and explicitly forbids.
+fn cap_bootstrap_urls(urls: &mut Vec<String>, cap: usize) {
+    if urls.len() > cap {
+        tracing::warn!(
+            discovered = urls.len(),
+            cap,
+            "CRL bootstrap: CA chain advertises more distinct CDP URLs than \
+             crl_max_cache_entries; fetching only the first {cap} after dedup"
+        );
+        urls.truncate(cap);
+    }
+}
+
 /// Bootstrap the CRL cache by extracting CDP URLs from the CA chain and
 /// fetching any reachable CRLs with a 10-second total deadline.
 ///
@@ -1472,6 +1553,7 @@ pub async fn bootstrap_fetch(
         .collect::<Vec<_>>();
     urls.sort();
     urls.dedup();
+    cap_bootstrap_urls(&mut urls, config.crl_max_cache_entries);
 
     // M-H2: same SSRF resolver hardening as CrlSet::new -- bootstrap
     // fetches the same attacker-controlled CDP URLs, just earlier in
@@ -2014,12 +2096,9 @@ mod tests {
         reason = "these tests deliberately exercise the deprecated out-of-band cache surface and the ungated test constructors; that is precisely the behaviour under test"
     )]
 
-    use std::{
-        sync::{
-            Mutex as StdMutex,
-            atomic::{AtomicBool, Ordering},
-        },
-        thread,
+    use std::sync::{
+        Mutex as StdMutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     use rcgen::{
@@ -2156,6 +2235,13 @@ mod tests {
         pending.insert(url.to_owned());
     }
 
+    /// The pending marker must exist before a URL becomes observable on the
+    /// discovery channel; otherwise a settlement racing the send strands the
+    /// URL as permanently pending.
+    ///
+    /// Asserted at the exact instant it can be violated, via the pre-send
+    /// probe. The previous form spun a contending thread across 200 attempts
+    /// and could pass without ever producing the bad interleaving.
     #[test]
     fn discovery_does_not_send_before_pending_marker_exists() {
         let mut config = test_mtls_config();
@@ -2163,55 +2249,42 @@ mod tests {
         config.crl_max_seen_urls = 512;
         let (set, mut discover_rx) = test_crl_set_with_receiver_config(config);
 
-        for attempt in 0..200 {
-            let url = format!("http://pending-race-{attempt}.example.test/crl");
-            let stop_contention = Arc::new(AtomicBool::new(false));
+        let url = "http://pending-order.example.test/crl".to_owned();
+        let observed = Arc::new(AtomicUsize::new(0));
+        let probe_observed = Arc::clone(&observed);
+        let probe_url = url.clone();
 
-            let contender_set = Arc::clone(&set);
-            let contender_stop = Arc::clone(&stop_contention);
-            let contender = thread::spawn(move || {
-                while !contender_stop.load(Ordering::Relaxed) {
-                    let guard = contender_set
-                        .pending_urls
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    thread::sleep(Duration::from_micros(100));
-                    drop(guard);
-                    thread::yield_now();
-                }
-            });
-
-            let receiver_set = Arc::clone(&set);
-            let receiver_url = url.clone();
-            thread::scope(|scope| {
-                let receiver_rx = &mut discover_rx;
-                let receiver = scope.spawn(move || {
-                    if receiver_rx.blocking_recv().as_deref() == Some(receiver_url.as_str()) {
-                        receiver_set.__test_settle_pending(&receiver_url, false);
-                    }
-                });
-
-                let note_set = Arc::clone(&set);
-                let note_url = url.clone();
-                let note = scope.spawn(move || {
-                    let _ = note_set.__test_note_discovered_urls_by_cert(&[note_url], &[]);
-                });
-
-                note.join().expect("discovery admission must complete");
-                receiver.join().expect("settlement helper must complete");
-            });
-            stop_contention.store(true, Ordering::Relaxed);
-            contender.join().expect("contention helper must complete");
-
+        set.__test_set_discovery_send_probe(Arc::new(move |set: &CrlSet, sent: &str| {
+            assert_eq!(sent, probe_url, "probe must observe the discovered URL");
             assert!(
-                !pending_contains(&set, &url),
-                "settling a fetch before the old post-send marker write must not strand pending URL {url}"
+                pending_contains(set, sent),
+                "URL {sent} became observable before its pending marker existed"
             );
-            assert!(
-                !set.__test_is_seen(&url),
-                "settling a failed fetch must leave URL {url} discoverable again"
-            );
-        }
+            probe_observed.fetch_add(1, Ordering::Relaxed);
+        }));
+
+        let _ = set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&url), &[]);
+
+        assert_eq!(
+            discover_rx.try_recv().ok().as_deref(),
+            Some(url.as_str()),
+            "the discovered URL must be published exactly once"
+        );
+        assert_eq!(
+            observed.load(Ordering::Relaxed),
+            1,
+            "the pre-send probe must have fired for this URL"
+        );
+
+        set.__test_settle_pending(&url, false);
+        assert!(
+            !pending_contains(&set, &url),
+            "settling a fetch must not strand pending URL {url}"
+        );
+        assert!(
+            !set.__test_is_seen(&url),
+            "settling a failed fetch must leave URL {url} discoverable again"
+        );
     }
 
     /// Covers the cap-before-publication invariant directly rather than by
@@ -3017,6 +3090,60 @@ mod tests {
         let mut config = tamper_test_config();
         config.crl_deny_on_unavailable = false;
         config
+    }
+
+    #[test]
+    fn bootstrap_urls_are_capped_to_the_cache_limit() {
+        let cap = 4usize;
+        let mut urls: Vec<String> = (0..cap + 9)
+            .map(|index| format!("https://ca-{index:02}.example.test/crl"))
+            .collect();
+
+        cap_bootstrap_urls(&mut urls, cap);
+
+        assert_eq!(
+            urls.len(),
+            cap,
+            "a broad CA bundle must not spawn one fetch task per advertised CDP"
+        );
+    }
+
+    #[test]
+    fn bootstrap_urls_below_the_cap_are_untouched() {
+        let mut urls: Vec<String> = (0..3)
+            .map(|index| format!("https://ca-{index:02}.example.test/crl"))
+            .collect();
+        let before = urls.clone();
+
+        cap_bootstrap_urls(&mut urls, 16);
+
+        assert_eq!(urls, before, "capping must not perturb an in-bounds chain");
+    }
+
+    #[tokio::test]
+    async fn end_entity_only_mode_does_not_discover_uncapped_intermediate_cdps() {
+        let mut config = tamper_test_config();
+        config.crl_end_entity_only = true;
+        let (set, mut rx) = test_crl_set_with_receiver_config(config);
+
+        let end_entity = vec!["https://ee.example.test/crl".to_owned()];
+        let intermediate: Vec<String> = (0..MAX_RELEVANT_CDP_URLS_PER_HANDSHAKE + 10)
+            .map(|index| format!("https://int-{index:03}.example.test/crl"))
+            .collect();
+
+        let _ = set.__test_note_discovered_urls_by_cert(&end_entity, &intermediate);
+
+        let mut enqueued = Vec::new();
+        while let Ok(url) = rx.try_recv() {
+            enqueued.push(url);
+        }
+
+        assert_eq!(
+            enqueued, end_entity,
+            "under crl_end_entity_only the capped end-entity set is the only \
+             discovery source; intermediate CDPs bypass MAX_RELEVANT_CDP_URLS_PER_HANDSHAKE \
+             and must never be enqueued"
+        );
     }
 
     #[test]

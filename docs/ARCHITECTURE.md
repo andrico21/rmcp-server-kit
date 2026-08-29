@@ -150,7 +150,7 @@ axum Router                                  src/transport.rs:1521  (build_app_r
    │      (see `extract_bearer` in src/auth.rs).
    │      On success: sets task-locals via `current_role`, `current_identity`, …
    │
-├── 8. RBAC middleware                    src/rbac.rs:846  (rbac_middleware) + 1015 (enforce_tool_policy)
+├── 8. RBAC middleware                    src/rbac.rs:898  (rbac_middleware) + 1015 (enforce_tool_policy)
    │      For POSTs to /mcp:
    │        - Reads body up to limit
    │        - Parses JSON-RPC envelope
@@ -388,7 +388,7 @@ the policy's salt, returning an 8-char hex prefix (`src/rbac.rs:749`).
   installed *after* enforcement (see "Task-locals" below).
 
 ### Middleware
-`rbac_middleware` (`src/rbac.rs:846`):
+`rbac_middleware` (`src/rbac.rs:898`):
 1. Extracts the role + identity name from the `AuthIdentity` request
    extension (set by the auth middleware).
 2. For `POST /mcp`, reads the body (bounded by body-size layer), parses
@@ -478,7 +478,7 @@ Configuration toggles:
 `[mtls]` is configured and `crl_enabled = true` (the default).
 
 Lifecycle:
-1. `bootstrap_fetch(roots, config)` (`src/mtls_revocation.rs:1450`) is
+1. `bootstrap_fetch(roots, config)` (`src/mtls_revocation.rs:1544`) is
    called from `run_server` *before* the listener is built. It walks the
    configured CA chain, extracts every X.509 CRL Distribution Point (CDP)
    URL via `extract_cdp_urls`, fetches each via `reqwest` under a 10 s
@@ -491,14 +491,14 @@ Lifecycle:
    - `discover_tx: mpsc::UnboundedSender<String>` — channel used by the
      handshake path to register newly observed CDP URLs for fetch.
    - `seen_urls: Mutex<HashSet<String>>` — dedupe of URLs already processed.
-3. `DynamicClientCertVerifier` (`src/mtls_revocation.rs:1273`) is the
+3. `DynamicClientCertVerifier` (`src/mtls_revocation.rs:1343`) is the
    `Arc<dyn ClientCertVerifier>` handed to `rustls::ServerConfig`. Its
    trait methods delegate to the inner verifier loaded from
    `inner_verifier.load()`. Because `tokio_rustls::TlsAcceptor` clones
    the verifier `Arc` from the `ServerConfig` at construction, the
    dynamic verifier MUST be the Arc handed to rustls; its inner verifier
    then swaps via the internal `ArcSwap`.
-4. `run_crl_refresher(set, rx, shutdown)` (`src/mtls_revocation.rs:1323`)
+4. `run_crl_refresher(set, rx, shutdown)` (`src/mtls_revocation.rs:1689`)
    is spawned by `run_server`. It:
    - Drains the `discover_tx` receiver and fetches any newly observed CDP URLs.
    - Re-fetches each cached CRL before its `nextUpdate`, clamped to
@@ -559,7 +559,7 @@ reachable:
 
 ### Discovery admission ordering
 
-`note_discovered_urls` (`src/mtls_revocation.rs:694`) implements a
+`note_discovered_urls` (`src/mtls_revocation.rs:758`) implements a
 strict commit-after-admission protocol to keep the discovery rate
 limiter from "leaking" URLs:
 
@@ -577,7 +577,7 @@ This ordering matters: a naive "mark seen, then attempt admission"
 implementation would silently drop CDP URLs forever the first time the
 rate limiter engaged, breaking revocation for the affected client
 identities. The current ordering is verified by
-`__test_check_discovery_rate` (`src/mtls_revocation.rs:951`) and by the
+`__test_check_discovery_rate` (`src/mtls_revocation.rs:1021`) and by the
 `__test_with_kept_receiver` helper used in unit tests.
 
 Hot-reload: `ReloadHandle::refresh_crls()` (in `src/transport.rs`) sends a
@@ -605,8 +605,8 @@ recommended.
    - Decodes the JWT header to get `kid` and `alg`.
    - `lookup_key()` looks up by `kid` in the cached JWKS
      (`src/oauth.rs:2456`).
-   - If not found, calls `refresh_with_cooldown()` (`src/oauth.rs:2945`):
-      - Enforces `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:2341`) so multiple
+   - If not found, calls `refresh_with_cooldown()` (`src/oauth.rs:3052`):
+      - Enforces `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:2448`) so multiple
        invalid tokens cannot DoS the JWKS endpoint.
      - Deduplicates concurrent refreshes.
    - Validates signature, `iss`, `aud`, `exp`, `nbf` using `jsonwebtoken`.
@@ -809,8 +809,8 @@ retiring.
 
 **TOML** — the deserializable sections:
 
-- `ServerConfig` — `src/config.rs:261`
-- `ObservabilityConfig` — `src/config.rs:935`
+- `ServerConfig` — `src/config.rs:296`
+- `ObservabilityConfig` — `src/config.rs:1066`
 - `SecurityHeadersConfig` — `src/transport.rs:239`
 - `AuthConfig`, `MtlsConfig`, `RateLimitConfig` — `src/auth.rs`
 - `RbacConfig` — `src/rbac.rs`
@@ -821,7 +821,7 @@ sections into its own root type. `[server]`, `[rbac]` and `[observability]`
 are a convention from [`docs/GUIDE.md`](GUIDE.md), not a type.
 
 `ServerConfig` was schema-only until 3.4.0 — nothing in the crate consumed it.
-`ServerConfig::apply_to_mcp_config` (`src/config.rs:668`) is the bridge that
+`ServerConfig::apply_to_mcp_config` (`src/config.rs:740`) is the bridge that
 makes it reachable. It uses **replacement semantics**: authoritative for every
 bridgeable transport field, with `None`/`false` clearing whatever the base
 held. Only the runtime-only fields above survive from the base. It is fallible
@@ -829,8 +829,8 @@ held. Only the runtime-only fields above survive from the base. It is fallible
 
 **Environment (opt-in)** — three inherent methods, one per section owning
 targeted fields: `ServerConfig::apply_env_overrides` (`src/config.rs:442`),
-`ObservabilityConfig::apply_env_overrides` (`src/config.rs:699`) and
-`RbacConfig::apply_env_overrides` (`src/rbac.rs:1255`). Each returns
+`ObservabilityConfig::apply_env_overrides` (`src/config.rs:832`) and
+`RbacConfig::apply_env_overrides` (`src/rbac.rs:1391`). Each returns
 `Vec<EnvOverride>` (`src/config.rs:64`) for audit logging, with `value: None`
 for secret targets. Fourteen curated variables under the `RMCP_SERVER_KIT__`
 prefix; `__` separates TOML path segments because field names already contain

@@ -232,6 +232,13 @@ pub(crate) const ENV_OVERRIDE_SPECS: &[EnvOverrideSpec] = &[
         redacted: false,
     },
     EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__OBSERVABILITY__LOG_UPSTREAM_ERROR_BODIES",
+        target_field: "observability.log_upstream_error_bodies",
+        value_type: "bool",
+        required_feature: None,
+        redacted: false,
+    },
+    EnvOverrideSpec {
         env_var: "RMCP_SERVER_KIT__RBAC__REDACTION_SALT",
         target_field: "rbac.redaction_salt",
         value_type: "SecretString",
@@ -273,11 +280,13 @@ pub(crate) const OBSERVABILITY_LOG_OAUTH_CLAIM_VALUES_ENV: &str =
     "RMCP_SERVER_KIT__OBSERVABILITY__LOG_OAUTH_CLAIM_VALUES";
 pub(crate) const OBSERVABILITY_LOG_TOOL_CALL_ARGUMENTS_ENV: &str =
     "RMCP_SERVER_KIT__OBSERVABILITY__LOG_TOOL_CALL_ARGUMENTS";
+pub(crate) const OBSERVABILITY_LOG_UPSTREAM_ERROR_BODIES_ENV: &str =
+    "RMCP_SERVER_KIT__OBSERVABILITY__LOG_UPSTREAM_ERROR_BODIES";
 pub(crate) const RBAC_REDACTION_SALT_ENV: &str = "RMCP_SERVER_KIT__RBAC__REDACTION_SALT";
 pub(crate) const RBAC_REDACTION_SALT_FILE_ENV: &str = "RMCP_SERVER_KIT__RBAC__REDACTION_SALT_FILE";
 
 /// Server listener configuration (reusable across MCP projects).
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 #[allow(
     clippy::struct_excessive_bools,
@@ -408,6 +417,69 @@ pub struct ServerConfig {
     /// Per-header OWASP security-header overrides.
     #[serde(default = "default_security_headers")]
     pub security_headers: SecurityHeadersConfig,
+}
+
+/// Hand-written so `tls_key_path` never reaches a log.
+///
+/// SECURITY: a derived `Debug` renders the private-key path verbatim, and the
+/// whole config is easy to log accidentally (`tracing::debug!(?config)`, a
+/// panic message, an error chain). Presence is still reported so diagnostics
+/// remain useful; only the location is withheld.
+///
+/// Every field is listed deliberately rather than using
+/// `finish_non_exhaustive`, and `server_config_debug_lists_every_field` fails
+/// if a field is added here without being rendered.
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("listen_addr", &self.listen_addr)
+            .field("listen_port", &self.listen_port)
+            .field("tls_cert_path", &self.tls_cert_path)
+            .field(
+                "tls_key_path",
+                &self.tls_key_path.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("tls_handshake_timeout", &self.tls_handshake_timeout)
+            .field(
+                "max_concurrent_tls_handshakes",
+                &self.max_concurrent_tls_handshakes,
+            )
+            .field("shutdown_timeout", &self.shutdown_timeout)
+            .field("request_timeout", &self.request_timeout)
+            .field("max_request_body", &self.max_request_body)
+            .field("allowed_origins", &self.allowed_origins)
+            .field("stdio_enabled", &self.stdio_enabled)
+            .field("tool_rate_limit", &self.tool_rate_limit)
+            .field("tool_rate_limit_burst", &self.tool_rate_limit_burst)
+            .field("extra_route_rate_limit", &self.extra_route_rate_limit)
+            .field(
+                "extra_route_rate_limit_burst",
+                &self.extra_route_rate_limit_burst,
+            )
+            .field(
+                "extra_route_rate_limit_exempt_paths",
+                &self.extra_route_rate_limit_exempt_paths,
+            )
+            .field("key_eviction_policy", &self.key_eviction_policy)
+            .field("trusted_proxies", &self.trusted_proxies)
+            .field(
+                "trusted_forwarder_max_entries",
+                &self.trusted_forwarder_max_entries,
+            )
+            .field("forwarded_header", &self.forwarded_header)
+            .field("session_idle_timeout", &self.session_idle_timeout)
+            .field("sse_keep_alive", &self.sse_keep_alive)
+            .field("public_url", &self.public_url)
+            .field("compression_enabled", &self.compression_enabled)
+            .field("compression_min_size", &self.compression_min_size)
+            .field("max_concurrent_requests", &self.max_concurrent_requests)
+            .field("admin_enabled", &self.admin_enabled)
+            .field("admin_role", &self.admin_role)
+            .field("auth", &self.auth)
+            .field("expose_build_metadata", &self.expose_build_metadata)
+            .field("security_headers", &self.security_headers)
+            .finish()
+    }
 }
 
 impl Default for ServerConfig {
@@ -800,6 +872,15 @@ impl ObservabilityConfig {
                 raw,
             ));
         }
+        if let Some(raw) = read_env(OBSERVABILITY_LOG_UPSTREAM_ERROR_BODIES_ENV)? {
+            self.log_upstream_error_bodies =
+                parse_env_bool(OBSERVABILITY_LOG_UPSTREAM_ERROR_BODIES_ENV, &raw)?;
+            applied.push(env_report(
+                OBSERVABILITY_LOG_UPSTREAM_ERROR_BODIES_ENV,
+                "observability.log_upstream_error_bodies",
+                raw,
+            ));
+        }
         apply_string_env(
             OBSERVABILITY_METRICS_BIND_ENV,
             "observability.metrics_bind",
@@ -975,7 +1056,7 @@ fn parse_duration_field(field: &str, value: &str) -> Result<Duration, RmcpServer
 }
 
 /// Observability settings (reusable across MCP projects).
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 #[allow(
     clippy::struct_excessive_bools,
@@ -1016,6 +1097,41 @@ pub struct ObservabilityConfig {
     /// only. Process-wide, not per-server.
     #[serde(default)]
     pub log_tool_call_arguments: bool,
+    /// Log the `error_description` an authorization server returns on a failed
+    /// RFC 8693 token exchange. Defaults to redacted; the value is free-form
+    /// upstream text that may reflect request parameters back. Process-wide,
+    /// not per-server.
+    #[serde(default)]
+    pub log_upstream_error_bodies: bool,
+}
+
+/// Hand-written so `audit_log_path` never reaches a log.
+///
+/// SECURITY: the audit log's location is operational metadata an attacker can
+/// use to find or tamper with the audit trail. Presence is still reported;
+/// only the path is withheld. `observability_config_debug_lists_every_field`
+/// fails if a field is added without being rendered here.
+impl std::fmt::Debug for ObservabilityConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObservabilityConfig")
+            .field("log_level", &self.log_level)
+            .field("log_format", &self.log_format)
+            .field(
+                "audit_log_path",
+                &self.audit_log_path.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("log_request_headers", &self.log_request_headers)
+            .field("metrics_enabled", &self.metrics_enabled)
+            .field("metrics_bind", &self.metrics_bind)
+            .field(
+                "log_plaintext_oauth_tokens",
+                &self.log_plaintext_oauth_tokens,
+            )
+            .field("log_oauth_claim_values", &self.log_oauth_claim_values)
+            .field("log_tool_call_arguments", &self.log_tool_call_arguments)
+            .field("log_upstream_error_bodies", &self.log_upstream_error_bodies)
+            .finish()
+    }
 }
 
 impl Default for ObservabilityConfig {
@@ -1030,8 +1146,59 @@ impl Default for ObservabilityConfig {
             log_plaintext_oauth_tokens: false,
             log_oauth_claim_values: false,
             log_tool_call_arguments: false,
+            log_upstream_error_bodies: false,
         }
     }
+}
+
+/// A violation of an invariant that BOTH config validators must enforce.
+///
+/// The variants exist so the two validators cannot drift in *ordering* while
+/// still reporting their own historical wording: `McpServerConfig::check`
+/// distinguishes which TLS half is missing, whereas `validate_server_config`
+/// emits one combined message. Callers map variants to their own text.
+pub(crate) enum SharedConfigViolation {
+    /// `admin_enabled` without an enabled auth config.
+    AdminRequiresAuth,
+    /// `tls_cert_path` set, `tls_key_path` missing.
+    TlsCertWithoutKey,
+    /// `tls_key_path` set, `tls_cert_path` missing.
+    TlsKeyWithoutCert,
+    /// `auth.mtls` configured on a listener without both TLS halves.
+    MtlsRequiresTls,
+}
+
+/// Evaluate the three invariants shared by both validators, in the one order
+/// both must report.
+///
+/// Scope is deliberately limited to these three. Everything else each
+/// validator checks (TOML-only parsing, timeouts, OAuth, security headers,
+/// env overrides, bridge behaviour) stays where it is: those inputs are not
+/// common to both types, and folding them in here would change validation
+/// behaviour that no test currently pins.
+#[allow(
+    clippy::fn_params_excessive_bools,
+    reason = "these are the five independent predicates both validators evaluate; a params struct would carry the same five bools and only relocate the lint"
+)]
+pub(crate) fn check_shared_config_invariants(
+    admin_enabled: bool,
+    auth_enabled: bool,
+    has_tls_cert: bool,
+    has_tls_key: bool,
+    has_mtls: bool,
+) -> Result<(), SharedConfigViolation> {
+    if admin_enabled && !auth_enabled {
+        return Err(SharedConfigViolation::AdminRequiresAuth);
+    }
+    match (has_tls_cert, has_tls_key) {
+        (true, false) => return Err(SharedConfigViolation::TlsCertWithoutKey),
+        (false, true) => return Err(SharedConfigViolation::TlsKeyWithoutCert),
+        _ => {}
+    }
+    if has_mtls && !(has_tls_cert && has_tls_key) {
+        return Err(SharedConfigViolation::MtlsRequiresTls);
+    }
+    Ok(())
 }
 
 /// Validate the generic server config fields.
@@ -1048,41 +1215,41 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
         ));
     }
 
-    // The next three checks are ordered to match `McpServerConfig::check`
-    // (admin/auth dependency, then TLS pairing, then mTLS-requires-TLS) so
-    // that a config which is invalid in more than one of these ways reports
-    // the same first error whichever validator a consumer reaches for.
+    // These three checks are delegated to `check_shared_config_invariants` so
+    // this validator and `McpServerConfig::check` cannot drift in ordering: a
+    // config invalid in more than one of these ways reports the same first
+    // error whichever validator a consumer reaches for. Wording stays local
+    // because the two types report the TLS pairing failure differently.
     // Checks outside this group are not ordered against the builder: the two
     // types accept different inputs (`listen_port` has no builder analog),
     // so full first-error parity is neither achievable nor claimed.
-    if server.admin_enabled && !server.auth.as_ref().is_some_and(|a| a.enabled) {
+    if let Err(violation) = check_shared_config_invariants(
+        server.admin_enabled,
+        server.auth.as_ref().is_some_and(|a| a.enabled),
+        server.tls_cert_path.is_some(),
+        server.tls_key_path.is_some(),
+        server.auth.as_ref().is_some_and(|a| a.mtls.is_some()),
+    ) {
         return Err(RmcpServerKitError::Config(
-            "admin_enabled=true requires auth to be configured and enabled".into(),
-        ));
-    }
-
-    match (&server.tls_cert_path, &server.tls_key_path) {
-        (Some(_), None) | (None, Some(_)) => {
-            return Err(RmcpServerKitError::Config(
-                "tls_cert_path and tls_key_path must both be set or both omitted".into(),
-            ));
-        }
-        _ => {}
-    }
-
-    // Kept duplicated from `McpServerConfig::check` deliberately, and must
-    // stay in this position: a consumer calling only `validate_server_config`
-    // on TOML would otherwise be told the config is valid while
-    // client-certificate authentication is silently inert, because a
-    // plaintext listener never performs a handshake and so never extracts an
-    // identity.
-    if server.auth.as_ref().is_some_and(|a| a.mtls.is_some())
-        && (server.tls_cert_path.is_none() || server.tls_key_path.is_none())
-    {
-        return Err(RmcpServerKitError::Config(
-            "auth.mtls requires TLS: set both tls_cert_path and tls_key_path \
-             (mTLS client certificates cannot be verified on a plaintext listener)"
-                .into(),
+            match violation {
+                SharedConfigViolation::AdminRequiresAuth => {
+                    "admin_enabled=true requires auth to be configured and enabled"
+                }
+                SharedConfigViolation::TlsCertWithoutKey
+                | SharedConfigViolation::TlsKeyWithoutCert => {
+                    "tls_cert_path and tls_key_path must both be set or both omitted"
+                }
+                // A consumer calling only `validate_server_config` on TOML
+                // would otherwise be told the config is valid while
+                // client-certificate authentication is silently inert: a
+                // plaintext listener never performs a handshake and so never
+                // extracts an identity.
+                SharedConfigViolation::MtlsRequiresTls => {
+                    "auth.mtls requires TLS: set both tls_cert_path and tls_key_path \
+                     (mTLS client certificates cannot be verified on a plaintext listener)"
+                }
+            }
+            .into(),
         ));
     }
 
@@ -2469,6 +2636,197 @@ mod tests {
         );
     }
 
+    /// Extract the `pub` field names of a struct from this file's own source.
+    fn struct_pub_fields(marker: &str) -> Vec<String> {
+        let source = include_str!("config.rs").replace("\r\n", "\n");
+        let (_, after) = source
+            .split_once(marker)
+            .unwrap_or_else(|| panic!("struct start marker {marker:?} not found"));
+        let (body, _) = after
+            .split_once("\n}\n")
+            .expect("struct end marker not found");
+        body.lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix("pub ")
+                    .and_then(|rest| rest.split_once(':').map(|(name, _)| name.trim().to_owned()))
+            })
+            .collect()
+    }
+
+    /// Config fields deliberately NOT exposed as environment overrides.
+    ///
+    /// Hand-maintained on purpose: adding a field to `ServerConfig` or
+    /// `ObservabilityConfig` must be a conscious decision to expose it or not,
+    /// and `every_config_field_is_env_overridable_or_excluded` fails until the
+    /// field appears in `ENV_OVERRIDE_SPECS` or here. Without this list a new
+    /// field silently defaults to "no override" with nothing to notice it.
+    const ENV_OVERRIDE_EXCLUDED_FIELDS: &[&str] = &[
+        // Structured / nested values with no single-scalar env representation.
+        "server.allowed_origins",
+        "server.extra_route_rate_limit_exempt_paths",
+        "server.trusted_proxies",
+        "server.auth",
+        "server.security_headers",
+        // Tuning knobs intentionally file-only: changing them per-process via
+        // the environment invites drift between replicas of the same service.
+        "server.tls_handshake_timeout",
+        "server.max_concurrent_tls_handshakes",
+        "server.shutdown_timeout",
+        "server.request_timeout",
+        "server.max_request_body",
+        "server.stdio_enabled",
+        "server.tool_rate_limit",
+        "server.tool_rate_limit_burst",
+        "server.extra_route_rate_limit",
+        "server.extra_route_rate_limit_burst",
+        "server.trusted_forwarder_max_entries",
+        "server.forwarded_header",
+        "server.session_idle_timeout",
+        "server.sse_keep_alive",
+        "server.compression_enabled",
+        "server.compression_min_size",
+        "server.max_concurrent_requests",
+        "server.admin_role",
+        "server.expose_build_metadata",
+        // `log_level` is already controlled by RUST_LOG; a second env source
+        // would give two switches for one behaviour.
+        "observability.log_level",
+        "observability.audit_log_path",
+        "observability.log_request_headers",
+    ];
+
+    #[test]
+    fn every_config_field_is_env_overridable_or_excluded() {
+        for (marker, prefix) in [
+            ("pub struct ServerConfig {", "server"),
+            ("pub struct ObservabilityConfig {", "observability"),
+        ] {
+            for field in struct_pub_fields(marker) {
+                let target = format!("{prefix}.{field}");
+                let overridable = ENV_OVERRIDE_SPECS
+                    .iter()
+                    .any(|spec| spec.target_field == target);
+                let excluded = ENV_OVERRIDE_EXCLUDED_FIELDS.contains(&target.as_str());
+                assert!(
+                    overridable || excluded,
+                    "`{target}` is neither env-overridable nor listed in \
+                     ENV_OVERRIDE_EXCLUDED_FIELDS; classify it deliberately"
+                );
+                assert!(
+                    !(overridable && excluded),
+                    "`{target}` is both env-overridable and excluded; remove one"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shared_invariants_report_a_fixed_precedence() {
+        // All three violated at once: both validators must surface the same
+        // one first, which is the drift this helper exists to prevent.
+        assert!(matches!(
+            check_shared_config_invariants(true, false, true, false, true),
+            Err(SharedConfigViolation::AdminRequiresAuth)
+        ));
+        // Admin satisfied: TLS pairing outranks mTLS-requires-TLS.
+        assert!(matches!(
+            check_shared_config_invariants(false, true, true, false, true),
+            Err(SharedConfigViolation::TlsCertWithoutKey)
+        ));
+        assert!(matches!(
+            check_shared_config_invariants(false, true, false, true, true),
+            Err(SharedConfigViolation::TlsKeyWithoutCert)
+        ));
+        // Pairing satisfied (neither half set), mTLS still unsatisfiable.
+        assert!(matches!(
+            check_shared_config_invariants(false, true, false, false, true),
+            Err(SharedConfigViolation::MtlsRequiresTls)
+        ));
+        // Fully valid combinations.
+        check_shared_config_invariants(true, true, true, true, true)
+            .unwrap_or_else(|_| panic!("admin+auth with full TLS and mTLS must be valid"));
+        check_shared_config_invariants(false, false, false, false, false)
+            .unwrap_or_else(|_| panic!("an empty config must be valid"));
+    }
+
+    #[test]
+    fn toml_validator_surfaces_the_shared_precedence() {
+        let server = ServerConfig {
+            admin_enabled: true,
+            tls_cert_path: Some(PathBuf::from("/etc/certs/server.crt")),
+            ..Default::default()
+        };
+
+        let err = validate_server_config(&server)
+            .expect_err("admin without auth must fail")
+            .to_string();
+        assert!(
+            err.contains("admin_enabled=true requires auth"),
+            "admin must be reported before the TLS pairing failure; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn server_config_debug_redacts_tls_key_path() {
+        let cfg = ServerConfig {
+            tls_cert_path: Some(PathBuf::from("/etc/certs/server.crt")),
+            tls_key_path: Some(PathBuf::from("/etc/secrets/server.key")),
+            ..Default::default()
+        };
+
+        let rendered = format!("{cfg:?}");
+        assert!(
+            !rendered.contains("server.key") && !rendered.contains("/etc/secrets"),
+            "the private-key path must never render; got {rendered}"
+        );
+        assert!(
+            rendered.contains("tls_key_path: Some(\"[REDACTED]\")"),
+            "presence must still be reported for diagnostics; got {rendered}"
+        );
+        assert!(
+            rendered.contains("server.crt"),
+            "the certificate path is not secret and must remain visible"
+        );
+    }
+
+    #[test]
+    fn observability_config_debug_redacts_audit_log_path() {
+        let cfg = ObservabilityConfig {
+            audit_log_path: Some(PathBuf::from("/var/log/rmcp/audit.log")),
+            ..Default::default()
+        };
+
+        let rendered = format!("{cfg:?}");
+        assert!(
+            !rendered.contains("audit.log") && !rendered.contains("/var/log"),
+            "the audit log location must never render; got {rendered}"
+        );
+        assert!(rendered.contains("audit_log_path: Some(\"[REDACTED]\")"));
+    }
+
+    #[test]
+    fn server_config_debug_lists_every_field() {
+        let rendered = format!("{:?}", ServerConfig::default());
+        for field in struct_pub_fields("pub struct ServerConfig {") {
+            assert!(
+                rendered.contains(&format!("{field}:")),
+                "hand-written Debug omits `{field}`; add it (redacted if sensitive)"
+            );
+        }
+    }
+
+    #[test]
+    fn observability_config_debug_lists_every_field() {
+        let rendered = format!("{:?}", ObservabilityConfig::default());
+        for field in struct_pub_fields("pub struct ObservabilityConfig {") {
+            assert!(
+                rendered.contains(&format!("{field}:")),
+                "hand-written Debug omits `{field}`; add it (redacted if sensitive)"
+            );
+        }
+    }
+
     #[test]
     fn t10_every_server_config_field_is_classified_for_bridge() {
         let source = include_str!("config.rs").replace("\r\n", "\n");
@@ -3222,6 +3580,12 @@ mod tests {
         (
             OBSERVABILITY_LOG_TOOL_CALL_ARGUMENTS_ENV,
             "observability.log_tool_call_arguments",
+            None,
+            false,
+        ),
+        (
+            OBSERVABILITY_LOG_UPSTREAM_ERROR_BODIES_ENV,
+            "observability.log_upstream_error_bodies",
             None,
             false,
         ),

@@ -1244,45 +1244,44 @@ impl McpServerConfig {
     /// internal call sites (e.g. tests) that need to inspect a config
     /// without taking ownership.
     fn check(&self) -> Result<(), RmcpServerKitError> {
-        // 1. admin <-> auth dependency. Mirrors the runtime check in
-        //    `build_app_router`: admin endpoints require an auth state,
-        //    which is built only when `auth` is `Some` *and* `enabled`.
-        if self.admin_enabled {
-            let auth_enabled = self.auth.as_ref().is_some_and(|a| a.enabled);
-            if !auth_enabled {
-                return Err(RmcpServerKitError::Config(
-                    "admin_enabled=true requires auth to be configured and enabled".into(),
-                ));
-            }
-        }
-
-        // 2. TLS cert / key must be paired
-        match (&self.tls_cert_path, &self.tls_key_path) {
-            (Some(_), None) => {
-                return Err(RmcpServerKitError::Config(
-                    "tls_cert_path is set but tls_key_path is missing".into(),
-                ));
-            }
-            (None, Some(_)) => {
-                return Err(RmcpServerKitError::Config(
-                    "tls_key_path is set but tls_cert_path is missing".into(),
-                ));
-            }
-            _ => {}
-        }
-
-        // 2b. mTLS requires TLS. The plaintext listener never performs a TLS
+        // Delegated to `check_shared_config_invariants` so this validator and
+        // `validate_server_config` cannot drift in ordering. Wording stays
+        // local: this type names which TLS half is missing, the TOML validator
+        // emits one combined message.
+        //
+        // 1. admin <-> auth dependency mirrors the runtime check in
+        //    `build_app_router`: admin endpoints require an auth state, built
+        //    only when `auth` is `Some` *and* `enabled`.
+        // 2. TLS cert / key must be paired.
+        // 2b. mTLS requires TLS. A plaintext listener never performs a TLS
         //     handshake, so it cannot populate `ConnectInfo<TlsConnInfo>` and
         //     the client-certificate identity is never extracted. Accepting
         //     this combination silently disables client-cert authentication
         //     for an operator who believes it is switched on.
-        if self.auth.as_ref().is_some_and(|a| a.mtls.is_some())
-            && (self.tls_cert_path.is_none() || self.tls_key_path.is_none())
-        {
+        if let Err(violation) = crate::config::check_shared_config_invariants(
+            self.admin_enabled,
+            self.auth.as_ref().is_some_and(|a| a.enabled),
+            self.tls_cert_path.is_some(),
+            self.tls_key_path.is_some(),
+            self.auth.as_ref().is_some_and(|a| a.mtls.is_some()),
+        ) {
             return Err(RmcpServerKitError::Config(
-                "auth.mtls requires TLS: set both tls_cert_path and tls_key_path \
-                 (mTLS client certificates cannot be verified on a plaintext listener)"
-                    .into(),
+                match violation {
+                    crate::config::SharedConfigViolation::AdminRequiresAuth => {
+                        "admin_enabled=true requires auth to be configured and enabled"
+                    }
+                    crate::config::SharedConfigViolation::TlsCertWithoutKey => {
+                        "tls_cert_path is set but tls_key_path is missing"
+                    }
+                    crate::config::SharedConfigViolation::TlsKeyWithoutCert => {
+                        "tls_key_path is set but tls_cert_path is missing"
+                    }
+                    crate::config::SharedConfigViolation::MtlsRequiresTls => {
+                        "auth.mtls requires TLS: set both tls_cert_path and tls_key_path \
+                         (mTLS client certificates cannot be verified on a plaintext listener)"
+                    }
+                }
+                .into(),
             ));
         }
 
@@ -3900,12 +3899,28 @@ fn log_incoming_request(
     }
 }
 
+/// Header names whose values are never rendered into logs.
+///
+/// SECURITY: the first three carry credentials. The forwarding headers carry
+/// client IPs and proxy topology and are attacker-controlled on any hop the
+/// operator has not declared trusted, so logging them verbatim lets a caller
+/// plant misleading provenance in an incident-response trail. The trusted,
+/// resolved address is published separately by `resolve_client_ip`.
+const REDACTED_LOG_HEADERS: [&str; 6] = [
+    "authorization",
+    "cookie",
+    "proxy-authorization",
+    "forwarded",
+    "x-forwarded-for",
+    "x-real-ip",
+];
+
 fn format_request_headers_for_log(headers: &axum::http::HeaderMap) -> String {
     headers
         .iter()
         .map(|(k, v)| {
             let name = k.as_str();
-            if name == "authorization" || name == "cookie" || name == "proxy-authorization" {
+            if REDACTED_LOG_HEADERS.contains(&name) {
                 format!("{name}: [REDACTED]")
             } else {
                 format!("{name}: {}", v.to_str().unwrap_or("<non-utf8>"))
@@ -5328,6 +5343,28 @@ mod tests {
         assert!(out.contains("cookie: [REDACTED]"));
         assert!(out.contains("x-request-id: req-123"));
         assert!(!out.contains("secret-token"));
+    }
+
+    #[test]
+    fn format_request_headers_redacts_forwarding_headers() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("forwarded", "for=203.0.113.9;by=10.1.2.3".parse().unwrap());
+        headers.insert("x-forwarded-for", "203.0.113.9, 10.1.2.3".parse().unwrap());
+        headers.insert("x-real-ip", "203.0.113.9".parse().unwrap());
+        headers.insert("x-request-id", "req-123".parse().unwrap());
+
+        let out = format_request_headers_for_log(&headers);
+        for name in ["forwarded", "x-forwarded-for", "x-real-ip"] {
+            assert!(
+                out.contains(&format!("{name}: [REDACTED]")),
+                "{name} carries client IP / proxy topology and must not reach logs; got {out}"
+            );
+        }
+        assert!(
+            !out.contains("203.0.113.9") && !out.contains("10.1.2.3"),
+            "no forwarded address may survive redaction; got {out}"
+        );
+        assert!(out.contains("x-request-id: req-123"));
     }
 
     // -- security_headers_middleware --

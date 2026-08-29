@@ -209,6 +209,7 @@ pub fn init_tracing_from_config_strict(
         plaintext_oauth_tokens: config.log_plaintext_oauth_tokens,
         oauth_claim_values: config.log_oauth_claim_values,
         tool_call_arguments: config.log_tool_call_arguments,
+        upstream_error_bodies: config.log_upstream_error_bodies,
     });
 
     for warning in audit_setup.warnings {
@@ -517,11 +518,7 @@ fn open_audit_file(path: &Path) -> Result<AuditSetup, String> {
         ));
     }
 
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|e| format!("failed to open audit log file {}: {e}", path.display()))?;
+    let file = create_private_audit_file(path)?;
 
     let warnings = audit_file_permission_warnings(&file);
 
@@ -606,11 +603,50 @@ fn legacy_tracing_guards() -> &'static Mutex<Vec<TracingGuard>> {
     GUARDS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// Create (or append to) the audit log with owner-only permissions.
+///
+/// SECURITY: the mode is applied by `open` itself rather than by a following
+/// `set_permissions`. The two-step form leaves a window in which the file
+/// exists with umask-derived permissions, so any local principal can open it
+/// before the mode is tightened. Audit logs carry identities and, under the
+/// diagnostic switches, credential material.
+#[cfg(unix)]
+fn create_private_audit_file(path: &Path) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    std::fs::OpenOptions::new()
+        .mode(0o600)
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("failed to open audit log file {}: {e}", path.display()))
+}
+
+/// Refuse to create an audit log where owner-only access cannot be guaranteed.
+///
+/// SECURITY: this platform has no POSIX mode bits, and ACL hardening is not
+/// implemented. Creating the file anyway would let it inherit directory ACLs -
+/// under a location such as `C:\ProgramData` that is world-readable - while the
+/// operator believes auditing is protected. Failing here turns a silent
+/// security-control failure into an explicit one: strict init reports a startup
+/// error, and the deprecated lenient init warns and installs no audit sink.
+#[cfg(not(unix))]
+fn create_private_audit_file(path: &Path) -> Result<std::fs::File, String> {
+    Err(format!(
+        "audit log private permissions are unsupported on this platform: cannot \
+         guarantee owner-only access for {}; Windows ACL hardening is not \
+         implemented; audit logging disabled",
+        path.display()
+    ))
+}
+
 #[cfg(unix)]
 fn audit_file_permission_warnings(file: &std::fs::File) -> Vec<String> {
     use std::os::unix::fs::PermissionsExt;
 
     let mut warnings = Vec::new();
+    // A pre-existing file keeps its old mode: `OpenOptions::mode` applies only
+    // when `open` creates the file, so tighten it explicitly here.
     if let Err(e) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
         warnings.push(format!("failed to set audit log permissions to 0o600: {e}"));
     }
@@ -634,8 +670,9 @@ mod tests {
         clippy::print_stderr,
         reason = "test-only relaxations; production code uses ? and tracing"
     )]
+    #[cfg(unix)]
+    use std::io::Write as _;
     use std::{
-        io::Write as _,
         path::PathBuf,
         sync::{
             Arc,
@@ -645,9 +682,13 @@ mod tests {
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
+    #[cfg(unix)]
     use tracing_subscriber::{Layer as _, fmt::MakeWriter as _, layer::SubscriberExt as _};
 
-    use super::{AuditMessage, AuditWorker, init_tracing, prepare_tracing_audit_strict};
+    use super::{
+        AuditMessage, AuditWorker, init_tracing, prepare_tracing_audit_lenient,
+        prepare_tracing_audit_strict,
+    };
     use crate::{config::ObservabilityConfig, error::RmcpServerKitError};
 
     struct FailingAuditSink;
@@ -674,6 +715,7 @@ mod tests {
             log_plaintext_oauth_tokens: false,
             log_oauth_claim_values: false,
             log_tool_call_arguments: false,
+            log_upstream_error_bodies: false,
         };
         assert!(config.log_format == "json" || config.log_format == "pretty");
     }
@@ -713,6 +755,7 @@ mod tests {
             log_plaintext_oauth_tokens: false,
             log_oauth_claim_values: false,
             log_tool_call_arguments: false,
+            log_upstream_error_bodies: false,
         };
         #[allow(
             deprecated,
@@ -770,6 +813,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn strict_init_succeeds_and_writes_audit_line() {
         let dir = unique_temp_path("audit-dir");
         let audit_path = dir.join("audit.log");
@@ -861,7 +905,76 @@ mod tests {
             log_plaintext_oauth_tokens: false,
             log_oauth_claim_values: false,
             log_tool_call_arguments: false,
+            log_upstream_error_bodies: false,
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn audit_file_is_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = unique_temp_path("audit-mode");
+        let audit_path = dir.join("audit.log");
+        let config = observability_config(Some(audit_path.clone()));
+        let setup = prepare_tracing_audit_strict(&config).expect("strict audit setup succeeds");
+        drop(setup.guard);
+
+        let mode = std::fs::metadata(&audit_path)
+            .expect("audit file exists")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "audit log must never be group- or world-accessible, even transiently; \
+             got mode {mode:o}"
+        );
+        std::fs::remove_dir_all(&dir).expect("remove audit temp dir");
+    }
+
+    #[test]
+    #[cfg(not(unix))]
+    fn strict_init_refuses_audit_log_without_private_permissions() {
+        let dir = unique_temp_path("audit-unsupported");
+        let audit_path = dir.join("audit.log");
+        let config = observability_config(Some(audit_path.clone()));
+
+        let err = prepare_tracing_audit_strict(&config)
+            .err()
+            .expect("audit logging must fail closed where owner-only access is unguaranteed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("private permissions are unsupported"),
+            "error must explain why auditing was refused; got {msg:?}"
+        );
+        assert!(
+            !audit_path.exists(),
+            "the audit file must NOT be created when its permissions cannot be guaranteed"
+        );
+    }
+
+    #[test]
+    #[cfg(not(unix))]
+    fn lenient_init_warns_and_installs_no_audit_sink() {
+        let dir = unique_temp_path("audit-lenient");
+        let audit_path = dir.join("audit.log");
+        let config = observability_config(Some(audit_path.clone()));
+
+        let setup = prepare_tracing_audit_lenient(&config);
+        assert!(
+            setup.writer.is_none(),
+            "no audit sink may be installed when permissions cannot be guaranteed"
+        );
+        assert!(
+            setup
+                .warnings
+                .iter()
+                .any(|w| w.contains("private permissions are unsupported")),
+            "lenient init must warn rather than fail silently; got {:?}",
+            setup.warnings
+        );
+        assert!(!audit_path.exists(), "no audit file may be created");
     }
 
     fn unique_temp_path(label: &str) -> PathBuf {

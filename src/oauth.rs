@@ -1148,6 +1148,7 @@ impl OAuthConfig {
                 "oauth.jwks_uri forbidden ({reason})"
             )));
         }
+        self.validate_discovery_metadata_urls(allow_http)?;
         // `audience` is not a URL, so the `check_oauth_url` calls above do not
         // cover it. Guard it explicitly: with `#[serde(default)]` an omitted
         // audience is an empty string that would otherwise pass validation and
@@ -1249,6 +1250,46 @@ impl OAuthConfig {
         })?;
         Ok(())
     }
+
+    /// Validate the URLs published by the discovery endpoints.
+    ///
+    /// SECURITY: `authorization_server_metadata_issuer` and
+    /// `authorization_servers[]` are reflected verbatim by the unauthenticated
+    /// `/.well-known/oauth-*` endpoints, so an unvalidated value is disclosed
+    /// to any caller. They are held to the same policy as every other OAuth
+    /// URL: parseable, no userinfo, scheme honouring `allow_http_oauth_urls`,
+    /// and no literal-IP target.
+    fn validate_discovery_metadata_urls(
+        &self,
+        allow_http: bool,
+    ) -> Result<(), crate::error::RmcpServerKitError> {
+        if let Some(ref issuer) = self.authorization_server_metadata_issuer {
+            let url = check_oauth_url(
+                "oauth.authorization_server_metadata_issuer",
+                issuer,
+                allow_http,
+            )?;
+            if let Some(reason) = crate::ssrf::check_url_literal_ip(&url) {
+                return Err(crate::error::RmcpServerKitError::Config(format!(
+                    "oauth.authorization_server_metadata_issuer forbidden ({reason})"
+                )));
+            }
+        }
+        // An empty vec is meaningful (it omits the claim entirely) and is
+        // preserved here by iterating zero times.
+        if let Some(ref servers) = self.authorization_servers {
+            for (index, server) in servers.iter().enumerate() {
+                let field = format!("oauth.authorization_servers[{index}]");
+                let url = check_oauth_url(&field, server, allow_http)?;
+                if let Some(reason) = crate::ssrf::check_url_literal_ip(&url) {
+                    return Err(crate::error::RmcpServerKitError::Config(format!(
+                        "{field} forbidden ({reason})"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// M-H4: enforce RFC 8705 §2 mutual exclusion (`client_secret` xor
@@ -1341,8 +1382,29 @@ fn validate_token_exchange_optional_params(
     if tx.scope.as_deref().is_some_and(str::is_empty) {
         return Err(empty_field("scope"));
     }
-    if matches!(tx.requested_token_type, RequestedTokenType::Custom(ref uri) if uri.is_empty()) {
-        return Err(empty_field("requested_token_type"));
+    if let RequestedTokenType::Custom(ref uri) = tx.requested_token_type {
+        if uri.is_empty() {
+            return Err(empty_field("requested_token_type"));
+        }
+        // A custom token type must be a URI (RFC 8693 §3), which is what makes
+        // a typo such as "acess_token" a config error rather than a bare word
+        // silently forwarded to the authorization server. Unlike `resource`
+        // below, a fragment is NOT rejected: the no-fragment rule is
+        // RFC 8707 §2's constraint on resource indicators, not a property of
+        // RFC 8693 token-type identifiers.
+        if !uri.chars().all(is_rfc3986_uri_char) || !has_valid_pct_encoding(uri) {
+            return Err(crate::error::RmcpServerKitError::Config(
+                "oauth.token_exchange.requested_token_type custom value must be an RFC 3986 \
+                 absolute URI using valid URI characters and percent-encoding (RFC 8693 §3)"
+                    .into(),
+            ));
+        }
+        url::Url::parse(uri).map_err(|e| {
+            crate::error::RmcpServerKitError::Config(format!(
+                "oauth.token_exchange.requested_token_type custom value must be an absolute \
+                 URI (RFC 8693 §3): {e}"
+            ))
+        })?;
     }
     if let Some(resource) = tx.resource.as_deref() {
         if resource.is_empty() {
@@ -1926,14 +1988,14 @@ impl TokenExchangeConfig {
     /// `with_*` methods.
     #[must_use]
     pub fn new(
-        token_url: String,
-        client_id: String,
+        token_url: impl Into<String>,
+        client_id: impl Into<String>,
         client_secret: Option<secrecy::SecretString>,
         client_cert: Option<ClientCertConfig>,
     ) -> Self {
         Self {
-            token_url,
-            client_id,
+            token_url: token_url.into(),
+            client_id: client_id.into(),
             client_secret,
             client_cert,
             audience: None,
@@ -4034,6 +4096,21 @@ struct OAuthErrorResponse {
     error_description: Option<String>,
 }
 
+/// Choose what to log for an upstream `error_description`.
+///
+/// SECURITY: `error_description` is free-form text chosen by the authorization
+/// server and may echo request parameters back, so it is redacted unless an
+/// operator explicitly enables `observability.log_upstream_error_bodies`. The
+/// sibling `error` field is an enumerated RFC 6749 §5.2 / RFC 8693 code rather
+/// than free text, and is logged unconditionally.
+fn upstream_error_description_for_log(description: Option<&str>) -> &str {
+    if crate::diagnostics::upstream_error_bodies() {
+        description.unwrap_or("")
+    } else {
+        "[REDACTED]"
+    }
+}
+
 /// Map an upstream OAuth error code to an allowlisted short code suitable
 /// for client exposure.
 ///
@@ -4155,10 +4232,11 @@ async fn exchange_token_inner(
             .as_ref()
             .map_or("server_error", |e| sanitize_oauth_error_code(&e.error));
         if let Some(ref e) = parsed {
+            let description = upstream_error_description_for_log(e.error_description.as_deref());
             tracing::warn!(
                 status = %status,
                 upstream_error = %e.error,
-                upstream_error_description = e.error_description.as_deref().unwrap_or(""),
+                upstream_error_description = description,
                 client_code = %short_code,
                 "token exchange rejected by authorization server",
             );
@@ -4905,6 +4983,42 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_non_conformant_discovery_metadata_urls() {
+        for bad in [
+            "https://user:pw@as.example.com",
+            "http://as.example.com",
+            "https://10.0.0.1",
+            "not-a-url",
+        ] {
+            let mut cfg = validation_https_config();
+            cfg.authorization_server_metadata_issuer = Some(bad.to_owned());
+            cfg.validate().unwrap_err();
+
+            let mut cfg = validation_https_config();
+            cfg.authorization_servers = Some(vec![bad.to_owned()]);
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("authorization_servers[0]"),
+                "error must identify the offending index; got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_discovery_metadata_urls_and_the_empty_override() {
+        let mut cfg = validation_https_config();
+        cfg.authorization_server_metadata_issuer = Some("https://as.example.com".to_owned());
+        cfg.authorization_servers = Some(vec!["https://as.example.com".to_owned()]);
+        cfg.validate()
+            .expect("well-formed https metadata must validate");
+
+        let mut cfg = validation_https_config();
+        cfg.authorization_servers = Some(vec![]);
+        cfg.validate()
+            .expect("an empty list is the documented way to omit the claim entirely");
+    }
+
+    #[test]
     fn validate_accepts_all_https_urls() {
         let cfg = validation_https_config();
         cfg.validate().expect("all-HTTPS config must validate");
@@ -5155,8 +5269,8 @@ role = "admin"
         let mut cfg = validation_https_config();
         cfg.token_exchange = Some(
             TokenExchangeConfig::new(
-                "http://idp.example.com/token".into(), // <-- HTTP
-                "client".into(),
+                "http://idp.example.com/token", // <-- HTTP
+                "client",
                 None,
                 None,
             )
@@ -5218,8 +5332,8 @@ role = "admin"
         );
         cfg.token_exchange = Some(
             TokenExchangeConfig::new(
-                "http://idp.local/token".into(),
-                "client".into(),
+                "http://idp.local/token",
+                "client",
                 Some(secrecy::SecretString::new("dev-secret".into())),
                 None,
             )
@@ -6104,7 +6218,7 @@ role = "admin"
     fn test_token_exchange_config(token_url: String) -> TokenExchangeConfig {
         TokenExchangeConfig::new(
             token_url,
-            "mcp-client".into(),
+            "mcp-client",
             Some(secrecy::SecretString::new("test-client-secret".into())),
             None,
         )
@@ -6131,13 +6245,9 @@ role = "admin"
 
     #[test]
     fn build_exchange_form_emits_only_required_params_when_all_optional_omitted() {
-        let config = TokenExchangeConfig::new(
-            "https://idp.example.com/token".into(),
-            "public-client".into(),
-            None,
-            None,
-        )
-        .with_requested_token_type(RequestedTokenType::Omit);
+        let config =
+            TokenExchangeConfig::new("https://idp.example.com/token", "public-client", None, None)
+                .with_requested_token_type(RequestedTokenType::Omit);
         let body = build_exchange_form(&config, "subj");
         assert_eq!(
             body,
@@ -6190,6 +6300,41 @@ role = "admin"
         assert_eq!(cfg.resource, None);
         assert_eq!(cfg.scope, None);
         assert_eq!(cfg.requested_token_type, RequestedTokenType::AccessToken);
+    }
+
+    #[test]
+    fn upstream_error_description_is_redacted_by_default() {
+        let _guard = crate::diagnostics::ExposureTestGuard::acquire();
+        crate::diagnostics::set_diagnostic_exposure(
+            &crate::diagnostics::DiagnosticExposure::default(),
+        );
+
+        assert_eq!(
+            upstream_error_description_for_log(Some("subject_token=eyJhbGciOi...")),
+            "[REDACTED]",
+            "upstream free-form text must not reach logs unless opted in"
+        );
+        assert_eq!(upstream_error_description_for_log(None), "[REDACTED]");
+    }
+
+    #[test]
+    fn upstream_error_description_is_shown_when_opted_in() {
+        let _guard = crate::diagnostics::ExposureTestGuard::acquire();
+        crate::diagnostics::set_diagnostic_exposure(&crate::diagnostics::DiagnosticExposure {
+            upstream_error_bodies: true,
+            ..crate::diagnostics::DiagnosticExposure::default()
+        });
+
+        assert_eq!(
+            upstream_error_description_for_log(Some("audience not permitted")),
+            "audience not permitted",
+            "the debug switch must surface the upstream description verbatim"
+        );
+        assert_eq!(
+            upstream_error_description_for_log(None),
+            "",
+            "an absent description renders empty, not the redaction marker"
+        );
     }
 
     #[test]
@@ -8483,12 +8628,46 @@ role = "admin"
         client_cert: Option<ClientCertConfig>,
     ) -> TokenExchangeConfig {
         TokenExchangeConfig::new(
-            "https://idp.example.com/token".into(),
-            "client".into(),
+            "https://idp.example.com/token",
+            "client",
             client_secret.map(|s| secrecy::SecretString::new(s.into())),
             client_cert,
         )
         .with_audience("downstream")
+    }
+
+    #[test]
+    fn validate_rejects_non_uri_custom_requested_token_type() {
+        for bad in ["acess_token", "not a uri", "urn:bad%zz:token"] {
+            let tx = tx_with(Some("s"), None)
+                .with_requested_token_type(RequestedTokenType::Custom(bad.to_owned()));
+            let err = https_cfg_with_tx(tx)
+                .validate()
+                .expect_err("a custom token type that is not a URI must be rejected")
+                .to_string();
+            assert!(
+                err.contains("requested_token_type"),
+                "error must name the offending field for {bad:?}; got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_uri_custom_requested_token_type_including_fragments() {
+        for good in [
+            "urn:ietf:params:oauth:token-type:saml2",
+            "https://vendor.example/token-type",
+            "urn:example:token#v2",
+        ] {
+            let tx = tx_with(Some("s"), None)
+                .with_requested_token_type(RequestedTokenType::Custom(good.to_owned()));
+            https_cfg_with_tx(tx).validate().unwrap_or_else(|e| {
+                panic!(
+                    "RFC 8693 §3 only requires a URI; {good:?} must be accepted \
+                     (the no-fragment rule is RFC 8707's, for `resource` only): {e}"
+                )
+            });
+        }
     }
 
     #[test]

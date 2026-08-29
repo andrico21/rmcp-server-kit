@@ -49,6 +49,8 @@ static PLAINTEXT_OAUTH_TOKENS: AtomicBool = AtomicBool::new(false);
 static OAUTH_CLAIM_VALUES: AtomicBool = AtomicBool::new(false);
 /// Plaintext tool-call arguments and identity fields in `Debug` output.
 static TOOL_CALL_ARGUMENTS: AtomicBool = AtomicBool::new(false);
+/// Plaintext upstream OAuth error-response bodies in token-exchange logs.
+static UPSTREAM_ERROR_BODIES: AtomicBool = AtomicBool::new(false);
 
 /// Which categories of sensitive material may be rendered in plaintext.
 ///
@@ -57,6 +59,10 @@ static TOOL_CALL_ARGUMENTS: AtomicBool = AtomicBool::new(false);
 /// process; see the [module docs](self) for the full warning.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each field is an independent operator-facing opt-in switch; grouping them into sub-structs would complicate the public API and the TOML surface for no safety gain"
+)]
 pub struct DiagnosticExposure {
     /// Render OAuth access tokens in plaintext instead of `[REDACTED]`.
     ///
@@ -74,6 +80,13 @@ pub struct DiagnosticExposure {
     /// [`ToolCallContext`](crate::tool_hooks::ToolCallContext). Tool
     /// arguments routinely carry credentials supplied by the caller.
     pub tool_call_arguments: bool,
+    /// Render the `error_description` returned by an authorization server on a
+    /// failed RFC 8693 token exchange.
+    ///
+    /// The value is free-form text chosen by the upstream server and may
+    /// reflect request parameters back, so it is redacted by default. Enable
+    /// only while debugging an exchange failure.
+    pub upstream_error_bodies: bool,
 }
 
 /// Apply `exposure` to the process-global diagnostic switches.
@@ -93,6 +106,7 @@ pub fn set_diagnostic_exposure(exposure: &DiagnosticExposure) {
     PLAINTEXT_OAUTH_TOKENS.store(exposure.plaintext_oauth_tokens, Ordering::Relaxed);
     OAUTH_CLAIM_VALUES.store(exposure.oauth_claim_values, Ordering::Relaxed);
     TOOL_CALL_ARGUMENTS.store(exposure.tool_call_arguments, Ordering::Relaxed);
+    UPSTREAM_ERROR_BODIES.store(exposure.upstream_error_bodies, Ordering::Relaxed);
 }
 
 /// Whether OAuth access tokens may be rendered in plaintext.
@@ -116,6 +130,19 @@ pub(crate) fn oauth_claim_values() -> bool {
 /// Whether tool-call arguments may be rendered in plaintext.
 pub(crate) fn tool_call_arguments() -> bool {
     TOOL_CALL_ARGUMENTS.load(Ordering::Relaxed)
+}
+
+/// Whether upstream OAuth error-response bodies may be rendered in plaintext.
+#[cfg_attr(
+    not(feature = "oauth"),
+    allow(
+        dead_code,
+        reason = "only consumed by the oauth module; kept unconditional so the \
+                  switch set is uniform across feature combinations"
+    )
+)]
+pub(crate) fn upstream_error_bodies() -> bool {
+    UPSTREAM_ERROR_BODIES.load(Ordering::Relaxed)
 }
 
 /// Serializes tests that mutate the process-global switches and restores the
@@ -147,6 +174,7 @@ impl ExposureTestGuard {
                 plaintext_oauth_tokens: plaintext_oauth_tokens(),
                 oauth_claim_values: oauth_claim_values(),
                 tool_call_arguments: tool_call_arguments(),
+                upstream_error_bodies: upstream_error_bodies(),
             },
         }
     }
@@ -212,6 +240,7 @@ mod tests {
             plaintext_oauth_tokens: true,
             oauth_claim_values: true,
             tool_call_arguments: true,
+            upstream_error_bodies: true,
         });
         assert!(plaintext_oauth_tokens());
         drop(guard);

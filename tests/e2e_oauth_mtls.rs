@@ -243,8 +243,8 @@ async fn exchange_token_presents_client_cert_and_omits_authorization() {
     let key_path = write_pem("client-key", &pki.client_key_pem);
 
     let cc = ClientCertConfig::new(cert_path.clone(), key_path.clone());
-    let tx_cfg = TokenExchangeConfig::new(token_url, "client".into(), None, Some(cc))
-        .with_audience("downstream");
+    let tx_cfg =
+        TokenExchangeConfig::new(token_url, "client", None, Some(cc)).with_audience("downstream");
 
     let mut oauth_cfg = OAuthConfig::builder(
         "https://issuer.invalid",
@@ -310,8 +310,8 @@ async fn mtls_client_does_not_follow_redirects() {
     let key_path = write_pem("client-key-redir", &pki.client_key_pem);
 
     let cc = ClientCertConfig::new(cert_path.clone(), key_path.clone());
-    let tx_cfg = TokenExchangeConfig::new(token_url, "client".into(), None, Some(cc))
-        .with_audience("downstream");
+    let tx_cfg =
+        TokenExchangeConfig::new(token_url, "client", None, Some(cc)).with_audience("downstream");
 
     let mut oauth_cfg = OAuthConfig::builder(
         "https://issuer.invalid",

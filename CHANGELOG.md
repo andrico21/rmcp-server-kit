@@ -29,6 +29,39 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
 
 ### Breaking
 
+- **Audit logging now fails closed on platforms without POSIX mode bits
+  (Windows).** A configured `observability.audit_log_path` previously created
+  the file with no permission hardening at all and reported no warning, so an
+  audit log under a location such as `C:\ProgramData` inherited broad read ACLs
+  while the operator believed it was protected. Silent failure of a security
+  control is worse than an explicit one, so:
+  - `init_tracing_from_config_strict` now returns a startup error and **does not
+    create the file**;
+  - the deprecated lenient `init_tracing` installs tracing **without** an audit
+    sink and emits a warning.
+
+  **Action required for Windows deployments that set `audit_log_path`:** the
+  server will refuse to start. Remove the key to run without auditing, or run on
+  a platform where owner-only permissions can be guaranteed. Unix behaviour is
+  unchanged apart from the hardening below.
+
+- **`TokenExchangeConfig::new` now takes `impl Into<String>` for `token_url`
+  and `client_id`**, matching its own `with_*` setters.
+
+  Passing a `String` variable still compiles. **Passing `"literal".into()` does
+  not** — the target type is now generic, so inference fails with `E0283`. Drop
+  the `.into()`:
+
+  ```rust
+  // before
+  TokenExchangeConfig::new("https://idp/token".into(), "client".into(), None, None)
+  // after
+  TokenExchangeConfig::new("https://idp/token", "client", None, None)
+  ```
+
+  `cargo-semver-checks` does **not** report this change, so it is documented
+  here rather than caught by tooling.
+
 - **`TokenExchangeConfig::audience` is now `Option<String>`, and
   `TokenExchangeConfig::new` no longer takes an `audience` argument.**
 
@@ -78,6 +111,51 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
   `with_requested_token_type` set them, matching the existing `McpServerConfig`
   constructor-plus-setters convention.
 
+- **`observability.log_upstream_error_bodies`** (default `false`, env
+  `RMCP_SERVER_KIT__OBSERVABILITY__LOG_UPSTREAM_ERROR_BODIES`). Opt-in switch
+  that surfaces the authorization server's `error_description` on a failed
+  token exchange. Off by default because the value is free-form upstream text
+  that may echo request parameters back.
+
+- **`rbac.roles.argument_allowlists.deny_unknown_arguments`** (default `false`).
+  Confines a tool to only the arguments its allowlists name. By default an
+  allowlist constrains only the argument it names, so with just `cmd`
+  allowlisted a call carrying `{"cmd": "ls", "danger": true}` is admitted and
+  `danger` reaches the handler unreviewed. Setting the flag on **any** allowlist
+  matching a `(role, tool)` pair makes the permitted names the union of every
+  matching entry's `argument`, rejecting any other top-level key — and rejecting
+  object/array values, which have no nested-path allowlist to constrain them.
+  Default-off preserves existing behaviour exactly.
+
+### Fixed
+
+- **The two config validators can no longer drift in ordering.** The three
+  invariants both enforce — admin-requires-auth, TLS cert/key pairing, and
+  mTLS-requires-TLS — are now evaluated by one shared helper, so a config
+  invalid in more than one way reports the same first error whichever validator
+  a consumer reaches for. Each validator keeps its own wording: the builder
+  names which TLS half is missing, the TOML validator emits one combined
+  message. Nothing else was folded in; the remaining checks are specific to one
+  type or the other.
+- **A scheduler-dependent CRL test is now deterministic.**
+  `discovery_does_not_send_before_pending_marker_exists` spun a contending
+  thread across 200 attempts and could pass without ever producing the
+  interleaving it claimed to test. It now asserts the marker-before-publish
+  ordering directly, at the one instant it can be violated, via a test-only
+  probe behind the existing `test-helpers` feature.
+- **Every config field is now provably classified for env overrides.** A new
+  test fails unless each `ServerConfig` / `ObservabilityConfig` field is either
+  present in `ENV_OVERRIDE_SPECS` or listed in `ENV_OVERRIDE_EXCLUDED_FIELDS`,
+  so a newly added field can no longer default silently to "no override".
+- **The hand-written `Debug` impls cannot silently drop a field.** Companion
+  tests parse the struct definitions and fail if a field is added without being
+  rendered (redacted or otherwise).
+- **CI: the `--release-type major` fallback now removes itself.** The semver
+  step runs unflagged first and treats *success* as a failure condition, so once
+  3.8.0 is the published baseline the job fails loudly demanding the flag be
+  dropped — instead of lingering and silently accepting every future breaking
+  change.
+
 ### Deprecated
 
 - `CrlSet::cache` is deprecated. Reading it remains safe; **mutating** it
@@ -94,6 +172,55 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
 
 ### Security
 
+- **The audit log is now created with owner-only permissions atomically.**
+  It was opened with `create(true)` and only then `chmod`'d to `0o600`, leaving
+  a window in which the file existed with umask-derived permissions and any
+  local principal could open it. The mode is now applied by `open` itself
+  (`OpenOptionsExt::mode`). Pre-existing files are still corrected afterwards,
+  because `mode` applies only at creation.
+- **Attacker-controlled intermediate CDP URLs no longer bypass the
+  per-handshake cap.** `MAX_RELEVANT_CDP_URLS_PER_HANDSHAKE` is evaluated
+  against the *relevant* URL set, but discovery candidates were collected from
+  the *full* set. With `crl_end_entity_only = true` a peer could therefore drive
+  CRL discovery, pending-set growth, and rate-limiter consumption from an
+  uncapped number of intermediate CDPs. Discovery now reads the same set the cap
+  governs.
+- **Upstream OAuth `error_description` is redacted by default.** The value is
+  free-form text chosen by the authorization server and may echo request
+  parameters back. It is now logged only when
+  `observability.log_upstream_error_bodies` is enabled. The `error` code itself
+  is an enumerated RFC 6749 §5.2 / RFC 8693 value and is still logged
+  unconditionally.
+- **Discovery-metadata URLs are validated at startup.**
+  `oauth.authorization_servers[]` and
+  `oauth.authorization_server_metadata_issuer` are published verbatim by the
+  unauthenticated `/.well-known/oauth-*` endpoints but were never checked. They
+  are now held to the same policy as every other OAuth URL: parseable, no
+  userinfo, scheme honouring `allow_http_oauth_urls`, and no literal-IP target.
+  `Some(vec![])` remains valid and still omits the claim.
+- **A custom `requested_token_type` must now be a URI.** A typo such as
+  `"acess_token"` previously became a custom token type and was forwarded to the
+  authorization server verbatim; it is now rejected at config validation.
+  Fragments are permitted here — the no-fragment rule is RFC 8707 §2's
+  constraint on `resource`, not a property of RFC 8693 §3 token-type
+  identifiers.
+- **`bootstrap_fetch` now bounds its startup fan-out.** It is a public helper
+  taking a raw `MtlsConfig`, so it is reachable without
+  `McpServerConfig::validate`; a broad CA bundle previously spawned one fetch
+  task and one cache entry per distinct CDP URL, unbounded by
+  `crl_max_cache_entries`. The URL set is now truncated to that cap, with a
+  warning when truncation occurs.
+- **Forwarding headers are no longer written to request logs.** `forwarded`,
+  `x-forwarded-for`, and `x-real-ip` are attacker-controlled on any untrusted
+  hop, so logging them verbatim let a caller plant misleading provenance in an
+  incident-response trail. They join `authorization`, `cookie`, and
+  `proxy-authorization` in the redaction set; the resolved client IP is still
+  reported separately.
+- **`tls_key_path` and `audit_log_path` are redacted from `Debug` output.**
+  Both structs previously derived `Debug`, so a single `tracing::debug!(?config)`
+  or panic message disclosed the private-key and audit-trail locations.
+  Presence is still reported (`Some("[REDACTED]")`) so diagnostics remain
+  useful.
 - **SSRF: the whole `0.0.0.0/8` "this network" prefix is now blocked, not just
   `0.0.0.0`.** `Ipv4Addr::is_unspecified()` matches only the single unspecified
   address, so literals such as `0.1.2.3` previously passed outbound screening
