@@ -182,6 +182,90 @@ let config = McpServerConfig::new("127.0.0.1:8443", "my-server", "0.1.0")
 | `oauth`   | No      | OAuth 2.1 JWT validation via JWKS.             |
 | `metrics` | No      | Prometheus metrics registry and `/metrics`.    |
 
+## Design decisions
+
+<details>
+<summary><strong>RFC 8693 delegation (<code>actor_token</code>) is deliberately not implemented — NO-GO</strong></summary>
+
+<br>
+
+**Status: NO-GO.** Reviewed and decided; recorded here so the reasoning is not
+rediscovered. The crate remains fully RFC-conformant without it.
+
+### What is missing
+
+RFC 8693 defines two exchange semantics:
+
+| Semantics | Meaning | Parameters |
+|---|---|---|
+| **Impersonation** *(implemented)* | The server acts *as* the user. Downstream sees only the user. | `subject_token` |
+| **Delegation** *(not implemented)* | The server acts *on behalf of* the user while remaining visible. Downstream sees both parties. | `subject_token` + `actor_token` |
+
+Delegation produces an `act` claim chain, letting a downstream service record
+*"service X acted for user Y"* rather than just *"user Y did this"*. In practice
+this crate can only say the latter.
+
+Per RFC 8693 §2.1, `actor_token` is **OPTIONAL**, and `actor_token_type` is
+*"REQUIRED when the `actor_token` parameter is present in the request but MUST
+NOT be included otherwise."* Because both are optional, omitting them is
+conformant. This is a missing **capability**, not a defect.
+
+### Why NO-GO
+
+1. **Already conformant.** Nothing is broken; no spec violation exists.
+2. **No user demand.** Identified during an internal review, not requested.
+3. **Thin real-world support.** Keycloak's delegation support is limited, and
+   Microsoft Entra ID does not use RFC 8693 for its on-behalf-of flow at all.
+4. **The blocker is credential acquisition, not serialization.** Delegation
+   needs a token representing the *server's own* identity. This crate has no
+   client-credentials flow and no way to obtain one. Adding it means a second
+   OAuth client inside the crate — token cache, refresh scheduling, failure
+   policy, SSRF/TLS handling — which is far larger than adding two form
+   parameters.
+
+### Revisit criteria
+
+Reopen when **all** of these are known:
+
+- [ ] A named consumer requires delegation, with a concrete audit/compliance use case
+- [ ] A named authorization server in their stack that actually supports RFC 8693 delegation
+- [ ] A chosen actor-token acquisition model (see below)
+- [ ] An expiry/rotation strategy for that credential
+
+### If revisited — design notes
+
+**Acquisition model.** Preferred: an **application-supplied async callback** —
+the application already owns service-identity lifecycle. Explicitly rejected:
+reusing the mTLS `client_cert` identity, which is RFC 8705 §2 *client
+authentication*, not an RFC 8693 actor token.
+
+**Known defect in the first sketch.** `build_exchange_form` is **synchronous**,
+so an async token provider cannot be invoked from it. The actor token must be
+resolved *before* form construction, higher in the exchange path. Any future
+attempt hits this immediately.
+
+**Serde feasibility (verified).** `TokenExchangeConfig` derives
+`Debug, Clone, Deserialize` with `#[serde(deny_unknown_fields)]` and is
+`#[non_exhaustive]`. A `#[serde(skip)]` provider field composes correctly and
+does not break existing TOML parsing. `Clone` survives with
+`Option<Arc<dyn _>>`; **`Debug` only survives if the trait itself requires
+`Debug`** — note `ToolHooks` sidesteps this by not deriving `Debug`.
+
+**Mandatory security constraints:**
+
+- Store as `secrecy::SecretString`; never logged, debug-printed, audited, or included in errors
+- Least-privilege scope/audience — this is the **service** identity, so a leak
+  affects every delegated exchange, not one user
+- Do **not** reuse `client_secret` as actor proof; client authentication and
+  actor identity are distinct credentials
+- Stale or expired actor tokens must fail **closed**
+- Preserve the RFC 8693 §2.1 invariant: emit `actor_token_type` **iff**
+  `actor_token` is present
+- Preserve byte-identical request output for any config that does not opt into
+  delegation
+
+</details>
+
 ## Minimum supported Rust
 
 `rmcp-server-kit` targets stable Rust **1.98** or newer (tracks `edition = "2024"`).
