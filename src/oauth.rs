@@ -902,6 +902,52 @@ pub struct OAuthConfig {
     /// signs with, e.g. `["RS256"]` for Microsoft Entra v2.0.
     #[serde(default)]
     pub allowed_algorithms: Option<Vec<String>>,
+    /// Authorization servers advertised in RFC 9728 Protected Resource
+    /// Metadata.
+    ///
+    /// **Default `None` = resolved from topology**, which is the RFC-correct
+    /// answer in both directions:
+    ///
+    /// - [`OAuthConfig::proxy`] configured -> this server's public URL. The
+    ///   proxy really does mount `/authorize`, `/token`, `/register`, and
+    ///   `/.well-known/oauth-authorization-server`.
+    /// - no proxy -> the upstream [`OAuthConfig::issuer`]. This process mounts
+    ///   no authorization-server endpoints, so advertising itself would send
+    ///   RFC 9728 discovery to a URL that returns 404.
+    ///
+    /// **Set this explicitly if your application mounts its own `/authorize`
+    /// and `/token` through `McpServerConfig::with_extra_router` without
+    /// configuring [`OAuthConfig::proxy`]** — that server *is* the
+    /// authorization server, and the crate cannot detect it. Set it to the
+    /// server's public URL.
+    ///
+    /// `Some(vec![])` omits `authorization_servers` from the document
+    /// entirely, per RFC 9728 3.2 (zero-valued claims must be omitted).
+    #[serde(default)]
+    pub authorization_servers: Option<Vec<String>>,
+    /// `issuer` published in the RFC 8414 Authorization Server Metadata
+    /// document served by the built-in proxy.
+    ///
+    /// **Default `None` = this server's own public URL**, which is what
+    /// RFC 8414 3.3 requires: the published `issuer` MUST be identical to the
+    /// identifier the metadata URL was built from, and this document is served
+    /// from the local origin. RFC 8414 6.2 additionally requires *clients* to
+    /// reject a mismatch, so the previous behaviour (publishing the upstream
+    /// issuer) was rejected outright by conformant clients.
+    ///
+    /// **Legacy opt-out.** Set this to your upstream
+    /// [`OAuthConfig::issuer`] to restore the pre-3.8 value. The one case that
+    /// needs it: an upstream `IdP` that emits RFC 9207 `iss` in the
+    /// authorization response *and* clients that validate it. The proxy does
+    /// not own the front channel — `/authorize` redirects to the upstream,
+    /// which redirects straight back to the client's `redirect_uri` without
+    /// passing through this process — so it cannot reconcile a local `issuer`
+    /// with an upstream-stamped `iss`.
+    ///
+    /// Token validation is unaffected either way: inbound JWT `iss` claims are
+    /// always checked against [`OAuthConfig::issuer`].
+    #[serde(default)]
+    pub authorization_server_metadata_issuer: Option<String>,
     /// Require the JWT `sub` (subject) claim. **Default: `false`** (current
     /// behavior). When `true`, a token without `sub` is rejected. Leave
     /// `false` for OAuth client-credentials / machine-to-machine tokens,
@@ -1016,6 +1062,8 @@ impl Default for OAuthConfig {
             allow_http_oauth_urls: false,
             max_jwks_keys: default_max_jwks_keys(),
             allowed_algorithms: None,
+            authorization_servers: None,
+            authorization_server_metadata_issuer: None,
             require_subject: false,
             #[allow(
                 deprecated,
@@ -1461,6 +1509,34 @@ impl OAuthConfigBuilder {
     ) -> Self {
         self.inner.allowed_algorithms =
             Some(algorithms.into_iter().map(Into::into).collect::<Vec<_>>());
+        self
+    }
+
+    /// Publish a specific `issuer` in the proxy's RFC 8414 Authorization
+    /// Server Metadata document.
+    ///
+    /// The default is already RFC 8414 3.3 conformant (this server's public
+    /// URL). Use this only to restore the pre-3.8 upstream value — see the
+    /// RFC 9207 caveat on
+    /// [`OAuthConfig::authorization_server_metadata_issuer`].
+    pub fn authorization_server_metadata_issuer(mut self, issuer: impl Into<String>) -> Self {
+        self.inner.authorization_server_metadata_issuer = Some(issuer.into());
+        self
+    }
+
+    /// Override the authorization servers advertised in Protected Resource
+    /// Metadata.
+    ///
+    /// Needed when the application mounts its own OAuth endpoints via
+    /// `with_extra_router` instead of using [`OAuthConfig::proxy`]. Pass an
+    /// empty iterator to omit the field. See
+    /// [`OAuthConfig::authorization_servers`].
+    pub fn authorization_servers(
+        mut self,
+        servers: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.inner.authorization_servers =
+            Some(servers.into_iter().map(Into::into).collect::<Vec<_>>());
         self
     }
 
@@ -3310,49 +3386,95 @@ pub fn looks_like_jwt(token: &str) -> bool {
 // Protected Resource Metadata (RFC 9728)
 // ---------------------------------------------------------------------------
 
+/// Resolve the `authorization_servers` list for Protected Resource Metadata.
+///
+/// RFC 9728 3.2: a zero-valued claim MUST be omitted, so an empty result means
+/// "leave the field out" rather than "emit `[]`".
+fn resolve_authorization_servers<'a>(server_url: &'a str, config: &'a OAuthConfig) -> Vec<&'a str> {
+    if let Some(ref explicit) = config.authorization_servers {
+        return explicit.iter().map(String::as_str).collect();
+    }
+    // Advertise this server only when it actually mounts the OAuth endpoints.
+    // `install_oauth_proxy_routes` mounts `/authorize`, `/token`, and
+    // `/.well-known/oauth-authorization-server` ONLY when `proxy` is set, while
+    // Protected Resource Metadata is served unconditionally -- so without a
+    // proxy the local URL resolves to a 404 and the upstream issuer is the only
+    // truthful answer. An application that mounts its own facade through
+    // `with_extra_router` must say so via `authorization_servers`.
+    if config.proxy.is_some() {
+        vec![server_url]
+    } else {
+        vec![config.issuer.as_str()]
+    }
+}
+
 /// Build the Protected Resource Metadata JSON response.
 ///
-/// When an OAuth proxy is configured, `authorization_servers` points to
-/// the MCP server itself (the proxy facade).  Otherwise it points directly
-/// to the upstream issuer.
+/// `authorization_servers` follows [`OAuthConfig::authorization_servers`]:
+/// the upstream issuer for a plain resource server, this server's own URL
+/// when the built-in proxy is mounted, or an explicit operator override.
 #[must_use]
 pub fn protected_resource_metadata(
     resource_url: &str,
     server_url: &str,
     config: &OAuthConfig,
 ) -> serde_json::Value {
-    // Always point to the local server -- when a proxy is configured the
-    // server exposes /authorize, /token, /register locally.  When an
-    // application provides its own chained OAuth flow (via extra_router)
-    // without a proxy, the auth server is still the local server.
-    let scopes: Vec<&str> = config.scopes.iter().map(|s| s.scope.as_str()).collect();
-    let auth_server = server_url;
-    serde_json::json!({
+    let mut meta = serde_json::json!({
         "resource": resource_url,
-        "authorization_servers": [auth_server],
-        "scopes_supported": scopes,
-        "bearer_methods_supported": ["header"]
-    })
+        "bearer_methods_supported": ["header"],
+    });
+    let Some(obj) = meta.as_object_mut() else {
+        return meta;
+    };
+    // RFC 9728 3.2: omit zero-valued claims rather than emitting empty arrays.
+    let auth_servers = resolve_authorization_servers(server_url, config);
+    if !auth_servers.is_empty() {
+        obj.insert(
+            "authorization_servers".into(),
+            serde_json::json!(auth_servers),
+        );
+    }
+    let scopes: Vec<&str> = config.scopes.iter().map(|s| s.scope.as_str()).collect();
+    if !scopes.is_empty() {
+        obj.insert("scopes_supported".into(), serde_json::json!(scopes));
+    }
+    meta
 }
 
 /// Build the Authorization Server Metadata JSON response (RFC 8414).
 ///
 /// Returned at `GET /.well-known/oauth-authorization-server` so MCP
 /// clients can discover the authorization and token endpoints.
+///
+/// `issuer` defaults to `server_url`, the origin this document is served from,
+/// as RFC 8414 3.3 requires. The upstream [`OAuthConfig::issuer`] remains the
+/// *token* issuer and is still what inbound JWT `iss` claims are validated
+/// against — the two are deliberately different. See
+/// [`OAuthConfig::authorization_server_metadata_issuer`] for the legacy
+/// opt-out.
 #[must_use]
 pub fn authorization_server_metadata(server_url: &str, config: &OAuthConfig) -> serde_json::Value {
-    let scopes: Vec<&str> = config.scopes.iter().map(|s| s.scope.as_str()).collect();
+    let issuer = config
+        .authorization_server_metadata_issuer
+        .as_deref()
+        .unwrap_or(server_url);
     let mut meta = serde_json::json!({
-        "issuer": &config.issuer,
+        "issuer": issuer,
         "authorization_endpoint": format!("{server_url}/authorize"),
         "token_endpoint": format!("{server_url}/token"),
         "registration_endpoint": format!("{server_url}/register"),
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
-        "scopes_supported": scopes,
         "token_endpoint_auth_methods_supported": ["none"],
     });
+    // RFC 8414 3.2: omit zero-valued claims rather than emitting `[]`.
+    let scopes: Vec<&str> = config.scopes.iter().map(|s| s.scope.as_str()).collect();
+    if !scopes.is_empty()
+        && let Some(obj) = meta.as_object_mut()
+    {
+        obj.insert("scopes_supported".into(), serde_json::json!(scopes));
+    }
     if let Some(proxy) = &config.proxy
         && proxy.expose_admin_endpoints
         && let Some(obj) = meta.as_object_mut()
@@ -4395,6 +4517,8 @@ mod tests {
             allow_http_oauth_urls: false,
             max_jwks_keys: default_max_jwks_keys(),
             allowed_algorithms: None,
+            authorization_servers: None,
+            authorization_server_metadata_issuer: None,
             #[allow(
                 deprecated,
                 reason = "test fixture: explicit value for the deprecated field"
@@ -4410,9 +4534,139 @@ mod tests {
             &config,
         );
         assert_eq!(meta["resource"], "https://mcp.example.com/mcp");
-        assert_eq!(meta["authorization_servers"][0], "https://mcp.example.com");
+        // No proxy: this process mounts no authorization-server endpoints, so
+        // advertising itself would point RFC 9728 discovery at a 404. The
+        // upstream issuer is the only truthful answer.
+        assert_eq!(meta["authorization_servers"][0], "https://auth.example.com");
         assert_eq!(meta["scopes_supported"].as_array().unwrap().len(), 2);
         assert_eq!(meta["bearer_methods_supported"][0], "header");
+    }
+
+    /// Build a PRM fixture with the given proxy / override topology.
+    fn prm_for(
+        proxy: Option<OAuthProxyConfig>,
+        authorization_servers: Option<Vec<String>>,
+        scopes: Vec<ScopeMapping>,
+    ) -> serde_json::Value {
+        let config = OAuthConfig {
+            issuer: "https://auth.example.com".into(),
+            audience: "https://mcp.example.com/mcp".into(),
+            jwks_uri: "https://auth.example.com/.well-known/jwks.json".into(),
+            scopes,
+            proxy,
+            authorization_servers,
+            ..OAuthConfig::default()
+        };
+        protected_resource_metadata(
+            "https://mcp.example.com/mcp",
+            "https://mcp.example.com",
+            &config,
+        )
+    }
+
+    fn demo_proxy() -> OAuthProxyConfig {
+        OAuthProxyConfig::builder(
+            "https://auth.example.com/authorize",
+            "https://auth.example.com/token",
+            "mcp",
+        )
+        .build()
+    }
+
+    #[test]
+    fn prm_advertises_local_server_only_when_proxy_mounts_the_endpoints() {
+        // With the built-in proxy the local server really does serve
+        // /authorize, /token, /register and the AS metadata document.
+        let meta = prm_for(Some(demo_proxy()), None, vec![]);
+        assert_eq!(meta["authorization_servers"][0], "https://mcp.example.com");
+    }
+
+    #[test]
+    fn prm_explicit_override_wins_over_topology() {
+        // The extra_router case: the application mounts its own OAuth facade
+        // without configuring `proxy`, so it must be able to say so.
+        let meta = prm_for(
+            None,
+            Some(vec!["https://mcp.example.com".to_owned()]),
+            vec![],
+        );
+        assert_eq!(meta["authorization_servers"][0], "https://mcp.example.com");
+
+        // An override also wins when a proxy IS configured.
+        let meta = prm_for(
+            Some(demo_proxy()),
+            Some(vec!["https://elsewhere.example".to_owned()]),
+            vec![],
+        );
+        assert_eq!(
+            meta["authorization_servers"][0],
+            "https://elsewhere.example"
+        );
+    }
+
+    #[test]
+    fn prm_omits_zero_valued_claims() {
+        // RFC 9728 3.2: claims with zero elements MUST be omitted, not
+        // emitted as `[]`.
+        let meta = prm_for(None, Some(vec![]), vec![]);
+        assert!(
+            meta.get("authorization_servers").is_none(),
+            "empty override must omit the claim: {meta}"
+        );
+        assert!(
+            meta.get("scopes_supported").is_none(),
+            "no configured scopes must omit the claim: {meta}"
+        );
+        assert_eq!(meta["resource"], "https://mcp.example.com/mcp");
+    }
+
+    fn proxy_as_metadata_config() -> OAuthConfig {
+        OAuthConfig {
+            issuer: "https://auth.example.com".into(),
+            audience: "https://mcp.example.com/mcp".into(),
+            jwks_uri: "https://auth.example.com/.well-known/jwks.json".into(),
+            proxy: Some(demo_proxy()),
+            ..OAuthConfig::default()
+        }
+    }
+
+    #[test]
+    fn as_metadata_issuer_defaults_to_the_origin_it_is_served_from() {
+        // RFC 8414 3.3: the published `issuer` MUST equal the identifier the
+        // metadata URL was built from. RFC 8414 6.2 requires clients to reject
+        // a mismatch, so publishing the upstream issuer here made the document
+        // unusable to conformant clients.
+        let config = proxy_as_metadata_config();
+        let meta = authorization_server_metadata("https://mcp.example.com", &config);
+        assert_eq!(meta["issuer"], "https://mcp.example.com");
+        assert_eq!(
+            meta["authorization_endpoint"],
+            "https://mcp.example.com/authorize"
+        );
+        assert!(
+            meta.get("scopes_supported").is_none(),
+            "RFC 8414 3.2: omit zero-valued claims: {meta}"
+        );
+    }
+
+    #[test]
+    fn as_metadata_issuer_legacy_opt_out_restores_upstream_value() {
+        // Escape hatch for an upstream IdP that emits RFC 9207 `iss` to
+        // clients that validate it; the proxy cannot reconcile that because
+        // the callback bypasses this process entirely.
+        let mut config = proxy_as_metadata_config();
+        config.authorization_server_metadata_issuer = Some("https://auth.example.com".into());
+        let meta = authorization_server_metadata("https://mcp.example.com", &config);
+        assert_eq!(meta["issuer"], "https://auth.example.com");
+    }
+
+    #[test]
+    fn as_metadata_issuer_never_affects_token_validation() {
+        // Whichever value is published, inbound JWT `iss` is validated against
+        // `config.issuer`.
+        let mut config = proxy_as_metadata_config();
+        config.authorization_server_metadata_issuer = Some("https://mcp.example.com".into());
+        assert_eq!(config.issuer, "https://auth.example.com");
     }
 
     // -----------------------------------------------------------------------
@@ -4949,6 +5203,8 @@ role = "admin"
             allow_http_oauth_urls: true,
             max_jwks_keys: default_max_jwks_keys(),
             allowed_algorithms: None,
+            authorization_servers: None,
+            authorization_server_metadata_issuer: None,
             #[allow(
                 deprecated,
                 reason = "test fixture: explicit value for the deprecated field"
@@ -6459,6 +6715,8 @@ role = "admin"
             allow_http_oauth_urls: true,
             max_jwks_keys: default_max_jwks_keys(),
             allowed_algorithms: None,
+            authorization_servers: None,
+            authorization_server_metadata_issuer: None,
             #[allow(
                 deprecated,
                 reason = "test fixture: explicit value for the deprecated field"

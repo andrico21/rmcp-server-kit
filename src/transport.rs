@@ -1587,6 +1587,19 @@ where
                 jwks_cache,
                 seen_identities: crate::auth::SeenIdentitySet::new(),
                 counters: crate::auth::AuthCounters::default(),
+                // Absolute only when `public_url` supplies a trustworthy
+                // external origin. Without it `derive_server_url` falls back
+                // to the bind address, which behind a TLS-terminating proxy
+                // is an internal `http://` address -- advertising that would
+                // send clients somewhere they cannot reach. `None` keeps the
+                // relative path, which resolves against whatever origin the
+                // client was actually challenged from.
+                resource_metadata_url: config.public_url.as_ref().map(|url| {
+                    format!(
+                        "{}/.well-known/oauth-protected-resource/mcp",
+                        url.trim_end_matches('/')
+                    )
+                }),
             }))
         }
         _ => None,
@@ -1840,16 +1853,7 @@ where
     // authorization_servers -- this tells MCP clients (e.g. Claude Code SDK)
     // that the server exists but does NOT require OAuth authentication,
     // preventing them from gating the connection behind a broken auth flow.
-    let server_url = if let Some(ref url) = config.public_url {
-        url.trim_end_matches('/').to_owned()
-    } else {
-        let prm_scheme = if config.tls_cert_path.is_some() {
-            "https"
-        } else {
-            "http"
-        };
-        format!("{prm_scheme}://{}", config.bind_addr)
-    };
+    let server_url = derive_server_url(&config);
     let resource_url = format!("{server_url}/mcp");
 
     #[cfg(feature = "oauth")]
@@ -1863,8 +1867,21 @@ where
     #[cfg(not(feature = "oauth"))]
     let prm_metadata = serde_json::json!({ "resource": resource_url });
 
+    // RFC 9728 3.1: for a resource whose identifier carries a path, the
+    // well-known segment is inserted between host and path, so the canonical
+    // location for resource `{server_url}/mcp` is
+    // `/.well-known/oauth-protected-resource/mcp`. The root path is retained
+    // as a compatibility alias for clients that only probe there.
+    let prm_root = prm_metadata.clone();
     router = router.route(
         "/.well-known/oauth-protected-resource",
+        axum::routing::get(move || {
+            let m = prm_root.clone();
+            async move { axum::Json(m) }
+        }),
+    );
+    router = router.route(
+        "/.well-known/oauth-protected-resource/mcp",
         axum::routing::get(move || {
             let m = prm_metadata.clone();
             async move { axum::Json(m) }
@@ -2633,6 +2650,30 @@ fn build_oauth_admin_router(
     } else {
         Ok(admin_router)
     }
+}
+
+/// This server's externally-visible origin.
+///
+/// Prefers the operator-supplied `public_url`; otherwise reconstructs it from
+/// the bind address, choosing the scheme from whether TLS is configured.
+/// Shared by the OAuth metadata documents and the `WWW-Authenticate`
+/// `resource_metadata` URL so they can never disagree.
+#[allow(
+    deprecated,
+    reason = "internal metadata assembly reads deprecated `pub` config fields by design until 1.0 makes them pub(crate)"
+)]
+fn derive_server_url(config: &McpServerConfig) -> String {
+    config.public_url.as_ref().map_or_else(
+        || {
+            let scheme = if config.tls_cert_path.is_some() {
+                "https"
+            } else {
+                "http"
+            };
+            format!("{scheme}://{}", config.bind_addr)
+        },
+        |url| url.trim_end_matches('/').to_owned(),
+    )
 }
 
 /// Build the host allow-list for rmcp's DNS rebinding protection.
@@ -5885,6 +5926,7 @@ mod tests {
             jwks_cache: None,
             seen_identities: crate::auth::SeenIdentitySet::new(),
             counters: crate::auth::AuthCounters::default(),
+            resource_metadata_url: None,
         });
         (state, admin_token, viewer_token)
     }

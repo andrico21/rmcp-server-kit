@@ -1046,6 +1046,14 @@ pub(crate) struct AuthState {
     pub seen_identities: SeenIdentitySet,
     /// Lightweight in-memory auth success/failure counters for diagnostics.
     pub counters: AuthCounters,
+    /// Absolute URL of this server's RFC 9728 Protected Resource Metadata,
+    /// advertised in the `WWW-Authenticate` challenge.
+    ///
+    /// RFC 9728 5.1 defines `resource_metadata` as a URL; emitting an
+    /// absolute one lets a client resolve it without knowing the origin it
+    /// was challenged from. `None` falls back to the well-known path, which
+    /// stays correct for same-origin clients.
+    pub resource_metadata_url: Option<String>,
 }
 
 impl AuthState {
@@ -1406,13 +1414,13 @@ pub fn generate_api_key() -> Result<(String, String), RmcpServerKitError> {
 }
 
 fn build_www_authenticate_value(
-    advertise_resource_metadata: bool,
+    resource_metadata: Option<&str>,
     failure: AuthFailureClass,
 ) -> String {
     let (error, error_description) = failure.bearer_error();
-    if advertise_resource_metadata {
+    if let Some(url) = resource_metadata {
         return format!(
-            "Bearer resource_metadata=\"/.well-known/oauth-protected-resource\", error=\"{error}\", error_description=\"{error_description}\""
+            "Bearer resource_metadata=\"{url}\", error=\"{error}\", error_description=\"{error_description}\""
         );
     }
     format!("Bearer error=\"{error}\", error_description=\"{error_description}\"")
@@ -1441,7 +1449,13 @@ fn unauthorized_response(state: &AuthState, failure_class: AuthFailureClass) -> 
     #[cfg(not(feature = "oauth"))]
     let advertise_resource_metadata = false;
 
-    let challenge = build_www_authenticate_value(advertise_resource_metadata, failure_class);
+    let resource_metadata = advertise_resource_metadata.then(|| {
+        state
+            .resource_metadata_url
+            .as_deref()
+            .unwrap_or("/.well-known/oauth-protected-resource")
+    });
+    let challenge = build_www_authenticate_value(resource_metadata, failure_class);
     (
         StatusCode::UNAUTHORIZED,
         [(header::WWW_AUTHENTICATE, challenge)],
@@ -2095,6 +2109,7 @@ mod tests {
             jwks_cache: None,
             seen_identities: SeenIdentitySet::new(),
             counters: AuthCounters::default(),
+            resource_metadata_url: None,
         })
     }
 
@@ -2194,6 +2209,7 @@ mod tests {
             jwks_cache: None,
             seen_identities: SeenIdentitySet::new(),
             counters: AuthCounters::default(),
+            resource_metadata_url: None,
         });
         let app = auth_router(state);
 
@@ -2327,6 +2343,7 @@ mod tests {
             jwks_cache: None,
             seen_identities: SeenIdentitySet::new(),
             counters: AuthCounters::default(),
+            resource_metadata_url: None,
         };
         let ip = RateLimitKey::Ip("10.7.7.7".parse::<IpAddr>().unwrap());
         assert!(
@@ -2360,6 +2377,7 @@ mod tests {
             jwks_cache: None,
             seen_identities: SeenIdentitySet::new(),
             counters: AuthCounters::default(),
+            resource_metadata_url: None,
         };
         let established = RateLimitKey::Ip("10.7.7.7".parse::<IpAddr>().unwrap());
         let unseen = RateLimitKey::Ip("10.7.7.8".parse::<IpAddr>().unwrap());
@@ -2417,6 +2435,7 @@ mod tests {
             jwks_cache: None,
             seen_identities: SeenIdentitySet::new(),
             counters: AuthCounters::default(),
+            resource_metadata_url: None,
         });
         let app = auth_router(Arc::clone(&state));
         let peer: SocketAddr = "10.0.0.10:54321".parse().unwrap();
@@ -2492,6 +2511,7 @@ mod tests {
             jwks_cache: None,
             seen_identities: SeenIdentitySet::new(),
             counters: AuthCounters::default(),
+            resource_metadata_url: None,
         });
         let app = auth_router(Arc::clone(&state));
         let peer: SocketAddr = "10.0.0.20:54321".parse().unwrap();
@@ -2552,6 +2572,7 @@ mod tests {
             jwks_cache: None,
             seen_identities: SeenIdentitySet::new(),
             counters: AuthCounters::default(),
+            resource_metadata_url: None,
         });
         let app = auth_router(Arc::clone(&state));
         let metrics = Arc::new(crate::metrics::McpMetrics::new().expect("metrics registry"));
@@ -2601,6 +2622,7 @@ mod tests {
             jwks_cache: None,
             seen_identities: SeenIdentitySet::new(),
             counters: AuthCounters::default(),
+            resource_metadata_url: None,
         });
         let app = auth_router(Arc::clone(&state));
         let metrics = Arc::new(crate::metrics::McpMetrics::new().expect("metrics registry"));

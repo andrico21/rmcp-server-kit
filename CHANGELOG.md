@@ -11,9 +11,17 @@ migration note and a config opt-out — see the 3.1.0 notes below.
 
 ## [Unreleased]
 
-Hardening pass from a full review against `RUST_GUIDELINES.md`. Public API
-changes are additive except for one deprecation that requires a minor-version
-release (`cargo semver-checks`); runtime behaviour changes are noted below.
+Hardening pass from a full review against `RUST_GUIDELINES.md`, plus the fixes
+for [#17](https://github.com/andrico21/rmcp-server-kit/issues/17) (Microsoft
+Entra compatibility). Public API changes are additive except for one
+deprecation that requires a minor-version release (`cargo semver-checks`).
+
+> **Read first if you use the `oauth` feature.** OAuth *discovery metadata* is
+> now RFC 9728 / RFC 8414 conformant, which changes two published values.
+> **Token validation is unchanged.** Both changes have a legacy escape hatch,
+> and exactly one topology needs action: an application that mounts its own
+> `/authorize` + `/token` via `with_extra_router` *without* `oauth.proxy` must
+> set `oauth.authorization_servers = ["<its public URL>"]`. See **Changed**.
 
 ### Deprecated
 
@@ -150,6 +158,63 @@ release (`cargo semver-checks`); runtime behaviour changes are noted below.
   the three required proxy fields have no env source.
 
 ### Changed
+
+- **BREAKING (behaviour): OAuth discovery metadata now conforms to RFC 9728 and
+  RFC 8414. Token validation is unchanged; two legacy escape hatches are
+  provided.**
+
+  1. **Authorization Server Metadata `issuer`** now publishes this server's own
+     public URL instead of the upstream `oauth.issuer`. RFC 8414 3.3 requires
+     the published `issuer` to be identical to the identifier the metadata URL
+     was built from, and this document is served from the local origin;
+     RFC 8414 6.2 requires *clients* to reject a mismatch, so the old value made
+     the document unusable to any conformant client.
+
+     *Legacy opt-out:* `oauth.authorization_server_metadata_issuer = "<upstream
+     issuer>"`. Needed only when the upstream IdP emits RFC 9207 `iss` in the
+     authorization response **and** clients validate it — the proxy cannot
+     reconcile that, because the upstream redirects straight to the client's
+     `redirect_uri` without passing through this process.
+
+  2. **Protected Resource Metadata `authorization_servers`** is now resolved
+     from topology instead of always advertising this server: the upstream
+     `oauth.issuer` when `oauth.proxy` is absent, this server's public URL when
+     it is present. Protected Resource Metadata is served unconditionally, but
+     `/authorize`, `/token`, and `/.well-known/oauth-authorization-server` are
+     mounted only under `oauth.proxy` — so the old default pointed RFC 9728
+     discovery at a URL that returns 404.
+
+     *Action required for one topology:* an application that mounts its **own**
+     `/authorize` and `/token` via `with_extra_router` **without** configuring
+     `oauth.proxy` must now declare itself explicitly:
+
+     ```toml
+     [server.auth.oauth]
+     authorization_servers = ["https://mcp.example.com"]
+     ```
+
+     The crate cannot detect that case — "no proxy" is indistinguishable from
+     "the application supplied its own facade".
+
+  Token validation is untouched in both cases: inbound JWT `iss` is always
+  validated against `oauth.issuer`.
+
+- **Zero-valued metadata claims are now omitted** rather than emitted as `[]`,
+  per RFC 8414 3.2 ("Claims with zero elements MUST be omitted from the
+  response") and RFC 9728 3.2. Affects `scopes_supported` in both documents and
+  `authorization_servers`.
+- **Protected Resource Metadata is also served at the RFC 9728 3.1
+  path-inserted location** `/.well-known/oauth-protected-resource/mcp` for the
+  `/mcp` resource. The root path is retained as an alias, so no client breaks.
+  Like every framework route, an `extra_router` entry that *exactly* overlaps
+  this new path panics at startup — see the collision caveat on
+  `McpServerConfig::with_extra_router`.
+- The `WWW-Authenticate` challenge advertises an **absolute**
+  `resource_metadata` URL when `public_url` is configured, and keeps the
+  previous relative path otherwise. Without `public_url` the only derivable
+  origin is the bind address, which behind a TLS-terminating proxy is an
+  internal address — a wrong absolute URL is not more conformant than a
+  relative one.
 
 - `tool_hooks::with_hooks` is now `#[must_use]`. Dropping the returned
   `HookedHandler` silently disables every supplied hook, so ignoring it is

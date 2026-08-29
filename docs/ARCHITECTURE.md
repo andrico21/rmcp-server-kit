@@ -47,7 +47,7 @@ The crate has two transports:
 | Transport          | Function                                            | Auth/RBAC/TLS  | Use case                                         |
 |--------------------|-----------------------------------------------------|----------------|--------------------------------------------------|
 | **Streamable HTTP**| `serve()` — `src/transport.rs:2154`                 | **Yes**        | Production network deployment                    |
-| stdio              | `serve_stdio()` — `src/transport.rs:3883`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
+| stdio              | `serve_stdio()` — `src/transport.rs:3936`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
 
 ---
 
@@ -184,7 +184,7 @@ Open endpoints (no auth):
 |--------------------------------------------|-----------------------------------------------|
 | `GET  /healthz`                            | `healthz` (~`src/transport.rs:1766`) |
 | `GET  /readyz`                             | `readyz`  (~`src/transport.rs:1767`) — runs configured readiness check |
-| `GET  /version`                            | `version_payload` (~`src/transport.rs:3091`) |
+| `GET  /version`                            | `version_payload` (~`src/transport.rs:3128`) |
 | `GET  /metrics`                            | served by `serve_metrics` on a **separate listener** when `feature = "metrics"` (`src/metrics.rs:142`) |
 | `GET  /.well-known/oauth-protected-resource` | feature = `oauth` (`src/transport.rs:1851`) |
 | `GET  /.well-known/oauth-authorization-server` | feature = `oauth` proxy (`src/transport.rs:1874`) |
@@ -606,7 +606,7 @@ recommended.
    - `lookup_key()` looks up by `kid` in the cached JWKS
      (`src/oauth.rs:2456`).
    - If not found, calls `refresh_with_cooldown()` (`src/oauth.rs:2710`):
-      - Enforces `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:2042`) so multiple
+      - Enforces `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:2116`) so multiple
        invalid tokens cannot DoS the JWKS endpoint.
      - Deduplicates concurrent refreshes.
    - Validates signature, `iss`, `aud`, `exp`, `nbf` using `jsonwebtoken`.

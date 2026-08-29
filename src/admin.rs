@@ -201,6 +201,7 @@ mod tests {
             jwks_cache: None,
             seen_identities: crate::auth::SeenIdentitySet::new(),
             counters: AuthCounters::default(),
+            resource_metadata_url: None,
         })
     }
 
