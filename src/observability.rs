@@ -685,10 +685,9 @@ mod tests {
     #[cfg(unix)]
     use tracing_subscriber::{Layer as _, fmt::MakeWriter as _, layer::SubscriberExt as _};
 
-    use super::{
-        AuditMessage, AuditWorker, init_tracing, prepare_tracing_audit_lenient,
-        prepare_tracing_audit_strict,
-    };
+    #[cfg(not(unix))]
+    use super::prepare_tracing_audit_lenient;
+    use super::{AuditMessage, AuditWorker, init_tracing, prepare_tracing_audit_strict};
     use crate::{config::ObservabilityConfig, error::RmcpServerKitError};
 
     struct FailingAuditSink;
