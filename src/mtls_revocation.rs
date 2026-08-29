@@ -2947,73 +2947,67 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    /// The commit path must reach `rebuild_verifier` BEFORE taking the cache
+    /// write lock.
+    ///
+    /// Asserted by ordering, not by timing: a held read guard excludes writers,
+    /// so a commit that surfaces a rebuild error *while that guard is still
+    /// held* provably performed the rebuild off-lock. Moving the rebuild back
+    /// inside the write-lock block makes this block until the timeout fires.
+    /// The previous form of this test compared `try_read` hit ratios, which
+    /// measured scheduler fairness under CPU oversubscription and failed
+    /// intermittently on shared CI runners.
+    ///
+    /// A multi-threaded runtime is REQUIRED: the commit must be able to make
+    /// progress on another worker while this task holds the read guard. Under
+    /// `current_thread` the spawned commit cannot advance and the timeout fires
+    /// spuriously. Two workers suffice; more only reintroduces oversubscription.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn commit_does_not_hold_the_cache_write_lock_across_the_verifier_rebuild() {
         let (set, _rx) = test_crl_set_with_receiver_config(tamper_test_config());
+        let url = "https://invalid-rebuild.example.test/crl";
         let now = SystemTime::now();
-        // A warm cache makes the off-lock clone + `rebuild_verifier` phase the
-        // dominant cost, so a reader starved by that phase is clearly visible.
-        for index in 0..256usize {
-            set.__test_insert_cache(
-                &format!("https://warm-{index:03}.example.test/crl"),
-                synthetic_entry(now),
-            )
-            .await;
-        }
 
-        let stop = Arc::new(AtomicBool::new(false));
-        let reader_set = Arc::clone(&set);
-        let reader_stop = Arc::clone(&stop);
-        let reader = tokio::task::spawn_blocking(move || {
-            let mut acquired = 0usize;
-            let mut blocked = 0usize;
-            while !reader_stop.load(Ordering::Relaxed) {
-                if reader_set.cache_lock().try_read().is_ok() {
-                    acquired += 1;
-                } else {
-                    blocked += 1;
-                }
-            }
-            (acquired, blocked)
-        });
+        let invalid = CachedCrl {
+            der: CertificateRevocationListDer::from(vec![0_u8]),
+            this_update: now,
+            next_update: now.checked_add(Duration::from_secs(24 * 60 * 60)),
+            fetched_at: now,
+            source_url: url.to_owned(),
+        };
 
-        for round in 0..64usize {
-            set.__test_insert_cache(
-                &format!("https://churn-{round:03}.example.test/crl"),
-                synthetic_entry(now),
-            )
-            .await;
-            // Model refresh cadence rather than a 100%-duty-cycle writer. Real
-            // commits are bounded by MIN_AUTO_REFRESH and the discovery
-            // limiter; a back-to-back loop keeps a writer permanently queued
-            // on this write-preferring lock and measures scheduler fairness
-            // instead of the lock-window property under test.
-            tokio::time::sleep(Duration::from_micros(200)).await;
-        }
-        stop.store(true, Ordering::Relaxed);
-        let (acquired, blocked) = reader.await.expect("reader task");
-
-        // The write lock covers only the two-statement publication, which is
-        // orders of magnitude shorter than the inter-commit gap, so a
-        // non-blocking reader wins overwhelmingly. Holding it across the clone
-        // and `rebuild_verifier` (the pre-fix shape) costs milliseconds per
-        // commit and inverts this ratio.
-        //
-        // Calibration, measured on this codebase:
-        //   write lock held across clone + rebuild:  73k acquired / 6.44M blocked  (0.011x)
-        //   publication-only, superseded map dropped in place:      1.28x then 5.5x
-        //   publication-only, superseded map dropped off-lock:      10.9x
-        // The threshold is 2x: ~5x below the passing value and ~180x above the
-        // failing one. It is deliberately NOT pushed nearer the observed pass
-        // value. `tokio::sync::RwLock` is write-preferring, so `try_read` also
-        // fails while a writer is merely QUEUED, and a spinning reader
-        // dominates that queueing latency; the residual blocked share is a
-        // property of the lock's fairness, not of the critical-section length,
-        // and cannot be shortened away. Raising the threshold would only make
-        // the test tune itself to the scheduler.
+        let invalid_cache = HashMap::from([(url.to_owned(), invalid.clone())]);
         assert!(
-            acquired > blocked.saturating_mul(2),
-            "verifier-path readers must not be starved by commits: {acquired} acquired vs {blocked} blocked"
+            rebuild_verifier(&set.roots, &set.config, &invalid_cache).is_err(),
+            "precondition: the synthetic CRL must make rebuild_verifier fail"
+        );
+
+        let read_guard = set.cache_lock().read().await;
+
+        let commit = {
+            let set = Arc::clone(&set);
+            tokio::spawn(async move { set.__test_try_insert_cache(url, invalid).await })
+        };
+
+        let finished_while_reader_held = tokio::time::timeout(Duration::from_secs(5), commit).await;
+
+        drop(read_guard);
+
+        let commit_result = finished_while_reader_held
+            .expect("commit must reach rebuild_verifier before waiting for the cache write lock")
+            .expect("commit task must not panic");
+
+        assert!(
+            commit_result.is_err(),
+            "invalid CRL must fail during verifier rebuild"
+        );
+        assert!(
+            !set.__test_cache_contains(url),
+            "failed commit must not publish the invalid CRL into the live cache"
+        );
+        assert!(
+            !set.__test_cached_url_contains(url),
+            "failed commit must not publish invalid CRL coverage into verifier_state"
         );
     }
 
