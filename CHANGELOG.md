@@ -11,6 +11,8 @@ migration note and a config opt-out — see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+## [3.8.0] - 2026-08-29
+
 Hardening pass from a full review against `RUST_GUIDELINES.md`, plus the fixes
 for [#17](https://github.com/andrico21/rmcp-server-kit/issues/17) (Microsoft
 Entra compatibility) and RFC 8693 token-exchange conformance.
