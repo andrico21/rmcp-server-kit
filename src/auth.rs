@@ -19,7 +19,7 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
-use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use axum::{
     body::Body,
     extract::ConnectInfo,
@@ -1365,23 +1365,17 @@ pub fn verify_bearer_token(token: &str, keys: &[ApiKeyEntry]) -> Option<AuthIden
 /// (`"rmcp-server-kit-dummy"`) and the fixed salt are unrelated to any
 /// real credential — randomness is unnecessary because this hash is
 /// only ever compared against attacker-supplied input on slots that
-/// will be discarded regardless of match result. Using a fixed salt
-/// avoids depending on `rand_core`'s `getrandom` feature, which is not
-/// activated transitively in every feature configuration of this crate.
+/// will be discarded regardless of match result. Argon2's work factor is
+/// set by the PHC `m`/`t`/`p` parameters, not by the salt value, so a
+/// fixed salt costs exactly what a random one would;
+/// `dummy_and_real_hashes_share_cost_parameters` pins that equivalence.
 static DUMMY_PHC_HASH: LazyLock<String> = LazyLock::new(|| {
-    // 16 bytes of base64 (`AAAA...`) — minimum valid Argon2 salt length.
     #[allow(
         clippy::expect_used,
-        reason = "fixed 22-char base64 ('AAAA...') decodes to a valid 16-byte salt; SaltString::from_b64 is infallible on this literal"
-    )]
-    let salt = SaltString::from_b64("AAAAAAAAAAAAAAAAAAAAAA")
-        .expect("fixed 16-byte base64 salt is well-formed");
-    #[allow(
-        clippy::expect_used,
-        reason = "Argon2::default() with a fixed plaintext and a well-formed salt is infallible; only fails on bad params/salt"
+        reason = "Argon2::default() over a fixed plaintext and a fixed 16-byte salt is infallible; it fails only on invalid params or salt length, both constants here"
     )]
     Argon2::default()
-        .hash_password(b"rmcp-server-kit-dummy", &salt)
+        .hash_password_with_salt(b"rmcp-server-kit-dummy", &[0u8; 16])
         .expect("Argon2 default params hash a fixed plaintext")
         .to_string()
 });
@@ -1393,20 +1387,17 @@ static DUMMY_PHC_HASH: LazyLock<String> = LazyLock::new(|| {
 ///
 /// # Errors
 ///
-/// Returns an error if salt encoding or Argon2id hashing fails
-/// (should not happen with valid inputs, but we avoid panicking).
+/// Returns an error if Argon2id hashing fails (should not happen with valid
+/// inputs, but we avoid panicking).
 pub fn generate_api_key() -> Result<(String, String), RmcpServerKitError> {
     let mut token_bytes = [0u8; 32];
     rand::fill(&mut token_bytes);
     let token = URL_SAFE_NO_PAD.encode(token_bytes);
 
-    // Generate 16 random bytes for salt, encode as base64 for SaltString.
     let mut salt_bytes = [0u8; 16];
     rand::fill(&mut salt_bytes);
-    let salt = SaltString::encode_b64(&salt_bytes)
-        .map_err(|e| RmcpServerKitError::Internal(format!("salt encoding failed: {e}")))?;
     let hash = Argon2::default()
-        .hash_password(token.as_bytes(), &salt)
+        .hash_password_with_salt(token.as_bytes(), &salt_bytes)
         .map_err(|e| RmcpServerKitError::Internal(format!("argon2id hashing failed: {e}")))?
         .to_string();
 
@@ -1691,6 +1682,45 @@ mod tests {
 
     use super::*;
     use crate::transport::RateLimitKey;
+
+    /// A PHC string produced by **argon2 0.5.3** through the same code path as
+    /// [`generate_api_key`] (16 salt bytes, `Argon2::default()`).
+    ///
+    /// Pinned so the argon2 0.6 upgrade cannot silently invalidate credentials
+    /// that are already deployed: if this stops verifying, every stored API key
+    /// stops working. Captured before the upgrade and asserted after it.
+    const ARGON2_0_5_TOKEN: &str = "golden-vector-token-0p5p3";
+    const ARGON2_0_5_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$BwcHBwcHBwcHBwcHBwcHBw$spS8B9AhHG1LikfhGlssVMfP8mq37+8/mXnl98ps0NU";
+
+    #[test]
+    fn argon2_0_5_produced_hash_still_verifies() {
+        let parsed =
+            PasswordHash::new(ARGON2_0_5_HASH).expect("a 0.5-era PHC string must still parse");
+        Argon2::default()
+            .verify_password(ARGON2_0_5_TOKEN.as_bytes(), &parsed)
+            .expect("already-deployed API keys must keep verifying across the argon2 upgrade");
+    }
+
+    /// The dummy hash burned on a miss must cost the same as a real one.
+    ///
+    /// Argon2 work is set by the PHC parameters, not the salt, so asserting the
+    /// dummy and a freshly generated key share `argon2id`, `v=19` and identical
+    /// `m`/`t`/`p` pins the constant-time property without a flaky wall-clock
+    /// measurement. Forcing `DUMMY_PHC_HASH` here also surfaces a `LazyLock`
+    /// panic in CI rather than at the first production auth.
+    #[test]
+    fn dummy_and_real_hashes_share_cost_parameters() {
+        let (_token, real_hash) = generate_api_key().expect("key generation must succeed");
+        let real = PasswordHash::new(&real_hash).expect("generated hash must parse");
+        let dummy = PasswordHash::new(&DUMMY_PHC_HASH).expect("dummy hash must parse");
+
+        assert_eq!(dummy.algorithm, real.algorithm, "algorithm must match");
+        assert_eq!(dummy.version, real.version, "PHC version must match");
+        assert_eq!(
+            dummy.params, real.params,
+            "m/t/p must match or the dummy no longer costs what a real verification costs"
+        );
+    }
 
     #[test]
     fn generate_and_verify_api_key() {

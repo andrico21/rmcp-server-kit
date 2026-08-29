@@ -11,6 +11,25 @@ migration note and a config opt-out — see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Changed
+
+- **`argon2` upgraded from 0.5 to 0.6.** **No action is required and no
+  re-hashing is needed: every existing stored API-key hash remains valid.**
+  Compatibility is pinned by a regression test carrying a PHC string produced
+  by argon2 0.5.3 through this crate's own key-generation path; it must keep
+  verifying, so a future upgrade cannot silently invalidate deployed
+  credentials.
+
+  Default cost parameters are unchanged (`Argon2id`, `v=19`, `m=19456`, `t=2`,
+  `p=1`), so newly issued keys have the same security posture as before.
+
+  Internally this pulls `password-hash` 0.6.1 (0.6.0 was yanked upstream) and
+  the new `phc` crate. `SaltString` moved out of `password-hash`, and
+  `hash_password` no longer takes an explicit salt — the crate now supplies its
+  own salt bytes directly via `hash_password_with_salt`, which removed a
+  base64-encoding step and one `expect()` from the constant-time placeholder
+  hash. `getrandom` and `rand_core` version counts are unchanged.
+
 ## [3.8.0] - 2026-08-29
 
 Hardening pass from a full review against `RUST_GUIDELINES.md`, plus the fixes

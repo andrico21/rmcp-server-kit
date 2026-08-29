@@ -52,7 +52,7 @@ version = "1.9.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.argon2]]
-version = "0.5.3"
+version = "0.6.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.asn1-rs]]
@@ -132,7 +132,7 @@ version = "2.13.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.blake2]]
-version = "0.10.6"
+version = "0.11.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.block-buffer]]
@@ -772,7 +772,7 @@ version = "0.9.12"
 criteria = "safe-to-deploy"
 
 [[exemptions.password-hash]]
-version = "0.5.0"
+version = "0.6.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.pastey]]
@@ -793,6 +793,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.percent-encoding]]
 version = "2.3.2"
+criteria = "safe-to-deploy"
+
+[[exemptions.phc]]
+version = "0.6.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.pin-project-lite]]
