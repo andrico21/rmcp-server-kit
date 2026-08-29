@@ -1275,6 +1275,47 @@ fn validate_token_exchange_client_auth(
     }
 }
 
+/// Whether `c` is legal anywhere in an RFC 3986 URI.
+///
+/// A character-class gate, not a positional grammar check. It exists because
+/// [`url::Url::parse`] implements the WHATWG URL Standard, not RFC 3986: it
+/// silently trims surrounding spaces and C0 controls and percent-encodes
+/// characters RFC 3986 forbids outright. Since `resource` is forwarded to the
+/// authorization server verbatim, a value the RFC rejects must fail at startup
+/// rather than be laundered into a different string.
+fn is_rfc3986_uri_char(c: char) -> bool {
+    matches!(
+        c,
+        'A'..='Z'
+            | 'a'..='z'
+            | '0'..='9'
+            | '-' | '.' | '_' | '~'
+            | '!' | '$' | '&' | '\'' | '(' | ')' | '*' | '+' | ',' | ';' | '='
+            | ':' | '/' | '?' | '#' | '[' | ']' | '@'
+            | '%'
+    )
+}
+
+/// Whether every `%` in `raw` begins a complete `%XX` triplet (RFC 3986 §2.1).
+fn has_valid_pct_encoding(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    let mut idx = 0;
+    while let Some(byte) = bytes.get(idx) {
+        if *byte == b'%' {
+            let (Some(hi), Some(lo)) = (bytes.get(idx + 1), bytes.get(idx + 2)) else {
+                return false;
+            };
+            if !hi.is_ascii_hexdigit() || !lo.is_ascii_hexdigit() {
+                return false;
+            }
+            idx += 3;
+        } else {
+            idx += 1;
+        }
+    }
+    true
+}
+
 /// Validate the RFC 8693 §2.1 OPTIONAL token-exchange parameters.
 ///
 /// An empty value is rejected because it is a malformed request parameter,
@@ -1306,6 +1347,13 @@ fn validate_token_exchange_optional_params(
     if let Some(resource) = tx.resource.as_deref() {
         if resource.is_empty() {
             return Err(empty_field("resource"));
+        }
+        if !resource.chars().all(is_rfc3986_uri_char) || !has_valid_pct_encoding(resource) {
+            return Err(crate::error::RmcpServerKitError::Config(
+                "oauth.token_exchange.resource must be an RFC 3986 absolute URI using valid \
+                 URI characters and percent-encoding (RFC 8707 §2)"
+                    .into(),
+            ));
         }
         let parsed = url::Url::parse(resource).map_err(|e| {
             crate::error::RmcpServerKitError::Config(format!(
@@ -8473,6 +8521,9 @@ role = "admin"
         for (value, expected) in [
             ("not-an-absolute-uri", "absolute URI"),
             ("https://api.example.com/v1#frag", "fragment"),
+            ("https://api.example.com/a b", "valid URI characters"),
+            ("https://api.example.com/%zz", "valid URI characters"),
+            ("https://api.example.com/\u{e9}", "valid URI characters"),
         ] {
             let cfg = https_cfg_with_tx(tx_with(Some("s"), None).with_resource(value));
             let err = cfg

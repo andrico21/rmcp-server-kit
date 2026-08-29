@@ -62,9 +62,13 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
 
 - `oauth.token_exchange` now supports the remaining RFC 8693 §2.1 OPTIONAL
   request parameters, each omitted by default:
-  - `resource` — an RFC 8707 resource indicator, validated as an absolute URI
-    with no fragment. **Unrelated to `oauth.proxy.strip_resource_param`**, which
-    governs the OAuth proxy endpoints rather than token exchange.
+  - `resource` — an RFC 8707 resource indicator, validated at startup as an
+    absolute URI with no fragment, using only RFC 3986 characters and
+    well-formed percent-encoding. (The `url` crate implements the WHATWG URL
+    Standard, which would otherwise silently trim or re-encode a value that is
+    then sent to the authorization server verbatim.) **Unrelated to
+    `oauth.proxy.strip_resource_param`**, which governs the OAuth proxy
+    endpoints rather than token exchange.
   - `scope` — space-delimited scopes for the exchanged token.
   - `requested_token_type` — `"access_token"` (default, unchanged behaviour),
     `"omit"` to let the authorization server choose per RFC 8693 §2.1, or any
