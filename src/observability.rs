@@ -622,20 +622,91 @@ fn create_private_audit_file(path: &Path) -> Result<std::fs::File, String> {
         .map_err(|e| format!("failed to open audit log file {}: {e}", path.display()))
 }
 
+/// Create (or append to) the audit log with an owner-only DACL.
+///
+/// SECURITY: Windows has no safe creation-time equivalent of `mode(0o600)`.
+/// Rust std cannot pass `SECURITY_ATTRIBUTES` to file creation
+/// (rust-lang/libs-team#324), so the file is created and the protected
+/// owner-only DACL applied immediately afterwards. That leaves a small
+/// create-then-harden window the Unix path does not have: this removes the
+/// *persistent* exposure, not the momentary one. It is not parity.
+///
+/// If hardening fails once the file exists, the file is deleted best-effort and
+/// the error states whether that succeeded, so an operator knows whether an
+/// unprotected audit log may remain on disk. Continuing instead would recreate
+/// the silent security-control failure this replaced.
+#[cfg(windows)]
+fn create_private_audit_file(path: &Path) -> Result<std::fs::File, String> {
+    use std::ffi::OsString;
+
+    use windows_permissions::{
+        LocalBox, SecurityDescriptor,
+        constants::{SeObjectType, SecurityInformation},
+        wrappers,
+    };
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("failed to open audit log file {}: {e}", path.display()))?;
+
+    let harden = || -> Result<(), String> {
+        let sid = windows_permissions::utilities::current_process_sid()
+            .map_err(|e| format!("cannot determine the current process SID: {e}"))?;
+        // `D:P` protects the DACL, discarding inherited ACEs; a single
+        // FA (full access) ACE for this process's SID is the owner-only grant.
+        let sd: LocalBox<SecurityDescriptor> = format!("D:P(A;;FA;;;{sid})")
+            .parse()
+            .map_err(|e| format!("cannot build an owner-only security descriptor: {e}"))?;
+        let dacl = sd
+            .dacl()
+            .ok_or_else(|| "owner-only security descriptor carried no DACL".to_owned())?;
+        let name: OsString = path.as_os_str().to_owned();
+        wrappers::SetNamedSecurityInfo(
+            &name,
+            SeObjectType::SE_FILE_OBJECT,
+            SecurityInformation::Dacl | SecurityInformation::ProtectedDacl,
+            None,
+            None,
+            Some(dacl),
+            None,
+        )
+        .map_err(|e| format!("cannot apply the owner-only DACL: {e}"))
+    };
+
+    match harden() {
+        Ok(()) => Ok(file),
+        Err(reason) => {
+            drop(file);
+            let cleanup = match std::fs::remove_file(path) {
+                Ok(()) => "the unprotected file was deleted".to_owned(),
+                Err(e) => format!(
+                    "the unprotected file could NOT be deleted and may remain at {}: {e}",
+                    path.display()
+                ),
+            };
+            Err(format!(
+                "audit log ACL hardening failed for {}: {reason}; {cleanup}",
+                path.display()
+            ))
+        }
+    }
+}
+
 /// Refuse to create an audit log where owner-only access cannot be guaranteed.
 ///
-/// SECURITY: this platform has no POSIX mode bits, and ACL hardening is not
-/// implemented. Creating the file anyway would let it inherit directory ACLs -
-/// under a location such as `C:\ProgramData` that is world-readable - while the
-/// operator believes auditing is protected. Failing here turns a silent
-/// security-control failure into an explicit one: strict init reports a startup
-/// error, and the deprecated lenient init warns and installs no audit sink.
-#[cfg(not(unix))]
+/// SECURITY: this platform has neither POSIX mode bits nor a supported ACL
+/// path. Creating the file anyway would let it inherit directory permissions
+/// while the operator believes auditing is protected. Failing here turns a
+/// silent security-control failure into an explicit one: strict init reports a
+/// startup error, and the deprecated lenient init warns and installs no audit
+/// sink.
+#[cfg(not(any(unix, windows)))]
 fn create_private_audit_file(path: &Path) -> Result<std::fs::File, String> {
     Err(format!(
         "audit log private permissions are unsupported on this platform: cannot \
-         guarantee owner-only access for {}; Windows ACL hardening is not \
-         implemented; audit logging disabled",
+         guarantee owner-only access for {}; audit logging disabled",
         path.display()
     ))
 }
@@ -685,7 +756,7 @@ mod tests {
     #[cfg(unix)]
     use tracing_subscriber::{Layer as _, fmt::MakeWriter as _, layer::SubscriberExt as _};
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     use super::prepare_tracing_audit_lenient;
     use super::{AuditMessage, AuditWorker, init_tracing, prepare_tracing_audit_strict};
     use crate::{config::ObservabilityConfig, error::RmcpServerKitError};
@@ -932,8 +1003,61 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("remove audit temp dir");
     }
 
+    /// The audit log must end up with a protected, owner-only DACL: exactly one
+    /// ACE, granting this process's SID, with inherited entries discarded.
+    ///
+    /// Read back through `windows-permissions` rather than shelling out to
+    /// `icacls`, so the assertion does not depend on a subprocess.
     #[test]
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    fn audit_file_dacl_is_owner_only() {
+        use windows_permissions::{
+            constants::{SeObjectType, SecurityInformation},
+            wrappers,
+        };
+
+        let dir = unique_temp_path("audit-dacl");
+        let audit_path = dir.join("audit.log");
+        let config = observability_config(Some(audit_path.clone()));
+
+        let setup = prepare_tracing_audit_strict(&config)
+            .expect("Windows audit logging must succeed once the DACL is applied");
+        drop(setup.guard);
+
+        assert!(
+            audit_path.exists(),
+            "the audit file must be created on Windows, not refused"
+        );
+
+        let sd = wrappers::GetNamedSecurityInfo(
+            audit_path.as_os_str(),
+            SeObjectType::SE_FILE_OBJECT,
+            SecurityInformation::Dacl,
+        )
+        .expect("reading the audit file security descriptor must succeed");
+        let dacl = sd.dacl().expect("the audit file must carry a DACL");
+
+        let expected = windows_permissions::utilities::current_process_sid()
+            .expect("current process SID must be resolvable");
+
+        assert_eq!(
+            dacl.len(),
+            1,
+            "a protected owner-only DACL must contain exactly one ACE; \
+             more means inherited entries survived"
+        );
+        let ace = dacl.get_ace(0).expect("the single ACE must be readable");
+        assert_eq!(
+            ace.sid().expect("the ACE must name a SID"),
+            &*expected,
+            "the only ACE must grant this process's SID"
+        );
+
+        std::fs::remove_dir_all(&dir).expect("remove audit temp dir");
+    }
+
+    #[test]
+    #[cfg(not(any(unix, windows)))]
     fn strict_init_refuses_audit_log_without_private_permissions() {
         let dir = unique_temp_path("audit-unsupported");
         let audit_path = dir.join("audit.log");
@@ -954,7 +1078,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn lenient_init_warns_and_installs_no_audit_sink() {
         let dir = unique_temp_path("audit-lenient");
         let audit_path = dir.join("audit.log");

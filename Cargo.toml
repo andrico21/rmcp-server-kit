@@ -151,6 +151,17 @@ reqwest = { version = "0.13.4", default-features = false, features = [
 ] }
 urlencoding = { version = "2", optional = true }
 
+# Windows-only: owner-only ACLs for the audit log.
+#
+# Unix applies 0o600 at creation via OpenOptionsExt::mode. Windows has no safe
+# creation-time equivalent -- std cannot pass SECURITY_ATTRIBUTES to file
+# creation (rust-lang/libs-team#324) -- so the DACL is applied immediately
+# after creation. This crate is used ONLY for current_process_sid() and
+# applying a protected owner-only DACL; its unsafe Win32 calls are
+# encapsulated, which is required because this crate is #![forbid(unsafe_code)].
+[target.'cfg(windows)'.dependencies]
+windows-permissions = "0.2.4"
+
 [features]
 default = []
 oauth = ["dep:jsonwebtoken", "dep:urlencoding"]

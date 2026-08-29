@@ -29,22 +29,6 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
 
 ### Breaking
 
-- **Audit logging now fails closed on platforms without POSIX mode bits
-  (Windows).** A configured `observability.audit_log_path` previously created
-  the file with no permission hardening at all and reported no warning, so an
-  audit log under a location such as `C:\ProgramData` inherited broad read ACLs
-  while the operator believed it was protected. Silent failure of a security
-  control is worse than an explicit one, so:
-  - `init_tracing_from_config_strict` now returns a startup error and **does not
-    create the file**;
-  - the deprecated lenient `init_tracing` installs tracing **without** an audit
-    sink and emits a warning.
-
-  **Action required for Windows deployments that set `audit_log_path`:** the
-  server will refuse to start. Remove the key to run without auditing, or run on
-  a platform where owner-only permissions can be guaranteed. Unix behaviour is
-  unchanged apart from the hardening below.
-
 - **`TokenExchangeConfig::new` now takes `impl Into<String>` for `token_url`
   and `client_id`**, matching its own `with_*` setters.
 
@@ -172,12 +156,34 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
 
 ### Security
 
-- **The audit log is now created with owner-only permissions atomically.**
-  It was opened with `create(true)` and only then `chmod`'d to `0o600`, leaving
-  a window in which the file existed with umask-derived permissions and any
-  local principal could open it. The mode is now applied by `open` itself
-  (`OpenOptionsExt::mode`). Pre-existing files are still corrected afterwards,
-  because `mode` applies only at creation.
+- **The audit log is now protected on both Unix and Windows.**
+
+  On **Unix**, owner-only permissions are applied **at file creation**
+  (`OpenOptionsExt::mode(0o600)`). Previously the file was opened with
+  `create(true)` and only then `chmod`'d to `0o600`, leaving a window in which
+  it existed with umask-derived permissions and any local principal could open
+  it. Pre-existing files are still corrected afterwards, because `mode` applies
+  only at creation.
+
+  On **Windows**, the file previously received no permission hardening at all
+  and no warning was reported, so an audit log under a location such as
+  `C:\ProgramData` inherited broad read ACLs while the operator believed it was
+  protected. The file is now created and a protected owner-only DACL applied
+  immediately afterwards.
+
+  **These are not equivalent.** Rust std cannot pass `SECURITY_ATTRIBUTES` to
+  file creation (rust-lang/libs-team#324), so Windows has no safe creation-time
+  equivalent of `mode(0o600)`. The Windows path therefore leaves a small
+  create-then-harden race that Unix does not have: it removes the *persistent*
+  exposure, not the momentary one.
+
+  If Windows ACL hardening fails, startup fails and the crate attempts to delete
+  the unprotected file; the error states whether that deletion succeeded, so an
+  operator knows whether an unprotected audit log may remain on disk. Hardening
+  uses the `windows-permissions` crate, target-gated to `cfg(windows)` and used
+  only to resolve the current process SID and apply the DACL — this crate is
+  `#![forbid(unsafe_code)]` and so cannot call the Win32 ACL APIs directly.
+
 - **Attacker-controlled intermediate CDP URLs no longer bypass the
   per-handshake cap.** `MAX_RELEVANT_CDP_URLS_PER_HANDSHAKE` is evaluated
   against the *relevant* URL set, but discovery candidates were collected from

@@ -1009,6 +1009,32 @@ file or parent directory cannot be opened. Audit writes use a bounded
 non-blocking channel plus a dedicated writer thread so tracing calls on tokio
 worker threads do not perform synchronous file I/O.
 
+#### Audit-log file permissions
+
+The audit log carries identities, and under the diagnostic switches it can carry
+credential material, so it is created with owner-only permissions.
+
+- **Unix:** owner-only (`0o600`) is applied **at file creation** via
+  `OpenOptions::mode`. There is no window in which the file is readable by other
+  local principals. A pre-existing file has its mode corrected after opening.
+- **Windows:** the file is created and a protected owner-only DACL is applied
+  immediately afterwards, discarding inherited ACEs.
+
+**These are not equivalent.** Rust's standard library cannot pass
+`SECURITY_ATTRIBUTES` to file creation ([rust-lang/libs-team#324]), so Windows
+has no safe creation-time equivalent of `mode(0o600)`. The Windows path
+therefore leaves a small create-then-harden race that Unix does not have: it
+removes the *persistent* exposure, not the momentary one.
+
+If Windows ACL hardening fails, startup fails and the crate attempts to delete
+the unprotected file. The error reports whether that deletion succeeded, so you
+can tell whether an unprotected audit log may remain at that path.
+
+On a platform that is neither Unix nor Windows, a configured `audit_log_path`
+fails closed: startup errors and no file is created.
+
+[rust-lang/libs-team#324]: https://github.com/rust-lang/libs-team/issues/324
+
 The deprecated `init_tracing_from_config(config)` compatibility entry point
 keeps the old fail-open audit-log behaviour and returns `Result<(), TryInitError>`.
 
