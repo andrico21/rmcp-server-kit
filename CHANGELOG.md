@@ -11,6 +11,8 @@ migration note and a config opt-out — see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+## [3.8.1] - 2026-08-30
+
 ### Changed
 
 - **`argon2` upgraded from 0.5 to 0.6.** **No action is required and no
