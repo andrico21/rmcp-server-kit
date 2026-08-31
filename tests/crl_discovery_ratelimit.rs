@@ -1,4 +1,4 @@
-//! F3 — CDP discovery rate-limit gate.
+//! F3 - CDP discovery rate-limit gate.
 //!
 //! These tests exercise the `discovery_limiter` field on `CrlSet`, which
 //! caps how many newly-discovered CDP URLs the mTLS verifier may forward

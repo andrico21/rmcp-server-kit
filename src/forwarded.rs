@@ -5,13 +5,13 @@
 //! `real_ip` and Envoy: when (and only when) the direct socket peer is
 //! one of the operator's trusted proxies, walk the forwarding chain from
 //! the right, skip addresses that are themselves trusted proxies, and
-//! take the first address that is not — that is the real client. Headers
+//! take the first address that is not - that is the real client. Headers
 //! arriving from untrusted peers are ignored entirely (the leftmost-trust
 //! anti-pattern is never used: anything left of the trusted suffix is
 //! attacker-controlled).
 //!
-//! Every ambiguous input — malformed entries, RFC 7239 obfuscated
-//! identifiers, chains that exhaust into trusted space, header bombs —
+//! Every ambiguous input - malformed entries, RFC 7239 obfuscated
+//! identifiers, chains that exhaust into trusted space, header bombs -
 //! falls back to the **direct peer**, never to a header value. Raw header
 //! contents are never logged; callers receive a [`FallbackReason`] code.
 
@@ -37,7 +37,7 @@ pub(crate) const MAX_CONFIGURABLE_SCANNED_ENTRIES: usize = 64;
 
 /// Why trusted-forwarder resolution fell back to the direct peer.
 ///
-/// Logged (as a code only — never the raw header contents, which are
+/// Logged (as a code only - never the raw header contents, which are
 /// attacker-controlled) at `debug` level by the peer-normalization
 /// middleware.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,7 +48,7 @@ pub(crate) enum FallbackReason {
     /// An entry at the decision point failed to parse as an IP address.
     MalformedEntry,
     /// RFC 7239 obfuscated identifier (`unknown` / `_…`) at the decision
-    /// point — the chain cannot be verified past it.
+    /// point - the chain cannot be verified past it.
     Obfuscated,
     /// Every scanned entry was inside the trusted-proxy set. Conservative
     /// divergence from nginx `real_ip` (which would use the leftmost
@@ -60,7 +60,7 @@ pub(crate) enum FallbackReason {
 
 /// Resolve the client IP for a request whose direct peer is `direct`.
 ///
-/// - Direct peer **not** in `trusted` → `Ok(direct)` (headers ignored —
+/// - Direct peer **not** in `trusted` → `Ok(direct)` (headers ignored -
 ///   the normal path for clients connecting directly).
 /// - Direct peer trusted → rightmost-untrusted walk over the **last**
 ///   instance of the configured header; `Ok(client)` on success,
@@ -124,7 +124,7 @@ fn parse_xff_entry(raw: &str) -> Result<IpAddr, FallbackReason> {
 
 /// Parse one RFC 7239 `Forwarded` stanza and extract its `for=` node.
 ///
-/// Stanza shape: `for=X;by=Y;proto=Z` — parameters separated by `;`,
+/// Stanza shape: `for=X;by=Y;proto=Z` - parameters separated by `;`,
 /// names case-insensitive, values optionally double-quoted.
 fn parse_forwarded_entry(raw: &str) -> Result<IpAddr, FallbackReason> {
     let stanza = raw.trim();
@@ -189,7 +189,7 @@ fn parse_node_identifier(token: &str) -> Result<IpAddr, FallbackReason> {
     if let Ok(ip) = token.parse::<IpAddr>() {
         return Ok(ip);
     }
-    // v4:port — exactly one colon and a v4 on the left. The port must be a
+    // v4:port - exactly one colon and a v4 on the left. The port must be a
     // non-empty decimal u16, else the node identifier is ambiguous.
     if let Some((host, port)) = token.rsplit_once(':')
         && !host.contains(':')

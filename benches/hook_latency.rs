@@ -20,7 +20,7 @@
 //! H-A4) originally called for `mean(hooked) <= 1.05 * mean(bare)`.
 //! Calibrating against the real numbers showed the bare baseline at
 //! this measurement layer is ~300 ns (literally "return a struct"),
-//! so any hook tax — even sub-microsecond — produces a multi-x ratio
+//! so any hook tax - even sub-microsecond - produces a multi-x ratio
 //! while remaining negligible in practice (a real MCP request spends
 //! tens of microseconds in transport+JSON before reaching a hook).
 //! The honest gate is therefore on absolute overhead. 2 microseconds

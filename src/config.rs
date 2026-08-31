@@ -345,7 +345,7 @@ pub struct ServerConfig {
     /// Maximum requests per source IP per minute on application routes
     /// merged via `McpServerConfig::with_extra_router` (which bypass
     /// auth/RBAC). Opt-in; must be greater than zero when set.
-    /// Keyed by the direct socket peer — no `X-Forwarded-For`
+    /// Keyed by the direct socket peer - no `X-Forwarded-For`
     /// interpretation. Startup-only.
     pub extra_route_rate_limit: Option<u32>,
     /// Burst capacity for the extra-route rate limiter (bucket size;
@@ -353,7 +353,7 @@ pub struct ServerConfig {
     /// `extra_route_rate_limit`; must be greater than zero.
     pub extra_route_rate_limit_burst: Option<u32>,
     /// Exact-match request paths exempt from the extra-route rate
-    /// limiter. Raw string comparison against the request path — no
+    /// limiter. Raw string comparison against the request path - no
     /// globs, no normalization; fail-closed (anything not listed stays
     /// limited). Requires `extra_route_rate_limit`; entries must be
     /// non-empty and start with `/`. Startup-only.
@@ -1318,7 +1318,7 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
 
 /// Validate the rate-limit burst knobs of a TOML [`ServerConfig`]: zero
 /// bursts and orphan bursts fail fast (mirrors `McpServerConfig::check`;
-/// the auth bursts have no orphan rule — their base rates always resolve).
+/// the auth bursts have no orphan rule - their base rates always resolve).
 fn validate_rate_limit_knobs(server: &ServerConfig) -> crate::error::Result<()> {
     use crate::error::RmcpServerKitError;
 

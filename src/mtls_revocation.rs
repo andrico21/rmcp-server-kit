@@ -102,7 +102,7 @@ pub struct CachedCrl {
 /// SECURITY: `verifier`, `cached_urls`, and `committed_identities` are
 /// published together as a single immutable snapshot behind one [`ArcSwap`].
 /// Publishing them separately would let a handshake observe the coverage hint
-/// from one commit against the verifier of another — a mixed-generation read
+/// from one commit against the verifier of another - a mixed-generation read
 /// the fail-closed precheck cannot distinguish from out-of-band mutation.
 /// Readers load this state exactly once per handshake and both pre-check and
 /// enforce against it.
@@ -133,7 +133,7 @@ impl std::fmt::Debug for VerifierState {
 /// # What this does and does not guarantee
 ///
 /// This detects **out-of-band mutation of the public [`CrlSet::cache`] field by
-/// non-adversarial code** — the API-misuse hazard that field creates. It is
+/// non-adversarial code** - the API-misuse hazard that field creates. It is
 /// deliberately **not** a cryptographic integrity check and must never be
 /// described as one.
 ///
@@ -215,7 +215,7 @@ fn crl_cache_identities<S: std::hash::BuildHasher>(
 /// Confirm the live cache still matches what `state` committed, for the CDP
 /// URLs this handshake would rely on.
 ///
-/// SECURITY: the scope is `relevant_urls ∩ state.cached_urls` — the only URLs
+/// SECURITY: the scope is `relevant_urls ∩ state.cached_urls` - the only URLs
 /// whose coverage claim can admit the handshake. A relevant URL missing from
 /// the live cache, missing an identity, or whose identity differs has had its
 /// entry mutated out of band: coverage is claimed but unproven.
@@ -248,7 +248,7 @@ pub struct CrlSet {
     /// Serializes commits end to end.
     ///
     /// SECURITY: the cache write lock is deliberately NOT the commit
-    /// transaction lock — holding it across `rebuild_verifier` would make the
+    /// transaction lock - holding it across `rebuild_verifier` would make the
     /// verifier path's non-blocking `try_read` fail under ordinary refresh
     /// load, turning a legitimate refresh into a spurious handshake denial.
     /// Without this mutex, two commits could each snapshot the same old cache
@@ -303,7 +303,7 @@ pub struct CrlSet {
     /// Note: this ships as a process-global limiter; per-source-IP scoping
     /// is deferred to a future release because the rustls
     /// `verify_client_cert` callback does not carry a `SocketAddr` for the
-    /// peer. This is a CRL-discovery limiter in the TLS verifier path —
+    /// peer. This is a CRL-discovery limiter in the TLS verifier path -
     /// distinct from the bearer pre-auth limiter (`AuthState`), which is
     /// already keyed per-IP via a bounded keyed governor and lives in the
     /// ordinary request middleware path.
@@ -523,7 +523,7 @@ impl CrlSet {
         removals: &[String],
     ) -> Result<bool, RmcpServerKitError> {
         // SECURITY (lock order, load-bearing): hold `commit_lock` across the
-        // whole transaction — snapshot, rebuild, publish. The cache write lock
+        // whole transaction - snapshot, rebuild, publish. The cache write lock
         // is taken only for the paired `*cache = candidate` +
         // `verifier_state.store(..)` publication, so readers synchronising on
         // that same `RwLock` can never observe a commit half-applied, while
@@ -690,7 +690,7 @@ impl CrlSet {
     /// A successful HTTP fetch is NOT sufficient:
     /// [`Self::commit_cache_update_atomically`] rejects new entries once
     /// `crl_max_cache_entries` is reached. Only a URL that genuinely landed in
-    /// the cache may be promoted to the permanent `seen_urls` dedup set —
+    /// the cache may be promoted to the permanent `seen_urls` dedup set -
     /// promoting on fetch success alone would suppress a URL that was never
     /// cached, which is the same revocation-bypass this state split fixes.
     // cancel-safe: commits only after gated_fetch returns, so cancellation
@@ -880,7 +880,7 @@ impl CrlSet {
             return (false, self.verifier_state.load_full());
         }
 
-        // SECURITY (lock order — must match `commit_cache_update_atomically`):
+        // SECURITY (lock order - must match `commit_cache_update_atomically`):
         // take the cache read guard FIRST, then load the verifier state while
         // still holding it. Commits publish `cache` and `verifier_state` under
         // the same write lock, so this ordering makes a legitimate commit
@@ -895,7 +895,7 @@ impl CrlSet {
 
         // SECURITY: a failed `try_read` is NOT evidence of tampering, and must
         // not deny on its own. `tokio::sync::RwLock` is write-preferring, so an
-        // ordinary refresh commit makes `try_read` fail — denying here would
+        // ordinary refresh commit makes `try_read` fail - denying here would
         // turn every legitimate CRL refresh into a self-inflicted handshake
         // outage. It also buys no security: the handshake is enforced by the
         // immutable `state.verifier` that was committed with `cached_urls`, not
@@ -1305,7 +1305,7 @@ const SYNTHETIC_TEST_CRL_DER: &[u8] = &[
 
 impl CachedCrl {
     /// Test-only: synthesize a cache entry that looks valid, `next_update`
-    /// = now + 24h. Fields used only to populate the HashMap — the bytes
+    /// = now + 24h. Fields used only to populate the HashMap - the bytes
     /// are a minimal CRL-shape that won't be parsed by tests.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
@@ -1620,7 +1620,7 @@ pub async fn bootstrap_fetch(
     while !tasks.is_empty() {
         // cancel-safe: pinned Sleep and JoinSet::join_next are cancel-safe
         // (tokio docs); on timeout the loop breaks and dropping the JoinSet
-        // aborts remaining fetches — the intended deadline behavior.
+        // aborts remaining fetches - the intended deadline behavior.
         tokio::select! {
             () = &mut timeout => {
                 tracing::warn!("CRL bootstrap timed out after {:?}", BOOTSTRAP_TIMEOUT);
@@ -1873,7 +1873,7 @@ async fn next_refresh_delay(set: &CrlSet) -> Duration {
 ///
 /// When the map is at `max_host_semaphores`, idle entries (no in-flight
 /// fetch) are evicted before rejecting, so the cap only fails when `max`
-/// distinct hosts are *concurrently* fetching — it is never a permanent
+/// distinct hosts are *concurrently* fetching - it is never a permanent
 /// lockout. Every clone of a host semaphore is created while holding the
 /// map lock, and a clone outlives the critical section only while a fetch
 /// is in flight, so an entry with `Arc::strong_count == 1` is provably
@@ -1960,7 +1960,7 @@ async fn fetch_crl(
 
     if let Err(reason) = check_scheme(&parsed, allow_http) {
         // Sanitized: the gate must not echo what it rejects (the URL may
-        // carry userinfo credentials — the very thing being refused).
+        // carry userinfo credentials - the very thing being refused).
         let sanitized = sanitized_url_for_log(&parsed);
         tracing::warn!(url = %sanitized, reason, "CRL fetch denied: scheme");
         return Err(RmcpServerKitError::Tls(format!(
@@ -2060,7 +2060,7 @@ fn clamp_refresh(duration: Duration) -> Duration {
     duration.clamp(MIN_AUTO_REFRESH, MAX_AUTO_REFRESH)
 }
 
-/// 9999-12-31T23:59:59Z — the maximum instant expressible as an ASN.1
+/// 9999-12-31T23:59:59Z - the maximum instant expressible as an ASN.1
 /// GeneralizedTime (four-digit year). Used to clamp absurd positive
 /// timestamps before converting to [`SystemTime`].
 const MAX_ASN1_TIMESTAMP_SECS: u64 = 253_402_300_799;
@@ -2559,7 +2559,7 @@ mod tests {
 
     #[test]
     fn asn1_time_clamps_unrepresentable_timestamps() {
-        // Year 1500 — pre-1601, NOT representable by Windows `SystemTime`.
+        // Year 1500 - pre-1601, NOT representable by Windows `SystemTime`.
         // Pre-fix this panicked on Windows; now it must return a value no
         // later than the epoch on every platform (clamped to UNIX_EPOCH on
         // Windows, the real instant on platforms that can represent it).
@@ -2568,7 +2568,7 @@ mod tests {
         #[cfg(windows)]
         assert_eq!(year_1500, UNIX_EPOCH);
 
-        // 1601-01-01T00:00:00Z — the exact Windows epoch boundary, which IS
+        // 1601-01-01T00:00:00Z - the exact Windows epoch boundary, which IS
         // representable everywhere. No clamp, no panic.
         let year_1601 = asn1_time_to_system_time(asn1(-11_644_473_600));
         assert!(year_1601 <= UNIX_EPOCH);
@@ -2602,7 +2602,7 @@ mod tests {
         }
         assert_eq!(map.len(), 4);
 
-        // At the cap, a NEW host must succeed by evicting idle entries —
+        // At the cap, a NEW host must succeed by evicting idle entries -
         // the cap error is not sticky.
         let sem = acquire_host_semaphore(&mut map, "new-host.example", 4)
             .expect("idle eviction frees space for a new host");

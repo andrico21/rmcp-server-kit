@@ -23,7 +23,7 @@ use thiserror::Error;
 /// will be sent to the client for any variant.
 ///
 /// The recurring mistake is interpolating an upstream error into one of these
-/// variants — `map_err(|e| Auth(format!("... {e}")))`. That publishes a
+/// variants - `map_err(|e| Auth(format!("... {e}")))`. That publishes a
 /// dependency's error chain to unauthenticated callers, and usually attaches
 /// the wrong status besides (a crypto or I/O fault is a `500`, not a `401`).
 /// Route such failures to [`Internal`](Self::Internal) instead. A heuristic
@@ -123,8 +123,8 @@ impl RmcpServerKitError {
     /// [`RateLimited`](Self::RateLimited), [`RateLimitedFor`](Self::RateLimitedFor))
     /// return their message verbatim; all internal variants return the generic
     /// `"internal server error"` so implementation detail never leaks on the
-    /// wire. This is the single source of truth for the client body — the
-    /// [`IntoResponse`] impl uses it — so callers can assert or reuse the
+    /// wire. This is the single source of truth for the client body - the
+    /// [`IntoResponse`] impl uses it - so callers can assert or reuse the
     /// client-safe text without duplicating the mapping.
     ///
     /// See the type-level "Client-facing message invariant" for the contract

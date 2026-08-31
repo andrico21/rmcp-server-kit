@@ -2,7 +2,7 @@
 //!
 //! The smallest working MCP server: Streamable HTTP transport, health
 //! endpoints, and the default `ServerHandler`. Add tools by implementing
-//! the corresponding `ServerHandler` trait methods — see
+//! the corresponding `ServerHandler` trait methods - see
 //! <https://docs.rs/rmcp> for the handler API.
 //!
 //! Run with:

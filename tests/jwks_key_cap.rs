@@ -3,11 +3,11 @@
 //! `JwksCache::refresh_inner` MUST refuse to populate the in-memory
 //! key cache when the upstream JWKS document carries more keys than
 //! [`OAuthConfig::max_jwks_keys`] (default 256). The failure mode is
-//! **fail-closed** — no keys are installed, so subsequent
+//! **fail-closed** - no keys are installed, so subsequent
 //! `validate_token` calls still reject the JWT. Silent truncation
 //! would cause sporadic auth failures and hide the misconfiguration.
 //!
-//! Failing-first TDD surface — requires these NEW helpers:
+//! Failing-first TDD surface - requires these NEW helpers:
 //!
 //! * `OAuthConfig::max_jwks_keys: usize` (`#[serde(default)]`, default 256)
 //! * `fn build_key_cache(&JwkSet, usize) -> Result<JwksKeyCache, String>`
@@ -30,7 +30,7 @@ use wiremock::{
 
 /// Build a synthetic JWKS document with `n` RSA keys. The key material
 /// is bogus (short base64url `"AQAB"` / `"dummy"`) because the test
-/// exercises the cap path — `build_key_cache` rejects on length BEFORE
+/// exercises the cap path - `build_key_cache` rejects on length BEFORE
 /// it would attempt key decoding, so invalid key bytes are fine.
 fn synthetic_jwks(n: usize) -> Value {
     let keys: Vec<Value> = (0..n)
@@ -74,7 +74,7 @@ async fn jwks_rejects_excess_keys_fail_closed() {
     // Cap = 256; document has 300 → must reject fail-closed.
     config.max_jwks_keys = 256;
 
-    // `JwksCache::new` does NOT fetch — only builds the reqwest client.
+    // `JwksCache::new` does NOT fetch - only builds the reqwest client.
     let cache = JwksCache::new(&config)
         .expect("construct cache")
         .__test_allow_loopback_ssrf();

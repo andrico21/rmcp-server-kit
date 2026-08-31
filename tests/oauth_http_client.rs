@@ -4,7 +4,7 @@
 //!
 //! - Reject any redirect that downgrades the scheme from `https` to
 //!   `http`, even when `allow_http_oauth_urls = true` (downgrade
-//!   defence — Test 1A).
+//!   defence - Test 1A).
 //! - Reject redirects to non-HTTP(S) schemes such as `ftp://` (Test 1B).
 //! - Reject more than two consecutive redirects (Test 1C).
 //! - Honour `OAuthConfig::ca_cert_path` so that OAuth-bound HTTP traffic
@@ -28,8 +28,8 @@
 //! 3. Reads the request line + headers, then writes a fixed HTTP/1.1
 //!    response.
 //!
-//! This is intentionally minimal — no `hyper`, no `tower`, no
-//! routing — so the test surface remains the redirect policy and TLS
+//! This is intentionally minimal - no `hyper`, no `tower`, no
+//! routing - so the test surface remains the redirect policy and TLS
 //! trust path themselves.
 
 #![allow(clippy::expect_used, reason = "tests")]
@@ -276,7 +276,7 @@ async fn redirect_downgrade_https_to_http_is_rejected() {
     // The TLS server replies with a 302 whose Location header points
     // back at a plain-HTTP URL on `attacker.invalid`. Resolution would
     // fail regardless, but the redirect policy must reject the attempt
-    // *before* DNS — we assert that by inspecting the error message.
+    // *before* DNS - we assert that by inspecting the error message.
     let response_bytes = b"HTTP/1.1 302 Found\r\n\
         Location: http://attacker.invalid/exfil\r\n\
         Content-Length: 0\r\n\
@@ -338,7 +338,7 @@ async fn redirect_to_non_http_scheme_is_rejected() {
         rendered.contains("non-http") || rendered.contains("refused") || rendered.contains("ftp"),
         "expected non-HTTP(S) error, got: {rendered}"
     );
-    // Secondary observation, informational only — substantive check above is what matters.
+    // Secondary observation, informational only - substantive check above is what matters.
     if !err.is_redirect() {
         eprintln!(
             "note: err.is_redirect()=false (likely transport-layer race under parallel load), got: {err:?}"
@@ -395,7 +395,7 @@ async fn redirect_chain_capped_at_two_hops() {
         rendered.contains("too many redirects") || rendered.contains("max 2"),
         "expected redirect-cap error, got: {rendered}"
     );
-    // Secondary observation, informational only — substantive check above is what matters.
+    // Secondary observation, informational only - substantive check above is what matters.
     if !err.is_redirect() {
         eprintln!(
             "note: err.is_redirect()=false (likely transport-layer race under parallel load), got: {err:?}"
@@ -489,7 +489,7 @@ fn nonexistent_ca_cert_path_returns_startup_error() {
 // The 1.2.1 redirect policies on both `OauthHttpClient::build` and
 // `JwksCache::new` only enforce scheme + hop-count. An attacker can
 // still redirect a validator to `https://10.0.0.1/` or
-// `https://127.0.0.1/` — both pass scheme + hop checks. 1.3.0 adds a
+// `https://127.0.0.1/` - both pass scheme + hop checks. 1.3.0 adds a
 // sync literal-IP guard (`redirect_target_reason`) that rejects
 // private / loopback / link-local / cloud-metadata destinations, plus
 // a userinfo check.
@@ -563,7 +563,7 @@ async fn rejects_per_hop_redirect_to_loopback_oauth_client() {
         rendered.contains("redirect target forbidden") || rendered.contains("loopback"),
         "expected loopback redirect rejection, got: {rendered}"
     );
-    // Secondary observation, informational only — substantive check above is what matters.
+    // Secondary observation, informational only - substantive check above is what matters.
     if !err.is_redirect() {
         eprintln!(
             "note: err.is_redirect()=false (likely transport-layer race under parallel load), got: {err:?}"
@@ -597,7 +597,7 @@ async fn rejects_redirect_with_userinfo_oauth_client() {
             || rendered.contains("credentials"),
         "expected userinfo redirect rejection, got: {rendered}"
     );
-    // Secondary observation, informational only — substantive check above is what matters.
+    // Secondary observation, informational only - substantive check above is what matters.
     if !err.is_redirect() {
         eprintln!(
             "note: err.is_redirect()=false (likely transport-layer race under parallel load), got: {err:?}"
@@ -632,7 +632,7 @@ async fn redirect_to_http_with_userinfo_rejected_when_http_allowed() {
             || rendered.contains("credentials"),
         "expected userinfo redirect rejection, got: {rendered}"
     );
-    // Secondary observation, informational only — substantive check above is what matters.
+    // Secondary observation, informational only - substantive check above is what matters.
     if !err.is_redirect() {
         eprintln!(
             "note: err.is_redirect()=false (likely transport-layer race under parallel load), got: {err:?}"

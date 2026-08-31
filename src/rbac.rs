@@ -764,7 +764,7 @@ impl RbacPolicy {
     /// evaluated and **rejected**. It would remove the remaining per-wildcard
     /// allocation, but [`RbacPolicy::host_patterns`] is public and must keep
     /// returning the operator's original casing, and the normalized copy would
-    /// have to be rebuilt on every `ArcSwap` hot reload — where getting it
+    /// have to be rebuilt on every `ArcSwap` hot reload - where getting it
     /// wrong means a reloaded policy silently stops matching
     /// case-insensitively. That risk is not worth an allocation count on a
     /// path already bounded by Argon2 verification and JSON parsing. Reopen
@@ -1964,7 +1964,7 @@ mod tests {
     #[test]
     fn argument_allowed_glob_pattern_with_literal_mismatch_still_enforced() {
         // Allowlist registered against pattern "run-*" with allowed=["ls"].
-        // Calling tool="run-foo" — literal "run-*" != "run-foo" (true),
+        // Calling tool="run-foo" - literal "run-*" != "run-foo" (true),
         // but glob_match("run-*", "run-foo") = true.
         //   Original `&&`: skip-condition = true && false = false → enforce
         //                  allowlist → "rm" not in ["ls"] → deny.
@@ -2523,7 +2523,7 @@ mod tests {
     }
 
     /// Tool-limiter deny path must increment the `tool` deny counter via
-    /// the metrics handle in the request extensions — and the increment
+    /// the metrics handle in the request extensions - and the increment
     /// must survive the middleware's body-buffer/`from_parts` rebuild.
     #[cfg(feature = "metrics")]
     #[tokio::test]

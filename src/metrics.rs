@@ -41,7 +41,7 @@ pub struct McpMetrics {
     /// HTTP request duration in seconds by method and path.
     pub http_request_duration_seconds: HistogramVec,
     /// Rate-limiter denials by limiter. Label `limiter` is one of
-    /// `tool`, `auth_pre`, `auth_post`, `extra_route` — matching the
+    /// `tool`, `auth_pre`, `auth_post`, `extra_route` - matching the
     /// four built-in per-IP limiters. Incremented at each deny site
     /// alongside the existing warn-level log.
     pub rate_limited_total: IntCounterVec,

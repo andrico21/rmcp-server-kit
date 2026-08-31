@@ -241,7 +241,7 @@ missing_const_for_fn = "allow"
 # [lints.rust]), which prefers `pub(crate)` over `pub` for crate-internal
 # items; this crate keeps explicit `pub(crate)` visibility markers.
 redundant_pub_crate = "allow"
-# nursery allow: frequently degrades readability here — rewrites would
+# nursery allow: frequently degrades readability here - rewrites would
 # contort the constant-time HMAC fallback (inner #[allow] + SAFETY comment
 # inside a closure), the poisoned-lock `match` idiom used across the crate,
 # and multi-statement tracing arms. Sites are clearer as if/let-else.
@@ -261,7 +261,7 @@ doc_markdown = "allow"
 duration_suboptimal_units = "allow"
 str_to_string = "warn"
 # `string_to_string` (RUST_GUIDELINES.md §9) is omitted: clippy removed the
-# lint — `implicit_clone` (enabled below) covers those cases.
+# lint - `implicit_clone` (enabled below) covers those cases.
 fallible_impl_from = "deny"
 wildcard_enum_match_arm = "deny"
 fn_params_excessive_bools = "deny"

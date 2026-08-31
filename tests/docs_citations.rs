@@ -8,9 +8,9 @@
 //! 1. **Existence / length** (all citations): the cited file exists and
 //!    has at least the cited line count.
 //! 2. **Symbol anchoring** (citations with a recognizable symbol on the
-//!    same doc line): at least one anchor symbol — a backticked token
+//!    same doc line): at least one anchor symbol - a backticked token
 //!    like `` `TlsListener` `` or a parenthesized identifier like
-//!    `(build_app_router)` — must appear within `TOLERANCE` lines of the
+//!    `(build_app_router)` - must appear within `TOLERANCE` lines of the
 //!    cited location in the cited file. This catches silent drift that
 //!    the length check cannot (a file that only ever grows keeps every
 //!    stale citation "valid" forever).
@@ -191,7 +191,7 @@ fn parse_path_at(tail: &str) -> Option<(String, usize, usize, usize)> {
     let base_consumed = "src/".len() + name_len + ".rs".len();
 
     let Some(after_ext) = after_name.strip_prefix(".rs:") else {
-        // Bare path (no :NNN) — still a valid file mention.
+        // Bare path (no :NNN) - still a valid file mention.
         if after_name.starts_with(".rs") {
             return Some((file, 0, 0, base_consumed));
         }

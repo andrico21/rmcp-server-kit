@@ -1,14 +1,14 @@
-# AGENTS.md — rmcp-server-kit
+# AGENTS.md - rmcp-server-kit
 
 > **Audience**: AI coding agents (and humans) working on the `rmcp-server-kit` crate.
 > **Purpose**: Single source of truth for navigating, building, testing, and
 > safely modifying this repository. Read this BEFORE making changes.
 >
 > **Companion docs**:
-> - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — deep architecture reference with file:line citations
-> - [`docs/MINDMAP.md`](docs/MINDMAP.md) — visual mermaid mindmap of the whole project
-> - [`docs/GUIDE.md`](docs/GUIDE.md) — end-user / consumer-facing guide
-> - [`RUST_GUIDELINES.md`](RUST_GUIDELINES.md) — mandatory coding standards (DO/DON'T)
+> - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) - deep architecture reference with file:line citations
+> - [`docs/MINDMAP.md`](docs/MINDMAP.md) - visual mermaid mindmap of the whole project
+> - [`docs/GUIDE.md`](docs/GUIDE.md) - end-user / consumer-facing guide
+> - [`RUST_GUIDELINES.md`](RUST_GUIDELINES.md) - mandatory coding standards (DO/DON'T)
 
 ---
 
@@ -109,9 +109,9 @@ Z:\TempPersistent\rmcp-server-kit\
 | **Metrics (opt)**  | `prometheus` (feature `metrics`)                               |
 
 **Cargo features**:
-- `oauth` (off by default) — OAuth 2.1 JWT validation against JWKS + optional OAuth proxy endpoints.
-- `metrics` (off by default) — Prometheus `/metrics` endpoint and recording middleware.
-- `test-helpers` (off by default) — exposes test-only helpers from `bounded_limiter` and `mtls_revocation` for downstream integration tests; not part of the stable API surface.
+- `oauth` (off by default) - OAuth 2.1 JWT validation against JWKS + optional OAuth proxy endpoints.
+- `metrics` (off by default) - Prometheus `/metrics` endpoint and recording middleware.
+- `test-helpers` (off by default) - exposes test-only helpers from `bounded_limiter` and `mtls_revocation` for downstream integration tests; not part of the stable API surface.
 
 ---
 
@@ -119,7 +119,7 @@ Z:\TempPersistent\rmcp-server-kit\
 
 > All commands assume cwd = `Z:\TempPersistent\rmcp-server-kit`.
 > Prefer the `rtk` wrapper (`Z:\TempPersistent\rtk.exe`) for token-efficient
-> output in agent contexts — e.g. `Z:\TempPersistent\rtk.exe cargo build`.
+> output in agent contexts - e.g. `Z:\TempPersistent\rtk.exe cargo build`.
 
 | Goal                             | Command                                                              |
 |----------------------------------|----------------------------------------------------------------------|
@@ -147,7 +147,7 @@ Z:\TempPersistent\rmcp-server-kit\
 
 Per [`RUST_GUIDELINES.md`](RUST_GUIDELINES.md) §13 ("DO: Separate test tiers"),
 tiers here are expressed by **file name and cfg gate** rather than by directory.
-Every tier below is autonomous — no test requires a live external service or
+Every tier below is autonomous - no test requires a live external service or
 human-assisted setup; outbound HTTP is faked with `wiremock` and servers bind
 ephemeral loopback ports.
 
@@ -158,8 +158,8 @@ ephemeral loopback ports.
 | **Integration (pure)** | `tests/crl_discovery_ratelimit.rs`, `crl_h3_regression.rs`, `crl_map_bounds.rs`, `oauth_url_validation.rs` | nothing | `cargo test --all-features` |
 | **Integration (mocked HTTP)** | `tests/crl_ssrf.rs`, `jwks_key_cap.rs`, `jwks_redirect_ssrf.rs`, `oauth_http_client.rs` | `wiremock` | `cargo test --all-features` |
 | **E2E (binds sockets)** | `tests/e2e.rs`, `e2e_oauth_mtls.rs`, `ssrf_resolver.rs`, `docs_citations.rs` | ephemeral loopback ports | `cargo test --all-features --test e2e` |
-| **Perf / bounded-memory** | `tests/limiter_memory.rs` | `#[ignore]`d — too heavy for shared runners | `cargo test --release --all-features --test limiter_memory -- --ignored --nocapture` |
-| **Benches** | `benches/rbac_redaction.rs`, `hook_latency.rs` | — | `cargo bench` |
+| **Perf / bounded-memory** | `tests/limiter_memory.rs` | `#[ignore]`d - too heavy for shared runners | `cargo test --release --all-features --test limiter_memory -- --ignored --nocapture` |
+| **Benches** | `benches/rbac_redaction.rs`, `hook_latency.rs` | - | `cargo bench` |
 
 **Feature gates matter.** Several files are `#![cfg(...)]`-gated and compile to
 nothing without the right features, so a bare `cargo test` silently skips them:
@@ -182,10 +182,10 @@ consumer applications and `examples/`.
 | Entry                                    | File                                                                  | Notes                                                                                                  |
 |------------------------------------------|----------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------|
 | Crate root / public API                  | [`src/lib.rs`](src/lib.rs)                                            | Re-exports all public modules                                                                          |
-| **Server entry (HTTP)**                  | [`src/transport.rs`](src/transport.rs) — `serve()` (~line 2154)        | The function consumers call. Wires rmcp + axum + middleware + TLS + admin + metrics                    |
-| Server entry (stdio)                     | [`src/transport.rs`](src/transport.rs) — `serve_stdio()` (~line 3945) | For desktop/IDE clients. **Bypasses auth/RBAC/TLS** — use only for local subprocess MCP                |
-| Config builder                           | [`src/transport.rs`](src/transport.rs) — `McpServerConfig::new` (~line 536) | Builder-style config struct                                                                       |
-| Hot-reload handle                        | [`src/transport.rs`](src/transport.rs) — `ReloadHandle` (~line 1376)   | `reload_auth_keys` / `reload_rbac` for runtime reconfig without restart                               |
+| **Server entry (HTTP)**                  | [`src/transport.rs`](src/transport.rs) - `serve()` (~line 2154)        | The function consumers call. Wires rmcp + axum + middleware + TLS + admin + metrics                    |
+| Server entry (stdio)                     | [`src/transport.rs`](src/transport.rs) - `serve_stdio()` (~line 3945) | For desktop/IDE clients. **Bypasses auth/RBAC/TLS** - use only for local subprocess MCP                |
+| Config builder                           | [`src/transport.rs`](src/transport.rs) - `McpServerConfig::new` (~line 536) | Builder-style config struct                                                                       |
+| Hot-reload handle                        | [`src/transport.rs`](src/transport.rs) - `ReloadHandle` (~line 1376)   | `reload_auth_keys` / `reload_rbac` for runtime reconfig without restart                               |
 | Runnable example                         | [`examples/minimal_server.rs`](examples/minimal_server.rs)            | Smallest possible consumer of `serve()`                                                                |
 | E2E reference                            | [`tests/e2e.rs`](tests/e2e.rs)                                        | Real-world usage patterns; use as an integration cookbook                                              |
 
@@ -228,10 +228,10 @@ consumer applications and `examples/`.
 ```
 
 **State plane** (lock-free hot reload via `arc-swap`):
-- `AuthState.api_keys: ArcSwap<HashMap<…>>` — swap API keys at runtime
-- `rbac_swap: ArcSwap<RbacPolicy>` — swap RBAC policy at runtime
-- mTLS identity: bound to the connection itself via `AuthenticatedTlsStream` / per-connection `TlsConnInfo` extension — set by the TLS handshake worker, read by auth middleware (no shared `SocketAddr`-keyed map)
-- Task-local: `current_role()`, `current_identity()`, `current_token()`, `current_sub()` — set by middleware, callable from inside tool handlers (`src/rbac.rs:108-150`)
+- `AuthState.api_keys: ArcSwap<HashMap<…>>` - swap API keys at runtime
+- `rbac_swap: ArcSwap<RbacPolicy>` - swap RBAC policy at runtime
+- mTLS identity: bound to the connection itself via `AuthenticatedTlsStream` / per-connection `TlsConnInfo` extension - set by the TLS handshake worker, read by auth middleware (no shared `SocketAddr`-keyed map)
+- Task-local: `current_role()`, `current_identity()`, `current_token()`, `current_sub()` - set by middleware, callable from inside tool handlers (`src/rbac.rs:108-150`)
 
 For a much deeper version see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
@@ -240,7 +240,7 @@ For a much deeper version see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 ## 7. Coding standards (NON-NEGOTIABLE)
 
 This crate enforces strict lints. See full guidance in [`RUST_GUIDELINES.md`](RUST_GUIDELINES.md).
-The most-violated rules — all `deny`-level in `Cargo.toml`:
+The most-violated rules - all `deny`-level in `Cargo.toml`:
 
 | Forbidden                                   | Use instead                                                       |
 |---------------------------------------------|--------------------------------------------------------------------|
@@ -257,7 +257,7 @@ The most-violated rules — all `deny`-level in `Cargo.toml`:
 | `std::fs` / `std::net` in async fn          | `tokio::fs` / `tokio::net`, or `tokio::task::spawn_blocking`       |
 
 **Rust 1.95 idioms required**:
-- `Vec::push_mut` / `VecDeque::push_{front,back}_mut` — return `&mut T`, avoid the `push` + `last_mut().unwrap()` anti-pattern.
+- `Vec::push_mut` / `VecDeque::push_{front,back}_mut` - return `&mut T`, avoid the `push` + `last_mut().unwrap()` anti-pattern.
 - `Atomic*::update` / `try_update` over hand-rolled `compare_exchange` loops.
 - `cfg_select!` macro instead of the `cfg-if` crate (don't proactively migrate existing `cfg-if` though).
 
@@ -271,7 +271,7 @@ The most-violated rules — all `deny`-level in `Cargo.toml`:
 3. Run `cargo build --all-features` to confirm a clean baseline.
 
 ### While editing
-1. **Add/change tests first** when modifying behaviour. E2E tests live in `tests/e2e.rs` and spawn a real server — that's the gold standard for integration coverage.
+1. **Add/change tests first** when modifying behaviour. E2E tests live in `tests/e2e.rs` and spawn a real server - that's the gold standard for integration coverage.
 2. Match existing patterns. This codebase is **disciplined** (consistent style, lints enforced, full docs). Follow conventions strictly.
 3. Use `tracing` for any output. Never `println!`/`eprintln!`/`dbg!`.
 4. Wrap secrets in `secrecy::Secret<T>` (re-exported via `src/secret.rs`).
@@ -281,7 +281,7 @@ The most-violated rules — all `deny`-level in `Cargo.toml`:
 ### Before declaring done (evidence required)
 - [ ] `cargo +nightly fmt --all -- --check` clean
 - [ ] `cargo clippy --all-targets --all-features -- -D warnings` clean
-- [ ] `cargo test --all-features` passes (note any pre-existing failures — do NOT delete tests)
+- [ ] `cargo test --all-features` passes (note any pre-existing failures - do NOT delete tests)
 - [ ] `cargo doc --no-deps --all-features` builds without warnings
 - [ ] If you touched the public API: `cargo semver-checks check-release` (or note the intentional break in CHANGELOG.md)
 - [ ] Updated [`CHANGELOG.md`](CHANGELOG.md) under the unreleased section
@@ -290,7 +290,7 @@ The most-violated rules — all `deny`-level in `Cargo.toml`:
 ### Never do
 - Commit without explicit user request.
 - Add `#[allow(clippy::unwrap_used)]` without a `// SAFETY/INVARIANT:` comment justifying why the value is guaranteed `Some`/`Ok`.
-- Suppress warnings globally (`#![deny(warnings)]` in source — forbidden; warnings policy is set in Cargo.toml + CI flags).
+- Suppress warnings globally (`#![deny(warnings)]` in source - forbidden; warnings policy is set in Cargo.toml + CI flags).
 - Add a dependency without checking `deny.toml` license allow-list.
 - Disable certificate validation on TLS (`rustls` must use real roots).
 - Log secrets, tokens, request bodies, or full identities. Redact first.
@@ -302,35 +302,35 @@ The most-violated rules — all `deny`-level in `Cargo.toml`:
 
 | I need to change…                              | Look in                                                |
 |------------------------------------------------|--------------------------------------------------------|
-| Server entry / router / middleware order       | `src/transport.rs` — `serve()` and surrounding helpers |
-| API key authentication                         | `src/auth.rs` — `AuthState`, `ApiKeyEntry`, `auth_middleware` |
-| mTLS identity extraction                       | `src/transport.rs` — `extract_mtls_identity` call site (~line 2884)   |
-| mTLS CRL revocation (CDP-driven)               | `src/mtls_revocation.rs` — `CrlSet`, `DynamicClientCertVerifier`, `bootstrap_fetch`, `run_crl_refresher` |
-| OAuth JWT validation / JWKS cache              | `src/oauth.rs` — `JwksCache`, feature-gated           |
-| RBAC policy evaluation                         | `src/rbac.rs` — `RbacPolicy::check`, `enforce_tool_policy` |
-| Per-tool argument allowlist                    | `src/rbac.rs` — `ArgumentAllowlist`, `argument_allowed` |
-| Per-IP tool rate limit                         | `src/rbac.rs` — `build_tool_rate_limiter`             |
-| Extra-route per-IP rate limit                  | `src/transport.rs` — `build_extra_route_rate_limiter`, `extra_route_rate_limit_middleware` |
-| Trusted-forwarder client-IP resolution         | `src/forwarded.rs` — `resolve_client_ip`; `src/transport.rs` — `ClientIp`, `limiter_client_ip`, `ForwardedHeaderMode` |
-| Tool-call hooks / result-size cap              | `src/tool_hooks.rs` — `HookedHandler::call_tool`      |
+| Server entry / router / middleware order       | `src/transport.rs` - `serve()` and surrounding helpers |
+| API key authentication                         | `src/auth.rs` - `AuthState`, `ApiKeyEntry`, `auth_middleware` |
+| mTLS identity extraction                       | `src/transport.rs` - `extract_mtls_identity` call site (~line 2884)   |
+| mTLS CRL revocation (CDP-driven)               | `src/mtls_revocation.rs` - `CrlSet`, `DynamicClientCertVerifier`, `bootstrap_fetch`, `run_crl_refresher` |
+| OAuth JWT validation / JWKS cache              | `src/oauth.rs` - `JwksCache`, feature-gated           |
+| RBAC policy evaluation                         | `src/rbac.rs` - `RbacPolicy::check`, `enforce_tool_policy` |
+| Per-tool argument allowlist                    | `src/rbac.rs` - `ArgumentAllowlist`, `argument_allowed` |
+| Per-IP tool rate limit                         | `src/rbac.rs` - `build_tool_rate_limiter`             |
+| Extra-route per-IP rate limit                  | `src/transport.rs` - `build_extra_route_rate_limiter`, `extra_route_rate_limit_middleware` |
+| Trusted-forwarder client-IP resolution         | `src/forwarded.rs` - `resolve_client_ip`; `src/transport.rs` - `ClientIp`, `limiter_client_ip`, `ForwardedHeaderMode` |
+| Tool-call hooks / result-size cap              | `src/tool_hooks.rs` - `HookedHandler::call_tool`      |
 | Admin endpoints (`/admin/*`)                   | `src/admin.rs`                                        |
 | Tracing init / audit log                       | `src/observability.rs`                                |
 | Prometheus registry / `/metrics`               | `src/metrics.rs`                                      |
 | Configuration struct (TOML schema)             | `src/config.rs` + `McpServerConfig` in `src/transport.rs` |
-| TOML → `serve()` bridge                        | `src/config.rs` — `ServerConfig::apply_to_mcp_config`; `src/transport.rs` — `McpServerConfig` clearing-capable setters |
-| Security-header TOML controls                  | `src/transport.rs` — `SecurityHeadersConfig`; `src/config.rs` — `ServerConfig::security_headers` |
-| Error type → HTTP status mapping               | `src/error.rs` — `RmcpServerKitError::into_response`           |
-| Origin / security headers / CORS               | `src/transport.rs` — `origin_check_middleware`, `security_headers_middleware` |
-| Graceful shutdown (Ctrl-C / SIGTERM)           | `src/transport.rs` — `shutdown_signal()` (~line 3194) |
-| Hot-reload of keys / RBAC                      | `src/transport.rs` — `ReloadHandle` (~line 1376)       |
-| Environment variable override mapping          | `src/config.rs` — `ServerConfig::apply_env_overrides`, `ObservabilityConfig::apply_env_overrides`; `src/rbac.rs` — `RbacConfig::apply_env_overrides` |
+| TOML → `serve()` bridge                        | `src/config.rs` - `ServerConfig::apply_to_mcp_config`; `src/transport.rs` - `McpServerConfig` clearing-capable setters |
+| Security-header TOML controls                  | `src/transport.rs` - `SecurityHeadersConfig`; `src/config.rs` - `ServerConfig::security_headers` |
+| Error type → HTTP status mapping               | `src/error.rs` - `RmcpServerKitError::into_response`           |
+| Origin / security headers / CORS               | `src/transport.rs` - `origin_check_middleware`, `security_headers_middleware` |
+| Graceful shutdown (Ctrl-C / SIGTERM)           | `src/transport.rs` - `shutdown_signal()` (~line 3194) |
+| Hot-reload of keys / RBAC                      | `src/transport.rs` - `ReloadHandle` (~line 1376)       |
+| Environment variable override mapping          | `src/config.rs` - `ServerConfig::apply_env_overrides`, `ObservabilityConfig::apply_env_overrides`; `src/rbac.rs` - `RbacConfig::apply_env_overrides` |
 
 ---
 
 ## 10. Common pitfalls (history of bites)
 
 1. **Middleware order matters for security.** Origin check MUST run before auth so unauthenticated callers are rejected by origin first. Rate limit MUST be inside auth so anonymous storms don't amplify. See `src/transport.rs` middleware wiring around lines 1640-1830.
-2. **JWKS refresh is rate-limited.** Don't remove the `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:2448`) — invalid JWTs would otherwise DoS the JWKS endpoint.
+2. **JWKS refresh is rate-limited.** Don't remove the `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:2448`) - invalid JWTs would otherwise DoS the JWKS endpoint.
 3. **Task-local RBAC context only exists inside the request scope.** Calling `current_role()` from a `tokio::spawn`ed background task returns `None`. Capture the value before spawning.
 4. **`stdio` transport bypasses everything.** `serve_stdio` does NOT enforce auth, RBAC, TLS, or origin checks. It's intended for trusted local subprocess scenarios only.
 5. **mTLS identity is bound to the connection stream (`TlsConnInfo`), not to a shared `SocketAddr` map.** If a load balancer terminates TCP and rewrites peer addresses you must terminate TLS at the LB and use a different identity-binding strategy; the in-process binding itself is immune to port-reuse aliasing.
@@ -342,12 +342,12 @@ The most-violated rules — all `deny`-level in `Cargo.toml`:
 
 | Term            | Meaning                                                                                          |
 |-----------------|--------------------------------------------------------------------------------------------------|
-| MCP             | Model Context Protocol — JSON-RPC-based protocol for LLM ↔ tool/server interaction               |
+| MCP             | Model Context Protocol - JSON-RPC-based protocol for LLM ↔ tool/server interaction               |
 | `rmcp`          | Official Rust SDK for MCP                                                                         |
 | Streamable HTTP | The MCP HTTP transport variant supporting SSE-style streaming                                     |
-| RBAC            | Role-Based Access Control — here, per-role tool allow-lists with argument constraints             |
-| JWKS            | JSON Web Key Set — public keys used to verify OAuth JWTs                                          |
-| mTLS            | Mutual TLS — both client and server present certificates                                          |
+| RBAC            | Role-Based Access Control - here, per-role tool allow-lists with argument constraints             |
+| JWKS            | JSON Web Key Set - public keys used to verify OAuth JWTs                                          |
+| mTLS            | Mutual TLS - both client and server present certificates                                          |
 | Hook            | Optional `before_call` / `after_call` callback for tool invocations (see `src/tool_hooks.rs`)    |
 | Hot reload      | Atomic, lock-free swap of API keys or RBAC policy without server restart (via `arc-swap`)         |
 
@@ -355,12 +355,12 @@ The most-violated rules — all `deny`-level in `Cargo.toml`:
 
 ## 12. Further reading
 
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — every type, module, file:line reference
-- [`docs/MINDMAP.md`](docs/MINDMAP.md) — mermaid mindmap diagram
-- [`docs/GUIDE.md`](docs/GUIDE.md) — how end-users configure and consume rmcp-server-kit
-- [`docs/RUST_1_95_NOTES.md`](docs/RUST_1_95_NOTES.md) — Rust 1.95 idioms used here
-- [`docs/MIGRATION.md`](docs/MIGRATION.md) — version-migration notes
-- [`docs/RELEASING.md`](docs/RELEASING.md) — release process
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) - every type, module, file:line reference
+- [`docs/MINDMAP.md`](docs/MINDMAP.md) - mermaid mindmap diagram
+- [`docs/GUIDE.md`](docs/GUIDE.md) - how end-users configure and consume rmcp-server-kit
+- [`docs/RUST_1_95_NOTES.md`](docs/RUST_1_95_NOTES.md) - Rust 1.95 idioms used here
+- [`docs/MIGRATION.md`](docs/MIGRATION.md) - version-migration notes
+- [`docs/RELEASING.md`](docs/RELEASING.md) - release process
 - [Model Context Protocol spec](https://modelcontextprotocol.io/)
 - [`rmcp` docs](https://docs.rs/rmcp)
 - [OWASP Secure Headers Project](https://owasp.org/www-project-secure-headers/)

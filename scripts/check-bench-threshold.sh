@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# check-bench-threshold.sh — assert a Criterion bench's mean is below max_ns.
+# check-bench-threshold.sh - assert a Criterion bench's mean is below max_ns.
 #
 # Usage: check-bench-threshold.sh <bench_name> <max_ns>
 #

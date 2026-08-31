@@ -72,8 +72,8 @@ pub type ReadinessCheck =
 
 /// Direct socket peer address of the current HTTP/TLS connection.
 ///
-/// Inserted as a request extension into every request served by [`serve`] —
-/// on both the plain and the TLS listener — and extractable in any axum
+/// Inserted as a request extension into every request served by [`serve`] -
+/// on both the plain and the TLS listener - and extractable in any axum
 /// handler, including routes mounted via
 /// [`McpServerConfig::with_extra_router`] (which bypass auth/RBAC and
 /// therefore often need the peer address for their own protection, e.g.
@@ -90,7 +90,7 @@ pub type ReadinessCheck =
 ///   L4/L7 proxy or load balancer it is the proxy's address; the framework
 ///   performs **no** `X-Forwarded-For` / `Forwarded` interpretation.
 /// - **Available on HTTP and TLS** transports alike ([`serve`]).
-/// - **Absent under [`serve_stdio`]** — a stdio session has no network
+/// - **Absent under [`serve_stdio`]** - a stdio session has no network
 ///   peer (stdio bypasses the HTTP stack entirely).
 /// - The separate Prometheus metrics listener (feature `metrics`) is a
 ///   different router and does not carry this extension.
@@ -136,7 +136,7 @@ impl PeerAddr {
 ///
 /// Responds `500 Internal Server Error` when the extension is missing.
 /// A missing `PeerAddr` means the handler is not running under [`serve`]
-/// (e.g. the router was mounted on a hand-rolled listener) — a wiring
+/// (e.g. the router was mounted on a hand-rolled listener) - a wiring
 /// bug, not a client error.
 impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerAddr {
     type Rejection = (axum::http::StatusCode, &'static str);
@@ -162,7 +162,7 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerAddr {
 /// right after [`PeerAddr`]. Equals the direct peer's IP unless
 /// **trusted-forwarder mode** is active
 /// ([`McpServerConfig::with_trusted_proxies`]) and the request arrived
-/// through a trusted proxy with a verifiable forwarding chain — in that
+/// through a trusted proxy with a verifiable forwarding chain - in that
 /// case it is the rightmost-untrusted address from `X-Forwarded-For`
 /// (or RFC 7239 `Forwarded`, per
 /// [`McpServerConfig::with_forwarded_header`]).
@@ -359,7 +359,7 @@ pub struct McpServerConfig {
     /// (the default) installs no limiter. Startup-only (not
     /// hot-reloadable via [`ReloadHandle`]).
     ///
-    /// Keyed by the **direct socket peer** ([`PeerAddr`] semantics — no
+    /// Keyed by the **direct socket peer** ([`PeerAddr`] semantics - no
     /// `X-Forwarded-For` interpretation): behind a reverse proxy all
     /// clients share the proxy's bucket, and IPv6 single-host address
     /// rotation can evade per-IP keying. Treat this as an abuse speed
@@ -384,10 +384,10 @@ pub struct McpServerConfig {
     pub extra_route_rate_limit_burst: Option<u32>,
     /// Exact-match request paths exempt from the extra-route rate
     /// limiter (e.g. `/.well-known/oauth-authorization-server`, which
-    /// MCP clients fetch on every connect — behind a shared egress the
+    /// MCP clients fetch on every connect - behind a shared egress the
     /// limiter would otherwise 429 discovery). Matching is a **raw
     /// exact string comparison** against `req.uri().path()`: no globs,
-    /// no prefixes, no normalization — trailing slashes,
+    /// no prefixes, no normalization - trailing slashes,
     /// percent-encoding, and dot-segments must match byte-for-byte.
     /// Fail-closed: any path not listed stays rate-limited (a mismatch
     /// can only mean "still limited", never "accidentally exempt").
@@ -956,7 +956,7 @@ impl McpServerConfig {
     }
 
     /// Cap requests per source IP per minute on routes merged via
-    /// [`with_extra_router`](Self::with_extra_router) — the natural
+    /// [`with_extra_router`](Self::with_extra_router) - the natural
     /// protection for unauthenticated application endpoints (OAuth
     /// callbacks, registration, …) that bypass auth/RBAC by design.
     ///
@@ -995,7 +995,7 @@ impl McpServerConfig {
     /// Exempt specific request paths from the extra-route rate limiter.
     ///
     /// Matching is a **raw exact string comparison** against
-    /// `req.uri().path()` — no globs, no prefixes, no normalization
+    /// `req.uri().path()` - no globs, no prefixes, no normalization
     /// (trailing slashes, percent-encoding, and dot-segments must match
     /// byte-for-byte). The check is fail-closed: anything not listed
     /// stays rate-limited, so a mismatch can only keep a request
@@ -1036,7 +1036,7 @@ impl McpServerConfig {
     /// networks are ignored entirely.
     ///
     /// Only enable when **all** ingress paths traverse the listed
-    /// proxies — otherwise direct clients keep their own buckets and
+    /// proxies - otherwise direct clients keep their own buckets and
     /// proxied clients collapse into the proxy's. Entries are validated
     /// at [`validate`](Self::validate) time. Startup-only.
     #[must_use]
@@ -1492,7 +1492,7 @@ struct AppRunParams {
     /// [`Self::ct`].
     ///
     /// Cancelling it terminates in-flight MCP sessions and SSE streams, so it
-    /// must not fire at the *start* of the grace period — that truncates
+    /// must not fire at the *start* of the grace period - that truncates
     /// responses a normal SIGTERM rollout is supposed to let finish. It is
     /// cancelled only after axum has drained, or when the force-exit timer
     /// wins. The force-exit path must still cancel it, or a stuck stream turns
@@ -1807,7 +1807,7 @@ where
         .merge(mcp_router);
 
     // Merge application-specific routes (bypass MCP auth/RBAC middleware).
-    // When configured, wrap them — and only them — in the per-IP rate
+    // When configured, wrap them - and only them - in the per-IP rate
     // limiter BEFORE merging: axum layers wrap only the routes already
     // present on the sub-router, so the limiter can never leak onto
     // `/mcp`, health, admin, or OAuth endpoints, while top-level layers
@@ -3572,10 +3572,10 @@ async fn oauth_token_cache_headers_middleware(
 /// The make-service installs `ConnectInfo<SocketAddr>` on the plain
 /// listener but `ConnectInfo<TlsConnInfo>` on the TLS listener (the
 /// latter additionally carries the connection-bound mTLS identity and
-/// stays `pub(crate)` — see the anti-aliasing rationale on
-/// [`TlsConnInfo`]). Application routes — in particular those merged via
+/// stays `pub(crate)` - see the anti-aliasing rationale on
+/// [`TlsConnInfo`]). Application routes - in particular those merged via
 /// [`McpServerConfig::with_extra_router`], which bypass the auth
-/// middleware and its private fallback — could therefore not read the
+/// middleware and its private fallback - could therefore not read the
 /// peer address under TLS.
 ///
 /// This middleware makes both branches look identical to every route and
@@ -3588,7 +3588,7 @@ async fn oauth_token_cache_headers_middleware(
 ///    branches, and
 /// 3. inserts the resolved [`ClientIp`] extension: the direct peer's IP,
 ///    unless trusted-forwarder mode is configured AND the direct peer is
-///    a trusted proxy AND the forwarding chain resolves — every
+///    a trusted proxy AND the forwarding chain resolves - every
 ///    ambiguous chain falls back to the direct peer with only a reason
 ///    code logged at `debug` (never raw header contents).
 ///
@@ -3786,7 +3786,7 @@ fn build_extra_route_rate_limiter_with_policy(
 ///
 /// Applied to the application-supplied router **before** it is merged
 /// into the top-level router, so it wraps exactly the extra routes
-/// (and their fallback, if any) and nothing else — `/mcp`, health,
+/// (and their fallback, if any) and nothing else - `/mcp`, health,
 /// admin, and OAuth endpoints are never affected. Outer layers (origin
 /// check, peer-address normalization, security headers, metrics) still
 /// wrap these routes and run first, so both `ConnectInfo` forms are
@@ -3802,7 +3802,7 @@ fn build_extra_route_rate_limiter_with_policy(
 /// `exempt` holds raw exact-match paths (validated at config time)
 /// checked against `req.uri().path()` **before** key extraction:
 /// exempt requests consume no limiter budget and produce no deny
-/// telemetry. Fail-closed — any non-listed path stays limited.
+/// telemetry. Fail-closed - any non-listed path stays limited.
 // cancel-safe: the limiter is charged synchronously before the `next.run(req)`
 // await. Charging an attempt that a later timeout cancels is deliberate -- the
 // request was admitted, so it must cost budget (same posture as auth/rbac).

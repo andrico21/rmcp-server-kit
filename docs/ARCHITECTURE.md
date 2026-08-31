@@ -4,7 +4,7 @@
 > **Companion**: [`MINDMAP.md`](MINDMAP.md) for the visual view, [`../AGENTS.md`](../AGENTS.md) for the navigation hub, [`GUIDE.md`](GUIDE.md) for end-user usage.
 >
 > All file references use `file:line` against the working tree as of 1.9.0.
-> Line numbers are approximate (±20) — they help localize, not replace `Read`.
+> Line numbers are approximate (±20) - they help localize, not replace `Read`.
 > Citations are pinned by `tests/docs_citations.rs` so they fail loudly when
 > a cited file disappears or shrinks below a referenced line.
 
@@ -38,16 +38,16 @@
 around the MCP Streamable HTTP transport from the official Rust SDK
 ([`rmcp`](https://docs.rs/rmcp)). The consumer's job is to implement
 `rmcp::handler::server::ServerHandler` and call `rmcp_server_kit::transport::serve()`.
-Everything below the `serve()` call — listeners, TLS, middleware, auth,
-RBAC, hooks, observability, metrics, admin endpoints — is rmcp-server-kit's
+Everything below the `serve()` call - listeners, TLS, middleware, auth,
+RBAC, hooks, observability, metrics, admin endpoints - is rmcp-server-kit's
 responsibility.
 
 The crate has two transports:
 
 | Transport          | Function                                            | Auth/RBAC/TLS  | Use case                                         |
 |--------------------|-----------------------------------------------------|----------------|--------------------------------------------------|
-| **Streamable HTTP**| `serve()` — `src/transport.rs:2154`                 | **Yes**        | Production network deployment                    |
-| stdio              | `serve_stdio()` — `src/transport.rs:3936`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
+| **Streamable HTTP**| `serve()` - `src/transport.rs:2154`                 | **Yes**        | Production network deployment                    |
+| stdio              | `serve_stdio()` - `src/transport.rs:3936`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
 
 ---
 
@@ -121,8 +121,8 @@ axum Router                                  src/transport.rs:1521  (build_app_r
    ├── 2. Peer-address normalization         src/transport.rs (normalize_peer_addr_middleware)
    │      Mirrors the TLS branch's peer address into ConnectInfo<SocketAddr>
    │      (insert-only-when-absent) and inserts the public `PeerAddr`
-   │      extension on BOTH listener branches, so every route — including
-   │      extra_router routes that bypass auth/RBAC — sees a uniform
+   │      extension on BOTH listener branches, so every route - including
+   │      extra_router routes that bypass auth/RBAC - sees a uniform
    │      peer-address contract. mTLS identity stays on the private
    │      per-connection TlsConnInfo.
    │
@@ -142,7 +142,7 @@ axum Router                                  src/transport.rs:1521  (build_app_r
    │      Determines AuthIdentity from one of:
    │        a) Authorization: Bearer <api-key>  → Argon2 verify against
    │           AuthState.api_keys (ArcSwap<HashMap>)
-   │        b) mTLS — read AuthIdentity from the per-connection
+   │        b) mTLS - read AuthIdentity from the per-connection
    │           TlsConnInfo extension (set by TlsListener at handshake time)
    │        c) Authorization: Bearer <jwt>      → JwksCache::validate
    │           (feature = "oauth")
@@ -165,7 +165,7 @@ axum Router                                  src/transport.rs:1521  (build_app_r
    ▼
 rmcp StreamableHttpService                   src/transport.rs:1362
    └── Your ServerHandler::call_tool(...)
-        (optionally wrapped by HookedHandler — src/tool_hooks.rs:361-482)
+        (optionally wrapped by HookedHandler - src/tool_hooks.rs:361-482)
        │
        │  Inside the handler you can call:
        │    rbac::current_role()      -> Option<String>
@@ -183,7 +183,7 @@ Open endpoints (no auth):
 | Path                                       | Handler                                       |
 |--------------------------------------------|-----------------------------------------------|
 | `GET  /healthz`                            | `healthz` (~`src/transport.rs:1766`) |
-| `GET  /readyz`                             | `readyz`  (~`src/transport.rs:1767`) — runs configured readiness check |
+| `GET  /readyz`                             | `readyz`  (~`src/transport.rs:1767`) - runs configured readiness check |
 | `GET  /version`                            | `version_payload` (~`src/transport.rs:3128`) |
 | `GET  /metrics`                            | served by `serve_metrics` on a **separate listener** when `feature = "metrics"` (`src/metrics.rs:142`) |
 | `GET  /.well-known/oauth-protected-resource` | feature = `oauth` (`src/transport.rs:1851`) |
@@ -202,7 +202,7 @@ Authenticated endpoints:
 
 ## 4. Core types
 
-### `McpServerConfig` — `src/transport.rs:285`
+### `McpServerConfig` - `src/transport.rs:285`
 Top-level builder-style config consumed by `serve()`. Holds:
 - bind address (`SocketAddr`)
 - server name + version
@@ -214,15 +214,15 @@ Top-level builder-style config consumed by `serve()`. Holds:
 - optional readiness check callback (`Arc<dyn Fn() -> bool + Send + Sync>`)
 - public URL (used in OAuth metadata responses)
 
-### `ReloadHandle` — `src/transport.rs:1405`
+### `ReloadHandle` - `src/transport.rs:1405`
 Returned (optionally) from `serve()` when the consumer needs runtime
 hot-reload. Two methods:
-- `reload_auth_keys(new_map)` — atomically swaps `AuthState.api_keys`
-- `reload_rbac(new_policy)` — atomically swaps the `ArcSwap<RbacPolicy>`
+- `reload_auth_keys(new_map)` - atomically swaps `AuthState.api_keys`
+- `reload_rbac(new_policy)` - atomically swaps the `ArcSwap<RbacPolicy>`
 
 Both use `arc-swap`, so live requests are not blocked or interrupted.
 
-### `AuthIdentity` — `src/auth.rs:47`
+### `AuthIdentity` - `src/auth.rs:47`
 Canonical caller record passed through the request scope:
 ```rust
 pub struct AuthIdentity {
@@ -234,35 +234,35 @@ pub struct AuthIdentity {
 }
 ```
 
-### `RbacPolicy` — `src/rbac.rs:418`
+### `RbacPolicy` - `src/rbac.rs:418`
 Holds:
-- `roles: HashMap<String, RoleConfig>` — per-role tool allow/deny rules
+- `roles: HashMap<String, RoleConfig>` - per-role tool allow/deny rules
 - default-deny semantics with explicit overrides
 - per-tool argument allowlists
 - per-IP rate limiter shared across the server
 
-### `HookedHandler<H>` — `src/tool_hooks.rs:219`
+### `HookedHandler<H>` - `src/tool_hooks.rs:219`
 Generic wrapper around a consumer's `ServerHandler` that runs:
-- `before_call(name, args, identity)` — may rewrite args or short-circuit
-- `after_call(name, result, identity)` — may rewrite or audit the result
+- `before_call(name, args, identity)` - may rewrite args or short-circuit
+- `after_call(name, result, identity)` - may rewrite or audit the result
 - enforces `max_result_bytes` (returns an error if the serialized result exceeds the cap)
 
-### `PeerAddr` — `src/transport.rs` (public, `#[non_exhaustive]`)
+### `PeerAddr` - `src/transport.rs` (public, `#[non_exhaustive]`)
 Framework-owned request extension carrying the **direct socket peer
 address** of the connection. Inserted by `normalize_peer_addr_middleware`
 on both listener branches (plain and TLS), extractable via its
-`FromRequestParts` impl or `Extension<PeerAddr>` — including from
+`FromRequestParts` impl or `Extension<PeerAddr>` - including from
 `extra_router` routes, which bypass auth/RBAC and therefore cannot rely
 on the auth middleware's private `ConnectInfo<TlsConnInfo>` fallback.
 Direct peer only (no `X-Forwarded-For` interpretation); absent under
 `serve_stdio`; never logged by the framework.
 
-### `ClientIp` — `src/transport.rs` (public, `#[non_exhaustive]`)
+### `ClientIp` - `src/transport.rs` (public, `#[non_exhaustive]`)
 Resolved client IP, inserted by `normalize_peer_addr_middleware` on every
 request right after `PeerAddr`. Equals the direct peer's IP unless
 **trusted-forwarder mode** (`trusted_proxies` config) is active and the
 request arrived through a trusted proxy with a verifiable forwarding
-chain — then it is the rightmost-untrusted address from
+chain - then it is the rightmost-untrusted address from
 `X-Forwarded-For` / RFC 7239 `Forwarded` (`ForwardedHeaderMode`),
 resolved by `src/forwarded.rs` (`pub(crate)`: rightmost-untrusted walk,
 16-entry scan cap, fail-safe-to-direct on malformed/obfuscated/
@@ -270,12 +270,12 @@ all-trusted chains, reason-code-only logging). All four per-IP rate
 limiters key by this value via `limiter_client_ip`; `PeerAddr` keeps its
 direct-socket-peer contract unchanged.
 
-### Extra-route per-IP rate limiter — `src/transport.rs` (opt-in)
+### Extra-route per-IP rate limiter - `src/transport.rs` (opt-in)
 `extra_route_rate_limit` (builder `with_extra_route_rate_limit` / TOML
 `server.extra_route_rate_limit`, requests/min per source IP, must be
 nonzero) installs `extra_route_rate_limit_middleware` as a layer on the
 application's `extra_router` **before** it is merged into the top-level
-router — axum layer-before-merge scoping guarantees it wraps only the
+router - axum layer-before-merge scoping guarantees it wraps only the
 extra routes, never `/mcp`/health/admin/OAuth endpoints, while outer
 layers (origin check, peer normalization) still run first. Same
 machinery and deny shape as the tool limiter: `BoundedKeyedLimiter<IpAddr>`
@@ -299,13 +299,13 @@ Startup-only.
 - `api_keys: ArcSwap<Vec<ApiKeyEntry>>` (`src/auth.rs:1033`)
 - mTLS identities: stored **per-connection** on the
   `TlsConnInfo` extension (`src/auth.rs:893`), read by `auth_middleware` (`src/auth.rs:1593-1598`).
-  No shared `SocketAddr`-keyed map exists — the previous design was replaced
+  No shared `SocketAddr`-keyed map exists - the previous design was replaced
   to avoid identity-binding races behind load balancers and to remove a
   `RwLock` from the request hot path.
-- `rate_limiter: Option<Arc<KeyedLimiter>>` — **post-failure backoff**:
+- `rate_limiter: Option<Arc<KeyedLimiter>>` - **post-failure backoff**:
   governor limit on *failed* auth attempts per IP. Consulted only after a
   credential check has run and rejected the caller.
-- `pre_auth_limiter: Option<Arc<KeyedLimiter>>` — **pre-auth abuse gate**:
+- `pre_auth_limiter: Option<Arc<KeyedLimiter>>` - **pre-auth abuse gate**:
   governor limit on *unauthenticated* requests per IP, consulted *before*
   any Argon2id work runs. Defends the bearer-verification path against
   CPU-spray attacks (an attacker submitting a flood of invalid tokens to
@@ -348,9 +348,9 @@ threaded as `SecretString` from `AuthIdentity.raw_token` through
 See [§8](#8-oauth-21--jwks-feature-oauth).
 
 ### Helpers
-- `generate_api_key()` — produces a fresh API key + Argon2 hash (used by
+- `generate_api_key()` - produces a fresh API key + Argon2 hash (used by
   e2e tests and tooling).
-- `verify_api_key()` — constant-time Argon2 verification.
+- `verify_api_key()` - constant-time Argon2 verification.
 
 ---
 
@@ -377,12 +377,12 @@ ArgumentAllowlist {                       // src/rbac.rs:275
 ```
 
 ### Decision function
-- `RbacPolicy::check(role, operation, host)` — pure allow/deny (`src/rbac.rs:511`; fn `check`)
-- `RbacPolicy::argument_allowed(role, tool, argument, value)` — JSON value match (`src/rbac.rs:589`; fn `argument_allowed`)
-- `RbacPolicy::redact_arg(value)` — HMAC-SHA256 of an argument value with
+- `RbacPolicy::check(role, operation, host)` - pure allow/deny (`src/rbac.rs:511`; fn `check`)
+- `RbacPolicy::argument_allowed(role, tool, argument, value)` - JSON value match (`src/rbac.rs:589`; fn `argument_allowed`)
+- `RbacPolicy::redact_arg(value)` - HMAC-SHA256 of an argument value with
 the policy's salt, returning an 8-char hex prefix (`src/rbac.rs:749`).
   Used to keep raw argument values out of deny logs.
-- `enforce_tool_policy(policy, identity_name, role, params)` — combines
+- `enforce_tool_policy(policy, identity_name, role, params)` - combines
   allow/deny + argument-allowlist checks, emitting structured deny logs.
   `identity_name` is passed explicitly because the task-local context is
   installed *after* enforcement (see "Task-locals" below).
@@ -425,7 +425,7 @@ Public accessors: `current_role()` (`src/rbac.rs:108`),
 `Option<T>` because the task-locals are absent outside the request scope.
 
 `current_token()` returns `Option<SecretString>`. Call `.expose_secret()`
-only when the raw value is genuinely required — e.g. when constructing
+only when the raw value is genuinely required - e.g. when constructing
 an outbound `Authorization` header for downstream token passthrough.
 
 > ⚠️ **These do NOT propagate across `tokio::spawn`.** Capture the value
@@ -459,7 +459,7 @@ Lifecycle (concurrent-acceptor design, since the 1.8.1 review fixes):
    internal). Failures and timeouts are logged at DEBUG and the
    connection dropped; the permit is released either way.
 4. `TlsListener::accept()` is a cancel-safe `rx.recv()` that just dequeues
-   completed handshakes — it never performs handshake work itself, so one
+   completed handshakes - it never performs handshake work itself, so one
    slow or idle client can no longer stall other connections.
 5. Dropping the listener aborts the acceptor task, releasing the port
    deterministically.
@@ -484,13 +484,13 @@ Lifecycle:
    URL via `extract_cdp_urls`, fetches each via `reqwest` under a 10 s
    total deadline, and seeds the cache.
 2. The returned `Arc<CrlSet>` (`src/mtls_revocation.rs:100`) owns:
-   - `inner_verifier: ArcSwap<VerifierHandle>` — current
+   - `inner_verifier: ArcSwap<VerifierHandle>` - current
      `Arc<dyn ClientCertVerifier>` built from the latest CRL set; swapped
      atomically when CRLs refresh.
    - `cache: tokio::sync::RwLock<HashMap<String, CachedCrl>>` keyed by URL.
-   - `discover_tx: mpsc::UnboundedSender<String>` — channel used by the
+   - `discover_tx: mpsc::UnboundedSender<String>` - channel used by the
      handshake path to register newly observed CDP URLs for fetch.
-   - `seen_urls: Mutex<HashSet<String>>` — dedupe of URLs already processed.
+   - `seen_urls: Mutex<HashSet<String>>` - dedupe of URLs already processed.
 3. `DynamicClientCertVerifier` (`src/mtls_revocation.rs:1343`) is the
    `Arc<dyn ClientCertVerifier>` handed to `rustls::ServerConfig`. Its
    trait methods delegate to the inner verifier loaded from
@@ -537,9 +537,9 @@ The shared SSRF helpers live in `src/ssrf.rs` and split into two layers:
 For OAuth, the guard covers:
 - All six configured URL fields at startup (`issuer`, `jwks_uri`,
   `authorization_endpoint`, `token_endpoint`, `revocation_endpoint`,
-  `introspection_endpoint`) — userinfo + literal-IP rejection.
+  `introspection_endpoint`) - userinfo + literal-IP rejection.
 - Both OAuth client redirect closures (`OauthHttpClient::build` and
-  `JwksCache::new`) — runtime per-hop range guard plus
+  `JwksCache::new`) - runtime per-hop range guard plus
   `https -> http` downgrade rejection and `http -> http` gating on
   `allow_http_oauth_urls`.
 
@@ -550,12 +550,12 @@ rejection is the primary trust anchor for operator-supplied URLs.
 Additionally, several knobs cap the blast radius even when a host is
 reachable:
 
-- `crl_max_concurrent_fetches` (default 4) — global parallel-fetch cap.
-- `crl_max_response_bytes` (default 5 MiB) — body size cap.
-- `crl_discovery_rate_per_min` (default 60) — discovery rate limit.
-- `crl_max_host_semaphores` (default 1024) — caps unique CDP hosts.
-- `crl_max_seen_urls` (default 4096) — caps discovery deduplication map.
-- `crl_max_cache_entries` (default 1024) — caps CRL memory cache.
+- `crl_max_concurrent_fetches` (default 4) - global parallel-fetch cap.
+- `crl_max_response_bytes` (default 5 MiB) - body size cap.
+- `crl_discovery_rate_per_min` (default 60) - discovery rate limit.
+- `crl_max_host_semaphores` (default 1024) - caps unique CDP hosts.
+- `crl_max_seen_urls` (default 4096) - caps discovery deduplication map.
+- `crl_max_cache_entries` (default 1024) - caps CRL memory cache.
 
 ### Discovery admission ordering
 
@@ -637,7 +637,7 @@ These let downstream MCP clients discover OAuth via the same origin as
 - JWKS responses cached with TTL; stale-while-revalidate semantics.
 - HTTPS-downgrade-rejecting redirect policy on `OauthHttpClient`.
 - **SSRF guard**: per-hop DNS/private-IP blocklist and URL validation
-  (no userinfo, no IP literals) — see [§7 SSRF hardening](#ssrf-hardening).
+  (no userinfo, no IP literals) - see [§7 SSRF hardening](#ssrf-hardening).
 - **JWKS key cap**: `max_jwks_keys` (default 256) blocks key-stuffing
   resource exhaustion.
 - Prefer `OauthHttpClient::with_config(&OAuthConfig)` over the deprecated
@@ -669,10 +669,10 @@ pub trait ToolHooks: Send + Sync + 'static {
 `HookedHandler<H>` implements `rmcp::ServerHandler` for any inner `H: ServerHandler`,
 delegating most calls but intercepting `call_tool` (`src/tool_hooks.rs:517`):
 1. Captures current identity from task-locals.
-2. Calls `before_call` — may rewrite args, may return early with an error.
+2. Calls `before_call` - may rewrite args, may return early with an error.
 3. Calls inner handler.
-4. Serializes result, checks `max_result_bytes` — error if exceeded.
-5. Calls `after_call` — may redact / audit / transform.
+4. Serializes result, checks `max_result_bytes` - error if exceeded.
+5. Calls `after_call` - may redact / audit / transform.
 
 Activated in `McpServerConfig` via `with_hooks(...)`. Skip if you don't need
 custom audit/transformation.
@@ -690,7 +690,7 @@ configured admin role (default: `"admin"`).
 | Endpoint               | Returns                                                  |
 |------------------------|----------------------------------------------------------|
 | `GET /admin/status`    | server name, version, uptime, feature flags, peer count  |
-| `GET /admin/auth/keys` | current API key metadata (name, role, expiry — never the secret) |
+| `GET /admin/auth/keys` | current API key metadata (name, role, expiry - never the secret) |
 | `GET /admin/auth/counters` | per-IP auth attempts, success/failure counts          |
 | `GET /admin/rbac`      | current RBAC policy snapshot                             |
 
@@ -706,7 +706,7 @@ Useful for debugging hot-reload state and verifying RBAC after a swap.
 `tracing-subscriber` with:
 - `EnvFilter` from `RUST_LOG` (or supplied filter string)
 - console layer (pretty when stdout is a TTY, JSON otherwise)
-- optional **audit-file sink** (`src/observability.rs:170`) — appends
+- optional **audit-file sink** (`src/observability.rs:170`) - appends
   structured JSON events to a path; useful for compliance/forensics.
 
 Conventions used by rmcp-server-kit itself:
@@ -717,7 +717,7 @@ Conventions used by rmcp-server-kit itself:
 
 > ⚠️ **Never log a `Secret<T>` directly.** `Debug`/`Display` of `secrecy::Secret`
 > prints `Secret([REDACTED])`, but `expose_secret()` is logged as plain
-> text — never log the result of that call.
+> text - never log the result of that call.
 
 ---
 
@@ -737,7 +737,7 @@ shared `McpMetrics::registry`, which is intentionally part of the public
 API surface.
 
 The `/metrics` endpoint is served on a **separate listener** (often a
-private bind address) configured via `MetricsConfig` — see
+private bind address) configured via `MetricsConfig` - see
 `src/metrics.rs::serve_metrics` (~`src/metrics.rs:110-130`). This isolates
 operational telemetry from the public MCP listener.
 
@@ -790,7 +790,7 @@ variant to a sanitized HTTP response:
 - Generic body (no internal details leaked to clients per OWASP)
 - Logs the full cause via `tracing::error!` with structured fields
 
-Inside handlers, `?` propagates errors. Never panic — the `panic = "deny"`
+Inside handlers, `?` propagates errors. Never panic - the `panic = "deny"`
 clippy lint enforces this.
 
 ---
@@ -799,35 +799,35 @@ clippy lint enforces this.
 
 Three layers, applied in a fixed order.
 
-**Programmatic** — `McpServerConfig::new(addr, name, version)` builder
+**Programmatic** - `McpServerConfig::new(addr, name, version)` builder
 (`src/transport.rs:695`). Holds everything `serve()` needs, including the
 runtime-only fields TOML cannot express: `rbac`, `readiness_check`,
 `extra_router`, `on_reload_ready`, and the metrics listener. Deliberately does
-**not** derive `Deserialize` — it carries callbacks and an `axum::Router`, and
+**not** derive `Deserialize` - it carries callbacks and an `axum::Router`, and
 deriving serde would freeze the deprecated public field surface the crate is
 retiring.
 
-**TOML** — the deserializable sections:
+**TOML** - the deserializable sections:
 
-- `ServerConfig` — `src/config.rs:296`
-- `ObservabilityConfig` — `src/config.rs:1066`
-- `SecurityHeadersConfig` — `src/transport.rs:239`
-- `AuthConfig`, `MtlsConfig`, `RateLimitConfig` — `src/auth.rs`
-- `RbacConfig` — `src/rbac.rs`
-- `OAuthConfig` — `src/oauth.rs`
+- `ServerConfig` - `src/config.rs:296`
+- `ObservabilityConfig` - `src/config.rs:1066`
+- `SecurityHeadersConfig` - `src/transport.rs:239`
+- `AuthConfig`, `MtlsConfig`, `RateLimitConfig` - `src/auth.rs`
+- `RbacConfig` - `src/rbac.rs`
+- `OAuthConfig` - `src/oauth.rs`
 
 There is **no kit-owned root config struct**; each downstream composes these
 sections into its own root type. `[server]`, `[rbac]` and `[observability]`
 are a convention from [`docs/GUIDE.md`](GUIDE.md), not a type.
 
-`ServerConfig` was schema-only until 3.4.0 — nothing in the crate consumed it.
+`ServerConfig` was schema-only until 3.4.0 - nothing in the crate consumed it.
 `ServerConfig::apply_to_mcp_config` (`src/config.rs:740`) is the bridge that
 makes it reachable. It uses **replacement semantics**: authoritative for every
 bridgeable transport field, with `None`/`false` clearing whatever the base
 held. Only the runtime-only fields above survive from the base. It is fallible
 (duration strings parse here) and never reads the environment.
 
-**Environment (opt-in)** — three inherent methods, one per section owning
+**Environment (opt-in)** - three inherent methods, one per section owning
 targeted fields: `ServerConfig::apply_env_overrides` (`src/config.rs:442`),
 `ObservabilityConfig::apply_env_overrides` (`src/config.rs:832`) and
 `RbacConfig::apply_env_overrides` (`src/rbac.rs:1391`). Each returns
@@ -836,7 +836,7 @@ for secret targets. Fourteen curated variables under the `RMCP_SERVER_KIT__`
 prefix; `__` separates TOML path segments because field names already contain
 single underscores.
 
-Nothing reads the environment implicitly — `serve()`, `validate()` and every
+Nothing reads the environment implicitly - `serve()`, `validate()` and every
 constructor are env-free. `RUST_LOG` remains the one exception, honoured by
 `init_tracing_from_config` per tracing convention.
 
@@ -864,16 +864,16 @@ matching, JWKS algorithm selection, etc.).
 **Integration / E2E** tests live in `tests/e2e.rs`. They:
 - Spawn `rmcp_server_kit::transport::serve(...)` on an **ephemeral port** via
   `spawn_server()` (`tests/e2e.rs:115`).
-- Use `reqwest` to make real HTTP calls — origin checks, auth, RBAC,
+- Use `reqwest` to make real HTTP calls - origin checks, auth, RBAC,
   rate-limiting, readiness, body limits, TLS handshakes.
 - Use `wiremock` for OAuth/JWKS upstreams.
 - Generate test certs at runtime using `rcgen`.
 
 Examples worth reading:
-- `auth_accepts_valid_bearer` — `tests/e2e.rs:244`
-- `rbac_denies_unpermitted_tool` — `tests/e2e.rs:361`
-- `rbac_allows_permitted_tool` — `tests/e2e.rs:390`
-- `rbac_argument_allowlist_enforced` — `tests/e2e.rs:422`
+- `auth_accepts_valid_bearer` - `tests/e2e.rs:244`
+- `rbac_denies_unpermitted_tool` - `tests/e2e.rs:361`
+- `rbac_allows_permitted_tool` - `tests/e2e.rs:390`
+- `rbac_argument_allowlist_enforced` - `tests/e2e.rs:422`
 
 > When changing behaviour, **add an E2E test first**. The unit tests in
 > `auth.rs`/`rbac.rs` are useful but the E2E suite is what catches
@@ -908,7 +908,7 @@ itself is at `src/transport.rs:3276`.
    `AuthIdentity` travels inside `AuthenticatedTlsStream` / the per-connection
    `TlsConnInfo` extension, so two simultaneous connections from the same
    client (or a reused ephemeral port) can never observe each other's
-   identity. Do not reintroduce a `SocketAddr`-keyed map — that earlier
+   identity. Do not reintroduce a `SocketAddr`-keyed map - that earlier
    design was removed precisely because of port-reuse aliasing races
    (see §5).
 
@@ -930,7 +930,7 @@ itself is at `src/transport.rs:3276`.
 
 ## See also
 
-- [`MINDMAP.md`](MINDMAP.md) — the same information, but visual.
-- [`../AGENTS.md`](../AGENTS.md) — quick-orientation hub for agents.
-- [`GUIDE.md`](GUIDE.md) — consumer-facing usage examples.
-- [`../RUST_GUIDELINES.md`](../RUST_GUIDELINES.md) — coding standards.
+- [`MINDMAP.md`](MINDMAP.md) - the same information, but visual.
+- [`../AGENTS.md`](../AGENTS.md) - quick-orientation hub for agents.
+- [`GUIDE.md`](GUIDE.md) - consumer-facing usage examples.
+- [`../RUST_GUIDELINES.md`](../RUST_GUIDELINES.md) - coding standards.

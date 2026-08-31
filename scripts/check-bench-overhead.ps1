@@ -1,4 +1,4 @@
-# check-bench-overhead.ps1 — assert mean(benchA) - mean(benchB) <= max_ns.
+# check-bench-overhead.ps1 - assert mean(benchA) - mean(benchB) <= max_ns.
 #
 # Usage: pwsh ./scripts/check-bench-overhead.ps1 <bench_hooked> <bench_bare> <max_overhead_ns>
 #

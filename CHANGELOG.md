@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 **API-breaking** changes bump the **major** version, which tracks the `rmcp` SDK
 major. Security-hardening changes that alter a runtime *default* (without
 removing or retyping public API) ship in a **minor** release with a documented
-migration note and a config opt-out — see the 3.1.0 notes below.
+migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
@@ -27,7 +27,7 @@ migration note and a config opt-out — see the 3.1.0 notes below.
 
   Internally this pulls `password-hash` 0.6.1 (0.6.0 was yanked upstream) and
   the new `phc` crate. `SaltString` moved out of `password-hash`, and
-  `hash_password` no longer takes an explicit salt — the crate now supplies its
+  `hash_password` no longer takes an explicit salt - the crate now supplies its
   own salt bytes directly via `hash_password_with_salt`, which removed a
   base64-encoding step and one `expect()` from the constant-time placeholder
   hash. `getrandom` and `rand_core` version counts are unchanged.
@@ -56,7 +56,7 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
   and `client_id`**, matching its own `with_*` setters.
 
   Passing a `String` variable still compiles. **Passing `"literal".into()` does
-  not** — the target type is now generic, so inference fails with `E0283`. Drop
+  not** - the target type is now generic, so inference fails with `E0283`. Drop
   the `.into()`:
 
   ```rust
@@ -75,8 +75,8 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
   RFC 8693 §2.1 marks `audience` **OPTIONAL** (only `grant_type`,
   `subject_token`, and `subject_token_type` are REQUIRED), but the crate made it
   mandatory and always emitted it. Omission was unrepresentable, so an
-  authorization server that rejects `audience` — or that expects RFC 8707
-  `resource` instead — could not be configured at all.
+  authorization server that rejects `audience` - or that expects RFC 8707
+  `resource` instead - could not be configured at all.
 
   Migration is mechanical:
 
@@ -90,7 +90,7 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
 
   **TOML configs need no change**; `audience` remains an accepted key and
   behaves identically. Setting `audience = ""` is now rejected at startup as a
-  malformed parameter — omit the key to leave the parameter out.
+  malformed parameter - omit the key to leave the parameter out.
 
   This break deliberately ships in a **minor** release rather than 4.0.0, as a
   documented exception to the versioning policy stated at the top of this file.
@@ -102,15 +102,15 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
 
 - `oauth.token_exchange` now supports the remaining RFC 8693 §2.1 OPTIONAL
   request parameters, each omitted by default:
-  - `resource` — an RFC 8707 resource indicator, validated at startup as an
+  - `resource` - an RFC 8707 resource indicator, validated at startup as an
     absolute URI with no fragment, using only RFC 3986 characters and
     well-formed percent-encoding. (The `url` crate implements the WHATWG URL
     Standard, which would otherwise silently trim or re-encode a value that is
     then sent to the authorization server verbatim.) **Unrelated to
     `oauth.proxy.strip_resource_param`**, which governs the OAuth proxy
     endpoints rather than token exchange.
-  - `scope` — space-delimited scopes for the exchanged token.
-  - `requested_token_type` — `"access_token"` (default, unchanged behaviour),
+  - `scope` - space-delimited scopes for the exchanged token.
+  - `requested_token_type` - `"access_token"` (default, unchanged behaviour),
     `"omit"` to let the authorization server choose per RFC 8693 §2.1, or any
     token-type URI sent verbatim.
 
@@ -130,15 +130,15 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
   allowlisted a call carrying `{"cmd": "ls", "danger": true}` is admitted and
   `danger` reaches the handler unreviewed. Setting the flag on **any** allowlist
   matching a `(role, tool)` pair makes the permitted names the union of every
-  matching entry's `argument`, rejecting any other top-level key — and rejecting
+  matching entry's `argument`, rejecting any other top-level key - and rejecting
   object/array values, which have no nested-path allowlist to constrain them.
   Default-off preserves existing behaviour exactly.
 
 ### Fixed
 
 - **The two config validators can no longer drift in ordering.** The three
-  invariants both enforce — admin-requires-auth, TLS cert/key pairing, and
-  mTLS-requires-TLS — are now evaluated by one shared helper, so a config
+  invariants both enforce - admin-requires-auth, TLS cert/key pairing, and
+  mTLS-requires-TLS - are now evaluated by one shared helper, so a config
   invalid in more than one way reports the same first error whichever validator
   a consumer reaches for. Each validator keeps its own wording: the builder
   names which TLS half is missing, the TOML validator emits one combined
@@ -160,7 +160,7 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
 - **CI: the `--release-type major` fallback now removes itself.** The semver
   step runs unflagged first and treats *success* as a failure condition, so once
   3.8.0 is the published baseline the job fails loudly demanding the flag be
-  dropped — instead of lingering and silently accepting every future breaking
+  dropped - instead of lingering and silently accepting every future breaking
   change.
 
 ### Deprecated
@@ -204,7 +204,7 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
   the unprotected file; the error states whether that deletion succeeded, so an
   operator knows whether an unprotected audit log may remain on disk. Hardening
   uses the `windows-permissions` crate, target-gated to `cfg(windows)` and used
-  only to resolve the current process SID and apply the DACL — this crate is
+  only to resolve the current process SID and apply the DACL - this crate is
   `#![forbid(unsafe_code)]` and so cannot call the Win32 ACL APIs directly.
 
 - **Attacker-controlled intermediate CDP URLs no longer bypass the
@@ -230,7 +230,7 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
 - **A custom `requested_token_type` must now be a URI.** A typo such as
   `"acess_token"` previously became a custom token type and was forwarded to the
   authorization server verbatim; it is now rejected at config validation.
-  Fragments are permitted here — the no-fragment rule is RFC 8707 §2's
+  Fragments are permitted here - the no-fragment rule is RFC 8707 §2's
   constraint on `resource`, not a property of RFC 8693 §3 token-type
   identifiers.
 - **`bootstrap_fetch` now bounds its startup fan-out.** It is a public helper
@@ -287,7 +287,7 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
   `kty=RSA`, `use=sig`, with no `alg`.
 
   When `alg` is absent the permitted algorithms are now inferred from the key
-  material — `RSA` → `RS256`/`RS384`/`RS512`/`PS256`/`PS384`/`PS512`,
+  material - `RSA` → `RS256`/`RS384`/`RS512`/`PS256`/`PS384`/`PS512`,
   `P-256` → `ES256`, `P-384` → `ES384`, `Ed25519` → `EdDSA`. An explicit `alg`
   continues to pin exactly one algorithm.
 
@@ -306,7 +306,7 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
   `.cargo/audit.toml` does not escalate yanked crates. The `chacha20`
   `safe-to-deploy` exemption in `supply-chain/config.toml` was regenerated in
   the same change (`cargo vet regenerate exemptions`) so `cargo vet --locked`
-  stays green — the regeneration touched only that one version line.
+  stays green - the regeneration touched only that one version line.
 - **Restored the default-feature and `--features oauth` builds.**
   `post_failure_rate_limit_response` binds `extensions` but reads it only inside
   a `#[cfg(feature = "metrics")]` block, so any build without `metrics` tripped
@@ -318,7 +318,7 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
 
 ### Added
 
-- **`OAuthConfig::allowed_algorithms` — operator-configurable JWT signing
+- **`OAuthConfig::allowed_algorithms` - operator-configurable JWT signing
   algorithm allowlist.** Previously the accepted set was a compile-time
   constant, so a deployment could not pin validation to exactly what its
   identity provider signs with (for example `["RS256"]` for Microsoft Entra).
@@ -341,11 +341,11 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
   resolved eagerly at override time so an unusable list is reported against the
   variable that set it.
 
-- **`OAuthProxyConfig::strip_resource_param` — opt-in workaround for Microsoft
+- **`OAuthProxyConfig::strip_resource_param` - opt-in workaround for Microsoft
   Entra ID ([#17](https://github.com/andrico21/rmcp-server-kit/issues/17)).**
   Entra v2.0 rejects an RFC 8707 `resource` parameter carried alongside a
   differing `api://` scope with `AADSTS9010010`, but MCP clients send `resource`
-  because the MCP specification requires it — so an Entra-backed proxy could not
+  because the MCP specification requires it - so an Entra-backed proxy could not
   complete an authorization-code flow without hand-rolling a replacement proxy.
 
   Set `strip_resource_param = true` to drop `resource` when forwarding
@@ -359,7 +359,7 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
   `code_challenge_method`, `nonce`, `scope`, `grant_type`, `code`, and
   `refresh_token` are always forwarded. The comparison happens post-decode, so
   `%72esource` cannot smuggle the parameter through. The `/introspect` and
-  `/revoke` proxy path is unaffected — `resource` is not a parameter of RFC 7662
+  `/revoke` proxy path is unaffected - `resource` is not a parameter of RFC 7662
   or RFC 7009 requests.
 
   Configurable via TOML (`[server.auth.oauth.proxy] strip_resource_param`), the
@@ -383,7 +383,7 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
 
      *Legacy opt-out:* `oauth.authorization_server_metadata_issuer = "<upstream
      issuer>"`. Needed only when the upstream IdP emits RFC 9207 `iss` in the
-     authorization response **and** clients validate it — the proxy cannot
+     authorization response **and** clients validate it - the proxy cannot
      reconcile that, because the upstream redirects straight to the client's
      `redirect_uri` without passing through this process.
 
@@ -392,7 +392,7 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
      `oauth.issuer` when `oauth.proxy` is absent, this server's public URL when
      it is present. Protected Resource Metadata is served unconditionally, but
      `/authorize`, `/token`, and `/.well-known/oauth-authorization-server` are
-     mounted only under `oauth.proxy` — so the old default pointed RFC 9728
+     mounted only under `oauth.proxy` - so the old default pointed RFC 9728
      discovery at a URL that returns 404.
 
      *Action required for one topology:* an application that mounts its **own**
@@ -404,7 +404,7 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
      authorization_servers = ["https://mcp.example.com"]
      ```
 
-     The crate cannot detect that case — "no proxy" is indistinguishable from
+     The crate cannot detect that case - "no proxy" is indistinguishable from
      "the application supplied its own facade".
 
   Token validation is untouched in both cases: inbound JWT `iss` is always
@@ -418,13 +418,13 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
   path-inserted location** `/.well-known/oauth-protected-resource/mcp` for the
   `/mcp` resource. The root path is retained as an alias, so no client breaks.
   Like every framework route, an `extra_router` entry that *exactly* overlaps
-  this new path panics at startup — see the collision caveat on
+  this new path panics at startup - see the collision caveat on
   `McpServerConfig::with_extra_router`.
 - The `WWW-Authenticate` challenge advertises an **absolute**
   `resource_metadata` URL when `public_url` is configured, and keeps the
   previous relative path otherwise. Without `public_url` the only derivable
   origin is the bind address, which behind a TLS-terminating proxy is an
-  internal address — a wrong absolute URL is not more conformant than a
+  internal address - a wrong absolute URL is not more conformant than a
   relative one.
 
 - `tool_hooks::with_hooks` is now `#[must_use]`. Dropping the returned
@@ -441,7 +441,7 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
   `ArgumentAllowlist::new_required` instead of `ArgumentAllowlist::new`. With
   the compatibility default (`required = false`) an allowlist constrains an
   argument only when it is supplied, so a caller omitting the key passes
-  unchecked and the handler's default value is used — the shipped examples were
+  unchecked and the handler's default value is used - the shipped examples were
   demonstrating a fail-open policy. The default itself is unchanged and still
   flips in 4.0.
 - Cancel-safety annotations added to the async request-path functions that were
@@ -498,7 +498,7 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
   certificate authentication, because a plaintext listener never performs a
   handshake and so never extracts an identity.
 - **Startup failures no longer leak background listeners.** A failure after
-  `build_app_router` — a main-bind `AddrInUse`, an unreadable TLS key — left
+  `build_app_router` - a main-bind `AddrInUse`, an unreadable TLS key - left
   the Prometheus metrics listener and the CRL refresher running with their
   ports bound. The external-shutdown bridge additionally parked forever on a
   caller token that might never be cancelled.
@@ -923,7 +923,7 @@ unaffected.
   `build_git_sha`, `build_timestamp`, and `rust_version` appear in the unauthenticated
   `/version` response (default `false`, unchanged from 3.1.0).
 
-- **`[server.security_headers]` TOML table — all twelve OWASP headers configurable
+- **`[server.security_headers]` TOML table - all twelve OWASP headers configurable
   from TOML.** `SecurityHeadersConfig` now derives `serde::Deserialize` with
   `#[serde(default)]`. Every one of the twelve fields is configurable under
   `[server.security_headers]` without any change to built-in defaults. The
@@ -935,7 +935,7 @@ unaffected.
   remains rejected by the validator. Unknown keys under `[server.security_headers]`
   are silently ignored (no `deny_unknown_fields`).
 
-- **`ServerConfig::apply_to_mcp_config`** — the bridge between the TOML schema and
+- **`ServerConfig::apply_to_mcp_config`** - the bridge between the TOML schema and
   `serve()`. Accepts a `base: McpServerConfig` and returns `McpServerConfig` with
   every bridgeable transport field replaced by the TOML-sourced value. Uses
   replacement semantics throughout: `None` and `false` in TOML clear the
@@ -959,7 +959,7 @@ unaffected.
   `with_optional_max_concurrent_requests`, `with_admin_enabled`, and `with_admin_role`.
   All are additive; no existing builder method is changed or removed.
 
-No default values changed. This release is purely additive — existing configurations
+No default values changed. This release is purely additive - existing configurations
 that do not opt in to `[server.security_headers]`, `max_request_body`, or
 `expose_build_metadata` parse and behave identically to 3.3.x.
 
@@ -971,7 +971,7 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
   `supply-chain/config.toml` set `audit-as-crates-io = true` for
   `rmcp-server-kit`, asking cargo-vet to audit our own package as though it
   were a third-party crates.io dependency. That requirement was satisfied with
-  a self-exemption — an explicit trust-without-audit marker — so it asserted no
+  a self-exemption - an explicit trust-without-audit marker - so it asserted no
   security property, while pinning an exact version meant every release
   orphaned it. The `cargo vet` CI job consequently sat red from the 3.2.0
   release until the 3.3.0 cycle without anyone noticing, because it was
@@ -981,7 +981,7 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
   for a first-party crate you author and publish. The self-exemption and the
   `unpublished` marker are removed, the per-release refresh step in
   `docs/RELEASING.md` is gone, and the CI job is now **blocking** rather than
-  advisory. Third-party audit coverage is unchanged (385 exemptions, was 386 —
+  advisory. Third-party audit coverage is unchanged (385 exemptions, was 386 -
   the difference is the self-entry).
 
 ### Testing
@@ -1001,8 +1001,8 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
   which point the assertion fails with an empty SSE frame.
 
 - **Regression test for the force-exit shutdown arm.** The session token is
-  cancelled in both arms of the shutdown `select!` — after axum drains, and
-  when the force-exit timer wins — but only the first was covered.
+  cancelled in both arms of the shutdown `select!` - after axum drains, and
+  when the force-exit timer wins - but only the first was covered.
 
   The assertion is on the client-side response body, not on the server task
   completing: when force-exit wins, the `axum::serve` future is dropped and
@@ -1020,7 +1020,7 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
 
 ### Added
 
-- **`ArgumentAllowlist::required`** (default `false`) — opt into requiring that
+- **`ArgumentAllowlist::required`** (default `false`) - opt into requiring that
   a constrained argument actually be supplied. An allowlist has always
   constrained the value *only when the argument is present*, so a caller could
   skip it entirely by omitting the key. That is safe when the tool's input
@@ -1042,15 +1042,15 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
 - **mTLS: a CRL whose first fetch failed is no longer suppressed for the
   process lifetime.** A discovered CRL Distribution Point URL was committed to
   the permanent dedup set as soon as it was queued. If that first fetch then
-  failed, no code path could undo it — `seen_urls` is pruned only for URLs
-  whose CRL was successfully cached and later went stale — so the URL was never
+  failed, no code path could undo it - `seen_urls` is pruned only for URLs
+  whose CRL was successfully cached and later went stale - so the URL was never
   re-enqueued and revocation for that CDP was silently disabled under the
   default `crl_deny_on_unavailable = false` (or the handshake failed forever
   with it set to `true`). CDP URLs come from the client-presented certificate,
   so a holder of a revoked-but-chain-valid cert could trigger this deliberately
   by making the first fetch fail from a host they control. Queued-but-unfetched
   URLs now occupy a separate in-flight state and are promoted to the permanent
-  set **only once the CRL is confirmed present in the cache** — a fetch error or
+  set **only once the CRL is confirmed present in the cache** - a fetch error or
   a `crl_max_cache_entries` rejection clears the marker so a later handshake
   retries. Retry volume stays bounded by the existing
   `crl_discovery_rate_per_min` limiter, global fetch concurrency, and per-host
@@ -1060,7 +1060,7 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
   be smuggled upstream.** `client_id` was stripped by splitting the raw form on
   `&` and dropping segments literally starting with `client_id=`. Percent-encoded
   keys (`%63lient_id=`, `client%5Fid=`) survived that filter but decode upstream
-  to `client_id`, and `client_secret` was never filtered at all — so a caller
+  to `client_id`, and `client_secret` was never filtered at all - so a caller
   could ship duplicate client credentials to the IdP alongside the proxy's own
   injected values, and a first-wins upstream parser would honour the caller's.
   The query/body is now parsed and re-serialized as
@@ -1074,7 +1074,7 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
 - **RBAC: a non-string `arguments.host` no longer downgrades the host check.**
   The host was read with `as_str()`, so an array, object, number, bool, or null
   yielded `None` and routed to `check_operation`, skipping `RoleConfig.hosts`
-  glob evaluation entirely — letting a caller opt out of host restrictions by
+  glob evaluation entirely - letting a caller opt out of host restrictions by
   changing the argument's shape. A present-but-non-string `host` is now denied,
   matching the existing fail-closed behaviour for non-string allowlisted
   arguments. An **absent** `host` still routes to `check_operation`, so
@@ -1103,16 +1103,16 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
   `FallbackReason::MalformedEntry` and resolution falls back to the direct
   peer. This removes a parser differential between `rmcp-server-kit` and an
   upstream proxy, which matters because the resolved client IP feeds per-IP
-  rate limiting and operator allowlists. Well-formed quoted values —
+  rate limiting and operator allowlists. Well-formed quoted values -
   including `for="[2001:db8::1]:443"` and quoted `unknown` / `_obfuscated`
-  identifiers — are unaffected.
+  identifiers - are unaffected.
 
 - **Graceful shutdown no longer cuts MCP sessions at the start of the grace
   window.** The MCP service received a child of the same cancellation token the
   shutdown path cancels immediately when the trigger fires, so in-flight
   sessions and SSE streams could terminate before `shutdown_timeout` elapsed
   during a normal SIGTERM rollout. The MCP service now holds a dedicated
-  session token, cancelled only after axum finishes draining — or when the
+  session token, cancelled only after axum finishes draining - or when the
   force-exit timer wins, so a stuck stream still cannot hang shutdown. The
   lifecycle token continues to drive the metrics listener, the CRL refresher,
   and external shutdown wiring unchanged.
@@ -1143,8 +1143,8 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
 ### Fixed (tooling)
 
 - **`cargo clippy --features oauth` (without `test-helpers`) now passes.**
-  It previously failed with four `-D warnings` errors — two
-  `clippy::clone_on_copy` and two `clippy::unit_arg` — because
+  It previously failed with four `-D warnings` errors - two
+  `clippy::clone_on_copy` and two `clippy::unit_arg` - because
   `TestLoopbackBypass` aliases to `()` outside test builds and the existing
   `#[allow]` covered only `clippy::clone_on_ref_ptr`. CI did not catch this:
   the `clippy` job runs `--all-features` only, and the `features-matrix` job
@@ -1185,9 +1185,9 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
 ### Changed
 
 - **`OAuthConfig::{issuer, audience, jwks_uri}` are now `#[serde(default)]`.**
-  A partially-specified `[server.auth.oauth]` table — e.g. one carrying only
+  A partially-specified `[server.auth.oauth]` table - e.g. one carrying only
   `role_claim`/`role_mappings`, with the URL and audience fields supplied by a
-  downstream env-override layer applied after TOML parsing — now deserializes
+  downstream env-override layer applied after TOML parsing - now deserializes
   instead of failing at parse time on a serde "missing field" error. The three
   fields are enforced at [`OAuthConfig::validate`] time instead
   (parse-don't-validate): empty `issuer` and `jwks_uri` were already rejected by
@@ -1206,7 +1206,7 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
 
 - Maintenance release: **no library code or public-API changes since 3.1.1**
   (`cargo-semver-checks` reports no break). Refreshes the dependency lockfile
-  to the latest semver-compatible versions — notably `ref-cast` 1.0.27 — and
+  to the latest semver-compatible versions - notably `ref-cast` 1.0.27 - and
   re-validates the crate against the current dependency set. Because
   `Cargo.lock` is not shipped for a library, consumers resolve their own
   dependency versions, so this release is behaviorally identical to 3.1.1.
@@ -1221,13 +1221,13 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
   tripping the `dead_code` lint under `RUSTFLAGS="-D warnings"`. The full
   feature matrix now builds cleanly with warnings denied.
 
-  *Note:* the 3.1.0 tag was never published to crates.io — its release build
-  failed on the issue above — so this is the first published release of the
+  *Note:* the 3.1.0 tag was never published to crates.io - its release build
+  failed on the issue above - so this is the first published release of the
   3.1.x line and includes all of the 3.1.0 changes below.
 
 ## [3.1.0] - 2026-08-01
 
-> **⚠️ Behavioral changes — please read before upgrading.** This release hardens
+> **⚠️ Behavioral changes - please read before upgrading.** This release hardens
 > several security-relevant runtime *defaults*. Because the crate's major version
 > tracks the `rmcp` SDK, these ship in a minor release; **no public API is removed
 > or retyped** (`cargo-semver-checks` reports no break), but the defaults below
@@ -1257,7 +1257,7 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
 > default. Re-enable them with `[server]` → `expose_build_metadata = true`.
 >
 > **3. `trusted_proxies` rejects a `/0` CIDR.** A `0.0.0.0/0` or `::/0` entry now
-> fails validation at startup — narrow it to your real proxy ranges, e.g.
+> fails validation at startup - narrow it to your real proxy ranges, e.g.
 > `[server]` → `trusted_proxies = ["10.0.0.0/8"]`.
 >
 > **4. OAuth `/introspect` and `/revoke` require the admin role.** When
@@ -1318,7 +1318,7 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
   every peer trusted and lets any client spoof the resolved client IP
   (rate-limit bypass, audit poisoning) via forwarding headers. Both validators
   now reject prefix-0 CIDRs via a shared helper, mirroring the SSRF allowlist
-  parser. **Behavioral change** — a configuration that relied on a `/0` trusted
+  parser. **Behavioral change** - a configuration that relied on a `/0` trusted
   proxy must narrow it to the real proxy CIDRs.
   (rust-review MEDIUM / M1.)
 - **OAuth credential POSTs no longer follow redirects.** `/token`, `/introspect`,
@@ -1334,11 +1334,11 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
 - **OAuth targets: internal hostname suffixes rejected pre-DNS.** OAuth/JWKS
   targets whose host ends in `.localhost`, `.local`, or `.internal` are rejected
   before resolution (an exact-host allowlist entry still overrides; a trailing
-  FQDN dot is canonicalized). Exact `localhost` is unaffected — already covered
+  FQDN dot is canonicalized). Exact `localhost` is unaffected - already covered
   by the post-DNS IP screen. (rust-review LOW / L3.)
 - **Security response headers now cover early and fallback responses.** The
   OWASP header layer (`X-Content-Type-Options`, `X-Frame-Options`,
-  `Content-Security-Policy`, and — under TLS — `Strict-Transport-Security`) was
+  `Content-Security-Policy`, and - under TLS - `Strict-Transport-Security`) was
   previously an inner layer, so origin-rejection 403s, CORS-preflight replies,
   overload 503s, and the 404 fallback were emitted without it. It is now the
   outermost response layer and decorates every response. (rust-review MEDIUM /
@@ -1401,7 +1401,7 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
   lockstep. Handlers that override `call_tool` / `get_prompt` /
   `read_resource` must switch their return types to the new MRTR-aware
   enums (`CallToolResponse` / `GetPromptResponse` / `ReadResourceResponse`)
-  — wrap an existing result with `.into()`; handlers using the default
+  - wrap an existing result with `.into()`; handlers using the default
   `ServerHandler` need only the version bump. Internally `HookedHandler`
   now returns `CallToolResponse` and passes MRTR `InputRequired`/`Task`
   responses through untouched (the result-size cap still applies to
@@ -1440,12 +1440,12 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
   now read upstream responses through a bounded, fail-closed streaming
   helper (`OAUTH_PROXY_MAX_RESPONSE_BYTES`, 1 MiB) instead of an unbounded
   `resp.bytes()`. An oversized or unreadable upstream response yields a
-  generic `502` and is never forwarded to the client — symmetric with the
+  generic `502` and is never forwarded to the client - symmetric with the
   already-bounded JWKS fetch. (rust-review LOW.)
 
 ### Added
 
-- **`McpxError::client_message()`** — returns the exact client-facing body
+- **`McpxError::client_message()`** - returns the exact client-facing body
   for any variant (verbatim message for `Auth`/`Rbac`/`RateLimited`/
   `RateLimitedFor`; a generic `"internal server error"` for all internal
   variants). Additive; documents and exposes the client-safe-message
@@ -1456,7 +1456,7 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
 - **JSON logs no longer emit escaped `Debug` wrappers for claim/identity
   fields.** Structured fields that were logged with `?` on quote-bearing
   types (`Option<String>`, `serde_json::Value`, audience lists) now render
-  as clean native strings — e.g. `"sub":"alice"` instead of
+  as clean native strings - e.g. `"sub":"alice"` instead of
   `"sub":"Some(String(\"alice\"))"`. Added internal helpers
   (`fmt_json_aud`, `fmt_json_str`, `OneOrMany::log_display`,
   `AudienceValidationMode::as_str`); the `aud` claim is formatted so
@@ -1481,7 +1481,7 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
 
 ### Changed
 
-- **BREAKING: Bumped the `rmcp` SDK from 1.8 to 2.1** — a major
+- **BREAKING: Bumped the `rmcp` SDK from 1.8 to 2.1** - a major
   ([rmcp-v1.8.0...rmcp-v2.1.0](https://github.com/modelcontextprotocol/rust-sdk/compare/rmcp-v1.8.0...rmcp-v2.1.0)).
   rmcp 2.0 realigns the Rust API with the MCP 2025-11-25 spec. The **JSON
   wire format is unchanged** (only additive `_meta` / optional fields);
@@ -1499,7 +1499,7 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
   are all source-compatible and unchanged. rmcp 2.1 (over 2.0) is a
   drop-in with fixes only (SEP-414 trace-context accessors, SEP-2575 meta
   helpers, cancel-safe `AsyncRwTransport::receive`, OAuth refresh-token
-  preservation) — none of which this crate consumes directly. No MSRV
+  preservation) - none of which this crate consumes directly. No MSRV
   change (rmcp pins nothing above our Rust 1.95 floor).
 
   **Why this is a major for `rmcp-server-kit`:** rmcp types appear in this
@@ -1516,7 +1516,7 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
   0.6). 0.7.0 is available but `reqwest` (which we depend on directly) and
   `axum 0.8` both hard-pin `tower-http = "^0.6.8"`, so upgrading our direct
   dependency to 0.7 would only fork a second `tower-http` major into the
-  tree with no functional benefit — we use no 0.7-only feature, and the one
+  tree with no functional benefit - we use no 0.7-only feature, and the one
   0.7 API delta that would touch us (`SizeAbove` threshold `u16`→`u64`)
   is a cost, not a gain. This will be revisited once `reqwest`/`axum`
   admit `tower-http 0.7`. Other dependencies were refreshed to their latest
@@ -1532,7 +1532,7 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
   ([rmcp-v1.7.0...rmcp-v1.8.0](https://github.com/modelcontextprotocol/rust-sdk/compare/rmcp-v1.7.0...rmcp-v1.8.0)):
   `ServerHandler`, `StreamableHttpService`, `call_tool` / `CallToolRequestParams`,
   and the `handler::server` module are all source-compatible. rmcp 1.8 adds
-  transparent server-side hardening that flows through `serve()` unchanged —
+  transparent server-side hardening that flows through `serve()` unchanged -
   `MCP-Protocol-Version` header vs initialize-body validation, stricter tool
   input/output-schema stripping, and SEP-2164 resource-not-found code
   selection (peers on `2026-07-28`+ get `INVALID_PARAMS`, older peers keep
@@ -1550,8 +1550,8 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
   ([#11](https://github.com/andrico21/rmcp-server-kit/issues/11)):
   `McpServerConfig::with_extra_route_rate_limit_exempt_paths(paths)` +
   TOML `server.extra_route_rate_limit_exempt_paths`. Entries are matched
-  by **raw exact string comparison** against the request path — no
-  globs, no normalization — and the check is fail-closed (anything not
+  by **raw exact string comparison** against the request path - no
+  globs, no normalization - and the check is fail-closed (anything not
   listed stays limited) and runs before key extraction, so exempt
   requests (e.g. the RFC 8414 metadata document MCP clients fetch on
   every connect) consume no limiter budget and never appear in deny
@@ -1573,9 +1573,9 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
 - **CRL URL gate now rejects embedded credentials (userinfo), and
   rejection sites no longer echo what they reject.** The shared
   scheme guard used by CDP extraction and the CRL fetcher refuses
-  `https://user:pass@host/...` URLs (`userinfo_forbidden`) — making the
+  `https://user:pass@host/...` URLs (`userinfo_forbidden`) - making the
   userinfo rejection that `SECURITY.md` already documented actually
-  enforced — and both rejection sites log only a sanitized
+  enforced - and both rejection sites log only a sanitized
   scheme+host+port rendering, so credentials from a CA chain's or client
   certificate's CDP extension can never reach warn logs or error
   strings. Found by the 1.13.0 guidelines review; fix design approved by
@@ -1648,7 +1648,7 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
   malformed/obfuscated/all-trusted chains fall back to the direct peer;
   only reason codes are logged, never header contents). The result is
   the new public `transport::ClientIp` request extension, and **all
-  four per-IP rate limiters now key by it** — behind a proxy, clients
+  four per-IP rate limiters now key by it** - behind a proxy, clients
   get individual buckets instead of sharing the proxy's. With the
   feature off (default), `ClientIp` equals the direct peer and behavior
   is unchanged. `PeerAddr` keeps its direct-socket-peer contract.
@@ -1693,8 +1693,8 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
   [#10](https://github.com/andrico21/rmcp-server-kit/issues/10)):
   `McpServerConfig::with_extra_route_rate_limit(per_minute)` and the
   matching TOML field `server.extra_route_rate_limit`. When set, the
-  application's extra router is wrapped — pre-merge, so the limiter can
-  never leak onto `/mcp`, health, admin, or OAuth endpoints — in a
+  application's extra router is wrapped - pre-merge, so the limiter can
+  never leak onto `/mcp`, health, admin, or OAuth endpoints - in a
   per-source-IP limiter backed by the same memory-bounded machinery as
   the tool limiter (10,000 tracked keys, 15-minute idle eviction). On
   limit: `429` with a plain-text body, matching the tool/auth limiters
@@ -1714,7 +1714,7 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
   - New public `transport::PeerAddr` request extension (`#[non_exhaustive]`,
     `Copy`/`Eq`/`Hash`) carrying the direct socket peer address, inserted
     on **both** the plain and the TLS listener and extractable via its
-    `FromRequestParts` impl or `Extension<PeerAddr>` — including from
+    `FromRequestParts` impl or `Extension<PeerAddr>` - including from
     `with_extra_router` routes, which bypass auth/RBAC. Direct peer only
     (no `X-Forwarded-For` interpretation); absent under `serve_stdio`;
     never logged by the framework.
@@ -1737,7 +1737,7 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
   and `server.max_concurrent_tls_handshakes`. Defaults are unchanged
   (10 s / 256). Both values must be greater than zero (validated in
   `McpServerConfig::validate` and `validate_server_config`) and are
-  **startup-only** — they bind at listener construction and do not
+  **startup-only** - they bind at listener construction and do not
   participate in `ReloadHandle` hot reload. The completed-handshake
   channel capacity remains internal.
 
@@ -1773,7 +1773,7 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
 - **Deduplicated OAuth SSRF target screening (internal).** The screening
   logic previously existed twice: a test-instrumented copy and a
   byte-identical production copy compiled only under
-  `cfg(not(any(test, feature = "test-helpers")))` — meaning the test suite
+  `cfg(not(any(test, feature = "test-helpers")))` - meaning the test suite
   never compiled the production branch and a future edit could silently
   diverge the two. Both paths now delegate to one shared core
   (`screen_oauth_target_core`) compiled identically under all cfgs, with
@@ -1782,7 +1782,7 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
 - **Lint hardening (internal):** enabled `clippy::string_slice` (warn,
   escalated to deny in CI) and pinned `clippy::await_holding_lock` to
   deny. Manual `&str[range]` slicing in the RBAC glob matcher and the
-  origin auto-derivation was rewritten with checked `get(..)` accessors —
+  origin auto-derivation was rewritten with checked `get(..)` accessors -
   behavior is unchanged under the existing char-boundary invariants, and
   a future invariant violation now degrades to a non-match instead of a
   panic.
@@ -1809,12 +1809,12 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
   `SystemTime`) previously panicked the spawned refresher task, silently
   halting CRL discovery and refresh for the process lifetime. Conversion now
   uses checked arithmetic and clamps unrepresentable or absurd values toward
-  `UNIX_EPOCH` — the safe direction (a clamped timestamp can only make a CRL
+  `UNIX_EPOCH` - the safe direction (a clamped timestamp can only make a CRL
   look older, forcing an eager refresh, never fresher).
 - **The per-host CRL fetch semaphore cap no longer permanently locks out new
   CRL hosts.** Previously, once `crl_max_host_semaphores` (default 1024)
   distinct CRL hosts had ever been seen, fetches for any NEW host failed
-  with `crl_host_semaphore_cap_exceeded` until process restart — an
+  with `crl_host_semaphore_cap_exceeded` until process restart - an
   attacker presenting client certificates with unique CDP hostnames could
   poison the map permanently. At the cap, idle entries (no in-flight fetch)
   are now evicted on demand; the cap error remains only for genuinely
@@ -1890,7 +1890,7 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
   with explicit per-field initialisation, making the assertions readable
   without cross-referencing the type's `Default` impl.
 - **Demoted speculative `TODO(refactor):` markers to `NOTE:`** (L1) at
-  `src/rbac.rs:647` and `src/transport.rs:850` — these are documented
+  `src/rbac.rs:647` and `src/transport.rs:850` - these are documented
   design trade-offs, not pending work.
 - **Added `reason = "..."` justifications** to remaining `#[allow]` /
   `#[expect]` attributes (L2 / L3 / Q5): `src/auth.rs:1031`,
@@ -2179,7 +2179,7 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
   a clear error pointing at the offending key. `verify_bearer_token` no
   longer needs to parse strings on the hot path.
 
-### Changed (BREAKING — source compatibility)
+### Changed (BREAKING - source compatibility)
 
 > Shipped as **1.6.0** by maintainer policy: the only known downstream
 > consumer (`atlassian-mcp-rs`, same maintainer) does not touch the
@@ -2218,7 +2218,7 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
   `src/auth.rs`, asserting `bearer` is `true` iff `api_keys` is
   non-empty (kills the surviving `!`-deletion mutant at line 615) and
   pinning `enabled` / `mtls` / `oauth` propagation.
-- **`RfcTimestamp` regression suite** (`src/auth.rs`) — eight tests covering
+- **`RfcTimestamp` regression suite** (`src/auth.rs`) - eight tests covering
   malformed/valid parse, TOML deserialization fail-closed behavior,
   `try_with_expiry`, and `ApiKeySummary` JSON serialization wire format.
 
@@ -2353,7 +2353,7 @@ remain blocked regardless of allowlist contents.
 
 ### Added
 
-- **`src/oauth.rs`** — New `OAuthSsrfAllowlist { hosts, cidrs }` type and
+- **`src/oauth.rs`** - New `OAuthSsrfAllowlist { hosts, cidrs }` type and
   `OAuthConfigBuilder::ssrf_allowlist(...)` setter. Lets operators name
   the hostnames or CIDR blocks (IPv4 and IPv6) whose otherwise-blocked
   addresses (private/loopback/link-local/CGNAT/unique-local) the
@@ -2363,11 +2363,11 @@ remain blocked regardless of allowlist contents.
   `OAuthConfig::validate()` and `JwksCache::new()` so deploy-time
   feedback is immediate. When non-empty, validation logs a
   `tracing::warn!` naming the host and CIDR counts.
-- **`src/ssrf.rs`** — New `CompiledSsrfAllowlist` + `CidrEntry` types
+- **`src/ssrf.rs`** - New `CompiledSsrfAllowlist` + `CidrEntry` types
   (crate-private) and `redirect_target_reason_with_allowlist` that
   consults the allowlist on per-redirect-hop literal-IP screening while
   keeping cloud-metadata unbypassable.
-- **`src/ssrf.rs`** — Cloud-metadata classifier now also covers AWS
+- **`src/ssrf.rs`** - Cloud-metadata classifier now also covers AWS
   IPv6 (`fd00:ec2::254`), GCP IPv6 (`fd20:ce::254`), and the
   Alibaba/Tencent IPv4 metadata address (`100.100.100.200`). These
   addresses are classified as `cloud_metadata` *before* the generic
@@ -2376,7 +2376,7 @@ remain blocked regardless of allowlist contents.
 
 ### Security
 
-- **`src/oauth.rs`** — Cloud-metadata IPv4 (`169.254.169.254`,
+- **`src/oauth.rs`** - Cloud-metadata IPv4 (`169.254.169.254`,
   `100.100.100.200`) and IPv6 (`fd00:ec2::254`, `fd20:ce::254`) are
   now explicitly carved out of the operator allowlist path: even when
   an operator allowlists a containing CIDR, addresses classified as
@@ -2384,7 +2384,7 @@ remain blocked regardless of allowlist contents.
   are never permitted. New unit tests pin this invariant
   (`redirect_with_fd00_8_allowlist_still_blocks_aws_v6_metadata`,
   `redirect_with_cgnat_allowlist_still_blocks_alibaba_metadata`).
-- **`src/oauth.rs`** — Empty (default) allowlist preserves the
+- **`src/oauth.rs`** - Empty (default) allowlist preserves the
   pre-1.4.0 error message verbatim so existing operator runbooks and
   alerting on "OAuth target resolved to blocked IP" keep working.
   Configured allowlists that still block emit a more verbose error
@@ -2393,16 +2393,16 @@ remain blocked regardless of allowlist contents.
 
 ### Changed
 
-- **`src/oauth.rs`** — `evaluate_oauth_redirect`,
+- **`src/oauth.rs`** - `evaluate_oauth_redirect`,
   `screen_oauth_target`, and `screen_oauth_target_with_test_override`
   now take a `&CompiledSsrfAllowlist` parameter. These are private
   helpers; no downstream impact.
 
 ### Documentation
 
-- **`docs/GUIDE.md`** — New "Allowing in-cluster IdPs" subsection in the
+- **`docs/GUIDE.md`** - New "Allowing in-cluster IdPs" subsection in the
   OAuth chapter showing the recommended TOML and builder snippets.
-- **`SECURITY.md`** — New "Operator allowlist" subsection under OAuth
+- **`SECURITY.md`** - New "Operator allowlist" subsection under OAuth
   SSRF hardening documenting the trust model, the cloud-metadata
   carve-out, and the auditing expectations.
 
@@ -2413,24 +2413,24 @@ review findings. No breaking changes; drop-in replacement for `1.3.1`.
 
 ### Security
 
-- **`src/auth.rs`** — Bearer-scheme parsing in the auth middleware is now case-insensitive per RFC 7235 §2.1 (e.g. `bearer …` and `BEARER …` are accepted alongside `Bearer …`). Previously these were silently rejected as `invalid_credential` and counted toward the auth-failure rate limit, which could cause spurious lockouts for spec-conformant clients.
-- **`src/auth.rs`** — `AuthIdentity` and `ApiKeyEntry` now have manual `Debug` implementations that redact the raw bearer token, the JWT `sub` claim, and the Argon2id hash. This prevents secret material from leaking via `format!("{:?}", …)` or `tracing::debug!(?identity, …)` calls, and is enforced by new unit tests.
-- **`src/oauth.rs`** — Added post-DNS SSRF screening for the initial OAuth/JWKS request target so hostnames resolving to blocked IP ranges are rejected before connect, mirroring CRL fetch hardening.
-- **`src/oauth.rs`** — Added opt-in `strict_audience_validation` so operators can disable the legacy `azp` fallback and enforce `aud`-only audience checks for new deployments.
-- **`src/transport.rs` / `src/oauth.rs`** — Added opt-in `require_auth_on_admin_endpoints` so OAuth `/introspect` and `/revoke` can be mounted behind the normal auth middleware while preserving legacy behavior by default.
-- **`src/rbac.rs`** — RBAC and tool rate limiting now inspect JSON-RPC batch arrays and reject the full batch if any `tools/call` entry is denied.
-- **`src/oauth.rs`** — Added `jwks_max_response_bytes` (default 1 MiB) and streaming JWKS reads so oversized responses are refused without unbounded allocation.
+- **`src/auth.rs`** - Bearer-scheme parsing in the auth middleware is now case-insensitive per RFC 7235 §2.1 (e.g. `bearer …` and `BEARER …` are accepted alongside `Bearer …`). Previously these were silently rejected as `invalid_credential` and counted toward the auth-failure rate limit, which could cause spurious lockouts for spec-conformant clients.
+- **`src/auth.rs`** - `AuthIdentity` and `ApiKeyEntry` now have manual `Debug` implementations that redact the raw bearer token, the JWT `sub` claim, and the Argon2id hash. This prevents secret material from leaking via `format!("{:?}", …)` or `tracing::debug!(?identity, …)` calls, and is enforced by new unit tests.
+- **`src/oauth.rs`** - Added post-DNS SSRF screening for the initial OAuth/JWKS request target so hostnames resolving to blocked IP ranges are rejected before connect, mirroring CRL fetch hardening.
+- **`src/oauth.rs`** - Added opt-in `strict_audience_validation` so operators can disable the legacy `azp` fallback and enforce `aud`-only audience checks for new deployments.
+- **`src/transport.rs` / `src/oauth.rs`** - Added opt-in `require_auth_on_admin_endpoints` so OAuth `/introspect` and `/revoke` can be mounted behind the normal auth middleware while preserving legacy behavior by default.
+- **`src/rbac.rs`** - RBAC and tool rate limiting now inspect JSON-RPC batch arrays and reject the full batch if any `tools/call` entry is denied.
+- **`src/oauth.rs`** - Added `jwks_max_response_bytes` (default 1 MiB) and streaming JWKS reads so oversized responses are refused without unbounded allocation.
 
 ### Changed
 
-- **`src/metrics.rs`** — `http_request_duration_seconds` now uses an explicit, latency-tuned bucket set (`[1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s]`) instead of the Prometheus default buckets, which were skewed toward web-page rather than RPC latency. The histogram name and labels are unchanged; existing dashboards keep working but will gain finer sub-100 ms resolution.
-- **`src/tool_hooks.rs`** — `with_hooks` now documents that dropping the returned wrapper silently loses the configured hooks. The natural `#[must_use]` enforcement is deferred to the next minor-version bump (adding `#[must_use]` to a public function is a SemVer-minor change per cargo-semver-checks).
-- **`README.md`** — Quick-start dependency line dropped the gratuitous `features = ["oauth"]` so a copy-paste install no longer pulls in OAuth, `jsonwebtoken`, and `reqwest` for users who only need the default transport. Optional features are now described in a separate note pointing at the Cargo features table.
+- **`src/metrics.rs`** - `http_request_duration_seconds` now uses an explicit, latency-tuned bucket set (`[1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s]`) instead of the Prometheus default buckets, which were skewed toward web-page rather than RPC latency. The histogram name and labels are unchanged; existing dashboards keep working but will gain finer sub-100 ms resolution.
+- **`src/tool_hooks.rs`** - `with_hooks` now documents that dropping the returned wrapper silently loses the configured hooks. The natural `#[must_use]` enforcement is deferred to the next minor-version bump (adding `#[must_use]` to a public function is a SemVer-minor change per cargo-semver-checks).
+- **`README.md`** - Quick-start dependency line dropped the gratuitous `features = ["oauth"]` so a copy-paste install no longer pulls in OAuth, `jsonwebtoken`, and `reqwest` for users who only need the default transport. Optional features are now described in a separate note pointing at the Cargo features table.
 
 ### Documentation
 
-- **`docs/ARCHITECTURE.md` / `docs/MINDMAP.md`** — Refreshed mTLS sections to match the current per-connection `TlsConnInfo` design (the previous text described the long-removed `RwLock<HashMap<SocketAddr, AuthIdentity>>` map).
-- **`docs/ARCHITECTURE.md`** — Metrics section now lists only the metrics actually exported by `src/metrics.rs` (`http_requests_total`, `http_request_duration_seconds`) and points operators at `McpMetrics::registry` for custom collectors. The previous list named gauges and counters that were never implemented.
+- **`docs/ARCHITECTURE.md` / `docs/MINDMAP.md`** - Refreshed mTLS sections to match the current per-connection `TlsConnInfo` design (the previous text described the long-removed `RwLock<HashMap<SocketAddr, AuthIdentity>>` map).
+- **`docs/ARCHITECTURE.md`** - Metrics section now lists only the metrics actually exported by `src/metrics.rs` (`http_requests_total`, `http_request_duration_seconds`) and points operators at `McpMetrics::registry` for custom collectors. The previous list named gauges and counters that were never implemented.
 
 ## [1.3.1] - 2026-04-21
 
@@ -2447,57 +2447,57 @@ diagnostics, and graceful shutdown.
 
 ### Highlights
 
-- **Transport** — Streamable HTTP (`/mcp`), `/healthz`, `/readyz`,
+- **Transport** - Streamable HTTP (`/mcp`), `/healthz`, `/readyz`,
   `/version`, admin diagnostics, graceful shutdown, configurable TLS
   and mTLS. Optional `serve_stdio()` for local subprocess MCP.
-- **Authentication** — API-key (Argon2id-hashed, constant-time verify),
+- **Authentication** - API-key (Argon2id-hashed, constant-time verify),
   mTLS client certificates with subject→role mapping, OAuth 2.1 JWT
   validation against JWKS (feature `oauth`). Pre-auth rate limiting
   defends Argon2id against CPU-spray attacks.
-- **mTLS revocation** — CDP-driven CRL fetching with bounded memory,
+- **mTLS revocation** - CDP-driven CRL fetching with bounded memory,
   bounded concurrency, and bounded discovery rate. Auto-discovers CRL
   URLs from the CA chain at startup and from connecting client certs
   during handshakes. Hot-reloadable via `ReloadHandle::refresh_crls()`.
-- **RBAC** — `RbacPolicy` with default-deny, per-role allow/deny tool
+- **RBAC** - `RbacPolicy` with default-deny, per-role allow/deny tool
   lists (glob-supported), per-tool argument allowlists, HMAC-SHA256
   argument-value redaction in deny logs, task-local accessors
   (`current_role`, `current_identity`, `current_token`, `current_sub`).
-- **OAuth 2.1** — JWKS cache with refresh cooldown, configurable allowed
+- **OAuth 2.1** - JWKS cache with refresh cooldown, configurable allowed
   algorithms (RS256/ES256 default; symmetric keys rejected), HTTPS-only
   redirect policy, custom CA support, optional OAuth proxy endpoints
   (`/authorize`, `/token`, `/register`, `/introspect`, `/revoke`).
-- **SSRF hardening** — Validate-time literal-IP / userinfo rejection on
+- **SSRF hardening** - Validate-time literal-IP / userinfo rejection on
   every operator-supplied URL plus a runtime per-hop IP-range guard on
   every redirect closure (CRL, JWKS, OAuth admin traffic). Blocks
   private, loopback, link-local, multicast, broadcast, and cloud-
   metadata ranges.
-- **Hardening defaults** — Per-IP token-bucket rate limiting (governor)
+- **Hardening defaults** - Per-IP token-bucket rate limiting (governor)
   with memory-bounded LRU eviction, request-body cap (default 1 MiB),
   request-timeout cap, OWASP security headers (HSTS, CSP, X-Frame-
   Options, etc.), configurable CORS and Host allow-lists, JWKS key cap
   (default 256), CRL response-body cap (default 5 MiB).
-- **Hot reload** — Lock-free `arc-swap`-backed reload of API keys,
+- **Hot reload** - Lock-free `arc-swap`-backed reload of API keys,
   RBAC policy, and CRL set without dropping in-flight requests.
-- **Tool hooks** — Opt-in `HookedHandler` wrapping `ServerHandler` with
+- **Tool hooks** - Opt-in `HookedHandler` wrapping `ServerHandler` with
   async `before_call` / `after_call` hooks. After-hooks run on a
   spawned task with the parent span and RBAC task-locals re-installed.
   Configurable `max_result_bytes` cap.
-- **Observability** — `tracing-subscriber` initialization with
+- **Observability** - `tracing-subscriber` initialization with
   `EnvFilter`, JSON or pretty console output, optional audit-file
   sink. Sensitive values wrapped in `secrecy::SecretString` end-to-end.
-- **Metrics** (feature `metrics`) — Prometheus registry served on a
+- **Metrics** (feature `metrics`) - Prometheus registry served on a
   separate listener (request count, duration histogram, in-flight
   gauge, auth failures, RBAC denies).
-- **Configuration** — Programmatic builder API on `McpServerConfig`
+- **Configuration** - Programmatic builder API on `McpServerConfig`
   with compile-time `Validated<T>` typestate, plus matching TOML
   schema in `src/config.rs`.
 
 ### Cargo features
 
-- `oauth` (default off) — OAuth 2.1 JWT validation via JWKS plus
+- `oauth` (default off) - OAuth 2.1 JWT validation via JWKS plus
   optional OAuth proxy endpoints.
-- `metrics` (default off) — Prometheus registry and `/metrics` endpoint.
-- `test-helpers` (default off) — opt-in test-only constructors used by
+- `metrics` (default off) - Prometheus registry and `/metrics` endpoint.
+- `test-helpers` (default off) - opt-in test-only constructors used by
   downstream integration suites; not part of the stable API surface.
 
 ### Minimum supported Rust
@@ -2506,10 +2506,10 @@ diagnostics, and graceful shutdown.
 
 ### Documentation
 
-- [`README.md`](README.md) — quick start.
-- [`docs/GUIDE.md`](docs/GUIDE.md) — end-to-end consumer guide and TOML schema.
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — file-cited deep architecture map.
-- [`docs/MINDMAP.md`](docs/MINDMAP.md) — visual project mindmap.
-- [`AGENTS.md`](AGENTS.md) — repository navigation hub for AI agents.
-- [`SECURITY.md`](SECURITY.md) — coordinated disclosure policy and
+- [`README.md`](README.md) - quick start.
+- [`docs/GUIDE.md`](docs/GUIDE.md) - end-to-end consumer guide and TOML schema.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) - file-cited deep architecture map.
+- [`docs/MINDMAP.md`](docs/MINDMAP.md) - visual project mindmap.
+- [`AGENTS.md`](AGENTS.md) - repository navigation hub for AI agents.
+- [`SECURITY.md`](SECURITY.md) - coordinated disclosure policy and
   hardening posture.

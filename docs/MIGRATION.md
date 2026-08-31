@@ -14,7 +14,7 @@ sent on the wire is byte-identical for any pre-3.8 configuration.**
 
 ### `TokenExchangeConfig::audience` is now `Option<String>`
 
-RFC 8693 §2.1 marks `audience` OPTIONAL — only `grant_type`, `subject_token`,
+RFC 8693 §2.1 marks `audience` OPTIONAL - only `grant_type`, `subject_token`,
 and `subject_token_type` are REQUIRED. The crate previously made it mandatory
 and always emitted it, so omission was unrepresentable and an authorization
 server that rejects `audience`, or expects RFC 8707 `resource` instead, could
@@ -60,7 +60,7 @@ TokenExchangeConfig::new("https://idp/token", "client", None, None)
 
 `with_resource`, `with_scope`, and `with_requested_token_type` expose the
 remaining RFC 8693 §2.1 OPTIONAL parameters. All default to omitted except
-`requested_token_type`, which defaults to `access_token` — exactly what every
+`requested_token_type`, which defaults to `access_token` - exactly what every
 release before 3.8 always sent.
 
 `resource` is validated as an RFC 8707 absolute URI with no fragment. It is
@@ -306,7 +306,7 @@ handling rules, and the metrics-wiring caveat.
 
 ## Migrating from 3.3 to 3.4
 
-`3.4` is additive at the API level — `cargo semver-checks` reports no breaking
+`3.4` is additive at the API level - `cargo semver-checks` reports no breaking
 change, no default values were altered, and no code change is required to
 upgrade. Existing configurations parse and behave identically to 3.3.x unless
 you opt in to the new features.
@@ -338,7 +338,7 @@ incrementally.
 
 ## Migrating from 3.2 to 3.3
 
-`3.3` is additive at the API level — `cargo semver-checks` reports no breaking
+`3.3` is additive at the API level - `cargo semver-checks` reports no breaking
 change, and no code change is required to upgrade. It does, however, tighten
 three **runtime behaviours** as part of a security-hardening pass. Each is a
 deliberate fail-closed change with no opt-out: an escape hatch would simply be
@@ -383,7 +383,7 @@ This removes a parser differential between `rmcp-server-kit` and the upstream
 proxy, which matters because the resolved client IP feeds per-IP rate limiting
 and operator allowlists.
 
-**Action:** none, if your proxy emits RFC-compliant headers — well-formed
+**Action:** none, if your proxy emits RFC-compliant headers - well-formed
 quoted values including `for="[2001:db8::1]:443"` are unaffected. If you see a
 rise in fallback-to-peer resolution after upgrading, your proxy is emitting
 malformed `Forwarded` values and should be fixed.
@@ -398,14 +398,14 @@ simply by changing the argument's shape.
 A present-but-non-string `host` is now denied with 403.
 
 **Action:** none for well-behaved clients. A client sending
-`"host": ["prod-1"]` and receiving 200 before will now receive 403 — which was
+`"host": ["prod-1"]` and receiving 200 before will now receive 403 - which was
 the vulnerability. An **absent** `host` is unchanged and still evaluated
 without host restrictions, so genuinely hostless tools (`ping`, `list_hosts`)
 continue to work.
 
 ### Also in 3.3 (no action required)
 
-- `ArgumentAllowlist::required` — new opt-in field, defaults to `false`.
+- `ArgumentAllowlist::required` - new opt-in field, defaults to `false`.
   Existing configurations parse and behave identically. See
   [`GUIDE.md`](GUIDE.md) for when to enable it.
 - mTLS CRL distribution points whose first fetch fails are now retried on a
@@ -427,7 +427,7 @@ a breaking change you must coordinate:
    major must match the one `rmcp-server-kit` links against, or the
    `ServerHandler` trait will not unify.
 
-2. **Update manual handler return types — only if you override them.**
+2. **Update manual handler return types - only if you override them.**
    rmcp 3.0 makes `tools/call`, `prompts/get`, and `resources/read`
    MRTR-aware (SEP-2322). If your `ServerHandler` overrides these methods,
    change the return type to the new response enum and wrap your existing
@@ -447,7 +447,7 @@ a breaking change you must coordinate:
 
    The same pattern applies to `get_prompt` (`GetPromptResponse`) and
    `read_resource` (`ReadResourceResponse`). Handlers that only implement
-   `get_info` — the common case — need **no** code change beyond step 1.
+   `get_info` - the common case - need **no** code change beyond step 1.
 
 3. **MSRV.** rmcp 3.0 requires Rust ≥ 1.88; `rmcp-server-kit` targets
    1.98, so no action is needed.
@@ -498,7 +498,7 @@ intended to be vendored as a workspace member of downstream projects.
 internal lint set (no `unwrap` / `expect` / `panic` / `println!` in
 production paths, `unsafe_code = "forbid"`, `missing_docs = "warn"`).
 Downstream crates are free to keep or promote their own workspace
-lints independently — the two lint tables do not interact.
+lints independently - the two lint tables do not interact.
 
 ## 4. Build & verify
 

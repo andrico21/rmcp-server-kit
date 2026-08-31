@@ -718,7 +718,7 @@ async fn auth_rate_limit_triggers() {
 // Extra-route per-IP rate limiting (issue #10)
 // ==========================================================================
 
-/// Extra router with a GET probe and a POST token-style endpoint —
+/// Extra router with a GET probe and a POST token-style endpoint -
 /// the unauthenticated surfaces the limiter is designed to protect.
 fn limited_extra_router() -> axum::Router {
     axum::Router::new()
@@ -782,8 +782,8 @@ async fn extra_route_rate_limit_scoped_to_extra_routes() {
     let limited = client.get(format!("{base}/ping")).send().await.unwrap();
     assert_eq!(limited.status(), 429, "extra route should be exhausted");
 
-    // Built-in routes — health AND the always-present unauthenticated
-    // protected-resource-metadata endpoint — must be unaffected: the
+    // Built-in routes - health AND the always-present unauthenticated
+    // protected-resource-metadata endpoint - must be unaffected: the
     // limiter is layered onto the extra router only, pre-merge.
     let health = client.get(format!("{base}/healthz")).send().await.unwrap();
     assert_eq!(health.status(), 200, "/healthz must not share the budget");
@@ -1528,7 +1528,7 @@ async fn c1_body_limit_applies_before_rbac() {
     let cfg = config_on_port(port)
         .with_auth(test_auth_config(keys))
         .with_rbac(policy)
-        // 512 byte cap — much smaller than default 1 MiB.
+        // 512 byte cap - much smaller than default 1 MiB.
         .with_max_request_body(512);
     let base = spawn_server(cfg).await;
 
@@ -1591,7 +1591,7 @@ fn oauth_cfg_with_proxy(expose: bool) -> rmcp_server_kit::oauth::OAuthConfig {
 /// Regression test for C3: by default (`expose_admin_endpoints = false`),
 /// `/introspect` and `/revoke` must NOT be mounted and must NOT be
 /// advertised in the authorization-server metadata document. This is the
-/// secure default — unauthenticated endpoints that proxy to the upstream
+/// secure default - unauthenticated endpoints that proxy to the upstream
 /// `IdP` must be explicitly opted in to.
 #[cfg(feature = "oauth")]
 #[tokio::test]
@@ -1645,7 +1645,7 @@ async fn c3_admin_endpoints_hidden_by_default() {
 /// Regression test for C3: when `expose_admin_endpoints = true`, the
 /// endpoints ARE advertised in metadata and ARE mounted (i.e. no longer
 /// 404). We don't assert a specific upstream response because no real
-/// `IdP` is reachable — we only assert non-404, proving the route is live.
+/// `IdP` is reachable - we only assert non-404, proving the route is live.
 #[cfg(feature = "oauth")]
 #[tokio::test]
 async fn c3_admin_endpoints_exposed_when_enabled() {
@@ -1751,8 +1751,8 @@ async fn c3_admin_endpoints_can_require_auth() {
 /// `max_request_body`, not fall back to axum's 2 MB `DefaultBodyLimit`.
 ///
 /// Sets a 1 KiB cap (well below the 2 MB default) and asserts an oversized
-/// (~4 KiB) POST to each route type — `/token` (String extractor),
-/// `/register` (Json extractor), and `/introspect` (admin-merge route) — is
+/// (~4 KiB) POST to each route type - `/token` (String extractor),
+/// `/register` (Json extractor), and `/introspect` (admin-merge route) - is
 /// rejected with 413. The body-limit layer rejects BEFORE the handler runs,
 /// so the unreachable upstream never matters. A small body proves the cap is
 /// not over-tight.
@@ -1772,7 +1772,7 @@ async fn c3_oauth_proxy_routes_honor_max_request_body() {
     let client = reqwest::Client::new();
     let oversized = "x".repeat(4096); // 4 KiB > 1 KiB cap
 
-    // /token — String extractor.
+    // /token - String extractor.
     let resp = client
         .post(format!("{base}/token"))
         .header("content-type", "application/x-www-form-urlencoded")
@@ -1787,7 +1787,7 @@ async fn c3_oauth_proxy_routes_honor_max_request_body() {
         resp.status()
     );
 
-    // /register — Json extractor. Send an oversized JSON string value.
+    // /register - Json extractor. Send an oversized JSON string value.
     let big_json = serde_json::json!({ "redirect_uris": [oversized.clone()] }).to_string();
     let resp = client
         .post(format!("{base}/register"))
@@ -1803,7 +1803,7 @@ async fn c3_oauth_proxy_routes_honor_max_request_body() {
         resp.status()
     );
 
-    // /introspect — admin-merge route (proves the admin sub-router inherits
+    // /introspect - admin-merge route (proves the admin sub-router inherits
     // the cap after the merge).
     let resp = client
         .post(format!("{base}/introspect"))
@@ -1821,7 +1821,7 @@ async fn c3_oauth_proxy_routes_honor_max_request_body() {
 
     // A small body must NOT be rejected by the limit (proves it isn't
     // over-tight). Upstream is unreachable so we expect a 5xx/4xx from the
-    // handler — just assert it is NOT 413.
+    // handler - just assert it is NOT 413.
     let resp = client
         .post(format!("{base}/token"))
         .header("content-type", "application/x-www-form-urlencoded")
@@ -2248,7 +2248,7 @@ mod peer_addr_tests {
 
     /// Extra router exposing `/peer`, which reports both peer-address
     /// extensions as `"<ConnectInfo>|<PeerAddr>"`. Mounted via
-    /// `with_extra_router`, i.e. it bypasses auth/RBAC — exactly the
+    /// `with_extra_router`, i.e. it bypasses auth/RBAC - exactly the
     /// scenario from the downstream report.
     fn peer_router() -> axum::Router {
         async fn peer_probe(

@@ -132,11 +132,11 @@ let s2 = String::from("foo bar");
 first_word(&s2, &mut cache);   // forces the borrow of s1 to extend to here
 ```
 
-Verified against `rustc 1.94` — the function builds clean, but the caller
+Verified against `rustc 1.94` - the function builds clean, but the caller
 fails to compile because `cache`'s element type `&'a str` is invariant in
 `'a`, so the compiler cannot let `s1` end its scope while `cache` is still
 alive. Once you wire the function into application code, every input must
-outlive the cache itself — almost never what you wanted.
+outlive the cache itself - almost never what you wanted.
 
 ```rust
 // GOOD: store owned values when the collection outlives any single input
@@ -154,7 +154,7 @@ fn first_word<'cache, 'input: 'cache>(
 ```
 
 Rule of thumb: every time you add explicit lifetimes to a signature, sketch a
-real caller in your head — specifically one where the inputs have disjoint
+real caller in your head - specifically one where the inputs have disjoint
 scopes from each other and from the collection. If `'a` appears inside both
 a `&mut` and the data being stored, it is invariant; the signature compiles
 in isolation but constrains every caller to keep all inputs alive for as
@@ -267,7 +267,7 @@ the caller can report.
 // BAD: any nonzero byte becomes true, including garbage from a torn NVS write
 let display_on: bool = nvs_byte != 0;
 
-// GOOD: strict — 0 or 1, anything else is a malformed record
+// GOOD: strict - 0 or 1, anything else is a malformed record
 let display_on = bool::try_from(nvs_byte)
     .map_err(|_| StorageError::InvalidFlag { tag: 0x09, value: nvs_byte })?;
 ```
@@ -507,14 +507,14 @@ match status {
 ```
 
 **Note (Rust 1.95+):** `if let` guards in `match` arms (stabilized in 1.95)
-do **NOT** participate in exhaustiveness checking — same rule as plain `if`
+do **NOT** participate in exhaustiveness checking - same rule as plain `if`
 guards. A new tool may suggest collapsing arms behind an `if let` guard
 and dropping the wildcard; the compiler will still require either an
 exhaustive listing or a `_` arm. Do not use an `if let` guard as
 justification for removing a previously-required wildcard.
 
 ```rust
-// The `if let` guard does NOT cover Status::Pending — the wildcard or an
+// The `if let` guard does NOT cover Status::Pending - the wildcard or an
 // explicit Pending arm is still required for the match to compile.
 match status {
     Status::Active if let Some(uid) = current_user() => handle_active(uid),

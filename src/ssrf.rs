@@ -55,8 +55,8 @@ pub(crate) fn check_scheme(url: &Url, allow_http: bool) -> Result<(), &'static s
 
 /// Authority-only rendering of a URL for logs: scheme + host + port.
 ///
-/// Strips userinfo, path, query, and fragment — any of which can carry
-/// credentials or other secrets — so rejection sites can name the
+/// Strips userinfo, path, query, and fragment - any of which can carry
+/// credentials or other secrets - so rejection sites can name the
 /// offending target without echoing what they rejected. Tolerates
 /// hostless URLs (renders `<no-host>`) without panicking; the port is
 /// included only when explicitly present in the URL.
@@ -700,14 +700,14 @@ mod tests {
 
     #[test]
     fn nat64_embedded_metadata_is_cloud_metadata() {
-        // 64:ff9b::169.254.169.254 — NAT64-wrapped AWS metadata (M2).
+        // 64:ff9b::169.254.169.254 - NAT64-wrapped AWS metadata (M2).
         assert_eq!(
             ip_block_reason(IpAddr::V6(Ipv6Addr::new(
                 0x0064, 0xff9b, 0, 0, 0, 0, 0xa9fe, 0xa9fe
             ))),
             Some("cloud_metadata")
         );
-        // 64:ff9b::100.100.100.200 — NAT64-wrapped Alibaba/Tencent metadata.
+        // 64:ff9b::100.100.100.200 - NAT64-wrapped Alibaba/Tencent metadata.
         assert_eq!(
             ip_block_reason(IpAddr::V6(Ipv6Addr::new(
                 0x0064, 0xff9b, 0, 0, 0, 0, 0x6464, 0x64c8
@@ -718,7 +718,7 @@ mod tests {
 
     #[test]
     fn sixto4_embedded_metadata_is_cloud_metadata() {
-        // 2002:a9fe:a9fe:: — 6to4-wrapped 169.254.169.254 (M2).
+        // 2002:a9fe:a9fe:: - 6to4-wrapped 169.254.169.254 (M2).
         assert_eq!(
             ip_block_reason(IpAddr::V6(Ipv6Addr::new(
                 0x2002, 0xa9fe, 0xa9fe, 0, 0, 0, 0, 0
@@ -751,12 +751,12 @@ mod tests {
             ip_block_reason(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0x0a00, 0x0001))),
             Some("private_rfc1918")
         );
-        // ::169.254.169.254 — metadata wins first.
+        // ::169.254.169.254 - metadata wins first.
         assert_eq!(
             ip_block_reason(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0xa9fe, 0xa9fe))),
             Some("cloud_metadata")
         );
-        // ::8.8.8.8 — public embedded still blocked as deprecated prefix.
+        // ::8.8.8.8 - public embedded still blocked as deprecated prefix.
         assert_eq!(
             ip_block_reason(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0x0808, 0x0808))),
             Some("ipv4_compatible")

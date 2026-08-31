@@ -122,7 +122,7 @@ enum AuthFailureClass {
     /// Source IP exceeded the post-failure backoff limit.
     RateLimited,
     /// Source IP exceeded the pre-auth abuse gate (rejected before any
-    /// password-hash work — see [`AuthState::pre_auth_limiter`]).
+    /// password-hash work - see [`AuthState::pre_auth_limiter`]).
     PreAuthGate,
 }
 
@@ -514,7 +514,7 @@ pub struct MtlsConfig {
     /// it requires plumbing the peer `SocketAddr` through the rustls
     /// verifier hook (a different subsystem than ordinary request
     /// middleware). Note: the **bearer pre-auth limiter** that gates
-    /// API-key / OAuth `Authorization` headers is already per-IP — see
+    /// API-key / OAuth `Authorization` headers is already per-IP - see
     /// [`RateLimitConfig::pre_auth_max_per_minute`] and the keyed
     /// governor built by `build_pre_auth_limiter`. URLs that lose the
     /// rate-limiter race are *not* marked as seen, so subsequent
@@ -635,7 +635,7 @@ pub struct RateLimitConfig {
     pub burst: Option<u32>,
     /// Burst capacity for the pre-auth abuse gate. `None` (default)
     /// keeps burst = the gate's resolved rate. Legal regardless of
-    /// whether [`Self::pre_auth_max_per_minute`] is set — the gate's
+    /// whether [`Self::pre_auth_max_per_minute`] is set - the gate's
     /// base rate always resolves (`max_attempts_per_minute * 10` when
     /// unset). Must be greater than zero when set.
     #[serde(default)]
@@ -1363,7 +1363,7 @@ pub fn verify_bearer_token(token: &str, keys: &[ApiKeyEntry]) -> Option<AuthIden
 /// parameters as live verifications, so the dummy verify takes
 /// indistinguishable wall time from a real one. The plaintext
 /// (`"rmcp-server-kit-dummy"`) and the fixed salt are unrelated to any
-/// real credential — randomness is unnecessary because this hash is
+/// real credential - randomness is unnecessary because this hash is
 /// only ever compared against attacker-supplied input on slots that
 /// will be discarded regardless of match result. Argon2's work factor is
 /// set by the PHC `m`/`t`/`p` parameters, not by the salt value, so a
@@ -1611,7 +1611,7 @@ pub(crate) async fn auth_middleware(
 ) -> Response {
     // Extract the mTLS identity from ConnectInfo (TLS / mTLS:
     // ConnectInfo<TlsConnInfo> carries the verified identity directly on
-    // the connection — no shared map, no port-reuse aliasing) and the
+    // the connection - no shared map, no port-reuse aliasing) and the
     // rate-limit key (resolved client IP when trusted-forwarder mode is
     // active, else the direct peer; see transport::limiter_client_ip).
     let tls_info = req.extensions().get::<ConnectInfo<TlsConnInfo>>().cloned();

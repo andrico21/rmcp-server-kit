@@ -185,7 +185,7 @@ let config = McpServerConfig::new("127.0.0.1:8443", "my-server", "0.1.0")
 ## Design decisions
 
 <details>
-<summary><strong>RFC 8693 delegation (<code>actor_token</code>) is deliberately not implemented — NO-GO</strong></summary>
+<summary><strong>RFC 8693 delegation (<code>actor_token</code>) is deliberately not implemented - NO-GO</strong></summary>
 
 <br>
 
@@ -219,8 +219,8 @@ conformant. This is a missing **capability**, not a defect.
 4. **The blocker is credential acquisition, not serialization.** Delegation
    needs a token representing the *server's own* identity. This crate has no
    client-credentials flow and no way to obtain one. Adding it means a second
-   OAuth client inside the crate — token cache, refresh scheduling, failure
-   policy, SSRF/TLS handling — which is far larger than adding two form
+   OAuth client inside the crate - token cache, refresh scheduling, failure
+   policy, SSRF/TLS handling - which is far larger than adding two form
    parameters.
 
 ### Revisit criteria
@@ -232,9 +232,9 @@ Reopen when **all** of these are known:
 - [ ] A chosen actor-token acquisition model (see below)
 - [ ] An expiry/rotation strategy for that credential
 
-### If revisited — design notes
+### If revisited - design notes
 
-**Acquisition model.** Preferred: an **application-supplied async callback** —
+**Acquisition model.** Preferred: an **application-supplied async callback** -
 the application already owns service-identity lifecycle. Explicitly rejected:
 reusing the mTLS `client_cert` identity, which is RFC 8705 §2 *client
 authentication*, not an RFC 8693 actor token.
@@ -249,12 +249,12 @@ attempt hits this immediately.
 `#[non_exhaustive]`. A `#[serde(skip)]` provider field composes correctly and
 does not break existing TOML parsing. `Clone` survives with
 `Option<Arc<dyn _>>`; **`Debug` only survives if the trait itself requires
-`Debug`** — note `ToolHooks` sidesteps this by not deriving `Debug`.
+`Debug`** - note `ToolHooks` sidesteps this by not deriving `Debug`.
 
 **Mandatory security constraints:**
 
 - Store as `secrecy::SecretString`; never logged, debug-printed, audited, or included in errors
-- Least-privilege scope/audience — this is the **service** identity, so a leak
+- Least-privilege scope/audience - this is the **service** identity, so a leak
   affects every delegated exchange, not one user
 - Do **not** reuse `client_secret` as actor proof; client authentication and
   actor identity are distinct credentials

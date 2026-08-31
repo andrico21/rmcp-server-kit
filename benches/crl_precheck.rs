@@ -22,11 +22,11 @@
 //! meaningless. The gate is now **scale invariance**, which is what actually
 //! detects a full-DER scan being reintroduced:
 //!
-//! - **Primary — CRL-size invariance.** At a fixed 16 relevant URLs, p95 for
+//! - **Primary - CRL-size invariance.** At a fixed 16 relevant URLs, p95 for
 //!   5 MiB CRLs must be within 1 ms of p95 for 64 KiB CRLs. Any per-byte work
 //!   on the handshake path blows this by orders of magnitude: the digest
 //!   implementation measured 6.607 ms vs 900.9 ms for exactly this pair.
-//! - **Secondary — URL-count slope.** Cost may scale with the relevant-URL
+//! - **Secondary - URL-count slope.** Cost may scale with the relevant-URL
 //!   count, which is bounded by `MAX_RELEVANT_CDP_URLS_PER_HANDSHAKE`, but
 //!   must not scale with CRL bytes.
 //!
@@ -374,8 +374,8 @@ fn bench_tampered(c: &mut Criterion) {
 }
 
 /// Under a concurrent refresh loop the precheck's non-blocking `try_read` can
-/// miss the cache lock. This variant exists so that cost — and any denial
-/// behaviour it triggers — is visible rather than assumed.
+/// miss the cache lock. This variant exists so that cost - and any denial
+/// behaviour it triggers - is visible rather than assumed.
 fn bench_writer_contention(c: &mut Criterion) {
     let ca = build_ca();
     let crl = build_crl(&ca, 64 * 1024);

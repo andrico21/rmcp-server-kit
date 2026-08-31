@@ -1,4 +1,4 @@
-# rmcp-server-kit — Project Mindmap
+# rmcp-server-kit - Project Mindmap
 
 > Visual map of the `rmcp-server-kit` crate. Pair with [`AGENTS.md`](../AGENTS.md) and
 > [`ARCHITECTURE.md`](ARCHITECTURE.md). All file:line references use the
@@ -446,11 +446,11 @@ graph TD
 
 ## How to read this mindmap
 
-1. **Start at the root** — confirms crate identity (library, edition, MSRV).
-2. **Modules branch** — every `src/*.rs` file with its key symbols and file:line refs.
-3. **Endpoints / Auth modes / Middleware order** — runtime surface of the server.
-4. **State plane / Hot reload** — how `ArcSwap` and task-locals coordinate.
-5. **Critical pitfalls** — checklist before proposing any change.
+1. **Start at the root** - confirms crate identity (library, edition, MSRV).
+2. **Modules branch** - every `src/*.rs` file with its key symbols and file:line refs.
+3. **Endpoints / Auth modes / Middleware order** - runtime surface of the server.
+4. **State plane / Hot reload** - how `ArcSwap` and task-locals coordinate.
+5. **Critical pitfalls** - checklist before proposing any change.
 
 For prose explanations of each branch, jump to the matching section in
 [`ARCHITECTURE.md`](ARCHITECTURE.md). For workflow rules and "where do I

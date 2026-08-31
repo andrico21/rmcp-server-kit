@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# check-bench-overhead.sh — assert mean(benchA) - mean(benchB) <= max_ns.
+# check-bench-overhead.sh - assert mean(benchA) - mean(benchB) <= max_ns.
 #
 # Usage: ./scripts/check-bench-overhead.sh <bench_hooked> <bench_bare> <max_overhead_ns>
 #

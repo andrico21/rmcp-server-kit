@@ -14,7 +14,7 @@
     )
 )]
 
-//! `rmcp-server-kit` — production-grade reusable framework for building
+//! `rmcp-server-kit` - production-grade reusable framework for building
 //! [Model Context Protocol](https://modelcontextprotocol.io/) servers in Rust.
 //!
 //! Application crates depend on `rmcp-server-kit` and supply their own
@@ -27,15 +27,15 @@
 //!   keep-alive and session idle timeouts, CORS, compression, body-size and
 //!   concurrency caps, and graceful shutdown on `SIGINT`/`SIGTERM`.
 //! - **Authentication**: API keys (Argon2-hashed, constant-time compared),
-//!   mTLS client certificates with optional CDP-driven CRL revocation, and —
-//!   under the `oauth` feature — OAuth 2.1 Bearer JWT validation against a
+//!   mTLS client certificates with optional CDP-driven CRL revocation, and -
+//!   under the `oauth` feature - OAuth 2.1 Bearer JWT validation against a
 //!   cached JWKS endpoint.
 //! - **RBAC** with per-tool argument allow-lists and per-IP per-tool rate
 //!   limiting; policies and API keys are hot-reloadable at runtime via
 //!   [`transport::ReloadHandle`] (lock-free [`arc_swap`] swaps).
 //! - **Observability**: `tracing` with JSON or pretty formats, optional audit
 //!   file sink, `/healthz` + `/readyz` probes, `/version`, `/admin/*`
-//!   diagnostics, and — under the `metrics` feature — a Prometheus
+//!   diagnostics, and - under the `metrics` feature - a Prometheus
 //!   `/metrics` endpoint on a separate listener.
 //! - **OWASP-grade defaults**: HSTS, CSP, `X-Frame-Options`, MCP `Origin`
 //!   validation, and per-hop SSRF guards on outbound HTTP.
@@ -87,18 +87,18 @@
 //!
 //! All features are **off by default**:
 //!
-//! - `oauth` — OAuth 2.1 Bearer JWT validation, JWKS cache, and optional
+//! - `oauth` - OAuth 2.1 Bearer JWT validation, JWKS cache, and optional
 //!   OAuth proxy endpoints. Pulls in [`jsonwebtoken`] and [`urlencoding`].
 //!   Required to use the [`oauth`] module.
-//! - `oauth-mtls-client` — RFC 8705 §2 mTLS client authentication for the
+//! - `oauth-mtls-client` - RFC 8705 §2 mTLS client authentication for the
 //!   OAuth token-exchange endpoint. Implies `oauth`. Without this feature,
 //!   [`oauth::OAuthConfig::validate`] rejects any configuration that sets
 //!   [`oauth::TokenExchangeConfig::client_cert`].
-//! - `metrics` — Prometheus registry and `/metrics` listener. Pulls in
+//! - `metrics` - Prometheus registry and `/metrics` listener. Pulls in
 //!   the [`prometheus`] crate. Required to use the [`metrics`] module.
-//! - `test-helpers` — exposes test-only helpers from [`mtls_revocation`] and,
+//! - `test-helpers` - exposes test-only helpers from [`mtls_revocation`] and,
 //!   when `oauth` is also enabled, [`oauth`], for downstream integration tests.
-//!   **Not part of the stable API surface** — no semver guarantees across minor
+//!   **Not part of the stable API surface** - no semver guarantees across minor
 //!   releases. **never enable in a production build:** some helpers deliberately
 //!   bypass SSRF screening, the JWKS refresh cooldown, the CDP discovery rate
 //!   limiter, and CRL verifier publication.
@@ -108,7 +108,7 @@
 //! [`transport::serve_stdio`] runs MCP over the process's stdin/stdout for
 //! local subprocess scenarios (desktop clients, IDE integrations). It
 //! **bypasses authentication, RBAC, TLS, Origin validation, and rate
-//! limiting** — the surrounding OS process boundary is the only trust
+//! limiting** - the surrounding OS process boundary is the only trust
 //! boundary. Never expose `serve_stdio` to untrusted callers; for any
 //! network-reachable deployment use [`transport::serve`] over HTTPS instead.
 

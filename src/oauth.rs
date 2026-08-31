@@ -790,10 +790,10 @@ fn compile_oauth_ssrf_allowlist(
 pub struct OAuthConfig {
     /// Token issuer (`iss` claim). Must match exactly.
     ///
-    /// `#[serde(default)]` so a partially-specified `[oauth]` table — one that
+    /// `#[serde(default)]` so a partially-specified `[oauth]` table - one that
     /// carries only `role_claim`/`role_mappings`, with the URL and audience
     /// fields supplied by a downstream env-override layer applied after TOML
-    /// parsing — still deserializes. An empty value is rejected at
+    /// parsing - still deserializes. An empty value is rejected at
     /// [`OAuthConfig::validate`] time (parse-don't-validate): the HTTPS URL
     /// check fails on an empty string.
     #[serde(default)]
@@ -917,7 +917,7 @@ pub struct OAuthConfig {
     ///
     /// **Set this explicitly if your application mounts its own `/authorize`
     /// and `/token` through `McpServerConfig::with_extra_router` without
-    /// configuring [`OAuthConfig::proxy`]** — that server *is* the
+    /// configuring [`OAuthConfig::proxy`]** - that server *is* the
     /// authorization server, and the crate cannot detect it. Set it to the
     /// server's public URL.
     ///
@@ -939,9 +939,9 @@ pub struct OAuthConfig {
     /// [`OAuthConfig::issuer`] to restore the pre-3.8 value. The one case that
     /// needs it: an upstream `IdP` that emits RFC 9207 `iss` in the
     /// authorization response *and* clients that validate it. The proxy does
-    /// not own the front channel — `/authorize` redirects to the upstream,
+    /// not own the front channel - `/authorize` redirects to the upstream,
     /// which redirects straight back to the client's `redirect_uri` without
-    /// passing through this process — so it cannot reconcile a local `issuer`
+    /// passing through this process - so it cannot reconcile a local `issuer`
     /// with an upstream-stamped `iss`.
     ///
     /// Token validation is unaffected either way: inbound JWT `iss` claims are
@@ -960,7 +960,7 @@ pub struct OAuthConfig {
     /// instead. Consulted only when [`OAuthConfig::audience_validation_mode`]
     /// is `None`: `Some(true)` resolves to [`AudienceValidationMode::Strict`],
     /// `Some(false)` resolves to [`AudienceValidationMode::Warn`], and `None`
-    /// (the default) resolves to [`AudienceValidationMode::Strict`] — the
+    /// (the default) resolves to [`AudienceValidationMode::Strict`] - the
     /// secure default that rejects `azp`-only audience matches.
     #[serde(default)]
     #[deprecated(
@@ -1001,14 +1001,14 @@ const fn default_jwks_max_bytes() -> u64 {
 ///
 /// **Background.** RFC 9068 §4 + OIDC Core §2 establish `aud` as the
 /// authoritative resource-server claim and `azp` as the authorized-party
-/// (client) claim. Some OAuth deployments — typically when the MCP server
+/// (client) claim. Some OAuth deployments - typically when the MCP server
 /// acts as both OAuth client *and* resource server (the documented
-/// [`OAuthProxyConfig`] topology) — issue tokens where the configured
+/// [`OAuthProxyConfig`] topology) - issue tokens where the configured
 /// audience appears only in `azp`. This enum lets operators decide
 /// whether that historic compatibility fallback is honored, surfaced via
 /// a one-shot warning, or refused.
 ///
-/// **Default**: [`AudienceValidationMode::Strict`] — rejects `azp`-only
+/// **Default**: [`AudienceValidationMode::Strict`] - rejects `azp`-only
 /// matches so a token whose configured audience appears only in `azp`
 /// is refused. To keep the previous `azp`-accepting behavior, set
 /// `audience_validation_mode = "warn"` (one-shot warning per process) or
@@ -1025,7 +1025,7 @@ pub enum AudienceValidationMode {
     /// one-shot `tracing::warn!` per process. Reject neither.
     Warn,
     /// Accept only `aud` matches. Reject `azp`-only matches as audience
-    /// mismatch. **Default** — recommended for new deployments and any
+    /// mismatch. **Default** - recommended for new deployments and any
     /// IdP that can be configured to populate `aud` reliably.
     #[default]
     Strict,
@@ -1360,7 +1360,7 @@ fn has_valid_pct_encoding(raw: &str) -> bool {
 /// Validate the RFC 8693 §2.1 OPTIONAL token-exchange parameters.
 ///
 /// An empty value is rejected because it is a malformed request parameter,
-/// semantically distinct from omission — omission is expressed by `None` (or
+/// semantically distinct from omission - omission is expressed by `None` (or
 /// [`RequestedTokenType::Omit`]) and is what RFC 8693 §2.1 actually permits.
 /// Sending `audience=` would otherwise reach the authorization server.
 ///
@@ -1675,7 +1675,7 @@ impl OAuthConfigBuilder {
     /// Server Metadata document.
     ///
     /// The default is already RFC 8414 3.3 conformant (this server's public
-    /// URL). Use this only to restore the pre-3.8 upstream value — see the
+    /// URL). Use this only to restore the pre-3.8 upstream value - see the
     /// RFC 9207 caveat on
     /// [`OAuthConfig::authorization_server_metadata_issuer`].
     pub fn authorization_server_metadata_issuer(mut self, issuer: impl Into<String>) -> Self {
@@ -1870,7 +1870,7 @@ pub struct RoleMapping {
 
 const TOKEN_TYPE_ACCESS_TOKEN: &str = "urn:ietf:params:oauth:token-type:access_token";
 
-/// RFC 8693 §2.1 `requested_token_type` — an OPTIONAL request parameter.
+/// RFC 8693 §2.1 `requested_token_type` - an OPTIONAL request parameter.
 ///
 /// The RFC states that when the requested type is unspecified, "the issued
 /// token type is at the discretion of the authorization server". [`Self::Omit`]
@@ -1879,7 +1879,7 @@ const TOKEN_TYPE_ACCESS_TOKEN: &str = "urn:ietf:params:oauth:token-type:access_t
 /// Deserialised from a plain TOML string: `"access_token"` and `"omit"` map to
 /// the corresponding variants, and any other string becomes [`Self::Custom`].
 /// A misspelling such as `"acess_token"` is therefore accepted as a custom
-/// token-type URI and sent verbatim rather than rejected — unavoidable, since
+/// token-type URI and sent verbatim rather than rejected - unavoidable, since
 /// RFC 8693 §3 permits arbitrary URIs here.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(from = "String")]
@@ -1951,7 +1951,7 @@ pub struct TokenExchangeConfig {
     /// bearer token once minted. In-place certificate rotation is
     /// not picked up without restart.
     pub client_cert: Option<ClientCertConfig>,
-    /// RFC 8693 §2.1 `audience` — OPTIONAL. The logical name of the
+    /// RFC 8693 §2.1 `audience` - OPTIONAL. The logical name of the
     /// downstream API (e.g. `upstream-api`); the exchanged token carries
     /// it in the `aud` claim. `None` omits the parameter.
     ///
@@ -1959,7 +1959,7 @@ pub struct TokenExchangeConfig {
     /// this server *expects* on inbound tokens.
     #[serde(default)]
     pub audience: Option<String>,
-    /// RFC 8693 §2.1 `resource` — OPTIONAL. An RFC 8707 resource
+    /// RFC 8693 §2.1 `resource` - OPTIONAL. An RFC 8707 resource
     /// indicator: an absolute URI, without a fragment, naming the target
     /// service. `None` omits the parameter.
     ///
@@ -1967,15 +1967,15 @@ pub struct TokenExchangeConfig {
     /// OAuth *proxy* endpoints, not token exchange.
     #[serde(default)]
     pub resource: Option<String>,
-    /// RFC 8693 §2.1 `scope` — OPTIONAL. Space-delimited scopes requested
+    /// RFC 8693 §2.1 `scope` - OPTIONAL. Space-delimited scopes requested
     /// for the exchanged token. `None` omits the parameter.
     #[serde(default)]
     pub scope: Option<String>,
-    /// RFC 8693 §2.1 `requested_token_type` — OPTIONAL.
+    /// RFC 8693 §2.1 `requested_token_type` - OPTIONAL.
     ///
     /// `#[serde(default)]` is load-bearing: without it, every existing
-    /// `[server.auth.oauth.token_exchange]` table — none of which contain
-    /// this key — would fail to parse.
+    /// `[server.auth.oauth.token_exchange]` table - none of which contain
+    /// this key - would fail to parse.
     #[serde(default)]
     pub requested_token_type: RequestedTokenType,
 }
@@ -2452,7 +2452,7 @@ const JWKS_REFRESH_COOLDOWN: Duration = Duration::from_secs(10);
 ///
 /// The upstream is the operator-configured, SSRF-screened authorization
 /// server, so this is defense-in-depth rather than an attacker-facing
-/// control — but it keeps the proxy paths symmetric with the bounded JWKS
+/// control - but it keeps the proxy paths symmetric with the bounded JWKS
 /// fetch (`jwks_max_response_bytes`) so a misbehaving or compromised IdP
 /// cannot make the server buffer an unbounded response. 1 MiB comfortably
 /// covers token, introspection, and revocation JSON payloads.
@@ -2682,7 +2682,7 @@ impl JwksCache {
             }));
 
         if let Some(ref ca_path) = config.ca_cert_path {
-            // Pre-startup blocking I/O — runs before the runtime begins
+            // Pre-startup blocking I/O - runs before the runtime begins
             // serving requests, so blocking the current thread here is
             // intentional. Do not wrap in `spawn_blocking`: the constructor
             // is synchronous by contract and is called from `serve()`'s
@@ -3045,9 +3045,9 @@ impl JwksCache {
     /// cache publication, a genuinely-new `kid` may be rejected for up to
     /// [`JWKS_REFRESH_COOLDOWN`] (10s). Endpoint DoS protection is preferred
     /// over immediate post-cancellation retriability. Do **not** "fix" this by
-    /// bypassing the cooldown on unknown-`kid` requests — that reopens the
+    /// bypassing the cooldown on unknown-`kid` requests - that reopens the
     /// DoS-amplification vector the cooldown exists to close.
-    // NOT cancel-safe: see the `# Cancellation` section above — cooldown is
+    // NOT cancel-safe: see the `# Cancellation` section above - cooldown is
     // committed before the fetch to throttle JWKS-endpoint abuse.
     async fn refresh_with_cooldown(&self) {
         // Acquire the mutex to serialize refresh attempts.
@@ -3715,7 +3715,7 @@ pub fn protected_resource_metadata(
 /// `issuer` defaults to `server_url`, the origin this document is served from,
 /// as RFC 8414 3.3 requires. The upstream [`OAuthConfig::issuer`] remains the
 /// *token* issuer and is still what inbound JWT `iss` claims are validated
-/// against — the two are deliberately different. See
+/// against - the two are deliberately different. See
 /// [`OAuthConfig::authorization_server_metadata_issuer`] for the legacy
 /// opt-out.
 #[must_use]
@@ -4418,8 +4418,8 @@ fn push_form_param(body: &mut String, name: &str, value: &str) {
 /// Emits the three REQUIRED parameters (RFC 8693 §2.1) unconditionally, then
 /// each OPTIONAL parameter only when configured. Parameter ORDER is fixed and
 /// load-bearing: `resource` and `scope` are appended after `audience` and
-/// before `client_id` so that a config predating 3.8.0 — where both are
-/// necessarily `None` — produces a byte-identical body to earlier releases.
+/// before `client_id` so that a config predating 3.8.0 - where both are
+/// necessarily `None` - produces a byte-identical body to earlier releases.
 fn build_exchange_form(config: &TokenExchangeConfig, subject_token: &str) -> String {
     let mut body = format!(
         "grant_type={}&subject_token={}&subject_token_type={}",

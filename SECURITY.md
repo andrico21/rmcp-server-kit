@@ -82,7 +82,7 @@ When mTLS is enabled, rmcp-server-kit:
    then admitted whenever its CRL is unreachable.
 
 `ReloadHandle::refresh_crls()` forces an immediate refresh of every cached
-CRL — useful from an admin endpoint or a cron-driven probe.
+CRL - useful from an admin endpoint or a cron-driven probe.
 
 ### Configuration (TOML)
 
@@ -149,11 +149,11 @@ SSRF/DoS amplification even if a CRL host is reachable:
 | `crl_max_response_bytes`        | `5 MiB`       | Body size cap; streams aborted mid-response when exceeded.                                    |
 | `crl_discovery_rate_per_min`    | `60`          | Process-global rate limit on *new* CDP URLs admitted into the fetch pipeline.                  |
 | `crl_fetch_timeout`             | `30 s`        | Per-fetch HTTP timeout.                                                                        |
-| `crl_max_host_semaphores`      | `1024`        | Caps the number of unique CDP hosts tracked for per-host concurrency gating. At the cap, idle entries (no in-flight fetch) are evicted on demand, so the cap only rejects genuinely concurrent fetch floods — it is never a permanent lockout. |
+| `crl_max_host_semaphores`      | `1024`        | Caps the number of unique CDP hosts tracked for per-host concurrency gating. At the cap, idle entries (no in-flight fetch) are evicted on demand, so the cap only rejects genuinely concurrent fetch floods - it is never a permanent lockout. |
 | `crl_max_seen_urls`            | `4096`        | Caps the URL-deduplication map to prevent unbounded memory growth from discovery.             |
 | `crl_max_cache_entries`        | `1024`        | Caps the number of parsed CRLs held in memory.                                                |
 
-The fetcher also disables HTTP redirects entirely for CRL traffic — a
+The fetcher also disables HTTP redirects entirely for CRL traffic - a
 CRL is signed by the issuing CA, so blindly following a redirect to an
 operator-unintended host has no security benefit.
 
@@ -170,7 +170,7 @@ IPv6 transition-mechanism prefixes:
   prefix is extracted and checked against the full IPv4 block list. The
   address is rejected when the embedded target is itself blocked (e.g.
   `64:ff9b::10.0.0.1` would reach internal RFC 1918 space through a NAT64
-  gateway), and permitted when it embeds a public IPv4 address — on
+  gateway), and permitted when it embeds a public IPv4 address - on
   DNS64/NAT64-only egress networks every public host maps into the NAT64
   prefix, so blocking it wholesale would break all outbound fetches.
 - **Teredo `2001::/32` (RFC 4380)**: blocked outright. The tunneling
@@ -184,7 +184,7 @@ CDP URLs are extracted from client certificates **before** chain
 validation. This ordering is a deliberate, load-bearing invariant: with
 `crl_deny_on_unavailable = true` the verifier must be able to fail
 closed on a never-fetched CDP, which requires discovering the CDP before
-delegating to the inner verifier. No HTTP happens on the handshake path —
+delegating to the inner verifier. No HTTP happens on the handshake path -
 discovery only enqueues onto a bounded, rate-limited channel, and the
 actual fetch runs on a background task behind the full SSRF guard.
 
@@ -192,7 +192,7 @@ The residual cost of that ordering is a bounded griefing window: an
 **unauthenticated** client can present throwaway certificates carrying
 unique CDP URLs and consume the process-global discovery budget
 (`crl_discovery_rate_per_min`) and `crl_max_seen_urls` slots. Memory
-stays bounded — the caps exist precisely for this — but discovery of
+stays bounded - the caps exist precisely for this - but discovery of
 *new legitimate* CDP URLs can be starved while the spray is in progress,
 which under `crl_deny_on_unavailable = true` fails those handshakes
 closed. Per-source-IP discovery budgeting is not possible at this layer:
@@ -201,12 +201,12 @@ address.
 
 Operator guidance:
 
-- Alert on `discovery_rate_limited` WARN log lines — they are the
+- Alert on `discovery_rate_limited` WARN log lines - they are the
   observable signature of a discovery spray (or of an undersized budget).
 - Size `crl_max_seen_urls` and `crl_max_cache_entries` to comfortably
   exceed your CA estate's real CDP count, especially with
   `crl_deny_on_unavailable = true`: at the cache cap the **newest** entry
-  is rejected (never an existing one — LRU eviction would let an attacker
+  is rejected (never an existing one - LRU eviction would let an attacker
   evict the legitimate warm set by spamming throwaway CDP URLs), so a
   full cache means newly discovered legitimate CDPs cannot enter until
   capacity frees up.
@@ -433,15 +433,15 @@ Implications:
 
 Even with CRL enabled, the original mitigations remain best practice:
 
-1. **Short-lived certificates (≤24h)** — bounds exposure regardless of CRL
+1. **Short-lived certificates (≤24h)** - bounds exposure regardless of CRL
    propagation latency.
    - [cert-manager](https://cert-manager.io/) `Certificate.spec.duration: 24h`, `renewBefore: 8h`.
    - [HashiCorp Vault PKI](https://developer.hashicorp.com/vault/docs/secrets/pki) `max_ttl=24h` with agent-driven renewal.
    - [Smallstep `step-ca`](https://smallstep.com/docs/step-ca/) with the autorenewal daemon.
-2. **CA rotation on compromise** — for longer-lived certs you can still
+2. **CA rotation on compromise** - for longer-lived certs you can still
    rotate the issuing CA and reload via `ReloadHandle::reload_*` for a
    zero-downtime swap of trust roots.
-3. **Network-layer revocation** — block compromised peers at the service
+3. **Network-layer revocation** - block compromised peers at the service
    mesh / load balancer / firewall for sub-second propagation.
 
 ### What "point-in-time mTLS" still means
@@ -457,7 +457,7 @@ short-lived certs for the strongest guarantees.
 
 - A stolen private key is valid until either (a) the next CRL publication
   marks it revoked **and** rmcp-server-kit's cache refreshes, or (b) the
-  certificate's `notAfter` passes — whichever comes first. ≤24 h cert
+  certificate's `notAfter` passes - whichever comes first. ≤24 h cert
   lifetimes still bound this exposure even when CRL fetching fails.
 - An evicted operator's certificate becomes invalid as soon as the
   issuing CA publishes the updated CRL and rmcp-server-kit refreshes it

@@ -54,7 +54,7 @@ async fn main() -> rmcp_server_kit::Result<()> {
     let (admin_token, admin_hash) = generate_api_key()?;
     let (viewer_token, viewer_hash) = generate_api_key()?;
 
-    // For demo purposes only — never log plaintext tokens in production.
+    // For demo purposes only - never log plaintext tokens in production.
     tracing::info!(%admin_token, "admin token (demo only)");
     tracing::info!(%viewer_token, "viewer token (demo only)");
 

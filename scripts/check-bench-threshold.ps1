@@ -1,4 +1,4 @@
-# check-bench-threshold.ps1 — assert a Criterion bench's mean is below max_ns.
+# check-bench-threshold.ps1 - assert a Criterion bench's mean is below max_ns.
 #
 # Usage: pwsh ./scripts/check-bench-threshold.ps1 <bench_name> <max_ns>
 #

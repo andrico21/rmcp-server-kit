@@ -16,7 +16,7 @@ onward.
 
 ## Pre-flight checklist
 
-1. **All CI jobs green on `main` — verify this before tagging, not after.**
+1. **All CI jobs green on `main` - verify this before tagging, not after.**
    `release.yml` is gated on `CI` via `workflow_run`, so a red CI silently
    *skips* the publish job. The 3.4.0 and 3.5.0 tags were both pushed onto red
    CI and neither ever reached crates.io; the tags exist but the versions do
@@ -42,7 +42,7 @@ onward.
    for why), so this is deterministic and no longer depends on what upstream
    published today. When you bump dependencies, run `cargo update` and
    `cargo vet regenerate exemptions` together in the same reviewed commit.
-7. `cargo doc --no-deps --all-features` — no broken intra-doc links.
+7. `cargo doc --no-deps --all-features` - no broken intra-doc links.
 8. `cargo publish --dry-run --all-features` succeeds.
 
 ## Step-by-step
@@ -92,7 +92,7 @@ Releases used to require an extra step here: run `cargo vet` so
 `supply-chain/config.toml` set `audit-as-crates-io = true` for this crate,
 which asked cargo-vet to audit **our own package** as though it were a
 third-party crates.io dependency. The requirement was then satisfied with a
-self-exemption — an explicit trust-without-audit marker — so it asserted no
+self-exemption - an explicit trust-without-audit marker - so it asserted no
 security property at all.
 
 Worse, exemptions pin an exact version, so every release orphaned it and the
@@ -101,7 +101,7 @@ job was `continue-on-error: true`, that failure was invisible; it stayed red
 from the 3.2.0 release until it was noticed during the 3.3.0 cycle.
 
 The policy is now `audit-as-crates-io = false`, which is the correct setting
-for a first-party crate you author and publish — the `true` variant exists for
+for a first-party crate you author and publish - the `true` variant exists for
 a local path/git crate that shadows a crates.io crate of the same name and
 should inherit its audit requirements. The self-exemption and the
 `unpublished` marker are gone, the per-release chore is gone, and the CI job

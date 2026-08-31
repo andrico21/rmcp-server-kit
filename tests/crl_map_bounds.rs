@@ -10,7 +10,7 @@
 //!    containing the literal substring `"crl_host_semaphore_cap_exceeded"`
 //!    is returned only when every entry has a concurrent in-flight fetch.
 //! 3. `cache` is capped at `MtlsConfig::crl_max_cache_entries` (silent
-//!    drop + warn log — newest-rejected, not LRU-evicted).
+//!    drop + warn log - newest-rejected, not LRU-evicted).
 //! 4. Stale-removal path (`refresh_urls` error branch) also clears the
 //!    affected URL from `seen_urls`, enabling retry after transient
 //!    attacker floods.
@@ -117,7 +117,7 @@ async fn seen_urls_hard_cap_drops_excess() {
         .map(|i| format!("https://host{i}.example.test/crl"))
         .collect();
 
-    // Submit in one batch — the implementation MUST drop admissions
+    // Submit in one batch - the implementation MUST drop admissions
     // beyond the cap rather than grow the set unboundedly.
     let _ = set.__test_note_discovered_urls(&urls);
 

@@ -447,8 +447,8 @@ handshake is rejected, per RFC 5280 §6.3. Denial requires every relevant CDP
 to be unavailable, so an attacker who blocks a single mirror cannot deny
 service. Expired CRLs are not trusted when `crl_enforce_expiration = true`
 (the default); webpki rejects them at `nextUpdate`. Operators who need the
-previous fail-open behaviour — where an unfetchable CRL still permits the
-handshake with a `WARN` log — can set `crl_deny_on_unavailable = false`, at
+previous fail-open behaviour - where an unfetchable CRL still permits the
+handshake with a `WARN` log - can set `crl_deny_on_unavailable = false`, at
 the cost of accepting a revoked certificate whenever its CRL is unreachable.
 
 > **Upgrading to 3.8:** fail-closed makes a low `crl_max_cache_entries`
@@ -479,7 +479,7 @@ detects API misuse, not a same-process adversary -- see
 [SECURITY.md](../SECURITY.md#out-of-band-crl-cache-mutation).
 
 `ReloadHandle::refresh_crls()` forces an immediate refresh of every
-cached CRL — useful from an admin endpoint or a cron-driven probe.
+cached CRL - useful from an admin endpoint or a cron-driven probe.
 
 ##### CRL configuration (TOML, all defaults shown)
 
@@ -531,21 +531,21 @@ crl_max_cache_entries      = 1024      # caps parsed CRLs held in memory
 
 ##### Defence-in-depth (still recommended even with CRL enabled)
 
-CRL checking does not eliminate the value of the strategies below — combine
+CRL checking does not eliminate the value of the strategies below - combine
 them for the strongest posture:
 
 1. **Short-lived certificates (recommended).** Issue client certs with a
    maximum lifetime of **24 hours or less** so that compromised
    credentials expire on their own. Supported issuers:
 
-   - **[cert-manager](https://cert-manager.io/)** — Kubernetes-native
+   - **[cert-manager](https://cert-manager.io/)** - Kubernetes-native
      issuer; configure `Certificate.spec.duration: 24h` and
      `renewBefore: 8h`. Pair with the CSI driver to deliver short-lived
      certs to workload pods without restart.
    - **[HashiCorp Vault PKI](https://developer.hashicorp.com/vault/docs/secrets/pki)**
-     — set `max_ttl` on the role to `24h` and have clients re-issue
+     - set `max_ttl` on the role to `24h` and have clients re-issue
      via `vault write pki/issue/<role>` on a cron / sidecar.
-   - **[Smallstep `step-ca`](https://smallstep.com/docs/step-ca/)** —
+   - **[Smallstep `step-ca`](https://smallstep.com/docs/step-ca/)** -
      configure provisioner `claims.maxTLSCertDuration: 24h`; use
      `step ca renew --daemon` for hands-off rotation.
 
@@ -567,7 +567,7 @@ calling `ReloadHandle::reload_auth_keys`.
 #### Limiter construction (internal)
 
 The per-source-IP auth limiters (post-failure backoff and pre-auth
-gate) are built internally by `serve()` from `RateLimitConfig` — the
+gate) are built internally by `serve()` from `RateLimitConfig` - the
 constructors are `pub(crate)` and not part of the public API. Configure
 the limiters via the `RateLimitConfig` fields above; there is no public
 constructor to call.
@@ -672,7 +672,7 @@ extracts the argument value, takes the first whitespace-delimited token (or
 `/`-basename), and checks it against the allowlist. If not found, the request
 is rejected with 403.
 
-By default this constrains the value **only when the argument is present** — a
+By default this constrains the value **only when the argument is present** - a
 caller that omits the key entirely passes unchecked. That is safe when the
 tool's input schema already marks the argument required, but it fails open if
 the handler substitutes a default for a missing value. Opt into presence
@@ -811,7 +811,7 @@ pub enum RbacDecision {
 #### Tool-limiter construction (internal)
 
 The per-source-IP `tools/call` limiter is built internally by `serve()`
-from the configured rate and optional burst — the constructor is
+from the configured rate and optional burst - the constructor is
 `pub(crate)` and not part of the public API. Configure it via
 `McpServerConfig::with_tool_rate_limit` /
 `with_tool_rate_limit_burst` (TOML: `tool_rate_limit`,
@@ -853,7 +853,7 @@ extra_route_rate_limit = 60
 | `shutdown_timeout` | `String` | `"30s"` | Humantime duration |
 | `request_timeout` | `String` | `"120s"` | Humantime duration |
 | `allowed_origins` | `Vec<String>` | `[]` | Origin validation |
-| `stdio_enabled` | `bool` | `false` | Enable stdio transport (bypasses auth/RBAC/TLS — see warning in `transport`) |
+| `stdio_enabled` | `bool` | `false` | Enable stdio transport (bypasses auth/RBAC/TLS - see warning in `transport`) |
 | `tool_rate_limit` | `Option<u32>` | `None` | Tool calls/min per IP |
 | `key_eviction_policy` | `KeyEvictionPolicy` | `"evict_lru"` | Full-table policy for per-IP limiter key maps; accepted values: `"evict_lru"`, `"reject_new"` |
 | `session_idle_timeout` | `String` | `"20m"` | Humantime duration; idle MCP sessions are closed after this period |
@@ -864,7 +864,7 @@ extra_route_rate_limit = 60
 | `max_concurrent_requests` | `Option<usize>` | `None` | Global cap on in-flight HTTP requests; excess receive `503` via load shedding |
 | `admin_enabled` | `bool` | `false` | Enable `/admin/*` diagnostic endpoints |
 | `admin_role` | `String` | `"admin"` | RBAC role required to access `/admin/*` |
-| `auth` | `Option<AuthConfig>` | `None` | Inline `[server.auth]` block selecting API-key / mTLS / OAuth — see [auth](#auth) |
+| `auth` | `Option<AuthConfig>` | `None` | Inline `[server.auth]` block selecting API-key / mTLS / OAuth - see [auth](#auth) |
 | `trusted_proxies` | `Vec<String>` | `[]` | CIDRs or IPs whose forwarding headers are trusted for client-IP resolution. When non-empty, enables trusted-forwarder mode. Pairs with `forwarded_header`. |
 | `forwarded_header` | `String` | `"x-forwarded-for"` | Which forwarding header to read when trusted-forwarder mode is active. Accepted values: `"x-forwarded-for"` (de-facto standard; nginx, HAProxy, CDNs) or `"forwarded"` (RFC 7239 `Forwarded` header). Ignored when `trusted_proxies` is empty. |
 | `trusted_forwarder_max_entries` | `usize` | `16` | Maximum forwarding-chain entries scanned per request in trusted-forwarder mode. Longer chains are treated as a header bomb and resolution falls back to the direct socket peer. Valid range `1..=64`; the ceiling exists because an unbounded value would disable the header-bomb protection. Ignored when `trusted_proxies` is empty. |
@@ -1123,7 +1123,7 @@ role = "viewer"
 | `jwks_max_response_bytes` | `u64` | `1048576` | Fail-closed cap on the JWKS HTTP response body size (1 MiB default). |
 | `allow_http_oauth_urls` | `bool` | `false` | Permit `http://` issuer/JWKS/etc. for local dev only. |
 | `audience_validation_mode` | `String` (`"permissive"` \| `"warn"` \| `"strict"`) | `"strict"` | How the resource server treats the legacy `azp` audience fallback. `"strict"` (default) accepts only `aud` matches and rejects `azp`-only matches; `"warn"` accepts `azp`-only matches but emits a one-shot WARN per process to surface IdPs not populating `aud`; `"permissive"` accepts `azp`-only matches silently (pre-1.7 behavior). |
-| `strict_audience_validation` | `Option<bool>` | _unset_ | **Deprecated since 1.7.0** — superseded by `audience_validation_mode`. Consulted only when `audience_validation_mode` is unset: `Some(true)` resolves to `"strict"`, `Some(false)` resolves to `"warn"`, and unset resolves to `"strict"` (the secure default). |
+| `strict_audience_validation` | `Option<bool>` | _unset_ | **Deprecated since 1.7.0** - superseded by `audience_validation_mode`. Consulted only when `audience_validation_mode` is unset: `Some(true)` resolves to `"strict"`, `Some(false)` resolves to `"warn"`, and unset resolves to `"strict"` (the secure default). |
 | `ssrf_allowlist` | `table` | _unset_ | Operator opt-in allowlist of `hosts` and/or `cidrs` whose otherwise-blocked addresses (private/loopback/CGNAT/unique-local) the OAuth/JWKS fetcher is allowed to reach. Cloud-metadata addresses remain blocked. See "Allowing in-cluster IdPs" below and the "Operator allowlist" section in [`SECURITY.md`](../SECURITY.md). |
 | `role_claim` | `Option<String>` | `None` | JWT claim path (dot-notation for nested claims) to extract role values from; e.g. `"roles"` or `"realm_access.roles"`. When set, claim values are matched against `role_mappings` instead of `scopes`. Supports space-separated string claims and JSON array claims. Pairs with `role_mappings`. |
 | `role_mappings` | `Vec<RoleMapping>` | `[]` | Claim-value-to-role mappings used when `role_claim` is set. First matching entry wins. See the worked example below. |
@@ -1147,7 +1147,7 @@ Used with `role_claim` for non-scope-based role extraction (e.g. Keycloak `realm
 | `claim_value` | `String` | Expected value of the claim named by `role_claim` (e.g. a Keycloak role name or an Azure AD role string). |
 | `role` | `String` | RBAC role granted when `claim_value` is present in the claim. |
 
-**Worked example — Keycloak `realm_access.roles` claim:**
+**Worked example - Keycloak `realm_access.roles` claim:**
 
 ```toml
 [server.auth.oauth]
@@ -1212,7 +1212,7 @@ every key at
 
 Such keys are accepted. When `alg` is present it pins exactly one algorithm.
 When it is absent, the permitted algorithms are inferred from the key material
-itself — never from the token header — as follows:
+itself - never from the token header - as follows:
 
 | JWK key type | Permitted algorithms |
 |---|---|
@@ -1220,7 +1220,7 @@ itself — never from the token header — as follows:
 | `EC`, `crv=P-256` | `ES256` |
 | `EC`, `crv=P-384` | `ES384` |
 | `OKP`, `crv=Ed25519` | `EdDSA` |
-| `oct` (symmetric) | *none — key is dropped* |
+| `oct` (symmetric) | *none - key is dropped* |
 
 Inference is deliberately constrained:
 
@@ -1234,8 +1234,8 @@ Inference is deliberately constrained:
 
 > **`EC` keys on curve `P-521` are not supported**, with or without an `alg`
 > member. The [`jsonwebtoken`](https://docs.rs/jsonwebtoken) crate that performs
-> signature verification defines no `ES512` variant in its `Algorithm` enum — it
-> implements only `ES256` and `ES384` for ECDSA — and its own
+> signature verification defines no `ES512` variant in its `Algorithm` enum - it
+> implements only `ES256` and `ES384` for ECDSA - and its own
 > `EllipticCurve::P521` documentation notes the curve is unsupported by `ring`,
 > the backing cryptography provider. A `P-521` key is therefore dropped from the
 > JWKS cache rather than cached as unusable. Supporting it requires upstream
@@ -1273,7 +1273,7 @@ jwks_max_response_bytes = 1048576
 
 The default `audience_validation_mode = "strict"` rejects tokens whose
 configured audience appears only in the `azp` claim (not `aud`). **To keep the
-previous behavior** — accepting `azp`-only matches — set
+previous behavior** - accepting `azp`-only matches - set
 `audience_validation_mode = "warn"` (accept with a one-shot WARN per process so
 operators can detect IdPs that leave `aud` unpopulated) or `"permissive"`
 (accept silently). Once your IdP issues tokens carrying `aud` reliably, keep the
@@ -1500,13 +1500,13 @@ rather than queued.
 
 `McpServerConfig::with_extra_router` merges your own axum routes into the
 top-level router. These routes **bypass** rmcp-server-kit auth and RBAC, so the
-application is responsible for its own protection — typically per-IP rate
+application is responsible for its own protection - typically per-IP rate
 limiting on unauthenticated endpoints (OAuth callbacks, registration, …).
 
 To support that, every request served by `serve()` carries the client
 peer address **regardless of whether TLS is enabled**, in two forms:
 
-1. **`transport::PeerAddr`** — the framework-blessed extractor for your
+1. **`transport::PeerAddr`** - the framework-blessed extractor for your
    own handlers:
 
    ```rust,ignore
@@ -1522,7 +1522,7 @@ peer address **regardless of whether TLS is enabled**, in two forms:
    let config = config.with_extra_router(extra);
    ```
 
-2. **`axum::extract::ConnectInfo<SocketAddr>`** — for compatibility with
+2. **`axum::extract::ConnectInfo<SocketAddr>`** - for compatibility with
    stock third-party middleware. On the TLS listener the kit mirrors the
    peer address into this standard axum extension, so per-IP middleware
    that expects it (e.g. `tower_governor`'s `PeerIpKeyExtractor`) works
@@ -1533,7 +1533,7 @@ Caveats:
 - **Direct socket peer only.** Behind an L4/L7 proxy or load balancer
   this is the proxy's address; the kit performs no `X-Forwarded-For` /
   `Forwarded` interpretation.
-- **Absent under `serve_stdio`** — a stdio session has no network peer.
+- **Absent under `serve_stdio`** - a stdio session has no network peer.
 - The separate Prometheus metrics listener is a different router and
   does not carry these extensions.
 - **Privacy**: `PeerAddr` exposes raw peer network metadata. The
@@ -1542,8 +1542,8 @@ Caveats:
 
 #### Built-in per-IP rate limiting
 
-For the common case — throttling unauthenticated extra routes (OAuth
-`/authorize`, `/token`, registration, callbacks) — the kit ships an
+For the common case - throttling unauthenticated extra routes (OAuth
+`/authorize`, `/token`, registration, callbacks) - the kit ships an
 opt-in limiter so you don't need third-party middleware:
 
 ```rust,ignore
@@ -1557,7 +1557,7 @@ wraps **only** the extra router (layered before it is merged), responds
 `429 Too Many Requests` with a plain-text body and a `Retry-After`
 header (delta-seconds, like every kit limiter), and is startup-only.
 
-Specific paths can be exempted — typically the RFC 8414 metadata
+Specific paths can be exempted - typically the RFC 8414 metadata
 document MCP clients fetch on every connect, which would otherwise 429
 behind a shared egress:
 
@@ -1570,7 +1570,7 @@ let config = config
 ```
 
 or in TOML: `extra_route_rate_limit_exempt_paths = [...]`. Matching is
-a **raw exact string comparison** against the request path — no globs,
+a **raw exact string comparison** against the request path - no globs,
 no prefixes, no normalization (trailing slashes, percent-encoding, and
 dot-segments must match byte-for-byte). The check is fail-closed
 (anything not listed stays limited) and runs before key extraction, so
@@ -1580,8 +1580,8 @@ base rate knob (all validated at startup).
 
 ##### Rate limiting across the kit
 
-All four built-in limiters — the auth pre-auth gate, the post-failure
-auth limiter, the `tools/call` limiter, and the extra-route limiter —
+All four built-in limiters - the auth pre-auth gate, the post-failure
+auth limiter, the `tools/call` limiter, and the extra-route limiter -
 share one deny contract: HTTP `429`, a plain-text body, and a
 `Retry-After: n` header where `n` is the best-effort wait in whole
 seconds (rounded up, never `0`).
@@ -1621,13 +1621,13 @@ Limitations to understand before relying on it:
   fresh buckets.
 
 Need custom keys (API key, header) or proxy-aware client IPs? Reach
-for `tower_governor` on your extra router instead — its stock
+for `tower_governor` on your extra router instead - its stock
 `PeerIpKeyExtractor` works on both plain and TLS listeners thanks to
 the `ConnectInfo<SocketAddr>` normalization described above.
 
 #### Trusted-forwarder mode (proxy-aware client IPs)
 
-Behind a reverse proxy, every client shares the proxy's IP — per-IP
+Behind a reverse proxy, every client shares the proxy's IP - per-IP
 rate limiting collapses into one bucket. **Trusted-forwarder mode**
 fixes that by resolving the real client from the forwarding header,
 but only when it is safe to do so:
@@ -1645,21 +1645,21 @@ How it resolves (the **rightmost-untrusted** algorithm, as in nginx
 `real_ip` / Envoy):
 
 1. If the **direct socket peer** is not in `trusted_proxies`, the
-   header is ignored entirely — prepending `X-Forwarded-For` from the
+   header is ignored entirely - prepending `X-Forwarded-For` from the
    open internet does nothing (the leftmost-trust anti-pattern is never
    used).
 2. Otherwise, walk the LAST header instance right-to-left, skip
    addresses that are themselves trusted proxies, and take the first
    that is not: that is the client.
-3. Anything ambiguous — malformed entries, RFC 7239 obfuscated
+3. Anything ambiguous - malformed entries, RFC 7239 obfuscated
    identifiers (`unknown`, `_…`), chains that are entirely trusted,
-   more than 16 entries — falls back to the **direct peer**, never to a
+   more than 16 entries - falls back to the **direct peer**, never to a
    header value. Only a reason code is logged (`debug`), never raw
    header contents.
 
 The result is exposed as the `transport::ClientIp` request extension
 (also extractable in your handlers) and is what **all four rate
-limiters key by**. `PeerAddr` is unchanged — it stays the direct socket
+limiters key by**. `PeerAddr` is unchanged - it stays the direct socket
 peer, so you can compare the two when you need provenance:
 
 | Extension | Meaning |
@@ -1671,7 +1671,7 @@ peer, so you can compare the two when you need provenance:
 proxies.** If clients can also reach the server directly, their direct
 IPs and the proxied clients' resolved IPs share one keyspace by design,
 but a direct attacker could choose their own bucket only via their real
-source IP — never via a header.
+source IP - never via a header.
 
 ### Customising security headers
 
@@ -1766,7 +1766,7 @@ config loading instead of silently leaving the intended header at its default.
 Check key spellings against the table above.
 
 > **Harden your own root type too.** rmcp-server-kit ships reusable *sections*
-> (`[server]`, `[observability]`, `[rbac]`, ...), not a kit-owned root type —
+> (`[server]`, `[observability]`, `[rbac]`, ...), not a kit-owned root type -
 > your application composes them into its own struct. The kit's sections reject
 > unknown **keys**, but only your root type can reject a misspelled **table
 > name**: without `deny_unknown_fields` on it, `[serverr]` is silently dropped
@@ -2268,7 +2268,7 @@ let config = McpServerConfig::new("127.0.0.1:8443", "my-server", "0.1.0")
 ```
 
 The TLS accept path can be tuned for unusual environments (since 1.9.0;
-both values are startup-only — they bind at listener construction and
+both values are startup-only - they bind at listener construction and
 are not hot-reloadable):
 
 ```rust,ignore
@@ -2477,7 +2477,7 @@ log_upstream_error_bodies = false  # env: RMCP_SERVER_KIT__OBSERVABILITY__LOG_UP
 
 ### Bridging TOML config to `McpServerConfig`
 
-`ServerConfig` is a TOML schema — it deserializes cleanly from your config file
+`ServerConfig` is a TOML schema - it deserializes cleanly from your config file
 but cannot reach `serve()` on its own. `serve()` takes `McpServerConfig`, which
 holds runtime-only state that cannot be expressed in TOML: callbacks, RBAC
 policy objects, metrics listeners, and extra routers. The `ServerConfig`
@@ -2507,7 +2507,7 @@ express: `name`, `version`, `rbac`, `readiness_check`, `extra_router`,
 
 **Fallibility.** `apply_to_mcp_config` returns
 `Result<McpServerConfig, RmcpServerKitError>`. It fails with `RmcpServerKitError::Config` when
-any duration string in the config cannot be parsed by `humantime` — for
+any duration string in the config cannot be parsed by `humantime` - for
 example `request_timeout = "not-a-duration"`. Calling `validate_server_config`
 first catches common structural errors before the bridge runs, giving cleaner
 diagnostics.
