@@ -1182,16 +1182,34 @@ extra configuration:
   served only when `proxy` is configured. Its published `issuer` is this server's own
   public URL (RFC 8414 §3.3).
 
-**One topology needs an explicit override.** If your application mounts its *own*
-`/authorize` and `/token` through `McpServerConfig::with_extra_router` **without**
-configuring `oauth.proxy`, the crate cannot tell that apart from a plain resource
-server and would advertise the upstream `issuer`. Declare the server as its own
-authorization server by setting `authorization_servers = ["https://mcp.example.com"]`
-(its public URL) under `[server.auth.oauth]`; set `authorization_servers = []` to omit
-the claim entirely.
+**One topology needs explicit handling: the facade.** If your application mounts its
+*own* `/authorize` and `/token` through `McpServerConfig::with_extra_router` **without**
+configuring `oauth.proxy`, the crate cannot tell that apart from a plain resource server
+(both leave `oauth.proxy` unset), so it advertises the upstream `oauth.issuer` by default.
+That is correct for a plain resource server but wrong for a facade, whose endpoints live
+at this server rather than upstream. A facade therefore needs one of two explicit settings
+under `[server.auth.oauth]`, and exactly one is required:
 
-Wherever these documents say "this server's own public URL", the value comes from
-`McpServerConfig::with_public_url`. When `public_url` is unset it falls back to the
+- **If you know your public URL** (recommended): `authorization_servers =
+  ["https://mcp.example.com"]`, using the URL clients actually reach and keeping it
+  identical to `public_url`. Clients then discover the facade's own endpoints.
+- **If you have no stable public URL** (for example behind a dynamic ingress you cannot
+  name at startup): `authorization_servers = []`. An empty list is a deliberate,
+  RFC 9728 §3.2-compliant "no authorization server advertised", **not** a misconfiguration:
+  it passes startup validation, and clients fall back to other discovery (the
+  `WWW-Authenticate` challenge or out-of-band configuration). Prefer this over advertising
+  a URL you cannot stand behind.
+
+`public_url` does **not** drive `authorization_servers` for a facade: with `oauth.proxy`
+unset, that list resolves to your explicit value or, if unset, to `oauth.issuer`, never to
+the `public_url`-derived URL. The derivation described next applies only to the built-in
+`proxy` topology and to the Authorization Server Metadata `issuer` (which the crate does
+not serve without `proxy`), so for a no-proxy facade `authorization_servers` is the only
+lever.
+
+In the derived cases (the built-in `proxy` `authorization_servers` and the metadata
+`issuer`), "this server's own public URL" comes from `McpServerConfig::with_public_url`.
+When `public_url` is unset it falls back to the
 server's bind address - behind a TLS-terminating proxy an internal `http://` address -
 so `authorization_servers`, the metadata `issuer`, and the advertised endpoint URLs
 would point clients somewhere they cannot reach, and the `WWW-Authenticate`

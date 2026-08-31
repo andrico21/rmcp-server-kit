@@ -113,27 +113,51 @@ Served unconditionally, `authorization_servers` is now resolved from topology: t
 upstream `oauth.issuer` when `oauth.proxy` is absent, this server's public URL when it
 is present.
 
-**Action required for one topology.** An application that mounts its **own**
+**Action required for one topology: the facade.** An application that mounts its **own**
 `/authorize` and `/token` through `McpServerConfig::with_extra_router` **without**
-configuring `oauth.proxy` must declare itself - the crate cannot distinguish that from a
-plain resource server, and would otherwise advertise the upstream issuer, pointing
-RFC 9728 discovery at a URL that returns 404:
+configuring `oauth.proxy` must set `authorization_servers` explicitly. The crate cannot
+distinguish a facade from a plain resource server - both leave `oauth.proxy` unset - so by
+default it advertises `oauth.issuer` (the upstream IdP). That is correct for a plain
+resource server, but wrong for a facade, whose `/authorize` + `/token` live at this
+server, not upstream.
 
-```toml
-[server.auth.oauth]
-authorization_servers = ["https://mcp.example.com"]   # this server's public URL
-```
+A facade has two correct settings, and exactly one is required:
 
-`authorization_servers = []` omits the claim entirely (RFC 9728 §3.2). Both discovery
-URLs are validated at startup (parseable, no userinfo, scheme honouring
-`allow_http_oauth_urls`, no literal-IP target); zero-valued claims are omitted rather
-than emitted as `[]`; and Protected Resource Metadata is additionally served at the
-RFC 9728 §3.1 path `/.well-known/oauth-protected-resource/mcp`, with the root path kept
-as an alias.
+- **You know your public URL** (recommended). Advertise it so clients discover the
+  facade's own endpoints. Use the URL clients actually reach, and keep it identical to
+  `public_url`:
+
+  ```toml
+  [server.auth.oauth]
+  authorization_servers = ["https://mcp.example.com"]   # this facade's public URL
+  ```
+
+- **You have no stable public URL** (for example behind a dynamic ingress you cannot name
+  at startup). Omit the claim rather than advertise a wrong one. An empty list is a
+  deliberate, RFC 9728 §3.2-compliant "no authorization server advertised here", **not** a
+  misconfiguration: it passes startup validation, and clients fall back to other discovery
+  (the `WWW-Authenticate` challenge, or out-of-band configuration):
+
+  ```toml
+  [server.auth.oauth]
+  authorization_servers = []   # omit the claim; never advertise a URL you cannot stand behind
+  ```
+
+**`public_url` does not help a facade.** With `oauth.proxy` unset, `authorization_servers`
+resolves to your explicit value or, if unset, to `oauth.issuer`; it never derives from
+`public_url`. The `public_url` derivation described below applies only to the built-in
+`proxy` topology and to the Authorization Server Metadata `issuer`, and the crate does not
+serve that document without `oauth.proxy` anyway (your facade serves its own). So for a
+no-proxy facade, `authorization_servers` is the only lever.
+
+Both discovery URLs are validated at startup (parseable, no userinfo, scheme honouring
+`allow_http_oauth_urls`, no literal-IP target); zero-valued claims are omitted rather than
+emitted as `[]`; and Protected Resource Metadata is additionally served at the RFC 9728
+§3.1 path `/.well-known/oauth-protected-resource/mcp`, with the root path kept as an alias.
 
 ### Both derive from `public_url`
 
-The "this server's public URL" advertised as `authorization_servers` (topology case) and
+With the built-in `oauth.proxy` mounted, the "this server's public URL" advertised as `authorization_servers` and
 as the metadata `issuer` comes from `McpServerConfig::with_public_url`. When `public_url`
 is unset it falls back to the bind address - behind a TLS-terminating proxy an internal
 `http://` address - so the discovery documents advertise `authorization_servers`,
