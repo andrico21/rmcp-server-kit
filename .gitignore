@@ -1,6 +1,8 @@
 # Build artifacts
 /target
 **/target
+# Stray rustc metadata (e.g. librust_out.rmeta from ad-hoc rustc / tooling runs)
+*.rmeta
 
 # Editor / tooling
 /.idea
