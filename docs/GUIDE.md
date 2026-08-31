@@ -1128,7 +1128,7 @@ role = "viewer"
 | `role_claim` | `Option<String>` | `None` | JWT claim path (dot-notation for nested claims) to extract role values from; e.g. `"roles"` or `"realm_access.roles"`. When set, claim values are matched against `role_mappings` instead of `scopes`. Supports space-separated string claims and JSON array claims. Pairs with `role_mappings`. |
 | `role_mappings` | `Vec<RoleMapping>` | `[]` | Claim-value-to-role mappings used when `role_claim` is set. First matching entry wins. See the worked example below. |
 | `require_subject` | `bool` | `false` | Reject tokens that lack a `sub` (subject) claim. Leave `false` for client-credentials / machine-to-machine tokens, which legitimately carry no subject. |
-| `authorization_servers` | `Option<Vec<String>>` | _unset_ (topology) | RFC 9728 Protected Resource Metadata `authorization_servers`. **Unset resolves from topology**: the upstream `issuer` when `proxy` is absent, this server's own public URL (from `public_url`) when `proxy` is set. **Set it explicitly when your application mounts its own `/authorize` + `/token` via `with_extra_router` without `proxy`** — the crate cannot detect that case and would otherwise advertise the upstream issuer at a URL that 404s. An empty list omits the claim entirely (RFC 9728 §3.2). Validated at startup: no userinfo, no literal-IP host, scheme per `allow_http_oauth_urls`. See "OAuth discovery metadata" below. |
+| `authorization_servers` | `Option<Vec<String>>` | _unset_ (topology) | RFC 9728 Protected Resource Metadata `authorization_servers`. **Unset resolves from topology**: the upstream `issuer` when `proxy` is absent, this server's own public URL (from `public_url`) when `proxy` is set. **Set it explicitly when your application mounts its own `/authorize` + `/token` via `with_extra_router` without `proxy`** - the crate cannot detect that case and would otherwise advertise the upstream issuer at a URL that 404s. An empty list omits the claim entirely (RFC 9728 §3.2). Validated at startup: no userinfo, no literal-IP host, scheme per `allow_http_oauth_urls`. See "OAuth discovery metadata" below. |
 | `authorization_server_metadata_issuer` | `Option<String>` | _unset_ (own URL) | RFC 8414 Authorization Server Metadata `issuer`, served by the proxy at `/.well-known/oauth-authorization-server`. **Unset publishes this server's own public URL (from `public_url`)**, as RFC 8414 §3.3 / §6.2 require. Legacy opt-out: set to your upstream `issuer` only when the IdP emits RFC 9207 `iss` and clients validate it. Validated at startup as above. |
 
 ##### `ScopeMapping`
@@ -1173,12 +1173,12 @@ With the `oauth` feature enabled the server publishes two unauthenticated discov
 documents whose values are derived from your topology, so most deployments need no
 extra configuration:
 
-- **Protected Resource Metadata** — `/.well-known/oauth-protected-resource`, plus the
-  RFC 9728 §3.1 path-inserted alias `/.well-known/oauth-protected-resource/mcp` — is
+- **Protected Resource Metadata** - `/.well-known/oauth-protected-resource`, plus the
+  RFC 9728 §3.1 path-inserted alias `/.well-known/oauth-protected-resource/mcp` - is
   served unconditionally. Its `authorization_servers` list resolves to the upstream
   `issuer` when no `proxy` is configured, or to this server's own public URL when the
   built-in `proxy` is mounted.
-- **Authorization Server Metadata** — `/.well-known/oauth-authorization-server` — is
+- **Authorization Server Metadata** - `/.well-known/oauth-authorization-server` - is
   served only when `proxy` is configured. Its published `issuer` is this server's own
   public URL (RFC 8414 §3.3).
 
@@ -1192,7 +1192,7 @@ the claim entirely.
 
 Wherever these documents say "this server's own public URL", the value comes from
 `McpServerConfig::with_public_url`. When `public_url` is unset it falls back to the
-server's bind address — behind a TLS-terminating proxy an internal `http://` address —
+server's bind address - behind a TLS-terminating proxy an internal `http://` address -
 so `authorization_servers`, the metadata `issuer`, and the advertised endpoint URLs
 would point clients somewhere they cannot reach, and the `WWW-Authenticate`
 `resource_metadata` challenge degrades to a relative path. **Set `public_url` on any
@@ -1251,8 +1251,8 @@ OAuth URL hardening operates in two layers:
   contain HTTP userinfo (`user:pass@host`) or that use a literal IP host
   (IPv4 or IPv6). Operators must use DNS hostnames. The two discovery-metadata
   URLs reflected verbatim by the unauthenticated `/.well-known/oauth-*` endpoints
-  — `authorization_server_metadata_issuer` and each `authorization_servers[]` entry
-  — are held to the same policy.
+  - `authorization_server_metadata_issuer` and each `authorization_servers[]` entry
+  - are held to the same policy.
 - **At runtime, on every HTTP redirect hop**, both the shared
   `OauthHttpClient` and the `JwksCache` redirect closures run a sync
   per-hop SSRF guard that rejects targets resolving to private, loopback,

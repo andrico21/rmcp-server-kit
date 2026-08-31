@@ -44,7 +44,7 @@ request parameter, distinct from omission. Omit the key instead.
 the crate's `with_*` setters. `cargo-semver-checks` does not report this change, so
 it is documented here rather than caught by tooling.
 
-- A bare value — `&str`, `String`, `.to_string()`, or `.to_owned()` — compiles unchanged.
+- A bare value - `&str`, `String`, `.to_string()`, or `.to_owned()` - compiles unchanged.
 - Adding `.into()` to either argument now fails to compile with `E0283`, because the
   generic target type is ambiguous. This includes a `String` variable (`url.into()`),
   not only string literals. Drop the `.into()`:
@@ -71,7 +71,7 @@ rejected at startup rather than forwarded to the authorization server verbatim.
 
 ### New config keys are not backward-compatible with an older binary
 
-`TokenExchangeConfig` — like every OAuth config struct — carries
+`TokenExchangeConfig` - like every OAuth config struct - carries
 `#[serde(deny_unknown_fields)]`. A pre-3.8 config parses cleanly on a 3.8 binary,
 because missing keys fall back to their defaults, but the reverse does **not** hold: a
 config that sets any new 3.8 key (`resource`, `scope`, `requested_token_type`, or the
@@ -86,8 +86,8 @@ any key is likewise a hard startup error, not a silent skip.
 ## Migrating to 3.8: OAuth discovery metadata (RFC 9728 / RFC 8414)
 
 Independently of token exchange, `3.8` makes the OAuth **discovery-metadata** documents
-RFC 9728 / RFC 8414 conformant. **Inbound JWT validation is unchanged** — the token
-`iss` is still validated against `oauth.issuer` — so most deployments need no action.
+RFC 9728 / RFC 8414 conformant. **Inbound JWT validation is unchanged** - the token
+`iss` is still validated against `oauth.issuer` - so most deployments need no action.
 Two published values change, each with a legacy escape hatch, and exactly one topology
 must act.
 
@@ -115,7 +115,7 @@ is present.
 
 **Action required for one topology.** An application that mounts its **own**
 `/authorize` and `/token` through `McpServerConfig::with_extra_router` **without**
-configuring `oauth.proxy` must declare itself — the crate cannot distinguish that from a
+configuring `oauth.proxy` must declare itself - the crate cannot distinguish that from a
 plain resource server, and would otherwise advertise the upstream issuer, pointing
 RFC 9728 discovery at a URL that returns 404:
 
@@ -135,8 +135,8 @@ as an alias.
 
 The "this server's public URL" advertised as `authorization_servers` (topology case) and
 as the metadata `issuer` comes from `McpServerConfig::with_public_url`. When `public_url`
-is unset it falls back to the bind address — behind a TLS-terminating proxy an internal
-`http://` address — so the discovery documents advertise `authorization_servers`,
+is unset it falls back to the bind address - behind a TLS-terminating proxy an internal
+`http://` address - so the discovery documents advertise `authorization_servers`,
 `issuer`, and endpoint URLs clients cannot reach, and the `WWW-Authenticate`
 `resource_metadata` challenge degrades to a relative path. **Any proxied or public
 deployment should set `public_url`**, and an explicit `authorization_servers` value
