@@ -488,7 +488,7 @@ version = "0.17.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.hermit-abi]]
-version = "0.5.2"
+version = "0.5.3"
 criteria = "safe-to-run"
 
 [[exemptions.hkdf]]
