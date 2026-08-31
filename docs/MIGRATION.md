@@ -5,9 +5,9 @@ downstream project, and how to migrate across breaking major releases.
 
 ## Migrating to 3.8: RFC 8693 token-exchange optionality
 
-`3.8` contains **one source-breaking API change**, shipped in a minor release as
+`3.8` contains **two source-breaking API changes**, shipped in a minor release as
 a deliberate, documented exception to the "breaking changes bump major" policy.
-It affects only code that constructs `TokenExchangeConfig` in Rust.
+Both affect only code that constructs `TokenExchangeConfig` in Rust.
 
 **TOML configuration files require no change, and the token-exchange request
 sent on the wire is byte-identical for any pre-3.8 configuration.**
@@ -38,6 +38,24 @@ To omit the parameter entirely, simply do not call `.with_audience(..)`.
 `audience = ""` is now **rejected at startup**: an empty value is a malformed
 request parameter, distinct from omission. Omit the key instead.
 
+### `TokenExchangeConfig::new` now takes `impl Into<String>`
+
+`token_url` and `client_id` changed from `String` to `impl Into<String>`, to match
+the crate's `with_*` setters. `cargo-semver-checks` does not report this change, so
+it is documented here rather than caught by tooling.
+
+- A bare value — `&str`, `String`, `.to_string()`, or `.to_owned()` — compiles unchanged.
+- Adding `.into()` to either argument now fails to compile with `E0283`, because the
+  generic target type is ambiguous. This includes a `String` variable (`url.into()`),
+  not only string literals. Drop the `.into()`:
+
+```rust
+// before
+TokenExchangeConfig::new("https://idp/token".into(), "client".into(), None, None)
+// after
+TokenExchangeConfig::new("https://idp/token", "client", None, None)
+```
+
 ### New optional parameters
 
 `with_resource`, `with_scope`, and `with_requested_token_type` expose the
@@ -47,12 +65,87 @@ release before 3.8 always sent.
 
 `resource` is validated as an RFC 8707 absolute URI with no fragment. It is
 **unrelated** to `oauth.proxy.strip_resource_param`, which governs the OAuth
-proxy endpoints, not token exchange.
+proxy endpoints, not token exchange. A custom `requested_token_type` is validated as
+an absolute RFC 3986 URI (fragments permitted), so a typo such as `"acess_token"` is
+rejected at startup rather than forwarded to the authorization server verbatim.
 
-## Migrating to 3.9: CRL fail-closed by default
+### New config keys are not backward-compatible with an older binary
 
-`3.9` is additive at the API level -- `cargo semver-checks` reports no breaking
-change -- but it **alters two runtime defaults**. `cargo semver-checks` cannot
+`TokenExchangeConfig` — like every OAuth config struct — carries
+`#[serde(deny_unknown_fields)]`. A pre-3.8 config parses cleanly on a 3.8 binary,
+because missing keys fall back to their defaults, but the reverse does **not** hold: a
+config that sets any new 3.8 key (`resource`, `scope`, `requested_token_type`, or the
+OAuth-level `authorization_servers` / `allowed_algorithms`) is rejected at startup by a
+**pre-3.8 binary**, which treats them as unknown fields.
+
+Roll the binary and the config forward together: you cannot stage the new config
+ahead of the deploy, nor roll the binary back while the new keys remain in place. If
+you need a rollback window, add the keys only after every instance is on 3.8. A typo in
+any key is likewise a hard startup error, not a silent skip.
+
+## Migrating to 3.8: OAuth discovery metadata (RFC 9728 / RFC 8414)
+
+Independently of token exchange, `3.8` makes the OAuth **discovery-metadata** documents
+RFC 9728 / RFC 8414 conformant. **Inbound JWT validation is unchanged** — the token
+`iss` is still validated against `oauth.issuer` — so most deployments need no action.
+Two published values change, each with a legacy escape hatch, and exactly one topology
+must act.
+
+### Authorization Server Metadata `issuer`
+
+Served at `/.well-known/oauth-authorization-server` (only when `oauth.proxy` is
+configured), the published `issuer` is now this server's own public URL instead of the
+upstream `oauth.issuer`. RFC 8414 §3.3 requires the `issuer` to match the origin the
+document is served from, and §6.2 requires clients to reject a mismatch, so the old
+value was unusable to conformant clients.
+
+Restore the upstream value only if your IdP emits RFC 9207 `iss` in the authorization
+response **and** your clients validate it:
+
+```toml
+[server.auth.oauth]
+authorization_server_metadata_issuer = "https://upstream-idp.example.com"
+```
+
+### Protected Resource Metadata `authorization_servers`
+
+Served unconditionally, `authorization_servers` is now resolved from topology: the
+upstream `oauth.issuer` when `oauth.proxy` is absent, this server's public URL when it
+is present.
+
+**Action required for one topology.** An application that mounts its **own**
+`/authorize` and `/token` through `McpServerConfig::with_extra_router` **without**
+configuring `oauth.proxy` must declare itself — the crate cannot distinguish that from a
+plain resource server, and would otherwise advertise the upstream issuer, pointing
+RFC 9728 discovery at a URL that returns 404:
+
+```toml
+[server.auth.oauth]
+authorization_servers = ["https://mcp.example.com"]   # this server's public URL
+```
+
+`authorization_servers = []` omits the claim entirely (RFC 9728 §3.2). Both discovery
+URLs are validated at startup (parseable, no userinfo, scheme honouring
+`allow_http_oauth_urls`, no literal-IP target); zero-valued claims are omitted rather
+than emitted as `[]`; and Protected Resource Metadata is additionally served at the
+RFC 9728 §3.1 path `/.well-known/oauth-protected-resource/mcp`, with the root path kept
+as an alias.
+
+### Both derive from `public_url`
+
+The "this server's public URL" advertised as `authorization_servers` (topology case) and
+as the metadata `issuer` comes from `McpServerConfig::with_public_url`. When `public_url`
+is unset it falls back to the bind address — behind a TLS-terminating proxy an internal
+`http://` address — so the discovery documents advertise `authorization_servers`,
+`issuer`, and endpoint URLs clients cannot reach, and the `WWW-Authenticate`
+`resource_metadata` challenge degrades to a relative path. **Any proxied or public
+deployment should set `public_url`**, and an explicit `authorization_servers` value
+should match it.
+
+## Migrating to 3.8: CRL fail-closed by default
+
+This mTLS/CRL hardening is additive at the API level -- `cargo semver-checks`
+reports no breaking change -- but it **alters two runtime defaults**. `cargo semver-checks` cannot
 detect a behavioural default change, so read this section before upgrading.
 
 ### 1. `crl_deny_on_unavailable` now defaults to `true`
@@ -62,7 +155,7 @@ Previously, a client certificate advertising CRL distribution points was
 the exact condition an attacker holding a revoked certificate can induce, by
 blocking reachability to the CA's CDP host.
 
-From `3.9`, such a handshake is **rejected**, per RFC 5280 §6.3. Denial requires
+From `3.8`, such a handshake is **rejected**, per RFC 5280 §6.3. Denial requires
 *every* relevant CDP to be unavailable, not merely one -- otherwise blocking a
 single mirror would become a denial-of-service vector.
 
@@ -127,7 +220,7 @@ constrains the argument only when the caller supplies it. If your tool
 substitutes a default for a missing argument, a caller can bypass the allowlist
 by omitting it. This now emits a startup warning naming the tool and argument.
 
-Behaviour is unchanged in `3.9`. Prefer the new constructor:
+Behaviour is unchanged in `3.8`. Prefer the new constructor:
 
 ```rust
 ArgumentAllowlist::new_required("tool", "arg", vec!["allowed".into()]);
@@ -158,7 +251,7 @@ the observed count and the cap.
 ### 6. `CrlSet::cache` and the ungated test constructors are deprecated
 
 **Impact:** `CrlSet::cache`, `CrlSet::__test_with_prepopulated_crls`, and
-`CrlSet::__test_with_kept_receiver` now carry `#[deprecated(since = "3.9.0")]`.
+`CrlSet::__test_with_kept_receiver` now carry `#[deprecated(since = "3.8.0")]`.
 
 > **This is not a semver-breaking change, but it CAN break your build.** A
 > downstream crate compiling with `-D warnings` (or `#![deny(warnings)]`) will

@@ -470,7 +470,7 @@ pub struct MtlsConfig {
     /// relevant CDPs to be unavailable, not merely one -- otherwise an
     /// attacker who blocks a single mirror could deny service.
     ///
-    /// Set to `false` to restore the pre-3.9 fail-open behaviour, in which an
+    /// Set to `false` to restore the pre-3.8 fail-open behaviour, in which an
     /// unreachable CRL lets the handshake proceed. That is strongly
     /// discouraged: a revoked certificate is then accepted whenever its CRL
     /// is unreachable, which is precisely the condition an attacker holding a

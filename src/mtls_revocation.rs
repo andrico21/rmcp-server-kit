@@ -23,7 +23,7 @@
 //!   RFC 5280 6.3; denying on a single unavailable mirror would let an
 //!   attacker who blocks one CDP deny service.
 //! - `crl_deny_on_unavailable = false` => fail open with warn logs. Restores
-//!   the pre-3.9 behaviour and is strongly discouraged: a revoked
+//!   the pre-3.8 behaviour and is strongly discouraged: a revoked
 //!   certificate is accepted whenever its CRL is unreachable.
 
 use std::{
@@ -261,12 +261,12 @@ pub struct CrlSet {
     ///
     /// Writing through this field bypasses the atomic commit path and
     /// desynchronises the published coverage hint from the live verifier.
-    /// Since 3.9 such a write is **detected and fails the handshake closed**
+    /// Since 3.8 such a write is **detected and fails the handshake closed**
     /// rather than silently admitting a certificate whose revocation status
     /// cannot be enforced. Reads remain safe but are not part of the supported
     /// surface. The field becomes private in 4.0.
     #[deprecated(
-        since = "3.9.0",
+        since = "3.8.0",
         note = "mutating the CRL cache out of band is detected and denies handshakes; this field becomes private in 4.0"
     )]
     pub cache: RwLock<HashMap<String, CachedCrl>>,
@@ -942,7 +942,7 @@ impl CrlSet {
     /// Returns an error if the verifier cannot be built from the provided CRLs.
     #[doc(hidden)]
     #[deprecated(
-        since = "3.9.0",
+        since = "3.8.0",
         note = "test-only constructor that is ungated in 3.x by accident; it becomes feature-gated in 4.0"
     )]
     pub fn __test_with_prepopulated_crls(
@@ -981,7 +981,7 @@ impl CrlSet {
     /// Returns an error if the verifier cannot be built from the provided CRLs.
     #[doc(hidden)]
     #[deprecated(
-        since = "3.9.0",
+        since = "3.8.0",
         note = "test-only constructor that is ungated in 3.x by accident; it becomes feature-gated in 4.0"
     )]
     pub fn __test_with_kept_receiver(

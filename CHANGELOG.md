@@ -479,7 +479,7 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
   unfetchable, per RFC 5280 §6.3. Denial deliberately requires all relevant
   CDPs to be unavailable rather than any single one, so blocking one mirror
   cannot be used to deny service. **Opt out with
-  `crl_deny_on_unavailable = false`.** See [`docs/MIGRATION.md`](docs/MIGRATION.md#migrating-to-39-crl-fail-closed-by-default).
+  `crl_deny_on_unavailable = false`.** See [`docs/MIGRATION.md`](docs/MIGRATION.md#migrating-to-38-crl-fail-closed-by-default).
 - **A CRL distribution point can no longer be stranded by a fast-settling fetch.**
   `note_discovered_urls` published the pending marker *after* handing the URL
   to the refresher, so a fetch that completed first left a stale marker that
