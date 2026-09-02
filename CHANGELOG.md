@@ -11,6 +11,55 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Security
+
+- **RBAC operation `deny` entries are now glob-matched.** Previously
+  `RoleConfig.deny` was compared by exact string equality, so a pattern such as
+  `deny = ["jira_delete_*"]` matched **nothing**. Combined with the idiomatic
+  `allow = ["*"]`, this failed **open**: a policy that looked locked down
+  permitted every delete tool. Deny entries now use the same `glob_match`
+  matcher already applied to `hosts` and `argument_allowlists.tool`.
+
+  **Migration.** `glob_match` treats `*` as its only metacharacter, so an entry
+  containing no `*` still reduces to exact equality - every glob-free `deny`
+  list behaves exactly as before. Audit any existing `deny` entry that *does*
+  contain a `*`: it was previously inert and will now start denying. That is
+  almost always the behaviour the operator originally intended, but it can
+  block tool calls that succeed today.
+
+  Matching remains case-sensitive (host matching is case-insensitive only
+  because `host_matches` lowercases both sides before calling `glob_match`).
+
+### Added
+
+- **`RbacConfig.global_deny`** - a server-wide operation kill switch evaluated
+  before any role is consulted. Entries are always glob-matched and veto even a
+  role's `allow = ["*"]`. This list can only ever remove capability, so it is
+  safe to enable in any deployment. Defaults to empty (no behaviour change).
+  Two scope limits: it is gated on `rbac.enabled`, and like the rest of the
+  engine it governs *invocation* (`tools/call`) only -- a denied tool may still
+  appear in a `tools/list` response unless the handler filters it.
+- **`RbacConfig.allow_operation_matching`** (`AllowOperationMatching::Legacy` |
+  `Glob`, TOML `"legacy"` | `"glob"`, default `Legacy`) - opt into glob matching
+  for `RoleConfig.allow`. This is **not** enabled by default: widening an
+  `allow` grants access, so a previously inert entry like `allow = ["jira_*"]`
+  must not silently start granting it. Widening a `deny` can only subtract
+  capability, which is why `deny` globs unconditionally.
+- **Config-load warning** for `allow` entries that contain a `*` (other than the
+  literal allow-all `"*"`) while `allow_operation_matching` is `legacy`. Under
+  legacy matching the `*` is an ordinary character, so such an entry grants only
+  an operation whose name contains that literal `*` -- almost never what the
+  operator meant. A warning is also emitted when `global_deny` is non-empty
+  while `rbac.enabled = false`, since every check short-circuits to allow.
+- **`RoleConfig::with_deny`**, **`RbacConfig::with_global_deny`**,
+  **`RbacConfig::with_allow_operation_matching`** builder methods.
+- **`RbacPolicySummary.global_deny`** - count of configured `global_deny`
+  patterns, surfaced via the admin diagnostics endpoint.
+
+Reported downstream by a consumer with ~130 product-scoped tools that had been
+hand-enumerating every destructive tool name to work around the exact-match
+behaviour.
+
 ## [3.8.1] - 2026-08-30
 
 ### Changed

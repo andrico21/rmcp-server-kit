@@ -228,6 +228,13 @@ impl RoleConfig {
         }
     }
 
+    /// Attach denied operations to this role. Deny entries are glob-matched.
+    #[must_use]
+    pub fn with_deny(mut self, deny: Vec<String>) -> Self {
+        self.deny = deny;
+        self
+    }
+
     /// Attach argument allowlists to this role.
     #[must_use]
     pub fn with_argument_allowlists(mut self, allowlists: Vec<ArgumentAllowlist>) -> Self {
@@ -363,6 +370,32 @@ fn default_hosts() -> Vec<String> {
     vec!["*".into()]
 }
 
+/// How [`RoleConfig::allow`] entries are matched against operation names.
+///
+/// [`RoleConfig::deny`] is **always** glob-matched and is deliberately not
+/// covered by this switch: widening a deny can only ever remove capability,
+/// so it is safe to enable unconditionally. Widening an *allow*, by contrast,
+/// grants access, so it stays opt-in.
+///
+/// TOML wire values are kebab-case: `"legacy"` (default) and `"glob"`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum AllowOperationMatching {
+    /// Exact string equality, plus the literal `"*"` meaning "all operations".
+    ///
+    /// A `*` inside any other entry is treated as an ordinary character, so
+    /// `"jira_get_*"` grants only an operation named exactly `jira_get_*` and
+    /// never acts as a pattern. [`RbacPolicy::new`] warns about such entries.
+    #[default]
+    Legacy,
+    /// Full glob matching via the same matcher used for hosts and
+    /// `argument_allowlists.tool` selectors. `*` is the only metacharacter and
+    /// matching stays case-sensitive, so glob-free entries still behave as
+    /// exact matches.
+    Glob,
+}
+
 /// Top-level RBAC configuration (deserializable from TOML).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -374,6 +407,27 @@ pub struct RbacConfig {
     /// Role definitions available to identities.
     #[serde(default)]
     pub roles: Vec<RoleConfig>,
+    /// How [`RoleConfig::allow`] entries are matched. Defaults to
+    /// [`AllowOperationMatching::Legacy`] (exact match) so that enabling glob
+    /// support is always a deliberate operator decision.
+    #[serde(default)]
+    pub allow_operation_matching: AllowOperationMatching,
+    /// Server-wide operation kill switch, evaluated **before** any role is
+    /// consulted and applied regardless of what a role's `allow` grants --
+    /// including `allow = ["*"]`.
+    ///
+    /// Entries are **always** glob-matched, independent of
+    /// [`RbacConfig::allow_operation_matching`]. This list can only ever
+    /// remove capability, never add it.
+    ///
+    /// Two scope limits apply. It is gated on [`RbacConfig::enabled`]: when
+    /// RBAC is disabled every check short-circuits to
+    /// [`RbacDecision::Allow`] before the kill switch is consulted. And it
+    /// governs *invocation* only -- like the rest of this engine it is
+    /// enforced on `tools/call`, so a denied tool may still appear in a
+    /// `tools/list` response unless the handler filters it.
+    #[serde(default)]
+    pub global_deny: Vec<String>,
     /// Optional stable HMAC key (any length) used to redact argument
     /// values in deny logs. When set, redacted hashes are stable across
     /// process restarts (useful for log correlation across deploys).
@@ -393,8 +447,24 @@ impl RbacConfig {
         Self {
             enabled: true,
             roles,
+            allow_operation_matching: AllowOperationMatching::default(),
+            global_deny: Vec::new(),
             redaction_salt: None,
         }
+    }
+
+    /// Set the server-wide operation kill switch. Entries are glob-matched.
+    #[must_use]
+    pub fn with_global_deny(mut self, global_deny: Vec<String>) -> Self {
+        self.global_deny = global_deny;
+        self
+    }
+
+    /// Opt into glob matching for [`RoleConfig::allow`] entries.
+    #[must_use]
+    pub fn with_allow_operation_matching(mut self, mode: AllowOperationMatching) -> Self {
+        self.allow_operation_matching = mode;
+        self
     }
 }
 
@@ -430,6 +500,8 @@ pub struct RbacRoleSummary {
 pub struct RbacPolicySummary {
     /// Whether RBAC enforcement is active.
     pub enabled: bool,
+    /// Number of server-wide `global_deny` patterns.
+    pub global_deny: usize,
     /// Per-role summaries.
     pub roles: Vec<RbacRoleSummary>,
 }
@@ -444,6 +516,8 @@ pub struct RbacPolicySummary {
 pub struct RbacPolicy {
     roles: Vec<RoleConfig>,
     enabled: bool,
+    allow_operation_matching: AllowOperationMatching,
+    global_deny: Vec<String>,
     /// HMAC key used to redact argument values in deny logs.
     /// Either a configured stable salt or a per-process random salt.
     redaction_salt: Arc<SecretString>,
@@ -455,6 +529,8 @@ impl RbacPolicy {
     #[must_use]
     pub fn new(config: &RbacConfig) -> Self {
         warn_on_optional_value_allowlists(&config.roles);
+        warn_on_literal_allow_globs(&config.roles, config.allow_operation_matching);
+        warn_on_inert_global_deny(config);
         let salt = config
             .redaction_salt
             .clone()
@@ -462,6 +538,8 @@ impl RbacPolicy {
         Self {
             roles: config.roles.clone(),
             enabled: config.enabled,
+            allow_operation_matching: config.allow_operation_matching,
+            global_deny: config.global_deny.clone(),
             redaction_salt: Arc::new(salt),
         }
     }
@@ -472,6 +550,8 @@ impl RbacPolicy {
         Self {
             roles: Vec::new(),
             enabled: false,
+            allow_operation_matching: AllowOperationMatching::default(),
+            global_deny: Vec::new(),
             redaction_salt: Arc::new(process_redaction_salt().clone()),
         }
     }
@@ -501,8 +581,38 @@ impl RbacPolicy {
             .collect();
         RbacPolicySummary {
             enabled: self.enabled,
+            global_deny: self.global_deny.len(),
             roles,
         }
+    }
+
+    /// Whether `operation` is vetoed by the server-wide kill switch.
+    ///
+    /// Always glob-matched, independent of
+    /// [`RbacConfig::allow_operation_matching`].
+    fn global_denied(&self, operation: &str) -> bool {
+        self.global_deny.iter().any(|d| glob_match(d, operation))
+    }
+
+    /// Whether `role_cfg` explicitly denies `operation`.
+    ///
+    /// Deny entries are always glob-matched: a glob-free entry reduces to
+    /// exact equality inside [`glob_match`], so existing exact configs are
+    /// unaffected, while a pattern such as `"*_delete_*"` now denies rather
+    /// than silently matching nothing.
+    fn role_denies(role_cfg: &RoleConfig, operation: &str) -> bool {
+        role_cfg.deny.iter().any(|d| glob_match(d, operation))
+    }
+
+    /// Whether `role_cfg` allows `operation` under the configured matching mode.
+    fn role_allows(&self, role_cfg: &RoleConfig, operation: &str) -> bool {
+        role_cfg.allow.iter().any(|a| {
+            a == "*"
+                || match self.allow_operation_matching {
+                    AllowOperationMatching::Legacy => a == operation,
+                    AllowOperationMatching::Glob => glob_match(a, operation),
+                }
+        })
     }
 
     /// Check whether `role` may perform `operation` (ignoring host).
@@ -514,13 +624,16 @@ impl RbacPolicy {
         if !self.enabled {
             return RbacDecision::Allow;
         }
+        if self.global_denied(operation) {
+            return RbacDecision::Deny;
+        }
         let Some(role_cfg) = self.find_role(role) else {
             return RbacDecision::Deny;
         };
-        if role_cfg.deny.iter().any(|d| d == operation) {
+        if Self::role_denies(role_cfg, operation) {
             return RbacDecision::Deny;
         }
-        if role_cfg.allow.iter().any(|a| a == "*" || a == operation) {
+        if self.role_allows(role_cfg, operation) {
             return RbacDecision::Allow;
         }
         RbacDecision::Deny
@@ -530,21 +643,26 @@ impl RbacPolicy {
     ///
     /// Evaluation order:
     /// 1. If RBAC is disabled, allow.
-    /// 2. Check operation permission (deny overrides allow).
-    /// 3. Check host visibility via glob matching (ASCII-case-insensitive;
+    /// 2. Apply [`RbacConfig::global_deny`] (glob; vetoes even `allow = ["*"]`).
+    /// 3. Check operation permission (deny overrides allow; deny is always
+    ///    glob-matched, allow follows [`RbacConfig::allow_operation_matching`]).
+    /// 4. Check host visibility via glob matching (ASCII-case-insensitive;
     ///    operation names above remain case-sensitive).
     #[must_use]
     pub fn check(&self, role: &str, operation: &str, host: &str) -> RbacDecision {
         if !self.enabled {
             return RbacDecision::Allow;
         }
+        if self.global_denied(operation) {
+            return RbacDecision::Deny;
+        }
         let Some(role_cfg) = self.find_role(role) else {
             return RbacDecision::Deny;
         };
-        if role_cfg.deny.iter().any(|d| d == operation) {
+        if Self::role_denies(role_cfg, operation) {
             return RbacDecision::Deny;
         }
-        if !role_cfg.allow.iter().any(|a| a == "*" || a == operation) {
+        if !self.role_allows(role_cfg, operation) {
             return RbacDecision::Deny;
         }
         if !Self::host_matches(&role_cfg.hosts, host) {
@@ -800,6 +918,43 @@ impl RbacPolicy {
     #[must_use]
     pub fn redact_arg(&self, value: &str) -> String {
         redact_with_salt(self.redaction_salt.expose_secret().as_bytes(), value)
+    }
+}
+
+/// Warn about `allow` entries that contain a `*` while
+/// [`AllowOperationMatching::Legacy`] is in effect.
+///
+/// Under legacy matching the `*` is an ordinary character, so the entry grants
+/// only an operation whose name contains that literal `*` -- almost never what
+/// the operator meant. The literal `"*"` is exempt: that is the documented
+/// allow-all form.
+fn warn_on_literal_allow_globs(roles: &[RoleConfig], mode: AllowOperationMatching) {
+    match mode {
+        AllowOperationMatching::Glob => return,
+        AllowOperationMatching::Legacy => {}
+    }
+    for role in roles {
+        for entry in role.allow.iter().filter(|a| *a != "*" && a.contains('*')) {
+            tracing::warn!(
+                role = %role.name,
+                operation = %entry,
+                "allow entry contains '*' but operation matching is 'legacy'; \
+                 the '*' is matched literally, not as a pattern -- set \
+                 rbac.allow_operation_matching = \"glob\" to enable globbing, \
+                 or list the operation names exactly"
+            );
+        }
+    }
+}
+
+/// Warn when a `global_deny` list is configured but can never take effect.
+fn warn_on_inert_global_deny(config: &RbacConfig) {
+    if !config.enabled && !config.global_deny.is_empty() {
+        tracing::warn!(
+            patterns = config.global_deny.len(),
+            "rbac.global_deny is configured but rbac.enabled is false; \
+             the kill switch is inert because all checks short-circuit to allow"
+        );
     }
 }
 
@@ -1837,6 +1992,7 @@ mod tests {
                 },
             ],
             redaction_salt: None,
+            ..RbacConfig::default()
         })
     }
 
@@ -1990,6 +2146,7 @@ mod tests {
             enabled: false,
             roles: vec![],
             redaction_salt: None,
+            ..RbacConfig::default()
         });
         assert_eq!(
             policy.check("nonexistent", "resource_delete", "any-host"),
@@ -2458,11 +2615,355 @@ mod tests {
             enabled: false,
             roles: vec![],
             redaction_salt: None,
+            ..RbacConfig::default()
         });
         assert_eq!(
             policy.check_operation("nonexistent", "anything"),
             RbacDecision::Allow
         );
+    }
+
+    // -- operation glob matching / global_deny tests --
+
+    fn op_policy(role: RoleConfig) -> RbacPolicy {
+        RbacPolicy::new(&RbacConfig::with_roles(vec![role]))
+    }
+
+    fn glob_op_policy(role: RoleConfig) -> RbacPolicy {
+        RbacPolicy::new(
+            &RbacConfig::with_roles(vec![role])
+                .with_allow_operation_matching(AllowOperationMatching::Glob),
+        )
+    }
+
+    #[test]
+    fn deny_glob_blocks_under_allow_all() {
+        let policy = op_policy(
+            RoleConfig::new("editor", vec!["*".into()], vec!["*".into()])
+                .with_deny(vec!["*_delete_*".into()]),
+        );
+        assert_eq!(
+            policy.check_operation("editor", "jira_delete_issue"),
+            RbacDecision::Deny
+        );
+        assert_eq!(
+            policy.check_operation("editor", "confluence_delete_page"),
+            RbacDecision::Deny
+        );
+        assert_eq!(
+            policy.check_operation("editor", "jira_get_issue"),
+            RbacDecision::Allow
+        );
+    }
+
+    #[test]
+    fn deny_glob_blocks_in_host_scoped_check() {
+        let policy = op_policy(
+            RoleConfig::new("editor", vec!["*".into()], vec!["*".into()])
+                .with_deny(vec!["jira_delete_*".into()]),
+        );
+        assert_eq!(
+            policy.check("editor", "jira_delete_issue", "web-prod"),
+            RbacDecision::Deny
+        );
+        assert_eq!(
+            policy.check("editor", "jira_get_issue", "web-prod"),
+            RbacDecision::Allow
+        );
+    }
+
+    #[test]
+    fn deny_without_glob_still_matches_exactly() {
+        let policy = op_policy(
+            RoleConfig::new("editor", vec!["*".into()], vec!["*".into()])
+                .with_deny(vec!["delete".into()]),
+        );
+        assert_eq!(
+            policy.check_operation("editor", "delete"),
+            RbacDecision::Deny
+        );
+        assert_eq!(
+            policy.check_operation("editor", "delete_thing"),
+            RbacDecision::Allow
+        );
+        assert_eq!(
+            policy.check_operation("editor", "soft_delete"),
+            RbacDecision::Allow
+        );
+    }
+
+    #[test]
+    fn allow_glob_is_inert_in_legacy_mode() {
+        let policy = op_policy(RoleConfig::new(
+            "reader",
+            vec!["jira_get_*".into()],
+            vec!["*".into()],
+        ));
+        assert_eq!(
+            policy.check_operation("reader", "jira_get_issue"),
+            RbacDecision::Deny
+        );
+        assert_eq!(
+            policy.check_operation("reader", "jira_get_*"),
+            RbacDecision::Allow
+        );
+    }
+
+    #[test]
+    fn allow_glob_is_honored_in_glob_mode() {
+        let policy = glob_op_policy(RoleConfig::new(
+            "reader",
+            vec!["jira_get_*".into()],
+            vec!["*".into()],
+        ));
+        assert_eq!(
+            policy.check_operation("reader", "jira_get_issue"),
+            RbacDecision::Allow
+        );
+        assert_eq!(
+            policy.check_operation("reader", "confluence_get_page"),
+            RbacDecision::Deny
+        );
+    }
+
+    #[test]
+    fn allow_glob_mode_preserves_case_sensitivity() {
+        let policy = glob_op_policy(RoleConfig::new(
+            "reader",
+            vec!["Jira_*".into()],
+            vec!["*".into()],
+        ));
+        assert_eq!(
+            policy.check_operation("reader", "jira_get_issue"),
+            RbacDecision::Deny
+        );
+        assert_eq!(
+            policy.check_operation("reader", "Jira_get_issue"),
+            RbacDecision::Allow
+        );
+    }
+
+    #[test]
+    fn allow_exact_entries_behave_identically_in_both_modes() {
+        let role = RoleConfig::new(
+            "reader",
+            vec!["ping".into(), "list_hosts".into()],
+            vec!["*".into()],
+        );
+        let legacy = op_policy(role.clone());
+        let glob = glob_op_policy(role);
+        for op in ["ping", "list_hosts", "delete", "pin", "pingg"] {
+            assert_eq!(
+                legacy.check_operation("reader", op),
+                glob.check_operation("reader", op),
+                "mode divergence on glob-free allow entry for {op}"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_star_means_all_operations_in_both_modes() {
+        let role = RoleConfig::new("admin", vec!["*".into()], vec!["*".into()]);
+        for policy in [op_policy(role.clone()), glob_op_policy(role)] {
+            assert_eq!(
+                policy.check_operation("admin", "anything_at_all"),
+                RbacDecision::Allow
+            );
+        }
+    }
+
+    #[test]
+    fn global_deny_vetoes_allow_all() {
+        let policy = RbacPolicy::new(
+            &RbacConfig::with_roles(vec![RoleConfig::new(
+                "admin",
+                vec!["*".into()],
+                vec!["*".into()],
+            )])
+            .with_global_deny(vec!["*_delete_*".into()]),
+        );
+        assert_eq!(
+            policy.check_operation("admin", "jira_delete_issue"),
+            RbacDecision::Deny
+        );
+        assert_eq!(
+            policy.check("admin", "jira_delete_issue", "web-prod"),
+            RbacDecision::Deny
+        );
+        assert_eq!(
+            policy.check_operation("admin", "jira_get_issue"),
+            RbacDecision::Allow
+        );
+    }
+
+    #[test]
+    fn global_deny_globs_even_in_legacy_allow_mode() {
+        let policy = RbacPolicy::new(
+            &RbacConfig::with_roles(vec![RoleConfig::new(
+                "admin",
+                vec!["*".into()],
+                vec!["*".into()],
+            )])
+            .with_allow_operation_matching(AllowOperationMatching::Legacy)
+            .with_global_deny(vec!["danger_*".into()]),
+        );
+        assert_eq!(
+            policy.check_operation("admin", "danger_wipe"),
+            RbacDecision::Deny
+        );
+    }
+
+    #[test]
+    fn global_deny_is_inert_when_rbac_disabled() {
+        let policy = RbacPolicy::new(&RbacConfig {
+            enabled: false,
+            global_deny: vec!["*".into()],
+            ..RbacConfig::default()
+        });
+        assert_eq!(
+            policy.check_operation("anyone", "anything"),
+            RbacDecision::Allow
+        );
+    }
+
+    #[test]
+    fn global_deny_defaults_to_empty_and_changes_nothing() {
+        let policy = op_policy(RoleConfig::new("admin", vec!["*".into()], vec!["*".into()]));
+        assert_eq!(
+            policy.check_operation("admin", "jira_delete_issue"),
+            RbacDecision::Allow
+        );
+        assert_eq!(policy.summary().global_deny, 0);
+    }
+
+    #[test]
+    fn empty_deny_entry_denies_only_the_empty_operation() {
+        let policy = op_policy(
+            RoleConfig::new("editor", vec!["*".into()], vec!["*".into()])
+                .with_deny(vec![String::new()]),
+        );
+        assert_eq!(policy.check_operation("editor", ""), RbacDecision::Deny);
+        assert_eq!(
+            policy.check_operation("editor", "anything"),
+            RbacDecision::Allow
+        );
+    }
+
+    #[test]
+    fn empty_global_deny_entry_denies_only_the_empty_operation() {
+        let policy = RbacPolicy::new(
+            &RbacConfig::with_roles(vec![RoleConfig::new(
+                "admin",
+                vec!["*".into()],
+                vec!["*".into()],
+            )])
+            .with_global_deny(vec![String::new()]),
+        );
+        assert_eq!(policy.check_operation("admin", ""), RbacDecision::Deny);
+        assert_eq!(
+            policy.check_operation("admin", "anything"),
+            RbacDecision::Allow
+        );
+    }
+
+    #[test]
+    fn star_deny_entry_denies_every_operation() {
+        let policy = op_policy(
+            RoleConfig::new("editor", vec!["*".into()], vec!["*".into()])
+                .with_deny(vec!["*".into()]),
+        );
+        for op in ["", "ping", "jira_delete_issue"] {
+            assert_eq!(policy.check_operation("editor", op), RbacDecision::Deny);
+            assert_eq!(policy.check("editor", op, "web-prod"), RbacDecision::Deny);
+        }
+    }
+
+    #[test]
+    fn star_global_deny_entry_denies_every_operation() {
+        let policy = RbacPolicy::new(
+            &RbacConfig::with_roles(vec![RoleConfig::new(
+                "admin",
+                vec!["*".into()],
+                vec!["*".into()],
+            )])
+            .with_global_deny(vec!["*".into()]),
+        );
+        for op in ["", "ping", "jira_delete_issue"] {
+            assert_eq!(policy.check_operation("admin", op), RbacDecision::Deny);
+        }
+    }
+
+    #[test]
+    fn legacy_allow_matches_a_literal_star_in_an_operation_name() {
+        let policy = op_policy(RoleConfig::new(
+            "odd",
+            vec!["weird_*_name".into()],
+            vec!["*".into()],
+        ));
+        assert_eq!(
+            policy.check_operation("odd", "weird_*_name"),
+            RbacDecision::Allow
+        );
+        assert_eq!(
+            policy.check_operation("odd", "weird_thing_name"),
+            RbacDecision::Deny
+        );
+    }
+
+    #[test]
+    fn deny_glob_matches_multibyte_operation_names() {
+        let policy = op_policy(
+            RoleConfig::new("editor", vec!["*".into()], vec!["*".into()])
+                .with_deny(vec!["削除_*".into()]),
+        );
+        assert_eq!(
+            policy.check_operation("editor", "削除_ページ"),
+            RbacDecision::Deny
+        );
+        assert_eq!(
+            policy.check_operation("editor", "取得_ページ"),
+            RbacDecision::Allow
+        );
+    }
+
+    #[test]
+    fn operation_matching_fields_deserialize_from_toml() {
+        let cfg: RbacConfig = toml::from_str(
+            r#"
+            enabled = true
+            allow_operation_matching = "glob"
+            global_deny = ["*_purge_*"]
+
+            [[roles]]
+            name = "ops"
+            allow = ["jira_*"]
+            hosts = ["*"]
+            "#,
+        )
+        .expect("config parses");
+        assert_eq!(
+            cfg.allow_operation_matching,
+            AllowOperationMatching::Glob,
+            "kebab-case wire value must map to the Glob variant"
+        );
+        assert_eq!(cfg.global_deny, vec!["*_purge_*".to_owned()]);
+
+        let policy = RbacPolicy::new(&cfg);
+        assert_eq!(
+            policy.check_operation("ops", "jira_get_issue"),
+            RbacDecision::Allow
+        );
+        assert_eq!(
+            policy.check_operation("ops", "jira_purge_project"),
+            RbacDecision::Deny
+        );
+    }
+
+    #[test]
+    fn operation_matching_defaults_to_legacy_when_absent_from_toml() {
+        let cfg: RbacConfig = toml::from_str("enabled = true").expect("config parses");
+        assert_eq!(cfg.allow_operation_matching, AllowOperationMatching::Legacy);
+        assert!(cfg.global_deny.is_empty());
     }
 
     // -- current_role / current_identity tests --
@@ -2617,6 +3118,62 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    fn global_deny_identity() -> AuthIdentity {
+        AuthIdentity {
+            method: crate::auth::AuthMethod::BearerToken,
+            name: "alice".into(),
+            role: "admin".into(),
+            raw_token: None,
+            sub: None,
+        }
+    }
+
+    fn global_deny_policy() -> Arc<RbacPolicy> {
+        Arc::new(RbacPolicy::new(
+            &RbacConfig::with_roles(vec![RoleConfig::new(
+                "admin",
+                vec!["*".into()],
+                vec!["*".into()],
+            )])
+            .with_global_deny(vec!["*_delete_*".into()]),
+        ))
+    }
+
+    async fn global_deny_call(args: serde_json::Value, tool: &str) -> StatusCode {
+        let app = rbac_router_with_identity(global_deny_policy(), global_deny_identity());
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(tool_call_body(tool, &args)))
+            .unwrap();
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn middleware_global_deny_blocks_hostless_tool_call() {
+        assert_eq!(
+            global_deny_call(serde_json::json!({}), "jira_delete_issue").await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            global_deny_call(serde_json::json!({}), "jira_get_issue").await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn middleware_global_deny_blocks_host_scoped_tool_call() {
+        assert_eq!(
+            global_deny_call(serde_json::json!({"host": "web-prod"}), "jira_delete_issue").await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            global_deny_call(serde_json::json!({"host": "web-prod"}), "jira_get_issue").await,
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]
@@ -2900,6 +3457,7 @@ mod tests {
             enabled: true,
             roles: vec![],
             redaction_salt: Some(SecretString::from("my-stable-salt")),
+            ..RbacConfig::default()
         };
         let p1 = RbacPolicy::new(&cfg);
         let p2 = RbacPolicy::new(&cfg);
@@ -2916,6 +3474,7 @@ mod tests {
             enabled: true,
             roles: vec![],
             redaction_salt: None,
+            ..RbacConfig::default()
         };
         let p1 = RbacPolicy::new(&cfg);
         let p2 = RbacPolicy::new(&cfg);

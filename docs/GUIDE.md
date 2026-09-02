@@ -2445,6 +2445,19 @@ strip_resource_param = false  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY
 
 [rbac]
 enabled = true
+# How `allow` entries are matched against operation names.
+#   "legacy" (default) - exact string equality, plus the literal "*" (all ops).
+#   "glob"             - `*` wildcards are honoured, e.g. allow = ["container_*"].
+# `deny` entries are ALWAYS glob-matched regardless of this setting: widening a
+# deny can only remove capability, whereas widening an allow grants access, so
+# allow-globbing stays opt-in. Under "legacy" the server warns about any `allow`
+# entry containing a `*`, because the `*` is then matched literally.
+allow_operation_matching = "glob"
+# Server-wide kill switch, evaluated before any role and always glob-matched.
+# Vetoes even a role's `allow = ["*"]`; can only ever remove capability.
+# Gated on `enabled` above, and enforced on `tools/call` only -- a denied tool
+# can still appear in `tools/list` unless your handler filters it.
+global_deny = ["*_purge_*"]
 # Optional: stable HMAC key used to redact argument values in deny logs.
 # When an argument fails the per-tool allowlist, the denied value is
 # logged as `arg_hmac=<8-hex-chars>` (HMAC-SHA256 prefix) instead of the

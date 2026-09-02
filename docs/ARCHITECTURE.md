@@ -150,7 +150,7 @@ axum Router                                  src/transport.rs:1521  (build_app_r
    │      (see `extract_bearer` in src/auth.rs).
    │      On success: sets task-locals via `current_role`, `current_identity`, …
    │
-├── 8. RBAC middleware                    src/rbac.rs:898  (rbac_middleware) + 1015 (enforce_tool_policy)
+├── 8. RBAC middleware                    src/rbac.rs:1031 (rbac_middleware) + 1200 (enforce_tool_policy)
    │      For POSTs to /mcp:
    │        - Reads body up to limit
    │        - Parses JSON-RPC envelope
@@ -378,7 +378,7 @@ ArgumentAllowlist {                       // src/rbac.rs:275
 
 ### Decision function
 - `RbacPolicy::check(role, operation, host)` - pure allow/deny (`src/rbac.rs:511`; fn `check`)
-- `RbacPolicy::argument_allowed(role, tool, argument, value)` - JSON value match (`src/rbac.rs:589`; fn `argument_allowed`)
+- `RbacPolicy::argument_allowed(role, tool, argument, value)` - JSON value match (`src/rbac.rs:724`; fn `argument_allowed`)
 - `RbacPolicy::redact_arg(value)` - HMAC-SHA256 of an argument value with
 the policy's salt, returning an 8-char hex prefix (`src/rbac.rs:749`).
   Used to keep raw argument values out of deny logs.
@@ -388,7 +388,7 @@ the policy's salt, returning an 8-char hex prefix (`src/rbac.rs:749`).
   installed *after* enforcement (see "Task-locals" below).
 
 ### Middleware
-`rbac_middleware` (`src/rbac.rs:898`):
+`rbac_middleware` (`src/rbac.rs:1031`):
 1. Extracts the role + identity name from the `AuthIdentity` request
    extension (set by the auth middleware).
 2. For `POST /mcp`, reads the body (bounded by body-size layer), parses
@@ -830,7 +830,7 @@ held. Only the runtime-only fields above survive from the base. It is fallible
 **Environment (opt-in)** - three inherent methods, one per section owning
 targeted fields: `ServerConfig::apply_env_overrides` (`src/config.rs:442`),
 `ObservabilityConfig::apply_env_overrides` (`src/config.rs:832`) and
-`RbacConfig::apply_env_overrides` (`src/rbac.rs:1391`). Each returns
+`RbacConfig::apply_env_overrides` (`src/rbac.rs:1524`). Each returns
 `Vec<EnvOverride>` (`src/config.rs:64`) for audit logging, with `value: None`
 for secret targets. Fourteen curated variables under the `RMCP_SERVER_KIT__`
 prefix; `__` separates TOML path segments because field names already contain

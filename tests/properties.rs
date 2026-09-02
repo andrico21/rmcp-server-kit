@@ -30,7 +30,7 @@
 use proptest::prelude::*;
 use rmcp_server_kit::{
     auth::{ApiKeyEntry, generate_api_key, verify_bearer_token},
-    rbac::{ArgumentAllowlist, RbacConfig, RbacPolicy, RoleConfig},
+    rbac::{ArgumentAllowlist, RbacConfig, RbacDecision, RbacPolicy, RoleConfig},
 };
 
 // Proptest config: ≥1024 cases per target (plan acceptance gate).
@@ -150,5 +150,90 @@ proptest! {
         // Both branches must terminate without panicking on any input.
         let _ = policy.argument_allowed("viewer", &tool, "cmd", "ls");
         let _ = policy.argument_allowed("viewer", &tool, "cmd", "rm");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 4. Operation deny matching
+// ---------------------------------------------------------------------------
+
+fn allow_all_role() -> RoleConfig {
+    RoleConfig::new("editor", vec!["*".into()], vec!["*".into()])
+}
+
+fn enabled_policy(config: RbacConfig) -> RbacPolicy {
+    let mut config = config;
+    config.enabled = true;
+    RbacPolicy::new(&config)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(PROPTEST_CASES))]
+
+    /// Glob-free deny entries must behave exactly like the pre-glob exact
+    /// matcher. `glob_match` short-circuits to `pattern == text` when the
+    /// pattern contains no `*`, so honouring globs in `deny` cannot change
+    /// the decision for any config that never used a `*`.
+    #[test]
+    fn glob_free_deny_is_exact_equality(
+        denied in "[a-z_]{1,12}",
+        operation in "[a-z_]{1,12}",
+    ) {
+        let policy = enabled_policy(RbacConfig::with_roles(vec![
+            allow_all_role().with_deny(vec![denied.clone()]),
+        ]));
+        let expected = if denied == operation {
+            RbacDecision::Deny
+        } else {
+            RbacDecision::Allow
+        };
+        prop_assert_eq!(policy.check_operation("editor", &operation), expected);
+        prop_assert_eq!(policy.check("editor", &operation, "any-host"), expected);
+    }
+
+    /// Adding a deny entry may only remove capability. A role that denies an
+    /// operation must never allow it, regardless of what `allow` grants --
+    /// this is the monotonicity guarantee the fail-open bug violated.
+    #[test]
+    fn adding_a_deny_entry_never_grants_access(
+        pattern in glob_pattern_strategy(),
+        operation in "[a-z*_]{1,16}",
+    ) {
+        let without = enabled_policy(RbacConfig::with_roles(vec![allow_all_role()]));
+        let with = enabled_policy(RbacConfig::with_roles(vec![
+            allow_all_role().with_deny(vec![pattern.clone()]),
+        ]));
+        if with.check_operation("editor", &operation) == RbacDecision::Allow {
+            prop_assert_eq!(
+                without.check_operation("editor", &operation),
+                RbacDecision::Allow,
+                "deny entry {} turned Deny into Allow for {}",
+                pattern,
+                operation
+            );
+        }
+    }
+
+    /// `global_deny` is a pure veto: whatever it matches must be denied, and
+    /// it must never turn a denial into an allow.
+    #[test]
+    fn global_deny_only_removes_capability(
+        pattern in glob_pattern_strategy(),
+        operation in "[a-z*_]{1,16}",
+    ) {
+        let without = enabled_policy(RbacConfig::with_roles(vec![allow_all_role()]));
+        let with = enabled_policy(
+            RbacConfig::with_roles(vec![allow_all_role()])
+                .with_global_deny(vec![pattern.clone()]),
+        );
+        if with.check_operation("editor", &operation) == RbacDecision::Allow {
+            prop_assert_eq!(
+                without.check_operation("editor", &operation),
+                RbacDecision::Allow,
+                "global_deny {} turned Deny into Allow for {}",
+                pattern,
+                operation
+            );
+        }
     }
 }
