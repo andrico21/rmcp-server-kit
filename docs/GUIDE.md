@@ -579,6 +579,35 @@ constructor to call.
 Role-based access control with deny-overrides-allow semantics, per-tool
 argument allowlists, and host-scoped visibility.
 
+#### One role per identity
+
+Authorization evaluates **exactly one role string per identity**. rmcp-server-kit does not
+union several matched roles, and there is no role inheritance. That single string comes from
+whichever mechanism authenticated the caller:
+
+| Auth method | Role source |
+|---|---|
+| API key   | `ApiKeyEntry.role` |
+| mTLS      | `MtlsConfig.default_role` (same role for every client certificate) |
+| OAuth JWT | the **first matching entry in configuration order** - see [oauth](#oauth) |
+
+The resolved string must name a role defined in `[[rbac.roles]]`. An unknown name **fails
+closed**: the lookup misses and every check denies.
+
+**If your IdP emits several role-granting claims** - say a user in both a "Jira ops" group and a
+"Confluence read-only" group - the caller receives only the *first* role that matches, not the
+combination. Two supported ways to grant the combined capability:
+
+1. Define one RBAC role that grants the union, and map the claim to it.
+2. Normalise the claim at the IdP so one claim value denotes the combined entitlement.
+
+A combined role is evaluated like any other: `global_deny` and that role's own `deny` entries
+subtract capability, and `allow` globbing remains governed by `allow_operation_matching`.
+
+> `current_role()` reports the resolved role to your tool handlers, but it is **not** an
+> authorization decision - enforcement happens in middleware before it is set. Use it for
+> context, audit, and filtering.
+
 #### `RbacConfig`
 
 ```rust
@@ -1166,6 +1195,17 @@ role = "viewer"
 ```
 
 `role_claim` accepts dot-notation for nested JWT claims (`"realm_access.roles"`) and handles both space-separated string claims (`"read write"`) and JSON array claims (`["read", "write"]`). When `role_claim` is set, `scopes` is ignored.
+
+**First match in configuration order wins.** Resolution scans `role_mappings` (or `scopes` when
+`role_claim` is unset) top to bottom and stops at the first entry whose value appears in the token.
+It does **not** scan in token order, and it does not collect every match. Ordering is therefore
+significant: list the most specific mapping first. In the example above a token carrying both
+`mcp-admin` and `mcp-viewer` resolves to `admin`, because that mapping is declared first; swapping
+the two blocks would resolve it to `viewer`.
+
+A token whose claims match no mapping is rejected. See
+[One role per identity](#one-role-per-identity) for how to grant a caller the combined capability
+of several claims.
 
 #### OAuth discovery metadata (RFC 9728 / RFC 8414)
 

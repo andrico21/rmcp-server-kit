@@ -11,6 +11,24 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Documentation
+
+- **Documented the single-role authorization contract.** rmcp-server-kit evaluates exactly one
+  role string per identity and never unions several matched roles; for OAuth that role is the
+  **first matching `role_mappings` / `scopes` entry in configuration order**, so mapping order is
+  significant and most-specific entries belong first. This was already the behaviour -- it was
+  simply never written down, which is how a downstream consumer came to discover it by reading
+  source. Now covered in the `current_role()` rustdoc and in `docs/GUIDE.md` (new
+  "One role per identity" section, plus the OAuth `role_claim` notes), together with the two
+  supported ways to grant a caller the combined capability of several claims: define one RBAC role
+  that grants the union, or normalise the claim at the IdP.
+
+  The docs also record that `current_role()` is **not** an authorization decision -- tool
+  authorization is enforced in middleware before the task-local is installed, and admin gating
+  reads the request's `AuthIdentity` directly.
+
+  **No behaviour change.** Documentation only; no code, API, or configuration was modified.
+
 ## [3.8.2] - 2026-09-02
 
 ### Security

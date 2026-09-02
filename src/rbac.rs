@@ -104,6 +104,36 @@ tokio::task_local! {
 
 /// Get the current caller's RBAC role (set by RBAC middleware).
 /// Returns `None` outside an RBAC-scoped request context.
+///
+/// # One role per identity
+///
+/// Authorization evaluates exactly one role string per identity; it never
+/// unions several matched roles. The string comes from
+/// [`ApiKeyEntry::role`](crate::auth::ApiKeyEntry), `MtlsConfig::default_role`,
+/// or -- for OAuth -- the **first matching entry in configuration order**
+/// (`role_mappings` when `role_claim` is set, otherwise `scopes`). A token
+/// bearing several role-granting claims therefore yields only the first
+/// mapped role. See the RBAC section of `docs/GUIDE.md` for the operator
+/// workarounds.
+///
+/// The resolved string must name a role configured in `[[rbac.roles]]`;
+/// an unknown name fails closed.
+///
+/// # This is not an authorization decision
+///
+/// Tool authorization is enforced by the RBAC middleware *before* this
+/// task-local is installed, and admin gating reads the request's
+/// `AuthIdentity` directly rather than this accessor. Use `current_role`
+/// for handler context, audit, and filtering -- never as the sole basis
+/// for granting access.
+///
+/// # Empty roles
+///
+/// The built-in middleware installs no task-local scope when the resolved
+/// role is empty (as happens when authentication is disabled), so this
+/// returns `None` in that case. It does not itself filter: the lower-level
+/// [`with_rbac_scope`] installs whatever string the caller passes,
+/// including `""`.
 #[must_use]
 pub fn current_role() -> Option<String> {
     CURRENT_ROLE.try_with(Clone::clone).ok()
