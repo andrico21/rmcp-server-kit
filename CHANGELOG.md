@@ -11,6 +11,8 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+## [3.8.2] - 2026-09-02
+
 ### Security
 
 - **RBAC operation `deny` entries are now glob-matched.** Previously
