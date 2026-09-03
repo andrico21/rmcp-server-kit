@@ -11,6 +11,38 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`current_identity()` and `current_role()` now treat an empty value as
+  absent**, matching `current_token()` and `current_sub()`, which already did.
+  Previously two of the four task-local accessors returned `Some("")` where the
+  other two returned `None`.
+
+  The asymmetry defeated a reasonable guard. `current_sub().or_else(current_identity)`
+  is a natural way to resolve a stable per-user key: `current_sub()` correctly
+  yielded `None`, evaluation fell through to `current_identity()`, and the
+  `Some("")` it returned satisfied the caller's `ok_or_else`. A downstream
+  consumer was using that value as a per-user OAuth token-store key, so
+  identity-less callers collapsed into one shared bucket. The call site looked
+  correctly guarded.
+
+  Reachable through an API key whose `name` is empty paired with a non-empty
+  role: `ApiKeyEntry::new` does not validate `name`, and the RBAC middleware
+  gates task-local installation only on the role being non-empty.
+
+  **This is a behaviour change.** Any caller receiving `Some("")` today will now
+  receive `None`. In this crate the change can only narrow: no internal path
+  treats `None` as more permissive. Downstream code should audit `unwrap_or`,
+  `unwrap_or_else` and `unwrap_or_default` fallbacks on these two accessors,
+  where substituting a default for `None` could widen behaviour.
+
+  **Scope.** This normalises the accessors only. A configured `AuthIdentity`
+  may still carry an empty `name`, which remains significant for session-binding
+  fingerprints, admin summaries and audit logs.
+
+  Reported by a downstream consumer running per-user OAuth across ~145
+  product-scoped tools.
+
 ### Added
 
 - Added opt-in `McpServerConfig::with_event_store` for supplying an external

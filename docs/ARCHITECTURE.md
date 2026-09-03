@@ -150,7 +150,7 @@ axum Router                                  src/transport.rs:1635  (build_app_r
    │      (see `extract_bearer` in src/auth.rs).
    │      On success: sets task-locals via `current_role`, `current_identity`, …
    │
-├── 8. RBAC middleware                    src/rbac.rs:1083 (rbac_middleware) + 1252 (enforce_tool_policy)
+├── 8. RBAC middleware                    src/rbac.rs:1118 (rbac_middleware) + 1252 (enforce_tool_policy)
    │      For POSTs to /mcp:
    │        - Reads body up to limit
    │        - Parses JSON-RPC envelope
@@ -237,7 +237,7 @@ pub struct AuthIdentity {
 }
 ```
 
-### `RbacPolicy` - `src/rbac.rs:418`
+### `RbacPolicy` - `src/rbac.rs:581`
 Holds:
 - `roles: HashMap<String, RoleConfig>` - per-role tool allow/deny rules
 - default-deny semantics with explicit overrides
@@ -381,7 +381,7 @@ ArgumentAllowlist {                       // src/rbac.rs:275
 
 ### Decision function
 - `RbacPolicy::check(role, operation, host)` - pure allow/deny (`src/rbac.rs:511`; fn `check`)
-- `RbacPolicy::argument_allowed(role, tool, argument, value)` - JSON value match (`src/rbac.rs:763`; fn `argument_allowed`)
+- `RbacPolicy::argument_allowed(role, tool, argument, value)` - JSON value match (`src/rbac.rs:798`; fn `argument_allowed`)
 - `RbacPolicy::redact_arg(value)` - HMAC-SHA256 of an argument value with
 the policy's salt, returning an 8-char hex prefix (`src/rbac.rs:749`).
   Used to keep raw argument values out of deny logs.
@@ -391,7 +391,7 @@ the policy's salt, returning an 8-char hex prefix (`src/rbac.rs:749`).
   installed *after* enforcement (see "Task-locals" below).
 
 ### Middleware
-`rbac_middleware` (`src/rbac.rs:1083`):
+`rbac_middleware` (`src/rbac.rs:1118`):
 1. Extracts the role + identity name from the `AuthIdentity` request
    extension (set by the auth middleware).
 2. For `POST /mcp`, reads the body (bounded by body-size layer), parses

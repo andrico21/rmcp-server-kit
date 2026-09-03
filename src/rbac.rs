@@ -129,21 +129,38 @@ tokio::task_local! {
 ///
 /// # Empty roles
 ///
-/// The built-in middleware installs no task-local scope when the resolved
-/// role is empty (as happens when authentication is disabled), so this
-/// returns `None` in that case. It does not itself filter: the lower-level
-/// [`with_rbac_scope`] installs whatever string the caller passes,
-/// including `""`.
+/// An empty role is treated as absent and yields `None`, matching
+/// [`current_identity`], [`current_token`] and [`current_sub`]. The built-in
+/// middleware additionally installs no task-local scope at all when the
+/// resolved role is empty (as happens when authentication is disabled), so
+/// both paths agree.
 #[must_use]
 pub fn current_role() -> Option<String> {
-    CURRENT_ROLE.try_with(Clone::clone).ok()
+    CURRENT_ROLE
+        .try_with(Clone::clone)
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 /// Get the current caller's identity name (set by RBAC middleware).
 /// Returns `None` outside an RBAC-scoped request context.
+///
+/// An empty identity is treated as absent and yields `None`, matching
+/// [`current_role`], [`current_token`] and [`current_sub`]. This matters
+/// because `current_sub().or_else(current_identity)` is a natural way to
+/// resolve a stable per-user key, and an empty string returned here would
+/// defeat the caller's `None` check while looking correct.
+///
+/// This normalises the accessor only. A configured
+/// [`AuthIdentity`](crate::auth::AuthIdentity) may still carry an empty
+/// `name`, which remains significant elsewhere (session-binding fingerprints,
+/// admin summaries, audit logs).
 #[must_use]
 pub fn current_identity() -> Option<String> {
-    CURRENT_IDENTITY.try_with(Clone::clone).ok()
+    CURRENT_IDENTITY
+        .try_with(Clone::clone)
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 /// Get the raw bearer token for the current request as a [`SecretString`].
@@ -3015,6 +3032,65 @@ mod tests {
     #[test]
     fn current_identity_returns_none_outside_scope() {
         assert!(current_identity().is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_task_locals_are_all_absent() {
+        with_rbac_scope(
+            String::new(),
+            String::new(),
+            SecretString::from(String::new()),
+            String::new(),
+            async {
+                assert!(current_role().is_none(), "empty role must be absent");
+                assert!(
+                    current_identity().is_none(),
+                    "empty identity must be absent"
+                );
+                assert!(current_token().is_none(), "empty token must be absent");
+                assert!(current_sub().is_none(), "empty sub must be absent");
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn non_empty_task_locals_are_all_present() {
+        with_rbac_scope(
+            "viewer".to_owned(),
+            "alice".to_owned(),
+            SecretString::from("tok".to_owned()),
+            "sub-1".to_owned(),
+            async {
+                assert_eq!(current_role().as_deref(), Some("viewer"));
+                assert_eq!(current_identity().as_deref(), Some("alice"));
+                assert!(current_token().is_some());
+                assert_eq!(current_sub().as_deref(), Some("sub-1"));
+            },
+        )
+        .await;
+    }
+
+    /// The reachable shape from the downstream report: a real role with an
+    /// empty identity and no sub. `current_sub().or_else(current_identity)`
+    /// must resolve to `None` so a caller's `ok_or_else` guard fires, rather
+    /// than yielding `Some("")` and being used as a per-user key.
+    #[tokio::test]
+    async fn sub_or_identity_fallback_is_absent_for_empty_identity() {
+        with_rbac_scope(
+            "viewer".to_owned(),
+            String::new(),
+            SecretString::from(String::new()),
+            String::new(),
+            async {
+                assert_eq!(current_role().as_deref(), Some("viewer"));
+                assert!(
+                    current_sub().or_else(current_identity).is_none(),
+                    "empty identity must not satisfy a sub-or-identity fallback"
+                );
+            },
+        )
+        .await;
     }
 
     // -- rbac_middleware integration tests --
