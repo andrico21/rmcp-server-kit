@@ -46,8 +46,8 @@ The crate has two transports:
 
 | Transport          | Function                                            | Auth/RBAC/TLS  | Use case                                         |
 |--------------------|-----------------------------------------------------|----------------|--------------------------------------------------|
-| **Streamable HTTP**| `serve()` - `src/transport.rs:2203`                 | **Yes**        | Production network deployment                    |
-| stdio              | `serve_stdio()` - `src/transport.rs:3989`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
+| **Streamable HTTP**| `serve()` - `src/transport.rs:2277`                 | **Yes**        | Production network deployment                    |
+| stdio              | `serve_stdio()` - `src/transport.rs:4063`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
 
 ---
 
@@ -185,12 +185,12 @@ Open endpoints (no auth):
 
 | Path                                       | Handler                                       |
 |--------------------------------------------|-----------------------------------------------|
-| `GET  /healthz`                            | `healthz` (~`src/transport.rs:1811`) |
-| `GET  /readyz`                             | `readyz`  (~`src/transport.rs:1812`) - runs configured readiness check |
-| `GET  /version`                            | `version_payload` (~`src/transport.rs:3165`) |
+| `GET  /healthz`                            | `healthz` (~`src/transport.rs:3224`) |
+| `GET  /readyz`                             | `readyz`  (~`src/transport.rs:3288`) - runs configured readiness check |
+| `GET  /version`                            | `version_payload` (~`src/transport.rs:3239`) |
 | `GET  /metrics`                            | served by `serve_metrics` on a **separate listener** when `feature = "metrics"` (`src/metrics.rs:142`) |
 | `GET  /.well-known/oauth-protected-resource` | feature = `oauth` (`src/transport.rs:1905`) |
-| `GET  /.well-known/oauth-authorization-server` | feature = `oauth` proxy (`src/transport.rs:2502`) |
+| `GET  /.well-known/oauth-authorization-server` | feature = `oauth` proxy (`src/transport.rs:2601`) |
 
 Authenticated endpoints:
 
@@ -217,7 +217,7 @@ Top-level builder-style config consumed by `serve()`. Holds:
 - optional readiness check callback (`Arc<dyn Fn() -> bool + Send + Sync>`)
 - public URL (used in OAuth metadata responses)
 
-### `ReloadHandle` - `src/transport.rs:1439`
+### `ReloadHandle` - `src/transport.rs:1483`
 Returned (optionally) from `serve()` when the consumer needs runtime
 hot-reload. Two methods:
 - `reload_auth_keys(new_map)` - atomically swaps `AuthState.api_keys`
@@ -446,7 +446,7 @@ Lifecycle (concurrent-acceptor design, since the 1.8.1 review fixes):
 1. `TlsListener::new(...)` reads PEM cert + key, builds a `rustls::ServerConfig`,
    optionally wraps with mTLS verification using configured root CAs, then
    spawns a dedicated background acceptor task (`run_tls_acceptor`,
-`src/transport.rs:2950`) that owns the `TcpListener`.
+`src/transport.rs:3011`) that owns the `TcpListener`.
 2. The acceptor task loops: acquires a permit from a semaphore sized by
    `max_concurrent_tls_handshakes` (default 256 via
    `DEFAULT_MAX_CONCURRENT_TLS_HANDSHAKES`; configurable since 1.9.0 via
@@ -813,7 +813,7 @@ retiring.
 **TOML** - the deserializable sections:
 
 - `ServerConfig` - `src/config.rs:296`
-- `ObservabilityConfig` - `src/config.rs:1066`
+- `ObservabilityConfig` - `src/config.rs:1167`
 - `SecurityHeadersConfig` - `src/transport.rs:239`
 - `AuthConfig`, `MtlsConfig`, `RateLimitConfig` - `src/auth.rs`
 - `RbacConfig` - `src/rbac.rs`
@@ -824,18 +824,18 @@ sections into its own root type. `[server]`, `[rbac]` and `[observability]`
 are a convention from [`docs/GUIDE.md`](GUIDE.md), not a type.
 
 `ServerConfig` was schema-only until 3.4.0 - nothing in the crate consumed it.
-`ServerConfig::apply_to_mcp_config` (`src/config.rs:740`) is the bridge that
+`ServerConfig::apply_to_mcp_config` (`src/config.rs:822`) is the bridge that
 makes it reachable. It uses **replacement semantics**: authoritative for every
 bridgeable transport field, with `None`/`false` clearing whatever the base
 held. Only the runtime-only fields above survive from the base. It is fallible
 (duration strings parse here) and never reads the environment.
 
 **Environment (opt-in)** - three inherent methods, one per section owning
-targeted fields: `ServerConfig::apply_env_overrides` (`src/config.rs:442`),
-`ObservabilityConfig::apply_env_overrides` (`src/config.rs:832`) and
+targeted fields: `ServerConfig::apply_env_overrides` (`src/config.rs:596`),
+`ObservabilityConfig::apply_env_overrides` (`src/config.rs:917`) and
 `RbacConfig::apply_env_overrides` (`src/rbac.rs:1594`). Each returns
 `Vec<EnvOverride>` (`src/config.rs:64`) for audit logging, with `value: None`
-for secret targets. Fourteen curated variables under the `RMCP_SERVER_KIT__`
+for secret targets. Curated variables under the `RMCP_SERVER_KIT__`
 prefix; `__` separates TOML path segments because field names already contain
 single underscores.
 
@@ -890,8 +890,8 @@ These are **non-negotiable**. Breaking any of them is a security regression.
 
 1. **Origin check runs before auth.** Reordering would allow unauthenticated
    browser-origin requests to hit the auth path and amplify timing oracles.
-Wired in `build_app_router` (`src/transport.rs:1521`); the middleware
-itself is at `src/transport.rs:3276`.
+Wired in `build_app_router` (`src/transport.rs:1559`); the middleware
+itself is at `src/transport.rs:3954`.
 
 2. **Auth runs before RBAC.** Without an `AuthIdentity`, RBAC has no role
    to evaluate. The middleware order in `src/transport.rs` (auth at

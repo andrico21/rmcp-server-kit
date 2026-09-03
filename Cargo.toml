@@ -188,6 +188,7 @@ criterion = { version = "0.8", default-features = false, features = [
 ] }
 proptest = "1"
 temp-env = "0.3.6"
+async-trait = "0.1"
 
 [[bench]]
 name = "rbac_redaction"

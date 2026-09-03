@@ -11,6 +11,22 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Added
+
+- Added `McpServerConfig::with_session_store` for supplying an external rmcp
+  `SessionStore`, enabling Streamable HTTP session recovery across replicas.
+- Added `McpServerConfig::with_session_binding_secret`, TOML
+  `server.session_binding_secret`, and the
+  `RMCP_SERVER_KIT__SERVER__SESSION_BINDING_SECRET(_FILE)` environment override
+  pair for sharing the session-binding HMAC key across replicas.
+
+### Changed
+
+- Config validation now rejects authenticated deployments that combine an
+  external `session_store` with enabled session binding but omit a shared
+  `session_binding_secret`, preventing cross-instance session verification
+  failures at runtime.
+
 ### Security
 
 - **`tools/list` responses are filtered by RBAC by default.** When RBAC is

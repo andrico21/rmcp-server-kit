@@ -198,6 +198,8 @@ config.validate().expect("config valid");
 | `allowed_origins` | `Vec<String>` | `[]` | Allowed Origin header values |
 | `tool_rate_limit` | `Option<u32>` | `None` | Max tool calls/min per IP |
 | `session_binding` | `bool` | `true` | Statelessly bind MCP session IDs to the authenticated identity |
+| `session_binding_secret` | `Option<SecretString>` | `None` | Shared HMAC secret for cross-instance session binding |
+| `session_store` | `Option<Arc<dyn SessionStore>>` | `None` | Programmatic external rmcp session store; no TOML field |
 | `readiness_check` | `Option<ReadinessCheck>` | `None` | Custom `/readyz` probe |
 | `max_request_body` | `usize` | `1 MiB` | Max request body bytes |
 | `request_timeout` | `Duration` | `120s` | Per-request timeout (408) |
@@ -923,6 +925,7 @@ extra_route_rate_limit = 60
 | `key_eviction_policy` | `KeyEvictionPolicy` | `"evict_lru"` | Full-table policy for per-IP limiter key maps; accepted values: `"evict_lru"`, `"reject_new"` |
 | `session_idle_timeout` | `String` | `"20m"` | Humantime duration; idle MCP sessions are closed after this period |
 | `session_binding` | `bool` | `true` | Stateless signed wrapper for `Mcp-Session-Id`; disables cross-identity session replay. Setting `false` reinstates CWE-384 risk and should only be used behind a gateway that deliberately re-authenticates each request under different labels |
+| `session_binding_secret` | `Option<SecretString>` | `None` | Shared HMAC secret for session binding across replicas; at least 32 UTF-8 bytes. No `session_store` TOML field exists because stores are trait objects supplied in code |
 | `sse_keep_alive` | `String` | `"15s"` | Humantime duration; SSE keep-alive ping interval |
 | `public_url` | `Option<String>` | `None` | Externally reachable base URL (e.g. `https://mcp.example.com`); required when `listen_addr` is `0.0.0.0` behind a reverse proxy or container |
 | `compression_enabled` | `bool` | `false` | Enable gzip/br response compression |
@@ -1784,6 +1787,60 @@ identity label between requests. Disabling the wrapper restores the CWE-384
 condition where a leaked raw rmcp session ID can be reused by another
 authenticated caller.
 
+#### Multi-replica session recovery
+
+For load-balanced deployments, supply an external rmcp `SessionStore` in code
+so a request routed to replica B can restore a session initialized on replica A:
+
+```rust,ignore
+use std::sync::Arc;
+use rmcp::transport::streamable_http_server::session::SessionStore;
+use rmcp_server_kit::secret::SecretString;
+use rmcp_server_kit::transport::McpServerConfig;
+
+let store: Arc<dyn SessionStore> = Arc::new(MyRedisSessionStore::new(redis_pool));
+
+let config = McpServerConfig::new("0.0.0.0:8443", "my-server", "0.1.0")
+    .with_auth(auth)
+    .with_session_store(store)
+    .with_session_binding_secret(SecretString::from(
+        std::env::var("RMCP_SERVER_KIT__SERVER__SESSION_BINDING_SECRET")?,
+    ));
+```
+
+`session_store` is programmatic only: it is an `Arc<dyn SessionStore>` trait
+object and therefore has no TOML representation. `server.session_binding_secret`
+is available in TOML and via environment variables. For Kubernetes or any
+secret-mounted deployment, prefer the `_FILE` form:
+
+```text
+RMCP_SERVER_KIT__SERVER__SESSION_BINDING_SECRET_FILE=/var/run/secrets/rmcp/session-binding-secret
+```
+
+The file is treated as text; one terminal newline (`\n`, `\r`, or `\r\n`) is
+removed and all other whitespace is preserved. Generate at least 32 random
+bytes, for example `openssl rand -base64 32`, and share the exact same value
+across every replica.
+
+Startup fails closed when all of these are true: `with_session_store(...)` is
+set, session binding is enabled, authentication is enabled, and no shared
+`session_binding_secret` is configured. The error names both `session_store`
+and `session_binding` and explains that a shared secret is required for
+cross-instance verification. With authentication disabled, session binding is
+inert because there is no `AuthIdentity`, so this validation rule does not
+apply.
+
+Rotating `session_binding_secret` invalidates active bound sessions. Clients
+will need to reinitialize after rotation; coordinate the change across replicas
+to avoid a mixed-secret window.
+
+API-key and mTLS identity fingerprints are stable when every replica uses the
+same API-key metadata and certificate identity mapping. OAuth fingerprints are
+stable only when the JWT `sub` claim is present; otherwise the identity name may
+fall back through mutable claims such as `preferred_username`. For OAuth
+deployments using an external session store, set `require_subject = true` on
+the OAuth config so token refreshes keep the same session-binding fingerprint.
+
 ### Customising security headers
 
 By default, rmcp-server-kit emits twelve OWASP security headers on every
@@ -2467,6 +2524,7 @@ request_timeout = "120s"
 allowed_origins = ["http://localhost:3000", "https://myapp.example.com"]
 tool_rate_limit = 120
 session_binding = true
+# session_binding_secret = "replace-with-32-plus-random-bytes"  # env: RMCP_SERVER_KIT__SERVER__SESSION_BINDING_SECRET
 tool_list_filtering = true
 key_eviction_policy = "evict_lru"  # env: RMCP_SERVER_KIT__SERVER__KEY_EVICTION_POLICY
 max_request_body = 1048576
@@ -2687,6 +2745,8 @@ call order is:
 | `RMCP_SERVER_KIT__SERVER__TLS_KEY_PATH` | `server.tls_key_path` | Path | |
 | `RMCP_SERVER_KIT__SERVER__ADMIN_ENABLED` | `server.admin_enabled` | bool | |
 | `RMCP_SERVER_KIT__SERVER__KEY_EVICTION_POLICY` | `server.key_eviction_policy` | KeyEvictionPolicy | |
+| `RMCP_SERVER_KIT__SERVER__SESSION_BINDING_SECRET` | `server.session_binding_secret` | SecretString | secret; redacted in report |
+| `RMCP_SERVER_KIT__SERVER__SESSION_BINDING_SECRET_FILE` | `server.session_binding_secret` | Path | secret; redacted in report |
 | `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ISSUER` | `server.auth.oauth.issuer` | String | requires `oauth` feature |
 | `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__AUDIENCE` | `server.auth.oauth.audience` | String | requires `oauth` feature |
 | `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__JWKS_URI` | `server.auth.oauth.jwks_uri` | String | requires `oauth` feature |
@@ -2730,7 +2790,7 @@ Each method returns `Vec<EnvOverride>`. Each entry carries:
 - `source` -- `EnvOverrideSource::Env` (value read directly from the variable) or `EnvOverrideSource::File` (value read from the file named by a `_FILE` variable)
 - `value` -- the applied string for non-secret targets; `None` for secret-typed targets
 
-Secret-typed targets (`rbac.redaction_salt`) always carry `value: None`. The secret never appears in `EnvOverride::value` or in its `Debug` output. Log the report after initializing tracing so any env variable that shadowed a TOML value leaves a structured trail at startup, as shown in [`examples/config_file_server.rs`](../examples/config_file_server.rs).
+Secret-typed targets (`server.session_binding_secret`, `rbac.redaction_salt`) always carry `value: None`. The secret never appears in `EnvOverride::value` or in its `Debug` output. Log the report after initializing tracing so any env variable that shadowed a TOML value leaves a structured trail at startup, as shown in [`examples/config_file_server.rs`](../examples/config_file_server.rs).
 
 #### `oauth` feature interaction
 

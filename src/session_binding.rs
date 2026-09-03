@@ -10,23 +10,33 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, KeyInit as _, Mac as _};
+use secrecy::{ExposeSecret as _, SecretString};
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
 
-use crate::auth::{AuthIdentity, AuthMethod};
+use crate::{
+    auth::{AuthIdentity, AuthMethod},
+    error::RmcpServerKitError,
+};
 
 const VERSION: &str = "v1";
 const DOMAIN_SEPARATOR: u8 = 0;
 const RAW_SESSION_ID_LEN: usize = 36;
 const RAW_SESSION_ID_B64_LEN: usize = 48;
 const MAC_LEN: usize = 32;
+pub(crate) const MIN_CONFIGURED_SECRET_BYTES: usize = 32;
 const MAC_B64_LEN: usize = 43;
 const MAX_WRAPPED_SESSION_TOKEN_LEN: usize =
     VERSION.len() + 1 + RAW_SESSION_ID_B64_LEN + 1 + MAC_B64_LEN;
 
 /// Process-random HMAC secret used for stateless session binding.
-#[derive(Clone, Copy)]
-pub(crate) struct SessionBindingSecret([u8; MAC_LEN]);
+#[derive(Clone)]
+pub(crate) enum SessionBindingSecret {
+    /// Process-random fallback for single-instance deployments.
+    Process([u8; MAC_LEN]),
+    /// Operator-supplied shared secret for multi-instance deployments.
+    Configured(SecretString),
+}
 
 impl std::fmt::Debug for SessionBindingSecret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -79,8 +89,35 @@ pub(crate) fn process_session_binding_secret() -> &'static SessionBindingSecret 
     PROCESS_SECRET.get_or_init(|| {
         let mut bytes = [0u8; MAC_LEN];
         rand::fill(&mut bytes);
-        SessionBindingSecret(bytes)
+        SessionBindingSecret::Process(bytes)
     })
+}
+
+/// Build a session-binding HMAC secret from operator configuration.
+pub(crate) fn configured_session_binding_secret(
+    secret: &SecretString,
+) -> Result<SessionBindingSecret, RmcpServerKitError> {
+    validate_configured_secret("session_binding_secret", secret.expose_secret())?;
+    Ok(SessionBindingSecret::Configured(secret.clone()))
+}
+
+/// Validate the configured session-binding secret's strength.
+pub(crate) fn validate_configured_secret(
+    field: &str,
+    value: &str,
+) -> Result<(), RmcpServerKitError> {
+    if value.trim().is_empty() {
+        return Err(RmcpServerKitError::Config(format!(
+            "{field} must not be empty or whitespace-only"
+        )));
+    }
+    let len = value.len();
+    if len < MIN_CONFIGURED_SECRET_BYTES {
+        return Err(RmcpServerKitError::Config(format!(
+            "{field} must be at least {MIN_CONFIGURED_SECRET_BYTES} UTF-8 bytes"
+        )));
+    }
+    Ok(())
 }
 
 /// Build the stable authenticated-identity fingerprint bytes.
@@ -217,15 +254,23 @@ fn compute_mac(
 ) -> [u8; MAC_LEN] {
     type HmacSha256 = Hmac<Sha256>;
 
-    // The secret is a fixed 32-byte process-random key, and HMAC-SHA256
-    // accepts keys of any length (RFC 2104), so construction cannot fail.
+    // HMAC-SHA256 accepts keys of any length (RFC 2104), so construction
+    // cannot fail for either the process-random default or configured secret.
     // Mirror the defensive re-key used by `rbac::redact_with_salt` rather
     // than unwrapping, so a future upstream contract change degrades to a
     // still-valid keyed MAC instead of a panic.
-    let mut mac = if let Ok(m) = HmacSha256::new_from_slice(&secret.0) {
+    let configured_key;
+    let key = match secret {
+        SessionBindingSecret::Process(bytes) => bytes.as_slice(),
+        SessionBindingSecret::Configured(secret) => {
+            configured_key = secret.expose_secret();
+            configured_key.as_bytes()
+        }
+    };
+    let mut mac = if let Ok(m) = HmacSha256::new_from_slice(key) {
         m
     } else {
-        let digest = Sha256::digest(secret.0);
+        let digest = Sha256::digest(key);
         #[allow(
             clippy::expect_used,
             reason = "32-byte SHA-256 digest is unconditionally valid as an HMAC-SHA256 key (RFC 2104 allows any key length); see surrounding comment"
@@ -308,7 +353,7 @@ mod tests {
     const OTHER_RAW_ID: &str = "550e8400-e29b-41d4-a716-446655440001";
 
     fn test_secret(byte: u8) -> SessionBindingSecret {
-        SessionBindingSecret([byte; MAC_LEN])
+        SessionBindingSecret::Process([byte; MAC_LEN])
     }
 
     fn test_identity(name: &str, method: AuthMethod, sub: Option<&str>) -> AuthIdentity {
@@ -327,6 +372,39 @@ mod tests {
 
     fn bound_token(secret: &SessionBindingSecret, identity: &AuthIdentity, raw: &str) -> String {
         wrap(secret, &raw_id(raw), &fingerprint(identity))
+    }
+
+    #[test]
+    fn session_binding_secret_from_config_is_used() {
+        let left = configured_session_binding_secret(&SecretString::from("x".repeat(32)))
+            .expect("configured secret valid");
+        let right = configured_session_binding_secret(&SecretString::from("x".repeat(32)))
+            .expect("configured secret valid");
+        let identity = test_identity("alice", AuthMethod::BearerToken, None);
+        let token = bound_token(&left, &identity, RAW_ID);
+
+        let verified = unwrap_and_verify(&right, &token, &fingerprint(&identity))
+            .expect("same configured secret verifies");
+
+        assert_eq!(verified, raw_id(RAW_ID));
+    }
+
+    #[test]
+    fn session_binding_secret_differs_from_process_secret() {
+        let configured = configured_session_binding_secret(&SecretString::from("x".repeat(32)))
+            .expect("configured secret valid");
+        let process = process_session_binding_secret();
+        let identity = test_identity("alice", AuthMethod::BearerToken, None);
+        let configured_token = bound_token(&configured, &identity, RAW_ID);
+        let process_token = bound_token(process, &identity, RAW_ID);
+
+        let configured_against_process =
+            unwrap_and_verify(process, &configured_token, &fingerprint(&identity));
+        let process_against_configured =
+            unwrap_and_verify(&configured, &process_token, &fingerprint(&identity));
+
+        assert_eq!(configured_against_process, Err(Reason::MacFailed));
+        assert_eq!(process_against_configured, Err(Reason::MacFailed));
     }
 
     #[test]
@@ -501,6 +579,7 @@ mod tests {
             .route("/echo", post(echo_session))
             .route("/mint", post(mint_session))
             .layer(middleware::from_fn(move |req, next| {
+                let secret = secret.clone();
                 session_binding_middleware(secret, req, next)
             }));
         match identity {

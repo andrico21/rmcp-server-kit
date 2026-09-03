@@ -1,5 +1,6 @@
 use std::{path::PathBuf, time::Duration};
 
+use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 
 use crate::{
@@ -30,6 +31,7 @@ const SERVER_CONFIG_BRIDGED_FIELDS: &[&str] = &[
     "forwarded_header",
     "session_idle_timeout",
     "session_binding",
+    "session_binding_secret",
     "sse_keep_alive",
     "public_url",
     "compression_enabled",
@@ -157,6 +159,20 @@ pub(crate) const ENV_OVERRIDE_SPECS: &[EnvOverrideSpec] = &[
         redacted: false,
     },
     EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__SERVER__SESSION_BINDING_SECRET",
+        target_field: "server.session_binding_secret",
+        value_type: "SecretString",
+        required_feature: None,
+        redacted: true,
+    },
+    EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__SERVER__SESSION_BINDING_SECRET_FILE",
+        target_field: "server.session_binding_secret",
+        value_type: "Path",
+        required_feature: None,
+        redacted: true,
+    },
+    EnvOverrideSpec {
         env_var: "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ISSUER",
         target_field: "server.auth.oauth.issuer",
         value_type: "String",
@@ -264,6 +280,10 @@ pub(crate) const SERVER_TLS_KEY_PATH_ENV: &str = "RMCP_SERVER_KIT__SERVER__TLS_K
 pub(crate) const SERVER_ADMIN_ENABLED_ENV: &str = "RMCP_SERVER_KIT__SERVER__ADMIN_ENABLED";
 pub(crate) const SERVER_KEY_EVICTION_POLICY_ENV: &str =
     "RMCP_SERVER_KIT__SERVER__KEY_EVICTION_POLICY";
+pub(crate) const SERVER_SESSION_BINDING_SECRET_ENV: &str =
+    "RMCP_SERVER_KIT__SERVER__SESSION_BINDING_SECRET";
+pub(crate) const SERVER_SESSION_BINDING_SECRET_FILE_ENV: &str =
+    "RMCP_SERVER_KIT__SERVER__SESSION_BINDING_SECRET_FILE";
 pub(crate) const SERVER_OAUTH_ISSUER_ENV: &str = "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ISSUER";
 pub(crate) const SERVER_OAUTH_AUDIENCE_ENV: &str = "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__AUDIENCE";
 pub(crate) const SERVER_OAUTH_JWKS_URI_ENV: &str = "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__JWKS_URI";
@@ -389,6 +409,8 @@ pub struct ServerConfig {
     /// signed wrapper. Default: true. Disabling reinstates CWE-384 risk.
     #[serde(default = "default_session_binding")]
     pub session_binding: bool,
+    /// Shared HMAC secret used for session binding across server instances.
+    pub session_binding_secret: Option<SecretString>,
     /// Interval for SSE keep-alive pings sent to the client. Prevents
     /// proxies and load balancers from killing idle connections.
     /// Default: 15 seconds.
@@ -479,6 +501,10 @@ impl std::fmt::Debug for ServerConfig {
             .field("forwarded_header", &self.forwarded_header)
             .field("session_idle_timeout", &self.session_idle_timeout)
             .field("session_binding", &self.session_binding)
+            .field(
+                "session_binding_secret",
+                &self.session_binding_secret.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("sse_keep_alive", &self.sse_keep_alive)
             .field("public_url", &self.public_url)
             .field("compression_enabled", &self.compression_enabled)
@@ -519,6 +545,7 @@ impl Default for ServerConfig {
             forwarded_header: None,
             session_idle_timeout: default_session_idle_timeout(),
             session_binding: default_session_binding(),
+            session_binding_secret: None,
             sse_keep_alive: default_sse_keep_alive(),
             public_url: None,
             compression_enabled: false,
@@ -617,12 +644,56 @@ impl ServerConfig {
                 raw,
             ));
         }
+        self.apply_session_binding_secret_env(&mut applied)?;
         let oauth_env = OAuthEnvOverrides::read()?;
         #[cfg(feature = "oauth")]
         self.apply_oauth_env_overrides(oauth_env, &mut applied)?;
         #[cfg(not(feature = "oauth"))]
         reject_oauth_env_overrides(&oauth_env)?;
         Ok(applied)
+    }
+
+    fn apply_session_binding_secret_env(
+        &mut self,
+        applied: &mut Vec<EnvOverride>,
+    ) -> Result<(), RmcpServerKitError> {
+        let direct = read_env(SERVER_SESSION_BINDING_SECRET_ENV)?;
+        let file = read_env(SERVER_SESSION_BINDING_SECRET_FILE_ENV)?;
+        match (direct, file) {
+            (None, None) => Ok(()),
+            (Some(_), Some(_)) => Err(RmcpServerKitError::Config(format!(
+                "{SERVER_SESSION_BINDING_SECRET_ENV} and {SERVER_SESSION_BINDING_SECRET_FILE_ENV} must not both be set"
+            ))),
+            (Some(value), None) => {
+                validate_session_binding_secret_env(SERVER_SESSION_BINDING_SECRET_ENV, &value)?;
+                self.session_binding_secret = Some(SecretString::from(value));
+                applied.push(secret_env_report(
+                    SERVER_SESSION_BINDING_SECRET_ENV,
+                    "server.session_binding_secret",
+                    EnvOverrideSource::Env,
+                ));
+                Ok(())
+            }
+            (None, Some(path)) => {
+                let secret = std::fs::read_to_string(PathBuf::from(&path)).map_err(|error| {
+                    RmcpServerKitError::Config(format!(
+                        "failed to read {SERVER_SESSION_BINDING_SECRET_FILE_ENV} file {path:?}: {error}"
+                    ))
+                })?;
+                let secret = normalize_text_secret_file(secret);
+                validate_session_binding_secret_env(
+                    SERVER_SESSION_BINDING_SECRET_FILE_ENV,
+                    &secret,
+                )?;
+                self.session_binding_secret = Some(SecretString::from(secret));
+                applied.push(secret_env_report(
+                    SERVER_SESSION_BINDING_SECRET_FILE_ENV,
+                    "server.session_binding_secret",
+                    EnvOverrideSource::File,
+                ));
+                Ok(())
+            }
+        }
     }
 
     #[cfg(feature = "oauth")]
@@ -773,6 +844,7 @@ impl ServerConfig {
                 &self.session_idle_timeout,
             )?)
             .with_session_binding(self.session_binding)
+            .with_optional_session_binding_secret(self.session_binding_secret.clone())
             .with_sse_keep_alive(parse_duration_field(
                 "server.sse_keep_alive",
                 &self.sse_keep_alive,
@@ -989,6 +1061,22 @@ fn apply_optional_path_env(
         applied.push(env_report(env_var, target_field, raw));
     }
     Ok(())
+}
+
+pub(crate) fn normalize_text_secret_file(mut secret: String) -> String {
+    if secret.ends_with("\r\n") {
+        secret.truncate(secret.len() - 2);
+    } else if secret.ends_with('\n') || secret.ends_with('\r') {
+        secret.truncate(secret.len() - 1);
+    }
+    secret
+}
+
+fn validate_session_binding_secret_env(
+    env_var: &str,
+    value: &str,
+) -> Result<(), RmcpServerKitError> {
+    crate::session_binding::validate_configured_secret(env_var, value)
 }
 
 struct OAuthEnvOverrides {
@@ -1289,6 +1377,13 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
         return Err(RmcpServerKitError::Config(
             "admin_role must not be empty".into(),
         ));
+    }
+
+    if let Some(secret) = &server.session_binding_secret {
+        crate::session_binding::validate_configured_secret(
+            "server.session_binding_secret",
+            secret.expose_secret(),
+        )?;
     }
 
     for (field, value) in [
@@ -2516,6 +2611,37 @@ mod tests {
     }
 
     #[test]
+    fn session_binding_secret_toml_roundtrip_and_bridge() {
+        let cfg = server_from_root_toml(
+            r#"
+                [server]
+                session_binding_secret = "0123456789abcdef0123456789abcdef"
+            "#,
+        );
+        let bridged = cfg
+            .apply_to_mcp_config(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0"))
+            .unwrap();
+
+        assert!(cfg.session_binding_secret.is_some());
+        assert!(bridged.session_binding_secret.is_some());
+        assert!(validate_server_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn session_binding_secret_short_toml_rejected() {
+        let cfg = server_from_root_toml(
+            r#"
+                [server]
+                session_binding_secret = "too-short"
+            "#,
+        );
+
+        let err = validate_server_config(&cfg).expect_err("short binding secret fails");
+
+        assert!(err.to_string().contains("at least 32 UTF-8 bytes"));
+    }
+
+    #[test]
     fn tool_list_filtering_toml_roundtrip_and_bridge() {
         let cfg = server_from_root_toml(
             r"
@@ -3133,6 +3259,74 @@ mod tests {
     }
 
     #[test]
+    fn session_binding_secret_env_and_file_conflict_rejected() {
+        with_env_vars(
+            &[
+                (
+                    SERVER_SESSION_BINDING_SECRET_ENV,
+                    Some("0123456789abcdef0123456789abcdef"),
+                ),
+                (SERVER_SESSION_BINDING_SECRET_FILE_ENV, Some("/tmp/secret")),
+            ],
+            || {
+                let mut cfg = ServerConfig::default();
+                let err = cfg.apply_env_overrides().unwrap_err();
+                let msg = err.to_string();
+                assert!(msg.contains(SERVER_SESSION_BINDING_SECRET_ENV));
+                assert!(msg.contains(SERVER_SESSION_BINDING_SECRET_FILE_ENV));
+            },
+        );
+    }
+
+    #[test]
+    fn session_binding_secret_blank_rejected() {
+        for value in ["", "\n", "   "] {
+            with_env_vars(&[(SERVER_SESSION_BINDING_SECRET_ENV, Some(value))], || {
+                let mut cfg = ServerConfig::default();
+                let err = cfg.apply_env_overrides().unwrap_err();
+                assert!(err.to_string().contains(SERVER_SESSION_BINDING_SECRET_ENV));
+            });
+        }
+    }
+
+    #[test]
+    fn session_binding_secret_file_normalizes_newline_and_reports_file_source() {
+        let path = std::env::temp_dir().join(format!(
+            "rmcp-server-kit-session-binding-secret-{}.txt",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::write(&path, "0123456789abcdef0123456789abcdef\n").expect("write secret file");
+        let path_string = path.to_string_lossy().to_string();
+        let report = with_env_vars(
+            &[(
+                SERVER_SESSION_BINDING_SECRET_FILE_ENV,
+                Some(path_string.as_str()),
+            )],
+            || {
+                let mut cfg = ServerConfig::default();
+                let report = cfg.apply_env_overrides().unwrap();
+                assert_eq!(
+                    cfg.session_binding_secret
+                        .as_ref()
+                        .map(SecretString::expose_secret),
+                    Some("0123456789abcdef0123456789abcdef")
+                );
+                report
+            },
+        );
+        std::fs::remove_file(path).expect("remove secret file");
+
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].env_var, SERVER_SESSION_BINDING_SECRET_FILE_ENV);
+        assert_eq!(report[0].target_field, "server.session_binding_secret");
+        assert_eq!(report[0].source, EnvOverrideSource::File);
+        assert!(report[0].value.is_none());
+    }
+
+    #[test]
     fn e4_oauth_env_without_auth_parent_fails_closed() {
         with_env_vars(&[(SERVER_OAUTH_ISSUER_ENV, Some("https://idp/"))], || {
             let mut cfg = ServerConfig::default();
@@ -3532,7 +3726,7 @@ mod tests {
                 .iter()
                 .filter(|spec| spec.value_type == "Path")
                 .count(),
-            3
+            4
         );
     }
 
@@ -3553,7 +3747,10 @@ mod tests {
     // `_FILE` is documented next to its sibling because both target the same
     // TOML key (`rbac.redaction_salt`); duplicating the inline annotation on
     // the key would be ambiguous rather than helpful.
-    const INLINE_ENV_ANNOTATION_EXEMPTIONS: &[&str] = &[RBAC_REDACTION_SALT_FILE_ENV];
+    const INLINE_ENV_ANNOTATION_EXEMPTIONS: &[&str] = &[
+        SERVER_SESSION_BINDING_SECRET_FILE_ENV,
+        RBAC_REDACTION_SALT_FILE_ENV,
+    ];
 
     type EnvSpecTuple = (&'static str, &'static str, Option<&'static str>, bool);
 
@@ -3579,6 +3776,18 @@ mod tests {
             "server.key_eviction_policy",
             None,
             false,
+        ),
+        (
+            SERVER_SESSION_BINDING_SECRET_ENV,
+            "server.session_binding_secret",
+            None,
+            true,
+        ),
+        (
+            SERVER_SESSION_BINDING_SECRET_FILE_ENV,
+            "server.session_binding_secret",
+            None,
+            true,
         ),
         (
             SERVER_OAUTH_ISSUER_ENV,

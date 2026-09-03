@@ -1619,7 +1619,7 @@ impl RbacConfig {
                         crate::config::RBAC_REDACTION_SALT_FILE_ENV
                     ))
                 })?;
-                let secret = normalize_text_secret_file(secret);
+                let secret = crate::config::normalize_text_secret_file(secret);
                 reject_blank_redaction_salt(crate::config::RBAC_REDACTION_SALT_FILE_ENV, &secret)?;
                 self.redaction_salt = Some(SecretString::from(secret));
                 Ok(vec![crate::config::secret_env_report(
@@ -1630,15 +1630,6 @@ impl RbacConfig {
             }
         }
     }
-}
-
-fn normalize_text_secret_file(mut secret: String) -> String {
-    if secret.ends_with("\r\n") {
-        secret.truncate(secret.len() - 2);
-    } else if secret.ends_with('\n') || secret.ends_with('\r') {
-        secret.truncate(secret.len() - 1);
-    }
-    secret
 }
 
 fn reject_blank_redaction_salt(env_var: &str, value: &str) -> Result<(), RmcpServerKitError> {

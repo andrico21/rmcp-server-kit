@@ -16,7 +16,7 @@
 //! Spins up a real `serve()` instance on an ephemeral port with a minimal
 //! `ServerHandler` and makes HTTP requests against it.
 
-use std::{future::Future, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, future::Future, net::SocketAddr, sync::Arc, time::Duration};
 
 use rmcp::{
     handler::server::ServerHandler,
@@ -25,6 +25,7 @@ use rmcp::{
         ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
     },
     service::{RequestContext, RoleServer},
+    transport::streamable_http_server::session::{SessionState, SessionStore, SessionStoreError},
 };
 use rmcp_server_kit::{
     auth::{ApiKeyEntry, AuthConfig, RateLimitConfig},
@@ -32,7 +33,12 @@ use rmcp_server_kit::{
     rbac::{ArgumentAllowlist, RbacConfig, RbacPolicy, RoleConfig},
     transport::McpServerConfig,
 };
-use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
+use secrecy::SecretString;
+use tokio::{
+    net::TcpListener,
+    sync::{Mutex, oneshot},
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken;
 
 // -- Minimal test handler --
@@ -154,6 +160,31 @@ impl ServerHandler for AdvertisedToolsHandler {
             CallToolResult::success(vec![ContentBlock::text(format!("called {}", request.name))])
                 .into(),
         )
+    }
+}
+
+#[derive(Clone, Default)]
+struct SharedMapSessionStore {
+    sessions: Arc<Mutex<HashMap<String, SessionState>>>,
+}
+
+#[async_trait::async_trait]
+impl SessionStore for SharedMapSessionStore {
+    async fn load(&self, session_id: &str) -> Result<Option<SessionState>, SessionStoreError> {
+        Ok(self.sessions.lock().await.get(session_id).cloned())
+    }
+
+    async fn store(&self, session_id: &str, state: &SessionState) -> Result<(), SessionStoreError> {
+        self.sessions
+            .lock()
+            .await
+            .insert(session_id.to_owned(), state.clone());
+        Ok(())
+    }
+
+    async fn delete(&self, session_id: &str) -> Result<(), SessionStoreError> {
+        self.sessions.lock().await.remove(session_id);
+        Ok(())
     }
 }
 
@@ -508,6 +539,126 @@ async fn t8_toml_expose_build_metadata_controls_version_payload() {
 
 fn test_auth_config(keys: Vec<ApiKeyEntry>) -> AuthConfig {
     AuthConfig::with_keys(keys)
+}
+
+fn shared_binding_secret(value: &str) -> SecretString {
+    SecretString::from(value.to_owned())
+}
+
+fn session_store_auth_config() -> (String, AuthConfig) {
+    let (token, hash) = rmcp_server_kit::auth::generate_api_key().unwrap();
+    (
+        token,
+        test_auth_config(vec![ApiKeyEntry::new("replica-key", hash, "ops")]),
+    )
+}
+
+async fn session_store_tool_call(base: &str, token: &str, session_id: &str) -> (u16, String) {
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/mcp"))
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-session-id", session_id)
+        .body(tool_call_body("resource_list", &serde_json::json!({})))
+        .send()
+        .await
+        .expect("tool call request");
+    let status = resp.status().as_u16();
+    (status, resp.text().await.unwrap_or_default())
+}
+
+async fn session_store_tool_call_status(base: &str, token: &str, session_id: &str) -> u16 {
+    session_store_tool_call(base, token, session_id).await.0
+}
+
+#[tokio::test]
+async fn session_store_shares_sessions_across_replicas() {
+    let (token, auth) = session_store_auth_config();
+    let store: Arc<dyn SessionStore> = Arc::new(SharedMapSessionStore::default());
+    let secret = shared_binding_secret("0123456789abcdef0123456789abcdef");
+    let server_a = spawn_server(
+        config_on_port(free_port().await)
+            .with_auth(auth.clone())
+            .with_session_store(Arc::clone(&store))
+            .with_session_binding_secret(secret.clone()),
+    )
+    .await;
+    let server_b = spawn_server(
+        config_on_port(free_port().await)
+            .with_auth(auth)
+            .with_session_store(store)
+            .with_session_binding_secret(secret),
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    let session_id = mcp_initialize_with_bearer(&client, &server_a.base, Some(&token)).await;
+    let status = session_store_tool_call_status(&server_b.base, &token, &session_id).await;
+
+    assert!(
+        session_id.starts_with("v1."),
+        "binding must wrap the session id"
+    );
+    assert_eq!(status, 200);
+}
+
+#[tokio::test]
+async fn session_store_rejects_mismatched_binding_secret() {
+    let (token, auth) = session_store_auth_config();
+    let store: Arc<dyn SessionStore> = Arc::new(SharedMapSessionStore::default());
+    let server_a = spawn_server(
+        config_on_port(free_port().await)
+            .with_auth(auth.clone())
+            .with_session_store(Arc::clone(&store))
+            .with_session_binding_secret(shared_binding_secret("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
+    )
+    .await;
+    let server_b = spawn_server(
+        config_on_port(free_port().await)
+            .with_auth(auth)
+            .with_session_store(store)
+            .with_session_binding_secret(shared_binding_secret("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")),
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    let session_id = mcp_initialize_with_bearer(&client, &server_a.base, Some(&token)).await;
+    let (status, body) = session_store_tool_call(&server_b.base, &token, &session_id).await;
+
+    assert_eq!(status, 404);
+    assert!(
+        body.contains("unknown MCP session"),
+        "404 must come from session binding, not an unrelated path: {body}"
+    );
+}
+
+#[tokio::test]
+async fn session_store_required_for_cross_replica() {
+    let (token, auth) = session_store_auth_config();
+    let secret = shared_binding_secret("0123456789abcdef0123456789abcdef");
+    let server_a = spawn_server(
+        config_on_port(free_port().await)
+            .with_auth(auth.clone())
+            .with_session_binding_secret(secret.clone()),
+    )
+    .await;
+    let server_b = spawn_server(
+        config_on_port(free_port().await)
+            .with_auth(auth)
+            .with_session_binding_secret(secret),
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    let session_id = mcp_initialize_with_bearer(&client, &server_a.base, Some(&token)).await;
+    let (status, body) = session_store_tool_call(&server_b.base, &token, &session_id).await;
+
+    assert_eq!(status, 404);
+    assert!(
+        body.contains("Session not found"),
+        "404 must come from rmcp after binding verified and unwrapped, proving the shared store is what is missing: {body}"
+    );
 }
 
 #[tokio::test]

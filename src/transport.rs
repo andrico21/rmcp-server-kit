@@ -18,10 +18,12 @@ use axum::{
 use rmcp::{
     ServerHandler,
     transport::streamable_http_server::{
-        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+        StreamableHttpServerConfig, StreamableHttpService,
+        session::{SessionStore, local::LocalSessionManager},
     },
 };
 use rustls::RootCertStore;
+use secrecy::{ExposeSecret as _, SecretString};
 use tokio::{
     net::TcpListener,
     sync::{Semaphore, mpsc},
@@ -38,7 +40,10 @@ use crate::{
     mtls_revocation::{self, CrlSet, DynamicClientCertVerifier},
     rbac::{RbacPolicy, ToolRateLimiter, build_tool_rate_limiter_with_policy, rbac_middleware},
     rbac_context::RbacContextHandler,
-    session_binding::{process_session_binding_secret, session_binding_middleware},
+    session_binding::{
+        configured_session_binding_secret, process_session_binding_secret,
+        session_binding_middleware,
+    },
 };
 
 /// Map an internal `anyhow::Error` chain into a public [`RmcpServerKitError::Startup`]
@@ -479,6 +484,12 @@ pub struct McpServerConfig {
     /// CWE-384 risk that a leaked raw session ID can be replayed by another
     /// authenticated identity.
     pub session_binding: bool,
+    /// Shared HMAC secret used when session binding must verify across
+    /// multiple server instances. When unset, a process-random secret keeps
+    /// single-instance behaviour unchanged.
+    pub session_binding_secret: Option<SecretString>,
+    /// Optional external rmcp session store for cross-instance recovery.
+    pub session_store: Option<Arc<dyn SessionStore>>,
     /// Interval for SSE keep-alive pings. Prevents proxies and load
     /// balancers from killing idle connections. Default: 15 seconds.
     #[deprecated(
@@ -730,6 +741,8 @@ impl McpServerConfig {
             shutdown_timeout: Duration::from_secs(30),
             session_idle_timeout: Duration::from_mins(20),
             session_binding: true,
+            session_binding_secret: None,
+            session_store: None,
             sse_keep_alive: Duration::from_secs(15),
             on_reload_ready: None,
             extra_router: None,
@@ -936,6 +949,20 @@ impl McpServerConfig {
     #[must_use]
     pub const fn with_session_binding(mut self, enabled: bool) -> Self {
         self.session_binding = enabled;
+        self
+    }
+
+    /// Set the shared HMAC secret used to bind MCP session IDs to identities.
+    #[must_use]
+    pub fn with_session_binding_secret(mut self, secret: SecretString) -> Self {
+        self.session_binding_secret = Some(secret);
+        self
+    }
+
+    /// Persist rmcp session state in an application-provided external store.
+    #[must_use]
+    pub fn with_session_store(mut self, session_store: Arc<dyn SessionStore>) -> Self {
+        self.session_store = Some(session_store);
         self
     }
 
@@ -1275,6 +1302,29 @@ impl McpServerConfig {
         Ok(())
     }
 
+    fn check_session_binding_config(&self) -> Result<(), RmcpServerKitError> {
+        if self.session_store.is_some()
+            && self.session_binding
+            && self.auth.as_ref().is_some_and(|auth| auth.enabled)
+            && self.session_binding_secret.is_none()
+        {
+            return Err(RmcpServerKitError::Config(
+                "session_store with session_binding enabled and auth configured requires \
+                 session_binding_secret: a shared secret is required for cross-instance \
+                 session verification"
+                    .into(),
+            ));
+        }
+
+        if let Some(secret) = &self.session_binding_secret {
+            crate::session_binding::validate_configured_secret(
+                "session_binding_secret",
+                secret.expose_secret(),
+            )?;
+        }
+        Ok(())
+    }
+
     /// Run the validation checks without consuming `self`. Used by
     /// internal call sites (e.g. tests) that need to inspect a config
     /// without taking ownership.
@@ -1375,6 +1425,8 @@ impl McpServerConfig {
         {
             oauth_cfg.validate()?;
         }
+
+        self.check_session_binding_config()?;
 
         // 8. Security-header overrides parse as valid HTTP header values,
         //    and HSTS does not smuggle in a `preload` directive.
@@ -1589,6 +1641,12 @@ where
 
     let rbac_for_handler = Arc::clone(&rbac_swap);
     let tool_list_filtering = config.tool_list_filtering;
+    let session_store = config.session_store.take();
+    let mut rmcp_config = StreamableHttpServerConfig::default()
+        .with_allowed_hosts(allowed_hosts)
+        .with_sse_keep_alive(Some(config.sse_keep_alive))
+        .with_cancellation_token(session_ct.clone());
+    rmcp_config.session_store = session_store;
     let mcp_service = StreamableHttpService::new(
         move || {
             Ok(RbacContextHandler::new(
@@ -1602,10 +1660,7 @@ where
             mgr.session_config.keep_alive = Some(config.session_idle_timeout);
             mgr.into()
         },
-        StreamableHttpServerConfig::default()
-            .with_allowed_hosts(allowed_hosts)
-            .with_sse_keep_alive(Some(config.sse_keep_alive))
-            .with_cancellation_token(session_ct.clone()),
+        rmcp_config,
     );
 
     // Build the MCP route, optionally wrapped with auth and RBAC middleware.
@@ -1710,8 +1765,12 @@ where
     // [0] Session identity-binding layer (innermost; RBAC wraps it so invalid
     // session tool calls are still charged by the RBAC tool-rate limiter).
     if config.session_binding {
-        let secret = *process_session_binding_secret();
+        let secret = match config.session_binding_secret.as_ref() {
+            Some(configured) => configured_session_binding_secret(configured)?,
+            None => process_session_binding_secret().clone(),
+        };
         mcp_router = mcp_router.layer(axum::middleware::from_fn(move |req, next| {
+            let secret = secret.clone();
             session_binding_middleware(secret, req, next)
         }));
     }
@@ -4072,6 +4131,13 @@ impl McpServerConfig {
         self
     }
 
+    /// Choose the configured session-binding secret, or `None` for the default process secret.
+    #[must_use]
+    pub fn with_optional_session_binding_secret(mut self, secret: Option<SecretString>) -> Self {
+        self.session_binding_secret = secret;
+        self
+    }
+
     /// Replace the optional tool rate limit exactly.
     #[must_use]
     pub fn with_optional_tool_rate_limit(mut self, per_minute: Option<u32>) -> Self {
@@ -4402,6 +4468,100 @@ mod tests {
         assert!(!cfg.log_request_headers);
         assert_eq!(cfg.tls_handshake_timeout, Duration::from_secs(10));
         assert_eq!(cfg.max_concurrent_tls_handshakes, 256);
+        assert!(cfg.session_store.is_none());
+        assert!(cfg.session_binding_secret.is_none());
+    }
+
+    #[derive(Default)]
+    struct TestSessionStore;
+
+    #[async_trait::async_trait]
+    impl SessionStore for TestSessionStore {
+        async fn load(
+            &self,
+            _session_id: &str,
+        ) -> Result<
+            Option<rmcp::transport::streamable_http_server::session::SessionState>,
+            rmcp::transport::streamable_http_server::session::SessionStoreError,
+        > {
+            Ok(None)
+        }
+
+        async fn store(
+            &self,
+            _session_id: &str,
+            _state: &rmcp::transport::streamable_http_server::session::SessionState,
+        ) -> Result<(), rmcp::transport::streamable_http_server::session::SessionStoreError>
+        {
+            Ok(())
+        }
+
+        async fn delete(
+            &self,
+            _session_id: &str,
+        ) -> Result<(), rmcp::transport::streamable_http_server::session::SessionStoreError>
+        {
+            Ok(())
+        }
+    }
+
+    fn test_session_store() -> Arc<dyn SessionStore> {
+        Arc::new(TestSessionStore)
+    }
+
+    fn shared_session_binding_secret() -> SecretString {
+        SecretString::from("0123456789abcdef0123456789abcdef")
+    }
+
+    #[test]
+    fn session_store_defaults_to_none() {
+        let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0");
+
+        assert!(cfg.session_store.is_none());
+    }
+
+    #[test]
+    fn validate_rejects_session_store_without_binding_secret() {
+        let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
+            .with_auth(AuthConfig::with_keys(vec![]))
+            .with_session_store(test_session_store());
+
+        let err = cfg
+            .validate()
+            .expect_err("authenticated shared-store binding needs a shared secret");
+        let msg = err.to_string();
+        assert!(msg.contains("session_store"), "{msg}");
+        assert!(msg.contains("session_binding"), "{msg}");
+        assert!(msg.contains("shared secret"), "{msg}");
+    }
+
+    #[test]
+    fn validate_allows_session_store_with_binding_secret() {
+        let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
+            .with_auth(AuthConfig::with_keys(vec![]))
+            .with_session_store(test_session_store())
+            .with_session_binding_secret(shared_session_binding_secret());
+
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_allows_session_store_when_binding_disabled() {
+        let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
+            .with_auth(AuthConfig::with_keys(vec![]))
+            .with_session_binding(false)
+            .with_session_store(test_session_store());
+
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_allows_binding_secret_without_session_store() {
+        let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
+            .with_auth(AuthConfig::with_keys(vec![]))
+            .with_session_binding_secret(shared_session_binding_secret());
+
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

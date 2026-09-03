@@ -66,6 +66,15 @@ escape hatch for a trusted gateway that deliberately re-authenticates each
 request under different labels. It also reinstates the CWE-384 risk: any leaked
 raw rmcp session ID can again be replayed by another authenticated identity.
 
+Multi-replica deployments that configure `McpServerConfig::with_session_store`
+must also configure a shared `server.session_binding_secret` (or the
+`RMCP_SERVER_KIT__SERVER__SESSION_BINDING_SECRET_FILE` environment variable).
+This shared secret is authorization-relevant: leaking it allows forging bound
+session tokens for any identity fingerprint and raw session ID known to the
+attacker. Treat it like an API-signing key: generate at least 32 random bytes,
+store it in a secret manager, mount it with least privilege, and rotate it with
+the expectation that all active bound sessions become invalid.
+
 ## Certificate revocation
 
 > ✅ **rmcp-server-kit performs CDP-driven CRL revocation
