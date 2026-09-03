@@ -6056,6 +6056,13 @@ role = "admin"
         assert_eq!(id.name, "ci-bot");
         assert_eq!(id.role, "viewer"); // first matching scope
         assert_eq!(id.method, AuthMethod::OAuthJwt);
+        // Session binding fingerprints prefer `sub` over `name` precisely
+        // because `name` falls back through preferred_username -> sub -> azp
+        // -> client_id and is unstable across token refresh. If `sub` stopped
+        // being carried onto the identity, that fallback would engage silently
+        // and OAuth sessions would break across replicas on refresh, with
+        // every other assertion here still passing.
+        assert_eq!(id.sub.as_deref(), Some("ci-bot"));
     }
 
     // -- L4: kid-strict key lookup + require_subject --
@@ -6174,9 +6181,18 @@ role = "admin"
             "https://mcp.test.local/mcp",
             "mcp:read",
         );
+        let identity = cache.validate_token(&no_sub).await;
         assert!(
-            cache.validate_token(&no_sub).await.is_some(),
+            identity.is_some(),
             "the default policy must accept a sub-less (client-credentials) token"
+        );
+        // Documents, rather than guards, the subjectless case: with no `sub`
+        // the session-binding fingerprint falls back to `name`, which is why
+        // `require_subject = true` is recommended for OAuth deployments using
+        // an external session store.
+        assert!(
+            identity.and_then(|id| id.sub).is_none(),
+            "a sub-less token must not synthesise a subject"
         );
     }
 

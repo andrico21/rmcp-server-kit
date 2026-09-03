@@ -309,14 +309,14 @@ jobs:
         # NOTE: cargo-mutants shards are ZERO-indexed: valid values for
         # `--shard k/4` are 0..3. Passing 4/4 silently selects an empty
         # shard instead of erroring.
-        shard: [0, 1, 2, 3]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.9.1
       - name: Install cargo-mutants
         run: cargo install cargo-mutants --locked
-      - name: Run cargo mutants on security-critical modules (shard ${{ matrix.shard }}/4)
+      - name: Run cargo mutants on security-critical modules (shard ${{ matrix.shard }}/8)
         # Scope to the security-critical modules where mutation testing is
         # most informative. `oauth.rs` was previously included but its
         # ~1700 lines dominated runtime (the suite only reached ~30% of
@@ -336,6 +336,75 @@ jobs:
         # surviving mutant) runs the whole suite; the suite grew past the
         # old 180s budget (~210s as of 1.8.2), which made a shard's
         # baseline time out and silently skip all of its mutants.
-        run: timeout --preserve-status 170m cargo mutants --no-shuffle --timeout 360 -j 2 --shard ${{ matrix.shard }}/4 -f src/rbac.rs -f src/auth.rs -f src/transport.rs -f src/ssrf.rs -f src/mtls_revocation.rs || true
+        run: |
+          set +e
+          timeout 170m cargo mutants --no-shuffle --timeout 360 -j 2 \
+            --sharding round-robin --shard ${{ matrix.shard }}/8 \
+            -f src/rbac.rs -f src/auth.rs -f src/transport.rs \
+            -f src/ssrf.rs -f src/mtls_revocation.rs \
+            -f src/session_binding.rs -f src/rbac_context.rs
+          status=$?
+          set -e
+          # `timeout` (without --preserve-status) reports 124 on wall expiry and
+          # 137 when the child had to be SIGKILLed. Either means the mutant list
+          # was truncated and the untested tail is silently absent from
+          # outcomes.json, which is the failure this job must never hide.
+          # cargo-mutants' own non-zero statuses are advisory: 2 = surviving
+          # mutants, 3 = mutants that timed out individually.
+          if [ "$status" = "124" ] || [ "$status" = "137" ]; then
+            echo "TRUNCATED=1" >> "$GITHUB_ENV"
+          else
+            echo "TRUNCATED=0" >> "$GITHUB_ENV"
+          fi
+          echo "MUTANTS_STATUS=$status" >> "$GITHUB_ENV"
+          exit 0
+
+      # cargo-mutants writes mutants.json (every mutant it intends to test)
+      # before testing, and fills outcomes.json in incrementally. If the run is
+      # killed at the wall, the untested tail is simply absent from outcomes,
+      # so generated-vs-completed is the only way to see how much was skipped.
+      - name: Summarize mutation results (shard ${{ matrix.shard }}/8)
+        if: always()
+        run: |
+          out=mutants.out
+          generated=$(jq 'length' "$out/mutants.json" 2>/dev/null || echo 0)
+          completed=$(jq '.outcomes | length' "$out/outcomes.json" 2>/dev/null || echo 0)
+          {
+            echo "### cargo-mutants shard ${{ matrix.shard }}/8"
+            echo ""
+            echo "| metric | value |"
+            echo "|---|---|"
+            echo "| exit status | ${MUTANTS_STATUS:-unknown} |"
+            echo "| wall-clock truncated | ${TRUNCATED:-unknown} |"
+            echo "| mutants generated | $generated |"
+            echo "| mutants completed | $completed |"
+            for k in missed caught timeout unviable; do
+              v=$(jq --arg k "$k" '[.outcomes[]? | select(.summary == $k)] | length' "$out/outcomes.json" 2>/dev/null || echo 0)
+              echo "| $k | $v |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "${TRUNCATED:-0}" = "1" ]; then
+            echo "::error::shard ${{ matrix.shard }}/8 hit the ${{ '170m' }} wall; $completed of $generated mutants were tested. Mutation coverage is incomplete."
+          fi
+
+      - name: Upload mutants.out (shard ${{ matrix.shard }}/8)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-shard-${{ matrix.shard }}
+          path: mutants.out
+          if-no-files-found: warn
+
+      # Surviving mutants stay advisory. Wall-clock truncation does not: a
+      # truncated shard silently under-reports, which is exactly how this went
+      # unnoticed. Job-level `continue-on-error: true` keeps the workflow green
+      # either way, so this is loud without being release-blocking.
+      - name: Fail the shard if the mutant list was truncated
+        if: always()
+        run: |
+          if [ "${TRUNCATED:-0}" = "1" ]; then
+            echo "shard truncated at the wall-clock cap; increase shard count or budget"
+            exit 1
+          fi
 
 
