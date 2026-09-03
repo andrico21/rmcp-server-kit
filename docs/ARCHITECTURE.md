@@ -830,7 +830,7 @@ held. Only the runtime-only fields above survive from the base. It is fallible
 **Environment (opt-in)** - three inherent methods, one per section owning
 targeted fields: `ServerConfig::apply_env_overrides` (`src/config.rs:442`),
 `ObservabilityConfig::apply_env_overrides` (`src/config.rs:832`) and
-`RbacConfig::apply_env_overrides` (`src/rbac.rs:1524`). Each returns
+`RbacConfig::apply_env_overrides` (`src/rbac.rs:1594`). Each returns
 `Vec<EnvOverride>` (`src/config.rs:64`) for audit logging, with `value: None`
 for secret targets. Fourteen curated variables under the `RMCP_SERVER_KIT__`
 prefix; `__` separates TOML path segments because field names already contain

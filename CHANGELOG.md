@@ -11,6 +11,18 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Fixed
+
+- **RBAC task-local context now reaches real `ServerHandler` methods.** The
+  Streamable HTTP transport executes handler calls in rmcp-owned spawned tasks,
+  so the middleware-only task-local scope was lost before consumer code ran.
+  `current_role()`, `current_identity()`, `current_sub()`, and the
+  `ToolCallContext` role / identity / sub fields therefore always observed
+  `None` in real HTTP tool handlers, and `current_token()` token passthrough was
+  non-functional for OAuth callers. The transport now internally re-enters the
+  RBAC scope from the authenticated HTTP request identity before delegating to
+  every `ServerHandler` method.
+
 ### Documentation
 
 - **Documented the single-role authorization contract.** rmcp-server-kit evaluates exactly one

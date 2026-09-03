@@ -37,6 +37,7 @@ use crate::{
     error::RmcpServerKitError,
     mtls_revocation::{self, CrlSet, DynamicClientCertVerifier},
     rbac::{RbacPolicy, ToolRateLimiter, build_tool_rate_limiter_with_policy, rbac_middleware},
+    rbac_context::RbacContextHandler,
 };
 
 /// Map an internal `anyhow::Error` chain into a public [`RmcpServerKitError::Startup`]
@@ -1544,7 +1545,7 @@ where
     }
 
     let mcp_service = StreamableHttpService::new(
-        move || Ok(handler_factory()),
+        move || Ok(RbacContextHandler::new(handler_factory())),
         {
             let mut mgr = LocalSessionManager::default();
             mgr.session_config.keep_alive = Some(config.session_idle_timeout);

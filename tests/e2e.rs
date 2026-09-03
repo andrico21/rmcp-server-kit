@@ -16,7 +16,7 @@
 //! Spins up a real `serve()` instance on an ephemeral port with a minimal
 //! `ServerHandler` and makes HTTP requests against it.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{future::Future, net::SocketAddr, sync::Arc, time::Duration};
 
 use rmcp::{
     handler::server::ServerHandler,
@@ -79,6 +79,45 @@ impl ServerHandler for BlockingToolHandler {
             rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text("released")])
                 .into(),
         )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservedRbacContext {
+    role: Option<String>,
+    identity: Option<String>,
+    sub: Option<String>,
+    token_present: bool,
+}
+
+#[derive(Debug, Clone)]
+struct RbacContextProbeHandler {
+    observed: Arc<std::sync::Mutex<Option<ObservedRbacContext>>>,
+}
+
+impl ServerHandler for RbacContextProbeHandler {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    }
+
+    fn call_tool(
+        &self,
+        _request: rmcp::model::CallToolRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> impl Future<Output = Result<rmcp::model::CallToolResponse, rmcp::ErrorData>>
+    + rmcp::service::MaybeSendFuture
+    + '_ {
+        let observed = ObservedRbacContext {
+            role: rmcp_server_kit::rbac::current_role(),
+            identity: rmcp_server_kit::rbac::current_identity(),
+            sub: rmcp_server_kit::rbac::current_sub(),
+            token_present: rmcp_server_kit::rbac::current_token().is_some(),
+        };
+        *self.observed.lock().expect("observed context lock") = Some(observed);
+        std::future::ready(Ok(rmcp::model::CallToolResult::success(vec![
+            rmcp::model::ContentBlock::text("context captured"),
+        ])
+        .into()))
     }
 }
 
@@ -687,6 +726,52 @@ async fn rbac_argument_allowlist_enforced() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 403, "denied cmd 'rm' should be rejected");
+}
+
+#[tokio::test]
+async fn rbac_context_reaches_handler() {
+    let (token, hash) = rmcp_server_kit::auth::generate_api_key().unwrap();
+    let keys = vec![ApiKeyEntry::new("ops-key", hash, "ops")];
+    let policy = Arc::new(RbacPolicy::new(&RbacConfig::with_roles(vec![
+        RoleConfig::new("ops", vec!["context_probe".into()], vec!["*".into()]),
+    ])));
+    let observed = Arc::new(std::sync::Mutex::new(None));
+    let handler = RbacContextProbeHandler {
+        observed: Arc::clone(&observed),
+    };
+
+    let port = free_port().await;
+    let cfg = config_on_port(port)
+        .with_auth(test_auth_config(keys))
+        .with_rbac(policy);
+    let base = spawn_server_with(cfg, move || handler.clone()).await;
+    let client = reqwest::Client::new();
+    let session_id = mcp_initialize_with_bearer(&client, &base.base, Some(&token)).await;
+
+    let resp = client
+        .post(format!("{base}/mcp"))
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-session-id", session_id)
+        .body(tool_call_body("context_probe", &serde_json::json!({})))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200, "permitted tool call must reach handler");
+    let observed = observed
+        .lock()
+        .expect("observed context lock")
+        .clone()
+        .expect("handler must record RBAC context");
+    assert_eq!(observed.role.as_deref(), Some("ops"));
+    assert_eq!(observed.identity.as_deref(), Some("ops-key"));
+    assert_eq!(observed.sub, None, "API-key auth does not carry a JWT sub");
+    assert!(
+        !observed.token_present,
+        "API-key auth does not install an OAuth passthrough token"
+    );
 }
 
 // ==========================================================================
@@ -2534,10 +2619,23 @@ async fn in_flight_mcp_call_completes_within_grace_window() {
 /// Perform the MCP `initialize` handshake and return the negotiated
 /// `Mcp-Session-Id`.
 async fn mcp_initialize(client: &reqwest::Client, base: &str) -> String {
-    let resp = client
+    mcp_initialize_with_bearer(client, base, None).await
+}
+
+async fn mcp_initialize_with_bearer(
+    client: &reqwest::Client,
+    base: &str,
+    bearer: Option<&str>,
+) -> String {
+    let request = client
         .post(format!("{base}/mcp"))
         .header("content-type", "application/json")
-        .header("accept", "application/json, text/event-stream")
+        .header("accept", "application/json, text/event-stream");
+    let request = match bearer {
+        Some(token) => request.header("authorization", format!("Bearer {token}")),
+        None => request,
+    };
+    let resp = request
         .body(
             serde_json::json!({
                 "jsonrpc": "2.0",
@@ -2563,11 +2661,16 @@ async fn mcp_initialize(client: &reqwest::Client, base: &str) -> String {
         .expect("session id is ascii")
         .to_owned();
 
-    client
+    let request = client
         .post(format!("{base}/mcp"))
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream")
-        .header("mcp-session-id", &session_id)
+        .header("mcp-session-id", &session_id);
+    let request = match bearer {
+        Some(token) => request.header("authorization", format!("Bearer {token}")),
+        None => request,
+    };
+    request
         .body(
             serde_json::json!({
                 "jsonrpc": "2.0",

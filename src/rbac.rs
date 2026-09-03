@@ -207,14 +207,32 @@ pub async fn with_rbac_scope<F: Future>(
     sub: String,
     f: F,
 ) -> F::Output {
+    with_rbac_scope_lazy(role, identity, token, sub, || f).await
+}
+
+pub(crate) async fn with_rbac_scope_lazy<T, F, Fut>(
+    role: String,
+    identity: String,
+    token: SecretString,
+    sub: String,
+    f: F,
+) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = T>,
+{
     CURRENT_ROLE
-        .scope(
-            role,
-            CURRENT_IDENTITY.scope(
-                identity,
-                CURRENT_TOKEN.scope(token, CURRENT_SUB.scope(sub, f)),
-            ),
-        )
+        .scope(role, async move {
+            CURRENT_IDENTITY
+                .scope(identity, async move {
+                    CURRENT_TOKEN
+                        .scope(token, async move {
+                            CURRENT_SUB.scope(sub, async move { f().await }).await
+                        })
+                        .await
+                })
+                .await
+        })
         .await
 }
 
