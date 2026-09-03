@@ -47,7 +47,7 @@ The crate has two transports:
 | Transport          | Function                                            | Auth/RBAC/TLS  | Use case                                         |
 |--------------------|-----------------------------------------------------|----------------|--------------------------------------------------|
 | **Streamable HTTP**| `serve()` - `src/transport.rs:2277`                 | **Yes**        | Production network deployment                    |
-| stdio              | `serve_stdio()` - `src/transport.rs:4063`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
+| stdio              | `serve_stdio()` - `src/transport.rs:4099`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
 
 ---
 
@@ -101,10 +101,10 @@ There are **no circular dependencies**.
 
 A complete HTTP request to `/mcp` flows through these layers, top-to-bottom
 (outermost → innermost). The corresponding code lives in
-`src/transport.rs:1525-1941` (middleware wiring inside `build_app_router`) and in each module.
+`src/transport.rs:1635-2052` (middleware wiring inside `build_app_router`) and in each module.
 
 ```
-TCP / TLS handshake                         src/transport.rs:2810  (TlsListener)
+TCP / TLS handshake                         src/transport.rs:2920  (TlsListener)
    │  - Handshakes run CONCURRENTLY on a background acceptor task
 │    (run_tls_acceptor, src/transport.rs:2937): 256-permit in-flight
    │    cap, 10 s per-handshake timeout; axum receives only completed
@@ -113,7 +113,7 @@ TCP / TLS handshake                         src/transport.rs:2810  (TlsListener)
    │    AuthIdentity is attached to the **per-connection** TlsConnInfo
    │    extension (no shared SocketAddr-keyed map).
    ▼
-axum Router                                  src/transport.rs:1525  (build_app_router)
+axum Router                                  src/transport.rs:1635  (build_app_router)
    │
 ├── 1. Origin check                       src/transport.rs:3880
    │      Rejects 403 if Origin/Host not allowed (MCP spec requirement)
@@ -185,9 +185,9 @@ Open endpoints (no auth):
 
 | Path                                       | Handler                                       |
 |--------------------------------------------|-----------------------------------------------|
-| `GET  /healthz`                            | `healthz` (~`src/transport.rs:3224`) |
-| `GET  /readyz`                             | `readyz`  (~`src/transport.rs:3288`) - runs configured readiness check |
-| `GET  /version`                            | `version_payload` (~`src/transport.rs:3239`) |
+| `GET  /healthz`                            | `healthz` (~`src/transport.rs:3260`) |
+| `GET  /readyz`                             | `readyz`  (~`src/transport.rs:3324`) - runs configured readiness check |
+| `GET  /version`                            | `version_payload` (~`src/transport.rs:3275`) |
 | `GET  /metrics`                            | served by `serve_metrics` on a **separate listener** when `feature = "metrics"` (`src/metrics.rs:142`) |
 | `GET  /.well-known/oauth-protected-resource` | feature = `oauth` (`src/transport.rs:1905`) |
 | `GET  /.well-known/oauth-authorization-server` | feature = `oauth` proxy (`src/transport.rs:2601`) |
@@ -217,7 +217,7 @@ Top-level builder-style config consumed by `serve()`. Holds:
 - optional readiness check callback (`Arc<dyn Fn() -> bool + Send + Sync>`)
 - public URL (used in OAuth metadata responses)
 
-### `ReloadHandle` - `src/transport.rs:1483`
+### `ReloadHandle` - `src/transport.rs:1515`
 Returned (optionally) from `serve()` when the consumer needs runtime
 hot-reload. Two methods:
 - `reload_auth_keys(new_map)` - atomically swaps `AuthState.api_keys`
@@ -438,7 +438,7 @@ an outbound `Authorization` header for downstream token passthrough.
 
 ## 7. TLS / mTLS
 
-**Custom listener**: `TlsListener` in `src/transport.rs:2833`, implementing
+**Custom listener**: `TlsListener` in `src/transport.rs:2920`, implementing
 `axum::serve::Listener` so axum's hyper machinery accepts it as a drop-in
 replacement for `TcpListener`.
 
@@ -446,7 +446,7 @@ Lifecycle (concurrent-acceptor design, since the 1.8.1 review fixes):
 1. `TlsListener::new(...)` reads PEM cert + key, builds a `rustls::ServerConfig`,
    optionally wraps with mTLS verification using configured root CAs, then
    spawns a dedicated background acceptor task (`run_tls_acceptor`,
-`src/transport.rs:3011`) that owns the `TcpListener`.
+`src/transport.rs:3047`) that owns the `TcpListener`.
 2. The acceptor task loops: acquires a permit from a semaphore sized by
    `max_concurrent_tls_handshakes` (default 256 via
    `DEFAULT_MAX_CONCURRENT_TLS_HANDSHAKES`; configurable since 1.9.0 via

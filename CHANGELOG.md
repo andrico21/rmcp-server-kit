@@ -11,6 +11,16 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Added
+
+- Added opt-in `McpServerConfig::with_event_store` for supplying an external
+  rmcp `EventStore`. Omitting it leaves behaviour unchanged: `Last-Event-ID`
+  resume already worked best-effort in-process for live legacy sessions whose
+  events remained in rmcp's bounded channel cache. A configured store adds
+  durable, cross-instance, and stateless replay. Implementations own globally
+  unique event IDs and stream isolation, because rmcp calls
+  `replay_events_after` with only the last event ID.
+
 ## [3.8.3] - 2026-09-03
 
 ### Added

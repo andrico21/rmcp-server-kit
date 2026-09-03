@@ -19,7 +19,7 @@ use rmcp::{
     ServerHandler,
     transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService,
-        session::{SessionStore, local::LocalSessionManager},
+        session::{EventStore, SessionStore, local::LocalSessionManager},
     },
 };
 use rustls::RootCertStore;
@@ -490,6 +490,19 @@ pub struct McpServerConfig {
     pub session_binding_secret: Option<SecretString>,
     /// Optional external rmcp session store for cross-instance recovery.
     pub session_store: Option<Arc<dyn SessionStore>>,
+    /// Optional external event store backing resumable SSE streams
+    /// (`Last-Event-ID`).
+    ///
+    /// A best-effort in-process resume already works without this, but only
+    /// for a live session whose events are still in rmcp''s bounded channel
+    /// cache. Supplying a store adds durable, cross-instance, and stateless
+    /// replay.
+    ///
+    /// The implementation owns stream isolation: rmcp passes only the last
+    /// event id to `replay_events_after`, never the stream, so event ids must
+    /// be globally unique and must identify their own stream. Replaying an
+    /// event onto a different stream violates the MCP transport spec.
+    pub event_store: Option<Arc<dyn EventStore>>,
     /// Interval for SSE keep-alive pings. Prevents proxies and load
     /// balancers from killing idle connections. Default: 15 seconds.
     #[deprecated(
@@ -743,6 +756,7 @@ impl McpServerConfig {
             session_binding: true,
             session_binding_secret: None,
             session_store: None,
+            event_store: None,
             sse_keep_alive: Duration::from_secs(15),
             on_reload_ready: None,
             extra_router: None,
@@ -963,6 +977,16 @@ impl McpServerConfig {
     #[must_use]
     pub fn with_session_store(mut self, session_store: Arc<dyn SessionStore>) -> Self {
         self.session_store = Some(session_store);
+        self
+    }
+
+    /// Back resumable SSE streams with an application-provided event store.
+    ///
+    /// See [`McpServerConfig::event_store`] for the stream-isolation
+    /// obligation this places on the implementation.
+    #[must_use]
+    pub fn with_event_store(mut self, event_store: Arc<dyn EventStore>) -> Self {
+        self.event_store = Some(event_store);
         self
     }
 
@@ -1647,6 +1671,7 @@ where
         .with_sse_keep_alive(Some(config.sse_keep_alive))
         .with_cancellation_token(session_ct.clone());
     rmcp_config.session_store = session_store;
+    let event_store = config.event_store.take();
     let mcp_service = StreamableHttpService::new(
         move || {
             Ok(RbacContextHandler::new(
@@ -1658,6 +1683,9 @@ where
         {
             let mut mgr = LocalSessionManager::default();
             mgr.session_config.keep_alive = Some(config.session_idle_timeout);
+            if let Some(event_store) = event_store {
+                mgr = mgr.with_event_store(event_store);
+            }
             mgr.into()
         },
         rmcp_config,
@@ -4518,6 +4546,13 @@ mod tests {
         let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0");
 
         assert!(cfg.session_store.is_none());
+    }
+
+    #[test]
+    fn event_store_defaults_to_none() {
+        let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0");
+
+        assert!(cfg.event_store.is_none());
     }
 
     #[test]

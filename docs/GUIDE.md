@@ -200,6 +200,7 @@ config.validate().expect("config valid");
 | `session_binding` | `bool` | `true` | Statelessly bind MCP session IDs to the authenticated identity |
 | `session_binding_secret` | `Option<SecretString>` | `None` | Shared HMAC secret for cross-instance session binding |
 | `session_store` | `Option<Arc<dyn SessionStore>>` | `None` | Programmatic external rmcp session store; no TOML field |
+| `event_store` | `Option<Arc<dyn EventStore>>` | `None` | Programmatic external rmcp event store for durable `Last-Event-ID` replay; no TOML field |
 | `readiness_check` | `Option<ReadinessCheck>` | `None` | Custom `/readyz` probe |
 | `max_request_body` | `usize` | `1 MiB` | Max request body bytes |
 | `request_timeout` | `Duration` | `120s` | Per-request timeout (408) |
@@ -925,7 +926,7 @@ extra_route_rate_limit = 60
 | `key_eviction_policy` | `KeyEvictionPolicy` | `"evict_lru"` | Full-table policy for per-IP limiter key maps; accepted values: `"evict_lru"`, `"reject_new"` |
 | `session_idle_timeout` | `String` | `"20m"` | Humantime duration; idle MCP sessions are closed after this period |
 | `session_binding` | `bool` | `true` | Stateless signed wrapper for `Mcp-Session-Id`; disables cross-identity session replay. Setting `false` reinstates CWE-384 risk and should only be used behind a gateway that deliberately re-authenticates each request under different labels |
-| `session_binding_secret` | `Option<SecretString>` | `None` | Shared HMAC secret for session binding across replicas; at least 32 UTF-8 bytes. No `session_store` TOML field exists because stores are trait objects supplied in code |
+| `session_binding_secret` | `Option<SecretString>` | `None` | Shared HMAC secret for session binding across replicas; at least 32 UTF-8 bytes. No `session_store` or `event_store` TOML field exists because stores are trait objects supplied in code |
 | `sse_keep_alive` | `String` | `"15s"` | Humantime duration; SSE keep-alive ping interval |
 | `public_url` | `Option<String>` | `None` | Externally reachable base URL (e.g. `https://mcp.example.com`); required when `listen_addr` is `0.0.0.0` behind a reverse proxy or container |
 | `compression_enabled` | `bool` | `false` | Enable gzip/br response compression |
@@ -1840,6 +1841,60 @@ stable only when the JWT `sub` claim is present; otherwise the identity name may
 fall back through mutable claims such as `preferred_username`. For OAuth
 deployments using an external session store, set `require_subject = true` on
 the OAuth config so token refreshes keep the same session-binding fingerprint.
+
+#### Resumable SSE event replay
+
+MCP stream resumability is optional: the transport spec says servers MAY attach
+SSE event IDs and MAY use the client's `Last-Event-ID` header to replay missed
+messages. rmcp-server-kit remains conformant when this is unset; omitting an
+event store leaves existing behaviour unchanged.
+
+Without a store, rmcp already supports a best-effort in-process resume for a
+live legacy session: a client can reconnect with `Mcp-Session-Id` and
+`Last-Event-ID` while the session worker still exists and the target events
+remain in rmcp's bounded channel cache (default capacity 16). Once
+`session_idle_timeout` lets that worker exit, or once the bounded cache evicts
+the event, nothing from that local cache is resumable.
+
+For durable replay, provide an application-owned rmcp `EventStore` in code:
+
+```rust,ignore
+use std::sync::Arc;
+use rmcp::transport::streamable_http_server::session::EventStore;
+use rmcp_server_kit::transport::McpServerConfig;
+
+let events: Arc<dyn EventStore> = Arc::new(MyDurableEventStore::new(pool));
+
+let config = McpServerConfig::new("0.0.0.0:8443", "my-server", "0.1.0")
+    .with_event_store(events);
+```
+
+`event_store` is programmatic only: it is an `Arc<dyn EventStore>` trait object
+and therefore has no TOML representation. The crate does not ship any
+`EventStore` implementation; production retention, eviction, replication, and
+backpressure policy belong to the application or infrastructure backing the
+store.
+
+The store adds durability, cross-instance replay, and stateless replay. It does
+not create resumption from nothing: the implementation must persist each event
+before returning the ID that will be sent to the client.
+
+**Stream isolation is the implementor's responsibility.** rmcp passes only
+`last_event_id` to `EventStore::replay_events_after`; it does not pass the
+stream ID. Event IDs must therefore be globally unique and must encode or let
+the store recover their owning stream. Returning events from another stream
+violates the MCP spec's hard `MUST NOT` for resumability.
+
+Cross-replica deployments have two distinct resume paths:
+
+| Path | Client request | Shared requirements |
+|---|---|---|
+| Legacy session-bound resume | `GET /mcp` with wrapped `Mcp-Session-Id` and `Last-Event-ID` | shared `EventStore`, shared `SessionStore`, and shared `session_binding_secret` when auth/session binding are enabled (the default) |
+| Stateless replay | non-legacy `GET /mcp` with `Last-Event-ID` and no `Mcp-Session-Id` | shared `EventStore` only, plus otherwise identical auth/config across replicas |
+
+If you configure only an event store and then test the legacy session-bound path
+through another replica, rmcp still has to recover the session first; add a
+shared `SessionStore` and shared binding secret for that path.
 
 ### Customising security headers
 

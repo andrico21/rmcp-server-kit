@@ -16,7 +16,17 @@
 //! Spins up a real `serve()` instance on an ephemeral port with a minimal
 //! `ServerHandler` and makes HTTP requests against it.
 
-use std::{collections::HashMap, future::Future, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    future::Future,
+    net::SocketAddr,
+    num::NonZeroUsize,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use rmcp::{
     handler::server::ServerHandler,
@@ -25,7 +35,10 @@ use rmcp::{
         ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
     },
     service::{RequestContext, RoleServer},
-    transport::streamable_http_server::session::{SessionState, SessionStore, SessionStoreError},
+    transport::streamable_http_server::session::{
+        EventStore, EventStoreError, EventStream, ServerSseMessage, SessionState, SessionStore,
+        SessionStoreError,
+    },
 };
 use rmcp_server_kit::{
     auth::{ApiKeyEntry, AuthConfig, RateLimitConfig},
@@ -185,6 +198,181 @@ impl SessionStore for SharedMapSessionStore {
     async fn delete(&self, session_id: &str) -> Result<(), SessionStoreError> {
         self.sessions.lock().await.remove(session_id);
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RecordedEvent {
+    stream_id: String,
+    event_id: String,
+    event: ServerSseMessage,
+}
+
+#[derive(Debug)]
+struct BoundedTestEventStore {
+    next_sequence: AtomicU64,
+    capacity: NonZeroUsize,
+    events: Mutex<VecDeque<RecordedEvent>>,
+}
+
+impl BoundedTestEventStore {
+    fn new(capacity: NonZeroUsize) -> Self {
+        Self {
+            next_sequence: AtomicU64::new(1),
+            capacity,
+            events: Mutex::new(VecDeque::with_capacity(capacity.get())),
+        }
+    }
+
+    fn default_capacity() -> NonZeroUsize {
+        NonZeroUsize::new(64).expect("test event-store capacity is non-zero")
+    }
+
+    async fn recorded_events(&self) -> Vec<RecordedEvent> {
+        let events = self.events.lock().await;
+        events.iter().cloned().collect()
+    }
+
+    async fn push_record(&self, record: RecordedEvent) {
+        let mut events = self.events.lock().await;
+        if events.len() == self.capacity.get() {
+            events.pop_front();
+        }
+        events.push_back(record);
+    }
+
+    async fn replay_after(&self, stream_id: &str, last_event_id: &str) -> Vec<ServerSseMessage> {
+        let events = self.events.lock().await;
+        let mut found_last_event = false;
+        events
+            .iter()
+            .filter_map(|record| {
+                if record.stream_id != stream_id {
+                    return None;
+                }
+                if found_last_event {
+                    return Some(record.event.clone());
+                }
+                if record.event_id == last_event_id {
+                    found_last_event = true;
+                }
+                None
+            })
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl EventStore for BoundedTestEventStore {
+    async fn store_event(
+        &self,
+        stream_id: &str,
+        event: &ServerSseMessage,
+    ) -> Result<String, EventStoreError> {
+        let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
+        let event_id = format!("{stream_id}:{sequence}");
+        let mut event = event.clone();
+        event.event_id = Some(event_id.clone());
+
+        self.push_record(RecordedEvent {
+            stream_id: stream_id.to_owned(),
+            event_id: event_id.clone(),
+            event,
+        })
+        .await;
+        Ok(event_id)
+    }
+
+    async fn replay_events_after(
+        &self,
+        last_event_id: &str,
+    ) -> Result<EventStream, EventStoreError> {
+        let Some((stream_id, _sequence)) = last_event_id.rsplit_once(':') else {
+            return Ok(Box::pin(futures::stream::empty()));
+        };
+        let replayed = self.replay_after(stream_id, last_event_id).await;
+        Ok(Box::pin(futures::stream::iter(replayed)))
+    }
+}
+
+struct EventStoreHarness {
+    server: ServerHarness,
+    client: reqwest::Client,
+    token: String,
+    session_id: String,
+    store: Arc<BoundedTestEventStore>,
+}
+
+impl EventStoreHarness {
+    async fn send_tool_call(&self) -> String {
+        let resp = self
+            .client
+            .post(format!("{}/mcp", self.server.base))
+            .header("authorization", format!("Bearer {}", self.token))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-session-id", &self.session_id)
+            .body(tool_call_body("allowed_tool", &serde_json::json!({})))
+            .send()
+            .await
+            .expect("tool call request");
+        assert_eq!(resp.status(), 200, "tool call must produce an SSE response");
+        resp.text().await.expect("read tool call SSE body")
+    }
+
+    async fn resume_after(&self, last_event_id: &str) -> String {
+        let resp = self
+            .client
+            .get(format!("{}/mcp", self.server.base))
+            .header("authorization", format!("Bearer {}", self.token))
+            .header("accept", "text/event-stream")
+            .header("mcp-session-id", &self.session_id)
+            .header("last-event-id", last_event_id)
+            .send()
+            .await
+            .expect("resume request");
+        assert_eq!(resp.status(), 200, "resume must return an SSE response");
+        resp.text().await.expect("read resumed SSE body")
+    }
+
+    async fn wait_for_recorded_events(&self, expected: usize) -> Vec<RecordedEvent> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let records = self.store.recorded_events().await;
+                if records.len() >= expected {
+                    return records;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("event store did not observe expected events within 10s")
+    }
+}
+
+async fn spawn_event_store_harness() -> EventStoreHarness {
+    let (token, hash) = rmcp_server_kit::auth::generate_api_key().unwrap();
+    let store = Arc::new(BoundedTestEventStore::new(
+        BoundedTestEventStore::default_capacity(),
+    ));
+    let event_store: Arc<dyn EventStore> = Arc::<BoundedTestEventStore>::clone(&store);
+    let cfg = config_on_port(free_port().await)
+        .with_auth(test_auth_config(vec![ApiKeyEntry::new(
+            "event-store-key",
+            hash,
+            "ops",
+        )]))
+        .with_event_store(event_store);
+    let server = spawn_server_with(cfg, || AdvertisedToolsHandler).await;
+    let client = reqwest::Client::new();
+    let session_id = mcp_initialize_with_bearer(&client, &server.base, Some(&token)).await;
+
+    EventStoreHarness {
+        server,
+        client,
+        token,
+        session_id,
+        store,
     }
 }
 
@@ -658,6 +846,76 @@ async fn session_store_required_for_cross_replica() {
     assert!(
         body.contains("Session not found"),
         "404 must come from rmcp after binding verified and unwrapped, proving the shared store is what is missing: {body}"
+    );
+}
+
+#[tokio::test]
+async fn event_store_receives_stored_events() {
+    let harness = spawn_event_store_harness().await;
+
+    let body = harness.send_tool_call().await;
+    let records = harness.wait_for_recorded_events(2).await;
+
+    assert!(
+        body.contains("called allowed_tool"),
+        "tool response: {body}"
+    );
+    assert_eq!(records.len(), 2);
+    assert!(
+        records
+            .iter()
+            .all(|record| record.event_id.starts_with(&record.stream_id)),
+        "event IDs must carry their stream id: {records:?}"
+    );
+}
+
+#[tokio::test]
+async fn resumption_replays_from_event_store() {
+    let harness = spawn_event_store_harness().await;
+
+    let body = harness.send_tool_call().await;
+    let records = harness.wait_for_recorded_events(2).await;
+    let before_id = &records[0].event_id;
+    let after_id = &records[1].event_id;
+    let replayed = harness.resume_after(before_id).await;
+
+    assert!(
+        body.contains(before_id),
+        "seed stream must include first id: {body}"
+    );
+    assert!(
+        body.contains(after_id),
+        "seed stream must include second id: {body}"
+    );
+    assert!(
+        !replayed.contains(before_id),
+        "resume must not replay the event at Last-Event-ID: {replayed}"
+    );
+    assert!(
+        replayed.contains(after_id),
+        "resume must replay events after Last-Event-ID: {replayed}"
+    );
+    assert!(
+        replayed.contains("called allowed_tool"),
+        "resume must carry the persisted tool result: {replayed}"
+    );
+}
+
+#[tokio::test]
+async fn resumption_works_through_session_binding() {
+    let harness = spawn_event_store_harness().await;
+
+    harness.send_tool_call().await;
+    let records = harness.wait_for_recorded_events(2).await;
+    let replayed = harness.resume_after(&records[0].event_id).await;
+
+    assert!(
+        harness.session_id.starts_with("v1."),
+        "default auth path must return an identity-bound session token"
+    );
+    assert!(
+        replayed.contains(&records[1].event_id),
+        "wrapped Mcp-Session-Id must be unwrapped before rmcp resumes: {replayed}"
     );
 }
 
