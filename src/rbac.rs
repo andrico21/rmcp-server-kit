@@ -152,7 +152,7 @@ pub fn current_role() -> Option<String> {
 /// defeat the caller's `None` check while looking correct.
 ///
 /// This normalises the accessor only. A configured
-/// [`AuthIdentity`](crate::auth::AuthIdentity) may still carry an empty
+/// [`AuthIdentity`] may still carry an empty
 /// `name`, which remains significant elsewhere (session-binding fingerprints,
 /// admin summaries, audit logs).
 #[must_use]
