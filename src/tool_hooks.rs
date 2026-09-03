@@ -38,17 +38,24 @@
 
 use std::{borrow::Cow, fmt, future::Future, io, pin::Pin, sync::Arc};
 
+#[allow(
+    deprecated,
+    reason = "transparent ServerHandler delegation must import legacy logging/subscription parameter types until rmcp removes those methods"
+)]
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams, ContentBlock,
-        DiscoverResult, GetPromptRequestParams, GetPromptResponse, GetTaskParams, GetTaskResult,
-        InitializeRequestParams, InitializeResult, ListPromptsResult, ListResourceTemplatesResult,
-        ListResourcesResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
-        ReadResourceRequestParams, ReadResourceResponse, ServerInfo, SubscriptionFilter, Tool,
+        CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams,
+        CancelledNotificationParam, CompleteRequestParams, CompleteResult, ContentBlock,
+        CustomNotification, CustomRequest, CustomResult, DiscoverResult, GetPromptRequestParams,
+        GetPromptResponse, GetTaskParams, GetTaskResult, InitializeRequestParams, InitializeResult,
+        ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
+        PaginatedRequestParams, ProgressNotificationParam, ProtocolVersion,
+        ReadResourceRequestParams, ReadResourceResponse, ServerInfo, SetLevelRequestParams,
+        SubscribeRequestParams, SubscriptionFilter, Tool, UnsubscribeRequestParams,
         UpdateTaskParams,
     },
-    service::{RequestContext, SubscriptionContext},
+    service::{NotificationContext, RequestContext, SubscriptionContext},
 };
 
 /// Context passed to before/after hooks for a single tool call.
@@ -438,7 +445,15 @@ fn apply_size_cap(
     }
 }
 
+#[allow(
+    deprecated,
+    reason = "transparent ServerHandler delegation must include legacy logging/subscription methods until rmcp removes them"
+)]
 impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
+    async fn ping(&self, context: RequestContext<RoleServer>) -> Result<(), ErrorData> {
+        self.inner.ping(context).await
+    }
+
     fn get_info(&self) -> ServerInfo {
         self.inner.get_info()
     }
@@ -457,6 +472,22 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         self.inner.list_tools(request, context).await
+    }
+
+    async fn complete(
+        &self,
+        request: CompleteRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CompleteResult, ErrorData> {
+        self.inner.complete(request, context).await
+    }
+
+    async fn set_level(
+        &self,
+        request: SetLevelRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        self.inner.set_level(request, context).await
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
@@ -606,6 +637,22 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.listen(context).await
     }
 
+    async fn subscribe(
+        &self,
+        request: SubscribeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        self.inner.subscribe(request, context).await
+    }
+
+    async fn unsubscribe(
+        &self,
+        request: UnsubscribeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        self.inner.unsubscribe(request, context).await
+    }
+
     async fn get_task(
         &self,
         request: GetTaskParams,
@@ -628,6 +675,48 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         context: RequestContext<RoleServer>,
     ) -> Result<(), ErrorData> {
         self.inner.cancel_task(request, context).await
+    }
+
+    async fn on_custom_request(
+        &self,
+        request: CustomRequest,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CustomResult, ErrorData> {
+        self.inner.on_custom_request(request, context).await
+    }
+
+    async fn on_cancelled(
+        &self,
+        notification: CancelledNotificationParam,
+        context: NotificationContext<RoleServer>,
+    ) {
+        self.inner.on_cancelled(notification, context).await;
+    }
+
+    async fn on_progress(
+        &self,
+        notification: ProgressNotificationParam,
+        context: NotificationContext<RoleServer>,
+    ) {
+        self.inner.on_progress(notification, context).await;
+    }
+
+    async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
+        self.inner.on_initialized(context).await;
+    }
+
+    async fn on_roots_list_changed(&self, context: NotificationContext<RoleServer>) {
+        self.inner.on_roots_list_changed(context).await;
+    }
+
+    async fn on_custom_notification(
+        &self,
+        notification: CustomNotification,
+        context: NotificationContext<RoleServer>,
+    ) {
+        self.inner
+            .on_custom_notification(notification, context)
+            .await;
     }
 }
 
@@ -714,15 +803,65 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
+    #[allow(
+        deprecated,
+        reason = "delegation tests cover legacy logging/subscription methods"
+    )]
     use rmcp::{
         ErrorData, RoleServer, ServerHandler,
         model::{
-            CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ServerInfo,
+            CallToolRequestParams, CallToolResponse, CallToolResult, CancelledNotificationParam,
+            CompleteRequestParams, CompleteResult, CompletionInfo, ContentBlock,
+            CustomNotification, CustomRequest, CustomResult, ProgressNotificationParam, ServerInfo,
+            SetLevelRequestParams, SubscribeRequestParams, UnsubscribeRequestParams,
         },
         service::RequestContext,
     };
+    use serde_json::json;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 
     use super::*;
+
+    type DelegationTransport = (
+        DelegationProbe,
+        BufReader<tokio::io::ReadHalf<DuplexStream>>,
+        tokio::io::WriteHalf<DuplexStream>,
+        rmcp::service::RunningService<RoleServer, HookedHandler<DelegationProbe>>,
+    );
+
+    /// Maintenance aid only: rmcp gives every `ServerHandler` method a default,
+    /// so this count cannot guarantee compile-time completeness. It makes future
+    /// upstream method additions visible in review alongside the delegation impl.
+    const HOOKED_HANDLER_DELEGATED_METHODS: &[&str] = &[
+        "ping",
+        "initialize",
+        "supported_protocol_versions",
+        "discover",
+        "complete",
+        "set_level",
+        "get_prompt",
+        "list_prompts",
+        "list_resources",
+        "list_resource_templates",
+        "read_resource",
+        "accepted_subscription_filter",
+        "listen",
+        "subscribe",
+        "unsubscribe",
+        "call_tool",
+        "list_tools",
+        "get_tool",
+        "on_custom_request",
+        "on_cancelled",
+        "on_progress",
+        "on_initialized",
+        "on_roots_list_changed",
+        "on_custom_notification",
+        "get_info",
+        "get_task",
+        "update_task",
+        "cancel_task",
+    ];
 
     #[derive(Clone, Default)]
     struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
@@ -781,6 +920,417 @@ mod tests {
             let body = "x".repeat(self.body_bytes.unwrap_or(4));
             Ok(CallToolResult::success(vec![ContentBlock::text(body)]).into())
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct DelegationProbe {
+        seen: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        notify: Arc<tokio::sync::Notify>,
+    }
+
+    impl DelegationProbe {
+        fn record(&self, method: &'static str) {
+            if let Ok(mut seen) = self.seen.lock() {
+                seen.push(method);
+            }
+            self.notify.notify_waiters();
+        }
+
+        fn seen(&self) -> Vec<&'static str> {
+            self.seen
+                .lock()
+                .map(|seen| seen.clone())
+                .unwrap_or_default()
+        }
+
+        async fn wait_for_seen_count(&self, count: usize) {
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while self.seen().len() < count {
+                    self.notify.notified().await;
+                }
+            })
+            .await
+            .expect("delegated handler methods should be observed");
+        }
+    }
+
+    #[allow(
+        clippy::unused_async_trait_impl,
+        deprecated,
+        reason = "delegation tests cover rmcp async trait methods whose probe implementations return immediately"
+    )]
+    impl ServerHandler for DelegationProbe {
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo::default()
+        }
+
+        async fn ping(&self, _context: RequestContext<RoleServer>) -> Result<(), ErrorData> {
+            self.record("ping");
+            Ok(())
+        }
+
+        async fn complete(
+            &self,
+            _request: CompleteRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<CompleteResult, ErrorData> {
+            self.record("complete");
+            let completion = CompletionInfo::with_all_values(vec!["delegated".to_owned()])
+                .expect("single completion is within rmcp max");
+            Ok(CompleteResult::new(completion))
+        }
+
+        async fn set_level(
+            &self,
+            _request: SetLevelRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<(), ErrorData> {
+            self.record("set_level");
+            Ok(())
+        }
+
+        async fn subscribe(
+            &self,
+            _request: SubscribeRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<(), ErrorData> {
+            self.record("subscribe");
+            Ok(())
+        }
+
+        async fn unsubscribe(
+            &self,
+            _request: UnsubscribeRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<(), ErrorData> {
+            self.record("unsubscribe");
+            Ok(())
+        }
+
+        async fn call_tool(
+            &self,
+            _request: CallToolRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<CallToolResponse, ErrorData> {
+            self.record("call_tool");
+            Ok(CallToolResult::success(vec![ContentBlock::text("inner")]).into())
+        }
+
+        async fn on_custom_request(
+            &self,
+            _request: CustomRequest,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<CustomResult, ErrorData> {
+            self.record("on_custom_request");
+            Ok(CustomResult::new(json!({ "delegated": true })))
+        }
+
+        async fn on_cancelled(
+            &self,
+            _notification: CancelledNotificationParam,
+            _context: NotificationContext<RoleServer>,
+        ) {
+            self.record("on_cancelled");
+        }
+
+        async fn on_progress(
+            &self,
+            _notification: ProgressNotificationParam,
+            _context: NotificationContext<RoleServer>,
+        ) {
+            self.record("on_progress");
+        }
+
+        async fn on_initialized(&self, _context: NotificationContext<RoleServer>) {
+            self.record("on_initialized");
+        }
+
+        async fn on_roots_list_changed(&self, _context: NotificationContext<RoleServer>) {
+            self.record("on_roots_list_changed");
+        }
+
+        async fn on_custom_notification(
+            &self,
+            _notification: CustomNotification,
+            _context: NotificationContext<RoleServer>,
+        ) {
+            self.record("on_custom_notification");
+        }
+    }
+
+    fn delegation_transport(probe: DelegationProbe, hooks: Arc<ToolHooks>) -> DelegationTransport {
+        let (client, server) = tokio::io::duplex(16 * 1024);
+        let (client_read, client_write) = tokio::io::split(client);
+        let service = rmcp::service::serve_directly::<RoleServer, _, _, io::Error, _>(
+            with_hooks(probe.clone(), hooks),
+            server,
+            None,
+        );
+        (probe, BufReader::new(client_read), client_write, service)
+    }
+
+    async fn send_json_rpc(
+        writer: &mut tokio::io::WriteHalf<DuplexStream>,
+        reader: &mut BufReader<tokio::io::ReadHalf<DuplexStream>>,
+        request: serde_json::Value,
+    ) -> serde_json::Value {
+        writer
+            .write_all(request.to_string().as_bytes())
+            .await
+            .expect("write request");
+        writer.write_all(b"\n").await.expect("write newline");
+        writer.flush().await.expect("flush request");
+
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("read response");
+        serde_json::from_str(&line).expect("response is JSON")
+    }
+
+    async fn send_notification(
+        writer: &mut tokio::io::WriteHalf<DuplexStream>,
+        notification: serde_json::Value,
+    ) {
+        writer
+            .write_all(notification.to_string().as_bytes())
+            .await
+            .expect("write notification");
+        writer.write_all(b"\n").await.expect("write newline");
+        writer.flush().await.expect("flush notification");
+    }
+
+    #[test]
+    fn hooked_handler_delegation_count_is_maintenance_aid() {
+        assert_eq!(
+            HOOKED_HANDLER_DELEGATED_METHODS.len(),
+            28,
+            "maintenance aid only: update this list and the HookedHandler impl when rmcp adds ServerHandler methods"
+        );
+    }
+
+    #[tokio::test]
+    async fn hooked_handler_delegates_ping() {
+        let (probe, mut reader, mut writer, _service) =
+            delegation_transport(DelegationProbe::default(), Arc::new(ToolHooks::new()));
+
+        let response = send_json_rpc(
+            &mut writer,
+            &mut reader,
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }),
+        )
+        .await;
+
+        assert_eq!(response["result"], json!({}));
+        assert_eq!(probe.seen(), vec!["ping"]);
+    }
+
+    #[tokio::test]
+    async fn hooked_handler_delegates_notifications() {
+        let (probe, _reader, mut writer, _service) =
+            delegation_transport(DelegationProbe::default(), Arc::new(ToolHooks::new()));
+
+        send_notification(
+            &mut writer,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": { "requestId": 1, "reason": "test" }
+            }),
+        )
+        .await;
+        send_notification(
+            &mut writer,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/progress",
+                "params": { "progressToken": 1, "progress": 0.5 }
+            }),
+        )
+        .await;
+        send_notification(
+            &mut writer,
+            json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        )
+        .await;
+        send_notification(
+            &mut writer,
+            json!({ "jsonrpc": "2.0", "method": "notifications/roots/list_changed" }),
+        )
+        .await;
+        send_notification(
+            &mut writer,
+            json!({ "jsonrpc": "2.0", "method": "notifications/custom/probe" }),
+        )
+        .await;
+
+        probe.wait_for_seen_count(5).await;
+        assert_eq!(
+            probe.seen(),
+            vec![
+                "on_cancelled",
+                "on_progress",
+                "on_initialized",
+                "on_roots_list_changed",
+                "on_custom_notification"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    #[allow(
+        deprecated,
+        reason = "set_level is deprecated by rmcp but must delegate"
+    )]
+    async fn hooked_handler_delegates_completion_and_level() {
+        let (probe, mut reader, mut writer, _service) =
+            delegation_transport(DelegationProbe::default(), Arc::new(ToolHooks::new()));
+
+        let completion = send_json_rpc(
+            &mut writer,
+            &mut reader,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "completion/complete",
+                "params": {
+                    "ref": { "type": "ref/prompt", "name": "prompt" },
+                    "argument": { "name": "arg", "value": "de" }
+                }
+            }),
+        )
+        .await;
+        let level = send_json_rpc(
+            &mut writer,
+            &mut reader,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "logging/setLevel",
+                "params": { "level": "debug" }
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            completion["result"]["completion"]["values"],
+            json!(["delegated"])
+        );
+        assert_eq!(level["result"], json!({}));
+        assert_eq!(probe.seen(), vec!["complete", "set_level"]);
+    }
+
+    #[tokio::test]
+    #[allow(
+        deprecated,
+        reason = "subscribe/unsubscribe are deprecated by rmcp but must delegate"
+    )]
+    async fn hooked_handler_delegates_subscriptions() {
+        let (probe, mut reader, mut writer, _service) =
+            delegation_transport(DelegationProbe::default(), Arc::new(ToolHooks::new()));
+
+        let subscribe = send_json_rpc(
+            &mut writer,
+            &mut reader,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "resources/subscribe",
+                "params": { "uri": "file:///tmp/a" }
+            }),
+        )
+        .await;
+        let unsubscribe = send_json_rpc(
+            &mut writer,
+            &mut reader,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "resources/unsubscribe",
+                "params": { "uri": "file:///tmp/a" }
+            }),
+        )
+        .await;
+
+        assert_eq!(subscribe["result"], json!({}));
+        assert_eq!(unsubscribe["result"], json!({}));
+        assert_eq!(probe.seen(), vec!["subscribe", "unsubscribe"]);
+    }
+
+    #[tokio::test]
+    async fn hooked_handler_delegates_custom_request() {
+        let (probe, mut reader, mut writer, _service) =
+            delegation_transport(DelegationProbe::default(), Arc::new(ToolHooks::new()));
+
+        let response = send_json_rpc(
+            &mut writer,
+            &mut reader,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "requests/custom/probe",
+                "params": { "x": true }
+            }),
+        )
+        .await;
+
+        assert_eq!(response["result"], json!({ "delegated": true }));
+        assert_eq!(probe.seen(), vec!["on_custom_request"]);
+    }
+
+    #[tokio::test]
+    async fn hooked_handler_still_applies_hooks_to_call_tool() {
+        let before_count = Arc::new(AtomicUsize::new(0));
+        let before_seen = Arc::clone(&before_count);
+        let before: BeforeHook = Arc::new(move |_ctx| {
+            let before_seen = Arc::clone(&before_seen);
+            Box::pin(async move {
+                before_seen.fetch_add(1, Ordering::Relaxed);
+                HookOutcome::Continue
+            })
+        });
+        let after_count = Arc::new(AtomicUsize::new(0));
+        let after_seen = Arc::clone(&after_count);
+        let after_notify = Arc::new(tokio::sync::Notify::new());
+        let after_notify_seen = Arc::clone(&after_notify);
+        let after: AfterHook = Arc::new(move |_ctx, _disp, _size| {
+            let after_seen = Arc::clone(&after_seen);
+            let after_notify_seen = Arc::clone(&after_notify_seen);
+            Box::pin(async move {
+                after_seen.fetch_add(1, Ordering::Relaxed);
+                after_notify_seen.notify_waiters();
+            })
+        });
+        let hooks = Arc::new(
+            ToolHooks::new()
+                .with_before(before)
+                .with_after(after)
+                .with_max_result_bytes(1024),
+        );
+        let (probe, mut reader, mut writer, _service) =
+            delegation_transport(DelegationProbe::default(), hooks);
+
+        let response = send_json_rpc(
+            &mut writer,
+            &mut reader,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": "probe", "arguments": {} }
+            }),
+        )
+        .await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while after_count.load(Ordering::Relaxed) == 0 {
+                after_notify.notified().await;
+            }
+        })
+        .await
+        .expect("after hook should run");
+        assert_eq!(response["result"]["content"][0]["text"], "inner");
+        assert_eq!(probe.seen(), vec!["call_tool"]);
+        assert_eq!(before_count.load(Ordering::Relaxed), 1);
+        assert_eq!(after_count.load(Ordering::Relaxed), 1);
     }
 
     fn ctx(name: &str) -> ToolCallContext {

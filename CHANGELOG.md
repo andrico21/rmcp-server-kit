@@ -13,6 +13,7 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ### Security
 
+
 - **MCP sessions are now bound to the authenticated identity by default.**
   The transport wraps newly minted `Mcp-Session-Id` values in a stateless
   HMAC-SHA256 token tied to the stable API-key, mTLS, or OAuth identity
@@ -26,6 +27,12 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   reinstates the CWE-384 session-replay risk.
 
 ### Fixed
+
+- **`HookedHandler` now transparently delegates every `ServerHandler` method.**
+  Handlers wrapped with `with_hooks` no longer fall through to rmcp trait
+  defaults for `ping`, completion, logging level, legacy subscription, custom
+  request, cancellation/progress/initialized/root-change, or custom
+  notification methods. Hook behaviour remains exclusive to `tools/call`.
 
 - **RBAC task-local context now reaches real `ServerHandler` methods.** The
   Streamable HTTP transport executes handler calls in rmcp-owned spawned tasks,
