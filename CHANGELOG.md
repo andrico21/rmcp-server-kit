@@ -11,6 +11,8 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+## [3.8.3] - 2026-09-03
+
 ### Added
 
 - Added `McpServerConfig::with_session_store` for supplying an external rmcp
@@ -85,7 +87,10 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
   **No behaviour change.** Documentation only; no code, API, or configuration was modified.
 
-## [3.8.2] - 2026-09-02
+## [3.8.2] - 2026-09-02 [NOT PUBLISHED]
+
+> Version 3.8.2 was prepared but never tagged or published to crates.io. Its
+> changes ship to users as part of 3.8.3; the section is retained for history.
 
 ### Security
 
