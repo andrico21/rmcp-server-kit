@@ -38,6 +38,7 @@ const SERVER_CONFIG_BRIDGED_FIELDS: &[&str] = &[
     "admin_enabled",
     "admin_role",
     "auth",
+    "tool_list_filtering",
     "max_request_body",
     "expose_build_metadata",
     "security_headers",
@@ -416,6 +417,10 @@ pub struct ServerConfig {
     pub admin_role: String,
     /// Authentication configuration (API keys, mTLS, OAuth).
     pub auth: Option<crate::auth::AuthConfig>,
+    /// Filter `tools/list` through RBAC visibility when RBAC is enabled.
+    /// Default: true.
+    #[serde(default = "default_tool_list_filtering")]
+    pub tool_list_filtering: bool,
     /// Expose build metadata on the unauthenticated `/version` endpoint.
     #[serde(default = "default_expose_build_metadata")]
     pub expose_build_metadata: bool,
@@ -482,6 +487,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("admin_enabled", &self.admin_enabled)
             .field("admin_role", &self.admin_role)
             .field("auth", &self.auth)
+            .field("tool_list_filtering", &self.tool_list_filtering)
             .field("expose_build_metadata", &self.expose_build_metadata)
             .field("security_headers", &self.security_headers)
             .finish()
@@ -521,6 +527,7 @@ impl Default for ServerConfig {
             admin_enabled: false,
             admin_role: default_admin_role(),
             auth: None,
+            tool_list_filtering: default_tool_list_filtering(),
             expose_build_metadata: default_expose_build_metadata(),
             security_headers: default_security_headers(),
         }
@@ -795,6 +802,7 @@ impl ServerConfig {
             .with_optional_max_concurrent_requests(self.max_concurrent_requests)
             .with_admin_enabled(self.admin_enabled)
             .with_admin_role(&self.admin_role)
+            .with_tool_list_filtering(self.tool_list_filtering)
             .with_expose_build_metadata(self.expose_build_metadata)
             .with_security_headers(self.security_headers.clone());
 
@@ -1507,6 +1515,9 @@ const fn default_trusted_forwarder_max_entries() -> usize {
 const fn default_expose_build_metadata() -> bool {
     false
 }
+const fn default_tool_list_filtering() -> bool {
+    true
+}
 fn default_security_headers() -> SecurityHeadersConfig {
     SecurityHeadersConfig::default()
 }
@@ -1587,6 +1598,7 @@ mod tests {
         assert_eq!(cfg.session_idle_timeout, "20m");
         assert_eq!(cfg.sse_keep_alive, "15s");
         assert!(cfg.public_url.is_none());
+        assert!(cfg.tool_list_filtering);
     }
 
     #[test]
@@ -2480,6 +2492,7 @@ mod tests {
         assert_eq!(actual.compression_min_size, expected.compression_min_size);
         assert_eq!(actual.admin_enabled, expected.admin_enabled);
         assert_eq!(actual.admin_role, expected.admin_role);
+        assert_eq!(actual.tool_list_filtering, expected.tool_list_filtering);
         assert_eq!(actual.expose_build_metadata, expected.expose_build_metadata);
         assert_eq!(actual.security_headers, expected.security_headers);
     }
@@ -2500,6 +2513,24 @@ mod tests {
         assert!(!bridged.session_binding);
         assert!(ServerConfig::default().session_binding);
         assert!(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0").session_binding);
+    }
+
+    #[test]
+    fn tool_list_filtering_toml_roundtrip_and_bridge() {
+        let cfg = server_from_root_toml(
+            r"
+                [server]
+                tool_list_filtering = false
+            ",
+        );
+        let bridged = cfg
+            .apply_to_mcp_config(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0"))
+            .unwrap();
+
+        assert!(!cfg.tool_list_filtering);
+        assert!(!bridged.tool_list_filtering);
+        assert!(ServerConfig::default().tool_list_filtering);
+        assert!(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0").tool_list_filtering);
     }
 
     #[test]
@@ -2719,6 +2750,7 @@ mod tests {
         "server.compression_min_size",
         "server.max_concurrent_requests",
         "server.admin_role",
+        "server.tool_list_filtering",
         "server.expose_build_metadata",
         // `log_level` is already controlled by RUST_LOG; a second env source
         // would give two switches for one behaviour.

@@ -329,6 +329,9 @@ pub struct McpServerConfig {
         note = "use McpServerConfig::with_rbac(); direct field access will become pub(crate) in a future major release"
     )]
     pub rbac: Option<Arc<RbacPolicy>>,
+    /// Filter `tools/list` responses through RBAC visibility when RBAC
+    /// is enabled and an authenticated role is present. Default: `true`.
+    pub tool_list_filtering: bool,
     /// Allowed Origin values for DNS rebinding protection (MCP spec MUST).
     /// When empty and `public_url` is set, the origin is auto-derived from
     /// the public URL. When both are empty, only requests with no Origin
@@ -718,6 +721,7 @@ impl McpServerConfig {
             tls_key_path: None,
             auth: None,
             rbac: None,
+            tool_list_filtering: true,
             allowed_origins: Vec::new(),
             tool_rate_limit: None,
             readiness_check: None,
@@ -794,6 +798,17 @@ impl McpServerConfig {
     #[must_use]
     pub fn with_rbac(mut self, rbac: Arc<RbacPolicy>) -> Self {
         self.rbac = Some(rbac);
+        self
+    }
+
+    /// Enable or disable RBAC-derived filtering of `tools/list` responses.
+    ///
+    /// Filtering is meaningful only when RBAC is enabled and the request has
+    /// an authenticated non-empty role. When active, denied tools are hidden
+    /// from the list and the response cache scope is forced to private.
+    #[must_use]
+    pub const fn with_tool_list_filtering(mut self, enabled: bool) -> Self {
+        self.tool_list_filtering = enabled;
         self
     }
 
@@ -1563,8 +1578,25 @@ where
         );
     }
 
+    // Build the RBAC policy swap before constructing the MCP service so the
+    // universal handler wrapper and RBAC middleware share hot-reload state.
+    let rbac_swap = Arc::new(ArcSwap::new(
+        config
+            .rbac
+            .clone()
+            .unwrap_or_else(|| Arc::new(RbacPolicy::disabled())),
+    ));
+
+    let rbac_for_handler = Arc::clone(&rbac_swap);
+    let tool_list_filtering = config.tool_list_filtering;
     let mcp_service = StreamableHttpService::new(
-        move || Ok(RbacContextHandler::new(handler_factory())),
+        move || {
+            Ok(RbacContextHandler::new(
+                handler_factory(),
+                Arc::clone(&rbac_for_handler),
+                tool_list_filtering,
+            ))
+        },
         {
             let mut mgr = LocalSessionManager::default();
             mgr.session_config.keep_alive = Some(config.session_idle_timeout);
@@ -1623,15 +1655,6 @@ where
         }
         _ => None,
     };
-
-    // Build the RBAC policy swap early so the admin router and the later
-    // RBAC middleware layer share the same hot-reloadable state.
-    let rbac_swap = Arc::new(ArcSwap::new(
-        config
-            .rbac
-            .clone()
-            .unwrap_or_else(|| Arc::new(RbacPolicy::disabled())),
-    ));
 
     // Optional /admin/* diagnostic routes. Merged BEFORE the
     // body-limit/timeout/RBAC/origin/auth layers so all of them apply.

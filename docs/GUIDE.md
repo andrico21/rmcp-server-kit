@@ -194,6 +194,7 @@ config.validate().expect("config valid");
 | `max_concurrent_tls_handshakes` | `usize` | `256` | Cap on in-flight TLS handshakes (startup-only) |
 | `auth` | `Option<AuthConfig>` | `None` | Authentication config |
 | `rbac` | `Option<Arc<RbacPolicy>>` | `None` | RBAC enforcement policy |
+| `tool_list_filtering` | `bool` | `true` | Hide RBAC-denied tools from `tools/list` when RBAC and a caller role are active |
 | `allowed_origins` | `Vec<String>` | `[]` | Allowed Origin header values |
 | `tool_rate_limit` | `Option<u32>` | `None` | Max tool calls/min per IP |
 | `session_binding` | `bool` | `true` | Statelessly bind MCP session IDs to the authenticated identity |
@@ -829,6 +830,39 @@ fn handle_tool_call() {
 
 These are set by the RBAC middleware for the duration of the request.
 
+#### RBAC-filtered `tools/list`
+
+When RBAC is enabled and the request has an authenticated non-empty role,
+rmcp-server-kit filters `tools/list` responses before they leave the server.
+Each advertised tool is retained only when
+`RbacPolicy::check_operation(role, tool.name) == RbacDecision::Allow`. Host
+scoping is still enforced at invocation time (`tools/call`), because a tool list
+is not host-specific and a tool usable on some host should remain discoverable.
+
+Filtering is enabled by default. Opt out only if your application intentionally
+advertises a superset, for example a discovery UI:
+
+```rust
+let config = McpServerConfig::new("127.0.0.1:8080", "my-server", "0.1.0")
+    .with_tool_list_filtering(false);
+```
+
+Or in TOML, set `tool_list_filtering = false` under `[server]`.
+
+Whenever filtering runs, the result is returned with `cache_scope = Private`,
+even if no tools were removed. In rmcp/SEP-2549, an absent `cacheScope` defaults
+to public, which means an intermediary may serve a cached list to another user;
+private scope prevents a cross-role tool-list leak. The inner handler's
+`next_cursor` and `ttl_ms` are preserved, so empty pages with a live cursor are
+valid and clients should keep paginating until `next_cursor` is absent.
+
+RBAC hot reloads are invocation-safe because every `tools/call` checks the live
+policy, and `tools/list` filtering also reads the live policy on each request.
+However, a reload does **not** invalidate list responses already cached inside a
+client: rmcp clients cache list responses by method and cursor and honour a
+positive `ttl_ms`. Emit a low `ttl_ms` (or no `ttl_ms`) for role-sensitive lists
+if you need clients to discover policy changes quickly.
+
 #### `RbacDecision`
 
 ```rust
@@ -885,6 +919,7 @@ extra_route_rate_limit = 60
 | `allowed_origins` | `Vec<String>` | `[]` | Origin validation |
 | `stdio_enabled` | `bool` | `false` | Enable stdio transport (bypasses auth/RBAC/TLS - see warning in `transport`) |
 | `tool_rate_limit` | `Option<u32>` | `None` | Tool calls/min per IP |
+| `tool_list_filtering` | `bool` | `true` | Filter `tools/list` through RBAC visibility when RBAC is enabled and a role is present |
 | `key_eviction_policy` | `KeyEvictionPolicy` | `"evict_lru"` | Full-table policy for per-IP limiter key maps; accepted values: `"evict_lru"`, `"reject_new"` |
 | `session_idle_timeout` | `String` | `"20m"` | Humantime duration; idle MCP sessions are closed after this period |
 | `session_binding` | `bool` | `true` | Stateless signed wrapper for `Mcp-Session-Id`; disables cross-identity session replay. Setting `false` reinstates CWE-384 risk and should only be used behind a gateway that deliberately re-authenticates each request under different labels |
@@ -2432,6 +2467,7 @@ request_timeout = "120s"
 allowed_origins = ["http://localhost:3000", "https://myapp.example.com"]
 tool_rate_limit = 120
 session_binding = true
+tool_list_filtering = true
 key_eviction_policy = "evict_lru"  # env: RMCP_SERVER_KIT__SERVER__KEY_EVICTION_POLICY
 max_request_body = 1048576
 expose_build_metadata = false
@@ -2514,8 +2550,8 @@ enabled = true
 allow_operation_matching = "glob"
 # Server-wide kill switch, evaluated before any role and always glob-matched.
 # Vetoes even a role's `allow = ["*"]`; can only ever remove capability.
-# Gated on `enabled` above, and enforced on `tools/call` only -- a denied tool
-# can still appear in `tools/list` unless your handler filters it.
+# Gated on `enabled` above. Invocation is enforced on `tools/call`; `tools/list`
+# is filtered by default via server.tool_list_filtering.
 global_deny = ["*_purge_*"]
 # Optional: stable HMAC key used to redact argument values in deny logs.
 # When an argument fails the per-tool allowlist, the denied value is

@@ -20,7 +20,11 @@ use std::{future::Future, net::SocketAddr, sync::Arc, time::Duration};
 
 use rmcp::{
     handler::server::ServerHandler,
-    model::{ServerCapabilities, ServerInfo},
+    model::{
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, JsonObject,
+        ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    },
+    service::{RequestContext, RoleServer},
 };
 use rmcp_server_kit::{
     auth::{ApiKeyEntry, AuthConfig, RateLimitConfig},
@@ -66,19 +70,16 @@ impl ServerHandler for BlockingToolHandler {
 
     async fn call_tool(
         &self,
-        _request: rmcp::model::CallToolRequestParams,
-        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
-    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        _request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, rmcp::ErrorData> {
         if let Ok(mut guard) = self.started.lock()
             && let Some(tx) = guard.take()
         {
             let _ = tx.send(());
         }
         self.release.notified().await;
-        Ok(
-            rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text("released")])
-                .into(),
-        )
+        Ok(CallToolResult::success(vec![ContentBlock::text("released")]).into())
     }
 }
 
@@ -102,9 +103,9 @@ impl ServerHandler for RbacContextProbeHandler {
 
     fn call_tool(
         &self,
-        _request: rmcp::model::CallToolRequestParams,
-        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
-    ) -> impl Future<Output = Result<rmcp::model::CallToolResponse, rmcp::ErrorData>>
+        _request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<CallToolResponse, rmcp::ErrorData>>
     + rmcp::service::MaybeSendFuture
     + '_ {
         let observed = ObservedRbacContext {
@@ -114,10 +115,45 @@ impl ServerHandler for RbacContextProbeHandler {
             token_present: rmcp_server_kit::rbac::current_token().is_some(),
         };
         *self.observed.lock().expect("observed context lock") = Some(observed);
-        std::future::ready(Ok(rmcp::model::CallToolResult::success(vec![
-            rmcp::model::ContentBlock::text("context captured"),
-        ])
+        std::future::ready(Ok(CallToolResult::success(vec![ContentBlock::text(
+            "context captured",
+        )])
         .into()))
+    }
+}
+
+#[derive(Clone)]
+struct AdvertisedToolsHandler;
+
+#[allow(
+    clippy::unused_async_trait_impl,
+    reason = "rmcp ServerHandler requires async methods; this E2E fake returns immediately"
+)]
+impl ServerHandler for AdvertisedToolsHandler {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, rmcp::ErrorData> {
+        Ok(ListToolsResult::with_all_items(vec![
+            Tool::new("allowed_tool", "allowed", Arc::new(JsonObject::default())),
+            Tool::new("denied_tool", "denied", Arc::new(JsonObject::default())),
+        ]))
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, rmcp::ErrorData> {
+        Ok(
+            CallToolResult::success(vec![ContentBlock::text(format!("called {}", request.name))])
+                .into(),
+        )
     }
 }
 
@@ -772,6 +808,58 @@ async fn rbac_context_reaches_handler() {
         !observed.token_present,
         "API-key auth does not install an OAuth passthrough token"
     );
+}
+
+#[tokio::test]
+async fn tools_list_hides_denied_tools() {
+    let (token, hash) = rmcp_server_kit::auth::generate_api_key().unwrap();
+    let keys = vec![ApiKeyEntry::new("viewer-key", hash, "viewer")];
+    let policy = Arc::new(RbacPolicy::new(&RbacConfig::with_roles(vec![
+        RoleConfig::new("viewer", vec!["allowed_tool".into()], vec!["*".into()]),
+    ])));
+    let port = free_port().await;
+    let cfg = config_on_port(port)
+        .with_auth(test_auth_config(keys))
+        .with_rbac(policy);
+    let base = spawn_server_with(cfg, || AdvertisedToolsHandler).await;
+    let client = reqwest::Client::new();
+    let session_id = mcp_initialize_with_bearer(&client, &base.base, Some(&token)).await;
+
+    let list_resp = client
+        .post(format!("{base}/mcp"))
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-session-id", &session_id)
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list"
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(list_resp.status(), 200);
+    let list_body = mcp_response_json(list_resp).await;
+    let tools = list_body["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["name"], "allowed_tool");
+    assert_eq!(list_body["result"]["cacheScope"], "private");
+
+    let denied_resp = client
+        .post(format!("{base}/mcp"))
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-session-id", session_id)
+        .body(tool_call_body("denied_tool", &serde_json::json!({})))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied_resp.status(), 403);
 }
 
 #[tokio::test]
@@ -2669,6 +2757,18 @@ async fn in_flight_mcp_call_completes_within_grace_window() {
 /// `Mcp-Session-Id`.
 async fn mcp_initialize(client: &reqwest::Client, base: &str) -> String {
     mcp_initialize_with_bearer(client, base, None).await
+}
+
+async fn mcp_response_json(resp: reqwest::Response) -> serde_json::Value {
+    let body = resp.text().await.expect("read MCP response body");
+    assert!(!body.is_empty(), "MCP response body must not be empty");
+    let payload = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim_start)
+        .find(|payload| !payload.is_empty())
+        .unwrap_or(body.as_str());
+    serde_json::from_str(payload).expect("MCP response body is JSON")
 }
 
 async fn mcp_initialize_with_bearer(

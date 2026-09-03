@@ -13,6 +13,13 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ### Security
 
+- **`tools/list` responses are filtered by RBAC by default.** When RBAC is
+  enabled and the request has an authenticated role, the transport hides tools
+  that `RbacPolicy::check_operation` would deny and forces the list response's
+  cache scope to `Private` to avoid cross-role cache leaks. Invocation remains
+  independently enforced on `tools/call`. Set
+  `McpServerConfig::with_tool_list_filtering(false)` or TOML
+  `server.tool_list_filtering = false` to deliberately advertise a superset.
 
 - **MCP sessions are now bound to the authenticated identity by default.**
   The transport wraps newly minted `Mcp-Session-Id` values in a stateless
