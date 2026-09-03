@@ -774,6 +774,55 @@ async fn rbac_context_reaches_handler() {
     );
 }
 
+#[tokio::test]
+async fn session_bound_to_initiating_identity() {
+    let (token_a, hash_a) = rmcp_server_kit::auth::generate_api_key().unwrap();
+    let (token_b, hash_b) = rmcp_server_kit::auth::generate_api_key().unwrap();
+    let keys = vec![
+        ApiKeyEntry::new("ops-a", hash_a, "ops"),
+        ApiKeyEntry::new("ops-b", hash_b, "ops"),
+    ];
+    let policy = Arc::new(RbacPolicy::new(&RbacConfig::with_roles(vec![
+        RoleConfig::new("ops", vec!["*".into()], vec!["*".into()]),
+    ])));
+
+    let port = free_port().await;
+    let cfg = config_on_port(port)
+        .with_auth(test_auth_config(keys))
+        .with_rbac(policy);
+    let base = spawn_server(cfg).await;
+    let client = reqwest::Client::new();
+    let session_id = mcp_initialize_with_bearer(&client, &base.base, Some(&token_a)).await;
+
+    let resp = client
+        .post(format!("{base}/mcp"))
+        .header("authorization", format!("Bearer {token_b}"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-session-id", &session_id)
+        .body(tool_call_body("resource_list", &serde_json::json!({})))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        404,
+        "identity B must not reach identity A's MCP session"
+    );
+
+    let resp = client
+        .post(format!("{base}/mcp"))
+        .header("authorization", format!("Bearer {token_a}"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-session-id", session_id)
+        .body(tool_call_body("resource_list", &serde_json::json!({})))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "identity A must retain its own session");
+}
+
 // ==========================================================================
 // Auth rate limiting
 // ==========================================================================

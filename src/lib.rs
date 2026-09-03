@@ -143,6 +143,7 @@ pub mod secret;
 
 pub(crate) mod forwarded;
 pub(crate) mod rbac_context;
+pub(crate) mod session_binding;
 pub(crate) mod ssrf;
 pub(crate) mod ssrf_resolver;
 

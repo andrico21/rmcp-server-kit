@@ -196,6 +196,7 @@ config.validate().expect("config valid");
 | `rbac` | `Option<Arc<RbacPolicy>>` | `None` | RBAC enforcement policy |
 | `allowed_origins` | `Vec<String>` | `[]` | Allowed Origin header values |
 | `tool_rate_limit` | `Option<u32>` | `None` | Max tool calls/min per IP |
+| `session_binding` | `bool` | `true` | Statelessly bind MCP session IDs to the authenticated identity |
 | `readiness_check` | `Option<ReadinessCheck>` | `None` | Custom `/readyz` probe |
 | `max_request_body` | `usize` | `1 MiB` | Max request body bytes |
 | `request_timeout` | `Duration` | `120s` | Per-request timeout (408) |
@@ -219,7 +220,7 @@ fresh handler for each MCP session. The server:
 - Registers `/healthz` (always 200), `/readyz` (custom or mirrors healthz),
   `/mcp` (MCP Streamable HTTP endpoint)
 - Applies middleware layers: Origin validation -> Auth -> RBAC + tool
-  rate-limit -> Request timeout -> Body size limit
+  rate-limit -> session binding -> Request timeout -> Body size limit
 - Listens for SIGTERM/SIGINT for graceful shutdown
 - Cancels active MCP sessions on shutdown
 
@@ -886,6 +887,7 @@ extra_route_rate_limit = 60
 | `tool_rate_limit` | `Option<u32>` | `None` | Tool calls/min per IP |
 | `key_eviction_policy` | `KeyEvictionPolicy` | `"evict_lru"` | Full-table policy for per-IP limiter key maps; accepted values: `"evict_lru"`, `"reject_new"` |
 | `session_idle_timeout` | `String` | `"20m"` | Humantime duration; idle MCP sessions are closed after this period |
+| `session_binding` | `bool` | `true` | Stateless signed wrapper for `Mcp-Session-Id`; disables cross-identity session replay. Setting `false` reinstates CWE-384 risk and should only be used behind a gateway that deliberately re-authenticates each request under different labels |
 | `sse_keep_alive` | `String` | `"15s"` | Humantime duration; SSE keep-alive ping interval |
 | `public_url` | `Option<String>` | `None` | Externally reachable base URL (e.g. `https://mcp.example.com`); required when `listen_addr` is `0.0.0.0` behind a reverse proxy or container |
 | `compression_enabled` | `bool` | `false` | Enable gzip/br response compression |
@@ -1731,6 +1733,22 @@ IPs and the proxied clients' resolved IPs share one keyspace by design,
 but a direct attacker could choose their own bucket only via their real
 source IP - never via a header.
 
+#### MCP session identity binding
+
+When authentication is enabled, rmcp-server-kit wraps every newly minted
+`Mcp-Session-Id` in a stateless token bound to the `AuthIdentity` that
+performed `initialize`. Later requests must present both valid credentials
+and a session token whose MAC verifies for that same stable identity
+fingerprint. A token minted for API key `ops-a` therefore cannot be replayed
+by API key `ops-b`, even if both keys map to the same RBAC role.
+
+The wrapper is enabled by default (`McpServerConfig::with_session_binding(true)`;
+TOML `session_binding = true`). Set it to `false` only for a trusted gateway
+that re-authenticates every request but intentionally changes the visible
+identity label between requests. Disabling the wrapper restores the CWE-384
+condition where a leaked raw rmcp session ID can be reused by another
+authenticated caller.
+
 ### Customising security headers
 
 By default, rmcp-server-kit emits twelve OWASP security headers on every
@@ -2413,6 +2431,7 @@ shutdown_timeout = "30s"
 request_timeout = "120s"
 allowed_origins = ["http://localhost:3000", "https://myapp.example.com"]
 tool_rate_limit = 120
+session_binding = true
 key_eviction_policy = "evict_lru"  # env: RMCP_SERVER_KIT__SERVER__KEY_EVICTION_POLICY
 max_request_body = 1048576
 expose_build_metadata = false

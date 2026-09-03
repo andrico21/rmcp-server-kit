@@ -38,6 +38,7 @@ use crate::{
     mtls_revocation::{self, CrlSet, DynamicClientCertVerifier},
     rbac::{RbacPolicy, ToolRateLimiter, build_tool_rate_limiter_with_policy, rbac_middleware},
     rbac_context::RbacContextHandler,
+    session_binding::{process_session_binding_secret, session_binding_middleware},
 };
 
 /// Map an internal `anyhow::Error` chain into a public [`RmcpServerKitError::Startup`]
@@ -467,6 +468,14 @@ pub struct McpServerConfig {
         note = "use McpServerConfig::with_session_idle_timeout(); direct field access will become pub(crate) in a future major release"
     )]
     pub session_idle_timeout: Duration,
+    /// Bind rmcp session IDs to the authenticated identity using a stateless
+    /// signed wrapper. Default: `true`.
+    ///
+    /// Disabling this is an escape hatch for gateways that re-authenticate
+    /// each request under intentionally different labels; it reinstates the
+    /// CWE-384 risk that a leaked raw session ID can be replayed by another
+    /// authenticated identity.
+    pub session_binding: bool,
     /// Interval for SSE keep-alive pings. Prevents proxies and load
     /// balancers from killing idle connections. Default: 15 seconds.
     #[deprecated(
@@ -716,6 +725,7 @@ impl McpServerConfig {
             request_timeout: Duration::from_mins(2),
             shutdown_timeout: Duration::from_secs(30),
             session_idle_timeout: Duration::from_mins(20),
+            session_binding: true,
             sse_keep_alive: Duration::from_secs(15),
             on_reload_ready: None,
             extra_router: None,
@@ -902,6 +912,15 @@ impl McpServerConfig {
     #[must_use]
     pub fn with_session_idle_timeout(mut self, timeout: Duration) -> Self {
         self.session_idle_timeout = timeout;
+        self
+    }
+
+    /// Enable or disable stateless binding of rmcp session IDs to the
+    /// authenticated identity. Enabled by default; disabling reinstates the
+    /// CWE-384 risk from reusable unbound session IDs.
+    #[must_use]
+    pub const fn with_session_binding(mut self, enabled: bool) -> Self {
+        self.session_binding = enabled;
         self
     }
 
@@ -1665,7 +1684,16 @@ where
     // - Origin runs before auth so we reject cross-origin requests
     //   without spending Argon2 cycles on unauthenticated callers.
 
-    // [1] RBAC + tool rate-limit layer (innermost; closest to handler).
+    // [0] Session identity-binding layer (innermost; RBAC wraps it so invalid
+    // session tool calls are still charged by the RBAC tool-rate limiter).
+    if config.session_binding {
+        let secret = *process_session_binding_secret();
+        mcp_router = mcp_router.layer(axum::middleware::from_fn(move |req, next| {
+            session_binding_middleware(secret, req, next)
+        }));
+    }
+
+    // [1] RBAC + tool rate-limit layer (inside auth; wraps session binding).
     // Always installed: even when RBAC is disabled, tool rate limiting may
     // be active (MCP spec: servers MUST rate limit tool invocations).
     {

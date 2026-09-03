@@ -46,8 +46,8 @@ The crate has two transports:
 
 | Transport          | Function                                            | Auth/RBAC/TLS  | Use case                                         |
 |--------------------|-----------------------------------------------------|----------------|--------------------------------------------------|
-| **Streamable HTTP**| `serve()` - `src/transport.rs:2154`                 | **Yes**        | Production network deployment                    |
-| stdio              | `serve_stdio()` - `src/transport.rs:3936`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
+| **Streamable HTTP**| `serve()` - `src/transport.rs:2203`                 | **Yes**        | Production network deployment                    |
+| stdio              | `serve_stdio()` - `src/transport.rs:3989`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
 
 ---
 
@@ -101,21 +101,21 @@ There are **no circular dependencies**.
 
 A complete HTTP request to `/mcp` flows through these layers, top-to-bottom
 (outermost → innermost). The corresponding code lives in
-`src/transport.rs:1521-1901` (middleware wiring inside `build_app_router`) and in each module.
+`src/transport.rs:1525-1941` (middleware wiring inside `build_app_router`) and in each module.
 
 ```
-TCP / TLS handshake                         src/transport.rs:2737  (TlsListener)
+TCP / TLS handshake                         src/transport.rs:2810  (TlsListener)
    │  - Handshakes run CONCURRENTLY on a background acceptor task
-│    (run_tls_acceptor, src/transport.rs:2864): 256-permit in-flight
+│    (run_tls_acceptor, src/transport.rs:2937): 256-permit in-flight
    │    cap, 10 s per-handshake timeout; axum receives only completed
    │    connections via a bounded channel.
    │  - mTLS: client cert verified during the handshake; the resulting
    │    AuthIdentity is attached to the **per-connection** TlsConnInfo
    │    extension (no shared SocketAddr-keyed map).
    ▼
-axum Router                                  src/transport.rs:1521  (build_app_router)
+axum Router                                  src/transport.rs:1525  (build_app_router)
    │
-├── 1. Origin check                       src/transport.rs:3790
+├── 1. Origin check                       src/transport.rs:3880
    │      Rejects 403 if Origin/Host not allowed (MCP spec requirement)
    │
    ├── 2. Peer-address normalization         src/transport.rs (normalize_peer_addr_middleware)
@@ -126,7 +126,7 @@ axum Router                                  src/transport.rs:1521  (build_app_r
    │      peer-address contract. mTLS identity stays on the private
    │      per-connection TlsConnInfo.
    │
-├── 3. Security headers                   src/transport.rs:3276
+├── 3. Security headers                   src/transport.rs:3359
    │      HSTS, CSP, X-Frame-Options=DENY, X-Content-Type-Options, ...
    │
    ├── 4. CORS / Compression / Timeouts      tower-http layers
@@ -160,10 +160,13 @@ axum Router                                  src/transport.rs:1521  (build_app_r
    │      Returns 403 on deny, 429 on rate-limit
    │
 ├── 9. Per-IP tool rate limiter           src/rbac.rs:64
-   │      governor::RateLimiter keyed by ClientIp (BoundedKeyedLimiter)
+    │      governor::RateLimiter keyed by ClientIp (BoundedKeyedLimiter)
+    │
+├── 10. Session binding                   src/session_binding.rs
+    │      Verifies/wraps identity-bound `Mcp-Session-Id` tokens
    │
    ▼
-rmcp StreamableHttpService                   src/transport.rs:1362
+rmcp StreamableHttpService                   src/transport.rs:1547
    └── Your ServerHandler::call_tool(...)
         (optionally wrapped by HookedHandler - src/tool_hooks.rs:361-482)
        │
@@ -182,12 +185,12 @@ Open endpoints (no auth):
 
 | Path                                       | Handler                                       |
 |--------------------------------------------|-----------------------------------------------|
-| `GET  /healthz`                            | `healthz` (~`src/transport.rs:1766`) |
-| `GET  /readyz`                             | `readyz`  (~`src/transport.rs:1767`) - runs configured readiness check |
-| `GET  /version`                            | `version_payload` (~`src/transport.rs:3128`) |
+| `GET  /healthz`                            | `healthz` (~`src/transport.rs:1811`) |
+| `GET  /readyz`                             | `readyz`  (~`src/transport.rs:1812`) - runs configured readiness check |
+| `GET  /version`                            | `version_payload` (~`src/transport.rs:3165`) |
 | `GET  /metrics`                            | served by `serve_metrics` on a **separate listener** when `feature = "metrics"` (`src/metrics.rs:142`) |
-| `GET  /.well-known/oauth-protected-resource` | feature = `oauth` (`src/transport.rs:1851`) |
-| `GET  /.well-known/oauth-authorization-server` | feature = `oauth` proxy (`src/transport.rs:1874`) |
+| `GET  /.well-known/oauth-protected-resource` | feature = `oauth` (`src/transport.rs:1905`) |
+| `GET  /.well-known/oauth-authorization-server` | feature = `oauth` proxy (`src/transport.rs:2502`) |
 
 Authenticated endpoints:
 

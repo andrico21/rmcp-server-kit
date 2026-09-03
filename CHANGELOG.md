@@ -11,6 +11,20 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Security
+
+- **MCP sessions are now bound to the authenticated identity by default.**
+  The transport wraps newly minted `Mcp-Session-Id` values in a stateless
+  HMAC-SHA256 token tied to the stable API-key, mTLS, or OAuth identity
+  fingerprint. A leaked session ID from user A therefore cannot be reused by
+  user B, even when B presents valid credentials and has the same RBAC role.
+
+  A new `McpServerConfig::with_session_binding(bool)` builder and TOML
+  `server.session_binding` field control the behaviour. The default is
+  `true`; setting it to `false` is an escape hatch for trusted gateways that
+  deliberately re-authenticate each request under different labels, and it
+  reinstates the CWE-384 session-replay risk.
+
 ### Fixed
 
 - **RBAC task-local context now reaches real `ServerHandler` methods.** The

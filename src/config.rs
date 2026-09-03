@@ -29,6 +29,7 @@ const SERVER_CONFIG_BRIDGED_FIELDS: &[&str] = &[
     "trusted_forwarder_max_entries",
     "forwarded_header",
     "session_idle_timeout",
+    "session_binding",
     "sse_keep_alive",
     "public_url",
     "compression_enabled",
@@ -383,6 +384,10 @@ pub struct ServerConfig {
     /// duration are closed automatically. Default: 20 minutes.
     #[serde(default = "default_session_idle_timeout")]
     pub session_idle_timeout: String,
+    /// Bind MCP session IDs to the authenticated identity using a stateless
+    /// signed wrapper. Default: true. Disabling reinstates CWE-384 risk.
+    #[serde(default = "default_session_binding")]
+    pub session_binding: bool,
     /// Interval for SSE keep-alive pings sent to the client. Prevents
     /// proxies and load balancers from killing idle connections.
     /// Default: 15 seconds.
@@ -468,6 +473,7 @@ impl std::fmt::Debug for ServerConfig {
             )
             .field("forwarded_header", &self.forwarded_header)
             .field("session_idle_timeout", &self.session_idle_timeout)
+            .field("session_binding", &self.session_binding)
             .field("sse_keep_alive", &self.sse_keep_alive)
             .field("public_url", &self.public_url)
             .field("compression_enabled", &self.compression_enabled)
@@ -506,6 +512,7 @@ impl Default for ServerConfig {
             trusted_forwarder_max_entries: default_trusted_forwarder_max_entries(),
             forwarded_header: None,
             session_idle_timeout: default_session_idle_timeout(),
+            session_binding: default_session_binding(),
             sse_keep_alive: default_sse_keep_alive(),
             public_url: None,
             compression_enabled: false,
@@ -758,6 +765,7 @@ impl ServerConfig {
                 "server.session_idle_timeout",
                 &self.session_idle_timeout,
             )?)
+            .with_session_binding(self.session_binding)
             .with_sse_keep_alive(parse_duration_field(
                 "server.sse_keep_alive",
                 &self.sse_keep_alive,
@@ -1513,6 +1521,9 @@ fn default_metrics_bind() -> String {
 }
 fn default_session_idle_timeout() -> String {
     "20m".into()
+}
+const fn default_session_binding() -> bool {
+    true
 }
 fn default_tls_handshake_timeout() -> String {
     "10s".into()
@@ -2456,6 +2467,7 @@ mod tests {
 
     fn assert_default_bridge_metadata_fields(actual: &McpServerConfig, expected: &McpServerConfig) {
         assert_eq!(actual.session_idle_timeout, expected.session_idle_timeout);
+        assert_eq!(actual.session_binding, expected.session_binding);
         assert_eq!(actual.sse_keep_alive, expected.sse_keep_alive);
         assert_eq!(actual.request_timeout, expected.request_timeout);
         assert_eq!(actual.shutdown_timeout, expected.shutdown_timeout);
@@ -2470,6 +2482,24 @@ mod tests {
         assert_eq!(actual.admin_role, expected.admin_role);
         assert_eq!(actual.expose_build_metadata, expected.expose_build_metadata);
         assert_eq!(actual.security_headers, expected.security_headers);
+    }
+
+    #[test]
+    fn session_binding_toml_roundtrip_and_bridge() {
+        let cfg = server_from_root_toml(
+            r"
+                [server]
+                session_binding = false
+            ",
+        );
+        let bridged = cfg
+            .apply_to_mcp_config(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0"))
+            .unwrap();
+
+        assert!(!cfg.session_binding);
+        assert!(!bridged.session_binding);
+        assert!(ServerConfig::default().session_binding);
+        assert!(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0").session_binding);
     }
 
     #[test]
@@ -2683,6 +2713,7 @@ mod tests {
         "server.trusted_forwarder_max_entries",
         "server.forwarded_header",
         "server.session_idle_timeout",
+        "server.session_binding",
         "server.sse_keep_alive",
         "server.compression_enabled",
         "server.compression_min_size",

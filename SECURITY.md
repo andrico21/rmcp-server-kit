@@ -50,6 +50,22 @@ within **30 days** for confirmed high-severity issues.
   direct peer. See the "Trusted-forwarder mode" section of
   [`docs/GUIDE.md`](docs/GUIDE.md) for the full model.
 
+## MCP session identity binding
+
+Network transports bind rmcp session IDs to the authenticated identity by
+default. On `initialize`, the raw rmcp `Mcp-Session-Id` is returned to the
+client as a stateless signed wrapper; on later requests the wrapper is
+verified against the current `AuthIdentity` and rewritten back to the raw ID
+before rmcp sees it. This prevents CWE-384 session fixation/replay where a
+session opened by one authenticated caller is reused by another caller that
+has its own valid credentials.
+
+The protection is controlled by `McpServerConfig::with_session_binding` and
+TOML `server.session_binding` (default `true`). Setting it to `false` is an
+escape hatch for a trusted gateway that deliberately re-authenticates each
+request under different labels. It also reinstates the CWE-384 risk: any leaked
+raw rmcp session ID can again be replayed by another authenticated identity.
+
 ## Certificate revocation
 
 > ✅ **rmcp-server-kit performs CDP-driven CRL revocation
@@ -475,4 +491,3 @@ Once a fix is released, we will:
 2. Tag the release `X.Y.Z` (no `v` prefix) with a `[SECURITY]`
    changelog entry.
 3. Credit the reporter (unless they request anonymity).
-
