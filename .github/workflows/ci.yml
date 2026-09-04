@@ -307,7 +307,7 @@ jobs:
       fail-fast: false
       matrix:
         # NOTE: cargo-mutants shards are ZERO-indexed: valid values for
-        # `--shard k/4` are 0..3. Passing 4/4 silently selects an empty
+        # `--shard k/8` are 0..7. Passing 8/8 silently selects an empty
         # shard instead of erroring.
         shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
@@ -327,7 +327,17 @@ jobs:
         # prefixes), and mtls_revocation.rs (semaphore eviction, timestamp
         # clamp), so those files joined the scope; to keep each nightly
         # job within the wall-clock budget the mutant list is now split
-        # deterministically across 4 parallel shards (`--shard K/4`).
+        # deterministically across 8 parallel shards (`--shard K/8`).
+        # `tool_hooks.rs` joined after the 8-shard run showed the worst
+        # shard finishing in ~105m against the 170m cap. Despite being
+        # ~1545 lines it yields only 70 mutants (most of the file is
+        # tests), a 7% increase on the 982 already in scope: ~123 -> ~132
+        # per shard, so the worst shard lands near ~112m. It is in scope
+        # because it enforces the tool-call result-size cap and runs the
+        # before/after hooks, both of which fail open if a guard is
+        # silently inverted. Re-measure before adding anything larger:
+        # `cargo mutants --list -f <file>` reports the true mutant count,
+        # which is what costs time, not the line count.
         # Wrap in `timeout` so we exit 0 even if cargo-mutants itself
         # blows past the wall-clock budget (GitHub's job-level
         # `timeout-minutes` SIGKILLs and bypasses `|| true`).
@@ -342,7 +352,8 @@ jobs:
             --sharding round-robin --shard ${{ matrix.shard }}/8 \
             -f src/rbac.rs -f src/auth.rs -f src/transport.rs \
             -f src/ssrf.rs -f src/mtls_revocation.rs \
-            -f src/session_binding.rs -f src/rbac_context.rs
+            -f src/session_binding.rs -f src/rbac_context.rs \
+            -f src/tool_hooks.rs
           status=$?
           set -e
           # `timeout` (without --preserve-status) reports 124 on wall expiry and
