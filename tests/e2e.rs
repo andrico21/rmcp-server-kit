@@ -1709,6 +1709,7 @@ mod crl_tests {
         server::danger::ClientCertVerifier as _,
     };
     use wiremock::MockServer;
+    use x509_parser::prelude::{FromDer as _, X509Certificate};
 
     use super::*;
 
@@ -1799,7 +1800,12 @@ mod crl_tests {
         .into()
     }
 
-    fn build_test_pki(cdp_url: &str, client_serial: u64, revoked_serials: &[u64]) -> TestPki {
+    fn build_test_pki_with_client_params(
+        cdp_url: &str,
+        client_serial: u64,
+        revoked_serials: &[u64],
+        mut client_params: CertificateParams,
+    ) -> TestPki {
         let ca = build_certified_ca();
 
         let server_key = KeyPair::generate().expect("server key");
@@ -1813,14 +1819,20 @@ mod crl_tests {
         .expect("server cert");
 
         let client_key = KeyPair::generate().expect("client key");
-        let client_cert = build_end_entity_params(
-            "mtls-client",
-            client_serial,
-            cdp_url,
-            vec![ExtendedKeyUsagePurpose::ClientAuth],
-        )
-        .signed_by(&client_key, &ca)
-        .expect("client cert");
+        client_params.serial_number = Some(SerialNumber::from(client_serial));
+        if client_params.key_usages.is_empty() {
+            client_params.key_usages = vec![
+                KeyUsagePurpose::DigitalSignature,
+                KeyUsagePurpose::KeyEncipherment,
+            ];
+        }
+        if client_params.extended_key_usages.is_empty() {
+            client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        }
+        client_params.use_authority_key_identifier_extension = true;
+        let client_cert = client_params
+            .signed_by(&client_key, &ca)
+            .expect("client cert");
 
         TestPki {
             ca_pem: ca.pem(),
@@ -1832,6 +1844,51 @@ mod crl_tests {
             ca_der: ca.der().clone(),
             crl_der: build_crl(&ca, revoked_serials),
         }
+    }
+
+    fn build_test_pki(cdp_url: &str, client_serial: u64, revoked_serials: &[u64]) -> TestPki {
+        let client_params = build_end_entity_params(
+            "mtls-client",
+            client_serial,
+            cdp_url,
+            vec![ExtendedKeyUsagePurpose::ClientAuth],
+        );
+        build_test_pki_with_client_params(cdp_url, client_serial, revoked_serials, client_params)
+    }
+
+    fn empty_cn_client_params(dns_sans: Vec<String>) -> CertificateParams {
+        let mut params = CertificateParams::new(dns_sans).expect("empty-CN client params");
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params.distinguished_name.push(DnType::CommonName, "");
+        params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyEncipherment,
+        ];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        params
+    }
+
+    fn build_empty_cn_test_pki(dns_sans: Vec<String>) -> TestPki {
+        let pki = build_test_pki_with_client_params(
+            "http://127.0.0.1:1/unused.crl",
+            200,
+            &[],
+            empty_cn_client_params(dns_sans),
+        );
+        assert_client_cert_has_empty_cn(&pki);
+        pki
+    }
+
+    fn assert_client_cert_has_empty_cn(pki: &TestPki) {
+        let (_, cert) =
+            X509Certificate::from_der(pki.client_der.as_ref()).expect("client certificate parses");
+        assert!(
+            cert.subject()
+                .iter_common_name()
+                .filter_map(|attr| attr.as_str().ok())
+                .any(str::is_empty),
+            "rcgen must preserve the explicitly empty Subject CN; otherwise the live-handshake test no longer exercises the reported scenario"
+        );
     }
 
     async fn write_tls_materials(pki: &TestPki, suffix: &str) -> TlsMaterialPaths {
@@ -1888,6 +1945,20 @@ mod crl_tests {
         .expect("mtls auth config")
     }
 
+    fn build_identity_mtls_auth_config(ca_cert_path: &PathBuf) -> AuthConfig {
+        serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "api_keys": [],
+            "mtls": {
+                "ca_cert_path": ca_cert_path,
+                "required": true,
+                "default_role": "viewer",
+                "crl_enabled": false
+            }
+        }))
+        .expect("identity mtls auth config")
+    }
+
     fn build_verifier_mtls_config(ca_cert_path: &str) -> MtlsConfig {
         serde_json::from_value(serde_json::json!({
             "ca_cert_path": ca_cert_path,
@@ -1916,7 +1987,14 @@ mod crl_tests {
         DynamicClientCertVerifier::new(crl_set)
     }
 
-    async fn spawn_tls_server(config: McpServerConfig) -> ServerHarness {
+    async fn spawn_tls_server_with<H, F>(
+        config: McpServerConfig,
+        handler_factory: F,
+    ) -> ServerHarness
+    where
+        H: ServerHandler + 'static,
+        F: Fn() -> H + Send + Sync + Clone + 'static,
+    {
         rustls::crypto::ring::default_provider()
             .install_default()
             .ok();
@@ -1933,7 +2011,7 @@ mod crl_tests {
             rmcp_server_kit::transport::serve_with_listener(
                 listener,
                 config.validate().expect("tls test config valid"),
-                || TestHandler,
+                handler_factory,
                 Some(ready_tx),
                 Some(shutdown_for_server),
             )
@@ -1950,6 +2028,10 @@ mod crl_tests {
             shutdown,
             join: Some(join),
         }
+    }
+
+    async fn spawn_tls_server(config: McpServerConfig) -> ServerHarness {
+        spawn_tls_server_with(config, || TestHandler).await
     }
 
     fn build_mtls_client(pki: &TestPki) -> reqwest::Client {
@@ -1972,6 +2054,108 @@ mod crl_tests {
             .identity(identity)
             .build()
             .expect("mtls reqwest client")
+    }
+
+    #[tokio::test]
+    async fn mtls_empty_cn_with_dns_san_authenticates_as_san() {
+        let pki = build_empty_cn_test_pki(vec!["san-fallback.example.com".to_owned()]);
+        let paths = write_tls_materials(&pki, "empty-cn-with-san").await;
+        let auth = build_identity_mtls_auth_config(&paths.ca_cert);
+        let policy = Arc::new(RbacPolicy::new(&RbacConfig::with_roles(vec![
+            RoleConfig::new("viewer", vec!["context_probe".into()], vec!["*".into()]),
+        ])));
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let handler = RbacContextProbeHandler {
+            observed: Arc::clone(&observed),
+        };
+
+        let cfg = config_on_port(free_port().await)
+            .with_tls(&paths.server_cert, &paths.server_key)
+            .with_auth(auth)
+            .with_rbac(policy);
+        let mut harness = spawn_tls_server_with(cfg, move || handler.clone()).await;
+        let client = build_mtls_client(&pki);
+
+        let session_id = mcp_initialize(&client, &harness.base).await;
+        let resp = client
+            .post(format!("{}/mcp", harness.base))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-session-id", session_id)
+            .body(tool_call_body("context_probe", &serde_json::json!({})))
+            .send()
+            .await
+            .expect("empty-CN-with-SAN request should complete after TLS handshake");
+
+        assert_eq!(resp.status(), 200, "SAN-backed mTLS identity must pass");
+        let captured = observed
+            .lock()
+            .expect("observed context lock")
+            .clone()
+            .expect("handler must record RBAC context");
+        assert_eq!(captured.role.as_deref(), Some("viewer"));
+        assert_eq!(
+            captured.identity.as_deref(),
+            Some("san-fallback.example.com")
+        );
+        assert_eq!(captured.sub, None, "mTLS auth does not carry a JWT sub");
+        assert!(
+            !captured.token_present,
+            "mTLS auth does not install an OAuth passthrough token"
+        );
+
+        harness
+            .shutdown()
+            .await
+            .expect("shutdown empty-CN-with-SAN server");
+    }
+
+    #[tokio::test]
+    async fn mtls_empty_cn_without_san_handshakes_but_is_unauthenticated() {
+        let pki = build_empty_cn_test_pki(Vec::new());
+        let paths = write_tls_materials(&pki, "empty-cn-no-san").await;
+        let auth = build_identity_mtls_auth_config(&paths.ca_cert);
+        let policy = Arc::new(RbacPolicy::new(&RbacConfig::with_roles(vec![
+            RoleConfig::new("viewer", vec!["context_probe".into()], vec!["*".into()]),
+        ])));
+
+        let cfg = config_on_port(free_port().await)
+            .with_tls(&paths.server_cert, &paths.server_key)
+            .with_auth(auth)
+            .with_rbac(policy);
+        let mut harness = spawn_tls_server(cfg).await;
+        let client = build_mtls_client(&pki);
+
+        let response = client
+            .post(format!("{}/mcp", harness.base))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": { "name": "empty-cn", "version": "0.0.1" }
+                    }
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("empty-CN-without-SAN request should complete after TLS handshake");
+
+        assert_eq!(
+            response.status(),
+            401,
+            "cert with no non-blank CN or DNS SAN must not authenticate"
+        );
+        harness
+            .shutdown()
+            .await
+            .expect("shutdown empty-CN-without-SAN server");
     }
 
     #[tokio::test]

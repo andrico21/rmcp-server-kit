@@ -29,9 +29,12 @@ migration note and a config opt-out - see the 3.1.0 notes below.
     yields a blank identity, and no longer shadows a usable DNS SAN. Selection
     now takes the first non-blank CN, else the first non-blank DNS SAN, then
     applies the existing character guard; a certificate with no non-blank CN or
-    SAN is rejected. Empirically confirmed reachable at the source level:
-    feeding a DER certificate with an explicitly empty CN to
-    `extract_mtls_identity` returned `Some(name == "")` before this fix.
+    SAN is rejected. Live E2E coverage confirms rustls/webpki accepts an
+    in-test-CA-signed mTLS client certificate whose Subject CN is explicitly
+    empty, so the blank-identity path was reachable through a real handshake,
+    not only by direct DER parsing. Post-fix, empty-CN-plus-DNS-SAN authenticates
+    under the SAN name; empty-CN-without-SAN completes the TLS handshake but is
+    rejected as unauthenticated before MCP handling.
   - **API-key configuration**: a blank API-key `name` is now rejected during
     config validation — via both `validate_server_config` and
     `McpServerConfig::validate()` — naming the offending key index.
