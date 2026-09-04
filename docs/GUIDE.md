@@ -942,6 +942,36 @@ extra_route_rate_limit = 60
 | `forwarded_header` | `String` | `"x-forwarded-for"` | Which forwarding header to read when trusted-forwarder mode is active. Accepted values: `"x-forwarded-for"` (de-facto standard; nginx, HAProxy, CDNs) or `"forwarded"` (RFC 7239 `Forwarded` header). Ignored when `trusted_proxies` is empty. |
 | `trusted_forwarder_max_entries` | `usize` | `16` | Maximum forwarding-chain entries scanned per request in trusted-forwarder mode. Longer chains are treated as a header bomb and resolution falls back to the direct socket peer. Valid range `1..=64`; the ceiling exists because an unbounded value would disable the header-bomb protection. Ignored when `trusted_proxies` is empty. |
 
+##### Choosing a `key_eviction_policy`
+
+Per-IP rate limiters track state in a map capped by `max_tracked_keys`
+(default `10_000`). `key_eviction_policy` decides what happens when that cap is
+reached and a request arrives from an IP not already tracked. Both options are
+safe; they trade different failure modes against each other.
+
+| Policy | Behaviour at capacity | Favours | Cost |
+|---|---|---|---|
+| `"evict_lru"` (default) | Evicts the least-recently-used entry to admit the new IP | Admitting new clients | A quiet tenant can be evicted and return with a fresh quota, so a spray attacker gets a small amount of extra budget |
+| `"reject_new"` | Refuses the new IP and keeps existing entries | Isolating established tenants | Genuinely new clients are turned away while the table is full |
+
+`"evict_lru"` is the default deliberately. Under a high-cardinality spray
+attack, `"reject_new"` would let the attacker fill the table and then deny
+*every* new legitimate client -- turning a rate-limit control into an outage.
+`"evict_lru"` keeps the service reachable and accepts a bounded quota-reset
+cost instead.
+
+Prefer `"reject_new"` only when your client population is small, known and
+stable -- for example a fixed set of internal services behind a gateway --
+where admitting an unknown IP is itself suspicious and quota isolation for
+existing tenants matters more than reachability for new ones.
+
+> **`reject_new` returns `503`, not `429`.** A rejection under this policy means
+> the server has run out of *admission capacity* to track another client, which
+> is a server-side resource condition. It is not a statement that the caller
+> exceeded a quota, so `429 Too Many Requests` would be misleading and would
+> invite clients to back off on a per-client schedule that cannot help. Ordinary
+> per-IP quota breaches still return `429`.
+
 #### `ObservabilityConfig`
 
 ```toml

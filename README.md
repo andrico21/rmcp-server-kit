@@ -177,10 +177,20 @@ let config = McpServerConfig::new("127.0.0.1:8443", "my-server", "0.1.0")
 
 ## Cargo features
 
-| Feature   | Default | Description                                    |
-|-----------|---------|------------------------------------------------|
-| `oauth`   | No      | OAuth 2.1 JWT validation via JWKS.             |
-| `metrics` | No      | Prometheus metrics registry and `/metrics`.    |
+| Feature              | Default | Description                                    |
+|----------------------|---------|------------------------------------------------|
+| `oauth`              | No      | OAuth 2.1 JWT validation via JWKS.             |
+| `oauth-mtls-client`  | No      | RFC 8705 mTLS client authentication for the OAuth token-exchange endpoint. Implies `oauth`. |
+| `metrics`            | No      | Prometheus metrics registry and `/metrics`.    |
+| `test-helpers`       | No      | Test-only helpers for downstream integration tests. **Never enable in a production build** -- see the warning below. |
+
+> **`test-helpers` is not safe in production.** It is not part of the stable
+> API surface and carries no semver guarantees across minor releases. Some of
+> the helpers it exposes deliberately bypass SSRF screening, the JWKS refresh
+> cooldown, the CDP discovery rate limiter, and CRL verifier publication. Enable
+> it only in test and integration builds. See the
+> [Cargo features section of the guide](docs/GUIDE.md#cargo-features) for the
+> per-helper detail.
 
 ## Design decisions
 

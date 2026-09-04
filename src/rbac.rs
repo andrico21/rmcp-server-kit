@@ -1031,7 +1031,13 @@ fn warn_on_optional_value_allowlists(roles: &[RoleConfig]) {
                     role = %role.name,
                     tool = %allowlist.tool,
                     argument = %allowlist.argument,
-                    "optional argument allowlist may fail open"
+                    "argument allowlist is optional and fails open when the \
+                     argument is omitted: the allowed-value list is enforced \
+                     only if the caller supplies the argument, so a tool that \
+                     substitutes its own default bypasses it entirely -- set \
+                     `required = true` in TOML, or construct via \
+                     `ArgumentAllowlist::new_required`, to reject calls that \
+                     omit it"
                 );
             }
         }
@@ -1806,7 +1812,7 @@ mod tests {
         let logs = capture_policy_construction_logs(&config);
 
         assert_eq!(
-            logs.matches("optional argument allowlist may fail open")
+            logs.matches("argument allowlist is optional and fails open")
                 .count(),
             1,
             "exactly one warning expected for one optional non-empty allowlist: {logs}"
@@ -1815,6 +1821,10 @@ mod tests {
         assert!(
             logs.contains("cmd"),
             "warning must name the argument: {logs}"
+        );
+        assert!(
+            logs.contains("required = true") && logs.contains("new_required"),
+            "warning must name the remedy so an operator can act on it: {logs}"
         );
     }
 
@@ -1827,7 +1837,7 @@ mod tests {
         let logs = capture_policy_construction_logs(&config);
 
         assert!(
-            !logs.contains("optional argument allowlist may fail open"),
+            !logs.contains("argument allowlist is optional and fails open"),
             "required allowlist must not warn: {logs}"
         );
     }

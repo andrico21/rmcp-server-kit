@@ -11,6 +11,39 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Changed
+
+- **The optional-argument-allowlist startup warning now names the remedy.** It
+  previously said only "optional argument allowlist may fail open", which
+  identified the role, tool and argument but gave an operator nothing to act on.
+  It now explains the failure mode — the allowed-value list is enforced only
+  when the caller supplies the argument, so a tool substituting its own default
+  bypasses it — and names the fix: `required = true` in TOML, or
+  `ArgumentAllowlist::new_required` in code. Warning text only; no behaviour
+  change. This remains the only mitigation available in 3.x, because flipping
+  the `required` default is a breaking change reserved for 4.0.
+
+### Documentation
+
+- **The README Cargo-features table listed only two of the four declared
+  features.** `oauth-mtls-client` and `test-helpers` were both absent, so a
+  reader arriving from crates.io had no signal that `test-helpers` exists — let
+  alone that it must never be enabled in a production build, since some of its
+  helpers deliberately bypass SSRF screening, the JWKS refresh cooldown, the CDP
+  discovery rate limiter, and CRL verifier publication. That hazard was already
+  documented in `src/lib.rs`, `Cargo.toml` and `docs/GUIDE.md`, but not on the
+  landing page most consumers read first.
+- **Operator guidance for `key_eviction_policy`.** The guide now explains the
+  trade-off rather than only listing the accepted values: `evict_lru` (the
+  default) favours admitting new clients at the cost of letting an evicted quiet
+  tenant return with a fresh quota, while `reject_new` favours isolating
+  established tenants at the cost of turning away genuinely new ones. It records
+  why `evict_lru` is the default — under a high-cardinality spray attack
+  `reject_new` would let an attacker fill the table and deny every new
+  legitimate client — and states that a `reject_new` rejection returns **503,
+  not 429**, because it signals server-side admission capacity rather than a
+  per-client quota breach.
+
 ## [3.9.0] - 2026-09-04
 
 ### Security
