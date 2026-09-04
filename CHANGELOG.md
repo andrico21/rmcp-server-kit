@@ -11,6 +11,8 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+## [3.9.0] - 2026-09-04
+
 ### Security
 
 - **Closed a cross-principal session-binding collision (CWE-384) caused by a
@@ -37,7 +39,9 @@ migration note and a config opt-out - see the 3.1.0 notes below.
     rejected as unauthenticated before MCP handling.
   - **API-key configuration**: a blank API-key `name` is now rejected during
     config validation — via both `validate_server_config` and
-    `McpServerConfig::validate()` — naming the offending key index.
+    `McpServerConfig::validate()` — naming the offending key index. The check is
+    exposed as `AuthConfig::validate_api_key_names`, so it can also be called
+    directly when a configuration is assembled programmatically.
   - **API-key hot reload**: added `ReloadHandle::try_reload_auth_keys` (fallible)
     which validates before swapping; the existing `reload_auth_keys` now rejects
     a blank-named batch, logging the error and leaving the previously installed
@@ -58,11 +62,12 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   stable id is non-blank — an in-crate breadcrumb that the first-party
   producers above are validated upstream, not a runtime guard.
 
-  **Compatibility:** API-additive (the new `ReloadHandle::try_reload_auth_keys`)
-  with a **runtime behavioural change**: `reload_auth_keys` now refuses a
-  blank-named batch and retains the previously installed keys rather than
-  swapping them in. `cargo semver-checks` reports the API surface as additive,
-  but this behaviour change is why the fix ships as a **minor**, not a patch.
+  **Compatibility:** API-additive — the new `ReloadHandle::try_reload_auth_keys`
+  and `AuthConfig::validate_api_key_names` — with a **runtime behavioural
+  change**: `reload_auth_keys` now refuses a blank-named batch and retains the
+  previously installed keys rather than swapping them in. `cargo semver-checks`
+  reports the API surface as additive, but this behaviour change is why the fix
+  ships as a **minor**, not a patch.
 
 ### Fixed
 
