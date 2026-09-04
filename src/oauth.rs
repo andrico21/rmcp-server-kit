@@ -1133,7 +1133,7 @@ impl OAuthConfig {
     /// to parse or violates the scheme policy.
     pub fn validate(&self) -> Result<(), crate::error::RmcpServerKitError> {
         validate_oauth_capacity_knobs(self)?;
-        resolve_allowed_algorithms(self.allowed_algorithms.as_ref())?;
+        resolve_allowed_algorithms(self.allowed_algorithms.as_deref())?;
 
         let allow_http = self.allow_http_oauth_urls;
         let url = check_oauth_url("oauth.issuer", &self.issuer, allow_http)?;
@@ -2532,7 +2532,7 @@ fn accepted_algorithm_names() -> String {
 /// token -- almost certainly an operator mistake rather than an intent to
 /// disable OAuth.
 pub(crate) fn resolve_allowed_algorithms(
-    configured: Option<&Vec<String>>,
+    configured: Option<&[String]>,
 ) -> Result<Vec<Algorithm>, crate::error::RmcpServerKitError> {
     let Some(names) = configured else {
         return Ok(ACCEPTED_ALGS.to_vec());
@@ -2698,7 +2698,7 @@ impl JwksCache {
             jwks_uri: config.jwks_uri.clone(),
             ttl,
             max_jwks_keys: config.max_jwks_keys,
-            allowed_algorithms: resolve_allowed_algorithms(config.allowed_algorithms.as_ref())?,
+            allowed_algorithms: resolve_allowed_algorithms(config.allowed_algorithms.as_deref())?,
             max_response_bytes: config.jwks_max_response_bytes,
             allow_http,
             inner: RwLock::new(None),
@@ -5858,7 +5858,7 @@ role = "admin"
                 accepted_algorithm_from_name(name).is_none(),
                 "{name} must not be resolvable"
             );
-            let err = resolve_allowed_algorithms(Some(&vec![name.to_owned()]))
+            let err = resolve_allowed_algorithms(Some(&[name.to_owned()]))
                 .expect_err("must reject non-accepted algorithm");
             assert!(err.to_string().contains("unsupported algorithm"));
         }
@@ -5866,8 +5866,8 @@ role = "admin"
 
     #[test]
     fn allowed_algorithms_rejects_empty_list() {
-        let err = resolve_allowed_algorithms(Some(&Vec::new()))
-            .expect_err("empty list would reject every token");
+        let err =
+            resolve_allowed_algorithms(Some(&[])).expect_err("empty list would reject every token");
         assert!(err.to_string().contains("must not be empty"));
     }
 
@@ -5881,7 +5881,7 @@ role = "admin"
 
     #[test]
     fn allowed_algorithms_narrows_and_dedups_case_insensitively() {
-        let resolved = resolve_allowed_algorithms(Some(&vec![
+        let resolved = resolve_allowed_algorithms(Some(&[
             "rs256".to_owned(),
             "RS256".to_owned(),
             "ES384".to_owned(),

@@ -13,6 +13,13 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ### Changed
 
+- **`resolve_allowed_algorithms` now accepts `Option<&[String]>` instead of
+  `Option<&Vec<String>>`** (`RUST_GUIDELINES.md` §1, "DO: Accept borrowed types
+  in function arguments"). Internal (`pub(crate)`) with no semver impact. The
+  `None` / `Some(empty)` / `Some(non-empty)` trichotomy is unchanged: omitting
+  the field still yields the default accepted set, and an explicitly empty list
+  is still a hard configuration error.
+
 - **Withdrawn: the promise that `ArgumentAllowlist.required` would default to
   `true` in 4.0.** It will not. `required` defaults to `false` permanently, and
   presence enforcement stays opt-in via `required = true` /

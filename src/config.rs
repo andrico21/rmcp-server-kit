@@ -754,7 +754,7 @@ impl ServerConfig {
             // Resolve eagerly so an unusable value is reported against the
             // env var that set it, rather than surfacing later as an opaque
             // `oauth.allowed_algorithms` config error.
-            crate::oauth::resolve_allowed_algorithms(Some(&names)).map_err(|err| {
+            crate::oauth::resolve_allowed_algorithms(Some(names.as_slice())).map_err(|err| {
                 RmcpServerKitError::Config(format!("{SERVER_OAUTH_ALLOWED_ALGORITHMS_ENV}: {err}"))
             })?;
             applied.push(env_report(
