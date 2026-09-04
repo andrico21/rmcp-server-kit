@@ -11,6 +11,40 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Changed
+
+- **Withdrawn: the promise that `ArgumentAllowlist.required` would default to
+  `true` in 4.0.** It will not. `required` defaults to `false` permanently, and
+  presence enforcement stays opt-in via `required = true` /
+  `ArgumentAllowlist::new_required`. Flipping the default would silently convert
+  previously-allowed traffic into `403`s with no compile error and nothing
+  `cargo semver-checks` could detect, and an allowlist that constrains a supplied
+  value is a legitimate configuration rather than a defect. The crate therefore
+  provides the control and leaves the policy to the operator.
+
+  This reverses forward-looking statements in earlier releases (3.8.0 and 3.9.1
+  notes, and `docs/MIGRATION.md`). Those release entries are left as written —
+  they were accurate at the time and rewriting shipped notes would falsify the
+  record — but `docs/MIGRATION.md`, the `ArgumentAllowlist` rustdoc, the README
+  and the guide have all been corrected, since they are live guidance rather
+  than history.
+
+  **No behaviour change.** Anything relying on the current default is
+  unaffected; the startup warning that names fail-open allowlists is now a
+  permanent control rather than an interim one, and is not going away.
+
+- **`ArgumentAllowlist` documentation now states where argument validation
+  actually belongs.** It is in the tool -- its input schema and handler -- not
+  in this crate, which sees an untyped JSON object at an authorization boundary
+  and cannot know a tool's parameter types, value ranges, or which option
+  combinations are meaningful. An allowlist is a coarse role-scoped gate layered
+  on top of that validation, never a replacement for it. The rustdoc and guide
+  now say so explicitly and record the limits that follow: only the first
+  `shlex::split` word is checked (so an allowlist of `["ls"]` accepts
+  `"ls -la; id"`), object- and array-valued arguments are denied rather than
+  inspected wherever an allowlist applies, and basename matching is POSIX-only.
+  Documentation only; no behaviour change.
+
 ## [3.9.1] - 2026-09-04
 
 ### Changed

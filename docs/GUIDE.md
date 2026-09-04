@@ -715,6 +715,27 @@ tool's input schema already marks the argument required, but it fails open if
 the handler substitutes a default for a missing value. Opt into presence
 enforcement with `with_required`:
 
+> **This default is permanent.** `required` defaults to `false` and will not
+> change in a future release. Presence enforcement is opt-in by design: an
+> allowlist that constrains a supplied value is a legitimate configuration, and
+> flipping the default would silently convert previously-allowed traffic into
+> `403`s with no compile error to warn you. Set `required = true` -- or use
+> `ArgumentAllowlist::new_required` -- on every allowlist where omitting the
+> argument must be rejected. A startup warning names any allowlist left in the
+> fail-open form.
+
+> **Argument validation belongs in your tool, not here.** Only your tool knows
+> its parameter types, value ranges, and which option combinations are
+> meaningful; declare those in its input schema and enforce them in the handler.
+> An allowlist is a coarse role-scoped gate at the authorization boundary --
+> defence in depth on top of that validation, never a substitute for it. It
+> checks only the **first `shlex::split` word**, so an allowlist of `["ls"]`
+> accepts `"ls -la; id"`: the first parsed word is `ls`, and everything after it
+> is unconstrained. Object- and array-valued arguments are denied rather than
+> inspected wherever an allowlist or `deny_unknown_arguments` applies, and
+> basename matching is POSIX-only. If a tool pipes an allowlisted value into a
+> shell, this control will not save you.
+
 ```rust
 use rmcp_server_kit::rbac::ArgumentAllowlist;
 

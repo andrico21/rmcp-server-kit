@@ -244,13 +244,20 @@ constrains the argument only when the caller supplies it. If your tool
 substitutes a default for a missing argument, a caller can bypass the allowlist
 by omitting it. This now emits a startup warning naming the tool and argument.
 
-Behaviour is unchanged in `3.8`. Prefer the new constructor:
+Behaviour is unchanged in `3.8`. Prefer the constructor that fails closed:
 
 ```rust
 ArgumentAllowlist::new_required("tool", "arg", vec!["allowed".into()]);
 ```
 
-`required` will default to `true` in `4.0`.
+`required` defaults to `false` and **will keep doing so**. An earlier version of
+this guide said the default would flip to `true` in `4.0`; that promise has been
+withdrawn. Presence enforcement is opt-in by design, because an allowlist that
+constrains a supplied value is a legitimate configuration and flipping the
+default would silently turn previously-allowed traffic into `403`s with no
+compile error. Set `required = true` (or use `new_required`) wherever omitting
+the argument must be rejected -- there is no future release in which that
+happens automatically.
 
 ### 5. Certificates advertising more than 64 CDP URLs are rejected
 

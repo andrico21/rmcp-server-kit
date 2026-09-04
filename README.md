@@ -92,6 +92,13 @@ let viewer = RoleConfig::new("viewer", vec!["echo".into()], vec!["*".into()])
 let rbac = Arc::new(RbacPolicy::new(&RbacConfig::with_roles(vec![viewer])));
 ```
 
+> Use `ArgumentAllowlist::new_required` (as above), not `new`, unless omitting
+> the argument is genuinely safe. `required` defaults to `false` -- permanently
+> -- so an allowlist built with `new` constrains the value only when the caller
+> supplies it, and a tool that substitutes its own default for a missing
+> argument bypasses the allowlist entirely. See the
+> [argument allowlist guide](docs/GUIDE.md#argumentallowlist).
+
 **OAuth 2.1 resource server (JWT validation against JWKS):**
 
 ```rust,ignore

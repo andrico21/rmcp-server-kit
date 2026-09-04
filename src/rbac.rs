@@ -315,12 +315,43 @@ impl RoleConfig {
 /// its first token against `allowed`. If the token is not in the list
 /// the call is rejected with 403.
 ///
+/// # Scope: this is not the argument-validation layer
+///
+/// Argument validation belongs **downstream, in the tool itself** -- its input
+/// schema and its handler. Only the tool knows its parameter types, value
+/// ranges, mutually exclusive options, and which combinations are meaningful.
+/// This crate deliberately does not attempt that, and cannot: it sees an
+/// untyped JSON object at an authorization boundary.
+///
+/// What an allowlist provides is a coarse, role-scoped gate answering "may
+/// this role invoke this tool in roughly this shape". It is defence in depth
+/// layered *on top of* the tool's own validation, never a replacement for it.
+/// Its deliberate limits follow from that:
+///
+/// - Only the **first `shlex::split` word** of the value is checked. An
+///   allowlist of `["ls"]` accepts `"ls -la; id"`, because the first parsed
+///   word is `ls`; everything after it is unconstrained. The check therefore
+///   constrains only the first parsed word, not every program a shell might
+///   go on to execute.
+/// - Object- and array-valued arguments are denied rather than inspected
+///   wherever an allowlist or `deny_unknown_arguments` actually applies;
+///   there is no nested-path matching.
+/// - Basename matching is POSIX-only, so `C:\bin\ls.exe` will not match `ls`.
+///
+/// This division is also why presence enforcement is opt-in rather than
+/// imposed: whether omitting an argument is safe depends entirely on the
+/// tool's schema and defaults, which are the consumer's to declare.
+///
 /// By default this constrains the value only **when the argument is
 /// present** -- omitting it entirely skips the check. Set
 /// [`required`](Self::required) to also demand the argument be supplied.
-/// This compatibility default is expected to flip to `true` in the next
-/// major version; prefer [`ArgumentAllowlist::new_required`] for new
-/// policies that should fail closed when the argument is omitted.
+/// This default is **permanent and deliberate**: presence enforcement is
+/// opt-in, because an allowlist that constrains a supplied value is a
+/// legitimate configuration and the crate does not impose the stricter
+/// policy on existing deployments. Use
+/// [`ArgumentAllowlist::new_required`] whenever omitting the argument must
+/// fail closed -- in particular when the tool substitutes its own default
+/// for a missing value, since that default is never checked.
 //
 // NOTE(future-pr): typed pre-tokenized argument matcher (CHANGELOG.md
 // "future release" promise).
@@ -386,9 +417,9 @@ pub struct ArgumentAllowlist {
 impl ArgumentAllowlist {
     /// Create an argument allowlist for a tool.
     ///
-    /// The argument is optional by default for backward compatibility; prefer
-    /// [`new_required`](Self::new_required) for new policies that should fail
-    /// closed when the argument is omitted.
+    /// The argument is optional: the allowed-value list is enforced only when
+    /// the caller supplies it. Use [`new_required`](Self::new_required) when
+    /// omitting the argument must fail closed.
     #[must_use]
     pub fn new(tool: impl Into<String>, argument: impl Into<String>, allowed: Vec<String>) -> Self {
         Self {

@@ -385,7 +385,7 @@ ArgumentAllowlist {                       // src/rbac.rs:275
 
 ### Decision function
 - `RbacPolicy::check(role, operation, host)` - pure allow/deny (`src/rbac.rs:511`; fn `check`)
-- `RbacPolicy::argument_allowed(role, tool, argument, value)` - JSON value match (`src/rbac.rs:798`; fn `argument_allowed`)
+- `RbacPolicy::argument_allowed(role, tool, argument, value)` - JSON value match (`src/rbac.rs:829`; fn `argument_allowed`)
 - `RbacPolicy::redact_arg(value)` - HMAC-SHA256 of an argument value with
 the policy's salt, returning an 8-char hex prefix (`src/rbac.rs:749`).
   Used to keep raw argument values out of deny logs.
@@ -395,7 +395,7 @@ the policy's salt, returning an 8-char hex prefix (`src/rbac.rs:749`).
   installed *after* enforcement (see "Task-locals" below).
 
 ### Middleware
-`rbac_middleware` (`src/rbac.rs:1118`):
+`rbac_middleware` (`src/rbac.rs:1152`):
 1. Extracts the role + identity name from the `AuthIdentity` request
    extension (set by the auth middleware).
 2. For `POST /mcp`, reads the body (bounded by body-size layer), parses
