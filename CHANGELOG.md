@@ -11,6 +11,23 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Corrected an inaccurate `ToolHooks.after` documentation contract.** The
+  field previously documented the after-hook as "invoked once per call,
+  regardless of how the call resolved". That holds only on the normal
+  Deny / Replace / Ok / Err resolution paths. If the `call_tool` future is
+  dropped after a before-hook has run but before the call resolves, the
+  paired after-hook is never spawned -- a caveat the implementation already
+  recorded internally but the public docs contradicted. Consumers who built
+  audit trails or resource-release guards on before/after *pairing* could
+  therefore see silently unpaired records under cancellation. The field docs
+  now state the cancellation limitation and direct such consumers to make the
+  after-hook idempotent or tolerant of missing closes.
+
+  **Documentation only -- no behaviour change.** The runtime has always
+  behaved this way; only the description was wrong.
+
 ### Changed
 
 - **`resolve_allowed_algorithms` now accepts `Option<&[String]>` instead of
@@ -19,6 +36,15 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   `None` / `Some(empty)` / `Some(non-empty)` trichotomy is unchanged: omitting
   the field still yields the default accepted set, and an explicitly empty list
   is still a hard configuration error.
+
+- **Documented cancel safety for the `tool_hooks`, `rbac_context`, and `admin`
+  modules** (`RUST_GUIDELINES.md` §5, "DO: Annotate every async fn with cancel
+  safety"). These modules' async functions are `ServerHandler` delegations and
+  Axum handlers that hold no lock, permit, guard, or task-local across an
+  `.await`, so they are cancel-safe with respect to their own state and inherit
+  the wrapped handler's contract; `HookedHandler::call_tool` remains the
+  documented **NOT cancel-safe** exception. `rbac_context` had no module
+  documentation at all and now does.
 
 - **Withdrawn: the promise that `ArgumentAllowlist.required` would default to
   `true` in 4.0.** It will not. `required` defaults to `false` permanently, and

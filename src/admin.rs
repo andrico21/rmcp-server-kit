@@ -8,6 +8,15 @@
 //! and additionally requires the caller's role to match the `role` field
 //! on [`crate::admin::AdminConfig`]. Configuration validation refuses to
 //! enable admin without auth.
+//!
+//! # Cancel safety
+//!
+//! Admin handlers are cancel-safe with respect to admin state: they only
+//! read in-memory `Arc` / `ArcSwap` state and build JSON responses.
+//! [`crate::admin::require_admin_role`] performs its role check before
+//! `next.run(req).await` and holds no guard, lock, or permit across that
+//! await; downstream route cancel safety is inherited from Axum and the
+//! selected route.
 
 use std::{
     sync::Arc,

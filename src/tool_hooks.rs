@@ -16,6 +16,17 @@
 //!   The cap applies both to inner-handler results and to
 //!   [`HookOutcome::Replace`](crate::tool_hooks::HookOutcome::Replace) payloads.
 //!
+//! # Cancel safety
+//!
+//! The transparent `ServerHandler` delegation methods are cancel-safe with
+//! respect to this wrapper: cancellation only drops the delegated inner
+//! future, so the wrapped handler's own cancel-safety contract is inherited
+//! unchanged.  The `call_tool` implementation on
+//! [`crate::tool_hooks::HookedHandler`] is the exception and is documented
+//! as **NOT cancel-safe** at its definition: once a before-hook or the
+//! inner handler has been awaited, cancellation can prevent the paired
+//! after-hook from being spawned.
+//!
 //! This is entirely **opt-in** at the application layer - `rmcp_server_kit::serve()`
 //! does not wrap handlers automatically.  Applications that want hooks do:
 //!
@@ -203,9 +214,15 @@ pub struct ToolHooks {
     /// Optional before-hook invoked after arg deserialization, before
     /// the wrapped handler is called.
     pub before: Option<BeforeHook>,
-    /// Optional after-hook invoked once per call, regardless of how the
-    /// call resolved.  Spawned via `tokio::spawn` and never blocks the
-    /// response path.
+    /// Optional after-hook invoked once per normally-resolved call - that
+    /// is, on the Deny / Replace / Ok / Err paths.  Spawned via
+    /// `tokio::spawn` and never blocks the response path.
+    ///
+    /// **Not guaranteed under cancellation.**  If the `call_tool` future is
+    /// dropped after a before-hook has run but before the call resolves,
+    /// the paired after-hook is never spawned.  Do not use before/after
+    /// pairing as a mandatory resource guard; make the after-hook
+    /// idempotent or tolerant of missing closes (see [`crate::cancel`]).
     pub after: Option<AfterHook>,
 }
 

@@ -1,3 +1,15 @@
+//! RBAC request-context propagation for `ServerHandler` calls.
+//!
+//! # Cancel safety
+//!
+//! The async wrappers in this module are cancel-safe with respect to this
+//! module's state.  They extract request identity, install the Tokio
+//! task-local RBAC scope around the delegated future, and await the wrapped
+//! `ServerHandler`.  Dropping the future drops that task-local scope and
+//! does not leak roles, tokens, locks, permits, or other guards.  The
+//! wrapped consumer handler's own cancel-safety contract is inherited
+//! unchanged.
+
 use std::{borrow::Cow, future::Future, sync::Arc};
 
 use arc_swap::ArcSwap;
