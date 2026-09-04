@@ -426,8 +426,11 @@ default_role = "operator"
 pub fn extract_mtls_identity(cert_der: &[u8], default_role: &str) -> Option<AuthIdentity>
 ```
 
-Parses an X.509 DER certificate and extracts the Common Name (CN) or first
-DNS SAN as the identity name. Used internally by the TLS acceptor.
+Parses an X.509 DER certificate and extracts the identity name: the first
+non-blank Common Name (CN), else the first non-blank DNS SAN. A blank (empty
+or whitespace-only) CN is treated as absent rather than shadowing a usable
+SAN, and a certificate yielding no non-blank CN or SAN is rejected. Used
+internally by the TLS acceptor.
 
 #### Certificate lifecycle and revocation (operator runbook)
 

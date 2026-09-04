@@ -11,6 +11,56 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Security
+
+- **Closed a cross-principal session-binding collision (CWE-384) caused by a
+  blank `AuthIdentity` stable id.** The session-binding fingerprint keys on a
+  per-identity stable id (`method || 0x00 || stable_id`,
+  `src/session_binding.rs`). When that stable id was blank (empty or
+  whitespace-only), two distinct principals produced byte-identical
+  fingerprints, so one caller's identity-bound session became usable by another
+  — reopening the CWE-384 hole previously closed for session binding.
+
+  The five first-party producers that could emit a blank stable id are now
+  closed — mTLS extraction, configured API keys, hot-reloaded API keys,
+  `verify_bearer_token`, and OAuth claims:
+
+  - **mTLS** (`extract_mtls_identity`): a present-but-blank Subject CN no longer
+    yields a blank identity, and no longer shadows a usable DNS SAN. Selection
+    now takes the first non-blank CN, else the first non-blank DNS SAN, then
+    applies the existing character guard; a certificate with no non-blank CN or
+    SAN is rejected. Empirically confirmed reachable at the source level:
+    feeding a DER certificate with an explicitly empty CN to
+    `extract_mtls_identity` returned `Some(name == "")` before this fix.
+  - **API-key configuration**: a blank API-key `name` is now rejected during
+    config validation — via both `validate_server_config` and
+    `McpServerConfig::validate()` — naming the offending key index.
+  - **API-key hot reload**: added `ReloadHandle::try_reload_auth_keys` (fallible)
+    which validates before swapping; the existing `reload_auth_keys` now rejects
+    a blank-named batch, logging the error and leaving the previously installed
+    keys untouched instead of silently installing colliding keys.
+  - **Bearer verification** (`verify_bearer_token`): the public verifier now
+    returns `None` (no identity) when the matched API key has a blank name. The
+    check runs after the constant-time match loop resolves, so the "one Argon2
+    verification per configured key" timing guarantee is unchanged.
+  - **OAuth claims**: blank `preferred_username` / `sub` / `azp` / `client_id`
+    are treated as absent so the identity-name fallback chain no longer
+    short-circuits into a blank name; a blank `sub` is stored as `None` (so the
+    OAuth fingerprint never keys on a blank stable id) and is rejected when
+    `require_subject` is set. **Correction:** an earlier draft of this change
+    stated OAuth was unaffected. That was wrong — OAuth carried the same
+    collision and is fixed here.
+
+  `fingerprint()` additionally carries a `debug_assert!` that the selected
+  stable id is non-blank — an in-crate breadcrumb that the first-party
+  producers above are validated upstream, not a runtime guard.
+
+  **Compatibility:** API-additive (the new `ReloadHandle::try_reload_auth_keys`)
+  with a **runtime behavioural change**: `reload_auth_keys` now refuses a
+  blank-named batch and retains the previously installed keys rather than
+  swapping them in. `cargo semver-checks` reports the API surface as additive,
+  but this behaviour change is why the fix ships as a **minor**, not a patch.
+
 ### Fixed
 
 - **`current_identity()` and `current_role()` now treat an empty value as

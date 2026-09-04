@@ -2758,25 +2758,36 @@ impl JwksCache {
     ) -> Result<AuthIdentity, JwtValidationFailure> {
         let claims = self.decode_claims(token).await?;
 
-        if self.require_subject && claims.sub.is_none() {
+        // `require_subject` must also reject a *blank* sub: it is the OAuth
+        // session-binding stable id, so a blank one collapses distinct
+        // principals to one fingerprint (CWE-384).
+        if self.require_subject && claims.sub.as_deref().is_none_or(|s| s.trim().is_empty()) {
             core::hint::cold_path();
-            tracing::debug!("JWT rejected: require_subject is set but the token has no `sub`");
+            tracing::debug!(
+                "JWT rejected: require_subject is set but the token has no non-blank `sub`"
+            );
             return Err(JwtValidationFailure::Invalid);
         }
         self.check_audience(&claims)?;
         let role = self.resolve_role(&claims)?;
 
-        // Identity: prefer human-readable `preferred_username` (Keycloak/OIDC),
-        // then `sub`, then `azp` (authorized party), then `client_id`.
-        let sub = claims.sub;
-        let name = claims
+        // Store a blank `sub` as `None` so `fingerprint` never keys on a blank
+        // stable id.
+        let sub = claims.sub.filter(|value| !value.trim().is_empty());
+
+        // Identity name: prefer `preferred_username`, then `sub`, then `azp`,
+        // then `client_id`. Skip every blank candidate so a present-but-empty
+        // claim cannot short-circuit the chain into a blank (colliding) name.
+        let preferred_username = claims
             .extra
             .get("preferred_username")
             .and_then(|v| v.as_str())
-            .map(String::from)
+            .filter(|s| !s.trim().is_empty())
+            .map(String::from);
+        let name = preferred_username
             .or_else(|| sub.clone())
-            .or(claims.azp)
-            .or(claims.client_id)
+            .or_else(|| claims.azp.filter(|s| !s.trim().is_empty()))
+            .or_else(|| claims.client_id.filter(|s| !s.trim().is_empty()))
             .unwrap_or_else(|| "oauth-client".into());
 
         Ok(AuthIdentity {
@@ -6193,6 +6204,178 @@ role = "admin"
         assert!(
             identity.and_then(|id| id.sub).is_none(),
             "a sub-less token must not synthesise a subject"
+        );
+    }
+
+    fn mint_token_with_extra(
+        private_pem: &str,
+        kid: &str,
+        issuer: &str,
+        audience: &str,
+        extra: &serde_json::Value,
+    ) -> String {
+        let encoding_key = jsonwebtoken::EncodingKey::from_rsa_pem(private_pem.as_bytes())
+            .expect("encoding key from PEM");
+        let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
+        header.kid = Some(kid.into());
+        let now = jsonwebtoken::get_current_timestamp();
+        let mut claims = serde_json::json!({
+            "iss": issuer,
+            "aud": audience,
+            "scope": "mcp:read",
+            "exp": now + 3600,
+            "iat": now,
+        });
+        if let (Some(base), Some(extra)) = (claims.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra {
+                base.insert(key.clone(), value.clone());
+            }
+        }
+        jsonwebtoken::encode(&header, &claims, &encoding_key).expect("JWT encoding")
+    }
+
+    async fn blank_claim_cache(require_subject: bool) -> (JwksCache, String, wiremock::MockServer) {
+        let kid = "blank-claim-kid";
+        let (pem, jwks) = generate_test_keypair(kid);
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/jwks.json"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&jwks))
+            .mount(&mock_server)
+            .await;
+        let jwks_uri = format!("{}/jwks.json", mock_server.uri());
+        let mut config = test_config(&jwks_uri);
+        config.require_subject = require_subject;
+        let cache = test_cache(&config);
+        (cache, pem, mock_server)
+    }
+
+    #[tokio::test]
+    async fn oauth_blank_preferred_username_falls_through_to_sub() {
+        let (cache, pem, _server) = blank_claim_cache(false).await;
+        let token = mint_token_with_extra(
+            &pem,
+            "blank-claim-kid",
+            "https://auth.test.local",
+            "https://mcp.test.local/mcp",
+            &serde_json::json!({ "sub": "real-sub", "preferred_username": "" }),
+        );
+        let id = cache
+            .validate_token(&token)
+            .await
+            .expect("a token with a usable sub must authenticate");
+        assert_eq!(
+            id.name, "real-sub",
+            "blank preferred_username must be skipped"
+        );
+        assert_eq!(id.sub.as_deref(), Some("real-sub"));
+    }
+
+    #[tokio::test]
+    async fn oauth_all_blank_claims_yield_non_blank_name_and_fingerprint() {
+        let (cache, pem, _server) = blank_claim_cache(false).await;
+        let token = mint_token_with_extra(
+            &pem,
+            "blank-claim-kid",
+            "https://auth.test.local",
+            "https://mcp.test.local/mcp",
+            &serde_json::json!({
+                "sub": "",
+                "preferred_username": "  ",
+                "azp": "",
+                "client_id": "   ",
+            }),
+        );
+        let id = cache
+            .validate_token(&token)
+            .await
+            .expect("all-blank identity claims still authenticate on a valid token");
+        assert_eq!(
+            id.name, "oauth-client",
+            "all-blank claims must fall to the sentinel"
+        );
+        assert!(id.sub.is_none(), "a blank sub must be stored as None");
+        // Exercises the fingerprint debug_assert: a blank stable id would panic.
+        let _fingerprint = crate::session_binding::fingerprint(&id);
+    }
+
+    #[tokio::test]
+    async fn oauth_blank_sub_rejected_when_require_subject() {
+        let (cache, pem, _server) = blank_claim_cache(true).await;
+        let token = mint_token_with_extra(
+            &pem,
+            "blank-claim-kid",
+            "https://auth.test.local",
+            "https://mcp.test.local/mcp",
+            &serde_json::json!({ "sub": "   " }),
+        );
+        assert!(
+            cache.validate_token(&token).await.is_none(),
+            "require_subject must reject a blank sub"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_blank_sub_stored_as_none() {
+        let (cache, pem, _server) = blank_claim_cache(false).await;
+        let token = mint_token_with_extra(
+            &pem,
+            "blank-claim-kid",
+            "https://auth.test.local",
+            "https://mcp.test.local/mcp",
+            &serde_json::json!({ "sub": "" }),
+        );
+        let id = cache
+            .validate_token(&token)
+            .await
+            .expect("a blank sub is accepted by default (require_subject off)");
+        assert!(id.sub.is_none(), "a blank sub must be stored as None");
+        assert_eq!(id.name, "oauth-client");
+    }
+
+    #[tokio::test]
+    async fn oauth_blank_preferred_and_sub_fall_through_to_azp() {
+        let (cache, pem, _server) = blank_claim_cache(false).await;
+        let token = mint_token_with_extra(
+            &pem,
+            "blank-claim-kid",
+            "https://auth.test.local",
+            "https://mcp.test.local/mcp",
+            &serde_json::json!({ "sub": "", "preferred_username": "  ", "azp": "svc-account" }),
+        );
+        let id = cache
+            .validate_token(&token)
+            .await
+            .expect("a usable azp must authenticate");
+        assert_eq!(
+            id.name, "svc-account",
+            "must fall through to a non-blank azp"
+        );
+        assert!(id.sub.is_none(), "a blank sub must be stored as None");
+    }
+
+    #[tokio::test]
+    async fn oauth_blank_azp_falls_through_to_client_id() {
+        let (cache, pem, _server) = blank_claim_cache(false).await;
+        let token = mint_token_with_extra(
+            &pem,
+            "blank-claim-kid",
+            "https://auth.test.local",
+            "https://mcp.test.local/mcp",
+            &serde_json::json!({
+                "sub": "",
+                "preferred_username": "",
+                "azp": "  ",
+                "client_id": "svc-client",
+            }),
+        );
+        let id = cache
+            .validate_token(&token)
+            .await
+            .expect("a usable client_id must authenticate");
+        assert_eq!(
+            id.name, "svc-client",
+            "must fall through past a blank azp to a non-blank client_id"
         );
     }
 

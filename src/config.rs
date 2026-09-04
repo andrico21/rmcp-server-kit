@@ -1357,6 +1357,10 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
         ));
     }
 
+    if let Some(auth) = &server.auth {
+        auth.validate_api_key_names()?;
+    }
+
     if server.max_concurrent_requests == Some(0) {
         return Err(RmcpServerKitError::Config(
             "max_concurrent_requests must be nonzero when set".into(),
@@ -1716,6 +1720,37 @@ mod tests {
     fn valid_server_config_passes() {
         let cfg = ServerConfig::default();
         assert!(validate_server_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn validate_server_config_rejects_blank_api_key_name() {
+        let blank = ServerConfig {
+            auth: Some(crate::auth::AuthConfig::with_keys(vec![
+                crate::auth::ApiKeyEntry::new("", "hash", "viewer"),
+            ])),
+            ..ServerConfig::default()
+        };
+        let err = validate_server_config(&blank).unwrap_err().to_string();
+        assert!(
+            err.contains("api_keys[0]"),
+            "must name offending index: {err}"
+        );
+
+        let whitespace = ServerConfig {
+            auth: Some(crate::auth::AuthConfig::with_keys(vec![
+                crate::auth::ApiKeyEntry::new("   ", "hash", "viewer"),
+            ])),
+            ..ServerConfig::default()
+        };
+        assert!(validate_server_config(&whitespace).is_err());
+
+        let ok = ServerConfig {
+            auth: Some(crate::auth::AuthConfig::with_keys(vec![
+                crate::auth::ApiKeyEntry::new("viewer-key", "hash", "viewer"),
+            ])),
+            ..ServerConfig::default()
+        };
+        assert!(validate_server_config(&ok).is_ok());
     }
 
     #[test]

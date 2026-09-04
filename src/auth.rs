@@ -763,6 +763,25 @@ pub struct AuthConfig {
     pub(crate) oauth: Option<serde::de::IgnoredAny>,
 }
 
+/// Reject any API key in `keys` whose `name` is blank (empty or
+/// whitespace-only), naming the first offending index.
+///
+/// Shared by [`AuthConfig::validate_api_key_names`] (startup validation) and
+/// [`AuthState::try_reload_keys`] (hot-reload validation) so both surfaces
+/// enforce the same rule: a blank name is the bearer session-binding stable
+/// id, so two blank-named keys collide to one fingerprint (CWE-384).
+pub(crate) fn check_api_key_names(keys: &[ApiKeyEntry]) -> Result<(), RmcpServerKitError> {
+    for (index, key) in keys.iter().enumerate() {
+        if key.name.trim().is_empty() {
+            return Err(RmcpServerKitError::Config(format!(
+                "auth.api_keys[{index}] has a blank name; each API-key name must be \
+                 non-empty and not whitespace-only (it is the session-binding identity)"
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl AuthConfig {
     /// Create an enabled auth config with the given API keys.
     #[must_use]
@@ -812,6 +831,22 @@ impl AuthConfig {
             })?;
         }
         Ok(())
+    }
+
+    /// Reject any configured API key whose `name` is blank (empty or
+    /// whitespace-only).
+    ///
+    /// The key name is the session-binding fingerprint's stable id for bearer
+    /// auth, so two blank-named keys hash identically and one key's session
+    /// becomes usable by the other (CWE-384). The first offending index is
+    /// named so an operator can locate the entry in their key list.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RmcpServerKitError::Config`] naming the first API-key index
+    /// whose `name` is blank.
+    pub fn validate_api_key_names(&self) -> Result<(), RmcpServerKitError> {
+        check_api_key_names(&self.api_keys)
     }
 }
 
@@ -1057,12 +1092,34 @@ pub(crate) struct AuthState {
 }
 
 impl AuthState {
-    /// Atomically replace the API key list (lock-free, wait-free).
+    /// Validate and atomically replace the API key list.
+    ///
+    /// Rejects a blank-named key before installing anything; on error the
+    /// previous key list stays in place, so a failed hot reload never leaves
+    /// the server serving blank-named (session-binding-colliding) keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RmcpServerKitError::Config`] naming the first blank-named
+    /// index; the current key list is left untouched.
+    pub(crate) fn try_reload_keys(&self, keys: Vec<ApiKeyEntry>) -> Result<(), RmcpServerKitError> {
+        check_api_key_names(&keys)?;
+        self.reload_keys_unchecked(keys);
+        Ok(())
+    }
+
+    /// Atomically replace the API key list **without validation** (lock-free,
+    /// wait-free).
     ///
     /// New requests immediately see the updated keys.
     /// In-flight requests that already loaded the old list finish
     /// using it -- no torn reads.
-    pub(crate) fn reload_keys(&self, keys: Vec<ApiKeyEntry>) {
+    ///
+    /// Private and unchecked on purpose: it does not reject a blank-named key
+    /// (session-binding-colliding, CWE-384). The only caller is
+    /// [`Self::try_reload_keys`], which validates first; all reload entry
+    /// points must go through that.
+    fn reload_keys_unchecked(&self, keys: Vec<ApiKeyEntry>) {
         let count = keys.len();
         self.api_keys.store(Arc::new(keys));
         tracing::info!(keys = count, "API keys reloaded");
@@ -1180,21 +1237,25 @@ const DEFAULT_PRE_AUTH_RATE: NonZeroU32 = NonZeroU32::new(300).unwrap();
 
 /// Parse an mTLS client certificate and extract an `AuthIdentity`.
 ///
-/// Reads the Subject CN as the identity name. Falls back to the first
-/// DNS SAN if CN is absent. The role is taken from the `MtlsConfig`.
+/// Uses the first non-blank Subject CN as the identity name, else the first
+/// non-blank DNS SAN. A blank (empty or whitespace-only) CN is treated as
+/// absent rather than shadowing a usable SAN. Returns `None` if neither
+/// yields a non-blank name that also passes the character guard. The role is
+/// taken from the `MtlsConfig`.
 #[must_use]
 pub fn extract_mtls_identity(cert_der: &[u8], default_role: &str) -> Option<AuthIdentity> {
     let (_, cert) = X509Certificate::from_der(cert_der).ok()?;
 
-    // Try CN from Subject first.
+    // First non-blank CN, else first non-blank DNS SAN: a blank stable id
+    // collapses distinct principals to one session-binding fingerprint (CWE-384),
+    // and a present-but-blank CN must not shadow a usable SAN.
     let cn = cert
         .subject()
         .iter_common_name()
-        .next()
-        .and_then(|attr| attr.as_str().ok())
+        .filter_map(|attr| attr.as_str().ok())
+        .find(|value| !value.trim().is_empty())
         .map(String::from);
 
-    // Fall back to first DNS SAN.
     let name = cn.or_else(|| {
         cert.subject_alternative_name()
             .ok()
@@ -1205,11 +1266,16 @@ pub fn extract_mtls_identity(cert_der: &[u8], default_role: &str) -> Option<Auth
                     reason = "x509-parser GeneralName is a large external enum; only DNSName is meaningful here"
                 )]
                 san.value.general_names.iter().find_map(|gn| match gn {
-                    GeneralName::DNSName(dns) => Some((*dns).to_owned()),
+                    GeneralName::DNSName(dns) if !dns.trim().is_empty() => Some((*dns).to_owned()),
                     _ => None,
                 })
             })
-    })?;
+    });
+
+    let Some(name) = name else {
+        tracing::warn!("mTLS identity rejected: no non-blank CN or DNS SAN present");
+        return None;
+    };
 
     // Reject identities with characters unsafe for logging and RBAC matching.
     if !name
@@ -1347,6 +1413,14 @@ pub fn verify_bearer_token(token: &str, keys: &[ApiKeyEntry]) -> Option<AuthIden
         return None;
     }
     let key = keys.get(matched_index)?;
+    // Blank stable id collides distinct principals in the session-binding
+    // fingerprint (CWE-384). Checked here, after the constant-time match loop
+    // has fully resolved `matched_index`, so the "one Argon2 per key" timing
+    // guarantee above is untouched.
+    if key.name.trim().is_empty() {
+        tracing::warn!("bearer token rejected: matched API key has a blank name");
+        return None;
+    }
     Some(AuthIdentity {
         name: key.name.clone(),
         role: key.role.clone(),
@@ -2111,6 +2185,127 @@ mod tests {
     #[test]
     fn extract_mtls_identity_invalid_der() {
         assert!(extract_mtls_identity(b"not-a-cert", "viewer").is_none());
+    }
+
+    #[test]
+    fn extract_mtls_identity_blank_cn_falls_back_to_san() {
+        // A present-but-blank CN must not shadow a usable DNS SAN. The pre-fix
+        // `or_else` never reached the SAN here because `Some("")` short-circuited it.
+        let mut params =
+            rcgen::CertificateParams::new(vec!["san-fallback.example.com".into()]).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "");
+        let cert = params
+            .self_signed(&rcgen::KeyPair::generate().unwrap())
+            .unwrap();
+
+        let id = extract_mtls_identity(cert.der(), "viewer").unwrap();
+        assert_eq!(id.name, "san-fallback.example.com");
+        assert_eq!(id.role, "viewer");
+    }
+
+    #[test]
+    fn extract_mtls_identity_blank_cn_without_san_yields_none() {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "");
+        let cert = params
+            .self_signed(&rcgen::KeyPair::generate().unwrap())
+            .unwrap();
+
+        assert!(extract_mtls_identity(cert.der(), "viewer").is_none());
+    }
+
+    #[test]
+    fn extract_mtls_identity_whitespace_cn_behaves_as_blank() {
+        let mut params =
+            rcgen::CertificateParams::new(vec!["san-fallback.example.com".into()]).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "   ");
+        let cert = params
+            .self_signed(&rcgen::KeyPair::generate().unwrap())
+            .unwrap();
+
+        let id = extract_mtls_identity(cert.der(), "viewer").unwrap();
+        assert_eq!(id.name, "san-fallback.example.com");
+    }
+
+    #[test]
+    fn validate_api_key_names_rejects_blank_and_whitespace() {
+        let blank = AuthConfig::with_keys(vec![
+            ApiKeyEntry::new("ok", "hash", "viewer"),
+            ApiKeyEntry::new("", "hash", "viewer"),
+        ]);
+        let err = blank.validate_api_key_names().unwrap_err().to_string();
+        assert!(
+            err.contains("api_keys[1]"),
+            "must name offending index: {err}"
+        );
+
+        let whitespace = AuthConfig::with_keys(vec![ApiKeyEntry::new("   ", "hash", "viewer")]);
+        assert!(whitespace.validate_api_key_names().is_err());
+
+        let ok = AuthConfig::with_keys(vec![ApiKeyEntry::new("viewer-key", "hash", "viewer")]);
+        assert!(ok.validate_api_key_names().is_ok());
+    }
+
+    #[test]
+    fn try_reload_keys_rejects_blank_name_and_keeps_previous() {
+        let (token, hash) = generate_api_key().unwrap();
+        let state = test_auth_state(vec![ApiKeyEntry::new("prev-key", hash, "ops")]);
+
+        let err = state
+            .try_reload_keys(vec![ApiKeyEntry::new("  ", "unused-hash", "ops")])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("api_keys[0]"),
+            "must name offending index: {err}"
+        );
+
+        let installed = state.api_keys.load();
+        assert!(
+            verify_bearer_token(&token, &installed).is_some(),
+            "the previous key must remain installed after a rejected reload"
+        );
+    }
+
+    #[test]
+    fn verify_bearer_token_rejects_blank_named_key() {
+        let (token, hash) = generate_api_key().unwrap();
+        let blank = ApiKeyEntry {
+            name: String::new(),
+            hash: hash.clone(),
+            role: "ops".into(),
+            expires_at: None,
+        };
+        assert!(
+            verify_bearer_token(&token, std::slice::from_ref(&blank)).is_none(),
+            "a valid token for a blank-named key must yield no identity"
+        );
+
+        let whitespace = ApiKeyEntry {
+            name: "   ".into(),
+            hash: hash.clone(),
+            role: "ops".into(),
+            expires_at: None,
+        };
+        assert!(
+            verify_bearer_token(&token, std::slice::from_ref(&whitespace)).is_none(),
+            "a whitespace-only key name must be treated as blank"
+        );
+
+        let named = ApiKeyEntry::new("real-key", hash, "ops");
+        assert!(
+            verify_bearer_token(&token, std::slice::from_ref(&named)).is_some(),
+            "a non-blank key name must still authenticate"
+        );
     }
 
     // -- auth_middleware integration tests --

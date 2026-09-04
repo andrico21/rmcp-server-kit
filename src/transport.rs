@@ -1394,6 +1394,10 @@ impl McpServerConfig {
             ));
         }
 
+        if let Some(auth) = &self.auth {
+            auth.validate_api_key_names()?;
+        }
+
         // 3. bind_addr parses
         if self.bind_addr.parse::<SocketAddr>().is_err() {
             return Err(RmcpServerKitError::Config(format!(
@@ -1519,10 +1523,44 @@ pub struct ReloadHandle {
 }
 
 impl ReloadHandle {
-    /// Atomically replace the API key list used by the auth middleware.
-    pub fn reload_auth_keys(&self, keys: Vec<crate::auth::ApiKeyEntry>) {
+    /// Validate and atomically replace the API key list used by the auth
+    /// middleware.
+    ///
+    /// The new keys are validated before any swap: a blank key name is
+    /// rejected because it would collapse distinct principals to one
+    /// session-binding fingerprint (CWE-384). On error the previously
+    /// installed keys stay in place. With no auth state configured this is a
+    /// successful no-op.
+    ///
+    /// This is the fallible counterpart to [`Self::reload_auth_keys`]; prefer
+    /// it so a rejected reload is observable rather than only logged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RmcpServerKitError::Config`] naming the first blank-named
+    /// index; the currently installed key list is left untouched.
+    pub fn try_reload_auth_keys(
+        &self,
+        keys: Vec<crate::auth::ApiKeyEntry>,
+    ) -> Result<(), RmcpServerKitError> {
         if let Some(ref auth) = self.auth {
-            auth.reload_keys(keys);
+            auth.try_reload_keys(keys)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Atomically replace the API key list used by the auth middleware.
+    ///
+    /// Compatibility wrapper over [`Self::try_reload_auth_keys`]. Invalid
+    /// input (a blank key name) is **rejected, not installed**: the error is
+    /// logged via `tracing::error!` and the previously installed keys are left
+    /// untouched, so a bad reload never silently swaps in
+    /// session-binding-colliding keys. Prefer [`Self::try_reload_auth_keys`]
+    /// to observe and handle the failure directly.
+    pub fn reload_auth_keys(&self, keys: Vec<crate::auth::ApiKeyEntry>) {
+        if let Err(error) = self.try_reload_auth_keys(keys) {
+            tracing::error!(%error, "API key hot reload rejected: keys left unchanged");
         }
     }
 
@@ -4473,6 +4511,77 @@ mod tests {
         cfg.tls_key_path = Some("key.pem".into());
 
         assert!(cfg.validate().is_ok(), "mTLS with both TLS paths is valid");
+    }
+
+    #[test]
+    fn validate_rejects_blank_api_key_name() {
+        let blank = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0").with_auth(
+            AuthConfig::with_keys(vec![crate::auth::ApiKeyEntry::new("", "hash", "viewer")]),
+        );
+        let err = blank
+            .validate()
+            .expect_err("blank API-key name must be rejected");
+        assert!(err.to_string().contains("api_keys[0]"), "{err}");
+
+        let whitespace = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0").with_auth(
+            AuthConfig::with_keys(vec![crate::auth::ApiKeyEntry::new("   ", "hash", "viewer")]),
+        );
+        assert!(whitespace.validate().is_err());
+
+        let ok = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0").with_auth(
+            AuthConfig::with_keys(vec![crate::auth::ApiKeyEntry::new(
+                "viewer-key",
+                "hash",
+                "viewer",
+            )]),
+        );
+        assert!(ok.validate().is_ok(), "a normal name must still validate");
+    }
+
+    fn reload_test_state(name: &str) -> (Arc<AuthState>, String) {
+        let (token, hash) = crate::auth::generate_api_key().unwrap();
+        let state = Arc::new(AuthState {
+            api_keys: ArcSwap::from_pointee(vec![crate::auth::ApiKeyEntry::new(name, hash, "ops")]),
+            rate_limiter: None,
+            pre_auth_limiter: None,
+            #[cfg(feature = "oauth")]
+            jwks_cache: None,
+            seen_identities: crate::auth::SeenIdentitySet::new(),
+            counters: crate::auth::AuthCounters::default(),
+            resource_metadata_url: None,
+        });
+        (state, token)
+    }
+
+    #[test]
+    fn try_reload_auth_keys_rejects_blank_name() {
+        let (state, _token) = reload_test_state("prev-key");
+        let handle = ReloadHandle {
+            auth: Some(state),
+            rbac: None,
+            crl_set: None,
+        };
+        let err = handle
+            .try_reload_auth_keys(vec![crate::auth::ApiKeyEntry::new("", "h", "ops")])
+            .expect_err("blank API-key name must be rejected on reload");
+        assert!(err.to_string().contains("api_keys[0]"), "{err}");
+    }
+
+    #[test]
+    fn reload_auth_keys_blank_name_leaves_previous_keys() {
+        let (state, token) = reload_test_state("prev-key");
+        let handle = ReloadHandle {
+            auth: Some(Arc::clone(&state)),
+            rbac: None,
+            crl_set: None,
+        };
+        handle.reload_auth_keys(vec![crate::auth::ApiKeyEntry::new("  ", "h", "ops")]);
+
+        let installed = state.api_keys.load();
+        assert!(
+            crate::auth::verify_bearer_token(&token, &installed).is_some(),
+            "the previous key must still authenticate after a rejected reload"
+        );
     }
 
     // -- McpServerConfig --
