@@ -11,6 +11,8 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+## [3.9.1] - 2026-09-04
+
 ### Changed
 
 - **The optional-argument-allowlist startup warning now names the remedy.** It
