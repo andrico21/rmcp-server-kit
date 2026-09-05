@@ -48,12 +48,19 @@ impl std::fmt::Debug for SessionBindingSecret {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IdentityFingerprint(Vec<u8>);
 
+impl IdentityFingerprint {
+    /// Canonical fingerprint bytes, for MAC inputs in sibling binding modules.
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 /// Raw rmcp session ID after wrapper verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RawSessionId(String);
 
 impl RawSessionId {
-    fn parse(raw: &str) -> Result<Self, Reason> {
+    pub(crate) fn parse(raw: &str) -> Result<Self, Reason> {
         if is_uuid_shaped(raw) {
             Ok(Self(raw.to_owned()))
         } else {
@@ -256,13 +263,13 @@ fn split_token(token: &str) -> Result<(&str, &str), Reason> {
     }
 }
 
-fn compute_mac(
-    secret: &SessionBindingSecret,
-    raw_id: &RawSessionId,
-    fp: &IdentityFingerprint,
-) -> [u8; MAC_LEN] {
-    type HmacSha256 = Hmac<Sha256>;
+pub(crate) type HmacSha256 = Hmac<Sha256>;
 
+/// Build a keyed HMAC-SHA256 instance from a binding secret.
+///
+/// Shared by session binding and [`crate::task_binding`] so the defensive
+/// re-key below exists in exactly one place.
+pub(crate) fn keyed_mac(secret: &SessionBindingSecret) -> HmacSha256 {
     // HMAC-SHA256 accepts keys of any length (RFC 2104), so construction
     // cannot fail for either the process-random default or configured secret.
     // Mirror the defensive re-key used by `rbac::redact_with_salt` rather
@@ -276,7 +283,7 @@ fn compute_mac(
             configured_key.as_bytes()
         }
     };
-    let mut mac = if let Ok(m) = HmacSha256::new_from_slice(key) {
+    if let Ok(m) = HmacSha256::new_from_slice(key) {
         m
     } else {
         let digest = Sha256::digest(key);
@@ -285,7 +292,15 @@ fn compute_mac(
             reason = "32-byte SHA-256 digest is unconditionally valid as an HMAC-SHA256 key (RFC 2104 allows any key length); see surrounding comment"
         )]
         HmacSha256::new_from_slice(&digest).expect("32-byte SHA256 digest is valid HMAC key")
-    };
+    }
+}
+
+fn compute_mac(
+    secret: &SessionBindingSecret,
+    raw_id: &RawSessionId,
+    fp: &IdentityFingerprint,
+) -> [u8; MAC_LEN] {
+    let mut mac = keyed_mac(secret);
     mac.update(VERSION.as_bytes());
     mac.update(&[DOMAIN_SEPARATOR]);
     mac.update(raw_id.0.as_bytes());

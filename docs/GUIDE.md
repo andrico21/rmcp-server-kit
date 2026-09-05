@@ -198,7 +198,8 @@ config.validate().expect("config valid");
 | `allowed_origins` | `Vec<String>` | `[]` | Allowed Origin header values |
 | `tool_rate_limit` | `Option<u32>` | `None` | Max tool calls/min per IP |
 | `session_binding` | `bool` | `true` | Statelessly bind MCP session IDs to the authenticated identity |
-| `session_binding_secret` | `Option<SecretString>` | `None` | Shared HMAC secret for cross-instance session binding |
+| `session_binding_secret` | `Option<SecretString>` | `None` | Shared HMAC secret for cross-instance session binding; also used by `task_binding` |
+| `task_binding` | `bool` | `false` | Bind MCP task IDs (SEP-2663) to the authenticated identity that created them |
 | `session_store` | `Option<Arc<dyn SessionStore>>` | `None` | Programmatic external rmcp session store; no TOML field |
 | `event_store` | `Option<Arc<dyn EventStore>>` | `None` | Programmatic external rmcp event store for durable `Last-Event-ID` replay; no TOML field |
 | `readiness_check` | `Option<ReadinessCheck>` | `None` | Custom `/readyz` probe |
@@ -950,7 +951,8 @@ extra_route_rate_limit = 60
 | `key_eviction_policy` | `KeyEvictionPolicy` | `"evict_lru"` | Full-table policy for per-IP limiter key maps; accepted values: `"evict_lru"`, `"reject_new"` |
 | `session_idle_timeout` | `String` | `"20m"` | Humantime duration; idle MCP sessions are closed after this period |
 | `session_binding` | `bool` | `true` | Stateless signed wrapper for `Mcp-Session-Id`; disables cross-identity session replay. Setting `false` reinstates CWE-384 risk and should only be used behind a gateway that deliberately re-authenticates each request under different labels |
-| `session_binding_secret` | `Option<SecretString>` | `None` | Shared HMAC secret for session binding across replicas; at least 32 UTF-8 bytes. No `session_store` or `event_store` TOML field exists because stores are trait objects supplied in code |
+| `session_binding_secret` | `Option<SecretString>` | `None` | Shared HMAC secret for session binding across replicas; at least 32 UTF-8 bytes. Also used by `task_binding`, domain-separated so a session token can never verify as a task token. No `session_store` or `event_store` TOML field exists because stores are trait objects supplied in code |
+| `task_binding` | `bool` | `false` | Stateless signed wrapper for MCP task IDs (SEP-2663), preventing one authenticated identity from reading, updating, or cancelling another's task via a leaked `taskId`. Off by default because it changes the wire format of `taskId` values; handlers keep seeing raw IDs, so only a consumer that persists the *client-visible* ID as its own key is affected. Reuses `session_binding_secret`; multi-replica deployments must share it |
 | `sse_keep_alive` | `String` | `"15s"` | Humantime duration; SSE keep-alive ping interval |
 | `public_url` | `Option<String>` | `None` | Externally reachable base URL (e.g. `https://mcp.example.com`); required when `listen_addr` is `0.0.0.0` behind a reverse proxy or container |
 | `compression_enabled` | `bool` | `false` | Enable gzip/br response compression |
@@ -1887,7 +1889,46 @@ apply.
 
 Rotating `session_binding_secret` invalidates active bound sessions. Clients
 will need to reinitialize after rotation; coordinate the change across replicas
-to avoid a mixed-secret window.
+to avoid a mixed-secret window. When `task_binding` is also enabled, rotation
+additionally invalidates every outstanding external task ID.
+
+### Binding MCP task IDs
+
+Session binding covers `Mcp-Session-Id` and nothing else. MCP tasks (SEP-2663)
+introduce a second long-lived identifier: `rmcp` resolves `tasks/get`,
+`tasks/update`, and `tasks/cancel` **by task ID alone**, and this crate's RBAC
+layer inspects only `tools/call`. So without task binding, any authenticated
+identity holding another identity's `taskId` can read, update, or cancel that
+task.
+
+```rust,ignore
+let config = McpServerConfig::new("127.0.0.1:8443", "my-server", "0.1.0")
+    .with_task_binding(true);
+```
+
+or in TOML:
+
+```toml
+[server]
+task_binding = true
+```
+
+Enabled, the `taskId` handed to the client is a signed wrapper bound to the
+authenticated identity; it is verified and rewritten back to the raw ID before
+your handler runs, so **handlers always see raw task IDs and need no changes**.
+A wrapper that fails verification is rejected with the same error `rmcp` returns
+for an unknown task, so it cannot be used to probe for another identity's tasks.
+
+It is off by default because it changes the wire format of `taskId`. The only
+consumer this breaks is one that persists the *client-visible* ID as its own
+key. It reuses `session_binding_secret` (domain-separated from session tokens),
+so multi-replica deployments must share that secret; a process-random secret
+invalidates outstanding task IDs on restart. With authentication disabled it is
+a no-op, since there is no identity to bind to.
+
+In MCP 2026-07-28 stateless mode there is no session ID, so session binding is
+inert for those clients -- authentication and RBAC still apply per request, and
+task binding is unaffected because it works on task IDs rather than sessions.
 
 API-key and mTLS identity fingerprints are stable when every replica uses the
 same API-key metadata and certificate identity mapping. OAuth fingerprints are

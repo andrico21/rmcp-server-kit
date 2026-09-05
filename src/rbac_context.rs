@@ -37,6 +37,8 @@ use crate::{
     auth::AuthIdentity,
     rbac::{RbacDecision, RbacPolicy},
     secret::SecretString,
+    session_binding::{IdentityFingerprint, SessionBindingSecret, fingerprint},
+    task_binding::{self, RawTaskId},
 };
 
 // Owns RBAC request context and RBAC-derived list visibility.
@@ -45,6 +47,9 @@ pub(crate) struct RbacContextHandler<H> {
     inner: H,
     rbac: Arc<ArcSwap<RbacPolicy>>,
     tool_list_filtering_enabled: bool,
+    /// When `Some`, task IDs crossing this boundary are HMAC-bound to the
+    /// authenticated identity. `None` leaves them untouched.
+    task_binding: Option<SessionBindingSecret>,
 }
 
 impl<H> RbacContextHandler<H> {
@@ -58,7 +63,29 @@ impl<H> RbacContextHandler<H> {
             inner,
             rbac,
             tool_list_filtering_enabled,
+            task_binding: None,
         }
+    }
+
+    /// Enable identity-bound task IDs using `secret`.
+    #[must_use]
+    pub(crate) fn with_task_binding(mut self, secret: Option<SessionBindingSecret>) -> Self {
+        self.task_binding = secret;
+        self
+    }
+
+    /// Resolve the (secret, fingerprint) pair needed to bind a task ID.
+    ///
+    /// Returns `None` when binding is disabled or the request carries no
+    /// authenticated identity, mirroring the session-binding no-op so
+    /// unauthenticated deployments keep working unchanged.
+    fn task_binding_for(
+        &self,
+        context: &RequestContext<RoleServer>,
+    ) -> Option<(&SessionBindingSecret, IdentityFingerprint)> {
+        let secret = self.task_binding.as_ref()?;
+        let identity = identity_from_request(context)?;
+        Some((secret, fingerprint(&identity)))
     }
 
     fn filtered_tool_list(
@@ -83,6 +110,24 @@ impl<H> RbacContextHandler<H> {
 
 fn identity_from_request(context: &RequestContext<RoleServer>) -> Option<AuthIdentity> {
     context_identity(&context.extensions)
+}
+
+/// Verify an external task ID and recover the raw ID the handler knows.
+///
+/// SECURITY: every failure mode -- malformed, unwrapped, signed for a different
+/// identity, or signed under a rotated secret -- collapses to the *same* error
+/// that upstream `rmcp` returns for a genuinely unknown task
+/// (`McpError::invalid_params("unknown task: ...")`). Distinguishing them would
+/// turn this into an oracle that confirms a task's existence to a non-owner.
+fn unbind_task_id(
+    secret: &SessionBindingSecret,
+    external_id: &str,
+    fp: &IdentityFingerprint,
+) -> Result<RawTaskId, ErrorData> {
+    task_binding::unwrap_and_verify(secret, external_id, fp).ok_or_else(|| {
+        tracing::warn!("task binding rejected request");
+        ErrorData::invalid_params(format!("unknown task: {external_id}"), None)
+    })
 }
 
 fn identity_from_notification(context: &NotificationContext<RoleServer>) -> Option<AuthIdentity> {
@@ -220,7 +265,26 @@ impl<H: ServerHandler> ServerHandler for RbacContextHandler<H> {
 
     delegate_request!(subscribe, SubscribeRequestParams, ());
     delegate_request!(unsubscribe, UnsubscribeRequestParams, ());
-    delegate_request!(call_tool, CallToolRequestParams, CallToolResponse);
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let binding = self.task_binding_for(&context);
+        let identity = identity_from_request(&context);
+        let mut response =
+            scope_with_identity(identity, || self.inner.call_tool(request, context)).await?;
+        // A tool may answer with a task handle instead of a result; that ID is
+        // the client's future handle to this task, so it must leave bound.
+        // Other `CallToolResponse` variants carry no task ID and are untouched.
+        if let Some((secret, fp)) = binding.as_ref()
+            && let CallToolResponse::Task(ref mut task) = response
+            && let Some(raw) = RawTaskId::parse(&task.task.task_id)
+        {
+            task.task.task_id = task_binding::wrap(secret, &raw, fp);
+        }
+        Ok(response)
+    }
 
     async fn list_tools(
         &self,
@@ -268,9 +332,56 @@ impl<H: ServerHandler> ServerHandler for RbacContextHandler<H> {
         self.inner.get_info()
     }
 
-    delegate_request!(get_task, GetTaskParams, GetTaskResult);
-    delegate_request!(update_task, UpdateTaskParams, ());
-    delegate_request!(cancel_task, CancelTaskParams, ());
+    // Task IDs are identity-bound when `task_binding` is enabled, so these
+    // cannot use `delegate_request!`: the external ID must be verified and
+    // rewritten to the raw ID before the inner handler sees it, and rejected
+    // without ever reaching that handler when it belongs to another identity.
+    async fn get_task(
+        &self,
+        mut request: GetTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskResult, ErrorData> {
+        let binding = self.task_binding_for(&context);
+        if let Some((secret, fp)) = binding.as_ref() {
+            let raw = unbind_task_id(secret, &request.task_id, fp)?;
+            raw.as_str().clone_into(&mut request.task_id);
+        }
+        let identity = identity_from_request(&context);
+        let mut result =
+            scope_with_identity(identity, || self.inner.get_task(request, context)).await?;
+        if let Some((secret, fp)) = binding.as_ref()
+            && let Some(raw) = RawTaskId::parse(&result.task.task.task_id)
+        {
+            result.task.task.task_id = task_binding::wrap(secret, &raw, fp);
+        }
+        Ok(result)
+    }
+
+    async fn update_task(
+        &self,
+        mut request: UpdateTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        if let Some((secret, fp)) = self.task_binding_for(&context) {
+            let raw = unbind_task_id(secret, &request.task_id, &fp)?;
+            raw.as_str().clone_into(&mut request.task_id);
+        }
+        let identity = identity_from_request(&context);
+        scope_with_identity(identity, || self.inner.update_task(request, context)).await
+    }
+
+    async fn cancel_task(
+        &self,
+        mut request: CancelTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        if let Some((secret, fp)) = self.task_binding_for(&context) {
+            let raw = unbind_task_id(secret, &request.task_id, &fp)?;
+            raw.as_str().clone_into(&mut request.task_id);
+        }
+        let identity = identity_from_request(&context);
+        scope_with_identity(identity, || self.inner.cancel_task(request, context)).await
+    }
 }
 
 #[cfg(test)]
@@ -658,5 +769,254 @@ mod tests {
 
         assert_eq!(first.tools, vec![tool("a_x")]);
         assert_eq!(second.tools, vec![tool("b_y")]);
+    }
+
+    // ----------------------------------------------------------------------
+    // Task identity binding
+    //
+    // These prove the property the feature exists for: a task ID leaked to a
+    // second authenticated identity must be useless to it, and the inner
+    // handler must never even observe the attempt.
+    // ----------------------------------------------------------------------
+
+    /// Records the `task_id` the inner handler actually received, so tests can
+    /// prove both that the wrapper is stripped before delegation and that a
+    /// rejected call never reaches the handler at all.
+    #[derive(Clone, Default)]
+    struct TaskProbeHandler {
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl TaskProbeHandler {
+        fn seen(&self) -> Vec<String> {
+            self.seen.lock().map(|s| s.clone()).unwrap_or_default()
+        }
+    }
+
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "rmcp ServerHandler requires async methods; this in-memory test handler returns immediately"
+    )]
+    impl ServerHandler for TaskProbeHandler {
+        fn get_info(&self) -> ServerInfo {
+            // rmcp gates `tasks/*` on the server advertising the extension AND
+            // the client declaring it, so both must be set up or the request is
+            // rejected upstream and never reaches the binding under test.
+            ServerInfo::new(
+                rmcp::model::ServerCapabilities::builder()
+                    .enable_tools()
+                    .enable_tasks()
+                    .build(),
+            )
+        }
+
+        async fn get_task(
+            &self,
+            request: GetTaskParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<GetTaskResult, ErrorData> {
+            if let Ok(mut seen) = self.seen.lock() {
+                seen.push(request.task_id.clone());
+            }
+            Ok(GetTaskResult::new(rmcp::model::DetailedTask::new(
+                rmcp::model::Task::new(
+                    request.task_id,
+                    rmcp::model::TaskStatus::Working,
+                    "2026-01-01T00:00:00Z",
+                    "2026-01-01T00:00:00Z",
+                ),
+                rmcp::model::TaskPayload::Working,
+            )))
+        }
+
+        async fn cancel_task(
+            &self,
+            request: CancelTaskParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<(), ErrorData> {
+            if let Ok(mut seen) = self.seen.lock() {
+                seen.push(request.task_id);
+            }
+            Ok(())
+        }
+    }
+
+    fn identity_named(name: &str) -> AuthIdentity {
+        AuthIdentity {
+            name: name.to_owned(),
+            role: "viewer".to_owned(),
+            method: AuthMethod::BearerToken,
+            raw_token: None,
+            sub: None,
+        }
+    }
+
+    fn task_secret() -> SessionBindingSecret {
+        SessionBindingSecret::Configured(SecretString::from(
+            "task-binding-test-secret-at-least-32-bytes".to_owned(),
+        ))
+    }
+
+    fn get_task_request(id: i64, task_id: &str, identity: AuthIdentity) -> ClientJsonRpcMessage {
+        let mut request = ClientRequest::GetTaskRequest(rmcp::model::GetTaskRequest::new(
+            GetTaskParams::new(task_id),
+        ));
+        // The envelope extensions are the canonical runtime home for `_meta`;
+        // a `params.meta` set in-memory is only honoured on serialization, so
+        // it would never reach `RequestContext::client_capabilities()` here.
+        let mut meta = rmcp::model::RequestMetaObject::default();
+        meta.set_client_capabilities(
+            rmcp::model::ClientCapabilities::builder()
+                .enable_tasks()
+                .build(),
+        );
+        request.extensions_mut().insert(meta);
+        let mut parts = axum::http::Request::new(()).into_parts().0;
+        parts.extensions.insert(identity);
+        request.extensions_mut().insert(parts);
+        JsonRpcMessage::request(request, NumberOrString::Number(id))
+    }
+
+    async fn get_task_via_service(
+        inner: TaskProbeHandler,
+        binding: Option<SessionBindingSecret>,
+        task_id: &str,
+        identity: AuthIdentity,
+    ) -> Result<GetTaskResult, ErrorData> {
+        let rbac = policy(RoleConfig::new(
+            "viewer",
+            vec!["*".to_owned()],
+            vec!["*".to_owned()],
+        ));
+        let message = get_task_request(1, task_id, identity);
+        let (transport, outbound) = InMemoryTransport::new(vec![message]);
+        let handler = RbacContextHandler::new(inner, rbac, false).with_task_binding(binding);
+        let running = rmcp::service::serve_directly::<RoleServer, _, _, Infallible, _>(
+            handler, transport, None,
+        );
+        running.waiting().await.expect("service task joins");
+
+        let messages = outbound.lock().expect("outbound messages lock").clone();
+        let Some(message) = messages.first() else {
+            panic!("expected one response");
+        };
+        match message {
+            ServerJsonRpcMessage::Response(response) => {
+                if let ServerResult::GetTaskResult(result) = &response.result {
+                    Ok(result.clone())
+                } else {
+                    panic!("expected tasks/get result, got {:?}", response.result);
+                }
+            }
+            ServerJsonRpcMessage::Error(err) => Err(err.error.clone()),
+            other @ (ServerJsonRpcMessage::Request(_) | ServerJsonRpcMessage::Notification(_)) => {
+                panic!("unexpected message {other:?}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn task_binding_wraps_outbound_and_unwraps_inbound_for_the_owner() {
+        let secret = task_secret();
+        let alice = identity_named("alice");
+        let fp = fingerprint(&alice);
+        let raw = RawTaskId::parse("task-42").expect("valid id");
+        let external = task_binding::wrap(&secret, &raw, &fp);
+        let probe = TaskProbeHandler::default();
+
+        let result = get_task_via_service(
+            probe.clone(),
+            Some(secret.clone()),
+            &external,
+            alice.clone(),
+        )
+        .await
+        .expect("owner may read its own task");
+
+        assert_eq!(
+            probe.seen(),
+            vec!["task-42".to_owned()],
+            "inner handler must observe the RAW id, never the wrapper"
+        );
+        assert_eq!(
+            result.task.task.task_id, external,
+            "outbound id must leave wrapped"
+        );
+        assert_ne!(
+            result.task.task.task_id, "task-42",
+            "raw id must never reach the client"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_binding_denies_a_second_identity_and_never_calls_the_handler() {
+        let secret = task_secret();
+        let alice = identity_named("alice");
+        let bob = identity_named("bob");
+        let raw = RawTaskId::parse("task-42").expect("valid id");
+        let alices_task = task_binding::wrap(&secret, &raw, &fingerprint(&alice));
+        let probe = TaskProbeHandler::default();
+
+        let err = get_task_via_service(probe.clone(), Some(secret), &alices_task, bob)
+            .await
+            .expect_err("bob must not reach alice's task");
+
+        assert_eq!(
+            err.code,
+            rmcp::model::ErrorCode::INVALID_PARAMS,
+            "must match upstream's unknown-task error code"
+        );
+        assert!(
+            err.message.contains("unknown task"),
+            "must be indistinguishable from a nonexistent task, got {:?}",
+            err.message
+        );
+        assert!(
+            probe.seen().is_empty(),
+            "the inner handler must never see a rejected task id"
+        );
+    }
+
+    /// A raw (unwrapped) id must be rejected too, or an attacker could simply
+    /// strip the wrapper and hit the handler directly.
+    #[tokio::test]
+    async fn task_binding_rejects_raw_and_malformed_ids_identically() {
+        let secret = task_secret();
+        let alice = identity_named("alice");
+        let probe = TaskProbeHandler::default();
+
+        for candidate in ["task-42", "", "t1.", "t1.a.b", "v1.a.b", "garbage"] {
+            let Err(err) = get_task_via_service(
+                probe.clone(),
+                Some(secret.clone()),
+                candidate,
+                alice.clone(),
+            )
+            .await
+            else {
+                panic!("must reject {candidate:?}");
+            };
+            assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+            assert!(
+                err.message.contains("unknown task"),
+                "every failure mode must look alike; {candidate:?} gave {:?}",
+                err.message
+            );
+        }
+        assert!(probe.seen().is_empty());
+    }
+
+    /// Disabled binding must be perfectly transparent, so existing task-using
+    /// consumers are unaffected until they opt in.
+    #[tokio::test]
+    async fn task_binding_disabled_passes_ids_through_untouched() {
+        let probe = TaskProbeHandler::default();
+
+        let result = get_task_via_service(probe.clone(), None, "task-42", identity_named("alice"))
+            .await
+            .expect("pass-through when disabled");
+
+        assert_eq!(probe.seen(), vec!["task-42".to_owned()]);
+        assert_eq!(result.task.task.task_id, "task-42");
     }
 }

@@ -488,6 +488,15 @@ pub struct McpServerConfig {
     /// multiple server instances. When unset, a process-random secret keeps
     /// single-instance behaviour unchanged.
     pub session_binding_secret: Option<SecretString>,
+    /// Bind MCP task IDs (SEP-2663) to the authenticated identity.
+    ///
+    /// Off by default: enabling it changes the wire format of `taskId` values,
+    /// which is safe for clients that treat them as opaque but would break a
+    /// consumer that persists the client-visible ID as its own key.
+    ///
+    /// Shares [`Self::session_binding_secret`]; the two bindings are
+    /// domain-separated so a session token can never verify as a task token.
+    pub task_binding: bool,
     /// Optional external rmcp session store for cross-instance recovery.
     pub session_store: Option<Arc<dyn SessionStore>>,
     /// Optional external event store backing resumable SSE streams
@@ -755,6 +764,7 @@ impl McpServerConfig {
             session_idle_timeout: Duration::from_mins(20),
             session_binding: true,
             session_binding_secret: None,
+            task_binding: false,
             session_store: None,
             event_store: None,
             sse_keep_alive: Duration::from_secs(15),
@@ -970,6 +980,18 @@ impl McpServerConfig {
     #[must_use]
     pub fn with_session_binding_secret(mut self, secret: SecretString) -> Self {
         self.session_binding_secret = Some(secret);
+        self
+    }
+
+    /// Bind MCP task IDs to the authenticated identity that created them.
+    ///
+    /// Prevents one authenticated identity from reading, updating, or
+    /// cancelling another's task via a leaked `taskId`. Reuses
+    /// [`Self::with_session_binding_secret`]. See [`Self::task_binding`] for
+    /// the compatibility caveat.
+    #[must_use]
+    pub const fn with_task_binding(mut self, enabled: bool) -> Self {
+        self.task_binding = enabled;
         self
     }
 
@@ -1662,6 +1684,45 @@ struct AppRunParams {
 /// It performs *no* network I/O: callers are responsible for binding
 /// (or accepting a pre-bound) [`TcpListener`] and invoking
 /// [`run_server`].
+/// Resolve the shared identity-binding HMAC secret for each binding feature.
+///
+/// Returns `(session_binding_secret, task_binding_secret)`, each `Some` only
+/// when that feature is enabled. Built once here because the handler factory
+/// (task binding) and the middleware layer (session binding) both need it, and
+/// the factory is constructed first. A configured secret is therefore now
+/// validated when *either* binding is on.
+type BindingSecrets = (
+    Option<crate::session_binding::SessionBindingSecret>,
+    Option<crate::session_binding::SessionBindingSecret>,
+);
+
+fn resolve_binding_secret(config: &McpServerConfig) -> anyhow::Result<BindingSecrets> {
+    #[allow(
+        deprecated,
+        reason = "internal router assembly reads deprecated `pub` config fields by design until 1.0 makes them pub(crate)"
+    )]
+    if !config.session_binding && !config.task_binding {
+        return Ok((None, None));
+    }
+    #[allow(
+        deprecated,
+        reason = "internal router assembly reads deprecated `pub` config fields by design until 1.0 makes them pub(crate)"
+    )]
+    let secret = match config.session_binding_secret.as_ref() {
+        Some(configured) => configured_session_binding_secret(configured)?,
+        None => process_session_binding_secret().clone(),
+    };
+    #[allow(
+        deprecated,
+        reason = "internal router assembly reads deprecated `pub` config fields by design until 1.0 makes them pub(crate)"
+    )]
+    let pair = (
+        config.session_binding.then(|| secret.clone()),
+        config.task_binding.then_some(secret),
+    );
+    Ok(pair)
+}
+
 #[allow(
     clippy::cognitive_complexity,
     reason = "router assembly is intrinsically sequential; splitting harms readability"
@@ -1710,13 +1771,15 @@ where
         .with_cancellation_token(session_ct.clone());
     rmcp_config.session_store = session_store;
     let event_store = config.event_store.take();
+    let (binding_secret, task_binding_secret) = resolve_binding_secret(&config)?;
     let mcp_service = StreamableHttpService::new(
         move || {
             Ok(RbacContextHandler::new(
                 handler_factory(),
                 Arc::clone(&rbac_for_handler),
                 tool_list_filtering,
-            ))
+            )
+            .with_task_binding(task_binding_secret.clone()))
         },
         {
             let mut mgr = LocalSessionManager::default();
@@ -1830,11 +1893,7 @@ where
 
     // [0] Session identity-binding layer (innermost; RBAC wraps it so invalid
     // session tool calls are still charged by the RBAC tool-rate limiter).
-    if config.session_binding {
-        let secret = match config.session_binding_secret.as_ref() {
-            Some(configured) => configured_session_binding_secret(configured)?,
-            None => process_session_binding_secret().clone(),
-        };
+    if let Some(secret) = binding_secret {
         mcp_router = mcp_router.layer(axum::middleware::from_fn(move |req, next| {
             let secret = secret.clone();
             session_binding_middleware(secret, req, next)

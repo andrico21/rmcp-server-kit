@@ -11,6 +11,42 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Added
+
+- **Identity-bound MCP task IDs (`task_binding`, opt-in, default `false`).**
+  MCP tasks (SEP-2663) hand the client a long-lived `taskId` that is later
+  presented to `tasks/get`, `tasks/update`, and `tasks/cancel`. Upstream `rmcp`
+  resolves those calls **by task ID alone** -- `TaskManager` takes no principal
+  argument -- and this crate's RBAC layer inspects only `tools/call`. Any
+  *authenticated* identity holding another identity's task ID could therefore
+  read, update, or cancel that task: the same
+  leaked-identifier-as-bearer-capability problem session binding already solves
+  for `Mcp-Session-Id`.
+
+  Enable via `McpServerConfig::with_task_binding(true)` or TOML
+  `server.task_binding = true`. The `taskId` returned to the client becomes a
+  signed wrapper bound to the authenticated identity, verified and rewritten
+  back to the raw ID before the consumer's handler runs -- **handlers continue
+  to see raw task IDs and need no changes.** A wrapper that fails verification
+  (malformed, unwrapped, signed for another identity, or signed under a rotated
+  secret) is rejected with exactly the error `rmcp` returns for a genuinely
+  unknown task, so the check cannot be used to probe whether another identity's
+  task exists.
+
+  Reuses `server.session_binding_secret`, domain-separated so a session token
+  can never verify as a task token or vice versa; rotating it now also
+  invalidates outstanding external task IDs. Multi-replica deployments must
+  share the secret. With authentication disabled the feature degrades to a
+  no-op rather than failing requests.
+
+  **Off by default** because it changes the wire format of `taskId` values. The
+  only consumer affected is one that persists the *client-visible* ID as its own
+  key; the ownership contract is that handlers own raw task IDs and
+  `rmcp-server-kit` owns the external wrapped ID.
+
+  Affects only consumers that implement tasks -- the `ServerHandler` task
+  methods otherwise default to method-not-found.
+
 ### Fixed
 
 - **Corrected an inaccurate `ToolHooks.after` documentation contract.** The

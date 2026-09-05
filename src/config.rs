@@ -32,6 +32,7 @@ const SERVER_CONFIG_BRIDGED_FIELDS: &[&str] = &[
     "session_idle_timeout",
     "session_binding",
     "session_binding_secret",
+    "task_binding",
     "sse_keep_alive",
     "public_url",
     "compression_enabled",
@@ -410,7 +411,15 @@ pub struct ServerConfig {
     #[serde(default = "default_session_binding")]
     pub session_binding: bool,
     /// Shared HMAC secret used for session binding across server instances.
+    ///
+    /// Also used by [`Self::task_binding`]; the two are domain-separated.
     pub session_binding_secret: Option<SecretString>,
+    /// Bind MCP task IDs (SEP-2663) to the authenticated identity that created
+    /// them, preventing cross-identity `tasks/get`, `tasks/update`, and
+    /// `tasks/cancel`. Default: false, because enabling it changes the wire
+    /// format of `taskId` values.
+    #[serde(default)]
+    pub task_binding: bool,
     /// Interval for SSE keep-alive pings sent to the client. Prevents
     /// proxies and load balancers from killing idle connections.
     /// Default: 15 seconds.
@@ -505,6 +514,7 @@ impl std::fmt::Debug for ServerConfig {
                 "session_binding_secret",
                 &self.session_binding_secret.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("task_binding", &self.task_binding)
             .field("sse_keep_alive", &self.sse_keep_alive)
             .field("public_url", &self.public_url)
             .field("compression_enabled", &self.compression_enabled)
@@ -546,6 +556,7 @@ impl Default for ServerConfig {
             session_idle_timeout: default_session_idle_timeout(),
             session_binding: default_session_binding(),
             session_binding_secret: None,
+            task_binding: false,
             sse_keep_alive: default_sse_keep_alive(),
             public_url: None,
             compression_enabled: false,
@@ -844,6 +855,7 @@ impl ServerConfig {
                 &self.session_idle_timeout,
             )?)
             .with_session_binding(self.session_binding)
+            .with_task_binding(self.task_binding)
             .with_optional_session_binding_secret(self.session_binding_secret.clone())
             .with_sse_keep_alive(parse_duration_field(
                 "server.sse_keep_alive",
@@ -2906,6 +2918,10 @@ mod tests {
         "server.forwarded_header",
         "server.session_idle_timeout",
         "server.session_binding",
+        // Identity-binding posture, file-only for the same reason as
+        // `session_binding`: replicas must agree, and an env-flippable
+        // security control invites per-process drift.
+        "server.task_binding",
         "server.sse_keep_alive",
         "server.compression_enabled",
         "server.compression_min_size",

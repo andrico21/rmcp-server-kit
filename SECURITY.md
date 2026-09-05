@@ -75,6 +75,53 @@ attacker. Treat it like an API-signing key: generate at least 32 random bytes,
 store it in a secret manager, mount it with least privilege, and rotate it with
 the expectation that all active bound sessions become invalid.
 
+### Scope: sessions only
+
+Session binding covers the `Mcp-Session-Id` header and **nothing else**. It does
+not protect MCP task IDs (see below), MRTR `requestState`, or any other
+long-lived identifier a handler hands to a client. Each such identifier needs
+its own binding.
+
+In MCP **2026-07-28 stateless mode** there is no session ID at all, so session
+binding is inert for those clients. That is safe, not a downgrade: authentication
+is evaluated per request from the `Authorization` header or the mTLS peer
+certificate, and RBAC is evaluated per request against the current message body.
+Neither depends on session state. Operators should simply not assume session
+binding is doing work for stateless clients.
+
+## MCP task identity binding
+
+MCP tasks (SEP-2663) hand the client a long-lived `taskId` that is later
+presented to `tasks/get`, `tasks/update`, and `tasks/cancel`. Upstream `rmcp`
+resolves those calls **by task ID alone**, and this crate's RBAC layer inspects
+only `tools/call`. Without binding, any *authenticated* identity holding another
+identity's task ID can read, update, or cancel that task -- the same
+leaked-identifier-as-bearer-capability problem session binding solves.
+
+When enabled, the task ID returned to the client is a signed wrapper bound to
+the authenticated identity, verified and rewritten back to the raw ID before the
+consumer's handler sees it. A wrapper that fails verification -- malformed, not
+wrapped, signed for a different identity, or signed under a rotated secret --
+is rejected with exactly the error `rmcp` returns for a genuinely unknown task,
+so the check cannot be used to probe whether another identity's task exists.
+
+The protection is controlled by `McpServerConfig::with_task_binding` and TOML
+`server.task_binding` (default `false`). It is **off by default** because
+enabling it changes the wire format of `taskId` values.
+
+- It reuses `server.session_binding_secret`. The two bindings are
+  domain-separated, so a session token can never verify as a task token or vice
+  versa. Rotating that secret invalidates both active bound sessions **and**
+  outstanding external task IDs.
+- Multi-replica deployments must configure the same shared secret on every
+  replica, exactly as for session binding. A process-random secret invalidates
+  outstanding external task IDs on restart.
+- **Ownership contract:** handlers own *raw* task IDs; `rmcp-server-kit` owns the
+  external wrapped ID. A consumer that persists the client-visible ID as its own
+  key will break when this is enabled.
+- With authentication disabled there is no identity to bind to, so the feature
+  degrades to a no-op rather than failing requests.
+
 ## Certificate revocation
 
 > ✅ **rmcp-server-kit performs CDP-driven CRL revocation

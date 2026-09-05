@@ -499,7 +499,7 @@ fn guide_toml_fences_parse() {
     let doc = fs::read_to_string(root.join("docs/GUIDE.md")).expect("read GUIDE.md");
     let fences = extract_toml_fences(&doc);
 
-    assert_eq!(fences.len(), 16, "GUIDE.md TOML fence count drifted");
+    assert_eq!(fences.len(), 17, "GUIDE.md TOML fence count drifted");
     for block in &fences {
         match block.info.as_str() {
             "toml" => assert_operator_config_block_parses(block),
