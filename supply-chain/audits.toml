@@ -1,4 +1,14 @@
 
 # cargo-vet audits file
 
-[audits]
+[[audits.rmcp]]
+who = "andrico <44984087+andrico21@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+delta = "3.1.4 -> 3.2.0"
+notes = "Reviewed the full 3.1.4..3.2.0 delta for rmcp-server-kit. No unsafe code in either version (0 occurrences); no new dependencies (only a new test target is registered). ServerHandler API unchanged - no method added, removed, renamed or resignatured. The initialize default body and streamable-HTTP is_legacy_request now route every initialize through the legacy/session lifecycle, and negotiate_protocol_version returns Result, so an unsupported version fails closed instead of passing through (#1228). Remaining changes are request-state key rotation (#1128), client-side OAuth credential-store refresh coordination (#1232, unused by this crate), concurrent streamable-HTTP requests (#1186) and sessionless discover fallback (#1211). Downstream coverage: tests/e2e.rs initialize_2026_protocol_is_session_bound_to_identity, verified to fail on 3.1.4 and pass on 3.2.0."
+
+[[audits.rmcp-macros]]
+who = "andrico <44984087+andrico21@users.noreply.github.com>"
+criteria = "safe-to-deploy"
+delta = "3.1.4 -> 3.2.0"
+notes = "No source changes between 3.1.4 and 3.2.0: the only differing files are .cargo_vcs_info.json, Cargo.lock, Cargo.toml (version bump) and CHANGELOG.md. This is a release-plz workspace version bump published alongside rmcp 3.2.0; the proc-macro code generation is byte-identical."

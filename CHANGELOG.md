@@ -30,6 +30,35 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ### Changed
 
+- **Updated `rmcp` and `rmcp-macros` 3.1.4 -> 3.2.0, plus 20 other
+  semver-compatible lockfile bumps** (`tower-http` 0.7.1, `tokio-rustls`
+  0.26.5, `toml` 1.1.5, `sse-stream` 0.2.6, `mio`, `indexmap`, `syn`, `cc`,
+  `smallvec`, the `wasm-bindgen` family, and others). No `Cargo.toml` version
+  requirement changed -- this is a lockfile-only move.
+
+  **Behaviour note for consumers.** rmcp 3.2.0 routes *every* `initialize`
+  request through the legacy/session lifecycle regardless of the protocol
+  version in the request body, and `negotiate_protocol_version` now returns a
+  `Result` rather than passing an unsupported version through. A client that
+  previously negotiated `2026-07-28` via `initialize` may therefore now
+  negotiate a legacy version instead, or receive `unsupported_protocol_version`
+  if its handler advertises no legacy version through
+  `ServerHandler::supported_protocol_versions()`. Servers that accept the
+  default version set are unaffected.
+
+  Identity-bound MCP sessions are unaffected by that transition: a post-legacy
+  `initialize` now mints a session, and that session is wrapped and bound to
+  the initiating identity exactly as a legacy one is. This is locked by the new
+  `initialize_2026_protocol_is_session_bound_to_identity` end-to-end test,
+  which was verified to fail against rmcp 3.1.4 and pass against 3.2.0 -- the
+  pre-existing suite could not have caught the change, because every other
+  end-to-end `initialize` uses a pre-`2026-07-28` (legacy) version.
+
+  `rmcp` 3.1.4 -> 3.2.0 and `rmcp-macros` 3.1.4 -> 3.2.0 were **hand-audited**
+  as `safe-to-deploy` delta audits rather than exempted; the remaining 20
+  bumps refreshed their `cargo vet` exemptions. `cargo audit` and
+  `cargo deny check` are clean.
+
 - **`resolve_allowed_algorithms` now accepts `Option<&[String]>` instead of
   `Option<&Vec<String>>`** (`RUST_GUIDELINES.md` §1, "DO: Accept borrowed types
   in function arguments"). Internal (`pub(crate)`) with no semver impact. The

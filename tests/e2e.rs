@@ -1320,6 +1320,112 @@ async fn session_bound_to_initiating_identity() {
     assert_eq!(resp.status(), 200, "identity A must retain its own session");
 }
 
+/// rmcp 3.2.0 (#1228) routes *every* `initialize` through the legacy/session
+/// lifecycle, regardless of the protocol version in the body. Before that, a
+/// `2026-07-28` initialize took the stateless path and minted no session.
+///
+/// Every other e2e initialize in this file uses `2025-06-18` or `2025-11-25`,
+/// both of which rmcp classifies as legacy (`< 2026-07-28`), so none of them
+/// crosses the path #1228 changed. This test pins the transition: a
+/// post-legacy client must still receive an *identity-bound* session, and that
+/// session must remain unusable by a second identity.
+#[tokio::test]
+async fn initialize_2026_protocol_is_session_bound_to_identity() {
+    let (token_a, hash_a) = rmcp_server_kit::auth::generate_api_key().unwrap();
+    let (token_b, hash_b) = rmcp_server_kit::auth::generate_api_key().unwrap();
+    let keys = vec![
+        ApiKeyEntry::new("ops-a", hash_a, "ops"),
+        ApiKeyEntry::new("ops-b", hash_b, "ops"),
+    ];
+    let policy = Arc::new(RbacPolicy::new(&RbacConfig::with_roles(vec![
+        RoleConfig::new("ops", vec!["*".into()], vec!["*".into()]),
+    ])));
+
+    let port = free_port().await;
+    let cfg = config_on_port(port)
+        .with_auth(test_auth_config(keys))
+        .with_rbac(policy);
+    let base = spawn_server(cfg).await;
+    let client = reqwest::Client::new();
+
+    // Issued inline rather than via `mcp_initialize_with_bearer`, which
+    // hardcodes the legacy `2025-06-18` and therefore cannot exercise #1228.
+    let resp = client
+        .post(format!("{base}/mcp"))
+        .header("authorization", format!("Bearer {token_a}"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2026-07-28",
+                    "capabilities": {},
+                    "clientInfo": { "name": "e2e-2026", "version": "0.0.1" }
+                }
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("initialize request");
+
+    assert_eq!(resp.status(), 200, "2026-07-28 initialize must succeed");
+
+    let session_id = resp
+        .headers()
+        .get("mcp-session-id")
+        .expect("#1228: a post-legacy initialize must now mint a session")
+        .to_str()
+        .expect("session id is ascii")
+        .to_owned();
+    assert!(
+        session_id.starts_with("v1."),
+        "session id must be wrapped by our identity binding, got {session_id}"
+    );
+
+    let body = mcp_response_json(resp).await;
+    let negotiated = body["result"]["protocolVersion"]
+        .as_str()
+        .expect("initialize result must carry protocolVersion");
+    // Asserted as an inequality, not equality with a specific legacy version:
+    // which legacy version rmcp settles on is upstream's choice and will move.
+    assert!(
+        negotiated < "2026-07-28",
+        "#1228 negotiates initialize down to a legacy version, got {negotiated}"
+    );
+
+    let resp = client
+        .post(format!("{base}/mcp"))
+        .header("authorization", format!("Bearer {token_b}"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-session-id", &session_id)
+        .body(tool_call_body("resource_list", &serde_json::json!({})))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        404,
+        "identity B must not reach identity A's post-legacy session"
+    );
+
+    let resp = client
+        .post(format!("{base}/mcp"))
+        .header("authorization", format!("Bearer {token_a}"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-session-id", &session_id)
+        .body(tool_call_body("resource_list", &serde_json::json!({})))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "identity A must retain its own session");
+}
+
 // ==========================================================================
 // Auth rate limiting
 // ==========================================================================
