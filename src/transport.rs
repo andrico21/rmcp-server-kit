@@ -496,6 +496,10 @@ pub struct McpServerConfig {
     ///
     /// Shares [`Self::session_binding_secret`]; the two bindings are
     /// domain-separated so a session token can never verify as a task token.
+    ///
+    /// Default `false` is a compatibility choice, not a staged default-flip
+    /// promise; enable it explicitly for task-using authenticated deployments
+    /// that need cross-identity isolation.
     pub task_binding: bool,
     /// Optional external rmcp session store for cross-instance recovery.
     pub session_store: Option<Arc<dyn SessionStore>>,

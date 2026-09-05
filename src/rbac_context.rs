@@ -258,6 +258,16 @@ impl<H: ServerHandler> ServerHandler for RbacContextHandler<H> {
         self.inner.accepted_subscription_filter(requested)
     }
 
+    // SECURITY FUTURE-WATCH: rmcp 3.2.0 rejects
+    // `ServerNotification::TaskStatusNotification` inside
+    // `SubscriptionSink::send` because `SubscriptionFilter` has no task-id
+    // selector; clients currently observe task state by polling `tasks/get`.
+    // If a future rmcp release makes `notifications/tasks` routable, this
+    // wrapper must bind the `DetailedTask.task.task_id` in every task status
+    // notification before it leaves the process. Sending it raw would bypass
+    // the wrapping done in `call_tool` and `get_task` below. The test
+    // `task_status_notifications_remain_unroutable_until_binding_is_added`
+    // fails when that upstream change lands.
     async fn listen(&self, context: SubscriptionContext) -> Result<(), ErrorData> {
         let identity = identity_from_subscription(&context);
         scope_with_identity(identity, || self.inner.listen(context)).await
@@ -1018,5 +1028,170 @@ mod tests {
 
         assert_eq!(probe.seen(), vec!["task-42".to_owned()]);
         assert_eq!(result.task.task.task_id, "task-42");
+    }
+
+    #[derive(Clone, Default)]
+    struct NotificationProbeHandler {
+        send_result: Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "rmcp ServerHandler requires async methods; this in-memory test handler returns immediately"
+    )]
+    impl ServerHandler for NotificationProbeHandler {
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo::new(
+                rmcp::model::ServerCapabilities::builder()
+                    .enable_tools()
+                    .enable_tool_list_changed()
+                    .enable_tasks()
+                    .build(),
+            )
+        }
+
+        fn accepted_subscription_filter(
+            &self,
+            requested: &SubscriptionFilter,
+        ) -> Option<SubscriptionFilter> {
+            Some(requested.clone())
+        }
+
+        async fn listen(&self, context: SubscriptionContext) -> Result<(), ErrorData> {
+            let task = rmcp::model::DetailedTask::new(
+                rmcp::model::Task::new(
+                    "task-42",
+                    rmcp::model::TaskStatus::Working,
+                    "2026-01-01T00:00:00Z",
+                    "2026-01-01T00:00:00Z",
+                ),
+                rmcp::model::TaskPayload::Working,
+            );
+            let outcome = context
+                .sink()
+                .send(rmcp::model::ServerNotification::TaskStatusNotification(
+                    rmcp::model::TaskStatusNotification::new(
+                        rmcp::model::TaskStatusNotificationParams::new(task),
+                    ),
+                ))
+                .await;
+            if let Ok(mut slot) = self.send_result.lock() {
+                *slot = Some(match outcome {
+                    Ok(()) => "sent".to_owned(),
+                    Err(err) => format!("{err:?}"),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    /// Like [`InMemoryTransport`] but never reports end-of-stream, so a
+    /// long-running `subscriptions/listen` handler is not cancelled by the
+    /// service shutting down the moment the inbound queue drains.
+    struct OpenTransport {
+        inbound: VecDeque<ClientJsonRpcMessage>,
+        outbound: Arc<std::sync::Mutex<Vec<ServerJsonRpcMessage>>>,
+    }
+
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "rmcp Transport requires async receive/close; this in-memory test transport returns immediately"
+    )]
+    impl Transport<RoleServer> for OpenTransport {
+        type Error = Infallible;
+
+        fn send(
+            &mut self,
+            item: ServerJsonRpcMessage,
+        ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
+            let outbound = Arc::clone(&self.outbound);
+            async move {
+                if let Ok(mut outbound) = outbound.lock() {
+                    outbound.push(item);
+                }
+                Ok(())
+            }
+        }
+
+        async fn receive(&mut self) -> Option<ClientJsonRpcMessage> {
+            if let Some(message) = self.inbound.pop_front() {
+                return Some(message);
+            }
+            std::future::pending().await
+        }
+
+        async fn close(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    /// Tripwire, not a behavioural test.
+    ///
+    /// `rmcp` currently refuses to route `notifications/tasks` through
+    /// `subscriptions/listen`, so a task status notification cannot carry a raw
+    /// task ID past the binding today. This test asserts that refusal still
+    /// holds. **It is expected to fail when a future `rmcp` release makes task
+    /// notifications routable** -- at which point the task ID inside
+    /// `TaskStatusNotificationParams` must be wrapped before it leaves the
+    /// process, exactly as `call_tool` and `get_task` already wrap theirs.
+    #[tokio::test]
+    async fn task_status_notifications_remain_unroutable_until_binding_is_added() {
+        let probe = NotificationProbeHandler::default();
+        let rbac = policy(RoleConfig::new(
+            "viewer",
+            vec!["*".to_owned()],
+            vec!["*".to_owned()],
+        ));
+
+        let filter = SubscriptionFilter::builder().tools_list_changed().build();
+        let mut params = rmcp::model::SubscriptionsListenRequestParams::new(filter);
+        let mut meta = rmcp::model::RequestMetaObject::default();
+        meta.set_protocol_version(ProtocolVersion::V_2026_07_28);
+        meta.set_client_capabilities(rmcp::model::ClientCapabilities::default());
+        params.meta = Some(meta.clone());
+        let mut request = ClientRequest::SubscriptionsListenRequest(
+            rmcp::model::SubscriptionsListenRequest::new(params),
+        );
+        request.extensions_mut().insert(meta);
+        let mut parts = axum::http::Request::new(()).into_parts().0;
+        parts.extensions.insert(identity_named("alice"));
+        request.extensions_mut().insert(parts);
+        let message = JsonRpcMessage::request(request, NumberOrString::Number(1));
+
+        let outbound = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let transport = OpenTransport {
+            inbound: VecDeque::from(vec![message]),
+            outbound: Arc::clone(&outbound),
+        };
+        let handler = RbacContextHandler::new(probe.clone(), rbac, false);
+        let running = rmcp::service::serve_directly::<RoleServer, _, _, Infallible, _>(
+            handler, transport, None,
+        );
+
+        // The transport never closes, so poll for the handler's result instead
+        // of joining the service, then cancel it.
+        let mut recorded = None;
+        for _ in 0..10_000 {
+            if let Some(value) = probe.send_result.lock().ok().and_then(|slot| slot.clone()) {
+                recorded = Some(value);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        running.cancel().await.ok();
+
+        let outcome = recorded.unwrap_or_else(|| {
+            let msgs = outbound.lock().expect("outbound lock").clone();
+            panic!("listen was never invoked; server responded: {msgs:?}")
+        });
+
+        assert!(
+            outcome.contains("UnsupportedNotification") && outcome.contains("notifications/tasks"),
+            "TRIPWIRE: rmcp now routes task status notifications (got {outcome:?}). \
+             This is not a flaky test -- bind the task_id inside \
+             TaskStatusNotificationParams in RbacContextHandler::listen before \
+             shipping this rmcp version, or identity A's raw task ID will leak \
+             to whoever is subscribed."
+        );
     }
 }

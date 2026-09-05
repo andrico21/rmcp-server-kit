@@ -121,6 +121,13 @@ enabling it changes the wire format of `taskId` values.
   key will break when this is enabled.
 - With authentication disabled there is no identity to bind to, so the feature
   degrades to a no-op rather than failing requests.
+- Current `rmcp` 3.2.0 does not route SEP-2663 `notifications/tasks` through
+  `subscriptions/listen`; clients observe task state by polling `tasks/get`,
+  which is wrapped. If a future `rmcp` release adds task-status subscriptions,
+  `rmcp-server-kit` must wrap the `task.task_id` inside each
+  `TaskStatusNotificationParams` before exposing that release. The test
+  `task_status_notifications_remain_unroutable_until_binding_is_added` fails
+  when that upstream change lands.
 
 ## Certificate revocation
 

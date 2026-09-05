@@ -328,16 +328,13 @@ jobs:
         # clamp), so those files joined the scope; to keep each nightly
         # job within the wall-clock budget the mutant list is now split
         # deterministically across 8 parallel shards (`--shard K/8`).
-        # `tool_hooks.rs` joined after the 8-shard run showed the worst
-        # shard finishing in ~105m against the 170m cap. Despite being
-        # ~1545 lines it yields only 70 mutants (most of the file is
-        # tests), a 7% increase on the 982 already in scope: ~123 -> ~132
-        # per shard, so the worst shard lands near ~112m. It is in scope
-        # because it enforces the tool-call result-size cap and runs the
-        # before/after hooks, both of which fail open if a guard is
-        # silently inverted. Re-measure before adding anything larger:
-        # `cargo mutants --list -f <file>` reports the true mutant count,
-        # which is what costs time, not the line count.
+        # `session_binding.rs`, `rbac_context.rs`, and `task_binding.rs`
+        # protect bearer-like MCP identifiers; `tool_hooks.rs` enforces the
+        # tool-call result-size cap and before/after hook policy. These files
+        # are in scope because silently inverted guards can fail open.
+        # Keep this list intentionally small. Before adding files, measure with
+        # `cargo mutants --list -f <file>` and compare against the 8-shard
+        # 170m wall cap; true mutant count, not line count, is what costs time.
         # Wrap in `timeout` so we exit 0 even if cargo-mutants itself
         # blows past the wall-clock budget (GitHub's job-level
         # `timeout-minutes` SIGKILLs and bypasses `|| true`).
@@ -353,7 +350,7 @@ jobs:
             -f src/rbac.rs -f src/auth.rs -f src/transport.rs \
             -f src/ssrf.rs -f src/mtls_revocation.rs \
             -f src/session_binding.rs -f src/rbac_context.rs \
-            -f src/tool_hooks.rs
+            -f src/tool_hooks.rs -f src/task_binding.rs
           status=$?
           set -e
           # `timeout` (without --preserve-status) reports 124 on wall expiry and

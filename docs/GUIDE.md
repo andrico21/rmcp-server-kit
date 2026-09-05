@@ -1930,6 +1930,11 @@ In MCP 2026-07-28 stateless mode there is no session ID, so session binding is
 inert for those clients -- authentication and RBAC still apply per request, and
 task binding is unaffected because it works on task IDs rather than sessions.
 
+This is an explicit opt-in compatibility control, not a staged default flip.
+Future releases may revisit the default only with a fresh compatibility review
+and migration note; enable `task_binding` now if your server exposes tasks across
+authenticated identities.
+
 API-key and mTLS identity fingerprints are stable when every replica uses the
 same API-key metadata and certificate identity mapping. OAuth fingerprints are
 stable only when the JWT `sub` claim is present; otherwise the identity name may

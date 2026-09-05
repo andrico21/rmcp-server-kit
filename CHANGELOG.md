@@ -44,6 +44,11 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   key; the ownership contract is that handlers own raw task IDs and
   `rmcp-server-kit` owns the external wrapped ID.
 
+  This compatibility decision is not a staged promise to flip the default later.
+  Future releases may revisit the default only with a fresh compatibility review
+  and migration note; consumers that need cross-identity task isolation should
+  enable `task_binding` explicitly.
+
   Affects only consumers that implement tasks -- the `ServerHandler` task
   methods otherwise default to method-not-found.
 

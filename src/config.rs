@@ -418,6 +418,9 @@ pub struct ServerConfig {
     /// them, preventing cross-identity `tasks/get`, `tasks/update`, and
     /// `tasks/cancel`. Default: false, because enabling it changes the wire
     /// format of `taskId` values.
+    ///
+    /// This is an opt-in compatibility control, not a staged default-flip
+    /// promise.
     #[serde(default)]
     pub task_binding: bool,
     /// Interval for SSE keep-alive pings sent to the client. Prevents
