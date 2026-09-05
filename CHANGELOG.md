@@ -11,6 +11,22 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Documentation
+
+- **Documented that MRTR `requestState` is not bound by this crate, and what to
+  do instead.** SEP-2322 multi-round-trip requests hand the client a third
+  long-lived echoed value alongside `Mcp-Session-Id` and `taskId`. Those two
+  have crate-level identity-binding support; `requestState` deliberately has
+  none, because sealing it correctly depends on business context only the
+  consumer has. A consumer could reasonably have assumed otherwise, so
+  `docs/GUIDE.md` now states the non-coverage plainly and gives concrete
+  identity-binding guidance for `RequestStateCodec` -- which principal accessor
+  to bind, that the type needs rmcp's non-default `request-state` feature, how
+  to scope it to the originating request, TTL and single-use handling, and the
+  reminder that the sealed payload is authenticated rather than encrypted.
+
+  No behaviour change.
+
 ### Added
 
 - **Identity-bound MCP task IDs (`task_binding`, opt-in, default `false`).**

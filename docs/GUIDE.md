@@ -1942,6 +1942,33 @@ fall back through mutable claims such as `preferred_username`. For OAuth
 deployments using an external session store, set `require_subject = true` on
 the OAuth config so token refreshes keep the same session-binding fingerprint.
 
+#### MRTR `requestState` identity binding
+
+SEP-2322 multi-round-trip requests let a handler return an
+`InputRequiredResult` with an opaque `requestState` that the client later echoes.
+Treat the echoed value as untrusted input. rmcp-server-kit does not wrap
+`requestState`: session binding protects only `Mcp-Session-Id`, and task binding
+protects only `taskId`.
+
+If `requestState` affects authorization, resource selection, tenant selection,
+or business logic, seal it with `rmcp::model::RequestStateCodec` and
+`SealOptions::associated_data`. That type sits behind rmcp's `request-state`
+feature, which is neither an rmcp default nor enabled by this crate, so add it
+to your own `rmcp` dependency first. Build the associated data from:
+
+- the authenticated principal: `current_sub().or_else(current_identity)` --
+  `current_sub()` is the OAuth `sub` claim and is preferred where present;
+  `current_identity()` is the stable API-key name or mTLS certificate identity;
+- the request scope: method/tool name plus a canonical digest of the original
+  request, resource, or tenant the retry is allowed to resume;
+- a deployment-stable namespace/version so future format changes fail closed.
+
+Use the same request-state signing key or keyring on every replica, set a short
+TTL, and enforce nonce/single-use server-side if redemption must be one-time.
+The sealed payload is authenticated, not encrypted: do not put secrets, bearer
+tokens, or hidden authorization decisions in it. Map every open/verification
+failure to one generic client-facing "invalid request state" error.
+
 #### Resumable SSE event replay
 
 MCP stream resumability is optional: the transport spec says servers MAY attach
