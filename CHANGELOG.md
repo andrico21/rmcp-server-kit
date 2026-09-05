@@ -11,6 +11,8 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+## [3.10.0] - 2026-09-05
+
 ### Documentation
 
 - **Documented that MRTR `requestState` is not bound by this crate, and what to
