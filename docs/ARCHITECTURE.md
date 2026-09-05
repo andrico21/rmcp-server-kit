@@ -46,8 +46,8 @@ The crate has two transports:
 
 | Transport          | Function                                            | Auth/RBAC/TLS  | Use case                                         |
 |--------------------|-----------------------------------------------------|----------------|--------------------------------------------------|
-| **Streamable HTTP**| `serve()` - `src/transport.rs:2277`                 | **Yes**        | Production network deployment                    |
-| stdio              | `serve_stdio()` - `src/transport.rs:4137`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
+| **Streamable HTTP**| `serve()` - `src/transport.rs:2336`                 | **Yes**        | Production network deployment                    |
+| stdio              | `serve_stdio()` - `src/transport.rs:4196`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
 
 ---
 
@@ -104,7 +104,7 @@ A complete HTTP request to `/mcp` flows through these layers, top-to-bottom
 `src/transport.rs:1635-2052` (middleware wiring inside `build_app_router`) and in each module.
 
 ```
-TCP / TLS handshake                         src/transport.rs:2920  (TlsListener)
+TCP / TLS handshake                         src/transport.rs:2979  (TlsListener)
    │  - Handshakes run CONCURRENTLY on a background acceptor task
 │    (run_tls_acceptor, src/transport.rs:2937): 256-permit in-flight
    │    cap, 10 s per-handshake timeout; axum receives only completed
@@ -185,12 +185,12 @@ Open endpoints (no auth):
 
 | Path                                       | Handler                                       |
 |--------------------------------------------|-----------------------------------------------|
-| `GET  /healthz`                            | `healthz` (~`src/transport.rs:3298`) |
-| `GET  /readyz`                             | `readyz`  (~`src/transport.rs:3362`) - runs configured readiness check |
-| `GET  /version`                            | `version_payload` (~`src/transport.rs:3313`) |
+| `GET  /healthz`                            | `healthz` (~`src/transport.rs:3357`) |
+| `GET  /readyz`                             | `readyz`  (~`src/transport.rs:3421`) - runs configured readiness check |
+| `GET  /version`                            | `version_payload` (~`src/transport.rs:3372`) |
 | `GET  /metrics`                            | served by `serve_metrics` on a **separate listener** when `feature = "metrics"` (`src/metrics.rs:142`) |
-| `GET  /.well-known/oauth-protected-resource` | feature = `oauth` (`src/transport.rs:1905`) |
-| `GET  /.well-known/oauth-authorization-server` | feature = `oauth` proxy (`src/transport.rs:2675`) |
+| `GET  /.well-known/oauth-protected-resource` | feature = `oauth` (`src/transport.rs:1964`) |
+| `GET  /.well-known/oauth-authorization-server` | feature = `oauth` proxy (`src/transport.rs:2734`) |
 
 Authenticated endpoints:
 
@@ -442,7 +442,7 @@ an outbound `Authorization` header for downstream token passthrough.
 
 ## 7. TLS / mTLS
 
-**Custom listener**: `TlsListener` in `src/transport.rs:2920`, implementing
+**Custom listener**: `TlsListener` in `src/transport.rs:2979`, implementing
 `axum::serve::Listener` so axum's hyper machinery accepts it as a drop-in
 replacement for `TcpListener`.
 
@@ -450,7 +450,7 @@ Lifecycle (concurrent-acceptor design, since the 1.8.1 review fixes):
 1. `TlsListener::new(...)` reads PEM cert + key, builds a `rustls::ServerConfig`,
    optionally wraps with mTLS verification using configured root CAs, then
    spawns a dedicated background acceptor task (`run_tls_acceptor`,
-   `src/transport.rs:3085`) that owns the `TcpListener`.
+   `src/transport.rs:3144`) that owns the `TcpListener`.
 2. The acceptor task loops: acquires a permit from a semaphore sized by
    `max_concurrent_tls_handshakes` (default 256 via
    `DEFAULT_MAX_CONCURRENT_TLS_HANDSHAKES`; configurable since 1.9.0 via
@@ -896,7 +896,7 @@ These are **non-negotiable**. Breaking any of them is a security regression.
 
 1. **Origin check runs before auth.** Reordering would allow unauthenticated
    browser-origin requests to hit the auth path and amplify timing oracles.
-Wired in `build_app_router` (`src/transport.rs:1673`); the middleware
+Wired in `build_app_router` (`src/transport.rs:1734`); the middleware
 itself is at `src/transport.rs:4028`.
 
 2. **Auth runs before RBAC.** Without an `AuthIdentity`, RBAC has no role
