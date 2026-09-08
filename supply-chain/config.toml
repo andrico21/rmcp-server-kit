@@ -72,7 +72,7 @@ version = "2.0.2"
 criteria = "safe-to-run"
 
 [[exemptions.async-compression]]
-version = "0.4.44"
+version = "0.4.45"
 criteria = "safe-to-deploy"
 
 [[exemptions.async-trait]]
@@ -212,7 +212,7 @@ version = "4.6.8"
 criteria = "safe-to-deploy"
 
 [[exemptions.compression-codecs]]
-version = "0.4.39"
+version = "0.4.40"
 criteria = "safe-to-deploy"
 
 [[exemptions.compression-core]]
@@ -256,7 +256,7 @@ version = "0.8.2"
 criteria = "safe-to-run"
 
 [[exemptions.crossbeam-utils]]
-version = "0.8.22"
+version = "0.8.23"
 criteria = "safe-to-deploy"
 
 [[exemptions.crunchy]]
@@ -600,7 +600,7 @@ version = "2.14.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.ipnet]]
-version = "2.12.1"
+version = "2.12.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.itertools]]
@@ -976,7 +976,7 @@ version = "1.1.4"
 criteria = "safe-to-run"
 
 [[exemptions.rustls]]
-version = "0.23.43"
+version = "0.23.44"
 criteria = "safe-to-deploy"
 
 [[exemptions.rustls-native-certs]]

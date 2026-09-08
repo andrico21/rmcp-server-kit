@@ -11,6 +11,27 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Changed
+
+- **Dependency refresh: 5 semver-compatible lockfile updates**, notably `rustls`
+  0.23.43 -> 0.23.44 and `ipnet` 2.12.1 -> 2.12.2, plus `async-compression`,
+  `compression-codecs` and `crossbeam-utils`. No `Cargo.toml` requirement
+  changed, and `cargo semver-checks` reports no API change.
+
+  **No security urgency.** No rustls advisory affects 0.23.43. rustls 0.23.44
+  does raise its `rustls-webpki` floor to 0.103.14, which carries the fix for a
+  high-severity CRL-parsing denial of service (RUSTSEC-2026-0104) whose
+  advisory names mTLS servers using CRLs -- directly this crate's territory --
+  but the committed lockfile already resolved `rustls-webpki` 0.103.15, so that
+  fix was already in place and `cargo audit` was clean before and after.
+
+  Everything else in rustls 0.23.44 is inapplicable or benign here: ML-DSA
+  support lands in the `aws-lc-rs` provider (this crate uses `ring`), the ECH
+  certificate-name fix is client-side, and `SSLKEYLOGFILE` files are now created
+  owner-only on Unix. One change did warrant testing rather than assumption --
+  TLS 1.2 client-certificate requests now filter the verifier's advertised
+  signature schemes -- and the mTLS end-to-end suites pass unchanged.
+
 ## [3.10.0] - 2026-09-05
 
 ### Documentation
