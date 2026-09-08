@@ -11,6 +11,8 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+## [3.10.1] - 2026-09-08
+
 ### Changed
 
 - **Dependency refresh: 5 semver-compatible lockfile updates**, notably `rustls`
