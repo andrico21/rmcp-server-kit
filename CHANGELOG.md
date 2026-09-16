@@ -11,6 +11,46 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Changed
+
+- **Dependency refresh: 19 semver-compatible lockfile updates**, notably `rmcp`
+  3.2.0 -> 3.4.0 and `rmcp-macros` 3.2.0 -> 3.4.0. Source usage of
+  rmcp's deprecated `ServerInfo` alias was renamed to the replacement
+  `ServerConfig` alias; both spellings name the same concrete
+  `InitializeResult`, so the source-level rename is alias-transparent and
+  non-breaking.
+
+  **Fixes RUSTSEC-2026-0285** (`rustls` 0.23.44 -> 0.23.45): rustls accepted
+  TLS 1.3 handshake messages sent at the wrong encryption level when packed
+  into the same record as a key-changing message -- e.g. a plaintext
+  `EncryptedExtensions` immediately following `ServerHello` -- violating RFC
+  8446 §5.1, which requires terminating such connections with an
+  `unexpected_message` alert. The handshake transcript is still authenticated,
+  so a network-position attacker could not use this to alter or complete a
+  handshake; the practical effect was that rustls accepted messages it should
+  have rejected. Same bug class as Go's GO-2026-4340 (CVE-2025-61730). This is
+  the advisory that turned the nightly scheduled `cargo-audit`/`cargo-deny` CI
+  jobs red on `main` from 2026-09-15 onward against the unchanged 3.10.1
+  commit (upstream discovered the issue; no code regression) -- this release's
+  lockfile bump resolves it.
+
+  Other refreshed packages: `reqwest`, `toml`, `async-compression`,
+  `compression-codecs`, `bitflags`, `cc`, `clap`, `clap_builder`, `clap_lex`,
+  `crc32fast`, `hybrid-array`, `smallvec`, `uuid`, `zerocopy`,
+  `zerocopy-derive`, and `zlib-rs`.
+
+  No `Cargo.toml` requirement changed, and `cargo semver-checks` reports no API
+  change. Regenerated `supply-chain/config.toml` cargo-vet exemptions for all
+  19 bumped versions (`cargo vet regenerate exemptions`); `cargo vet --locked`
+  passes (390 exempted). Verified against the full local CI gate: fmt,
+  clippy (`--all-features` and each of `--features oauth` /
+  `--features metrics` individually, per the feature-matrix job), the
+  default-feature build, `cargo +1.98.0 build --all-features` (exact MSRV
+  toolchain pin), `cargo test` for `--all-features` / `--no-default-features` /
+  `--features oauth` / `--features metrics`, rustdoc, `cargo deny check`,
+  `cargo audit`, `taplo fmt --check`, `cargo machete`, and
+  `cargo publish --dry-run --all-features` all pass clean.
+
 ## [3.10.1] - 2026-09-08
 
 ### Changed
@@ -1935,7 +1975,7 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
   and the `matches!(&result.content[N].raw, RawContent::Text(_))` test
   assertions → `matches!(&result.content[N], ContentBlock::Text(_))` in
   `src/tool_hooks.rs`, `tests/e2e.rs`, and `benches/hook_latency.rs`.
-  `ServerHandler`, `ServerInfo` / `ServerCapabilities` (already built via
+  `ServerHandler`, `ServerConfig` / `ServerCapabilities` (already built via
   the builder), `StreamableHttpService`, `StreamableHttpServerConfig`,
   `ServiceExt`, `transport::io::stdio()`, and the requested feature set
   (`server`, `transport-streamable-http-server`, `transport-io`, `macros`)
