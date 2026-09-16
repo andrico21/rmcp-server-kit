@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use rmcp::{
     handler::server::ServerHandler,
-    model::{ServerCapabilities, ServerInfo},
+    model::{ServerCapabilities, ServerConfig},
 };
 use rmcp_server_kit::{
     auth::AuthConfig,
@@ -38,8 +38,8 @@ use rmcp_server_kit::{
 struct OAuthHandler;
 
 impl ServerHandler for OAuthHandler {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 }
 

@@ -20,7 +20,7 @@
 
 use rmcp::{
     handler::server::ServerHandler,
-    model::{ServerCapabilities, ServerInfo},
+    model::{ServerCapabilities, ServerConfig},
 };
 use rmcp_server_kit::{
     config::ObservabilityConfig,
@@ -32,8 +32,8 @@ use rmcp_server_kit::{
 struct MinimalHandler;
 
 impl ServerHandler for MinimalHandler {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 }
 

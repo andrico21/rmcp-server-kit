@@ -32,7 +32,7 @@ use rmcp::{
     handler::server::ServerHandler,
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, JsonObject,
-        ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+        ListToolsResult, PaginatedRequestParams, ServerCapabilities, Tool,
     },
     service::{RequestContext, RoleServer},
     transport::streamable_http_server::session::{
@@ -60,8 +60,8 @@ use tokio_util::sync::CancellationToken;
 struct TestHandler;
 
 impl ServerHandler for TestHandler {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> rmcp::model::ServerConfig {
+        rmcp::model::ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 }
 
@@ -83,8 +83,8 @@ struct BlockingToolHandler {
 }
 
 impl ServerHandler for BlockingToolHandler {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> rmcp::model::ServerConfig {
+        rmcp::model::ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 
     async fn call_tool(
@@ -116,8 +116,8 @@ struct RbacContextProbeHandler {
 }
 
 impl ServerHandler for RbacContextProbeHandler {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> rmcp::model::ServerConfig {
+        rmcp::model::ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 
     fn call_tool(
@@ -149,8 +149,8 @@ struct AdvertisedToolsHandler;
     reason = "rmcp ServerHandler requires async methods; this E2E fake returns immediately"
 )]
 impl ServerHandler for AdvertisedToolsHandler {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> rmcp::model::ServerConfig {
+        rmcp::model::ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 
     async fn list_tools(

@@ -26,10 +26,7 @@
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use rmcp::{
-    handler::server::ServerHandler,
-    model::{ServerCapabilities, ServerInfo},
-};
+use rmcp::{handler::server::ServerHandler, model::ServerCapabilities};
 use rmcp_server_kit::{
     config::{ObservabilityConfig, ServerConfig, validate_server_config},
     observability::init_tracing_from_config_strict,
@@ -92,8 +89,8 @@ struct AppConfig {
 struct ConfigFileHandler;
 
 impl ServerHandler for ConfigFileHandler {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> rmcp::model::ServerConfig {
+        rmcp::model::ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 }
 
