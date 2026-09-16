@@ -1874,13 +1874,13 @@ the signature to `fn … -> impl Future` returning `std::future::ready(..)`.
 ```rust
 // Lint fires: no .await in the body
 impl ServerHandler for MyHandler {
-    async fn get_info(&self) -> ServerInfo { ServerInfo::default() }
+    async fn get_info(&self) -> ServerConfig { ServerConfig::default() }
 }
 
 // Suggested rewrite
 impl ServerHandler for MyHandler {
-    fn get_info(&self) -> impl Future<Output = ServerInfo> {
-        std::future::ready(ServerInfo::default())
+    fn get_info(&self) -> impl Future<Output = ServerConfig> {
+        std::future::ready(ServerConfig::default())
     }
 }
 ```
@@ -1903,7 +1903,7 @@ trait forces your hand:
               impl cannot drop it without failing to satisfy the trait"
 )]
 impl ServerHandler for MyHandler {
-    async fn get_info(&self) -> ServerInfo { ServerInfo::default() }
+    async fn get_info(&self) -> ServerConfig { ServerConfig::default() }
 }
 ```
 

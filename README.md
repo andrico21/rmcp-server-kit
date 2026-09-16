@@ -35,14 +35,14 @@ use rmcp_server_kit::{
     transport::{McpServerConfig, serve},
 };
 use rmcp::handler::server::ServerHandler;
-use rmcp::model::{ServerCapabilities, ServerInfo};
+use rmcp::model::{ServerCapabilities, ServerConfig};
 
 #[derive(Clone)]
 struct MyHandler;
 
 impl ServerHandler for MyHandler {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 }
 

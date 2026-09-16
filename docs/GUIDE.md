@@ -55,14 +55,14 @@ use rmcp_server_kit::{
     transport::{McpServerConfig, serve},
 };
 use rmcp::handler::server::ServerHandler;
-use rmcp::model::{ServerCapabilities, ServerInfo};
+use rmcp::model::{ServerCapabilities, ServerConfig};
 
 #[derive(Clone)]
 struct MyHandler;
 
 impl ServerHandler for MyHandler {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 }
 
@@ -2271,7 +2271,7 @@ use rmcp_server_kit::auth::{AuthConfig, ApiKeyEntry, RateLimitConfig, generate_a
 use rmcp_server_kit::rbac::{RbacConfig, RbacPolicy, RoleConfig, current_role};
 use rmcp_server_kit::transport::{McpServerConfig, serve};
 use rmcp::handler::server::ServerHandler;
-use rmcp::model::{ServerCapabilities, ServerInfo};
+use rmcp::model::{ServerCapabilities, ServerConfig};
 use rmcp::{tool, Error as McpError};
 
 #[derive(Clone)]
@@ -2295,8 +2295,8 @@ impl MyHandler {
 
 #[tool(tool_box)]
 impl ServerHandler for MyHandler {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 }
 
