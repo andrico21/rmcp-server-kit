@@ -27,7 +27,7 @@ use rmcp::{
         GetTaskResult, InitializeRequestParams, InitializeResult, ListPromptsResult,
         ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
         ProgressNotificationParam, ProtocolVersion, ReadResourceRequestParams,
-        ReadResourceResponse, ServerInfo, SetLevelRequestParams, SubscribeRequestParams,
+        ReadResourceResponse, ServerConfig, SetLevelRequestParams, SubscribeRequestParams,
         SubscriptionFilter, Tool, UnsubscribeRequestParams, UpdateTaskParams,
     },
     service::{NotificationContext, RequestContext, RoleServer, SubscriptionContext},
@@ -338,7 +338,7 @@ impl<H: ServerHandler> ServerHandler for RbacContextHandler<H> {
         .await;
     }
 
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         self.inner.get_info()
     }
 
@@ -445,8 +445,8 @@ mod tests {
         reason = "rmcp ServerHandler requires async methods; this in-memory test handler returns immediately"
     )]
     impl ServerHandler for ListToolsHandler {
-        fn get_info(&self) -> ServerInfo {
-            ServerInfo::default()
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::default()
         }
 
         async fn list_tools(
@@ -808,11 +808,11 @@ mod tests {
         reason = "rmcp ServerHandler requires async methods; this in-memory test handler returns immediately"
     )]
     impl ServerHandler for TaskProbeHandler {
-        fn get_info(&self) -> ServerInfo {
+        fn get_info(&self) -> ServerConfig {
             // rmcp gates `tasks/*` on the server advertising the extension AND
             // the client declaring it, so both must be set up or the request is
             // rejected upstream and never reaches the binding under test.
-            ServerInfo::new(
+            ServerConfig::new(
                 rmcp::model::ServerCapabilities::builder()
                     .enable_tools()
                     .enable_tasks()
@@ -1040,8 +1040,8 @@ mod tests {
         reason = "rmcp ServerHandler requires async methods; this in-memory test handler returns immediately"
     )]
     impl ServerHandler for NotificationProbeHandler {
-        fn get_info(&self) -> ServerInfo {
-            ServerInfo::new(
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(
                 rmcp::model::ServerCapabilities::builder()
                     .enable_tools()
                     .enable_tool_list_changed()

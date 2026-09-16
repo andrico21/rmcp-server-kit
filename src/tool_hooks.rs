@@ -62,7 +62,7 @@ use rmcp::{
         GetPromptResponse, GetTaskParams, GetTaskResult, InitializeRequestParams, InitializeResult,
         ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
         PaginatedRequestParams, ProgressNotificationParam, ProtocolVersion,
-        ReadResourceRequestParams, ReadResourceResponse, ServerInfo, SetLevelRequestParams,
+        ReadResourceRequestParams, ReadResourceResponse, ServerConfig, SetLevelRequestParams,
         SubscribeRequestParams, SubscriptionFilter, Tool, UnsubscribeRequestParams,
         UpdateTaskParams,
     },
@@ -471,7 +471,7 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.ping(context).await
     }
 
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         self.inner.get_info()
     }
 
@@ -829,8 +829,8 @@ mod tests {
         model::{
             CallToolRequestParams, CallToolResponse, CallToolResult, CancelledNotificationParam,
             CompleteRequestParams, CompleteResult, CompletionInfo, ContentBlock,
-            CustomNotification, CustomRequest, CustomResult, ProgressNotificationParam, ServerInfo,
-            SetLevelRequestParams, SubscribeRequestParams, UnsubscribeRequestParams,
+            CustomNotification, CustomRequest, CustomResult, ProgressNotificationParam,
+            ServerConfig, SetLevelRequestParams, SubscribeRequestParams, UnsubscribeRequestParams,
         },
         service::RequestContext,
     };
@@ -921,8 +921,8 @@ mod tests {
     }
 
     impl ServerHandler for TestHandler {
-        fn get_info(&self) -> ServerInfo {
-            ServerInfo::default()
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::default()
         }
 
         #[allow(
@@ -977,8 +977,8 @@ mod tests {
         reason = "delegation tests cover rmcp async trait methods whose probe implementations return immediately"
     )]
     impl ServerHandler for DelegationProbe {
-        fn get_info(&self) -> ServerInfo {
-            ServerInfo::default()
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::default()
         }
 
         async fn ping(&self, _context: RequestContext<RoleServer>) -> Result<(), ErrorData> {
