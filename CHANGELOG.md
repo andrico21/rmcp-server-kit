@@ -11,6 +11,35 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Changed
+
+- **Dependency refresh: 4 semver-compatible lockfile updates**, notably
+  `jsonwebtoken` 11.0.0 -> 11.1.0 (the `oauth` feature's JWT dependency).
+  Confirmed via the upstream tag-to-tag diff that this is additive-only: it
+  adds `dangerous::insecure_decode_claims` (an explicitly no-validation
+  decode helper we do not use), with no changes to algorithm allow-listing,
+  `Validation` defaults, JWKS/key handling, the `rust_crypto` backend, or
+  normal claims validation. `cargo test --features oauth` passes unchanged.
+
+  Other refreshed packages: `synstructure` (new transitive dependency),
+  `yoke-derive`, `zerofrom-derive`. No `Cargo.toml` requirement changed, and
+  `cargo semver-checks` reports no API change. Regenerated
+  `supply-chain/config.toml` cargo-vet exemptions for all 4 packages;
+  `cargo vet --locked` passes (391 exempted).
+
+### Added
+
+- **`rust-toolchain.toml`** pinning the development/build toolchain to
+  Rust **1.98.1** (`clippy` and `rustfmt` components). This does not change
+  the crate's `rust-version = "1.98.0"` MSRV promise to consumers -- patch
+  releases are forward-compatible, so code built against the 1.98.0 floor
+  still compiles under 1.98.1 unchanged, confirmed by a clean
+  `cargo +1.98.0 build --all-features`. The pin exists purely to stop this
+  repo's local/CI-adjacent toolchain from silently drifting to a newer
+  `stable` release over time; `rustc`/`cargo` already resolved to 1.98.1 on
+  this machine before the pin was added, so this is a no-op today and only
+  matters for future `rustup update` runs.
+
 ## [3.11.0] - 2026-09-16
 
 ### Changed
