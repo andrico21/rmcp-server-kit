@@ -11,6 +11,8 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+## [3.12.0] - 2026-09-16
+
 ### Changed
 
 - **Dependency refresh: 4 semver-compatible lockfile updates**, notably
