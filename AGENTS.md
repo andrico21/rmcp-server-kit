@@ -155,7 +155,7 @@ ephemeral loopback ports.
 |------|-------|-------|-----|
 | **Unit** | `#[cfg(test)] mod tests` inside `src/*.rs` | nothing | `cargo test --all-features --lib` |
 | **Property** | `tests/properties.rs` | `proptest` | `cargo test --all-features --test properties` |
-| **Integration (pure)** | `tests/crl_discovery_ratelimit.rs`, `crl_h3_regression.rs`, `crl_map_bounds.rs`, `oauth_url_validation.rs` | nothing | `cargo test --all-features` |
+| **Integration (pure)** | `tests/crl_discovery_ratelimit.rs`, `crl_h3_regression.rs`, `crl_map_bounds.rs`, `delegation_guard.rs`, `oauth_url_validation.rs` | nothing | `cargo test --all-features` |
 | **Integration (mocked HTTP)** | `tests/crl_ssrf.rs`, `jwks_key_cap.rs`, `jwks_redirect_ssrf.rs`, `oauth_http_client.rs` | `wiremock` | `cargo test --all-features` |
 | **E2E (binds sockets)** | `tests/e2e.rs`, `e2e_oauth_mtls.rs`, `ssrf_resolver.rs`, `docs_citations.rs` | ephemeral loopback ports | `cargo test --all-features --test e2e` |
 | **Perf / bounded-memory** | `tests/limiter_memory.rs` | `#[ignore]`d - too heavy for shared runners | `cargo test --release --all-features --test limiter_memory -- --ignored --nocapture` |
@@ -171,6 +171,11 @@ nothing without the right features, so a bare `cargo test` silently skips them:
 
 Always use `--all-features` locally; CI additionally runs a feature matrix so
 the default-feature build is covered too.
+
+**`delegation_guard` reads the pinned rmcp source.** It locates
+`rmcp-<version>/src/handler/server.rs` under the local Cargo registry and hard-fails if
+it is missing, so run `cargo fetch` first on a cold checkout. Set `RMCP_SRC_DIR` to the
+rmcp crate root for atypical layouts - notably `cargo vendor`, which CI does not use.
 
 ---
 
@@ -326,6 +331,7 @@ The most-violated rules - all `deny`-level in `Cargo.toml`:
 | Graceful shutdown (Ctrl-C / SIGTERM)           | `src/transport.rs` - `shutdown_signal()` (~line 3438) |
 | Hot-reload of keys / RBAC                      | `src/transport.rs` - `ReloadHandle` (~line 1515)       |
 | Environment variable override mapping          | `src/config.rs` - `ServerConfig::apply_env_overrides`, `ObservabilityConfig::apply_env_overrides`; `src/rbac.rs` - `RbacConfig::apply_env_overrides` |
+| `rmcp` / `rmcp-macros` version bump in `Cargo.toml` / `Cargo.lock` | `docs/RMCP_UPGRADE_CHECKLIST.md` - the checks to run; `tests/delegation_guard.rs` - the trait-surface guard |
 
 ---
 
@@ -363,6 +369,7 @@ The most-violated rules - all `deny`-level in `Cargo.toml`:
 - [`docs/RUST_1_95_NOTES.md`](docs/RUST_1_95_NOTES.md) - Rust 1.95 idioms used here
 - [`docs/MIGRATION.md`](docs/MIGRATION.md) - version-migration notes
 - [`docs/RELEASING.md`](docs/RELEASING.md) - release process
+- [`docs/RMCP_UPGRADE_CHECKLIST.md`](docs/RMCP_UPGRADE_CHECKLIST.md) - the checks to run when `rmcp` moves
 - [Model Context Protocol spec](https://modelcontextprotocol.io/)
 - [`rmcp` docs](https://docs.rs/rmcp)
 - [OWASP Secure Headers Project](https://owasp.org/www-project-secure-headers/)

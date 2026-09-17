@@ -11,6 +11,69 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Added
+
+- **Structural guard against rmcp `ServerHandler` drift**
+  (`tests/delegation_guard.rs`). rmcp gives every `ServerHandler` method a
+  default body, so a dropped delegation compiles silently and the default
+  shadows the inner handler's override at runtime. The guard parses the
+  `server_handler_methods!` macro body out of the rmcp source pinned in
+  `Cargo.lock` (dependency-free; `RMCP_SRC_DIR` overrides the registry search,
+  and the test fails loudly - rather than skipping - when the source or the
+  macro shape cannot be found) and asserts that both delegating wrappers
+  classify every upstream method as `DIRECTLY_DELEGATED`,
+  `BEHAVIORAL_WRAPPED`, or `INTENTIONALLY_DEFAULTED`, with the three sets
+  pairwise disjoint and their union equal to the upstream surface. It fails on
+  rmcp adding, removing, or renaming any method, and pins the expected count
+  (29 for rmcp 3.4.0). It also reads each wrapper's own impl block and asserts
+  it contains a method for every classified name, and pins each macro-generated
+  method's origin. Forwarding itself is proven by the semantic coverage suite
+  below.
+- **`docs/RMCP_UPGRADE_CHECKLIST.md`**: the recurring checks to run on an rmcp
+  bump (trait surface, transport/config drift, protocol constants, deprecations,
+  dependency hygiene), linking the guard and the wrapper transparency tests.
+- **Full semantic delegation coverage for both wrappers** - `HookedHandler`
+  proven forwarding rises 14 -> 29 methods, `RbacContextHandler` 7 -> 29. New
+  in-crate drivers prove, per method, that the wrapper's body actually reaches
+  the inner handler: exact equality on a probe's record log against the expected
+  log for that driver, plus sentinel values (or sentinel errors) that rmcp's
+  default bodies cannot construct. No assertion uses `contains`, `is_empty()` or
+  a length threshold: rmcp's self-re-entrant defaults (`initialize`,
+  `negotiate_initialize`, `discover`) and its ambient handler calls could
+  otherwise let a non-forwarding body pass. Every driver also runs its request
+  against `PassthroughDefaults`, the same wrapper with every delegation deleted,
+  and asserts the probe stayed untouched, so each method carries a mutation
+  check that re-executes on every `cargo test` rather than a one-off ritual.
+  `tests/delegation_guard.rs` gains the matching gates: a completeness gate
+  asserting the in-crate `SEMANTIC_DRIVERS` table covers exactly the
+  classification (minus an explicitly enumerated, asserted-empty
+  `SEMANTICALLY_UNPROVABLE` set), and a macro-origin gate pinning the twelve
+  `RbacContextHandler` methods discharged by the three macro-body drivers, so
+  rewriting one as a hand-written `fn` fails until it gains its own driver.
+
+### Fixed
+
+- **`ServerHandler::negotiate_initialize` is now delegated by both wrappers**
+  (`HookedHandler` in `src/tool_hooks.rs`, `RbacContextHandler` in
+  `src/rbac_context.rs`). rmcp 3.4.0 added the method with a default body that
+  re-derives the negotiation from `get_info()` + `supported_protocol_versions()`;
+  both wrappers implemented 28 of 29 methods and inherited that default, so a
+  *direct* call on a wrapper silently lost an inner handler's override. The
+  HTTP handshake path was never affected - rmcp dispatches `initialize`, which
+  both wrappers already delegated - so this is an API-transparency fix, not a
+  reachable request bug. Both methods are synchronous and context-free, so they
+  delegate verbatim; new in-crate tests
+  (`hooked_handler_preserves_inner_negotiate_initialize_override`,
+  `rbac_context_handler_preserves_inner_negotiate_initialize_override`) call the
+  wrappers directly and assert the inner override is observed.
+
+### Changed
+
+- Replaced the in-crate `HOOKED_HANDLER_DELEGATED_METHODS` list and its
+  `len() == 28` maintenance assertion with the mechanical guard above; the
+  hand-maintained count could not detect upstream drift (it missed
+  `negotiate_initialize`), and `RbacContextHandler` had no guard at all.
+
 ## [3.12.0] - 2026-09-16
 
 ### Changed

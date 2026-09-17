@@ -483,6 +483,16 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.initialize(request, context).await
     }
 
+    // Synchronous negotiation helper: no context and no hooks apply, so plain
+    // delegation is the only transparent option -- the trait default would
+    // shadow an inner override.
+    fn negotiate_initialize(
+        &self,
+        request: &InitializeRequestParams,
+    ) -> Result<InitializeResult, ErrorData> {
+        self.inner.negotiate_initialize(request)
+    }
+
     async fn list_tools(
         &self,
         request: Option<PaginatedRequestParams>,
@@ -829,10 +839,15 @@ mod tests {
         model::{
             CallToolRequestParams, CallToolResponse, CallToolResult, CancelledNotificationParam,
             CompleteRequestParams, CompleteResult, CompletionInfo, ContentBlock,
-            CustomNotification, CustomRequest, CustomResult, ProgressNotificationParam,
-            ServerConfig, SetLevelRequestParams, SubscribeRequestParams, UnsubscribeRequestParams,
+            CustomNotification, CustomRequest, CustomResult, DiscoverResult,
+            GetPromptRequestParams, GetPromptResult, GetTaskParams, GetTaskResult,
+            ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
+            PaginatedRequestParams, ProgressNotificationParam, Prompt, PromptMessage,
+            ProtocolVersion, ReadResourceRequestParams, ReadResourceResult, Resource,
+            ResourceContents, ResourceTemplate, Role, ServerConfig, SetLevelRequestParams,
+            SubscribeRequestParams, SubscriptionFilter, UnsubscribeRequestParams, UpdateTaskParams,
         },
-        service::RequestContext,
+        service::{RequestContext, SubscriptionContext},
     };
     use serde_json::json;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
@@ -845,40 +860,6 @@ mod tests {
         tokio::io::WriteHalf<DuplexStream>,
         rmcp::service::RunningService<RoleServer, HookedHandler<DelegationProbe>>,
     );
-
-    /// Maintenance aid only: rmcp gives every `ServerHandler` method a default,
-    /// so this count cannot guarantee compile-time completeness. It makes future
-    /// upstream method additions visible in review alongside the delegation impl.
-    const HOOKED_HANDLER_DELEGATED_METHODS: &[&str] = &[
-        "ping",
-        "initialize",
-        "supported_protocol_versions",
-        "discover",
-        "complete",
-        "set_level",
-        "get_prompt",
-        "list_prompts",
-        "list_resources",
-        "list_resource_templates",
-        "read_resource",
-        "accepted_subscription_filter",
-        "listen",
-        "subscribe",
-        "unsubscribe",
-        "call_tool",
-        "list_tools",
-        "get_tool",
-        "on_custom_request",
-        "on_cancelled",
-        "on_progress",
-        "on_initialized",
-        "on_roots_list_changed",
-        "on_custom_notification",
-        "get_info",
-        "get_task",
-        "update_task",
-        "cancel_task",
-    ];
 
     #[derive(Clone, Default)]
     struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
@@ -1075,6 +1056,253 @@ mod tests {
         }
     }
 
+    /// The wrapper as it would be if every delegation were deleted: it holds the
+    /// probe but overrides nothing, so rmcp's default `ServerHandler` bodies
+    /// answer every call and the inner handler is never reached.
+    ///
+    /// Driving a method against this type is the per-method mutation check: if
+    /// the inner probe still observes the call, the observation came from the
+    /// harness (or a re-entrant default) rather than from the wrapper's
+    /// delegation. `inner` is deliberately never read, hence the `dead_code`
+    /// allow.
+    #[derive(Clone, Default)]
+    struct PassthroughDefaults<H> {
+        #[allow(
+            dead_code,
+            reason = "deliberately never read: this type overrides nothing, so the probe must stay unreached"
+        )]
+        inner: H,
+    }
+
+    impl<H: ServerHandler> PassthroughDefaults<H> {
+        fn new(inner: H) -> Self {
+            Self { inner }
+        }
+    }
+
+    impl<H: ServerHandler> ServerHandler for PassthroughDefaults<H> {}
+
+    /// Two of rmcp's five known versions: distinguishable from the default
+    /// (all of `KNOWN_VERSIONS`), while still covering an initialize-capable
+    /// version and the 2026-07-28 version that `discover` requires.
+    const SENTINEL_VERSIONS: [ProtocolVersion; 2] =
+        [ProtocolVersion::V_2025_11_25, ProtocolVersion::V_2026_07_28];
+
+    /// Capabilities the probe advertises so the dispatcher routes prompts,
+    /// resources, tools, tool-list-changed subscriptions and tasks to the
+    /// wrapper at all.
+    fn probe_capabilities() -> rmcp::model::ServerCapabilities {
+        rmcp::model::ServerCapabilities::builder()
+            .enable_prompts()
+            .enable_resources()
+            .enable_tools()
+            .enable_tool_list_changed()
+            .enable_tasks()
+            .build()
+    }
+
+    /// Records every method it is called with and answers with a sentinel no
+    /// rmcp default body can construct, so exact-log equality proves the
+    /// wrapper forwarded the call.
+    ///
+    /// Deliberately silent (no record) for `get_info`,
+    /// `supported_protocol_versions` and `get_tool`: rmcp calls those outside
+    /// request dispatch (peer configuration, capability validation), so a
+    /// record could not be attributed to the driver. Those three are proven by
+    /// value differential against [`PassthroughDefaults`] instead.
+    #[derive(Clone, Default)]
+    struct ForwardingProbe {
+        seen: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl ForwardingProbe {
+        fn record(&self, method: &'static str) {
+            if let Ok(mut seen) = self.seen.lock() {
+                seen.push(method);
+            }
+        }
+
+        fn seen(&self) -> Vec<&'static str> {
+            self.seen
+                .lock()
+                .map(|seen| seen.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    #[allow(
+        clippy::unused_async_trait_impl,
+        deprecated,
+        reason = "coverage drives rmcp's async trait methods, whose probe bodies return immediately"
+    )]
+    impl ServerHandler for ForwardingProbe {
+        fn get_info(&self) -> ServerConfig {
+            let mut info = ServerConfig::new(probe_capabilities());
+            info.instructions = Some("forwarding-probe".to_owned());
+            info
+        }
+
+        fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+            Cow::Borrowed(&SENTINEL_VERSIONS)
+        }
+
+        fn get_tool(&self, name: &str) -> Option<Tool> {
+            Some(Tool::new(
+                name.to_owned(),
+                "forwarding-probe",
+                Arc::new(rmcp::model::JsonObject::default()),
+            ))
+        }
+
+        async fn initialize(
+            &self,
+            _request: InitializeRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<InitializeResult, ErrorData> {
+            self.record("initialize");
+            let mut info = InitializeResult::new(probe_capabilities());
+            info.instructions = Some("forwarding-probe:initialize".to_owned());
+            Ok(info)
+        }
+
+        async fn discover(
+            &self,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<DiscoverResult, ErrorData> {
+            self.record("discover");
+            Ok(DiscoverResult::new(
+                SENTINEL_VERSIONS.to_vec(),
+                probe_capabilities(),
+            ))
+        }
+
+        async fn list_tools(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ListToolsResult, ErrorData> {
+            self.record("list_tools");
+            Ok(ListToolsResult::with_all_items(vec![Tool::new(
+                "sentinel-tool",
+                "forwarding-probe",
+                Arc::new(rmcp::model::JsonObject::default()),
+            )]))
+        }
+
+        async fn list_prompts(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ListPromptsResult, ErrorData> {
+            self.record("list_prompts");
+            Ok(ListPromptsResult::with_all_items(vec![Prompt::new(
+                "sentinel-prompt",
+                Some("forwarding-probe"),
+                None,
+            )]))
+        }
+
+        async fn list_resources(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ListResourcesResult, ErrorData> {
+            self.record("list_resources");
+            Ok(ListResourcesResult::with_all_items(vec![Resource::new(
+                "test://sentinel-resource",
+                "sentinel-resource",
+            )]))
+        }
+
+        async fn list_resource_templates(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ListResourceTemplatesResult, ErrorData> {
+            self.record("list_resource_templates");
+            Ok(ListResourceTemplatesResult::with_all_items(vec![
+                ResourceTemplate::new("test://sentinel/{id}", "sentinel-template"),
+            ]))
+        }
+
+        async fn get_prompt(
+            &self,
+            _request: GetPromptRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<GetPromptResponse, ErrorData> {
+            self.record("get_prompt");
+            Ok(GetPromptResult::new(vec![PromptMessage::new_text(
+                Role::User,
+                "forwarding-probe:get_prompt",
+            )])
+            .into())
+        }
+
+        async fn read_resource(
+            &self,
+            _request: ReadResourceRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ReadResourceResponse, ErrorData> {
+            self.record("read_resource");
+            Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                "forwarding-probe:read_resource",
+                "test://sentinel-resource",
+            )])
+            .into())
+        }
+
+        fn accepted_subscription_filter(
+            &self,
+            requested: &SubscriptionFilter,
+        ) -> Option<SubscriptionFilter> {
+            self.record("accepted_subscription_filter");
+            Some(requested.clone())
+        }
+
+        async fn listen(&self, _context: SubscriptionContext) -> Result<(), ErrorData> {
+            self.record("listen");
+            Ok(())
+        }
+
+        async fn get_task(
+            &self,
+            request: GetTaskParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<GetTaskResult, ErrorData> {
+            self.record("get_task");
+            Ok(GetTaskResult::new(rmcp::model::DetailedTask::new(
+                rmcp::model::Task::new(
+                    request.task_id,
+                    rmcp::model::TaskStatus::Working,
+                    "2026-01-01T00:00:00Z",
+                    "2026-01-01T00:00:00Z",
+                ),
+                rmcp::model::TaskPayload::Working,
+            )))
+        }
+
+        async fn update_task(
+            &self,
+            _request: UpdateTaskParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<(), ErrorData> {
+            self.record("update_task");
+            Err(ErrorData::invalid_request(
+                "forwarding-probe:update_task",
+                None,
+            ))
+        }
+
+        async fn cancel_task(
+            &self,
+            _request: CancelTaskParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<(), ErrorData> {
+            self.record("cancel_task");
+            Ok(())
+        }
+    }
+
     fn delegation_transport(probe: DelegationProbe, hooks: Arc<ToolHooks>) -> DelegationTransport {
         let (client, server) = tokio::io::duplex(16 * 1024);
         let (client_read, client_write) = tokio::io::split(client);
@@ -1115,12 +1343,48 @@ mod tests {
         writer.flush().await.expect("flush notification");
     }
 
+    /// Overrides only `negotiate_initialize`, so the sentinel value can only
+    /// come from an inner override reaching the caller through the wrapper.
+    /// `get_info` stays at the test default and `initialize` at the upstream
+    /// default, so no other path can produce the sentinel.
+    #[derive(Clone, Default)]
+    struct NegotiateProbe;
+
+    impl ServerHandler for NegotiateProbe {
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::default()
+        }
+
+        fn negotiate_initialize(
+            &self,
+            _request: &InitializeRequestParams,
+        ) -> Result<InitializeResult, ErrorData> {
+            let mut info = ServerConfig::new(rmcp::model::ServerCapabilities::default());
+            info.instructions = Some("inner negotiate_initialize override".to_owned());
+            Ok(info)
+        }
+    }
+
     #[test]
-    fn hooked_handler_delegation_count_is_maintenance_aid() {
+    fn hooked_handler_preserves_inner_negotiate_initialize_override() {
+        let handler = with_hooks(NegotiateProbe, Arc::new(ToolHooks::new()));
+        let request = InitializeRequestParams::new(
+            rmcp::model::ClientCapabilities::default(),
+            rmcp::model::Implementation::new("delegation-test-client", "0.0.0"),
+        );
+
+        // Called directly on the wrapper (the HTTP path routes `initialize`,
+        // which is already delegated); the trait default here would negotiate
+        // from `get_info()` + `supported_protocol_versions()`, losing the
+        // override.
+        let result = handler
+            .negotiate_initialize(&request)
+            .expect("direct negotiation must succeed");
+
         assert_eq!(
-            HOOKED_HANDLER_DELEGATED_METHODS.len(),
-            28,
-            "maintenance aid only: update this list and the HookedHandler impl when rmcp adds ServerHandler methods"
+            result.instructions.as_deref(),
+            Some("inner negotiate_initialize override"),
+            "wrapper must delegate to the inner `negotiate_initialize` override"
         );
     }
 
@@ -1348,6 +1612,548 @@ mod tests {
         assert_eq!(probe.seen(), vec!["call_tool"]);
         assert_eq!(before_count.load(Ordering::Relaxed), 1);
         assert_eq!(after_count.load(Ordering::Relaxed), 1);
+    }
+
+    // ----------------------------------------------------------------------
+    // Semantic coverage drivers
+    //
+    // Each driver proves, by exact equality on the inner probe's record log
+    // (and on sentinel values no rmcp default body can produce), that the
+    // wrapper forwarded the call. Every driver runs twice: once against the
+    // real wrapper, and once against `PassthroughDefaults` -- the wrapper with
+    // all delegations deleted -- where the probe must stay untouched. That
+    // second half is the per-method mutation check.
+    //
+    // No assertion here uses `contains`, `is_empty()` or a length threshold:
+    // rmcp's self-re-entrant defaults (`initialize`, `negotiate_initialize`,
+    // `discover`) and its ambient handler calls can otherwise make a
+    // non-forwarding body look green.
+    // ----------------------------------------------------------------------
+
+    /// Maps every method the `HookedHandler` `ServerHandler` impl defines to the
+    /// test that proves the inner handler was reached.
+    ///
+    /// Parsed by `tests/delegation_guard.rs`, which asserts this table covers
+    /// exactly its `DIRECTLY_DELEGATED ∪ BEHAVIORAL_WRAPPED` classification --
+    /// so a method cannot be added or reclassified without a driver.
+    const SEMANTIC_DRIVERS: &[(&str, &str)] = &[
+        ("ping", "hooked_handler_delegates_ping"),
+        (
+            "initialize",
+            "hooked_handler_forwards_initialize_and_discover",
+        ),
+        (
+            "negotiate_initialize",
+            "hooked_handler_preserves_inner_negotiate_initialize_override",
+        ),
+        (
+            "supported_protocol_versions",
+            "hooked_handler_forwards_direct_sync_methods",
+        ),
+        (
+            "discover",
+            "hooked_handler_forwards_initialize_and_discover",
+        ),
+        ("complete", "hooked_handler_delegates_completion_and_level"),
+        ("set_level", "hooked_handler_delegates_completion_and_level"),
+        (
+            "get_prompt",
+            "hooked_handler_forwards_prompt_and_resource_reads",
+        ),
+        ("list_prompts", "hooked_handler_forwards_listing_methods"),
+        ("list_resources", "hooked_handler_forwards_listing_methods"),
+        (
+            "list_resource_templates",
+            "hooked_handler_forwards_listing_methods",
+        ),
+        (
+            "read_resource",
+            "hooked_handler_forwards_prompt_and_resource_reads",
+        ),
+        (
+            "accepted_subscription_filter",
+            "hooked_handler_forwards_subscription_lifecycle",
+        ),
+        ("listen", "hooked_handler_forwards_subscription_lifecycle"),
+        ("subscribe", "hooked_handler_delegates_subscriptions"),
+        ("unsubscribe", "hooked_handler_delegates_subscriptions"),
+        (
+            "call_tool",
+            "hooked_handler_still_applies_hooks_to_call_tool",
+        ),
+        ("list_tools", "hooked_handler_forwards_listing_methods"),
+        ("get_tool", "hooked_handler_forwards_direct_sync_methods"),
+        (
+            "on_custom_request",
+            "hooked_handler_delegates_custom_request",
+        ),
+        ("on_cancelled", "hooked_handler_delegates_notifications"),
+        ("on_progress", "hooked_handler_delegates_notifications"),
+        ("on_initialized", "hooked_handler_delegates_notifications"),
+        (
+            "on_roots_list_changed",
+            "hooked_handler_delegates_notifications",
+        ),
+        (
+            "on_custom_notification",
+            "hooked_handler_delegates_notifications",
+        ),
+        ("get_info", "hooked_handler_forwards_direct_sync_methods"),
+        ("get_task", "hooked_handler_forwards_task_methods"),
+        ("update_task", "hooked_handler_forwards_task_methods"),
+        ("cancel_task", "hooked_handler_forwards_task_methods"),
+    ];
+
+    /// `SEMANTIC_DRIVERS` is parsed by `tests/delegation_guard.rs`; this
+    /// in-crate check keeps the constant referenced (so it cannot rot as dead
+    /// code) and rejects duplicate entries, which the source-level parser
+    /// cannot see.
+    #[test]
+    fn semantic_drivers_table_is_well_formed() {
+        assert!(!SEMANTIC_DRIVERS.is_empty());
+        let mut names: Vec<&str> = SEMANTIC_DRIVERS.iter().map(|(name, _)| *name).collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "duplicate method in SEMANTIC_DRIVERS");
+        for (name, driver) in SEMANTIC_DRIVERS {
+            assert!(!name.is_empty());
+            assert!(!driver.is_empty());
+        }
+    }
+
+    /// Per-request metadata satisfying every gate the drivers cross: a protocol
+    /// version inside the probe's narrowed list, and client capabilities
+    /// declaring the tasks extension that `tasks/*` requires.
+    fn coverage_meta() -> serde_json::Value {
+        json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {
+                "extensions": { "io.modelcontextprotocol/tasks": {} }
+            }
+        })
+    }
+
+    /// A request whose `params._meta` carries [`coverage_meta`].
+    fn coverage_request(id: i64, method: &str, mut params: serde_json::Value) -> serde_json::Value {
+        let object = params
+            .as_object_mut()
+            .expect("coverage requests carry an object of params");
+        object.insert("_meta".to_owned(), coverage_meta());
+        json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+    }
+
+    /// Read one server frame that is already queued (used where a single
+    /// request produces two frames: the subscription acknowledgement, then the
+    /// response).
+    async fn read_json_rpc(
+        reader: &mut BufReader<tokio::io::ReadHalf<DuplexStream>>,
+    ) -> serde_json::Value {
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("read response");
+        serde_json::from_str(&line).expect("response is JSON")
+    }
+
+    type ForwardingTransport<P> = (
+        BufReader<tokio::io::ReadHalf<DuplexStream>>,
+        tokio::io::WriteHalf<DuplexStream>,
+        rmcp::service::RunningService<RoleServer, HookedHandler<P>>,
+    );
+
+    /// Like [`delegation_transport`], but for a caller-chosen inner handler, so
+    /// one driver can run against both the real wrapper and
+    /// [`PassthroughDefaults`].
+    fn forwarding_transport<P: ServerHandler>(
+        inner: P,
+        hooks: Arc<ToolHooks>,
+    ) -> ForwardingTransport<P> {
+        let (client, server) = tokio::io::duplex(16 * 1024);
+        let (client_read, client_write) = tokio::io::split(client);
+        let service = rmcp::service::serve_directly::<RoleServer, _, _, io::Error, _>(
+            with_hooks(inner, hooks),
+            server,
+            None,
+        );
+        (BufReader::new(client_read), client_write, service)
+    }
+
+    fn coverage_hooks() -> Arc<ToolHooks> {
+        Arc::new(ToolHooks::new())
+    }
+
+    #[test]
+    fn hooked_handler_forwards_direct_sync_methods() {
+        // No record log in this driver: `get_info`, `get_tool` and
+        // `supported_protocol_versions` are proven by value differential, so
+        // rmcp's ambient calls cannot contaminate the proof.
+        let wrapper = with_hooks(ForwardingProbe::default(), coverage_hooks());
+        let control = PassthroughDefaults::<ForwardingProbe>::default();
+
+        // `get_info`: sentinel instructions no default body can produce.
+        assert_eq!(
+            wrapper.get_info().instructions.as_deref(),
+            Some("forwarding-probe")
+        );
+        assert_eq!(control.get_info().instructions, None);
+
+        // `get_tool`: the default returns `None` unconditionally.
+        let tool = wrapper
+            .get_tool("sentinel-tool")
+            .expect("inner get_tool must reach the caller");
+        assert_eq!(tool.name, "sentinel-tool");
+        assert_eq!(control.get_tool("sentinel-tool"), None);
+
+        // `supported_protocol_versions`: the default is all of KNOWN_VERSIONS.
+        assert_eq!(
+            wrapper.supported_protocol_versions().as_ref(),
+            SENTINEL_VERSIONS.as_slice()
+        );
+        assert_ne!(
+            control.supported_protocol_versions().as_ref(),
+            SENTINEL_VERSIONS.as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn hooked_handler_forwards_initialize_and_discover() {
+        let probe = ForwardingProbe::default();
+        let (mut reader, mut writer, _service) =
+            forwarding_transport(probe.clone(), coverage_hooks());
+
+        let initialize = send_json_rpc(
+            &mut writer,
+            &mut reader,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": { "name": "coverage-driver", "version": "0.0.0" }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(
+            initialize["result"]["instructions"],
+            json!("forwarding-probe:initialize")
+        );
+
+        let discover = send_json_rpc(
+            &mut writer,
+            &mut reader,
+            coverage_request(2, "server/discover", json!({})),
+        )
+        .await;
+        assert_eq!(
+            discover["result"]["supportedVersions"],
+            json!(["2025-11-25", "2026-07-28"])
+        );
+
+        // Exact full sequence (mechanism 3): the two driven methods and nothing
+        // else. Neither can be produced by a re-entrant default -- the probe
+        // overrides `initialize` outright, and `discover` is only reachable
+        // through the wrapper's delegation -- so the expected log contains both
+        // driven methods, per the ambient-calls invariant.
+        assert_eq!(probe.seen(), vec!["initialize", "discover"]);
+
+        // Negative control: with every delegation deleted, both requests are
+        // answered by rmcp defaults and the probe stays untouched.
+        let control = ForwardingProbe::default();
+        let (mut reader, mut writer, _service) =
+            forwarding_transport(PassthroughDefaults::new(control.clone()), coverage_hooks());
+        let control_initialize = send_json_rpc(
+            &mut writer,
+            &mut reader,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": { "name": "coverage-driver", "version": "0.0.0" }
+                }
+            }),
+        )
+        .await;
+        let control_discover = send_json_rpc(
+            &mut writer,
+            &mut reader,
+            coverage_request(2, "server/discover", json!({})),
+        )
+        .await;
+        assert_ne!(
+            control_initialize["result"]["instructions"],
+            json!("forwarding-probe:initialize")
+        );
+        assert_ne!(
+            control_discover["result"]["supportedVersions"],
+            json!(["2025-11-25", "2026-07-28"])
+        );
+        assert_eq!(control.seen(), Vec::<&str>::new());
+    }
+
+    #[tokio::test]
+    async fn hooked_handler_forwards_listing_methods() {
+        // Mechanism 1 (ambient-silent probe): the expected log is exactly the
+        // driven methods.
+        let probe = ForwardingProbe::default();
+        let (mut reader, mut writer, _service) =
+            forwarding_transport(probe.clone(), coverage_hooks());
+
+        let tools = send_json_rpc(
+            &mut writer,
+            &mut reader,
+            coverage_request(1, "tools/list", json!({})),
+        )
+        .await;
+        let prompts = send_json_rpc(
+            &mut writer,
+            &mut reader,
+            coverage_request(2, "prompts/list", json!({})),
+        )
+        .await;
+        let resources = send_json_rpc(
+            &mut writer,
+            &mut reader,
+            coverage_request(3, "resources/list", json!({})),
+        )
+        .await;
+        let templates = send_json_rpc(
+            &mut writer,
+            &mut reader,
+            coverage_request(4, "resources/templates/list", json!({})),
+        )
+        .await;
+
+        assert_eq!(tools["result"]["tools"][0]["name"], json!("sentinel-tool"));
+        assert_eq!(
+            prompts["result"]["prompts"][0]["name"],
+            json!("sentinel-prompt")
+        );
+        assert_eq!(
+            resources["result"]["resources"][0]["uri"],
+            json!("test://sentinel-resource")
+        );
+        assert_eq!(
+            templates["result"]["resourceTemplates"][0]["uriTemplate"],
+            json!("test://sentinel/{id}")
+        );
+        assert_eq!(
+            probe.seen(),
+            vec![
+                "list_tools",
+                "list_prompts",
+                "list_resources",
+                "list_resource_templates"
+            ]
+        );
+
+        // Negative control: the same four requests, answered by defaults --
+        // empty result sets, probe untouched.
+        let control = ForwardingProbe::default();
+        let (mut reader, mut writer, _service) =
+            forwarding_transport(PassthroughDefaults::new(control.clone()), coverage_hooks());
+        let control_tools = send_json_rpc(
+            &mut writer,
+            &mut reader,
+            coverage_request(1, "tools/list", json!({})),
+        )
+        .await;
+        let control_prompts = send_json_rpc(
+            &mut writer,
+            &mut reader,
+            coverage_request(2, "prompts/list", json!({})),
+        )
+        .await;
+        let control_resources = send_json_rpc(
+            &mut writer,
+            &mut reader,
+            coverage_request(3, "resources/list", json!({})),
+        )
+        .await;
+        let control_templates = send_json_rpc(
+            &mut writer,
+            &mut reader,
+            coverage_request(4, "resources/templates/list", json!({})),
+        )
+        .await;
+        assert_eq!(control_tools["result"]["tools"], json!([]));
+        assert_eq!(control_prompts["result"]["prompts"], json!([]));
+        assert_eq!(control_resources["result"]["resources"], json!([]));
+        assert_eq!(control_templates["result"]["resourceTemplates"], json!([]));
+        assert_eq!(control.seen(), Vec::<&str>::new());
+    }
+
+    #[tokio::test]
+    async fn hooked_handler_forwards_prompt_and_resource_reads() {
+        // Mechanism 1 (ambient-silent probe): the expected log is exactly the
+        // driven methods.
+        let probe = ForwardingProbe::default();
+        let (mut reader, mut writer, _service) =
+            forwarding_transport(probe.clone(), coverage_hooks());
+
+        let prompt = send_json_rpc(
+            &mut writer,
+            &mut reader,
+            coverage_request(1, "prompts/get", json!({ "name": "sentinel-prompt" })),
+        )
+        .await;
+        let resource = send_json_rpc(
+            &mut writer,
+            &mut reader,
+            coverage_request(
+                2,
+                "resources/read",
+                json!({ "uri": "test://sentinel-resource" }),
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            prompt["result"]["messages"][0]["content"]["text"],
+            json!("forwarding-probe:get_prompt")
+        );
+        assert_eq!(
+            resource["result"]["contents"][0]["text"],
+            json!("forwarding-probe:read_resource")
+        );
+        assert_eq!(probe.seen(), vec!["get_prompt", "read_resource"]);
+
+        // Negative control: both defaults reject with method-not-found, so the
+        // client sees an error and the probe is never entered.
+        let control = ForwardingProbe::default();
+        let (mut reader, mut writer, _service) =
+            forwarding_transport(PassthroughDefaults::new(control.clone()), coverage_hooks());
+        let control_prompt = send_json_rpc(
+            &mut writer,
+            &mut reader,
+            coverage_request(1, "prompts/get", json!({ "name": "sentinel-prompt" })),
+        )
+        .await;
+        let control_resource = send_json_rpc(
+            &mut writer,
+            &mut reader,
+            coverage_request(
+                2,
+                "resources/read",
+                json!({ "uri": "test://sentinel-resource" }),
+            ),
+        )
+        .await;
+        assert_eq!(control_prompt["error"]["code"], json!(-32601));
+        assert_eq!(control_resource["error"]["code"], json!(-32601));
+        assert_eq!(control.seen(), Vec::<&str>::new());
+    }
+
+    #[tokio::test]
+    async fn hooked_handler_forwards_task_methods() {
+        // Mechanism 1 (ambient-silent probe): rmcp calls `get_info` for the
+        // tasks-capability gate, which this probe does not record, so the
+        // expected log is exactly the driven methods.
+        let probe = ForwardingProbe::default();
+        let (mut reader, mut writer, _service) =
+            forwarding_transport(probe.clone(), coverage_hooks());
+
+        let get = send_json_rpc(
+            &mut writer,
+            &mut reader,
+            coverage_request(1, "tasks/get", json!({ "taskId": "raw-task" })),
+        )
+        .await;
+        let update = send_json_rpc(
+            &mut writer,
+            &mut reader,
+            coverage_request(
+                2,
+                "tasks/update",
+                json!({ "taskId": "raw-task", "inputResponses": {} }),
+            ),
+        )
+        .await;
+        let cancel = send_json_rpc(
+            &mut writer,
+            &mut reader,
+            coverage_request(3, "tasks/cancel", json!({ "taskId": "raw-task" })),
+        )
+        .await;
+
+        // `DetailedTask` inlines the base task fields at the top level of the
+        // result, so the echoed sentinel id sits at `result.taskId`.
+        assert_eq!(get["result"]["taskId"], json!("raw-task"));
+        assert_eq!(
+            update["error"]["message"],
+            json!("forwarding-probe:update_task")
+        );
+        assert_eq!(cancel["result"], json!({ "resultType": "complete" }));
+        assert_eq!(probe.seen(), vec!["get_task", "update_task", "cancel_task"]);
+
+        // Negative control: the tasks capability gate rejects both requests
+        // before dispatch (the passthrough advertises no `tasks` extension).
+        let control = ForwardingProbe::default();
+        let (mut reader, mut writer, _service) =
+            forwarding_transport(PassthroughDefaults::new(control.clone()), coverage_hooks());
+        let control_get = send_json_rpc(
+            &mut writer,
+            &mut reader,
+            coverage_request(1, "tasks/get", json!({ "taskId": "raw-task" })),
+        )
+        .await;
+        assert_eq!(control_get["error"]["code"], json!(-32601));
+        assert_eq!(control.seen(), Vec::<&str>::new());
+    }
+
+    #[tokio::test]
+    async fn hooked_handler_forwards_subscription_lifecycle() {
+        let probe = ForwardingProbe::default();
+        let (mut reader, mut writer, _service) =
+            forwarding_transport(probe.clone(), coverage_hooks());
+
+        // Two frames come back: the acknowledgement is emitted before `listen`
+        // runs, the response after it returns.
+        let ack = send_json_rpc(
+            &mut writer,
+            &mut reader,
+            coverage_request(
+                1,
+                "subscriptions/listen",
+                json!({ "notifications": { "toolsListChanged": true } }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            ack["method"],
+            json!("notifications/subscriptions/acknowledged")
+        );
+        let response = read_json_rpc(&mut reader).await;
+        assert_eq!(response["id"], json!(1));
+        assert_eq!(response["result"]["resultType"], json!("complete"));
+
+        // Exact full sequence (mechanism 3): this arm calls
+        // `accepted_subscription_filter` before `listen`, and both are the
+        // wrapper's own delegations -- so the expected log is the two-element
+        // ordered sequence, not the singleton `["listen"]`.
+        assert_eq!(probe.seen(), vec!["accepted_subscription_filter", "listen"]);
+
+        // Negative control: the default filter hook returns `None`, so rmcp
+        // rejects the request before `listen` and the probe stays untouched.
+        let control = ForwardingProbe::default();
+        let (mut reader, mut writer, _service) =
+            forwarding_transport(PassthroughDefaults::new(control.clone()), coverage_hooks());
+        let control_listen = send_json_rpc(
+            &mut writer,
+            &mut reader,
+            coverage_request(
+                1,
+                "subscriptions/listen",
+                json!({ "notifications": { "toolsListChanged": true } }),
+            ),
+        )
+        .await;
+        assert_eq!(control_listen["error"]["code"], json!(-32601));
+        assert_eq!(control.seen(), Vec::<&str>::new());
     }
 
     fn ctx(name: &str) -> ToolCallContext {
