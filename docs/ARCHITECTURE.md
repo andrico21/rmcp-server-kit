@@ -888,6 +888,36 @@ Examples worth reading:
 > `auth.rs`/`rbac.rs` are useful but the E2E suite is what catches
 > middleware-ordering regressions.
 
+### Delegation-safety layers (the `ServerHandler` wrappers)
+
+`HookedHandler` (`src/tool_hooks.rs`) and `RbacContextHandler`
+(`src/rbac_context.rs`) are transparent wrappers: every `ServerHandler` method
+must reach the inner handler, and rmcp's trait defaults make a dropped
+delegation compile - and pass - silently. Three layers hold that line, and they
+prove different things:
+
+- **Presence and origin** - `tests/delegation_guard.rs` parses the upstream
+  `ServerHandler` surface out of the rmcp source pinned in `Cargo.lock`, asserts
+  each wrapper's impl contains a method for every classified name, pins the
+  origin of every macro-generated `RbacContextHandler` method (a
+  `delegate_request!` invocation is not the same as a hand-written `fn` of the
+  same name), and asserts the in-crate `SEMANTIC_DRIVERS` tables cover the whole
+  classification.
+- **Forwarding** - the in-crate semantic suites (the `mod tests` modules of
+  both files above) drive every method and assert exact equality against the
+  expected record log for that driver, or a sentinel value (or sentinel error)
+  that no default body can construct.
+
+`PassthroughDefaults<H>` (test-only, defined in both modules) is the negative
+control: the same wrapper with every delegation deleted. Each driver runs twice
+- once through the real wrapper, once through `PassthroughDefaults` - so every
+method carries a mutation check that re-executes on every `cargo test` rather
+than a one-off ritual.
+
+Split, in one line: the guard proves **presence and origin**, the semantic
+suites prove **forwarding**. Neither alone suffices - a body can exist and never
+call `self.inner`.
+
 ---
 
 ## 17. Critical invariants

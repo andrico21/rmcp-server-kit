@@ -222,6 +222,10 @@ mindmap
         spawn_server L46-71
         Real server on ephemeral ports
         Integration cookbook
+      tests/delegation_guard.rs
+        rmcp ServerHandler surface from the pinned source
+        Wrapper impl presence and macro-origin pins
+        SEMANTIC_DRIVERS completeness gate
       examples/minimal_server.rs
         Smallest consumer
         cargo run --example minimal_server

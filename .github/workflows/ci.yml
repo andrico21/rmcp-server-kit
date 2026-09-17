@@ -343,6 +343,28 @@ jobs:
         # surviving mutant) runs the whole suite; the suite grew past the
         # old 180s budget (~210s as of 1.8.2), which made a shard's
         # baseline time out and silently skip all of its mutants.
+        #
+        # Budget re-measured 2026-09-17. The cap governs the DEFAULT-feature
+        # suite, which is what cargo-mutants runs locally (no `--all-features`
+        # in this invocation and no mutants.toml):
+        #   `cargo test` samples, warm, 4 vCPU, PROPTEST_CASES unset:
+        #     218 s, 193 s, 212 s  ->  B = 218 s (max of 3)
+        #     (`cargo test --all-features` measured 292 s; it is NOT what the
+        #      cap governs - eight test files compile to nothing without the
+        #      oauth/test-helpers features)
+        #   CI baseline, 2026-09-17 nightly artifacts (commit predates the
+        #   delegation work), per shard: test phase 94-214 s, build 76-115 s
+        #   same nightly, for context: mutant test phase median 219 s, max
+        #     351 s against this 360 s cap (9 of 161 test runs >= 330 s);
+        #     shard wall 70-126 min of the 170m cap; nothing truncated
+        #     (generated == tested on all 8 shards)
+        #   mutant count for this scope: 1110 (tool_hooks.rs 71 and
+        #     rbac_context.rs 44 are the two files the delegation work touched)
+        # B <= 250 s -> keep the 360 s per-run cap; margin is ~39%. cargo-mutants'
+        # own default for this knob is a 5x multiplier; a 2x cap would be a
+        # deliberate wall-budget compromise, not upstream best practice - and
+        # at B = 218 s it is not needed. Re-measure when the suite grows.
+
         run: |
           set +e
           timeout 170m cargo mutants --no-shuffle --timeout 360 -j 2 \
@@ -357,8 +379,12 @@ jobs:
           # 137 when the child had to be SIGKILLed. Either means the mutant list
           # was truncated and the untested tail is silently absent from
           # outcomes.json, which is the failure this job must never hide.
-          # cargo-mutants' own non-zero statuses are advisory: 2 = surviving
-          # mutants, 3 = mutants that timed out individually.
+          # cargo-mutants' own statuses: 0 = clean, 2 = surviving mutants,
+          # 3 = mutants that timed out individually -- those keep the job green.
+          # 4 = ExitCode::BaselineFailed (e.g. the baseline test run hitting
+          # `--timeout`) is NOT advisory: it leaves outcomes.json truncated or
+          # absent, which the summariser below treats as a hard error rather
+          # than a green job with near-zero coverage.
           if [ "$status" = "124" ] || [ "$status" = "137" ]; then
             echo "TRUNCATED=1" >> "$GITHUB_ENV"
           else
@@ -375,8 +401,15 @@ jobs:
         if: always()
         run: |
           out=mutants.out
-          generated=$(jq 'length' "$out/mutants.json" 2>/dev/null || echo 0)
-          completed=$(jq '.outcomes | length' "$out/outcomes.json" 2>/dev/null || echo 0)
+          # Both counters are mutant-only. `outcomes.json` also carries the
+          # baseline scenario (`"scenario": "Baseline"`), which must be filtered
+          # out: with one mutant untested, the baseline-inclusive count still
+          # equals `generated`, so the alarm below would miss exactly the
+          # single-skip case.
+          generated_raw=$(jq 'length' "$out/mutants.json" 2>/dev/null)
+          completed_raw=$(jq '[.outcomes[]? | select(.scenario != "Baseline")] | length' "$out/outcomes.json" 2>/dev/null)
+          generated=${generated_raw:-0}
+          completed=${completed_raw:-0}
           {
             echo "### cargo-mutants shard ${{ matrix.shard }}/8"
             echo ""
@@ -387,10 +420,33 @@ jobs:
             echo "| mutants generated | $generated |"
             echo "| mutants completed | $completed |"
             for k in missed caught timeout unviable; do
-              v=$(jq --arg k "$k" '[.outcomes[]? | select(.summary == $k)] | length' "$out/outcomes.json" 2>/dev/null || echo 0)
+              v=$(jq --arg k "$k" '[.outcomes[]? | select(.scenario != "Baseline") | select(.summary == $k)] | length' "$out/outcomes.json" 2>/dev/null || echo 0)
               echo "| $k | $v |"
             done
           } >> "$GITHUB_STEP_SUMMARY"
+          # Advisory statuses (0 clean, 2 missed mutants, 3 timed-out mutants,
+          # 124/137 wall-clock kill) all still write both files. Missing or
+          # unparseable output under any OTHER status -- notably 4 =
+          # ExitCode::BaselineFailed, which is not advisory -- means the run
+          # never produced results and must not pass silently.
+          status="${MUTANTS_STATUS:-unknown}"
+          if [ -z "$generated_raw" ] || [ -z "$completed_raw" ]; then
+            case "$status" in
+              0 | 2 | 3 | 124 | 137) ;;
+              *)
+                echo "::error::shard ${{ matrix.shard }}/8 left no parseable mutants.out (exit status $status); mutation results were never produced. See the run log."
+                exit 1
+                ;;
+            esac
+          fi
+          # Fail loudly whenever mutants are missing from outcomes.json. This is
+          # deliberately independent of TRUNCATED: a baseline `--timeout` expiry
+          # exits 4 (not 124/137), so it used to leave a green job with
+          # near-zero coverage and no annotation at all.
+          if [ "$completed" -lt "$generated" ]; then
+            echo "::error::shard ${{ matrix.shard }}/8 tested $completed of $generated mutants; $((generated - completed)) are absent from outcomes.json. Mutation coverage is incomplete."
+            exit 1
+          fi
           if [ "${TRUNCATED:-0}" = "1" ]; then
             echo "::error::shard ${{ matrix.shard }}/8 hit the ${{ '170m' }} wall; $completed of $generated mutants were tested. Mutation coverage is incomplete."
           fi
