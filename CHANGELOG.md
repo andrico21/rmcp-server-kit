@@ -11,6 +11,8 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+## [3.13.0] - 2026-09-18
+
 ### Added
 
 - **Structural guard against rmcp `ServerHandler` drift**
