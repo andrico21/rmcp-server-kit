@@ -170,6 +170,26 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   (`config::tests::every_shared_config_field_is_validated_by_both`) now fails
   when a shared field is validated on one side only, or exempted from that rule
   without a stated reason.
+- **Dependency refresh: 6 semver-compatible lockfile updates** - `syn` 3.0.5 ->
+  3.0.6, `cfg-if` 1.0.4 -> 1.0.5, `unicode-ident` 1.0.24 -> 1.0.26, `rustix`
+  1.1.4 -> 1.1.5, `async-compression` 0.4.47 -> 0.4.48 and
+  `compression-codecs` 0.4.42 -> 0.4.43. All six are transitive, so no
+  `Cargo.toml` requirement changed, and `cargo semver-checks` reports no
+  semver update required.
+
+  **No security urgency.** None of the six appears in the RustSec advisory
+  database at any version, and `cargo audit` is clean on both sides of the
+  refresh. The two compression crates run behind `tower-http`'s
+  response-compression layer only - this crate installs no
+  request-decompression middleware - and the other four are build-time or
+  utility dependencies (`syn`, `cfg-if` and `unicode-ident` feed proc-macro
+  expansion; `rustix` is the Unix syscall layer under `tempfile`).
+
+  Two packages have an update available and are deliberately left alone:
+  `matchit` 0.8.4 (axum 0.8.9 pins `=0.8.4` exactly, so 0.8.6 is unreachable
+  until axum lifts it) and `crypto-common` 0.1.6 (0.1.7 is selectable only by
+  downgrading `generic-array` 0.14.9 -> 0.14.7 - a wash). `cargo vet`
+  exemptions were regenerated in the same commit as `Cargo.lock`.
 
 ## [3.12.0] - 2026-09-16
 
