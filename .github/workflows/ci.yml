@@ -365,9 +365,12 @@ jobs:
         # deliberate wall-budget compromise, not upstream best practice - and
         # at B = 218 s it is not needed. Re-measure when the suite grows.
 
+        env:
+          MUTANTS_TEST_TIMEOUT: "360"
+
         run: |
           set +e
-          timeout 170m cargo mutants --no-shuffle --timeout 360 -j 2 \
+          timeout 170m cargo mutants --no-shuffle --timeout "$MUTANTS_TEST_TIMEOUT" -j 2 \
             --sharding round-robin --shard ${{ matrix.shard }}/8 \
             -f src/rbac.rs -f src/auth.rs -f src/transport.rs \
             -f src/ssrf.rs -f src/mtls_revocation.rs \
@@ -391,6 +394,9 @@ jobs:
             echo "TRUNCATED=0" >> "$GITHUB_ENV"
           fi
           echo "MUTANTS_STATUS=$status" >> "$GITHUB_ENV"
+          # Single source of truth for the per-test-run cap: the summariser's
+          # near-cap trend warning reads it back.
+          echo "MUTANTS_TEST_TIMEOUT=$MUTANTS_TEST_TIMEOUT" >> "$GITHUB_ENV"
           exit 0
 
       # cargo-mutants writes mutants.json (every mutant it intends to test)
@@ -410,6 +416,9 @@ jobs:
           completed_raw=$(jq '[.outcomes[]? | select(.scenario != "Baseline")] | length' "$out/outcomes.json" 2>/dev/null)
           generated=${generated_raw:-0}
           completed=${completed_raw:-0}
+          # Trend indicator for the per-run cap: the max mutant test phase.
+          max_test=$(jq '[.outcomes[]? | select(.scenario != "Baseline") | .phase_results[]? | select(.phase == "Test") | .duration] | max // 0' "$out/outcomes.json" 2>/dev/null || echo 0)
+          test_cap="${MUTANTS_TEST_TIMEOUT:-360}"
           {
             echo "### cargo-mutants shard ${{ matrix.shard }}/8"
             echo ""
@@ -419,6 +428,7 @@ jobs:
             echo "| wall-clock truncated | ${TRUNCATED:-unknown} |"
             echo "| mutants generated | $generated |"
             echo "| mutants completed | $completed |"
+            echo "| max mutant test phase | ${max_test}s / ${test_cap}s cap |"
             for k in missed caught timeout unviable; do
               v=$(jq --arg k "$k" '[.outcomes[]? | select(.scenario != "Baseline") | select(.summary == $k)] | length' "$out/outcomes.json" 2>/dev/null || echo 0)
               echo "| $k | $v |"
@@ -449,6 +459,17 @@ jobs:
           fi
           if [ "${TRUNCATED:-0}" = "1" ]; then
             echo "::error::shard ${{ matrix.shard }}/8 hit the ${{ '170m' }} wall; $completed of $generated mutants were tested. Mutation coverage is incomplete."
+          fi
+          # Near-cap trend warning, deliberately NOT a failure: a mutant whose
+          # test phase approaches the per-run cap is one slow run away from
+          # being misclassified as a mutant timeout - a false signal rather than
+          # a slow one - but failing the nightly here would train people to
+          # ignore it. The max, not a percentile: at ~160 runs p95 is roughly
+          # the eighth-highest, and the first run over the cap is already the
+          # problem. Re-evaluates itself every nightly instead of waiting for
+          # someone to remember to re-measure.
+          if awk -v m="$max_test" -v c="$test_cap" 'BEGIN { exit !(m >= 0.9 * c) }'; then
+            echo "::warning::shard ${{ matrix.shard }}/8: max mutant test phase ${max_test}s is within 10% of the ${test_cap}s --timeout cap; a slow run would be misclassified as a mutant timeout. Trend indicator only."
           fi
 
       - name: Upload mutants.out (shard ${{ matrix.shard }}/8)
