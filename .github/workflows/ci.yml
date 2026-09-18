@@ -416,7 +416,15 @@ jobs:
           completed_raw=$(jq '[.outcomes[]? | select(.scenario != "Baseline")] | length' "$out/outcomes.json" 2>/dev/null)
           generated=${generated_raw:-0}
           completed=${completed_raw:-0}
-          # Trend indicator for the per-run cap: the max mutant test phase.
+          # Trend indicators. The baseline test phase is the quantity the
+          # per-run cap exists to cover ("must exceed the FULL suite's
+          # runtime"), and its growth is the suite's fault rather than the
+          # runner's: on the 2026-09-17 nightly, mutant test phases ran
+          # 1.7-2.4x their own shard baseline purely from contention (8 shards
+          # x -j 2), so a max-mutant-test trigger fired on 5 of 8 shards every
+          # night - alarm fatigue, one level down from the failure mode this
+          # job already avoids.
+          baseline_test=$(jq '[.outcomes[] | select(.scenario == "Baseline") | .phase_results[]? | select(.phase == "Test") | .duration] | first // 0' "$out/outcomes.json" 2>/dev/null || echo 0)
           max_test=$(jq '[.outcomes[]? | select(.scenario != "Baseline") | .phase_results[]? | select(.phase == "Test") | .duration] | max // 0' "$out/outcomes.json" 2>/dev/null || echo 0)
           test_cap="${MUTANTS_TEST_TIMEOUT:-360}"
           {
@@ -428,7 +436,8 @@ jobs:
             echo "| wall-clock truncated | ${TRUNCATED:-unknown} |"
             echo "| mutants generated | $generated |"
             echo "| mutants completed | $completed |"
-            echo "| max mutant test phase | ${max_test}s / ${test_cap}s cap |"
+            echo "| baseline test phase | ${baseline_test}s / ${test_cap}s cap |"
+            echo "| max mutant test phase | ${max_test}s |"
             for k in missed caught timeout unviable; do
               v=$(jq --arg k "$k" '[.outcomes[]? | select(.scenario != "Baseline") | select(.summary == $k)] | length' "$out/outcomes.json" 2>/dev/null || echo 0)
               echo "| $k | $v |"
@@ -460,16 +469,15 @@ jobs:
           if [ "${TRUNCATED:-0}" = "1" ]; then
             echo "::error::shard ${{ matrix.shard }}/8 hit the ${{ '170m' }} wall; $completed of $generated mutants were tested. Mutation coverage is incomplete."
           fi
-          # Near-cap trend warning, deliberately NOT a failure: a mutant whose
-          # test phase approaches the per-run cap is one slow run away from
-          # being misclassified as a mutant timeout - a false signal rather than
-          # a slow one - but failing the nightly here would train people to
-          # ignore it. The max, not a percentile: at ~160 runs p95 is roughly
-          # the eighth-highest, and the first run over the cap is already the
-          # problem. Re-evaluates itself every nightly instead of waiting for
-          # someone to remember to re-measure.
-          if awk -v m="$max_test" -v c="$test_cap" 'BEGIN { exit !(m >= 0.9 * c) }'; then
-            echo "::warning::shard ${{ matrix.shard }}/8: max mutant test phase ${max_test}s is within 10% of the ${test_cap}s --timeout cap; a slow run would be misclassified as a mutant timeout. Trend indicator only."
+          # Baseline near-cap warning, deliberately NOT a failure: the cap must
+          # exceed the full suite's runtime, so a baseline creeping toward it is
+          # the actionable signal (raise the cap or make the suite faster) -
+          # while a mutant phase at the cap is already visible as `timeout` in
+          # the table above. Keyed to the baseline, not to the max mutant phase:
+          # see the contention note above. Re-evaluates itself every nightly
+          # instead of waiting for someone to remember to re-measure.
+          if awk -v b="$baseline_test" -v c="$test_cap" 'BEGIN { exit !(b >= 0.9 * c) }'; then
+            echo "::warning::shard ${{ matrix.shard }}/8: baseline test phase ${baseline_test}s is within 10% of the ${test_cap}s --timeout cap; a slow run would be misclassified as a baseline failure. Raise the cap or make the suite faster."
           fi
 
       - name: Upload mutants.out (shard ${{ matrix.shard }}/8)
