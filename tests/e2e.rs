@@ -2475,6 +2475,44 @@ async fn c1_body_limit_applies_before_rbac() {
     );
 }
 
+/// Regression test for the public `max_request_body` knob above rmcp's own
+/// default: rmcp independently caps POST bodies at 4 MiB
+/// (`DEFAULT_MAX_REQUEST_BODY_BYTES`), so a configured cap above that used to
+/// under-deliver - the outer tower layer admitted the body and rmcp answered
+/// 413 from inside the service. The fix propagates the configured value into
+/// `StreamableHttpServerConfig::with_max_request_body_bytes`.
+#[tokio::test]
+async fn max_request_body_above_rmcp_default_is_honoured() {
+    let port = free_port().await;
+    let cfg = config_on_port(port)
+        // Above rmcp's 4 MiB default, below this crate's outer cap.
+        .with_max_request_body(6 * 1024 * 1024);
+    let base = spawn_server(cfg).await;
+
+    // ~5 MiB: accepted only if the configured cap reaches rmcp. The padding
+    // rides in an ignored extra field so the request stays otherwise valid.
+    let padding = "x".repeat(5 * 1024 * 1024);
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2025-11-25","capabilities":{{}},"clientInfo":{{"name":"test","version":"0.1"}},"pad":"{padding}"}}}}"#
+    );
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/mcp"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        200,
+        "a valid body under the configured cap must be accepted, not rejected as too large"
+    );
+}
+
 // ==========================================================================
 // C3 regression: OAuth admin endpoints gated by expose_admin_endpoints
 // ==========================================================================

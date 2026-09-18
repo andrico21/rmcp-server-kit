@@ -195,7 +195,7 @@ config.validate().expect("config valid");
 | `auth` | `Option<AuthConfig>` | `None` | Authentication config |
 | `rbac` | `Option<Arc<RbacPolicy>>` | `None` | RBAC enforcement policy |
 | `tool_list_filtering` | `bool` | `true` | Hide RBAC-denied tools from `tools/list` when RBAC and a caller role are active |
-| `allowed_origins` | `Vec<String>` | `[]` | Allowed Origin header values |
+| `allowed_origins` | `Vec<String>` | `[]` | Allowed origins: bare `scheme://host[:port]` entries (optional root `/`) or the literal token `null`; matched with normalized scheme/host/port semantics (see "Origin validation") |
 | `tool_rate_limit` | `Option<u32>` | `None` | Max tool calls/min per IP |
 | `session_binding` | `bool` | `true` | Statelessly bind MCP session IDs to the authenticated identity |
 | `session_binding_secret` | `Option<SecretString>` | `None` | Shared HMAC secret for cross-instance session binding; also used by `task_binding` |
@@ -203,11 +203,42 @@ config.validate().expect("config valid");
 | `session_store` | `Option<Arc<dyn SessionStore>>` | `None` | Programmatic external rmcp session store; no TOML field |
 | `event_store` | `Option<Arc<dyn EventStore>>` | `None` | Programmatic external rmcp event store for durable `Last-Event-ID` replay; no TOML field |
 | `readiness_check` | `Option<ReadinessCheck>` | `None` | Custom `/readyz` probe |
-| `max_request_body` | `usize` | `1 MiB` | Max request body bytes |
-| `request_timeout` | `Duration` | `120s` | Per-request timeout (408) |
+| `max_request_body` | `usize` | `1 MiB` | Max request body bytes (enforced by the outer limit layer and by the MCP service) |
+| `request_timeout` | `Duration` | `120s` | Response-future timeout (408 if no `Response` before the deadline); response-body transfer/streaming not covered |
 | `shutdown_timeout` | `Duration` | `30s` | Graceful shutdown window |
 | `metrics_enabled` | `bool` | `false` | Enable Prometheus (feature: `metrics`) |
 | `metrics_bind` | `String` | `"127.0.0.1:9090"` | Metrics listener (feature: `metrics`) |
+
+##### Origin validation
+
+`allowed_origins` is enforced by an **outer middleware that wraps every route
+and runs before authentication**, so a rejected origin answers `403 Forbidden`
+with the body `Forbidden: Origin not allowed` without touching the auth path.
+Requests without an `Origin` header pass through (curl, SDKs, server-to-server
+clients).
+
+Matching is **normalized**, not raw-string:
+
+- scheme and host compare case-insensitively (`HTTPS://EXAMPLE.COM` matches
+  `https://example.com`);
+- default ports are implied, so `https://example.com`, `https://example.com:443`
+  and a configured `https://example.com/` are all the same origin;
+- a **non-default port must match exactly** - unlike rmcp's own origin
+  validator, a configured origin without a port does not match an arbitrary
+  explicit port. The stricter rule is deliberate: this check runs before auth
+  and across every route.
+- CORS uses the same normalized matcher, so the `Access-Control-Allow-Origin`
+  decision can never disagree with the origin gate.
+
+Configured entries must be bare origins (`scheme://host[:port]`, with at most
+one root `/`) or the literal token `null`. Entries with a non-root path, query,
+or fragment fail startup validation instead of being silently ineffective.
+`Origin: null` is rejected unless the exact token `null` is listed (the
+incoming header is matched case-insensitively).
+
+rmcp's internal origin check is **intentionally left disabled** - this
+middleware is the single authoritative validator, which avoids double
+enforcement under diverging semantics.
 
 #### `serve()`
 
@@ -944,14 +975,14 @@ extra_route_rate_limit = 60
 | `max_concurrent_tls_handshakes` | `usize` | `256` | Cap on concurrently in-flight TLS handshakes; at saturation new connections wait in the kernel backlog. Startup-only |
 | `shutdown_timeout` | `String` | `"30s"` | Humantime duration |
 | `request_timeout` | `String` | `"120s"` | Humantime duration |
-| `allowed_origins` | `Vec<String>` | `[]` | Origin validation |
+| `allowed_origins` | `Vec<String>` | `[]` | Origin validation; bare origins plus the optional literal `null` token (normalized matching) |
 | `stdio_enabled` | `bool` | `false` | Enable stdio transport (bypasses auth/RBAC/TLS - see warning in `transport`) |
 | `tool_rate_limit` | `Option<u32>` | `None` | Tool calls/min per IP |
 | `tool_list_filtering` | `bool` | `true` | Filter `tools/list` through RBAC visibility when RBAC is enabled and a role is present |
 | `key_eviction_policy` | `KeyEvictionPolicy` | `"evict_lru"` | Full-table policy for per-IP limiter key maps; accepted values: `"evict_lru"`, `"reject_new"` |
 | `session_idle_timeout` | `String` | `"20m"` | Humantime duration; idle MCP sessions are closed after this period |
 | `session_binding` | `bool` | `true` | Stateless signed wrapper for `Mcp-Session-Id`; disables cross-identity session replay. Setting `false` reinstates CWE-384 risk and should only be used behind a gateway that deliberately re-authenticates each request under different labels |
-| `session_binding_secret` | `Option<SecretString>` | `None` | Shared HMAC secret for session binding across replicas; at least 32 UTF-8 bytes. Also used by `task_binding`, domain-separated so a session token can never verify as a task token. No `session_store` or `event_store` TOML field exists because stores are trait objects supplied in code |
+| `session_binding_secret` | `Option<SecretString>` | `None` | Shared HMAC secret for session binding across replicas; at least 32 UTF-8 bytes. Also used by `task_binding`, domain-separated so a session token can never verify as a task token. No `session_store` or `event_store` TOML field exists because stores are trait objects supplied in code. For cross-instance continuity, also supply a `SessionStore` in code via `McpServerConfig::with_session_store` |
 | `task_binding` | `bool` | `false` | Stateless signed wrapper for MCP task IDs (SEP-2663), preventing one authenticated identity from reading, updating, or cancelling another's task via a leaked `taskId`. Off by default because it changes the wire format of `taskId` values; handlers keep seeing raw IDs, so only a consumer that persists the *client-visible* ID as its own key is affected. Reuses `session_binding_secret`; multi-replica deployments must share it |
 | `sse_keep_alive` | `String` | `"15s"` | Humantime duration; SSE keep-alive ping interval |
 | `public_url` | `Option<String>` | `None` | Externally reachable base URL (e.g. `https://mcp.example.com`); required when `listen_addr` is `0.0.0.0` behind a reverse proxy or container |
@@ -1613,6 +1644,48 @@ Spawns a dedicated HTTP listener serving `/metrics` in Prometheus text format.
 You don't call this directly -- rmcp-server-kit spawns it automatically when
 `metrics_enabled = true` on `McpServerConfig`.
 
+#### Registering custom collectors (`with_metrics_handle`)
+
+The registry the server actually serves is otherwise constructed inside the
+transport, so application collectors had nowhere to attach. Supply your own
+handle:
+
+```rust,ignore
+use std::sync::Arc;
+use prometheus::{IntCounterVec, opts};
+use rmcp_server_kit::metrics::McpMetrics;
+use rmcp_server_kit::transport::McpServerConfig;
+
+let metrics = Arc::new(McpMetrics::new()?);
+let queue_depth = IntCounterVec::new(opts!("app_queue_depth", "queued jobs"), &["queue"])?;
+metrics.registry.register(Box::new(queue_depth))?;
+
+let config = McpServerConfig::new("0.0.0.0:8443", "my-server", "0.1.0")
+    .with_metrics("127.0.0.1:9090")          // opens the listener
+    .with_metrics_handle(Arc::clone(&metrics)); // serves THIS registry
+```
+
+- `with_metrics_handle` does **not** open the listener: call `with_metrics(bind)`
+  too. A handle without an enabled listener is rejected at validation, and
+  without a handle the framework constructs a fresh registry as before.
+- The `rmcp_server_kit_*` namespace is **reserved**. At startup the framework
+  registers its three collectors (`http_requests_total`,
+  `http_request_duration_seconds`, `rate_limited_total`) on the supplied
+  registry, evicting any descriptor-equivalent occupant first. A collector that
+  reuses a reserved name with different help text or variable labels is rejected
+  when you try to register it (the registry's dimension record is sticky), and
+  any conflict that survives startup fails closed with a `Startup` error naming
+  the namespace - never silently empty telemetry.
+- **Disclosure**: `/metrics` is served on a separate, **unauthenticated**
+  listener with only `GET /metrics`. Admitting application collectors widens
+  what that endpoint exposes, so keep it bound to loopback or a protected
+  monitoring network (default `127.0.0.1:9090`).
+- Mutating the registry *after* startup (unregistering framework collectors,
+  for instance) is unsupported and remains caller responsibility.
+- Encoding failures serve a non-empty marker body
+  (`# rmcp-server-kit: prometheus encoding failed - see server logs`) and log at
+  ERROR, so one malformed collector cannot blank an entire scrape.
+
 ---
 
 ## Additional Built-in Endpoints and Features
@@ -1891,6 +1964,20 @@ Rotating `session_binding_secret` invalidates active bound sessions. Clients
 will need to reinitialize after rotation; coordinate the change across replicas
 to avoid a mixed-secret window. When `task_binding` is also enabled, rotation
 additionally invalidates every outstanding external task ID.
+
+Field notes for cross-instance failures:
+
+- **Do not disable `session_binding` to paper over cross-instance `404`s.** That
+  reinstates the CWE-384 replay risk described above; fix the shared secret and
+  the shared store instead.
+- Two `404`s help locate the failure, as a debugging aid only - these bodies are
+  not a stable API contract. A binding-MAC failure answers `404` with body
+  `unknown MCP session` and logs `mcp session binding rejected request` with
+  `reason=mac_failed`; an rmcp session-store lookup miss answers rmcp's own
+  `404` (`Not Found: Session not found`) with no binding warning.
+- A `SessionStore` cannot be supplied through TOML - it is a trait object
+  injected in code. Load-balanced deployments without one need sticky routing,
+  or must tolerate clients re-initializing after a hop.
 
 ### Binding MCP task IDs
 

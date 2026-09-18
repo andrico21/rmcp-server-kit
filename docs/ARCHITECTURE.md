@@ -46,8 +46,8 @@ The crate has two transports:
 
 | Transport          | Function                                            | Auth/RBAC/TLS  | Use case                                         |
 |--------------------|-----------------------------------------------------|----------------|--------------------------------------------------|
-| **Streamable HTTP**| `serve()` - `src/transport.rs:2336`                 | **Yes**        | Production network deployment                    |
-| stdio              | `serve_stdio()` - `src/transport.rs:4196`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
+| **Streamable HTTP**| `serve()` - `src/transport.rs:2519`                 | **Yes**        | Production network deployment                    |
+| stdio              | `serve_stdio()` - `src/transport.rs:4480`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
 
 ---
 
@@ -104,7 +104,7 @@ A complete HTTP request to `/mcp` flows through these layers, top-to-bottom
 `src/transport.rs:1635-2052` (middleware wiring inside `build_app_router`) and in each module.
 
 ```
-TCP / TLS handshake                         src/transport.rs:2979  (TlsListener)
+TCP / TLS handshake                         src/transport.rs:3126  (TlsListener)
    │  - Handshakes run CONCURRENTLY on a background acceptor task
 │    (run_tls_acceptor, src/transport.rs:2937): 256-permit in-flight
    │    cap, 10 s per-handshake timeout; axum receives only completed
@@ -113,7 +113,7 @@ TCP / TLS handshake                         src/transport.rs:2979  (TlsListener)
    │    AuthIdentity is attached to the **per-connection** TlsConnInfo
    │    extension (no shared SocketAddr-keyed map).
    ▼
-axum Router                                  src/transport.rs:1635  (build_app_router)
+axum Router                                  src/transport.rs:1805  (build_app_router)
    │
 ├── 1. Origin check                       src/transport.rs:3880
    │      Rejects 403 if Origin/Host not allowed (MCP spec requirement)
@@ -185,12 +185,12 @@ Open endpoints (no auth):
 
 | Path                                       | Handler                                       |
 |--------------------------------------------|-----------------------------------------------|
-| `GET  /healthz`                            | `healthz` (~`src/transport.rs:3357`) |
-| `GET  /readyz`                             | `readyz`  (~`src/transport.rs:3421`) - runs configured readiness check |
-| `GET  /version`                            | `version_payload` (~`src/transport.rs:3372`) |
+| `GET  /healthz`                            | `healthz` (~`src/transport.rs:3466`) |
+| `GET  /readyz`                             | `readyz`  (~`src/transport.rs:3530`) - runs configured readiness check |
+| `GET  /version`                            | `version_payload` (~`src/transport.rs:3481`) |
 | `GET  /metrics`                            | served by `serve_metrics` on a **separate listener** when `feature = "metrics"` (`src/metrics.rs:142`) |
-| `GET  /.well-known/oauth-protected-resource` | feature = `oauth` (`src/transport.rs:1964`) |
-| `GET  /.well-known/oauth-authorization-server` | feature = `oauth` proxy (`src/transport.rs:2734`) |
+| `GET  /.well-known/oauth-protected-resource` | feature = `oauth` (`src/transport.rs:2200`) |
+| `GET  /.well-known/oauth-authorization-server` | feature = `oauth` proxy (`src/transport.rs:2818`) |
 
 Authenticated endpoints:
 
@@ -217,7 +217,7 @@ Top-level builder-style config consumed by `serve()`. Holds:
 - optional readiness check callback (`Arc<dyn Fn() -> bool + Send + Sync>`)
 - public URL (used in OAuth metadata responses)
 
-### `ReloadHandle` - `src/transport.rs:1515`
+### `ReloadHandle` - `src/transport.rs:1612`
 Returned (optionally) from `serve()` when the consumer needs runtime
 hot-reload. Methods:
 - `try_reload_auth_keys(new_keys)` - validates, then atomically swaps
@@ -302,7 +302,7 @@ Startup-only.
 **File**: `src/auth.rs` (~600 LOC).
 
 ### Construction
-`AuthState` is built inside `build_app_router()` at `src/transport.rs:1521`. It contains:
+`AuthState` is built inside `build_app_router()` at `src/transport.rs:1897`. It contains:
 - `api_keys: ArcSwap<Vec<ApiKeyEntry>>` (`src/auth.rs:1068`)
 - mTLS identities: stored **per-connection** on the
   `TlsConnInfo` extension (`src/auth.rs:928`), read by `auth_middleware` (`src/auth.rs:1664-1669`).
@@ -442,7 +442,7 @@ an outbound `Authorization` header for downstream token passthrough.
 
 ## 7. TLS / mTLS
 
-**Custom listener**: `TlsListener` in `src/transport.rs:2979`, implementing
+**Custom listener**: `TlsListener` in `src/transport.rs:3126`, implementing
 `axum::serve::Listener` so axum's hyper machinery accepts it as a drop-in
 replacement for `TcpListener`.
 
@@ -745,7 +745,7 @@ API surface.
 
 The `/metrics` endpoint is served on a **separate listener** (often a
 private bind address) configured via `MetricsConfig` - see
-`src/metrics.rs::serve_metrics` (~`src/metrics.rs:110-130`). This isolates
+`src/metrics.rs::serve_metrics` (~`src/metrics.rs:166`). This isolates
 operational telemetry from the public MCP listener.
 
 ---

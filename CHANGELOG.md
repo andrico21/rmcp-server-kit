@@ -50,6 +50,27 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   `SEMANTICALLY_UNPROVABLE` set), and a macro-origin gate pinning the twelve
   `RbacContextHandler` methods discharged by the three macro-body drivers, so
   rewriting one as a hand-written `fn` fails until it gains its own driver.
+- **`McpServerConfig::with_metrics_handle(Arc<McpMetrics>)` (feature:
+  `metrics`)** exposes the registry the server actually serves, so applications
+  can register their own collectors instead of only reading a documentation
+  promise that they could. Supplying a handle does not open the listener - call
+  `with_metrics(bind)` as well; a handle without one is rejected at validation,
+  and the fallback path (no handle) keeps constructing a fresh registry.
+
+  Startup hardening on the supplied handle: the framework's three
+  `rmcp_server_kit_*` collectors are registered authoritatively with
+  evict-then-register semantics, because `Registry::register` compares
+  descriptor IDs rather than object identity - a descriptor-equivalent squatter
+  would otherwise satisfy `AlreadyReg` while the framework's own collectors
+  stayed unregistered and `metrics_middleware` kept incrementing them into the
+  void (silent telemetry loss). A squatter that reuses a reserved name with
+  different help text or variable labels is rejected at registration (the
+  registry's dimension record is sticky across `unregister`), and any conflict
+  that survives startup fails closed with a `Startup` error naming the
+  namespace. `McpMetrics::encode()` no longer returns an empty body on encoder
+  failure: it logs at ERROR and serves a stable marker
+  (`# rmcp-server-kit: prometheus encoding failed - see server logs`), so one
+  malformed collector cannot blank a scrape.
 
 ### Fixed
 
@@ -66,6 +87,22 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   (`hooked_handler_preserves_inner_negotiate_initialize_override`,
   `rbac_context_handler_preserves_inner_negotiate_initialize_override`) call the
   wrappers directly and assert the inner override is observed.
+- **`with_max_request_body` above 4 MiB now reaches the MCP service.** The
+  public knob was only applied to the outer tower limit layer; the MCP
+  service's own `StreamableHttpServerConfig` kept rmcp's 4 MiB default
+  (`DEFAULT_MAX_REQUEST_BODY_BYTES`), so a configured cap above 4 MiB silently
+  under-delivered - the outer layer admitted the body and rmcp answered 413
+  from inside the service. The configured value is now propagated via
+  `with_max_request_body_bytes`; both layers enforce the same bytes, and the
+  outer layer stays the user-visible rejection point (it is installed first,
+  before RBAC buffers anything).
+
+  Security note for deployments that previously set the knob above 4 MiB: the
+  *effective* accepted-body ceiling rises to the configured value. Review any
+  front-door WAF / reverse-proxy caps if the intent was to stay at 4 MiB.
+  Regression test: `max_request_body_above_rmcp_default_is_honoured`
+  (`tests/e2e.rs`) - a ~5 MiB body under a 6 MiB cap used to be answered 413 by
+  rmcp and is now accepted.
 
 ### Changed
 
@@ -73,6 +110,42 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   `len() == 28` maintenance assertion with the mechanical guard above; the
   hand-maintained count could not detect upstream drift (it missed
   `negotiate_initialize`), and `RbacContextHandler` had no guard at all.
+- **Origin validation now uses normalized tuple matching, and CORS shares the
+  same matcher.** The outer middleware previously compared the raw `Origin`
+  string against the configured entries, so equivalent spellings behaved
+  differently and the CORS layer could disagree with the origin gate.
+
+  Widening (newly accepted):
+
+  - scheme and host compare case-insensitively (`HTTPS://EXAMPLE.COM` matches
+    `https://example.com`);
+  - an explicit default port matches the implicit form
+    (`https://example.com:443` equals `https://example.com`);
+  - one root trailing `/` in a configured entry is normalized away
+    (`https://example.com/` is the same entry as `https://example.com`);
+  - CORS now grants `Access-Control-Allow-Origin` under exactly the same
+    normalization, removing a case where the origin gate accepted a request
+    but the browser-facing CORS layer denied it.
+
+  Narrowing:
+
+  - configured entries must be bare origins (`scheme://host[:port]`); entries
+    carrying a non-root path, query, or fragment - previously silently
+    ineffective at runtime - now fail configuration validation at startup;
+  - a non-UTF-8 or malformed `Origin` value is rejected with the same
+    `403 Forbidden: Origin not allowed` (a non-UTF-8 value used to be coerced
+    to an empty string, so the outcome differed by accident);
+  - unlike rmcp's own origin validator, a configured origin without a port
+    does **not** match an arbitrary explicit port; this crate requires exact
+    effective-port equality. The divergence is deliberate - the check runs
+    before auth and across every route, and a port wildcard is not worth
+    inheriting.
+
+  `Origin: null` stays rejected by default; listing the literal token `null`
+  in `allowed_origins` opts in explicitly (the incoming header is matched
+  case-insensitively). rmcp's internal origin check remains intentionally
+  disabled: the outer layer is the single authoritative validator, so there is
+  no double enforcement under diverging semantics.
 
 ## [3.12.0] - 2026-09-16
 

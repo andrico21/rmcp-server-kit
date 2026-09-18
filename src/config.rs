@@ -412,6 +412,13 @@ pub struct ServerConfig {
     pub session_binding: bool,
     /// Shared HMAC secret used for session binding across server instances.
     ///
+    /// Necessary but not sufficient for cross-instance session continuity: this
+    /// makes a session token minted by one instance verifiable by another. The
+    /// session itself lives in rmcp's session store, so continuity also requires
+    /// a shared store via [`crate::transport::McpServerConfig::with_session_store`].
+    /// Without one, a session does not survive a restart or a hop to another
+    /// instance even when this secret is shared.
+    ///
     /// Also used by [`Self::task_binding`]; the two are domain-separated.
     pub session_binding_secret: Option<SecretString>,
     /// Bind MCP task IDs (SEP-2663) to the authenticated identity that created

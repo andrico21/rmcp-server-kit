@@ -100,19 +100,40 @@ impl McpMetrics {
     }
 
     /// Encode all collected metrics as Prometheus text format.
+    ///
+    /// On encoder failure the response is a **non-empty, stable marker body**
+    /// rather than an empty string, and the failure is logged at ERROR: with
+    /// caller-registered collectors admitted, one malformed collector must not
+    /// silently blank an entire scrape.
     #[must_use]
     pub fn encode(&self) -> String {
         let encoder = TextEncoder::new();
         let metric_families = self.registry.gather();
         let mut buf = Vec::new();
-        if let Err(e) = encoder.encode(&metric_families, &mut buf) {
-            tracing::warn!(error = %e, "prometheus encode failed");
-            return String::new();
+        if let Err(error) = encoder.encode(&metric_families, &mut buf) {
+            return encode_failure_body(&error);
         }
         // TextEncoder always produces valid UTF-8; fall back to empty on
         // the near-impossible chance it doesn't.
         String::from_utf8(buf).unwrap_or_default()
     }
+}
+
+/// Marker body served when Prometheus encoding fails. Public within the crate
+/// so tests can assert its stability; scrapers and alert rules can key on it.
+pub(crate) const ENCODE_FAILURE_MARKER: &str =
+    "# rmcp-server-kit: prometheus encoding failed - see server logs\n";
+
+/// Build the failure body and log the underlying encoder error at ERROR.
+///
+/// The text encoder's only failure mode is an IO error from the sink (it
+/// performs no content validation), so this branch is unreachable with the
+/// in-memory `Vec` sink [`McpMetrics::encode`] uses - it exists so that a
+/// future writer-backed path, or a prometheus version that adds validation,
+/// cannot serve an empty scrape.
+fn encode_failure_body(error: &prometheus::Error) -> String {
+    tracing::error!(error = %error, "prometheus encoding failed; serving error marker body");
+    ENCODE_FAILURE_MARKER.to_owned()
 }
 
 /// Increment the rate-limiter deny counter for `limiter`, if the shared
@@ -179,6 +200,25 @@ mod tests {
         reason = "test-only relaxations; production code uses ? and tracing"
     )]
     use super::*;
+
+    #[test]
+    fn encode_failure_returns_stable_non_empty_marker() {
+        // The encoder's only failure mode is an IO error from the sink, so the
+        // failure branch is driven here through `encode_failure_body` - the
+        // exact function `encode` returns through - rather than through a
+        // collector, which cannot make the encoder fail.
+        let body = encode_failure_body(&prometheus::Error::Msg("encoder exploded".to_owned()));
+
+        assert!(
+            !body.is_empty(),
+            "a failed encode must never serve an empty body"
+        );
+        assert!(
+            body.contains("rmcp-server-kit: prometheus encoding failed"),
+            "marker body must be stable for scrapers/alerts: {body:?}"
+        );
+        assert_eq!(body, ENCODE_FAILURE_MARKER);
+    }
 
     #[test]
     fn new_creates_registry_with_counters() {

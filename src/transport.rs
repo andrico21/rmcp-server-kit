@@ -449,14 +449,22 @@ pub struct McpServerConfig {
     )]
     pub readiness_check: Option<ReadinessCheck>,
     /// Maximum request body size in bytes. Default: 1 MiB.
-    /// Protects against oversized payloads causing OOM.
+    ///
+    /// Enforced end to end: the outer limit layer rejects oversized bodies
+    /// (413, before auth/RBAC buffer them) and the MCP service enforces the
+    /// same value internally. One knob - there is no second limit to keep in
+    /// sync.
     #[deprecated(
         since = "0.13.0",
         note = "use McpServerConfig::with_max_request_body(); direct field access will become pub(crate) in a future major release"
     )]
     pub max_request_body: usize,
     /// Request processing timeout. Default: 120s.
-    /// Requests exceeding this duration receive 408 Request Timeout.
+    ///
+    /// Bounds the inner service response future (the time until a `Response` is
+    /// produced). Response-body transfer/streaming work that occurs after the
+    /// `Response` exists - including SSE body frames - is not covered by this
+    /// timeout. Requests exceeding this duration receive 408 Request Timeout.
     #[deprecated(
         since = "0.13.0",
         note = "use McpServerConfig::with_request_timeout(); direct field access will become pub(crate) in a future major release"
@@ -486,7 +494,9 @@ pub struct McpServerConfig {
     pub session_binding: bool,
     /// Shared HMAC secret used when session binding must verify across
     /// multiple server instances. When unset, a process-random secret keeps
-    /// single-instance behaviour unchanged.
+    /// single-instance behaviour unchanged. For cross-instance session
+    /// continuity you also need a shared rmcp `SessionStore`
+    /// (see [`Self::with_session_store`]).
     pub session_binding_secret: Option<SecretString>,
     /// Bind MCP task IDs (SEP-2663) to the authenticated identity.
     ///
@@ -615,6 +625,16 @@ pub struct McpServerConfig {
         note = "use McpServerConfig::with_metrics(); direct field access will become pub(crate) in a future major release"
     )]
     pub metrics_bind: String,
+    /// Caller-supplied metrics registry handle (feature: `metrics`).
+    ///
+    /// When set, the metrics middleware records into this registry and the
+    /// `/metrics` listener serves it. The framework registers its own three
+    /// collectors on it at startup (evicting any descriptor-equivalent
+    /// occupant first) and fails startup closed on a reserved-name conflict.
+    /// Set via [`Self::with_metrics_handle`]; supplying a handle requires
+    /// [`Self::with_metrics`] as well.
+    #[cfg(feature = "metrics")]
+    pub(crate) metrics_handle: Option<Arc<crate::metrics::McpMetrics>>,
     /// Per-header overrides for the OWASP security headers emitted by
     /// the global response middleware. See [`SecurityHeadersConfig`]
     /// for the three-state semantic and validation rules.
@@ -786,6 +806,8 @@ impl McpServerConfig {
             metrics_enabled: false,
             #[cfg(feature = "metrics")]
             metrics_bind: "127.0.0.1:9090".into(),
+            #[cfg(feature = "metrics")]
+            metrics_handle: None,
             security_headers: SecurityHeadersConfig::default(),
             tls_handshake_timeout: DEFAULT_TLS_HANDSHAKE_TIMEOUT,
             max_concurrent_tls_handshakes: DEFAULT_MAX_CONCURRENT_TLS_HANDSHAKES,
@@ -944,6 +966,9 @@ impl McpServerConfig {
 
     /// Override the maximum request body (bytes). Must be `> 0`.
     /// Default: 1 MiB.
+    ///
+    /// Applies to both layers that can reject an oversized body: the outer
+    /// limit layer in front of the router and the MCP service's own limit.
     #[must_use]
     pub fn with_max_request_body(mut self, bytes: usize) -> Self {
         self.max_request_body = bytes;
@@ -951,6 +976,10 @@ impl McpServerConfig {
     }
 
     /// Override the per-request processing timeout. Default: 2 minutes.
+    ///
+    /// Bounds the inner service response future - the time until a `Response`
+    /// is produced. Streaming/response-body transfer after that point is not
+    /// covered.
     #[must_use]
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
@@ -981,6 +1010,7 @@ impl McpServerConfig {
     }
 
     /// Set the shared HMAC secret used to bind MCP session IDs to identities.
+    /// For cross-instance continuity, combine with [`Self::with_session_store`].
     #[must_use]
     pub fn with_session_binding_secret(mut self, secret: SecretString) -> Self {
         self.session_binding_secret = Some(secret);
@@ -1000,6 +1030,8 @@ impl McpServerConfig {
     }
 
     /// Persist rmcp session state in an application-provided external store.
+    /// Combine with [`Self::with_session_binding_secret`] to enable cross-instance
+    /// session continuity (verification + existence).
     #[must_use]
     pub fn with_session_store(mut self, session_store: Arc<dyn SessionStore>) -> Self {
         self.session_store = Some(session_store);
@@ -1232,6 +1264,26 @@ impl McpServerConfig {
         self
     }
 
+    /// Use a caller-constructed [`crate::metrics::McpMetrics`] handle as the
+    /// served metrics registry (feature: `metrics`).
+    ///
+    /// Register application collectors on `handle.registry` before passing it;
+    /// the framework registers (and verifies) its own three
+    /// `rmcp_server_kit_*` collectors on the same registry at startup, so
+    /// those names are reserved. Supplying a handle does **not** enable the
+    /// listener - call [`Self::with_metrics`] as well; a handle without an
+    /// enabled listener is rejected by validation.
+    ///
+    /// `/metrics` stays an unauthenticated listener: admitting application
+    /// collectors widens what it exposes, so keep it bound to loopback or a
+    /// protected monitoring network.
+    #[cfg(feature = "metrics")]
+    #[must_use]
+    pub fn with_metrics_handle(mut self, handle: Arc<crate::metrics::McpMetrics>) -> Self {
+        self.metrics_handle = Some(handle);
+        self
+    }
+
     /// Validate the configuration and consume `self`, returning a
     /// [`Validated<McpServerConfig>`] proof token required by [`serve`]
     /// and [`serve_with_listener`]. This is the only way to construct
@@ -1245,8 +1297,9 @@ impl McpServerConfig {
     ///    be unset.
     /// 3. `bind_addr` must parse as a [`SocketAddr`].
     /// 4. `public_url`, when set, must start with `http://` or `https://`.
-    /// 5. Each entry in `allowed_origins` must start with `http://` or
-    ///    `https://`.
+    /// 5. Each entry in `allowed_origins` must be a bare origin:
+    ///    `scheme://host[:port]` with `http`/`https`, optionally with one
+    ///    root trailing `/`, or the literal token `"null"`.
     /// 6. `max_request_body` must be greater than zero.
     /// 7. When the `oauth` feature is enabled and an [`OAuthConfig`] is
     ///    present, all OAuth URL fields (`jwks_uri`, `proxy.authorize_url`,
@@ -1267,6 +1320,18 @@ impl McpServerConfig {
     pub fn validate(self) -> Result<Validated<Self>, RmcpServerKitError> {
         self.check()?;
         Ok(Validated(self))
+    }
+
+    /// 6b2. A supplied metrics handle without an enabled listener is a
+    /// misconfiguration: the handle would never be installed or served.
+    #[cfg(feature = "metrics")]
+    fn check_metrics_handle(&self) -> Result<(), RmcpServerKitError> {
+        if self.metrics_handle.is_some() && !self.metrics_enabled {
+            return Err(RmcpServerKitError::Config(
+                "metrics_handle supplied but metrics listener is disabled; call with_metrics(...) as well".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Validate the burst knobs: every burst must be greater than zero
@@ -1441,11 +1506,16 @@ impl McpServerConfig {
             )));
         }
 
-        // 5. allowed_origins scheme
+        // 5. allowed_origins entries must be bare origins: scheme://host[:port]
+        //    (http or https), optionally with one root trailing slash, or the
+        //    literal token "null". Entries carrying a non-root path, query, or
+        //    fragment used to be silently ineffective at runtime; they now
+        //    fail fast at startup.
         for origin in &self.allowed_origins {
-            if !(origin.starts_with("http://") || origin.starts_with("https://")) {
+            if parse_allowed_origin(origin).is_none() {
                 return Err(RmcpServerKitError::Config(format!(
-                    "allowed_origins entry {origin:?} must start with http:// or https://"
+                    "allowed_origins entry {origin:?} must be scheme://host[:port] (http or https), \
+                     optionally with one trailing '/', or the literal \"null\""
                 )));
             }
         }
@@ -1465,6 +1535,10 @@ impl McpServerConfig {
                 "extra_route_rate_limit must be greater than zero".into(),
             ));
         }
+
+        // 6b2. Metrics-handle knob (extracted helper).
+        #[cfg(feature = "metrics")]
+        self.check_metrics_handle()?;
 
         // 6c. Burst knobs (extracted helper).
         self.check_burst_knobs()?;
@@ -1769,9 +1843,18 @@ where
     let rbac_for_handler = Arc::clone(&rbac_swap);
     let tool_list_filtering = config.tool_list_filtering;
     let session_store = config.session_store.take();
+    // Origin validation is owned by rmcp-server-kit's outer middleware (see
+    // `origin_check_middleware`): it covers every route and runs before auth.
+    // rmcp's internal `allowed_origins` is intentionally left unset to avoid
+    // double enforcement with diverging semantics.
     let mut rmcp_config = StreamableHttpServerConfig::default()
         .with_allowed_hosts(allowed_hosts)
         .with_sse_keep_alive(Some(config.sse_keep_alive))
+        // Propagate the public cap into rmcp's own body limit. rmcp otherwise
+        // enforces its 4 MiB default and silently under-delivers any larger
+        // configured value; equal caps keep the OUTER tower layer (installed
+        // before RBAC, below) as the user-visible rejection point.
+        .with_max_request_body_bytes(config.max_request_body)
         .with_cancellation_token(session_ct.clone());
     rmcp_config.session_store = session_store;
     let event_store = config.event_store.take();
@@ -1962,8 +2045,9 @@ where
         }));
     }
 
-    // [3] Request timeout (returns 408 on expiry). Bounds total request
-    // duration including auth + handler.
+    // [3] Request timeout (returns 408 on expiry). Bounds the inner service
+    // response future: the time until a Response is produced. Response body
+    // transfer/streaming (including SSE body frames) is not covered.
     mcp_router = mcp_router.layer(tower_http::timeout::TimeoutLayer::with_status_code(
         axum::http::StatusCode::REQUEST_TIMEOUT,
         config.request_timeout,
@@ -2003,7 +2087,14 @@ where
             effective_origins.push(origin);
         }
     }
-    let allowed_origins: Arc<[String]> = Arc::from(effective_origins);
+    // Pre-parse once: the middleware and the CORS layer both match against
+    // this normalized representation, never against the raw config strings.
+    let allowed_origins: Arc<[AllowedOrigin]> = Arc::from(
+        effective_origins
+            .iter()
+            .filter_map(|origin| parse_allowed_origin(origin))
+            .collect::<Vec<_>>(),
+    );
     let cors_origins = Arc::clone(&allowed_origins);
     let log_request_headers = config.log_request_headers;
 
@@ -2155,13 +2246,20 @@ where
     // Uses the same effective origins as the origin check middleware
     // (including auto-derived origin from public_url).
     if !cors_origins.is_empty() {
+        // Align CORS with the origin middleware: the predicate matches the
+        // same normalized `AllowedOrigin` set, so an entry that normalizes
+        // equal (case, default port, one root trailing slash) is accepted by
+        // both layers, and nothing the middleware rejects is granted CORS.
+        let cors_allowed = Arc::clone(&cors_origins);
+        let allow_origin = tower_http::cors::AllowOrigin::predicate(
+            move |origin: &axum::http::HeaderValue, _parts: &axum::http::request::Parts| {
+                origin
+                    .to_str()
+                    .is_ok_and(|value| request_origin_allowed(value, &cors_allowed))
+            },
+        );
         let cors = tower_http::cors::CorsLayer::new()
-            .allow_origin(
-                cors_origins
-                    .iter()
-                    .filter_map(|o| o.parse::<axum::http::HeaderValue>().ok())
-                    .collect::<Vec<_>>(),
-            )
+            .allow_origin(allow_origin)
             .allow_methods([
                 axum::http::Method::GET,
                 axum::http::Method::POST,
@@ -2233,9 +2331,22 @@ where
     // Prometheus metrics: recording middleware + separate listener.
     #[cfg(feature = "metrics")]
     if config.metrics_enabled {
-        let metrics = Arc::new(
-            crate::metrics::McpMetrics::new().map_err(|e| anyhow::anyhow!("metrics init: {e}"))?,
-        );
+        // Caller-supplied handle, or a fresh registry. `.take()` moves the
+        // handle out of the config (same pattern as the session/event stores).
+        let metrics: Arc<crate::metrics::McpMetrics> =
+            if let Some(handle) = config.metrics_handle.take() {
+                handle
+            } else {
+                Arc::new(
+                    crate::metrics::McpMetrics::new()
+                        .map_err(|e| anyhow::anyhow!("metrics init: {e}"))?,
+                )
+            };
+        // Security hardening: the three framework collectors must be bound to
+        // the served registry whatever the caller pre-registered there.
+        // Evict-then-register; a conflict on the reserved namespace fails
+        // startup closed instead of serving silently empty telemetry.
+        ensure_framework_metrics_registered(&metrics).map_err(|e| anyhow::anyhow!("{e}"))?;
         let m = Arc::clone(&metrics);
         router = router.layer(axum::middleware::from_fn(
             move |req: Request<Body>, next: Next| {
@@ -3517,6 +3628,50 @@ fn metrics_labels(req: &Request<Body>) -> (&'static str, String) {
     (method, path)
 }
 
+/// Bind the three framework collectors to `metrics.registry` authoritatively.
+///
+/// `Registry::register` compares descriptor and collector IDs, not object
+/// identity (and checks descriptor IDs *before* the dimension check), so a
+/// descriptor-equivalent squatter also yields `AlreadyReg`. Accepting that as
+/// success would leave the framework's own `http_requests_total` etc.
+/// unregistered while `metrics_middleware` kept incrementing them - silent
+/// telemetry loss.
+///
+/// Each collector is therefore evicted (a clone) and then registered for real.
+/// `unregister` deliberately leaves the registry's dim-hash map populated for
+/// the process lifetime, so a squatter whose help text or variable-label names
+/// differ cannot even be registered alongside - it fails its own `register`
+/// with a reserved-name conflict, i.e. the namespace is protected at the
+/// earliest point.
+#[cfg(feature = "metrics")]
+fn ensure_framework_metrics_registered(
+    metrics: &crate::metrics::McpMetrics,
+) -> Result<(), RmcpServerKitError> {
+    use prometheus::core::Collector;
+
+    // `Box<dyn Collector>` is not `Clone`; each factory hands out a *fresh*
+    // boxed clone of the same collector. `MetricVec` clones share one
+    // `Arc<MetricVecCore>`, so descriptors and sample storage stay identical.
+    type BoxedFactory<'a> = &'a dyn Fn() -> Box<dyn Collector>;
+    let factories: [BoxedFactory<'_>; 3] = [
+        &|| -> Box<dyn Collector> { Box::new(metrics.http_requests_total.clone()) },
+        &|| -> Box<dyn Collector> { Box::new(metrics.http_request_duration_seconds.clone()) },
+        &|| -> Box<dyn Collector> { Box::new(metrics.rate_limited_total.clone()) },
+    ];
+
+    for make in factories {
+        // Evict whatever occupies this collector/descriptor ID. A "collector is
+        // not registered" error is expected here and non-fatal.
+        let _ = metrics.registry.unregister(make());
+        metrics.registry.register(make()).map_err(|error| {
+            RmcpServerKitError::Startup(format!(
+                "metrics registry conflict on reserved rmcp_server_kit_* name: {error}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 /// Record HTTP request metrics (method, path, status, duration).
 ///
 /// Also exposes the shared [`crate::metrics::McpMetrics`] handle to
@@ -4083,13 +4238,139 @@ async fn extra_route_rate_limit_middleware(
     next.run(req).await
 }
 
+/// A configured allowed origin, normalized for comparison.
+///
+/// Built once at router construction by [`parse_allowed_origin`]; the origin
+/// middleware and the CORS layer both match against this representation, so
+/// the two layers cannot drift apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AllowedOrigin {
+    /// `(scheme, host, effective_port)` - lowercased, default ports applied.
+    Tuple(String, String, u16),
+    /// The literal token `null` (opt-in): accepts `Origin: null`.
+    Null,
+}
+
+/// Parse an incoming `Origin` header value under the crate's strict rules.
+///
+/// Accepts exactly `scheme://host[:port]`. Any path (including a bare trailing
+/// `/`), query, or fragment is rejected, as is any scheme other than `http` or
+/// `https`. Scheme and host are lowercased and default ports are applied, so
+/// comparison happens on the effective tuple rather than on the raw string.
+fn parse_request_origin_tuple(value: &str) -> Option<(String, String, u16)> {
+    parse_origin(value, false)
+}
+
+/// Parse a configured allowlist entry: the request rules, plus one optional
+/// root trailing `/`, which is normalized away.
+fn parse_config_origin_tuple(value: &str) -> Option<(String, String, u16)> {
+    parse_origin(value, true)
+}
+
+/// Shared parser behind [`parse_request_origin_tuple`] and
+/// [`parse_config_origin_tuple`].
+fn parse_origin(value: &str, allow_root_slash: bool) -> Option<(String, String, u16)> {
+    let (scheme, rest) = value.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    let default_port = match scheme.as_str() {
+        "http" => 80,
+        "https" => 443,
+        _ => return None,
+    };
+
+    if rest.is_empty() {
+        return None;
+    }
+    let rest = if allow_root_slash {
+        rest.strip_suffix('/').unwrap_or(rest)
+    } else {
+        rest
+    };
+    if rest.is_empty() || rest.contains(['/', '?', '#']) {
+        return None;
+    }
+
+    let (host, port) = if let Some(after_bracket) = rest.strip_prefix('[') {
+        // Bracketed IPv6 literal: `[::1]` or `[::1]:8080`.
+        let (inside, tail) = after_bracket.split_once(']')?;
+        if inside.is_empty() {
+            return None;
+        }
+        let port = if tail.is_empty() {
+            default_port
+        } else {
+            tail.strip_prefix(':')?.parse().ok()?
+        };
+        (format!("[{inside}]"), port)
+    } else {
+        if rest.matches(':').count() > 1 {
+            // Unbracketed IPv6 is not a valid origin host.
+            return None;
+        }
+        match rest.split_once(':') {
+            Some((host, port)) => {
+                if host.is_empty() {
+                    return None;
+                }
+                (host.to_owned(), port.parse().ok()?)
+            }
+            None => (rest.to_owned(), default_port),
+        }
+    };
+
+    if host.is_empty() || host.contains(|c: char| c.is_whitespace() || c.is_control()) {
+        return None;
+    }
+    if port == 0 {
+        return None;
+    }
+    Some((scheme, host.to_ascii_lowercase(), port))
+}
+
+/// Parse a configured allowlist entry into the runtime match representation.
+///
+/// `null` (case-insensitive) is the opt-in sentinel for `Origin: null`; every
+/// other entry must be a bare origin. Startup validation rejects anything
+/// else, so a malformed entry here is simply dropped.
+fn parse_allowed_origin(value: &str) -> Option<AllowedOrigin> {
+    if value.eq_ignore_ascii_case("null") {
+        return Some(AllowedOrigin::Null);
+    }
+    parse_config_origin_tuple(value)
+        .map(|(scheme, host, port)| AllowedOrigin::Tuple(scheme, host, port))
+}
+
+/// Match an incoming `Origin` value against the prebuilt allow set.
+///
+/// Fails closed: a malformed value matches nothing, and only an exact
+/// normalized match (or the configured `null` sentinel) is accepted.
+fn request_origin_allowed(value: &str, allowed: &[AllowedOrigin]) -> bool {
+    if value.eq_ignore_ascii_case("null") {
+        return allowed.contains(&AllowedOrigin::Null);
+    }
+    let Some((scheme, host, port)) = parse_request_origin_tuple(value) else {
+        return false;
+    };
+    allowed.iter().any(|entry| {
+        matches!(
+            entry,
+            AllowedOrigin::Tuple(entry_scheme, entry_host, entry_port)
+                if *entry_scheme == scheme && *entry_host == host && *entry_port == port
+        )
+    })
+}
+
 /// Per the MCP spec: if the Origin header is present and its value is not in
 /// the allowed list, respond with 403 Forbidden. Requests without an Origin
 /// header are allowed through (e.g. non-browser clients like curl, SDKs).
+///
+/// Matching is normalized tuple equality (see [`parse_request_origin_tuple`]),
+/// not raw string comparison; a non-UTF-8 or malformed value fails closed with
+/// the same 403.
 // cancel-safe: origin validation and request logging are synchronous and happen
 // before the single `next.run(req)` await; nothing is published on cancellation.
 async fn origin_check_middleware(
-    allowed: Arc<[String]>,
+    allowed: Arc<[AllowedOrigin]>,
     log_request_headers: bool,
     req: Request<Body>,
     next: Next,
@@ -4100,10 +4381,15 @@ async fn origin_check_middleware(
     log_incoming_request(&method, &path, req.headers(), log_request_headers);
 
     if let Some(origin) = req.headers().get(axum::http::header::ORIGIN) {
-        let origin_str = origin.to_str().unwrap_or("");
-        if !allowed.iter().any(|a| a == origin_str) {
+        let accepted = origin
+            .to_str()
+            .is_ok_and(|value| request_origin_allowed(value, &allowed));
+        if !accepted {
+            // Non-UTF-8 values are logged as a placeholder rather than
+            // lossily converted.
+            let logged = origin.to_str().unwrap_or("<non-utf8>");
             tracing::warn!(
-                origin = origin_str,
+                origin = logged,
                 %method,
                 %path,
                 allowed = ?&*allowed,
@@ -5689,7 +5975,12 @@ mod tests {
 
     /// Build a test router with origin check middleware and a simple handler.
     fn origin_router(origins: Vec<String>, log_request_headers: bool) -> axum::Router {
-        let allowed: Arc<[String]> = Arc::from(origins);
+        let allowed: Arc<[AllowedOrigin]> = Arc::from(
+            origins
+                .into_iter()
+                .filter_map(|origin| parse_allowed_origin(&origin))
+                .collect::<Vec<_>>(),
+        );
         axum::Router::new()
             .route("/test", axum::routing::get(|| async { "ok" }))
             .layer(axum::middleware::from_fn(move |req, next| {
@@ -6528,6 +6819,264 @@ mod tests {
                 !path.contains("secret-token"),
                 "raw request path must never become a label value: {path}"
             );
+        }
+    }
+
+    /// Origin matching semantics: normalized tuple equality on both the request
+    /// and config sides, the `null` opt-in, and fail-closed parsing.
+    mod origin_semantics {
+        use super::*;
+
+        fn allowed(entries: &[&str]) -> Vec<AllowedOrigin> {
+            entries
+                .iter()
+                .map(|entry| parse_allowed_origin(entry).expect("valid test entry"))
+                .collect()
+        }
+
+        #[test]
+        fn request_parse_normalizes_scheme_host_and_ports() {
+            assert_eq!(
+                parse_request_origin_tuple("https://example.com"),
+                Some(("https".to_owned(), "example.com".to_owned(), 443))
+            );
+            assert_eq!(
+                parse_request_origin_tuple("HTTPS://EXAMPLE.COM"),
+                Some(("https".to_owned(), "example.com".to_owned(), 443))
+            );
+            assert_eq!(
+                parse_request_origin_tuple("http://example.com"),
+                Some(("http".to_owned(), "example.com".to_owned(), 80))
+            );
+            assert_eq!(
+                parse_request_origin_tuple("https://example.com:444"),
+                Some(("https".to_owned(), "example.com".to_owned(), 444))
+            );
+            assert_eq!(
+                parse_request_origin_tuple("https://example.com:443"),
+                parse_request_origin_tuple("https://example.com"),
+                "explicit default port must equal the implicit form"
+            );
+        }
+
+        #[test]
+        fn request_parse_rejects_paths_queries_fragments_and_odd_schemes() {
+            for value in [
+                "https://example.com/",
+                "https://example.com/path",
+                "https://example.com?x=1",
+                "https://example.com#frag",
+                "ws://example.com",
+                "https://",
+                "https://:443",
+                "",
+            ] {
+                assert_eq!(
+                    parse_request_origin_tuple(value),
+                    None,
+                    "{value:?} must be rejected"
+                );
+            }
+        }
+
+        #[test]
+        fn config_parse_tolerates_one_root_trailing_slash_only() {
+            assert_eq!(
+                parse_config_origin_tuple("https://example.com/"),
+                parse_config_origin_tuple("https://example.com")
+            );
+            assert_eq!(
+                parse_config_origin_tuple("https://example.com:443"),
+                parse_config_origin_tuple("https://example.com")
+            );
+            for value in [
+                "https://example.com//",
+                "https://example.com/path/",
+                "https://example.com?x=1",
+                "https://example.com#frag",
+                "ws://example.com",
+            ] {
+                assert_eq!(
+                    parse_config_origin_tuple(value),
+                    None,
+                    "{value:?} must be rejected"
+                );
+            }
+        }
+
+        #[test]
+        fn matching_uses_normalized_equality_not_raw_strings() {
+            let set = allowed(&["HTTPS://Example.COM:443/"]);
+            assert!(request_origin_allowed("https://example.com", &set));
+            assert!(request_origin_allowed("https://EXAMPLE.com:443", &set));
+            assert!(
+                !request_origin_allowed("https://example.com:444", &set),
+                "non-default ports must match exactly; there is no wildcard"
+            );
+        }
+
+        #[test]
+        fn null_is_opt_in() {
+            let without = allowed(&["https://example.com"]);
+            assert!(!request_origin_allowed("null", &without));
+            assert!(!request_origin_allowed("NULL", &without));
+
+            let with = allowed(&["null"]);
+            assert!(request_origin_allowed("null", &with));
+            assert!(request_origin_allowed("NULL", &with));
+            assert!(!request_origin_allowed("https://example.com", &with));
+        }
+
+        #[test]
+        fn malformed_or_non_matching_origins_fail_closed() {
+            let set = allowed(&["https://example.com"]);
+            for value in [
+                "",
+                "garbage",
+                "https://example.com/",
+                "https://example.com:0",
+                "https://evil.example",
+            ] {
+                assert!(
+                    !request_origin_allowed(value, &set),
+                    "{value:?} must not match"
+                );
+            }
+        }
+    }
+
+    /// Evict-then-register semantics for the framework's reserved metrics
+    /// namespace.
+    #[cfg(feature = "metrics")]
+    mod framework_metrics_guard {
+        use prometheus::{IntCounterVec, opts};
+
+        use super::*;
+
+        /// A descriptor-equivalent replacement: same name, help, and variable
+        /// labels, but its own storage.
+        fn identical_squatter() -> IntCounterVec {
+            IntCounterVec::new(
+                opts!("rmcp_server_kit_http_requests_total", "Total HTTP requests"),
+                &["method", "path", "status"],
+            )
+            .expect("counter builds")
+        }
+
+        #[test]
+        fn identical_squatter_is_evicted_and_the_real_collector_rebound() {
+            let metrics = crate::metrics::McpMetrics::new().expect("metrics build");
+            // Drop the real collector, then let a same-shape squatter take the
+            // name - the state the guard exists to repair.
+            metrics
+                .registry
+                .unregister(Box::new(metrics.http_requests_total.clone()))
+                .expect("real collector was registered");
+            metrics
+                .registry
+                .register(Box::new(identical_squatter()))
+                .expect("squatter registers under the freed name");
+
+            ensure_framework_metrics_registered(&metrics).expect("guard repairs the registry");
+
+            // The authoritative binding is restored: incrementing the real
+            // collector now reaches the served registry (with a surviving
+            // squatter and no rebind, this sample would be absent - silent
+            // telemetry loss).
+            metrics
+                .http_requests_total
+                .with_label_values(&["GET", "/healthz", "200"])
+                .inc();
+            let gathered = metrics.registry.gather();
+            let family = gathered
+                .iter()
+                .find(|family| family.name() == "rmcp_server_kit_http_requests_total")
+                .expect("framework family is served");
+            assert_eq!(
+                family.get_metric().len(),
+                1,
+                "the real collector's sample must be served exactly once"
+            );
+        }
+
+        #[test]
+        fn idempotent_on_a_healthy_registry() {
+            let metrics = crate::metrics::McpMetrics::new().expect("metrics build");
+            ensure_framework_metrics_registered(&metrics).expect("first call is a no-op");
+            ensure_framework_metrics_registered(&metrics).expect("second call is a no-op");
+
+            metrics
+                .http_requests_total
+                .with_label_values(&["GET", "/healthz", "200"])
+                .inc();
+            let gathered = metrics.registry.gather();
+            let samples: usize = gathered
+                .iter()
+                .filter(|family| family.name() == "rmcp_server_kit_http_requests_total")
+                .map(|family| family.get_metric().len())
+                .sum();
+            assert_eq!(
+                samples, 1,
+                "re-running the guard must not duplicate families"
+            );
+        }
+
+        #[test]
+        fn divergent_help_cannot_be_registered_under_a_reserved_name() {
+            let metrics = crate::metrics::McpMetrics::new().expect("metrics build");
+            metrics
+                .registry
+                .unregister(Box::new(metrics.http_requests_total.clone()))
+                .expect("real collector was registered");
+
+            // Same name, different help => different dim hash. The registry's
+            // dim-hash map survives `unregister`, so the reserved namespace is
+            // protected at the earliest point: the squatter cannot even land.
+            let squatter = IntCounterVec::new(
+                opts!("rmcp_server_kit_http_requests_total", "different help"),
+                &["method", "path", "status"],
+            )
+            .expect("counter builds");
+            let error = metrics
+                .registry
+                .register(Box::new(squatter))
+                .expect_err("divergent-help squatter must be rejected");
+            let rendered = format!("{error}");
+            assert!(
+                rendered.contains("rmcp_server_kit_http_requests_total")
+                    && rendered.contains("different"),
+                "rejection must name the conflicting family: {rendered}"
+            );
+
+            // The guard then re-establishes the authoritative binding.
+            ensure_framework_metrics_registered(&metrics)
+                .expect("guard restores the real collector");
+        }
+
+        #[test]
+        fn added_const_label_name_cannot_be_registered_under_a_reserved_name() {
+            let metrics = crate::metrics::McpMetrics::new().expect("metrics build");
+            metrics
+                .registry
+                .unregister(Box::new(metrics.rate_limited_total.clone()))
+                .expect("real collector was registered");
+
+            let squatter = IntCounterVec::new(
+                prometheus::Opts::new(
+                    "rmcp_server_kit_rate_limited_total",
+                    "Rate-limiter denials by limiter",
+                )
+                .const_label("squatter", "yes"),
+                &["limiter"],
+            )
+            .expect("counter builds");
+            metrics
+                .registry
+                .register(Box::new(squatter))
+                .expect_err("const-label-divergent squatter must be rejected");
+
+            ensure_framework_metrics_registered(&metrics)
+                .expect("guard restores the real collector");
         }
     }
 }
