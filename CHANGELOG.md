@@ -131,7 +131,15 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
   - configured entries must be bare origins (`scheme://host[:port]`); entries
     carrying a non-root path, query, or fragment - previously silently
-    ineffective at runtime - now fail configuration validation at startup;
+    ineffective at runtime - now fail configuration validation at startup, and
+    the **same rule now runs in `validate_server_config`**, which previously
+    reported `Ok` for entries `serve()` then rejected at startup;
+  - ports are accepted only as ASCII digits without leading zeros:
+    `+443`, `0443` and ` 443` were previously normalized to `443` by
+    `str::parse`, and are now rejected under both parsers;
+  - a request carrying more than one `Origin` header is rejected with the same
+    `403` - `Origin` is a single-value field, and trusting the first of several
+    values was ambiguous;
   - a non-UTF-8 or malformed `Origin` value is rejected with the same
     `403 Forbidden: Origin not allowed` (a non-UTF-8 value used to be coerced
     to an empty string, so the outcome differed by accident);
@@ -146,6 +154,22 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   case-insensitively). rmcp's internal origin check remains intentionally
   disabled: the outer layer is the single authoritative validator, so there is
   no double enforcement under diverging semantics.
+
+  Operators should read the migration note for this narrowing - including the
+  `with_max_request_body` ceiling change - in [`docs/MIGRATION.md`](docs/MIGRATION.md)
+  ("Migrating to 3.13").
+- **Validator parity: `validate_server_config` and `McpServerConfig::check` now
+  enforce the same rules for the fields both types share.** Four rules that
+  existed on one side only are now shared: the TOML validator checks
+  `max_request_body > 0`, `public_url`'s scheme and the security-header
+  overrides (all via the same helpers the builder uses), and the builder
+  rejects an empty `admin_role`. Every one of these was already rejected by
+  `serve()` at startup, so the runtime outcome for anything that reached `serve`
+  is unchanged - the fix is that the documented pre-flight validator no longer
+  reports `Ok` for a config that will not boot. A source-derived parity guard
+  (`config::tests::every_shared_config_field_is_validated_by_both`) now fails
+  when a shared field is validated on one side only, or exempted from that rule
+  without a stated reason.
 
 ## [3.12.0] - 2026-09-16
 

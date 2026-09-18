@@ -3,6 +3,61 @@
 This guide shows how to wire the standalone `rmcp-server-kit` crate into a
 downstream project, and how to migrate across breaking major releases.
 
+## Migrating to 3.13: origin validation narrowing
+
+`3.13` tightens `allowed_origins` at several points. **No default changed** - an
+empty allowlist still accepts requests without an `Origin` header - but two
+classes of configuration and one class of request that previously passed now
+fail.
+
+### `allowed_origins` entries with a path, query, or fragment are a startup error
+
+Previously such entries were accepted and simply never matched, so a
+misconfigured allowlist started cleanly and rejected every browser request.
+They now fail configuration validation with a message naming the field:
+
+```text
+allowed_origins entry "https://app.example.com/ui" must be scheme://host[:port]
+(http or https), optionally with one trailing '/', or the literal "null"
+```
+
+Fix by reducing each entry to its bare origin (`https://app.example.com`). One
+root trailing slash is tolerated (`https://app.example.com/`), and the literal
+token `null` opts in to `Origin: null` (which is rejected otherwise).
+
+**The same rule now runs in both public validators.** `validate_server_config`
+(the TOML-facing validator used by `examples/config_file_server.rs`) previously
+returned `Ok` for these entries while `serve()` rejected them at startup; both
+now call the same helper. The same pass closed three more one-sided rules:
+`validate_server_config` now also checks `max_request_body > 0`, `public_url`'s
+scheme, and the security-header overrides, and `McpServerConfig::check` now
+rejects an empty `admin_role`. Configs that hit any of those were already
+rejected by `serve()`; only the earlier validator disagreed.
+
+**Acceptance widened at the same time**, so most explicit allowlists keep
+working: scheme/host comparison is case-insensitive, and an explicit default
+port matches the implicit form (`https://x:443` is the same origin as
+`https://x`). If both spellings are listed today, one entry is now redundant.
+
+**Ports are strict.** Only ASCII digits without leading zeros are accepted, and
+a configured origin without a port matches only the default port - unlike
+rmcp's own validator, which treats an omitted port as a wildcard. A configured
+`https://x` therefore does **not** match `Origin: https://x:444`; add
+`https://x:444` explicitly if that is intended.
+
+**Requests carrying duplicate `Origin` headers are rejected** with `403`:
+`Origin` is a single-value field, and trusting the first of several values was
+ambiguous.
+
+### `with_max_request_body` above 4 MiB is now actually enforced
+
+Separately: the public `max_request_body` cap is now propagated into rmcp's own
+streamable-HTTP config, which previously kept its 4 MiB default. A deployment
+that configured the knob above 4 MiB accepted only 4 MiB; it now accepts up to
+the configured value. If the intent was to stay at 4 MiB, set the knob to
+`4194304` (or lower) and keep any front-door WAF / reverse-proxy cap in sync -
+the framework no longer rejects bodies between 4 MiB and the configured value.
+
 ## Migrating to 3.8: RFC 8693 token-exchange optionality
 
 `3.8` contains **two source-breaking API changes**, shipped in a minor release as

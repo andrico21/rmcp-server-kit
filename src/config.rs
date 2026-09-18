@@ -1329,6 +1329,17 @@ pub(crate) fn check_shared_config_invariants(
 
 /// Validate the generic server config fields.
 ///
+/// # Scope
+///
+/// This is a pre-flight for TOML files, not a substitute for the authoritative
+/// check: `serve()` runs `McpServerConfig::check`, which is the only validator
+/// that sees the fully bridged configuration - runtime-only state
+/// (`session_store`, `event_store`, ...) has no TOML representation and cannot
+/// be checked here. Every rule expressible on both types is enforced by both:
+/// the shared rules call the same helpers, and a source-derived parity guard
+/// (`every_shared_config_field_is_validated_by_both`) fails when a config field
+/// is validated on one side only.
+///
 /// # Errors
 ///
 /// Returns `RmcpServerKitError::Config` on invalid values.
@@ -1381,6 +1392,14 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
 
     if let Some(auth) = &server.auth {
         auth.validate_api_key_names()?;
+    }
+
+    // `allowed_origins` entries are checked with the same helper
+    // `McpServerConfig::check` uses, so a TOML-only consumer cannot be told
+    // the config is valid and then have `serve()` refuse it at startup.
+    for origin in &server.allowed_origins {
+        crate::transport::validate_allowed_origin_entry(origin)
+            .map_err(RmcpServerKitError::Config)?;
     }
 
     if server.max_concurrent_requests == Some(0) {
@@ -1449,6 +1468,20 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
             "server.max_concurrent_tls_handshakes must be greater than zero".into(),
         ));
     }
+
+    // Parity block: rules shared with `McpServerConfig::check`, called from
+    // both validators (or reusing the same helper) so a TOML-only consumer
+    // cannot be told the config is valid and then have `serve()` refuse it at
+    // startup. Appended last so existing error ordering is unchanged.
+    if server.max_request_body == 0 {
+        return Err(RmcpServerKitError::Config(
+            "max_request_body must be greater than zero".into(),
+        ));
+    }
+    if let Some(url) = &server.public_url {
+        crate::transport::validate_public_url_value(url).map_err(RmcpServerKitError::Config)?;
+    }
+    crate::transport::validate_security_headers(&server.security_headers)?;
 
     Ok(())
 }
@@ -2040,6 +2073,27 @@ mod tests {
                 auth.mtls = Some(mtls_config);
             }
         }
+    }
+
+    #[test]
+    fn allowed_origins_validated_by_toml_validator_too() {
+        // Parity with `McpServerConfig::check`: an entry that cannot match must
+        // fail the public TOML validator too, not only `serve()` at startup.
+        let cfg = ServerConfig {
+            allowed_origins: vec!["https://example.com/path".to_owned()],
+            ..ServerConfig::default()
+        };
+        let err = validate_server_config(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("allowed_origins"),
+            "TOML validator must reject unmatchable origins: {err}"
+        );
+
+        let ok = ServerConfig {
+            allowed_origins: vec!["https://example.com/".to_owned(), "null".to_owned()],
+            ..ServerConfig::default()
+        };
+        validate_server_config(&ok).expect("equivalent and null entries stay valid");
     }
 
     #[test]
@@ -3062,6 +3116,195 @@ mod tests {
             assert!(
                 rendered.contains(&format!("{field}:")),
                 "hand-written Debug omits `{field}`; add it (redacted if sensitive)"
+            );
+        }
+    }
+
+    /// Fields of `struct` `marker`, including `pub(crate)` ones.
+    fn struct_fields_in(source: &str, marker: &str) -> Vec<String> {
+        let (_, after) = source
+            .split_once(marker)
+            .unwrap_or_else(|| panic!("struct start marker {marker:?} not found"));
+        let (body, _) = after
+            .split_once("\n}\n")
+            .expect("struct end marker not found");
+        body.lines()
+            .filter_map(|line| {
+                let trimmed = line.trim();
+                let rest = trimmed
+                    .strip_prefix("pub(crate) ")
+                    .or_else(|| trimmed.strip_prefix("pub "))?;
+                rest.split_once(':').map(|(name, _)| name.trim().to_owned())
+            })
+            .collect()
+    }
+
+    /// Bodies of every function at `indent` whose signature line satisfies
+    /// `wanted`, ending at the first following line that is exactly `indent}`.
+    /// Line-based extraction is sound because the tree is rustfmt-clean.
+    fn function_bodies(source: &str, indent: &str, wanted: &dyn Fn(&str) -> bool) -> Vec<String> {
+        let lines: Vec<&str> = source.lines().collect();
+        let close = format!("{indent}}}");
+        let inner_indent = format!("{indent}    ");
+        let mut out = Vec::new();
+        let mut index = 0;
+        while index < lines.len() {
+            let line = lines[index];
+            let at_this_indent = line.starts_with(indent) && !line.starts_with(&inner_indent);
+            if at_this_indent && wanted(line) {
+                let mut body = String::from(line);
+                index += 1;
+                while index < lines.len() && lines[index] != close {
+                    body.push_str(lines[index]);
+                    body.push('\n');
+                    index += 1;
+                }
+                out.push(body);
+            }
+            index += 1;
+        }
+        out
+    }
+
+    /// Whole-word containment, so `auth` does not match `authorize`.
+    fn mentions_identifier(haystack: &str, needle: &str) -> bool {
+        let boundary = |c: Option<char>| c.is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+        haystack.match_indices(needle).any(|(start, _)| {
+            let end = start + needle.len();
+            let before = haystack.get(..start).and_then(|s| s.chars().next_back());
+            let after = haystack.get(end..).and_then(|s| s.chars().next());
+            boundary(before) && boundary(after)
+        })
+    }
+
+    /// Fields present in BOTH config types that neither validator needs a rule
+    /// for.
+    ///
+    /// Hand-maintained on purpose, mirroring `ENV_OVERRIDE_EXCLUDED_FIELDS`:
+    /// `every_shared_config_field_is_validated_by_both` fails until a shared
+    /// field is validated by both validators or listed here with a reason.
+    /// Without this, a rule added to one validator silently stops at the
+    /// other - the defect class that let `allowed_origins` reach `serve()`
+    /// while `validate_server_config` reported `Ok`.
+    const VALIDATION_PARITY_EXEMPT: &[(&str, &str)] = &[
+        ("compression_enabled", "bool; no invalid state exists"),
+        (
+            "compression_min_size",
+            "zero is meaningful (compress every response); neither validator has a rule for it",
+        ),
+        ("expose_build_metadata", "bool; no invalid state exists"),
+        ("key_eviction_policy", "enum; every variant is valid"),
+        (
+            "task_binding",
+            "bool; the secret it reuses is validated through `session_binding_secret`, and the pairing itself happens at router build (`resolve_binding_secret`), which is runtime state neither config type owns",
+        ),
+        (
+            "request_timeout",
+            "builder side is a Duration, which cannot be malformed; the TOML string form is parsed and rejected there",
+        ),
+        (
+            "session_idle_timeout",
+            "builder side is a Duration, which cannot be malformed; the TOML string form is parsed and rejected there",
+        ),
+        (
+            "shutdown_timeout",
+            "builder side is a Duration, which cannot be malformed; the TOML string form is parsed and rejected there",
+        ),
+        (
+            "sse_keep_alive",
+            "builder side is a Duration, which cannot be malformed; the TOML string form is parsed and rejected there",
+        ),
+        ("tool_list_filtering", "bool; no invalid state exists"),
+    ];
+
+    #[test]
+    fn every_shared_config_field_is_validated_by_both() {
+        let toml_source = include_str!("config.rs");
+        let builder_source = include_str!("transport.rs");
+
+        let toml_fields = struct_fields_in(toml_source, "pub struct ServerConfig {");
+        let builder_fields = struct_fields_in(builder_source, "pub struct McpServerConfig {");
+        let shared: Vec<String> = toml_fields
+            .iter()
+            .filter(|field| builder_fields.contains(field))
+            .cloned()
+            .collect();
+        assert!(
+            shared.len() >= 25,
+            "parity guard parsed only {} shared fields; the struct shape changed - fix the parser",
+            shared.len()
+        );
+
+        // Derived surfaces: every top-level fn taking a `&ServerConfig` in
+        // `config.rs` (plus the shared-invariant helper), and every `check*`
+        // method on `McpServerConfig`.
+        let toml_surface: String = function_bodies(toml_source, "", &|line| {
+            (line.contains("fn ")
+                && (line.contains("&ServerConfig") || line.contains(": ServerConfig")))
+                || line.trim_start().starts_with("pub(crate) fn check_shared_")
+        })
+        .join("\n");
+        let builder_surface: String = function_bodies(builder_source, "    ", &|line| {
+            line.trim_start().starts_with("fn check")
+                || line.trim_start().starts_with("pub fn check")
+        })
+        .join("\n");
+
+        // Sanity: the extraction must have found the validators it knows about.
+        // These fail loudly if a validator is renamed or reformatted, which is
+        // the safe direction for a hand-written expectation.
+        for expected in [
+            "fn validate_server_config",
+            "fn validate_rate_limit_knobs",
+            "fn validate_mtls_knobs",
+            "fn validate_trusted_forwarder_config",
+            "fn check_shared_config_invariants",
+        ] {
+            assert!(
+                toml_surface.contains(expected),
+                "TOML validator surface lost `{expected}`; update the extraction rule"
+            );
+        }
+        for expected in [
+            "fn check(",
+            "fn check_burst_knobs",
+            "fn check_trusted_forwarder",
+            "fn check_session_binding_config",
+            "fn check_metrics_handle",
+        ] {
+            assert!(
+                builder_surface.contains(expected),
+                "builder validator surface lost `{expected}`; update the extraction rule"
+            );
+        }
+
+        for field in &shared {
+            if let Some((_, reason)) = VALIDATION_PARITY_EXEMPT
+                .iter()
+                .find(|(name, _)| name == field)
+            {
+                assert!(
+                    !reason.trim().is_empty(),
+                    "`{field}` is exempted without a reason"
+                );
+                continue;
+            }
+            assert!(
+                mentions_identifier(&toml_surface, field),
+                "`{field}` is not validated by `validate_server_config`; add the rule there, \
+                 or exempt it in VALIDATION_PARITY_EXEMPT with a reason"
+            );
+            assert!(
+                mentions_identifier(&builder_surface, field),
+                "`{field}` is not validated by `McpServerConfig::check`; add the rule there, \
+                 or exempt it in VALIDATION_PARITY_EXEMPT with a reason"
+            );
+        }
+
+        for (field, _) in VALIDATION_PARITY_EXEMPT {
+            assert!(
+                shared.iter().any(|candidate| candidate == field),
+                "VALIDATION_PARITY_EXEMPT lists `{field}`, which is no longer shared by both config types"
             );
         }
     }

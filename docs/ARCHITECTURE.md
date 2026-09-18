@@ -47,7 +47,7 @@ The crate has two transports:
 | Transport          | Function                                            | Auth/RBAC/TLS  | Use case                                         |
 |--------------------|-----------------------------------------------------|----------------|--------------------------------------------------|
 | **Streamable HTTP**| `serve()` - `src/transport.rs:2519`                 | **Yes**        | Production network deployment                    |
-| stdio              | `serve_stdio()` - `src/transport.rs:4480`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
+| stdio              | `serve_stdio()` - `src/transport.rs:4523`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
 
 ---
 

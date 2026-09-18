@@ -1334,6 +1334,18 @@ impl McpServerConfig {
         Ok(())
     }
 
+    /// 6e. An empty `admin_role` gates `/admin/*` behind a role no identity can
+    /// hold. The TOML validator has always rejected it; the builder now
+    /// matches, so the two public validators cannot disagree.
+    fn check_admin_role(&self) -> Result<(), RmcpServerKitError> {
+        if self.admin_enabled && self.admin_role.trim().is_empty() {
+            return Err(RmcpServerKitError::Config(
+                "admin_role must not be empty".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Validate the burst knobs: every burst must be greater than zero
     /// when set, and the two top-level bursts require their base limiter
     /// to be configured. The auth bursts
@@ -1497,13 +1509,11 @@ impl McpServerConfig {
             )));
         }
 
-        // 4. public_url scheme
-        if let Some(ref url) = self.public_url
-            && !(url.starts_with("http://") || url.starts_with("https://"))
+        // 4. public_url scheme (shared with the TOML validator).
+        if let Some(url) = &self.public_url
+            && let Err(message) = validate_public_url_value(url)
         {
-            return Err(RmcpServerKitError::Config(format!(
-                "public_url {url:?} must start with http:// or https://"
-            )));
+            return Err(RmcpServerKitError::Config(message));
         }
 
         // 5. allowed_origins entries must be bare origins: scheme://host[:port]
@@ -1512,12 +1522,7 @@ impl McpServerConfig {
         //    fragment used to be silently ineffective at runtime; they now
         //    fail fast at startup.
         for origin in &self.allowed_origins {
-            if parse_allowed_origin(origin).is_none() {
-                return Err(RmcpServerKitError::Config(format!(
-                    "allowed_origins entry {origin:?} must be scheme://host[:port] (http or https), \
-                     optionally with one trailing '/', or the literal \"null\""
-                )));
-            }
+            validate_allowed_origin_entry(origin).map_err(RmcpServerKitError::Config)?;
         }
 
         // 6. max_request_body > 0
@@ -1542,6 +1547,9 @@ impl McpServerConfig {
 
         // 6c. Burst knobs (extracted helper).
         self.check_burst_knobs()?;
+
+        // 6e. Admin-role parity (extracted helper).
+        self.check_admin_role()?;
 
         // 6d. Trusted-forwarder knobs (extracted helper).
         self.check_trusted_forwarder()?;
@@ -3867,7 +3875,9 @@ fn apply_security_header(
 ///   want to commit to the HSTS preload list must do so via a future
 ///   explicit `with_hsts_preload(true)` builder, not by smuggling
 ///   `preload` through this knob.
-fn validate_security_headers(cfg: &SecurityHeadersConfig) -> Result<(), RmcpServerKitError> {
+pub(crate) fn validate_security_headers(
+    cfg: &SecurityHeadersConfig,
+) -> Result<(), RmcpServerKitError> {
     use axum::http::HeaderValue;
 
     let fields: &[(&str, Option<&str>)] = &[
@@ -4267,6 +4277,24 @@ fn parse_config_origin_tuple(value: &str) -> Option<(String, String, u16)> {
     parse_origin(value, true)
 }
 
+/// Parse an explicit port under the crate's strict rules.
+///
+/// ASCII digits only - `str::parse` alone would accept `+443` and ` 443` -
+/// and no leading zeros, so `0443` is rejected rather than silently
+/// normalized to `443`. Port `0` is not a valid origin port.
+fn parse_port_token(token: &str) -> Option<u16> {
+    if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    if token.len() > 1 && token.starts_with('0') {
+        return None;
+    }
+    match token.parse::<u16>() {
+        Ok(0) | Err(_) => None,
+        Ok(port) => Some(port),
+    }
+}
+
 /// Shared parser behind [`parse_request_origin_tuple`] and
 /// [`parse_config_origin_tuple`].
 fn parse_origin(value: &str, allow_root_slash: bool) -> Option<(String, String, u16)> {
@@ -4299,7 +4327,7 @@ fn parse_origin(value: &str, allow_root_slash: bool) -> Option<(String, String, 
         let port = if tail.is_empty() {
             default_port
         } else {
-            tail.strip_prefix(':')?.parse().ok()?
+            parse_port_token(tail.strip_prefix(':')?)?
         };
         (format!("[{inside}]"), port)
     } else {
@@ -4312,7 +4340,7 @@ fn parse_origin(value: &str, allow_root_slash: bool) -> Option<(String, String, 
                 if host.is_empty() {
                     return None;
                 }
-                (host.to_owned(), port.parse().ok()?)
+                (host.to_owned(), parse_port_token(port)?)
             }
             None => (rest.to_owned(), default_port),
         }
@@ -4338,6 +4366,35 @@ fn parse_allowed_origin(value: &str) -> Option<AllowedOrigin> {
     }
     parse_config_origin_tuple(value)
         .map(|(scheme, host, port)| AllowedOrigin::Tuple(scheme, host, port))
+}
+
+/// Validate a `public_url` value: it must be an `http`/`https` URL.
+///
+/// Shared by `McpServerConfig::check` and `config::validate_server_config` so
+/// the two public validators cannot disagree.
+pub(crate) fn validate_public_url_value(url: &str) -> Result<(), String> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(format!(
+            "public_url {url:?} must start with http:// or https://"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate one `allowed_origins` entry, returning the operator-facing message
+/// on failure.
+///
+/// Shared by `McpServerConfig::check` and `config::validate_server_config` so
+/// the two public validators cannot disagree: a TOML-file consumer must not be
+/// told a config is valid and then have `serve()` refuse it at startup.
+pub(crate) fn validate_allowed_origin_entry(entry: &str) -> Result<(), String> {
+    if parse_allowed_origin(entry).is_none() {
+        return Err(format!(
+            "allowed_origins entry {entry:?} must be scheme://host[:port] (http or https), \
+             optionally with one trailing '/', or the literal \"null\""
+        ));
+    }
+    Ok(())
 }
 
 /// Match an incoming `Origin` value against the prebuilt allow set.
@@ -4380,16 +4437,24 @@ async fn origin_check_middleware(
 
     log_incoming_request(&method, &path, req.headers(), log_request_headers);
 
-    if let Some(origin) = req.headers().get(axum::http::header::ORIGIN) {
-        let accepted = origin
-            .to_str()
-            .is_ok_and(|value| request_origin_allowed(value, &allowed));
+    // `Origin` is a single-value field: a request carrying more than one is
+    // malformed, so fail closed rather than trusting whichever value a
+    // different consumer might have read. Requests without the header pass
+    // through (curl, SDKs, server-to-server clients).
+    let mut origins = req.headers().get_all(axum::http::header::ORIGIN).iter();
+    if let Some(origin) = origins.next() {
+        let duplicate_origin_headers = origins.next().is_some();
+        let accepted = !duplicate_origin_headers
+            && origin
+                .to_str()
+                .is_ok_and(|value| request_origin_allowed(value, &allowed));
         if !accepted {
             // Non-UTF-8 values are logged as a placeholder rather than
             // lossily converted.
             let logged = origin.to_str().unwrap_or("<non-utf8>");
             tracing::warn!(
                 origin = logged,
+                duplicate_origin_headers,
                 %method,
                 %path,
                 allowed = ?&*allowed,
@@ -6940,6 +7005,55 @@ mod tests {
                 assert!(
                     !request_origin_allowed(value, &set),
                     "{value:?} must not match"
+                );
+            }
+        }
+
+        #[test]
+        fn non_canonical_port_spellings_are_rejected() {
+            // `str::parse::<u16>` alone accepts `+443` and ` 443`, and
+            // normalizes `0443`; none of those is a canonical origin port.
+            for value in [
+                "https://example.com:+443",
+                "https://example.com:0443",
+                "https://example.com: 443",
+                "https://example.com:-443",
+                "https://example.com:44 3",
+                "https://example.com:65536",
+            ] {
+                assert_eq!(
+                    parse_request_origin_tuple(value),
+                    None,
+                    "{value:?} must be rejected"
+                );
+                assert_eq!(
+                    parse_config_origin_tuple(value),
+                    None,
+                    "{value:?} must be rejected in config too"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn duplicate_origin_headers_are_rejected() {
+            // `Origin` is a single-value field; a request carrying two is
+            // malformed and must fail closed regardless of which value matches.
+            for values in [
+                ["https://example.com", "https://example.com"],
+                ["https://example.com", "https://evil.example"],
+            ] {
+                let app = origin_router(vec!["https://example.com".into()], false);
+                let req = Request::builder()
+                    .uri("/test")
+                    .header(header::ORIGIN, values[0])
+                    .header(header::ORIGIN, values[1])
+                    .body(Body::empty())
+                    .unwrap();
+                let resp = app.oneshot(req).await.unwrap();
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::FORBIDDEN,
+                    "duplicated Origin headers must fail closed: {values:?}"
                 );
             }
         }

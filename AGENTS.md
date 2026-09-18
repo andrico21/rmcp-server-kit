@@ -188,7 +188,7 @@ consumer applications and `examples/`.
 |------------------------------------------|----------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------|
 | Crate root / public API                  | [`src/lib.rs`](src/lib.rs)                                            | Re-exports all public modules                                                                          |
 | **Server entry (HTTP)**                  | [`src/transport.rs`](src/transport.rs) - `serve()` (~line 2519)        | The function consumers call. Wires rmcp + axum + middleware + TLS + admin + metrics                    |
-| Server entry (stdio)                     | [`src/transport.rs`](src/transport.rs) - `serve_stdio()` (~line 4480) | For desktop/IDE clients. **Bypasses auth/RBAC/TLS** - use only for local subprocess MCP                |
+| Server entry (stdio)                     | [`src/transport.rs`](src/transport.rs) - `serve_stdio()` (~line 4551) | For desktop/IDE clients. **Bypasses auth/RBAC/TLS** - use only for local subprocess MCP                |
 | Config builder                           | [`src/transport.rs`](src/transport.rs) - `McpServerConfig::new` (~line 536) | Builder-style config struct                                                                       |
 | Hot-reload handle                        | [`src/transport.rs`](src/transport.rs) - `ReloadHandle` (~line 1612)   | `try_reload_auth_keys` / `reload_auth_keys` / `reload_rbac` for runtime reconfig without restart      |
 | Runnable example                         | [`examples/minimal_server.rs`](examples/minimal_server.rs)            | Smallest possible consumer of `serve()`                                                                |
@@ -369,6 +369,7 @@ The most-violated rules - all `deny`-level in `Cargo.toml`:
 - [`docs/RUST_1_95_NOTES.md`](docs/RUST_1_95_NOTES.md) - Rust 1.95 idioms used here
 - [`docs/MIGRATION.md`](docs/MIGRATION.md) - version-migration notes
 - [`docs/RELEASING.md`](docs/RELEASING.md) - release process
+- [`docs/decisions/`](docs/decisions/) - internal decision records whose rulings constrain the code (e.g. the 2026-07-28 stateless posture)
 - [`docs/RMCP_UPGRADE_CHECKLIST.md`](docs/RMCP_UPGRADE_CHECKLIST.md) - the checks to run when `rmcp` moves
 - [Model Context Protocol spec](https://modelcontextprotocol.io/)
 - [`rmcp` docs](https://docs.rs/rmcp)
