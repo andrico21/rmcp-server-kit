@@ -23,7 +23,7 @@
 #   * Coverage via `cargo llvm-cov` (lcov -> GitLab native UI).
 #   * Cache keyed on Cargo.toml hash + job, scoped per branch.
 #   * MR pipelines run the full required gate; main re-runs everything
-#     plus publish-dry-run; tags run the release job.
+#     plus publish-dry-run; tags run validation jobs only.
 
 include:
   - template: Security/SAST.gitlab-ci.yml
@@ -37,7 +37,6 @@ stages:
   - docs      # rustdoc + SECURITY.md citation grep
   - deep      # bench thresholds, vet (advisory)
   - nightly   # mutants (schedule-only)
-  - release   # publish to crates.io on tag
 
 variables:
   CARGO_TERM_COLOR: always
@@ -349,58 +348,3 @@ mutants:
     expire_in: 1 month
     paths:
       - mutants.out
-
-# ---------------------------------------------------------------------------
-# Release stage: tag-triggered publish to crates.io
-# ---------------------------------------------------------------------------
-
-publish:
-  stage: release
-  needs: []
-  rules:
-    - if: $CI_COMMIT_TAG =~ /^[0-9]+\.[0-9]+\.[0-9]+(-.*)?$/
-  variables:
-    # Don't fail-loud on missing CARGO_REGISTRY_TOKEN: explicit check below
-    # gives a clearer error than `cargo publish` would.
-    GIT_DEPTH: "0"
-  script:
-    - |
-      set -euo pipefail
-      TAG="${CI_COMMIT_TAG}"
-      CRATE_VERSION=$(cargo metadata --no-deps --format-version 1 \
-        | jq -r '.packages[] | select(.name == "rmcp-server-kit") | .version')
-      if [ "$TAG" != "$CRATE_VERSION" ]; then
-        echo "ERROR: git tag $TAG does not match Cargo.toml version $CRATE_VERSION" >&2
-        exit 1
-      fi
-      if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
-        echo "ERROR: CARGO_REGISTRY_TOKEN is not set as a CI/CD variable" >&2
-        exit 1
-      fi
-    - |
-      set -euo pipefail
-      TAG="${CI_COMMIT_TAG}"
-      NOTES_PATH="${CI_PROJECT_DIR}/RELEASE_NOTES.md"
-      awk -v ver="$TAG" '
-        $0 ~ "^## \\[" ver "\\]" { found=1; next }
-        found && /^## \[/        { exit }
-        found                    { print }
-      ' CHANGELOG.md > "$NOTES_PATH"
-      if [ ! -s "$NOTES_PATH" ]; then
-        echo "ERROR: No CHANGELOG.md section found for version $TAG" >&2
-        exit 1
-      fi
-      echo "----- RELEASE_NOTES.md -----"
-      cat "$NOTES_PATH"
-      echo "----- end -----"
-    - rtk cargo publish --dry-run --all-features
-    - rtk cargo publish --all-features --token "$CARGO_REGISTRY_TOKEN"
-  artifacts:
-    when: always
-    expire_in: 1 year
-    paths:
-      - RELEASE_NOTES.md
-  release:
-    tag_name: "$CI_COMMIT_TAG"
-    name: "rmcp-server-kit $CI_COMMIT_TAG"
-    description: "./RELEASE_NOTES.md"

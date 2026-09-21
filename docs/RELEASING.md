@@ -80,9 +80,8 @@ curl -s "https://crates.io/api/v1/crates/rmcp-server-kit" | jq -r '.crate.max_ve
 > **A pushed tag is not a release.** Verify `max_version` on crates.io matches
 > the tag before considering the release done.
 
-> **Tag the canonical remote only.** `.gitlab-ci.yml` fires its own
-> `cargo publish` on any `MAJOR.MINOR.PATCH` tag, so pushing the tag to the
-> GitLab mirror as well would attempt a duplicate upload.
+> **The GitLab mirror does not publish releases.** Tags pushed there are inert;
+> crates.io publication is handled only by the canonical GitHub release path.
 
 ### A note on `cargo vet` and the version bump
 
