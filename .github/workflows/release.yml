@@ -41,10 +41,17 @@ on:
 jobs:
   publish:
     name: cargo publish
-    # Cheap pre-gate: only proceed if the triggering CI run succeeded.
-    # The deeper checks (tag existence, name match) happen in steps so
-    # they emit a clear ::error:: message in the run log.
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    # Provenance gate (runs BEFORE the untrusted checkout below): require a
+    # succeeded CI run whose head_repository is THIS repo (excludes fork PRs)
+    # and whose event is push or workflow_dispatch. workflow_dispatch is the
+    # documented manual-rerun recovery path and is not fork-triggerable, so it
+    # must stay; pull_request/schedule are excluded by this allowlist form.
+    # Deeper checks (tag existence, version match) still happen in later steps.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      (github.event.workflow_run.event == 'push' ||
+       github.event.workflow_run.event == 'workflow_dispatch')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -57,9 +64,16 @@ jobs:
           ref: ${{ github.event.workflow_run.head_sha }}
           # We need tags for the `git tag --points-at` lookup below.
           fetch-depth: 0
+          # This job only reads local git metadata; it never pushes, so no
+          # push credential is persisted into the untrusted-head_sha checkout.
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          # Single-build job: never write the shared cache from here, so an
+          # untrusted head_sha cannot poison a cache other jobs restore.
+          save-if: false
 
       - name: Find semver tag pointing at this commit
         id: find-tag
