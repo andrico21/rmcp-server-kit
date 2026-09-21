@@ -40,6 +40,53 @@ role.
 naming the first offending index, e.g. `auth.api_keys[1] reuses the name
 'ops' with role 'viewer' while an earlier entry uses role 'admin'`.
 
+## Migrating to 3.14: CRL discovery rate limit is now per source peer IP
+
+The `mtls.crl_discovery_rate_per_min` budget that gates admission of *new*
+CDP URLs into the CRL fetch pipeline is now applied **per source peer IP**
+for attributed TLS handshakes, instead of as a single process-global bucket.
+This is a **minor**, additive change: no config field is added or removed,
+`crl_discovery_rate_per_min` keeps its name, type, `#[serde(default)]`, and
+validation, and no public signature changes -- so `cargo semver-checks`
+reports nothing. Only the *documented semantics* of an existing knob change,
+which is what this note exists to record.
+
+**Impact:** the numeric value is now each peer's **own** per-minute quota,
+not a shared ceiling. Before this change, one unauthenticated peer presenting
+throwaway certificates carrying unique CDP URLs could drain the single global
+budget and fail-closed (`crl_deny_on_unavailable = true`) a concurrent
+legitimate peer whose certificate pointed at a not-yet-cached CDP. After it,
+each peer draws on its own bucket, so that cross-peer starvation is removed.
+The aggregate *rate* ceiling across all attributed peers is intentionally
+gone; memory and outbound work stay bounded by the unchanged queue/dedup
+(`crl_max_seen_urls`), cache (`crl_max_cache_entries`), and fetch-concurrency
+(`crl_max_concurrent_fetches`) caps, and the discovery receiver still
+processes URLs serially.
+
+**This has no opt-out and is not operator-tunable beyond the existing knob.**
+The per-peer quota reuses `crl_discovery_rate_per_min` as-is; there is
+deliberately no new `MtlsConfig` field (adding one would break every existing
+TOML under `deny_unknown_fields` and make rollback breaking). The per-peer
+key is the **direct** peer IP: behind a TCP load balancer that terminates the
+connection it is the balancer's address, and per-IP keying does not by itself
+defeat a distributed attacker. Submissions with no attributed handshake peer
+-- a `DynamicClientCertVerifier` built outside this crate's transport -- fall
+back to the pre-change process-global bucket.
+
+**Action required:** none for the common case. If you deliberately relied on
+the *global* rate ceiling as a cap on total outbound CRL discovery across all
+peers, note that ceiling is now per-peer; the bounded queue/cache/fetch caps
+remain your aggregate bound. If you sized `crl_discovery_rate_per_min` low to
+throttle the whole process, consider whether each *individual* peer now needs
+that headroom (a single peer pointing at many distinct CDP URLs draws on one
+peer bucket).
+
+**Observable signature:** discovery drops now emit a throttled
+`discovery_rate_limited` WARN (per-peer when attributed, global otherwise); a
+new throttled `discovery_unattributed_fallback` WARN fires only when
+discovery runs with no handshake peer scope (i.e. the per-peer path is not
+active), which on the standard transport should never happen.
+
 ## Migrating to 3.13: origin validation narrowing
 
 `3.13` tightens `allowed_origins` at several points. **No default changed** - an

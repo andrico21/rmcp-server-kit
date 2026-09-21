@@ -28,6 +28,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    net::IpAddr,
     num::NonZeroU32,
     pin::Pin,
     sync::{Arc, Mutex},
@@ -61,6 +62,7 @@ use x509_parser::{
 
 use crate::{
     auth::MtlsConfig,
+    bounded_limiter::BoundedKeyedLimiter,
     error::RmcpServerKitError,
     ssrf::{check_scheme, ip_block_reason, sanitized_url_for_log},
 };
@@ -80,6 +82,18 @@ const CRL_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// a private constant rather than a config field: no operator should need to
 /// tune it, and widening the public config surface for it would be worse.
 const MAX_RELEVANT_CDP_URLS_PER_HANDSHAKE: usize = 64;
+
+/// Peer-key cap for CRL discovery admission. Matches the house pair used by
+/// the tool and extra-route limiters.
+const CRL_DISCOVERY_MAX_TRACKED_PEERS: usize = 10_000;
+/// Idle-eviction window for CRL discovery peer keys. Matches the house pair.
+const CRL_DISCOVERY_PEER_IDLE_EVICTION: Duration = Duration::from_mins(15);
+
+tokio::task_local! {
+    /// Peer IP of the TLS handshake being verified on this task. Set by the
+    /// accept path; read by discovery admission. Absent outside a handshake.
+    pub(crate) static CURRENT_HANDSHAKE_PEER: IpAddr;
+}
 
 /// Parsed CRL cached in memory and keyed by its source URL.
 #[derive(Clone, Debug)]
@@ -297,17 +311,24 @@ pub struct CrlSet {
     /// on demand (see [`acquire_host_semaphore`]), so the cap only rejects
     /// genuinely concurrent fetch floods and is never a permanent lockout.
     host_semaphores: Arc<tokio::sync::Mutex<HashMap<String, Arc<Semaphore>>>>,
-    /// Global rate-limiter on discovery URL submissions; protects against
-    /// cert-driven URL flooding by a malicious mTLS peer.
+    /// Process-global rate-limiter on discovery URL submissions; the
+    /// **fallback** admission path, consulted only when a submission arrives
+    /// with no attributed handshake peer (see `discovery_limiter_per_peer`).
     ///
-    /// Note: this ships as a process-global limiter; per-source-IP scoping
-    /// is deferred to a future release because the rustls
-    /// `verify_client_cert` callback does not carry a `SocketAddr` for the
-    /// peer. This is a CRL-discovery limiter in the TLS verifier path -
-    /// distinct from the bearer pre-auth limiter (`AuthState`), which is
-    /// already keyed per-IP via a bounded keyed governor and lives in the
-    /// ordinary request middleware path.
+    /// Attributed handshakes -- the sole production path, via the
+    /// `CURRENT_HANDSHAKE_PEER` scope installed by the TLS accept worker in
+    /// `crate::transport` -- consult the per-peer limiter instead, so one peer
+    /// can no longer drain another peer's discovery budget. This global bucket
+    /// still guards the unattributed path: a downstream verifier built outside
+    /// this crate's transport, or any future caller of `note_discovered_urls`
+    /// without a handshake scope. Distinct from the bearer pre-auth limiter
+    /// (`AuthState`), which is already keyed per-IP via a bounded keyed
+    /// governor and lives in the ordinary request middleware path.
     discovery_limiter: Arc<DefaultDirectRateLimiter>,
+    /// Per-peer discovery admission for attributed handshakes. Quota mirrors
+    /// `crl_discovery_rate_per_min`, so a single peer sees today's rate; what
+    /// changes is that one peer can no longer consume another peer's budget.
+    discovery_limiter_per_peer: Arc<BoundedKeyedLimiter<IpAddr>>,
     /// Cached cap on per-fetch response body size; copied from `config` so the
     /// hot path doesn't re-read the (rarely changing) config struct.
     max_response_bytes: u64,
@@ -389,6 +410,11 @@ impl CrlSet {
         let rate =
             NonZeroU32::new(config.crl_discovery_rate_per_min.max(1)).unwrap_or(NonZeroU32::MIN);
         let discovery_limiter = Arc::new(RateLimiter::direct(Quota::per_minute(rate)));
+        let discovery_limiter_per_peer = Arc::new(BoundedKeyedLimiter::with_per_minute(
+            config.crl_discovery_rate_per_min,
+            CRL_DISCOVERY_MAX_TRACKED_PEERS,
+            CRL_DISCOVERY_PEER_IDLE_EVICTION,
+        ));
 
         let max_response_bytes = config.crl_max_response_bytes;
 
@@ -409,6 +435,7 @@ impl CrlSet {
             global_fetch_sem,
             host_semaphores,
             discovery_limiter,
+            discovery_limiter_per_peer,
             max_response_bytes,
             last_cap_warn: Mutex::new(HashMap::new()),
             #[cfg(any(test, feature = "test-helpers"))]
@@ -508,6 +535,41 @@ impl CrlSet {
         if self.should_warn_throttled("cache_entry_mismatch") {
             tracing::warn!(
                 "crl_cache_out_of_band_mutation: live CRL cache does not match the committed identity index; denying handshake"
+            );
+        }
+    }
+
+    /// Report a CDP discovery submission dropped by the per-minute limiter --
+    /// per-peer when the handshake peer is attributed, process-global
+    /// otherwise. Throttled through `should_warn_throttled` exactly like the
+    /// cap warnings: the drain happens on the unauthenticated handshake path,
+    /// so an unthrottled `warn!` here would itself be a log-flood amplifier of
+    /// the same class this limiter defends against. Throttling trades away a
+    /// line per dropped URL for flood resistance: at most one line survives per
+    /// cooldown window, naming whichever `url` tripped it rather than every one.
+    fn warn_discovery_rate_limited_throttled(&self, url: &str) {
+        if self.should_warn_throttled("discovery_rate_limited") {
+            tracing::warn!(
+                url = %url,
+                "discovery_rate_limited: dropped CDP URL beyond the per-minute cap (per-peer when the handshake peer is attributed, process-global otherwise; will be retried on the next handshake observing this URL)"
+            );
+        }
+    }
+
+    /// Report that discovery ran with no attributed handshake peer, so per-peer
+    /// admission was unavailable and the process-global limiter was consulted
+    /// as a fallback. The happy path -- attributed TLS handshakes driven by the
+    /// scoped accept worker in `crate::transport` -- never triggers this; it is
+    /// a regression canary. If a future edit drops the `CURRENT_HANDSHAKE_PEER`
+    /// scope, per-peer isolation silently reverts to global-only admission and
+    /// this WARN is what makes that observable. Downstream users constructing
+    /// `DynamicClientCertVerifier` outside this crate's transport also land
+    /// here. Throttled like the cap warnings for the same flood-resistance
+    /// reason.
+    fn warn_unattributed_discovery_throttled(&self) {
+        if self.should_warn_throttled("discovery_unattributed_fallback") {
+            tracing::warn!(
+                "discovery_unattributed_fallback: CDP discovery ran without a handshake peer scope; per-peer admission unavailable, using the process-global discovery limiter"
             );
         }
     }
@@ -830,13 +892,29 @@ impl CrlSet {
 
         // Rate-limit gate: drop excess submissions on the floor with a WARN.
         // The mTLS verifier must remain non-blocking, so we use the
-        // synchronous `check()` API and never await here.
+        // synchronous `check()`/`check_key()` APIs and never await here.
+        //
+        // Admission is per-peer when the handshake peer is attributed via the
+        // `CURRENT_HANDSHAKE_PEER` task-local (set by the TLS accept worker),
+        // and falls back to the process-global limiter only when no handshake
+        // scope is present. SECURITY (order is load-bearing): the
+        // `governor`-backed `check()`/`check_key()` APIs CONSUME a token rather
+        // than peek, so an attributed peer must consult ONLY its own bucket --
+        // also consulting the global bucket would let a rejected attacker still
+        // drain the shared budget, the exact cross-peer starvation this fixes.
         for url in candidates {
-            if self.discovery_limiter.check().is_err() {
-                tracing::warn!(
-                    url = %url,
-                    "discovery_rate_limited: dropped CDP URL beyond per-minute cap (will be retried on next handshake observing this URL)"
-                );
+            let admitted = if let Ok(peer) = CURRENT_HANDSHAKE_PEER.try_with(|ip| *ip) {
+                self.discovery_limiter_per_peer.check_key(&peer).is_ok()
+            } else {
+                // No handshake scope: preserve the pre-change process-global
+                // behaviour exactly. Emitted (throttled) so a future
+                // regression dropping the task-local scope is observable
+                // rather than silently reverting to global-only admission.
+                self.warn_unattributed_discovery_throttled();
+                self.discovery_limiter.check().is_ok()
+            };
+            if !admitted {
+                self.warn_discovery_rate_limited_throttled(&url);
                 continue;
             }
             let inserted = {
@@ -3308,6 +3386,131 @@ mod tests {
         assert!(
             !set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&url), &[]),
             "fail-open must stay fail-open for out-of-band mutation"
+        );
+    }
+
+    // ---- WO-R6: per-peer CRL discovery admission ---------------------------
+
+    /// A single peer draining its own per-peer discovery quota must not deny a
+    /// concurrent legitimate peer presenting a not-yet-cached CDP URL -- the
+    /// cross-peer starvation the process-global limiter allowed and per-peer
+    /// keying removes. Also asserts the attributed path never fires the
+    /// unattributed-fallback canary, proving the task-local scope was honoured.
+    #[tokio::test]
+    async fn per_peer_discovery_quota_does_not_starve_other_peers() {
+        let mut config = test_mtls_config();
+        config.crl_discovery_rate_per_min = 4;
+        config.crl_deny_on_unavailable = false;
+        let (set, _rx) = test_crl_set_with_receiver_config(config);
+
+        let peer_a = IpAddr::from([203, 0, 113, 7]);
+        let peer_b = IpAddr::from([203, 0, 113, 8]);
+
+        let attacker_urls: Vec<String> = (0..8)
+            .map(|i| format!("http://attacker-{i:02}.example.test/crl"))
+            .collect();
+        CURRENT_HANDSHAKE_PEER
+            .scope(peer_a, async {
+                let _ = set.__test_note_discovered_urls_by_cert(&attacker_urls, &[]);
+            })
+            .await;
+
+        let attacker_dropped = attacker_urls
+            .iter()
+            .filter(|url| !set.__test_is_seen(url.as_str()))
+            .count();
+        assert!(
+            attacker_dropped > 0,
+            "peer_a must exhaust its own per-peer quota so later URLs are dropped"
+        );
+        assert!(
+            warned(&set, "discovery_rate_limited"),
+            "a per-peer denial must fire the throttled discovery_rate_limited WARN"
+        );
+        assert!(
+            !warned(&set, "discovery_unattributed_fallback"),
+            "an attributed handshake must NOT fall back to the global limiter"
+        );
+
+        let victim_url = "http://victim.example.test/crl".to_owned();
+        CURRENT_HANDSHAKE_PEER
+            .scope(peer_b, async {
+                let _ =
+                    set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&victim_url), &[]);
+            })
+            .await;
+
+        assert!(
+            set.__test_is_seen(&victim_url),
+            "peer_b's not-yet-cached URL must still be admitted after peer_a drained its own quota"
+        );
+    }
+
+    /// With no handshake peer scope, admission must fall back to the
+    /// process-global limiter and behave exactly as before per-peer keying:
+    /// the global per-minute quota gates admission and the unattributed canary
+    /// fires so a lost scope is observable rather than silent.
+    #[tokio::test]
+    async fn unattributed_discovery_falls_back_to_global_limiter() {
+        let mut config = test_mtls_config();
+        config.crl_discovery_rate_per_min = 4;
+        config.crl_deny_on_unavailable = false;
+        let (set, _rx) = test_crl_set_with_receiver_config(config);
+
+        let urls: Vec<String> = (0..8)
+            .map(|i| format!("http://unattributed-{i:02}.example.test/crl"))
+            .collect();
+        let _ = set.__test_note_discovered_urls_by_cert(&urls, &[]);
+
+        let admitted = urls
+            .iter()
+            .filter(|url| set.__test_is_seen(url.as_str()))
+            .count();
+        assert_eq!(
+            admitted, 4,
+            "the global fallback limiter must admit exactly the per-minute quota and drop the rest"
+        );
+        assert!(
+            warned(&set, "discovery_unattributed_fallback"),
+            "the unattributed path must fire the fallback canary so a lost scope is observable"
+        );
+        assert!(
+            warned(&set, "discovery_rate_limited"),
+            "the global fallback must still fire the rate-limited WARN on drops"
+        );
+    }
+
+    /// Per-peer keying widens the aggregate discovery RATE but must never let
+    /// many distinct peers push the shared `pending_urls` set past
+    /// `crl_max_seen_urls`: memory stays bounded regardless of peer count.
+    #[tokio::test]
+    async fn many_peers_cannot_exceed_pending_urls_cap() {
+        let mut config = test_mtls_config();
+        config.crl_discovery_rate_per_min = 64;
+        config.crl_deny_on_unavailable = false;
+        let cap = config.crl_max_seen_urls;
+        let (set, _rx) = test_crl_set_with_receiver_config(config);
+
+        for peer_index in 0..32u8 {
+            let peer = IpAddr::from([198, 51, 100, peer_index]);
+            let urls: Vec<String> = (0..4)
+                .map(|u| format!("http://p{peer_index:03}-u{u}.example.test/crl"))
+                .collect();
+            CURRENT_HANDSHAKE_PEER
+                .scope(peer, async {
+                    let _ = set.__test_note_discovered_urls_by_cert(&urls, &[]);
+                })
+                .await;
+        }
+
+        let pending = set
+            .pending_urls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        assert!(
+            pending <= cap,
+            "pending_urls ({pending}) must never exceed crl_max_seen_urls ({cap}) regardless of peer count"
         );
     }
 }

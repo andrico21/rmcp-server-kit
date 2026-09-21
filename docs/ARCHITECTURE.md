@@ -47,7 +47,7 @@ The crate has two transports:
 | Transport          | Function                                            | Auth/RBAC/TLS  | Use case                                         |
 |--------------------|-----------------------------------------------------|----------------|--------------------------------------------------|
 | **Streamable HTTP**| `serve()` - `src/transport.rs:2519`                 | **Yes**        | Production network deployment                    |
-| stdio              | `serve_stdio()` - `src/transport.rs:4523`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
+| stdio              | `serve_stdio()` - `src/transport.rs:4562`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
 
 ---
 
@@ -485,7 +485,7 @@ Configuration toggles:
 `[mtls]` is configured and `crl_enabled = true` (the default).
 
 Lifecycle:
-1. `bootstrap_fetch(roots, config)` (`src/mtls_revocation.rs:1544`) is
+1. `bootstrap_fetch(roots, config)` (`src/mtls_revocation.rs:1621`) is
    called from `run_server` *before* the listener is built. It walks the
    configured CA chain, extracts every X.509 CRL Distribution Point (CDP)
    URL via `extract_cdp_urls`, fetches each via `reqwest` under a 10 s
@@ -498,14 +498,14 @@ Lifecycle:
    - `discover_tx: mpsc::UnboundedSender<String>` - channel used by the
      handshake path to register newly observed CDP URLs for fetch.
    - `seen_urls: Mutex<HashSet<String>>` - dedupe of URLs already processed.
-3. `DynamicClientCertVerifier` (`src/mtls_revocation.rs:1343`) is the
+3. `DynamicClientCertVerifier` (`src/mtls_revocation.rs:1420`) is the
    `Arc<dyn ClientCertVerifier>` handed to `rustls::ServerConfig`. Its
    trait methods delegate to the inner verifier loaded from
    `inner_verifier.load()`. Because `tokio_rustls::TlsAcceptor` clones
    the verifier `Arc` from the `ServerConfig` at construction, the
    dynamic verifier MUST be the Arc handed to rustls; its inner verifier
    then swaps via the internal `ArcSwap`.
-4. `run_crl_refresher(set, rx, shutdown)` (`src/mtls_revocation.rs:1689`)
+4. `run_crl_refresher(set, rx, shutdown)` (`src/mtls_revocation.rs:1766`)
    is spawned by `run_server`. It:
    - Drains the `discover_tx` receiver and fetches any newly observed CDP URLs.
    - Re-fetches each cached CRL before its `nextUpdate`, clamped to
@@ -559,20 +559,28 @@ reachable:
 
 - `crl_max_concurrent_fetches` (default 4) - global parallel-fetch cap.
 - `crl_max_response_bytes` (default 5 MiB) - body size cap.
-- `crl_discovery_rate_per_min` (default 60) - discovery rate limit.
+- `crl_discovery_rate_per_min` (default 60) - discovery rate limit, applied per source peer IP for attributed handshakes (process-global fallback when unattributed).
 - `crl_max_host_semaphores` (default 1024) - caps unique CDP hosts.
 - `crl_max_seen_urls` (default 4096) - caps discovery deduplication map.
 - `crl_max_cache_entries` (default 1024) - caps CRL memory cache.
 
 ### Discovery admission ordering
 
-`note_discovered_urls` (`src/mtls_revocation.rs:758`) implements a
+`note_discovered_urls` (`src/mtls_revocation.rs:819`) implements a
 strict commit-after-admission protocol to keep the discovery rate
 limiter from "leaking" URLs:
 
 1. Snapshot the candidate URL set.
 2. Apply `ssrf_guard` to filter unreachable / hostile URLs.
-3. For each survivor, attempt `discovery_rate_limiter.check()`.
+3. For each survivor, attempt admission. When the handshake peer is
+   attributed via the `CURRENT_HANDSHAKE_PEER` task-local (set by the
+   TLS accept worker), admission consults that peer's own bucket
+   (`discovery_limiter_per_peer.check_key(peer)`); with no attributed
+   peer it falls back to the process-global `discovery_limiter.check()`.
+   Order is load-bearing: the `governor` APIs **consume** a token rather
+   than peek, so an attributed peer must consult **only** its own bucket -
+   also touching the global one would let a rejected attacker still drain
+   the shared budget.
 4. **Only after** the limiter admits the URL **and** the
    `discover_tx.send(url)` succeeds, insert the URL into the
    `seen_urls` `HashSet`. If admission fails (limiter-throttled or
@@ -583,9 +591,11 @@ limiter from "leaking" URLs:
 This ordering matters: a naive "mark seen, then attempt admission"
 implementation would silently drop CDP URLs forever the first time the
 rate limiter engaged, breaking revocation for the affected client
-identities. The current ordering is verified by
-`__test_check_discovery_rate` (`src/mtls_revocation.rs:1021`) and by the
-`__test_with_kept_receiver` helper used in unit tests.
+identities. Per-peer keying additionally stops one peer's spray from
+fail-closing a concurrent legitimate peer. The current ordering is
+verified by `__test_check_discovery_rate` (`src/mtls_revocation.rs:1098`)
+and by the per-peer isolation test
+(`per_peer_discovery_quota_does_not_starve_other_peers`).
 
 Hot-reload: `ReloadHandle::refresh_crls()` (in `src/transport.rs`) sends a
 sentinel through the discover channel that forces re-fetch of every cached

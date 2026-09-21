@@ -152,7 +152,7 @@ mindmap
             redirect=none for CRL traffic
             crl_max_concurrent_fetches default 4
             crl_max_response_bytes default 5 MiB
-            crl_discovery_rate_per_min default 60
+            crl_discovery_rate_per_min default 60 per-peer with global fallback
             commit-after-admission ordering
       OAuth 2.1 JWT
         JWKS verify
@@ -425,10 +425,10 @@ graph TD
 | Area                              | Module / file                           | Notable symbols (file:line)                                                  |
 |-----------------------------------|------------------------------------------|-------------------------------------------------------------------------------|
 | Server entry (HTTP)               | `src/transport.rs`                       | `serve` ~L2519, `McpServerConfig` L285-606, `ReloadHandle` ~L1515              |
-| Server entry (stdio, no auth)     | `src/transport.rs`                       | `serve_stdio` ~L4523                                                          |
+| Server entry (stdio, no auth)     | `src/transport.rs`                       | `serve_stdio` ~L4562                                                          |
 | Router builder + middleware wire  | `src/transport.rs`                       | `build_app_router` ~L1805, security headers wired ~L2160, peer-addr normalize wired ~L2123, origin wired ~L2168 |
 | TLS / mTLS acceptor               | `src/transport.rs`                       | `TlsListener` ~L3126                                                          |
-| Origin / security headers (defs)  | `src/transport.rs`                       | `origin_check_middleware` ~L4401, `security_headers_middleware` ~L3507       |
+| Origin / security headers (defs)  | `src/transport.rs`                       | `origin_check_middleware` ~L4440, `security_headers_middleware` ~L3744       |
 | Graceful shutdown                 | `src/transport.rs`                       | `shutdown_signal` ~L3547                                                      |
 | API key + mTLS auth               | `src/auth.rs`                            | `AuthIdentity` L51, `AuthState` ~L1102, `auth_middleware` L1703              |
 | RBAC engine                       | `src/rbac.rs`                            | `RbacPolicy` L352, task-locals L90-150, `rbac_middleware` L678-825           |

@@ -226,7 +226,7 @@ SSRF/DoS amplification even if a CRL host is reachable:
 |---------------------------------|---------------|-----------------------------------------------------------------------------------------------|
 | `crl_max_concurrent_fetches`    | `4`           | Global cap on parallel CRL fetches across all hosts (per-host concurrency is hard-capped at 1). |
 | `crl_max_response_bytes`        | `5 MiB`       | Body size cap; streams aborted mid-response when exceeded.                                    |
-| `crl_discovery_rate_per_min`    | `60`          | Process-global rate limit on *new* CDP URLs admitted into the fetch pipeline.                  |
+| `crl_discovery_rate_per_min`    | `60`          | Rate limit on *new* CDP URLs admitted into the fetch pipeline: **per source peer IP** for attributed TLS handshakes, with a process-global fallback bucket of the same rate when the peer is unattributed. |
 | `crl_fetch_timeout`             | `30 s`        | Per-fetch HTTP timeout.                                                                        |
 | `crl_max_host_semaphores`      | `1024`        | Caps the number of unique CDP hosts tracked for per-host concurrency gating. At the cap, idle entries (no in-flight fetch) are evicted on demand, so the cap only rejects genuinely concurrent fetch floods - it is never a permanent lockout. |
 | `crl_max_seen_urls`            | `4096`        | Caps the URL-deduplication map to prevent unbounded memory growth from discovery.             |
@@ -267,21 +267,61 @@ delegating to the inner verifier. No HTTP happens on the handshake path -
 discovery only enqueues onto a bounded, rate-limited channel, and the
 actual fetch runs on a background task behind the full SSRF guard.
 
-The residual cost of that ordering is a bounded griefing window: an
-**unauthenticated** client can present throwaway certificates carrying
-unique CDP URLs and consume the process-global discovery budget
-(`crl_discovery_rate_per_min`) and `crl_max_seen_urls` slots. Memory
-stays bounded - the caps exist precisely for this - but discovery of
-*new legitimate* CDP URLs can be starved while the spray is in progress,
-which under `crl_deny_on_unavailable = true` fails those handshakes
-closed. Per-source-IP discovery budgeting is not possible at this layer:
-`rustls`'s `ClientCertVerifier` callback has no access to the peer
-address.
+The residual cost of that ordering is a bounded griefing window, now
+**scoped per source peer IP** for attributed TLS handshakes. Discovery
+admission is keyed on the peer address: the TLS accept worker installs the
+handshake peer's IP in a task-local that the synchronous
+`ClientCertVerifier` callback reads, so each peer draws on its own
+per-minute `crl_discovery_rate_per_min` budget. An **unauthenticated**
+peer presenting throwaway certificates carrying unique CDP URLs can still
+exhaust *its own* budget and fill `crl_max_seen_urls` slots, but it can no
+longer drain a shared bucket and thereby starve a concurrent legitimate
+peer's discovery of a *new* CDP URL - the fail-closed denial under
+`crl_deny_on_unavailable = true` that such starvation used to cause is
+removed. Earlier releases stated per-source-IP budgeting was "not possible
+at this layer" because `rustls`'s `ClientCertVerifier` callback has no
+access to the peer address; that is no longer true - the address is carried
+to the callback out of band via the task-local, without changing the
+callback signature.
+
+This is not a complete DoS defense, and the trade-offs are deliberate:
+
+- Per-IP keying does **not** defeat a *distributed* attacker; a sprayer
+  controlling many source IPs cycles through fresh per-peer budgets. Each
+  sprayed IP still pays a full TLS handshake, matching the default posture
+  of the bearer pre-auth limiter elsewhere in this crate.
+- The key is the **direct** peer IP. Behind a TCP load balancer that
+  terminates the connection, that is the balancer's address, not the
+  client's - terminate TLS at the edge if you need true client attribution.
+- The global aggregate *rate* ceiling for attributed traffic is
+  intentionally replaced by the per-peer quota plus the bounded queue,
+  dedup (`crl_max_seen_urls`), cache (`crl_max_cache_entries`), and
+  outbound-fetch (`crl_max_concurrent_fetches`) caps. Distributed peers can
+  fill the bounded `crl_max_seen_urls` pending set faster than before, but
+  memory and outbound concurrency stay bounded - the discovery receiver
+  processes URLs serially - so the residual is a bounded distributed-DoS,
+  not unbounded amplification.
+- Submissions with **no** attributed handshake peer - a
+  `DynamicClientCertVerifier` built outside this crate's transport - fall
+  back to a single process-global bucket of the same rate, preserving the
+  pre-change behaviour on that path.
 
 Operator guidance:
 
-- Alert on `discovery_rate_limited` WARN log lines - they are the
-  observable signature of a discovery spray (or of an undersized budget).
+- Alert on `discovery_rate_limited` WARN log lines - a peer hit its
+  per-minute discovery budget (per-peer when the handshake is attributed,
+  otherwise the global fallback bucket). This is the observable signature
+  of a discovery spray or of an undersized `crl_discovery_rate_per_min`.
+  The line is throttled to at most one per minute, so it is a
+  flood-resistant signal rather than a per-URL audit trail.
+- Alert **separately** on `discovery_unattributed_fallback` WARN log lines
+  - discovery ran with no handshake peer scope, so per-peer protection was
+  **not** active and admission fell back to the global bucket. On the
+  standard transport this should never fire; if it does, either a
+  downstream integration is driving discovery outside the scoped TLS accept
+  path, or per-peer attribution has regressed. Its semantics are distinct
+  from `discovery_rate_limited`: the latter means a budget was hit, the
+  former means the per-peer budget was not even consulted.
 - Size `crl_max_seen_urls` and `crl_max_cache_entries` to comfortably
   exceed your CA estate's real CDP count, especially with
   `crl_deny_on_unavailable = true`: at the cache cap the **newest** entry

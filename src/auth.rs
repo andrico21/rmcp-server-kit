@@ -513,16 +513,22 @@ pub struct MtlsConfig {
     /// amplification. Default: 5 MiB (`5 * 1024 * 1024`).
     #[serde(default = "default_crl_max_response_bytes")]
     pub crl_max_response_bytes: u64,
-    /// Global CDP discovery rate limit, in URLs per minute. Throttles
-    /// how many *new* CDP URLs the verifier may admit into the fetch
-    /// pipeline across the whole process, bounding asymmetric `DoS`
-    /// amplification when attacker-controlled certificates carry large
-    /// CDP lists. The limit is global (not per-source-IP) in this
-    /// release; per-IP scoping is deferred to a future version because
-    /// it requires plumbing the peer `SocketAddr` through the rustls
-    /// verifier hook (a different subsystem than ordinary request
-    /// middleware). Note: the **bearer pre-auth limiter** that gates
-    /// API-key / OAuth `Authorization` headers is already per-IP - see
+    /// CDP discovery rate limit, in URLs per minute. Throttles how many
+    /// *new* CDP URLs the verifier may admit into the fetch pipeline,
+    /// bounding asymmetric `DoS` amplification when attacker-controlled
+    /// certificates carry large CDP lists.
+    ///
+    /// Applied **per source peer IP** for attributed TLS handshakes: the
+    /// value is each peer's own per-minute quota, so one peer draining its
+    /// budget can no longer fail-closed deny a concurrent legitimate peer
+    /// presenting a not-yet-cached CDP URL. Submissions with no attributed
+    /// handshake peer (e.g. a `DynamicClientCertVerifier` built outside this
+    /// crate's transport) fall back to a single process-global bucket of the
+    /// same rate. The key is the direct peer IP, so behind a TCP load
+    /// balancer this keys on the balancer, and per-IP keying does not by
+    /// itself defeat a distributed attacker (each sprayed IP still pays a
+    /// full TLS handshake). Note: the **bearer pre-auth limiter** that gates
+    /// API-key / OAuth `Authorization` headers is separately per-IP - see
     /// [`RateLimitConfig::pre_auth_max_per_minute`] and the keyed
     /// governor built by `build_pre_auth_limiter`. URLs that lose the
     /// rate-limiter race are *not* marked as seen, so subsequent

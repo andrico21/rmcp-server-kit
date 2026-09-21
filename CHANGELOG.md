@@ -223,6 +223,36 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   downgrading `generic-array` 0.14.9 -> 0.14.7 - a wash). `cargo vet`
   exemptions were regenerated in the same commit as `Cargo.lock`.
 
+- **CRL discovery rate limiting is now per source peer IP for attributed
+  mTLS handshakes (cross-peer denial-of-service, CWE-770).** Previously a
+  single process-global `crl_discovery_rate_per_min` bucket gated admission
+  of new CDP URLs into the fetch pipeline. Because `note_discovered_urls`
+  (`src/mtls_revocation.rs`) runs on the unauthenticated TLS verifier path
+  *before* chain validation, one peer presenting throwaway certificates with
+  unique CDP URLs could drain that shared bucket and fail-closed
+  (`crl_deny_on_unavailable = true`) a concurrent legitimate peer whose
+  certificate pointed at a not-yet-cached CDP. The TLS accept worker now
+  scopes each handshake's peer IP into a `CURRENT_HANDSHAKE_PEER` task-local
+  that the synchronous `ClientCertVerifier` reads, so admission consults a
+  bounded per-peer keyed limiter (`discovery_limiter_per_peer`): each peer
+  draws on its own quota and can no longer consume another peer's budget.
+  Submissions with no attributed handshake peer fall back to the unchanged
+  process-global bucket. Two throttled WARN keys distinguish the cases:
+  `discovery_rate_limited` (a budget was hit) and the new
+  `discovery_unattributed_fallback` (per-peer admission was unavailable, so
+  the global fallback was used).
+
+  **Compatibility:** no API change — a private `CrlSet` field and two private
+  constants are added, `DynamicClientCertVerifier::new` keeps its signature,
+  and no `MtlsConfig` field is added or retyped, so `cargo semver-checks`
+  reports nothing — with a **runtime behavioural change**: the public
+  `crl_discovery_rate_per_min` field keeps its name/type/serde-default/
+  validation, but its documented semantics change from process-global to
+  per-peer-when-attributed. This is why the change ships as a **minor**, not
+  a patch. Rollback is clean: no config field was added, so no consumer TOML
+  can depend on the new behaviour. See `docs/MIGRATION.md` (§ "Migrating to
+  3.14: CRL discovery rate limit is now per source peer IP").
+
 ## [3.12.0] - 2026-09-16
 
 ### Changed

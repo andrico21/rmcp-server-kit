@@ -283,6 +283,52 @@ does not break existing TOML parsing. `Clone` survives with
 
 </details>
 
+<details>
+<summary><strong>CRL discovery rate limiting is per source peer IP, not per client - known residuals</strong></summary>
+
+<br>
+
+**Status: shipped (minor, additive).** Recorded here so the residual
+trade-offs are not rediscovered. `crl_discovery_rate_per_min` gates admission
+of *new* CDP URLs into the CRL fetch pipeline on the unauthenticated mTLS
+handshake path. It is now keyed **per source peer IP** for attributed
+handshakes (process-global fallback when unattributed), which removes the
+cross-peer starvation a single global bucket allowed: one peer could drain
+the shared budget and fail-closed a concurrent legitimate peer whose
+certificate pointed at a not-yet-cached CDP. It is a mitigation, not a
+complete DoS defense; the accepted residuals are:
+
+- **Per-IP keying does not defeat a *distributed* attacker.** A sprayer using
+  many source IPs cycles through independent per-peer budgets. Each sprayed IP
+  still pays a full TLS handshake, matching the default posture of the bearer
+  pre-auth limiter elsewhere in this crate.
+- **The key is the *direct* peer IP.** Behind a TCP load balancer that
+  terminates the connection, that is the balancer's address, not the client's.
+  Terminate TLS at the edge if you need true client attribution.
+- **A sprayer controlling more than the ~10k tracked peer keys can cycle into
+  fresh buckets** - the tracking map is bounded and idle/LRU-evicts, the same
+  default posture as the pre-auth limiter, and still one full handshake per IP.
+- **Downstream code constructing `DynamicClientCertVerifier` outside this
+  crate's transport gets the unattributed (global-only) fallback**, because
+  the peer-IP task-local is installed only by the scoped TLS accept worker.
+  This is not remotely attacker-selectable: the only production path to
+  `note_discovered_urls` is via `acceptor.accept` in that scoped worker.
+- **The global aggregate *rate* ceiling for attributed traffic is
+  intentionally replaced** by the per-peer quota plus the bounded discovery
+  queue, dedup (`crl_max_seen_urls`), cache (`crl_max_cache_entries`), and
+  outbound-fetch (`crl_max_concurrent_fetches`) caps. Distributed peers can
+  fill the bounded pending set faster than before, but memory and outbound
+  concurrency stay bounded - the discovery receiver processes URLs serially -
+  so the residual is a bounded distributed-DoS, not unbounded amplification.
+
+No config knob was added: the per-peer quota reuses `crl_discovery_rate_per_min`,
+and the tracking-map bounds are private, non-operator-tunable constants, so
+rollback is clean and no consumer TOML can depend on the new behaviour. See
+[`SECURITY.md`](SECURITY.md#crl-discovery-under-adversarial-load) and
+[`docs/MIGRATION.md`](docs/MIGRATION.md).
+
+</details>
+
 ## Minimum supported Rust
 
 `rmcp-server-kit` targets stable Rust **1.98** or newer (tracks `edition = "2024"`).

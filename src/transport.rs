@@ -3297,7 +3297,18 @@ async fn run_tls_acceptor(
         let tx = tx.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await {
+            // Attribute this handshake's CRL-discovery admission to the peer IP
+            // so one peer cannot drain another peer's discovery budget. rustls
+            // calls `verify_client_cert` synchronously inside `accept`'s own
+            // poll, and `tokio::time::timeout` polls its wrapped future first,
+            // so the scope nests correctly and is not leaked on the timeout arm.
+            let accept_fut = acceptor.accept(stream);
+            match tokio::time::timeout(
+                handshake_timeout,
+                mtls_revocation::CURRENT_HANDSHAKE_PEER.scope(addr.ip(), accept_fut),
+            )
+            .await
+            {
                 Ok(Ok(tls_stream)) => {
                     let identity =
                         TlsListener::extract_handshake_identity(&tls_stream, &default_role, addr);

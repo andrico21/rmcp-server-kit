@@ -541,19 +541,22 @@ crl_retry_retention      = "24h"    # keep failed-refresh entries for retry only
 crl_max_concurrent_fetches = 4         # global parallel CRL fetches across all hosts
                                        # (per-host concurrency is hard-capped at 1)
 crl_max_response_bytes     = 5242880   # 5 MiB hard cap; streams aborted mid-response when exceeded
-crl_discovery_rate_per_min = 60        # process-global rate limit on *new* CDP URLs admitted
-                                       # to the fetch pipeline; URLs that lose the race are
-                                       # NOT marked as seen and may retry on the next handshake
+crl_discovery_rate_per_min = 60        # per-source-peer-IP rate limit on *new* CDP URLs admitted
+                                       # to the fetch pipeline (process-global fallback when the
+                                       # peer is unattributed); URLs that lose the race are NOT
+                                       # marked as seen and may retry on the next handshake
 crl_max_host_semaphores    = 1024      # caps unique CDP hosts tracked
 crl_max_seen_urls          = 4096      # caps URL-deduplication map
 crl_max_cache_entries      = 1024      # caps parsed CRLs held in memory
 ```
 
 > **Tuning guidance.** The defaults are calibrated for a typical
-> single-tenant deployment. Raise `crl_discovery_rate_per_min` when you
-> expect bursts of *distinct* client identities pointing at many
-> distinct CDP URLs (e.g. multi-PKI federations); leave it conservative
-> when CDPs are few and stable. `crl_max_concurrent_fetches` is the global
+> single-tenant deployment. The limit applies **per source peer IP** for
+> attributed handshakes (process-global fallback when unattributed), so
+> raise `crl_discovery_rate_per_min` when a single peer legitimately
+> points at many *distinct* CDP URLs (e.g. a multi-PKI federation behind
+> one client address); leave it conservative when CDPs are few and stable.
+> `crl_max_concurrent_fetches` is the global
 > SSRF blast-radius bound - keep it low. Raise `crl_max_seen_urls` and
 > `crl_max_cache_entries` if your PKI hierarchy is unusually deep
 > or diverse.
