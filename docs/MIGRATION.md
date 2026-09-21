@@ -3,6 +3,43 @@
 This guide shows how to wire the standalone `rmcp-server-kit` crate into a
 downstream project, and how to migrate across breaking major releases.
 
+## Migrating to 3.14: same-named API keys must map to one role
+
+Two `auth.api_keys` entries that share a `name` but declare *different*
+`role`s are now rejected. This is a no-opt-out hard error on
+previously-accepted configuration, shipped in a **minor** release -- the same
+shape as two hard errors already shipped in a 3.8 minor (`auth.mtls` without
+TLS is a validation error; a certificate advertising more than 64 CDP URLs is
+rejected): a security-motivated rejection of malformed config, not an API
+break. `check_api_key_names` stays `pub(crate)` and no public signature
+changes, so `cargo-semver-checks` reports nothing.
+
+**Impact:** the API-key `name` is the session/task-binding *principal
+identity* -- the MCP session-binding and task-binding fingerprints derive
+their per-principal namespace from it alone. Two same-named entries are
+therefore one principal, so mapping one name to two roles is a contradiction
+that silently collapses two authorization profiles into a single identity
+namespace: a token minted under one role verifies under the other (CWE-384).
+A config that boots today with such a pair will refuse to start after
+upgrading.
+
+**This has no opt-out and applies on both the startup and hot-reload paths.**
+The hot-reload path was already safe -- `try_reload_auth_keys` validates
+before swapping and retains the prior keys on error -- so a *running* server
+cannot be pushed into this state; the newly-strict surface is startup
+validation, which previously accepted the contradictory pair.
+
+**Action required:** none for conforming configuration. Same name with the
+*same* role remains valid -- that is credential rotation (one principal, two
+secrets), and is explicitly preserved. Give two entries the same `name` only
+when they are the same principal; use distinct names for distinct principals,
+and each name keeps its own session/task namespace even under a shared RBAC
+role.
+
+**Observable signature:** startup fails with an `RmcpServerKitError::Config`
+naming the first offending index, e.g. `auth.api_keys[1] reuses the name
+'ops' with role 'viewer' while an earlier entry uses role 'admin'`.
+
 ## Migrating to 3.13: origin validation narrowing
 
 `3.13` tightens `allowed_origins` at several points. **No default changed** - an

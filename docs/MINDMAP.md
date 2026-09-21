@@ -295,7 +295,7 @@ sequenceDiagram
     participant R as axum Router
     participant O as origin_check<br/>src/transport.rs:2151
     participant H as security_headers<br/>src/transport.rs:2082
-    participant A as auth_middleware<br/>src/auth.rs:970
+    participant A as auth_middleware<br/>src/auth.rs:1006
     participant B as rbac_middleware<br/>src/rbac.rs:584
     participant L as per-IP rate limit<br/>governor + bounded_limiter
     participant M as rmcp Streamable<br/>HTTP service
@@ -331,13 +331,13 @@ flowchart LR
     end
 
     subgraph SharedState["Shared state (lock-free / fine-grained)"]
-        AKS[(ArcSwap&lt;ApiKeys&gt;<br/>AuthState.api_keys<br/>src/auth.rs:623)]
+        AKS[(ArcSwap&lt;ApiKeys&gt;<br/>AuthState.api_keys<br/>src/auth.rs:631)]
         RBS[(ArcSwap&lt;RbacPolicy&gt;<br/>rbac_swap)]
-        MTL[mTLS AuthIdentity<br/>per-connection<br/>TlsConnInfo extension<br/>src/auth.rs:594-602]
+        MTL[mTLS AuthIdentity<br/>per-connection<br/>TlsConnInfo extension<br/>src/auth.rs:602-610]
     end
 
     subgraph Hot["Request-time consumers"]
-        AM[auth_middleware<br/>src/auth.rs:970]
+        AM[auth_middleware<br/>src/auth.rs:1006]
         BM[rbac_middleware<br/>src/rbac.rs:584]
         TL["Task-locals<br/>current_role / current_identity<br/>current_token / current_sub<br/>src/rbac.rs:83-145"]
         TH[HookedHandler<br/>src/tool_hooks.rs:219]
@@ -430,7 +430,7 @@ graph TD
 | TLS / mTLS acceptor               | `src/transport.rs`                       | `TlsListener` ~L3126                                                          |
 | Origin / security headers (defs)  | `src/transport.rs`                       | `origin_check_middleware` ~L4401, `security_headers_middleware` ~L3507       |
 | Graceful shutdown                 | `src/transport.rs`                       | `shutdown_signal` ~L3547                                                      |
-| API key + mTLS auth               | `src/auth.rs`                            | `AuthIdentity` L51, `AuthState` ~L1066, `auth_middleware` L1664              |
+| API key + mTLS auth               | `src/auth.rs`                            | `AuthIdentity` L51, `AuthState` ~L1102, `auth_middleware` L1703              |
 | RBAC engine                       | `src/rbac.rs`                            | `RbacPolicy` L352, task-locals L90-150, `rbac_middleware` L678-825           |
 | Memory-bounded keyed limiter      | `src/bounded_limiter.rs`                 | `BoundedKeyedLimiter` L134                                                    |
 | Trusted-forwarder resolution      | `src/forwarded.rs`                       | `resolve_client_ip`, `FallbackReason` (rightmost-untrusted, fail-safe-to-direct) |

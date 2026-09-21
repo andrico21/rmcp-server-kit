@@ -1907,8 +1907,18 @@ When authentication is enabled, rmcp-server-kit wraps every newly minted
 `Mcp-Session-Id` in a stateless token bound to the `AuthIdentity` that
 performed `initialize`. Later requests must present both valid credentials
 and a session token whose MAC verifies for that same stable identity
-fingerprint. A token minted for API key `ops-a` therefore cannot be replayed
-by API key `ops-b`, even if both keys map to the same RBAC role.
+fingerprint. That fingerprint is the authenticated **principal**, identified
+by the API-key **name**: a token minted for API key `ops-a` therefore cannot
+be replayed by API key `ops-b`, even when both keys map to the same RBAC
+role. Distinct names get distinct session/task namespaces regardless of role.
+
+Because the name alone is the principal identity, two API-key entries that
+share a name are intentionally *one* principal sharing a single session/task
+namespace -- that is how credential rotation (an old secret and its
+replacement under one service name) keeps working. To stop that from becoming
+a footgun, startup and hot-reload validation reject two same-named keys that
+declare *different* roles: one name is one principal and must map to one role
+(`AuthConfig::validate_api_key_names`).
 
 The wrapper is enabled by default (`McpServerConfig::with_session_binding(true)`;
 TOML `session_binding = true`). Set it to `false` only for a trusted gateway

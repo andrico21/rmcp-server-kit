@@ -138,7 +138,7 @@ axum Router                                  src/transport.rs:1805  (build_app_r
    ├── 6. Optional metrics middleware        src/metrics.rs (records
    │      request count, duration histograms, in-flight gauge)
    │
-├── 7. Auth middleware                    src/auth.rs:1664 (auth_middleware)
+├── 7. Auth middleware                    src/auth.rs:1703 (auth_middleware)
    │      Determines AuthIdentity from one of:
    │        a) Authorization: Bearer <api-key>  → Argon2 verify against
    │           AuthState.api_keys (ArcSwap<Vec<ApiKeyEntry>>)
@@ -303,9 +303,9 @@ Startup-only.
 
 ### Construction
 `AuthState` is built inside `build_app_router()` at `src/transport.rs:1897`. It contains:
-- `api_keys: ArcSwap<Vec<ApiKeyEntry>>` (`src/auth.rs:1068`)
+- `api_keys: ArcSwap<Vec<ApiKeyEntry>>` (`src/auth.rs:1104`)
 - mTLS identities: stored **per-connection** on the
-  `TlsConnInfo` extension (`src/auth.rs:928`), read by `auth_middleware` (`src/auth.rs:1664-1669`).
+  `TlsConnInfo` extension (`src/auth.rs:964`), read by `auth_middleware` (`src/auth.rs:1703-1708`).
   No shared `SocketAddr`-keyed map exists - the previous design was replaced
   to avoid identity-binding races behind load balancers and to remove a
   `RwLock` from the request hot path.
@@ -322,11 +322,11 @@ Startup-only.
   entirely** (the TLS handshake already performed expensive crypto with a
   verified peer, so mTLS callers cannot be used to mount a CPU-spray
   attack).
-- `jwks_cache: Option<Arc<JwksCache>>` (`src/auth.rs:1076`) when `feature=oauth` is on and `oauth.issuer` is configured
+- `jwks_cache: Option<Arc<JwksCache>>` (`src/auth.rs:1112`) when `feature=oauth` is on and `oauth.issuer` is configured
 
 ### API key flow
 1. Client sends `Authorization: Bearer <api-key>`.
-2. `auth_middleware` (`src/auth.rs:1664`) first runs the **pre-auth abuse
+2. `auth_middleware` (`src/auth.rs:1703`) first runs the **pre-auth abuse
    gate** keyed by the request's source IP. If the gate is exhausted the
    middleware returns `429` immediately, *without* touching Argon2id.
 3. Otherwise the middleware looks up the key by an indexed prefix
@@ -348,7 +348,7 @@ threaded as `SecretString` from `AuthIdentity.raw_token` through
    to the **per-connection** `TlsConnInfo` extension
    (`src/transport.rs:2178-2244`).
 3. `auth_middleware` reads the identity directly from the connection
-   extension (`src/auth.rs:1342-1345`); no shared SocketAddr-keyed map is
+   extension (`src/auth.rs:1381-1384`); no shared SocketAddr-keyed map is
    consulted, so there is no port-reuse aliasing risk.
 
 ### OAuth JWT flow (feature = `oauth`)
@@ -756,7 +756,7 @@ Two ArcSwaps power runtime reconfiguration:
 
 | State            | Type                           | Defined at                  |
 |------------------|---------------------------------|-----------------------------|
-| API keys         | `ArcSwap<Vec<ApiKeyEntry>>`     | `src/auth.rs:1068`          |
+| API keys         | `ArcSwap<Vec<ApiKeyEntry>>`     | `src/auth.rs:1104`          |
 | RBAC policy      | `ArcSwap<RbacPolicy>`           | `src/transport.rs:1633`      |
 
 Procedure:
@@ -931,7 +931,7 @@ itself is at `src/transport.rs:4028`.
 
 2. **Auth runs before RBAC.** Without an `AuthIdentity`, RBAC has no role
    to evaluate. The middleware order in `src/transport.rs` (auth at
-   `src/auth.rs:1342`, RBAC at `src/rbac.rs:749`) enforces this.
+   `src/auth.rs:1381`, RBAC at `src/rbac.rs:749`) enforces this.
 
 3. **Per-IP rate limiter sits inside auth.** Anonymous IPs cannot
    exhaust the rate-limit budget for authenticated callers.

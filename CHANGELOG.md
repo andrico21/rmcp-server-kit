@@ -11,6 +11,36 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Security
+
+- **Closed the residual cross-principal session-binding collision (CWE-384)
+  when two API keys share a `name` but declare different roles.** The 3.9.0
+  hardening (below) closed the *blank*-name case; this closes the
+  *duplicate*-name case. The session/task-binding fingerprint derives its
+  per-principal namespace from the API-key `name` alone (`fingerprint()`,
+  `src/session_binding.rs`) — no key id, hash, or role is mixed in — so two
+  entries sharing a name produce byte-identical fingerprints and a
+  session/task token minted under one verifies under the other, even though
+  the two keys grant different roles.
+
+  `check_api_key_names` (shared by `AuthConfig::validate_api_key_names` at
+  startup and `AuthState::try_reload_keys` on hot reload) now rejects a
+  configuration in which one `name` maps to two different `role`s, naming the
+  first offending index. Same name with the *same* role is still accepted:
+  that is legitimate credential rotation (one principal, two secrets), and
+  breaking it would break key rollover. Distinct principals must use distinct
+  names; each name then keeps its own session/task namespace even under a
+  shared RBAC role.
+
+  **Compatibility:** no API change — `check_api_key_names` is `pub(crate)` and
+  every public caller keeps its signature, so `cargo semver-checks` reports
+  nothing — with a **runtime behavioural change**: a startup configuration
+  that pairs one name with two roles, previously accepted, is now rejected.
+  The hot-reload path was already fail-safe (`try_reload_auth_keys` validates
+  before swapping and retains the prior keys on error), so only the startup
+  surface changes. This is why the change ships as a **minor**, not a patch.
+  See `docs/MIGRATION.md` (§ "Migrating to 3.14").
+
 ## [3.13.0] - 2026-09-18
 
 ### Added

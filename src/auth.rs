@@ -347,7 +347,15 @@ impl From<chrono::DateTime<chrono::FixedOffset>> for RfcTimestamp {
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ApiKeyEntry {
-    /// Human-readable key label (used in logs and audit records).
+    /// Session/task-binding **principal identity** for this key (and the
+    /// label shown in logs and audit records).
+    ///
+    /// Not a mere display string: the MCP session-binding and task-binding
+    /// fingerprints derive their per-principal namespace from this name
+    /// alone, so two entries sharing a `name` are one principal. Config
+    /// validation therefore rejects same-named entries that declare
+    /// different [`role`](Self::role)s, while permitting same-named,
+    /// same-role entries (credential rotation).
     pub name: String,
     /// Argon2id hash of the token (PHC string format).
     pub hash: String,
@@ -763,19 +771,43 @@ pub struct AuthConfig {
     pub(crate) oauth: Option<serde::de::IgnoredAny>,
 }
 
-/// Reject any API key in `keys` whose `name` is blank (empty or
-/// whitespace-only), naming the first offending index.
+/// Validate API-key `name`s as session/task-binding principal identities,
+/// naming the first offending index.
+///
+/// Two rules, because the name alone is the session-binding fingerprint's
+/// stable id (CWE-384):
+///
+/// 1. A blank name (empty or whitespace-only) is rejected: two blank names
+///    collide to one fingerprint.
+/// 2. A name reused with a *different* `role` is rejected: same-named keys
+///    are one principal sharing one identity namespace, so two roles under
+///    one name is a contradiction. Same name with the *same* role is
+///    permitted -- that is credential rotation (one principal, two secrets).
 ///
 /// Shared by [`AuthConfig::validate_api_key_names`] (startup validation) and
 /// [`AuthState::try_reload_keys`] (hot-reload validation) so both surfaces
-/// enforce the same rule: a blank name is the bearer session-binding stable
-/// id, so two blank-named keys collide to one fingerprint (CWE-384).
+/// enforce the same rule.
 pub(crate) fn check_api_key_names(keys: &[ApiKeyEntry]) -> Result<(), RmcpServerKitError> {
+    let mut seen: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     for (index, key) in keys.iter().enumerate() {
         if key.name.trim().is_empty() {
             return Err(RmcpServerKitError::Config(format!(
                 "auth.api_keys[{index}] has a blank name; each API-key name must be \
                  non-empty and not whitespace-only (it is the session-binding identity)"
+            )));
+        }
+        // Same name + same role is credential rotation: one principal, two secrets. Allowed.
+        // Same name + different role is contradictory: session/task binding keys on the name
+        // alone, so the two would silently share one identity namespace.
+        if let Some(prior_role) = seen.insert(key.name.as_str(), key.role.as_str())
+            && prior_role != key.role.as_str()
+        {
+            return Err(RmcpServerKitError::Config(format!(
+                "auth.api_keys[{index}] reuses the name '{}' with role '{}' while an earlier \
+                 entry uses role '{}'. API-key names are the session/task-binding principal \
+                 identity, so same-named keys are one principal and must share one role. \
+                 Use distinct names for distinct principals.",
+                key.name, key.role, prior_role
             )));
         }
     }
@@ -833,18 +865,22 @@ impl AuthConfig {
         Ok(())
     }
 
-    /// Reject any configured API key whose `name` is blank (empty or
-    /// whitespace-only).
+    /// Validate configured API-key `name`s as session/task-binding principal
+    /// identities.
     ///
     /// The key name is the session-binding fingerprint's stable id for bearer
-    /// auth, so two blank-named keys hash identically and one key's session
-    /// becomes usable by the other (CWE-384). The first offending index is
-    /// named so an operator can locate the entry in their key list.
+    /// auth (CWE-384): two keys that share a fingerprint share a session
+    /// namespace. This rejects a blank (empty or whitespace-only) name, and a
+    /// name reused across entries with different [`role`](ApiKeyEntry::role)s
+    /// (same name = one principal, so it must map to one role); same name with
+    /// the same role is permitted as credential rotation. The first offending
+    /// index is named so an operator can locate the entry.
     ///
     /// # Errors
     ///
-    /// Returns [`RmcpServerKitError::Config`] naming the first API-key index
-    /// whose `name` is blank.
+    /// Returns [`RmcpServerKitError::Config`] naming the first offending
+    /// API-key index: either its `name` is blank, or it reuses an earlier
+    /// entry's `name` with a different `role`.
     pub fn validate_api_key_names(&self) -> Result<(), RmcpServerKitError> {
         check_api_key_names(&self.api_keys)
     }
@@ -1094,14 +1130,17 @@ pub(crate) struct AuthState {
 impl AuthState {
     /// Validate and atomically replace the API key list.
     ///
-    /// Rejects a blank-named key before installing anything; on error the
-    /// previous key list stays in place, so a failed hot reload never leaves
-    /// the server serving blank-named (session-binding-colliding) keys.
+    /// Rejects an invalid key list before installing anything (a blank name,
+    /// or a name reused with a different role -- see
+    /// [`AuthConfig::validate_api_key_names`]); on error the previous key list
+    /// stays in place, so a failed hot reload never leaves the server serving
+    /// session-binding-colliding keys.
     ///
     /// # Errors
     ///
-    /// Returns [`RmcpServerKitError::Config`] naming the first blank-named
-    /// index; the current key list is left untouched.
+    /// Returns [`RmcpServerKitError::Config`] naming the first offending
+    /// index -- either a blank `name`, or a `name` reused with a different
+    /// `role` -- and leaves the current key list untouched.
     pub(crate) fn try_reload_keys(&self, keys: Vec<ApiKeyEntry>) -> Result<(), RmcpServerKitError> {
         check_api_key_names(&keys)?;
         self.reload_keys_unchecked(keys);
@@ -2253,6 +2292,67 @@ mod tests {
 
         let ok = AuthConfig::with_keys(vec![ApiKeyEntry::new("viewer-key", "hash", "viewer")]);
         assert!(ok.validate_api_key_names().is_ok());
+    }
+
+    #[test]
+    fn check_api_key_names_rejects_same_name_different_role() {
+        // Two entries share a name but declare different roles. The name alone
+        // is the session/task-binding principal identity, so this is one label
+        // for two authorization profiles -- rejected.
+        let keys = vec![
+            ApiKeyEntry::new("ops", "hash-a", "admin"),
+            ApiKeyEntry::new("ops", "hash-b", "viewer"),
+        ];
+        let err = check_api_key_names(&keys).unwrap_err().to_string();
+        assert!(
+            err.contains("api_keys[1]"),
+            "must name the offending index: {err}"
+        );
+        assert!(
+            err.contains("reuses the name 'ops'"),
+            "must explain the name/role conflict: {err}"
+        );
+        // The public startup entry point enforces the identical rule.
+        assert!(
+            AuthConfig::with_keys(keys)
+                .validate_api_key_names()
+                .is_err(),
+            "validate_api_key_names must reject the same contradiction"
+        );
+    }
+
+    #[test]
+    fn check_api_key_names_permits_same_name_same_role_rotation() {
+        // Same name + same role is credential rotation (one principal, two
+        // secrets): explicitly allowed so key rollover keeps working.
+        let keys = vec![
+            ApiKeyEntry::new("ops", "old-hash", "admin"),
+            ApiKeyEntry::new("ops", "new-hash", "admin"),
+        ];
+        assert!(
+            check_api_key_names(&keys).is_ok(),
+            "same-name same-role rotation must be permitted"
+        );
+        assert!(AuthConfig::with_keys(keys).validate_api_key_names().is_ok());
+    }
+
+    #[test]
+    fn check_api_key_names_rejects_blank_name() {
+        // Regression guard: the blank-name rule still fires now that the
+        // same-name/different-role rule is enforced alongside it.
+        let keys = vec![
+            ApiKeyEntry::new("ok", "hash", "viewer"),
+            ApiKeyEntry::new("   ", "hash", "viewer"),
+        ];
+        let err = check_api_key_names(&keys).unwrap_err().to_string();
+        assert!(
+            err.contains("api_keys[1]"),
+            "must name the blank index: {err}"
+        );
+        assert!(
+            err.contains("blank name"),
+            "must cite the blank-name rule: {err}"
+        );
     }
 
     #[test]
