@@ -116,7 +116,49 @@ The `release.yml` workflow then:
 1. Verifies the tag matches the crate version.
 2. Runs `cargo publish --dry-run`.
 3. Runs `cargo publish` (requires `CARGO_REGISTRY_TOKEN` secret).
-4. Creates a GitHub release with auto-generated notes.
+4. Creates a GitHub release with auto-generated notes -- but only when this
+   run actually performed the `cargo publish` upload. If the version was
+   already on crates.io before this run (the publish step reports
+   `published=false`), this step is skipped, because the run that truly
+   uploaded the bytes already created that release.
+
+### Recovering a missing GitHub release
+
+Because "Create GitHub release" is now gated on `steps.publish.outputs.published
+== 'true'`, only the run that actually uploaded the crate creates the release.
+That closes a recovery path the pipeline used to have for free: previously, if
+run A published successfully but its release-creation step failed transiently, a
+later run B -- which sees the version already on crates.io -- would create the
+release instead. Now run B reports `published=false` and skips the step, so
+**no** run will auto-create that release. You must create it by hand, and only
+after proving the published bytes are the ones this tag describes.
+
+```bash
+# 1. Confirm a CI run actually published this version, and which SHA it used.
+gh run list --workflow=Release --limit 10          # find the run; note its head_sha
+git rev-parse "<tag>^{commit}"                      # must equal that head_sha
+
+# 2. Reconstruct the package from the tag and compare against the registry.
+git checkout "<tag>"
+cargo package --all-features                        # produces target/package/<crate>-<tag>.crate
+sha256sum "target/package/rmcp-server-kit-<tag>.crate"
+# Retrieve the published checksum from the crates.io sparse index and compare.
+# (Index path is derived from the crate name; rmcp-server-kit -> rm/cp/.)
+curl -sS https://index.crates.io/rm/cp/rmcp-server-kit \
+  | jq -r 'select(.vers=="<tag>") | .cksum'
+# The two hex digests must match.
+
+# 3. ONLY if step 2 matches:
+gh release create "<tag>" --notes-file <path-to-extracted-CHANGELOG-section>
+```
+
+If the two checksums do **not** match, **stop**. That is exactly the
+out-of-band-publish case this gating exists to surface: creating a release then
+would certify bytes the pipeline never uploaded. Note also that `cargo package`
+output is **not** guaranteed byte-reproducible across toolchain versions, so a
+difference is not automatically proof of tampering; if the hashes differ, re-run
+step 2 with the exact toolchain from the publishing run's log before concluding
+the mismatch is real.
 
 ## Yanking
 
