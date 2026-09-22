@@ -145,6 +145,18 @@ patterns. Log-ingestion pipelines (grok patterns, SIEM parsers) anchored on
 either escaped shape must be updated similarly. Consumers that merely log
 or forward these fields verbatim need no change.
 
+**One security caveat, and it cuts the other way.** The JSON-RPC `id` is
+client-controlled. Debug previously escaped control characters in it; Display
+does not. A hook that writes the raw `request_id` into a log line - e.g.
+`tracing::info!(request_id = %id, …)` - therefore lets a client embed
+newlines or terminal escape sequences and forge log entries. The crate itself
+never logs the field, and `ToolCallContext`'s own `Debug` impl still renders
+it through `Debug` (which escapes), so the framework's own output is
+unaffected. If your hook logs it, switch to the new
+`ToolCallContext::request_id_for_log()`, which escapes control characters via
+`str::escape_debug` **without** reintroducing surrounding quotes: `abc-123`
+stays `abc-123`, while `a\nb` becomes `a\\nb`.
+
 **Observable signature:** `"request_id":"abc-123"` instead of
 `"request_id":"String(\"abc-123\")"`; `"allowed":"https://example.com:443,
 null"` instead of `"allowed":"[Tuple(\"https\", \"example.com\", 443),

@@ -84,10 +84,44 @@ pub struct ToolCallContext {
     /// OAuth `sub` claim, if present.
     pub sub: Option<String>,
     /// Raw JSON-RPC request id rendered as a string, if available.
+    ///
+    /// # Log-injection warning
+    ///
+    /// This value is **client-controlled**. The JSON-RPC `id` may be a string
+    /// of the client's choosing, so it can contain newlines, ANSI/terminal
+    /// escape sequences, or other control characters. Since 3.14 it is
+    /// rendered via [`Display`](std::fmt::Display) (`abc-123`) rather than
+    /// [`Debug`](std::fmt::Debug) (`String("abc-123")`), which means control
+    /// characters are **no longer escaped for you**.
+    ///
+    /// [`ToolCallContext`]'s own `Debug` impl is safe - it renders this field
+    /// through `Debug`, which escapes. The risk is a hook that writes the raw
+    /// value into a log line, e.g. `tracing::info!(request_id = %id, …)`.
+    /// Use [`ToolCallContext::request_id_for_log`] instead, which escapes
+    /// control characters without adding surrounding quotes.
     pub request_id: Option<String>,
 }
 
 impl ToolCallContext {
+    /// Return [`request_id`](Self::request_id) with control characters
+    /// escaped, safe to write directly into a log line.
+    ///
+    /// The JSON-RPC request id is client-controlled and may contain newlines
+    /// or terminal escape sequences; writing it verbatim into a log allows an
+    /// attacker to forge log lines. This escapes via
+    /// [`str::escape_debug`], which neutralises control characters, quotes and
+    /// backslashes **without** wrapping the value in quotes - so an ordinary
+    /// id such as `abc-123` is returned unchanged while `a\nb` becomes
+    /// `a\\nb`.
+    ///
+    /// Returns `None` when no request id was available.
+    #[must_use]
+    pub fn request_id_for_log(&self) -> Option<String> {
+        self.request_id
+            .as_deref()
+            .map(|id| id.escape_debug().to_string())
+    }
+
     /// Construct a [`ToolCallContext`] with the given tool name and all
     /// optional fields cleared.  Primarily for use in unit tests and
     /// benchmarks of user-supplied hooks; the runtime path populates
@@ -2176,6 +2210,47 @@ mod tests {
             sub: Some("sub-secret".to_owned()),
             request_id: Some("request-id-visible".to_owned()),
         }
+    }
+
+    #[test]
+    fn request_id_for_log_escapes_control_characters() {
+        let ctx = ToolCallContext {
+            request_id: Some("evil\n2026-01-01 INFO forged log line\u{1b}[31m".to_owned()),
+            ..ToolCallContext::for_tool("t")
+        };
+        let escaped = ctx
+            .request_id_for_log()
+            .expect("request id is present so the accessor returns Some");
+        assert!(
+            !escaped.contains('\n'),
+            "a raw newline lets a client forge log lines: {escaped}"
+        );
+        assert!(
+            !escaped.contains('\u{1b}'),
+            "a raw ESC lets a client emit terminal escape sequences: {escaped}"
+        );
+        assert!(
+            escaped.starts_with("evil\\n"),
+            "the newline must be escaped, not stripped: {escaped}"
+        );
+    }
+
+    #[test]
+    fn request_id_for_log_leaves_ordinary_ids_unquoted() {
+        let ctx = ToolCallContext {
+            request_id: Some("abc-123".to_owned()),
+            ..ToolCallContext::for_tool("t")
+        };
+        assert_eq!(
+            ctx.request_id_for_log().as_deref(),
+            Some("abc-123"),
+            "an ordinary id must survive unchanged and unquoted"
+        );
+        assert_eq!(
+            ToolCallContext::for_tool("t").request_id_for_log(),
+            None,
+            "absent request id yields None"
+        );
     }
 
     #[test]

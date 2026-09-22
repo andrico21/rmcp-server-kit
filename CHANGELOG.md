@@ -96,6 +96,21 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   Ships as a **minor**. See `docs/MIGRATION.md` (§ "Migrating to 3.14: JSON
   log quote-escaping fixed").
 
+### Added
+
+- **`ToolCallContext::request_id_for_log()`**, returning the request id with
+  control characters escaped and no surrounding quotes. The JSON-RPC `id` is
+  client-controlled, so rendering it via `Display` (see the `### Changed`
+  entry above) means newlines and terminal escape sequences are no longer
+  escaped for you - a hook that writes the raw value into a log line would
+  let a client forge log entries. `ToolCallContext`'s own `Debug` impl was
+  already safe because it renders the field through `Debug`; this accessor
+  gives hook authors the same safety without reintroducing the `\"` noise
+  that the `Display` change removed. Escaping uses `str::escape_debug`, so an
+  ordinary id such as `abc-123` is returned unchanged while `a\nb` becomes
+  `a\\nb`. The `request_id` field documentation now carries a matching
+  log-injection warning.
+
 ## [3.13.0] - 2026-09-18
 
 ### Added
