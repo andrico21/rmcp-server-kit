@@ -329,6 +329,35 @@ rollback is clean and no consumer TOML can depend on the new behaviour. See
 
 </details>
 
+<details>
+<summary><strong>TLS session resumption is disabled on mTLS listeners - revocation and expiry over handshake performance</strong></summary>
+
+<br>
+
+**Status: shipped (minor, no opt-out).** Recorded here so the trade-off is
+not rediscovered or "optimized" away.
+
+rustls restores a resumed handshake's peer certificate chain from cached
+session state without ever calling `ClientCertVerifier::verify_client_cert`
+- the only place this crate checks CRL revocation, certificate expiry
+(`notAfter`), and chain validity. Left enabled, a certificate that had since
+been revoked or expired could keep authenticating for as long as a session
+stayed resumable, with no log, metric, or audit signal distinguishing that
+connection from a freshly verified one. `TlsListener` now disables the
+rustls session store and TLS 1.3 ticket emission whenever `[mtls]` is
+configured at all - not only when CRL checking is enabled, since non-CRL
+mTLS still relies on `verify_client_cert` for expiry and chain validation.
+
+No config knob was added, and none is planned: an opt-out would reintroduce
+the exact bypass this closes. The cost is a full handshake on every mTLS
+connection instead of a cheaper resumed one where the client would otherwise
+have resumed; high-churn clients should use HTTP keep-alive/connection
+pooling to amortize it. Plain TLS (no client certificate) is unaffected. See
+[`SECURITY.md`](SECURITY.md#what-point-in-time-mtls-still-means) and
+[`docs/MIGRATION.md`](docs/MIGRATION.md).
+
+</details>
+
 ## Minimum supported Rust
 
 `rmcp-server-kit` targets stable Rust **1.98** or newer (tracks `edition = "2024"`).

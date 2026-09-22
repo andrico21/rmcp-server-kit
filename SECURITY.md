@@ -148,8 +148,11 @@ When mTLS is enabled, rmcp-server-kit:
 3. Caches every CRL in memory keyed by URL and refreshes it before
    `nextUpdate` (clamped to `[10 min, 24 h]`) on a background task.
 4. Hot-swaps the underlying `rustls::ClientCertVerifier` via `ArcSwap` once
-   new CRLs land, so handshakes always check the freshest revocation data
-   without dropping in-flight connections.
+   new CRLs land, so every new handshake checks the freshest revocation
+   data without dropping in-flight connections. TLS session resumption is
+   disabled on mTLS listeners (since 3.14) precisely so every connection is
+   a full handshake that reaches this verifier - see
+   [What "point-in-time mTLS" still means](#what-point-in-time-mtls-still-means).
 5. **Fails closed by default** (since 3.9): a certificate advertising CRL
    distribution points is rejected when *every* relevant CDP is uncached and
    unfetchable, per RFC 5280 §6.3. Denial requires all relevant CDPs to be
@@ -553,7 +556,11 @@ Implications:
 Even with CRL enabled, the original mitigations remain best practice:
 
 1. **Short-lived certificates (≤24h)** - bounds exposure regardless of CRL
-   propagation latency.
+   propagation latency. This bound holds for mTLS *only because* TLS
+   session resumption is disabled on mTLS listeners (since 3.14): a resumed
+   handshake never re-checks `notAfter`, so if resumption were ever
+   re-enabled here, certificate lifetime would stop bounding session
+   lifetime and this mitigation would silently stop working.
    - [cert-manager](https://cert-manager.io/) `Certificate.spec.duration: 24h`, `renewBefore: 8h`.
    - [HashiCorp Vault PKI](https://developer.hashicorp.com/vault/docs/secrets/pki) `max_ttl=24h` with agent-driven renewal.
    - [Smallstep `step-ca`](https://smallstep.com/docs/step-ca/) with the autorenewal daemon.
@@ -572,15 +579,32 @@ revoked *after* the handshake will continue to be honoured until the
 connection is closed by either side.** Combine short-lived sessions with
 short-lived certs for the strongest guarantees.
 
+**Since 3.14, that combination actually delivers on its promise.**
+rmcp-server-kit disables TLS session resumption on mTLS listeners, so a
+*new* connection can no longer bypass revocation (or certificate expiry) by
+resuming cached session state instead of performing a full handshake.
+Before 3.14, rustls could restore a resumed connection's peer certificate
+from its session cache without ever calling
+`ClientCertVerifier::verify_client_cert`, so closing and reopening a
+connection did not reliably force re-verification - the "short-lived
+sessions" guidance above only fully closes that gap as of 3.14.
+
 ### Threat model addendum
 
-- A stolen private key is valid until either (a) the next CRL publication
-  marks it revoked **and** rmcp-server-kit's cache refreshes, or (b) the
+- A stolen private key is valid, for *new* connections (or once existing
+  connections close), until either (a) the next CRL publication marks it
+  revoked **and** rmcp-server-kit's cache refreshes, or (b) the
   certificate's `notAfter` passes - whichever comes first. ≤24 h cert
   lifetimes still bound this exposure even when CRL fetching fails.
-- An evicted operator's certificate becomes invalid as soon as the
-  issuing CA publishes the updated CRL and rmcp-server-kit refreshes it
-  (≤ `nextUpdate` clamped to 24 h, or immediately via
+  **This is enforced correctly since 3.14** because session resumption is
+  disabled on mTLS listeners: every new connection performs a full
+  handshake, the only path that re-checks both revocation and `notAfter`.
+  Before 3.14, a resumed connection skipped
+  `ClientCertVerifier::verify_client_cert` entirely, so neither bound
+  actually applied to a session an attacker could keep resuming.
+- An evicted operator's certificate becomes invalid, for *new* connections,
+  as soon as the issuing CA publishes the updated CRL and rmcp-server-kit
+  refreshes it (≤ `nextUpdate` clamped to 24 h, or immediately via
   `ReloadHandle::refresh_crls()`).
 - OCSP is not implemented; if your PKI publishes only OCSP, treat
   revocation as unsupported and apply the defence-in-depth mitigations

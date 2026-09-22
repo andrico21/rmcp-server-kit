@@ -3166,54 +3166,10 @@ impl TlsListener {
         let certs = load_certs(cert_path)?;
         let key = load_key(key_path)?;
 
-        let mtls_default_role;
+        let mtls_default_role =
+            mtls_config.map_or_else(|| "viewer".to_owned(), |m| m.default_role.clone());
 
-        let tls_config = if let Some(mtls) = mtls_config {
-            mtls_default_role = mtls.default_role.clone();
-            let verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> = if mtls.crl_enabled
-            {
-                let Some(crl_set) = crl_set else {
-                    return Err(anyhow::anyhow!(
-                        "mTLS CRL verifier requested but CRL state was not initialized"
-                    ));
-                };
-                Arc::new(DynamicClientCertVerifier::new(crl_set))
-            } else {
-                let (_, root_store) = load_client_auth_roots(&mtls.ca_cert_path)?;
-                if mtls.required {
-                    rustls::server::WebPkiClientVerifier::builder(root_store)
-                        .build()
-                        .map_err(|e| anyhow::anyhow!("mTLS verifier error: {e}"))?
-                } else {
-                    rustls::server::WebPkiClientVerifier::builder(root_store)
-                        .allow_unauthenticated()
-                        .build()
-                        .map_err(|e| anyhow::anyhow!("mTLS verifier error: {e}"))?
-                }
-            };
-
-            tracing::info!(
-                ca = %mtls.ca_cert_path.display(),
-                required = mtls.required,
-                crl_enabled = mtls.crl_enabled,
-                "mTLS client auth configured"
-            );
-
-            rustls::ServerConfig::builder_with_protocol_versions(&[
-                &rustls::version::TLS12,
-                &rustls::version::TLS13,
-            ])
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(certs, key)?
-        } else {
-            mtls_default_role = "viewer".to_owned();
-            rustls::ServerConfig::builder_with_protocol_versions(&[
-                &rustls::version::TLS12,
-                &rustls::version::TLS13,
-            ])
-            .with_no_client_auth()
-            .with_single_cert(certs, key)?
-        };
+        let tls_config = build_tls_server_config(certs, key, mtls_config, crl_set)?;
 
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
         tracing::info!(
@@ -3481,6 +3437,103 @@ fn load_key(path: &Path) -> anyhow::Result<rustls::pki_types::PrivateKeyDer<'sta
     use rustls::pki_types::pem::PemObject;
     rustls::pki_types::PrivateKeyDer::from_pem_file(path)
         .map_err(|e| anyhow::anyhow!("failed to read key from {}: {e}", path.display()))
+}
+
+/// Test/production seam: builds a `ServerConfig` from an explicit verifier
+/// so tests can inject one without file-backed CA/CRL setup. Production
+/// code reaches this only via `build_tls_server_config` below.
+fn build_tls_server_config_from_verifier(
+    certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+    key: rustls::pki_types::PrivateKeyDer<'static>,
+    verifier: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+    disable_resumption: bool,
+) -> anyhow::Result<rustls::ServerConfig> {
+    let mut tls_config = rustls::ServerConfig::builder_with_protocol_versions(&[
+        &rustls::version::TLS12,
+        &rustls::version::TLS13,
+    ])
+    .with_client_cert_verifier(verifier)
+    .with_single_cert(certs, key)?;
+
+    if disable_resumption {
+        // SECURITY: rustls restores `peer_certificates` from cached session
+        // state on resumed handshakes WITHOUT calling
+        // `ClientCertVerifier::verify_client_cert` (rustls 0.23:
+        // server/tls12.rs:287-290, server/tls13.rs:371-375; the only
+        // verifier call sites are the full-handshake ExpectCertificate
+        // states at tls12.rs:490-493 and tls13.rs:1128-1130). That function
+        // is also the sole site of certificate expiry and chain validation
+        // (webpki/client_verifier.rs:385-394 `verify_for_usage(.., now, ..)`),
+        // so a resumed handshake re-checks neither revocation NOR
+        // `notAfter`. Since this crate derives `AuthIdentity` from
+        // `peer_certificates()`, a resumed connection would yield a fully
+        // authenticated identity from a chain that was never re-checked.
+        // Disabling the session store closes both the TLS 1.2 session-ID
+        // path (`can_cache() == false` suppresses session-ID issuance) and
+        // the TLS 1.3 stateful-ticket path (`put()` returning false makes
+        // ticket emission bail). NOTE: this relies on `ticketer` remaining
+        // disabled (rustls' default); enabling a ticketer would reintroduce
+        // stateless TLS 1.3 resumption and must not be done for mTLS.
+        tls_config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+        tls_config.send_tls13_tickets = 0;
+        tracing::info!(
+            "TLS session resumption disabled for mTLS listener; every connection performs full client-certificate verification"
+        );
+    }
+
+    Ok(tls_config)
+}
+
+/// Builds the production verifier (CRL-backed or plain webpki) and disables
+/// session resumption whenever mTLS is configured at all: non-CRL mTLS still
+/// relies on `verify_client_cert` for expiry and chain validation, so
+/// scoping to `crl_enabled` alone would leave that path unprotected. The
+/// non-mTLS branch is untouched -- it requests no client cert, so
+/// resumption there is not security-relevant.
+fn build_tls_server_config(
+    certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+    key: rustls::pki_types::PrivateKeyDer<'static>,
+    mtls_config: Option<&MtlsConfig>,
+    crl_set: Option<Arc<CrlSet>>,
+) -> anyhow::Result<rustls::ServerConfig> {
+    if let Some(mtls) = mtls_config {
+        let verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> = if mtls.crl_enabled {
+            let Some(crl_set) = crl_set else {
+                return Err(anyhow::anyhow!(
+                    "mTLS CRL verifier requested but CRL state was not initialized"
+                ));
+            };
+            Arc::new(DynamicClientCertVerifier::new(crl_set))
+        } else {
+            let (_, root_store) = load_client_auth_roots(&mtls.ca_cert_path)?;
+            if mtls.required {
+                rustls::server::WebPkiClientVerifier::builder(root_store)
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("mTLS verifier error: {e}"))?
+            } else {
+                rustls::server::WebPkiClientVerifier::builder(root_store)
+                    .allow_unauthenticated()
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("mTLS verifier error: {e}"))?
+            }
+        };
+
+        tracing::info!(
+            ca = %mtls.ca_cert_path.display(),
+            required = mtls.required,
+            crl_enabled = mtls.crl_enabled,
+            "mTLS client auth configured"
+        );
+
+        build_tls_server_config_from_verifier(certs, key, verifier, mtls_config.is_some())
+    } else {
+        Ok(rustls::ServerConfig::builder_with_protocol_versions(&[
+            &rustls::version::TLS12,
+            &rustls::version::TLS13,
+        ])
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?)
+    }
 }
 
 // cancel-safe: builds a constant JSON body with no awaits and no shared state.
@@ -6608,6 +6661,439 @@ mod tests {
         }
 
         drop(tls);
+    }
+
+    // -- TLS session resumption disabled for mTLS (WO-T1) --
+
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use rustls::{
+        DigitallySignedStruct, DistinguishedName, SignatureScheme,
+        client::danger::HandshakeSignatureValid,
+        server::danger::{ClientCertVerified, ClientCertVerifier},
+    };
+
+    fn self_signed_test_material() -> (
+        Vec<rustls::pki_types::CertificateDer<'static>>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+    ) {
+        let key = rcgen::KeyPair::generate().expect("generate key");
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
+            .expect("cert params")
+            .self_signed(&key)
+            .expect("self-signed cert");
+        (
+            vec![cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+        )
+    }
+
+    #[test]
+    fn build_tls_server_config_disables_resumption_for_mtls() {
+        let (certs, key) = self_signed_test_material();
+        let mut roots = RootCertStore::empty();
+        roots.add(certs[0].clone()).expect("add root");
+        let verifier: Arc<dyn ClientCertVerifier> =
+            rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+                .allow_unauthenticated()
+                .build()
+                .expect("client verifier");
+
+        let cfg = build_tls_server_config_from_verifier(certs, key, verifier, true)
+            .expect("build tls config");
+
+        assert!(
+            !cfg.session_storage.can_cache(),
+            "mTLS must not offer resumable sessions"
+        );
+        assert!(
+            !cfg.session_storage.put(vec![1], vec![2]),
+            "mTLS session store must reject writes"
+        );
+        assert!(
+            cfg.session_storage.take(&[1]).is_none(),
+            "mTLS session store must never yield a session"
+        );
+        assert_eq!(
+            cfg.send_tls13_tickets, 0,
+            "mTLS must not emit TLS 1.3 session tickets"
+        );
+    }
+
+    #[test]
+    fn build_tls_server_config_keeps_resumption_for_non_mtls() {
+        let (certs, key) = self_signed_test_material();
+        let cfg = build_tls_server_config(certs, key, None, None).expect("build tls config");
+        assert!(
+            cfg.session_storage.can_cache(),
+            "non-mTLS listeners intentionally keep resumption enabled (deliberate scope decision)"
+        );
+    }
+
+    struct ResumptionTestMaterial {
+        server_certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+        server_key: rustls::pki_types::PrivateKeyDer<'static>,
+        client_certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+        client_key: rustls::pki_types::PrivateKeyDer<'static>,
+        roots: Arc<RootCertStore>,
+    }
+
+    /// A small CA-backed PKI for the resumption regression test below.
+    /// Deliberately independent of `tests/e2e.rs::crl_tests` (a separate
+    /// test binary that cannot see this module's private helpers).
+    fn build_resumption_test_material() -> ResumptionTestMaterial {
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("ca params");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::DigitalSignature,
+        ];
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "resumption-test-ca");
+        let ca_key = rcgen::KeyPair::generate().expect("ca key");
+        let ca = rcgen::CertifiedIssuer::self_signed(ca_params, ca_key).expect("ca self-signed");
+
+        let mut roots = RootCertStore::empty();
+        roots.add(ca.der().clone()).expect("add ca root");
+
+        let server_key = rcgen::KeyPair::generate().expect("server key");
+        let mut server_params =
+            rcgen::CertificateParams::new(vec!["localhost".to_owned()]).expect("server params");
+        server_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "localhost");
+        server_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::DigitalSignature,
+            rcgen::KeyUsagePurpose::KeyEncipherment,
+        ];
+        server_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        server_params.use_authority_key_identifier_extension = true;
+        let server_cert = server_params
+            .signed_by(&server_key, &ca)
+            .expect("server cert");
+
+        let client_key = rcgen::KeyPair::generate().expect("client key");
+        let mut client_params =
+            rcgen::CertificateParams::new(Vec::<String>::new()).expect("client params");
+        client_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "resumption-test-client");
+        client_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::DigitalSignature,
+            rcgen::KeyUsagePurpose::KeyEncipherment,
+        ];
+        client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        client_params.use_authority_key_identifier_extension = true;
+        let client_cert = client_params
+            .signed_by(&client_key, &ca)
+            .expect("client cert");
+
+        ResumptionTestMaterial {
+            server_certs: vec![server_cert.der().clone()],
+            server_key: rustls::pki_types::PrivatePkcs8KeyDer::from(server_key.serialize_der())
+                .into(),
+            client_certs: vec![client_cert.der().clone()],
+            client_key: rustls::pki_types::PrivatePkcs8KeyDer::from(client_key.serialize_der())
+                .into(),
+            roots: Arc::new(roots),
+        }
+    }
+
+    /// Counts `verify_client_cert` calls and can be flipped to reject every
+    /// subsequent verification, proving whether rustls actually invoked
+    /// verification for a given handshake (full) or bypassed it (resumed).
+    struct FlipVerifier {
+        inner: Arc<dyn ClientCertVerifier>,
+        calls: AtomicUsize,
+        reject_after_first: AtomicBool,
+    }
+
+    impl FlipVerifier {
+        fn new(inner: Arc<dyn ClientCertVerifier>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                calls: AtomicUsize::new(0),
+                reject_after_first: AtomicBool::new(false),
+            })
+        }
+    }
+
+    impl std::fmt::Debug for FlipVerifier {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("FlipVerifier")
+                .field("calls", &self.calls)
+                .field("reject_after_first", &self.reject_after_first)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl ClientCertVerifier for FlipVerifier {
+        fn offer_client_auth(&self) -> bool {
+            self.inner.offer_client_auth()
+        }
+
+        fn client_auth_mandatory(&self) -> bool {
+            self.inner.client_auth_mandatory()
+        }
+
+        fn root_hint_subjects(&self) -> &[DistinguishedName] {
+            self.inner.root_hint_subjects()
+        }
+
+        fn verify_client_cert(
+            &self,
+            end_entity: &rustls::pki_types::CertificateDer<'_>,
+            intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            now: rustls::pki_types::UnixTime,
+        ) -> Result<ClientCertVerified, rustls::Error> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.reject_after_first.load(Ordering::SeqCst) {
+                return Err(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::Revoked,
+                ));
+            }
+            self.inner
+                .verify_client_cert(end_entity, intermediates, now)
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            self.inner.verify_tls12_signature(message, cert, dss)
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            self.inner.verify_tls13_signature(message, cert, dss)
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.inner.supported_verify_schemes()
+        }
+
+        fn requires_raw_public_keys(&self) -> bool {
+            self.inner.requires_raw_public_keys()
+        }
+    }
+
+    /// Accepts one TLS connection, reads the request to the blank line (or
+    /// EOF) with a timeout, writes a minimal HTTP response, then shuts down
+    /// cleanly. Pairs with `connect_and_drive`'s EOF read so TLS 1.3
+    /// post-handshake `NewSessionTicket` messages are actually delivered.
+    async fn accept_and_serve(
+        listener: &TcpListener,
+        acceptor: &tokio_rustls::TlsAcceptor,
+    ) -> std::io::Result<()> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let (tcp, _addr) = listener.accept().await?;
+        let mut tls = tokio::time::timeout(Duration::from_secs(5), acceptor.accept(tcp))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "server: TLS accept timed out")
+            })??;
+
+        let mut request = Vec::new();
+        let mut byte = [0_u8; 1];
+        loop {
+            let n = tokio::time::timeout(Duration::from_secs(5), tls.read(&mut byte))
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "server: read timed out")
+                })??;
+            if n == 0 {
+                break;
+            }
+            request.push(byte[0]);
+            if request.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        tls.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok")
+            .await?;
+        tls.flush().await?;
+        tls.shutdown().await?;
+        Ok(())
+    }
+
+    /// Connects, sends a minimal HTTP request, and reads the response to
+    /// EOF -- required so the client's rustls state machine actually
+    /// processes any post-handshake `NewSessionTicket` messages before the
+    /// stream is dropped. Returns the live stream so the caller can inspect
+    /// `handshake_kind()` afterward.
+    async fn connect_and_drive(
+        connector: &tokio_rustls::TlsConnector,
+        addr: SocketAddr,
+        server_name: rustls::pki_types::ServerName<'static>,
+    ) -> std::io::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let tcp = tokio::net::TcpStream::connect(addr).await?;
+        let mut tls = connector.connect(server_name, tcp).await?;
+
+        tls.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await?;
+        tls.flush().await?;
+
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), tls.read_to_end(&mut response))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "client: read timed out")
+            })??;
+
+        Ok(tls)
+    }
+
+    /// Outcome of driving two sequential connections against one
+    /// `FlipVerifier`-backed server.
+    struct ScenarioOutcome {
+        calls_after_first: usize,
+        second_client_result: std::io::Result<()>,
+        second_handshake_kind: Option<rustls::HandshakeKind>,
+        calls_after_second: usize,
+    }
+
+    /// Stands up a fresh mTLS-verifying TLS server (`disable_resumption`
+    /// controls the exact fix under test) and a matching client with
+    /// in-memory session resumption enabled. Drives one full handshake to
+    /// completion, flips the verifier to reject-everything, drives a second
+    /// connection, and reports what happened.
+    async fn run_resumption_scenario(disable_resumption: bool) -> ScenarioOutcome {
+        let material = build_resumption_test_material();
+
+        let base_verifier: Arc<dyn ClientCertVerifier> =
+            rustls::server::WebPkiClientVerifier::builder(Arc::clone(&material.roots))
+                .build()
+                .expect("client verifier");
+        let flip = FlipVerifier::new(base_verifier);
+        let flip_for_config: Arc<FlipVerifier> = Arc::clone(&flip);
+        let verifier_handle: Arc<dyn ClientCertVerifier> = flip_for_config;
+
+        let tls_config = build_tls_server_config_from_verifier(
+            material.server_certs,
+            material.server_key,
+            verifier_handle,
+            disable_resumption,
+        )
+        .expect("server tls config");
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+
+        let mut client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(Arc::clone(&material.roots))
+            .with_client_auth_cert(material.client_certs, material.client_key)
+            .expect("client config");
+        // `rustls::client::handy::ClientSessionMemoryCache` divides its
+        // requested `size` by `MAX_TLS13_TICKETS_PER_SERVER` (8) to get a
+        // server-name-slot count. A `size` of 8 or less rounds down to
+        // exactly one slot, whose backing `VecDeque` has capacity 1 --
+        // its own eviction guard (`capacity() == len()`) then fires on the
+        // very first insert and evicts the entry that insert just made,
+        // so no ticket ever survives to the next connection. 256 mirrors
+        // the crate's own server-side default
+        // (`ServerSessionMemoryCache::new(256)`), well clear of that
+        // one-slot edge for this test's single server name.
+        client_config.resumption = rustls::client::Resumption::in_memory_sessions(256);
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+
+        let server_name =
+            rustls::pki_types::ServerName::try_from("localhost").expect("server name");
+
+        let (server_result_1, client_result_1) = tokio::join!(
+            accept_and_serve(&listener, &acceptor),
+            connect_and_drive(&connector, addr, server_name.clone()),
+        );
+        server_result_1.expect("connection 1: server side must complete");
+        client_result_1.expect("connection 1: full handshake must succeed");
+
+        let calls_after_first = flip.calls.load(Ordering::SeqCst);
+        flip.reject_after_first.store(true, Ordering::SeqCst);
+
+        let (_server_result_2, client_result_2) = tokio::join!(
+            accept_and_serve(&listener, &acceptor),
+            connect_and_drive(&connector, addr, server_name),
+        );
+
+        let (second_client_result, second_handshake_kind) = match client_result_2 {
+            Ok(stream) => (Ok(()), stream.get_ref().1.handshake_kind()),
+            Err(e) => (Err(e), None),
+        };
+
+        ScenarioOutcome {
+            calls_after_first,
+            second_client_result,
+            second_handshake_kind,
+            calls_after_second: flip.calls.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Regression test for the mTLS session-resumption bypass: rustls
+    /// restores `peer_certificates` from cached session state on resumed
+    /// handshakes without calling `ClientCertVerifier::verify_client_cert`,
+    /// so a de-authorized principal (revoked or expired certificate) could
+    /// keep authenticating past both checks for as long as it held a live
+    /// session. `disable_resumption` (wired to mTLS listeners via
+    /// `mtls_config.is_some()` in `build_tls_server_config`) closes this.
+    ///
+    /// The `control` half proves the harness can produce a genuine resumed
+    /// handshake at all; without it, an unrelated harness bug that always
+    /// forces full handshakes would make the `fixed` assertions pass for
+    /// the wrong reason.
+    #[tokio::test]
+    async fn mtls_resumption_disabled_forces_full_reverification() {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+
+        let fixed = run_resumption_scenario(true).await;
+        assert_eq!(
+            fixed.calls_after_first, 1,
+            "connection 1 must invoke the verifier exactly once"
+        );
+        assert!(
+            fixed.second_client_result.is_err(),
+            "connection 2 must fail once the verifier rejects everything, proving no \
+             cached identity was reused"
+        );
+        assert_ne!(
+            fixed.second_handshake_kind,
+            Some(rustls::HandshakeKind::Resumed),
+            "connection 2 must not be a resumed handshake when resumption is disabled"
+        );
+        assert_eq!(
+            fixed.calls_after_second, 2,
+            "connection 2 must re-invoke the verifier -- this is the fix"
+        );
+
+        let control = run_resumption_scenario(false).await;
+        assert_eq!(control.calls_after_first, 1);
+        assert!(
+            control.second_client_result.is_ok(),
+            "control connection 2 must succeed via resumption; if it does not, the \
+             `fixed` assertions above prove nothing because the client never even \
+             attempted resumption"
+        );
+        assert_eq!(
+            control.second_handshake_kind,
+            Some(rustls::HandshakeKind::Resumed),
+            "control connection 2 must be a genuine resumed handshake"
+        );
+        assert_eq!(
+            control.calls_after_second, 1,
+            "control verifier must NOT be re-invoked -- this is the exact bypass the fix eliminates"
+        );
     }
 
     // -- M5: OWASP security headers reach early / fallback responses --

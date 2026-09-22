@@ -41,6 +41,37 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   surface changes. This is why the change ships as a **minor**, not a patch.
   See `docs/MIGRATION.md` (§ "Migrating to 3.14").
 
+- **Disabled TLS session resumption on mTLS listeners, so a resumed
+  handshake can no longer skip both certificate revocation and expiry
+  checking (CWE-295, CWE-299, CWE-613).** rustls restores a resumed
+  handshake's peer certificate chain from cached session state without ever
+  calling `ClientCertVerifier::verify_client_cert` - the sole site of both
+  CRL revocation checking and certificate validity-period (`notAfter`) /
+  chain validation. Resumption requires the *client-side* resumption
+  secret, not the private key, so a pure key thief still faces a full,
+  verified handshake; the actual beneficiary was a warm, already-verified
+  principal who had since been de-authorized (an evicted operator, a
+  terminated employee's still-running client, a decommissioned service),
+  retaining its existing RBAC role for as long as the server process and
+  its session cache stayed up, with no log, metric, or audit signal
+  distinguishing the bypassed connection from a freshly verified one.
+  `TlsListener` now disables the rustls session store and TLS 1.3 ticket
+  emission whenever mTLS is configured at all - not only when CRL checking
+  is enabled, since non-CRL mTLS still relies on `verify_client_cert` for
+  expiry and chain validation.
+
+  **Compatibility:** no public API or config surface change - the
+  resumption toggle is an internal parameter of a private helper, and no
+  `MtlsConfig` field is added - with a **runtime behavioural change**: mTLS
+  listeners no longer issue or accept TLS session resumption, so every new
+  connection performs a full handshake instead of a cheaper resumed one (a
+  deliberate performance trade-off in exchange for closing the bypass).
+  Connections already established when this ships are unaffected; only new
+  connections after upgrade gain full re-verification. Non-mTLS TLS
+  listeners are untouched. This ships as a **minor**, not a patch. See
+  `docs/MIGRATION.md` (§ "Migrating to 3.14: mTLS session resumption
+  disabled").
+
 ## [3.13.0] - 2026-09-18
 
 ### Added

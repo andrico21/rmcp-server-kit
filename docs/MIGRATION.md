@@ -87,6 +87,41 @@ new throttled `discovery_unattributed_fallback` WARN fires only when
 discovery runs with no handshake peer scope (i.e. the per-peer path is not
 active), which on the standard transport should never happen.
 
+## Migrating to 3.14: mTLS session resumption disabled
+
+mTLS listeners no longer issue or accept TLS session resumption (TLS 1.2
+session IDs/tickets, TLS 1.3 tickets). rustls previously restored a resumed
+handshake's peer certificate chain from cached session state without ever
+calling `ClientCertVerifier::verify_client_cert` -- the only site that checks
+CRL revocation and certificate validity-period (`notAfter`) / chain
+validation -- so a certificate that had been revoked or had expired could
+continue authenticating for as long as a session could be resumed. This is a
+**minor**, no-opt-out behavioural change: no public API or `MtlsConfig` field
+changes, so `cargo semver-checks` reports nothing.
+
+**Impact:** every *new* mTLS connection now performs a full handshake, so CRL
+revocation and `notAfter` expiry apply starting with the next connection
+after upgrade. Connections already established when the server restarts are
+unaffected -- they remain trusted until closed, exactly as before; this
+change only removes a *new* connection's ability to skip verification via a
+resumed session. High-churn mTLS clients (short-lived connections that
+previously resumed) now pay a full handshake -- a CPU cost, not a
+correctness change -- on every connection; plain TLS (no client certificate)
+is untouched.
+
+**Action required:** none for correctness. If you serve a high volume of
+short-lived mTLS connections from the same clients, consider HTTP
+keep-alive/connection pooling on the client side to amortize the full
+handshake cost, and review `tls_handshake_timeout` /
+`max_concurrent_tls_handshakes` sizing if handshake volume increases
+materially.
+
+**Observable signature:** clients no longer observe a resumed handshake
+(`HandshakeKind::Resumed`) against this server on mTLS listeners, and no TLS
+1.3 session tickets are issued to mTLS clients. Startup logs a new line for
+each configured mTLS listener: `TLS session resumption disabled for mTLS
+listener; every connection performs full client-certificate verification`.
+
 ## Migrating to 3.13: origin validation narrowing
 
 `3.13` tightens `allowed_origins` at several points. **No default changed** - an

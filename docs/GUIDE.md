@@ -478,8 +478,23 @@ CRL URLs are auto-discovered from the X.509 **CRL Distribution Points**
 observed during a TLS handshake (lazily). CRLs are cached in memory keyed
 by URL and refreshed on a background task before `nextUpdate`, clamped to
 `[10 min, 24 h]`. The underlying `rustls::ClientCertVerifier` is hot-swapped
-via `ArcSwap` whenever fresh CRLs land, so handshakes always see the
+via `ArcSwap` whenever fresh CRLs land, so every new handshake sees the
 latest revocation data without dropping in-flight connections.
+
+**Since 3.14, TLS session resumption is disabled on mTLS listeners**, which
+is what makes "every new handshake" true rather than "every full handshake."
+Before 3.14, rustls could restore a resumed connection's peer certificate
+from cached session state without ever calling the verifier, so a
+certificate that had since been revoked -- or had expired -- could keep
+authenticating for as long as a session stayed resumable. Every mTLS
+connection now performs a full handshake: clients that previously relied on
+resumption for a high volume of short-lived connections should use HTTP
+keep-alive/connection pooling to amortize the extra handshake cost, and
+operators may need to revisit `tls_handshake_timeout` /
+`max_concurrent_tls_handshakes` sizing if handshake volume increases
+materially. See
+[SECURITY.md](../SECURITY.md#what-point-in-time-mtls-still-means) for the
+full threat model.
 
 **Default behaviour is fail-closed** (since 3.8): if a certificate advertises
 CRL distribution points and *none* of them is cached or fetchable, the

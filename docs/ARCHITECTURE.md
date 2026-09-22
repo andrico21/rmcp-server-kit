@@ -47,7 +47,7 @@ The crate has two transports:
 | Transport          | Function                                            | Auth/RBAC/TLS  | Use case                                         |
 |--------------------|-----------------------------------------------------|----------------|--------------------------------------------------|
 | **Streamable HTTP**| `serve()` - `src/transport.rs:2519`                 | **Yes**        | Production network deployment                    |
-| stdio              | `serve_stdio()` - `src/transport.rs:4562`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
+| stdio              | `serve_stdio()` - `src/transport.rs:4615`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
 
 ---
 
@@ -104,9 +104,9 @@ A complete HTTP request to `/mcp` flows through these layers, top-to-bottom
 `src/transport.rs:1635-2052` (middleware wiring inside `build_app_router`) and in each module.
 
 ```
-TCP / TLS handshake                         src/transport.rs:3126  (TlsListener)
+TCP / TLS handshake                         src/transport.rs:3140  (TlsListener)
    │  - Handshakes run CONCURRENTLY on a background acceptor task
-│    (run_tls_acceptor, src/transport.rs:2937): 256-permit in-flight
+│    (run_tls_acceptor, src/transport.rs:3223): 256-permit in-flight
    │    cap, 10 s per-handshake timeout; axum receives only completed
    │    connections via a bounded channel.
    │  - mTLS: client cert verified during the handshake; the resulting
@@ -185,9 +185,9 @@ Open endpoints (no auth):
 
 | Path                                       | Handler                                       |
 |--------------------------------------------|-----------------------------------------------|
-| `GET  /healthz`                            | `healthz` (~`src/transport.rs:3466`) |
-| `GET  /readyz`                             | `readyz`  (~`src/transport.rs:3530`) - runs configured readiness check |
-| `GET  /version`                            | `version_payload` (~`src/transport.rs:3481`) |
+| `GET  /healthz`                            | `healthz` (~`src/transport.rs:3544`) |
+| `GET  /readyz`                             | `readyz`  (~`src/transport.rs:3608`) - runs configured readiness check |
+| `GET  /version`                            | `version_payload` (~`src/transport.rs:3559`) |
 | `GET  /metrics`                            | served by `serve_metrics` on a **separate listener** when `feature = "metrics"` (`src/metrics.rs:142`) |
 | `GET  /.well-known/oauth-protected-resource` | feature = `oauth` (`src/transport.rs:2200`) |
 | `GET  /.well-known/oauth-authorization-server` | feature = `oauth` proxy (`src/transport.rs:2818`) |
@@ -442,7 +442,7 @@ an outbound `Authorization` header for downstream token passthrough.
 
 ## 7. TLS / mTLS
 
-**Custom listener**: `TlsListener` in `src/transport.rs:3126`, implementing
+**Custom listener**: `TlsListener` in `src/transport.rs:3140`, implementing
 `axum::serve::Listener` so axum's hyper machinery accepts it as a drop-in
 replacement for `TcpListener`.
 
@@ -450,7 +450,7 @@ Lifecycle (concurrent-acceptor design, since the 1.8.1 review fixes):
 1. `TlsListener::new(...)` reads PEM cert + key, builds a `rustls::ServerConfig`,
    optionally wraps with mTLS verification using configured root CAs, then
    spawns a dedicated background acceptor task (`run_tls_acceptor`,
-   `src/transport.rs:3144`) that owns the `TcpListener`.
+   `src/transport.rs:3223`) that owns the `TcpListener`.
 2. The acceptor task loops: acquires a permit from a semaphore sized by
    `max_concurrent_tls_handshakes` (default 256 via
    `DEFAULT_MAX_CONCURRENT_TLS_HANDSHAKES`; configurable since 1.9.0 via
@@ -478,6 +478,23 @@ Configuration toggles:
 - TLS version: TLSv1.2+ (set in `rustls` features).
 - Cipher suites: `rustls` defaults (ring crypto provider).
 - mTLS: optional; when enabled, missing/invalid client cert → connection refused.
+- TLS session resumption: disabled whenever mTLS is configured at all (since
+  3.14), regardless of `crl_enabled`. Non-mTLS listeners keep the rustls
+  default (resumption enabled).
+
+**Why resumption is disabled for mTLS**: `TlsListener::new` builds its
+`rustls::ServerConfig` through `build_tls_server_config`
+(`src/transport.rs`), which passes `disable_resumption = mtls_config.is_some()`
+into the low-level seam `build_tls_server_config_from_verifier`. rustls
+restores a resumed handshake's peer certificate chain from cached session
+state without ever calling `ClientCertVerifier::verify_client_cert` - the
+only place this crate checks CRL revocation, certificate expiry
+(`notAfter`), and chain validity. Left enabled, a certificate that had been
+revoked or had expired could keep authenticating for as long as a session
+stayed resumable, with no observable signal distinguishing the bypassed
+connection from a freshly verified one. Scoping the fix to `crl_enabled`
+alone would be insufficient: non-CRL mTLS still relies on
+`verify_client_cert` for expiry and chain validation.
 
 ### CRL revocation (CDP-driven)
 
