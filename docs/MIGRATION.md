@@ -122,6 +122,34 @@ materially.
 each configured mTLS listener: `TLS session resumption disabled for mTLS
 listener; every connection performs full client-certificate verification`.
 
+## Migrating to 3.14: JSON log quote-escaping fixed
+
+Two structured-logging sites rendered a value with the Debug sigil (`?`)
+whose Debug output embeds quotes; JSON logging then escapes those embedded
+quotes, producing a noticeably harder to read (and harder to grep/regex)
+field. Both are fixed to use `Display` instead. This is a **minor**: no
+public API changes shape, but the **rendered content** of a public field
+changes.
+
+**Impact:** `ToolCallContext.request_id` (`src/tool_hooks.rs`) is a public
+field read by every consumer hook on every tool call. Its rendered format
+changes from Debug (`String("abc-123")` / `Number(42)`) to Display
+(`abc-123` / `42`); the field itself stays `Option<String>`, so this is a
+runtime behavioural change, not an API break. Separately, the `allowed`
+field in rejected-origin WARN logs (`origin_check_middleware`) changes from
+a Debug-rendered private enum to a readable, comma-joined origin list.
+
+**Action required:** consumers that string-match, parse, or regex
+`request_id` must drop the `String(...)` / `Number(...)` wrapper from their
+patterns. Log-ingestion pipelines (grok patterns, SIEM parsers) anchored on
+either escaped shape must be updated similarly. Consumers that merely log
+or forward these fields verbatim need no change.
+
+**Observable signature:** `"request_id":"abc-123"` instead of
+`"request_id":"String(\"abc-123\")"`; `"allowed":"https://example.com:443,
+null"` instead of `"allowed":"[Tuple(\"https\", \"example.com\", 443),
+Null]"`.
+
 ## Migrating to 3.13: origin validation narrowing
 
 `3.13` tightens `allowed_origins` at several points. **No default changed** - an

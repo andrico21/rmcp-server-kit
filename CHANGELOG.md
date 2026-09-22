@@ -72,6 +72,30 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   `docs/MIGRATION.md` (§ "Migrating to 3.14: mTLS session resumption
   disabled").
 
+### Changed
+
+- **JSON log output no longer escapes quotes in the tool-call `request_id`
+  field or in rejected-origin WARN logs.** Two sites recorded a structured
+  field with the Debug sigil (`?`) on a value whose Debug rendering embeds
+  quotes; the JSON log formatter then escapes those embedded quotes, so the
+  field becomes noticeably harder to read or match on. `ToolCallContext`'s
+  `request_id` (populated on every tool call) now renders
+  `rmcp::model::RequestId` via its `Display` impl instead of `Debug`. The
+  private `AllowedOrigin` enum gained a `Display` impl, and the
+  rejected-origin WARN log in `origin_check_middleware` now renders the
+  allowed-origins list with `%` instead of `?`. Before:
+  `"request_id":"String(\"abc-123\")"` and
+  `"allowed":"[Tuple(\"https\", \"example.com\", 443), Null]"`. After:
+  `"request_id":"abc-123"` and `"allowed":"https://example.com:443, null"`.
+  A new source-scanning test guards against recurrence.
+
+  **Compatibility:** no API break - `ToolCallContext.request_id` stays
+  `Option<String>` and `AllowedOrigin` stays private - but the **rendered
+  content** of a public field changes, which is a runtime behavioural
+  change for any consumer parsing or pattern-matching these log values.
+  Ships as a **minor**. See `docs/MIGRATION.md` (§ "Migrating to 3.14: JSON
+  log quote-escaping fixed").
+
 ## [3.13.0] - 2026-09-18
 
 ### Added

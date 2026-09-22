@@ -577,7 +577,7 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        let req_id = Some(format!("{:?}", context.id));
+        let req_id = Some(context.id.to_string());
         let ctx = Self::build_context(&request, req_id);
         let max = self.hooks.max_result_bytes;
         let after_holder = self

@@ -4325,6 +4325,15 @@ enum AllowedOrigin {
     Null,
 }
 
+impl std::fmt::Display for AllowedOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tuple(scheme, host, port) => write!(f, "{scheme}://{host}:{port}"),
+            Self::Null => f.write_str("null"),
+        }
+    }
+}
+
 /// Parse an incoming `Origin` header value under the crate's strict rules.
 ///
 /// Accepts exactly `scheme://host[:port]`. Any path (including a bare trailing
@@ -4516,12 +4525,17 @@ async fn origin_check_middleware(
             // Non-UTF-8 values are logged as a placeholder rather than
             // lossily converted.
             let logged = origin.to_str().unwrap_or("<non-utf8>");
+            let allowed_rendered = allowed
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
             tracing::warn!(
                 origin = logged,
                 duplicate_origin_headers,
                 %method,
                 %path,
-                allowed = ?&*allowed,
+                allowed = %allowed_rendered,
                 "rejected request: Origin not allowed"
             );
             return (

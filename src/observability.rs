@@ -1110,4 +1110,410 @@ mod tests {
             std::process::id()
         ))
     }
+
+    // -----------------------------------------------------------------
+    // Guard against `\"`-escaping in JSON log output (WO-T2).
+    //
+    // With JSON logging (`.json()`, wired above in this module), a field
+    // recorded with the Debug sigil (`?`) is rendered via `format!("{:?}")`
+    // and then embedded in a JSON string; if the Debug output itself
+    // contains quotes, the JSON serializer escapes them --
+    // `"request_id":"String(\"abc-123\")"` instead of
+    // `"request_id":"abc-123"`. This is a heuristic TRIPWIRE modelled on
+    // `crate::error`'s guard, not a proof: it enforces two syntactic rules
+    // and does not attempt data-flow analysis.
+    // -----------------------------------------------------------------
+
+    /// Drop comment lines and everything from the `#[cfg(test)] mod tests`
+    /// module onward. Mirrors `crate::error`'s guard precedent exactly.
+    fn production_source(src: &str) -> String {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut out = String::with_capacity(src.len());
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed == "#[cfg(test)]"
+                && lines
+                    .get(i + 1)
+                    .is_some_and(|next| next.trim_start().starts_with("mod tests"))
+            {
+                break;
+            }
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Index of the `)` matching the `(` at byte offset `open`, respecting
+    /// nested delimiters and string literals so a `)` or `,` inside a
+    /// message string cannot confuse the scan.
+    fn find_matching_paren(s: &str, open: usize) -> Option<usize> {
+        let mut depth = 0_i32;
+        let mut in_string = false;
+        let mut escape = false;
+        for (i, c) in s.get(open..)?.char_indices() {
+            if in_string {
+                if escape {
+                    escape = false;
+                } else if c == '\\' {
+                    escape = true;
+                } else if c == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match c {
+                '"' => in_string = true,
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(open + i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Split a macro argument list on top-level commas, respecting nested
+    /// delimiters and string literals.
+    fn split_top_level_args(args: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut depth = 0_i32;
+        let mut in_string = false;
+        let mut escape = false;
+        let mut start = 0_usize;
+        for (i, c) in args.char_indices() {
+            if in_string {
+                if escape {
+                    escape = false;
+                } else if c == '\\' {
+                    escape = true;
+                } else if c == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match c {
+                '"' => in_string = true,
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                ',' if depth == 0 => {
+                    out.push(args.get(start..i).unwrap_or_default().trim());
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        let tail = args.get(start..).unwrap_or_default().trim();
+        if !tail.is_empty() {
+            out.push(tail);
+        }
+        out
+    }
+
+    fn is_plain_identifier(s: &str) -> bool {
+        let mut chars = s.chars();
+        matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+
+    /// Rule A: a `format!(...)` format string that is *only* a single Debug
+    /// placeholder (`"{:?}"` or `"{value:?}"`) -- unconditional
+    /// Debug-stringification with no surrounding human-readable text.
+    #[allow(
+        clippy::literal_string_with_formatting_args,
+        reason = "comparing scanned source text against a literal pattern, not passing it to a formatting macro"
+    )]
+    fn is_bare_debug_format_string(unquoted: &str) -> bool {
+        unquoted == "{:?}"
+            || unquoted
+                .strip_prefix('{')
+                .and_then(|s| s.strip_suffix(":?}"))
+                .is_some_and(is_plain_identifier)
+    }
+
+    /// Every production `format!(...)` call whose format string matches
+    /// [`is_bare_debug_format_string`]. Scans `format!` invocations only --
+    /// a `tracing::warn!("... {:?}", x)` message string is not this shape
+    /// (see `rule_a_ignores...` below).
+    fn find_bare_debug_format_calls(src: &str) -> Vec<String> {
+        let scanned = production_source(src);
+        let needle = "format!(";
+        let mut hits = Vec::new();
+        let mut from = 0_usize;
+        while let Some(rel) = scanned.get(from..).and_then(|s| s.find(needle)) {
+            let call_start = from + rel;
+            let open = call_start + needle.len() - 1;
+            let Some(close) = find_matching_paren(&scanned, open) else {
+                break;
+            };
+            let args = scanned.get(open + 1..close).unwrap_or_default();
+            let first_arg = split_top_level_args(args).into_iter().next();
+            if let Some(quoted) = first_arg
+                && let Some(unquoted) = quoted.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
+                && is_bare_debug_format_string(unquoted)
+            {
+                hits.push(scanned.get(call_start..=close).unwrap_or(quoted).to_owned());
+            }
+            from = close + 1;
+        }
+        hits
+    }
+
+    /// Rule B: a Debug-sigil (`?`) structured field inside a
+    /// `tracing::{trace,debug,info,warn,error}!` call, covering both
+    /// `field = ?expr` and shorthand `?field`.
+    fn is_debug_sigil_field(arg: &str) -> bool {
+        if let Some(rest) = arg.strip_prefix('?') {
+            return is_plain_identifier(rest);
+        }
+        let Some(eq) = arg.find('=') else {
+            return false;
+        };
+        let is_bare_eq = arg.as_bytes().get(eq + 1) != Some(&b'=')
+            && (eq == 0 || arg.as_bytes().get(eq - 1) != Some(&b'='));
+        is_bare_eq
+            && is_plain_identifier(arg.get(..eq).unwrap_or_default().trim())
+            && arg
+                .get(eq + 1..)
+                .unwrap_or_default()
+                .trim_start()
+                .starts_with('?')
+    }
+
+    const TRACING_MACROS: &[&str] = &[
+        "tracing::trace!(",
+        "tracing::debug!(",
+        "tracing::info!(",
+        "tracing::warn!(",
+        "tracing::error!(",
+    ];
+
+    /// Every Debug-sigil structured field inside a production
+    /// `tracing::*!` call, as raw field text (e.g. `"url = ?raw"`,
+    /// `"?identity"`) for allowlist matching.
+    fn find_debug_sigil_fields(src: &str) -> Vec<String> {
+        let scanned = production_source(src);
+        let mut hits = Vec::new();
+        for macro_prefix in TRACING_MACROS {
+            let mut from = 0_usize;
+            while let Some(rel) = scanned.get(from..).and_then(|s| s.find(macro_prefix)) {
+                let call_start = from + rel;
+                let open = call_start + macro_prefix.len() - 1;
+                let Some(close) = find_matching_paren(&scanned, open) else {
+                    break;
+                };
+                let args = scanned.get(open + 1..close).unwrap_or_default();
+                for arg in split_top_level_args(args) {
+                    if is_debug_sigil_field(arg) {
+                        hits.push(arg.to_owned());
+                    }
+                }
+                from = close + 1;
+            }
+        }
+        hits
+    }
+
+    /// Rule B allowlist: `(file path relative to the crate root, exact
+    /// field-text needle, reason)`. Keyed by needle text rather than line
+    /// number so it survives unrelated line drift elsewhere in the file.
+    const RULE_B_ALLOWLIST: &[(&str, &str, &str)] = &[
+        (
+            "src/mtls_revocation.rs",
+            "url = ?raw",
+            "deliberate control-character escaping of attacker-supplied input -- see the log-injection note at the call site",
+        ),
+        (
+            "src/oauth.rs",
+            "?alg",
+            "unit-variant enum (JwtValidationFailure); Debug renders an unquoted identifier",
+        ),
+        (
+            "src/oauth.rs",
+            "?failure",
+            "unit-variant enum (JwtValidationFailure); Debug renders an unquoted identifier",
+        ),
+        (
+            "src/oauth.rs",
+            "alg = ?header.alg",
+            "unit-variant enum (jsonwebtoken::Algorithm); Debug renders an unquoted identifier",
+        ),
+        (
+            "src/oauth.rs",
+            "family = ?family",
+            "unit-variant enum (JwkKeyFamily); Debug renders an unquoted identifier",
+        ),
+        (
+            "src/transport.rs",
+            "reason = ?reason",
+            "unit-variant enum (FallbackReason); Debug renders an unquoted identifier",
+        ),
+    ];
+
+    fn is_allowlisted(file: &str, needle: &str) -> bool {
+        RULE_B_ALLOWLIST
+            .iter()
+            .any(|(f, n, _)| *f == file && *n == needle)
+    }
+
+    fn scan_production_src(mut visit: impl FnMut(&std::path::Path, &str)) -> usize {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let entries = std::fs::read_dir(&src_dir).expect("src/ is readable");
+        let mut scanned_files = 0_usize;
+        for entry in entries {
+            let path = entry.expect("dir entry").path();
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("source file is readable");
+            scanned_files += 1;
+            visit(&path, &src);
+        }
+        scanned_files
+    }
+
+    #[test]
+    fn production_source_has_no_bare_debug_format_calls() {
+        let mut offenders: Vec<String> = Vec::new();
+        let scanned_files = scan_production_src(|path, src| {
+            for hit in find_bare_debug_format_calls(src) {
+                offenders.push(format!("{}: {hit}", path.display()));
+            }
+        });
+        assert!(
+            scanned_files > 10,
+            "guard scanned only {scanned_files} files; the walk is broken"
+        );
+        assert!(
+            offenders.is_empty(),
+            "production `format!(...)` must not unconditionally Debug-stringify a value with \
+             no surrounding text -- JSON logging escapes embedded quotes (e.g. \
+             `\"request_id\":\"String(\\\"abc-123\\\")\"`). Use `.to_string()` on a `Display` \
+             value instead:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    #[test]
+    fn production_source_has_no_unallowlisted_debug_sigil_tracing_fields() {
+        let mut offenders: Vec<String> = Vec::new();
+        let scanned_files = scan_production_src(|path, src| {
+            let rel = path
+                .file_name()
+                .map(|name| format!("src/{}", name.to_string_lossy()))
+                .unwrap_or_default();
+            for hit in find_debug_sigil_fields(src) {
+                if !is_allowlisted(&rel, &hit) {
+                    offenders.push(format!("{rel}: {hit}"));
+                }
+            }
+        });
+        assert!(
+            scanned_files > 10,
+            "guard scanned only {scanned_files} files; the walk is broken"
+        );
+        assert!(
+            offenders.is_empty(),
+            "production tracing::{{trace,debug,info,warn,error}}! calls must not use the Debug \
+             sigil (`?`) on a structured field unless explicitly allowlisted -- JSON logging \
+             escapes embedded quotes in the Debug rendering. Use `%` (Display) instead, or add \
+             an entry to RULE_B_ALLOWLIST with a reason if Debug really is intended:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::literal_string_with_formatting_args,
+        reason = "the format-shaped text is the fixture under test, not a format call"
+    )]
+    fn rule_a_detects_bare_debug_format_synthetic_violations() {
+        // Without this, a broken matcher would be indistinguishable from a
+        // clean codebase and the guard would rot into a no-op.
+        assert_eq!(
+            find_bare_debug_format_calls("fn f() { let s = format!(\"{:?}\", value); }").len(),
+            1
+        );
+        assert_eq!(
+            find_bare_debug_format_calls("fn f() { let s = format!(\"{value:?}\"); }").len(),
+            1
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::literal_string_with_formatting_args,
+        reason = "the format-shaped text is the fixture under test, not a format call"
+    )]
+    fn rule_a_ignores_debug_embedded_in_larger_text_and_tracing_message_strings() {
+        // Diagnostic messages that embed Debug inside human-readable text
+        // are outside this bug class -- the quoting is often desirable
+        // there (it delimits an untrusted value).
+        assert!(
+            find_bare_debug_format_calls(
+                "fn f() { let s = format!(\"invalid CRL DER: {error:?}\"); }"
+            )
+            .is_empty()
+        );
+        assert!(
+            find_bare_debug_format_calls(
+                "fn f() { let s = format!(\"CIDR {raw:?} missing '/' prefix length\"); }"
+            )
+            .is_empty()
+        );
+        // `tracing::warn!("... {:?}", X)` is a message-text format, not a
+        // structured field, and must not fire Rule A.
+        assert!(
+            find_bare_debug_format_calls(
+                "fn f() { tracing::warn!(\"shutting down (grace period: {timeout:?})\"); }"
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn rule_b_detects_debug_sigil_field_synthetic_violations() {
+        assert_eq!(
+            find_debug_sigil_fields("fn f() { tracing::warn!(allowed = ?value, \"x\"); }").len(),
+            1
+        );
+        assert_eq!(
+            find_debug_sigil_fields("fn f() { tracing::debug!(?identity, \"x\"); }").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn rule_b_allows_display_sigil_and_bare_fields() {
+        assert!(
+            find_debug_sigil_fields(
+                "fn f() { tracing::warn!(origin = logged, duplicate_origin_headers, %method, %path, \"x\"); }"
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn rule_b_ignores_comments_test_modules_and_try_operator() {
+        let in_doc_comment = "/// BAD: tracing::debug!(?identity)\nfn f() {}";
+        assert!(find_debug_sigil_fields(in_doc_comment).is_empty());
+
+        let in_test_module =
+            "#[cfg(test)]\nmod tests {\n    fn t() { tracing::debug!(?identity, \"x\"); }\n}";
+        assert!(find_debug_sigil_fields(in_test_module).is_empty());
+
+        // The try operator `?` must never be confused for the Debug sigil:
+        // it is always followed by a statement terminator or `.`, never
+        // glued directly to an identifier, but this fixture pins that a
+        // scan across a whole function body containing `?` finds nothing.
+        let try_operator = "fn f() -> Option<()> { let _ = maybe_thing()?; Some(()) }";
+        assert!(find_debug_sigil_fields(try_operator).is_empty());
+    }
 }
