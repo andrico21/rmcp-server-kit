@@ -11,6 +11,8 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+## [3.14.0] - 2026-09-22
+
 ### Security
 
 - **Closed the residual cross-principal session-binding collision (CWE-384)
