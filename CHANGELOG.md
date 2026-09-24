@@ -11,6 +11,17 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Changed
+
+- **Dependency refresh: 10 semver-compatible lockfile updates**, notably
+  `rmcp` 3.4.0 -> 3.4.1 and `rmcp-macros` 3.4.0 -> 3.4.1, plus `thiserror` /
+  `thiserror-impl` 2.0.20 -> 2.0.21, `hyper-rustls` 0.27.9 -> 0.27.10,
+  `zerocopy` / `zerocopy-derive` 0.8.57 -> 0.8.58, `rand` 0.10.2 -> 0.10.3,
+  `cc` 1.4.6 -> 1.4.7, and `find-msvc-tools` 0.1.12 -> 0.1.13. No
+  `Cargo.toml` requirement changed, and `cargo semver-checks` reports no API
+  change. Regenerated `supply-chain/config.toml` cargo-vet exemptions for all
+  10 packages; `cargo vet --locked` passes (391 exempted).
+
 ## [3.14.0] - 2026-09-22
 
 ### Security
