@@ -46,5 +46,8 @@ Thumbs.db
 # Agent / planning scratchpad (not part of the crate)
 /.sisyphus/
 /.omo/
+# CodeGraph local index (db/logs/sockets) - machine-local, not part of the
+# crate. Blocks `cargo publish` from a clean tree if left untracked.
+/.codegraph/
 # Local code-review reports (working artifacts; not shipped in the crate)
 /docs/reviews/
