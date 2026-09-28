@@ -11,6 +11,42 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Changed
+
+- **Dependency refresh: 17 semver-compatible lockfile updates**, notably
+  `rmcp` 3.4.1 -> 3.5.0 and `rmcp-macros` 3.4.1 -> 3.5.0, plus
+  `hyper-util` 0.1.20 -> 0.1.21, `rustls-platform-verifier` 0.7.0 -> 0.7.1,
+  `rustls-platform-verifier-android` 0.1.1 -> 0.2.0, `smallvec`
+  1.16.1 -> 1.16.2, `zerocopy` / `zerocopy-derive` 0.8.58 -> 0.8.59, `cc`
+  1.4.7 -> 1.5.1, `find-msvc-tools` 0.1.13 -> 0.1.14, and the wasm32-only
+  `wasm-bindgen` family plus `js-sys` / `web-sys` (all `cfg(target_arch =
+  "wasm32")`-gated; no effect on native builds). No `Cargo.toml` requirement
+  changed, and `cargo semver-checks` reports no API change (`223 checks: 223
+  pass`). Regenerated `supply-chain/config.toml` cargo-vet exemptions for all
+  17 packages; `cargo vet --locked` passes (391 exempted).
+
+  Ran the full `docs/RMCP_UPGRADE_CHECKLIST.md` for the `rmcp` minor bump:
+  - Trait surface: `delegation_guard` passes unchanged - the pinned
+    `ServerHandler` surface did not move.
+  - Transport/config: the knobs this crate forwards
+    (`with_allowed_hosts`, `with_sse_keep_alive`,
+    `with_max_request_body_bytes`, `session_store`, `event_store`) are
+    unchanged. rmcp 3.5.0 changed `StreamableHttpServerConfig::allowed_origins`
+    port-matching semantics (bare host now soft-deprecated in favor of an
+    explicit `:port` or `:*`) - not applicable here: this crate leaves that
+    field unset and owns Origin validation itself via
+    `origin_check_middleware`.
+  - Protocol constants: `ProtocolVersion::LATEST` moved to `V_2026_07_28`
+    (now aliased `NO_INITIALIZE`) inside rmcp - not applicable here: this
+    crate's wrappers always pin explicit version literals
+    (`V_2025_11_25` / `V_2026_07_28`) and forward `negotiate_initialize` /
+    `supported_protocol_versions` to the inner handler untouched, never
+    reading `LATEST`.
+  - `cargo build`/`clippy --all-targets --all-features -- -D warnings`
+    clean (no new deprecations); full `cargo test --all-features` green
+    (869 unit tests, every integration/E2E tier, all doctests); `cargo
+    audit` clean.
+
 ## [3.14.1] - 2026-09-24
 
 ### Changed
