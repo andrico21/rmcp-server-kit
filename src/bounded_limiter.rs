@@ -22,7 +22,7 @@
 //! 2. Capping the map at `max_tracked_keys` entries.
 //! 3. On insert when the map is full, first pruning entries whose
 //!    `last_seen` is older than `idle_eviction`, then applying
-//!    [`KeyEvictionPolicy`](crate::bounded_limiter::KeyEvictionPolicy). The default policy evicts the entry with the
+//!    [`KeyEvictionPolicy`]. The default policy evicts the entry with the
 //!    oldest `last_seen` ("LRU eviction") so the new key is inserted.
 //! 4. Updating `last_seen` on **every** check (including rate-limit
 //!    rejections) so an actively-firing attacker cannot dodge eviction by
