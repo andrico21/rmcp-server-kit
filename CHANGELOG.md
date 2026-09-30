@@ -11,6 +11,28 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Changed
+
+- **Dependency refresh: 3 semver-compatible lockfile updates** - `tokio-rustls`
+  0.26.5 -> 0.26.6 (used directly and through `hyper-rustls` / `reqwest`), plus
+  `async-compression` 0.4.48 -> 0.4.49 and `compression-codecs`
+  0.4.43 -> 0.4.44 behind `tower-http`'s response-compression layer. No
+  `Cargo.toml` requirement changed, and `cargo semver-checks` reports no API
+  change. Regenerated `supply-chain/config.toml` cargo-vet exemptions for the
+  three packages; `cargo vet --locked` passes (391 exempted).
+
+  No security urgency: `cargo audit` is clean (1 277 advisories, 392 crates),
+  and the only RustSec entry naming any of the three is RUSTSEC-2020-0019
+  (tokio-rustls memory-growth DoS, patched `>= 0.13.1`). The tokio-rustls bump
+  keeps its `rustls = "^0.23.27"` requirement unchanged, so the resolved TLS
+  stack does not move (`rustls` stays 0.23.45, `rustls-webpki` 0.103.15); the
+  compression pair moves together because async-compression 0.4.49 requires
+  `compression-codecs ^0.4.44`, and holds `compression-core ^0.4.33` as before.
+
+  Two updates stay held back: `matchit` 0.8.4 (`axum` 0.8.9 requires
+  `=0.8.4` exactly, so 0.8.6 remains unreachable) and `crypto-common` 0.1.6
+  (0.1.7 is selectable only by downgrading `generic-array` 0.14.9 -> 0.14.7).
+
 ## [3.14.2] - 2026-09-28
 
 ### Changed

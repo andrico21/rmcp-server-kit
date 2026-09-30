@@ -72,7 +72,7 @@ version = "2.0.2"
 criteria = "safe-to-run"
 
 [[exemptions.async-compression]]
-version = "0.4.48"
+version = "0.4.49"
 criteria = "safe-to-deploy"
 
 [[exemptions.async-trait]]
@@ -212,7 +212,7 @@ version = "4.6.8"
 criteria = "safe-to-deploy"
 
 [[exemptions.compression-codecs]]
-version = "0.4.43"
+version = "0.4.44"
 criteria = "safe-to-deploy"
 
 [[exemptions.compression-core]]
@@ -1240,7 +1240,7 @@ version = "2.7.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.tokio-rustls]]
-version = "0.26.5"
+version = "0.26.6"
 criteria = "safe-to-deploy"
 
 [[exemptions.tokio-stream]]
