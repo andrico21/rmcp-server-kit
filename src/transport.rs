@@ -6617,6 +6617,51 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn compression_layer_br_encodes_response() {
+        use tower_http::compression::Predicate as _;
+
+        let big_body = "a".repeat(4096);
+        let app = axum::Router::new()
+            .route(
+                "/big",
+                axum::routing::get(move || {
+                    let body = big_body.clone();
+                    async move { body }
+                }),
+            )
+            .layer(
+                tower_http::compression::CompressionLayer::new()
+                    .gzip(true)
+                    .br(true)
+                    .compress_when(
+                        tower_http::compression::DefaultPredicate::new()
+                            .and(tower_http::compression::predicate::SizeAbove::new(1024)),
+                    ),
+            );
+
+        let req = Request::builder()
+            .uri("/big")
+            .header(header::ACCEPT_ENCODING, "br")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get(header::CONTENT_ENCODING).unwrap(), "br");
+
+        // Reading the body is what drives the encoder - a header-only
+        // assertion passes without any brotli code running, so the payload
+        // must actually be shorter than the 4096-byte input.
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !body.is_empty() && body.len() < 4096,
+            "br-encoded body should be smaller than the 4096-byte payload, got {} bytes",
+            body.len()
+        );
+    }
+
     // -- TlsListener handshake timeout --
 
     #[tokio::test]

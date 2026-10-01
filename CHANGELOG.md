@@ -50,7 +50,11 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   `Accept-Encoding: br` responses, not a parser exposed to untrusted input:
   `brotli-decompressor` is reachable only through the encoder crate (no reqwest
   or request-decompression path pulls it in), and brotli's own MSRV (1.59.0)
-  and `sha2` dependency are unchanged. Covered by the full test suite.
+  and `sha2` dependency are unchanged. Exercised end to end by
+  `compression_layer_br_encodes_response` (`src/transport.rs`), which asserts
+  `Content-Encoding: br` and then reads the encoded body - the encoder only
+  runs when the body is polled, so a header-only assertion would not have
+  covered it.
 
   No security urgency: none of the seven appears in the RustSec advisory
   database at any version, and `cargo audit` is clean.
