@@ -16,11 +16,11 @@ version = "1.1.5"
 criteria = "safe-to-deploy"
 
 [[exemptions.alloc-no-stdlib]]
-version = "2.0.4"
+version = "3.0.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.alloc-stdlib]]
-version = "0.2.4"
+version = "0.3.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.alloca]]
@@ -72,7 +72,7 @@ version = "2.0.2"
 criteria = "safe-to-run"
 
 [[exemptions.async-compression]]
-version = "0.4.49"
+version = "0.4.50"
 criteria = "safe-to-deploy"
 
 [[exemptions.async-trait]]
@@ -144,11 +144,11 @@ version = "0.12.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.brotli]]
-version = "8.0.4"
+version = "9.0.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.brotli-decompressor]]
-version = "5.0.3"
+version = "6.0.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.bumpalo]]
@@ -212,7 +212,7 @@ version = "4.6.8"
 criteria = "safe-to-deploy"
 
 [[exemptions.compression-codecs]]
-version = "0.4.44"
+version = "0.4.45"
 criteria = "safe-to-deploy"
 
 [[exemptions.compression-core]]
@@ -1524,7 +1524,7 @@ version = "0.8.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.yoke-derive]]
-version = "0.8.3"
+version = "0.8.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.zerocopy]]

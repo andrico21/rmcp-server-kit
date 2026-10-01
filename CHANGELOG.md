@@ -32,6 +32,28 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   Two updates stay held back: `matchit` 0.8.4 (`axum` 0.8.9 requires
   `=0.8.4` exactly, so 0.8.6 remains unreachable) and `crypto-common` 0.1.6
   (0.1.7 is selectable only by downgrading `generic-array` 0.14.9 -> 0.14.7).
+- **Dependency refresh: 7 further lockfile updates, including a coordinated
+  brotli major bump** - `async-compression` 0.4.49 -> 0.4.50,
+  `compression-codecs` 0.4.44 -> 0.4.45, `brotli` 8.0.4 -> 9.0.0,
+  `brotli-decompressor` 5.0.3 -> 6.0.1, `alloc-no-stdlib` 2.0.4 -> 3.0.0,
+  `alloc-stdlib` 0.2.4 -> 0.3.0 and `yoke-derive` 0.8.3 -> 0.8.4. All seven are
+  transitive, so no `Cargo.toml` requirement changed, and `cargo semver-checks`
+  reports no semver update required. Regenerated `supply-chain/config.toml`
+  exemptions for the seven packages; `cargo vet --locked` passes (391
+  exempted).
+
+  Four of the seven are one upstream event, not four independent jumps:
+  `compression-codecs` 0.4.45 requires `brotli ^9`, and brotli 9.0.0 in turn
+  requires `brotli-decompressor ~6.0` plus the `alloc-no-stdlib` /
+  `alloc-stdlib` majors. That moves the **encoder** behind the
+  `compression-br` response path this crate enables - a behavioural change for
+  `Accept-Encoding: br` responses, not a parser exposed to untrusted input:
+  `brotli-decompressor` is reachable only through the encoder crate (no reqwest
+  or request-decompression path pulls it in), and brotli's own MSRV (1.59.0)
+  and `sha2` dependency are unchanged. Covered by the full test suite.
+
+  No security urgency: none of the seven appears in the RustSec advisory
+  database at any version, and `cargo audit` is clean.
 
 ## [3.14.2] - 2026-09-28
 
