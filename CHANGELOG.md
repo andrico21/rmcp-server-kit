@@ -11,6 +11,8 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+## [3.14.3] - 2026-10-01
+
 ### Changed
 
 - **Dependency refresh: 3 semver-compatible lockfile updates** - `tokio-rustls`
@@ -58,6 +60,26 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
   No security urgency: none of the seven appears in the RustSec advisory
   database at any version, and `cargo audit` is clean.
+- **Dependency refresh: `lazy_static` 1.5.0 -> 1.5.1** - transitive-only, so
+  no `Cargo.toml` requirement changed. Production chains (verified with
+  `cargo tree -i lazy_static --all-features -e normal`): `x509-parser` and
+  `sharded-slab` behind `tracing-subscriber` on every build, plus
+  `prometheus` under the `metrics` feature and `num-bigint-dig` behind
+  `rsa` behind `jsonwebtoken` under `oauth`. Regenerated the
+  `supply-chain/config.toml` cargo-vet exemption for the new version;
+  `cargo vet --locked` passes (391 exempted). No API change, so `cargo
+  semver-checks` reports nothing.
+
+  No security urgency: `cargo audit` is clean (1 278 advisories, 392
+  crates), and the single advisory-database mention of `lazy_static`
+  (RUSTSEC-2019-0013, `spin`) explicitly states its users are *not*
+  affected. The two prior hold-backs are unchanged: `matchit` 0.8.4 (`axum`
+  0.8.9 requires `=0.8.4` exactly, so 0.8.6 stays unreachable) and
+  `crypto-common` 0.1.6 (0.1.7 is selectable only by downgrading
+  `generic-array` 0.14.9 -> 0.14.7, and that chain is live in the `oauth`
+  build - `jsonwebtoken`'s `rsa` / `hmac` / `sha2` / `p256` / `p384` /
+  `ed25519` family all sit on `digest` 0.10.7 - so it is a production
+  dependency, not a dev-only one).
 
 ## [3.14.2] - 2026-09-28
 
