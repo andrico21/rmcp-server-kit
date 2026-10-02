@@ -11,6 +11,79 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Added
+
+- **Per-item client-context logging controls** - added `LogContextConfig`, the
+  `McpServerConfig::with_log_context()` builder hook, TOML
+  `[server.log_context]`, and `LogContextConfig::recommended()` for operators
+  that want client context on framework log lines. Every knob is off by default.
+  The knobs are `client_ip`, `peer_ip`, `request_id`, `request_id_header`,
+  `request_line`, `user_agent`, `auth_scheme`, `mcp_hints`,
+  `credential_fingerprint`, and `request_completion`. `client_ip` adds the
+  resolved `client_ip` field to DEBUG request lines, auth failure lines, and
+  RBAC denial lines. `peer_ip` adds the direct peer address as `peer_ip` on the
+  same lines. `request_id` adds a proxy request ID field on those lines, but it
+  is trusted only when the immediate peer matches `trusted_proxies`.
+  `request_id_header` names the header that `request_id` reads, `x-request-id`
+  by default. `request_line` adds `method` and `path` (without the query
+  string) to `auth failed` lines.
+  `user_agent` adds quoted user-agent text on `auth failed` lines only.
+  `auth_scheme` adds `auth_scheme` (`none`, `bearer`, `basic`, or `other`)
+  and, for Bearer credentials, `token_kind` (`jwt` or `opaque`) to
+  `auth failed` lines. `mcp_hints` adds `mcp_session` (whether an
+  `Mcp-Session-Id` header was sent, never its value) and
+  `mcp_protocol_version` to `auth failed` and DEBUG `incoming request` lines.
+  `credential_fingerprint` adds `credential_fp` on `auth failed` lines only,
+  for Bearer credentials only: a stable, redacted identifier for the presented
+  credential, not the secret or bearer token itself. `request_completion`
+  enables the DEBUG `request completed` line.
+- **Client-context validation rules** - `request_log_exclude_paths` entries must
+  be non-empty and start with `/`; `request_id = true` requires non-empty
+  `trusted_proxies`; and `request_id_header` must be a valid header name that
+  is not `authorization`, `cookie`, `proxy-authorization`, `forwarded`,
+  `x-forwarded-for`, `x-real-ip`, or `mcp-session-id`.
+- **Probe request-log exclusion** - added `request_log_exclude_paths` on the
+  builder and in TOML. It skips DEBUG request logging for exact path matches,
+  defaults to the probe endpoints, and can be cleared with
+  `request_log_exclude_paths = []` or `Vec::<String>::new()`.
+
+  These logging controls credit the downstream `atlassian-mcp` request tracked
+  as C4/C5.
+
+### Changed
+
+- **Framework INFO lines are visible under the default filter** - the default
+  `log_level` is now `"info,rmcp=warn,rmcp_server_kit=info"`. The previous
+  default used prefix matching that hid this crate's own INFO lines, including
+  in the audit file. The restored lines include `<name> listening on`, `auth
+  enabled on /mcp`, `RBAC enforcement enabled on /mcp`, `auto-derived allowed
+  origin from public_url`, `JWKS refresh skipped (cooldown active)`, the first
+  per identity `authenticated` line, and hot-reload events. To opt out, set
+  `log_level = "info,rmcp=warn"`, set `RUST_LOG`, or append
+  `,rmcp_server_kit::auth=warn` to keep auth success lines quiet.
+- **Request logging now runs after peer-address normalization** - the DEBUG
+  `incoming request` line is emitted by a dedicated layer after peer-address
+  normalization. Origin-rejected requests still log exactly one line and never
+  include client fields. Probe paths are skipped by default. Clear the skip list
+  with `request_log_exclude_paths = []` or `Vec::<String>::new()` if you need
+  those probes logged. A DEBUG `request completed` line is available through
+  `LogContextConfig::request_completion` and TOML
+  `[server.log_context].request_completion`.
+- **The `PeerAddr` and `ClientIp` logging contract is explicit** - docs now name
+  every place the framework can log a client IP: request start, request
+  completion, auth failure, and RBAC denial, all gated by the per-item
+  `log_context.client_ip` knob. Rate-limit deny lines always carry the resolved
+  IP as `rate_limit_key`, regardless of those knobs.
+
+### Notes
+
+- This is a minor release under the policy above because it changes a runtime
+  default without removing or retyping public API.
+- Client IP on auth and authz lines is deliberately opt-in, a privacy deviation
+  from `RUST_GUIDELINES.md` section 10 that uses the guideline's own qualifier.
+- Example auth failure output with user agent enabled:
+  `auth failed failure_class=missing_credential user_agent="probe/1.0"`.
+
 ## [3.14.3] - 2026-10-01
 
 ### Changed
