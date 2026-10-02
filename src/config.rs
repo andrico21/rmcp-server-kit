@@ -1191,6 +1191,11 @@ fn parse_duration_field(field: &str, value: &str) -> Result<Duration, RmcpServer
 #[non_exhaustive]
 pub struct ObservabilityConfig {
     /// `tracing` log level / env filter string (e.g. `info,rmcp_server_kit=debug`).
+    /// Default: `info,rmcp=warn,rmcp_server_kit=info`.
+    ///
+    /// Directives match by target *prefix* (`tracing-subscriber` `EnvFilter`), so `rmcp=warn` on its
+    /// own also matches `rmcp_server_kit::*`; keep an explicit `rmcp_server_kit=<level>` directive
+    /// when quieting the `rmcp` SDK. The same filter also gates the audit-log file.
     #[serde(default = "default_log_level")]
     pub log_level: String,
     /// Log output format: `json`, `pretty`, or `text` (default: `pretty`).
@@ -1676,7 +1681,7 @@ fn default_security_headers() -> SecurityHeadersConfig {
     SecurityHeadersConfig::default()
 }
 fn default_log_level() -> String {
-    "info,rmcp=warn".into()
+    "info,rmcp=warn,rmcp_server_kit=info".into()
 }
 fn default_log_format() -> String {
     "pretty".into()
@@ -1719,7 +1724,7 @@ mod tests {
         deprecated,
         reason = "test-only relaxations; production code uses ? and tracing"
     )]
-    use std::{collections::HashSet, time::Duration};
+    use std::{collections::HashSet, sync::Arc, time::Duration};
 
     use super::*;
     use crate::transport::McpServerConfig;
@@ -1728,6 +1733,39 @@ mod tests {
     #[serde(deny_unknown_fields)]
     struct RootConfig {
         server: ServerConfig,
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            let bytes = self.0.lock().map(|guard| guard.clone()).unwrap_or_default();
+            String::from_utf8(bytes).unwrap_or_default()
+        }
+    }
+
+    struct CapturedLogsWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogsWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Ok(mut guard) = self.0.lock() {
+                guard.extend_from_slice(buf);
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogsWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogsWriter(Arc::clone(&self.0))
+        }
     }
 
     fn server_from_root_toml(toml: &str) -> ServerConfig {
@@ -1758,7 +1796,7 @@ mod tests {
     #[test]
     fn observability_config_defaults() {
         let cfg = ObservabilityConfig::default();
-        assert_eq!(cfg.log_level, "info,rmcp=warn");
+        assert_eq!(cfg.log_level, "info,rmcp=warn,rmcp_server_kit=info");
         assert_eq!(cfg.log_format, "pretty");
         assert!(cfg.audit_log_path.is_none());
         assert!(!cfg.log_request_headers);
@@ -1767,6 +1805,50 @@ mod tests {
         assert!(!cfg.log_plaintext_oauth_tokens);
         assert!(!cfg.log_oauth_claim_values);
         assert!(!cfg.log_tool_call_arguments);
+    }
+
+    #[allow(
+        clippy::cognitive_complexity,
+        reason = "tracing! macro expansions add branches"
+    )]
+    fn emit_log_filter_test_probes() {
+        tracing::info!(target: "rmcp_server_kit::transport", "probe-kit");
+        tracing::info!(target: "rmcp_server_kit::oauth", "probe-kit-oauth");
+        tracing::info!(target: "rmcp::service", "probe-sdk-info");
+        tracing::warn!(target: "rmcp::service", "probe-sdk-warn");
+    }
+
+    #[test]
+    fn default_log_filter_keeps_framework_info() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(
+                ObservabilityConfig::default().log_level,
+            ))
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, emit_log_filter_test_probes);
+
+        let captured = logs.contents();
+        assert!(
+            captured.contains("probe-kit"),
+            "captured log should contain probe-kit; got: {captured:?}"
+        );
+        assert!(
+            captured.contains("probe-kit-oauth"),
+            "captured log should contain probe-kit-oauth; got: {captured:?}"
+        );
+        assert!(
+            captured.contains("probe-sdk-warn"),
+            "captured log should contain probe-sdk-warn; got: {captured:?}"
+        );
+        assert!(
+            !captured.contains("probe-sdk-info"),
+            "captured log should NOT contain probe-sdk-info; got: {captured:?}"
+        );
     }
 
     // -- validate_server_config --
@@ -3483,7 +3565,7 @@ mod tests {
     #[test]
     fn observability_config_deserialize_defaults() {
         let cfg: ObservabilityConfig = toml::from_str("").unwrap();
-        assert_eq!(cfg.log_level, "info,rmcp=warn");
+        assert_eq!(cfg.log_level, "info,rmcp=warn,rmcp_server_kit=info");
         assert_eq!(cfg.log_format, "pretty");
         assert!(!cfg.log_request_headers);
         assert!(!cfg.metrics_enabled);
