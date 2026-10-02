@@ -754,7 +754,8 @@ mod tests {
     };
 
     #[cfg(unix)]
-    use tracing_subscriber::{Layer as _, fmt::MakeWriter as _, layer::SubscriberExt as _};
+    use tracing_subscriber::fmt::MakeWriter as _;
+    use tracing_subscriber::{Layer as _, layer::SubscriberExt as _};
 
     #[cfg(not(any(unix, windows)))]
     use super::prepare_tracing_audit_lenient;
