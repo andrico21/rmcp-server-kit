@@ -981,6 +981,17 @@ key_eviction_policy = "evict_lru"
 extra_route_rate_limit = 60
 # extra_route_rate_limit_burst = 120 # optional bucket capacity (default: = rate)
 # extra_route_rate_limit_exempt_paths = ["/.well-known/oauth-authorization-server"]
+# request_log_exclude_paths = ["/healthz", "/readyz"]
+
+# [server.log_context]
+# client_ip = true
+# peer_ip = false
+# request_line = true
+# user_agent = true
+# credential_fingerprint = false
+# auth_scheme = true
+# mcp_hints = true
+# request_completion = true
 ```
 
 | Field | Type | Default | Description |
@@ -1013,6 +1024,8 @@ extra_route_rate_limit = 60
 | `trusted_proxies` | `Vec<String>` | `[]` | CIDRs or IPs whose forwarding headers are trusted for client-IP resolution. When non-empty, enables trusted-forwarder mode. Pairs with `forwarded_header`. |
 | `forwarded_header` | `String` | `"x-forwarded-for"` | Which forwarding header to read when trusted-forwarder mode is active. Accepted values: `"x-forwarded-for"` (de-facto standard; nginx, HAProxy, CDNs) or `"forwarded"` (RFC 7239 `Forwarded` header). Ignored when `trusted_proxies` is empty. |
 | `trusted_forwarder_max_entries` | `usize` | `16` | Maximum forwarding-chain entries scanned per request in trusted-forwarder mode. Longer chains are treated as a header bomb and resolution falls back to the direct socket peer. Valid range `1..=64`; the ceiling exists because an unbounded value would disable the header-bomb protection. Ignored when `trusted_proxies` is empty. |
+| `request_log_exclude_paths` | `Vec<String>` | `["/healthz", "/readyz"]` | Exact request paths skipped by the DEBUG `incoming request` line. MCP traffic, admin routes, OAuth routes, and `/version` still log unless you add them. |
+| `log_context` | `LogContextConfig` | `LogContextConfig::default()` | Per-line controls for client context fields on request, auth failure, and RBAC denial logs. See [Client-context logging (`[server.log_context]`)](#client-context-logging-serverlog_context). |
 
 ##### Choosing a `key_eviction_policy`
 
@@ -1049,7 +1062,7 @@ existing tenants matters more than reachability for new ones.
 ```toml
 [observability]
 log_level = "debug"
-log_format = "json"
+log_format = "pretty"
 audit_log_path = "/var/log/my-server/audit.log"
 metrics_enabled = true
 metrics_bind = "127.0.0.1:9090"
@@ -1061,10 +1074,10 @@ log_upstream_error_bodies = false
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `log_level` | `String` | `"info"` | trace, debug, info, warn, error |
-| `log_format` | `String` | `"json"` | json, pretty, or text |
+| `log_level` | `String` | `"info,rmcp=warn,rmcp_server_kit=info"` | EnvFilter directives. Targets match by prefix, so `rmcp=warn` also matches `rmcp_server_kit::*` unless the more specific `rmcp_server_kit=info` directive is present. Use trace, debug, info, warn, or error levels. |
+| `log_format` | `String` | `"pretty"` | json, pretty, or text |
 | `audit_log_path` | `Option<PathBuf>` | `None` | JSON audit log file |
-| `log_request_headers` | `bool` | `false` | Emit inbound HTTP request headers at DEBUG level (sensitive headers remain redacted) |
+| `log_request_headers` | `bool` | `false` | Emit inbound HTTP request headers at DEBUG level (sensitive headers remain redacted); the incoming request line is skipped for request_log_exclude_paths |
 | `metrics_enabled` | `bool` | `false` | Enable Prometheus |
 | `metrics_bind` | `String` | `"127.0.0.1:9090"` | Metrics listener |
 | `log_plaintext_oauth_tokens` | `bool` | `false` | Defaults to redacted; enabling writes secrets to logs, is for local debugging only, and is process-wide, not per-server |
@@ -1783,8 +1796,11 @@ Caveats:
 - The separate Prometheus metrics listener is a different router and
   does not carry these extensions.
 - **Privacy**: `PeerAddr` exposes raw peer network metadata. The
-  framework deliberately never logs it on its own; whether to log or
-  persist peer addresses is application policy.
+  framework never logs the full socket address by itself, and raw
+  forwarding headers are never logged. IP-only `client_ip` and
+  `peer_ip` fields appear only when their client-context knobs are on.
+  One caveat: rate-limit deny lines always log an IP-only
+  `rate_limit_key`, regardless of those knobs.
 
 #### Built-in per-IP rate limiting
 
@@ -1918,6 +1934,106 @@ proxies.** If clients can also reach the server directly, their direct
 IPs and the proxied clients' resolved IPs share one keyspace by design,
 but a direct attacker could choose their own bucket only via their real
 source IP - never via a header.
+
+#### Client-context logging (`[server.log_context]`)
+
+`[server.log_context]` controls which resolved client-context fields appear on
+the framework's request, auth failure, and RBAC denial logs. It uses the
+trusted-forwarder result, never raw forwarding header strings, so operators can
+attribute probe noise without logging spoofable header material.
+
+| Knob | Fields and lines controlled |
+|---|---|
+| `client_ip` | Adds `client_ip` to `auth failed`, RBAC deny, `incoming request`, and `request completed` lines. This is `ClientIp`: the resolved forwarding result when trusted-forwarder mode applies, otherwise the direct socket peer. |
+| `peer_ip` | Adds `peer_ip` to the same lines as `client_ip`. This is always the direct socket peer, useful for checking which proxy or node reached the pod. |
+| `request_id` | Adds `request_id` to the same lines as `client_ip`. It is taken only from a direct peer inside `trusted_proxies`; the last header occurrence wins. |
+| `request_id_header` | Names the header read when `request_id` is enabled. The default is `x-request-id`. On OpenShift, the IngressController's `spec.httpHeaders.uniqueId.name` sets this header router-side. |
+| `request_line` | Adds `method` and `path` to `auth failed` lines. The path excludes the query string. `incoming request` and `request completed` always include `method` and `path`; RBAC deny lines don't. |
+| `user_agent` | Adds `user_agent` to `auth failed` lines only. Values are quoted, control characters are stripped, and long values are truncated. |
+| `credential_fingerprint` | Adds a field named `credential_fp` to `auth failed` only, and only for Bearer credentials. The value is an 8-hex HMAC prefix, not a token fragment. Missing credentials, Basic credentials, other auth schemes, and mTLS failures don't get this field. |
+| `auth_scheme` | Adds `auth_scheme` and `token_kind` to `auth failed` lines. |
+| `mcp_hints` | Adds `mcp_session` and `mcp_protocol_version` to `auth failed` and `incoming request` lines. |
+| `request_completion` | Emits a DEBUG `request completed` line with `method`, `path`, `status`, `latency_ms`, and any enabled `client_ip`, `peer_ip`, or `request_id` fields. |
+
+Defaults follow `LogContextConfig::default()`: all fields default to `false`.
+`LogContextConfig::recommended()` enables `client_ip`, `peer_ip`, `request_line`,
+`user_agent`, `auth_scheme`, and `mcp_hints`. This is the recommended production
+posture: enough context to identify noisy clients and understand authentication
+failures. It leaves `request_id`, `credential_fingerprint`, and
+`request_completion` off unless you ask for those fields.
+
+Validation rejects `request_log_exclude_paths` entries that are empty or don't
+start with `/`. It also rejects `request_id = true` unless `trusted_proxies` is
+non-empty. `request_id_header` must be a valid header name, and it can't be
+`authorization`, `cookie`, `proxy-authorization`, `forwarded`,
+`x-forwarded-for`, `x-real-ip`, or `mcp-session-id`. The exclude list is exact
+path matching, with defaults for `/healthz` and `/readyz` to keep Kubernetes
+probes out of DEBUG request logs.
+
+Privacy note: this section is a deliberate, documented deviation from the
+pre-3.15 RUST_GUIDELINES rule that authentication attempts should include the
+source IP. Client context is now opt-in and off by default. Operators choose
+which fields to add to security-relevant framework lines; the kit still never
+logs raw forwarding headers or credential bytes.
+
+Rendering rules are stable. Client-supplied strings such as `user_agent` are
+quoted in structured fields, control characters are removed, and long strings
+are truncated before logging. `credential_fp` is emitted only for
+Bearer credentials and is an 8-hex HMAC prefix, so log readers can correlate
+repeated bad tokens without seeing token bytes.
+
+Example lines with the recommended defaults:
+
+- `WARN rmcp_server_kit::auth: auth failed failure_class=missing_credential client_ip=203.0.113.7 peer_ip=10.0.0.42 method=POST path=/mcp user_agent="probe/1.0" auth_scheme=none mcp_session=false`
+- `WARN rmcp_server_kit::rbac: RBAC denied user=viewer role=viewer tool="forbidden" host="-" client_ip=203.0.113.7 peer_ip=10.0.0.42`
+- `DEBUG rmcp_server_kit::transport: incoming request method=POST path=/mcp client_ip=203.0.113.7 peer_ip=10.0.0.42 mcp_session=false`
+- With `request_completion = true` added: `DEBUG rmcp_server_kit::transport: request completed method=POST path=/mcp status=401 latency_ms=0 client_ip=203.0.113.7 peer_ip=10.0.0.42`
+
+Builder form:
+
+```rust
+use rmcp_server_kit::transport::{LogContextConfig, McpServerConfig};
+
+let mut log_context = LogContextConfig::recommended();
+log_context.request_completion = true;
+
+let config = McpServerConfig::new("127.0.0.1:8080", "my-server", "0.1.0")
+    .with_request_log_exclude_paths(Vec::<String>::new())
+    .with_log_context(log_context);
+```
+
+TOML form:
+
+```toml,fragment
+[server.log_context]
+client_ip = false
+peer_ip = false
+request_id = false
+request_id_header = "x-request-id"
+request_line = false
+user_agent = false
+credential_fingerprint = false
+auth_scheme = false
+mcp_hints = false
+request_completion = false
+```
+
+OpenShift note: verify `trusted_proxies` from the new `peer_ip` field as the
+pod sees it, not from the external router address. The default OpenShift router
+uses `forwardedHeaderPolicy: Append`, so `X-Forwarded-For` should carry the
+client chain plus the router hop, and rmcp-server-kit's rightmost-untrusted
+algorithm works when that router hop is listed in `trusted_proxies`. If proxied
+traffic logs `client_ip` equal to `peer_ip`, the hop is not trusted yet. For a
+cluster-wide correlation ID, configure the IngressController
+(`operator.openshift.io/v1`) with `spec.httpHeaders.uniqueId.name` set to
+`X-Request-Id`; the default format already includes client and router endpoint
+details. Then set `request_id = true` under `[server.log_context]`. The default
+`request_id_header` (`x-request-id`) already matches, since header names are
+case-insensitive, and the kit takes the value only from a direct peer inside
+`trusted_proxies`. Include HAProxy's `%ID` in the IngressController's
+`spec.logging.access.httpLogFormat` to join router logs with kit logs. A Route
+only has `spec.httpHeaders.actions`, which can add, set, or delete ordinary
+request and response headers. It doesn't own `uniqueId`.
 
 #### MCP session identity binding
 
@@ -2828,6 +2944,16 @@ max_request_body = 1048576
 expose_build_metadata = false
 # public_url = "https://mcp.example.com"  # env: RMCP_SERVER_KIT__SERVER__PUBLIC_URL
 admin_enabled = false  # env: RMCP_SERVER_KIT__SERVER__ADMIN_ENABLED
+request_log_exclude_paths = ["/healthz", "/readyz"]
+
+[server.log_context]
+client_ip = true
+peer_ip = false
+request_line = true
+user_agent = true
+credential_fingerprint = false
+auth_scheme = true
+mcp_hints = true
 
 [server.security_headers]
 # Customise any of the twelve OWASP headers; omit a key to keep the built-in default.
@@ -2945,8 +3071,8 @@ argument = "cmd"
 allowed = ["ls", "cat", "ps", "df", "top"]
 
 [observability]
-log_level = "info"
-log_format = "json"  # env: RMCP_SERVER_KIT__OBSERVABILITY__LOG_FORMAT
+log_level = "info,rmcp=warn,rmcp_server_kit=info"
+log_format = "pretty"  # env: RMCP_SERVER_KIT__OBSERVABILITY__LOG_FORMAT
 audit_log_path = "/var/log/my-server/audit.log"
 metrics_enabled = true  # env: RMCP_SERVER_KIT__OBSERVABILITY__METRICS_ENABLED
 metrics_bind = "127.0.0.1:9090"  # env: RMCP_SERVER_KIT__OBSERVABILITY__METRICS_BIND
