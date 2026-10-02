@@ -2523,9 +2523,10 @@ crate handling auth and credentials.
 
 ### DO: Implement proper logging and monitoring
 
-- Log authentication attempts (success and failure) with source IP.
-- Log authorization denials with the identity, requested resource, and
-  reason.
+- Log authentication attempts (success and failure). In rmcp-server-kit the source IP is added to `auth failed` lines when `[server.log_context]` `client_ip` (`LogContextConfig::client_ip`) is enabled, which is off by default as a privacy choice.
+- Log authorization denials with the identity, requested resource, and reason;
+  client IP, peer IP and the proxy request ID are added under the same
+  per-item knobs.
 - Use structured logging (`tracing` with JSON output) so logs are machine-
   parseable.
 - Never log request/response bodies that may contain credentials, tokens,
