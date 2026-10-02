@@ -28,14 +28,14 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use x509_parser::prelude::*;
 
 use crate::{
     bounded_limiter::{BoundedKeyedLimiter, BoundedLimiterDeny, KeyEvictionPolicy},
     error::RmcpServerKitError,
-    transport::RateLimitKey,
+    transport::{LogContextConfig, RateLimitKey},
 };
 
 /// Identity of an authenticated caller.
@@ -1096,6 +1096,21 @@ impl Default for SeenIdentitySet {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct AuthLogContext {
+    pub(crate) fields: LogContextConfig,
+    pub(crate) fingerprint_salt: Option<Arc<SecretString>>,
+}
+
+impl AuthLogContext {
+    pub(crate) fn new(fields: &LogContextConfig, rbac: &crate::rbac::RbacPolicy) -> Self {
+        Self {
+            fields: fields.clone(),
+            fingerprint_salt: fields.credential_fingerprint.then(|| rbac.redaction_salt()),
+        }
+    }
+}
+
 /// Shared state for the auth middleware.
 ///
 /// `api_keys` uses [`ArcSwap`] so the SIGHUP handler can atomically
@@ -1131,6 +1146,8 @@ pub(crate) struct AuthState {
     /// was challenged from. `None` falls back to the well-known path, which
     /// stays correct for same-origin clients.
     pub resource_metadata_url: Option<String>,
+    /// Per-item client context for `auth failed` logs; startup-only.
+    pub log_context: AuthLogContext,
 }
 
 impl AuthState {
@@ -1544,6 +1561,136 @@ fn auth_method_label(method: AuthMethod) -> &'static str {
     }
 }
 
+#[derive(Debug, Default)]
+struct AuthFailureFields {
+    client_ip: Option<std::net::IpAddr>,
+    peer_ip: Option<std::net::IpAddr>,
+    request_id: Option<Arc<str>>,
+    method: Option<axum::http::Method>,
+    path: Option<String>,
+    user_agent: Option<String>,
+    auth_scheme: Option<&'static str>,
+    token_kind: Option<&'static str>,
+    mcp_session: Option<bool>,
+    mcp_protocol_version: Option<String>,
+    credential_fp: Option<String>,
+}
+
+fn user_agent_for_log(headers: &axum::http::HeaderMap) -> String {
+    headers.get(header::USER_AGENT).map_or_else(
+        || "-".to_owned(),
+        |value| {
+            value.to_str().map_or_else(
+                |_| "<non-utf8>".to_owned(),
+                |raw| {
+                    crate::transport::sanitize_for_log(
+                        raw,
+                        crate::transport::MAX_LOGGED_HEADER_CHARS,
+                    )
+                },
+            )
+        },
+    )
+}
+
+fn auth_scheme_for_log(headers: &axum::http::HeaderMap) -> &'static str {
+    let Some(value) = headers.get(header::AUTHORIZATION) else {
+        return "none";
+    };
+    let Ok(raw) = value.to_str() else {
+        return "other";
+    };
+    let scheme = raw.split_ascii_whitespace().next().unwrap_or_default();
+    if scheme.eq_ignore_ascii_case("bearer") {
+        "bearer"
+    } else if scheme.eq_ignore_ascii_case("basic") {
+        "basic"
+    } else {
+        "other"
+    }
+}
+
+fn token_kind(token: &str) -> &'static str {
+    let mut parts = token.split('.');
+    let Some(first) = parts.next() else {
+        return "opaque";
+    };
+    let Some(second) = parts.next() else {
+        return "opaque";
+    };
+    let Some(third) = parts.next() else {
+        return "opaque";
+    };
+    if parts.next().is_some() {
+        return "opaque";
+    }
+    let valid = [first, second, third].into_iter().all(|part| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    });
+    if valid { "jwt" } else { "opaque" }
+}
+
+fn auth_failure_fields(ctx: &AuthLogContext, req: &Request<Body>) -> AuthFailureFields {
+    let fields = &ctx.fields;
+    let headers = req.headers();
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(extract_bearer);
+    let (mcp_session, mcp_protocol_version) = if fields.mcp_hints {
+        crate::transport::mcp_hints_for_log(headers)
+    } else {
+        (false, None)
+    };
+    AuthFailureFields {
+        client_ip: fields
+            .client_ip
+            .then(|| crate::transport::limiter_client_ip(req.extensions()))
+            .flatten(),
+        peer_ip: fields
+            .peer_ip
+            .then(|| crate::transport::peer_ip_for_log(req.extensions()))
+            .flatten(),
+        request_id: fields
+            .request_id
+            .then(|| crate::transport::request_id_for_log(req.extensions()))
+            .flatten(),
+        method: fields.request_line.then(|| req.method().clone()),
+        path: fields.request_line.then(|| req.uri().path().to_owned()),
+        user_agent: fields.user_agent.then(|| user_agent_for_log(headers)),
+        auth_scheme: fields.auth_scheme.then(|| auth_scheme_for_log(headers)),
+        token_kind: fields.auth_scheme.then(|| bearer.map(token_kind)).flatten(),
+        mcp_session: fields.mcp_hints.then_some(mcp_session),
+        mcp_protocol_version,
+        credential_fp: ctx.fingerprint_salt.as_ref().and_then(|salt| {
+            bearer
+                .map(|token| crate::rbac::redact_with_salt(salt.expose_secret().as_bytes(), token))
+        }),
+    }
+}
+
+fn log_auth_failure(failure_class: AuthFailureClass, ctx: &AuthLogContext, req: &Request<Body>) {
+    let fields = auth_failure_fields(ctx, req);
+    tracing::warn!(
+        failure_class = %failure_class.as_str(),
+        client_ip = fields.client_ip.map(tracing::field::display),
+        peer_ip = fields.peer_ip.map(tracing::field::display),
+        request_id = fields.request_id.as_deref(),
+        method = fields.method.as_ref().map(tracing::field::display),
+        path = fields.path.as_deref().map(tracing::field::display),
+        user_agent = fields.user_agent.as_deref(),
+        auth_scheme = fields.auth_scheme.map(tracing::field::display),
+        token_kind = fields.token_kind.map(tracing::field::display),
+        mcp_session = fields.mcp_session,
+        mcp_protocol_version = fields.mcp_protocol_version.as_deref(),
+        credential_fp = fields.credential_fp.as_deref().map(tracing::field::display),
+        "auth failed"
+    );
+}
+
 #[cfg_attr(
     not(feature = "oauth"),
     allow(
@@ -1778,7 +1925,7 @@ pub(crate) async fn auth_middleware(
         AuthFailureClass::MissingCredential
     };
 
-    tracing::warn!(failure_class = %failure_class.as_str(), "auth failed");
+    log_auth_failure(failure_class, &state.log_context, &req);
 
     // Rate limit check (applied after auth failure only).
     // Successful authentications do not consume rate limit budget.
@@ -1801,6 +1948,39 @@ mod tests {
 
     use super::*;
     use crate::transport::RateLimitKey;
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            let bytes = self.0.lock().map(|guard| guard.clone()).unwrap_or_default();
+            String::from_utf8(bytes).unwrap_or_default()
+        }
+    }
+
+    struct CapturedLogsWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogsWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Ok(mut guard) = self.0.lock() {
+                guard.extend_from_slice(buf);
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogsWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogsWriter(Arc::clone(&self.0))
+        }
+    }
 
     /// A PHC string produced by **argon2 0.5.3** through the same code path as
     /// [`generate_api_key`] (16 salt bytes, `Argon2::default()`).
@@ -2432,6 +2612,14 @@ mod tests {
     }
 
     fn test_auth_state(keys: Vec<ApiKeyEntry>) -> Arc<AuthState> {
+        test_auth_state_with_log_context(keys, LogContextConfig::default())
+    }
+
+    fn test_auth_state_with_log_context(
+        keys: Vec<ApiKeyEntry>,
+        fields: LogContextConfig,
+    ) -> Arc<AuthState> {
+        let credential_fingerprint = fields.credential_fingerprint;
         Arc::new(AuthState {
             api_keys: ArcSwap::new(Arc::new(keys)),
             rate_limiter: None,
@@ -2441,7 +2629,318 @@ mod tests {
             seen_identities: SeenIdentitySet::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
+            log_context: AuthLogContext {
+                fields,
+                fingerprint_salt: credential_fingerprint
+                    .then(|| Arc::new(SecretString::from("test-salt"))),
+            },
         })
+    }
+
+    async fn capture_auth_failure_log(
+        state: Arc<AuthState>,
+        req: Request<Body>,
+    ) -> (StatusCode, String) {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let app = auth_router(state);
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let status = app
+            .oneshot(req)
+            .await
+            .expect("auth request must complete")
+            .status();
+        (status, logs.contents())
+    }
+
+    fn auth_request(uri: &str) -> Request<Body> {
+        Request::builder()
+            .method(axum::http::Method::POST)
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request must build")
+    }
+
+    fn auth_request_with_all_context() -> Request<Body> {
+        let mut req = auth_request("/mcp?probe=1");
+        req.headers_mut().insert(
+            header::USER_AGENT,
+            axum::http::HeaderValue::from_static("probe/1.0"),
+        );
+        req.headers_mut().insert(
+            "x-request-id",
+            axum::http::HeaderValue::from_static("ignored"),
+        );
+        req.extensions_mut().insert(crate::transport::ClientIp::new(
+            "203.0.113.7".parse().expect("ip parses"),
+        ));
+        req.extensions_mut().insert(crate::transport::PeerAddr::new(
+            "127.0.0.1:5555".parse().expect("socket parses"),
+        ));
+        req.extensions_mut()
+            .insert(crate::transport::RequestId::new("qa-1"));
+        req.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:5555"
+                .parse::<SocketAddr>()
+                .expect("socket parses"),
+        ));
+        req
+    }
+
+    fn assert_auth_failed_line<'a>(logs: &'a str, needle: &str) -> &'a str {
+        logs.lines()
+            .find(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("missing {needle:?} in logs: {logs}"))
+    }
+
+    fn knobs(mut configure: impl FnMut(&mut LogContextConfig)) -> LogContextConfig {
+        let mut fields = LogContextConfig::default();
+        configure(&mut fields);
+        fields
+    }
+
+    #[tokio::test]
+    async fn auth_failure_log_omits_client_context_by_default() {
+        let state = test_auth_state(vec![]);
+        let req = auth_request_with_all_context();
+
+        let (status, logs) = capture_auth_failure_log(state, req).await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let line = assert_auth_failed_line(&logs, "auth failed");
+        assert!(
+            line.ends_with("auth failed failure_class=missing_credential"),
+            "default log must preserve golden suffix: {line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_failure_log_carries_client_context() {
+        let mut fields = LogContextConfig::recommended();
+        fields.request_id = true;
+        let state = test_auth_state_with_log_context(vec![], fields);
+
+        let (status, logs) =
+            capture_auth_failure_log(Arc::clone(&state), auth_request_with_all_context()).await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let line = assert_auth_failed_line(&logs, "failure_class=missing_credential");
+        assert!(line.contains("client_ip=203.0.113.7"), "{line}");
+        assert!(line.contains("peer_ip=127.0.0.1"), "{line}");
+        assert!(line.contains("request_id=\"qa-1\""), "{line}");
+        assert!(line.contains("method=POST"), "{line}");
+        assert!(line.contains("path=/mcp"), "{line}");
+        assert!(line.contains("user_agent=\"probe/1.0\""), "{line}");
+        assert!(line.contains("auth_scheme=none"), "{line}");
+        assert!(line.contains("mcp_session=false"), "{line}");
+        assert!(
+            !line.contains("probe=1"),
+            "query string must not be logged: {line}"
+        );
+
+        let mut bearer = auth_request_with_all_context();
+        bearer.headers_mut().insert(
+            header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer not-a-key"),
+        );
+        let (_, logs) = capture_auth_failure_log(Arc::clone(&state), bearer).await;
+        let line = assert_auth_failed_line(&logs, "failure_class=invalid_credential");
+        assert!(line.contains("auth_scheme=bearer"), "{line}");
+        assert!(line.contains("token_kind=opaque"), "{line}");
+        assert!(
+            !line.contains("not-a-key"),
+            "credential must not leak: {line}"
+        );
+
+        let mut basic = auth_request_with_all_context();
+        basic.headers_mut().insert(
+            header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Basic abc"),
+        );
+        let (_, logs) = capture_auth_failure_log(state, basic).await;
+        let line = assert_auth_failed_line(&logs, "failure_class=invalid_credential");
+        assert!(line.contains("auth_scheme=basic"), "{line}");
+        assert!(
+            !line.contains("token_kind"),
+            "non-bearer token kind omitted: {line}"
+        );
+        assert!(!line.contains("abc"), "credential must not leak: {line}");
+    }
+
+    #[tokio::test]
+    async fn auth_failure_client_ip_falls_back_to_connect_info() {
+        let fields = knobs(|ctx| ctx.client_ip = true);
+        let state = test_auth_state_with_log_context(vec![], fields);
+        let mut req = auth_request("/mcp");
+        req.extensions_mut().insert(ConnectInfo(
+            "10.9.8.7:1234"
+                .parse::<SocketAddr>()
+                .expect("socket parses"),
+        ));
+
+        let (_, logs) = capture_auth_failure_log(state, req).await;
+        let line = assert_auth_failed_line(&logs, "auth failed");
+
+        assert!(line.contains("client_ip=10.9.8.7"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn auth_failure_auth_shape_fields() {
+        let fields = knobs(|ctx| ctx.auth_scheme = true);
+        let state = test_auth_state_with_log_context(vec![], fields);
+        let cases = [
+            (None, "auth_scheme=none", None),
+            (
+                Some("Bearer not-a-key"),
+                "auth_scheme=bearer",
+                Some("token_kind=opaque"),
+            ),
+            (
+                Some("Bearer aaa.bbb.ccc"),
+                "auth_scheme=bearer",
+                Some("token_kind=jwt"),
+            ),
+            (Some("Basic abc"), "auth_scheme=basic", None),
+            (Some("Digest x"), "auth_scheme=other", None),
+        ];
+        for (header_value, scheme, kind) in cases {
+            let mut req = auth_request("/mcp");
+            if let Some(header_value) = header_value {
+                req.headers_mut().insert(
+                    header::AUTHORIZATION,
+                    axum::http::HeaderValue::from_static(header_value),
+                );
+            }
+            let (_, logs) = capture_auth_failure_log(Arc::clone(&state), req).await;
+            let line = assert_auth_failed_line(&logs, "auth failed");
+            assert!(line.contains(scheme), "{line}");
+            if let Some(kind) = kind {
+                assert!(line.contains(kind), "{line}");
+            } else {
+                assert!(!line.contains("token_kind"), "{line}");
+            }
+        }
+
+        let mut req = auth_request("/mcp");
+        req.headers_mut().insert(
+            header::AUTHORIZATION,
+            axum::http::HeaderValue::from_bytes(b"\xff").expect("non-utf8 header builds"),
+        );
+        let (_, logs) = capture_auth_failure_log(state, req).await;
+        let line = assert_auth_failed_line(&logs, "auth failed");
+        assert!(line.contains("auth_scheme=other"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn auth_failure_mcp_hints() {
+        let fields = knobs(|ctx| ctx.mcp_hints = true);
+        let state = test_auth_state_with_log_context(vec![], fields);
+        let mut req = auth_request("/mcp");
+        req.headers_mut().insert(
+            "mcp-session-id",
+            axum::http::HeaderValue::from_static("secret-session-value"),
+        );
+        req.headers_mut().insert(
+            "mcp-protocol-version",
+            axum::http::HeaderValue::from_static("2025-06-18"),
+        );
+
+        let (_, logs) = capture_auth_failure_log(state, req).await;
+        let line = assert_auth_failed_line(&logs, "auth failed");
+
+        assert!(line.contains("mcp_session=true"), "{line}");
+        assert!(
+            line.contains("mcp_protocol_version=\"2025-06-18\""),
+            "{line}"
+        );
+        assert!(!line.contains("secret-session-value"), "{line}");
+    }
+
+    fn credential_fp_from_line(line: &str) -> &str {
+        line.split_whitespace()
+            .find_map(|part| part.strip_prefix("credential_fp="))
+            .unwrap_or_else(|| panic!("credential_fp missing from line: {line}"))
+    }
+
+    #[tokio::test]
+    async fn auth_failure_credential_fingerprint_is_stable_and_bearer_only() {
+        let fields = knobs(|ctx| ctx.credential_fingerprint = true);
+        let state = test_auth_state_with_log_context(vec![], fields);
+        let run = |state: Arc<AuthState>, header_value: &'static str| async move {
+            let mut req = auth_request("/mcp");
+            req.headers_mut().insert(
+                header::AUTHORIZATION,
+                axum::http::HeaderValue::from_static(header_value),
+            );
+            capture_auth_failure_log(state, req).await.1
+        };
+
+        let logs_a1 = run(Arc::clone(&state), "Bearer tok-A").await;
+        let line_a1 = assert_auth_failed_line(&logs_a1, "auth failed");
+        let fp_a1 = credential_fp_from_line(line_a1);
+        assert_eq!(fp_a1.len(), 8, "{line_a1}");
+        assert!(fp_a1.chars().all(|c| c.is_ascii_hexdigit()), "{line_a1}");
+
+        let logs_a2 = run(Arc::clone(&state), "Bearer tok-A").await;
+        let fp_a2 = credential_fp_from_line(assert_auth_failed_line(&logs_a2, "auth failed"));
+        assert_eq!(fp_a1, fp_a2);
+
+        let logs_b = run(Arc::clone(&state), "Bearer tok-B").await;
+        let fp_b = credential_fp_from_line(assert_auth_failed_line(&logs_b, "auth failed"));
+        assert_ne!(fp_a1, fp_b);
+
+        let logs_basic = run(Arc::clone(&state), "Basic tok-A").await;
+        let line_basic = assert_auth_failed_line(&logs_basic, "auth failed");
+        assert!(!line_basic.contains("credential_fp"), "{line_basic}");
+
+        let all_logs = format!("{logs_a1}{logs_a2}{logs_b}{logs_basic}");
+        assert!(!all_logs.contains("tok-A"), "{all_logs}");
+        assert!(!all_logs.contains("tok-B"), "{all_logs}");
+
+        let state = test_auth_state_with_log_context(vec![], LogContextConfig::default());
+        let logs = run(state, "Bearer tok-A").await;
+        let line = assert_auth_failed_line(&logs, "auth failed");
+        assert!(!line.contains("credential_fp"), "{line}");
+    }
+
+    #[test]
+    fn user_agent_for_log_reads_the_header() {
+        let mut headers = axum::http::HeaderMap::new();
+        assert_eq!(user_agent_for_log(&headers), "-");
+
+        headers.insert(
+            header::USER_AGENT,
+            axum::http::HeaderValue::from_static("probe/1.0"),
+        );
+        assert_eq!(user_agent_for_log(&headers), "probe/1.0");
+
+        headers.insert(
+            header::USER_AGENT,
+            axum::http::HeaderValue::from_bytes(b"caf\xe9").expect("non-utf8 header builds"),
+        );
+        assert_eq!(user_agent_for_log(&headers), "<non-utf8>");
+
+        let long = "a".repeat(200);
+        headers.insert(
+            header::USER_AGENT,
+            axum::http::HeaderValue::from_str(&long).expect("header builds"),
+        );
+        assert_eq!(
+            user_agent_for_log(&headers),
+            format!("{}...(truncated)", "a".repeat(128))
+        );
+    }
+
+    #[test]
+    fn token_kind_classifies_jwt_shape() {
+        assert_eq!(token_kind("aaa.bbb.ccc"), "jwt");
+        for opaque in ["a.b", "a..c", "a+b.c.d", "opaque-key"] {
+            assert_eq!(token_kind(opaque), "opaque", "{opaque}");
+        }
     }
 
     #[tokio::test]
@@ -2541,6 +3040,7 @@ mod tests {
             seen_identities: SeenIdentitySet::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
+            log_context: AuthLogContext::default(),
         });
         let app = auth_router(state);
 
@@ -2675,6 +3175,7 @@ mod tests {
             seen_identities: SeenIdentitySet::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
+            log_context: AuthLogContext::default(),
         };
         let ip = RateLimitKey::Ip("10.7.7.7".parse::<IpAddr>().unwrap());
         assert!(
@@ -2709,6 +3210,7 @@ mod tests {
             seen_identities: SeenIdentitySet::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
+            log_context: AuthLogContext::default(),
         };
         let established = RateLimitKey::Ip("10.7.7.7".parse::<IpAddr>().unwrap());
         let unseen = RateLimitKey::Ip("10.7.7.8".parse::<IpAddr>().unwrap());
@@ -2767,6 +3269,7 @@ mod tests {
             seen_identities: SeenIdentitySet::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
+            log_context: AuthLogContext::default(),
         });
         let app = auth_router(Arc::clone(&state));
         let peer: SocketAddr = "10.0.0.10:54321".parse().unwrap();
@@ -2843,6 +3346,7 @@ mod tests {
             seen_identities: SeenIdentitySet::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
+            log_context: AuthLogContext::default(),
         });
         let app = auth_router(Arc::clone(&state));
         let peer: SocketAddr = "10.0.0.20:54321".parse().unwrap();
@@ -2904,6 +3408,7 @@ mod tests {
             seen_identities: SeenIdentitySet::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
+            log_context: AuthLogContext::default(),
         });
         let app = auth_router(Arc::clone(&state));
         let metrics = Arc::new(crate::metrics::McpMetrics::new().expect("metrics registry"));
@@ -2954,6 +3459,7 @@ mod tests {
             seen_identities: SeenIdentitySet::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
+            log_context: AuthLogContext::default(),
         });
         let app = auth_router(Arc::clone(&state));
         let metrics = Arc::new(crate::metrics::McpMetrics::new().expect("metrics registry"));

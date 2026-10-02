@@ -108,7 +108,7 @@ pub(crate) fn resolve_client_ip(
     Err(FallbackReason::AllEntriesTrusted)
 }
 
-fn is_trusted(ip: IpAddr, trusted: &[IpNet]) -> bool {
+pub(crate) fn is_trusted(ip: IpAddr, trusted: &[IpNet]) -> bool {
     trusted.iter().any(|net| net.contains(&ip))
 }
 

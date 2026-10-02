@@ -25,6 +25,8 @@ const SERVER_CONFIG_BRIDGED_FIELDS: &[&str] = &[
     "extra_route_rate_limit",
     "extra_route_rate_limit_burst",
     "extra_route_rate_limit_exempt_paths",
+    "request_log_exclude_paths",
+    "log_context",
     "key_eviction_policy",
     "trusted_proxies",
     "trusted_forwarder_max_entries",
@@ -382,6 +384,14 @@ pub struct ServerConfig {
     /// non-empty and start with `/`. Startup-only.
     #[serde(default)]
     pub extra_route_rate_limit_exempt_paths: Vec<String>,
+    /// Request paths to exclude from request logging. Exact-match against
+    /// the request path - no globs, no normalization. Default: `["/healthz", "/readyz"]`.
+    /// Entries must be non-empty and start with `/`.
+    #[serde(default = "crate::transport::default_request_log_exclude_paths")]
+    pub request_log_exclude_paths: Vec<String>,
+    /// Configuration for client context logging (request ID, client IP, peer IP, etc.).
+    #[serde(default)]
+    pub log_context: crate::transport::LogContextConfig,
     /// Full-table policy for per-IP rate limiters. Default: `evict_lru`.
     #[serde(default)]
     pub key_eviction_policy: KeyEvictionPolicy,
@@ -511,6 +521,8 @@ impl std::fmt::Debug for ServerConfig {
                 "extra_route_rate_limit_exempt_paths",
                 &self.extra_route_rate_limit_exempt_paths,
             )
+            .field("request_log_exclude_paths", &self.request_log_exclude_paths)
+            .field("log_context", &self.log_context)
             .field("key_eviction_policy", &self.key_eviction_policy)
             .field("trusted_proxies", &self.trusted_proxies)
             .field(
@@ -559,6 +571,8 @@ impl Default for ServerConfig {
             extra_route_rate_limit: None,
             extra_route_rate_limit_burst: None,
             extra_route_rate_limit_exempt_paths: Vec::new(),
+            request_log_exclude_paths: crate::transport::default_request_log_exclude_paths(),
+            log_context: crate::transport::LogContextConfig::default(),
             key_eviction_policy: KeyEvictionPolicy::default(),
             trusted_proxies: Vec::new(),
             trusted_forwarder_max_entries: default_trusted_forwarder_max_entries(),
@@ -882,6 +896,10 @@ impl ServerConfig {
                     .iter()
                     .map(String::as_str),
             )
+            .with_request_log_exclude_paths(
+                self.request_log_exclude_paths.iter().map(String::as_str),
+            )
+            .with_log_context(self.log_context.clone())
             .with_trusted_proxies(self.trusted_proxies.iter().map(String::as_str))
             .with_trusted_forwarder_max_entries(self.trusted_forwarder_max_entries)
             .with_optional_tool_rate_limit(self.tool_rate_limit)
@@ -1532,6 +1550,13 @@ fn validate_rate_limit_knobs(server: &ServerConfig) -> crate::error::Result<()> 
             )));
         }
     }
+    for path in &server.request_log_exclude_paths {
+        if path.is_empty() || !path.starts_with('/') {
+            return Err(RmcpServerKitError::Config(format!(
+                "server.request_log_exclude_paths entries must be non-empty and start with '/': {path:?}"
+            )));
+        }
+    }
     if let Some(auth) = server.auth.as_ref() {
         auth.check_oauth_feature()?;
     }
@@ -1620,6 +1645,13 @@ fn validate_trusted_forwarder_config(server: &ServerConfig) -> crate::error::Res
             crate::forwarded::MAX_CONFIGURABLE_SCANNED_ENTRIES,
             server.trusted_forwarder_max_entries
         )));
+    }
+    crate::transport::validate_request_id_header(&server.log_context.request_id_header)
+        .map_err(|e| RmcpServerKitError::Config(format!("server.{e}")))?;
+    if server.log_context.request_id && server.trusted_proxies.is_empty() {
+        return Err(RmcpServerKitError::Config(
+            "server.log_context.request_id requires server.trusted_proxies to be nonempty".into(),
+        ));
     }
     Ok(())
 }
@@ -2312,6 +2344,160 @@ mod tests {
                 "entry {bad:?}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn request_log_exclude_paths_toml_roundtrip_and_validation() {
+        let cfg: ServerConfig = toml::from_str(
+            r#"
+                request_log_exclude_paths = ["/version"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.request_log_exclude_paths, vec!["/version".to_owned()]);
+        assert!(validate_server_config(&cfg).is_ok());
+
+        let cfg_default: ServerConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            cfg_default.request_log_exclude_paths,
+            crate::transport::default_request_log_exclude_paths()
+        );
+
+        let cfg_empty: ServerConfig = toml::from_str(
+            "
+                request_log_exclude_paths = []
+            ",
+        )
+        .unwrap();
+        assert_eq!(cfg_empty.request_log_exclude_paths, Vec::<String>::new());
+        assert!(validate_server_config(&cfg_empty).is_ok());
+    }
+
+    #[test]
+    fn malformed_request_log_exclude_paths_rejected() {
+        for bad in ["", "healthz", "no-slash"] {
+            let cfg = ServerConfig {
+                request_log_exclude_paths: vec![bad.into()],
+                ..ServerConfig::default()
+            };
+            let err = validate_server_config(&cfg).unwrap_err();
+            assert!(
+                err.to_string().contains(
+                    "server.request_log_exclude_paths entries must be non-empty and start with '/'"
+                ),
+                "entry {bad:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn log_context_toml_roundtrip_and_bridge() {
+        let toml_str = r#"
+[log_context]
+client_ip = true
+peer_ip = true
+request_id = false
+request_id_header = "x-request-id"
+request_line = true
+user_agent = false
+auth_scheme = true
+mcp_hints = false
+credential_fingerprint = false
+request_completion = true
+        "#;
+        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.log_context.client_ip);
+        assert!(cfg.log_context.peer_ip);
+        assert!(cfg.log_context.request_line);
+        assert!(cfg.log_context.auth_scheme);
+        assert!(cfg.log_context.request_completion);
+
+        let base = crate::transport::McpServerConfig::new("127.0.0.1:8080", "test", "0.1.0");
+        let mcp_cfg = cfg.apply_to_mcp_config(base).unwrap();
+        assert!(mcp_cfg.log_context.client_ip);
+        assert!(mcp_cfg.log_context.peer_ip);
+
+        let cfg_default: ServerConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            cfg_default.log_context,
+            crate::transport::LogContextConfig::default()
+        );
+    }
+
+    #[test]
+    fn log_context_toml_validation_mirrors_builder() {
+        // Test 1: request_id requires trusted_proxies
+        let cfg = ServerConfig {
+            log_context: crate::transport::LogContextConfig {
+                request_id: true,
+                ..crate::transport::LogContextConfig::default()
+            },
+            trusted_proxies: vec![],
+            ..ServerConfig::default()
+        };
+        let err = validate_server_config(&cfg).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("server.log_context.request_id requires server.trusted_proxies"),
+            "{err}"
+        );
+
+        // Test 2: forbidden request_id_header values from the builder test list
+        for bad in [
+            "",
+            "x request id",
+            "authorization",
+            "Cookie",
+            "proxy-authorization",
+            "forwarded",
+            "X-Forwarded-For",
+            "x-real-ip",
+            "Mcp-Session-Id",
+        ] {
+            let cfg = ServerConfig {
+                log_context: crate::transport::LogContextConfig {
+                    request_id_header: bad.to_owned(),
+                    ..crate::transport::LogContextConfig::default()
+                },
+                trusted_proxies: vec!["127.0.0.1/32".into()],
+                ..ServerConfig::default()
+            };
+            let err = validate_server_config(&cfg).unwrap_err();
+            let err_msg = err.to_string();
+            assert!(
+                err_msg.contains("server.log_context.request_id_header"),
+                "Error for header '{bad}' missing 'server.log_context.request_id_header': {err_msg}"
+            );
+            // The key check: should NOT contain the doubled prefix
+            assert!(
+                !err_msg.contains("log_context.log_context"),
+                "Error for header '{bad}' contains doubled 'log_context.log_context' prefix: {err_msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_toml_bridges_log_defaults() {
+        let cfg: ServerConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            cfg.request_log_exclude_paths,
+            crate::transport::default_request_log_exclude_paths()
+        );
+        assert_eq!(
+            cfg.log_context,
+            crate::transport::LogContextConfig::default()
+        );
+
+        let base = crate::transport::McpServerConfig::new("127.0.0.1:8080", "test", "0.1.0");
+        let mcp_cfg = cfg.apply_to_mcp_config(base).unwrap();
+        assert_eq!(
+            mcp_cfg.request_log_exclude_paths,
+            crate::transport::default_request_log_exclude_paths()
+        );
+        assert_eq!(
+            mcp_cfg.log_context,
+            crate::transport::LogContextConfig::default()
+        );
     }
 
     #[test]
@@ -3045,6 +3231,8 @@ mod tests {
         // Structured / nested values with no single-scalar env representation.
         "server.allowed_origins",
         "server.extra_route_rate_limit_exempt_paths",
+        "server.request_log_exclude_paths",
+        "server.log_context",
         "server.trusted_proxies",
         "server.auth",
         "server.security_headers",
@@ -3455,7 +3643,13 @@ mod tests {
             .enable_compression(512)
             .with_max_concurrent_requests(99)
             .enable_admin("admin")
-            .expose_build_metadata();
+            .expose_build_metadata()
+            .with_log_context(crate::transport::LogContextConfig {
+                client_ip: true,
+                request_id: true,
+                ..crate::transport::LogContextConfig::default()
+            })
+            .with_request_log_exclude_paths(["/x"]);
 
         let actual = ServerConfig::default().apply_to_mcp_config(base).unwrap();
 
@@ -3475,6 +3669,14 @@ mod tests {
         assert!(!actual.admin_enabled);
         assert_eq!(actual.admin_role, "admin");
         assert!(!actual.expose_build_metadata);
+        assert_eq!(
+            actual.request_log_exclude_paths,
+            crate::transport::default_request_log_exclude_paths()
+        );
+        assert_eq!(
+            actual.log_context,
+            crate::transport::LogContextConfig::default()
+        );
     }
 
     #[test]

@@ -8,7 +8,7 @@
 //! and enforces RBAC and per-IP tool rate limiting before the request
 //! reaches the handler.
 
-use std::{num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
+use std::{net::IpAddr, num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
@@ -26,6 +26,7 @@ use crate::{
     auth::AuthIdentity,
     bounded_limiter::{BoundedKeyedLimiter, BoundedLimiterDeny, KeyEvictionPolicy},
     error::RmcpServerKitError,
+    transport::LogContextConfig,
 };
 
 /// Per-source-IP rate limiter for tool invocations. Memory-bounded against
@@ -658,6 +659,10 @@ impl RbacPolicy {
         self.enabled
     }
 
+    pub(crate) fn redaction_salt(&self) -> Arc<SecretString> {
+        Arc::clone(&self.redaction_salt)
+    }
+
     /// Summarize the policy for diagnostics (admin endpoint).
     ///
     /// Returns `(enabled, role_count, per_role_stats)` where each stat is
@@ -1093,7 +1098,7 @@ fn process_redaction_salt() -> &'static SecretString {
 ///
 /// Pulled out as a free function so it can be unit-tested and benchmarked
 /// without constructing a full [`RbacPolicy`].
-fn redact_with_salt(salt: &[u8], value: &str) -> String {
+pub(crate) fn redact_with_salt(salt: &[u8], value: &str) -> String {
     use std::fmt::Write as _;
 
     use sha2::Digest as _;
@@ -1127,6 +1132,49 @@ fn redact_with_salt(salt: &[u8], value: &str) -> String {
 
 // -- RBAC middleware --
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DenyLogKnobs {
+    pub(crate) client_ip: bool,
+    pub(crate) peer_ip: bool,
+    pub(crate) request_id: bool,
+}
+
+impl DenyLogKnobs {
+    pub(crate) const fn from_config(cfg: &LogContextConfig) -> Self {
+        Self {
+            client_ip: cfg.client_ip,
+            peer_ip: cfg.peer_ip,
+            request_id: cfg.request_id,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DenyLogFields {
+    pub(crate) client_ip: Option<IpAddr>,
+    pub(crate) peer_ip: Option<IpAddr>,
+    pub(crate) request_id: Option<Arc<str>>,
+}
+
+impl DenyLogFields {
+    fn from_extensions(knobs: DenyLogKnobs, ext: &axum::http::Extensions) -> Self {
+        Self {
+            client_ip: knobs
+                .client_ip
+                .then(|| crate::transport::limiter_client_ip(ext))
+                .flatten(),
+            peer_ip: knobs
+                .peer_ip
+                .then(|| crate::transport::peer_ip_for_log(ext))
+                .flatten(),
+            request_id: knobs
+                .request_id
+                .then(|| crate::transport::request_id_for_log(ext))
+                .flatten(),
+        }
+    }
+}
+
 /// Axum middleware that enforces RBAC and per-IP tool rate limiting on
 /// MCP tool calls.
 ///
@@ -1155,6 +1203,7 @@ fn redact_with_salt(salt: &[u8], value: &str) -> String {
 pub(crate) async fn rbac_middleware(
     policy: Arc<RbacPolicy>,
     tool_limiter: Option<Arc<ToolRateLimiter>>,
+    knobs: DenyLogKnobs,
     req: Request<Body>,
     next: Next,
 ) -> Response {
@@ -1182,6 +1231,8 @@ pub(crate) async fn rbac_middleware(
         .and_then(|id| id.raw_token.clone())
         .unwrap_or_else(|| SecretString::from(String::new()));
     let sub = identity.and_then(|id| id.sub.clone()).unwrap_or_default();
+
+    let deny_fields = DenyLogFields::from_extensions(knobs, req.extensions());
 
     // RBAC requires an authenticated identity.
     if policy.is_enabled() && identity.is_none() {
@@ -1213,7 +1264,8 @@ pub(crate) async fn rbac_middleware(
                     return resp;
                 }
                 if policy.is_enabled()
-                    && let Some(resp) = enforce_tool_policy(&policy, &identity_name, &role, params)
+                    && let Some(resp) =
+                        enforce_tool_policy(&policy, &identity_name, &role, params, &deny_fields)
                 {
                     return resp;
                 }
@@ -1326,6 +1378,7 @@ fn enforce_tool_policy(
     identity_name: &str,
     role: &str,
     params: &serde_json::Value,
+    fields: &DenyLogFields,
 ) -> Option<Response> {
     let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let host_value = params.get("arguments").and_then(|a| a.get("host"));
@@ -1345,6 +1398,9 @@ fn enforce_tool_policy(
             role = %role,
             tool = tool_name,
             value_type = json_value_type(value),
+            client_ip = fields.client_ip.map(tracing::field::display),
+            peer_ip = fields.peer_ip.map(tracing::field::display),
+            request_id = fields.request_id.as_deref(),
             "non-string host argument rejected"
         );
         return Some(
@@ -1369,6 +1425,9 @@ fn enforce_tool_policy(
             role = %role,
             tool = tool_name,
             host = host.unwrap_or("-"),
+            client_ip = fields.client_ip.map(tracing::field::display),
+            peer_ip = fields.peer_ip.map(tracing::field::display),
+            request_id = fields.request_id.as_deref(),
             "RBAC denied"
         );
         return Some(
@@ -1389,18 +1448,25 @@ fn enforce_tool_policy(
                     permitted,
                     arg_key,
                     arg_val,
+                    fields,
                 )
             {
                 return Some(resp);
             }
-            if let Some(resp) =
-                check_argument(policy, identity_name, role, tool_name, arg_key, arg_val)
-            {
+            if let Some(resp) = check_argument(
+                policy,
+                identity_name,
+                role,
+                tool_name,
+                arg_key,
+                arg_val,
+                fields,
+            ) {
                 return Some(resp);
             }
         }
     }
-    check_required_arguments(policy, identity_name, role, tool_name, args)
+    check_required_arguments(policy, identity_name, role, tool_name, args, fields)
 }
 
 /// Deny arguments outside the allowlisted set when strict confinement is on.
@@ -1414,6 +1480,7 @@ fn check_strict_argument(
     permitted: &[&str],
     arg_key: &str,
     arg_val: &serde_json::Value,
+    fields: &DenyLogFields,
 ) -> Option<Response> {
     if !permitted.contains(&arg_key) {
         tracing::warn!(
@@ -1421,6 +1488,9 @@ fn check_strict_argument(
             role = %role,
             tool = tool_name,
             argument = arg_key,
+            client_ip = fields.client_ip.map(tracing::field::display),
+            peer_ip = fields.peer_ip.map(tracing::field::display),
+            request_id = fields.request_id.as_deref(),
             "unknown argument rejected by strict allowlist"
         );
         return Some(
@@ -1437,6 +1507,9 @@ fn check_strict_argument(
             tool = tool_name,
             argument = arg_key,
             value_type = json_value_type(arg_val),
+            client_ip = fields.client_ip.map(tracing::field::display),
+            peer_ip = fields.peer_ip.map(tracing::field::display),
+            request_id = fields.request_id.as_deref(),
             "structured argument rejected by strict allowlist"
         );
         return Some(
@@ -1462,6 +1535,7 @@ fn check_required_arguments(
     role: &str,
     tool_name: &str,
     args: Option<&serde_json::Map<String, serde_json::Value>>,
+    fields: &DenyLogFields,
 ) -> Option<Response> {
     let missing = policy.missing_required_argument(role, tool_name, args)?;
     tracing::warn!(
@@ -1469,6 +1543,9 @@ fn check_required_arguments(
         role = %role,
         tool = tool_name,
         argument = missing,
+        client_ip = fields.client_ip.map(tracing::field::display),
+        peer_ip = fields.peer_ip.map(tracing::field::display),
+        request_id = fields.request_id.as_deref(),
         "required argument missing"
     );
     Some(
@@ -1486,6 +1563,7 @@ fn check_argument(
     tool_name: &str,
     arg_key: &str,
     arg_val: &serde_json::Value,
+    fields: &DenyLogFields,
 ) -> Option<Response> {
     if !policy.has_argument_allowlist(role, tool_name, arg_key) {
         return None;
@@ -1502,6 +1580,9 @@ fn check_argument(
             tool = tool_name,
             argument = arg_key,
             value_type = json_value_type(arg_val),
+            client_ip = fields.client_ip.map(tracing::field::display),
+            peer_ip = fields.peer_ip.map(tracing::field::display),
+            request_id = fields.request_id.as_deref(),
             "non-string argument rejected by allowlist"
         );
         return Some(
@@ -1524,6 +1605,9 @@ fn check_argument(
         tool = tool_name,
         argument = arg_key,
         arg_hmac = %policy.redact_arg(val_str),
+        client_ip = fields.client_ip.map(tracing::field::display),
+        peer_ip = fields.peer_ip.map(tracing::field::display),
+        request_id = fields.request_id.as_deref(),
         "argument not in allowlist"
     );
     Some(
@@ -1833,6 +1917,121 @@ mod tests {
 
         let _policy = RbacPolicy::new(config);
         logs.contents()
+    }
+
+    fn capture_rbac_deny_logs(fields: &DenyLogFields) -> String {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        trigger_all_rbac_deny_lines(fields);
+        logs.contents()
+    }
+
+    fn enabled_policy(role: RoleConfig) -> RbacPolicy {
+        let mut config = RbacConfig::with_roles(vec![role]);
+        config.enabled = true;
+        RbacPolicy::new(&config)
+    }
+
+    fn run_policy(allowlists: Vec<ArgumentAllowlist>) -> RbacPolicy {
+        enabled_policy(
+            RoleConfig::new("viewer", vec!["run".into()], vec!["*".into()])
+                .with_argument_allowlists(allowlists),
+        )
+    }
+
+    fn trigger_all_rbac_deny_lines(fields: &DenyLogFields) {
+        let denied_policy = enabled_policy(RoleConfig::new(
+            "viewer",
+            vec!["echo".into()],
+            vec!["*".into()],
+        ));
+        let denied = serde_json::json!({ "name": "forbidden", "arguments": {} });
+        let _ = enforce_tool_policy(&denied_policy, "alice", "viewer", &denied, fields);
+
+        let host_shape = serde_json::json!({ "name": "echo", "arguments": { "host": ["bad"] } });
+        let _ = enforce_tool_policy(&denied_policy, "alice", "viewer", &host_shape, fields);
+
+        let strict_policy = run_policy(vec![
+            ArgumentAllowlist::new_required("run", "cmd", vec!["ls".into()])
+                .with_deny_unknown_arguments(true),
+        ]);
+        let unknown =
+            serde_json::json!({ "name": "run", "arguments": { "cmd": "ls", "danger": true } });
+        let _ = enforce_tool_policy(&strict_policy, "alice", "viewer", &unknown, fields);
+        let structured =
+            serde_json::json!({ "name": "run", "arguments": { "cmd": { "nested": true } } });
+        let _ = enforce_tool_policy(&strict_policy, "alice", "viewer", &structured, fields);
+
+        let required_policy = run_policy(vec![ArgumentAllowlist::new_required(
+            "run",
+            "cmd",
+            vec!["ls".into()],
+        )]);
+        let missing = serde_json::json!({ "name": "run", "arguments": {} });
+        let _ = enforce_tool_policy(&required_policy, "alice", "viewer", &missing, fields);
+
+        let allow_policy = run_policy(vec![ArgumentAllowlist::new_required(
+            "run",
+            "cmd",
+            vec!["ls".into()],
+        )]);
+        let non_string = serde_json::json!({ "name": "run", "arguments": { "cmd": true } });
+        let _ = enforce_tool_policy(&allow_policy, "alice", "viewer", &non_string, fields);
+        let not_allowed = serde_json::json!({ "name": "run", "arguments": { "cmd": "rm" } });
+        let _ = enforce_tool_policy(&allow_policy, "alice", "viewer", &not_allowed, fields);
+    }
+
+    fn assert_all_rbac_deny_messages_present(logs: &str) {
+        for message in [
+            "RBAC denied",
+            "non-string host argument rejected",
+            "unknown argument rejected by strict allowlist",
+            "structured argument rejected by strict allowlist",
+            "required argument missing",
+            "non-string argument rejected by allowlist",
+            "argument not in allowlist",
+        ] {
+            assert!(logs.contains(message), "missing {message:?}: {logs}");
+        }
+    }
+
+    #[test]
+    fn rbac_deny_lines_carry_client_fields_when_enabled() {
+        let fields = DenyLogFields {
+            client_ip: Some("198.51.100.4".parse().expect("ip parses")),
+            peer_ip: Some("10.0.0.1".parse().expect("ip parses")),
+            request_id: Some(Arc::from("qa-3")),
+        };
+
+        let logs = capture_rbac_deny_logs(&fields);
+
+        assert_all_rbac_deny_messages_present(&logs);
+        for line in logs.lines().filter(|line| {
+            line.contains("rejected")
+                || line.contains("denied")
+                || line.contains("missing")
+                || line.contains("allowlist")
+        }) {
+            assert!(line.contains("client_ip=198.51.100.4"), "{line}");
+            assert!(line.contains("peer_ip=10.0.0.1"), "{line}");
+            assert!(line.contains("request_id=\"qa-3\""), "{line}");
+        }
+    }
+
+    #[test]
+    fn rbac_deny_lines_omit_client_fields_by_default() {
+        let logs = capture_rbac_deny_logs(&DenyLogFields::default());
+
+        assert_all_rbac_deny_messages_present(&logs);
+        assert!(!logs.contains("client_ip"), "{logs}");
+        assert!(!logs.contains("peer_ip"), "{logs}");
+        assert!(!logs.contains("request_id"), "{logs}");
     }
 
     #[test]
@@ -2491,7 +2690,8 @@ mod tests {
         )]);
         let params = tool_call(serde_json::json!({ "cmd": "ls", "danger": true }));
         assert!(
-            enforce_tool_policy(&policy, "u", "viewer", &params).is_none(),
+            enforce_tool_policy(&policy, "u", "viewer", &params, &DenyLogFields::default())
+                .is_none(),
             "default behaviour must be unchanged: unnamed arguments pass"
         );
     }
@@ -2504,13 +2704,21 @@ mod tests {
         ]);
         let params = tool_call(serde_json::json!({ "cmd": "ls", "danger": true }));
         assert!(
-            enforce_tool_policy(&policy, "u", "viewer", &params).is_some(),
+            enforce_tool_policy(&policy, "u", "viewer", &params, &DenyLogFields::default())
+                .is_some(),
             "an argument no allowlist names must be denied under strict mode"
         );
 
         let permitted = tool_call(serde_json::json!({ "cmd": "ls" }));
         assert!(
-            enforce_tool_policy(&policy, "u", "viewer", &permitted).is_none(),
+            enforce_tool_policy(
+                &policy,
+                "u",
+                "viewer",
+                &permitted,
+                &DenyLogFields::default()
+            )
+            .is_none(),
             "an allowlisted argument must still pass"
         );
     }
@@ -2526,7 +2734,8 @@ mod tests {
         ] {
             let params = tool_call(serde_json::json!({ "cmd": shape }));
             assert!(
-                enforce_tool_policy(&policy, "u", "viewer", &params).is_some(),
+                enforce_tool_policy(&policy, "u", "viewer", &params, &DenyLogFields::default())
+                    .is_some(),
                 "object/array values cannot be constrained and must be denied"
             );
         }
@@ -2543,7 +2752,8 @@ mod tests {
         ]);
         let params = tool_call(serde_json::json!({ "cmd": "ls", "host": "dev-1" }));
         assert!(
-            enforce_tool_policy(&policy, "u", "viewer", &params).is_none(),
+            enforce_tool_policy(&policy, "u", "viewer", &params, &DenyLogFields::default())
+                .is_none(),
             "every matching allowlist's argument must remain permitted"
         );
     }
@@ -3160,7 +3370,7 @@ mod tests {
             .route("/mcp", axum::routing::post(|| async { "ok" }))
             .layer(axum::middleware::from_fn(move |req, next| {
                 let p = Arc::clone(&policy);
-                rbac_middleware(p, None, req, next)
+                rbac_middleware(p, None, DenyLogKnobs::default(), req, next)
             }))
     }
 
@@ -3173,10 +3383,85 @@ mod tests {
                     let id = identity.clone();
                     async move {
                         req.extensions_mut().insert(id);
-                        rbac_middleware(p, None, req, next).await
+                        rbac_middleware(p, None, DenyLogKnobs::default(), req, next).await
                     }
                 },
             ))
+    }
+
+    #[tokio::test]
+    async fn rbac_middleware_logs_client_fields_from_extensions() {
+        let policy = Arc::new(enabled_policy(RoleConfig::new(
+            "viewer",
+            vec!["echo".into()],
+            vec!["*".into()],
+        )));
+        let identity = AuthIdentity {
+            method: crate::auth::AuthMethod::BearerToken,
+            name: "alice".into(),
+            role: "viewer".into(),
+            raw_token: None,
+            sub: None,
+        };
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let app = axum::Router::new()
+            .route("/mcp", axum::routing::post(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(
+                move |mut req: Request<Body>, next| {
+                    let p = Arc::clone(&policy);
+                    let id = identity.clone();
+                    async move {
+                        req.extensions_mut().insert(id);
+                        req.extensions_mut().insert(crate::transport::ClientIp::new(
+                            "198.51.100.4".parse().expect("ip parses"),
+                        ));
+                        req.extensions_mut().insert(crate::transport::PeerAddr::new(
+                            "10.0.0.1:5555".parse().expect("socket parses"),
+                        ));
+                        req.extensions_mut()
+                            .insert(crate::transport::RequestId::new("qa-4"));
+                        rbac_middleware(
+                            p,
+                            None,
+                            DenyLogKnobs {
+                                client_ip: true,
+                                peer_ip: true,
+                                request_id: true,
+                            },
+                            req,
+                            next,
+                        )
+                        .await
+                    }
+                },
+            ));
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(tool_call_body(
+                "forbidden",
+                &serde_json::json!({}),
+            )))
+            .unwrap();
+
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let status = app.oneshot(req).await.expect("request completes").status();
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let contents = logs.contents();
+        let line = contents
+            .lines()
+            .find(|line| line.contains("RBAC denied"))
+            .unwrap_or_else(|| panic!("missing RBAC denied line: {contents}"));
+        assert!(line.contains("client_ip=198.51.100.4"), "{line}");
+        assert!(line.contains("peer_ip=10.0.0.1"), "{line}");
+        assert!(line.contains("request_id=\"qa-4\""), "{line}");
     }
 
     /// Tool-limiter deny path must increment the `tool` deny counter via
@@ -3213,7 +3498,7 @@ mod tests {
                             let peer: std::net::SocketAddr =
                                 "10.9.9.1:40000".parse().expect("static socket addr parses");
                             req.extensions_mut().insert(ConnectInfo(peer));
-                            rbac_middleware(p, Some(l), req, next).await
+                            rbac_middleware(p, Some(l), DenyLogKnobs::default(), req, next).await
                         }
                     },
                 ))

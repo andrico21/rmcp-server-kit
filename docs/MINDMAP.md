@@ -170,8 +170,10 @@ mindmap
             Closures stay sync no async DNS
     Middleware order
       outer to inner
+      0 Security headers
       1 Origin check
-      2 Security headers
+      2 Peer-address normalize
+      2b Request log request_log_middleware
       3 CORS
       4 Compression
       5 Body size cap
@@ -424,12 +426,12 @@ graph TD
 
 | Area                              | Module / file                           | Notable symbols (file:line)                                                  |
 |-----------------------------------|------------------------------------------|-------------------------------------------------------------------------------|
-| Server entry (HTTP)               | `src/transport.rs`                       | `serve` ~L2519, `McpServerConfig` L285-606, `ReloadHandle` ~L1515              |
-| Server entry (stdio, no auth)     | `src/transport.rs`                       | `serve_stdio` ~L4615                                                          |
-| Router builder + middleware wire  | `src/transport.rs`                       | `build_app_router` ~L1805, security headers wired ~L2160, peer-addr normalize wired ~L2123, origin wired ~L2168 |
-| TLS / mTLS acceptor               | `src/transport.rs`                       | `TlsListener` ~L3140                                                          |
-| Origin / security headers (defs)  | `src/transport.rs`                       | `origin_check_middleware` ~L4493, `security_headers_middleware` ~L3797       |
-| Graceful shutdown                 | `src/transport.rs`                       | `shutdown_signal` ~L3625                                                      |
+| Server entry (HTTP)               | `src/transport.rs`                       | `serve` ~L2750, `McpServerConfig` L387-776, `ReloadHandle` ~L1816              |
+| Server entry (stdio, no auth)     | `src/transport.rs`                       | `serve_stdio` ~L5045                                                          |
+| Router builder + middleware wire  | `src/transport.rs`                       | `build_app_router` ~L2016, security headers wired ~L2657, peer-addr normalize wired ~L2624, request log wired just inside peer-addr normalize, origin wired ~L2641 |
+| TLS / mTLS acceptor               | `src/transport.rs`                       | `TlsListener` ~L3357                                                          |
+| Origin / security headers (defs)  | `src/transport.rs`                       | `origin_check_middleware` ~L4773, `security_headers_middleware` ~L4014       |
+| Graceful shutdown                 | `src/transport.rs`                       | `shutdown_signal` ~L3842                                                      |
 | API key + mTLS auth               | `src/auth.rs`                            | `AuthIdentity` L51, `AuthState` ~L1102, `auth_middleware` L1703              |
 | RBAC engine                       | `src/rbac.rs`                            | `RbacPolicy` L352, task-locals L90-150, `rbac_middleware` L678-825           |
 | Memory-bounded keyed limiter      | `src/bounded_limiter.rs`                 | `BoundedKeyedLimiter` L134                                                    |
