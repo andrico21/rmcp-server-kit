@@ -7,7 +7,6 @@ license = "MIT OR Apache-2.0"
 description = "Reusable MCP server framework with auth, RBAC, and Streamable HTTP transport (built on the rmcp SDK)"
 readme = "README.md"
 repository = "https://github.com/andrico21/rmcp-server-kit"
-homepage = "https://github.com/andrico21/rmcp-server-kit"
 documentation = "https://docs.rs/rmcp-server-kit"
 keywords = ["mcp", "rmcp", "server", "oauth", "rbac"]
 categories = [
@@ -28,6 +27,10 @@ exclude = [
   # them -- they contain internal review notes and session identifiers.
   ".omo/",
   ".sisyphus/",
+  # Development-only guideline docs. The root file is the vendoring index; the
+  # rules themselves are vendored under docs/rust-guidelines/.
+  "RUST_GUIDELINES.md",
+  "docs/rust-guidelines/",
 ]
 
 [lib]

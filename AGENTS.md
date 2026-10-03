@@ -8,7 +8,7 @@
 > - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) - deep architecture reference with file:line citations
 > - [`docs/MINDMAP.md`](docs/MINDMAP.md) - visual mermaid mindmap of the whole project
 > - [`docs/GUIDE.md`](docs/GUIDE.md) - end-user / consumer-facing guide
-> - [`RUST_GUIDELINES.md`](RUST_GUIDELINES.md) - mandatory coding standards (DO/DON'T)
+> - [`RUST_GUIDELINES.md`](RUST_GUIDELINES.md) - mandatory coding standards: the index of the vendored guideline set ([`docs/rust-guidelines/RUST_GUIDELINES.md`](docs/rust-guidelines/RUST_GUIDELINES.md))
 
 ---
 
@@ -88,6 +88,7 @@ Z:\TempPersistent\rmcp-server-kit\
 │   ├── MINDMAP.md            ★ Mermaid mindmap of the project
 │   ├── MIGRATION.md          Version-migration notes
 │   ├── RELEASING.md          Release process
+│   ├── rust-guidelines/      Vendored universal guidelines (core + overlays; do not edit)
 │   └── RUST_1_95_NOTES.md    Notes on Rust 1.95 idioms used here
 ├── .github/workflows/        GitHub Actions CI (fmt, clippy, test, doc, deny, audit, MSRV)
 ├── .gitlab-ci.yml            GitLab mirror CI pipeline (build/test/lint/audit/publish)
@@ -98,7 +99,7 @@ Z:\TempPersistent\rmcp-server-kit\
 ├── rustfmt.toml              rustfmt config (import grouping, granularity)
 ├── README.md                 Short quick-start
 ├── CHANGELOG.md              Release history
-├── RUST_GUIDELINES.md        ★ MANDATORY - Coding standards. READ IT.
+├── RUST_GUIDELINES.md        ★ MANDATORY - index of the vendored coding standards
 ├── CONTRIBUTING.md           Contribution guide
 ├── CODE_OF_CONDUCT.md        Code of conduct
 ├── SECURITY.md               Security disclosure policy
@@ -163,7 +164,7 @@ Z:\TempPersistent\rmcp-server-kit\
 
 ### Test tiers
 
-Per [`RUST_GUIDELINES.md`](RUST_GUIDELINES.md) §13 ("DO: Separate test tiers"),
+Per the vendored core [`docs/rust-guidelines/RUST_GUIDELINES.md`](docs/rust-guidelines/RUST_GUIDELINES.md) §13 ("DO: Separate test tiers"),
 tests live in one of two directories, one file per test crate. There is no `e2e`
 tier: every test is autonomous - no test requires a live external service or
 human-assisted setup; outbound HTTP is faked with `wiremock` and servers bind
@@ -272,34 +273,46 @@ For a much deeper version see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## 7. Coding standards (NON-NEGOTIABLE)
 
-This crate enforces strict lints. See full guidance in [`RUST_GUIDELINES.md`](RUST_GUIDELINES.md).
-The most-violated rules - all `deny`-level in `Cargo.toml`:
+The mandatory rules are the vendored universal guidelines. Read them in this
+order before writing or reviewing Rust code here:
+
+1. [`docs/rust-guidelines/RUST_GUIDELINES.md`](docs/rust-guidelines/RUST_GUIDELINES.md) - universal core
+2. [`docs/rust-guidelines/overlays/domains/http-services.md`](docs/rust-guidelines/overlays/domains/http-services.md) - HTTP services
+3. [`docs/rust-guidelines/overlays/domains/mcp-servers.md`](docs/rust-guidelines/overlays/domains/mcp-servers.md) - MCP servers
+4. [`docs/rust-guidelines/overlays/projects/rmcp-server-kit.md`](docs/rust-guidelines/overlays/projects/rmcp-server-kit.md) - project overlay
+
+[`RUST_GUIDELINES.md`](RUST_GUIDELINES.md) is the index (provenance, hashes, open
+deviations, re-vendor procedure). Never edit the vendored files - re-vendor
+instead. The lint profile is not duplicated here: it is the core Section 9
+profile adopted in `Cargo.toml`, and exceptions are narrowest-item
+`#[expect(lint, reason = "...")]`, never `#[allow]`.
+
+Project rules that stay true on top of the core:
 
 | Forbidden                                   | Use instead                                                       |
 |---------------------------------------------|--------------------------------------------------------------------|
 | `unwrap()` / `expect()` in production paths | `?`, `unwrap_or`, `unwrap_or_else`, `match`                        |
-| `panic!()`, `todo!()`, `unimplemented!()`   | Return `Result<_, RmcpServerKitError>` (see `src/error.rs`)                 |
+| `panic!()`, `todo!()`, `unimplemented!()`   | Return `Result<_, RmcpServerKitError>` (see `src/error.rs`)        |
 | `println!()` / `eprintln!()` / `dbg!()`     | `tracing::{info,warn,error,debug}!` macros                         |
-| `as any` ish casts                          | `TryFrom`, explicit conversion with error                          |
+| `as` casts for lossy conversion             | `TryFrom`, or an explicit conversion with an error                 |
 | `unsafe` code                               | Forbidden (`unsafe_code = "forbid"` at crate level)                |
 | `.clone()` to dodge borrow checker          | Restructure ownership; borrow `&str`/`&[T]` not `&String`/`&Vec`   |
 | `Box<Vec<T>>`, `Box<String>`, `Arc<String>` | Use `Vec<T>`, `String`, `Arc<str>`                                 |
-| Wildcard `_ =>` on owned enums              | Exhaustive match (lint: `wildcard_enum_match_arm = "deny"`)        |
-| Indexing `vec[i]`                           | `vec.get(i)?`, slice patterns (lint: `indexing_slicing = "deny"`)  |
+| Wildcard `_ =>` on owned enums              | Exhaustive match                                                   |
+| Indexing `vec[i]`                           | `vec.get(i)?`, slice patterns                                      |
 | Holding `std::sync::Mutex` across `.await`  | `tokio::sync::Mutex`, or release lock before await                 |
-| `std::fs` / `std::net` in async fn          | `tokio::fs` / `tokio::net`, or `tokio::task::spawn_blocking`       |
+| Blocking I/O in an `async fn`               | `tokio` equivalents, or `tokio::task::spawn_blocking`              |
 
-**Rust 1.95 idioms required**:
-- `Vec::push_mut` / `VecDeque::push_{front,back}_mut` - return `&mut T`, avoid the `push` + `last_mut().unwrap()` anti-pattern.
-- `Atomic*::update` / `try_update` over hand-rolled `compare_exchange` loops.
-- `cfg_select!` macro instead of the `cfg-if` crate (don't proactively migrate existing `cfg-if` though).
+The core's current-Rust idioms (for example `Vec::push_mut` /
+`VecDeque::push_{front,back}_mut`, `Atomic*::update` / `try_update`, and
+`cfg_select!`) apply; do not proactively migrate existing `cfg-if` usage.
 
 ---
 
 ## 8. Workflow rules for agents
 
 ### Before editing
-1. Read [`RUST_GUIDELINES.md`](RUST_GUIDELINES.md) §1-9 (or the relevant subsection for your change).
+1. Read the vendored guidelines in load order (above), or the relevant section for your change.
 2. Skim [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) to find the right module.
 3. Run `cargo build --all-features` to confirm a clean baseline.
 
@@ -308,8 +321,8 @@ The most-violated rules - all `deny`-level in `Cargo.toml`:
 2. Match existing patterns. This codebase is **disciplined** (consistent style, lints enforced, full docs). Follow conventions strictly.
 3. Use `tracing` for any output. Never `println!`/`eprintln!`/`dbg!`.
 4. Wrap secrets in `secrecy::Secret<T>` (re-exported via `src/secret.rs`).
-5. New public API surface → add doc comments; the `missing_docs = "warn"` lint requires them.
-6. Public types in this library crate should be `#[non_exhaustive]` where future-extension is plausible (lints `exhaustive_enums`, `exhaustive_structs` warn otherwise).
+5. New public API surface → add doc comments; the profile's docs lints are `deny`, so the gate enforces this.
+6. Public types in this library crate should be `#[non_exhaustive]` where future-extension is plausible (the profile denies `exhaustive_enums` / `exhaustive_structs`).
 
 ### Before declaring done (evidence required)
 - [ ] `cargo +nightly fmt --all -- --check` clean
@@ -322,7 +335,7 @@ The most-violated rules - all `deny`-level in `Cargo.toml`:
 
 ### Never do
 - Commit without explicit user request.
-- Add `#[allow(clippy::unwrap_used)]` without a `// SAFETY/INVARIANT:` comment justifying why the value is guaranteed `Some`/`Ok`.
+- Add a lint exception without a narrowest-item `#[expect(lint, reason = "...")]` - never `#[allow]` - with the reason explaining why the exception is sound.
 - Suppress warnings globally (`#![deny(warnings)]` in source - forbidden; warnings policy is set in Cargo.toml + CI flags).
 - Add a dependency without checking `deny.toml` license allow-list.
 - Disable certificate validation on TLS (`rustls` must use real roots).

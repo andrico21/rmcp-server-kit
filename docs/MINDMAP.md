@@ -249,7 +249,7 @@ mindmap
       .cargo/audit.toml
       rustfmt.toml
     Coding standards
-      RUST_GUIDELINES.md mandatory
+      RUST_GUIDELINES.md index + docs/rust-guidelines/ vendored
       No unwrap / expect prod
       No panic / todo / unimplemented
       No println / eprintln / dbg
@@ -258,7 +258,7 @@ mindmap
       No std::sync::Mutex across await
       Use tracing macros
       Use Result + RmcpServerKitError
-      Use Rust 1.95 idioms
+      Use current-Rust idioms
         Vec::push_mut
         Atomic::update
         cfg_select!
