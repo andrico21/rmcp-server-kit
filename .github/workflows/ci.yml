@@ -19,7 +19,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   # `RUSTFLAGS="-D warnings"` denies warnings across every job. Cargo's
-  # `build.warnings` (stable since 1.97) is now within our 1.98 MSRV, but
+  # `build.warnings` (stable since 1.97) is now within our 1.99 MSRV, but
   # RUSTFLAGS is retained for parity with the GitLab mirror. See
   # docs/RUST_1_95_NOTES.md.
   RUSTFLAGS: "-D warnings"
@@ -117,8 +117,8 @@ jobs:
       # `--force` and the floor matter together: rust-cache can restore an
       # older cargo-semver-checks from ~/.cargo/bin, and `cargo install`
       # would then skip the upgrade. Versions before 0.50 cannot parse the
-      # rustdoc JSON v60 emitted by Rust 1.98 and fail with
-      # "unsupported rustdoc format v60" -- a tooling error indistinguishable
+      # rustdoc JSON v61 emitted by Rust 1.99 and fail with
+      # "unsupported rustdoc format v61" -- a tooling error indistinguishable
       # from a real semver break in the CI log.
       - name: Install cargo-semver-checks
         run: cargo install cargo-semver-checks --locked --force --version '^0.50'
@@ -215,11 +215,20 @@ jobs:
         run: cargo audit
 
   msrv:
-    name: MSRV (1.98.0)
+    name: MSRV (1.99.0)
     runs-on: ubuntu-latest
+    # This job proves compile compatibility with `rust-version`, not lint
+    # cleanliness: lints are enforced on the latest stable (the clippy job).
+    # `--cap-lints=warn` caps rustc/clippy lints emitted by dependencies and
+    # by this crate, and CARGO_BUILD_WARNINGS=allow neutralises the committed
+    # `build.warnings = "deny"`. Recorded in the index's local deviations
+    # register.
+    env:
+      RUSTFLAGS: "--cap-lints=warn"
+      CARGO_BUILD_WARNINGS: allow
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2.9.1
       - run: rustc --version && cargo --version
       - run: cargo build --all-features

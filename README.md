@@ -360,7 +360,7 @@ pooling to amortize it. Plain TLS (no client certificate) is unaffected. See
 
 ## Minimum supported Rust
 
-`rmcp-server-kit` targets stable Rust **1.98** or newer (tracks `edition = "2024"`).
+`rmcp-server-kit` targets stable Rust **1.99** or newer (tracks `edition = "2024"`).
 
 ## Repository
 

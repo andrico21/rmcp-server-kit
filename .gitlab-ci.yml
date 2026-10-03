@@ -6,7 +6,7 @@
 #
 # Toolchain image: ci-tools/rust-ci-images (built separately).
 # It pre-installs:
-#   - rustup channels: 1.98.0 (stable pin) + nightly (rustfmt, clippy,
+#   - rustup channels: 1.99.0 (stable pin) + nightly (rustfmt, clippy,
 #     rust-src, llvm-tools-preview)
 #   - cargo subcommands: nextest, llvm-cov, deny, audit, semver-checks,
 #     vet, machete, mutants, msrv, hack, outdated, sort, upgrades, geiger,
@@ -41,16 +41,18 @@ stages:
 variables:
   CARGO_TERM_COLOR: always
   # RUSTFLAGS="-D warnings" denies warnings across all jobs. Cargo
-  # `build.warnings` (stable 1.97+) is now within our 1.98 MSRV but is not
+  # `build.warnings` (stable 1.97+) is now within our 1.99 MSRV but is not
   # adopted here; RUSTFLAGS is kept for parity with GitHub CI. See
   # docs/RUST_1_95_NOTES.md.
   RUSTFLAGS: "-D warnings"
   CARGO_INCREMENTAL: "0"          # CI cache hit-rate > incremental gain
   CARGO_NET_RETRY: "10"
   RUSTUP_MAX_RETRIES: "10"
-  # Pin to the rust-ci-images tag matching our MSRV. Bump deliberately
-  # together with Cargo.toml `rust-version`.
-  CI_IMAGE: gitlab-ad.andrico.local:5050/ci-tools/rust-ci-images/rust:rust-1.98.0
+  # Pin to the rust-ci-images tag matching our MSRV (1.99.0). Bump
+  # deliberately together with Cargo.toml `rust-version`. The tag cannot be
+  # verified by an agent without registry credentials; see the local
+  # deviations register in RUST_GUIDELINES.md.
+  CI_IMAGE: gitlab-ad.andrico.local:5050/ci-tools/rust-ci-images/rust:rust-1.99.0
   # SAST/secret-detection toggles (templates honour these).
   SECRET_DETECTION_ENABLED: "true"
   SAST_EXCLUDED_PATHS: "target,docs"
@@ -155,10 +157,15 @@ audit:
 msrv:
   stage: check
   needs: []
+  # Proves compile compatibility with `rust-version`, not lint cleanliness;
+  # see the local deviations register in RUST_GUIDELINES.md.
+  variables:
+    RUSTFLAGS: "--cap-lints=warn"
+    CARGO_BUILD_WARNINGS: allow
   script:
-    # Image's stable channel is already pinned to MSRV (1.98.0). If a
+    # Image's stable channel is already pinned to MSRV (1.99.0). If a
     # downstream image bump moves stable forward, switch this to
-    # `cargo +1.98.0 build` and add the toolchain via `rustup install`.
+    # `cargo +1.99.0 build` and add the toolchain via `rustup install`.
     # Deliberately no --locked, as above.
     - rtk cargo build --all-features
 

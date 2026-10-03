@@ -91,6 +91,15 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   reasoned `RUSTSEC-2023-0071` ignore kept in sync with `.cargo/audit.toml`
   (which drops the stale `RUSTSEC-2026-0097`). No dependency version and no
   `Cargo.lock` change.
+- **Minimum supported Rust version is now 1.99.0** - `rust-version` moves from
+  `1.98.0` to `1.99.0`. Under the project's SemVer policy an MSRV bump is a
+  minor-version change. Roots that use resolver 3 (`edition = "2024"` or
+  `resolver = "3"`) consider `rust-version`, so they stay on `3.14.x` while on
+  Rust 1.98 and only move once their toolchain is 1.99+. Roots still on the
+  resolver-2 default can pull this release on `cargo update` and then fail the
+  `rust-version` check naming `rustc 1.99.0`. The CI MSRV job now pins 1.99.0
+  and builds with `--cap-lints=warn` (compile compatibility only; lints are
+  enforced on the latest stable). See `docs/MIGRATION.md` 3.15.
 
 ### Fixed
 
