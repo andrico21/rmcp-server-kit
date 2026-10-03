@@ -30,10 +30,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@nightly
+      # Dated nightly (D-14 v): the newest release that passes both this job
+      # and the docsrs job below. Move the pin only through the re-vendor +
+      # toolchain-bump procedure in RUST_GUIDELINES.md.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-03
           components: rustfmt
-      - run: cargo +nightly fmt --all -- --check
+      - run: cargo +nightly-2026-10-03 fmt --all -- --check
 
   clippy:
     name: Clippy
@@ -162,9 +166,12 @@ jobs:
       RUSTDOCFLAGS: "-D warnings --cfg docsrs"
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@nightly
+      # Dated nightly (D-14 v), the same pin as the `fmt` job.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-03
       - uses: Swatinem/rust-cache@v2.9.1
-      - run: cargo +nightly doc --no-deps --all-features
+      - run: cargo +nightly-2026-10-03 doc --no-deps --all-features
       - name: Verify SECURITY.md documents mTLS revocation [H-S4]
         run: |
           set -e
@@ -181,6 +188,21 @@ jobs:
           # Defence-in-depth guidance must remain.
           grep -qE "(short-lived|24h|24 hour)" SECURITY.md
           grep -qE "(cert-manager|Vault PKI|Smallstep)" docs/GUIDE.md
+
+  rustdoc-canary:
+    name: Rustdoc (latest nightly canary)
+    runs-on: ubuntu-latest
+    # Non-blocking (D-14 v): docs.rs builds with its own current nightly, so
+    # this surfaces drift early without gating merges on it. The blocking
+    # `docs` job uses the dated, verified pin above.
+    continue-on-error: true
+    env:
+      RUSTDOCFLAGS: "-D warnings --cfg docsrs"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2.9.1
+      - run: cargo +nightly doc --no-deps --all-features
 
   rustdoc-stable:
     name: Rustdoc (stable)
@@ -297,7 +319,8 @@ jobs:
   machete:
     name: cargo-machete (unused deps)
     runs-on: ubuntu-latest
-    continue-on-error: true
+    # Blocking: `cargo machete` passes on main, so an unused dependency is a
+    # real regression, not advisory signal.
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -306,6 +329,22 @@ jobs:
         run: cargo install cargo-machete --locked
       - name: Detect unused dependencies
         run: cargo machete
+
+  geiger:
+    name: cargo-geiger (informational)
+    runs-on: ubuntu-latest
+    # Informational only (D-17): cargo-geiger exits non-zero whenever it finds
+    # unsafe code, so it must never gate merges. `--all-features` reports the
+    # full dependency unsafe-usage picture.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+      - name: Install cargo-geiger
+        run: cargo install cargo-geiger --locked
+      - name: Run cargo geiger
+        run: cargo geiger --all-features
 
   mutants:
     name: cargo-mutants (nightly mutation tests)
