@@ -104,7 +104,7 @@ permission. Status of each item at this vendoring:
 | - | --------- | ------ | -------------- |
 | 1 | `pedantic`/`nursery` at `warn`; remove the listed allows; `doc_markdown` -> `doc-valid-idents` | open | Closed by the Section 9 profile switch, which replaces the local lint table wholesale. |
 | 2 | `rust-toolchain.toml` pin and the CI `1.98.0` job contradict the Version Policy | open | The pin file is already deleted; `rust-version`, the CI jobs and the 1.98 text retarget are closed by the MSRV work. |
-| 3 | `deny.toml`: `multiple-versions = "warn"` -> `"deny"` | open | Closed by the supply-chain policy work. |
+| 3 | `deny.toml`: `multiple-versions = "warn"` -> `"deny"` | closed | Closed by the core cargo-deny policy adopted in PR #31 (merged into this branch): `multiple-versions = "deny"`, `[graph] all-features`, `unmaintained` / `unsound` scope "all", licenses trimmed to the encountered set, duplicates in `skip` with a reason each. |
 | 4 | `.cargo/config.toml`: `build.warnings = "deny"` not set | open | Closed by the warnings-policy work. |
 | 5 | 1.99 lint impact: message-less `assert!(..is_empty())` sites | closed | All 30 test-side sites fixed on 1.99 in PR #30 (before this vendoring); they were never profile-only. The overlay's count is an erratum (30 measured, not 25) for the final report. |
 | 6 | 1.99 idioms: `String::from_utf8_lossy(..).into_owned()` sites | not applicable | False positive: both sites convert borrowed bytes (`&guard`; `&buf[..filled]`), not owned bytes. Upstream erratum. |
