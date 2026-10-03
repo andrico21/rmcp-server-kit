@@ -106,7 +106,7 @@ permission. Status of each item at this vendoring:
 | 2 | `rust-toolchain.toml` pin and the CI `1.98.0` job contradict the Version Policy | open | The pin file is already deleted; `rust-version`, the CI jobs and the 1.98 text retarget are closed by the MSRV work. |
 | 3 | `deny.toml`: `multiple-versions = "warn"` -> `"deny"` | open | Closed by the supply-chain policy work. |
 | 4 | `.cargo/config.toml`: `build.warnings = "deny"` not set | open | Closed by the warnings-policy work. |
-| 5 | 1.99 lint impact: message-less `assert!(..is_empty())` sites | open | Remaining sites are test-only and fire only under the Section 9 profile; closed as the profile lands. The overlay's count is itself an erratum (re-measured for the final report). |
+| 5 | 1.99 lint impact: message-less `assert!(..is_empty())` sites | closed | All 30 test-side sites fixed on 1.99 in PR #30 (before this vendoring); they were never profile-only. The overlay's count is an erratum (30 measured, not 25) for the final report. |
 | 6 | 1.99 idioms: `String::from_utf8_lossy(..).into_owned()` sites | not applicable | False positive: both sites convert borrowed bytes (`&guard`; `&buf[..filled]`), not owned bytes. Upstream erratum. |
 
 Closure evidence for each row, and every erratum found in the vendored text,
