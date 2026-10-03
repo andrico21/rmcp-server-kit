@@ -101,8 +101,17 @@ mod tests {
         }
     }
 
+    /// Install the process-wide rustls provider that reqwest's
+    /// `rustls-no-provider` build requires before any client is constructed.
+    fn install_crypto_provider() {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+    }
+
     /// Spawn the public `serve_metrics` on a fresh ephemeral port.
     async fn spawn_serve_metrics() -> anyhow::Result<MetricsHarness> {
+        install_crypto_provider();
         let port = reserve_port().await?;
         let bind = format!("127.0.0.1:{port}");
         let metrics = Arc::new(McpMetrics::new()?);
@@ -133,9 +142,7 @@ mod tests {
     /// Start a `serve()` instance (with its metrics listener) on ephemeral
     /// ports and wait until it signals readiness.
     async fn spawn(config: McpServerConfig) -> anyhow::Result<ServeHarness> {
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .ok();
+        install_crypto_provider();
 
         let listener = TcpListener::bind("127.0.0.1:0")
             .await

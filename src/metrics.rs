@@ -18,8 +18,10 @@ use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounterVec, Registry, TextEncoder, opts,
 };
 
-use crate::error::RmcpServerKitError;
-use crate::transport::{SecurityHeadersConfig, security_headers_middleware};
+use crate::{
+    error::RmcpServerKitError,
+    transport::{SecurityHeadersConfig, security_headers_middleware},
+};
 
 /// Default Prometheus histogram buckets for HTTP request latency
 /// (seconds). Tuned for low-latency service work: sub-millisecond
