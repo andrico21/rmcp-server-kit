@@ -754,7 +754,8 @@ mod tests {
     };
 
     #[cfg(unix)]
-    use tracing_subscriber::{Layer as _, fmt::MakeWriter as _, layer::SubscriberExt as _};
+    use tracing_subscriber::fmt::MakeWriter as _;
+    use tracing_subscriber::{Layer as _, layer::SubscriberExt as _};
 
     #[cfg(not(any(unix, windows)))]
     use super::prepare_tracing_audit_lenient;
@@ -773,6 +774,79 @@ mod tests {
         }
     }
 
+    // Helper structs for default_filter_reaches_audit_layer test.
+    struct BufferWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for BufferWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Ok(mut guard) = self.0.lock() {
+                guard.extend_from_slice(buf);
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct BufferA(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufferA {
+        type Writer = BufferWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            BufferWriter(Arc::clone(&self.0))
+        }
+    }
+
+    struct BufferB(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufferB {
+        type Writer = BufferWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            BufferWriter(Arc::clone(&self.0))
+        }
+    }
+
+    /// Helper function to build a two-layer subscriber for testing filter reaches.
+    fn build_two_layer_test_subscriber(
+        buffer_a: &Arc<std::sync::Mutex<Vec<u8>>>,
+        buffer_b: &Arc<std::sync::Mutex<Vec<u8>>>,
+    ) -> impl tracing::Subscriber {
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new(
+                ObservabilityConfig::default().log_level,
+            ))
+            .with(tracing_subscriber::fmt::layer().with_writer(BufferA(Arc::clone(buffer_a))))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_writer(BufferB(Arc::clone(buffer_b)))
+                    .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+            )
+    }
+
+    #[allow(
+        clippy::cognitive_complexity,
+        reason = "tracing! macro expansions add branches"
+    )]
+    fn emit_filter_test_probes() {
+        tracing::info!(target: "rmcp_server_kit::transport", "probe-kit");
+        tracing::info!(target: "rmcp_server_kit::oauth", "probe-kit-oauth");
+        tracing::info!(target: "rmcp::service", "probe-sdk-info");
+        tracing::warn!(target: "rmcp::service", "probe-sdk-warn");
+    }
+
+    /// Helper function to run filter reach test logic and return (a_contents, b_contents).
+    fn run_filter_reach_probe() -> (String, String) {
+        let buffer_a = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let buffer_b = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let subscriber = build_two_layer_test_subscriber(&buffer_a, &buffer_b);
+
+        tracing::subscriber::with_default(subscriber, emit_filter_test_probes);
+
+        let a_contents = String::from_utf8(buffer_a.lock().unwrap().clone()).unwrap_or_default();
+        let b_contents = String::from_utf8(buffer_b.lock().unwrap().clone()).unwrap_or_default();
+
+        (a_contents, b_contents)
+    }
     #[test]
     fn config_format_valid() {
         let config = ObservabilityConfig {
@@ -910,6 +984,39 @@ mod tests {
             "guard drop should drain this normal audit line before timeout; got {contents:?}"
         );
         std::fs::remove_dir_all(&dir).expect("remove audit temp dir");
+    }
+
+    #[test]
+    fn default_filter_reaches_audit_layer() {
+        let (a_contents, b_contents) = run_filter_reach_probe();
+
+        // Both layers should see probe-kit and probe-sdk-warn
+        assert!(
+            a_contents.contains("probe-kit"),
+            "buffer A should contain probe-kit; got: {a_contents:?}"
+        );
+        assert!(
+            b_contents.contains("probe-kit"),
+            "buffer B should contain probe-kit; got: {b_contents:?}"
+        );
+        assert!(
+            a_contents.contains("probe-sdk-warn"),
+            "buffer A should contain probe-sdk-warn; got: {a_contents:?}"
+        );
+        assert!(
+            b_contents.contains("probe-sdk-warn"),
+            "buffer B should contain probe-sdk-warn; got: {b_contents:?}"
+        );
+
+        // Neither should see probe-sdk-info
+        assert!(
+            !a_contents.contains("probe-sdk-info"),
+            "buffer A should NOT contain probe-sdk-info; got: {a_contents:?}"
+        );
+        assert!(
+            !b_contents.contains("probe-sdk-info"),
+            "buffer B should NOT contain probe-sdk-info; got: {b_contents:?}"
+        );
     }
 
     #[test]

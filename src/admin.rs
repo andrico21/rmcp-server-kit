@@ -211,6 +211,7 @@ mod tests {
             seen_identities: crate::auth::SeenIdentitySet::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
+            log_context: crate::auth::AuthLogContext::default(),
         })
     }
 

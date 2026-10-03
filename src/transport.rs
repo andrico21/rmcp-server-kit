@@ -104,9 +104,9 @@ pub type ReadinessCheck =
 ///
 /// # Privacy
 ///
-/// `PeerAddr` exposes raw peer network metadata. The framework deliberately
-/// never logs it on its own; whether to log or persist peer addresses is
-/// application policy.
+/// `PeerAddr` exposes raw peer network metadata. The framework never logs the
+/// socket address (IP and port) on its own; the IP-only `peer_ip`/`client_ip`
+/// fields appear only under the `log_context` knobs (see [`ClientIp`]).
 ///
 /// # Example
 ///
@@ -183,8 +183,11 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerAddr {
 /// Resolution only ever activates when the **direct peer** is inside the
 /// operator's trusted-proxy CIDRs; every ambiguous chain (malformed or
 /// obfuscated entries, all-trusted chains, header bombs) falls back to
-/// the direct peer, never to a header value. The framework never logs
-/// this value outside rate-limit deny paths.
+/// the direct peer, never to a header value. The value is logged only (a) as
+/// `rate_limit_key` on rate-limit deny lines, and (b) as `client_ip` when
+/// [`LogContextConfig::client_ip`] is on, on `auth failed`, RBAC-deny,
+/// `incoming request` and `request completed` lines. Raw forwarding headers
+/// are never logged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct ClientIp {
@@ -221,6 +224,7 @@ struct ForwardResolver {
     trusted: Vec<ipnet::IpNet>,
     mode: ForwardedHeaderMode,
     max_scanned_entries: usize,
+    request_id_header: Option<axum::http::HeaderName>,
 }
 
 /// Per-header overrides for the OWASP security headers emitted by the
@@ -277,6 +281,97 @@ pub struct SecurityHeadersConfig {
     /// active; the override is ignored on plaintext deployments. The
     /// substring `preload` (any case) is rejected by the validator.
     pub strict_transport_security: Option<String>,
+}
+
+/// Per-item switches for client-context fields in log lines.
+///
+/// Every field is off by default: client IPs, user agents and
+/// identifiers are personal data, so each item is an explicit opt-in.
+/// With every knob off, log lines keep their pre-3.15 shape. See
+/// [`LogContextConfig::recommended`] for a curated low-risk preset.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(default)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each field is an independent operator-facing opt-in switch; grouping them into sub-structs would complicate the public API and the TOML surface for no safety gain"
+)]
+pub struct LogContextConfig {
+    /// Include the resolved [`ClientIp`] on `auth failed`, RBAC-deny
+    /// WARNs, `incoming request` and `request completed` lines.
+    pub client_ip: bool,
+    /// Include the direct socket peer IP (never the port) on the same
+    /// lines as [`Self::client_ip`].
+    pub peer_ip: bool,
+    /// Include the value of [`Self::request_id_header`] on the same
+    /// lines as [`Self::client_ip`]. Taken only from a direct peer
+    /// inside `trusted_proxies` (last occurrence wins); requires
+    /// non-empty `trusted_proxies` (validated).
+    pub request_id: bool,
+    /// Header name read when [`Self::request_id`] is enabled. Default:
+    /// `x-request-id`. On OpenShift, the `IngressController`'s
+    /// `spec.httpHeaders.uniqueId.name` sets this header router-side.
+    pub request_id_header: String,
+    /// Include `method` and `path` (no query string) on `auth failed`
+    /// lines.
+    pub request_line: bool,
+    /// Include the sanitized `User-Agent` on `auth failed` lines.
+    pub user_agent: bool,
+    /// Include `auth_scheme` and `token_kind` on `auth failed` lines.
+    pub auth_scheme: bool,
+    /// Include `mcp_session` (presence of `Mcp-Session-Id`, never its
+    /// value) and `mcp_protocol_version` on `auth failed` and
+    /// `incoming request` lines.
+    pub mcp_hints: bool,
+    /// Include `credential_fp` on `auth failed` lines, for Bearer
+    /// tokens only: the first 8 hex characters of HMAC-SHA256 keyed
+    /// with the RBAC redaction salt. Set `rbac.redaction_salt` for
+    /// fingerprints that are stable across replicas.
+    pub credential_fingerprint: bool,
+    /// Emit a DEBUG `request completed` line with `status` and
+    /// `latency_ms`.
+    pub request_completion: bool,
+}
+
+impl Default for LogContextConfig {
+    fn default() -> Self {
+        Self {
+            client_ip: false,
+            peer_ip: false,
+            request_id: false,
+            request_id_header: "x-request-id".to_owned(),
+            request_line: false,
+            user_agent: false,
+            auth_scheme: false,
+            mcp_hints: false,
+            credential_fingerprint: false,
+            request_completion: false,
+        }
+    }
+}
+
+impl LogContextConfig {
+    /// A curated low-risk preset: enables `client_ip`, `peer_ip`,
+    /// `request_line`, `user_agent`, `auth_scheme` and `mcp_hints`.
+    /// Leaves `request_id` (needs `trusted_proxies`),
+    /// `credential_fingerprint` and `request_completion` off, so the
+    /// result validates without any other configuration.
+    #[must_use]
+    pub fn recommended() -> Self {
+        Self {
+            client_ip: true,
+            peer_ip: true,
+            request_id: false,
+            request_line: true,
+            user_agent: true,
+            auth_scheme: true,
+            mcp_hints: true,
+            credential_fingerprint: false,
+            request_completion: false,
+            ..Self::default()
+        }
+    }
 }
 
 /// Configuration for the MCP server.
@@ -562,12 +657,26 @@ pub struct McpServerConfig {
     )]
     pub public_url: Option<String>,
     /// Log inbound HTTP request headers at DEBUG level.
-    /// Sensitive values remain redacted.
+    /// Sensitive values remain redacted. Paths listed in
+    /// [`Self::request_log_exclude_paths`] are not logged.
     #[deprecated(
         since = "0.13.0",
         note = "use McpServerConfig::enable_request_header_logging(); direct field access will become pub(crate) in a future major release"
     )]
     pub log_request_headers: bool,
+    /// Per-item switches for client-context fields in `incoming
+    /// request` / `request completed` / `auth failed` / RBAC-deny log
+    /// lines. Off by default. Startup-only.
+    pub log_context: LogContextConfig,
+    /// Paths excluded from the `incoming request` / `request
+    /// completed` log lines.
+    ///
+    /// Matching is an exact-string comparison against
+    /// `req.uri().path()` (no globs, no prefixes). Default:
+    /// `["/healthz", "/readyz"]`. An empty list logs every request.
+    /// Entries are validated at [`validate`](Self::validate) time.
+    /// Startup-only.
+    pub request_log_exclude_paths: Vec<String>,
     /// Expose build metadata (`build_git_sha`, `build_timestamp`,
     /// `rust_version`) on the unauthenticated `/version` endpoint.
     /// **Default: `false`** -- only `name`, `version`, and `rmcp_server_kit_version`
@@ -752,6 +861,12 @@ impl<T> Validated<T> {
     }
 }
 
+/// Default [`McpServerConfig::request_log_exclude_paths`]: health-check
+/// paths, which would otherwise dominate the request log.
+pub(crate) fn default_request_log_exclude_paths() -> Vec<String> {
+    vec!["/healthz".to_owned(), "/readyz".to_owned()]
+}
+
 #[allow(
     deprecated,
     reason = "internal builders/validators legitimately read/write the deprecated `pub` fields they were designed to manage"
@@ -796,6 +911,8 @@ impl McpServerConfig {
             extra_router: None,
             public_url: None,
             log_request_headers: false,
+            log_context: LogContextConfig::default(),
+            request_log_exclude_paths: default_request_log_exclude_paths(),
             expose_build_metadata: false,
             compression_enabled: false,
             compression_min_size: 1024,
@@ -1237,10 +1354,66 @@ impl McpServerConfig {
     }
 
     /// Log inbound HTTP request headers at DEBUG level. Sensitive
-    /// values remain redacted by the logging layer.
+    /// values remain redacted by the logging layer. Paths listed in
+    /// [`Self::request_log_exclude_paths`] are not logged.
     #[must_use]
     pub fn enable_request_header_logging(mut self) -> Self {
         self.log_request_headers = true;
+        self
+    }
+
+    /// Set the per-item client-context logging switches (see
+    /// [`LogContextConfig`]). Off by default; use
+    /// [`LogContextConfig::recommended`] for a curated low-risk preset,
+    /// or flip individual fields on the `#[non_exhaustive]` struct.
+    ///
+    /// ```rust
+    /// use rmcp_server_kit::transport::{LogContextConfig, McpServerConfig};
+    ///
+    /// let config = McpServerConfig::new("127.0.0.1:8080", "my-server", "0.1.0")
+    ///     .with_log_context(LogContextConfig::recommended());
+    /// assert!(config.validate().is_ok());
+    /// ```
+    ///
+    /// Enabling individual knobs:
+    ///
+    /// ```rust
+    /// use rmcp_server_kit::transport::{LogContextConfig, McpServerConfig};
+    ///
+    /// let mut ctx = LogContextConfig::default();
+    /// ctx.client_ip = true;
+    /// ctx.request_completion = true;
+    /// let config =
+    ///     McpServerConfig::new("127.0.0.1:8080", "my-server", "0.1.0").with_log_context(ctx);
+    /// assert!(config.validate().is_ok());
+    /// ```
+    #[must_use]
+    pub fn with_log_context(mut self, log_context: LogContextConfig) -> Self {
+        self.log_context = log_context;
+        self
+    }
+
+    /// Replace the list of paths excluded from the `incoming request` /
+    /// `request completed` log lines (default: `["/healthz",
+    /// "/readyz"]`). Matching is an exact-string comparison against
+    /// `req.uri().path()`. Pass an empty iterator to log every request,
+    /// including health-check probes. Entries are validated at
+    /// [`validate`](Self::validate) time. Startup-only.
+    ///
+    /// ```rust
+    /// use rmcp_server_kit::transport::McpServerConfig;
+    ///
+    /// let config = McpServerConfig::new("127.0.0.1:8080", "my-server", "0.1.0")
+    ///     .with_request_log_exclude_paths(Vec::<String>::new());
+    /// assert!(config.validate().is_ok());
+    /// ```
+    #[must_use]
+    pub fn with_request_log_exclude_paths<I, S>(mut self, paths: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.request_log_exclude_paths = paths.into_iter().map(Into::into).collect();
         self
     }
 
@@ -1398,6 +1571,13 @@ impl McpServerConfig {
                 )));
             }
         }
+        for path in &self.request_log_exclude_paths {
+            if path.is_empty() || !path.starts_with('/') {
+                return Err(RmcpServerKitError::Config(format!(
+                    "request_log_exclude_paths entries must be non-empty and start with '/': {path:?}"
+                )));
+            }
+        }
         if let Some(rl) = self.auth.as_ref().and_then(|a| a.rate_limit.as_ref()) {
             if rl.burst == Some(0) {
                 return Err(RmcpServerKitError::Config(
@@ -1416,7 +1596,9 @@ impl McpServerConfig {
     /// Validate the trusted-forwarder knobs: every `trusted_proxies`
     /// entry must parse as a CIDR (`ipnet::IpNet`) or a bare IP
     /// (normalized to a host network), and `forwarded_header` requires a
-    /// nonempty proxy list (fail-fast over a silent no-op).
+    /// nonempty proxy list (fail-fast over a silent no-op). Also
+    /// validates [`LogContextConfig::request_id_header`] and that
+    /// `log_context.request_id` requires `trusted_proxies`.
     fn check_trusted_forwarder(&self) -> Result<(), RmcpServerKitError> {
         for entry in &self.trusted_proxies {
             validate_trusted_proxy_entry(entry).map_err(RmcpServerKitError::Config)?;
@@ -1424,6 +1606,13 @@ impl McpServerConfig {
         if self.forwarded_header.is_some() && self.trusted_proxies.is_empty() {
             return Err(RmcpServerKitError::Config(
                 "forwarded_header requires trusted_proxies to be nonempty".into(),
+            ));
+        }
+        validate_request_id_header(&self.log_context.request_id_header)
+            .map_err(RmcpServerKitError::Config)?;
+        if self.log_context.request_id && self.trusted_proxies.is_empty() {
+            return Err(RmcpServerKitError::Config(
+                "log_context.request_id requires trusted_proxies to be nonempty".into(),
             ));
         }
         Ok(())
@@ -1809,6 +1998,13 @@ fn resolve_binding_secret(config: &McpServerConfig) -> anyhow::Result<BindingSec
     Ok(pair)
 }
 
+fn mcp_resource_metadata_url(public_url: &str) -> String {
+    format!(
+        "{}/.well-known/oauth-protected-resource/mcp",
+        public_url.trim_end_matches('/')
+    )
+}
+
 #[allow(
     clippy::cognitive_complexity,
     reason = "router assembly is intrinsically sequential; splitting harms readability"
@@ -1924,12 +2120,11 @@ where
                 // send clients somewhere they cannot reach. `None` keeps the
                 // relative path, which resolves against whatever origin the
                 // client was actually challenged from.
-                resource_metadata_url: config.public_url.as_ref().map(|url| {
-                    format!(
-                        "{}/.well-known/oauth-protected-resource/mcp",
-                        url.trim_end_matches('/')
-                    )
-                }),
+                resource_metadata_url: config.public_url.as_deref().map(mcp_resource_metadata_url),
+                log_context: crate::auth::AuthLogContext::new(
+                    &config.log_context,
+                    &rbac_swap.load(),
+                ),
             }))
         }
         _ => None,
@@ -2015,10 +2210,11 @@ where
         }
 
         let rbac_for_mw = Arc::clone(&rbac_swap);
+        let deny_log_knobs = crate::rbac::DenyLogKnobs::from_config(&config.log_context);
         mcp_router = mcp_router.layer(axum::middleware::from_fn(move |req, next| {
             let p = rbac_for_mw.load_full();
             let tl = tool_limiter.clone();
-            rbac_middleware(p, tl, req, next)
+            rbac_middleware(p, tl, deny_log_knobs, req, next)
         }));
     }
 
@@ -2104,7 +2300,11 @@ where
             .collect::<Vec<_>>(),
     );
     let cors_origins = Arc::clone(&allowed_origins);
-    let log_request_headers = config.log_request_headers;
+    let request_log = Arc::new(RequestLogConfig {
+        log_request_headers: config.log_request_headers,
+        exclude_paths: config.request_log_exclude_paths.iter().cloned().collect(),
+        fields: config.log_context.clone(),
+    });
 
     let readyz_route = if let Some(check) = config.readiness_check.take() {
         axum::routing::get(move || readyz(Arc::clone(&check)))
@@ -2395,6 +2595,12 @@ where
                 .forwarded_header
                 .unwrap_or(ForwardedHeaderMode::XForwardedFor),
             max_scanned_entries: config.trusted_forwarder_max_entries,
+            request_id_header: if config.log_context.request_id {
+                axum::http::HeaderName::from_bytes(config.log_context.request_id_header.as_bytes())
+                    .ok()
+            } else {
+                None
+            },
         }))
     };
     if forward_resolver.is_some() {
@@ -2403,6 +2609,16 @@ where
             "trusted-forwarder mode enabled: limiters key by resolved client IP"
         );
     }
+    // Request logging sits just inside peer normalization, so `ClientIp` and
+    // trusted `RequestId` exist, and outside every other inner layer, so
+    // overload-503s, 404s and auth failures are logged; origin-rejected
+    // requests are logged by the origin layer.
+    let request_log_inner = Arc::clone(&request_log);
+    router = router.layer(axum::middleware::from_fn(move |req, next| {
+        let cfg = Arc::clone(&request_log_inner);
+        request_log_middleware(cfg, req, next)
+    }));
+
     router = router.layer(axum::middleware::from_fn(move |req, next| {
         let r = forward_resolver.clone();
         normalize_peer_addr_middleware(r, req, next)
@@ -2421,7 +2637,8 @@ where
     // that does not match `effective_origins` are rejected.
     router = router.layer(axum::middleware::from_fn(move |req, next| {
         let origins = Arc::clone(&allowed_origins);
-        origin_check_middleware(origins, log_request_headers, req, next)
+        let log_cfg = Arc::clone(&request_log);
+        origin_check_middleware(origins, log_cfg, req, next)
     }));
 
     // OWASP security response headers. Installed LAST, making this the
@@ -4063,7 +4280,9 @@ async fn oauth_token_cache_headers_middleware(
 ///
 /// Precedence mirrors the auth middleware: an existing
 /// `ConnectInfo<SocketAddr>` always wins and is never overwritten. The
-/// peer address is deliberately not logged here.
+/// peer address is deliberately not logged here (the request log runs in the
+/// next layer). The request-ID header is honoured only from trusted peers;
+/// when multiple instances are present, the last occurrence wins.
 // cancel-safe: inserts request extensions synchronously before the single
 // `next.run(req)` await; the extensions die with the dropped request.
 async fn normalize_peer_addr_middleware(
@@ -4102,6 +4321,17 @@ async fn normalize_peer_addr_middleware(
             None => addr.ip(),
         };
         req.extensions_mut().insert(ClientIp::new(client_ip));
+        if let Some(r) = &resolver
+            && let Some(name) = &r.request_id_header
+            && crate::forwarded::is_trusted(addr.ip(), &r.trusted)
+            && let Some(value) = req.headers().get_all(name).iter().next_back()
+            && let Ok(raw) = value.to_str()
+        {
+            let sanitized = sanitize_for_log(raw, MAX_LOGGED_HEADER_CHARS);
+            if !sanitized.is_empty() {
+                req.extensions_mut().insert(RequestId::new(&sanitized));
+            }
+        }
     }
     next.run(req).await
 }
@@ -4136,9 +4366,34 @@ pub(crate) fn validate_trusted_proxy_entry(entry: &str) -> Result<(), String> {
     }
 }
 
+/// Validate [`LogContextConfig::request_id_header`]. Requires a
+/// syntactically valid HTTP header name that is neither one of
+/// [`REDACTED_LOG_HEADERS`] nor `mcp-session-id` (the session ID must
+/// never reach a log line). Shared by the builder
+/// ([`McpServerConfig::check_trusted_forwarder`]) and the TOML
+/// validator so the two cannot drift.
+///
+/// # Errors
+///
+/// Returns a message naming `request_id_header` when the name is not a
+/// valid header name or is on the forbidden list.
+pub(crate) fn validate_request_id_header(name: &str) -> Result<(), String> {
+    axum::http::HeaderName::from_bytes(name.as_bytes()).map_err(|_err| {
+        format!("log_context.request_id_header {name:?} is not a valid header name")
+    })?;
+    let lower = name.to_ascii_lowercase();
+    if REDACTED_LOG_HEADERS.contains(&lower.as_str()) || lower == "mcp-session-id" {
+        return Err(format!(
+            "log_context.request_id_header {name:?} is not allowed (would leak a redacted or session header into logs)"
+        ));
+    }
+    Ok(())
+}
+
 /// Rate-limit key for the current request: the resolved [`ClientIp`]
 /// when present, else the direct peer from either `ConnectInfo` form.
-/// All four built-in limiters key through this helper.
+/// All four built-in limiters key through this helper; it is also the
+/// `client_ip` value used by client-context logging.
 pub(crate) fn limiter_client_ip(extensions: &axum::http::Extensions) -> Option<IpAddr> {
     if let Some(client) = extensions.get::<ClientIp>() {
         return Some(client.ip);
@@ -4146,6 +4401,23 @@ pub(crate) fn limiter_client_ip(extensions: &axum::http::Extensions) -> Option<I
     extensions
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0.ip())
+        .or_else(|| {
+            extensions
+                .get::<ConnectInfo<TlsConnInfo>>()
+                .map(|ci| ci.0.addr.ip())
+        })
+}
+
+/// Extract the direct peer IP address for logging.
+pub(crate) fn peer_ip_for_log(extensions: &axum::http::Extensions) -> Option<IpAddr> {
+    extensions
+        .get::<PeerAddr>()
+        .map(|peer| peer.addr.ip())
+        .or_else(|| {
+            extensions
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|ci| ci.0.ip())
+        })
         .or_else(|| {
             extensions
                 .get::<ConnectInfo<TlsConnInfo>>()
@@ -4501,14 +4773,12 @@ fn request_origin_allowed(value: &str, allowed: &[AllowedOrigin]) -> bool {
 // before the single `next.run(req)` await; nothing is published on cancellation.
 async fn origin_check_middleware(
     allowed: Arc<[AllowedOrigin]>,
-    log_request_headers: bool,
+    log_cfg: Arc<RequestLogConfig>,
     req: Request<Body>,
     next: Next,
 ) -> axum::response::Response {
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
-
-    log_incoming_request(&method, &path, req.headers(), log_request_headers);
 
     // `Origin` is a single-value field: a request carrying more than one is
     // malformed, so fail closed rather than trusting whichever value a
@@ -4522,6 +4792,15 @@ async fn origin_check_middleware(
                 .to_str()
                 .is_ok_and(|value| request_origin_allowed(value, &allowed));
         if !accepted {
+            if log_cfg.logs(&path) {
+                log_incoming_request(
+                    &method,
+                    &path,
+                    req.headers(),
+                    log_cfg.log_request_headers,
+                    &RequestLogFields::default(),
+                );
+            }
             // Non-UTF-8 values are logged as a placeholder rather than
             // lossily converted.
             let logged = origin.to_str().unwrap_or("<non-utf8>");
@@ -4548,23 +4827,165 @@ async fn origin_check_middleware(
     next.run(req).await
 }
 
-/// Emit a DEBUG log for an incoming request, optionally including the full
-/// (redacted) header set.
+/// Maximum header value length for logging before truncation.
+pub(crate) const MAX_LOGGED_HEADER_CHARS: usize = 128;
+
+/// Remove control characters and truncate a string for safe logging.
+pub(crate) fn sanitize_for_log(raw: &str, max_chars: usize) -> String {
+    let mut out: String = raw
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(max_chars)
+        .collect();
+    if raw.chars().filter(|c| !c.is_control()).count() > max_chars {
+        out.push_str("...(truncated)");
+    }
+    out
+}
+
+/// Request ID for logging and tracing purposes.
+#[derive(Clone, Debug)]
+pub(crate) struct RequestId(Arc<str>);
+
+impl RequestId {
+    pub(crate) fn new(value: &str) -> Self {
+        Self(Arc::from(value))
+    }
+}
+
+/// Extract the request ID from extensions for logging.
+pub(crate) fn request_id_for_log(ext: &axum::http::Extensions) -> Option<Arc<str>> {
+    ext.get::<RequestId>().map(|id| Arc::clone(&id.0))
+}
+
+/// Extract MCP-specific hints (session presence and protocol version) from headers for logging.
+pub(crate) fn mcp_hints_for_log(headers: &axum::http::HeaderMap) -> (bool, Option<String>) {
+    let mcp_session = headers.contains_key("mcp-session-id");
+    let protocol = headers
+        .get("mcp-protocol-version")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| sanitize_for_log(value, MAX_LOGGED_HEADER_CHARS));
+    (mcp_session, protocol)
+}
+
+struct RequestLogConfig {
+    log_request_headers: bool,
+    exclude_paths: std::collections::HashSet<String>,
+    fields: LogContextConfig,
+}
+
+impl RequestLogConfig {
+    fn logs(&self, path: &str) -> bool {
+        !self.exclude_paths.contains(path)
+    }
+}
+
+#[derive(Clone, Default)]
+struct RequestLogFields {
+    client_ip: Option<IpAddr>,
+    peer_ip: Option<IpAddr>,
+    request_id: Option<Arc<str>>,
+    mcp_session: Option<bool>,
+    mcp_protocol_version: Option<String>,
+}
+
+fn request_log_fields(cfg: &LogContextConfig, req: &Request<Body>) -> RequestLogFields {
+    let (mcp_session, mcp_protocol_version) = if cfg.mcp_hints {
+        mcp_hints_for_log(req.headers())
+    } else {
+        (false, None)
+    };
+    RequestLogFields {
+        client_ip: cfg
+            .client_ip
+            .then(|| limiter_client_ip(req.extensions()))
+            .flatten(),
+        peer_ip: cfg
+            .peer_ip
+            .then(|| peer_ip_for_log(req.extensions()))
+            .flatten(),
+        request_id: cfg
+            .request_id
+            .then(|| request_id_for_log(req.extensions()))
+            .flatten(),
+        mcp_session: cfg.mcp_hints.then_some(mcp_session),
+        mcp_protocol_version,
+    }
+}
+
+// cancel-safe: request logging is emitted before `next.run(req)`; completion
+// logging is omitted if the future is dropped (timeout or disconnect). For SSE,
+// latency measures time to the response head, not body streaming duration.
+async fn request_log_middleware(
+    cfg: Arc<RequestLogConfig>,
+    req: Request<Body>,
+    next: Next,
+) -> axum::response::Response {
+    let captured = if cfg.logs(req.uri().path()) {
+        let fields = request_log_fields(&cfg.fields, &req);
+        let method = req.method().clone();
+        let path = req.uri().path().to_owned();
+        log_incoming_request(
+            &method,
+            &path,
+            req.headers(),
+            cfg.log_request_headers,
+            &fields,
+        );
+        cfg.fields
+            .request_completion
+            .then(|| (method, path, std::time::Instant::now(), fields))
+    } else {
+        None
+    };
+
+    let resp = next.run(req).await;
+    if let Some((method, path, started, fields)) = captured {
+        tracing::debug!(
+            %method,
+            %path,
+            status = resp.status().as_u16(),
+            latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            client_ip = fields.client_ip.map(tracing::field::display),
+            peer_ip = fields.peer_ip.map(tracing::field::display),
+            request_id = fields.request_id.as_deref(),
+            "request completed"
+        );
+    }
+    resp
+}
+
+/// Emit a DEBUG log for an incoming request, optionally including the full (redacted) header set.
 fn log_incoming_request(
     method: &axum::http::Method,
     path: &str,
     headers: &axum::http::HeaderMap,
     log_request_headers: bool,
+    fields: &RequestLogFields,
 ) {
     if log_request_headers {
         tracing::debug!(
             %method,
             %path,
+            client_ip = fields.client_ip.map(tracing::field::display),
+            peer_ip = fields.peer_ip.map(tracing::field::display),
+            request_id = fields.request_id.as_deref(),
+            mcp_session = fields.mcp_session,
+            mcp_protocol_version = fields.mcp_protocol_version.as_deref(),
             headers = %format_request_headers_for_log(headers),
             "incoming request"
         );
     } else {
-        tracing::debug!(%method, %path, "incoming request");
+        tracing::debug!(
+            %method,
+            %path,
+            client_ip = fields.client_ip.map(tracing::field::display),
+            peer_ip = fields.peer_ip.map(tracing::field::display),
+            request_id = fields.request_id.as_deref(),
+            mcp_session = fields.mcp_session,
+            mcp_protocol_version = fields.mcp_protocol_version.as_deref(),
+            "incoming request"
+        );
     }
 }
 
@@ -4573,8 +4994,8 @@ fn log_incoming_request(
 /// SECURITY: the first three carry credentials. The forwarding headers carry
 /// client IPs and proxy topology and are attacker-controlled on any hop the
 /// operator has not declared trusted, so logging them verbatim lets a caller
-/// plant misleading provenance in an incident-response trail. The trusted,
-/// resolved address is published separately by `resolve_client_ip`.
+/// plant misleading provenance in an incident-response trail. The resolved
+/// address is logged separately as `client_ip` under its knob.
 const REDACTED_LOG_HEADERS: [&str; 6] = [
     "authorization",
     "cookie",
@@ -4921,6 +5342,57 @@ mod tests {
 
     use super::*;
 
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            let bytes = self.0.lock().map(|guard| guard.clone()).unwrap_or_default();
+            String::from_utf8(bytes).unwrap_or_default()
+        }
+
+        fn lines_containing(&self, needle: &str) -> Vec<String> {
+            self.contents()
+                .lines()
+                .filter(|line| line.contains(needle))
+                .map(ToOwned::to_owned)
+                .collect()
+        }
+    }
+
+    struct CapturedLogsWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogsWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Ok(mut guard) = self.0.lock() {
+                guard.extend_from_slice(buf);
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogsWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogsWriter(Arc::clone(&self.0))
+        }
+    }
+
+    fn capture_debug_logs(logs: CapturedLogs) -> tracing::dispatcher::DefaultGuard {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::set_default(subscriber)
+    }
+
     // -- startup task lifecycle --
 
     #[tokio::test]
@@ -5041,6 +5513,7 @@ mod tests {
             seen_identities: crate::auth::SeenIdentitySet::new(),
             counters: crate::auth::AuthCounters::default(),
             resource_metadata_url: None,
+            log_context: crate::auth::AuthLogContext::default(),
         });
         (state, token)
     }
@@ -5785,6 +6258,141 @@ mod tests {
     }
 
     #[test]
+    fn new_config_defaults_log_settings() {
+        let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0");
+        assert_eq!(cfg.log_context, LogContextConfig::default());
+        assert!(!cfg.log_context.client_ip);
+        assert!(!cfg.log_context.peer_ip);
+        assert!(!cfg.log_context.request_id);
+        assert_eq!(cfg.log_context.request_id_header, "x-request-id");
+        assert!(!cfg.log_context.request_line);
+        assert!(!cfg.log_context.user_agent);
+        assert!(!cfg.log_context.auth_scheme);
+        assert!(!cfg.log_context.mcp_hints);
+        assert!(!cfg.log_context.credential_fingerprint);
+        assert!(!cfg.log_context.request_completion);
+        assert_eq!(cfg.request_log_exclude_paths, vec!["/healthz", "/readyz"]);
+    }
+
+    #[test]
+    fn log_context_recommended_enables_low_risk_set() {
+        let recommended = LogContextConfig::recommended();
+        assert!(recommended.client_ip);
+        assert!(recommended.peer_ip);
+        assert!(recommended.request_line);
+        assert!(recommended.user_agent);
+        assert!(recommended.auth_scheme);
+        assert!(recommended.mcp_hints);
+        assert!(!recommended.request_id);
+        assert!(!recommended.credential_fingerprint);
+        assert!(!recommended.request_completion);
+
+        let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
+            .with_log_context(recommended);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn request_log_exclude_paths_builder_replaces_list() {
+        let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
+            .with_request_log_exclude_paths(["/version"]);
+        assert_eq!(cfg.request_log_exclude_paths, vec!["/version"]);
+        assert!(cfg.validate().is_ok());
+
+        let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
+            .with_request_log_exclude_paths(Vec::<String>::new());
+        assert!(cfg.request_log_exclude_paths.is_empty());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn malformed_request_log_exclude_paths_rejected() {
+        for bad in ["", "healthz"] {
+            let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
+                .with_request_log_exclude_paths([bad]);
+            let err = cfg.validate().expect_err("malformed exclude path");
+            assert!(
+                err.to_string().contains("request_log_exclude_paths"),
+                "entry {bad:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn log_context_request_id_requires_trusted_proxies() {
+        let log_context = LogContextConfig {
+            request_id: true,
+            ..LogContextConfig::default()
+        };
+        let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
+            .with_log_context(log_context.clone());
+        let err = cfg
+            .validate()
+            .expect_err("request_id without trusted_proxies");
+        assert!(
+            err.to_string()
+                .contains("log_context.request_id requires trusted_proxies")
+        );
+
+        let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
+            .with_log_context(log_context)
+            .with_trusted_proxies(["127.0.0.1/32"]);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn log_context_request_id_header_rules() {
+        for bad in [
+            "",
+            "x request id",
+            "authorization",
+            "Cookie",
+            "proxy-authorization",
+            "forwarded",
+            "X-Forwarded-For",
+            "x-real-ip",
+            "Mcp-Session-Id",
+        ] {
+            let log_context = LogContextConfig {
+                request_id_header: bad.to_owned(),
+                ..LogContextConfig::default()
+            };
+            let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
+                .with_log_context(log_context);
+            let err = cfg.validate().expect_err("forbidden request_id_header");
+            assert!(
+                err.to_string().contains("request_id_header"),
+                "header {bad:?}: {err}"
+            );
+
+            // The rule applies whether or not request_id is enabled.
+            let log_context = LogContextConfig {
+                request_id_header: bad.to_owned(),
+                request_id: true,
+                ..LogContextConfig::default()
+            };
+            let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
+                .with_log_context(log_context)
+                .with_trusted_proxies(["127.0.0.1/32"]);
+            let err = cfg.validate().expect_err("forbidden request_id_header");
+            assert!(
+                err.to_string().contains("request_id_header"),
+                "header {bad:?}: {err}"
+            );
+        }
+
+        for good in ["x-request-id", "unique-id", "X-Correlation-ID"] {
+            let log_context = LogContextConfig {
+                request_id_header: good.to_owned(),
+                ..LogContextConfig::default()
+            };
+            let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
+                .with_log_context(log_context);
+            assert!(cfg.validate().is_ok(), "header {good:?} should be accepted");
+        }
+    }
+
+    #[test]
     fn validate_rejects_zero_extra_route_rate_limit() {
         let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
             .with_extra_route_rate_limit(0);
@@ -5965,6 +6573,7 @@ mod tests {
             trusted: trusted.iter().map(|s| s.parse().unwrap()).collect(),
             mode,
             max_scanned_entries: crate::forwarded::MAX_SCANNED_ENTRIES,
+            request_id_header: None,
         })
     }
 
@@ -5991,6 +6600,20 @@ mod tests {
             }))
     }
 
+    fn request_id_probe_router(resolver: Option<Arc<ForwardResolver>>) -> axum::Router {
+        async fn probe(req: Request<Body>) -> String {
+            request_id_for_log(req.extensions())
+                .map(|id| id.to_string())
+                .unwrap_or_default()
+        }
+        axum::Router::new()
+            .route("/probe", axum::routing::get(probe))
+            .layer(axum::middleware::from_fn(move |req, next| {
+                let r = resolver.clone();
+                normalize_peer_addr_middleware(r, req, next)
+            }))
+    }
+
     fn probe_req(peer: &str, header: Option<(&str, &str)>) -> Request<Body> {
         let addr: SocketAddr = peer.parse().unwrap();
         let mut builder = Request::builder()
@@ -6000,6 +6623,675 @@ mod tests {
             builder = builder.header(name, value);
         }
         builder.body(Body::empty()).unwrap()
+    }
+
+    fn request_id_probe_req(peer: &str, values: &[&str]) -> Request<Body> {
+        let addr: SocketAddr = peer.parse().unwrap();
+        let mut builder = Request::builder()
+            .uri("/probe")
+            .extension(ConnectInfo(addr));
+        for value in values {
+            builder = builder.header("x-request-id", *value);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    fn request_id_resolver(header: Option<&'static str>) -> Arc<ForwardResolver> {
+        Arc::new(ForwardResolver {
+            trusted: vec!["127.0.0.1/32".parse().unwrap()],
+            mode: ForwardedHeaderMode::XForwardedFor,
+            max_scanned_entries: crate::forwarded::MAX_SCANNED_ENTRIES,
+            request_id_header: header.map(axum::http::HeaderName::from_static),
+        })
+    }
+
+    #[test]
+    fn sanitize_for_log_strips_controls_and_bounds() {
+        assert_eq!(sanitize_for_log("a\r\nb", MAX_LOGGED_HEADER_CHARS), "ab");
+        assert_eq!(
+            sanitize_for_log("\u{1b}[31m", MAX_LOGGED_HEADER_CHARS),
+            "[31m"
+        );
+        assert_eq!(sanitize_for_log("a\tb", MAX_LOGGED_HEADER_CHARS), "ab");
+        let long = "a".repeat(129);
+        assert_eq!(
+            sanitize_for_log(&long, MAX_LOGGED_HEADER_CHARS),
+            format!("{}...(truncated)", "a".repeat(128))
+        );
+        assert_eq!(
+            sanitize_for_log(&"a".repeat(128), MAX_LOGGED_HEADER_CHARS),
+            "a".repeat(128)
+        );
+        assert_eq!(sanitize_for_log("", MAX_LOGGED_HEADER_CHARS), "");
+    }
+
+    #[tokio::test]
+    async fn request_id_taken_from_trusted_peer_last_occurrence() {
+        let app = request_id_probe_router(Some(request_id_resolver(Some("x-request-id"))));
+        let resp = app
+            .oneshot(request_id_probe_req(
+                "127.0.0.1:5555",
+                &["spoofed", "router-1"],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(body_string(resp).await, "router-1");
+    }
+
+    #[tokio::test]
+    async fn request_id_ignored_from_untrusted_peer() {
+        let app = request_id_probe_router(Some(request_id_resolver(Some("x-request-id"))));
+        let resp = app
+            .oneshot(request_id_probe_req("10.9.9.9:5555", &["router-1"]))
+            .await
+            .unwrap();
+        assert_eq!(body_string(resp).await, "");
+    }
+
+    #[tokio::test]
+    async fn request_id_sanitized_and_bounded() {
+        let app = request_id_probe_router(Some(request_id_resolver(Some("x-request-id"))));
+        let resp = app
+            .clone()
+            .oneshot(request_id_probe_req("127.0.0.1:5555", &["a\tb"]))
+            .await
+            .unwrap();
+        assert_eq!(body_string(resp).await, "ab");
+
+        let long = "a".repeat(200);
+        let resp = app
+            .clone()
+            .oneshot(request_id_probe_req("127.0.0.1:5555", &[&long]))
+            .await
+            .unwrap();
+        assert_eq!(
+            body_string(resp).await,
+            format!("{}...(truncated)", "a".repeat(128))
+        );
+
+        let addr: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+        let req = Request::builder()
+            .uri("/probe")
+            .extension(ConnectInfo(addr))
+            .header(
+                "x-request-id",
+                axum::http::HeaderValue::from_bytes(b"caf\xe9").unwrap(),
+            )
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(body_string(resp).await, "");
+    }
+
+    #[tokio::test]
+    async fn request_id_not_extracted_when_knob_off() {
+        let app = request_id_probe_router(Some(request_id_resolver(None)));
+        let resp = app
+            .oneshot(request_id_probe_req("127.0.0.1:5555", &["router-1"]))
+            .await
+            .unwrap();
+        assert_eq!(body_string(resp).await, "");
+    }
+
+    fn knobs(f: impl FnOnce(&mut LogContextConfig)) -> LogContextConfig {
+        let mut cfg = LogContextConfig::default();
+        f(&mut cfg);
+        cfg
+    }
+
+    fn reqlog_router(configure: impl FnOnce(McpServerConfig) -> McpServerConfig) -> axum::Router {
+        #[derive(Clone)]
+        struct H;
+        impl ServerHandler for H {}
+        let config = configure(McpServerConfig::new("127.0.0.1:8080", "test", "0.0.0"));
+        build_app_router(config, || H).expect("build_app_router").0
+    }
+
+    fn reqlog_req(method: axum::http::Method, path: &str, peer: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .extension(ConnectInfo(peer.parse::<SocketAddr>().unwrap()))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn reqlog_req_with_headers(
+        method: axum::http::Method,
+        path: &str,
+        peer: &str,
+        headers: &[(&str, &str)],
+    ) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(path)
+            .extension(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    async fn drive_reqlog(app: &axum::Router, req: Request<Body>) -> axum::response::Response {
+        app.clone().oneshot(req).await.unwrap()
+    }
+
+    async fn reqlog_lines_after(
+        app: &axum::Router,
+        logs: &CapturedLogs,
+        req: Request<Body>,
+        message: &str,
+    ) -> Vec<String> {
+        let _resp = drive_reqlog(app, req).await;
+        logs.lines_containing(message)
+    }
+
+    #[tokio::test]
+    async fn probe_paths_are_not_request_logged_by_default() {
+        let logs = CapturedLogs::default();
+        let _guard = capture_debug_logs(logs.clone());
+        let app = reqlog_router(|cfg| cfg);
+
+        for path in ["/healthz", "/readyz"] {
+            let before = logs.lines_containing("incoming request").len();
+            let _resp = drive_reqlog(
+                &app,
+                reqlog_req(axum::http::Method::GET, path, "127.0.0.1:5555"),
+            )
+            .await;
+            assert_eq!(logs.lines_containing("incoming request").len(), before);
+        }
+
+        let before = logs.lines_containing("incoming request").len();
+        let _resp = drive_reqlog(
+            &app,
+            reqlog_req(axum::http::Method::GET, "/version", "127.0.0.1:5555"),
+        )
+        .await;
+        assert_eq!(logs.lines_containing("incoming request").len(), before + 1);
+
+        let before = logs.lines_containing("incoming request").len();
+        let _resp = drive_reqlog(
+            &app,
+            reqlog_req(axum::http::Method::POST, "/mcp", "127.0.0.1:5555"),
+        )
+        .await;
+        assert_eq!(logs.lines_containing("incoming request").len(), before + 1);
+    }
+
+    #[tokio::test]
+    async fn request_log_exclusion_list_is_replaceable() {
+        let logs = CapturedLogs::default();
+        let _guard = capture_debug_logs(logs.clone());
+        let app = reqlog_router(|cfg| cfg.with_request_log_exclude_paths(["/version"]));
+        let healthz = reqlog_lines_after(
+            &app,
+            &logs,
+            reqlog_req(axum::http::Method::GET, "/healthz", "127.0.0.1:5555"),
+            "incoming request",
+        )
+        .await;
+        assert_eq!(healthz.len(), 1);
+        let _resp = drive_reqlog(
+            &app,
+            reqlog_req(axum::http::Method::GET, "/version", "127.0.0.1:5555"),
+        )
+        .await;
+        assert_eq!(logs.lines_containing("incoming request").len(), 1);
+
+        let logs = CapturedLogs::default();
+        let _guard = capture_debug_logs(logs.clone());
+        let app = reqlog_router(|cfg| cfg.with_request_log_exclude_paths(Vec::<String>::new()));
+        let lines = reqlog_lines_after(
+            &app,
+            &logs,
+            reqlog_req(axum::http::Method::GET, "/healthz", "127.0.0.1:5555"),
+            "incoming request",
+        )
+        .await;
+        assert_eq!(lines.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn request_log_omits_client_fields_by_default() {
+        let logs = CapturedLogs::default();
+        let _guard = capture_debug_logs(logs.clone());
+        let app = reqlog_router(|cfg| cfg.with_trusted_proxies(["127.0.0.1/32"]));
+        let lines = reqlog_lines_after(
+            &app,
+            &logs,
+            reqlog_req_with_headers(
+                axum::http::Method::POST,
+                "/mcp",
+                "127.0.0.1:5555",
+                &[("x-forwarded-for", "203.0.113.7"), ("x-request-id", "qa-1")],
+            ),
+            "incoming request",
+        )
+        .await;
+        assert_eq!(lines.len(), 1);
+        let line = &lines[0];
+        for absent in ["client_ip", "peer_ip", "request_id", "mcp_session"] {
+            assert!(
+                !line.contains(absent),
+                "{absent} must be absent from {line}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn request_log_carries_enabled_client_fields() {
+        let logs = CapturedLogs::default();
+        let _guard = capture_debug_logs(logs.clone());
+        let app = reqlog_router(|cfg| {
+            cfg.with_trusted_proxies(["127.0.0.1/32"])
+                .with_log_context(knobs(|ctx| {
+                    ctx.client_ip = true;
+                    ctx.peer_ip = true;
+                    ctx.request_id = true;
+                }))
+        });
+        let lines = reqlog_lines_after(
+            &app,
+            &logs,
+            reqlog_req_with_headers(
+                axum::http::Method::POST,
+                "/mcp",
+                "127.0.0.1:5555",
+                &[("x-forwarded-for", "203.0.113.7"), ("x-request-id", "qa-1")],
+            ),
+            "incoming request",
+        )
+        .await;
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("client_ip=203.0.113.7"), "{}", lines[0]);
+        assert!(lines[0].contains("peer_ip=127.0.0.1"), "{}", lines[0]);
+        assert!(lines[0].contains("request_id=\"qa-1\""), "{}", lines[0]);
+
+        let lines = reqlog_lines_after(
+            &app,
+            &logs,
+            reqlog_req_with_headers(
+                axum::http::Method::POST,
+                "/mcp",
+                "10.9.9.9:5555",
+                &[("x-forwarded-for", "203.0.113.7"), ("x-request-id", "qa-1")],
+            ),
+            "incoming request",
+        )
+        .await;
+        let line = lines.last().expect("second incoming request line");
+        assert!(line.contains("client_ip=10.9.9.9"), "{line}");
+        assert!(line.contains("peer_ip=10.9.9.9"), "{line}");
+        assert!(!line.contains("request_id"), "{line}");
+    }
+
+    #[test]
+    fn mcp_hints_for_log_bounds_protocol_version() {
+        let mut headers = axum::http::HeaderMap::new();
+        let exact = "a".repeat(128);
+        headers.insert("mcp-protocol-version", exact.parse().unwrap());
+        assert_eq!(mcp_hints_for_log(&headers), (false, Some(exact)));
+
+        let mut headers = axum::http::HeaderMap::new();
+        let long = "a".repeat(129);
+        headers.insert("mcp-protocol-version", long.parse().unwrap());
+        assert_eq!(
+            mcp_hints_for_log(&headers),
+            (false, Some(format!("{}...(truncated)", "a".repeat(128))))
+        );
+
+        let headers = axum::http::HeaderMap::new();
+        assert_eq!(mcp_hints_for_log(&headers), (false, None));
+    }
+
+    #[tokio::test]
+    async fn mcp_hints_on_incoming_request() {
+        let logs = CapturedLogs::default();
+        let _guard = capture_debug_logs(logs.clone());
+        let app = reqlog_router(|cfg| cfg.with_log_context(knobs(|ctx| ctx.mcp_hints = true)));
+        let lines = reqlog_lines_after(
+            &app,
+            &logs,
+            reqlog_req_with_headers(
+                axum::http::Method::POST,
+                "/mcp",
+                "127.0.0.1:5555",
+                &[
+                    ("mcp-session-id", "secret-session-value"),
+                    ("mcp-protocol-version", "2025-06-18"),
+                ],
+            ),
+            "incoming request",
+        )
+        .await;
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("mcp_session=true"), "{}", lines[0]);
+        assert!(
+            lines[0].contains("mcp_protocol_version=\"2025-06-18\""),
+            "{}",
+            lines[0]
+        );
+        assert!(!logs.contents().contains("secret-session-value"));
+
+        let lines = reqlog_lines_after(
+            &app,
+            &logs,
+            reqlog_req(axum::http::Method::POST, "/mcp", "127.0.0.1:5555"),
+            "incoming request",
+        )
+        .await;
+        let line = lines.last().expect("second incoming request line");
+        assert!(line.contains("mcp_session=false"), "{line}");
+        assert!(!line.contains("mcp_protocol_version"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn request_log_headers_keep_forwarding_redacted_with_client_ip() {
+        let logs = CapturedLogs::default();
+        let _guard = capture_debug_logs(logs.clone());
+        let app = reqlog_router(|cfg| {
+            cfg.enable_request_header_logging()
+                .with_trusted_proxies(["127.0.0.1/32"])
+                .with_log_context(knobs(|ctx| ctx.client_ip = true))
+        });
+        let lines = reqlog_lines_after(
+            &app,
+            &logs,
+            reqlog_req_with_headers(
+                axum::http::Method::POST,
+                "/mcp",
+                "127.0.0.1:5555",
+                &[
+                    ("forwarded", "for=203.0.113.7"),
+                    ("x-forwarded-for", "203.0.113.7"),
+                    ("x-real-ip", "203.0.113.7"),
+                ],
+            ),
+            "incoming request",
+        )
+        .await;
+        let line = lines.first().expect("incoming request line");
+        for name in ["forwarded", "x-forwarded-for", "x-real-ip"] {
+            assert!(line.contains(&format!("{name}: [REDACTED]")), "{line}");
+        }
+        assert!(line.contains("client_ip=203.0.113.7"), "{line}");
+        let headers_text = line.split("headers=").nth(1).unwrap_or_default();
+        assert!(!headers_text.contains("203.0.113.7"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn origin_rejected_request_logs_once_without_client_fields() {
+        let logs = CapturedLogs::default();
+        let _guard = capture_debug_logs(logs.clone());
+        let app = reqlog_router(|cfg| {
+            cfg.with_allowed_origins(["http://good.example"])
+                .with_log_context(knobs(|ctx| {
+                    ctx.client_ip = true;
+                    ctx.peer_ip = true;
+                    ctx.mcp_hints = true;
+                    ctx.request_completion = true;
+                }))
+        });
+        let resp = drive_reqlog(
+            &app,
+            reqlog_req_with_headers(
+                axum::http::Method::POST,
+                "/mcp",
+                "127.0.0.1:5555",
+                &[("origin", "http://evil.example")],
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let incoming = logs.lines_containing("incoming request");
+        assert_eq!(incoming.len(), 1);
+        for absent in ["client_ip", "peer_ip", "mcp_session"] {
+            assert!(!incoming[0].contains(absent), "{}", incoming[0]);
+        }
+        assert_eq!(
+            logs.lines_containing("rejected request: Origin not allowed")
+                .len(),
+            1
+        );
+        assert!(logs.lines_containing("request completed").is_empty());
+
+        let before = logs.lines_containing("incoming request").len();
+        let _resp = drive_reqlog(
+            &app,
+            reqlog_req_with_headers(
+                axum::http::Method::GET,
+                "/healthz",
+                "127.0.0.1:5555",
+                &[("origin", "http://evil.example")],
+            ),
+        )
+        .await;
+        assert_eq!(logs.lines_containing("incoming request").len(), before);
+    }
+
+    #[tokio::test]
+    async fn request_completion_line_reports_status_and_latency() {
+        let logs = CapturedLogs::default();
+        let _guard = capture_debug_logs(logs.clone());
+        let app = reqlog_router(|cfg| {
+            cfg.with_log_context(knobs(|ctx| {
+                ctx.request_completion = true;
+                ctx.client_ip = true;
+            }))
+        });
+        for (method, path) in [
+            (axum::http::Method::POST, "/mcp"),
+            (axum::http::Method::GET, "/version"),
+        ] {
+            let before = logs.lines_containing("request completed").len();
+            let resp = drive_reqlog(&app, reqlog_req(method.clone(), path, "127.0.0.1:5555")).await;
+            let lines = logs.lines_containing("request completed");
+            assert_eq!(lines.len(), before + 1);
+            let line = lines.last().expect("completion line");
+            assert!(line.contains(&format!("method={method}")), "{line}");
+            assert!(line.contains(&format!("path={path}")), "{line}");
+            assert!(
+                line.contains(&format!("status={}", resp.status().as_u16())),
+                "{line}"
+            );
+            assert!(line.contains("latency_ms="), "{line}");
+            assert!(line.contains("client_ip=127.0.0.1"), "{line}");
+        }
+    }
+
+    #[tokio::test]
+    async fn request_completion_line_absent_by_default_and_for_excluded_paths() {
+        let logs = CapturedLogs::default();
+        let _guard = capture_debug_logs(logs.clone());
+        let app = reqlog_router(|cfg| cfg);
+        let _resp = drive_reqlog(
+            &app,
+            reqlog_req(axum::http::Method::GET, "/version", "127.0.0.1:5555"),
+        )
+        .await;
+        assert!(logs.lines_containing("request completed").is_empty());
+
+        let logs = CapturedLogs::default();
+        let _guard = capture_debug_logs(logs.clone());
+        let app = reqlog_router(|cfg| {
+            cfg.with_log_context(knobs(|ctx| {
+                ctx.request_completion = true;
+            }))
+        });
+        let _resp = drive_reqlog(
+            &app,
+            reqlog_req(axum::http::Method::GET, "/healthz", "127.0.0.1:5555"),
+        )
+        .await;
+        assert!(logs.lines_containing("request completed").is_empty());
+        let _resp = drive_reqlog(
+            &app,
+            reqlog_req(axum::http::Method::GET, "/version", "127.0.0.1:5555"),
+        )
+        .await;
+        assert_eq!(logs.lines_containing("request completed").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn auth_failure_through_real_wiring_carries_resolved_client_fields() {
+        let (_token, hash) = crate::auth::generate_api_key().unwrap();
+        let mut fields = LogContextConfig::recommended();
+        fields.request_id = true;
+        fields.credential_fingerprint = true;
+        let logs = CapturedLogs::default();
+        let _guard = capture_debug_logs(logs.clone());
+        let app = reqlog_router(|cfg| {
+            cfg.with_trusted_proxies(["127.0.0.1/32"])
+                .with_log_context(fields)
+                .with_auth(AuthConfig::with_keys(vec![crate::auth::ApiKeyEntry::new(
+                    "viewer-key",
+                    hash,
+                    "viewer",
+                )]))
+        });
+
+        let resp = drive_reqlog(
+            &app,
+            reqlog_req_with_headers(
+                axum::http::Method::POST,
+                "/mcp",
+                "127.0.0.1:5555",
+                &[
+                    ("x-forwarded-for", "203.0.113.7"),
+                    ("x-request-id", "qa-1"),
+                    ("user-agent", "probe/1.0"),
+                ],
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let line = logs
+            .lines_containing("failure_class=missing_credential")
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("missing auth failed line: {}", logs.contents()));
+        assert!(line.contains("client_ip=203.0.113.7"), "{line}");
+        assert!(line.contains("peer_ip=127.0.0.1"), "{line}");
+        assert!(line.contains("request_id=\"qa-1\""), "{line}");
+        assert!(line.contains("method=POST"), "{line}");
+        assert!(line.contains("path=/mcp"), "{line}");
+        assert!(line.contains("user_agent=\"probe/1.0\""), "{line}");
+        assert!(line.contains("auth_scheme=none"), "{line}");
+
+        let before = logs.lines_containing("auth failed").len();
+        let resp = drive_reqlog(
+            &app,
+            reqlog_req_with_headers(
+                axum::http::Method::POST,
+                "/mcp",
+                "10.9.9.9:5555",
+                &[("x-request-id", "untrusted")],
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let line = logs.lines_containing("auth failed").remove(before);
+        assert!(line.contains("client_ip=10.9.9.9"), "{line}");
+        assert!(!line.contains("request_id"), "{line}");
+
+        let before = logs.lines_containing("auth failed").len();
+        let resp = drive_reqlog(
+            &app,
+            reqlog_req_with_headers(
+                axum::http::Method::POST,
+                "/mcp",
+                "127.0.0.1:5555",
+                &[("authorization", "Bearer not-a-key")],
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let line = logs.lines_containing("auth failed").remove(before);
+        assert!(line.contains("failure_class=invalid_credential"), "{line}");
+        assert!(line.contains("token_kind=opaque"), "{line}");
+        assert!(line.contains("credential_fp="), "{line}");
+        assert!(!line.contains("not-a-key"), "{line}");
+
+        let logs = CapturedLogs::default();
+        let _guard = capture_debug_logs(logs.clone());
+        let app = reqlog_router(|cfg| cfg.with_auth(AuthConfig::with_keys(vec![])));
+        let resp = drive_reqlog(
+            &app,
+            reqlog_req_with_headers(
+                axum::http::Method::POST,
+                "/mcp",
+                "127.0.0.1:5555",
+                &[("x-request-id", "qa-ignored")],
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let line = logs
+            .lines_containing("auth failed")
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("missing auth failed line: {}", logs.contents()));
+        assert!(
+            line.ends_with("auth failed failure_class=missing_credential"),
+            "{line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rbac_denial_through_real_wiring_carries_client_fields() {
+        let (token, hash) = crate::auth::generate_api_key().unwrap();
+        let logs = CapturedLogs::default();
+        let _guard = capture_debug_logs(logs.clone());
+        let app = reqlog_router(|cfg| {
+            cfg.with_trusted_proxies(["127.0.0.1/32"])
+                .with_log_context(knobs(|ctx| {
+                    ctx.client_ip = true;
+                    ctx.peer_ip = true;
+                    ctx.request_id = true;
+                }))
+                .with_auth(AuthConfig::with_keys(vec![crate::auth::ApiKeyEntry::new(
+                    "viewer-key",
+                    hash,
+                    "viewer",
+                )]))
+                .with_rbac(Arc::new(RbacPolicy::new(
+                    &crate::rbac::RbacConfig::with_roles(vec![crate::rbac::RoleConfig::new(
+                        "viewer",
+                        vec!["echo".into()],
+                        vec!["*".into()],
+                    )]),
+                )))
+        });
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "forbidden", "arguments": {} }
+        })
+        .to_string();
+        let req = Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/mcp")
+            .extension(ConnectInfo("127.0.0.1:5555".parse::<SocketAddr>().unwrap()))
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .header("x-forwarded-for", "203.0.113.7")
+            .header("x-request-id", "qa-2")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = drive_reqlog(&app, req).await;
+
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let line = logs
+            .lines_containing("RBAC denied")
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("missing RBAC denied line: {}", logs.contents()));
+        assert!(line.contains("client_ip=203.0.113.7"), "{line}");
+        assert!(line.contains("peer_ip=127.0.0.1"), "{line}");
+        assert!(line.contains("request_id=\"qa-2\""), "{line}");
     }
 
     #[tokio::test]
@@ -6124,11 +7416,17 @@ mod tests {
                 .filter_map(|origin| parse_allowed_origin(&origin))
                 .collect::<Vec<_>>(),
         );
+        let request_log = Arc::new(RequestLogConfig {
+            log_request_headers,
+            exclude_paths: std::collections::HashSet::new(),
+            fields: LogContextConfig::default(),
+        });
         axum::Router::new()
             .route("/test", axum::routing::get(|| async { "ok" }))
             .layer(axum::middleware::from_fn(move |req, next| {
                 let a = Arc::clone(&allowed);
-                origin_check_middleware(a, log_request_headers, req, next)
+                let l = Arc::clone(&request_log);
+                origin_check_middleware(a, l, req, next)
             }))
     }
 
@@ -7281,7 +8579,7 @@ mod tests {
     // -- M6: OAuth proxy admin endpoints enforce the admin role --
 
     #[cfg(feature = "oauth")]
-    fn m6_auth_state() -> (Arc<AuthState>, String, String) {
+    fn m6_auth_state(fields: LogContextConfig) -> (Arc<AuthState>, String, String) {
         let (admin_token, admin_hash) = crate::auth::generate_api_key().unwrap();
         let (viewer_token, viewer_hash) = crate::auth::generate_api_key().unwrap();
         let state = Arc::new(AuthState {
@@ -7295,6 +8593,10 @@ mod tests {
             seen_identities: crate::auth::SeenIdentitySet::new(),
             counters: crate::auth::AuthCounters::default(),
             resource_metadata_url: None,
+            log_context: crate::auth::AuthLogContext {
+                fields,
+                fingerprint_salt: None,
+            },
         });
         (state, admin_token, viewer_token)
     }
@@ -7327,8 +8629,36 @@ mod tests {
 
     #[cfg(feature = "oauth")]
     #[tokio::test]
+    async fn oauth_admin_auth_failure_carries_client_context() {
+        let (state, _admin, _viewer) = m6_auth_state(LogContextConfig::recommended());
+        let logs = CapturedLogs::default();
+        let _guard = capture_debug_logs(logs.clone());
+        let app = m6_admin_router(&state);
+        let req = Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/introspect")
+            .extension(ConnectInfo("127.0.0.1:5555".parse::<SocketAddr>().unwrap()))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let line = logs
+            .lines_containing("auth failed")
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("missing auth failed log: {}", logs.contents()));
+        assert!(line.contains("client_ip=127.0.0.1"), "{line}");
+        assert!(line.contains("peer_ip=127.0.0.1"), "{line}");
+        assert!(line.contains("method=POST"), "{line}");
+        assert!(line.contains("path=/introspect"), "{line}");
+    }
+
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
     async fn oauth_proxy_admin_requires_admin_role() {
-        let (state, _admin, viewer) = m6_auth_state();
+        let (state, _admin, viewer) = m6_auth_state(LogContextConfig::default());
         for path in ["/introspect", "/revoke"] {
             let app = m6_admin_router(&state);
             let resp = app.oneshot(m6_req(path, &viewer)).await.unwrap();
@@ -7343,7 +8673,7 @@ mod tests {
     #[cfg(feature = "oauth")]
     #[tokio::test]
     async fn oauth_proxy_admin_allows_admin_role() {
-        let (state, admin, _viewer) = m6_auth_state();
+        let (state, admin, _viewer) = m6_auth_state(LogContextConfig::default());
         for path in ["/introspect", "/revoke"] {
             let app = m6_admin_router(&state);
             let resp = app.oneshot(m6_req(path, &admin)).await.unwrap();

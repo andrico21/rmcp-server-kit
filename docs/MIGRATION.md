@@ -3,6 +3,95 @@
 This guide shows how to wire the standalone `rmcp-server-kit` crate into a
 downstream project, and how to migrate across breaking major releases.
 
+## Migrating to 3.15: logging defaults and per-item client-context logging
+
+### Framework INFO lines are visible under the default filter
+
+The default `log_level` is now `"info,rmcp=warn,rmcp_server_kit=info"`. The
+previous default relied on prefix matching in a way that suppressed this
+crate's own INFO lines, including in the audit-file sink. After upgrading, the
+following framework lines are visible without extra filter configuration:
+
+- `<name> listening on`
+- `auth enabled on /mcp`
+- `RBAC enforcement enabled on /mcp`
+- `auto-derived allowed origin from public_url`
+- `JWKS refresh skipped (cooldown active)`
+- once per identity, `"<method> authenticated" name=... role=...`
+- hot-reload events
+
+For OAuth, the displayed `name` on the authenticated line falls back through
+`preferred_username`, then `sub`, then `azp`, then `client_id`. If you write an
+audit file, the same default filter change applies there too, so these INFO
+events can appear in both console and audit output.
+
+To keep the old filter, set `log_level = "info,rmcp=warn"`. You can also set
+`RUST_LOG` as before. If only the once-per-identity auth success line is too
+chatty, append `,rmcp_server_kit::auth=warn` to your filter.
+
+### Probe requests are no longer request-logged by default
+
+The DEBUG request-log layer now skips probe paths by default through
+`request_log_exclude_paths`. Matching is exact path matching. If you want probe
+requests in DEBUG request logs, clear the list in TOML:
+
+```toml
+[server]
+request_log_exclude_paths = []
+```
+
+Or clear it in the builder with `Vec::<String>::new()`.
+
+### Per-item client-context logging
+
+Per-item client context is controlled by `LogContextConfig`. In Rust, pass it to
+the server builder with `with_log_context()`:
+
+```rust,ignore
+use rmcp_server_kit::transport::LogContextConfig;
+
+let config = config.with_log_context(LogContextConfig::recommended());
+```
+
+In TOML, enable only the fields you need:
+
+```toml
+[server]
+# request_id requires at least one trusted proxy.
+trusted_proxies = ["10.0.0.0/8"]
+
+[server.log_context]
+client_ip = true
+peer_ip = true
+request_id = true
+user_agent = true
+credential_fingerprint = true
+request_completion = true
+```
+
+All knobs are off by default. `LogContextConfig::recommended()` turns on the
+recommended client context set for deployments that need operational request
+attribution. The default-off posture is intentional: client IPs, peer IPs,
+proxy request IDs, user agents, and credential fingerprints can become personal
+or sensitive operational data in downstream logs. That is a deliberate deviation
+from `RUST_GUIDELINES.md` section 10 for this crate: auth and authz lines can
+carry client context, but only when you opt in per item.
+
+`request_id` is trusted only from peers configured with `with_trusted_proxies`
+or the TOML trusted-proxy equivalent. Validation rejects `request_id = true`
+when `trusted_proxies` is empty. Without a trusted proxy match, the framework
+does not treat an inbound proxy request ID as authenticated client context.
+Downstream verification steps that assumed client context is logged by default
+must now enable the relevant `log_context` knobs before checking those fields.
+For an end-to-end OpenShift example, see the GUIDE OpenShift recipe.
+
+### New config keys are not backward-compatible with an older binary
+
+`ServerConfig` uses `deny_unknown_fields`, so config files that contain
+`request_log_exclude_paths` or `[server.log_context]` fail to parse on 3.14.3 or
+older. Before rolling back to an older binary, remove those keys from the TOML
+file.
+
 ## Migrating to 3.14: same-named API keys must map to one role
 
 Two `auth.api_keys` entries that share a `name` but declare *different*

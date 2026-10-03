@@ -187,10 +187,10 @@ consumer applications and `examples/`.
 | Entry                                    | File                                                                  | Notes                                                                                                  |
 |------------------------------------------|----------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------|
 | Crate root / public API                  | [`src/lib.rs`](src/lib.rs)                                            | Re-exports all public modules                                                                          |
-| **Server entry (HTTP)**                  | [`src/transport.rs`](src/transport.rs) - `serve()` (~line 2519)        | The function consumers call. Wires rmcp + axum + middleware + TLS + admin + metrics                    |
-| Server entry (stdio)                     | [`src/transport.rs`](src/transport.rs) - `serve_stdio()` (~line 4615) | For desktop/IDE clients. **Bypasses auth/RBAC/TLS** - use only for local subprocess MCP                |
+| **Server entry (HTTP)**                  | [`src/transport.rs`](src/transport.rs) - `serve()` (~line 2750)        | The function consumers call. Wires rmcp + axum + middleware + TLS + admin + metrics                    |
+| Server entry (stdio)                     | [`src/transport.rs`](src/transport.rs) - `serve_stdio()` (~line 5045) | For desktop/IDE clients. **Bypasses auth/RBAC/TLS** - use only for local subprocess MCP                |
 | Config builder                           | [`src/transport.rs`](src/transport.rs) - `McpServerConfig::new` (~line 536) | Builder-style config struct                                                                       |
-| Hot-reload handle                        | [`src/transport.rs`](src/transport.rs) - `ReloadHandle` (~line 1612)   | `try_reload_auth_keys` / `reload_auth_keys` / `reload_rbac` for runtime reconfig without restart      |
+| Hot-reload handle                        | [`src/transport.rs`](src/transport.rs) - `ReloadHandle` (~line 1816)   | `try_reload_auth_keys` / `reload_auth_keys` / `reload_rbac` for runtime reconfig without restart      |
 | Runnable example                         | [`examples/minimal_server.rs`](examples/minimal_server.rs)            | Smallest possible consumer of `serve()`                                                                |
 | E2E reference                            | [`tests/e2e.rs`](tests/e2e.rs)                                        | Real-world usage patterns; use as an integration cookbook                                              |
 
@@ -217,9 +217,11 @@ consumer applications and `examples/`.
         Outermost ── Middleware chain ── Innermost     │
         (executed top-to-bottom on request)            │
                                                        │
+        0. Security headers - outermost, response-only decoration; pass-through on requests
         1. Origin check       src/transport.rs:4493    │  spec: MCP origin validation
+           Logs only the requests it rejects.
         2. Peer-addr normalize (normalize_peer_addr_middleware) │  mirrors TLS peer into ConnectInfo<SocketAddr> + public PeerAddr (both branches)
-        3. Security headers   src/transport.rs:3797    │  HSTS, CSP, X-Frame-Options, ...
+        2b. Request log (request_log_middleware): DEBUG `incoming request` / `request completed`, skips request_log_exclude_paths, client fields per [server.log_context] knobs
         4. CORS / compression / body-size / timeouts   │  tower-http layers
         5. Optional concurrency cap + metrics          │
         6. Auth middleware    src/auth.rs              │  API key (Argon2) | mTLS | OAuth JWT
@@ -310,7 +312,7 @@ The most-violated rules - all `deny`-level in `Cargo.toml`:
 |------------------------------------------------|--------------------------------------------------------|
 | Server entry / router / middleware order       | `src/transport.rs` - `serve()` and surrounding helpers |
 | API key authentication                         | `src/auth.rs` - `AuthState`, `ApiKeyEntry`, `auth_middleware` |
-| mTLS identity extraction                       | `src/transport.rs` - `extract_mtls_identity` call site (~line 3207)   |
+| mTLS identity extraction                       | `src/transport.rs` - `extract_mtls_identity` call site (~line 3424)   |
 | mTLS CRL revocation (CDP-driven)               | `src/mtls_revocation.rs` - `CrlSet`, `DynamicClientCertVerifier`, `bootstrap_fetch`, `run_crl_refresher` |
 | OAuth JWT validation / JWKS cache              | `src/oauth.rs` - `JwksCache`, feature-gated           |
 | RBAC policy evaluation                         | `src/rbac.rs` - `RbacPolicy::check`, `enforce_tool_policy` |
@@ -319,6 +321,7 @@ The most-violated rules - all `deny`-level in `Cargo.toml`:
 | Extra-route per-IP rate limit                  | `src/transport.rs` - `build_extra_route_rate_limiter`, `extra_route_rate_limit_middleware` |
 | CRL discovery per-peer rate limit              | `src/mtls_revocation.rs` - `note_discovered_urls`, `discovery_limiter_per_peer`, `CURRENT_HANDSHAKE_PEER` (scoped in `src/transport.rs` handshake worker) |
 | Trusted-forwarder client-IP resolution         | `src/forwarded.rs` - `resolve_client_ip`; `src/transport.rs` - `ClientIp`, `limiter_client_ip`, `ForwardedHeaderMode` |
+| Client-context logging / request log / probe exclusion | `src/transport.rs` - `LogContextConfig`, `request_log_middleware`, `log_incoming_request`, `RequestId`; `src/auth.rs` - `AuthLogContext`, `log_auth_failure`; `src/rbac.rs` - `DenyLogKnobs`, `DenyLogFields` |
 | Tool-call hooks / result-size cap              | `src/tool_hooks.rs` - `HookedHandler::call_tool`      |
 | Identity-bound MCP task IDs                    | `src/task_binding.rs` - `wrap`, `unwrap_and_verify`; wired in `src/rbac_context.rs` task methods |
 | Admin endpoints (`/admin/*`)                   | `src/admin.rs`                                        |
@@ -329,8 +332,8 @@ The most-violated rules - all `deny`-level in `Cargo.toml`:
 | Security-header TOML controls                  | `src/transport.rs` - `SecurityHeadersConfig`; `src/config.rs` - `ServerConfig::security_headers` |
 | Error type → HTTP status mapping               | `src/error.rs` - `RmcpServerKitError::into_response`           |
 | Origin / security headers / CORS               | `src/transport.rs` - `origin_check_middleware`, `security_headers_middleware` |
-| Graceful shutdown (Ctrl-C / SIGTERM)           | `src/transport.rs` - `shutdown_signal()` (~line 3625) |
-| Hot-reload of keys / RBAC                      | `src/transport.rs` - `ReloadHandle` (~line 1612)       |
+| Graceful shutdown (Ctrl-C / SIGTERM)           | `src/transport.rs` - `shutdown_signal()` (~line 3842) |
+| Hot-reload of keys / RBAC                      | `src/transport.rs` - `ReloadHandle` (~line 1816)       |
 | Environment variable override mapping          | `src/config.rs` - `ServerConfig::apply_env_overrides`, `ObservabilityConfig::apply_env_overrides`; `src/rbac.rs` - `RbacConfig::apply_env_overrides` |
 | `rmcp` / `rmcp-macros` version bump in `Cargo.toml` / `Cargo.lock` | `docs/RMCP_UPGRADE_CHECKLIST.md` - the checks to run; `tests/delegation_guard.rs` - the trait-surface guard |
 
