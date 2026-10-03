@@ -1745,7 +1745,7 @@ describing the running binary:
   "version": "1.2.3",
   "build_sha": "abcdef0",
   "build_time": "2025-01-15T12:00:00Z",
-  "rust_version": "rustc 1.98.0",
+  "rust_version": "rustc 1.99.0",
   "rmcp_server_kit_version": "1.0.0"
 }
 ```

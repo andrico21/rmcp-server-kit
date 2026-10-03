@@ -18,11 +18,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # `RUSTFLAGS="-D warnings"` denies warnings across every job. Cargo's
-  # `build.warnings` (stable since 1.97) is now within our 1.98 MSRV, but
-  # RUSTFLAGS is retained for parity with the GitLab mirror. See
-  # docs/RUST_1_95_NOTES.md.
-  RUSTFLAGS: "-D warnings"
+  # Warnings are denied by the committed .cargo/config.toml ([build] warnings
+  # = "deny"), for every job.
 
 jobs:
   fmt:
@@ -30,10 +27,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@nightly
+      # Dated nightly (D-14 v): the newest release that passes both this job
+      # and the docsrs job below. Move the pin only through the re-vendor +
+      # toolchain-bump procedure in RUST_GUIDELINES.md.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-03
           components: rustfmt
-      - run: cargo +nightly fmt --all -- --check
+      - run: cargo +nightly-2026-10-03 fmt --all -- --check
 
   clippy:
     name: Clippy
@@ -117,8 +118,8 @@ jobs:
       # `--force` and the floor matter together: rust-cache can restore an
       # older cargo-semver-checks from ~/.cargo/bin, and `cargo install`
       # would then skip the upgrade. Versions before 0.50 cannot parse the
-      # rustdoc JSON v60 emitted by Rust 1.98 and fail with
-      # "unsupported rustdoc format v60" -- a tooling error indistinguishable
+      # rustdoc JSON v61 emitted by Rust 1.99 and fail with
+      # "unsupported rustdoc format v61" -- a tooling error indistinguishable
       # from a real semver break in the CI log.
       - name: Install cargo-semver-checks
         run: cargo install cargo-semver-checks --locked --force --version '^0.50'
@@ -162,9 +163,12 @@ jobs:
       RUSTDOCFLAGS: "-D warnings --cfg docsrs"
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@nightly
+      # Dated nightly (D-14 v), the same pin as the `fmt` job.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-03
       - uses: Swatinem/rust-cache@v2.9.1
-      - run: cargo +nightly doc --no-deps --all-features
+      - run: cargo +nightly-2026-10-03 doc --no-deps --all-features
       - name: Verify SECURITY.md documents mTLS revocation [H-S4]
         run: |
           set -e
@@ -181,6 +185,21 @@ jobs:
           # Defence-in-depth guidance must remain.
           grep -qE "(short-lived|24h|24 hour)" SECURITY.md
           grep -qE "(cert-manager|Vault PKI|Smallstep)" docs/GUIDE.md
+
+  rustdoc-canary:
+    name: Rustdoc (latest nightly canary)
+    runs-on: ubuntu-latest
+    # Non-blocking (D-14 v): docs.rs builds with its own current nightly, so
+    # this surfaces drift early without gating merges on it. The blocking
+    # `docs` job uses the dated, verified pin above.
+    continue-on-error: true
+    env:
+      RUSTDOCFLAGS: "-D warnings --cfg docsrs"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2.9.1
+      - run: cargo +nightly doc --no-deps --all-features
 
   rustdoc-stable:
     name: Rustdoc (stable)
@@ -215,11 +234,20 @@ jobs:
         run: cargo audit
 
   msrv:
-    name: MSRV (1.98.0)
+    name: MSRV (1.99.0)
     runs-on: ubuntu-latest
+    # This job proves compile compatibility with `rust-version`, not lint
+    # cleanliness: lints are enforced on the latest stable (the clippy job).
+    # `--cap-lints=warn` caps rustc/clippy lints emitted by dependencies and
+    # by this crate, and CARGO_BUILD_WARNINGS=allow neutralises the committed
+    # `build.warnings = "deny"`. Recorded in the index's local deviations
+    # register.
+    env:
+      RUSTFLAGS: "--cap-lints=warn"
+      CARGO_BUILD_WARNINGS: allow
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2.9.1
       - run: rustc --version && cargo --version
       - run: cargo build --all-features
@@ -250,6 +278,17 @@ jobs:
         with:
           args: --offline --no-progress README.md RUST_GUIDELINES.md docs/*.md
           fail: true
+
+  lint-ratchet:
+    name: lint-ratchet self-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # stdlib-only Python (>= 3.11, tomllib); no Rust toolchain needed. GitLab
+      # deliberately does not run these (image python version unknown; GitHub is
+      # the canonical gate).
+      - name: Run every lint-ratchet self-test
+        run: for s in scripts/lint-ratchet/*.py; do python3 "$s" --self-test; done
 
   # ---------------------------------------------------------------------------
   # Supply-chain advisory jobs (Phase 2 / 1.1.0).
@@ -297,7 +336,8 @@ jobs:
   machete:
     name: cargo-machete (unused deps)
     runs-on: ubuntu-latest
-    continue-on-error: true
+    # Blocking: `cargo machete` passes on main, so an unused dependency is a
+    # real regression, not advisory signal.
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -307,6 +347,22 @@ jobs:
       - name: Detect unused dependencies
         run: cargo machete
 
+  geiger:
+    name: cargo-geiger (informational)
+    runs-on: ubuntu-latest
+    # Informational only (D-17): cargo-geiger exits non-zero whenever it finds
+    # unsafe code, so it must never gate merges. `--all-features` reports the
+    # full dependency unsafe-usage picture.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+      - name: Install cargo-geiger
+        run: cargo install cargo-geiger --locked
+      - name: Run cargo geiger
+        run: cargo geiger --all-features
+
   mutants:
     name: cargo-mutants (nightly mutation tests)
     runs-on: ubuntu-latest
@@ -315,6 +371,11 @@ jobs:
     # manual dispatch.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     continue-on-error: true
+    # Mutation runs only need the build to compile. Deny-level lints make
+    # mutants unviable (a mutant often introduces an unused binding), so cap
+    # lints via `--cap-lints=true` and let warnings through for this job.
+    env:
+      CARGO_BUILD_WARNINGS: allow
     # Hard-cap each shard well below GitHub's 6h ceiling so it terminates
     # gracefully (allowing `continue-on-error` to take effect) instead of
     # being SIGKILLed and marking the entire workflow run as failed.
@@ -386,7 +447,8 @@ jobs:
 
         run: |
           set +e
-          timeout 170m cargo mutants --no-shuffle --timeout "$MUTANTS_TEST_TIMEOUT" -j 2 \
+          timeout 170m cargo mutants --no-shuffle --cap-lints=true \
+            --timeout "$MUTANTS_TEST_TIMEOUT" -j 2 \
             --sharding round-robin --shard ${{ matrix.shard }}/8 \
             -f src/rbac.rs -f src/auth.rs -f src/transport.rs \
             -f src/ssrf.rs -f src/mtls_revocation.rs \

@@ -17,13 +17,14 @@ new APIs, MSRV policy), see
 
 ## Development prerequisites
 
-- Rust **1.98 or newer** (stable toolchain) - `edition = "2024"`.
+- Rust **1.99 or newer** (stable toolchain) - `edition = "2024"`.
 - `cargo-deny` (for the `ci deny` step): `cargo install cargo-deny`.
 - `cargo-audit` (for the `ci audit` step): `cargo install cargo-audit`.
 - `cargo-vet` (for the `ci vet` step): `cargo install cargo-vet`.
 - `taplo` (for the `ci taplo` step): `cargo install taplo-cli`.
-- A nightly toolchain is only required for `cargo fmt` (the `rustfmt.toml`
-  uses a couple of unstable options).
+- A dated nightly toolchain is only required for `cargo fmt` (the
+  `rustfmt.toml` uses a couple of unstable options). CI pins `nightly-2026-10-03`;
+  install it with `rustup toolchain install nightly-2026-10-03 --component rustfmt`.
 
 ## Verification steps
 
@@ -31,7 +32,7 @@ Run locally before opening a PR - these mirror the blocking CI gates (the
 authoritative list is [`.github/workflows/ci.yml`](.github/workflows/ci.yml)):
 
 ```bash
-cargo +nightly fmt --all -- --check
+cargo +nightly-2026-10-03 fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 cargo deny check
@@ -42,6 +43,18 @@ taplo fmt --check
 ```
 
 All of these must pass.
+
+Warnings are denied for local builds too, by the committed
+`.cargo/config.toml` (`[build] warnings = "deny"`). While iterating on
+work-in-progress code you can relax this for a single command without
+editing the config (and without invalidating the build cache):
+
+```bash
+CARGO_BUILD_WARNINGS=allow cargo build
+```
+
+Use this only for transient local iteration - a PR must not leave warnings
+behind.
 
 ## Pull request checklist
 
