@@ -2573,9 +2573,18 @@ where
         ));
         let metrics_bind = config.metrics_bind.clone();
         let metrics_shutdown = ct.clone();
+        // The metrics listener is plaintext whatever the main server's TLS
+        // setting, so clone the operator's effective security-headers config
+        // and let the listener apply it with `is_tls = false` (no HSTS).
+        let metrics_security_headers = config.security_headers.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                crate::metrics::serve_metrics(metrics_bind, metrics, metrics_shutdown).await
+            if let Err(e) = crate::metrics::serve_metrics_with_security_headers(
+                metrics_bind,
+                metrics,
+                metrics_shutdown,
+                metrics_security_headers,
+            )
+            .await
             {
                 tracing::error!("metrics listener failed: {e}");
             }
@@ -4020,7 +4029,7 @@ async fn metrics_middleware(
 /// (`None` = default, `Some("")` = omit, `Some(v)` = override).
 // cancel-safe: the only await is `next.run(req)`; header mutation afterwards is
 // synchronous, so cancellation simply drops the response before it is sent.
-async fn security_headers_middleware(
+pub(crate) async fn security_headers_middleware(
     is_tls: bool,
     cfg: Arc<SecurityHeadersConfig>,
     req: Request<Body>,

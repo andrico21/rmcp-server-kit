@@ -106,6 +106,12 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   keeps working). `required-features` replaces the crate-level
   `#![cfg(feature = ...)]` gates: running a gated target without its features now
   errors instead of silently running an empty binary. No test behavior changes.
+- **`/metrics` now sends the OWASP security headers** - the dedicated metrics
+  listener applies the same eleven security response headers as the main
+  router, and the operator's `security_headers` overrides and omissions
+  (`Some("")` to drop a header) are honoured there too. The listener is always
+  plaintext, so no `Strict-Transport-Security` header is sent. The public
+  `serve_metrics` signature is unchanged.
 
 ### Fixed
 
