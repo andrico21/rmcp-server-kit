@@ -29,7 +29,7 @@ use serde::Deserialize;
 use tokio::{net::lookup_host, sync::RwLock};
 use tracing::Instrument;
 
-use crate::auth::{AuthIdentity, AuthMethod};
+use crate::auth::{AuthIdentity, AuthMethod, CredentialOwner, RejectionReason};
 
 // ---------------------------------------------------------------------------
 // Shared OAuth redirect-policy helper
@@ -2569,6 +2569,17 @@ pub enum JwtValidationFailure {
     Invalid,
 }
 
+/// JWT validation rejection plus optional verified credential owner details.
+pub(crate) struct JwtRejection {
+    pub(crate) failure: JwtValidationFailure,
+    pub(crate) owner: Option<CredentialOwner>,
+}
+
+struct DecodeFailure {
+    failure: JwtValidationFailure,
+    expired_claims: Option<Box<Claims>>,
+}
+
 impl JwksCache {
     /// Build a new cache from OAuth configuration.
     ///
@@ -2756,7 +2767,37 @@ impl JwksCache {
         &self,
         token: &str,
     ) -> Result<AuthIdentity, JwtValidationFailure> {
-        let claims = self.decode_claims(token).await?;
+        self.validate_token_detailed(token, false)
+            .await
+            .map_err(|rejection| rejection.failure)
+    }
+
+    /// Validate a JWT Bearer token with internal rejection owner attribution.
+    // cancel-safe: composed of cancel-safe `decode_claims` (spawn_blocking
+    // decode, no shared state) plus pure claim checks. Owner attribution uses
+    // already-verified claims or expired claims from the same blocking decode.
+    // No partial state is committed on cancellation.
+    pub(crate) async fn validate_token_detailed(
+        &self,
+        token: &str,
+        want_owner: bool,
+    ) -> Result<AuthIdentity, JwtRejection> {
+        let claims = match self.decode_claims(token, want_owner).await {
+            Ok(claims) => claims,
+            Err(failure) => {
+                let owner = match (want_owner, failure.expired_claims.as_ref()) {
+                    (true, Some(claims)) => Some(CredentialOwner {
+                        name: identity_label(claims, claims.sub.as_deref()),
+                        reason: RejectionReason::Expired,
+                    }),
+                    (true | false, None) | (false, Some(_)) => None,
+                };
+                return Err(JwtRejection {
+                    failure: failure.failure,
+                    owner,
+                });
+            }
+        };
 
         // `require_subject` must also reject a *blank* sub: it is the OAuth
         // session-binding stable id, so a blank one collapses distinct
@@ -2766,29 +2807,45 @@ impl JwksCache {
             tracing::debug!(
                 "JWT rejected: require_subject is set but the token has no non-blank `sub`"
             );
-            return Err(JwtValidationFailure::Invalid);
+            return Err(JwtRejection {
+                failure: JwtValidationFailure::Invalid,
+                owner: want_owner.then(|| CredentialOwner {
+                    name: identity_label(&claims, claims.sub.as_deref()),
+                    reason: RejectionReason::Subject,
+                }),
+            });
         }
-        self.check_audience(&claims)?;
-        let role = self.resolve_role(&claims)?;
+        if let Err(failure) = self.check_audience(&claims) {
+            return Err(JwtRejection {
+                failure,
+                owner: want_owner.then(|| CredentialOwner {
+                    name: identity_label(&claims, claims.sub.as_deref()),
+                    reason: RejectionReason::Audience,
+                }),
+            });
+        }
+        let role = match self.resolve_role(&claims) {
+            Ok(role) => role,
+            Err(failure) => {
+                return Err(JwtRejection {
+                    failure,
+                    owner: want_owner.then(|| CredentialOwner {
+                        name: identity_label(&claims, claims.sub.as_deref()),
+                        reason: RejectionReason::Role,
+                    }),
+                });
+            }
+        };
 
         // Store a blank `sub` as `None` so `fingerprint` never keys on a blank
         // stable id.
-        let sub = claims.sub.filter(|value| !value.trim().is_empty());
-
-        // Identity name: prefer `preferred_username`, then `sub`, then `azp`,
-        // then `client_id`. Skip every blank candidate so a present-but-empty
-        // claim cannot short-circuit the chain into a blank (colliding) name.
-        let preferred_username = claims
-            .extra
-            .get("preferred_username")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.trim().is_empty())
+        let sub = claims
+            .sub
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
             .map(String::from);
-        let name = preferred_username
-            .or_else(|| sub.clone())
-            .or_else(|| claims.azp.filter(|s| !s.trim().is_empty()))
-            .or_else(|| claims.client_id.filter(|s| !s.trim().is_empty()))
-            .unwrap_or_else(|| "oauth-client".into());
+
+        let name = identity_label(&claims, sub.as_deref());
 
         Ok(AuthIdentity {
             name,
@@ -2814,8 +2871,18 @@ impl JwksCache {
     // refresh) then a `spawn_blocking` decode whose `JoinHandle`, if dropped on
     // cancellation, detaches the verification (it completes off-task). No shared
     // state is mutated on this path.
-    async fn decode_claims(&self, token: &str) -> Result<Claims, JwtValidationFailure> {
-        let (key, alg) = self.select_jwks_key(token).await?;
+    async fn decode_claims(
+        &self,
+        token: &str,
+        want_expired_claims: bool,
+    ) -> Result<Claims, DecodeFailure> {
+        let (key, alg) = self
+            .select_jwks_key(token)
+            .await
+            .map_err(|failure| DecodeFailure {
+                failure,
+                expired_claims: None,
+            })?;
 
         // Build a per-decode validation scoped to the header's algorithm.
         // jsonwebtoken requires ALL algorithms in the list to share the
@@ -2826,9 +2893,29 @@ impl JwksCache {
         // Move the (cheap) clones into the blocking task so the verifier
         // does not hold a reference into the request's async scope.
         let token_owned = token.to_owned();
-        let join =
-            tokio::task::spawn_blocking(move || decode::<Claims>(&token_owned, &key, &validation))
-                .await;
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        let join = tokio::task::spawn_blocking(move || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                let first = decode::<Claims>(&token_owned, &key, &validation);
+                if want_expired_claims
+                    && let Err(error) = &first
+                    && matches!(
+                        error.kind(),
+                        jsonwebtoken::errors::ErrorKind::ExpiredSignature
+                    )
+                {
+                    tracing::debug!("JWT expired; re-decoding without exp for owner attribution");
+                    let mut expired_validation = validation.clone();
+                    expired_validation.validate_exp = false;
+                    let expired_claims = decode::<Claims>(&token_owned, &key, &expired_validation)
+                        .ok()
+                        .map(|data| Box::new(data.claims));
+                    return (first, expired_claims);
+                }
+                (first, None)
+            })
+        })
+        .await;
 
         let decode_result = match join {
             Ok(r) => r,
@@ -2838,11 +2925,14 @@ impl JwksCache {
                     error = %join_err,
                     "JWT decode task panicked or was cancelled"
                 );
-                return Err(JwtValidationFailure::Invalid);
+                return Err(DecodeFailure {
+                    failure: JwtValidationFailure::Invalid,
+                    expired_claims: None,
+                });
             }
         };
 
-        decode_result.map(|td| td.claims).map_err(|e| {
+        decode_result.0.map(|td| td.claims).map_err(|e| {
             core::hint::cold_path();
             let failure = if matches!(e.kind(), jsonwebtoken::errors::ErrorKind::ExpiredSignature) {
                 JwtValidationFailure::Expired
@@ -2850,7 +2940,10 @@ impl JwksCache {
                 JwtValidationFailure::Invalid
             };
             tracing::debug!(error = %e, ?alg, ?failure, "JWT decode failed");
-            failure
+            DecodeFailure {
+                failure,
+                expired_claims: decode_result.1,
+            }
         })
     }
 
@@ -3249,6 +3342,19 @@ impl JwksCache {
             .as_ref()
             .is_some_and(|cache| cache.keys.contains_key(kid))
     }
+}
+
+fn identity_label(claims: &Claims, sub: Option<&str>) -> String {
+    claims
+        .extra
+        .get("preferred_username")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(String::from)
+        .or_else(|| sub.filter(|s| !s.trim().is_empty()).map(String::from))
+        .or_else(|| claims.azp.clone().filter(|s| !s.trim().is_empty()))
+        .or_else(|| claims.client_id.clone().filter(|s| !s.trim().is_empty()))
+        .unwrap_or_else(|| "oauth-client".into())
 }
 
 /// Partition a JWKS into a kid-indexed map plus a list of unnamed keys.
@@ -7102,6 +7208,93 @@ role = "admin"
     }
 
     #[tokio::test]
+    async fn characterize_expired_jwt_is_classified_expired() {
+        let kid = "test-key-characterize-expired";
+        let (pem, jwks) = generate_test_keypair(kid);
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/jwks.json"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&jwks))
+            .mount(&mock_server)
+            .await;
+        let jwks_uri = format!("{}/jwks.json", mock_server.uri());
+        let config = test_config(&jwks_uri);
+        let cache = test_cache(&config);
+        let now = jsonwebtoken::get_current_timestamp();
+        let token = mint_token_with_claims(
+            &pem,
+            kid,
+            &serde_json::json!({
+                "iss": "https://auth.test.local",
+                "aud": "https://mcp.test.local/mcp",
+                "sub": "expired-bot",
+                "scope": "mcp:read",
+                "exp": now - 120,
+                "iat": now - 3720,
+            }),
+        );
+
+        assert!(matches!(
+            cache.validate_token_with_reason(&token).await,
+            Err(JwtValidationFailure::Expired)
+        ));
+    }
+
+    #[tokio::test]
+    async fn characterize_rejections_are_invalid_publicly() {
+        let kid = "test-key-characterize-invalid";
+        let (pem, jwks) = generate_test_keypair(kid);
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/jwks.json"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&jwks))
+            .mount(&mock_server)
+            .await;
+        let jwks_uri = format!("{}/jwks.json", mock_server.uri());
+        let cache = test_cache(&test_config(&jwks_uri));
+        let wrong_aud = mint_token(
+            &pem,
+            kid,
+            "https://auth.test.local",
+            "https://wrong-audience.example.com",
+            "attacker",
+            "mcp:read",
+        );
+        assert!(matches!(
+            cache.validate_token_with_reason(&wrong_aud).await,
+            Err(JwtValidationFailure::Invalid)
+        ));
+
+        let no_role = mint_token(
+            &pem,
+            kid,
+            "https://auth.test.local",
+            "https://mcp.test.local/mcp",
+            "limited",
+            "no:mapping",
+        );
+        assert!(matches!(
+            cache.validate_token_with_reason(&no_role).await,
+            Err(JwtValidationFailure::Invalid)
+        ));
+
+        let mut require_sub = test_config(&jwks_uri);
+        require_sub.require_subject = true;
+        let cache = test_cache(&require_sub);
+        let no_sub = mint_token_without_sub(
+            &pem,
+            kid,
+            "https://auth.test.local",
+            "https://mcp.test.local/mcp",
+            "mcp:read",
+        );
+        assert!(matches!(
+            cache.validate_token_with_reason(&no_sub).await,
+            Err(JwtValidationFailure::Invalid)
+        ));
+    }
+
+    #[tokio::test]
     async fn no_matching_scope_rejected() {
         let kid = "test-key-5";
         let (pem, jwks) = generate_test_keypair(kid);
@@ -7364,6 +7557,312 @@ role = "admin"
         let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
         header.kid = Some(kid.into());
         jsonwebtoken::encode(&header, &claims, &encoding_key).expect("JWT encoding")
+    }
+
+    async fn cache_for_jwks(jwks: &serde_json::Value) -> (JwksCache, wiremock::MockServer) {
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/jwks.json"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(jwks))
+            .mount(&mock_server)
+            .await;
+        let jwks_uri = format!("{}/jwks.json", mock_server.uri());
+        (test_cache(&test_config(&jwks_uri)), mock_server)
+    }
+
+    fn assert_jwt_owner(
+        rejection: &JwtRejection,
+        failure: JwtValidationFailure,
+        owner: Option<(&str, RejectionReason)>,
+    ) {
+        assert_eq!(rejection.failure, failure);
+        match (rejection.owner.as_ref(), owner) {
+            (Some(actual), Some((name, reason))) => {
+                assert_eq!(actual.name, name);
+                assert_eq!(actual.reason, reason);
+            }
+            (None, None) => {}
+            (actual, expected) => panic!("owner mismatch: actual={actual:?} expected={expected:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn detailed_expired_correct_issuer_names_owner() {
+        let logs = CapturedLogs::default();
+        let _guard = capture_debug_logs(logs.clone());
+        let kid = "detailed-expired-owner";
+        let (pem, jwks) = generate_test_keypair(kid);
+        let (cache, _server) = cache_for_jwks(&jwks).await;
+        let now = jsonwebtoken::get_current_timestamp();
+        let token = mint_token_with_claims(
+            &pem,
+            kid,
+            &serde_json::json!({
+                "iss": "https://auth.test.local",
+                "aud": "https://mcp.test.local/mcp",
+                "sub": "sub-alice",
+                "preferred_username": "alice",
+                "scope": "mcp:read",
+                "exp": now - 120,
+                "iat": now - 3720,
+            }),
+        );
+
+        let rejection = cache
+            .validate_token_detailed(&token, true)
+            .await
+            .expect_err("expired token must reject");
+
+        assert_jwt_owner(
+            &rejection,
+            JwtValidationFailure::Expired,
+            Some(("alice", RejectionReason::Expired)),
+        );
+        assert!(
+            logs.contents()
+                .contains("JWT expired; re-decoding without exp for owner attribution")
+        );
+    }
+
+    #[tokio::test]
+    async fn detailed_expired_without_owner_does_not_redecode() {
+        let logs = CapturedLogs::default();
+        let _guard = capture_debug_logs(logs.clone());
+        let kid = "detailed-expired-no-owner";
+        let (pem, jwks) = generate_test_keypair(kid);
+        let (cache, _server) = cache_for_jwks(&jwks).await;
+        let now = jsonwebtoken::get_current_timestamp();
+        let token = mint_token_with_claims(
+            &pem,
+            kid,
+            &serde_json::json!({
+                "iss": "https://auth.test.local",
+                "aud": "https://mcp.test.local/mcp",
+                "sub": "sub-alice",
+                "preferred_username": "alice",
+                "scope": "mcp:read",
+                "exp": now - 120,
+                "iat": now - 3720,
+            }),
+        );
+
+        let rejection = cache
+            .validate_token_detailed(&token, false)
+            .await
+            .expect_err("expired token must reject");
+
+        assert_jwt_owner(&rejection, JwtValidationFailure::Expired, None);
+        assert!(
+            !logs
+                .contents()
+                .contains("JWT expired; re-decoding without exp for owner attribution")
+        );
+    }
+
+    #[tokio::test]
+    async fn detailed_expired_wrong_issuer_has_no_owner() {
+        let kid = "detailed-expired-wrong-issuer";
+        let (pem, jwks) = generate_test_keypair(kid);
+        let (cache, _server) = cache_for_jwks(&jwks).await;
+        let now = jsonwebtoken::get_current_timestamp();
+        let token = mint_token_with_claims(
+            &pem,
+            kid,
+            &serde_json::json!({
+                "iss": "https://evil.example",
+                "aud": "https://mcp.test.local/mcp",
+                "preferred_username": "alice",
+                "scope": "mcp:read",
+                "exp": now - 120,
+                "iat": now - 3720,
+            }),
+        );
+
+        let rejection = cache
+            .validate_token_detailed(&token, true)
+            .await
+            .unwrap_err();
+
+        assert_jwt_owner(&rejection, JwtValidationFailure::Expired, None);
+    }
+
+    #[tokio::test]
+    async fn detailed_expired_future_nbf_has_no_owner() {
+        let kid = "detailed-expired-future-nbf";
+        let (pem, jwks) = generate_test_keypair(kid);
+        let (cache, _server) = cache_for_jwks(&jwks).await;
+        let now = jsonwebtoken::get_current_timestamp();
+        let token = mint_token_with_claims(
+            &pem,
+            kid,
+            &serde_json::json!({
+                "iss": "https://auth.test.local",
+                "aud": "https://mcp.test.local/mcp",
+                "preferred_username": "alice",
+                "scope": "mcp:read",
+                "exp": now - 120,
+                "nbf": now + 3600,
+                "iat": now - 3720,
+            }),
+        );
+
+        let rejection = cache
+            .validate_token_detailed(&token, true)
+            .await
+            .unwrap_err();
+
+        assert_jwt_owner(&rejection, JwtValidationFailure::Expired, None);
+    }
+
+    #[tokio::test]
+    async fn detailed_bad_signature_has_no_owner() {
+        let logs = CapturedLogs::default();
+        let _guard = capture_debug_logs(logs.clone());
+        let kid = "detailed-bad-signature";
+        let (_pem, jwks) = generate_test_keypair(kid);
+        let (attacker_pem, _) = generate_test_keypair(kid);
+        let (cache, _server) = cache_for_jwks(&jwks).await;
+        let token = mint_token(
+            &attacker_pem,
+            kid,
+            "https://auth.test.local",
+            "https://mcp.test.local/mcp",
+            "attacker",
+            "mcp:read",
+        );
+
+        let rejection = cache
+            .validate_token_detailed(&token, true)
+            .await
+            .unwrap_err();
+
+        assert_jwt_owner(&rejection, JwtValidationFailure::Invalid, None);
+        assert!(
+            !logs
+                .contents()
+                .contains("JWT expired; re-decoding without exp for owner attribution")
+        );
+    }
+
+    #[tokio::test]
+    async fn detailed_wrong_audience_names_owner() {
+        let kid = "detailed-wrong-audience";
+        let (pem, jwks) = generate_test_keypair(kid);
+        let (cache, _server) = cache_for_jwks(&jwks).await;
+        let token = mint_token(
+            &pem,
+            kid,
+            "https://auth.test.local",
+            "https://wrong.example",
+            "bob",
+            "mcp:read",
+        );
+
+        let rejection = cache
+            .validate_token_detailed(&token, true)
+            .await
+            .unwrap_err();
+
+        assert_jwt_owner(
+            &rejection,
+            JwtValidationFailure::Invalid,
+            Some(("bob", RejectionReason::Audience)),
+        );
+    }
+
+    #[tokio::test]
+    async fn detailed_no_role_names_owner() {
+        let kid = "detailed-no-role";
+        let (pem, jwks) = generate_test_keypair(kid);
+        let (cache, _server) = cache_for_jwks(&jwks).await;
+        let token = mint_token(
+            &pem,
+            kid,
+            "https://auth.test.local",
+            "https://mcp.test.local/mcp",
+            "carol",
+            "no:mapping",
+        );
+
+        let rejection = cache
+            .validate_token_detailed(&token, true)
+            .await
+            .unwrap_err();
+
+        assert_jwt_owner(
+            &rejection,
+            JwtValidationFailure::Invalid,
+            Some(("carol", RejectionReason::Role)),
+        );
+    }
+
+    #[tokio::test]
+    async fn detailed_require_subject_names_owner() {
+        let kid = "detailed-require-subject";
+        let (pem, jwks) = generate_test_keypair(kid);
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/jwks.json"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&jwks))
+            .mount(&mock_server)
+            .await;
+        let mut config = test_config(&format!("{}/jwks.json", mock_server.uri()));
+        config.require_subject = true;
+        let cache = test_cache(&config);
+        let now = jsonwebtoken::get_current_timestamp();
+        let token = mint_token_with_claims(
+            &pem,
+            kid,
+            &serde_json::json!({
+                "iss": "https://auth.test.local",
+                "aud": "https://mcp.test.local/mcp",
+                "preferred_username": "svc",
+                "scope": "mcp:read",
+                "exp": now + 3600,
+                "iat": now,
+            }),
+        );
+
+        let rejection = cache
+            .validate_token_detailed(&token, true)
+            .await
+            .unwrap_err();
+
+        assert_jwt_owner(
+            &rejection,
+            JwtValidationFailure::Invalid,
+            Some(("svc", RejectionReason::Subject)),
+        );
+    }
+
+    #[tokio::test]
+    async fn detailed_no_name_claims_uses_oauth_client_fallback() {
+        let kid = "detailed-no-name-fallback";
+        let (pem, jwks) = generate_test_keypair(kid);
+        let (cache, _server) = cache_for_jwks(&jwks).await;
+        let now = jsonwebtoken::get_current_timestamp();
+        let token = mint_token_with_claims(
+            &pem,
+            kid,
+            &serde_json::json!({
+                "iss": "https://auth.test.local",
+                "aud": "https://wrong.example",
+                "scope": "mcp:read",
+                "exp": now + 3600,
+                "iat": now,
+            }),
+        );
+
+        let rejection = cache
+            .validate_token_detailed(&token, true)
+            .await
+            .unwrap_err();
+
+        assert_jwt_owner(
+            &rejection,
+            JwtValidationFailure::Invalid,
+            Some(("oauth-client", RejectionReason::Audience)),
+        );
     }
 
     fn test_config_with_role_claim(
@@ -8042,6 +8541,16 @@ role = "admin"
         fn make_writer(&'a self) -> Self::Writer {
             CapturedLogsWriter(Arc::clone(&self.0))
         }
+    }
+
+    fn capture_debug_logs(logs: CapturedLogs) -> tracing::dispatcher::DefaultGuard {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(logs)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::set_default(subscriber)
     }
 
     fn exchanged_token_for_debug(secret: &str) -> ExchangedToken {

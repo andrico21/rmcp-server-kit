@@ -50,6 +50,10 @@ within **30 days** for confirmed high-severity issues.
   direct peer. See the "Trusted-forwarder mode" section of
   [`docs/GUIDE.md`](docs/GUIDE.md) for the full model.
 
+**Not a vulnerability:** Expired API keys deliberately disclose that the key
+existed and has expired, via `token is expired` and `unauthorized: expired
+credential`; this is an accepted authentication trade-off.
+
 ## MCP session identity binding
 
 Network transports bind rmcp session IDs to the authenticated identity by

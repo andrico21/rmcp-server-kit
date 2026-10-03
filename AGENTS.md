@@ -321,7 +321,7 @@ The most-violated rules - all `deny`-level in `Cargo.toml`:
 | Extra-route per-IP rate limit                  | `src/transport.rs` - `build_extra_route_rate_limiter`, `extra_route_rate_limit_middleware` |
 | CRL discovery per-peer rate limit              | `src/mtls_revocation.rs` - `note_discovered_urls`, `discovery_limiter_per_peer`, `CURRENT_HANDSHAKE_PEER` (scoped in `src/transport.rs` handshake worker) |
 | Trusted-forwarder client-IP resolution         | `src/forwarded.rs` - `resolve_client_ip`; `src/transport.rs` - `ClientIp`, `limiter_client_ip`, `ForwardedHeaderMode` |
-| Client-context logging / request log / probe exclusion | `src/transport.rs` - `LogContextConfig`, `request_log_middleware`, `log_incoming_request`, `RequestId`; `src/auth.rs` - `AuthLogContext`, `log_auth_failure`; `src/rbac.rs` - `DenyLogKnobs`, `DenyLogFields` |
+| Client-context logging / request log / probe exclusion | `src/transport.rs` - `LogContextConfig`, `request_log_middleware`, `log_incoming_request`, `RequestId`; `src/auth.rs` - `AuthLogContext`, `log_auth_failure`, `ApiKeyVerdict`, `verify_slots`, `AuthRejection`; `src/oauth.rs` - `validate_token_detailed`; `src/rbac.rs` - `DenyLogKnobs`, `DenyLogFields` |
 | Tool-call hooks / result-size cap              | `src/tool_hooks.rs` - `HookedHandler::call_tool`      |
 | Identity-bound MCP task IDs                    | `src/task_binding.rs` - `wrap`, `unwrap_and_verify`; wired in `src/rbac_context.rs` task methods |
 | Admin endpoints (`/admin/*`)                   | `src/admin.rs`                                        |

@@ -35,7 +35,10 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   `mcp_protocol_version` to `auth failed` and DEBUG `incoming request` lines.
   `credential_fingerprint` adds `credential_fp` on `auth failed` lines only,
   for Bearer credentials only: a stable, redacted identifier for the presented
-  credential, not the secret or bearer token itself. `request_completion`
+  credential, not the secret or bearer token itself. `credential_owner` adds
+  `credential_owner` and `credential_rejection` on `auth failed` lines when a
+  credential verifies but is rejected because it is expired, has the wrong
+  audience, maps to no role, or is missing a required subject. `request_completion`
   enables the DEBUG `request completed` line.
 - **Client-context validation rules** - `request_log_exclude_paths` entries must
   be non-empty and start with `/`; `request_id = true` requires non-empty
@@ -74,6 +77,12 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   completion, auth failure, and RBAC denial, all gated by the per-item
   `log_context.client_ip` knob. Rate-limit deny lines always carry the resolved
   IP as `rate_limit_key`, regardless of those knobs.
+- **Expired API keys now answer `expired_credential`** - expired API keys now
+  return the `expired_credential` failure visible to clients instead of
+  `invalid_credential`, with `token is expired` in the challenge and
+  `unauthorized: expired credential` in the body. `/admin/auth/counters`
+  attribution for these hits moves from `failure_invalid_credential` to
+  `failure_expired_credential`.
 
 ### Notes
 

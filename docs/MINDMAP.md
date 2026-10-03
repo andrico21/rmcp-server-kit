@@ -432,7 +432,7 @@ graph TD
 | TLS / mTLS acceptor               | `src/transport.rs`                       | `TlsListener` ~L3357                                                          |
 | Origin / security headers (defs)  | `src/transport.rs`                       | `origin_check_middleware` ~L4773, `security_headers_middleware` ~L4014       |
 | Graceful shutdown                 | `src/transport.rs`                       | `shutdown_signal` ~L3842                                                      |
-| API key + mTLS auth               | `src/auth.rs`                            | `AuthIdentity` L51, `AuthState` ~L1102, `auth_middleware` L1703              |
+| API key + mTLS auth               | `src/auth.rs`                            | `AuthIdentity` L51, `AuthState` ~L1165, `auth_middleware` L2007              |
 | RBAC engine                       | `src/rbac.rs`                            | `RbacPolicy` L352, task-locals L90-150, `rbac_middleware` L678-825           |
 | Memory-bounded keyed limiter      | `src/bounded_limiter.rs`                 | `BoundedKeyedLimiter` L134                                                    |
 | Trusted-forwarder resolution      | `src/forwarded.rs`                       | `resolve_client_ip`, `FallbackReason` (rightmost-untrusted, fail-safe-to-direct) |

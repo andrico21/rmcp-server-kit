@@ -2403,6 +2403,7 @@ user_agent = false
 auth_scheme = true
 mcp_hints = false
 credential_fingerprint = false
+credential_owner = false
 request_completion = true
         "#;
         let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
@@ -2411,6 +2412,7 @@ request_completion = true
         assert!(cfg.log_context.request_line);
         assert!(cfg.log_context.auth_scheme);
         assert!(cfg.log_context.request_completion);
+        assert!(!cfg.log_context.credential_owner);
 
         let base = crate::transport::McpServerConfig::new("127.0.0.1:8080", "test", "0.1.0");
         let mcp_cfg = cfg.apply_to_mcp_config(base).unwrap();
@@ -2421,6 +2423,40 @@ request_completion = true
         assert_eq!(
             cfg_default.log_context,
             crate::transport::LogContextConfig::default()
+        );
+    }
+
+    #[test]
+    fn log_context_credential_owner_toml_roundtrip() {
+        // Test 1: credential_owner = true parses and carries through
+        let toml_str = r"
+[log_context]
+credential_owner = true
+        ";
+        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert!(
+            cfg.log_context.credential_owner,
+            "credential_owner must be true"
+        );
+
+        let base = crate::transport::McpServerConfig::new("127.0.0.1:8080", "test", "0.1.0");
+        let mcp_cfg = cfg.apply_to_mcp_config(base).unwrap();
+        assert!(
+            mcp_cfg.log_context.credential_owner,
+            "must carry through to mcp_config"
+        );
+
+        // Test 2: omitted key gives false (default)
+        let cfg_default: ServerConfig = toml::from_str(
+            r"
+[log_context]
+client_ip = false
+        ",
+        )
+        .unwrap();
+        assert!(
+            !cfg_default.log_context.credential_owner,
+            "omitted key must default to false"
         );
     }
 

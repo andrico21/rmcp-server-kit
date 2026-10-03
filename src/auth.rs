@@ -110,20 +110,65 @@ pub enum AuthMethod {
 enum AuthFailureClass {
     MissingCredential,
     InvalidCredential,
-    #[cfg_attr(
-        not(feature = "oauth"),
-        allow(
-            dead_code,
-            reason = "only OAuth JWT validation can report an expired credential; \
-                      the variant is unconstructed in builds without that feature"
-        )
-    )]
     ExpiredCredential,
     /// Source IP exceeded the post-failure backoff limit.
     RateLimited,
     /// Source IP exceeded the pre-auth abuse gate (rejected before any
     /// password-hash work - see [`AuthState::pre_auth_limiter`]).
     PreAuthGate,
+}
+
+/// Reason an authentic credential was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RejectionReason {
+    Expired,
+    #[cfg_attr(
+        not(feature = "oauth"),
+        allow(dead_code, reason = "constructed only by OAuth JWT validation")
+    )]
+    Audience,
+    #[cfg_attr(
+        not(feature = "oauth"),
+        allow(dead_code, reason = "constructed only by OAuth JWT validation")
+    )]
+    Role,
+    #[cfg_attr(
+        not(feature = "oauth"),
+        allow(dead_code, reason = "constructed only by OAuth JWT validation")
+    )]
+    Subject,
+}
+
+impl RejectionReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Expired => "expired",
+            Self::Audience => "audience",
+            Self::Role => "role",
+            Self::Subject => "subject",
+        }
+    }
+}
+
+/// Authenticated credential owner and rejection reason for opt-in failure logs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CredentialOwner {
+    pub(crate) name: String,
+    pub(crate) reason: RejectionReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthRejection {
+    failure_class: AuthFailureClass,
+    owner: Option<CredentialOwner>,
+}
+
+/// API-key verification result from the fixed-work slot scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ApiKeyVerdict {
+    Active { name: String, role: String },
+    Expired { name: String },
+    NoMatch,
 }
 
 impl AuthFailureClass {
@@ -178,7 +223,7 @@ pub struct AuthCountersSnapshot {
     pub failure_missing_credential: u64,
     /// Failures because the credential was malformed or wrong.
     pub failure_invalid_credential: u64,
-    /// Failures because the credential had expired.
+    /// Failures because the OAuth JWT or API key had expired.
     pub failure_expired_credential: u64,
     /// Failures because the source IP was rate-limited (post-failure backoff).
     pub failure_rate_limited: u64,
@@ -1405,17 +1450,20 @@ fn extract_bearer(value: &str) -> Option<&str> {
 /// # Timing-side-channel resistance
 ///
 /// Always performs **exactly one Argon2id verification per configured key**,
-/// regardless of:
+/// regardless of which slot (if any) matches the presented token.
 ///
-/// * which slot (if any) matches the presented token, or
-/// * whether a key has expired.
+/// **Expired slots** with parseable hashes verify against their own real hash.
+/// **Unparseable or malformed hashes** and slots encountered **after the active
+/// match has already been found** verify against an internal dummy PHC hash
+/// (`DUMMY_PHC_HASH`), a fixed Argon2id PHC string with the same cost
+/// parameters as real hashes. This bounds the timing observable to "one Argon2
+/// per configured key" regardless of which (if any) slot held the matching
+/// credential, closing the first-match latency oracle (CWE-208).
 ///
-/// Expired and post-match slots are verified against an internal dummy PHC hash,
-/// a fixed Argon2id PHC string with the same cost parameters as the real
-/// hashes. This bounds the timing observable to "one Argon2 per configured
-/// key" regardless of which (if any) slot held the matching credential,
-/// closing the first-match latency oracle (CWE-208) and the expired-slot
-/// timing leak.
+/// Uniform timing assumes every configured key uses the same PHC (Argon2) cost
+/// parameters (`m`, `t`, `p`) as the dummy hash. Those are the crate defaults
+/// produced by [`generate_api_key`]; arbitrary operator-supplied hashes are not
+/// rewritten or cost-normalized at load time.
 ///
 /// `subtle::ConstantTimeEq` folds each slot's match bit into the running
 /// result without comparing the token bytes in short-circuiting fashion.
@@ -1435,9 +1483,29 @@ fn extract_bearer(value: &str) -> Option<&str> {
 /// [`argon2::Argon2::hash_password`] which always emits a valid PHC string.
 #[must_use]
 pub fn verify_bearer_token(token: &str, keys: &[ApiKeyEntry]) -> Option<AuthIdentity> {
+    match verify_bearer_token_verdict(token, keys) {
+        ApiKeyVerdict::Active { name, role } => Some(AuthIdentity {
+            name,
+            role,
+            method: AuthMethod::BearerToken,
+            raw_token: None,
+            sub: None,
+        }),
+        ApiKeyVerdict::Expired { .. } | ApiKeyVerdict::NoMatch => None,
+    }
+}
+
+fn verify_slots<F>(
+    token: &str,
+    keys: &[ApiKeyEntry],
+    now: chrono::DateTime<chrono::Utc>,
+    mut verify: F,
+) -> ApiKeyVerdict
+where
+    F: FnMut(&[u8], &PasswordHash) -> bool,
+{
     use subtle::ConstantTimeEq as _;
 
-    let now = chrono::Utc::now();
     #[allow(
         clippy::expect_used,
         reason = "DUMMY_PHC_HASH is a static LazyLock built from a fixed Argon2id PHC string by construction; PasswordHash::new on it is infallible. See DUMMY_PHC_HASH definition."
@@ -1447,21 +1515,19 @@ pub fn verify_bearer_token(token: &str, keys: &[ApiKeyEntry]) -> Option<AuthIden
 
     let mut matched_index: usize = usize::MAX;
     let mut any_match: u8 = 0;
+    let mut expired_index: usize = usize::MAX;
+    let mut any_expired: u8 = 0;
 
     for (idx, key) in keys.iter().enumerate() {
         let expired = key.expires_at.is_some_and(|exp| exp.as_datetime() < &now);
 
         let real_hash = PasswordHash::new(&key.hash);
         let verify_against = match (&real_hash, expired, any_match) {
-            (Ok(h), false, 0) => h,
+            (Ok(h), true, _) | (Ok(h), false, 0) => h,
             _ => &dummy_hash,
         };
 
-        let slot_ok = u8::from(
-            Argon2::default()
-                .verify_password(token.as_bytes(), verify_against)
-                .is_ok(),
-        );
+        let slot_ok = u8::from(verify(token.as_bytes(), verify_against));
 
         let real_match = slot_ok & u8::from(!expired) & u8::from(real_hash.is_ok());
         let first_real_match = real_match & (1 - any_match);
@@ -1469,42 +1535,64 @@ pub fn verify_bearer_token(token: &str, keys: &[ApiKeyEntry]) -> Option<AuthIden
             matched_index = idx;
         }
         any_match |= real_match;
+
+        let expired_hit = slot_ok & u8::from(expired) & u8::from(real_hash.is_ok());
+        let first_expired = expired_hit & (1 - any_expired);
+        if first_expired.ct_eq(&1).into() {
+            expired_index = idx;
+        }
+        any_expired |= expired_hit;
     }
 
-    if any_match == 0 {
-        return None;
+    if any_match != 0
+        && let Some(key) = keys.get(matched_index)
+    {
+        if key.name.trim().is_empty() {
+            tracing::warn!("bearer token rejected: matched API key has a blank name");
+            return ApiKeyVerdict::NoMatch;
+        }
+        return ApiKeyVerdict::Active {
+            name: key.name.clone(),
+            role: key.role.clone(),
+        };
     }
-    let key = keys.get(matched_index)?;
-    // Blank stable id collides distinct principals in the session-binding
-    // fingerprint (CWE-384). Checked here, after the constant-time match loop
-    // has fully resolved `matched_index`, so the "one Argon2 per key" timing
-    // guarantee above is untouched.
-    if key.name.trim().is_empty() {
-        tracing::warn!("bearer token rejected: matched API key has a blank name");
-        return None;
+
+    if any_expired != 0
+        && let Some(key) = keys.get(expired_index)
+    {
+        if key.name.trim().is_empty() {
+            tracing::warn!("bearer token rejected: matched expired API key has a blank name");
+            return ApiKeyVerdict::NoMatch;
+        }
+        return ApiKeyVerdict::Expired {
+            name: key.name.clone(),
+        };
     }
-    Some(AuthIdentity {
-        name: key.name.clone(),
-        role: key.role.clone(),
-        method: AuthMethod::BearerToken,
-        raw_token: None,
-        sub: None,
+
+    ApiKeyVerdict::NoMatch
+}
+
+/// Verify an API-key bearer token and preserve active/expired/no-match detail.
+pub(crate) fn verify_bearer_token_verdict(token: &str, keys: &[ApiKeyEntry]) -> ApiKeyVerdict {
+    verify_slots(token, keys, chrono::Utc::now(), |t, h| {
+        Argon2::default().verify_password(t, h).is_ok()
     })
 }
 
-/// Fixed Argon2id PHC hash used as a constant-time placeholder when an
-/// API-key slot is expired, malformed, or follows the matching slot.
+/// Fixed Argon2id PHC hash used as a constant-time placeholder for
+/// unparseable/malformed hashes and for slots encountered after the active
+/// match has already been found.
 ///
 /// Generated once on first access using the same default Argon2 cost
-/// parameters as live verifications, so the dummy verify takes
-/// indistinguishable wall time from a real one. The plaintext
+/// parameters produced by [`generate_api_key`]. Uniform timing assumes
+/// configured keys keep those defaults; operator-supplied hashes with different
+/// PHC costs are not normalized by this crate. The plaintext
 /// (`"rmcp-server-kit-dummy"`) and the fixed salt are unrelated to any
 /// real credential - randomness is unnecessary because this hash is
 /// only ever compared against attacker-supplied input on slots that
 /// will be discarded regardless of match result. Argon2's work factor is
 /// set by the PHC `m`/`t`/`p` parameters, not by the salt value, so a
-/// fixed salt costs exactly what a random one would;
-/// `dummy_and_real_hashes_share_cost_parameters` pins that equivalence.
+/// fixed salt costs exactly what a random one would.
 static DUMMY_PHC_HASH: LazyLock<String> = LazyLock::new(|| {
     #[allow(
         clippy::expect_used,
@@ -1574,6 +1662,8 @@ struct AuthFailureFields {
     mcp_session: Option<bool>,
     mcp_protocol_version: Option<String>,
     credential_fp: Option<String>,
+    credential_owner: Option<String>,
+    credential_rejection: Option<&'static str>,
 }
 
 fn user_agent_for_log(headers: &axum::http::HeaderMap) -> String {
@@ -1633,7 +1723,11 @@ fn token_kind(token: &str) -> &'static str {
     if valid { "jwt" } else { "opaque" }
 }
 
-fn auth_failure_fields(ctx: &AuthLogContext, req: &Request<Body>) -> AuthFailureFields {
+fn auth_failure_fields(
+    ctx: &AuthLogContext,
+    req: &Request<Body>,
+    owner: Option<&CredentialOwner>,
+) -> AuthFailureFields {
     let fields = &ctx.fields;
     let headers = req.headers();
     let bearer = headers
@@ -1669,11 +1763,23 @@ fn auth_failure_fields(ctx: &AuthLogContext, req: &Request<Body>) -> AuthFailure
             bearer
                 .map(|token| crate::rbac::redact_with_salt(salt.expose_secret().as_bytes(), token))
         }),
+        credential_owner: fields.credential_owner.then_some(owner).flatten().map(|o| {
+            crate::transport::sanitize_for_log(&o.name, crate::transport::MAX_LOGGED_HEADER_CHARS)
+        }),
+        credential_rejection: fields
+            .credential_owner
+            .then_some(owner.map(|o| o.reason.as_str()))
+            .flatten(),
     }
 }
 
-fn log_auth_failure(failure_class: AuthFailureClass, ctx: &AuthLogContext, req: &Request<Body>) {
-    let fields = auth_failure_fields(ctx, req);
+fn log_auth_failure(
+    failure_class: AuthFailureClass,
+    owner: Option<&CredentialOwner>,
+    ctx: &AuthLogContext,
+    req: &Request<Body>,
+) {
+    let fields = auth_failure_fields(ctx, req, owner);
     tracing::warn!(
         failure_class = %failure_class.as_str(),
         client_ip = fields.client_ip.map(tracing::field::display),
@@ -1687,6 +1793,8 @@ fn log_auth_failure(failure_class: AuthFailureClass, ctx: &AuthLogContext, req: 
         mcp_session = fields.mcp_session,
         mcp_protocol_version = fields.mcp_protocol_version.as_deref(),
         credential_fp = fields.credential_fp.as_deref().map(tracing::field::display),
+        credential_owner = fields.credential_owner.as_deref(),
+        credential_rejection = fields.credential_rejection.map(tracing::field::display),
         "auth failed"
     );
 }
@@ -1724,50 +1832,79 @@ fn unauthorized_response(state: &AuthState, failure_class: AuthFailureClass) -> 
 // cancel-safe: no shared-state mutation. The Argon2 verification is offloaded
 // to `spawn_blocking`; dropping its `JoinHandle` on cancellation detaches the
 // task (the hash completes off-task, harmlessly) rather than tearing partial
-// state. The OAuth branch delegates to `validate_token_with_reason`, which is
+// state. The OAuth branch delegates to `validate_token_detailed`, which is
 // itself cancel-safe (read-only JWKS lookup + pure claim checks).
 async fn authenticate_bearer_identity(
     state: &AuthState,
     token: &str,
-) -> Result<AuthIdentity, AuthFailureClass> {
+) -> Result<AuthIdentity, AuthRejection> {
     let mut failure_class = AuthFailureClass::MissingCredential;
+    let mut owner = None;
 
     #[cfg(feature = "oauth")]
     if let Some(ref cache) = state.jwks_cache
         && crate::oauth::looks_like_jwt(token)
     {
-        match cache.validate_token_with_reason(token).await {
+        match cache
+            .validate_token_detailed(token, state.log_context.fields.credential_owner)
+            .await
+        {
             Ok(mut id) => {
                 id.raw_token = Some(SecretString::from(token.to_owned()));
                 return Ok(id);
             }
-            Err(crate::oauth::JwtValidationFailure::Expired) => {
-                failure_class = AuthFailureClass::ExpiredCredential;
-            }
-            Err(crate::oauth::JwtValidationFailure::Invalid) => {
-                failure_class = AuthFailureClass::InvalidCredential;
+            Err(rejection) => {
+                failure_class = match rejection.failure {
+                    crate::oauth::JwtValidationFailure::Expired => {
+                        AuthFailureClass::ExpiredCredential
+                    }
+                    crate::oauth::JwtValidationFailure::Invalid => {
+                        AuthFailureClass::InvalidCredential
+                    }
+                };
+                owner = rejection.owner;
             }
         }
     }
 
     let token = token.to_owned();
     let keys = state.api_keys.load_full(); // Arc clone, lock-free
+    let keys_for_verify = Arc::clone(&keys);
 
     // Argon2id is CPU-bound - offload to blocking thread pool.
-    let identity = tokio::task::spawn_blocking(move || verify_bearer_token(&token, &keys))
-        .await
-        .ok()
-        .flatten();
+    let verdict =
+        tokio::task::spawn_blocking(move || verify_bearer_token_verdict(&token, &keys_for_verify))
+            .await
+            .ok();
 
-    if let Some(id) = identity {
-        return Ok(id);
+    match verdict {
+        Some(ApiKeyVerdict::Active { name, role }) => {
+            return Ok(AuthIdentity {
+                name,
+                role,
+                method: AuthMethod::BearerToken,
+                raw_token: None,
+                sub: None,
+            });
+        }
+        Some(ApiKeyVerdict::Expired { name }) => {
+            failure_class = AuthFailureClass::ExpiredCredential;
+            owner = Some(CredentialOwner {
+                name,
+                reason: RejectionReason::Expired,
+            });
+        }
+        Some(ApiKeyVerdict::NoMatch) | None => {}
     }
 
     if failure_class == AuthFailureClass::MissingCredential {
         failure_class = AuthFailureClass::InvalidCredential;
     }
 
-    Err(failure_class)
+    Err(AuthRejection {
+        failure_class,
+        owner,
+    })
 }
 
 /// Consult the pre-auth abuse gate for the given peer.
@@ -1917,15 +2054,20 @@ pub(crate) async fn auth_middleware(
                     req.extensions_mut().insert(id);
                     return next.run(req).await;
                 }
-                Err(class) => class,
+                Err(rejection) => (rejection.failure_class, rejection.owner),
             },
-            None => AuthFailureClass::InvalidCredential,
+            None => (AuthFailureClass::InvalidCredential, None),
         }
     } else {
-        AuthFailureClass::MissingCredential
+        (AuthFailureClass::MissingCredential, None)
     };
 
-    log_auth_failure(failure_class, &state.log_context, &req);
+    log_auth_failure(
+        failure_class.0,
+        failure_class.1.as_ref(),
+        &state.log_context,
+        &req,
+    );
 
     // Rate limit check (applied after auth failure only).
     // Successful authentications do not consume rate limit budget.
@@ -1938,8 +2080,8 @@ pub(crate) async fn auth_middleware(
         return resp;
     }
 
-    state.counters.record_failure(failure_class);
-    unauthorized_response(&state, failure_class)
+    state.counters.record_failure(failure_class.0);
+    unauthorized_response(&state, failure_class.0)
 }
 
 #[cfg(test)]
@@ -2047,6 +2189,24 @@ mod tests {
     }
 
     #[test]
+    fn verify_bearer_token_uses_the_matched_slot_role() {
+        let (admin_token, admin_hash) = generate_api_key().unwrap();
+        let (viewer_token, viewer_hash) = generate_api_key().unwrap();
+        let keys = vec![
+            ApiKeyEntry::new("svc", admin_hash, "admin"),
+            ApiKeyEntry::new("svc", viewer_hash, "viewer"),
+        ];
+
+        let viewer = verify_bearer_token(&viewer_token, &keys)
+            .expect("viewer token must authenticate from its own slot");
+        let admin = verify_bearer_token(&admin_token, &keys)
+            .expect("admin token must authenticate from its own slot");
+
+        assert_eq!(viewer.role, "viewer");
+        assert_eq!(admin.role, "admin");
+    }
+
+    #[test]
     fn wrong_token_rejected() {
         let (_token, hash) = generate_api_key().unwrap();
         let keys = vec![ApiKeyEntry {
@@ -2142,6 +2302,156 @@ mod tests {
         let id = verify_bearer_token(&token, &keys)
             .expect("valid slot following a malformed-hash slot must authenticate");
         assert_eq!(id.name, "valid");
+    }
+
+    fn fixed_now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .expect("fixed timestamp parses")
+            .with_timezone(&chrono::Utc)
+    }
+
+    fn slot_key(name: &str, hash: &str, expires_at: Option<&str>) -> ApiKeyEntry {
+        let mut key = ApiKeyEntry::new(name, hash, "viewer");
+        if let Some(expiry) = expires_at {
+            key.expires_at = Some(RfcTimestamp::parse(expiry).expect("expiry parses"));
+        }
+        key
+    }
+
+    #[test]
+    fn slots_no_match_verifies_every_slot() {
+        let keys = vec![
+            slot_key("a", ARGON2_0_5_HASH, None),
+            slot_key("b", ARGON2_0_5_HASH, None),
+            slot_key("old", ARGON2_0_5_HASH, Some("2020-01-01T00:00:00Z")),
+        ];
+        let mut calls = Vec::new();
+
+        let verdict = verify_slots("unknown", &keys, fixed_now(), |_, hash| {
+            calls.push(hash.to_string());
+            false
+        });
+
+        assert_eq!(verdict, ApiKeyVerdict::NoMatch);
+        assert_eq!(calls.len(), keys.len());
+        assert_eq!(calls.get(2).map(String::as_str), Some(ARGON2_0_5_HASH));
+    }
+
+    #[test]
+    fn slots_active_then_expired_same_secret() {
+        let keys = vec![
+            slot_key("new", ARGON2_0_5_HASH, None),
+            slot_key("old", ARGON2_0_5_HASH, Some("2020-01-01T00:00:00Z")),
+        ];
+        let mut calls = Vec::new();
+
+        let verdict = verify_slots(ARGON2_0_5_TOKEN, &keys, fixed_now(), |token, hash| {
+            calls.push(hash.to_string());
+            hash.to_string() == ARGON2_0_5_HASH && token == ARGON2_0_5_TOKEN.as_bytes()
+        });
+
+        assert_eq!(
+            verdict,
+            ApiKeyVerdict::Active {
+                name: "new".into(),
+                role: "viewer".into()
+            }
+        );
+        assert_eq!(calls.len(), keys.len());
+        assert_eq!(calls.get(1).map(String::as_str), Some(ARGON2_0_5_HASH));
+    }
+
+    #[test]
+    fn slots_expired_then_active_same_secret() {
+        let keys = vec![
+            slot_key("old", ARGON2_0_5_HASH, Some("2020-01-01T00:00:00Z")),
+            slot_key("new", ARGON2_0_5_HASH, None),
+        ];
+
+        let verdict = verify_slots(ARGON2_0_5_TOKEN, &keys, fixed_now(), |token, hash| {
+            hash.to_string() == ARGON2_0_5_HASH && token == ARGON2_0_5_TOKEN.as_bytes()
+        });
+
+        assert_eq!(
+            verdict,
+            ApiKeyVerdict::Active {
+                name: "new".into(),
+                role: "viewer".into()
+            }
+        );
+    }
+
+    #[test]
+    fn slots_malformed_hash_uses_dummy() {
+        let keys = vec![
+            slot_key("broken", "not-a-phc", None),
+            slot_key("old", ARGON2_0_5_HASH, Some("2020-01-01T00:00:00Z")),
+        ];
+        let mut calls = Vec::new();
+
+        let verdict = verify_slots("unknown", &keys, fixed_now(), |_, hash| {
+            calls.push(hash.to_string());
+            false
+        });
+
+        assert_eq!(verdict, ApiKeyVerdict::NoMatch);
+        assert_eq!(calls.len(), keys.len());
+        assert_eq!(
+            calls.first().map(String::as_str),
+            Some(DUMMY_PHC_HASH.as_str())
+        );
+        assert_eq!(calls.get(1).map(String::as_str), Some(ARGON2_0_5_HASH));
+    }
+
+    #[test]
+    fn slots_all_expired_reports_first_expired_match() {
+        let keys = vec![
+            slot_key("first", ARGON2_0_5_HASH, Some("2020-01-01T00:00:00Z")),
+            slot_key("second", ARGON2_0_5_HASH, Some("2020-01-01T00:00:00Z")),
+        ];
+
+        let verdict = verify_slots(ARGON2_0_5_TOKEN, &keys, fixed_now(), |token, hash| {
+            hash.to_string() == ARGON2_0_5_HASH && token == ARGON2_0_5_TOKEN.as_bytes()
+        });
+
+        assert_eq!(
+            verdict,
+            ApiKeyVerdict::Expired {
+                name: "first".into()
+            }
+        );
+    }
+
+    #[test]
+    fn slots_blank_name_expired_is_no_match() {
+        let keys = vec![slot_key(
+            "  ",
+            ARGON2_0_5_HASH,
+            Some("2020-01-01T00:00:00Z"),
+        )];
+
+        let verdict = verify_slots(ARGON2_0_5_TOKEN, &keys, fixed_now(), |token, hash| {
+            hash.to_string() == ARGON2_0_5_HASH && token == ARGON2_0_5_TOKEN.as_bytes()
+        });
+
+        assert_eq!(verdict, ApiKeyVerdict::NoMatch);
+    }
+
+    #[test]
+    fn verdict_reports_expired_match_by_name() {
+        let keys = vec![slot_key(
+            "old-key",
+            ARGON2_0_5_HASH,
+            Some("2020-01-01T00:00:00Z"),
+        )];
+
+        assert_eq!(
+            verify_bearer_token_verdict(ARGON2_0_5_TOKEN, &keys),
+            ApiKeyVerdict::Expired {
+                name: "old-key".into()
+            }
+        );
+        assert!(verify_bearer_token(ARGON2_0_5_TOKEN, &keys).is_none());
     }
 
     // Regression tests for H3 (api_key_expires_at_fail_open).
@@ -2600,6 +2910,7 @@ mod tests {
         body::Body,
         http::{Request, StatusCode},
     };
+    use http_body_util::BodyExt as _;
     use tower::ServiceExt as _;
 
     fn auth_router(state: Arc<AuthState>) -> axum::Router {
@@ -3019,6 +3330,122 @@ mod tests {
 
         let counters = state.counters_snapshot();
         assert_eq!(counters.failure_invalid_credential, 1);
+    }
+
+    #[tokio::test]
+    async fn expired_api_key_gets_expired_credential_challenge() {
+        let key = slot_key("old-key", ARGON2_0_5_HASH, Some("2020-01-01T00:00:00Z"));
+        let state = test_auth_state(vec![key]);
+        let app = auth_router(Arc::clone(&state));
+        let req = Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/mcp")
+            .header(header::AUTHORIZATION, format!("Bearer {ARGON2_0_5_TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let challenge = resp
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(challenge.contains("error_description=\"token is expired\""));
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"unauthorized: expired credential");
+        let counters = state.counters_snapshot();
+        assert_eq!(counters.failure_expired_credential, 1);
+        assert_eq!(counters.failure_invalid_credential, 0);
+
+        let req = Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/mcp")
+            .header(header::AUTHORIZATION, "Bearer garbage-token")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let challenge = resp
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(challenge.contains("error_description=\"token is invalid\""));
+        let counters = state.counters_snapshot();
+        assert_eq!(counters.failure_invalid_credential, 1);
+    }
+
+    #[tokio::test]
+    async fn credential_owner_logged_for_expired_api_key_only_when_enabled() {
+        for (enabled, expected_owner) in [(true, true), (false, false)] {
+            let fields = LogContextConfig {
+                credential_owner: enabled,
+                ..LogContextConfig::default()
+            };
+            let state = test_auth_state_with_log_context(
+                vec![slot_key(
+                    "old-key",
+                    ARGON2_0_5_HASH,
+                    Some("2020-01-01T00:00:00Z"),
+                )],
+                fields,
+            );
+            let mut req = auth_request("/mcp");
+            req.headers_mut().insert(
+                header::AUTHORIZATION,
+                axum::http::HeaderValue::from_static("Bearer golden-vector-token-0p5p3"),
+            );
+
+            let (status, logs) = capture_auth_failure_log(state, req).await;
+
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            let line = assert_auth_failed_line(&logs, "failure_class=expired_credential");
+            if expected_owner {
+                assert!(line.contains("credential_owner=\"old-key\""), "{line}");
+                assert!(line.contains("credential_rejection=expired"), "{line}");
+            } else {
+                assert!(
+                    line.ends_with("auth failed failure_class=expired_credential"),
+                    "{line}"
+                );
+            }
+            assert!(!logs.contains(ARGON2_0_5_TOKEN), "{logs}");
+        }
+    }
+
+    #[tokio::test]
+    async fn no_owner_for_unknown_bearer() {
+        let fields = knobs(|ctx| ctx.credential_owner = true);
+        let state = test_auth_state_with_log_context(
+            vec![slot_key(
+                "old-key",
+                ARGON2_0_5_HASH,
+                Some("2020-01-01T00:00:00Z"),
+            )],
+            fields,
+        );
+        let mut req = auth_request("/mcp");
+        req.headers_mut().insert(
+            header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer not-a-key"),
+        );
+
+        let (_, logs) = capture_auth_failure_log(Arc::clone(&state), req).await;
+
+        let line = assert_auth_failed_line(&logs, "failure_class=invalid_credential");
+        assert!(!line.contains("credential_owner"), "{line}");
+
+        let mut req = auth_request("/mcp");
+        req.headers_mut().insert(
+            header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer golden-vector-token-0p5p3"),
+        );
+        let (_, logs) = capture_auth_failure_log(state, req).await;
+        let line = assert_auth_failed_line(&logs, "failure_class=expired_credential");
+        assert!(line.contains("credential_owner=\"old-key\""), "{line}");
     }
 
     #[tokio::test]
