@@ -31,7 +31,7 @@
 //! `observability.log_*` keys are applied by
 //! [`init_tracing_from_config_strict`](crate::observability::init_tracing_from_config_strict).
 //! Builder-only consumers that never touch TOML can call
-//! [`set_diagnostic_exposure`] directly.
+//! [`crate::diagnostics::set_diagnostic_exposure`] directly.
 //!
 //! ```
 //! use rmcp_server_kit::diagnostics::{DiagnosticExposure, set_diagnostic_exposure};

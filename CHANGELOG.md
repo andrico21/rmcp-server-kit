@@ -84,6 +84,14 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   attribution for these hits moves from `failure_invalid_credential` to
   `failure_expired_credential`.
 
+### Fixed
+
+- **Stable rustdoc builds are warning-free** - the module-level doc links in
+  `diagnostics`, `bounded_limiter` and `tool_hooks` now use fully-qualified
+  intra-doc paths, so `RUSTDOCFLAGS="-D warnings" cargo +stable doc --no-deps
+  --all-features` succeeds. A new `Rustdoc (stable)` CI job guards this on
+  GitHub, with a matching step in the GitLab `rustdoc` job.
+
 ### Notes
 
 - This is a minor release under the policy above because it changes a runtime
