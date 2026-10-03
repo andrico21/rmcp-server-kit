@@ -1006,4 +1006,4 @@ itself is at `src/transport.rs:4773`.
 - [`MINDMAP.md`](MINDMAP.md) - the same information, but visual.
 - [`../AGENTS.md`](../AGENTS.md) - quick-orientation hub for agents.
 - [`GUIDE.md`](GUIDE.md) - consumer-facing usage examples.
-- [`../RUST_GUIDELINES.md`](../RUST_GUIDELINES.md) - coding standards.
+- [`../RUST_GUIDELINES.md`](../RUST_GUIDELINES.md) - index of the vendored coding standards; the core is at [`rust-guidelines/RUST_GUIDELINES.md`](rust-guidelines/RUST_GUIDELINES.md).

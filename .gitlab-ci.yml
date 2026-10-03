@@ -264,7 +264,8 @@ docs-validate:
   needs: []
   script:
     - rtk cargo nextest run --all-features --test docs_citations
-    - rtk lychee --offline --no-progress README.md docs/*.md
+    - (cd docs/rust-guidelines && sha256sum -c SHA256SUMS)
+    - rtk lychee --offline --no-progress README.md RUST_GUIDELINES.md docs/*.md
 
 # ---------------------------------------------------------------------------
 # Docs stage: rustdoc + SECURITY.md grep gates (mirrors GitHub `docs` job)
