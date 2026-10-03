@@ -7490,14 +7490,17 @@ role = "admin"
     #[test]
     fn resolve_claim_path_missing_returns_empty() {
         let extra = HashMap::new();
-        assert!(resolve_claim_path(&extra, "nonexistent.path").is_empty());
+        assert_eq!(
+            resolve_claim_path(&extra, "nonexistent.path"),
+            Vec::<&str>::new()
+        );
     }
 
     #[test]
     fn resolve_claim_path_numeric_leaf_returns_empty() {
         let mut extra = HashMap::new();
         extra.insert("count".into(), serde_json::json!(42));
-        assert!(resolve_claim_path(&extra, "count").is_empty());
+        assert_eq!(resolve_claim_path(&extra, "count"), Vec::<&str>::new());
     }
 
     fn make_claims(json: serde_json::Value) -> Claims {
@@ -7543,7 +7546,10 @@ role = "admin"
             "iss": "https://issuer.example.com",
             "exp": 9_999_999_999_u64,
         }));
-        assert!(first_class_claim_values(&claims, "realm_access.roles").is_empty());
+        assert_eq!(
+            first_class_claim_values(&claims, "realm_access.roles"),
+            Vec::<String>::new()
+        );
     }
 
     // -----------------------------------------------------------------------
