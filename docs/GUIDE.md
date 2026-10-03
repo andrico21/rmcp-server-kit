@@ -1682,6 +1682,12 @@ Spawns a dedicated HTTP listener serving `/metrics` in Prometheus text format.
 You don't call this directly -- rmcp-server-kit spawns it automatically when
 `metrics_enabled = true` on `McpServerConfig`.
 
+The listener applies the same OWASP security response headers as the main
+router (see [Customising security headers](#customising-security-headers)), and the operator's
+`security_headers` overrides and omissions apply to `/metrics` as well. The
+metrics listener is always plaintext regardless of the main server's TLS
+setting, so it never sends `Strict-Transport-Security`.
+
 #### Registering custom collectors (`with_metrics_handle`)
 
 The registry the server actually serves is otherwise constructed inside the

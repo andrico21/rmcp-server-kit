@@ -276,6 +276,11 @@ path = "tests/integration/metrics_handle.rs"
 required-features = ["metrics"]
 
 [[test]]
+name = "metrics_headers"
+path = "tests/integration/metrics_headers.rs"
+required-features = ["metrics"]
+
+[[test]]
 name = "oauth_http_client"
 path = "tests/integration/oauth_http_client.rs"
 required-features = ["oauth", "test-helpers"]

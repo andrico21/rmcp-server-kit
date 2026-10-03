@@ -19,6 +19,7 @@ use prometheus::{
 };
 
 use crate::error::RmcpServerKitError;
+use crate::transport::{SecurityHeadersConfig, security_headers_middleware};
 
 /// Default Prometheus histogram buckets for HTTP request latency
 /// (seconds). Tuned for low-latency service work: sub-millisecond
@@ -168,13 +169,45 @@ pub async fn serve_metrics(
     metrics: Arc<McpMetrics>,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<(), RmcpServerKitError> {
-    let app = axum::Router::new().route(
-        "/metrics",
-        axum::routing::get(move || {
-            let m = Arc::clone(&metrics);
-            async move { m.encode() }
-        }),
-    );
+    serve_metrics_with_security_headers(bind, metrics, shutdown, SecurityHeadersConfig::default())
+        .await
+}
+
+/// Spawn a dedicated plaintext HTTP listener that serves Prometheus metrics on
+/// `/metrics`, decorated with the same OWASP security headers as the main
+/// router.
+///
+/// This is the [`serve_metrics`] body with an operator-supplied
+/// [`SecurityHeadersConfig`]. The metrics listener is always plaintext - the
+/// main server's TLS setting does not apply to it - so `is_tls` is fixed to
+/// `false` and no `Strict-Transport-Security` header is emitted. Overrides and
+/// omissions in `security_headers` are honoured exactly as on the main router.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Startup`] if the TCP listener cannot bind or the
+/// underlying axum server fails.
+// cancel-safe: same as [`serve_metrics`] - the parent server cancels via
+// `shutdown.cancelled()` inside axum graceful shutdown; dropping this future
+// only drops the listener/app, with no metrics registry mutation.
+pub(crate) async fn serve_metrics_with_security_headers(
+    bind: String,
+    metrics: Arc<McpMetrics>,
+    shutdown: tokio_util::sync::CancellationToken,
+    security_headers: SecurityHeadersConfig,
+) -> Result<(), RmcpServerKitError> {
+    let cfg = Arc::new(security_headers);
+    let app = axum::Router::new()
+        .route(
+            "/metrics",
+            axum::routing::get(move || {
+                let m = Arc::clone(&metrics);
+                async move { m.encode() }
+            }),
+        )
+        .layer(axum::middleware::from_fn(move |req, next| {
+            security_headers_middleware(false, Arc::clone(&cfg), req, next)
+        }));
 
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
