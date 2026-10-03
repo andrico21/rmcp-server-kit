@@ -100,6 +100,12 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   `rust-version` check naming `rustc 1.99.0`. The CI MSRV job now pins 1.99.0
   and builds with `--cap-lints=warn` (compile compatibility only; lints are
   enforced on the latest stable). See `docs/MIGRATION.md` 3.15.
+- **Tiered test layout (internal)** - the 17 flat `tests/*.rs` files moved into
+  `tests/unit/` and `tests/integration/`, one crate per file, with explicit
+  `[[test]]` targets in `Cargo.toml` (names unchanged, so `cargo test --test X`
+  keeps working). `required-features` replaces the crate-level
+  `#![cfg(feature = ...)]` gates: running a gated target without its features now
+  errors instead of silently running an empty binary. No test behavior changes.
 
 ### Fixed
 

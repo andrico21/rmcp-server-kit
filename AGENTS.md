@@ -59,7 +59,25 @@ Z:\TempPersistent\rmcp-server-kit\
 │   ├── error.rs                RmcpServerKitError + IntoResponse mapping
 │   └── secret.rs               Re-exports of `secrecy` wrappers
 ├── tests/
-│   └── e2e.rs                Integration / E2E tests - spawns serve() on ephemeral ports
+│   ├── unit/                 In-process tests (no I/O)
+│   │   ├── crl_discovery_ratelimit.rs
+│   │   ├── crl_h3_regression.rs      (feature = "test-helpers")
+│   │   ├── crl_map_bounds.rs         (feature = "test-helpers")
+│   │   ├── oauth_url_validation.rs   (feature = "oauth")
+│   │   └── properties.rs
+│   └── integration/          Loopback ports, `wiremock`, or file reads
+│       ├── crl_ssrf.rs
+│       ├── delegation_guard.rs
+│       ├── docs_citations.rs
+│       ├── e2e.rs            Spawns serve() on ephemeral ports
+│       ├── e2e_oauth_mtls.rs        (features = "oauth", "oauth-mtls-client", "test-helpers")
+│       ├── jwks_key_cap.rs          (features = "oauth", "test-helpers")
+│       ├── jwks_redirect_ssrf.rs    (features = "oauth", "test-helpers")
+│       ├── limiter_memory.rs        (#[ignore]d release RSS gate)
+│       ├── metrics_handle.rs        (feature = "metrics")
+│       ├── oauth_http_client.rs     (features = "oauth", "test-helpers")
+│       ├── origin_validation.rs
+│       └── ssrf_resolver.rs         (features = "oauth", "test-helpers")
 ├── examples/
 │   ├── minimal_server.rs     Minimal runnable example (`cargo run --example minimal_server`)
 │   ├── api_key_rbac.rs       API-key auth + RBAC + argument allowlist example
@@ -147,28 +165,35 @@ Z:\TempPersistent\rmcp-server-kit\
 ### Test tiers
 
 Per the vendored core [`docs/rust-guidelines/RUST_GUIDELINES.md`](docs/rust-guidelines/RUST_GUIDELINES.md) §13 ("DO: Separate test tiers"),
-tiers here are expressed by **file name and cfg gate** rather than by directory.
-Every tier below is autonomous - no test requires a live external service or
+tests live in one of two directories, one file per test crate. There is no `e2e`
+tier: every test is autonomous - no test requires a live external service or
 human-assisted setup; outbound HTTP is faked with `wiremock` and servers bind
 ephemeral loopback ports.
 
 | Tier | Where | Needs | Run |
 |------|-------|-------|-----|
-| **Unit** | `#[cfg(test)] mod tests` inside `src/*.rs` | nothing | `cargo test --all-features --lib` |
-| **Property** | `tests/properties.rs` | `proptest` | `cargo test --all-features --test properties` |
-| **Integration (pure)** | `tests/crl_discovery_ratelimit.rs`, `crl_h3_regression.rs`, `crl_map_bounds.rs`, `delegation_guard.rs`, `oauth_url_validation.rs` | nothing | `cargo test --all-features` |
-| **Integration (mocked HTTP)** | `tests/crl_ssrf.rs`, `jwks_key_cap.rs`, `jwks_redirect_ssrf.rs`, `oauth_http_client.rs` | `wiremock` | `cargo test --all-features` |
-| **E2E (binds sockets)** | `tests/e2e.rs`, `e2e_oauth_mtls.rs`, `ssrf_resolver.rs`, `docs_citations.rs` | ephemeral loopback ports | `cargo test --all-features --test e2e` |
-| **Perf / bounded-memory** | `tests/limiter_memory.rs` | `#[ignore]`d - too heavy for shared runners | `cargo test --release --all-features --test limiter_memory -- --ignored --nocapture` |
+| **Unit** | `tests/unit/*.rs` (plus `#[cfg(test)] mod tests` inside `src/*.rs`) | nothing - no I/O, no network | `cargo test --all-features --test properties` etc. |
+| **Integration** | `tests/integration/*.rs` | loopback ports, `wiremock`, or file reads | `cargo test --all-features` |
 | **Benches** | `benches/rbac_redaction.rs`, `hook_latency.rs` | - | `cargo bench` |
 
-**Feature gates matter.** Several files are `#![cfg(...)]`-gated and compile to
-nothing without the right features, so a bare `cargo test` silently skips them:
+`tests/unit/` (in-process): `crl_discovery_ratelimit`, `crl_h3_regression`,
+`crl_map_bounds`, `oauth_url_validation`, `properties`.
+
+`tests/integration/` (loopback ports, `wiremock` or file reads): `crl_ssrf`,
+`delegation_guard`, `docs_citations`, `e2e`, `e2e_oauth_mtls`, `jwks_key_cap`,
+`jwks_redirect_ssrf`, `limiter_memory` (`#[ignore]`d), `metrics_handle`,
+`oauth_http_client`, `origin_validation`, `ssrf_resolver`.
+
+**Feature-gated targets.** Each test file is declared with an explicit `[[test]]`
+target in `Cargo.toml`; nine of them carry `required-features`, so running a
+gated target without its features now **errors** with "requires the features"
+instead of silently running an empty binary:
 
 - `test-helpers`: `crl_h3_regression`, `crl_map_bounds`
 - `oauth`: `oauth_url_validation`
 - `oauth` **and** `test-helpers`: `jwks_key_cap`, `jwks_redirect_ssrf`,
   `oauth_http_client`, `ssrf_resolver`, `e2e_oauth_mtls`
+- `metrics`: `metrics_handle`
 
 Always use `--all-features` locally; CI additionally runs a feature matrix so
 the default-feature build is covered too.
@@ -193,7 +218,7 @@ consumer applications and `examples/`.
 | Config builder                           | [`src/transport.rs`](src/transport.rs) - `McpServerConfig::new` (~line 536) | Builder-style config struct                                                                       |
 | Hot-reload handle                        | [`src/transport.rs`](src/transport.rs) - `ReloadHandle` (~line 1816)   | `try_reload_auth_keys` / `reload_auth_keys` / `reload_rbac` for runtime reconfig without restart      |
 | Runnable example                         | [`examples/minimal_server.rs`](examples/minimal_server.rs)            | Smallest possible consumer of `serve()`                                                                |
-| E2E reference                            | [`tests/e2e.rs`](tests/e2e.rs)                                        | Real-world usage patterns; use as an integration cookbook                                              |
+| Integration reference                    | [`tests/integration/e2e.rs`](tests/integration/e2e.rs)                | Real-world usage patterns; use as an integration cookbook                                              |
 
 ---
 
@@ -292,7 +317,7 @@ The core's current-Rust idioms (for example `Vec::push_mut` /
 3. Run `cargo build --all-features` to confirm a clean baseline.
 
 ### While editing
-1. **Add/change tests first** when modifying behaviour. E2E tests live in `tests/e2e.rs` and spawn a real server - that's the gold standard for integration coverage.
+1. **Add/change tests first** when modifying behaviour. The end-to-end tests live in `tests/integration/e2e.rs` and spawn a real server - that's the gold standard for integration coverage.
 2. Match existing patterns. This codebase is **disciplined** (consistent style, lints enforced, full docs). Follow conventions strictly.
 3. Use `tracing` for any output. Never `println!`/`eprintln!`/`dbg!`.
 4. Wrap secrets in `secrecy::Secret<T>` (re-exported via `src/secret.rs`).
@@ -348,7 +373,7 @@ The core's current-Rust idioms (for example `Vec::push_mut` /
 | Graceful shutdown (Ctrl-C / SIGTERM)           | `src/transport.rs` - `shutdown_signal()` (~line 3842) |
 | Hot-reload of keys / RBAC                      | `src/transport.rs` - `ReloadHandle` (~line 1816)       |
 | Environment variable override mapping          | `src/config.rs` - `ServerConfig::apply_env_overrides`, `ObservabilityConfig::apply_env_overrides`; `src/rbac.rs` - `RbacConfig::apply_env_overrides` |
-| `rmcp` / `rmcp-macros` version bump in `Cargo.toml` / `Cargo.lock` | `docs/RMCP_UPGRADE_CHECKLIST.md` - the checks to run; `tests/delegation_guard.rs` - the trait-surface guard |
+| `rmcp` / `rmcp-macros` version bump in `Cargo.toml` / `Cargo.lock` | `docs/RMCP_UPGRADE_CHECKLIST.md` - the checks to run; `tests/integration/delegation_guard.rs` - the trait-surface guard |
 
 ---
 
