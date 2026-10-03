@@ -3,7 +3,7 @@
 //! alignment with the same matcher.
 //!
 //! Each test spawns a real server on an ephemeral loopback port - the same
-//! harness pattern as `tests/e2e.rs` - and drives it with `reqwest`.
+//! harness pattern as `tests/integration/e2e.rs` - and drives it with `reqwest`.
 
 #![allow(
     clippy::unwrap_used,
@@ -46,10 +46,10 @@ impl Drop for Harness {
 }
 
 /// Spawn a server on an ephemeral loopback port and wait for its readiness
-/// signal, mirroring `tests/e2e.rs`'s deterministic harness.
+/// signal, mirroring `tests/integration/e2e.rs`'s deterministic harness.
 async fn spawn(config: McpServerConfig) -> Harness {
     // Ensure ring crypto provider is available for reqwest's TLS stack
-    // (mirrors tests/e2e.rs; harmless when already installed).
+    // (mirrors tests/integration/e2e.rs; harmless when already installed).
     rustls::crypto::ring::default_provider()
         .install_default()
         .ok();

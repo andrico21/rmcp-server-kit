@@ -684,7 +684,7 @@ impl CrlSet {
         self.refresh_urls(urls).await
     }
 
-    // cancel-safe: selects due URLs and delegates to efresh_urls, which
+    // cancel-safe: selects due URLs and delegates to refresh_urls, which
     // stages results locally before a single atomic commit.
     async fn refresh_due_urls(&self) -> Result<(), RmcpServerKitError> {
         let now = SystemTime::now();
@@ -1210,7 +1210,7 @@ impl CrlSet {
     }
 
     /// Test-only: current count of host semaphores. Used by
-    /// `tests/crl_map_bounds.rs` to assert the cap is enforced.
+    /// `tests/unit/crl_map_bounds.rs` to assert the cap is enforced.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     pub fn __test_host_semaphore_count(&self) -> usize {

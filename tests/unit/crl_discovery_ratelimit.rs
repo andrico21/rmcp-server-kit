@@ -26,7 +26,8 @@
 //! populated, masking both real bugs and real fixes.
 //!
 //! Component-level testing only: end-to-end exercise via the verifier
-//! requires a full mTLS handshake, which is already covered in `e2e.rs`.
+//! requires a full mTLS handshake, which is already covered in
+//! `tests/integration/e2e.rs`.
 
 #![allow(
     deprecated,
