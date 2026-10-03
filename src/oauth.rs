@@ -13,9 +13,12 @@
 //! authorization server via Protected Resource Metadata (RFC 9728) and
 //! perform the standard Authorization Code + PKCE flow transparently.
 #![cfg_attr(
-#![cfg_attr(feature = "oauth", expect(clippy::too_many_lines, reason = "lint-migration: src/oauth.rs"))]
     all(not(test), not(feature = "metrics"), feature = "oauth"),
     expect(clippy::cfg_not_test, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    feature = "oauth",
+    expect(clippy::too_many_lines, reason = "lint-migration: src/oauth.rs")
 )]
 #![cfg_attr(
     all(feature = "oauth", target_os = "linux"),
