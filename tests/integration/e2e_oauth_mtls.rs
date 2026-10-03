@@ -21,11 +21,6 @@
 #![allow(clippy::panic, reason = "tests")]
 #![allow(clippy::print_stderr, reason = "tests")]
 #![allow(clippy::indexing_slicing, reason = "tests")]
-#![cfg(all(
-    feature = "oauth",
-    feature = "oauth-mtls-client",
-    feature = "test-helpers"
-))]
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 

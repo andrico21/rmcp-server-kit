@@ -18,11 +18,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # `RUSTFLAGS="-D warnings"` denies warnings across every job. Cargo's
-  # `build.warnings` (stable since 1.97) is now within our 1.98 MSRV, but
-  # RUSTFLAGS is retained for parity with the GitLab mirror. See
-  # docs/RUST_1_95_NOTES.md.
-  RUSTFLAGS: "-D warnings"
+  # Warnings are denied by the committed .cargo/config.toml ([build] warnings
+  # = "deny"), for every job.
 
 jobs:
   fmt:
@@ -121,8 +118,8 @@ jobs:
       # `--force` and the floor matter together: rust-cache can restore an
       # older cargo-semver-checks from ~/.cargo/bin, and `cargo install`
       # would then skip the upgrade. Versions before 0.50 cannot parse the
-      # rustdoc JSON v60 emitted by Rust 1.98 and fail with
-      # "unsupported rustdoc format v60" -- a tooling error indistinguishable
+      # rustdoc JSON v61 emitted by Rust 1.99 and fail with
+      # "unsupported rustdoc format v61" -- a tooling error indistinguishable
       # from a real semver break in the CI log.
       - name: Install cargo-semver-checks
         run: cargo install cargo-semver-checks --locked --force --version '^0.50'
@@ -237,11 +234,20 @@ jobs:
         run: cargo audit
 
   msrv:
-    name: MSRV (1.98.0)
+    name: MSRV (1.99.0)
     runs-on: ubuntu-latest
+    # This job proves compile compatibility with `rust-version`, not lint
+    # cleanliness: lints are enforced on the latest stable (the clippy job).
+    # `--cap-lints=warn` caps rustc/clippy lints emitted by dependencies and
+    # by this crate, and CARGO_BUILD_WARNINGS=allow neutralises the committed
+    # `build.warnings = "deny"`. Recorded in the index's local deviations
+    # register.
+    env:
+      RUSTFLAGS: "--cap-lints=warn"
+      CARGO_BUILD_WARNINGS: allow
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2.9.1
       - run: rustc --version && cargo --version
       - run: cargo build --all-features
@@ -272,6 +278,17 @@ jobs:
         with:
           args: --offline --no-progress README.md RUST_GUIDELINES.md docs/*.md
           fail: true
+
+  lint-ratchet:
+    name: lint-ratchet self-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # stdlib-only Python (>= 3.11, tomllib); no Rust toolchain needed. GitLab
+      # deliberately does not run these (image python version unknown; GitHub is
+      # the canonical gate).
+      - name: Run every lint-ratchet self-test
+        run: for s in scripts/lint-ratchet/*.py; do python3 "$s" --self-test; done
 
   # ---------------------------------------------------------------------------
   # Supply-chain advisory jobs (Phase 2 / 1.1.0).
@@ -354,6 +371,11 @@ jobs:
     # manual dispatch.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     continue-on-error: true
+    # Mutation runs only need the build to compile. Deny-level lints make
+    # mutants unviable (a mutant often introduces an unused binding), so cap
+    # lints via `--cap-lints=true` and let warnings through for this job.
+    env:
+      CARGO_BUILD_WARNINGS: allow
     # Hard-cap each shard well below GitHub's 6h ceiling so it terminates
     # gracefully (allowing `continue-on-error` to take effect) instead of
     # being SIGKILLed and marking the entire workflow run as failed.
@@ -425,7 +447,8 @@ jobs:
 
         run: |
           set +e
-          timeout 170m cargo mutants --no-shuffle --timeout "$MUTANTS_TEST_TIMEOUT" -j 2 \
+          timeout 170m cargo mutants --no-shuffle --cap-lints=true \
+            --timeout "$MUTANTS_TEST_TIMEOUT" -j 2 \
             --sharding round-robin --shard ${{ matrix.shard }}/8 \
             -f src/rbac.rs -f src/auth.rs -f src/transport.rs \
             -f src/ssrf.rs -f src/mtls_revocation.rs \

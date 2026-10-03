@@ -1,0 +1,20 @@
+# Toolchain-driven deltas between the vendored core Section 9 profile and
+# Cargo.toml (D-14 iii).  Empty at the start; entries are added only by the
+# toolchain-drift procedure, each with the toolchain version that requires it.
+#
+# [[rename]]
+# from = "clippy::old_lint"
+# to = "clippy::new_lint"
+# toolchain = "1.100"
+#
+# [[removed]]
+# lint = "clippy::gone_lint"
+# toolchain = "1.100"
+#
+# [[level]]
+# lint = "clippy::some_lint"
+# level = "warn"
+# toolchain = "1.100"
+#
+# ``measure.py`` also reads this file: diagnostics of lints named as a
+# ``from`` (renamed-from) or ``lint`` (removed) are excluded from the count.

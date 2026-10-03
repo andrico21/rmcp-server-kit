@@ -11,7 +11,6 @@
 //!   IPv4 or IPv6 host in the URL string (any canonical form parsed by
 //!   [`url::Url`]).
 
-#![cfg(feature = "oauth")]
 #![allow(clippy::expect_used, reason = "tests")]
 #![allow(clippy::unwrap_used, reason = "tests")]
 #![allow(clippy::panic, reason = "tests")]

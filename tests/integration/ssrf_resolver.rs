@@ -34,7 +34,6 @@
 #![allow(clippy::expect_used, reason = "tests")]
 #![allow(clippy::unwrap_used, reason = "tests")]
 #![allow(clippy::panic, reason = "tests")]
-#![cfg(all(feature = "oauth", feature = "test-helpers"))]
 
 use std::time::Duration;
 

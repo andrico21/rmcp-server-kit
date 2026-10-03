@@ -105,6 +105,28 @@ will see these hits move from `failure_invalid_credential` to
 key under `[server.log_context]` fail to parse on 3.14.3 or older. Before
 rolling back to an older binary, remove those keys from the TOML file.
 
+### Minimum supported Rust is now 1.99
+
+`rust-version` moves from `1.98.0` to `1.99.0`. Under the project's SemVer
+policy an MSRV bump is a minor-version change, so no `rmcp` SDK major change is
+involved.
+
+The bump interacts with Cargo's dependency resolver:
+
+- Roots that use **resolver 3** (`resolver = "3"` in `Cargo.toml`, or
+  `edition = "2024"`) consider `rust-version` during resolution. They stay on a
+  `3.14.x` release while they are on Rust 1.98, and only move to the new minor
+  once their toolchain is 1.99 or newer. No action is needed.
+- Roots still on the **resolver-2 default** do not consider `rust-version`. On
+  `cargo update` they can pull this crate's next release and then fail the
+  `rust-version` check with an error naming `rustc 1.99.0`. Fix it by upgrading
+  the toolchain to Rust 1.99, or by pinning this crate to a `3.14.x` release
+  until then.
+
+The CI MSRV job pins `1.99.0` and builds with `--cap-lints=warn` so it proves
+compile compatibility with `rust-version` only; lints are enforced on the
+latest stable.
+
 ## Migrating to 3.14: same-named API keys must map to one role
 
 Two `auth.api_keys` entries that share a `name` but declare *different*
@@ -874,6 +896,6 @@ Both are opt-in to keep the default dependency footprint small.
 
 ## 6. Minimum supported Rust
 
-`rmcp-server-kit` targets stable Rust **1.98** or newer (`edition = "2024"`).
+`rmcp-server-kit` targets stable Rust **1.99** or newer (`edition = "2024"`).
 Bumping the MSRV is a minor-version change under the project's SemVer
 policy.
