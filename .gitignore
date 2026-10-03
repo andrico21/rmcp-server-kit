@@ -10,6 +10,8 @@
 *.swp
 *.swo
 *.log
+__pycache__/
+*.pyc
 
 # Cargo.lock IS committed, despite this being a library.
 #
