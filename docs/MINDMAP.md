@@ -220,11 +220,11 @@ mindmap
       Hot swap arc-swap
       Serde + serde_json + toml
     Tests + Examples
-      tests/e2e.rs
+      tests/integration/e2e.rs
         spawn_server L46-71
         Real server on ephemeral ports
         Integration cookbook
-      tests/delegation_guard.rs
+      tests/integration/delegation_guard.rs
         rmcp ServerHandler surface from the pinned source
         Wrapper impl presence and macro-origin pins
         SEMANTIC_DRIVERS completeness gate
@@ -445,7 +445,7 @@ graph TD
 | Prometheus metrics                | `src/metrics.rs` (feature `metrics`)     | `McpMetrics` L26, `serve_metrics` L95                                         |
 | Configuration (TOML)              | `src/config.rs` + `src/transport.rs`     | TOML schema + `McpServerConfig`                                               |
 | Error → HTTP mapping              | `src/error.rs`                           | `RmcpServerKitError` L13, `IntoResponse` L56                                           |
-| E2E reference                     | `tests/e2e.rs`                           | `spawn_server` L115                                                           |
+| Integration reference             | `tests/integration/e2e.rs`               | `spawn_server` L115                                                           |
 | Runnable examples                 | `examples/`                              | `minimal_server.rs`, `api_key_rbac.rs`, `oauth_server.rs`                    |
 
 ---

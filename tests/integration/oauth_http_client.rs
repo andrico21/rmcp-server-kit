@@ -39,7 +39,6 @@
 #![allow(clippy::print_stderr, reason = "tests")]
 #![allow(clippy::indexing_slicing, reason = "tests")]
 #![allow(dead_code, reason = "PEM fields kept for symmetry / future tests")]
-#![cfg(all(feature = "oauth", feature = "test-helpers"))]
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 

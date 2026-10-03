@@ -1517,7 +1517,7 @@ mod tests {
     /// Maps every method the `RbacContextHandler` `ServerHandler` impl defines
     /// to the test that proves the inner handler was reached.
     ///
-    /// Parsed by `tests/delegation_guard.rs`, which asserts this table covers
+    /// Parsed by `tests/integration/delegation_guard.rs`, which asserts this table covers
     /// exactly its `DIRECTLY_DELEGATED ∪ BEHAVIORAL_WRAPPED` classification --
     /// so a method cannot be added or reclassified without a driver. The nine
     /// methods attributed to the macro-body drivers are each discharged by that
@@ -1641,7 +1641,7 @@ mod tests {
         ),
     ];
 
-    /// `SEMANTIC_DRIVERS` is parsed by `tests/delegation_guard.rs`; this
+    /// `SEMANTIC_DRIVERS` is parsed by `tests/integration/delegation_guard.rs`; this
     /// in-crate check keeps the constant referenced (so it cannot rot as dead
     /// code) and rejects duplicate entries, which the source-level parser
     /// cannot see.
