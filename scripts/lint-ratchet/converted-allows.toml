@@ -1,8 +1,15 @@
 # (file, lint, reason) triples of the outer `#[allow]` attributes that task 11
-# converted to permanent `#[expect]` (D-6''). `catalog_gate.py` exempts these from the
-# catalog prefixes; they keep their pre-migration reviewed reasons. Rows whose lint was
-# stale (unfulfilled in every config) were removed. Regenerated, never hand-edited.
-
+# converted to permanent `#[expect]` (D-6''). `catalog_gate.py` exempts these
+# from the catalog prefixes; they keep their pre-migration reviewed reasons.
+#
+# Accounting (re-inventoried at the pre-switch HEAD): 174 allow attributes =
+# 113 outer + 61 inner. The 61 inner allows were deleted. The 113 outer allows
+# converted 1:1 to `#[expect]` (122 lint occurrences, 102 distinct
+# (file, lint, reason) triples). Validation against the 7 CI configs removed
+# 24 stale converted lint occurrences (19 distinct triples) whose lint fired in
+# no config; 5 attributes were re-predicated to their exact config set and 2
+# multi-lint attributes were split. 83 triples remain below.
+# Regenerated, never hand-edited.
 [[converted]]
 file = "src/auth.rs"
 lint = "clippy::expect_used"

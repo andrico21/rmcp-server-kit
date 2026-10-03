@@ -140,7 +140,7 @@ entry in the same PR that introduces a deviation.
    downstream; opting in is deliberate.
 4. **2026-10-03 - Overlay deviation 6 does not apply.** Both
    `String::from_utf8_lossy(..).into_owned()` sites pass borrowed bytes
-   (`src/mtls_revocation.rs`, `tests/e2e_oauth_mtls.rs`). Upstream erratum, not
+   (`src/mtls_revocation.rs`, `tests/integration/e2e_oauth_mtls.rs`). Upstream erratum, not
    a deviation.
 5. **Informational (not a deviation):** the CSP sent by this crate is
    `default-src 'none'`, stricter than `http-services.md:30`

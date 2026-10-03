@@ -290,104 +290,35 @@ jobs:
       - name: Run every lint-ratchet self-test
         run: for s in scripts/lint-ratchet/*.py; do python3 "$s" --self-test; done
 
-  # TEMPORARY (task 11): measures the Section 9 profile at `warn` in the 7 CI
-  # configs, one raw `--message-format=json` stream per (row, OS, mode, kind)
-  # invocation, for `scripts/lint-ratchet/generate.py`. Deleted before merge.
-  lint-measure:
-    name: lint measure (${{ matrix.os }} / ${{ matrix.row }})
-    runs-on: ${{ matrix.os }}
-    env:
-      CARGO_BUILD_WARNINGS: warn
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        row:
-          - ""
-          - "--no-default-features"
-          - "--features oauth"
-          - "--features metrics"
-          - "--all-features"
-        exclude:
-          - os: macos-latest
-            row: ""
-          - os: macos-latest
-            row: "--no-default-features"
-          - os: macos-latest
-            row: "--features oauth"
-          - os: macos-latest
-            row: "--features metrics"
-          - os: windows-latest
-            row: ""
-          - os: windows-latest
-            row: "--no-default-features"
-          - os: windows-latest
-            row: "--features oauth"
-          - os: windows-latest
-            row: "--features metrics"
+  lint-count-gate:
+    name: lint count gate
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      # The committed baseline is measured with the pinned 1.99.0 clippy; the
+      # count gate is a ratchet: a (file, scope, lint, row) key may not exceed
+      # its baseline, and the baseline only moves down (D-6'').
       - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2.9.1
-      - name: Measure lint streams
-        shell: bash
-        env:
-          ROW: ${{ matrix.row }}
-        run: |
-          set -euo pipefail
-          case "${{ runner.os }}" in
-            Linux) os_tag=linux ;;
-            macOS) os_tag=macos ;;
-            Windows) os_tag=windows ;;
-          esac
-          row_slug=$(printf '%s' "${ROW:-default}" | tr -d ' -')
-          out="$RUNNER_TEMP/lm"
-          mkdir -p "$out"
+      - name: Measure the lint-migration baseline
+        run: python3 scripts/lint-ratchet/measure.py
+      - name: Enforce the count gate
+        run: python3 scripts/lint-ratchet/count_gate.py
 
-          record() { # mode kind ...
-            local mode="$1" kind="$2"
-            shift 2
-            local file="$mode-$kind.json"
-            set +e
-            "$@" --message-format=json > "$out/$file" 2> "$out/$mode-$kind.err"
-            local rc=$?
-            set -e
-            printf '%s|%s|%s|%s|%s\n' "$ROW" "$os_tag" "$mode" "$kind" "$file" >> "$out/manifest.txt"
-            echo "$mode/$kind exit=$rc bytes=$(wc -c < "$out/$file")"
-            if [ "$rc" -ne 0 ]; then
-              echo "::error::$mode/$kind failed (exit $rc)"
-              tail -n 40 "$out/$mode-$kind.err" || true
-              exit 1
-            fi
-          }
-
-          if [ "${{ runner.os }}" = "Linux" ]; then
-            record plain clippy cargo clippy --lib --examples $ROW
-            record plain build cargo build --lib --examples $ROW
-            record benches clippy cargo clippy --benches $ROW
-            record benches build cargo build --benches $ROW
-            record unit-harness clippy cargo clippy --lib --profile test $ROW
-            record unit-harness test cargo test --no-run --lib $ROW
-            record integration clippy cargo clippy --tests $ROW
-            record integration test cargo test --no-run --tests $ROW
-          else
-            record plain build cargo build --lib --examples $ROW
-            record benches build cargo build --benches $ROW
-            record unit-harness test cargo test --no-run --lib $ROW
-            record integration test cargo test --no-run --tests $ROW
-          fi
-
-          echo "artifact=lm-${{ matrix.os }}-$row_slug" >> "$GITHUB_ENV"
-          echo "outdir=$out" >> "$GITHUB_ENV"
-      - name: Upload lint streams
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.artifact }}
-          path: ${{ env.outdir }}
-          if-no-files-found: error
-          retention-days: 7
+  lint-gates:
+    name: lint catalog + allow gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # stdlib-only Python (>= 3.11, tomllib); no Rust toolchain needed.
+      - name: Catalog gate
+        run: python3 scripts/lint-ratchet/catalog_gate.py
+      - name: Allow gate
+        run: python3 scripts/lint-ratchet/allow_gate.py --enforce
+      - name: Profile equality
+        run: python3 scripts/lint-ratchet/profile_eq.py --clippy-toml
 
   # ---------------------------------------------------------------------------
   # Supply-chain advisory jobs (Phase 2 / 1.1.0).
