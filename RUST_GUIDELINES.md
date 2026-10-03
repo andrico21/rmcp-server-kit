@@ -103,7 +103,7 @@ permission. Status of each item at this vendoring:
 | # | Deviation | Status | Closure / note |
 | - | --------- | ------ | -------------- |
 | 1 | `pedantic`/`nursery` at `warn`; remove the listed allows; `doc_markdown` -> `doc-valid-idents` | open | Closed by the Section 9 profile switch, which replaces the local lint table wholesale. |
-| 2 | `rust-toolchain.toml` pin and the CI `1.98.0` job contradict the Version Policy | open | The pin file is already deleted; `rust-version`, the CI jobs and the 1.98 text retarget are closed by the MSRV work. |
+| 2 | `rust-toolchain.toml` pin and the CI `1.98.0` job contradict the Version Policy | closed | Closed by the MSRV work: the pin file was deleted (PR #29), `rust-version` is `1.99.0`, and the GitHub and GitLab MSRV jobs plus every live 1.98 doc/CI reference are retargeted to 1.99. |
 | 3 | `deny.toml`: `multiple-versions = "warn"` -> `"deny"` | closed | Closed by the core cargo-deny policy adopted in PR #31 (merged into this branch): `multiple-versions = "deny"`, `[graph] all-features`, `unmaintained` / `unsound` scope "all", licenses trimmed to the encountered set, duplicates in `skip` with a reason each. |
 | 4 | `.cargo/config.toml`: `build.warnings = "deny"` not set | open | Closed by the warnings-policy work. |
 | 5 | 1.99 lint impact: message-less `assert!(..is_empty())` sites | closed | All 30 test-side sites fixed on 1.99 in PR #30 (before this vendoring); they were never profile-only. The overlay's count is an erratum (30 measured, not 25) for the final report. |
@@ -145,9 +145,27 @@ entry in the same PR that introduces a deviation.
 5. **Informational (not a deviation):** the CSP sent by this crate is
    `default-src 'none'`, stricter than `http-services.md:30`
    (`default-src 'self'`). Stricter is allowed; recorded so no one "aligns" it.
+6. **2026-10-04 - MSRV job lint-capped (compile compatibility only).** The
+   GitHub `MSRV (1.99.0)` job and the GitLab `msrv` job run with
+   `RUSTFLAGS="--cap-lints=warn"` and `CARGO_BUILD_WARNINGS=allow`. They prove
+   that the crate compiles on `rust-version = "1.99.0"`; they do not enforce
+   lint cleanliness. Lints stay enforced on the latest stable by the `clippy`
+   and feature-matrix jobs, so a warning is still an error everywhere except in
+   the minimum-version proof. This is the core Version Policy's MSRV job
+   (core 3160-3165) and closes overlay deviation 2. Evidence: the task-2
+   migration record (capped build log, CI check list).
+7. **2026-10-04 - GitLab image tag not verified by the executor.** `CI_IMAGE`
+   switched to
+   `gitlab-ad.andrico.local:5050/ci-tools/rust-ci-images/rust:rust-1.99.0` on
+   the owner's explicit instruction (Q2). The private registry cannot be
+   inspected without credentials: an anonymous `skopeo inspect` returns
+   `manifest unknown` even for the previously in-use `rust-1.98.0` tag, so the
+   new tag could not be positively verified from this environment. GitLab
+   pipelines are likewise unobservable here; GitHub CI is the gate. Verify the
+   tag, or watch the first mirrored pipeline fail, once registry credentials are
+   available. Evidence: the task-2 migration record.
 
-Entries to be added by the work that creates them: the lint-capped MSRV job and
-the GitLab image-verification status (MSRV work); the dated nightly pin plus its
+Entries to be added by the work that creates them: the dated nightly pin plus its
 latest-nightly canary, and cargo-geiger's status (CI tooling); the temporary
 `lint-migration:` expects, "new in `<version>`" expects and profile deltas
 (profile switch and toolchain-drift work); frozen public-API items (the lint
