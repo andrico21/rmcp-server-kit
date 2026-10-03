@@ -148,10 +148,10 @@ Z:\TempPersistent\rmcp-server-kit\
 | Run all tests                    | `cargo test --all-features`                                          |
 | Run unit tests only              | `cargo test --all-features --lib`                                    |
 | Run E2E tests only               | `cargo test --all-features --test e2e`                               |
-| Format check (CI)                | `cargo +nightly fmt --all -- --check`                                |
-| Format apply                     | `cargo +nightly fmt --all`                                           |
+| Format check (CI)                | `cargo +nightly-2026-10-03 fmt --all -- --check`                     |
+| Format apply                     | `cargo +nightly-2026-10-03 fmt --all`                                |
 | Lint (CI gate)                   | `cargo clippy --all-targets --all-features -- -D warnings`           |
-| Build docs                       | `cargo +nightly doc --no-deps --all-features`                        |
+| Build docs                       | `cargo +nightly-2026-10-03 doc --no-deps --all-features`             |
 | Supply-chain audit               | `cargo audit`                                                        |
 | License/ban policy               | `cargo deny check`                                                   |
 | MSRV check                       | `cargo +1.99.0 build --all-features`                                 |
@@ -325,7 +325,7 @@ The core's current-Rust idioms (for example `Vec::push_mut` /
 6. Public types in this library crate should be `#[non_exhaustive]` where future-extension is plausible (the profile denies `exhaustive_enums` / `exhaustive_structs`).
 
 ### Before declaring done (evidence required)
-- [ ] `cargo +nightly fmt --all -- --check` clean
+- [ ] `cargo +nightly-2026-10-03 fmt --all -- --check` clean
 - [ ] `cargo clippy --all-targets --all-features -- -D warnings` clean
 - [ ] `cargo test --all-features` passes (note any pre-existing failures - do NOT delete tests)
 - [ ] `cargo doc --no-deps --all-features` builds without warnings

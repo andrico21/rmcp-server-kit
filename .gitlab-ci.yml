@@ -35,7 +35,7 @@ stages:
   - check     # MSRV build, feature matrix, semver-checks
   - test      # nextest, doctests, coverage, docs-validate, memory-bounds
   - docs      # rustdoc + SECURITY.md citation grep
-  - deep      # bench thresholds, vet (advisory)
+  - deep      # bench thresholds, vet (blocking), geiger (informational)
   - nightly   # mutants (schedule-only)
 
 variables:
@@ -329,10 +329,19 @@ bench-thresholds:
 vet:
   stage: deep
   needs: []
+  script:
+    # Blocking, mirroring the canonical GitHub vet job.
+    - rtk cargo vet --locked
+
+geiger:
+  stage: deep
+  needs: []
+  # Informational only (D-17), mirroring the GitHub job: cargo-geiger exits
+  # non-zero whenever it finds unsafe code.
   allow_failure: true
   script:
-    # Mirror job stays advisory; the canonical GitHub vet job is blocking.
-    - rtk cargo vet --locked || true
+    - rtk cargo geiger --version || { echo "cargo-geiger not in image"; exit 0; }
+    - rtk cargo geiger --all-features
 
 # ---------------------------------------------------------------------------
 # Nightly stage: scheduled-only mutation tests

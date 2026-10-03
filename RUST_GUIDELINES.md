@@ -164,9 +164,23 @@ entry in the same PR that introduces a deviation.
    pipelines are likewise unobservable here; GitHub CI is the gate. Verify the
    tag, or watch the first mirrored pipeline fail, once registry credentials are
    available. Evidence: the task-2 migration record.
+8. **2026-10-04 - CI nightly is a dated pin with a non-blocking canary
+   (D-14 v).** The GitHub `fmt` and docsrs jobs pin `nightly-2026-10-03`, the
+   newest nightly that passes both `cargo +nightly-2026-10-03 fmt --all --
+   --check` and `RUSTDOCFLAGS="-D warnings --cfg docsrs" cargo
+   +nightly-2026-10-03 doc --no-deps --all-features`. docs.rs builds with its
+   own current nightly, so a non-blocking `Rustdoc (latest nightly canary)` job
+   runs the docsrs command on floating `nightly`. The pin moves only through
+   the re-vendor + toolchain-bump procedure in this file.
+9. **2026-10-04 - cargo-geiger runs informational (D-17).** Its GitHub job
+   (`cargo-geiger (informational)`, `continue-on-error: true`) and GitLab job
+   (`geiger`, `allow_failure: true`) run `cargo geiger --all-features`. It
+   builds on Rust 1.99 (cargo-geiger 0.13.0) and runs, but exits non-zero
+   whenever it finds unsafe code (`error: Found 251 warnings` on the current
+   tree), which is why it must not gate merges. Evidence in the migration
+   record.
 
-Entries to be added by the work that creates them: the dated nightly pin plus its
-latest-nightly canary, and cargo-geiger's status (CI tooling); the temporary
+Entries to be added by the work that creates them: the temporary
 `lint-migration:` expects, "new in `<version>`" expects and profile deltas
 (profile switch and toolchain-drift work); frozen public-API items (the lint
 lanes); the GitLab mirror skew tolerance, if it is ever required.
