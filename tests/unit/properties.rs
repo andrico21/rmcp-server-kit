@@ -1,9 +1,3 @@
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing
-)]
 //! Property-based tests for `rmcp-server-kit`.
 //!
 //! Each target asserts a *property* that must hold for an arbitrary,

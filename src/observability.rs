@@ -444,7 +444,7 @@ where
     }
 }
 
-#[allow(
+#[expect(
     clippy::print_stderr,
     reason = "audit writer failure reporting deliberately uses process stderr as the last-resort sink; routing through tracing would recurse into the failing audit writer"
 )]
@@ -731,16 +731,6 @@ fn audit_file_permission_warnings(_file: &std::fs::File) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::indexing_slicing,
-        clippy::unwrap_in_result,
-        clippy::print_stdout,
-        clippy::print_stderr,
-        reason = "test-only relaxations; production code uses ? and tracing"
-    )]
     #[cfg(unix)]
     use std::io::Write as _;
     use std::{
@@ -822,7 +812,7 @@ mod tests {
             )
     }
 
-    #[allow(
+    #[expect(
         clippy::cognitive_complexity,
         reason = "tracing! macro expansions add branches"
     )]
@@ -901,7 +891,7 @@ mod tests {
             log_tool_call_arguments: false,
             log_upstream_error_bodies: false,
         };
-        #[allow(
+        #[expect(
             deprecated,
             reason = "this regression test explicitly covers the legacy fail-open API"
         )]
@@ -1333,7 +1323,7 @@ mod tests {
     /// Rule A: a `format!(...)` format string that is *only* a single Debug
     /// placeholder (`"{:?}"` or `"{value:?}"`) -- unconditional
     /// Debug-stringification with no surrounding human-readable text.
-    #[allow(
+    #[expect(
         clippy::literal_string_with_formatting_args,
         reason = "comparing scanned source text against a literal pattern, not passing it to a formatting macro"
     )]
@@ -1537,7 +1527,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::literal_string_with_formatting_args,
         reason = "the format-shaped text is the fixture under test, not a format call"
     )]
@@ -1555,7 +1545,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::literal_string_with_formatting_args,
         reason = "the format-shaped text is the fixture under test, not a format call"
     )]

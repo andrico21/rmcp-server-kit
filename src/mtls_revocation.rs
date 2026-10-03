@@ -250,7 +250,7 @@ fn cache_matches_committed_identities(
 }
 
 /// Shared CRL state backing the dynamic mTLS verifier.
-#[allow(
+#[expect(
     missing_debug_implementations,
     reason = "contains ArcSwap and dyn verifier internals"
 )]
@@ -418,7 +418,7 @@ impl CrlSet {
 
         let max_response_bytes = config.crl_max_response_bytes;
 
-        #[allow(
+        #[expect(
             deprecated,
             reason = "constructing the struct necessarily names the deprecated field; the deprecation targets downstream mutation, not construction"
         )]
@@ -462,7 +462,7 @@ impl CrlSet {
 
     #[cfg(not(any(test, feature = "test-helpers")))]
     #[inline]
-    #[allow(
+    #[expect(
         clippy::unused_self,
         reason = "the receiver keeps the call site identical across cfgs; production builds compile this to nothing"
     )]
@@ -510,7 +510,7 @@ impl CrlSet {
     /// Routing every internal use through here keeps the deprecation honest for
     /// downstream callers while confining the `allow` to one site instead of
     /// scattering it across every read.
-    #[allow(
+    #[expect(
         deprecated,
         reason = "the deprecation targets downstream out-of-band mutation; in-crate reads and the atomic commit path are the supported users of this field"
     )]
@@ -812,7 +812,7 @@ impl CrlSet {
     /// Returns `(deny, state)`. The caller MUST enforce with the returned
     /// `state.verifier` rather than re-loading: pre-check and enforcement have
     /// to observe the same verifier generation.
-    #[allow(
+    #[expect(
         clippy::significant_drop_tightening,
         reason = "the cache read guard is deliberately acquired BEFORE loading VerifierState and is released by the match that consumes it; tightening as the lint suggests would invert the lock order this precheck's generation-coherence depends on"
     )]
@@ -1611,7 +1611,7 @@ fn cap_bootstrap_urls(urls: &mut Vec<String>, cap: usize) {
 /// # Errors
 ///
 /// Returns an error if the initial verifier cannot be built.
-#[allow(
+#[expect(
     clippy::cognitive_complexity,
     reason = "bootstrap coordinates timeout, parallel fetches, and partial-cache recovery"
 )]
@@ -1753,7 +1753,7 @@ fn apply_bootstrap_cache_cap(
 }
 
 /// Run the CRL refresher loop until shutdown.
-#[allow(
+#[expect(
     clippy::cognitive_complexity,
     reason = "refresher loop intentionally handles shutdown, timer, and discovery in one select"
 )]
@@ -2169,10 +2169,6 @@ fn asn1_time_to_system_time(time: x509_parser::time::ASN1Time) -> SystemTime {
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        deprecated,
-        reason = "these tests deliberately exercise the deprecated out-of-band cache surface and the ungated test constructors; that is precisely the behaviour under test"
-    )]
 
     use std::sync::{
         Mutex as StdMutex,

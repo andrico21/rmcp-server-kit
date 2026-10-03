@@ -1113,7 +1113,7 @@ pub(crate) fn redact_with_salt(salt: &[u8], value: &str) -> String {
         m
     } else {
         let digest = Sha256::digest(salt);
-        #[allow(
+        #[expect(
             clippy::expect_used,
             reason = "32-byte SHA-256 digest is unconditionally valid as an HMAC-SHA256 key (RFC 2104 allows any key length); see surrounding comment"
         )]
@@ -1193,7 +1193,7 @@ impl DenyLogFields {
 // `enforce_tool_policy` and `enforce_rate_limit`. Remaining flow is a
 // linear body-collect + JSON-RPC parse + dispatch, intentionally left
 // inline to keep the request lifecycle visible at a glance.
-#[allow(
+#[expect(
     clippy::too_many_lines,
     reason = "linear request lifecycle (body collect → JSON-RPC parse → policy dispatch) kept inline for security review visibility; helpers already extracted"
 )]

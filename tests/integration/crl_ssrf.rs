@@ -18,11 +18,6 @@
 //! attacker-controlled hostnames to private IPs (which `wiremock` cannot
 //! provide). The unit tests there cover all 12 IP classes exhaustively.
 
-#![allow(clippy::expect_used, reason = "tests")]
-#![allow(clippy::unwrap_used, reason = "tests")]
-#![allow(clippy::panic, reason = "tests")]
-#![allow(clippy::indexing_slicing, reason = "tests")]
-
 use std::time::Duration;
 
 use rcgen::{

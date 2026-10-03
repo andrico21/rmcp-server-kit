@@ -224,16 +224,6 @@ pub(crate) async fn serve_metrics_with_security_headers(
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::indexing_slicing,
-        clippy::unwrap_in_result,
-        clippy::print_stdout,
-        clippy::print_stderr,
-        reason = "test-only relaxations; production code uses ? and tracing"
-    )]
     use super::*;
 
     #[test]

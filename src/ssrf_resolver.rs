@@ -64,7 +64,7 @@ pub(crate) struct SsrfScreeningResolver {
     /// Test-only loopback bypass; see `TestLoopbackBypass` doc.
     #[cfg_attr(
         not(any(test, feature = "test-helpers")),
-        allow(
+        expect(
             dead_code,
             reason = "`TestLoopbackBypass` aliases to `()` outside test/test-helpers \
                       builds, so this field is never read there; it is retained so the \

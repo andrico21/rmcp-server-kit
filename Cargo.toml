@@ -309,80 +309,217 @@ required-features = ["oauth", "test-helpers"]
 ignored = ["humantime-serde", "subtle"]
 
 [lints.rust]
-unsafe_code = "forbid"
+# Every rustc lint group, at deny (individual entries below override at priority 0)
+future_incompatible = { level = "warn", priority = -1 }
+let_underscore = { level = "warn", priority = -1 }
+nonstandard_style = { level = "warn", priority = -1 }
+rust_2018_idioms = { level = "warn", priority = -1 }
+rust_2018_compatibility = { level = "warn", priority = -1 }
+rust_2021_compatibility = { level = "warn", priority = -1 }
+rust_2024_compatibility = { level = "warn", priority = -1 }
+unused = { level = "warn", priority = -1 }
+keyword_idents = { level = "warn", priority = -1 }
+refining_impl_trait = { level = "warn", priority = -1 }
+deprecated_safe = { level = "warn", priority = -1 }
+unknown_or_malformed_diagnostic_attributes = { level = "warn", priority = -1 }
+# Overridable only by the unsafe-ffi overlay
+unsafe_code = "warn"
+# Every allow-by-default rustc lint available on stable, plus warn-by-default ones made explicit
+absolute_paths_not_starting_with_crate = "warn"
+ambiguous_negative_literals = "warn"
+closure_returning_async_block = "warn"
+confusable_idents = "warn"
+dead_code_pub_in_binary = "warn"
+deprecated_in_future = "warn"
+deprecated_safe_2024 = "warn"
+deref_into_dyn_supertrait = "warn"
+edition_2024_expr_fragment_specifier = "warn"
+elided_lifetimes_in_paths = "warn"
+explicit_outlives_requirements = "warn"
+ffi_unwind_calls = "warn"
+if_let_rescope = "warn"
+impl_trait_overcaptures = "warn"
+impl_trait_redundant_captures = "warn"
+keyword_idents_2018 = "warn"
+keyword_idents_2024 = "warn"
+let_underscore_drop = "warn"
+linker_messages = "warn"
+macro_use_extern_crate = "warn"
+meta_variable_misuse = "warn"
+missing_abi = "warn"
+missing_copy_implementations = "warn"
 missing_debug_implementations = "warn"
 missing_docs = "warn"
+missing_unsafe_on_extern = "warn"
+mixed_script_confusables = "warn"
+non_ascii_idents = "warn"
+raw_borrows_via_references = "warn"
+redundant_imports = "warn"
+redundant_lifetimes = "warn"
+renamed_and_removed_lints = "warn"
+rust_2021_incompatible_closure_captures = "warn"
+rust_2021_incompatible_or_patterns = "warn"
+rust_2021_prefixes_incompatible_syntax = "warn"
+rust_2021_prelude_collisions = "warn"
+rust_2024_guarded_string_incompatible_syntax = "warn"
+rust_2024_incompatible_pat = "warn"
+rust_2024_prelude_collisions = "warn"
+single_use_lifetimes = "warn"
+tail_expr_drop_order = "warn"
+text_direction_codepoint_in_comment = "warn"
+text_direction_codepoint_in_literal = "warn"
 trivial_casts = "warn"
 trivial_numeric_casts = "warn"
+uncommon_codepoints = "warn"
+unexpected_cfgs = "warn"
+unit_bindings = "warn"
+unknown_lints = "warn"
+unnameable_types = "warn"
 unreachable_pub = "warn"
+unsafe_attr_outside_unsafe = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unstable_features = "warn"
 unused_extern_crates = "warn"
 unused_import_braces = "warn"
+unused_lifetimes = "warn"
+unused_macro_rules = "warn"
 unused_qualifications = "warn"
+unused_results = "warn"
+variant_size_differences = "warn"
+
+[lints.rustdoc]
+all = { level = "warn", priority = -1 }
 
 [lints.clippy]
-all = { level = "deny", priority = -1 }
+# Every Clippy group
+all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
-# Extra unstable lints that catch patterns pedantic misses (high-signal on
-# AI-touched code, per RUST_GUIDELINES.md §9). Noisy nursery lints may be
-# allowed individually below with a justification comment.
 nursery = { level = "warn", priority = -1 }
-# nursery allow: const-ness on ~40 pub fns is a one-way semver promise
-# (removing `const` later is a breaking change) and the lint is documented
-# as having false positives; opting fns into `const` stays a deliberate,
-# per-fn decision rather than lint-driven churn.
-missing_const_for_fn = "allow"
-# nursery allow: antagonistic to rustc's `unreachable_pub = "warn"` (set in
-# [lints.rust]), which prefers `pub(crate)` over `pub` for crate-internal
-# items; this crate keeps explicit `pub(crate)` visibility markers.
-redundant_pub_crate = "allow"
-# nursery allow: frequently degrades readability here - rewrites would
-# contort the constant-time HMAC fallback (inner #[allow] + SAFETY comment
-# inside a closure), the poisoned-lock `match` idiom used across the crate,
-# and multi-statement tracing arms. Sites are clearer as if/let-else.
-option_if_let_else = "allow"
-unwrap_used = "deny"
-expect_used = "deny"
-panic = "deny"
-todo = "deny"
-unimplemented = "deny"
-unreachable = "warn"
-indexing_slicing = "deny"
-string_slice = "warn"
-await_holding_lock = "deny"
-await_holding_refcell_ref = "deny"
-mem_forget = "deny"
-doc_markdown = "allow"
-duration_suboptimal_units = "allow"
-str_to_string = "warn"
-# `string_to_string` (RUST_GUIDELINES.md §9) is omitted: clippy removed the
-# lint - `implicit_clone` (enabled below) covers those cases.
-fallible_impl_from = "deny"
-wildcard_enum_match_arm = "deny"
-fn_params_excessive_bools = "deny"
-must_use_candidate = "warn"
-unneeded_field_pattern = "warn"
-dbg_macro = "deny"
-print_stdout = "deny"
-print_stderr = "deny"
-redundant_clone = "warn"
-implicit_clone = "warn"
-needless_pass_by_value = "warn"
-large_enum_variant = "warn"
-box_collection = "warn"
-rc_buffer = "warn"
-clone_on_ref_ptr = "deny"
+cargo = { level = "warn", priority = -1 }
+# Every `restriction` lint except the documented exclusions (120 of 135)
+absolute_paths = "warn"
+alloc_instead_of_core = "warn"
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+arithmetic_side_effects = "warn"
+as_conversions = "warn"
+as_pointer_underscore = "warn"
+as_underscore = "warn"
+assertions_on_result_states = "warn"
+cfg_not_test = "warn"
+clone_on_ref_ptr = "warn"
+cognitive_complexity = "warn"
+create_dir = "warn"
+dbg_macro = "warn"
+decimal_literal_representation = "warn"
+default_numeric_fallback = "warn"
+default_union_representation = "warn"
+definition_in_module_root = "warn"
+deref_by_slicing = "warn"
+disallowed_script_idents = "warn"
+doc_include_without_cfg = "warn"
+doc_paragraphs_missing_punctuation = "warn"
+else_if_without_else = "warn"
+empty_drop = "warn"
+empty_enum_variants_with_brackets = "warn"
+empty_structs_with_brackets = "warn"
+error_impl_error = "warn"
 exhaustive_enums = "warn"
 exhaustive_structs = "warn"
-cognitive_complexity = "warn"
-too_many_lines = "warn"
-# Additional LLM-generated-code lints (RUST_GUIDELINES.md §9). The
-# pointer-alignment lints (cast_ptr_alignment / transmute_ptr_to_ref /
-# not_unsafe_ptr_arg_deref) are intentionally omitted -- moot under the
-# crate-level `unsafe_code = "forbid"`.
-large_stack_arrays = "warn"
-large_stack_frames = "warn"
-ptr_as_ptr = "warn"
-cast_lossless = "warn"
+exit = "warn"
+expect_used = "warn"
+field_scoped_visibility_modifiers = "warn"
+filetype_is_file = "warn"
+float_arithmetic = "warn"
+float_cmp_const = "warn"
+fn_to_numeric_cast_any = "warn"
+get_unwrap = "warn"
+host_endian_bytes = "warn"
+if_then_some_else_none = "warn"
+impl_trait_in_params = "warn"
+indexing_slicing = "warn"
+infinite_loop = "warn"
+inline_asm_x86_att_syntax = "warn"
+inline_modules = "warn"
+inline_trait_bounds = "warn"
+integer_division = "warn"
+integer_division_remainder_used = "warn"
+iter_over_hash_type = "warn"
+large_include_file = "warn"
+let_underscore_must_use = "warn"
+let_underscore_untyped = "warn"
+lossy_float_literal = "warn"
+map_err_ignore = "warn"
+map_with_unused_argument_over_ranges = "warn"
+mem_forget = "warn"
+min_ident_chars = "warn"
+missing_assert_message = "warn"
+missing_asserts_for_indexing = "warn"
+missing_docs_in_private_items = "warn"
+missing_inline_in_public_items = "warn"
+mixed_read_write_in_expression = "warn"
+mod_module_files = "warn"
+module_name_repetitions = "warn"
+modulo_arithmetic = "warn"
+multiple_inherent_impl = "warn"
+multiple_unsafe_ops_per_block = "warn"
+mutex_atomic = "warn"
+mutex_integer = "warn"
+needless_raw_strings = "warn"
+non_ascii_literal = "warn"
+non_zero_suggestions = "warn"
+panic = "warn"
+panic_in_result_fn = "warn"
+partial_pub_fields = "warn"
+pathbuf_init_then_push = "warn"
+pointer_format = "warn"
+precedence_bits = "warn"
+print_stderr = "warn"
+print_stdout = "warn"
+pub_use = "warn"
+pub_without_shorthand = "warn"   # keeps pub(crate) / pub(super), the form rustfmt writes
+rc_buffer = "warn"
+rc_mutex = "warn"
+redundant_test_prefix = "warn"
+ref_patterns = "warn"
+renamed_function_params = "warn"
+rest_pat_in_fully_bound_structs = "warn"
+rest_pattern_accessible_field = "warn"
+return_and_then = "warn"
+same_name_method = "warn"
+semicolon_inside_block = "warn"
+shadow_reuse = "warn"
+shadow_same = "warn"
+shadow_unrelated = "warn"
+single_char_lifetime_names = "warn"
+std_instead_of_alloc = "warn"
+std_instead_of_core = "warn"
+str_to_string = "warn"
+string_add = "warn"
+string_lit_chars_any = "warn"
+string_slice = "warn"
+suspicious_xor_used_as_pow = "warn"
+tests_outside_test_module = "warn"
+todo = "warn"
+try_err = "warn"
+undocumented_unsafe_blocks = "warn"
+unimplemented = "warn"
+unnecessary_rest_pattern = "warn"
+unnecessary_safety_comment = "warn"
+unnecessary_safety_doc = "warn"
+unnecessary_self_imports = "warn"
+unreachable = "warn"
+unseparated_literal_suffix = "warn"
+unused_result_ok = "warn"
+unused_trait_names = "warn"
+unwrap_in_result = "warn"
+unwrap_used = "warn"
+use_debug = "warn"
+verbose_file_reads = "warn"
+wildcard_enum_match_arm = "warn"
+# Contradiction override: rustc `unreachable_pub` (denied above) and nursery's
+# `redundant_pub_crate` give opposite advice on `pub(crate)`; rustc's wins.
+redundant_pub_crate = "warn"
 
 [profile.release]
 opt-level = 3

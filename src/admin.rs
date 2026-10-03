@@ -54,7 +54,7 @@ impl Default for AdminConfig {
 }
 
 /// Shared state used by admin endpoint handlers.
-#[allow(
+#[expect(
     missing_debug_implementations,
     reason = "contains Arc<AuthState> and ArcSwap<RbacPolicy> without Debug impls"
 )]
@@ -182,11 +182,6 @@ pub(crate) fn admin_router(state: AdminState, config: &AdminConfig) -> Router {
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        reason = "test-only relaxations; production code uses ? and tracing"
-    )]
 
     use axum::http::Request;
     use tower::ServiceExt as _;

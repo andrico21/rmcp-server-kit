@@ -27,13 +27,6 @@
 //!
 //! Drift fixes are easy: re-read the cited code and update the number.
 
-#![allow(
-    clippy::expect_used,
-    clippy::missing_docs_in_private_items,
-    clippy::panic,
-    clippy::print_stderr
-)]
-
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use rmcp_server_kit::{

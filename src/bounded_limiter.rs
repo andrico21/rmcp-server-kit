@@ -128,7 +128,7 @@ struct Inner<K: Eq + Hash + Clone> {
 /// Memory-bounded keyed rate limiter.
 ///
 /// Cheaply cloneable; clones share state.
-#[allow(
+#[expect(
     missing_debug_implementations,
     reason = "wraps governor RateLimiter which has no Debug impl"
 )]

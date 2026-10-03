@@ -59,7 +59,7 @@ static UPSTREAM_ERROR_BODIES: AtomicBool = AtomicBool::new(false);
 /// process; see the [module docs](self) for the full warning.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "each field is an independent operator-facing opt-in switch; grouping them into sub-structs would complicate the public API and the TOML surface for no safety gain"
 )]
@@ -117,7 +117,7 @@ pub(crate) fn plaintext_oauth_tokens() -> bool {
 /// Whether JWT claim values may be rendered in plaintext.
 #[cfg_attr(
     not(feature = "oauth"),
-    allow(
+    expect(
         dead_code,
         reason = "only consumed by the oauth module; kept unconditional so the \
                   switch set is uniform across feature combinations"
@@ -135,7 +135,7 @@ pub(crate) fn tool_call_arguments() -> bool {
 /// Whether upstream OAuth error-response bodies may be rendered in plaintext.
 #[cfg_attr(
     not(feature = "oauth"),
-    allow(
+    expect(
         dead_code,
         reason = "only consumed by the oauth module; kept unconditional so the \
                   switch set is uniform across feature combinations"

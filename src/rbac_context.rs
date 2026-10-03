@@ -14,7 +14,7 @@ use std::{borrow::Cow, future::Future, sync::Arc};
 
 use arc_swap::ArcSwap;
 use axum::http::request::Parts;
-#[allow(
+#[expect(
     deprecated,
     reason = "ServerHandler delegation must import legacy logging/subscription parameter types until rmcp removes those methods"
 )]
@@ -196,7 +196,7 @@ macro_rules! delegate_notification {
     };
 }
 
-#[allow(
+#[expect(
     deprecated,
     reason = "ServerHandler delegation must include the legacy subscribe/unsubscribe methods until rmcp removes them"
 )]
@@ -456,7 +456,7 @@ mod tests {
         }
     }
 
-    #[allow(
+    #[expect(
         clippy::unused_async_trait_impl,
         reason = "rmcp ServerHandler requires async methods; this in-memory test handler returns immediately"
     )]
@@ -505,7 +505,7 @@ mod tests {
         }
     }
 
-    #[allow(
+    #[expect(
         clippy::unused_async_trait_impl,
         reason = "rmcp Transport requires async receive/close; this in-memory test transport returns immediately"
     )]
@@ -819,7 +819,7 @@ mod tests {
         }
     }
 
-    #[allow(
+    #[expect(
         clippy::unused_async_trait_impl,
         reason = "rmcp ServerHandler requires async methods; this in-memory test handler returns immediately"
     )]
@@ -878,7 +878,7 @@ mod tests {
     /// allow.
     #[derive(Clone, Default)]
     struct PassthroughDefaults<H> {
-        #[allow(
+        #[expect(
             dead_code,
             reason = "deliberately never read: this type overrides nothing, so the probe must stay unreached"
         )]
@@ -1073,7 +1073,7 @@ mod tests {
         send_result: Arc<std::sync::Mutex<Option<String>>>,
     }
 
-    #[allow(
+    #[expect(
         clippy::unused_async_trait_impl,
         reason = "rmcp ServerHandler requires async methods; this in-memory test handler returns immediately"
     )]
@@ -1131,7 +1131,7 @@ mod tests {
         outbound: Arc<std::sync::Mutex<Vec<ServerJsonRpcMessage>>>,
     }
 
-    #[allow(
+    #[expect(
         clippy::unused_async_trait_impl,
         reason = "rmcp Transport requires async receive/close; this in-memory test transport returns immediately"
     )]
@@ -1377,7 +1377,7 @@ mod tests {
         }
     }
 
-    #[allow(
+    #[expect(
         clippy::unused_async_trait_impl,
         deprecated,
         reason = "coverage drives rmcp's async trait methods, whose probe bodies return immediately"

@@ -95,7 +95,7 @@ fn evaluate_oauth_redirect(
 /// loopback and is already blocked by the post-DNS IP screen, and an
 /// operator may legitimately reach a local IdP via an explicit loopback
 /// CIDR allowlist.
-#[allow(
+#[expect(
     clippy::case_sensitive_file_extension_comparisons,
     reason = "these are DNS-name suffixes on an already-lowercased host, not file extensions"
 )]
@@ -422,7 +422,7 @@ impl OauthHttpClient {
         // builds and to `()` in production. The `.clone()` is required in
         // test builds; in production the alias is a unit, which is why the
         // unit-value lints are allowed alongside the Arc one.
-        #[allow(
+        #[expect(
             clippy::clone_on_ref_ptr,
             clippy::clone_on_copy,
             clippy::unit_arg,
@@ -1065,7 +1065,7 @@ impl Default for OAuthConfig {
             authorization_servers: None,
             authorization_server_metadata_issuer: None,
             require_subject: false,
-            #[allow(
+            #[expect(
                 deprecated,
                 reason = "default-construct deprecated field for backward compat"
             )]
@@ -1089,7 +1089,7 @@ impl OAuthConfig {
         if let Some(mode) = self.audience_validation_mode {
             return mode;
         }
-        #[allow(deprecated, reason = "intentional: legacy flag resolution path")]
+        #[expect(deprecated, reason = "intentional: legacy flag resolution path")]
         match self.strict_audience_validation {
             Some(true) | None => AudienceValidationMode::Strict,
             Some(false) => AudienceValidationMode::Warn,
@@ -1555,7 +1555,7 @@ fn build_mtls_clients(
             // builds and to `()` in production. We need a value clone here
             // (not Arc::clone) because the type vanishes outside test cfg;
             // the allow is justified by the feature-gated type alias.
-            #[allow(clippy::clone_on_ref_ptr, reason = "type alias varies per feature")]
+            #[expect(clippy::clone_on_ref_ptr, reason = "type alias varies per feature")]
             test_bypass.clone(),
         ));
 
@@ -1786,7 +1786,7 @@ impl OAuthConfigBuilder {
     /// applies.
     #[deprecated(since = "1.7.0", note = "use `audience_validation_mode` instead")]
     pub const fn strict_audience_validation(mut self, strict: bool) -> Self {
-        #[allow(
+        #[expect(
             deprecated,
             reason = "intentional: deprecated builder forwards to deprecated field"
         )]
@@ -2104,7 +2104,7 @@ impl fmt::Debug for ExchangedToken {
 /// server and perform a standard Authorization Code + PKCE flow.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "flat TOML sub-table of independent operator toggles; collapsing them into an enum would break both the public API and the deserialized schema"
 )]
@@ -2397,7 +2397,7 @@ impl CachedKeys {
 ///   endpoint by sending JWTs with fabricated `kid` values.
 /// - **Concurrent deduplication**: Only one refresh in flight at a time;
 ///   concurrent waiters share the same fetch result.
-#[allow(
+#[expect(
     missing_debug_implementations,
     reason = "contains reqwest::Client and DecodingKey cache with no Debug impl"
 )]
@@ -2483,7 +2483,7 @@ const ACCEPTED_ALGS: &[Algorithm] = &[
 /// [`OAuthConfig::allowed_algorithms`], so config parsing and error messages
 /// can never drift from [`ACCEPTED_ALGS`]. `accepted_algorithm_names_cover_accepted_algs`
 /// asserts the two stay in lockstep.
-#[allow(
+#[expect(
     clippy::wildcard_enum_match_arm,
     reason = "jsonwebtoken Algorithm is #[non_exhaustive], so an exhaustive match is impossible; HS*, `none`, and any future variant must fail closed to None"
 )]
@@ -2648,7 +2648,7 @@ impl JwksCache {
         #[cfg(not(any(test, feature = "test-helpers")))]
         let test_bypass: crate::ssrf_resolver::TestLoopbackBypass = ();
 
-        #[allow(
+        #[expect(
             clippy::clone_on_ref_ptr,
             clippy::clone_on_copy,
             clippy::unit_arg,
@@ -2959,7 +2959,7 @@ impl JwksCache {
     // enter `refresh_with_cooldown`. That commits `last_refresh_attempt` before
     // fetching, so a cancellation mid-refresh still consumes the cooldown slot
     // and the next caller may be refused a refresh for the cooldown window.
-    #[allow(
+    #[expect(
         clippy::cognitive_complexity,
         reason = "each failure arm pairs `cold_path()` with a distinct `tracing::debug!` site for observability; collapsing into combinators would lose structured-field log sites without reducing real complexity"
     )]
@@ -3221,7 +3221,7 @@ impl JwksCache {
     }
 
     /// Fetch and parse the JWKS document. Returns `None` and logs on failure.
-    #[allow(
+    #[expect(
         clippy::cognitive_complexity,
         reason = "screening, bounded streaming, and parse logging are intentionally kept in one fetch path"
     )]
@@ -3508,7 +3508,7 @@ fn jwk_algorithm(jwk: &jsonwebtoken::jwk::Jwk) -> Option<JwkAlg> {
 }
 
 /// Map a declared JWK `alg` onto a supported JWS algorithm.
-#[allow(
+#[expect(
     clippy::wildcard_enum_match_arm,
     reason = "jsonwebtoken KeyAlgorithm is a large external enum; only the JWT-signing variants are mappable to `Algorithm`"
 )]
@@ -3535,7 +3535,7 @@ fn explicit_jwk_algorithm(declared: jsonwebtoken::jwk::KeyAlgorithm) -> Option<A
 /// verification key -- and `P-521` yields `None` because `jsonwebtoken` 11
 /// defines no `ES512` variant (its own `EllipticCurve::P521` doc notes the
 /// curve is unsupported by `ring`).
-#[allow(
+#[expect(
     clippy::wildcard_enum_match_arm,
     reason = "jsonwebtoken AlgorithmParameters and EllipticCurve are both #[non_exhaustive] external enums, so an exhaustive match is impossible; unmatched variants must fail closed to None"
 )]
@@ -4936,7 +4936,7 @@ mod tests {
             allowed_algorithms: None,
             authorization_servers: None,
             authorization_server_metadata_issuer: None,
-            #[allow(
+            #[expect(
                 deprecated,
                 reason = "test fixture: explicit value for the deprecated field"
             )]
@@ -5662,7 +5662,7 @@ role = "admin"
             allowed_algorithms: None,
             authorization_servers: None,
             authorization_server_metadata_issuer: None,
-            #[allow(
+            #[expect(
                 deprecated,
                 reason = "test fixture: explicit value for the deprecated field"
             )]
@@ -7893,7 +7893,7 @@ role = "admin"
             allowed_algorithms: None,
             authorization_servers: None,
             authorization_server_metadata_issuer: None,
-            #[allow(
+            #[expect(
                 deprecated,
                 reason = "test fixture: explicit value for the deprecated field"
             )]
@@ -8264,7 +8264,7 @@ role = "admin"
         let mut config = test_config(&jwks_uri);
         // Legacy opt-out: the deprecated bool set to Some(false) with the enum
         // unset must resolve to Warn, preserving the pre-3.2 azp-accepting path.
-        #[allow(deprecated, reason = "covers the legacy bool compat mapping")]
+        #[expect(deprecated, reason = "covers the legacy bool compat mapping")]
         {
             config.strict_audience_validation = Some(false);
         }
@@ -8341,7 +8341,7 @@ role = "admin"
 
         let jwks_uri = format!("{}/jwks.json", mock_server.uri());
         let mut config = test_config(&jwks_uri);
-        #[allow(deprecated, reason = "covers the legacy bool resolution path")]
+        #[expect(deprecated, reason = "covers the legacy bool resolution path")]
         {
             config.strict_audience_validation = Some(true);
         }
@@ -8468,7 +8468,7 @@ role = "admin"
     #[test]
     fn audience_validation_mode_overrides_legacy_bool() {
         let mut config = OAuthConfig::default();
-        #[allow(deprecated, reason = "covers the precedence rule for the legacy bool")]
+        #[expect(deprecated, reason = "covers the precedence rule for the legacy bool")]
         {
             config.strict_audience_validation = Some(false);
         }
@@ -8480,7 +8480,7 @@ role = "admin"
         );
 
         let mut config = OAuthConfig::default();
-        #[allow(deprecated, reason = "covers the precedence rule for the legacy bool")]
+        #[expect(deprecated, reason = "covers the precedence rule for the legacy bool")]
         {
             config.strict_audience_validation = Some(true);
         }
@@ -8505,7 +8505,7 @@ role = "admin"
     #[test]
     fn audience_validation_legacy_bool_true_resolves_to_strict() {
         let mut config = OAuthConfig::default();
-        #[allow(deprecated, reason = "covers the legacy bool resolution path")]
+        #[expect(deprecated, reason = "covers the legacy bool resolution path")]
         {
             config.strict_audience_validation = Some(true);
         }

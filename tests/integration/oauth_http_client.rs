@@ -32,14 +32,6 @@
 //! routing - so the test surface remains the redirect policy and TLS
 //! trust path themselves.
 
-#![allow(clippy::expect_used, reason = "tests")]
-#![allow(clippy::unwrap_used, reason = "tests")]
-#![allow(clippy::panic, reason = "tests")]
-#![allow(clippy::print_stdout, reason = "tests")]
-#![allow(clippy::print_stderr, reason = "tests")]
-#![allow(clippy::indexing_slicing, reason = "tests")]
-#![allow(dead_code, reason = "PEM fields kept for symmetry / future tests")]
-
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use rcgen::{

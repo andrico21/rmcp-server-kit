@@ -1,16 +1,3 @@
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::unwrap_in_result,
-    clippy::print_stdout,
-    clippy::print_stderr
-)]
-#![allow(
-    deprecated,
-    reason = "exercises the deprecated ungated test constructors on purpose"
-)]
 //! End-to-end tests for the rmcp-server-kit HTTP server stack.
 //!
 //! Spins up a real `serve()` instance on an ephemeral port with a minimal
@@ -144,7 +131,7 @@ impl ServerHandler for RbacContextProbeHandler {
 #[derive(Clone)]
 struct AdvertisedToolsHandler;
 
-#[allow(
+#[expect(
     clippy::unused_async_trait_impl,
     reason = "rmcp ServerHandler requires async methods; this E2E fake returns immediately"
 )]
@@ -389,7 +376,7 @@ async fn free_port() -> u16 {
 /// Handle to a server spawned via [`spawn_server`]. Drop the harness
 /// (or call [`ServerHarness::shutdown`]) to terminate the server
 /// deterministically.
-#[allow(
+#[expect(
     dead_code,
     reason = "shutdown() and join field are used by the BUG-NEW shutdown_timeout test added in the same release"
 )]
@@ -406,7 +393,7 @@ struct ServerHarness {
     join: Option<JoinHandle<rmcp_server_kit::Result<()>>>,
 }
 
-#[allow(
+#[expect(
     dead_code,
     reason = "shutdown() is used by the BUG-NEW shutdown_timeout test added in the same release"
 )]
@@ -2930,7 +2917,7 @@ async fn shutdown_timeout_honored_on_first_signal() {
 /// assignment. Asserts a representative subset of fields touched by
 /// every common builder so future drift surfaces here first.
 #[tokio::test]
-#[allow(
+#[expect(
     deprecated,
     reason = "intentionally exercises the deprecated direct-field-write path to verify builder equivalence; this test IS the equivalence proof"
 )]
@@ -3015,7 +3002,7 @@ async fn validate_rejects_admin_without_auth() {
 /// Setting only the TLS cert (or only the key) must be rejected by
 /// `validate()`. Both paths must be present together or absent together.
 #[tokio::test]
-#[allow(
+#[expect(
     deprecated,
     reason = "intentionally exercises direct field writes to test partial-pair rejection (no builder sets only one of the pair)"
 )]

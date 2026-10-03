@@ -124,17 +124,17 @@ pub(crate) enum RejectionReason {
     Expired,
     #[cfg_attr(
         not(feature = "oauth"),
-        allow(dead_code, reason = "constructed only by OAuth JWT validation")
+        expect(dead_code, reason = "constructed only by OAuth JWT validation")
     )]
     Audience,
     #[cfg_attr(
         not(feature = "oauth"),
-        allow(dead_code, reason = "constructed only by OAuth JWT validation")
+        expect(dead_code, reason = "constructed only by OAuth JWT validation")
     )]
     Role,
     #[cfg_attr(
         not(feature = "oauth"),
-        allow(dead_code, reason = "constructed only by OAuth JWT validation")
+        expect(dead_code, reason = "constructed only by OAuth JWT validation")
     )]
     Subject,
 }
@@ -467,7 +467,7 @@ impl ApiKeyEntry {
 /// mTLS client certificate authentication configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "mTLS CRL behavior is intentionally configured as independent booleans"
 )]
@@ -954,7 +954,7 @@ pub struct ApiKeySummary {
 
 /// Snapshot of the enabled authentication methods for admin endpoints.
 #[derive(Debug, Clone, serde::Serialize)]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "this is a flat summary of independent auth-method booleans"
 )]
@@ -1160,7 +1160,7 @@ impl AuthLogContext {
 ///
 /// `api_keys` uses [`ArcSwap`] so the SIGHUP handler can atomically
 /// swap in a new key list without blocking in-flight requests.
-#[allow(
+#[expect(
     missing_debug_implementations,
     reason = "contains governor RateLimiter and JwksCache without Debug impls"
 )]
@@ -1368,7 +1368,7 @@ pub fn extract_mtls_identity(cert_der: &[u8], default_role: &str) -> Option<Auth
             .ok()
             .flatten()
             .and_then(|san| {
-                #[allow(
+                #[expect(
                     clippy::wildcard_enum_match_arm,
                     reason = "x509-parser GeneralName is a large external enum; only DNSName is meaningful here"
                 )]
@@ -1506,7 +1506,7 @@ where
 {
     use subtle::ConstantTimeEq as _;
 
-    #[allow(
+    #[expect(
         clippy::expect_used,
         reason = "DUMMY_PHC_HASH is a static LazyLock built from a fixed Argon2id PHC string by construction; PasswordHash::new on it is infallible. See DUMMY_PHC_HASH definition."
     )]
@@ -1594,7 +1594,7 @@ pub(crate) fn verify_bearer_token_verdict(token: &str, keys: &[ApiKeyEntry]) -> 
 /// set by the PHC `m`/`t`/`p` parameters, not by the salt value, so a
 /// fixed salt costs exactly what a random one would.
 static DUMMY_PHC_HASH: LazyLock<String> = LazyLock::new(|| {
-    #[allow(
+    #[expect(
         clippy::expect_used,
         reason = "Argon2::default() over a fixed plaintext and a fixed 16-byte salt is infallible; it fails only on invalid params or salt length, both constants here"
     )]
@@ -1801,7 +1801,7 @@ fn log_auth_failure(
 
 #[cfg_attr(
     not(feature = "oauth"),
-    allow(
+    expect(
         unused_variables,
         reason = "`state` is only read to decide whether to advertise OAuth \
                   protected-resource metadata; without the `oauth` feature that \
@@ -1954,7 +1954,7 @@ fn pre_auth_gate(state: &AuthState, client_key: Option<&RateLimitKey>) -> Option
 
 #[cfg_attr(
     not(feature = "metrics"),
-    allow(
+    expect(
         unused_variables,
         reason = "`extensions` is read only to record the \
                   `rmcp_server_kit_rate_limited_total` metric; without the \

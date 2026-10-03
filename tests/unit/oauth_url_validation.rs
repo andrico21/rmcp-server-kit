@@ -11,10 +11,6 @@
 //!   IPv4 or IPv6 host in the URL string (any canonical form parsed by
 //!   [`url::Url`]).
 
-#![allow(clippy::expect_used, reason = "tests")]
-#![allow(clippy::unwrap_used, reason = "tests")]
-#![allow(clippy::panic, reason = "tests")]
-
 use rmcp_server_kit::oauth::OAuthConfig;
 
 /// Build a minimal OAuthConfig with a given jwks_uri and allow_http flag.

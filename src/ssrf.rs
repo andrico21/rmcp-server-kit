@@ -315,7 +315,7 @@ impl CidrEntry {
     /// Uses `std::net` only -- no new dependencies.
     #[cfg_attr(
         not(feature = "oauth"),
-        allow(dead_code, reason = "consumer is feature-gated")
+        expect(dead_code, reason = "consumer is feature-gated")
     )]
     pub(crate) fn parse(raw: &str) -> Result<Self, String> {
         let raw = raw.trim();
@@ -435,7 +435,7 @@ impl CompiledSsrfAllowlist {
     /// entries (lowercased) and CIDR entries.
     #[cfg_attr(
         not(feature = "oauth"),
-        allow(dead_code, reason = "consumer is feature-gated")
+        expect(dead_code, reason = "consumer is feature-gated")
     )]
     pub(crate) fn new(hosts: Vec<String>, cidrs: Vec<CidrEntry>) -> Self {
         Self { hosts, cidrs }
@@ -468,7 +468,7 @@ impl CompiledSsrfAllowlist {
     /// Number of allowlisted hosts (for diagnostic logging).
     #[cfg_attr(
         not(feature = "oauth"),
-        allow(dead_code, reason = "consumer is feature-gated")
+        expect(dead_code, reason = "consumer is feature-gated")
     )]
     pub(crate) fn host_count(&self) -> usize {
         self.hosts.len()
@@ -477,7 +477,7 @@ impl CompiledSsrfAllowlist {
     /// Number of allowlisted CIDR entries (for diagnostic logging).
     #[cfg_attr(
         not(feature = "oauth"),
-        allow(dead_code, reason = "consumer is feature-gated")
+        expect(dead_code, reason = "consumer is feature-gated")
     )]
     pub(crate) fn cidr_count(&self) -> usize {
         self.cidrs.len()

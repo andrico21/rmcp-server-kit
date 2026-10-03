@@ -29,14 +29,6 @@
 //! requires a full mTLS handshake, which is already covered in
 //! `tests/integration/e2e.rs`.
 
-#![allow(
-    deprecated,
-    reason = "exercises the deprecated ungated test constructors on purpose"
-)]
-#![allow(clippy::expect_used)]
-#![allow(clippy::unwrap_used)]
-#![allow(clippy::panic)]
-
 use std::sync::Arc;
 
 use rcgen::{

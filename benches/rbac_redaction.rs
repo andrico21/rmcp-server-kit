@@ -9,12 +9,6 @@
 //! The CI gate `bench-thresholds` runs this bench and asserts
 //! `mean < 10_000 ns` via `scripts/check-bench-threshold.{sh,ps1}`.
 
-#![allow(
-    clippy::expect_used,
-    clippy::missing_docs_in_private_items,
-    missing_docs
-)]
-
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};

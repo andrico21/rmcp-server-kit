@@ -6,16 +6,6 @@
 //! chosen port, so each test pre-reserves an ephemeral port, passes the
 //! concrete address, and polls for readiness.
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::unwrap_in_result,
-    clippy::print_stdout,
-    clippy::print_stderr
-)]
-
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use prometheus::{IntCounterVec, opts};

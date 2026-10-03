@@ -16,10 +16,6 @@
 //! * `impl JwksCache { pub async fn __test_refresh_now(&self) -> Result<(), String> }`
 //! * `impl JwksCache { pub async fn __test_has_kid(&self, kid: &str) -> bool }`
 
-#![allow(clippy::expect_used, reason = "tests")]
-#![allow(clippy::unwrap_used, reason = "tests")]
-#![allow(clippy::panic, reason = "tests")]
-
 use rmcp_server_kit::oauth::{JwksCache, OAuthConfig};
 use serde_json::{Value, json};
 use wiremock::{

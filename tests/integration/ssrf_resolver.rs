@@ -31,10 +31,6 @@
 //! production constructor `OauthHttpClient::with_config(&OAuthConfig)`
 //! and observe behaviour via the test-only `__test_get` accessor.
 
-#![allow(clippy::expect_used, reason = "tests")]
-#![allow(clippy::unwrap_used, reason = "tests")]
-#![allow(clippy::panic, reason = "tests")]
-
 use std::time::Duration;
 
 use rmcp_server_kit::oauth::{OAuthConfig, OauthHttpClient};

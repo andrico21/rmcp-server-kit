@@ -11,8 +11,6 @@
 //!
 //! A dedicated `memory-bounds` CI job runs this on Linux as a release-gate.
 
-#![allow(clippy::expect_used, clippy::print_stderr, clippy::cast_precision_loss)]
-
 use std::{net::IpAddr, time::Duration};
 
 use rmcp_server_kit::bounded_limiter::BoundedKeyedLimiter;

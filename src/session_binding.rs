@@ -287,7 +287,7 @@ pub(crate) fn keyed_mac(secret: &SessionBindingSecret) -> HmacSha256 {
         m
     } else {
         let digest = Sha256::digest(key);
-        #[allow(
+        #[expect(
             clippy::expect_used,
             reason = "32-byte SHA-256 digest is unconditionally valid as an HMAC-SHA256 key (RFC 2104 allows any key length); see surrounding comment"
         )]

@@ -34,13 +34,6 @@
 //! the hook overhead in transport noise and make the gate unable to
 //! detect regressions in the hook machinery itself.
 
-#![allow(
-    clippy::expect_used,
-    clippy::missing_docs_in_private_items,
-    clippy::unreachable,
-    missing_docs
-)]
-
 use std::{hint::black_box, sync::Arc};
 
 use criterion::{Criterion, criterion_group, criterion_main};

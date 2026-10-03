@@ -313,7 +313,7 @@ pub(crate) const RBAC_REDACTION_SALT_FILE_ENV: &str = "RMCP_SERVER_KIT__RBAC__RE
 /// Server listener configuration (reusable across MCP projects).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "server configuration is a flat TOML schema with independent boolean feature flags"
 )]
@@ -1202,7 +1202,7 @@ fn parse_duration_field(field: &str, value: &str) -> Result<Duration, RmcpServer
 /// Observability settings (reusable across MCP projects).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "observability configuration is a flat TOML schema with independent boolean feature flags"
 )]
@@ -1325,7 +1325,7 @@ pub(crate) enum SharedConfigViolation {
 /// env overrides, bridge behaviour) stays where it is: those inputs are not
 /// common to both types, and folding them in here would change validation
 /// behaviour that no test currently pins.
-#[allow(
+#[expect(
     clippy::fn_params_excessive_bools,
     reason = "these are the five independent predicates both validators evaluate; a params struct would carry the same five bools and only relocate the lint"
 )]
@@ -1745,17 +1745,6 @@ fn default_sse_keep_alive() -> String {
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::indexing_slicing,
-        clippy::unwrap_in_result,
-        clippy::print_stdout,
-        clippy::print_stderr,
-        deprecated,
-        reason = "test-only relaxations; production code uses ? and tracing"
-    )]
     use std::{collections::HashSet, sync::Arc, time::Duration};
 
     use super::*;
@@ -1839,7 +1828,7 @@ mod tests {
         assert!(!cfg.log_tool_call_arguments);
     }
 
-    #[allow(
+    #[expect(
         clippy::cognitive_complexity,
         reason = "tracing! macro expansions add branches"
     )]

@@ -213,12 +213,6 @@ fn is_valid_port(port: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        reason = "unit tests use unwrap/expect for brevity"
-    )]
 
     use axum::http::HeaderValue;
 

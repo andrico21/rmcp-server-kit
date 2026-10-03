@@ -20,19 +20,6 @@
 //! transparency tests in `src/tool_hooks.rs` and `src/rbac_context.rs` cover the
 //! negotiation entry point; extend them when adding coverage here.
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::string_slice,
-    reason = "a drift guard must fail loudly; panicking is the failure mode. \
-              Every slice here is taken at a byte offset produced by `str::find` \
-              on an ASCII delimiter, by the ASCII brace scan, or by the byte \
-              length of an extracted ASCII identifier, so it always lands on a \
-              char boundary"
-)]
-
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,

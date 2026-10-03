@@ -50,7 +50,7 @@
 
 use std::{borrow::Cow, fmt, future::Future, io, pin::Pin, sync::Arc};
 
-#[allow(
+#[expect(
     deprecated,
     reason = "transparent ServerHandler delegation must import legacy logging/subscription parameter types until rmcp removes those methods"
 )]
@@ -237,7 +237,7 @@ pub type AfterHook = Arc<
 >;
 
 /// Opt-in hooks applied by [`crate::tool_hooks::HookedHandler`].
-#[allow(clippy::struct_field_names, reason = "before/after read naturally")]
+#[expect(clippy::struct_field_names, reason = "before/after read naturally")]
 #[derive(Clone, Default)]
 #[non_exhaustive]
 pub struct ToolHooks {
@@ -497,7 +497,7 @@ fn apply_size_cap(
     }
 }
 
-#[allow(
+#[expect(
     deprecated,
     reason = "transparent ServerHandler delegation must include legacy logging/subscription methods until rmcp removes them"
 )]
@@ -603,7 +603,7 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
     // record a started call that is never closed out. Consumers needing
     // guaranteed pairing should make the after-hook idempotent or run the tool
     // body detached (see `crate::cancel`).
-    #[allow(
+    #[expect(
         clippy::wildcard_enum_match_arm,
         reason = "CallToolResponse is #[non_exhaustive]; the non-Complete MRTR variants (InputRequired/Task) are passed through unchanged"
     )]
@@ -865,7 +865,7 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
-    #[allow(
+    #[expect(
         deprecated,
         reason = "delegation tests cover legacy logging/subscription methods"
     )]
@@ -941,7 +941,7 @@ mod tests {
             ServerConfig::default()
         }
 
-        #[allow(
+        #[expect(
             clippy::unused_async_trait_impl,
             reason = "async is mandated by the rmcp ServerHandler trait signature; this test handler does not await"
         )]
@@ -987,7 +987,7 @@ mod tests {
         }
     }
 
-    #[allow(
+    #[expect(
         clippy::unused_async_trait_impl,
         deprecated,
         reason = "delegation tests cover rmcp async trait methods whose probe implementations return immediately"
@@ -1102,7 +1102,7 @@ mod tests {
     /// allow.
     #[derive(Clone, Default)]
     struct PassthroughDefaults<H> {
-        #[allow(
+        #[expect(
             dead_code,
             reason = "deliberately never read: this type overrides nothing, so the probe must stay unreached"
         )]
@@ -1165,7 +1165,7 @@ mod tests {
         }
     }
 
-    #[allow(
+    #[expect(
         clippy::unused_async_trait_impl,
         deprecated,
         reason = "coverage drives rmcp's async trait methods, whose probe bodies return immediately"
@@ -1492,7 +1492,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(
+    #[expect(
         deprecated,
         reason = "set_level is deprecated by rmcp but must delegate"
     )]
@@ -1535,7 +1535,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(
+    #[expect(
         deprecated,
         reason = "subscribe/unsubscribe are deprecated by rmcp but must delegate"
     )]

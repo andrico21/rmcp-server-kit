@@ -1,10 +1,6 @@
 //! 1.3.0 Oracle B3: exercise JWKS redirect SSRF protection through the
 //! real `JwksCache::new()` client and refresh path.
 
-#![allow(clippy::expect_used, reason = "tests")]
-#![allow(clippy::unwrap_used, reason = "tests")]
-#![allow(clippy::panic, reason = "tests")]
-
 use rmcp_server_kit::oauth::{JwksCache, OAuthConfig};
 use serde_json::{Value, json};
 use wiremock::{

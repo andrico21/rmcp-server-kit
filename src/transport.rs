@@ -49,7 +49,7 @@ use crate::{
 /// Map an internal `anyhow::Error` chain into a public [`RmcpServerKitError::Startup`]
 /// at the public API boundary, flattening the chain via the alternate
 /// formatter so callers see the full causal path.
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "consumed at .map_err(anyhow_to_startup) call sites; by-value matches the closure shape"
 )]
@@ -62,7 +62,7 @@ fn anyhow_to_startup(e: anyhow::Error) -> RmcpServerKitError {
 /// `From` impl here because startup-phase IO errors (bind, listener) are
 /// semantically distinct from request-time IO errors and should surface
 /// the originating operation in the message.
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "consumed at .map_err(|e| io_to_startup(...)) call sites; by-value matches the closure shape"
 )]
@@ -148,7 +148,7 @@ impl PeerAddr {
 impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerAddr {
     type Rejection = (axum::http::StatusCode, &'static str);
 
-    #[allow(
+    #[expect(
         clippy::unused_async_trait_impl,
         reason = "async is mandated by the axum FromRequestParts trait signature; this impl only reads a request extension synchronously"
     )]
@@ -293,7 +293,7 @@ pub struct SecurityHeadersConfig {
 #[serde(default)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "each field is an independent operator-facing opt-in switch; grouping them into sub-structs would complicate the public API and the TOML surface for no safety gain"
 )]
@@ -384,11 +384,11 @@ impl LogContextConfig {
 }
 
 /// Configuration for the MCP server.
-#[allow(
+#[expect(
     missing_debug_implementations,
     reason = "contains callback/trait objects that don't impl Debug"
 )]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "server configuration naturally has many boolean feature flags"
 )]
@@ -841,7 +841,7 @@ pub struct McpServerConfig {
 /// serve(config, || H).await
 /// # }
 /// ```
-#[allow(
+#[expect(
     missing_debug_implementations,
     reason = "wraps T which may not implement Debug; manual impl below avoids leaking inner contents into logs"
 )]
@@ -876,7 +876,7 @@ pub(crate) fn default_request_log_exclude_paths() -> Vec<String> {
     vec!["/healthz".to_owned(), "/readyz".to_owned()]
 }
 
-#[allow(
+#[expect(
     deprecated,
     reason = "internal builders/validators legitimately read/write the deprecated `pub` fields they were designed to manage"
 )]
@@ -1818,7 +1818,7 @@ impl McpServerConfig {
 /// Obtained via [`McpServerConfig::on_reload_ready`].
 /// All swap operations are lock-free and wait-free -- in-flight requests
 /// finish with the old values while new requests see the update immediately.
-#[allow(
+#[expect(
     missing_debug_implementations,
     reason = "contains Arc<AuthState> with non-Debug fields"
 )]
@@ -1914,7 +1914,7 @@ impl ReloadHandle {
 // gated auth/RBAC wiring, and PRM/metrics installation. Further extraction
 // would require threading many `&mut Router` helpers and hurt readability
 // of the layer order (which is security-relevant and must stay visible).
-#[allow(
+#[expect(
     clippy::too_many_lines,
     clippy::cognitive_complexity,
     reason = "middleware layer order is security-critical and must remain visible at one glance; extracting `&mut Router` helpers would obscure the auth/RBAC/origin/rate-limit ordering"
@@ -1981,14 +1981,14 @@ type BindingSecrets = (
 );
 
 fn resolve_binding_secret(config: &McpServerConfig) -> anyhow::Result<BindingSecrets> {
-    #[allow(
+    #[expect(
         deprecated,
         reason = "internal router assembly reads deprecated `pub` config fields by design until 1.0 makes them pub(crate)"
     )]
     if !config.session_binding && !config.task_binding {
         return Ok((None, None));
     }
-    #[allow(
+    #[expect(
         deprecated,
         reason = "internal router assembly reads deprecated `pub` config fields by design until 1.0 makes them pub(crate)"
     )]
@@ -1996,7 +1996,7 @@ fn resolve_binding_secret(config: &McpServerConfig) -> anyhow::Result<BindingSec
         Some(configured) => configured_session_binding_secret(configured)?,
         None => process_session_binding_secret().clone(),
     };
-    #[allow(
+    #[expect(
         deprecated,
         reason = "internal router assembly reads deprecated `pub` config fields by design until 1.0 makes them pub(crate)"
     )]
@@ -2014,11 +2014,11 @@ fn mcp_resource_metadata_url(public_url: &str) -> String {
     )
 }
 
-#[allow(
+#[expect(
     clippy::cognitive_complexity,
     reason = "router assembly is intrinsically sequential; splitting harms readability"
 )]
-#[allow(
+#[expect(
     deprecated,
     reason = "internal router assembly reads deprecated `pub` config fields by design until 1.0 makes them pub(crate)"
 )]
@@ -2321,7 +2321,7 @@ where
         axum::routing::get(healthz)
     };
 
-    #[allow(
+    #[expect(
         unused_mut,
         reason = "the binding is only reassigned when the `oauth` feature adds the \
                   protected-resource-metadata route below"
@@ -2774,7 +2774,7 @@ where
     F: Fn() -> H + Send + Sync + Clone + 'static,
 {
     let config = config.into_inner();
-    #[allow(
+    #[expect(
         deprecated,
         reason = "internal serve() reads `bind_addr` to construct the listener; field becomes pub(crate) in 1.0"
     )]
@@ -2892,7 +2892,7 @@ where
 
 /// Emit the standard "listening on …" log lines used by both
 /// [`serve`] and [`serve_with_listener`].
-#[allow(
+#[expect(
     clippy::cognitive_complexity,
     reason = "tracing::info! macro expansions inflate the score; logic is trivial"
 )]
@@ -2925,7 +2925,7 @@ fn log_listening(name: &str, scheme: &str, addr: &str) {
 /// hang indefinitely. The current implementation derives both branches
 /// from a single shared trigger so the timeout race is anchored to the
 /// FIRST (and only) signal.
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     clippy::cognitive_complexity,
     reason = "server start-up threads TLS, reload state, and graceful shutdown through one flow"
@@ -3251,7 +3251,7 @@ fn build_oauth_admin_router(
 /// the bind address, choosing the scheme from whether TLS is configured.
 /// Shared by the OAuth metadata documents and the `WWW-Authenticate`
 /// `resource_metadata` URL so they can never disagree.
-#[allow(
+#[expect(
     deprecated,
     reason = "internal metadata assembly reads deprecated `pub` config fields by design until 1.0 makes them pub(crate)"
 )]
@@ -3772,7 +3772,7 @@ fn build_tls_server_config(
 }
 
 // cancel-safe: builds a constant JSON body with no awaits and no shared state.
-#[allow(
+#[expect(
     clippy::unused_async,
     reason = "axum route handler signature requires `async fn` even when the body is synchronous"
 )]
@@ -5061,7 +5061,7 @@ fn format_request_headers_for_log(headers: &axum::http::HeaderMap) -> String {
 // NOTE: reported complexity 32/25 is driven entirely by `tracing::*!`
 // macro expansion in this 18-line function (info/warn/info + two matches).
 // There is nothing meaningful to extract; the allow stays.
-#[allow(
+#[expect(
     clippy::cognitive_complexity,
     reason = "complexity is purely tracing macro expansion (info/warn + match arms); 18 lines of straight-line code, nothing meaningful to extract"
 )]
@@ -5088,7 +5088,7 @@ where
     Ok(())
 }
 
-#[allow(
+#[expect(
     deprecated,
     reason = "builder methods are the sanctioned transition layer for deprecated public fields"
 )]
@@ -5337,17 +5337,6 @@ fn check_mtls_capacity_knobs(mtls: &MtlsConfig) -> Result<(), RmcpServerKitError
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::indexing_slicing,
-        clippy::unwrap_in_result,
-        clippy::print_stdout,
-        clippy::print_stderr,
-        deprecated,
-        reason = "internal unit tests legitimately read/write the deprecated `pub` fields they were designed to verify"
-    )]
     use std::{sync::Arc, time::Duration};
 
     use axum::{

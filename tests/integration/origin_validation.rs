@@ -5,16 +5,6 @@
 //! Each test spawns a real server on an ephemeral loopback port - the same
 //! harness pattern as `tests/integration/e2e.rs` - and drives it with `reqwest`.
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::unwrap_in_result,
-    clippy::print_stdout,
-    clippy::print_stderr
-)]
-
 use std::{net::SocketAddr, time::Duration};
 
 use rmcp::{ServerHandler, model::ServerConfig};

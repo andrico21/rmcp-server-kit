@@ -35,17 +35,6 @@
 //!
 //! Run with `cargo bench --bench crl_precheck --features test-helpers`.
 
-#![allow(
-    deprecated,
-    reason = "benchmarks the deprecated ungated test constructors and the out-of-band cache write path on purpose"
-)]
-#![allow(
-    clippy::expect_used,
-    clippy::missing_docs_in_private_items,
-    clippy::print_stdout,
-    missing_docs
-)]
-
 use std::{
     hint::black_box,
     sync::Arc,

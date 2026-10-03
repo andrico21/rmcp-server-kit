@@ -535,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::literal_string_with_formatting_args,
         reason = "the format-shaped text is the fixture under test, not a format call"
     )]

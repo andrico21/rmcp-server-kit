@@ -16,12 +16,6 @@
 //!    an attacker-controlled 3xx from the token endpoint cannot
 //!    cause the cert to be re-presented to a different host.
 
-#![allow(clippy::expect_used, reason = "tests")]
-#![allow(clippy::unwrap_used, reason = "tests")]
-#![allow(clippy::panic, reason = "tests")]
-#![allow(clippy::print_stderr, reason = "tests")]
-#![allow(clippy::indexing_slicing, reason = "tests")]
-
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use rcgen::{

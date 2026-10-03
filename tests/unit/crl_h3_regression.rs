@@ -1,13 +1,5 @@
 //! H3 regression coverage for mTLS CRL cache/verifier atomicity and precheck semantics.
 
-#![allow(
-    deprecated,
-    reason = "exercises the deprecated ungated test constructors on purpose"
-)]
-#![allow(clippy::expect_used)]
-#![allow(clippy::unwrap_used)]
-#![allow(clippy::panic)]
-
 use std::{sync::Arc, time::Duration};
 
 use rcgen::{
