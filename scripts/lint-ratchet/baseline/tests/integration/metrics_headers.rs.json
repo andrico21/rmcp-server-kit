@@ -1,0 +1,28 @@
+{
+  "file": "tests/integration/metrics_headers.rs",
+  "keys": {
+    "test|clippy::absolute_paths|--all-features": 5,
+    "test|clippy::absolute_paths|--features metrics": 5,
+    "test|clippy::default_numeric_fallback|--all-features": 2,
+    "test|clippy::default_numeric_fallback|--features metrics": 2,
+    "test|clippy::missing_errors_doc|--all-features": 8,
+    "test|clippy::missing_errors_doc|--features metrics": 8,
+    "test|clippy::missing_panics_doc|--all-features": 3,
+    "test|clippy::missing_panics_doc|--features metrics": 3,
+    "test|clippy::panic_in_result_fn|--all-features": 2,
+    "test|clippy::panic_in_result_fn|--features metrics": 2,
+    "test|clippy::shadow_reuse|--all-features": 1,
+    "test|clippy::shadow_reuse|--features metrics": 1,
+    "test|clippy::std_instead_of_alloc|--all-features": 1,
+    "test|clippy::std_instead_of_alloc|--features metrics": 1,
+    "test|clippy::std_instead_of_core|--all-features": 2,
+    "test|clippy::std_instead_of_core|--features metrics": 2,
+    "test|clippy::unused_result_ok|--all-features": 1,
+    "test|clippy::unused_result_ok|--features metrics": 1,
+    "test|clippy::unused_trait_names|--all-features": 1,
+    "test|clippy::unused_trait_names|--features metrics": 1,
+    "test|unused_results|--all-features": 1,
+    "test|unused_results|--features metrics": 1
+  },
+  "toolchain": "1.99.0"
+}

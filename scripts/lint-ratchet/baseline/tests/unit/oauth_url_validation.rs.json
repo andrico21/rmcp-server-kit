@@ -1,0 +1,14 @@
+{
+  "file": "tests/unit/oauth_url_validation.rs",
+  "keys": {
+    "test|clippy::doc_markdown|--all-features": 3,
+    "test|clippy::doc_markdown|--features oauth": 3,
+    "test|clippy::expect_used|--all-features": 13,
+    "test|clippy::expect_used|--features oauth": 13,
+    "test|clippy::missing_panics_doc|--all-features": 13,
+    "test|clippy::missing_panics_doc|--features oauth": 13,
+    "test|clippy::tests_outside_test_module|--all-features": 13,
+    "test|clippy::tests_outside_test_module|--features oauth": 13
+  },
+  "toolchain": "1.99.0"
+}

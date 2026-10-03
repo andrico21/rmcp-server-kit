@@ -1,0 +1,32 @@
+{
+  "file": "src/metrics.rs",
+  "keys": {
+    "prod|clippy::absolute_paths|--all-features": 6,
+    "prod|clippy::absolute_paths|--features metrics": 6,
+    "prod|clippy::min_ident_chars|--all-features": 10,
+    "prod|clippy::min_ident_chars|--features metrics": 10,
+    "prod|clippy::missing_inline_in_public_items|--all-features": 3,
+    "prod|clippy::missing_inline_in_public_items|--features metrics": 3,
+    "prod|clippy::module_name_repetitions|--all-features": 2,
+    "prod|clippy::module_name_repetitions|--features metrics": 2,
+    "prod|clippy::std_instead_of_alloc|--all-features": 1,
+    "prod|clippy::std_instead_of_alloc|--features metrics": 1,
+    "prod|clippy::too_long_first_doc_paragraph|--all-features": 1,
+    "prod|clippy::too_long_first_doc_paragraph|--features metrics": 1,
+    "prod|clippy::unused_trait_names|--all-features": 1,
+    "prod|clippy::unused_trait_names|--features metrics": 1,
+    "test|clippy::absolute_paths|--all-features": 13,
+    "test|clippy::absolute_paths|--features metrics": 13,
+    "test|clippy::expect_used|--all-features": 3,
+    "test|clippy::expect_used|--features metrics": 3,
+    "test|clippy::min_ident_chars|--all-features": 8,
+    "test|clippy::min_ident_chars|--features metrics": 8,
+    "test|clippy::std_instead_of_core|--all-features": 3,
+    "test|clippy::std_instead_of_core|--features metrics": 3,
+    "test|clippy::unwrap_used|--all-features": 11,
+    "test|clippy::unwrap_used|--features metrics": 11,
+    "test|unused_results|--all-features": 1,
+    "test|unused_results|--features metrics": 1
+  },
+  "toolchain": "1.99.0"
+}

@@ -1,0 +1,22 @@
+{
+  "file": "tests/integration/e2e_oauth_mtls.rs",
+  "keys": {
+    "test|clippy::absolute_paths|--all-features": 13,
+    "test|clippy::arithmetic_side_effects|--all-features": 1,
+    "test|clippy::expect_used|--all-features": 22,
+    "test|clippy::indexing_slicing|--all-features": 3,
+    "test|clippy::let_underscore_must_use|--all-features": 9,
+    "test|clippy::let_underscore_untyped|--all-features": 9,
+    "test|clippy::min_ident_chars|--all-features": 5,
+    "test|clippy::missing_panics_doc|--all-features": 6,
+    "test|clippy::print_stderr|--all-features": 6,
+    "test|clippy::std_instead_of_alloc|--all-features": 1,
+    "test|clippy::std_instead_of_core|--all-features": 2,
+    "test|clippy::tests_outside_test_module|--all-features": 2,
+    "test|clippy::unseparated_literal_suffix|--all-features": 2,
+    "test|clippy::unused_trait_names|--all-features": 2,
+    "test|let_underscore_drop|--all-features": 9,
+    "test|unused_results|--all-features": 1
+  },
+  "toolchain": "1.99.0"
+}

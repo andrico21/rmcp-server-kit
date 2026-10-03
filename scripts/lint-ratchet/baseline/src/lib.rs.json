@@ -1,0 +1,11 @@
+{
+  "file": "src/lib.rs",
+  "keys": {
+    "prod|clippy::missing_docs_in_private_items|": 1,
+    "prod|clippy::missing_docs_in_private_items|--all-features": 1,
+    "prod|clippy::missing_docs_in_private_items|--features metrics": 1,
+    "prod|clippy::missing_docs_in_private_items|--features oauth": 1,
+    "prod|clippy::missing_docs_in_private_items|--no-default-features": 1
+  },
+  "toolchain": "1.99.0"
+}
