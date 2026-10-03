@@ -29,7 +29,6 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::panic)]
-#![cfg(feature = "test-helpers")]
 
 use std::sync::Arc;
 

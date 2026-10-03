@@ -209,6 +209,88 @@ name = "crl_precheck"
 harness = false
 required-features = ["test-helpers"]
 
+# Tiered test targets. One `[[test]]` per file so the target name stays the
+# bare file stem (`--test e2e`, `--test docs_citations`, ...). `required-features`
+# replaces the crate-level `#![cfg(feature = ...)]` gates the moved files used
+# to carry: running a gated target without its features now errors with
+# "requires the features" instead of silently running an empty binary.
+[[test]]
+name = "crl_discovery_ratelimit"
+path = "tests/unit/crl_discovery_ratelimit.rs"
+
+[[test]]
+name = "crl_h3_regression"
+path = "tests/unit/crl_h3_regression.rs"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "crl_map_bounds"
+path = "tests/unit/crl_map_bounds.rs"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "oauth_url_validation"
+path = "tests/unit/oauth_url_validation.rs"
+required-features = ["oauth"]
+
+[[test]]
+name = "properties"
+path = "tests/unit/properties.rs"
+
+[[test]]
+name = "crl_ssrf"
+path = "tests/integration/crl_ssrf.rs"
+
+[[test]]
+name = "delegation_guard"
+path = "tests/integration/delegation_guard.rs"
+
+[[test]]
+name = "docs_citations"
+path = "tests/integration/docs_citations.rs"
+
+[[test]]
+name = "e2e"
+path = "tests/integration/e2e.rs"
+
+[[test]]
+name = "e2e_oauth_mtls"
+path = "tests/integration/e2e_oauth_mtls.rs"
+required-features = ["oauth", "oauth-mtls-client", "test-helpers"]
+
+[[test]]
+name = "jwks_key_cap"
+path = "tests/integration/jwks_key_cap.rs"
+required-features = ["oauth", "test-helpers"]
+
+[[test]]
+name = "jwks_redirect_ssrf"
+path = "tests/integration/jwks_redirect_ssrf.rs"
+required-features = ["oauth", "test-helpers"]
+
+[[test]]
+name = "limiter_memory"
+path = "tests/integration/limiter_memory.rs"
+
+[[test]]
+name = "metrics_handle"
+path = "tests/integration/metrics_handle.rs"
+required-features = ["metrics"]
+
+[[test]]
+name = "oauth_http_client"
+path = "tests/integration/oauth_http_client.rs"
+required-features = ["oauth", "test-helpers"]
+
+[[test]]
+name = "origin_validation"
+path = "tests/integration/origin_validation.rs"
+
+[[test]]
+name = "ssrf_resolver"
+path = "tests/integration/ssrf_resolver.rs"
+required-features = ["oauth", "test-helpers"]
+
 # cargo-machete config: dependencies machete cannot detect via static
 # analysis but that ARE used at runtime.
 #

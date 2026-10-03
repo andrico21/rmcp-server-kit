@@ -91,6 +91,12 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   reasoned `RUSTSEC-2023-0071` ignore kept in sync with `.cargo/audit.toml`
   (which drops the stale `RUSTSEC-2026-0097`). No dependency version and no
   `Cargo.lock` change.
+- **Tiered test layout (internal)** - the 17 flat `tests/*.rs` files moved into
+  `tests/unit/` and `tests/integration/`, one crate per file, with explicit
+  `[[test]]` targets in `Cargo.toml` (names unchanged, so `cargo test --test X`
+  keeps working). `required-features` replaces the crate-level
+  `#![cfg(feature = ...)]` gates: running a gated target without its features now
+  errors instead of silently running an empty binary. No test behavior changes.
 
 ### Fixed
 
