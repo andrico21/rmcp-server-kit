@@ -1,20 +1,29 @@
-[advisories]
-db-urls = ["https://github.com/rustsec/advisory-db"]
-yanked = "deny"
-# Policy posture (cargo-deny v2 schema):
-#   - vulnerabilities: deny by default (an advisory entry triggers a hard
-#     failure unless explicitly listed in `ignore` below);
-#   - unmaintained / notice / unsound: warn by default;
-#   - yanked: deny (above).
-# The deprecated `vulnerability`/`unmaintained`/`notice` keys from cargo-deny
-# v1 are intentionally not set - v2 emits warnings for them.
+# deny.toml - workspace root
 #
-# See .cargo/audit.toml for the rationale behind each ignored advisory.
-# RUSTSEC-2023-0071: Marvin timing sidechannel in `rsa` 0.9.x (no upstream
-#   fix; rmcp-server-kit validates JWTs with public keys only, not vulnerable).
-ignore = ["RUSTSEC-2023-0071"]
+# The core sample from RUST_GUIDELINES.md (andrico21/rust-guidelines
+# @ 1314cadf42caa88b172bc72d156eb2d3cbf65e7b), adjusted to this workspace:
+# the license allowlist is exactly what the locked dependency graph carries
+# and the duplicate/advisory dispositions below are each reasoned.
+# Keep `[bans] skip` in step with `allowed-duplicate-crates` in clippy.toml.
+
+[graph]
+all-features = true # optional dependencies are held to the same policy
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Scope, NOT a lint level: one of "all" | "workspace" | "transitive" | "none".
+# "all" - transitive deps are where most RUSTSEC exposure actually lives.
+unmaintained = "all"
+unsound = "all"
+yanked = "deny"
+# Mirrored in .cargo/audit.toml; the two ignore sets must stay equal.
+ignore = [
+  { id = "RUSTSEC-2023-0071", reason = "Marvin timing sidechannel in `rsa` 0.9.x with no upstream fix; rmcp-server-kit verifies JWTs with public keys only and never performs RSA decryption, so the sidechannel does not apply" },
+]
 
 [licenses]
+confidence-threshold = 0.93
 allow = [
   "MIT",
   "Apache-2.0",
@@ -23,23 +32,150 @@ allow = [
   "BSD-3-Clause",
   "ISC",
   "Unicode-3.0",
-  "Unicode-DFS-2016",
   "Zlib",
   "BSL-1.0",
-  "CC0-1.0",
-  "MPL-2.0",
-  "OpenSSL",
   "CDLA-Permissive-2.0",
 ]
-confidence-threshold = 0.8
 
 [bans]
-multiple-versions = "warn"
-wildcards = "deny"
+multiple-versions = "deny"   # unavoidable duplicates go into `skip`, each with a reason
+wildcards = "deny"           # No * version specs
+allow-wildcard-paths = false
 highlight = "all"
+
+# Every entry below is an upstream-forced duplicate: the direct dependencies
+# are already at their latest release, so the second (third) copy can only be
+# removed upstream. Reasons are the reverse dependency chains reported by
+# `cargo tree -i <crate>@<version> -e normal --all-features` (plus `--target all`
+# for the platform-gated Windows/UEFI edges).
+[[bans.skip]]
+name = "base64"
+version = "=0.22.1"
+reason = "jsonwebtoken 11.1.0 -> pem 3.0.6; base64 0.23.1 is the direct dependency"
+
+[[bans.skip]]
+name = "bitflags"
+version = "=1.3.2"
+reason = "windows-permissions 0.2.4 (Windows-only transitive dependency)"
+
+[[bans.skip]]
+name = "block-buffer"
+version = "=0.10.4"
+reason = "digest 0.10.7 via ed25519-dalek 2.2.0 / ecdsa 0.16.9 / elliptic-curve 0.13.8 (jsonwebtoken 11.1.0 RustCrypto 0.10 stack)"
+
+[[bans.skip]]
+name = "const-oid"
+version = "=0.9.6"
+reason = "der 0.7.10 / pkcs1 0.7.5 / pkcs8 0.10.2 via rsa 0.9.10 and ecdsa 0.16.9 (jsonwebtoken 11.1.0)"
+
+[[bans.skip]]
+name = "cpufeatures"
+version = "=0.2.17"
+reason = "curve25519-dalek 4.1.3 and sha2 0.10.9 via jsonwebtoken 11.1.0"
+
+[[bans.skip]]
+name = "crypto-common"
+version = "=0.1.6"
+reason = "digest 0.10.7 of the jsonwebtoken 11.1.0 RustCrypto 0.10 stack"
+
+[[bans.skip]]
+name = "digest"
+version = "=0.10.7"
+reason = "jsonwebtoken 11.1.0 RustCrypto 0.10 stack (ed25519-dalek 2.2.0, ecdsa 0.16.9, hmac 0.12.1)"
+
+[[bans.skip]]
+name = "hmac"
+version = "=0.12.1"
+reason = "hkdf 0.12.4 / rfc6979 0.4.0 via elliptic-curve 0.13.8 and jsonwebtoken 11.1.0"
+
+[[bans.skip]]
+name = "r-efi"
+version = "=5.3.0"
+reason = "getrandom 0.3.4 via governor 0.10.4 (UEFI target only)"
+
+[[bans.skip]]
+name = "rand_chacha"
+version = "=0.3.1"
+reason = "rand 0.8.8 via jsonwebtoken 11.1.0 and num-bigint-dig 0.8.6 -> rsa 0.9.10"
+
+[[bans.skip]]
+name = "sha2"
+version = "=0.10.9"
+reason = "ed25519-dalek 2.2.0 and p256 0.13.2 / p384 0.13.1 via jsonwebtoken 11.1.0"
+
+[[bans.skip]]
+name = "syn"
+version = "=2.0.119"
+reason = "asn1-rs-derive 0.6.0 / curve25519-dalek-derive 0.1.1 via x509-parser 0.18.1 and jsonwebtoken 11.1.0"
+
+[[bans.skip]]
+name = "synstructure"
+version = "=0.13.2"
+reason = "asn1-rs-derive 0.6.0 -> asn1-rs 0.7.2 -> x509-parser 0.18.1"
+
+[[bans.skip]]
+name = "thiserror"
+version = "=1.0.69"
+reason = "protobuf 3.7.2 and protobuf-support 3.7.2 -> prometheus 0.14.0"
+
+[[bans.skip]]
+name = "thiserror-impl"
+version = "=1.0.69"
+reason = "thiserror 1.0.69 (proc-macro) via protobuf 3.7.2 -> prometheus 0.14.0"
+
+[[bans.skip]]
+name = "tower-http"
+version = "=0.6.11"
+reason = "reqwest 0.13.5 (dev dependency); tower-http 0.7.1 is the direct dependency"
+
+[[bans.skip]]
+name = "windows-sys"
+version = "=0.52.0"
+reason = "ring 0.17.14 -> rustls 0.23.45 (Windows-only transitive dependency)"
+
+[[bans.skip]]
+name = "getrandom"
+version = "=0.2.17"
+reason = "rand_core 0.6.4 via crypto-bigint 0.5.5 -> elliptic-curve 0.13.8 (jsonwebtoken 11.1.0)"
+
+[[bans.skip]]
+name = "getrandom"
+version = "=0.3.4"
+reason = "governor 0.10.4 and rand 0.9.5"
+
+[[bans.skip]]
+name = "hashbrown"
+version = "=0.14.5"
+reason = "dashmap 6.2.1 -> governor 0.10.4"
+
+[[bans.skip]]
+name = "hashbrown"
+version = "=0.16.1"
+reason = "governor 0.10.4"
+
+[[bans.skip]]
+name = "rand"
+version = "=0.8.8"
+reason = "jsonwebtoken 11.1.0 and num-bigint-dig 0.8.6 -> rsa 0.9.10"
+
+[[bans.skip]]
+name = "rand"
+version = "=0.9.5"
+reason = "governor 0.10.4"
+
+[[bans.skip]]
+name = "rand_core"
+version = "=0.6.4"
+reason = "crypto-bigint 0.5.5 / rsa 0.9.10 via jsonwebtoken 11.1.0"
+
+[[bans.skip]]
+name = "rand_core"
+version = "=0.9.5"
+reason = "rand 0.9.5 -> governor 0.10.4 and rand_chacha 0.9.0"
 
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+required-git-spec = "rev"                                         # git dependencies pinned to a commit
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = []
