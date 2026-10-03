@@ -4,6 +4,66 @@
 //!
 //! Each test spawns a real server on an ephemeral loopback port - the same
 //! harness pattern as `tests/integration/e2e.rs` - and drives it with `reqwest`.
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::tests_outside_test_module,
+        reason = "lint-migration: tests/integration/origin_validation.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::expect_used,
+        reason = "lint-migration: tests/integration/origin_validation.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::shadow_reuse,
+        reason = "lint-migration: tests/integration/origin_validation.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::unwrap_used,
+        reason = "lint-migration: tests/integration/origin_validation.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::absolute_paths,
+        reason = "lint-migration: tests/integration/origin_validation.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::unused_result_ok,
+        reason = "lint-migration: tests/integration/origin_validation.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_panics_doc,
+        reason = "lint-migration: tests/integration/origin_validation.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::std_instead_of_core,
+        reason = "lint-migration: tests/integration/origin_validation.rs"
+    )
+)]
+#![expect(
+    unused_results,
+    reason = "lint-migration: tests/integration/origin_validation.rs"
+)]
 
 use std::{net::SocketAddr, time::Duration};
 

@@ -17,6 +17,80 @@
 //! because exercising it in an integration test would require resolving
 //! attacker-controlled hostnames to private IPs (which `wiremock` cannot
 //! provide). The unit tests there cover all 12 IP classes exhaustively.
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::min_ident_chars,
+        reason = "lint-migration: tests/integration/crl_ssrf.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::indexing_slicing,
+        reason = "lint-migration: tests/integration/crl_ssrf.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::tests_outside_test_module,
+        reason = "lint-migration: tests/integration/crl_ssrf.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::let_underscore_untyped,
+        reason = "lint-migration: tests/integration/crl_ssrf.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::let_underscore_must_use,
+        reason = "lint-migration: tests/integration/crl_ssrf.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::absolute_paths,
+        reason = "lint-migration: tests/integration/crl_ssrf.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::expect_used,
+        reason = "lint-migration: tests/integration/crl_ssrf.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_panics_doc,
+        reason = "lint-migration: tests/integration/crl_ssrf.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::std_instead_of_core,
+        reason = "lint-migration: tests/integration/crl_ssrf.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::unseparated_literal_suffix,
+        reason = "lint-migration: tests/integration/crl_ssrf.rs"
+    )
+)]
+#![expect(
+    let_underscore_drop,
+    reason = "lint-migration: tests/integration/crl_ssrf.rs"
+)]
 
 use std::time::Duration;
 

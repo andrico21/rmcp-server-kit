@@ -8,6 +8,56 @@
 //!
 //! The CI gate `bench-thresholds` runs this bench and asserts
 //! `mean < 10_000 ns` via `scripts/check-bench-threshold.{sh,ps1}`.
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::modulo_arithmetic,
+        reason = "lint-migration: benches/rbac_redaction.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::integer_division_remainder_used,
+        reason = "lint-migration: benches/rbac_redaction.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::arithmetic_side_effects,
+        reason = "lint-migration: benches/rbac_redaction.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::min_ident_chars,
+        reason = "lint-migration: benches/rbac_redaction.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::default_numeric_fallback,
+        reason = "lint-migration: benches/rbac_redaction.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_docs_in_private_items,
+        reason = "lint-migration: benches/rbac_redaction.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::std_instead_of_core,
+        reason = "lint-migration: benches/rbac_redaction.rs"
+    )
+)]
+#![expect(unused_results, reason = "lint-migration: benches/rbac_redaction.rs")]
 
 use std::hint::black_box;
 

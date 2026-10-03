@@ -1,3 +1,59 @@
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::missing_const_for_fn, reason = "lint-migration: src/ssrf.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::arithmetic_side_effects,
+        reason = "lint-migration: src/ssrf.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::shadow_reuse, reason = "lint-migration: src/ssrf.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::min_ident_chars, reason = "lint-migration: src/ssrf.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::option_if_let_else, reason = "lint-migration: src/ssrf.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::missing_errors_doc, reason = "lint-migration: src/ssrf.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::too_long_first_doc_paragraph,
+        reason = "lint-migration: src/ssrf.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::doc_paragraphs_missing_punctuation,
+        reason = "lint-migration: src/ssrf.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::redundant_pub_crate, reason = "lint-migration: src/ssrf.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::std_instead_of_core, reason = "lint-migration: src/ssrf.rs")
+)]
+#![cfg_attr(
+    all(not(test), target_os = "linux"),
+    expect(
+        clippy::missing_docs_in_private_items,
+        reason = "lint-migration: src/ssrf.rs"
+    )
+)]
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use url::Url;
@@ -314,7 +370,7 @@ impl CidrEntry {
     ///
     /// Uses `std::net` only -- no new dependencies.
     #[cfg_attr(
-        not(feature = "oauth"),
+        all(not(test), not(feature = "oauth")),
         expect(dead_code, reason = "consumer is feature-gated")
     )]
     pub(crate) fn parse(raw: &str) -> Result<Self, String> {
@@ -434,7 +490,7 @@ impl CompiledSsrfAllowlist {
     /// Construct a compiled allowlist from already-validated host
     /// entries (lowercased) and CIDR entries.
     #[cfg_attr(
-        not(feature = "oauth"),
+        all(not(test), not(feature = "oauth")),
         expect(dead_code, reason = "consumer is feature-gated")
     )]
     pub(crate) fn new(hosts: Vec<String>, cidrs: Vec<CidrEntry>) -> Self {
@@ -522,6 +578,28 @@ pub(crate) fn redirect_target_reason_with_allowlist(
 }
 
 #[cfg(test)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::shadow_unrelated, reason = "lint-migration: src/ssrf.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::assertions_on_result_states,
+        reason = "lint-migration: src/ssrf.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::expect_used, reason = "lint-migration: src/ssrf.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::missing_panics_doc,
+        reason = "test code is not rendered API documentation"
+    )
+)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 

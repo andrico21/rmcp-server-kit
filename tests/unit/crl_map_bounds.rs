@@ -21,6 +21,115 @@
 //! * `CrlSet::__test_cache_len(&self) -> usize`
 //! * `CrlSet::__test_cache_contains(&self, &str) -> bool`
 //! * `CrlSet::__test_trigger_fetch(&self, &str) -> Result<(), RmcpServerKitError>`
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::too_long_first_doc_paragraph,
+        reason = "lint-migration: tests/unit/crl_map_bounds.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::duration_suboptimal_units,
+        reason = "lint-migration: tests/unit/crl_map_bounds.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::std_instead_of_core,
+        reason = "lint-migration: tests/unit/crl_map_bounds.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::min_ident_chars,
+        reason = "lint-migration: tests/unit/crl_map_bounds.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::default_numeric_fallback,
+        reason = "lint-migration: tests/unit/crl_map_bounds.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::tests_outside_test_module,
+        reason = "lint-migration: tests/unit/crl_map_bounds.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::shadow_reuse,
+        reason = "lint-migration: tests/unit/crl_map_bounds.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::let_underscore_untyped,
+        reason = "lint-migration: tests/unit/crl_map_bounds.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::let_underscore_must_use,
+        reason = "lint-migration: tests/unit/crl_map_bounds.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::expect_used,
+        reason = "lint-migration: tests/unit/crl_map_bounds.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::absolute_paths,
+        reason = "lint-migration: tests/unit/crl_map_bounds.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::missing_panics_doc,
+        reason = "lint-migration: tests/unit/crl_map_bounds.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::std_instead_of_alloc,
+        reason = "lint-migration: tests/unit/crl_map_bounds.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::unseparated_literal_suffix,
+        reason = "lint-migration: tests/unit/crl_map_bounds.rs"
+    )
+)]
+#![cfg_attr(
+    feature = "oauth-mtls-client",
+    expect(
+        let_underscore_drop,
+        reason = "lint-migration: tests/unit/crl_map_bounds.rs"
+    )
+)]
+#![cfg_attr(
+    feature = "oauth-mtls-client",
+    expect(deprecated, reason = "lint-migration: tests/unit/crl_map_bounds.rs")
+)]
 
 use std::sync::Arc;
 

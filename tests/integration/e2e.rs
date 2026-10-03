@@ -2,6 +2,171 @@
 //!
 //! Spins up a real `serve()` instance on an ephemeral port with a minimal
 //! `ServerHandler` and makes HTTP requests against it.
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_assert_message,
+        reason = "lint-migration: tests/integration/e2e.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::ref_patterns,
+        reason = "lint-migration: tests/integration/e2e.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::too_long_first_doc_paragraph,
+        reason = "lint-migration: tests/integration/e2e.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::default_numeric_fallback,
+        reason = "lint-migration: tests/integration/e2e.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::shadow_unrelated,
+        reason = "lint-migration: tests/integration/e2e.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::indexing_slicing,
+        reason = "lint-migration: tests/integration/e2e.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::tests_outside_test_module,
+        reason = "lint-migration: tests/integration/e2e.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::unused_result_ok,
+        reason = "lint-migration: tests/integration/e2e.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::min_ident_chars,
+        reason = "lint-migration: tests/integration/e2e.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_errors_doc,
+        reason = "lint-migration: tests/integration/e2e.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::unwrap_used,
+        reason = "lint-migration: tests/integration/e2e.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::shadow_reuse,
+        reason = "lint-migration: tests/integration/e2e.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_const_for_fn,
+        reason = "lint-migration: tests/integration/e2e.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_panics_doc,
+        reason = "lint-migration: tests/integration/e2e.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::expect_used,
+        reason = "lint-migration: tests/integration/e2e.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::let_underscore_untyped,
+        reason = "lint-migration: tests/integration/e2e.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::let_underscore_must_use,
+        reason = "lint-migration: tests/integration/e2e.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::absolute_paths,
+        reason = "lint-migration: tests/integration/e2e.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::std_instead_of_core,
+        reason = "lint-migration: tests/integration/e2e.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::std_instead_of_alloc,
+        reason = "lint-migration: tests/integration/e2e.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::inline_modules,
+        reason = "lint-migration: tests/integration/e2e.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::needless_raw_strings,
+        reason = "lint-migration: tests/integration/e2e.rs"
+    )
+)]
+#![expect(
+    let_underscore_drop,
+    reason = "lint-migration: tests/integration/e2e.rs"
+)]
+#![expect(
+    closure_returning_async_block,
+    reason = "lint-migration: tests/integration/e2e.rs"
+)]
+#![expect(unused_results, reason = "lint-migration: tests/integration/e2e.rs")]
+#![expect(deprecated, reason = "lint-migration: tests/integration/e2e.rs")]
+#![expect(redundant_imports, reason = "lint-migration: tests/integration/e2e.rs")]
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -376,10 +541,6 @@ async fn free_port() -> u16 {
 /// Handle to a server spawned via [`spawn_server`]. Drop the harness
 /// (or call [`ServerHarness::shutdown`]) to terminate the server
 /// deterministically.
-#[expect(
-    dead_code,
-    reason = "shutdown() and join field are used by the BUG-NEW shutdown_timeout test added in the same release"
-)]
 struct ServerHarness {
     /// Base URL (`http://127.0.0.1:<port>`). Always contains the
     /// actually-bound port -- safe to use immediately.
@@ -393,10 +554,6 @@ struct ServerHarness {
     join: Option<JoinHandle<rmcp_server_kit::Result<()>>>,
 }
 
-#[expect(
-    dead_code,
-    reason = "shutdown() is used by the BUG-NEW shutdown_timeout test added in the same release"
-)]
 impl ServerHarness {
     /// Cancel the shutdown token, await the server task, and return
     /// the server's final result. Safe to call multiple times: only

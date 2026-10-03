@@ -112,6 +112,43 @@
 //!   `.instrument(tracing::Span::current())`, so log lines from the
 //!   detached task remain attached to the request span (matching the
 //!   convention in [`crate::tool_hooks`]).
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::too_long_first_doc_paragraph,
+        reason = "lint-migration: src/cancel.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::integer_division_remainder_used,
+        reason = "lint-migration: src/cancel.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::min_ident_chars, reason = "lint-migration: src/cancel.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_inline_in_public_items,
+        reason = "lint-migration: src/cancel.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::absolute_paths, reason = "lint-migration: src/cancel.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::unused_trait_names, reason = "lint-migration: src/cancel.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::std_instead_of_core, reason = "lint-migration: src/cancel.rs")
+)]
 
 use std::time::Duration;
 
@@ -230,6 +267,37 @@ fn map_join<T>(joined: Result<T, tokio::task::JoinError>) -> DetachOutcome<T> {
 }
 
 #[cfg(test)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::default_numeric_fallback,
+        reason = "lint-migration: src/cancel.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::ref_patterns, reason = "lint-migration: src/cancel.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::panic, reason = "lint-migration: src/cancel.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::missing_panics_doc,
+        reason = "test code is not rendered API documentation"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::std_instead_of_alloc, reason = "lint-migration: src/cancel.rs")
+)]
+#[cfg_attr(test, expect(unused_results, reason = "lint-migration: src/cancel.rs"))]
+#[cfg_attr(
+    test,
+    expect(redundant_imports, reason = "lint-migration: src/cancel.rs")
+)]
 mod tests {
 
     use std::sync::{

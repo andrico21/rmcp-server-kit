@@ -179,11 +179,39 @@ entry in the same PR that introduces a deviation.
    whenever it finds unsafe code (`error: Found 251 warnings` on the current
    tree), which is why it must not gate merges. Evidence in the migration
    record.
+10. **2026-10-04 - Temporary per-file `lint-migration:` expectations
+   (D-6'').** The atomic profile switch lands the whole strict profile at once.
+   Findings that the file-ownership lanes have not burned down yet are covered
+   by generated expectations whose reason starts with `lint-migration:`. They
+   sit at the file level for production lints, on `mod tests` for test-only
+   lints, and at the crate root for standalone `tests/`/`benches/`/`examples/`
+   crates, and each carries its file path. They are temporary and break core
+   1568's narrowest-item rule while they exist; the lanes remove them. The
+   `lint count gate` prevents any key from growing, and the stable `clippy` job
+   still denies `unknown_lints` and `unfulfilled_lint_expectations`. Evidence:
+   `scripts/lint-ratchet/baseline/`, the task-11 migration record, and
+   `blocks.txt`.
+11. **2026-10-04 - `pub_use` facade expectations (D-7'', core 1961-1962,
+   2184).** The crate root and `secret` are public facades; their `pub use`
+   re-exports are the point, so each module carries a single module-level
+   `#![expect(clippy::pub_use, reason = "public facade")]` instead of an
+   item-level expect (an item-level `pub_use` expect trips
+   `clippy::useless_attribute`). The `secret` re-export additionally carries
+   `#[expect(clippy::module_name_repetitions, reason = "public API frozen until
+   the next major release")]`. Evidence: the task-11 migration record.
+12. **2026-10-04 - Crate-level `dead_code_pub_in_binary` expectation (C-9).**
+   `dead_code_pub_in_binary` fires on eight public `serve*` items only in the
+   lib unit-test binary, and rustc accepts an expectation for it only at crate
+   level. `src/lib.rs` therefore carries
+   `#![cfg_attr(test, expect(dead_code_pub_in_binary, reason = "public API:
+   unused inside the unit-test harness"))]`: inert in the lib build, fulfilled
+   in lib-test. It is the narrowest scope rustc accepts, together with the
+   facade expectation above the only inner expectations in `src/lib.rs`.
+   Evidence: the task-11 migration record.
 
-Entries to be added by the work that creates them: the temporary
-`lint-migration:` expects, "new in `<version>`" expects and profile deltas
-(profile switch and toolchain-drift work); frozen public-API items (the lint
-lanes); the GitLab mirror skew tolerance, if it is ever required.
+Entries to be added by the work that creates them: "new in `<version>`"
+expects and profile deltas (the toolchain-drift work); frozen public-API items
+(the lint lanes); the GitLab mirror skew tolerance, if it is ever required.
 
 ## Re-vendor procedure
 

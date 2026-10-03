@@ -1,3 +1,96 @@
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::option_if_let_else,
+        reason = "lint-migration: src/observability.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::min_ident_chars,
+        reason = "lint-migration: src/observability.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::arithmetic_side_effects,
+        reason = "lint-migration: src/observability.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::let_underscore_must_use,
+        reason = "lint-migration: src/observability.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_errors_doc,
+        reason = "lint-migration: src/observability.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::let_underscore_untyped,
+        reason = "lint-migration: src/observability.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_inline_in_public_items,
+        reason = "lint-migration: src/observability.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::absolute_paths,
+        reason = "lint-migration: src/observability.rs"
+    )
+)]
+#![cfg_attr(
+    all(not(test), target_os = "linux"),
+    expect(
+        clippy::missing_docs_in_private_items,
+        reason = "lint-migration: src/observability.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::unused_trait_names,
+        reason = "lint-migration: src/observability.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::std_instead_of_core,
+        reason = "lint-migration: src/observability.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::std_instead_of_alloc,
+        reason = "lint-migration: src/observability.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::single_char_lifetime_names,
+        reason = "lint-migration: src/observability.rs"
+    )
+)]
+#![expect(unused_results, reason = "lint-migration: src/observability.rs")]
+#![expect(let_underscore_drop, reason = "lint-migration: src/observability.rs")]
 use std::{
     fmt,
     io::{self, Write as _},
@@ -444,10 +537,6 @@ where
     }
 }
 
-#[expect(
-    clippy::print_stderr,
-    reason = "audit writer failure reporting deliberately uses process stderr as the last-resort sink; routing through tracing would recurse into the failing audit writer"
-)]
 fn write_audit_io_failure_warning(
     operation: &'static str,
     failure_count: u64,
@@ -730,6 +819,46 @@ fn audit_file_permission_warnings(_file: &std::fs::File) -> Vec<String> {
 }
 
 #[cfg(test)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::default_numeric_fallback,
+        reason = "lint-migration: src/observability.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::expect_used, reason = "lint-migration: src/observability.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::too_long_first_doc_paragraph,
+        reason = "test code is not rendered API documentation"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::unwrap_used, reason = "lint-migration: src/observability.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::missing_panics_doc,
+        reason = "test code is not rendered API documentation"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::doc_markdown, reason = "lint-migration: src/observability.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::else_if_without_else,
+        reason = "lint-migration: src/observability.rs"
+    )
+)]
 mod tests {
     #[cfg(unix)]
     use std::io::Write as _;

@@ -47,6 +47,90 @@
 //! );
 //! let _wrapped = with_hooks(handler, hooks);
 //! ```
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::if_then_some_else_none,
+        reason = "lint-migration: src/tool_hooks.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::min_ident_chars, reason = "lint-migration: src/tool_hooks.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::unused_trait_names,
+        reason = "lint-migration: src/tool_hooks.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::shadow_reuse, reason = "lint-migration: src/tool_hooks.rs")
+)]
+#![cfg_attr(
+    all(not(test), target_os = "linux"),
+    expect(
+        clippy::missing_docs_in_private_items,
+        reason = "lint-migration: src/tool_hooks.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_const_for_fn,
+        reason = "lint-migration: src/tool_hooks.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::absolute_paths, reason = "lint-migration: src/tool_hooks.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::impl_trait_in_params,
+        reason = "lint-migration: src/tool_hooks.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_inline_in_public_items,
+        reason = "lint-migration: src/tool_hooks.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::std_instead_of_core,
+        reason = "lint-migration: src/tool_hooks.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::std_instead_of_alloc,
+        reason = "lint-migration: src/tool_hooks.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::inline_trait_bounds,
+        reason = "lint-migration: src/tool_hooks.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::single_char_lifetime_names,
+        reason = "lint-migration: src/tool_hooks.rs"
+    )
+)]
+#![expect(unused_results, reason = "lint-migration: src/tool_hooks.rs")]
+#![expect(redundant_imports, reason = "lint-migration: src/tool_hooks.rs")]
 
 use std::{borrow::Cow, fmt, future::Future, io, pin::Pin, sync::Arc};
 
@@ -237,7 +321,6 @@ pub type AfterHook = Arc<
 >;
 
 /// Opt-in hooks applied by [`crate::tool_hooks::HookedHandler`].
-#[expect(clippy::struct_field_names, reason = "before/after read naturally")]
 #[derive(Clone, Default)]
 #[non_exhaustive]
 pub struct ToolHooks {
@@ -603,10 +686,6 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
     // record a started call that is never closed out. Consumers needing
     // guaranteed pairing should make the after-hook idempotent or run the tool
     // body detached (see `crate::cancel`).
-    #[expect(
-        clippy::wildcard_enum_match_arm,
-        reason = "CallToolResponse is #[non_exhaustive]; the non-Complete MRTR variants (InputRequired/Task) are passed through unchanged"
-    )]
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
@@ -859,6 +938,58 @@ fn serialized_size(result: &CallToolResult, max: Option<usize>) -> SizeMeasure {
 }
 
 #[cfg(test)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::unwrap_used, reason = "lint-migration: src/tool_hooks.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::panic, reason = "lint-migration: src/tool_hooks.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::let_underscore_untyped,
+        reason = "lint-migration: src/tool_hooks.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::shadow_unrelated, reason = "lint-migration: src/tool_hooks.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::indexing_slicing, reason = "lint-migration: src/tool_hooks.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::default_numeric_fallback,
+        reason = "lint-migration: src/tool_hooks.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::too_long_first_doc_paragraph,
+        reason = "test code is not rendered API documentation"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::expect_used, reason = "lint-migration: src/tool_hooks.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::missing_panics_doc,
+        reason = "test code is not rendered API documentation"
+    )
+)]
+#[cfg_attr(
+    test,
+    expect(let_underscore_drop, reason = "lint-migration: src/tool_hooks.rs")
+)]
 mod tests {
     use std::sync::{
         Arc,
@@ -1167,7 +1298,6 @@ mod tests {
 
     #[expect(
         clippy::unused_async_trait_impl,
-        deprecated,
         reason = "coverage drives rmcp's async trait methods, whose probe bodies return immediately"
     )]
     impl ServerHandler for ForwardingProbe {
@@ -1492,10 +1622,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "set_level is deprecated by rmcp but must delegate"
-    )]
     async fn hooked_handler_delegates_completion_and_level() {
         let (probe, mut reader, mut writer, _service) =
             delegation_transport(DelegationProbe::default(), Arc::new(ToolHooks::new()));
@@ -1535,10 +1661,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(
-        deprecated,
-        reason = "subscribe/unsubscribe are deprecated by rmcp but must delegate"
-    )]
     async fn hooked_handler_delegates_subscriptions() {
         let (probe, mut reader, mut writer, _service) =
             delegation_transport(DelegationProbe::default(), Arc::new(ToolHooks::new()));

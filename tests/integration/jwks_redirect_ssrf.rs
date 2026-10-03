@@ -1,5 +1,54 @@
 //! 1.3.0 Oracle B3: exercise JWKS redirect SSRF protection through the
 //! real `JwksCache::new()` client and refresh path.
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::expect_used,
+        reason = "lint-migration: tests/integration/jwks_redirect_ssrf.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::tests_outside_test_module,
+        reason = "lint-migration: tests/integration/jwks_redirect_ssrf.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::missing_panics_doc,
+        reason = "lint-migration: tests/integration/jwks_redirect_ssrf.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::absolute_paths,
+        reason = "lint-migration: tests/integration/jwks_redirect_ssrf.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::let_underscore_untyped,
+        reason = "lint-migration: tests/integration/jwks_redirect_ssrf.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::let_underscore_must_use,
+        reason = "lint-migration: tests/integration/jwks_redirect_ssrf.rs"
+    )
+)]
+#![cfg_attr(
+    feature = "oauth-mtls-client",
+    expect(
+        let_underscore_drop,
+        reason = "lint-migration: tests/integration/jwks_redirect_ssrf.rs"
+    )
+)]
 
 use rmcp_server_kit::oauth::{JwksCache, OAuthConfig};
 use serde_json::{Value, json};

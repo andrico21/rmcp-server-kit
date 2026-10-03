@@ -20,6 +20,69 @@
 //!    alphanumeric strings + `*` wildcards must never panic when matched
 //!    against arbitrary tool names. (Catches regex/glob-engine
 //!    regressions.)
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::shadow_same,
+        reason = "lint-migration: tests/unit/properties.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::let_underscore_untyped,
+        reason = "lint-migration: tests/unit/properties.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::let_underscore_must_use,
+        reason = "lint-migration: tests/unit/properties.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::min_ident_chars,
+        reason = "lint-migration: tests/unit/properties.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::absolute_paths,
+        reason = "lint-migration: tests/unit/properties.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::shadow_reuse,
+        reason = "lint-migration: tests/unit/properties.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::expect_used,
+        reason = "lint-migration: tests/unit/properties.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::tests_outside_test_module,
+        reason = "lint-migration: tests/unit/properties.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::unseparated_literal_suffix,
+        reason = "lint-migration: tests/unit/properties.rs"
+    )
+)]
 
 use proptest::prelude::*;
 use rmcp_server_kit::{

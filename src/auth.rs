@@ -5,6 +5,147 @@
 //! 2. Bearer token (API key) with Argon2id hash verification
 //!
 //! Includes per-source-IP rate limiting on authentication attempts.
+#![cfg_attr(
+    not(feature = "oauth"),
+    expect(clippy::doc_markdown, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    not(feature = "oauth"),
+    expect(clippy::partial_pub_fields, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::multiple_inherent_impl, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::shadow_same, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::ref_patterns, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::arithmetic_side_effects,
+        reason = "lint-migration: src/auth.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::missing_panics_doc, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::rest_pattern_accessible_field,
+        reason = "lint-migration: src/auth.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::return_and_then, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::option_if_let_else, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::unnecessary_safety_comment,
+        reason = "lint-migration: src/auth.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::shadow_reuse, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::unnecessary_wraps, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::unused_self, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::uninlined_format_args, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::missing_errors_doc, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::impl_trait_in_params, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::min_ident_chars, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::missing_const_for_fn, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    all(not(test), target_os = "linux"),
+    expect(
+        clippy::missing_docs_in_private_items,
+        reason = "lint-migration: src/auth.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_inline_in_public_items,
+        reason = "lint-migration: src/auth.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::absolute_paths, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::module_name_repetitions,
+        reason = "lint-migration: src/auth.rs"
+    )
+)]
+#![cfg_attr(
+    all(not(test), target_os = "linux"),
+    expect(clippy::wildcard_imports, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::unused_trait_names, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::std_instead_of_alloc, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::std_instead_of_core, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::unseparated_literal_suffix,
+        reason = "lint-migration: src/auth.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::field_scoped_visibility_modifiers,
+        reason = "lint-migration: src/auth.rs"
+    )
+)]
+#![expect(unused_results, reason = "lint-migration: src/auth.rs")]
 
 use std::{
     collections::HashSet,
@@ -1160,10 +1301,6 @@ impl AuthLogContext {
 ///
 /// `api_keys` uses [`ArcSwap`] so the SIGHUP handler can atomically
 /// swap in a new key list without blocking in-flight requests.
-#[expect(
-    missing_debug_implementations,
-    reason = "contains governor RateLimiter and JwksCache without Debug impls"
-)]
 #[non_exhaustive]
 pub(crate) struct AuthState {
     /// Active set of API keys (hot-swappable).
@@ -1799,15 +1936,6 @@ fn log_auth_failure(
     );
 }
 
-#[cfg_attr(
-    not(feature = "oauth"),
-    expect(
-        unused_variables,
-        reason = "`state` is only read to decide whether to advertise OAuth \
-                  protected-resource metadata; without the `oauth` feature that \
-                  decision is a compile-time `false`"
-    )
-)]
 fn unauthorized_response(state: &AuthState, failure_class: AuthFailureClass) -> Response {
     #[cfg(feature = "oauth")]
     let advertise_resource_metadata = state.jwks_cache.is_some();
@@ -2085,6 +2213,66 @@ pub(crate) async fn auth_middleware(
 }
 
 #[cfg(test)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::indexing_slicing, reason = "lint-migration: src/auth.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::too_long_first_doc_paragraph,
+        reason = "test code is not rendered API documentation"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::deref_by_slicing, reason = "lint-migration: src/auth.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::shadow_unrelated, reason = "lint-migration: src/auth.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::panic, reason = "lint-migration: src/auth.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::default_numeric_fallback,
+        reason = "lint-migration: src/auth.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::assertions_on_result_states,
+        reason = "lint-migration: src/auth.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::unwrap_used, reason = "lint-migration: src/auth.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::expect_used, reason = "lint-migration: src/auth.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::single_char_lifetime_names,
+        reason = "lint-migration: src/auth.rs"
+    )
+)]
+#[cfg_attr(
+    test,
+    expect(closure_returning_async_block, reason = "lint-migration: src/auth.rs")
+)]
+#[cfg_attr(
+    test,
+    expect(redundant_imports, reason = "lint-migration: src/auth.rs")
+)]
 mod tests {
     use std::net::IpAddr;
 

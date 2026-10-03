@@ -34,6 +34,151 @@
 //! path and must never be cited as coverage for it.
 //!
 //! Run with `cargo bench --bench crl_precheck --features test-helpers`.
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::min_ident_chars,
+        reason = "lint-migration: benches/crl_precheck.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(clippy::use_debug, reason = "lint-migration: benches/crl_precheck.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::print_stdout,
+        reason = "lint-migration: benches/crl_precheck.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::map_with_unused_argument_over_ranges,
+        reason = "lint-migration: benches/crl_precheck.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::absolute_paths,
+        reason = "lint-migration: benches/crl_precheck.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::let_underscore_untyped,
+        reason = "lint-migration: benches/crl_precheck.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::let_underscore_must_use,
+        reason = "lint-migration: benches/crl_precheck.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::arithmetic_side_effects,
+        reason = "lint-migration: benches/crl_precheck.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::integer_division_remainder_used,
+        reason = "lint-migration: benches/crl_precheck.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::integer_division,
+        reason = "lint-migration: benches/crl_precheck.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::default_numeric_fallback,
+        reason = "lint-migration: benches/crl_precheck.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::expect_used,
+        reason = "lint-migration: benches/crl_precheck.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::missing_docs_in_private_items,
+        reason = "lint-migration: benches/crl_precheck.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::missing_panics_doc,
+        reason = "lint-migration: benches/crl_precheck.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::too_long_first_doc_paragraph,
+        reason = "lint-migration: benches/crl_precheck.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::std_instead_of_alloc,
+        reason = "lint-migration: benches/crl_precheck.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::std_instead_of_core,
+        reason = "lint-migration: benches/crl_precheck.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::unseparated_literal_suffix,
+        reason = "lint-migration: benches/crl_precheck.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::inline_trait_bounds,
+        reason = "lint-migration: benches/crl_precheck.rs"
+    )
+)]
+#![cfg_attr(
+    feature = "oauth-mtls-client",
+    expect(unused_results, reason = "lint-migration: benches/crl_precheck.rs")
+)]
+#![cfg_attr(
+    feature = "oauth-mtls-client",
+    expect(
+        let_underscore_drop,
+        reason = "lint-migration: benches/crl_precheck.rs"
+    )
+)]
+#![cfg_attr(
+    feature = "oauth-mtls-client",
+    expect(deprecated, reason = "lint-migration: benches/crl_precheck.rs")
+)]
 
 use std::{
     hint::black_box,

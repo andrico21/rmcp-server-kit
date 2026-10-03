@@ -10,6 +10,76 @@
 //! ```
 //!
 //! A dedicated `memory-bounds` CI job runs this on Linux as a release-gate.
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::print_stderr,
+        reason = "lint-migration: tests/integration/limiter_memory.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::as_conversions,
+        reason = "lint-migration: tests/integration/limiter_memory.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::cast_precision_loss,
+        reason = "lint-migration: tests/integration/limiter_memory.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::let_underscore_untyped,
+        reason = "lint-migration: tests/integration/limiter_memory.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::let_underscore_must_use,
+        reason = "lint-migration: tests/integration/limiter_memory.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::expect_used,
+        reason = "lint-migration: tests/integration/limiter_memory.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::default_numeric_fallback,
+        reason = "lint-migration: tests/integration/limiter_memory.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::tests_outside_test_module,
+        reason = "lint-migration: tests/integration/limiter_memory.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_panics_doc,
+        reason = "lint-migration: tests/integration/limiter_memory.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::std_instead_of_core,
+        reason = "lint-migration: tests/integration/limiter_memory.rs"
+    )
+)]
 
 use std::{net::IpAddr, time::Duration};
 

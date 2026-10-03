@@ -1,3 +1,82 @@
+#![cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::field_scoped_visibility_modifiers,
+        reason = "lint-migration: src/config.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::too_long_first_doc_paragraph,
+        reason = "lint-migration: src/config.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::min_ident_chars, reason = "lint-migration: src/config.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::missing_const_for_fn, reason = "lint-migration: src/config.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::arithmetic_side_effects,
+        reason = "lint-migration: src/config.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::map_err_ignore, reason = "lint-migration: src/config.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::shadow_reuse, reason = "lint-migration: src/config.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::missing_errors_doc, reason = "lint-migration: src/config.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_inline_in_public_items,
+        reason = "lint-migration: src/config.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::absolute_paths, reason = "lint-migration: src/config.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::module_name_repetitions,
+        reason = "lint-migration: src/config.rs"
+    )
+)]
+#![cfg_attr(
+    all(not(test), target_os = "linux"),
+    expect(
+        clippy::missing_docs_in_private_items,
+        reason = "lint-migration: src/config.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::std_instead_of_core, reason = "lint-migration: src/config.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::else_if_without_else, reason = "lint-migration: src/config.rs")
+)]
+#![cfg_attr(
+    any(feature = "oauth", test),
+    expect(unused_results, reason = "lint-migration: src/config.rs")
+)]
+#![expect(redundant_imports, reason = "lint-migration: src/config.rs")]
 use std::{path::PathBuf, time::Duration};
 
 use secrecy::{ExposeSecret as _, SecretString};
@@ -1744,6 +1823,74 @@ fn default_sse_keep_alive() -> String {
 }
 
 #[cfg(test)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::unused_trait_names, reason = "lint-migration: src/config.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::indexing_slicing, reason = "lint-migration: src/config.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::duration_suboptimal_units,
+        reason = "lint-migration: src/config.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::shadow_unrelated, reason = "lint-migration: src/config.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::expect_used, reason = "lint-migration: src/config.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::uninlined_format_args,
+        reason = "lint-migration: src/config.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::panic, reason = "lint-migration: src/config.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::assertions_on_result_states,
+        reason = "lint-migration: src/config.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::unwrap_used, reason = "lint-migration: src/config.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::missing_panics_doc,
+        reason = "test code is not rendered API documentation"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::std_instead_of_alloc, reason = "lint-migration: src/config.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::needless_raw_strings, reason = "lint-migration: src/config.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::single_char_lifetime_names,
+        reason = "lint-migration: src/config.rs"
+    )
+)]
+#[cfg_attr(test, expect(deprecated, reason = "lint-migration: src/config.rs"))]
 mod tests {
     use std::{collections::HashSet, sync::Arc, time::Duration};
 

@@ -27,6 +27,45 @@
 //!
 //! Every function here is synchronous and pure, so cancel safety is not
 //! applicable: there is no `.await` and no shared mutable state.
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::std_instead_of_core,
+        reason = "lint-migration: src/task_binding.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::if_then_some_else_none,
+        reason = "lint-migration: src/task_binding.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::absolute_paths, reason = "lint-migration: src/task_binding.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::redundant_pub_crate,
+        reason = "lint-migration: src/task_binding.rs"
+    )
+)]
+#![cfg_attr(
+    all(not(test), target_os = "linux"),
+    expect(
+        clippy::missing_docs_in_private_items,
+        reason = "lint-migration: src/task_binding.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::unseparated_literal_suffix,
+        reason = "lint-migration: src/task_binding.rs"
+    )
+)]
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::Mac as _;
@@ -165,6 +204,24 @@ fn compute_mac(
 }
 
 #[cfg(test)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::expect_used, reason = "lint-migration: src/task_binding.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::min_ident_chars,
+        reason = "lint-migration: src/task_binding.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::missing_panics_doc,
+        reason = "test code is not rendered API documentation"
+    )
+)]
 mod tests {
     use secrecy::SecretString;
 

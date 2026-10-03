@@ -1,4 +1,85 @@
 //! H3 regression coverage for mTLS CRL cache/verifier atomicity and precheck semantics.
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::duration_suboptimal_units,
+        reason = "lint-migration: tests/unit/crl_h3_regression.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::tests_outside_test_module,
+        reason = "lint-migration: tests/unit/crl_h3_regression.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::expect_used,
+        reason = "lint-migration: tests/unit/crl_h3_regression.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::missing_panics_doc,
+        reason = "lint-migration: tests/unit/crl_h3_regression.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::absolute_paths,
+        reason = "lint-migration: tests/unit/crl_h3_regression.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::let_underscore_untyped,
+        reason = "lint-migration: tests/unit/crl_h3_regression.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::let_underscore_must_use,
+        reason = "lint-migration: tests/unit/crl_h3_regression.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::std_instead_of_core,
+        reason = "lint-migration: tests/unit/crl_h3_regression.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::std_instead_of_alloc,
+        reason = "lint-migration: tests/unit/crl_h3_regression.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::unseparated_literal_suffix,
+        reason = "lint-migration: tests/unit/crl_h3_regression.rs"
+    )
+)]
+#![cfg_attr(
+    feature = "oauth-mtls-client",
+    expect(
+        let_underscore_drop,
+        reason = "lint-migration: tests/unit/crl_h3_regression.rs"
+    )
+)]
+#![cfg_attr(
+    feature = "oauth-mtls-client",
+    expect(deprecated, reason = "lint-migration: tests/unit/crl_h3_regression.rs")
+)]
 
 use std::{sync::Arc, time::Duration};
 

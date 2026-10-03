@@ -19,6 +19,94 @@
 //! default trait body makes that unobservable at compile time). Direct-call
 //! transparency tests in `src/tool_hooks.rs` and `src/rbac_context.rs` cover the
 //! negotiation entry point; extend them when adding coverage here.
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::uninlined_format_args,
+        reason = "lint-migration: tests/integration/delegation_guard.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::shadow_reuse,
+        reason = "lint-migration: tests/integration/delegation_guard.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::indexing_slicing,
+        reason = "lint-migration: tests/integration/delegation_guard.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::arithmetic_side_effects,
+        reason = "lint-migration: tests/integration/delegation_guard.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::string_slice,
+        reason = "lint-migration: tests/integration/delegation_guard.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::panic,
+        reason = "lint-migration: tests/integration/delegation_guard.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_panics_doc,
+        reason = "lint-migration: tests/integration/delegation_guard.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::tests_outside_test_module,
+        reason = "lint-migration: tests/integration/delegation_guard.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::too_long_first_doc_paragraph,
+        reason = "lint-migration: tests/integration/delegation_guard.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::std_instead_of_alloc,
+        reason = "lint-migration: tests/integration/delegation_guard.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::else_if_without_else,
+        reason = "lint-migration: tests/integration/delegation_guard.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::unseparated_literal_suffix,
+        reason = "lint-migration: tests/integration/delegation_guard.rs"
+    )
+)]
+#![expect(
+    unused_results,
+    reason = "lint-migration: tests/integration/delegation_guard.rs"
+)]
 
 use std::{
     collections::{BTreeMap, BTreeSet},

@@ -10,6 +10,34 @@
 //!   `crate::ssrf::check_url_literal_ip` guard that rejects any literal
 //!   IPv4 or IPv6 host in the URL string (any canonical form parsed by
 //!   [`url::Url`]).
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::expect_used,
+        reason = "lint-migration: tests/unit/oauth_url_validation.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::tests_outside_test_module,
+        reason = "lint-migration: tests/unit/oauth_url_validation.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::missing_panics_doc,
+        reason = "lint-migration: tests/unit/oauth_url_validation.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::doc_markdown,
+        reason = "lint-migration: tests/unit/oauth_url_validation.rs"
+    )
+)]
 
 use rmcp_server_kit::oauth::OAuthConfig;
 

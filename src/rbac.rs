@@ -7,6 +7,122 @@
 //! Includes an axum middleware that inspects MCP JSON-RPC tool calls
 //! and enforces RBAC and per-IP tool rate limiting before the request
 //! reaches the handler.
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::multiple_inherent_impl, reason = "lint-migration: src/rbac.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::missing_errors_doc, reason = "lint-migration: src/rbac.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::arithmetic_side_effects,
+        reason = "lint-migration: src/rbac.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::ref_patterns, reason = "lint-migration: src/rbac.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::shadow_reuse, reason = "lint-migration: src/rbac.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::shadow_unrelated, reason = "lint-migration: src/rbac.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::let_underscore_must_use,
+        reason = "lint-migration: src/rbac.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::option_if_let_else, reason = "lint-migration: src/rbac.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::missing_panics_doc, reason = "lint-migration: src/rbac.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::missing_const_for_fn, reason = "lint-migration: src/rbac.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::module_name_repetitions,
+        reason = "lint-migration: src/rbac.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::impl_trait_in_params, reason = "lint-migration: src/rbac.rs")
+)]
+#![cfg_attr(
+    all(not(test), target_os = "linux"),
+    expect(
+        clippy::missing_docs_in_private_items,
+        reason = "lint-migration: src/rbac.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_inline_in_public_items,
+        reason = "lint-migration: src/rbac.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::min_ident_chars, reason = "lint-migration: src/rbac.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::unnecessary_safety_comment,
+        reason = "lint-migration: src/rbac.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::absolute_paths, reason = "lint-migration: src/rbac.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::unused_trait_names, reason = "lint-migration: src/rbac.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::std_instead_of_alloc, reason = "lint-migration: src/rbac.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::std_instead_of_core, reason = "lint-migration: src/rbac.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::field_scoped_visibility_modifiers,
+        reason = "lint-migration: src/rbac.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::unseparated_literal_suffix,
+        reason = "lint-migration: src/rbac.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::inline_trait_bounds, reason = "lint-migration: src/rbac.rs")
+)]
 
 use std::{net::IpAddr, num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
 
@@ -1193,10 +1309,6 @@ impl DenyLogFields {
 // `enforce_tool_policy` and `enforce_rate_limit`. Remaining flow is a
 // linear body-collect + JSON-RPC parse + dispatch, intentionally left
 // inline to keep the request lifecycle visible at a glance.
-#[expect(
-    clippy::too_many_lines,
-    reason = "linear request lifecycle (body collect → JSON-RPC parse → policy dispatch) kept inline for security review visibility; helpers already extracted"
-)]
 // cancel-safe: `TimeoutLayer` may drop during `body.collect` or `next.run`;
 // buffered body/task-local scopes are request-local, and tool limiter checks
 // deliberately price attempted tool calls even if the handler times out.
@@ -1780,6 +1892,72 @@ fn reject_blank_redaction_salt(env_var: &str, value: &str) -> Result<(), RmcpSer
 }
 
 #[cfg(test)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::panic, reason = "lint-migration: src/rbac.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::non_ascii_literal, reason = "lint-migration: src/rbac.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::too_long_first_doc_paragraph,
+        reason = "test code is not rendered API documentation"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::default_numeric_fallback,
+        reason = "lint-migration: src/rbac.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::unwrap_in_result, reason = "lint-migration: src/rbac.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::let_underscore_untyped, reason = "lint-migration: src/rbac.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::expect_used, reason = "lint-migration: src/rbac.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::indexing_slicing, reason = "lint-migration: src/rbac.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::unwrap_used, reason = "lint-migration: src/rbac.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::needless_raw_strings, reason = "lint-migration: src/rbac.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::single_char_lifetime_names,
+        reason = "lint-migration: src/rbac.rs"
+    )
+)]
+#[cfg_attr(
+    test,
+    expect(closure_returning_async_block, reason = "lint-migration: src/rbac.rs")
+)]
+#[cfg_attr(test, expect(unused_results, reason = "lint-migration: src/rbac.rs"))]
+#[cfg_attr(
+    test,
+    expect(let_underscore_drop, reason = "lint-migration: src/rbac.rs")
+)]
+#[cfg_attr(
+    test,
+    expect(redundant_imports, reason = "lint-migration: src/rbac.rs")
+)]
 mod tests {
     use std::net::IpAddr;
 

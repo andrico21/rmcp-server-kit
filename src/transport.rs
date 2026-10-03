@@ -1,3 +1,166 @@
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::multiple_inherent_impl,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::unused_trait_names,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::unused_result_ok, reason = "lint-migration: src/transport.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::renamed_function_params,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::let_underscore_untyped,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::let_underscore_must_use,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::integer_division_remainder_used,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::arithmetic_side_effects,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::shadow_reuse, reason = "lint-migration: src/transport.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::ref_patterns, reason = "lint-migration: src/transport.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::option_if_let_else,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_errors_doc,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::impl_trait_in_params,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_const_for_fn,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    all(not(test), target_os = "linux"),
+    expect(
+        clippy::missing_docs_in_private_items,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_inline_in_public_items,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::absolute_paths, reason = "lint-migration: src/transport.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::too_long_first_doc_paragraph,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::min_ident_chars, reason = "lint-migration: src/transport.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::std_instead_of_alloc,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::std_instead_of_core,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    any(
+        all(test, target_os = "linux"),
+        all(feature = "metrics", target_os = "linux")
+    ),
+    expect(
+        clippy::single_char_lifetime_names,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "metrics", target_os = "linux"),
+    expect(
+        clippy::field_scoped_visibility_modifiers,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "metrics", target_os = "linux"),
+    expect(
+        clippy::partial_pub_fields,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![expect(let_underscore_drop, reason = "lint-migration: src/transport.rs")]
+#![expect(unused_results, reason = "lint-migration: src/transport.rs")]
+#![expect(
+    closure_returning_async_block,
+    reason = "lint-migration: src/transport.rs"
+)]
+#![expect(redundant_imports, reason = "lint-migration: src/transport.rs")]
 use std::{
     future::Future,
     net::{IpAddr, SocketAddr},
@@ -841,10 +1004,6 @@ pub struct McpServerConfig {
 /// serve(config, || H).await
 /// # }
 /// ```
-#[expect(
-    missing_debug_implementations,
-    reason = "wraps T which may not implement Debug; manual impl below avoids leaking inner contents into logs"
-)]
 pub struct Validated<T>(T);
 
 impl<T> std::fmt::Debug for Validated<T> {
@@ -1914,11 +2073,6 @@ impl ReloadHandle {
 // gated auth/RBAC wiring, and PRM/metrics installation. Further extraction
 // would require threading many `&mut Router` helpers and hurt readability
 // of the layer order (which is security-relevant and must stay visible).
-#[expect(
-    clippy::too_many_lines,
-    clippy::cognitive_complexity,
-    reason = "middleware layer order is security-critical and must remain visible at one glance; extracting `&mut Router` helpers would obscure the auth/RBAC/origin/rate-limit ordering"
-)]
 /// Internal bundle of values produced by [`build_app_router`] and
 /// consumed by [`serve`] / [`serve_with_listener`] when driving the
 /// HTTP listener.
@@ -1981,25 +2135,13 @@ type BindingSecrets = (
 );
 
 fn resolve_binding_secret(config: &McpServerConfig) -> anyhow::Result<BindingSecrets> {
-    #[expect(
-        deprecated,
-        reason = "internal router assembly reads deprecated `pub` config fields by design until 1.0 makes them pub(crate)"
-    )]
     if !config.session_binding && !config.task_binding {
         return Ok((None, None));
     }
-    #[expect(
-        deprecated,
-        reason = "internal router assembly reads deprecated `pub` config fields by design until 1.0 makes them pub(crate)"
-    )]
     let secret = match config.session_binding_secret.as_ref() {
         Some(configured) => configured_session_binding_secret(configured)?,
         None => process_session_binding_secret().clone(),
     };
-    #[expect(
-        deprecated,
-        reason = "internal router assembly reads deprecated `pub` config fields by design until 1.0 makes them pub(crate)"
-    )]
     let pair = (
         config.session_binding.then(|| secret.clone()),
         config.task_binding.then_some(secret),
@@ -2321,11 +2463,6 @@ where
         axum::routing::get(healthz)
     };
 
-    #[expect(
-        unused_mut,
-        reason = "the binding is only reassigned when the `oauth` feature adds the \
-                  protected-resource-metadata route below"
-    )]
     let mut router = axum::Router::new()
         .route("/healthz", axum::routing::get(healthz))
         .route("/readyz", readyz_route)
@@ -3772,10 +3909,6 @@ fn build_tls_server_config(
 }
 
 // cancel-safe: builds a constant JSON body with no awaits and no shared state.
-#[expect(
-    clippy::unused_async,
-    reason = "axum route handler signature requires `async fn` even when the body is synchronous"
-)]
 async fn healthz() -> impl IntoResponse {
     axum::Json(serde_json::json!({
         "status": "ok",
@@ -5336,6 +5469,67 @@ fn check_mtls_capacity_knobs(mtls: &MtlsConfig) -> Result<(), RmcpServerKitError
 }
 
 #[cfg(test)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::map_err_ignore, reason = "lint-migration: src/transport.rs")
+)]
+#[cfg_attr(
+    all(test, feature = "oauth", target_os = "linux"),
+    expect(clippy::non_ascii_literal, reason = "lint-migration: src/transport.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::panic, reason = "lint-migration: src/transport.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::doc_markdown, reason = "lint-migration: src/transport.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::shadow_unrelated, reason = "lint-migration: src/transport.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::default_numeric_fallback,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::indexing_slicing, reason = "lint-migration: src/transport.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::duration_suboptimal_units,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::unwrap_used, reason = "lint-migration: src/transport.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::assertions_on_result_states,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::expect_used, reason = "lint-migration: src/transport.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::missing_panics_doc,
+        reason = "test code is not rendered API documentation"
+    )
+)]
+#[cfg_attr(test, expect(deprecated, reason = "lint-migration: src/transport.rs"))]
 mod tests {
     use std::{sync::Arc, time::Duration};
 

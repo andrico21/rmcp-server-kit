@@ -12,6 +12,171 @@
 //! upstream identity provider (e.g. Keycloak).  MCP clients discover this server as the
 //! authorization server via Protected Resource Metadata (RFC 9728) and
 //! perform the standard Authorization Code + PKCE flow transparently.
+#![cfg_attr(
+#![cfg_attr(feature = "oauth", expect(clippy::too_many_lines, reason = "lint-migration: src/oauth.rs"))]
+    all(not(test), not(feature = "metrics"), feature = "oauth"),
+    expect(clippy::cfg_not_test, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::integer_division_remainder_used,
+        reason = "lint-migration: src/oauth.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::renamed_function_params,
+        reason = "lint-migration: src/oauth.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::option_if_let_else, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::uninlined_format_args, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::let_underscore_untyped,
+        reason = "lint-migration: src/oauth.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::let_underscore_must_use,
+        reason = "lint-migration: src/oauth.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::doc_markdown, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::doc_paragraphs_missing_punctuation,
+        reason = "lint-migration: src/oauth.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::arithmetic_side_effects,
+        reason = "lint-migration: src/oauth.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::non_ascii_literal, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::shadow_unrelated, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::impl_trait_in_params, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::missing_const_for_fn, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::shadow_reuse, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::ref_patterns, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::min_ident_chars, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::unused_result_ok, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::missing_inline_in_public_items,
+        reason = "lint-migration: src/oauth.rs"
+    )
+)]
+#![cfg_attr(
+    all(not(test), feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::missing_docs_in_private_items,
+        reason = "lint-migration: src/oauth.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::module_name_repetitions,
+        reason = "lint-migration: src/oauth.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::too_long_first_doc_paragraph,
+        reason = "lint-migration: src/oauth.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::absolute_paths, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::missing_errors_doc, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::unused_trait_names, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::std_instead_of_core, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::std_instead_of_alloc, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::inline_trait_bounds, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::single_char_lifetime_names,
+        reason = "lint-migration: src/oauth.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::field_scoped_visibility_modifiers,
+        reason = "lint-migration: src/oauth.rs"
+    )
+)]
+#![cfg_attr(
+    feature = "oauth",
+    expect(let_underscore_drop, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    feature = "oauth",
+    expect(unused_results, reason = "lint-migration: src/oauth.rs")
+)]
 
 use std::{
     collections::HashMap,
@@ -422,11 +587,23 @@ impl OauthHttpClient {
         // builds and to `()` in production. The `.clone()` is required in
         // test builds; in production the alias is a unit, which is why the
         // unit-value lints are allowed alongside the Arc one.
-        #[expect(
-            clippy::clone_on_ref_ptr,
-            clippy::clone_on_copy,
-            clippy::unit_arg,
-            reason = "TestLoopbackBypass aliases to Arc<AtomicBool> under cfg(test)/test-helpers and to `()` otherwise; each cfg trips a different clone/arg lint"
+        #[cfg_attr(
+            any(
+                not(feature = "oauth"),
+                all(not(test), not(feature = "oauth-mtls-client"))
+            ),
+            expect(
+                clippy::clone_on_copy,
+                clippy::unit_arg,
+                reason = "TestLoopbackBypass aliases to Arc<AtomicBool> under cfg(test)/test-helpers and to `()` otherwise; each cfg trips a different clone/arg lint"
+            )
+        )]
+        #[cfg_attr(
+            any(not(feature = "oauth"), test, feature = "metrics"),
+            expect(
+                clippy::clone_on_ref_ptr,
+                reason = "TestLoopbackBypass aliases to Arc<AtomicBool> under cfg(test)/test-helpers and to `()` otherwise; each cfg trips a different clone/arg lint"
+            )
         )]
         let resolver: Arc<dyn reqwest::dns::Resolve> =
             Arc::new(crate::ssrf_resolver::SsrfScreeningResolver::new(
@@ -2648,11 +2825,23 @@ impl JwksCache {
         #[cfg(not(any(test, feature = "test-helpers")))]
         let test_bypass: crate::ssrf_resolver::TestLoopbackBypass = ();
 
-        #[expect(
-            clippy::clone_on_ref_ptr,
-            clippy::clone_on_copy,
-            clippy::unit_arg,
-            reason = "TestLoopbackBypass aliases to Arc<AtomicBool> under cfg(test)/test-helpers and to `()` otherwise; each cfg trips a different clone/arg lint"
+        #[cfg_attr(
+            any(
+                not(feature = "oauth"),
+                all(not(test), not(feature = "oauth-mtls-client"))
+            ),
+            expect(
+                clippy::clone_on_copy,
+                clippy::unit_arg,
+                reason = "TestLoopbackBypass aliases to Arc<AtomicBool> under cfg(test)/test-helpers and to `()` otherwise; each cfg trips a different clone/arg lint"
+            )
+        )]
+        #[cfg_attr(
+            any(not(feature = "oauth"), test, feature = "metrics"),
+            expect(
+                clippy::clone_on_ref_ptr,
+                reason = "TestLoopbackBypass aliases to Arc<AtomicBool> under cfg(test)/test-helpers and to `()` otherwise; each cfg trips a different clone/arg lint"
+            )
         )]
         let resolver: Arc<dyn reqwest::dns::Resolve> =
             Arc::new(crate::ssrf_resolver::SsrfScreeningResolver::new(
@@ -4672,6 +4861,44 @@ fn rewrite_client_auth_params(
 }
 
 #[cfg(test)]
+#[cfg_attr(
+    all(test, feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::default_numeric_fallback,
+        reason = "lint-migration: src/oauth.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, feature = "oauth", target_os = "linux"),
+    expect(clippy::panic, reason = "lint-migration: src/oauth.rs")
+)]
+#[cfg_attr(
+    all(test, feature = "oauth", target_os = "linux"),
+    expect(clippy::expect_used, reason = "lint-migration: src/oauth.rs")
+)]
+#[cfg_attr(
+    all(test, feature = "oauth", target_os = "linux"),
+    expect(clippy::unwrap_used, reason = "lint-migration: src/oauth.rs")
+)]
+#[cfg_attr(
+    all(test, feature = "oauth", target_os = "linux"),
+    expect(clippy::indexing_slicing, reason = "lint-migration: src/oauth.rs")
+)]
+#[cfg_attr(
+    all(test, feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::missing_panics_doc,
+        reason = "test code is not rendered API documentation"
+    )
+)]
+#[cfg_attr(
+    all(test, feature = "oauth"),
+    expect(unit_bindings, reason = "lint-migration: src/oauth.rs")
+)]
+#[cfg_attr(
+    all(test, feature = "oauth"),
+    expect(redundant_imports, reason = "lint-migration: src/oauth.rs")
+)]
 mod tests {
     use std::{sync::Arc, time::Instant};
 

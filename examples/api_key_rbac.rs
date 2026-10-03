@@ -19,6 +19,20 @@
 //! ```bash
 //! curl -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:8080/mcp
 //! ```
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_docs_in_private_items,
+        reason = "lint-migration: examples/api_key_rbac.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::std_instead_of_alloc,
+        reason = "lint-migration: examples/api_key_rbac.rs"
+    )
+)]
 
 use std::sync::Arc;
 

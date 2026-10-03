@@ -25,6 +25,148 @@
 //! - `crl_deny_on_unavailable = false` => fail open with warn logs. Restores
 //!   the pre-3.8 behaviour and is strongly discouraged: a revoked
 //!   certificate is accepted whenever its CRL is unreachable.
+#![cfg_attr(
+    all(not(test), not(feature = "oauth-mtls-client")),
+    expect(
+        clippy::cfg_not_test,
+        reason = "lint-migration: src/mtls_revocation.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::min_ident_chars,
+        reason = "lint-migration: src/mtls_revocation.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::iter_over_hash_type,
+        reason = "lint-migration: src/mtls_revocation.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::integer_division_remainder_used,
+        reason = "lint-migration: src/mtls_revocation.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::let_underscore_must_use,
+        reason = "lint-migration: src/mtls_revocation.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::option_if_let_else,
+        reason = "lint-migration: src/mtls_revocation.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::arithmetic_side_effects,
+        reason = "lint-migration: src/mtls_revocation.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::let_underscore_untyped,
+        reason = "lint-migration: src/mtls_revocation.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_const_for_fn,
+        reason = "lint-migration: src/mtls_revocation.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_inline_in_public_items,
+        reason = "lint-migration: src/mtls_revocation.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::shadow_reuse,
+        reason = "lint-migration: src/mtls_revocation.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_errors_doc,
+        reason = "lint-migration: src/mtls_revocation.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::absolute_paths,
+        reason = "lint-migration: src/mtls_revocation.rs"
+    )
+)]
+#![cfg_attr(
+    all(not(test), target_os = "linux"),
+    expect(
+        clippy::missing_docs_in_private_items,
+        reason = "lint-migration: src/mtls_revocation.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::unused_trait_names,
+        reason = "lint-migration: src/mtls_revocation.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::std_instead_of_alloc,
+        reason = "lint-migration: src/mtls_revocation.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::std_instead_of_core,
+        reason = "lint-migration: src/mtls_revocation.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::partial_pub_fields,
+        reason = "lint-migration: src/mtls_revocation.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::inline_trait_bounds,
+        reason = "lint-migration: src/mtls_revocation.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::unseparated_literal_suffix,
+        reason = "lint-migration: src/mtls_revocation.rs"
+    )
+)]
+#![expect(let_underscore_drop, reason = "lint-migration: src/mtls_revocation.rs")]
+#![expect(unused_results, reason = "lint-migration: src/mtls_revocation.rs")]
 
 use std::{
     collections::{HashMap, HashSet},
@@ -1753,10 +1895,6 @@ fn apply_bootstrap_cache_cap(
 }
 
 /// Run the CRL refresher loop until shutdown.
-#[expect(
-    clippy::cognitive_complexity,
-    reason = "refresher loop intentionally handles shutdown, timer, and discovery in one select"
-)]
 // cancel-safe, including under abort: cooperative `shutdown` breaks the loop at
 // a settlement point, and the discovery arm holds a `PendingUrlGuard` across
 // `fetch_and_store_url`, so a `JoinHandle::abort` that drops the future mid-await
@@ -2168,6 +2306,56 @@ fn asn1_time_to_system_time(time: x509_parser::time::ASN1Time) -> SystemTime {
 }
 
 #[cfg(test)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::duration_suboptimal_units,
+        reason = "lint-migration: src/mtls_revocation.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::integer_division,
+        reason = "lint-migration: src/mtls_revocation.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::too_long_first_doc_paragraph,
+        reason = "test code is not rendered API documentation"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::default_numeric_fallback,
+        reason = "lint-migration: src/mtls_revocation.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::shadow_unrelated,
+        reason = "lint-migration: src/mtls_revocation.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::expect_used, reason = "lint-migration: src/mtls_revocation.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::missing_panics_doc,
+        reason = "test code is not rendered API documentation"
+    )
+)]
+#[cfg_attr(
+    test,
+    expect(deprecated, reason = "lint-migration: src/mtls_revocation.rs")
+)]
 mod tests {
 
     use std::sync::{
