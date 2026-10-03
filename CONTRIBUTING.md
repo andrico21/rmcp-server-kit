@@ -4,11 +4,15 @@ Thanks for your interest in contributing!
 
 ## Coding standards
 
-All Rust code in this repository must follow
-[RUST_GUIDELINES.md](RUST_GUIDELINES.md). Before opening a PR, review the
-Quick Reference Checklist at the end of that document; reviewers will
-enforce it. For Rust / Cargo / Clippy 1.95 specifics (new lints, new
-APIs, MSRV policy), see
+All Rust code in this repository must follow the vendored universal
+guidelines: start at
+[docs/rust-guidelines/RUST_GUIDELINES.md](docs/rust-guidelines/RUST_GUIDELINES.md)
+(the core), then the HTTP-services, MCP-servers and project overlays it names
+in its load order. The root [RUST_GUIDELINES.md](RUST_GUIDELINES.md) is the
+index (provenance, hashes, open deviations, re-vendor procedure). Before
+opening a PR, review the Quick Reference Checklist at the end of the core;
+reviewers will enforce it. For Rust / Cargo / Clippy 1.95 specifics (new lints,
+new APIs, MSRV policy), see
 [docs/RUST_1_95_NOTES.md](docs/RUST_1_95_NOTES.md).
 
 ## Development prerequisites
@@ -16,12 +20,15 @@ APIs, MSRV policy), see
 - Rust **1.98 or newer** (stable toolchain) - `edition = "2024"`.
 - `cargo-deny` (for the `ci deny` step): `cargo install cargo-deny`.
 - `cargo-audit` (for the `ci audit` step): `cargo install cargo-audit`.
+- `cargo-vet` (for the `ci vet` step): `cargo install cargo-vet`.
+- `taplo` (for the `ci taplo` step): `cargo install taplo-cli`.
 - A nightly toolchain is only required for `cargo fmt` (the `rustfmt.toml`
   uses a couple of unstable options).
 
 ## Verification steps
 
-Run locally before opening a PR:
+Run locally before opening a PR - these mirror the blocking CI gates (the
+authoritative list is [`.github/workflows/ci.yml`](.github/workflows/ci.yml)):
 
 ```bash
 cargo +nightly fmt --all -- --check
@@ -29,9 +36,12 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 cargo deny check
 cargo audit
+cargo vet --locked
+taplo fmt --check
+(cd docs/rust-guidelines && sha256sum -c SHA256SUMS)
 ```
 
-All five must pass.
+All of these must pass.
 
 Warnings are denied for local builds too, by the committed
 `.cargo/config.toml` (`[build] warnings = "deny"`). While iterating on

@@ -240,10 +240,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.1
       - name: Verify ARCHITECTURE.md citations resolve
         run: cargo test --all-features --test docs_citations
+      - name: Verify vendored guideline checksums
+        run: (cd docs/rust-guidelines && sha256sum -c SHA256SUMS)
       - name: Check Markdown links (offline)
         uses: lycheeverse/lychee-action@v2
         with:
-          args: --offline --no-progress README.md docs/*.md
+          args: --offline --no-progress README.md RUST_GUIDELINES.md docs/*.md
           fail: true
 
   # ---------------------------------------------------------------------------

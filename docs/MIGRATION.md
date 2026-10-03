@@ -74,7 +74,10 @@ recommended client context set for deployments that need operational request
 attribution. The default-off posture is intentional: client IPs, peer IPs,
 proxy request IDs, user agents, and credential fingerprints can become personal
 or sensitive operational data in downstream logs. That is a deliberate deviation
-from `RUST_GUIDELINES.md` section 10 for this crate: auth and authz lines can
+from Section 10 of the vendored
+[`docs/rust-guidelines/RUST_GUIDELINES.md`](rust-guidelines/RUST_GUIDELINES.md)
+for this crate, recorded in the local deviations register of the root
+[`RUST_GUIDELINES.md`](../RUST_GUIDELINES.md) index: auth and authz lines can
 carry client context, but only when you opt in per item.
 
 `request_id` is trusted only from peers configured with `with_trusted_proxies`
@@ -838,10 +841,14 @@ intended to be vendored as a workspace member of downstream projects.
 
 ## 3. Lints
 
-`rmcp-server-kit` owns its own `[lints]` table and enforces a strict
-internal lint set (no `unwrap` / `expect` / `panic` / `println!` in
-production paths, `unsafe_code = "forbid"`, `missing_docs = "warn"`).
-Downstream crates are free to keep or promote their own workspace
+`rmcp-server-kit` owns its own `[lints]` table and enforces the strictest stable
+lint profile from the vendored universal guidelines (see
+[`docs/rust-guidelines/RUST_GUIDELINES.md`](rust-guidelines/RUST_GUIDELINES.md),
+Section 9), with warnings denied (`.cargo/config.toml` `build.warnings = "deny"`
+plus `-D warnings` on CI). Exceptions are narrowest-item
+`#[expect(lint, reason = "...")]` attributes, never `#[allow]`: no `unwrap` /
+`expect` / `panic` / `println!` in production paths, and `unsafe_code =
+"forbid"`. Downstream crates are free to keep or promote their own workspace
 lints independently - the two lint tables do not interact.
 
 ## 4. Build & verify

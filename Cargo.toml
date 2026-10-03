@@ -29,6 +29,10 @@ exclude = [
   # them -- they contain internal review notes and session identifiers.
   ".omo/",
   ".sisyphus/",
+  # Development-only guideline docs. The root file is the vendoring index; the
+  # rules themselves are vendored under docs/rust-guidelines/.
+  "RUST_GUIDELINES.md",
+  "docs/rust-guidelines/",
 ]
 
 [lib]
