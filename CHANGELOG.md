@@ -83,6 +83,22 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   `unauthorized: expired credential` in the body. `/admin/auth/counters`
   attribution for these hits moves from `failure_invalid_credential` to
   `failure_expired_credential`.
+- **Cargo-deny policy tightened** - `deny.toml` now carries the strict core
+  policy: `multiple-versions = "deny"` with every upstream-forced duplicate
+  recorded and reasoned in `bans.skip` (21 crates), the license allowlist
+  trimmed to exactly the licenses the locked graph carries, the
+  unmaintained/unsound scope set to `all`, git sources pinned to `rev`, and the
+  reasoned `RUSTSEC-2023-0071` ignore kept in sync with `.cargo/audit.toml`
+  (which drops the stale `RUSTSEC-2026-0097`). No dependency version and no
+  `Cargo.lock` change.
+
+### Fixed
+
+- **Stable rustdoc builds are warning-free** - the module-level doc links in
+  `diagnostics`, `bounded_limiter` and `tool_hooks` now use fully-qualified
+  intra-doc paths, so `RUSTDOCFLAGS="-D warnings" cargo +stable doc --no-deps
+  --all-features` succeeds. A new `Rustdoc (stable)` CI job guards this on
+  GitHub, with a matching step in the GitLab `rustdoc` job.
 
 ### Notes
 

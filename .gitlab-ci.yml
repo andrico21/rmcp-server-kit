@@ -271,6 +271,11 @@ rustdoc:
     RUSTDOCFLAGS: "-D warnings --cfg docsrs"
   script:
     - rtk cargo +nightly doc --no-deps --all-features
+    # Stable rustdoc with warnings denied, on the image's default toolchain
+    # (it may not have a toolchain named `stable`). This overrides the
+    # docsrs flags above for this one invocation and mirrors the GitHub
+    # `Rustdoc (stable)` job.
+    - RUSTDOCFLAGS="-D warnings" rtk cargo doc --no-deps --all-features
     # Mirrors the SECURITY.md / GUIDE.md grep gates from GitHub CI.
     - grep -q "Certificate revocation" SECURITY.md
     - grep -qE "CDP[- ]driven CRL" SECURITY.md

@@ -684,7 +684,7 @@ impl CrlSet {
         self.refresh_urls(urls).await
     }
 
-    // cancel-safe: selects due URLs and delegates to efresh_urls, which
+    // cancel-safe: selects due URLs and delegates to refresh_urls, which
     // stages results locally before a single atomic commit.
     async fn refresh_due_urls(&self) -> Result<(), RmcpServerKitError> {
         let now = SystemTime::now();
