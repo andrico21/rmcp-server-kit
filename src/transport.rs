@@ -5570,7 +5570,7 @@ mod tests {
         assert!(cfg.tls_key_path.is_none());
         assert!(cfg.auth.is_none());
         assert!(cfg.rbac.is_none());
-        assert!(cfg.allowed_origins.is_empty());
+        assert_eq!(cfg.allowed_origins, Vec::<String>::new());
         assert!(cfg.tool_rate_limit.is_none());
         assert!(cfg.readiness_check.is_none());
         assert_eq!(cfg.max_request_body, 1024 * 1024);
@@ -6311,7 +6311,7 @@ mod tests {
 
         let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
             .with_request_log_exclude_paths(Vec::<String>::new());
-        assert!(cfg.request_log_exclude_paths.is_empty());
+        assert_eq!(cfg.request_log_exclude_paths, Vec::<String>::new());
         assert!(cfg.validate().is_ok());
     }
 
@@ -7073,7 +7073,10 @@ mod tests {
                 .len(),
             1
         );
-        assert!(logs.lines_containing("request completed").is_empty());
+        assert_eq!(
+            logs.lines_containing("request completed"),
+            Vec::<String>::new()
+        );
 
         let before = logs.lines_containing("incoming request").len();
         let _resp = drive_reqlog(
@@ -7129,7 +7132,10 @@ mod tests {
             reqlog_req(axum::http::Method::GET, "/version", "127.0.0.1:5555"),
         )
         .await;
-        assert!(logs.lines_containing("request completed").is_empty());
+        assert_eq!(
+            logs.lines_containing("request completed"),
+            Vec::<String>::new()
+        );
 
         let logs = CapturedLogs::default();
         let _guard = capture_debug_logs(logs.clone());
@@ -7143,7 +7149,10 @@ mod tests {
             reqlog_req(axum::http::Method::GET, "/healthz", "127.0.0.1:5555"),
         )
         .await;
-        assert!(logs.lines_containing("request completed").is_empty());
+        assert_eq!(
+            logs.lines_containing("request completed"),
+            Vec::<String>::new()
+        );
         let _resp = drive_reqlog(
             &app,
             reqlog_req(axum::http::Method::GET, "/version", "127.0.0.1:5555"),

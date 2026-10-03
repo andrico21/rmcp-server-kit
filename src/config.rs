@@ -1815,7 +1815,7 @@ mod tests {
         assert!(cfg.tls_key_path.is_none());
         assert_eq!(cfg.shutdown_timeout, "30s");
         assert_eq!(cfg.request_timeout, "120s");
-        assert!(cfg.allowed_origins.is_empty());
+        assert_eq!(cfg.allowed_origins, Vec::<String>::new());
         assert!(!cfg.stdio_enabled);
         assert!(cfg.tool_rate_limit.is_none());
         assert_eq!(cfg.key_eviction_policy, KeyEvictionPolicy::EvictLru);
@@ -3846,7 +3846,7 @@ client_ip = false
         with_env_vars(&[], || {
             let mut cfg = ServerConfig::default();
             let report = cfg.apply_env_overrides().unwrap();
-            assert!(report.is_empty());
+            assert_eq!(report, []);
             assert_eq!(cfg.listen_addr, "127.0.0.1");
             assert_eq!(cfg.listen_port, 8443);
             assert!(cfg.tls_cert_path.is_none());

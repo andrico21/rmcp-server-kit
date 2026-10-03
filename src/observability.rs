@@ -1563,25 +1563,25 @@ mod tests {
         // Diagnostic messages that embed Debug inside human-readable text
         // are outside this bug class -- the quoting is often desirable
         // there (it delimits an untrusted value).
-        assert!(
+        assert_eq!(
             find_bare_debug_format_calls(
                 "fn f() { let s = format!(\"invalid CRL DER: {error:?}\"); }"
-            )
-            .is_empty()
+            ),
+            Vec::<String>::new()
         );
-        assert!(
+        assert_eq!(
             find_bare_debug_format_calls(
                 "fn f() { let s = format!(\"CIDR {raw:?} missing '/' prefix length\"); }"
-            )
-            .is_empty()
+            ),
+            Vec::<String>::new()
         );
         // `tracing::warn!("... {:?}", X)` is a message-text format, not a
         // structured field, and must not fire Rule A.
-        assert!(
+        assert_eq!(
             find_bare_debug_format_calls(
                 "fn f() { tracing::warn!(\"shutting down (grace period: {timeout:?})\"); }"
-            )
-            .is_empty()
+            ),
+            Vec::<String>::new()
         );
     }
 
@@ -1599,28 +1599,34 @@ mod tests {
 
     #[test]
     fn rule_b_allows_display_sigil_and_bare_fields() {
-        assert!(
+        assert_eq!(
             find_debug_sigil_fields(
                 "fn f() { tracing::warn!(origin = logged, duplicate_origin_headers, %method, %path, \"x\"); }"
-            )
-            .is_empty()
+            ),
+            Vec::<String>::new()
         );
     }
 
     #[test]
     fn rule_b_ignores_comments_test_modules_and_try_operator() {
         let in_doc_comment = "/// BAD: tracing::debug!(?identity)\nfn f() {}";
-        assert!(find_debug_sigil_fields(in_doc_comment).is_empty());
+        assert_eq!(
+            find_debug_sigil_fields(in_doc_comment),
+            Vec::<String>::new()
+        );
 
         let in_test_module =
             "#[cfg(test)]\nmod tests {\n    fn t() { tracing::debug!(?identity, \"x\"); }\n}";
-        assert!(find_debug_sigil_fields(in_test_module).is_empty());
+        assert_eq!(
+            find_debug_sigil_fields(in_test_module),
+            Vec::<String>::new()
+        );
 
         // The try operator `?` must never be confused for the Debug sigil:
         // it is always followed by a statement terminator or `.`, never
         // glued directly to an identifier, but this fixture pins that a
         // scan across a whole function body containing `?` finds nothing.
         let try_operator = "fn f() -> Option<()> { let _ = maybe_thing()?; Some(()) }";
-        assert!(find_debug_sigil_fields(try_operator).is_empty());
+        assert_eq!(find_debug_sigil_fields(try_operator), Vec::<String>::new());
     }
 }

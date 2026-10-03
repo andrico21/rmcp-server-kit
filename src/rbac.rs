@@ -3270,7 +3270,7 @@ mod tests {
     fn operation_matching_defaults_to_legacy_when_absent_from_toml() {
         let cfg: RbacConfig = toml::from_str("enabled = true").expect("config parses");
         assert_eq!(cfg.allow_operation_matching, AllowOperationMatching::Legacy);
-        assert!(cfg.global_deny.is_empty());
+        assert_eq!(cfg.global_deny, Vec::<String>::new());
     }
 
     // -- current_role / current_identity tests --

@@ -556,19 +556,19 @@ mod tests {
     fn guard_allows_caller_known_interpolation() {
         // The five real rbac.rs sites echo caller-supplied names on purpose.
         let allowed = "fn f() { RmcpServerKitError::Rbac(format!(\"{tool_name} denied for role '{role}'\")); }";
-        assert!(find_error_interpolations(allowed).is_empty());
+        assert_eq!(find_error_interpolations(allowed), Vec::<String>::new());
 
         let arg = "fn f() { RmcpServerKitError::Rbac(format!(\"argument '{arg_key}' must be a string for tool '{tool_name}'\")); }";
-        assert!(find_error_interpolations(arg).is_empty());
+        assert_eq!(find_error_interpolations(arg), Vec::<String>::new());
     }
 
     #[test]
     fn guard_ignores_comments_and_test_modules() {
         let in_comment = "/// BAD: RmcpServerKitError::Auth(format!(\"{e}\"))\nfn f() {}";
-        assert!(find_error_interpolations(in_comment).is_empty());
+        assert_eq!(find_error_interpolations(in_comment), Vec::<String>::new());
 
         let in_tests = "fn ok() {}\n#[cfg(test)]\nmod tests {\n    RmcpServerKitError::Auth(format!(\"{e}\"));\n}";
-        assert!(find_error_interpolations(in_tests).is_empty());
+        assert_eq!(find_error_interpolations(in_tests), Vec::<String>::new());
 
         // A `#[cfg(test)]` const must NOT truncate the scan (config.rs shape).
         let const_then_code = "#[cfg(test)]\nconst X: &[&str] = &[];\nfn f() { RmcpServerKitError::Auth(format!(\"{e}\")); }";

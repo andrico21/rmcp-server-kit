@@ -1744,15 +1744,15 @@ mod tests {
     /// cannot see.
     #[test]
     fn semantic_drivers_table_is_well_formed() {
-        assert!(!SEMANTIC_DRIVERS.is_empty());
+        assert_ne!(SEMANTIC_DRIVERS, []);
         let mut names: Vec<&str> = SEMANTIC_DRIVERS.iter().map(|(name, _)| *name).collect();
         let total = names.len();
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), total, "duplicate method in SEMANTIC_DRIVERS");
         for (name, driver) in SEMANTIC_DRIVERS {
-            assert!(!name.is_empty());
-            assert!(!driver.is_empty());
+            assert_ne!(*name, "");
+            assert_ne!(*driver, "");
         }
     }
 
