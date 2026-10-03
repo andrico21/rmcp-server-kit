@@ -18,11 +18,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # `RUSTFLAGS="-D warnings"` denies warnings across every job. Cargo's
-  # `build.warnings` (stable since 1.97) is now within our 1.98 MSRV, but
-  # RUSTFLAGS is retained for parity with the GitLab mirror. See
-  # docs/RUST_1_95_NOTES.md.
-  RUSTFLAGS: "-D warnings"
+  # Warnings are denied by the committed .cargo/config.toml ([build] warnings
+  # = "deny"), for every job.
 
 jobs:
   fmt:
@@ -300,6 +297,11 @@ jobs:
     # manual dispatch.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     continue-on-error: true
+    # Mutation runs only need the build to compile. Deny-level lints make
+    # mutants unviable (a mutant often introduces an unused binding), so cap
+    # lints via `--cap-lints=true` and let warnings through for this job.
+    env:
+      CARGO_BUILD_WARNINGS: allow
     # Hard-cap each shard well below GitHub's 6h ceiling so it terminates
     # gracefully (allowing `continue-on-error` to take effect) instead of
     # being SIGKILLed and marking the entire workflow run as failed.
@@ -371,7 +373,8 @@ jobs:
 
         run: |
           set +e
-          timeout 170m cargo mutants --no-shuffle --timeout "$MUTANTS_TEST_TIMEOUT" -j 2 \
+          timeout 170m cargo mutants --no-shuffle --cap-lints=true \
+            --timeout "$MUTANTS_TEST_TIMEOUT" -j 2 \
             --sharding round-robin --shard ${{ matrix.shard }}/8 \
             -f src/rbac.rs -f src/auth.rs -f src/transport.rs \
             -f src/ssrf.rs -f src/mtls_revocation.rs \

@@ -33,6 +33,18 @@ cargo audit
 
 All five must pass.
 
+Warnings are denied for local builds too, by the committed
+`.cargo/config.toml` (`[build] warnings = "deny"`). While iterating on
+work-in-progress code you can relax this for a single command without
+editing the config (and without invalidating the build cache):
+
+```bash
+CARGO_BUILD_WARNINGS=allow cargo build
+```
+
+Use this only for transient local iteration - a PR must not leave warnings
+behind.
+
 ## Pull request checklist
 
 - [ ] Commit follows the [Conventional Commits](#commit-convention) format.
