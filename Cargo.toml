@@ -22,6 +22,8 @@ exclude = [
   "tests/artifacts/",
   ".github/",
   ".gitlab-ci.yml",
+  # Committed warnings policy, not meant for the published crate.
+  ".cargo/config.toml",
   # Agent planning scratchpads. Untracked, so a clean CI checkout never sees
   # them, but `cargo publish --allow-dirty` from a working tree would package
   # them -- they contain internal review notes and session identifiers.
