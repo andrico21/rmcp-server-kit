@@ -5,7 +5,7 @@
 >
 > All file references use `file:line` against the working tree as of 1.9.0.
 > Line numbers are approximate (±20) - they help localize, not replace `Read`.
-> Citations are pinned by `tests/docs_citations.rs` so they fail loudly when
+> Citations are pinned by `tests/integration/docs_citations.rs` so they fail loudly when
 > a cited file disappears or shrinks below a referenced line.
 
 ---
@@ -625,7 +625,7 @@ Hot-reload: `ReloadHandle::refresh_crls()` (in `src/transport.rs`) sends a
 sentinel through the discover channel that forces re-fetch of every cached
 URL on the next refresher tick.
 
-Test helper: `__test_with_prepopulated_crls(...)` (doc-hidden) lets `tests/e2e.rs`
+Test helper: `__test_with_prepopulated_crls(...)` (doc-hidden) lets `tests/integration/e2e.rs`
 seed a `CrlSet` with synthetic `rcgen`-generated CRLs and `wiremock`-served
 CDP endpoints. Four e2e tests cover: unrevoked-allows, revoked-rejects,
 fail-open on unreachable CDP, fail-closed on unreachable CDP.
@@ -904,19 +904,19 @@ Defaults (chosen for safe production posture):
 cover pure logic (config validation, error mapping, argument allowlist
 matching, JWKS algorithm selection, etc.).
 
-**Integration / E2E** tests live in `tests/e2e.rs`. They:
+**Integration / E2E** tests live in `tests/integration/e2e.rs`. They:
 - Spawn `rmcp_server_kit::transport::serve(...)` on an **ephemeral port** via
-  `spawn_server()` (`tests/e2e.rs:115`).
+  `spawn_server()` (`tests/integration/e2e.rs:115`).
 - Use `reqwest` to make real HTTP calls - origin checks, auth, RBAC,
   rate-limiting, readiness, body limits, TLS handshakes.
 - Use `wiremock` for OAuth/JWKS upstreams.
 - Generate test certs at runtime using `rcgen`.
 
 Examples worth reading:
-- `auth_accepts_valid_bearer` - `tests/e2e.rs:244`
-- `rbac_denies_unpermitted_tool` - `tests/e2e.rs:361`
-- `rbac_allows_permitted_tool` - `tests/e2e.rs:390`
-- `rbac_argument_allowlist_enforced` - `tests/e2e.rs:422`
+- `auth_accepts_valid_bearer` - `tests/integration/e2e.rs:244`
+- `rbac_denies_unpermitted_tool` - `tests/integration/e2e.rs:361`
+- `rbac_allows_permitted_tool` - `tests/integration/e2e.rs:390`
+- `rbac_argument_allowlist_enforced` - `tests/integration/e2e.rs:422`
 
 > When changing behaviour, **add an E2E test first**. The unit tests in
 > `auth.rs`/`rbac.rs` are useful but the E2E suite is what catches
@@ -930,7 +930,7 @@ must reach the inner handler, and rmcp's trait defaults make a dropped
 delegation compile - and pass - silently. Three layers hold that line, and they
 prove different things:
 
-- **Presence and origin** - `tests/delegation_guard.rs` parses the upstream
+- **Presence and origin** - `tests/integration/delegation_guard.rs` parses the upstream
   `ServerHandler` surface out of the rmcp source pinned in `Cargo.lock`, asserts
   each wrapper's impl contains a method for every classified name, pins the
   origin of every macro-generated `RbacContextHandler` method (a

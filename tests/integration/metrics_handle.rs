@@ -6,7 +6,6 @@
 //! chosen port, so each test pre-reserves an ephemeral port, passes the
 //! concrete address, and polls for readiness.
 
-#![cfg(feature = "metrics")]
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,

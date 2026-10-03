@@ -6,7 +6,7 @@ trait defaults are inherited silently: upstream drift shows up as behaviour
 differences at runtime, not as compile errors.
 
 Related: [`../AGENTS.md`](../AGENTS.md) (build/test gates),
-[`../tests/delegation_guard.rs`](../tests/delegation_guard.rs) (mechanical
+[`../tests/integration/delegation_guard.rs`](../tests/integration/delegation_guard.rs) (mechanical
 trait-surface guard), [`MIGRATION.md`](MIGRATION.md) (consumer-facing notes).
 
 ## 1. Trait surface drift
@@ -21,7 +21,7 @@ trait-surface guard), [`MIGRATION.md`](MIGRATION.md) (consumer-facing notes).
   filtering); `DIRECTLY_DELEGATED` must forward unchanged.
   `INTENTIONALLY_DEFAULTED` must stay empty, and the guard enforces that - a
   non-empty set is rejected outright. Legitimising an exception is a deliberate
-  code change: relax the assertion in `tests/delegation_guard.rs` and record why,
+  code change: relax the assertion in `tests/integration/delegation_guard.rs` and record why,
   in the same commit.
 - Add or extend a direct-call transparency test
   (`hooked_handler_preserves_inner_negotiate_initialize_override` and the
@@ -42,7 +42,7 @@ inner state, the argument breaks - and with it every semantic driver below.
 
 ### What the guard enforces
 
-`tests/delegation_guard.rs` holds every constant below; update them together when
+`tests/integration/delegation_guard.rs` holds every constant below; update them together when
 an rmcp bump changes the surface:
 
 | Constant / table | Role |

@@ -8172,7 +8172,7 @@ mod tests {
     }
 
     /// A small CA-backed PKI for the resumption regression test below.
-    /// Deliberately independent of `tests/e2e.rs::crl_tests` (a separate
+    /// Deliberately independent of `tests/integration/e2e.rs::crl_tests` (a separate
     /// test binary that cannot see this module's private helpers).
     fn build_resumption_test_material() -> ResumptionTestMaterial {
         let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("ca params");

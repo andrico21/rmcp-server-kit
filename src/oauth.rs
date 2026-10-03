@@ -594,7 +594,7 @@ impl OauthHttpClient {
     }
 
     /// Test-only: borrow the inner `reqwest::Client` so the M-H2
-    /// env-proxy matrix test (`tests/e2e.rs::ssrf_no_proxy_*`) can
+    /// env-proxy matrix test (`tests/integration/e2e.rs::ssrf_no_proxy_*`) can
     /// drive `.get(...).send()` directly and observe whether the
     /// SsrfScreeningResolver fired (vs. the proxy short-circuiting
     /// the request). Not part of the public API.
@@ -3306,7 +3306,7 @@ impl JwksCache {
     }
 
     /// Test-only: drive `refresh_inner` now, surfacing the
-    /// `build_key_cache` error string. Used by `tests/jwks_key_cap.rs`.
+    /// `build_key_cache` error string. Used by `tests/integration/jwks_key_cap.rs`.
     ///
     /// # ⚠️ Security
     ///

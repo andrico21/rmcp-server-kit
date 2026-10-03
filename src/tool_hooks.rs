@@ -1668,7 +1668,7 @@ mod tests {
     /// Maps every method the `HookedHandler` `ServerHandler` impl defines to the
     /// test that proves the inner handler was reached.
     ///
-    /// Parsed by `tests/delegation_guard.rs`, which asserts this table covers
+    /// Parsed by `tests/integration/delegation_guard.rs`, which asserts this table covers
     /// exactly its `DIRECTLY_DELEGATED ∪ BEHAVIORAL_WRAPPED` classification --
     /// so a method cannot be added or reclassified without a driver.
     const SEMANTIC_DRIVERS: &[(&str, &str)] = &[
@@ -1739,7 +1739,7 @@ mod tests {
         ("cancel_task", "hooked_handler_forwards_task_methods"),
     ];
 
-    /// `SEMANTIC_DRIVERS` is parsed by `tests/delegation_guard.rs`; this
+    /// `SEMANTIC_DRIVERS` is parsed by `tests/integration/delegation_guard.rs`; this
     /// in-crate check keeps the constant referenced (so it cannot rot as dead
     /// code) and rejects duplicate entries, which the source-level parser
     /// cannot see.
