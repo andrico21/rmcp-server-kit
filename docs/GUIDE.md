@@ -357,6 +357,13 @@ let key = ApiKeyEntry::new("temp-key", hash, "viewer")
     .with_expiry("2025-12-31T23:59:59Z");
 ```
 
+An expired API key gets HTTP 401 with
+`WWW-Authenticate: Bearer error="invalid_token", error_description="token is expired"`
+and body `unauthorized: expired credential`. This tells the token holder that
+the key existed and has expired. That disclosure is an accepted trade-off,
+so clients and operators can distinguish expired credentials from unknown
+tokens. There is no opt-out.
+
 #### `RateLimitConfig`
 
 Per-source-IP rate limiting for authentication. rmcp-server-kit uses two independent
@@ -1951,6 +1958,7 @@ attribute probe noise without logging spoofable header material.
 | `request_line` | Adds `method` and `path` to `auth failed` lines. The path excludes the query string. `incoming request` and `request completed` always include `method` and `path`; RBAC deny lines don't. |
 | `user_agent` | Adds `user_agent` to `auth failed` lines only. Values are quoted, control characters are stripped, and long values are truncated. |
 | `credential_fingerprint` | Adds a field named `credential_fp` to `auth failed` only, and only for Bearer credentials. The value is an 8-hex HMAC prefix, not a token fragment. Missing credentials, Basic credentials, other auth schemes, and mTLS failures don't get this field. |
+| `credential_owner` | Adds `credential_owner` and `credential_rejection` to `auth failed` lines when a credential verifies but is rejected: an expired API key, or an OAuth JWT rejected for expiry, wrong audience, no mapped role, or missing subject. The label is the same identity the `authenticated` line logs. Off by default and not enabled by `recommended()`. |
 | `auth_scheme` | Adds `auth_scheme` and `token_kind` to `auth failed` lines. |
 | `mcp_hints` | Adds `mcp_session` and `mcp_protocol_version` to `auth failed` and `incoming request` lines. |
 | `request_completion` | Emits a DEBUG `request completed` line with `method`, `path`, `status`, `latency_ms`, and any enabled `client_ip`, `peer_ip`, or `request_id` fields. |
@@ -1959,8 +1967,8 @@ Defaults follow `LogContextConfig::default()`: all fields default to `false`.
 `LogContextConfig::recommended()` enables `client_ip`, `peer_ip`, `request_line`,
 `user_agent`, `auth_scheme`, and `mcp_hints`. This is the recommended production
 posture: enough context to identify noisy clients and understand authentication
-failures. It leaves `request_id`, `credential_fingerprint`, and
-`request_completion` off unless you ask for those fields.
+failures. It leaves `request_id`, `credential_fingerprint`,
+`credential_owner`, and `request_completion` off unless you ask for those fields.
 
 Validation rejects `request_log_exclude_paths` entries that are empty or don't
 start with `/`. It also rejects `request_id = true` unless `trusted_proxies` is
@@ -2013,6 +2021,7 @@ request_id_header = "x-request-id"
 request_line = false
 user_agent = false
 credential_fingerprint = false
+credential_owner = false
 auth_scheme = false
 mcp_hints = false
 request_completion = false

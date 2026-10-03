@@ -85,12 +85,22 @@ Downstream verification steps that assumed client context is logged by default
 must now enable the relevant `log_context` knobs before checking those fields.
 For an end-to-end OpenShift example, see the GUIDE OpenShift recipe.
 
+### Expired API keys now answer `expired_credential`
+
+Expired API keys now return `expired_credential` instead of
+`invalid_credential`. Clients and monitors that matched `invalid_credential`,
+`token is invalid`, or `unauthorized: invalid credential` for expired keys must
+also accept `expired_credential`, `token is expired`, and
+`unauthorized: expired credential`. Dashboards built on `/admin/auth/counters`
+will see these hits move from `failure_invalid_credential` to
+`failure_expired_credential`.
+
 ### New config keys are not backward-compatible with an older binary
 
 `ServerConfig` uses `deny_unknown_fields`, so config files that contain
-`request_log_exclude_paths` or `[server.log_context]` fail to parse on 3.14.3 or
-older. Before rolling back to an older binary, remove those keys from the TOML
-file.
+`request_log_exclude_paths`, `[server.log_context]`, or the `credential_owner`
+key under `[server.log_context]` fail to parse on 3.14.3 or older. Before
+rolling back to an older binary, remove those keys from the TOML file.
 
 ## Migrating to 3.14: same-named API keys must map to one role
 

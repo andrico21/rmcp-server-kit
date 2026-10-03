@@ -144,7 +144,7 @@ axum Router                                  src/transport.rs:2016  (build_app_r
    ├── 6. Optional metrics middleware        src/metrics.rs (records
    │      request count, duration histograms, in-flight gauge)
    │
-├── 7. Auth middleware                    src/auth.rs:1873 (auth_middleware)
+├── 7. Auth middleware                    src/auth.rs:2007 (auth_middleware)
    │      Determines AuthIdentity from one of:
    │        a) Authorization: Bearer <api-key>  → Argon2 verify against
    │           AuthState.api_keys (ArcSwap<Vec<ApiKeyEntry>>)
@@ -310,9 +310,9 @@ Startup-only.
 
 ### Construction
 `AuthState` is built inside `build_app_router()` at `src/transport.rs:1897`. It contains:
-- `api_keys: ArcSwap<Vec<ApiKeyEntry>>` (`src/auth.rs:1104`)
+- `api_keys: ArcSwap<Vec<ApiKeyEntry>>` (`src/auth.rs:1167`)
 - mTLS identities: stored **per-connection** on the
-  `TlsConnInfo` extension (`src/auth.rs:970`), read by `auth_middleware` (`src/auth.rs:1873-1883`).
+  `TlsConnInfo` extension (`src/auth.rs:1012`), read by `auth_middleware` (`src/auth.rs:2007-2017`).
   No shared `SocketAddr`-keyed map exists - the previous design was replaced
   to avoid identity-binding races behind load balancers and to remove a
   `RwLock` from the request hot path.
@@ -329,11 +329,11 @@ Startup-only.
   entirely** (the TLS handshake already performed expensive crypto with a
   verified peer, so mTLS callers cannot be used to mount a CPU-spray
   attack).
-- `jwks_cache: Option<Arc<JwksCache>>` (`src/auth.rs:1112`) when `feature=oauth` is on and `oauth.issuer` is configured
+- `jwks_cache: Option<Arc<JwksCache>>` (`src/auth.rs:1175`) when `feature=oauth` is on and `oauth.issuer` is configured
 
 ### API key flow
 1. Client sends `Authorization: Bearer <api-key>`.
-2. `auth_middleware` (`src/auth.rs:1873`) first runs the **pre-auth abuse
+2. `auth_middleware` (`src/auth.rs:2007`) first runs the **pre-auth abuse
    gate** keyed by the request's source IP. If the gate is exhausted the
    middleware returns `429` immediately, *without* touching Argon2id.
 3. Otherwise the middleware looks up the key by an indexed prefix
@@ -646,7 +646,7 @@ recommended.
    - Decodes the JWT header to get `kid` and `alg`.
    - `lookup_key()` looks up by `kid` in the cached JWKS
      (`src/oauth.rs:2456`).
-   - If not found, calls `refresh_with_cooldown()` (`src/oauth.rs:3052`):
+   - If not found, calls `refresh_with_cooldown()` (`src/oauth.rs:3150`):
       - Enforces `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:2448`) so multiple
        invalid tokens cannot DoS the JWKS endpoint.
      - Deduplicates concurrent refreshes.
@@ -790,7 +790,7 @@ Two ArcSwaps power runtime reconfiguration:
 
 | State            | Type                           | Defined at                  |
 |------------------|---------------------------------|-----------------------------|
-| API keys         | `ArcSwap<Vec<ApiKeyEntry>>`     | `src/auth.rs:1104`          |
+| API keys         | `ArcSwap<Vec<ApiKeyEntry>>`     | `src/auth.rs:1167`          |
 | RBAC policy      | `ArcSwap<RbacPolicy>`           | `src/transport.rs:1818`      |
 
 Procedure:
