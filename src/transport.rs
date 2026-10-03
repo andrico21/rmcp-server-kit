@@ -329,6 +329,14 @@ pub struct LogContextConfig {
     /// with the RBAC redaction salt. Set `rbac.redaction_salt` for
     /// fingerprints that are stable across replicas.
     pub credential_fingerprint: bool,
+    /// Add `credential_owner` (identity label) and `credential_rejection`
+    /// (`expired` | `audience` | `role` | `subject`) to `auth failed` when
+    /// a credential verifies but is rejected: an API key matching an expired
+    /// configured key, or a JWT whose signature and issuer verify but that is
+    /// expired, has the wrong audience, maps to no role, or lacks a required
+    /// subject. The label is the identity the `authenticated` line logs. Off
+    /// by default and not enabled by `recommended()`.
+    pub credential_owner: bool,
     /// Emit a DEBUG `request completed` line with `status` and
     /// `latency_ms`.
     pub request_completion: bool,
@@ -346,6 +354,7 @@ impl Default for LogContextConfig {
             auth_scheme: false,
             mcp_hints: false,
             credential_fingerprint: false,
+            credential_owner: false,
             request_completion: false,
         }
     }
@@ -355,8 +364,8 @@ impl LogContextConfig {
     /// A curated low-risk preset: enables `client_ip`, `peer_ip`,
     /// `request_line`, `user_agent`, `auth_scheme` and `mcp_hints`.
     /// Leaves `request_id` (needs `trusted_proxies`),
-    /// `credential_fingerprint` and `request_completion` off, so the
-    /// result validates without any other configuration.
+    /// `credential_fingerprint`, `credential_owner` and `request_completion`
+    /// off, so the result validates without any other configuration.
     #[must_use]
     pub fn recommended() -> Self {
         Self {
@@ -6286,6 +6295,7 @@ mod tests {
         assert!(!recommended.request_id);
         assert!(!recommended.credential_fingerprint);
         assert!(!recommended.request_completion);
+        assert!(!recommended.credential_owner);
 
         let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
             .with_log_context(recommended);
@@ -6338,6 +6348,15 @@ mod tests {
             .with_log_context(log_context)
             .with_trusted_proxies(["127.0.0.1/32"]);
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn log_context_credential_owner_defaults_off_and_not_recommended() {
+        let default = LogContextConfig::default();
+        assert!(!default.credential_owner, "default must be off");
+
+        let recommended = LogContextConfig::recommended();
+        assert!(!recommended.credential_owner, "recommended must be off");
     }
 
     #[test]
@@ -7236,6 +7255,54 @@ mod tests {
             line.ends_with("auth failed failure_class=missing_credential"),
             "{line}"
         );
+    }
+
+    #[tokio::test]
+    async fn expired_api_key_through_real_wiring_names_owner_and_returns_expired_challenge() {
+        let logs = CapturedLogs::default();
+        let _guard = capture_debug_logs(logs.clone());
+        let mut fields = LogContextConfig::recommended();
+        fields.credential_owner = true;
+        let app = reqlog_router(|cfg| {
+            cfg.with_log_context(fields)
+                .with_auth(AuthConfig::with_keys(vec![
+                    crate::auth::ApiKeyEntry::new(
+                        "old-key",
+                        "$argon2id$v=19$m=19456,t=2,p=1$BwcHBwcHBwcHBwcHBwcHBw$spS8B9AhHG1LikfhGlssVMfP8mq37+8/mXnl98ps0NU",
+                        "viewer",
+                    )
+                    .try_with_expiry("2020-01-01T00:00:00Z")
+                    .unwrap(),
+                ]))
+        });
+        let resp = drive_reqlog(
+            &app,
+            reqlog_req_with_headers(
+                axum::http::Method::POST,
+                "/mcp",
+                "127.0.0.1:5555",
+                &[("authorization", "Bearer golden-vector-token-0p5p3")],
+            ),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let challenge = resp
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(challenge.contains("error_description=\"token is expired\""));
+        assert_eq!(body_string(resp).await, "unauthorized: expired credential");
+        let line = logs
+            .lines_containing("failure_class=expired_credential")
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("missing expired auth failed line: {}", logs.contents()));
+        assert!(line.contains("credential_owner=\"old-key\""), "{line}");
+        assert!(line.contains("credential_rejection=expired"), "{line}");
     }
 
     #[tokio::test]
