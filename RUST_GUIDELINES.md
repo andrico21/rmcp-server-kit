@@ -244,6 +244,26 @@ entry in the same PR that introduces a deviation.
    `impl Trait`) are frozen without probing. The lanes add the per-item
    expectations; this entry records the decision that governs them. Evidence:
    the task-12 migration record (`probe.txt`, `probe-converted.txt`).
+14. **2026-10-04 - Lane 15 per-item frozen public-API expectations
+   (`src/transport.rs`).** Under entry 13's decision this lane adds: the
+   frozen `clippy::impl_trait_in_params` expectation on every public builder
+   that takes `impl Trait` (`McpServerConfig::new`, `with_bind_addr`,
+   `with_tls`, `with_public_url`, `enable_admin`, `with_metrics`,
+   `with_tls_cert_path`, `with_tls_key_path`, `with_admin_role`); the frozen
+   `clippy::missing_const_for_fn` expectation as one item-level attribute per
+   `impl` block of `McpServerConfig` and of `Validated<T>`; and the frozen
+   `clippy::field_scoped_visibility_modifiers` + `clippy::partial_pub_fields`
+   expectation on the `pub(crate) McpServerConfig::metrics_handle` field (the
+   narrowest scope rustc accepts for `partial_pub_fields`, since the lint is
+   attributed to the struct). All carry the catalog reason `public API frozen
+   until the next major release`. Two further item-level expectations document
+   deliberate shapes rather than freezing API: `clippy::multiple_inherent_impl`
+   on the second `impl McpServerConfig` block (it groups the TLS-path and role
+   accessors; merging relocates ~140 lines for no behavior gain) and
+   `clippy::too_many_lines` on `build_app_router` (the length is layer wiring,
+   matching the pre-existing `cognitive_complexity` judgement on the same fn).
+   The file's temporary test-suite expectations are covered by entry 10 and are
+   removed by the test-conversion PR. Evidence: the task-15 migration record.
 
 14. **2026-10-04 - `src/oauth.rs` lane expectations (frozen API + deliberate).**
    Under entry 13's decision, the 16 public `impl_trait_in_params` builder
