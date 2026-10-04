@@ -9,47 +9,6 @@
 //! does not leak roles, tokens, locks, permits, or other guards.  The
 //! wrapped consumer handler's own cancel-safety contract is inherited
 //! unchanged.
-#![cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::missing_errors_doc,
-        reason = "lint-migration: src/rbac_context.rs"
-    )
-)]
-#![cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::absolute_paths, reason = "lint-migration: src/rbac_context.rs")
-)]
-#![cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::shadow_reuse, reason = "lint-migration: src/rbac_context.rs")
-)]
-#![cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::redundant_pub_crate,
-        reason = "lint-migration: src/rbac_context.rs"
-    )
-)]
-#![cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::std_instead_of_core,
-        reason = "lint-migration: src/rbac_context.rs"
-    )
-)]
-#![cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::std_instead_of_alloc,
-        reason = "lint-migration: src/rbac_context.rs"
-    )
-)]
-#![cfg_attr(
-    all(test, target_os = "linux"),
-    expect(redundant_imports, reason = "lint-migration: src/rbac_context.rs")
-)]
-
 extern crate alloc;
 
 use alloc::{borrow::Cow, sync::Arc};
@@ -498,108 +457,41 @@ impl<H: ServerHandler> ServerHandler for RbacContextHandler<H> {
     }
 }
 
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::indexing_slicing,
-        reason = "lint-migration: src/rbac_context.rs"
-    )
+#[expect(
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    reason = "test code is not rendered API documentation"
 )]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::too_long_first_doc_paragraph,
-        reason = "test code is not rendered API documentation"
-    )
+#[expect(
+    clippy::too_long_first_doc_paragraph,
+    reason = "test code is not rendered API documentation"
 )]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::unused_result_ok,
-        reason = "lint-migration: src/rbac_context.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::default_numeric_fallback,
-        reason = "lint-migration: src/rbac_context.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::min_ident_chars,
-        reason = "lint-migration: src/rbac_context.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::panic, reason = "lint-migration: src/rbac_context.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::shadow_unrelated,
-        reason = "lint-migration: src/rbac_context.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::expect_used, reason = "lint-migration: src/rbac_context.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::missing_panics_doc,
-        reason = "test code is not rendered API documentation"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::return_and_then,
-        reason = "lint-migration: src/rbac_context.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::unused_trait_names,
-        reason = "lint-migration: src/rbac_context.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::inline_trait_bounds,
-        reason = "lint-migration: src/rbac_context.rs"
-    )
-)]
-#[cfg_attr(
-    test,
-    expect(unused_results, reason = "lint-migration: src/rbac_context.rs")
-)]
+#[expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")]
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, convert::Infallible, sync::Arc};
+    use alloc::collections::VecDeque;
+    use core::{convert::Infallible, future::pending, time::Duration};
+    use std::sync::{Mutex, PoisonError};
 
+    use anyhow::Context as _;
+    use axum::http::Request;
     use rmcp::{
-        ServerHandler,
         model::{
-            ArgumentInfo, CacheScope, CallToolRequest, CallToolRequestParams, CancelTaskRequest,
-            CancelledNotification, CancelledNotificationParam, ClientCapabilities,
-            ClientJsonRpcMessage, ClientNotification, ClientRequest, CompleteRequest,
-            CompleteRequestParams, CreateTaskResult, CustomNotification, DiscoverRequest,
-            DiscoverRequestParams, Extensions, GetExtensions, InitializeRequest, JsonObject,
-            JsonRpcMessage, ListPromptsRequest, ListPromptsResult, ListToolsRequest,
-            ListToolsRequestMethod, ListToolsResult, NumberOrString, PaginatedRequestParams,
-            PingRequest, Prompt, PromptReference, Reference, ServerJsonRpcMessage, ServerResult,
-            Tool, UpdateTaskRequest,
+            ArgumentInfo, CallToolRequest, CancelTaskRequest, CancelledNotification,
+            ClientCapabilities, ClientJsonRpcMessage, ClientNotification, ClientRequest,
+            CompleteRequest, CreateTaskResult, DetailedTask, DiscoverRequest,
+            DiscoverRequestParams, ErrorCode, GetExtensions as _, GetTaskRequest, Implementation,
+            InitializeRequest, InputResponses, JsonObject, JsonRpcMessage, ListPromptsRequest,
+            ListToolsRequest, ListToolsRequestMethod, NotificationNoParam, NumberOrString,
+            PingRequest, Prompt, PromptReference, Reference, RequestMetaObject, ServerCapabilities,
+            ServerJsonRpcMessage, ServerNotification, ServerResult, SubscriptionsListenRequest,
+            SubscriptionsListenRequestParams, Task, TaskPayload, TaskStatus,
+            TaskStatusNotification, TaskStatusNotificationParams, UpdateTaskRequest,
         },
-        service::RoleServer,
+        service::serve_directly,
         transport::Transport,
     };
+    use tokio::{sync::Notify, task::yield_now, time::timeout};
 
     use super::*;
     use crate::{
@@ -615,20 +507,21 @@ mod tests {
 
     #[derive(Clone)]
     struct ListToolsHandler {
-        pages: Arc<std::sync::Mutex<VecDeque<ListToolsResult>>>,
-        observed_role: Arc<std::sync::Mutex<Option<ObservedRole>>>,
+        pages: Arc<Mutex<VecDeque<ListToolsResult>>>,
+        observed_role: Arc<Mutex<Option<ObservedRole>>>,
     }
 
     impl ListToolsHandler {
         fn new(pages: Vec<ListToolsResult>) -> Self {
             Self {
-                pages: Arc::new(std::sync::Mutex::new(VecDeque::from(pages))),
-                observed_role: Arc::new(std::sync::Mutex::new(None)),
+                pages: Arc::new(Mutex::new(VecDeque::from(pages))),
+                observed_role: Arc::new(Mutex::new(None)),
             }
         }
 
         fn observed_role(&self) -> Option<ObservedRole> {
-            self.observed_role.lock().ok().and_then(|role| role.clone())
+            let role = self.observed_role.lock().ok()?;
+            role.clone()
         }
     }
 
@@ -661,14 +554,14 @@ mod tests {
 
     struct InMemoryTransport {
         inbound: VecDeque<ClientJsonRpcMessage>,
-        outbound: Arc<std::sync::Mutex<Vec<ServerJsonRpcMessage>>>,
+        outbound: Arc<Mutex<Vec<ServerJsonRpcMessage>>>,
     }
 
     impl InMemoryTransport {
         fn new(
             messages: Vec<ClientJsonRpcMessage>,
-        ) -> (Self, Arc<std::sync::Mutex<Vec<ServerJsonRpcMessage>>>) {
-            let outbound = Arc::new(std::sync::Mutex::new(Vec::new()));
+        ) -> (Self, Arc<Mutex<Vec<ServerJsonRpcMessage>>>) {
+            let outbound = Arc::new(Mutex::new(Vec::new()));
             (
                 Self {
                     inbound: VecDeque::from(messages),
@@ -690,10 +583,10 @@ mod tests {
             &mut self,
             item: ServerJsonRpcMessage,
         ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
-            let outbound = Arc::clone(&self.outbound);
+            let shared = Arc::clone(&self.outbound);
             async move {
-                if let Ok(mut outbound) = outbound.lock() {
-                    outbound.push(item);
+                if let Ok(mut guard) = shared.lock() {
+                    guard.push(item);
                 }
                 Ok(())
             }
@@ -760,10 +653,10 @@ mod tests {
             params: None,
             extensions: Extensions::default(),
         });
-        if let Some(identity) = identity {
-            let mut parts = axum::http::Request::new(()).into_parts().0;
-            parts.extensions.insert(identity);
-            request.extensions_mut().insert(parts);
+        if let Some(present) = identity {
+            let mut parts = Request::new(()).into_parts().0;
+            let _previous_identity = parts.extensions.insert(present);
+            let _previous_parts = request.extensions_mut().insert(parts);
         }
         JsonRpcMessage::request(request, NumberOrString::Number(id))
     }
@@ -773,34 +666,37 @@ mod tests {
         rbac: Arc<ArcSwap<RbacPolicy>>,
         filtering_enabled: bool,
         identity: Option<AuthIdentity>,
-    ) -> ListToolsResult {
+    ) -> anyhow::Result<ListToolsResult> {
         let message = list_request(1, identity);
         let (transport, outbound) = InMemoryTransport::new(vec![message]);
-        let running = rmcp::service::serve_directly::<RoleServer, _, _, Infallible, _>(
+        let running = serve_directly::<RoleServer, _, _, Infallible, _>(
             RbacContextHandler::new(inner, rbac, filtering_enabled),
             transport,
             None,
         );
-        running.waiting().await.expect("service task joins");
+        let _quit_reason = running.waiting().await.context("service task joins")?;
 
-        let messages = outbound.lock().expect("outbound messages lock").clone();
-        let Some(message) = messages.first() else {
-            panic!("expected one response");
+        let messages = outbound
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let Some(frame) = messages.first() else {
+            anyhow::bail!("expected one response");
         };
-        let ServerJsonRpcMessage::Response(response) = message else {
-            panic!("expected JSON-RPC response, got {message:?}");
+        let ServerJsonRpcMessage::Response(response) = frame else {
+            anyhow::bail!("expected JSON-RPC response, got {frame:?}");
         };
         if let ServerResult::ListToolsResult(result) = &response.result {
-            result.clone()
+            Ok(result.clone())
         } else {
-            panic!("expected tools/list result, got {:?}", response.result);
+            anyhow::bail!("expected tools/list result, got {:?}", response.result);
         }
     }
 
     async fn list_tools_for_viewer(
         page: ListToolsResult,
         rbac: Arc<ArcSwap<RbacPolicy>>,
-    ) -> ListToolsResult {
+    ) -> anyhow::Result<ListToolsResult> {
         list_tools_via_service(
             ListToolsHandler::new(vec![page]),
             rbac,
@@ -811,45 +707,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_tools_filters_denied_tools() {
+    /// Pins that `tools/list` drops tools the role's allowlist rejects.
+    async fn list_tools_filters_denied_tools() -> anyhow::Result<()> {
         let rbac = glob_policy(RoleConfig::new(
             "viewer",
             vec!["a_*".to_owned()],
             vec!["*".to_owned()],
         ));
 
-        let result = list_tools_for_viewer(page(&["a_x", "b_y"]), rbac).await;
+        let result = list_tools_for_viewer(page(&["a_x", "b_y"]), rbac).await?;
 
         assert_eq!(result.tools, vec![tool("a_x")]);
         assert_eq!(result.cache_scope, Some(CacheScope::Private));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn list_tools_applies_global_deny() {
+    /// Pins that the global deny list removes matching tools from `tools/list`.
+    async fn list_tools_applies_global_deny() -> anyhow::Result<()> {
         let rbac = policy_with_global_deny(
             RoleConfig::new("viewer", vec!["*".to_owned()], vec!["*".to_owned()]),
             vec!["*_delete_*".to_owned()],
         );
 
-        let result = list_tools_for_viewer(page(&["safe_read", "user_delete_all"]), rbac).await;
+        let result = list_tools_for_viewer(page(&["safe_read", "user_delete_all"]), rbac).await?;
 
         assert_eq!(result.tools, vec![tool("safe_read")]);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn list_tools_unfiltered_when_rbac_disabled() {
+    /// Pins that a disabled policy leaves the tool list unfiltered.
+    async fn list_tools_unfiltered_when_rbac_disabled() -> anyhow::Result<()> {
         let result = list_tools_for_viewer(
             page(&["a_x", "b_y"]),
             Arc::new(ArcSwap::new(Arc::new(RbacPolicy::disabled()))),
         )
-        .await;
+        .await?;
 
         assert_eq!(result.tools, vec![tool("a_x"), tool("b_y")]);
         assert_eq!(result.cache_scope, None);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn list_tools_unfiltered_when_no_role() {
+    /// Pins that a request without a role leaves the tool list unfiltered.
+    async fn list_tools_unfiltered_when_no_role() -> anyhow::Result<()> {
         let rbac = policy(RoleConfig::new(
             "viewer",
             vec!["a_x".to_owned()],
@@ -862,14 +765,16 @@ mod tests {
             true,
             None,
         )
-        .await;
+        .await?;
 
         assert_eq!(result.tools, vec![tool("a_x"), tool("b_y")]);
         assert_eq!(result.cache_scope, None);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn list_tools_sets_cache_scope_private_when_filtered() {
+    /// Pins that filtering forces the cache scope from public to private.
+    async fn list_tools_sets_cache_scope_private_when_filtered() -> anyhow::Result<()> {
         let rbac = policy(RoleConfig::new(
             "viewer",
             vec!["a_x".to_owned(), "b_y".to_owned()],
@@ -878,14 +783,16 @@ mod tests {
         let mut inner_page = page(&["a_x", "b_y"]);
         inner_page.cache_scope = Some(CacheScope::Public);
 
-        let result = list_tools_for_viewer(inner_page, rbac).await;
+        let result = list_tools_for_viewer(inner_page, rbac).await?;
 
         assert_eq!(result.tools, vec![tool("a_x"), tool("b_y")]);
         assert_eq!(result.cache_scope, Some(CacheScope::Private));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn list_tools_preserves_next_cursor() {
+    /// Pins that filtering preserves the inner page's next cursor.
+    async fn list_tools_preserves_next_cursor() -> anyhow::Result<()> {
         let rbac = policy(RoleConfig::new(
             "viewer",
             vec!["a_x".to_owned()],
@@ -894,14 +801,16 @@ mod tests {
         let mut inner_page = page(&["a_x", "b_y"]);
         inner_page.next_cursor = Some("next".to_owned());
 
-        let result = list_tools_for_viewer(inner_page, rbac).await;
+        let result = list_tools_for_viewer(inner_page, rbac).await?;
 
         assert_eq!(result.tools, vec![tool("a_x")]);
         assert_eq!(result.next_cursor.as_deref(), Some("next"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn list_tools_preserves_ttl_ms_while_forcing_private() {
+    /// Pins that filtering forces a private scope while keeping the TTL.
+    async fn list_tools_preserves_ttl_ms_while_forcing_private() -> anyhow::Result<()> {
         let rbac = policy(RoleConfig::new(
             "viewer",
             vec!["a_x".to_owned(), "b_y".to_owned()],
@@ -909,14 +818,16 @@ mod tests {
         ));
         let inner_page = page(&["a_x", "b_y"]).with_ttl_ms(30_000);
 
-        let result = list_tools_for_viewer(inner_page, rbac).await;
+        let result = list_tools_for_viewer(inner_page, rbac).await?;
 
         assert_eq!(result.ttl_ms, Some(30_000));
         assert_eq!(result.cache_scope, Some(CacheScope::Private));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn list_tools_allows_empty_page_with_live_cursor() {
+    /// Pins that a fully denied page keeps its live cursor and empty tool list.
+    async fn list_tools_allows_empty_page_with_live_cursor() -> anyhow::Result<()> {
         let rbac = policy(RoleConfig::new(
             "viewer",
             vec!["allowed_later".to_owned()],
@@ -925,14 +836,16 @@ mod tests {
         let mut inner_page = page(&["denied_now"]);
         inner_page.next_cursor = Some("next".to_owned());
 
-        let result = list_tools_for_viewer(inner_page, rbac).await;
+        let result = list_tools_for_viewer(inner_page, rbac).await?;
 
-        assert_eq!(result.tools, Vec::<rmcp::model::Tool>::new());
+        assert_eq!(result.tools, Vec::<Tool>::new());
         assert_eq!(result.next_cursor.as_deref(), Some("next"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn list_tools_filters_when_role_present_after_delegation() {
+    /// Pins that the inner handler observes the role the wrapper scoped in.
+    async fn list_tools_filters_when_role_present_after_delegation() -> anyhow::Result<()> {
         let rbac = policy(RoleConfig::new(
             "viewer",
             vec!["a_x".to_owned()],
@@ -941,7 +854,7 @@ mod tests {
         let inner = ListToolsHandler::new(vec![page(&["a_x", "b_y"])]);
         let probe = inner.clone();
 
-        let result = list_tools_via_service(inner, rbac, true, Some(viewer())).await;
+        let result = list_tools_via_service(inner, rbac, true, Some(viewer())).await?;
 
         assert_eq!(
             probe.observed_role(),
@@ -949,10 +862,12 @@ mod tests {
         );
         assert_eq!(rbac::current_role(), None);
         assert_eq!(result.tools, vec![tool("a_x")]);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn list_tools_reflects_reloaded_policy() {
+    /// Pins that filtering follows a policy reload without restarting.
+    async fn list_tools_reflects_reloaded_policy() -> anyhow::Result<()> {
         let rbac = policy(RoleConfig::new(
             "viewer",
             vec!["a_x".to_owned()],
@@ -961,14 +876,15 @@ mod tests {
         let inner = ListToolsHandler::new(vec![page(&["a_x", "b_y"]), page(&["a_x", "b_y"])]);
 
         let first =
-            list_tools_via_service(inner.clone(), Arc::clone(&rbac), true, Some(viewer())).await;
+            list_tools_via_service(inner.clone(), Arc::clone(&rbac), true, Some(viewer())).await?;
         rbac.store(Arc::new(RbacPolicy::new(&RbacConfig::with_roles(vec![
             RoleConfig::new("viewer", vec!["b_y".to_owned()], vec!["*".to_owned()]),
         ]))));
-        let second = list_tools_via_service(inner, rbac, true, Some(viewer())).await;
+        let second = list_tools_via_service(inner, rbac, true, Some(viewer())).await?;
 
         assert_eq!(first.tools, vec![tool("a_x")]);
         assert_eq!(second.tools, vec![tool("b_y")]);
+        Ok(())
     }
 
     // ----------------------------------------------------------------------
@@ -984,12 +900,15 @@ mod tests {
     /// rejected call never reaches the handler at all.
     #[derive(Clone, Default)]
     struct TaskProbeHandler {
-        seen: Arc<std::sync::Mutex<Vec<String>>>,
+        seen: Arc<Mutex<Vec<String>>>,
     }
 
     impl TaskProbeHandler {
         fn seen(&self) -> Vec<String> {
-            self.seen.lock().map(|s| s.clone()).unwrap_or_default()
+            self.seen
+                .lock()
+                .map(|stored| stored.clone())
+                .unwrap_or_default()
         }
     }
 
@@ -1003,7 +922,7 @@ mod tests {
             // the client declaring it, so both must be set up or the request is
             // rejected upstream and never reaches the binding under test.
             ServerConfig::new(
-                rmcp::model::ServerCapabilities::builder()
+                ServerCapabilities::builder()
                     .enable_tools()
                     .enable_tasks()
                     .build(),
@@ -1018,14 +937,14 @@ mod tests {
             if let Ok(mut seen) = self.seen.lock() {
                 seen.push(request.task_id.clone());
             }
-            Ok(GetTaskResult::new(rmcp::model::DetailedTask::new(
-                rmcp::model::Task::new(
+            Ok(GetTaskResult::new(DetailedTask::new(
+                Task::new(
                     request.task_id,
-                    rmcp::model::TaskStatus::Working,
+                    TaskStatus::Working,
                     "2026-01-01T00:00:00Z",
                     "2026-01-01T00:00:00Z",
                 ),
-                rmcp::model::TaskPayload::Working,
+                TaskPayload::Working,
             )))
         }
 
@@ -1084,21 +1003,24 @@ mod tests {
     }
 
     fn get_task_request(id: i64, task_id: &str, identity: AuthIdentity) -> ClientJsonRpcMessage {
-        let mut request = ClientRequest::GetTaskRequest(rmcp::model::GetTaskRequest::new(
-            GetTaskParams::new(task_id),
-        ));
+        let mut request =
+            ClientRequest::GetTaskRequest(GetTaskRequest::new(GetTaskParams::new(task_id)));
         // The envelope extensions are the canonical runtime home for `_meta`;
         // a `params.meta` set in-memory is only honoured on serialization, so
         // it would never reach `RequestContext::client_capabilities()` here.
-        let mut meta = rmcp::model::RequestMetaObject::default();
+        let mut meta = RequestMetaObject::default();
         meta.set_client_capabilities(ClientCapabilities::builder().enable_tasks().build());
-        request.extensions_mut().insert(meta);
-        let mut parts = axum::http::Request::new(()).into_parts().0;
-        parts.extensions.insert(identity);
-        request.extensions_mut().insert(parts);
+        let _previous_meta = request.extensions_mut().insert(meta);
+        let mut parts = Request::new(()).into_parts().0;
+        let _previous_identity = parts.extensions.insert(identity);
+        let _previous_parts = request.extensions_mut().insert(parts);
         JsonRpcMessage::request(request, NumberOrString::Number(id))
     }
 
+    #[expect(
+        clippy::panic,
+        reason = "deliberate: src/rbac_context.rs::get_task_via_service panics only when the in-memory service returns no usable frame (harness invariant)"
+    )]
     async fn get_task_via_service(
         inner: TaskProbeHandler,
         binding: Option<SessionBindingSecret>,
@@ -1113,16 +1035,19 @@ mod tests {
         let message = get_task_request(1, task_id, identity);
         let (transport, outbound) = InMemoryTransport::new(vec![message]);
         let handler = RbacContextHandler::new(inner, rbac, false).with_task_binding(binding);
-        let running = rmcp::service::serve_directly::<RoleServer, _, _, Infallible, _>(
-            handler, transport, None,
-        );
-        running.waiting().await.expect("service task joins");
+        let running = serve_directly::<RoleServer, _, _, Infallible, _>(handler, transport, None);
+        let _quit_reason = running.waiting().await.map_err(|error| {
+            ErrorData::internal_error(format!("service task join must succeed: {error}"), None)
+        })?;
 
-        let messages = outbound.lock().expect("outbound messages lock").clone();
-        let Some(message) = messages.first() else {
+        let messages = outbound
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let Some(frame) = messages.first() else {
             panic!("expected one response");
         };
-        match message {
+        match frame {
             ServerJsonRpcMessage::Response(response) => {
                 if let ServerResult::GetTaskResult(result) = &response.result {
                     Ok(result.clone())
@@ -1132,17 +1057,18 @@ mod tests {
             }
             ServerJsonRpcMessage::Error(err) => Err(err.error.clone()),
             other @ (ServerJsonRpcMessage::Request(_) | ServerJsonRpcMessage::Notification(_)) => {
-                panic!("unexpected message {other:?}")
+                panic!("unexpected message {other:?}");
             }
         }
     }
 
     #[tokio::test]
-    async fn task_binding_wraps_outbound_and_unwraps_inbound_for_the_owner() {
+    /// Pins that the owner's raw task id is unwrapped inbound and rewrapped outbound.
+    async fn task_binding_wraps_outbound_and_unwraps_inbound_for_the_owner() -> anyhow::Result<()> {
         let secret = task_secret();
         let alice = identity_named("alice");
         let fp = fingerprint(&alice);
-        let raw = RawTaskId::parse("task-42").expect("valid id");
+        let raw = RawTaskId::parse("task-42").context("valid id")?;
         let external = task_binding::wrap(&secret, &raw, &fp);
         let probe = TaskProbeHandler::default();
 
@@ -1153,7 +1079,7 @@ mod tests {
             alice.clone(),
         )
         .await
-        .expect("owner may read its own task");
+        .context("owner may read its own task")?;
 
         assert_eq!(
             probe.seen(),
@@ -1168,47 +1094,53 @@ mod tests {
             result.task.task.task_id, "task-42",
             "raw id must never reach the client"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn task_binding_denies_a_second_identity_and_never_calls_the_handler() {
+    /// Pins that a second identity is denied and the handler is never called.
+    async fn task_binding_denies_a_second_identity_and_never_calls_the_handler()
+    -> anyhow::Result<()> {
         let secret = task_secret();
         let alice = identity_named("alice");
         let bob = identity_named("bob");
-        let raw = RawTaskId::parse("task-42").expect("valid id");
+        let raw = RawTaskId::parse("task-42").context("valid id")?;
         let alices_task = task_binding::wrap(&secret, &raw, &fingerprint(&alice));
         let probe = TaskProbeHandler::default();
 
-        let err = get_task_via_service(probe.clone(), Some(secret), &alices_task, bob)
+        let error = get_task_via_service(probe.clone(), Some(secret), &alices_task, bob)
             .await
-            .expect_err("bob must not reach alice's task");
+            .err()
+            .context("bob must not reach alice's task")?;
 
         assert_eq!(
-            err.code,
-            rmcp::model::ErrorCode::INVALID_PARAMS,
+            error.code,
+            ErrorCode::INVALID_PARAMS,
             "must match upstream's unknown-task error code"
         );
         assert!(
-            err.message.contains("unknown task"),
+            error.message.contains("unknown task"),
             "must be indistinguishable from a nonexistent task, got {:?}",
-            err.message
+            error.message
         );
         assert!(
             probe.seen().is_empty(),
             "the inner handler must never see a rejected task id"
         );
+        Ok(())
     }
 
     /// A raw (unwrapped) id must be rejected too, or an attacker could simply
     /// strip the wrapper and hit the handler directly.
     #[tokio::test]
-    async fn task_binding_rejects_raw_and_malformed_ids_identically() {
+    /// Pins that raw and malformed task IDs are rejected indistinguishably.
+    async fn task_binding_rejects_raw_and_malformed_ids_identically() -> anyhow::Result<()> {
         let secret = task_secret();
         let alice = identity_named("alice");
         let probe = TaskProbeHandler::default();
 
         for candidate in ["task-42", "", "t1.", "t1.a.b", "v1.a.b", "garbage"] {
-            let Err(err) = get_task_via_service(
+            let Err(error) = get_task_via_service(
                 probe.clone(),
                 Some(secret.clone()),
                 candidate,
@@ -1216,41 +1148,44 @@ mod tests {
             )
             .await
             else {
-                panic!("must reject {candidate:?}");
+                anyhow::bail!("must reject {candidate:?}");
             };
-            assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+            assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
             assert!(
-                err.message.contains("unknown task"),
+                error.message.contains("unknown task"),
                 "every failure mode must look alike; {candidate:?} gave {:?}",
-                err.message
+                error.message
             );
         }
         assert_eq!(probe.seen(), Vec::<String>::new());
+        Ok(())
     }
 
     /// Disabled binding must be perfectly transparent, so existing task-using
     /// consumers are unaffected until they opt in.
     #[tokio::test]
-    async fn task_binding_disabled_passes_ids_through_untouched() {
+    /// Pins that disabled binding passes task IDs through untouched.
+    async fn task_binding_disabled_passes_ids_through_untouched() -> anyhow::Result<()> {
         let probe = TaskProbeHandler::default();
 
         let result = get_task_via_service(probe.clone(), None, "task-42", identity_named("alice"))
             .await
-            .expect("pass-through when disabled");
+            .context("pass-through when disabled")?;
 
         assert_eq!(probe.seen(), vec!["task-42".to_owned()]);
         assert_eq!(result.task.task.task_id, "task-42");
+        Ok(())
     }
 
     #[derive(Clone, Default)]
     struct NotificationProbeHandler {
-        send_result: Arc<std::sync::Mutex<Option<String>>>,
+        send_result: Arc<Mutex<Option<String>>>,
     }
 
     impl ServerHandler for NotificationProbeHandler {
         fn get_info(&self) -> ServerConfig {
             ServerConfig::new(
-                rmcp::model::ServerCapabilities::builder()
+                ServerCapabilities::builder()
                     .enable_tools()
                     .enable_tool_list_changed()
                     .enable_tasks()
@@ -1266,21 +1201,19 @@ mod tests {
         }
 
         async fn listen(&self, context: SubscriptionContext) -> Result<(), ErrorData> {
-            let task = rmcp::model::DetailedTask::new(
-                rmcp::model::Task::new(
+            let task = DetailedTask::new(
+                Task::new(
                     "task-42",
-                    rmcp::model::TaskStatus::Working,
+                    TaskStatus::Working,
                     "2026-01-01T00:00:00Z",
                     "2026-01-01T00:00:00Z",
                 ),
-                rmcp::model::TaskPayload::Working,
+                TaskPayload::Working,
             );
             let outcome = context
                 .sink()
-                .send(rmcp::model::ServerNotification::TaskStatusNotification(
-                    rmcp::model::TaskStatusNotification::new(
-                        rmcp::model::TaskStatusNotificationParams::new(task),
-                    ),
+                .send(ServerNotification::TaskStatusNotification(
+                    TaskStatusNotification::new(TaskStatusNotificationParams::new(task)),
                 ))
                 .await;
             if let Ok(mut slot) = self.send_result.lock() {
@@ -1298,7 +1231,7 @@ mod tests {
     /// service shutting down the moment the inbound queue drains.
     struct OpenTransport {
         inbound: VecDeque<ClientJsonRpcMessage>,
-        outbound: Arc<std::sync::Mutex<Vec<ServerJsonRpcMessage>>>,
+        outbound: Arc<Mutex<Vec<ServerJsonRpcMessage>>>,
     }
 
     #[expect(
@@ -1312,10 +1245,10 @@ mod tests {
             &mut self,
             item: ServerJsonRpcMessage,
         ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
-            let outbound = Arc::clone(&self.outbound);
+            let shared = Arc::clone(&self.outbound);
             async move {
-                if let Ok(mut outbound) = outbound.lock() {
-                    outbound.push(item);
+                if let Ok(mut guard) = shared.lock() {
+                    guard.push(item);
                 }
                 Ok(())
             }
@@ -1325,7 +1258,7 @@ mod tests {
             if let Some(message) = self.inbound.pop_front() {
                 return Some(message);
             }
-            std::future::pending().await
+            pending().await
         }
 
         async fn close(&mut self) -> Result<(), Self::Error> {
@@ -1343,7 +1276,8 @@ mod tests {
     /// `TaskStatusNotificationParams` must be wrapped before it leaves the
     /// process, exactly as `call_tool` and `get_task` already wrap theirs.
     #[tokio::test]
-    async fn task_status_notifications_remain_unroutable_until_binding_is_added() {
+    async fn task_status_notifications_remain_unroutable_until_binding_is_added()
+    -> anyhow::Result<()> {
         let probe = NotificationProbeHandler::default();
         let rbac = policy(RoleConfig::new(
             "viewer",
@@ -1352,46 +1286,47 @@ mod tests {
         ));
 
         let filter = SubscriptionFilter::builder().tools_list_changed().build();
-        let mut params = rmcp::model::SubscriptionsListenRequestParams::new(filter);
-        let mut meta = rmcp::model::RequestMetaObject::default();
+        let mut params = SubscriptionsListenRequestParams::new(filter);
+        let mut meta = RequestMetaObject::default();
         meta.set_protocol_version(ProtocolVersion::V_2026_07_28);
         meta.set_client_capabilities(ClientCapabilities::default());
         params.meta = Some(meta.clone());
-        let mut request = ClientRequest::SubscriptionsListenRequest(
-            rmcp::model::SubscriptionsListenRequest::new(params),
-        );
-        request.extensions_mut().insert(meta);
-        let mut parts = axum::http::Request::new(()).into_parts().0;
-        parts.extensions.insert(identity_named("alice"));
-        request.extensions_mut().insert(parts);
+        let mut request =
+            ClientRequest::SubscriptionsListenRequest(SubscriptionsListenRequest::new(params));
+        let _previous_meta = request.extensions_mut().insert(meta);
+        let mut parts = Request::new(()).into_parts().0;
+        let _previous_identity = parts.extensions.insert(identity_named("alice"));
+        let _previous_parts = request.extensions_mut().insert(parts);
         let message = JsonRpcMessage::request(request, NumberOrString::Number(1));
 
-        let outbound = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let outbound = Arc::new(Mutex::new(Vec::new()));
         let transport = OpenTransport {
             inbound: VecDeque::from(vec![message]),
             outbound: Arc::clone(&outbound),
         };
         let handler = RbacContextHandler::new(probe.clone(), rbac, false);
-        let running = rmcp::service::serve_directly::<RoleServer, _, _, Infallible, _>(
-            handler, transport, None,
-        );
+        let running = serve_directly::<RoleServer, _, _, Infallible, _>(handler, transport, None);
 
         // The transport never closes, so poll for the handler's result instead
         // of joining the service, then cancel it.
         let mut recorded = None;
-        for _ in 0..10_000 {
+        for _ in 0_i32..10_000_i32 {
             if let Some(value) = probe.send_result.lock().ok().and_then(|slot| slot.clone()) {
                 recorded = Some(value);
                 break;
             }
-            tokio::task::yield_now().await;
+            yield_now().await;
         }
-        running.cancel().await.ok();
+        // Cleanup cancel; a failure here cannot affect the assertion below.
+        let _cancel_result = running.cancel().await;
 
-        let outcome = recorded.unwrap_or_else(|| {
-            let msgs = outbound.lock().expect("outbound lock").clone();
-            panic!("listen was never invoked; server responded: {msgs:?}")
-        });
+        let Some(outcome) = recorded else {
+            let messages = outbound
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            anyhow::bail!("listen was never invoked; server responded: {messages:?}");
+        };
 
         assert!(
             outcome.contains("UnsupportedNotification") && outcome.contains("notifications/tasks"),
@@ -1401,6 +1336,7 @@ mod tests {
              shipping this rmcp version, or identity A's raw task ID will leak \
              to whoever is subscribed."
         );
+        Ok(())
     }
 
     /// Overrides only `negotiate_initialize`, so the sentinel value can only
@@ -1418,14 +1354,15 @@ mod tests {
             &self,
             _request: &InitializeRequestParams,
         ) -> Result<InitializeResult, ErrorData> {
-            let mut info = ServerConfig::new(rmcp::model::ServerCapabilities::default());
+            let mut info = ServerConfig::new(ServerCapabilities::default());
             info.instructions = Some("inner negotiate_initialize override".to_owned());
             Ok(info)
         }
     }
 
     #[test]
-    fn rbac_context_handler_preserves_inner_negotiate_initialize_override() {
+    /// Pins that the wrapper delegates `negotiate_initialize` to an inner override.
+    fn rbac_context_handler_preserves_inner_negotiate_initialize_override() -> anyhow::Result<()> {
         let rbac = policy(RoleConfig::new(
             "viewer",
             vec!["*".to_owned()],
@@ -1434,20 +1371,21 @@ mod tests {
         let handler = RbacContextHandler::new(NegotiateProbe, rbac, false);
         let request = InitializeRequestParams::new(
             ClientCapabilities::default(),
-            rmcp::model::Implementation::new("delegation-test-client", "0.0.0"),
+            Implementation::new("delegation-test-client", "0.0.0"),
         );
 
         // Direct call on the wrapper: negotiation carries no request context,
         // so there is no identity to scope and delegation must be transparent.
         let result = handler
             .negotiate_initialize(&request)
-            .expect("direct negotiation must succeed");
+            .context("direct negotiation must succeed")?;
 
         assert_eq!(
             result.instructions.as_deref(),
             Some("inner negotiate_initialize override"),
             "wrapper must delegate to the inner `negotiate_initialize` override"
         );
+        Ok(())
     }
 
     // ----------------------------------------------------------------------
@@ -1476,8 +1414,8 @@ mod tests {
 
     /// Capabilities the probe advertises so the dispatcher routes tools, task
     /// methods and subscriptions to the wrapper at all.
-    fn probe_capabilities() -> rmcp::model::ServerCapabilities {
-        rmcp::model::ServerCapabilities::builder()
+    fn probe_capabilities() -> ServerCapabilities {
+        ServerCapabilities::builder()
             .enable_prompts()
             .enable_resources()
             .enable_tools()
@@ -1487,7 +1425,7 @@ mod tests {
     }
 
     /// The observed call log: `(method, role observed inside the call)`.
-    type ObservedCalls = Arc<std::sync::Mutex<Vec<(&'static str, Option<String>)>>>;
+    type ObservedCalls = Arc<Mutex<Vec<(&'static str, Option<String>)>>>;
 
     /// Records each call as `(method, role observed inside the call)` and
     /// answers with a sentinel no rmcp default body can construct. The role is
@@ -1502,8 +1440,8 @@ mod tests {
     #[derive(Clone, Default)]
     struct ForwardingProbe {
         seen: ObservedCalls,
-        task_ids: Arc<std::sync::Mutex<Vec<String>>>,
-        notify: Arc<tokio::sync::Notify>,
+        task_ids: Arc<Mutex<Vec<String>>>,
+        notify: Arc<Notify>,
     }
 
     impl ForwardingProbe {
@@ -1536,14 +1474,15 @@ mod tests {
                 .unwrap_or_default()
         }
 
-        async fn wait_for_seen_count(&self, count: usize) {
-            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        async fn wait_for_seen_count(&self, count: usize) -> anyhow::Result<()> {
+            timeout(Duration::from_secs(1), async {
                 while self.seen().len() < count {
                     self.notify.notified().await;
                 }
             })
             .await
-            .expect("delegated handler methods should be observed");
+            .context("delegated handler methods should be observed")?;
+            Ok(())
         }
     }
 
@@ -1652,14 +1591,12 @@ mod tests {
             _context: RequestContext<RoleServer>,
         ) -> Result<CallToolResponse, ErrorData> {
             self.record("call_tool");
-            Ok(CallToolResponse::Task(CreateTaskResult::new(
-                rmcp::model::Task::new(
-                    "raw-task-call",
-                    rmcp::model::TaskStatus::Working,
-                    "2026-01-01T00:00:00Z",
-                    "2026-01-01T00:00:00Z",
-                ),
-            )))
+            Ok(CallToolResponse::Task(CreateTaskResult::new(Task::new(
+                "raw-task-call",
+                TaskStatus::Working,
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+            ))))
         }
 
         async fn update_task(
@@ -1814,8 +1751,13 @@ mod tests {
     /// in-crate check keeps the constant referenced (so it cannot rot as dead
     /// code) and rejects duplicate entries, which the source-level parser
     /// cannot see.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac_context.rs::semantic_drivers_table_is_well_formed keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn semantic_drivers_table_is_well_formed() {
+    /// Pins that the semantic-driver table has no duplicate or empty entries.
+    fn semantic_drivers_table_is_well_formed() -> anyhow::Result<()> {
         assert_ne!(SEMANTIC_DRIVERS, []);
         let mut names: Vec<&str> = SEMANTIC_DRIVERS.iter().map(|(name, _)| *name).collect();
         let total = names.len();
@@ -1826,13 +1768,14 @@ mod tests {
             assert_ne!(*name, "");
             assert_ne!(*driver, "");
         }
+        Ok(())
     }
 
     /// Per-request metadata declaring the protocol version and the tasks client
     /// capability that the `tasks/*` gates and a task-returning `call_tool`
     /// require.
-    fn coverage_meta() -> rmcp::model::RequestMetaObject {
-        let mut meta = rmcp::model::RequestMetaObject::default();
+    fn coverage_meta() -> RequestMetaObject {
+        let mut meta = RequestMetaObject::default();
         meta.set_protocol_version(ProtocolVersion::V_2026_07_28);
         meta.set_client_capabilities(ClientCapabilities::builder().enable_tasks().build());
         meta
@@ -1844,47 +1787,58 @@ mod tests {
 
     /// Attach the authenticated identity the way the transport middleware does:
     /// an [`axum`] `Parts` extension carrying the [`AuthIdentity`].
-    fn attach_identity(message: &mut ClientJsonRpcMessage, identity: AuthIdentity) {
-        let mut parts = axum::http::Request::new(()).into_parts().0;
-        parts.extensions.insert(identity);
+    fn attach_identity(
+        message: &mut ClientJsonRpcMessage,
+        identity: AuthIdentity,
+    ) -> anyhow::Result<()> {
+        let mut parts = Request::new(()).into_parts().0;
+        let _previous_identity = parts.extensions.insert(identity);
         match message {
             JsonRpcMessage::Request(request) => {
-                request.request.extensions_mut().insert(parts);
+                let _previous_parts = request.request.extensions_mut().insert(parts);
             }
             JsonRpcMessage::Notification(notification) => {
-                notification.notification.extensions_mut().insert(parts);
+                let _previous_parts = notification.notification.extensions_mut().insert(parts);
             }
             other @ (JsonRpcMessage::Response(_) | JsonRpcMessage::Error(_)) => {
-                panic!("coverage drivers only send requests and notifications, got {other:?}")
+                anyhow::bail!(
+                    "coverage drivers only send requests and notifications, got {other:?}"
+                );
             }
         }
+        Ok(())
     }
 
-    fn attach_meta(message: &mut ClientJsonRpcMessage, meta: rmcp::model::RequestMetaObject) {
+    fn attach_meta(
+        message: &mut ClientJsonRpcMessage,
+        meta: RequestMetaObject,
+    ) -> anyhow::Result<()> {
         let JsonRpcMessage::Request(request) = message else {
-            panic!("only requests carry request metadata");
+            anyhow::bail!("only requests carry request metadata");
         };
-        request.request.extensions_mut().insert(meta);
+        let _previous_meta = request.request.extensions_mut().insert(meta);
+        Ok(())
     }
 
-    type OutboundFrames = Arc<std::sync::Mutex<Vec<ServerJsonRpcMessage>>>;
+    type OutboundFrames = Arc<Mutex<Vec<ServerJsonRpcMessage>>>;
 
     /// Drive messages through a real service wrapping `inner`, and hand back
     /// the outbound frames. Response order is not a contract -- callers match
     /// by JSON-RPC id with [`frame_for`].
-    async fn drive_coverage_requests<H: ServerHandler>(
+    async fn drive_coverage_requests<H>(
         inner: H,
         rbac: Arc<ArcSwap<RbacPolicy>>,
         binding: Option<SessionBindingSecret>,
         messages: Vec<ClientJsonRpcMessage>,
-    ) -> OutboundFrames {
+    ) -> anyhow::Result<OutboundFrames>
+    where
+        H: ServerHandler,
+    {
         let (transport, outbound) = InMemoryTransport::new(messages);
         let handler = RbacContextHandler::new(inner, rbac, false).with_task_binding(binding);
-        let running = rmcp::service::serve_directly::<RoleServer, _, _, Infallible, _>(
-            handler, transport, None,
-        );
-        running.waiting().await.expect("service task joins");
-        outbound
+        let running = serve_directly::<RoleServer, _, _, Infallible, _>(handler, transport, None);
+        let _quit_reason = running.waiting().await.context("service task joins")?;
+        Ok(outbound)
     }
 
     /// Drive one request against the real wrapper, then the same request
@@ -1894,27 +1848,27 @@ mod tests {
     async fn forward_once<F>(
         build_message: F,
         binding: Option<SessionBindingSecret>,
-    ) -> (OutboundFrames, ForwardingProbe, OutboundFrames)
+    ) -> anyhow::Result<(OutboundFrames, ForwardingProbe, OutboundFrames)>
     where
-        F: Fn() -> ClientJsonRpcMessage,
+        F: Fn() -> anyhow::Result<ClientJsonRpcMessage>,
     {
         let probe = ForwardingProbe::default();
         let outbound = drive_coverage_requests(
             probe.clone(),
             viewer_policy(),
             binding.clone(),
-            vec![build_message()],
+            vec![build_message()?],
         )
-        .await;
+        .await?;
 
         let control = ForwardingProbe::default();
         let control_outbound = drive_coverage_requests(
             PassthroughDefaults::new(control.clone()),
             viewer_policy(),
             binding,
-            vec![build_message()],
+            vec![build_message()?],
         )
-        .await;
+        .await?;
         assert_eq!(
             control.seen(),
             Vec::<(&'static str, Option<String>)>::new(),
@@ -1926,41 +1880,43 @@ mod tests {
             "PassthroughDefaults must not reach the inner handler"
         );
 
-        (outbound, probe, control_outbound)
+        Ok((outbound, probe, control_outbound))
     }
 
-    fn frame_for(outbound: &OutboundFrames, id: i64) -> ServerJsonRpcMessage {
-        let messages = outbound.lock().expect("outbound messages lock").clone();
-        messages
-            .into_iter()
-            .find(|message| match message {
-                ServerJsonRpcMessage::Response(response) => {
-                    response.id == NumberOrString::Number(id)
-                }
-                ServerJsonRpcMessage::Error(error) => error.id == Some(NumberOrString::Number(id)),
-                ServerJsonRpcMessage::Request(_) | ServerJsonRpcMessage::Notification(_) => false,
-            })
-            .unwrap_or_else(|| panic!("no frame with id {id}"))
+    fn frame_for(outbound: &OutboundFrames, id: i64) -> anyhow::Result<ServerJsonRpcMessage> {
+        let messages = outbound
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let found = messages.into_iter().find(|message| match message {
+            ServerJsonRpcMessage::Response(response) => response.id == NumberOrString::Number(id),
+            ServerJsonRpcMessage::Error(error) => error.id == Some(NumberOrString::Number(id)),
+            ServerJsonRpcMessage::Request(_) | ServerJsonRpcMessage::Notification(_) => false,
+        });
+        let Some(frame) = found else {
+            anyhow::bail!("no frame with id {id}");
+        };
+        Ok(frame)
     }
 
-    fn expect_response(frame: ServerJsonRpcMessage) -> ServerResult {
+    fn expect_response(frame: ServerJsonRpcMessage) -> anyhow::Result<ServerResult> {
         match frame {
-            ServerJsonRpcMessage::Response(response) => response.result,
+            ServerJsonRpcMessage::Response(response) => Ok(response.result),
             other @ (ServerJsonRpcMessage::Request(_)
             | ServerJsonRpcMessage::Notification(_)
             | ServerJsonRpcMessage::Error(_)) => {
-                panic!("expected a response, got {other:?}")
+                anyhow::bail!("expected a response, got {other:?}")
             }
         }
     }
 
-    fn expect_error(frame: ServerJsonRpcMessage) -> ErrorData {
+    fn expect_error(frame: ServerJsonRpcMessage) -> anyhow::Result<ErrorData> {
         match frame {
-            ServerJsonRpcMessage::Error(error) => error.error,
+            ServerJsonRpcMessage::Error(error) => Ok(error.error),
             other @ (ServerJsonRpcMessage::Request(_)
             | ServerJsonRpcMessage::Response(_)
             | ServerJsonRpcMessage::Notification(_)) => {
-                panic!("expected an error, got {other:?}")
+                anyhow::bail!("expected an error, got {other:?}")
             }
         }
     }
@@ -1974,7 +1930,8 @@ mod tests {
     }
 
     #[test]
-    fn rbac_context_handler_forwards_direct_sync_methods() {
+    /// Pins that `get_info`, `get_tool` and `supported_protocol_versions` forward.
+    fn rbac_context_handler_forwards_direct_sync_methods() -> anyhow::Result<()> {
         // No record log in this driver: `get_info`, `get_tool` and
         // `supported_protocol_versions` are proven by value differential, so
         // rmcp's ambient calls cannot contaminate the proof.
@@ -1991,7 +1948,7 @@ mod tests {
         // `get_tool`: the default returns `None` unconditionally.
         let tool = wrapper
             .get_tool("sentinel-tool")
-            .expect("inner get_tool must reach the caller");
+            .context("inner get_tool must reach the caller")?;
         assert_eq!(tool.name, "sentinel-tool");
         assert_eq!(control.get_tool("sentinel-tool"), None);
 
@@ -2004,10 +1961,12 @@ mod tests {
             control.supported_protocol_versions().as_ref(),
             SENTINEL_VERSIONS.as_slice()
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn rbac_context_handler_forwards_macro_request_plain_arm() {
+    /// Pins that the plain-params request arm forwards and propagates errors.
+    async fn rbac_context_handler_forwards_macro_request_plain_arm() -> anyhow::Result<()> {
         // Mechanism 1 (ambient-silent probe): the expected log is exactly the
         // driven method.
         let (outbound, probe, control_outbound) = forward_once(
@@ -2021,29 +1980,31 @@ mod tests {
                     )),
                     1,
                 );
-                attach_identity(&mut message, viewer());
-                message
+                attach_identity(&mut message, viewer())?;
+                Ok(message)
             },
             None,
         )
-        .await;
+        .await?;
 
         // A sentinel *error* proves the `Result` channel, not just entry: the
         // plain-params arm of `delegate_request!` must propagate it verbatim.
-        let error = expect_error(frame_for(&outbound, 1));
+        let error = expect_error(frame_for(&outbound, 1)?)?;
         assert_eq!(error.message, "forwarding-probe:complete");
         assert_eq!(probe.seen(), vec![("complete", Some("viewer".to_owned()))]);
 
         // The default answers `Ok`, so the sentinel error cannot come from it.
-        let default_result = expect_response(frame_for(&control_outbound, 1));
-        let ServerResult::CompleteResult(default_result) = default_result else {
-            panic!("expected a completion result, got {default_result:?}")
+        let default_response = expect_response(frame_for(&control_outbound, 1)?)?;
+        let ServerResult::CompleteResult(completed) = default_response else {
+            anyhow::bail!("expected a completion result, got {default_response:?}")
         };
-        assert_eq!(default_result.completion.values, Vec::<String>::new());
+        assert_eq!(completed.completion.values, Vec::<String>::new());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn rbac_context_handler_forwards_macro_request_option_arm() {
+    /// Pins that the optional-params request arm forwards to the inner handler.
+    async fn rbac_context_handler_forwards_macro_request_option_arm() -> anyhow::Result<()> {
         // Mechanism 1 (ambient-silent probe): the expected log is exactly the
         // driven method.
         let (outbound, probe, control_outbound) = forward_once(
@@ -2054,33 +2015,42 @@ mod tests {
                     )),
                     1,
                 );
-                attach_identity(&mut message, viewer());
-                message
+                attach_identity(&mut message, viewer())?;
+                Ok(message)
             },
             None,
         )
-        .await;
+        .await?;
 
-        let result = expect_response(frame_for(&outbound, 1));
-        let ServerResult::ListPromptsResult(result) = result else {
-            panic!("expected a prompts/list result, got {result:?}")
+        let option_response = expect_response(frame_for(&outbound, 1)?)?;
+        let ServerResult::ListPromptsResult(listed) = option_response else {
+            anyhow::bail!("expected a prompts/list result, got {option_response:?}")
         };
-        assert_eq!(result.prompts[0].name, "sentinel-prompt");
+        assert_eq!(
+            listed
+                .prompts
+                .first()
+                .context("the sentinel prompt is present")?
+                .name,
+            "sentinel-prompt"
+        );
         assert_eq!(
             probe.seen(),
             vec![("list_prompts", Some("viewer".to_owned()))]
         );
 
         // The default returns an empty page.
-        let default_result = expect_response(frame_for(&control_outbound, 1));
-        let ServerResult::ListPromptsResult(default_result) = default_result else {
-            panic!("expected a prompts/list result, got {default_result:?}")
+        let option_default_response = expect_response(frame_for(&control_outbound, 1)?)?;
+        let ServerResult::ListPromptsResult(default_listed) = option_default_response else {
+            anyhow::bail!("expected a prompts/list result, got {option_default_response:?}")
         };
-        assert_eq!(default_result.prompts, Vec::new());
+        assert_eq!(default_listed.prompts, Vec::new());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn rbac_context_handler_forwards_macro_notification_arm() {
+    /// Pins that the notification arm forwards and the passthrough stays silent.
+    async fn rbac_context_handler_forwards_macro_notification_arm() -> anyhow::Result<()> {
         // Mechanism 1 (ambient-silent probe): notifications do not pass through
         // the request prelude, and the probe records nothing ambient, so the
         // expected log is exactly the driven method.
@@ -2091,19 +2061,17 @@ mod tests {
                 Some("coverage".to_owned()),
             )),
         ));
-        attach_identity(&mut message, viewer());
+        attach_identity(&mut message, viewer())?;
 
-        let outbound = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let outbound = Arc::new(Mutex::new(Vec::new()));
         let transport = OpenTransport {
             inbound: VecDeque::from(vec![message]),
             outbound: Arc::clone(&outbound),
         };
         let handler = RbacContextHandler::new(probe.clone(), viewer_policy(), false);
-        let running = rmcp::service::serve_directly::<RoleServer, _, _, Infallible, _>(
-            handler, transport, None,
-        );
-        probe.wait_for_seen_count(1).await;
-        running.cancel().await.ok();
+        let running = serve_directly::<RoleServer, _, _, Infallible, _>(handler, transport, None);
+        probe.wait_for_seen_count(1).await?;
+        let _cancel_result = running.cancel().await;
 
         // Notifications have no response channel, so record + observed identity
         // is the whole proof.
@@ -2115,102 +2083,107 @@ mod tests {
         // Negative control: the default notification arm does nothing. Dispatch
         // is spawned, so give it a bounded window and assert nothing arrived.
         let control = ForwardingProbe::default();
-        let mut message = JsonRpcMessage::notification(ClientNotification::CancelledNotification(
-            CancelledNotification::new(CancelledNotificationParam::new(
-                Some(NumberOrString::Number(1)),
-                Some("coverage".to_owned()),
-            )),
-        ));
-        attach_identity(&mut message, viewer());
-        let outbound = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let transport = OpenTransport {
-            inbound: VecDeque::from(vec![message]),
-            outbound: Arc::clone(&outbound),
+        let mut control_message =
+            JsonRpcMessage::notification(ClientNotification::CancelledNotification(
+                CancelledNotification::new(CancelledNotificationParam::new(
+                    Some(NumberOrString::Number(1)),
+                    Some("coverage".to_owned()),
+                )),
+            ));
+        attach_identity(&mut control_message, viewer())?;
+        let control_outbound = Arc::new(Mutex::new(Vec::new()));
+        let control_transport = OpenTransport {
+            inbound: VecDeque::from(vec![control_message]),
+            outbound: Arc::clone(&control_outbound),
         };
-        let handler = RbacContextHandler::new(
+        let control_handler = RbacContextHandler::new(
             PassthroughDefaults::new(control.clone()),
             viewer_policy(),
             false,
         );
-        let running = rmcp::service::serve_directly::<RoleServer, _, _, Infallible, _>(
-            handler, transport, None,
+        let control_running = serve_directly::<RoleServer, _, _, Infallible, _>(
+            control_handler,
+            control_transport,
+            None,
         );
-        tokio::time::timeout(std::time::Duration::from_millis(250), async {
-            tokio::task::yield_now().await;
+        timeout(Duration::from_millis(250), async {
+            yield_now().await;
         })
         .await
-        .expect("bounded negative-control window");
-        running.cancel().await.ok();
+        .context("bounded negative-control window")?;
+        let _control_cancel_result = control_running.cancel().await;
         assert_eq!(control.seen(), Vec::new());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn rbac_context_handler_forwards_ping_initialize_and_discover() {
+    /// Pins that `ping`, `initialize` and `discover` forward to the inner handler.
+    async fn rbac_context_handler_forwards_ping_initialize_and_discover() -> anyhow::Result<()> {
         // Mechanism 1 (ambient-silent probe) plus one exact full sequence per
         // method: each request is driven through its own service, and the probe
         // never records the ambient `get_info` / `supported_protocol_versions`
         // calls the prelude may make.
         // `ping` speaks the legacy lifecycle only: adding per-request metadata
         // would make rmcp answer method-not-found before the wrapper.
-        let (outbound, probe, control_outbound) = forward_once(
+        let (ping_outbound, ping_probe, ping_control_outbound) = forward_once(
             || {
                 let mut message =
                     request_message(ClientRequest::PingRequest(PingRequest::default()), 1);
-                attach_identity(&mut message, viewer());
-                message
+                attach_identity(&mut message, viewer())?;
+                Ok(message)
             },
             None,
         )
-        .await;
+        .await?;
         assert!(matches!(
-            frame_for(&outbound, 1),
+            frame_for(&ping_outbound, 1)?,
             ServerJsonRpcMessage::Response(_)
         ));
         assert!(matches!(
-            frame_for(&control_outbound, 1),
+            frame_for(&ping_control_outbound, 1)?,
             ServerJsonRpcMessage::Response(_)
         ));
-        assert_eq!(probe.seen(), vec![("ping", Some("viewer".to_owned()))]);
+        assert_eq!(ping_probe.seen(), vec![("ping", Some("viewer".to_owned()))]);
 
-        let (outbound, probe, control_outbound) = forward_once(
+        let (init_outbound, init_probe, init_control_outbound) = forward_once(
             || {
                 let mut message = request_message(
                     ClientRequest::InitializeRequest(InitializeRequest::new(
                         InitializeRequestParams::new(
                             ClientCapabilities::default(),
-                            rmcp::model::Implementation::new("coverage-driver", "0.0.0"),
+                            Implementation::new("coverage-driver", "0.0.0"),
                         ),
                     )),
                     1,
                 );
-                attach_identity(&mut message, viewer());
-                message
+                attach_identity(&mut message, viewer())?;
+                Ok(message)
             },
             None,
         )
-        .await;
-        let result = expect_response(frame_for(&outbound, 1));
-        let ServerResult::InitializeResult(result) = result else {
-            panic!("expected an initialize result, got {result:?}")
+        .await?;
+        let init_response = expect_response(frame_for(&init_outbound, 1)?)?;
+        let ServerResult::InitializeResult(initialized) = init_response else {
+            anyhow::bail!("expected an initialize result, got {init_response:?}")
         };
         assert_eq!(
-            result.instructions.as_deref(),
+            initialized.instructions.as_deref(),
             Some("forwarding-probe:initialize")
         );
         assert_eq!(
-            probe.seen(),
+            init_probe.seen(),
             vec![("initialize", Some("viewer".to_owned()))]
         );
-        let default_result = expect_response(frame_for(&control_outbound, 1));
-        let ServerResult::InitializeResult(default_result) = default_result else {
-            panic!("expected an initialize result, got {default_result:?}")
+        let init_default_response = expect_response(frame_for(&init_control_outbound, 1)?)?;
+        let ServerResult::InitializeResult(default_initialized) = init_default_response else {
+            anyhow::bail!("expected an initialize result, got {init_default_response:?}")
         };
         assert_ne!(
-            default_result.instructions.as_deref(),
+            default_initialized.instructions.as_deref(),
             Some("forwarding-probe:initialize")
         );
 
-        let (outbound, probe, control_outbound) = forward_once(
+        let (discover_outbound, discover_probe, discover_control_outbound) = forward_once(
             || {
                 let mut message = request_message(
                     ClientRequest::DiscoverRequest(DiscoverRequest::new(
@@ -2218,31 +2191,36 @@ mod tests {
                     )),
                     1,
                 );
-                attach_identity(&mut message, viewer());
-                attach_meta(&mut message, coverage_meta());
-                message
+                attach_identity(&mut message, viewer())?;
+                attach_meta(&mut message, coverage_meta())?;
+                Ok(message)
             },
             None,
         )
-        .await;
-        let result = expect_response(frame_for(&outbound, 1));
-        let ServerResult::DiscoverResult(result) = result else {
-            panic!("expected a discover result, got {result:?}")
+        .await?;
+        let discover_response = expect_response(frame_for(&discover_outbound, 1)?)?;
+        let ServerResult::DiscoverResult(discovered) = discover_response else {
+            anyhow::bail!("expected a discover result, got {discover_response:?}")
         };
-        assert_eq!(result.supported_versions, SENTINEL_VERSIONS.to_vec());
-        assert_eq!(probe.seen(), vec![("discover", Some("viewer".to_owned()))]);
-        let default_result = expect_response(frame_for(&control_outbound, 1));
-        let ServerResult::DiscoverResult(default_result) = default_result else {
-            panic!("expected a discover result, got {default_result:?}")
+        assert_eq!(discovered.supported_versions, SENTINEL_VERSIONS.to_vec());
+        assert_eq!(
+            discover_probe.seen(),
+            vec![("discover", Some("viewer".to_owned()))]
+        );
+        let discover_default_response = expect_response(frame_for(&discover_control_outbound, 1)?)?;
+        let ServerResult::DiscoverResult(default_discovered) = discover_default_response else {
+            anyhow::bail!("expected a discover result, got {discover_default_response:?}")
         };
         assert_ne!(
-            default_result.supported_versions,
+            default_discovered.supported_versions,
             SENTINEL_VERSIONS.to_vec()
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn rbac_context_handler_forwards_notifications() {
+    /// Pins that the three notification methods forward and defaults stay silent.
+    async fn rbac_context_handler_forwards_notifications() -> anyhow::Result<()> {
         // Mechanism 1 (ambient-silent probe): the expected log is exactly the
         // driven notifications.
         let probe = ForwardingProbe::default();
@@ -2254,13 +2232,11 @@ mod tests {
         let mut messages = Vec::new();
         for method in notifications {
             let notification = match method {
-                "notifications/initialized" => ClientNotification::InitializedNotification(
-                    rmcp::model::NotificationNoParam::default(),
-                ),
+                "notifications/initialized" => {
+                    ClientNotification::InitializedNotification(NotificationNoParam::default())
+                }
                 "notifications/roots/list_changed" => {
-                    ClientNotification::RootsListChangedNotification(
-                        rmcp::model::NotificationNoParam::default(),
-                    )
+                    ClientNotification::RootsListChangedNotification(NotificationNoParam::default())
                 }
                 _ => ClientNotification::CustomNotification(CustomNotification::new(
                     method,
@@ -2268,21 +2244,19 @@ mod tests {
                 )),
             };
             let mut message = JsonRpcMessage::notification(notification);
-            attach_identity(&mut message, viewer());
+            attach_identity(&mut message, viewer())?;
             messages.push(message);
         }
 
-        let outbound = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let outbound = Arc::new(Mutex::new(Vec::new()));
         let transport = OpenTransport {
             inbound: VecDeque::from(messages),
             outbound: Arc::clone(&outbound),
         };
         let handler = RbacContextHandler::new(probe.clone(), viewer_policy(), false);
-        let running = rmcp::service::serve_directly::<RoleServer, _, _, Infallible, _>(
-            handler, transport, None,
-        );
-        probe.wait_for_seen_count(3).await;
-        running.cancel().await.ok();
+        let running = serve_directly::<RoleServer, _, _, Infallible, _>(handler, transport, None);
+        probe.wait_for_seen_count(3).await?;
+        let _cancel_result = running.cancel().await;
 
         assert_eq!(
             probe.seen(),
@@ -2296,50 +2270,52 @@ mod tests {
         // Negative control: all three defaults are no-ops; the bounded window
         // is the only way to observe a non-event.
         let control = ForwardingProbe::default();
-        let mut messages = Vec::new();
+        let mut control_messages = Vec::new();
         for method in notifications {
             let notification = match method {
-                "notifications/initialized" => ClientNotification::InitializedNotification(
-                    rmcp::model::NotificationNoParam::default(),
-                ),
+                "notifications/initialized" => {
+                    ClientNotification::InitializedNotification(NotificationNoParam::default())
+                }
                 "notifications/roots/list_changed" => {
-                    ClientNotification::RootsListChangedNotification(
-                        rmcp::model::NotificationNoParam::default(),
-                    )
+                    ClientNotification::RootsListChangedNotification(NotificationNoParam::default())
                 }
                 _ => ClientNotification::CustomNotification(CustomNotification::new(
                     method,
                     Some(serde_json::json!({ "coverage": true })),
                 )),
             };
-            let mut message = JsonRpcMessage::notification(notification);
-            attach_identity(&mut message, viewer());
-            messages.push(message);
+            let mut control_message = JsonRpcMessage::notification(notification);
+            attach_identity(&mut control_message, viewer())?;
+            control_messages.push(control_message);
         }
-        let outbound = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let transport = OpenTransport {
-            inbound: VecDeque::from(messages),
-            outbound: Arc::clone(&outbound),
+        let control_outbound = Arc::new(Mutex::new(Vec::new()));
+        let control_transport = OpenTransport {
+            inbound: VecDeque::from(control_messages),
+            outbound: Arc::clone(&control_outbound),
         };
-        let handler = RbacContextHandler::new(
+        let control_handler = RbacContextHandler::new(
             PassthroughDefaults::new(control.clone()),
             viewer_policy(),
             false,
         );
-        let running = rmcp::service::serve_directly::<RoleServer, _, _, Infallible, _>(
-            handler, transport, None,
+        let control_running = serve_directly::<RoleServer, _, _, Infallible, _>(
+            control_handler,
+            control_transport,
+            None,
         );
-        tokio::time::timeout(std::time::Duration::from_millis(250), async {
-            tokio::task::yield_now().await;
+        timeout(Duration::from_millis(250), async {
+            yield_now().await;
         })
         .await
-        .expect("bounded negative-control window");
-        running.cancel().await.ok();
+        .context("bounded negative-control window")?;
+        let _control_cancel_result = control_running.cancel().await;
         assert_eq!(control.seen(), Vec::new());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn rbac_context_handler_forwards_task_producing_call_tool() {
+    /// Pins that a task-returning `call_tool` binds the outbound task ID.
+    async fn rbac_context_handler_forwards_task_producing_call_tool() -> anyhow::Result<()> {
         // Mechanism 1 (ambient-silent probe): the expected log is exactly the
         // driven method.
         let secret = task_secret();
@@ -2353,33 +2329,36 @@ mod tests {
                     )),
                     1,
                 );
-                attach_identity(&mut message, alice.clone());
-                attach_meta(&mut message, coverage_meta());
-                message
+                attach_identity(&mut message, alice.clone())?;
+                attach_meta(&mut message, coverage_meta())?;
+                Ok(message)
             },
             Some(secret.clone()),
         )
-        .await;
+        .await?;
 
         // The inner returned a raw task ID; the client must see it bound.
-        let result = expect_response(frame_for(&outbound, 1));
+        let result = expect_response(frame_for(&outbound, 1)?)?;
         let ServerResult::CreateTaskResult(created) = result else {
-            panic!("expected a create-task result, got {result:?}")
+            anyhow::bail!("expected a create-task result, got {result:?}")
         };
         assert_ne!(created.task.task_id, "raw-task-call");
         let raw =
             task_binding::unwrap_and_verify(&secret, &created.task.task_id, &fingerprint(&alice))
-                .expect("the client-visible id must unwrap for its owner");
+                .context("the client-visible id must unwrap for its owner")?;
         assert_eq!(raw.as_str(), "raw-task-call");
         assert_eq!(probe.seen(), vec![("call_tool", Some("viewer".to_owned()))]);
 
         // The default `call_tool` errors, so it cannot produce the sentinel.
-        let error = expect_error(frame_for(&control_outbound, 1));
-        assert_eq!(error.code, rmcp::model::ErrorCode::METHOD_NOT_FOUND);
+        let error = expect_error(frame_for(&control_outbound, 1)?)?;
+        assert_eq!(error.code, ErrorCode::METHOD_NOT_FOUND);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn rbac_context_handler_forwards_task_binding_on_update_and_cancel() {
+    /// Pins that task binding rewrites update/cancel IDs and rejects a foreign one.
+    async fn rbac_context_handler_forwards_task_binding_on_update_and_cancel() -> anyhow::Result<()>
+    {
         // Mechanism 1 (ambient-silent probe): the tasks gate calls `get_info`,
         // which this probe does not record, so the expected log is exactly the
         // driven method.
@@ -2387,46 +2366,43 @@ mod tests {
         let alice = identity_named("alice");
         let bob = identity_named("bob");
         let alice_fingerprint = fingerprint(&alice);
-        let raw_update = RawTaskId::parse("raw-update").expect("valid id");
-        let raw_cancel = RawTaskId::parse("raw-cancel").expect("valid id");
+        let raw_update = RawTaskId::parse("raw-update").context("valid id")?;
+        let raw_cancel = RawTaskId::parse("raw-cancel").context("valid id")?;
         let bound_update = task_binding::wrap(&secret, &raw_update, &alice_fingerprint);
         let bound_cancel = task_binding::wrap(&secret, &raw_cancel, &alice_fingerprint);
 
-        let (outbound, probe, control_outbound) = forward_once(
+        let (update_outbound, update_probe, update_control_outbound) = forward_once(
             || {
                 let mut message = request_message(
                     ClientRequest::UpdateTaskRequest(UpdateTaskRequest::new(
-                        UpdateTaskParams::new(
-                            bound_update.clone(),
-                            rmcp::model::InputResponses::new(),
-                        ),
+                        UpdateTaskParams::new(bound_update.clone(), InputResponses::new()),
                     )),
                     1,
                 );
-                attach_identity(&mut message, alice.clone());
-                attach_meta(&mut message, coverage_meta());
-                message
+                attach_identity(&mut message, alice.clone())?;
+                attach_meta(&mut message, coverage_meta())?;
+                Ok(message)
             },
             Some(secret.clone()),
         )
-        .await;
+        .await?;
         assert!(matches!(
-            frame_for(&outbound, 1),
+            frame_for(&update_outbound, 1)?,
             ServerJsonRpcMessage::Response(_)
         ));
         assert_eq!(
-            probe.task_ids(),
+            update_probe.task_ids(),
             vec!["raw-update".to_owned()],
             "the inner handler must observe the RAW id, never the wrapper"
         );
         assert_eq!(
-            probe.seen(),
+            update_probe.seen(),
             vec![("update_task", Some("viewer".to_owned()))]
         );
-        let error = expect_error(frame_for(&control_outbound, 1));
-        assert_eq!(error.code, rmcp::model::ErrorCode::METHOD_NOT_FOUND);
+        let update_control_error = expect_error(frame_for(&update_control_outbound, 1)?)?;
+        assert_eq!(update_control_error.code, ErrorCode::METHOD_NOT_FOUND);
 
-        let (outbound, probe, control_outbound) = forward_once(
+        let (cancel_outbound, cancel_probe, cancel_control_outbound) = forward_once(
             || {
                 let mut message = request_message(
                     ClientRequest::CancelTaskRequest(CancelTaskRequest::new(
@@ -2434,30 +2410,30 @@ mod tests {
                     )),
                     1,
                 );
-                attach_identity(&mut message, alice.clone());
-                attach_meta(&mut message, coverage_meta());
-                message
+                attach_identity(&mut message, alice.clone())?;
+                attach_meta(&mut message, coverage_meta())?;
+                Ok(message)
             },
             Some(secret.clone()),
         )
-        .await;
+        .await?;
         assert!(matches!(
-            frame_for(&outbound, 1),
+            frame_for(&cancel_outbound, 1)?,
             ServerJsonRpcMessage::Response(_)
         ));
-        assert_eq!(probe.task_ids(), vec!["raw-cancel".to_owned()]);
+        assert_eq!(cancel_probe.task_ids(), vec!["raw-cancel".to_owned()]);
         assert_eq!(
-            probe.seen(),
+            cancel_probe.seen(),
             vec![("cancel_task", Some("viewer".to_owned()))]
         );
-        let error = expect_error(frame_for(&control_outbound, 1));
-        assert_eq!(error.code, rmcp::model::ErrorCode::METHOD_NOT_FOUND);
+        let cancel_control_error = expect_error(frame_for(&cancel_control_outbound, 1)?)?;
+        assert_eq!(cancel_control_error.code, ErrorCode::METHOD_NOT_FOUND);
 
         // A bound id for the wrong identity is rejected before the inner handler
         // records anything.
         let bob_bound = task_binding::wrap(
             &secret,
-            &RawTaskId::parse("raw-cancel").expect("valid id"),
+            &RawTaskId::parse("raw-cancel").context("valid id")?,
             &fingerprint(&bob),
         );
         let mut message = request_message(
@@ -2466,15 +2442,23 @@ mod tests {
             ))),
             1,
         );
-        attach_identity(&mut message, alice.clone());
-        attach_meta(&mut message, coverage_meta());
-        let probe = ForwardingProbe::default();
-        let outbound =
-            drive_coverage_requests(probe.clone(), viewer_policy(), Some(secret), vec![message])
-                .await;
-        let error = expect_error(frame_for(&outbound, 1));
-        assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
-        assert_eq!(probe.task_ids(), Vec::<String>::new());
-        assert_eq!(probe.seen(), Vec::<(&'static str, Option<String>)>::new());
+        attach_identity(&mut message, alice.clone())?;
+        attach_meta(&mut message, coverage_meta())?;
+        let reject_probe = ForwardingProbe::default();
+        let reject_outbound = drive_coverage_requests(
+            reject_probe.clone(),
+            viewer_policy(),
+            Some(secret),
+            vec![message],
+        )
+        .await?;
+        let reject_error = expect_error(frame_for(&reject_outbound, 1)?)?;
+        assert_eq!(reject_error.code, ErrorCode::INVALID_PARAMS);
+        assert_eq!(reject_probe.task_ids(), Vec::<String>::new());
+        assert_eq!(
+            reject_probe.seen(),
+            Vec::<(&'static str, Option<String>)>::new()
+        );
+        Ok(())
     }
 }
