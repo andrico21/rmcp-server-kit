@@ -181,23 +181,53 @@
     expect(unused_results, reason = "lint-migration: src/oauth.rs")
 )]
 
-use std::{
-    collections::HashMap,
+extern crate alloc;
+
+use alloc::sync::Arc;
+use core::{
+    error::Error,
     fmt,
-    path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::{Duration, Instant},
+    hint::cold_path,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
 };
+use std::{collections::HashMap, fs, path::PathBuf, time::Instant};
 
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
+use axum::{http::StatusCode, response::Response};
+use base64::engine::general_purpose;
+use jsonwebtoken::{
+    Algorithm, DecodingKey, Validation, crypto::rust_crypto::DEFAULT_PROVIDER, decode,
+    decode_header, errors::ErrorKind, jwk::{Jwk, JwkSet, KeyAlgorithm},
+};
+use reqwest::{
+    dns::Resolve,
+    redirect::{Attempt, Policy},
+    tls::Certificate,
+};
+use rustls::crypto::ring::default_provider;
 use serde::Deserialize;
-use tokio::{net::lookup_host, sync::RwLock};
-use tracing::Instrument;
+use tokio::{
+    net::lookup_host,
+    sync::{Mutex, RwLock, oneshot},
+    task::spawn_blocking,
+    time::sleep,
+};
+use tokio::sync::oneshot::error::RecvError;
+use tokio_util::sync::CancellationToken;
+use tracing::{Instrument as _, dispatcher};
+use url::form_urlencoded;
 
-use crate::auth::{AuthIdentity, AuthMethod, CredentialOwner, RejectionReason};
+use crate::{
+    auth::{AuthIdentity, AuthMethod, CredentialOwner, RejectionReason},
+    cancel::DetachOutcome,
+    diagnostics::{oauth_claim_values, plaintext_oauth_tokens, upstream_error_bodies},
+    error::RmcpServerKitError,
+    ssrf::{
+        CidrEntry, CompiledSsrfAllowlist, check_url_literal_ip, ip_block_reason,
+        redirect_target_reason_with_allowlist, sanitized_url_for_log,
+    },
+    ssrf_resolver::SsrfScreeningResolver,
+};
 
 // ---------------------------------------------------------------------------
 // Shared OAuth redirect-policy helper
@@ -224,10 +254,14 @@ use crate::auth::{AuthIdentity, AuthMethod, CredentialOwner, RejectionReason};
 ///      consults the operator-supplied allowlist while keeping
 ///      cloud-metadata addresses unbypassable.
 ///   4. The hop count is capped at 2 (i.e. at most 2 prior redirects).
+///
+/// # Errors
+///
+/// Returns the rejection reason when the redirect must not be followed.
 fn evaluate_oauth_redirect(
-    attempt: &reqwest::redirect::Attempt<'_>,
+    attempt: &Attempt<'_>,
     allow_http: bool,
-    allowlist: &crate::ssrf::CompiledSsrfAllowlist,
+    allowlist: &CompiledSsrfAllowlist,
 ) -> Result<(), String> {
     let prev_https = attempt
         .previous()
@@ -243,7 +277,7 @@ fn evaluate_oauth_redirect(
             return Err("redirect to non-HTTP(S) URL refused".to_owned());
         }
     }
-    if let Some(reason) = crate::ssrf::redirect_target_reason_with_allowlist(target_url, allowlist)
+    if let Some(reason) = redirect_target_reason_with_allowlist(target_url, allowlist)
     {
         return Err(format!("redirect target forbidden: {reason}"));
     }
@@ -269,7 +303,7 @@ fn evaluate_oauth_redirect(
 )]
 fn oauth_internal_suffix_blocked(
     host: &str,
-    allowlist: &crate::ssrf::CompiledSsrfAllowlist,
+    allowlist: &CompiledSsrfAllowlist,
 ) -> bool {
     let host_canon = host.strip_suffix('.').unwrap_or(host);
     let host_lower = host_canon.to_ascii_lowercase();
@@ -301,39 +335,44 @@ fn oauth_internal_suffix_blocked(
 /// [`screen_oauth_target_with_test_override`].
 // cancel-safe: performs DNS resolution and pure screening, publishing no
 // shared state; cancellation just discards the verdict.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when the target URL is malformed or resolves to a
+/// blocked address.
 async fn screen_oauth_target_core(
     url: &str,
     allow_http: bool,
-    allowlist: &crate::ssrf::CompiledSsrfAllowlist,
+    allowlist: &CompiledSsrfAllowlist,
     test_allow_loopback_ssrf: bool,
-) -> Result<(), crate::error::RmcpServerKitError> {
+) -> Result<(), RmcpServerKitError> {
     let target = oauth_request_target_for_log(url);
     let parsed = check_oauth_url("oauth target", url, allow_http)?;
     if test_allow_loopback_ssrf {
         return Ok(());
     }
-    if let Some(reason) = crate::ssrf::check_url_literal_ip(&parsed) {
-        return Err(crate::error::RmcpServerKitError::Config(format!(
+    if let Some(reason) = check_url_literal_ip(&parsed) {
+        return Err(RmcpServerKitError::Config(format!(
             "OAuth target forbidden ({reason}): {target}"
         )));
     }
 
     let host = parsed.host_str().ok_or_else(|| {
-        crate::error::RmcpServerKitError::Config(format!("OAuth target URL has no host: {target}"))
+        RmcpServerKitError::Config(format!("OAuth target URL has no host: {target}"))
     })?;
     if oauth_internal_suffix_blocked(host, allowlist) {
-        return Err(crate::error::RmcpServerKitError::Config(format!(
+        return Err(RmcpServerKitError::Config(format!(
             "OAuth target forbidden (internal hostname suffix): {target}"
         )));
     }
     let port = parsed.port_or_known_default().ok_or_else(|| {
-        crate::error::RmcpServerKitError::Config(format!(
+        RmcpServerKitError::Config(format!(
             "OAuth target URL has no known port: {target}"
         ))
     })?;
 
     let addrs = lookup_host((host, port)).await.map_err(|error| {
-        crate::error::RmcpServerKitError::Config(format!(
+        RmcpServerKitError::Config(format!(
             "OAuth target DNS resolution {target}: {error}"
         ))
     })?;
@@ -343,11 +382,11 @@ async fn screen_oauth_target_core(
     for addr in addrs {
         any_addr = true;
         let ip = addr.ip();
-        if let Some(reason) = crate::ssrf::ip_block_reason(ip) {
+        if let Some(reason) = ip_block_reason(ip) {
             // Cloud-metadata is unbypassable. Use the strict message
             // that does NOT advertise the allowlist knob.
             if reason == "cloud_metadata" {
-                return Err(crate::error::RmcpServerKitError::Config(format!(
+                return Err(RmcpServerKitError::Config(format!(
                     "OAuth target resolved to blocked IP ({reason}): {target}"
                 )));
             }
@@ -355,7 +394,7 @@ async fn screen_oauth_target_core(
             // message verbatim so existing tests continue to pass and
             // operators get the same diagnostic they had before.
             if allowlist.is_empty() {
-                return Err(crate::error::RmcpServerKitError::Config(format!(
+                return Err(RmcpServerKitError::Config(format!(
                     "OAuth target resolved to blocked IP ({reason}): {target}"
                 )));
             }
@@ -363,7 +402,7 @@ async fn screen_oauth_target_core(
             if host_allowed || allowlist.ip_allowed(ip) {
                 continue;
             }
-            return Err(crate::error::RmcpServerKitError::Config(format!(
+            return Err(RmcpServerKitError::Config(format!(
                 "OAuth target blocked: hostname {host} resolved to {ip} ({reason}). \
                  To allow, add the hostname to oauth.ssrf_allowlist.hosts or the CIDR \
                  to oauth.ssrf_allowlist.cidrs (operators only -- see SECURITY.md). \
@@ -372,7 +411,7 @@ async fn screen_oauth_target_core(
         }
     }
     if !any_addr {
-        return Err(crate::error::RmcpServerKitError::Config(format!(
+        return Err(RmcpServerKitError::Config(format!(
             "OAuth target DNS resolution returned no addresses: {target}"
         )));
     }
@@ -382,11 +421,16 @@ async fn screen_oauth_target_core(
 
 /// Production entry point for OAuth/JWKS target screening. Delegates to
 /// [`screen_oauth_target_core`] with the loopback bypass hardcoded off.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when the target URL is malformed or resolves to a
+/// blocked address.
 async fn screen_oauth_target(
     url: &str,
     allow_http: bool,
-    allowlist: &crate::ssrf::CompiledSsrfAllowlist,
-) -> Result<(), crate::error::RmcpServerKitError> {
+    allowlist: &CompiledSsrfAllowlist,
+) -> Result<(), RmcpServerKitError> {
     screen_oauth_target_core(url, allow_http, allowlist, false).await
 }
 
@@ -397,9 +441,9 @@ async fn screen_oauth_target(
 async fn screen_oauth_target_with_test_override(
     url: &str,
     allow_http: bool,
-    allowlist: &crate::ssrf::CompiledSsrfAllowlist,
+    allowlist: &CompiledSsrfAllowlist,
     test_allow_loopback_ssrf: bool,
-) -> Result<(), crate::error::RmcpServerKitError> {
+) -> Result<(), RmcpServerKitError> {
     screen_oauth_target_core(url, allow_http, allowlist, test_allow_loopback_ssrf).await
 }
 
@@ -443,6 +487,7 @@ async fn screen_oauth_target_with_test_override(
 /// fetch client.
 ///
 /// [`with_config`]: Self::with_config
+#[expect(clippy::module_name_repetitions, reason = "public API frozen until the next major release")]
 #[derive(Clone)]
 pub struct OauthHttpClient {
     /// Screened-redirect JWKS/discovery client: follows redirects, but every
@@ -466,7 +511,7 @@ pub struct OauthHttpClient {
     /// to literal-IP redirect-hop screening. Wrapped in `Arc` so cloning
     /// the client (which is cheap and refcounted) does not deep-copy
     /// the parsed CIDR / host vectors.
-    allowlist: Arc<crate::ssrf::CompiledSsrfAllowlist>,
+    allowlist: Arc<CompiledSsrfAllowlist>,
     /// M-H4: per-`(cert_path, key_path)` cache of cert-bearing
     /// `reqwest::Client`s. Built eagerly with `redirect::Policy::none()`
     /// so an attacker-controlled 3xx cannot re-present the client cert
@@ -510,7 +555,8 @@ impl OauthHttpClient {
     /// Returns [`crate::error::RmcpServerKitError::Startup`] if the configured
     /// `ca_cert_path` cannot be read or parsed, or if the underlying
     /// HTTP client cannot be constructed (e.g. TLS backend init failure).
-    pub fn with_config(config: &OAuthConfig) -> Result<Self, crate::error::RmcpServerKitError> {
+    #[inline]
+    pub fn with_config(config: &OAuthConfig) -> Result<Self, RmcpServerKitError> {
         Self::build(Some(config))
     }
 
@@ -540,34 +586,39 @@ impl OauthHttpClient {
         since = "1.2.1",
         note = "use OauthHttpClient::with_config(&OAuthConfig) so token/introspect/revoke/exchange traffic inherits ca_cert_path and the allow_http_oauth_urls toggle"
     )]
-    pub fn new() -> Result<Self, crate::error::RmcpServerKitError> {
+    #[inline]
+    pub fn new() -> Result<Self, RmcpServerKitError> {
         Self::build(None)
     }
 
     /// Internal builder shared by [`new`](Self::new) (config = `None`)
     /// and [`with_config`](Self::with_config) (config = `Some`).
-    fn build(config: Option<&OAuthConfig>) -> Result<Self, crate::error::RmcpServerKitError> {
+#[expect(clippy::too_many_lines, reason = "deliberate: src/oauth.rs::OauthHttpClient::build keeps shared client construction in one reviewable block")]
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Startup`] when the CA bundle cannot be read or parsed or a
+/// client cannot be constructed.
+    fn build(config: Option<&OAuthConfig>) -> Result<Self, RmcpServerKitError> {
         // Install the rustls crypto provider before constructing any reqwest
         // client (idempotent -- `ok()` ignores the error when a provider was
         // already installed elsewhere in the process). Without this a
         // standalone `OauthHttpClient::new`/`with_config` built before
         // `JwksCache::new` or TLS setup would panic inside reqwest with
         // "no rustls crypto provider is configured".
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .ok();
+        drop(default_provider().install_default());
 
-        let allow_http = config.is_some_and(|c| c.allow_http_oauth_urls);
+        let allow_http = config.is_some_and(|cfg| cfg.allow_http_oauth_urls);
 
         // Compile the operator SSRF allowlist (if any) up front. Surface
         // CIDR / host parse errors as Startup so misconfiguration fails
         // fast at server boot, mirroring how OAuthConfig::validate
         // surfaces them as Config errors.
-        let allowlist = match config.and_then(|c| c.ssrf_allowlist.as_ref()) {
-            Some(raw) => Arc::new(compile_oauth_ssrf_allowlist(raw).map_err(|e| {
-                crate::error::RmcpServerKitError::Startup(format!("oauth http client: {e}"))
+        let allowlist = match config.and_then(|cfg| cfg.ssrf_allowlist.as_ref()) {
+            Some(raw) => Arc::new(compile_oauth_ssrf_allowlist(raw).map_err(|error| {
+                RmcpServerKitError::Startup(format!("oauth http client: {error}"))
             })?),
-            None => Arc::new(crate::ssrf::CompiledSsrfAllowlist::default()),
+            None => Arc::new(CompiledSsrfAllowlist::default()),
         };
 
         // Clone an Arc into the redirect closure so the policy can
@@ -608,8 +659,8 @@ impl OauthHttpClient {
                 reason = "TestLoopbackBypass aliases to Arc<AtomicBool> under cfg(test)/test-helpers and to `()` otherwise; each cfg trips a different clone/arg lint"
             )
         )]
-        let resolver: Arc<dyn reqwest::dns::Resolve> =
-            Arc::new(crate::ssrf_resolver::SsrfScreeningResolver::new(
+        let resolver: Arc<dyn Resolve> =
+            Arc::new(SsrfScreeningResolver::new(
                 Arc::clone(&allowlist),
                 test_bypass.clone(),
             ));
@@ -618,11 +669,11 @@ impl OauthHttpClient {
         // Pre-startup blocking I/O is intentional -- the constructor is sync
         // by contract and runs from `serve()`'s pre-startup phase.
         let ca_pem: Option<Vec<u8>> = if let Some(cfg) = config
-            && let Some(ref ca_path) = cfg.ca_cert_path
+            && let Some(ca_path) = &cfg.ca_cert_path
         {
-            Some(std::fs::read(ca_path).map_err(|e| {
-                crate::error::RmcpServerKitError::Startup(format!(
-                    "oauth http client: read ca_cert_path {}: {e}",
+            Some(fs::read(ca_path).map_err(|error| {
+                RmcpServerKitError::Startup(format!(
+                    "oauth http client: read ca_cert_path {}: {error}",
                     ca_path.display()
                 ))
             })?)
@@ -633,21 +684,21 @@ impl OauthHttpClient {
         // Base builder shared by both clients: `no_proxy` (so HTTP(S)_PROXY
         // env vars cannot bypass the SsrfScreeningResolver), the SSRF
         // resolver, timeouts, and CA trust. Only the redirect policy differs.
-        let make_base = || -> Result<reqwest::ClientBuilder, crate::error::RmcpServerKitError> {
-            let mut b = reqwest::Client::builder()
+        let make_base = || -> Result<reqwest::ClientBuilder, RmcpServerKitError> {
+            let mut builder = reqwest::Client::builder()
                 .no_proxy()
                 .dns_resolver(Arc::clone(&resolver))
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(30));
-            if let Some(ref pem) = ca_pem {
-                let cert = reqwest::tls::Certificate::from_pem(pem).map_err(|e| {
-                    crate::error::RmcpServerKitError::Startup(format!(
-                        "oauth http client: parse ca_cert_path: {e}"
+            if let Some(pem) = &ca_pem {
+                let cert = Certificate::from_pem(pem).map_err(|error| {
+                    RmcpServerKitError::Startup(format!(
+                        "oauth http client: parse ca_cert_path: {error}"
                     ))
                 })?;
-                b = b.add_root_certificate(cert);
+                builder = builder.add_root_certificate(cert);
             }
-            Ok(b)
+            Ok(builder)
         };
 
         // JWKS / discovery client: follows redirects, but every hop is screened
@@ -659,13 +710,13 @@ impl OauthHttpClient {
         #[cfg(any(test, feature = "test-helpers"))]
         let inner =
             make_base()?
-                .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                .redirect(Policy::custom(move |attempt| {
                     match evaluate_oauth_redirect(&attempt, allow_http, &redirect_allowlist) {
                         Ok(()) => attempt.follow(),
                         Err(reason) => {
                             tracing::warn!(
                                 reason = %reason,
-                                target = %crate::ssrf::sanitized_url_for_log(attempt.url()),
+                                target = %sanitized_url_for_log(attempt.url()),
                                 "oauth redirect rejected"
                             );
                             attempt.error(reason)
@@ -673,9 +724,9 @@ impl OauthHttpClient {
                     }
                 }))
                 .build()
-                .map_err(|e| {
-                    crate::error::RmcpServerKitError::Startup(format!(
-                        "oauth http client init: {e}"
+                .map_err(|error| {
+                    RmcpServerKitError::Startup(format!(
+                        "oauth http client init: {error}"
                     ))
                 })?;
 
@@ -692,10 +743,10 @@ impl OauthHttpClient {
         // compiled in. Genuine misconfiguration (allowlist, ca_cert_path read
         // and parse) is already reported by `make_base()` itself.
         let credential_client = make_base()?
-            .redirect(reqwest::redirect::Policy::none())
+            .redirect(Policy::none())
             .build()
-            .map_err(|e| {
-                crate::error::RmcpServerKitError::Startup(format!("oauth http client init: {e}"))
+            .map_err(|error| {
+                RmcpServerKitError::Startup(format!("oauth http client init: {error}"))
             })?;
 
         #[cfg(feature = "oauth-mtls-client")]
@@ -721,7 +772,7 @@ impl OauthHttpClient {
         &self,
         url: &str,
         request: reqwest::RequestBuilder,
-    ) -> Result<reqwest::Response, crate::error::RmcpServerKitError> {
+    ) -> Result<reqwest::Response, RmcpServerKitError> {
         #[cfg(any(test, feature = "test-helpers"))]
         if self.test_allow_loopback_ssrf.load(Ordering::Relaxed) {
             screen_oauth_target_with_test_override(url, self.allow_http, &self.allowlist, true)
@@ -734,7 +785,7 @@ impl OauthHttpClient {
         request.send().await.map_err(|error| {
             let target = oauth_request_target_for_log(url);
             let error = error.without_url();
-            crate::error::RmcpServerKitError::Config(format!("oauth request {target}: {error}"))
+            RmcpServerKitError::Config(format!("oauth request {target}: {error}"))
         })
     }
 
@@ -811,21 +862,24 @@ impl OauthHttpClient {
     }
 
     #[cfg(not(feature = "oauth-mtls-client"))]
-    fn client_for(&self, _cfg: &TokenExchangeConfig) -> &reqwest::Client {
+    const fn client_for(&self, _cfg: &TokenExchangeConfig) -> &reqwest::Client {
         &self.credential_client
     }
 }
 
 impl fmt::Debug for OauthHttpClient {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OauthHttpClient").finish_non_exhaustive()
     }
 }
 
+/// Sanitize a URL for logs: drop userinfo, query, and fragment, or return a placeholder when
+/// unparseable.
 fn oauth_request_target_for_log(raw: &str) -> String {
     url::Url::parse(raw).map_or_else(
         |_| "<unparseable-url>".to_owned(),
-        |url| crate::ssrf::sanitized_url_for_log(&url),
+        |url| sanitized_url_for_log(&url),
     )
 }
 
@@ -916,9 +970,13 @@ pub struct OAuthSsrfAllowlist {
 /// entries, parses + validates each CIDR (see [`crate::ssrf::CidrEntry::parse`]).
 /// Returns a `String` error suitable for embedding in
 /// [`crate::error::RmcpServerKitError::Config`] / [`crate::error::RmcpServerKitError::Startup`].
+///
+/// # Errors
+///
+/// Returns the first invalid host or CIDR entry as a message.
 fn compile_oauth_ssrf_allowlist(
     raw: &OAuthSsrfAllowlist,
-) -> Result<crate::ssrf::CompiledSsrfAllowlist, String> {
+) -> Result<CompiledSsrfAllowlist, String> {
     let mut hosts: Vec<String> = Vec::with_capacity(raw.hosts.len());
     for (idx, entry) in raw.hosts.iter().enumerate() {
         let trimmed = entry.trim();
@@ -942,9 +1000,9 @@ fn compile_oauth_ssrf_allowlist(
                      here -- list them via oauth.ssrf_allowlist.cidrs instead"
                 ));
             }
-            Err(e) => {
+            Err(error) => {
                 return Err(format!(
-                    "oauth.ssrf_allowlist.hosts[{idx}] = {trimmed:?}: invalid hostname: {e}"
+                    "oauth.ssrf_allowlist.hosts[{idx}] = {trimmed:?}: invalid hostname: {error}"
                 ));
             }
         }
@@ -955,12 +1013,12 @@ fn compile_oauth_ssrf_allowlist(
 
     let mut cidrs = Vec::with_capacity(raw.cidrs.len());
     for (idx, entry) in raw.cidrs.iter().enumerate() {
-        let parsed = crate::ssrf::CidrEntry::parse(entry)
-            .map_err(|e| format!("oauth.ssrf_allowlist.cidrs[{idx}]: {e}"))?;
+        let parsed = CidrEntry::parse(entry)
+            .map_err(|error| format!("oauth.ssrf_allowlist.cidrs[{idx}]: {error}"))?;
         cidrs.push(parsed);
     }
 
-    Ok(crate::ssrf::CompiledSsrfAllowlist::new(hosts, cidrs))
+    Ok(CompiledSsrfAllowlist::new(hosts, cidrs))
 }
 
 /// OAuth 2.1 JWT configuration.
@@ -1165,14 +1223,17 @@ pub struct OAuthConfig {
     pub jwks_max_response_bytes: u64,
 }
 
+/// Serde default for `jwks_cache_ttl` (`"10m"`).
 fn default_jwks_cache_ttl() -> String {
     "10m".into()
 }
 
+/// Serde default for `max_jwks_keys` (256 keys).
 const fn default_max_jwks_keys() -> usize {
     256
 }
 
+/// Serde default for `jwks_max_response_bytes` (1 MiB).
 const fn default_jwks_max_bytes() -> u64 {
     1024 * 1024
 }
@@ -1227,6 +1288,7 @@ impl AudienceValidationMode {
 }
 
 impl Default for OAuthConfig {
+    #[inline]
     fn default() -> Self {
         Self {
             issuer: String::new(),
@@ -1265,6 +1327,8 @@ impl OAuthConfig {
     /// the default is [`AudienceValidationMode::Strict`] (secure default;
     /// `azp`-only matches are rejected).
     #[must_use]
+    #[inline]
+#[expect(clippy::missing_const_for_fn, reason = "public API frozen until the next major release")]
     pub fn effective_audience_validation_mode(&self) -> AudienceValidationMode {
         if let Some(mode) = self.audience_validation_mode {
             return mode;
@@ -1281,6 +1345,8 @@ impl OAuthConfig {
     /// All other fields default to the same values as
     /// [`OAuthConfig::default`] (empty scopes/role mappings, no proxy or
     /// token exchange, a JWKS cache TTL of `10m`).
+    #[inline]
+#[expect(clippy::impl_trait_in_params, reason = "public API frozen until the next major release")]
     pub fn builder(
         issuer: impl Into<String>,
         audience: impl Into<String>,
@@ -1311,20 +1377,21 @@ impl OAuthConfig {
     ///
     /// Returns [`crate::error::RmcpServerKitError::Config`] when any field fails
     /// to parse or violates the scheme policy.
-    pub fn validate(&self) -> Result<(), crate::error::RmcpServerKitError> {
+    #[inline]
+    pub fn validate(&self) -> Result<(), RmcpServerKitError> {
         validate_oauth_capacity_knobs(self)?;
         resolve_allowed_algorithms(self.allowed_algorithms.as_deref())?;
 
         let allow_http = self.allow_http_oauth_urls;
-        let url = check_oauth_url("oauth.issuer", &self.issuer, allow_http)?;
-        if let Some(reason) = crate::ssrf::check_url_literal_ip(&url) {
-            return Err(crate::error::RmcpServerKitError::Config(format!(
+        let issuer_url = check_oauth_url("oauth.issuer", &self.issuer, allow_http)?;
+        if let Some(reason) = check_url_literal_ip(&issuer_url) {
+            return Err(RmcpServerKitError::Config(format!(
                 "oauth.issuer forbidden ({reason})"
             )));
         }
-        let url = check_oauth_url("oauth.jwks_uri", &self.jwks_uri, allow_http)?;
-        if let Some(reason) = crate::ssrf::check_url_literal_ip(&url) {
-            return Err(crate::error::RmcpServerKitError::Config(format!(
+        let jwks_url = check_oauth_url("oauth.jwks_uri", &self.jwks_uri, allow_http)?;
+        if let Some(reason) = check_url_literal_ip(&jwks_url) {
+            return Err(RmcpServerKitError::Config(format!(
                 "oauth.jwks_uri forbidden ({reason})"
             )));
         }
@@ -1334,39 +1401,41 @@ impl OAuthConfig {
         // audience is an empty string that would otherwise pass validation and
         // then fail-closed silently at runtime (Strict mode matches nothing).
         if self.audience.is_empty() {
-            return Err(crate::error::RmcpServerKitError::Config(
+            return Err(RmcpServerKitError::Config(
                 "oauth.audience must not be empty".into(),
             ));
         }
         if let Some(proxy) = &self.proxy {
-            let url = check_oauth_url(
+            let authorize_url = check_oauth_url(
                 "oauth.proxy.authorize_url",
                 &proxy.authorize_url,
                 allow_http,
             )?;
-            if let Some(reason) = crate::ssrf::check_url_literal_ip(&url) {
-                return Err(crate::error::RmcpServerKitError::Config(format!(
+            if let Some(reason) = check_url_literal_ip(&authorize_url) {
+                return Err(RmcpServerKitError::Config(format!(
                     "oauth.proxy.authorize_url forbidden ({reason})"
                 )));
             }
-            let url = check_oauth_url("oauth.proxy.token_url", &proxy.token_url, allow_http)?;
-            if let Some(reason) = crate::ssrf::check_url_literal_ip(&url) {
-                return Err(crate::error::RmcpServerKitError::Config(format!(
+            let token_url = check_oauth_url("oauth.proxy.token_url", &proxy.token_url, allow_http)?;
+            if let Some(reason) = check_url_literal_ip(&token_url) {
+                return Err(RmcpServerKitError::Config(format!(
                     "oauth.proxy.token_url forbidden ({reason})"
                 )));
             }
-            if let Some(url) = &proxy.introspection_url {
-                let parsed = check_oauth_url("oauth.proxy.introspection_url", url, allow_http)?;
-                if let Some(reason) = crate::ssrf::check_url_literal_ip(&parsed) {
-                    return Err(crate::error::RmcpServerKitError::Config(format!(
+            if let Some(introspection_url) = &proxy.introspection_url {
+                let parsed =
+                    check_oauth_url("oauth.proxy.introspection_url", introspection_url, allow_http)?;
+                if let Some(reason) = check_url_literal_ip(&parsed) {
+                    return Err(RmcpServerKitError::Config(format!(
                         "oauth.proxy.introspection_url forbidden ({reason})"
                     )));
                 }
             }
-            if let Some(url) = &proxy.revocation_url {
-                let parsed = check_oauth_url("oauth.proxy.revocation_url", url, allow_http)?;
-                if let Some(reason) = crate::ssrf::check_url_literal_ip(&parsed) {
-                    return Err(crate::error::RmcpServerKitError::Config(format!(
+            if let Some(revocation_url) = &proxy.revocation_url {
+                let parsed =
+                    check_oauth_url("oauth.proxy.revocation_url", revocation_url, allow_http)?;
+                if let Some(reason) = check_url_literal_ip(&parsed) {
+                    return Err(RmcpServerKitError::Config(format!(
                         "oauth.proxy.revocation_url forbidden ({reason})"
                     )));
                 }
@@ -1381,7 +1450,7 @@ impl OAuthConfig {
                 && !proxy.require_auth_on_admin_endpoints
                 && !proxy.allow_unauthenticated_admin_endpoints
             {
-                return Err(crate::error::RmcpServerKitError::Config(
+                return Err(RmcpServerKitError::Config(
                     "oauth.proxy: expose_admin_endpoints = true requires \
                      require_auth_on_admin_endpoints = true (recommended) \
                      or allow_unauthenticated_admin_endpoints = true \
@@ -1392,9 +1461,9 @@ impl OAuthConfig {
             }
         }
         if let Some(tx) = &self.token_exchange {
-            let url = check_oauth_url("oauth.token_exchange.token_url", &tx.token_url, allow_http)?;
-            if let Some(reason) = crate::ssrf::check_url_literal_ip(&url) {
-                return Err(crate::error::RmcpServerKitError::Config(format!(
+            let exchange_url = check_oauth_url("oauth.token_exchange.token_url", &tx.token_url, allow_http)?;
+            if let Some(reason) = check_url_literal_ip(&exchange_url) {
+                return Err(RmcpServerKitError::Config(format!(
                     "oauth.token_exchange.token_url forbidden ({reason})"
                 )));
             }
@@ -1407,8 +1476,8 @@ impl OAuthConfig {
         // time so misconfiguration is rejected up-front, before any
         // outbound HTTP client is ever built.
         if let Some(raw) = &self.ssrf_allowlist {
-            let compiled = compile_oauth_ssrf_allowlist(raw).map_err(|e| {
-                crate::error::RmcpServerKitError::Config(format!("oauth.ssrf_allowlist: {e}"))
+            let compiled = compile_oauth_ssrf_allowlist(raw).map_err(|error| {
+                RmcpServerKitError::Config(format!("oauth.ssrf_allowlist: {error}"))
             })?;
             if !compiled.is_empty() {
                 tracing::warn!(
@@ -1422,9 +1491,9 @@ impl OAuthConfig {
         }
         // Validate jwks_cache_ttl parses as a humantime duration so the
         // limiter constructor can rely on a non-fallback value (M5).
-        humantime::parse_duration(&self.jwks_cache_ttl).map_err(|e| {
-            crate::error::RmcpServerKitError::Config(format!(
-                "oauth.jwks_cache_ttl {:?} is not a valid humantime duration (e.g. \"10m\", \"1h30m\"): {e}",
+        humantime::parse_duration(&self.jwks_cache_ttl).map_err(|error| {
+            RmcpServerKitError::Config(format!(
+                "oauth.jwks_cache_ttl {:?} is not a valid humantime duration (e.g. \"10m\", \"1h30m\"): {error}",
                 self.jwks_cache_ttl
             ))
         })?;
@@ -1442,27 +1511,27 @@ impl OAuthConfig {
     fn validate_discovery_metadata_urls(
         &self,
         allow_http: bool,
-    ) -> Result<(), crate::error::RmcpServerKitError> {
-        if let Some(ref issuer) = self.authorization_server_metadata_issuer {
+    ) -> Result<(), RmcpServerKitError> {
+        if let Some(issuer) = &self.authorization_server_metadata_issuer {
             let url = check_oauth_url(
                 "oauth.authorization_server_metadata_issuer",
                 issuer,
                 allow_http,
             )?;
-            if let Some(reason) = crate::ssrf::check_url_literal_ip(&url) {
-                return Err(crate::error::RmcpServerKitError::Config(format!(
+            if let Some(reason) = check_url_literal_ip(&url) {
+                return Err(RmcpServerKitError::Config(format!(
                     "oauth.authorization_server_metadata_issuer forbidden ({reason})"
                 )));
             }
         }
         // An empty vec is meaningful (it omits the claim entirely) and is
         // preserved here by iterating zero times.
-        if let Some(ref servers) = self.authorization_servers {
+        if let Some(servers) = &self.authorization_servers {
             for (index, server) in servers.iter().enumerate() {
                 let field = format!("oauth.authorization_servers[{index}]");
                 let url = check_oauth_url(&field, server, allow_http)?;
-                if let Some(reason) = crate::ssrf::check_url_literal_ip(&url) {
-                    return Err(crate::error::RmcpServerKitError::Config(format!(
+                if let Some(reason) = check_url_literal_ip(&url) {
+                    return Err(RmcpServerKitError::Config(format!(
                         "{field} forbidden ({reason})"
                     )));
                 }
@@ -1477,18 +1546,23 @@ impl OAuthConfig {
 /// authentication. Without this a `client_cert`-only config silently
 /// disables client auth at the token endpoint (the runtime path
 /// simply omits the Authorization header).
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when both or neither client-auth method is set, or
+/// the mTLS feature is missing.
 fn validate_token_exchange_client_auth(
     tx: &TokenExchangeConfig,
-) -> Result<(), crate::error::RmcpServerKitError> {
+) -> Result<(), RmcpServerKitError> {
     match (&tx.client_cert, tx.client_secret.is_some()) {
-        (Some(_), true) => Err(crate::error::RmcpServerKitError::Config(
+        (Some(_), true) => Err(RmcpServerKitError::Config(
             "oauth.token_exchange: client_cert and client_secret are mutually \
-             exclusive (RFC 8705 §2). Set exactly one."
+             exclusive (RFC 8705 \u{a7}2). Set exactly one."
                 .into(),
         )),
-        (None, false) => Err(crate::error::RmcpServerKitError::Config(
+        (None, false) => Err(RmcpServerKitError::Config(
             "oauth.token_exchange: token exchange requires client authentication. \
-             Set either client_secret (RFC 6749 §2.3.1) or client_cert (RFC 8705 §2)."
+             Set either client_secret (RFC 6749 \u{a7}2.3.1) or client_cert (RFC 8705 \u{a7}2)."
                 .into(),
         )),
         (Some(cc), false) => validate_client_cert_config(cc),
@@ -1504,9 +1578,9 @@ fn validate_token_exchange_client_auth(
 /// characters RFC 3986 forbids outright. Since `resource` is forwarded to the
 /// authorization server verbatim, a value the RFC rejects must fail at startup
 /// rather than be laundered into a different string.
-fn is_rfc3986_uri_char(c: char) -> bool {
+const fn is_rfc3986_uri_char(ch: char) -> bool {
     matches!(
-        c,
+        ch,
         'A'..='Z'
             | 'a'..='z'
             | '0'..='9'
@@ -1523,15 +1597,18 @@ fn has_valid_pct_encoding(raw: &str) -> bool {
     let mut idx = 0;
     while let Some(byte) = bytes.get(idx) {
         if *byte == b'%' {
-            let (Some(hi), Some(lo)) = (bytes.get(idx + 1), bytes.get(idx + 2)) else {
+            let (Some(hi), Some(lo)) = (
+                bytes.get(idx.saturating_add(1)),
+                bytes.get(idx.saturating_add(2)),
+            ) else {
                 return false;
             };
             if !hi.is_ascii_hexdigit() || !lo.is_ascii_hexdigit() {
                 return false;
             }
-            idx += 3;
+            idx = idx.saturating_add(3);
         } else {
-            idx += 1;
+            idx = idx.saturating_add(1);
         }
     }
     true
@@ -1546,11 +1623,16 @@ fn has_valid_pct_encoding(raw: &str) -> bool {
 ///
 /// `resource` is additionally held to RFC 8707 §2, which requires an absolute
 /// URI with no fragment; both are uppercase MUSTs.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when `requested_token_type` or `resource` violates
+/// RFC 8693 / RFC 8707.
 fn validate_token_exchange_optional_params(
     tx: &TokenExchangeConfig,
-) -> Result<(), crate::error::RmcpServerKitError> {
-    fn empty_field(field: &str) -> crate::error::RmcpServerKitError {
-        crate::error::RmcpServerKitError::Config(format!(
+) -> Result<(), RmcpServerKitError> {
+    fn empty_field(field: &str) -> RmcpServerKitError {
+        RmcpServerKitError::Config(format!(
             "oauth.token_exchange.{field} must not be empty; omit the key entirely \
              to leave the RFC 8693 §2.1 parameter out of the request"
         ))
@@ -1562,7 +1644,7 @@ fn validate_token_exchange_optional_params(
     if tx.scope.as_deref().is_some_and(str::is_empty) {
         return Err(empty_field("scope"));
     }
-    if let RequestedTokenType::Custom(ref uri) = tx.requested_token_type {
+    if let RequestedTokenType::Custom(uri) = &tx.requested_token_type {
         if uri.is_empty() {
             return Err(empty_field("requested_token_type"));
         }
@@ -1573,16 +1655,16 @@ fn validate_token_exchange_optional_params(
         // RFC 8707 §2's constraint on resource indicators, not a property of
         // RFC 8693 token-type identifiers.
         if !uri.chars().all(is_rfc3986_uri_char) || !has_valid_pct_encoding(uri) {
-            return Err(crate::error::RmcpServerKitError::Config(
+            return Err(RmcpServerKitError::Config(
                 "oauth.token_exchange.requested_token_type custom value must be an RFC 3986 \
-                 absolute URI using valid URI characters and percent-encoding (RFC 8693 §3)"
+                 absolute URI using valid URI characters and percent-encoding (RFC 8693 \u{a7}3)"
                     .into(),
             ));
         }
-        url::Url::parse(uri).map_err(|e| {
-            crate::error::RmcpServerKitError::Config(format!(
+        url::Url::parse(uri).map_err(|error| {
+            RmcpServerKitError::Config(format!(
                 "oauth.token_exchange.requested_token_type custom value must be an absolute \
-                 URI (RFC 8693 §3): {e}"
+                 URI (RFC 8693 \u{a7}3): {error}"
             ))
         })?;
     }
@@ -1591,21 +1673,21 @@ fn validate_token_exchange_optional_params(
             return Err(empty_field("resource"));
         }
         if !resource.chars().all(is_rfc3986_uri_char) || !has_valid_pct_encoding(resource) {
-            return Err(crate::error::RmcpServerKitError::Config(
+            return Err(RmcpServerKitError::Config(
                 "oauth.token_exchange.resource must be an RFC 3986 absolute URI using valid \
-                 URI characters and percent-encoding (RFC 8707 §2)"
+                 URI characters and percent-encoding (RFC 8707 \u{a7}2)"
                     .into(),
             ));
         }
-        let parsed = url::Url::parse(resource).map_err(|e| {
-            crate::error::RmcpServerKitError::Config(format!(
-                "oauth.token_exchange.resource must be an absolute URI (RFC 8707 §2): {e}"
+        let parsed = url::Url::parse(resource).map_err(|error| {
+            RmcpServerKitError::Config(format!(
+                "oauth.token_exchange.resource must be an absolute URI (RFC 8707 \u{a7}2): {error}"
             ))
         })?;
         if parsed.fragment().is_some() {
-            return Err(crate::error::RmcpServerKitError::Config(
+            return Err(RmcpServerKitError::Config(
                 "oauth.token_exchange.resource must not include a fragment component \
-                 (RFC 8707 §2)"
+                 (RFC 8707 \u{a7}2)"
                     .into(),
             ));
         }
@@ -1625,13 +1707,18 @@ fn validate_token_exchange_optional_params(
 ///
 /// The returned error message includes the file path; the underlying
 /// IO / parse error stays in a `tracing::warn!` log line.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when the feature is disabled or the cert/key cannot
+/// be read or parsed.
 fn validate_client_cert_config(
     cc: &ClientCertConfig,
-) -> Result<(), crate::error::RmcpServerKitError> {
+) -> Result<(), RmcpServerKitError> {
     #[cfg(not(feature = "oauth-mtls-client"))]
     {
-        let _ = cc;
-        Err(crate::error::RmcpServerKitError::Config(
+        let _: &ClientCertConfig = cc;
+        Err(RmcpServerKitError::Config(
             "oauth.token_exchange.client_cert requires the `oauth-mtls-client` cargo feature; \
              rebuild rmcp-server-kit with --features oauth-mtls-client (or have your \
              application crate enable it via `rmcp-server-kit/oauth-mtls-client`), or remove \
@@ -1641,16 +1728,16 @@ fn validate_client_cert_config(
     }
     #[cfg(feature = "oauth-mtls-client")]
     {
-        let cert_bytes = std::fs::read(&cc.cert_path).map_err(|e| {
-            tracing::warn!(error = %e, path = %cc.cert_path.display(), "client cert read failed");
-            crate::error::RmcpServerKitError::Config(format!(
+        let cert_bytes = fs::read(&cc.cert_path).map_err(|error| {
+            tracing::warn!(error = %error, path = %cc.cert_path.display(), "client cert read failed");
+            RmcpServerKitError::Config(format!(
                 "oauth.token_exchange.client_cert.cert_path unreadable: {}",
                 cc.cert_path.display()
             ))
         })?;
-        let key_bytes = std::fs::read(&cc.key_path).map_err(|e| {
-            tracing::warn!(error = %e, path = %cc.key_path.display(), "client cert key read failed");
-            crate::error::RmcpServerKitError::Config(format!(
+        let key_bytes = fs::read(&cc.key_path).map_err(|error| {
+            tracing::warn!(error = %error, path = %cc.key_path.display(), "client cert key read failed");
+            RmcpServerKitError::Config(format!(
                 "oauth.token_exchange.client_cert.key_path unreadable: {}",
                 cc.key_path.display()
             ))
@@ -1661,14 +1748,14 @@ fn validate_client_cert_config(
             combined.push(b'\n');
         }
         combined.extend_from_slice(&key_bytes);
-        let _identity = reqwest::Identity::from_pem(&combined).map_err(|e| {
+        let _identity = reqwest::Identity::from_pem(&combined).map_err(|error| {
             tracing::warn!(
-                error = %e,
+                error = %error,
                 cert_path = %cc.cert_path.display(),
                 key_path = %cc.key_path.display(),
                 "client cert PEM parse failed"
             );
-            crate::error::RmcpServerKitError::Config(format!(
+            RmcpServerKitError::Config(format!(
                 "oauth.token_exchange.client_cert: PEM parse failed (cert={}, key={})",
                 cc.cert_path.display(),
                 cc.key_path.display()
@@ -1685,12 +1772,17 @@ fn validate_client_cert_config(
 /// and inherits the same `ca_cert_path`, connect/total timeouts as
 /// the shared `inner` client. Returns an empty map when no
 /// `token_exchange.client_cert` is configured.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Startup`] when a configured client certificate cannot be
+/// loaded or built.
 #[cfg(feature = "oauth-mtls-client")]
 fn build_mtls_clients(
     config: Option<&OAuthConfig>,
-    allowlist: &Arc<crate::ssrf::CompiledSsrfAllowlist>,
+    allowlist: &Arc<CompiledSsrfAllowlist>,
     test_bypass: &crate::ssrf_resolver::TestLoopbackBypass,
-) -> Result<Arc<HashMap<MtlsClientKey, reqwest::Client>>, crate::error::RmcpServerKitError> {
+) -> Result<Arc<HashMap<MtlsClientKey, reqwest::Client>>, RmcpServerKitError> {
     let mut map: HashMap<MtlsClientKey, reqwest::Client> = HashMap::new();
     let Some(cfg) = config else {
         return Ok(Arc::new(map));
@@ -1702,15 +1794,15 @@ fn build_mtls_clients(
         return Ok(Arc::new(map));
     };
 
-    let cert_bytes = std::fs::read(&cc.cert_path).map_err(|e| {
-        crate::error::RmcpServerKitError::Startup(format!(
-            "oauth http client mTLS: read cert_path {}: {e}",
+    let cert_bytes = fs::read(&cc.cert_path).map_err(|error| {
+        RmcpServerKitError::Startup(format!(
+            "oauth http client mTLS: read cert_path {}: {error}",
             cc.cert_path.display()
         ))
     })?;
-    let key_bytes = std::fs::read(&cc.key_path).map_err(|e| {
-        crate::error::RmcpServerKitError::Startup(format!(
-            "oauth http client mTLS: read key_path {}: {e}",
+    let key_bytes = fs::read(&cc.key_path).map_err(|error| {
+        RmcpServerKitError::Startup(format!(
+            "oauth http client mTLS: read key_path {}: {error}",
             cc.key_path.display()
         ))
     })?;
@@ -1720,16 +1812,16 @@ fn build_mtls_clients(
         combined.push(b'\n');
     }
     combined.extend_from_slice(&key_bytes);
-    let identity = reqwest::Identity::from_pem(&combined).map_err(|e| {
-        crate::error::RmcpServerKitError::Startup(format!(
-            "oauth http client mTLS: PEM parse (cert={}, key={}): {e}",
+    let identity = reqwest::Identity::from_pem(&combined).map_err(|error| {
+        RmcpServerKitError::Startup(format!(
+            "oauth http client mTLS: PEM parse (cert={}, key={}): {error}",
             cc.cert_path.display(),
             cc.key_path.display()
         ))
     })?;
 
-    let resolver: Arc<dyn reqwest::dns::Resolve> =
-        Arc::new(crate::ssrf_resolver::SsrfScreeningResolver::new(
+    let resolver: Arc<dyn Resolve> =
+        Arc::new(SsrfScreeningResolver::new(
             Arc::clone(allowlist),
             // M-H2/B1: TestLoopbackBypass aliases to Arc<AtomicBool> in test
             // builds and to `()` in production. We need a value clone here
@@ -1745,27 +1837,27 @@ fn build_mtls_clients(
         .dns_resolver(Arc::clone(&resolver))
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(Policy::none())
         .identity(identity);
 
-    if let Some(ref ca_path) = cfg.ca_cert_path {
-        let pem = std::fs::read(ca_path).map_err(|e| {
-            crate::error::RmcpServerKitError::Startup(format!(
-                "oauth http client mTLS: read ca_cert_path {}: {e}",
+    if let Some(ca_path) = &cfg.ca_cert_path {
+        let pem = fs::read(ca_path).map_err(|error| {
+            RmcpServerKitError::Startup(format!(
+                "oauth http client mTLS: read ca_cert_path {}: {error}",
                 ca_path.display()
             ))
         })?;
-        let cert = reqwest::tls::Certificate::from_pem(&pem).map_err(|e| {
-            crate::error::RmcpServerKitError::Startup(format!(
-                "oauth http client mTLS: parse ca_cert_path {}: {e}",
+        let cert = Certificate::from_pem(&pem).map_err(|error| {
+            RmcpServerKitError::Startup(format!(
+                "oauth http client mTLS: parse ca_cert_path {}: {error}",
                 ca_path.display()
             ))
         })?;
         builder = builder.add_root_certificate(cert);
     }
 
-    let client = builder.build().map_err(|e| {
-        crate::error::RmcpServerKitError::Startup(format!("oauth http client mTLS init: {e}"))
+    let client = builder.build().map_err(|error| {
+        RmcpServerKitError::Startup(format!("oauth http client mTLS init: {error}"))
     })?;
     map.insert(
         MtlsClientKey {
@@ -1783,42 +1875,53 @@ fn build_mtls_clients(
 /// `allow_http` is `true`. All other schemes (and parse failures) are
 /// rejected with a [`crate::error::RmcpServerKitError::Config`] referencing the
 /// caller-supplied `field` name for diagnostics.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when the URL does not parse or its scheme is not
+/// permitted.
 fn check_oauth_url(
     field: &str,
     raw: &str,
     allow_http: bool,
-) -> Result<url::Url, crate::error::RmcpServerKitError> {
-    let parsed = url::Url::parse(raw).map_err(|e| {
-        crate::error::RmcpServerKitError::Config(format!(
-            "{field}: invalid URL <unparseable-url>: {e}"
+) -> Result<url::Url, RmcpServerKitError> {
+    let parsed = url::Url::parse(raw).map_err(|error| {
+        RmcpServerKitError::Config(format!(
+            "{field}: invalid URL <unparseable-url>: {error}"
         ))
     })?;
     if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(crate::error::RmcpServerKitError::Config(format!(
+        return Err(RmcpServerKitError::Config(format!(
             "{field} rejected: URL contains userinfo (credentials in URL are forbidden)"
         )));
     }
     match parsed.scheme() {
         "https" => Ok(parsed),
         "http" if allow_http => Ok(parsed),
-        "http" => Err(crate::error::RmcpServerKitError::Config(format!(
+        "http" => Err(RmcpServerKitError::Config(format!(
             "{field}: must use https scheme (got http; set allow_http_oauth_urls=true \
              to override - strongly discouraged in production)"
         ))),
-        other => Err(crate::error::RmcpServerKitError::Config(format!(
+        other => Err(RmcpServerKitError::Config(format!(
             "{field}: must use https scheme (got {other:?})"
         ))),
     }
 }
 
+/// Reject zero-valued capacity knobs ([`OAuthConfig::max_jwks_keys`],
+/// [`OAuthConfig::jwks_max_response_bytes`]).
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when either knob is zero.
 fn validate_oauth_capacity_knobs(
     config: &OAuthConfig,
-) -> Result<(), crate::error::RmcpServerKitError> {
+) -> Result<(), RmcpServerKitError> {
     (config.max_jwks_keys != 0).ok_or_else(|| {
-        crate::error::RmcpServerKitError::Config("oauth.max_jwks_keys must be nonzero".into())
+        RmcpServerKitError::Config("oauth.max_jwks_keys must be nonzero".into())
     })?;
     (config.jwks_max_response_bytes != 0).ok_or_else(|| {
-        crate::error::RmcpServerKitError::Config(
+        RmcpServerKitError::Config(
             "oauth.jwks_max_response_bytes must be nonzero".into(),
         )
     })?;
@@ -1833,6 +1936,7 @@ fn validate_oauth_capacity_knobs(
 #[derive(Debug, Clone)]
 #[must_use = "builders do nothing until `.build()` is called"]
 pub struct OAuthConfigBuilder {
+/// Configuration under construction.
     inner: OAuthConfig,
 }
 
@@ -1842,6 +1946,8 @@ impl OAuthConfigBuilder {
     /// Must be a non-empty subset of the built-in set; validated by
     /// [`OAuthConfig::validate`]. See
     /// [`OAuthConfig::allowed_algorithms`].
+    #[inline]
+#[expect(clippy::impl_trait_in_params, reason = "public API frozen until the next major release")]
     pub fn allowed_algorithms(
         mut self,
         algorithms: impl IntoIterator<Item = impl Into<String>>,
@@ -1858,6 +1964,8 @@ impl OAuthConfigBuilder {
     /// URL). Use this only to restore the pre-3.8 upstream value - see the
     /// RFC 9207 caveat on
     /// [`OAuthConfig::authorization_server_metadata_issuer`].
+    #[inline]
+#[expect(clippy::impl_trait_in_params, reason = "public API frozen until the next major release")]
     pub fn authorization_server_metadata_issuer(mut self, issuer: impl Into<String>) -> Self {
         self.inner.authorization_server_metadata_issuer = Some(issuer.into());
         self
@@ -1870,6 +1978,8 @@ impl OAuthConfigBuilder {
     /// `with_extra_router` instead of using [`OAuthConfig::proxy`]. Pass an
     /// empty iterator to omit the field. See
     /// [`OAuthConfig::authorization_servers`].
+    #[inline]
+#[expect(clippy::impl_trait_in_params, reason = "public API frozen until the next major release")]
     pub fn authorization_servers(
         mut self,
         servers: impl IntoIterator<Item = impl Into<String>>,
@@ -1880,12 +1990,15 @@ impl OAuthConfigBuilder {
     }
 
     /// Replace the scope-to-role mappings.
+    #[inline]
     pub fn scopes(mut self, scopes: Vec<ScopeMapping>) -> Self {
         self.inner.scopes = scopes;
         self
     }
 
     /// Append a single scope-to-role mapping.
+    #[inline]
+#[expect(clippy::impl_trait_in_params, reason = "public API frozen until the next major release")]
     pub fn scope(mut self, scope: impl Into<String>, role: impl Into<String>) -> Self {
         self.inner.scopes.push(ScopeMapping {
             scope: scope.into(),
@@ -1896,12 +2009,15 @@ impl OAuthConfigBuilder {
 
     /// Set the JWT claim path used to extract roles directly (without
     /// going through `scope` mappings).
+    #[inline]
+#[expect(clippy::impl_trait_in_params, reason = "public API frozen until the next major release")]
     pub fn role_claim(mut self, claim: impl Into<String>) -> Self {
         self.inner.role_claim = Some(claim.into());
         self
     }
 
     /// Replace the claim-value-to-role mappings.
+    #[inline]
     pub fn role_mappings(mut self, mappings: Vec<RoleMapping>) -> Self {
         self.inner.role_mappings = mappings;
         self
@@ -1909,6 +2025,8 @@ impl OAuthConfigBuilder {
 
     /// Append a single claim-value-to-role mapping (used with
     /// [`Self::role_claim`]).
+    #[inline]
+#[expect(clippy::impl_trait_in_params, reason = "public API frozen until the next major release")]
     pub fn role_mapping(mut self, claim_value: impl Into<String>, role: impl Into<String>) -> Self {
         self.inner.role_mappings.push(RoleMapping {
             claim_value: claim_value.into(),
@@ -1919,6 +2037,8 @@ impl OAuthConfigBuilder {
 
     /// Override the JWKS cache TTL (humantime string, e.g. `"5m"`).
     /// Defaults to `"10m"`.
+    #[inline]
+#[expect(clippy::impl_trait_in_params, reason = "public API frozen until the next major release")]
     pub fn jwks_cache_ttl(mut self, ttl: impl Into<String>) -> Self {
         self.inner.jwks_cache_ttl = ttl.into();
         self
@@ -1926,12 +2046,14 @@ impl OAuthConfigBuilder {
 
     /// Attach an OAuth proxy configuration. When set, the server
     /// exposes `/authorize`, `/token`, and `/register` endpoints.
+    #[inline]
     pub fn proxy(mut self, proxy: OAuthProxyConfig) -> Self {
         self.inner.proxy = Some(proxy);
         self
     }
 
     /// Attach an RFC 8693 token exchange configuration.
+    #[inline]
     pub fn token_exchange(mut self, token_exchange: TokenExchangeConfig) -> Self {
         self.inner.token_exchange = Some(token_exchange);
         self
@@ -1941,6 +2063,8 @@ impl OAuthConfigBuilder {
     /// originated by this crate (JWKS fetches and the optional OAuth proxy
     /// `/authorize`, `/token`, `/register`, `/introspect`, `/revoke`,
     /// `/.well-known/oauth-authorization-server` upstream calls).
+    #[inline]
+#[expect(clippy::impl_trait_in_params, reason = "public API frozen until the next major release")]
     pub fn ca_cert_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.inner.ca_cert_path = Some(path.into());
         self
@@ -1951,6 +2075,7 @@ impl OAuthConfigBuilder {
     /// **Default: `false`.** See the field-level documentation on
     /// [`OAuthConfig::allow_http_oauth_urls`] for the security caveats
     /// before enabling this.
+    #[inline]
     pub const fn allow_http_oauth_urls(mut self, allow: bool) -> Self {
         self.inner.allow_http_oauth_urls = allow;
         self
@@ -1965,6 +2090,7 @@ impl OAuthConfigBuilder {
     /// `audience_validation_mode` so the legacy bool resolution path
     /// applies.
     #[deprecated(since = "1.7.0", note = "use `audience_validation_mode` instead")]
+    #[inline]
     pub const fn strict_audience_validation(mut self, strict: bool) -> Self {
         #[expect(
             deprecated,
@@ -1984,6 +2110,7 @@ impl OAuthConfigBuilder {
     /// [`AudienceValidationMode`] for variant semantics. Defaults to
     /// [`AudienceValidationMode::Strict`] when neither this method nor the
     /// legacy flag is set.
+    #[inline]
     pub const fn audience_validation_mode(mut self, mode: AudienceValidationMode) -> Self {
         self.inner.audience_validation_mode = Some(mode);
         self
@@ -1994,12 +2121,14 @@ impl OAuthConfigBuilder {
     /// When `true`, a token without `sub` is rejected. Leave `false` for
     /// OAuth client-credentials / machine-to-machine tokens, which
     /// legitimately carry no subject.
+    #[inline]
     pub const fn require_subject(mut self, require: bool) -> Self {
         self.inner.require_subject = require;
         self
     }
 
     /// Override the maximum JWKS response body size in bytes.
+    #[inline]
     pub const fn jwks_max_response_bytes(mut self, bytes: u64) -> Self {
         self.inner.jwks_max_response_bytes = bytes;
         self
@@ -2012,6 +2141,7 @@ impl OAuthConfigBuilder {
     /// Cloud-metadata addresses (AWS/GCP/Alibaba IPv4 + IPv6) remain
     /// blocked regardless of allowlist contents -- see
     /// [`OAuthSsrfAllowlist`] and `SECURITY.md`  "Operator allowlist".
+    #[inline]
     pub fn ssrf_allowlist(mut self, allowlist: OAuthSsrfAllowlist) -> Self {
         self.inner.ssrf_allowlist = Some(allowlist);
         self
@@ -2019,6 +2149,7 @@ impl OAuthConfigBuilder {
 
     /// Finalise the builder and return the [`OAuthConfig`].
     #[must_use]
+    #[inline]
     pub fn build(self) -> OAuthConfig {
         self.inner
     }
@@ -2048,6 +2179,7 @@ pub struct RoleMapping {
     pub role: String,
 }
 
+/// RFC 8693 URN for access tokens; the default `requested_token_type`.
 const TOKEN_TYPE_ACCESS_TOKEN: &str = "urn:ietf:params:oauth:token-type:access_token";
 
 /// RFC 8693 §2.1 `requested_token_type` - an OPTIONAL request parameter.
@@ -2078,6 +2210,7 @@ pub enum RequestedTokenType {
 }
 
 impl From<String> for RequestedTokenType {
+    #[inline]
     fn from(value: String) -> Self {
         match value.as_str() {
             "access_token" => Self::AccessToken,
@@ -2089,11 +2222,11 @@ impl From<String> for RequestedTokenType {
 
 impl RequestedTokenType {
     /// The wire value, or `None` when the parameter must be omitted.
-    fn wire_value(&self) -> Option<&str> {
-        match *self {
+    const fn wire_value(&self) -> Option<&str> {
+        match self {
             Self::AccessToken => Some(TOKEN_TYPE_ACCESS_TOKEN),
             Self::Omit => None,
-            Self::Custom(ref uri) => Some(uri.as_str()),
+            Self::Custom(uri) => Some(uri.as_str()),
         }
     }
 }
@@ -2167,6 +2300,8 @@ impl TokenExchangeConfig {
     /// `requested_token_type`) default to omitted and are set with the
     /// `with_*` methods.
     #[must_use]
+    #[inline]
+#[expect(clippy::impl_trait_in_params, reason = "public API frozen until the next major release")]
     pub fn new(
         token_url: impl Into<String>,
         client_id: impl Into<String>,
@@ -2187,6 +2322,8 @@ impl TokenExchangeConfig {
 
     /// Set the RFC 8693 `audience` parameter.
     #[must_use]
+    #[inline]
+#[expect(clippy::impl_trait_in_params, reason = "public API frozen until the next major release")]
     pub fn with_audience(mut self, audience: impl Into<String>) -> Self {
         self.audience = Some(audience.into());
         self
@@ -2194,6 +2331,8 @@ impl TokenExchangeConfig {
 
     /// Set the RFC 8693 / RFC 8707 `resource` parameter.
     #[must_use]
+    #[inline]
+#[expect(clippy::impl_trait_in_params, reason = "public API frozen until the next major release")]
     pub fn with_resource(mut self, resource: impl Into<String>) -> Self {
         self.resource = Some(resource.into());
         self
@@ -2201,6 +2340,8 @@ impl TokenExchangeConfig {
 
     /// Set the RFC 8693 `scope` parameter.
     #[must_use]
+    #[inline]
+#[expect(clippy::impl_trait_in_params, reason = "public API frozen until the next major release")]
     pub fn with_scope(mut self, scope: impl Into<String>) -> Self {
         self.scope = Some(scope.into());
         self
@@ -2208,6 +2349,7 @@ impl TokenExchangeConfig {
 
     /// Set the RFC 8693 `requested_token_type` parameter.
     #[must_use]
+    #[inline]
     pub fn with_requested_token_type(mut self, requested_token_type: RequestedTokenType) -> Self {
         self.requested_token_type = requested_token_type;
         self
@@ -2235,6 +2377,8 @@ impl ClientCertConfig {
     /// `#[non_exhaustive]` and so cannot be built with a struct literal
     /// from outside the crate.
     #[must_use]
+    #[inline]
+#[expect(clippy::missing_const_for_fn, reason = "public API frozen until the next major release")]
     pub fn new(cert_path: PathBuf, key_path: PathBuf) -> Self {
         Self {
             cert_path,
@@ -2257,19 +2401,20 @@ pub struct ExchangedToken {
 }
 
 impl fmt::Debug for ExchangedToken {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
             access_token,
             expires_in,
             issued_token_type,
         } = self;
-        let access_token = if crate::diagnostics::plaintext_oauth_tokens() {
+        let access_token_display = if plaintext_oauth_tokens() {
             access_token.as_str()
         } else {
             "[REDACTED]"
         };
         f.debug_struct("ExchangedToken")
-            .field("access_token", &access_token)
+            .field("access_token", &access_token_display)
             .field("expires_in", expires_in)
             .field("issued_token_type", issued_token_type)
             .finish()
@@ -2374,6 +2519,8 @@ impl OAuthProxyConfig {
     /// `revocation_url`, `expose_admin_endpoints`) default to their
     /// [`Default`] values and can be set via the corresponding builder
     /// methods.
+    #[inline]
+#[expect(clippy::impl_trait_in_params, reason = "public API frozen until the next major release")]
     pub fn builder(
         authorize_url: impl Into<String>,
         token_url: impl Into<String>,
@@ -2398,11 +2545,13 @@ impl OAuthProxyConfig {
 #[derive(Debug, Clone)]
 #[must_use = "builders do nothing until `.build()` is called"]
 pub struct OAuthProxyConfigBuilder {
+/// Proxy configuration under construction.
     inner: OAuthProxyConfig,
 }
 
 impl OAuthProxyConfigBuilder {
     /// Set the upstream OAuth client secret. Omit for public clients.
+    #[inline]
     pub fn client_secret(mut self, secret: secrecy::SecretString) -> Self {
         self.inner.client_secret = Some(secret);
         self
@@ -2411,6 +2560,8 @@ impl OAuthProxyConfigBuilder {
     /// Configure the upstream RFC 7662 introspection endpoint. Only
     /// advertised and reachable when
     /// [`Self::expose_admin_endpoints`] is also set to `true`.
+    #[inline]
+#[expect(clippy::impl_trait_in_params, reason = "public API frozen until the next major release")]
     pub fn introspection_url(mut self, url: impl Into<String>) -> Self {
         self.inner.introspection_url = Some(url.into());
         self
@@ -2419,6 +2570,8 @@ impl OAuthProxyConfigBuilder {
     /// Configure the upstream RFC 7009 revocation endpoint. Only
     /// advertised and reachable when
     /// [`Self::expose_admin_endpoints`] is also set to `true`.
+    #[inline]
+#[expect(clippy::impl_trait_in_params, reason = "public API frozen until the next major release")]
     pub fn revocation_url(mut self, url: impl Into<String>) -> Self {
         self.inner.revocation_url = Some(url.into());
         self
@@ -2431,6 +2584,7 @@ impl OAuthProxyConfigBuilder {
     /// **Security:** see the field-level documentation on
     /// [`OAuthProxyConfig::expose_admin_endpoints`] for the caveats
     /// before enabling this.
+    #[inline]
     pub const fn expose_admin_endpoints(mut self, expose: bool) -> Self {
         self.inner.expose_admin_endpoints = expose;
         self
@@ -2438,6 +2592,7 @@ impl OAuthProxyConfigBuilder {
 
     /// Require the normal authentication middleware on `/introspect` and
     /// `/revoke`.
+    #[inline]
     pub const fn require_auth_on_admin_endpoints(mut self, require: bool) -> Self {
         self.inner.require_auth_on_admin_endpoints = require;
         self
@@ -2446,6 +2601,7 @@ impl OAuthProxyConfigBuilder {
     /// Explicit opt-out for the M3 startup check that rejects exposing
     /// `/introspect`/`/revoke` without authentication. See
     /// [`OAuthProxyConfig::allow_unauthenticated_admin_endpoints`].
+    #[inline]
     pub const fn allow_unauthenticated_admin_endpoints(mut self, allow: bool) -> Self {
         self.inner.allow_unauthenticated_admin_endpoints = allow;
         self
@@ -2455,6 +2611,7 @@ impl OAuthProxyConfigBuilder {
     /// and `/token` upstream. Required for Microsoft Entra v2.0
     /// (`AADSTS9010010`). See
     /// [`OAuthProxyConfig::strip_resource_param`].
+    #[inline]
     pub const fn strip_resource_param(mut self, strip: bool) -> Self {
         self.inner.strip_resource_param = strip;
         self
@@ -2462,6 +2619,7 @@ impl OAuthProxyConfigBuilder {
 
     /// Finalise the builder and return the [`OAuthProxyConfig`].
     #[must_use]
+    #[inline]
     pub fn build(self) -> OAuthProxyConfig {
         self.inner
     }
@@ -2552,18 +2710,23 @@ type JwksKeyCache = (
     Vec<(JwkAlg, DecodingKey)>,
 );
 
+/// One fetched JWKS snapshot: kid-indexed keys, unnamed keys, and freshness metadata.
 struct CachedKeys {
     /// `kid` -> (`JwkAlg`, `DecodingKey`)
     keys: HashMap<String, (JwkAlg, DecodingKey)>,
     /// Keys without a kid, indexed by algorithm family.
     unnamed_keys: Vec<(JwkAlg, DecodingKey)>,
+/// When this snapshot was stored.
     fetched_at: Instant,
+/// How long this snapshot stays fresh.
     ttl: Duration,
 }
 
+/// Anchor keeping [`JWKS_REFRESH_COOLDOWN`] linkable from module docs.
 const _JWKS_REFRESH_COOLDOWN_DOC_ANCHOR: &str = "JWKS_REFRESH_COOLDOWN";
 
 impl CachedKeys {
+/// Whether the snapshot has outlived its TTL.
     fn is_expired(&self) -> bool {
         self.fetched_at.elapsed() >= self.ttl
     }
@@ -2583,41 +2746,54 @@ impl CachedKeys {
 )]
 #[non_exhaustive]
 pub struct JwksCache {
+/// The upstream JWKS endpoint.
     jwks_uri: String,
+/// Configured cache TTL for fetched keys.
     ttl: Duration,
+/// Upper bound on keys accepted from one JWKS document.
     max_jwks_keys: usize,
     /// Algorithms this cache will verify with. Defaults to [`ACCEPTED_ALGS`];
     /// [`OAuthConfig::allowed_algorithms`] may narrow it but never widen it.
     allowed_algorithms: Vec<Algorithm>,
+/// Upper bound on the JWKS response body size in bytes.
     max_response_bytes: u64,
+/// Whether plain-HTTP JWKS URLs are permitted (`allow_http_oauth_urls`).
     allow_http: bool,
+/// Current key snapshot; `None` until the first successful fetch.
     inner: RwLock<Option<CachedKeys>>,
+/// Fetch client (SSRF-screened, redirect-policy applied).
     http: reqwest::Client,
+/// Base `Validation` template; per-token validation clones and narrows it.
     validation_template: Validation,
     /// Expected audience value from config; checked against `aud` and,
     /// per `audience_mode`, optionally `azp`.
     expected_audience: String,
+/// How `aud`/`azp` are validated.
     audience_mode: AudienceValidationMode,
+/// Whether tokens without `sub` are rejected.
     require_subject: bool,
     /// Set to `true` after the first `azp`-only audience match while in
     /// [`AudienceValidationMode::Warn`], so the deprecation warning logs
     /// at most once per process lifetime.
     azp_fallback_warned: AtomicBool,
-    /// Separate from [Self::azp_fallback_warned] on purpose: sharing one
+    /// Separate from [`Self::azp_fallback_warned`] on purpose: sharing one
     /// flag would let whichever mode logged first suppress the other.
     azp_permissive_logged: AtomicBool,
+/// Scope-to-role mappings.
     scopes: Vec<ScopeMapping>,
+/// Claim path that carries roles directly, when set.
     role_claim: Option<String>,
+/// Claim-value-to-role mappings.
     role_mappings: Vec<RoleMapping>,
     /// Tracks the last refresh attempt timestamp. Enforces a 10-second cooldown
     /// between refresh attempts to prevent abuse via fabricated JWTs with invalid kids.
     last_refresh_attempt: RwLock<Option<Instant>>,
     /// Serializes concurrent refresh attempts so only one fetch is in flight.
-    refresh_lock: tokio::sync::Mutex<()>,
+    refresh_lock: Mutex<()>,
     /// Compiled operator SSRF allowlist (empty by default = original
     /// fail-closed behaviour). Wrapped in `Arc` so the redirect-policy
     /// closure can capture a cheap clone without inflating the cache size.
-    allowlist: Arc<crate::ssrf::CompiledSsrfAllowlist>,
+    allowlist: Arc<CompiledSsrfAllowlist>,
     /// M-H2/B1: shared loopback bypass; same Arc is captured by the
     /// SSRF resolver inside the cached `reqwest::Client`. See the
     /// matching field on `OauthHttpClient`.
@@ -2667,7 +2843,7 @@ const ACCEPTED_ALGS: &[Algorithm] = &[
     clippy::wildcard_enum_match_arm,
     reason = "jsonwebtoken Algorithm is #[non_exhaustive], so an exhaustive match is impossible; HS*, `none`, and any future variant must fail closed to None"
 )]
-fn accepted_algorithm_name(alg: Algorithm) -> Option<&'static str> {
+const fn accepted_algorithm_name(alg: Algorithm) -> Option<&'static str> {
     match alg {
         Algorithm::RS256 => Some("RS256"),
         Algorithm::RS384 => Some("RS384"),
@@ -2713,12 +2889,12 @@ fn accepted_algorithm_names() -> String {
 /// disable OAuth.
 pub(crate) fn resolve_allowed_algorithms(
     configured: Option<&[String]>,
-) -> Result<Vec<Algorithm>, crate::error::RmcpServerKitError> {
+) -> Result<Vec<Algorithm>, RmcpServerKitError> {
     let Some(names) = configured else {
         return Ok(ACCEPTED_ALGS.to_vec());
     };
     if names.is_empty() {
-        return Err(crate::error::RmcpServerKitError::Config(
+        return Err(RmcpServerKitError::Config(
             "oauth.allowed_algorithms must not be empty; omit the field to accept the default set"
                 .into(),
         ));
@@ -2726,7 +2902,7 @@ pub(crate) fn resolve_allowed_algorithms(
     let mut resolved = Vec::with_capacity(names.len());
     for name in names {
         let Some(alg) = accepted_algorithm_from_name(name) else {
-            return Err(crate::error::RmcpServerKitError::Config(format!(
+            return Err(RmcpServerKitError::Config(format!(
                 "oauth.allowed_algorithms contains unsupported algorithm {name:?}; \
                  permitted values are: {}",
                 accepted_algorithm_names()
@@ -2750,13 +2926,19 @@ pub enum JwtValidationFailure {
 }
 
 /// JWT validation rejection plus optional verified credential owner details.
+#[expect(clippy::field_scoped_visibility_modifiers, reason = "deliberate: src/oauth.rs::JwtRejection fields are read by src/auth.rs; accessors would churn the crate-internal API")]
 pub(crate) struct JwtRejection {
+/// Why validation failed.
     pub(crate) failure: JwtValidationFailure,
+/// Verified credential owner details, when the endpoint wants them.
     pub(crate) owner: Option<CredentialOwner>,
 }
 
+/// A failed decode plus any expired-claim data recovered from it.
 struct DecodeFailure {
+/// Classification of the decode failure.
     failure: JwtValidationFailure,
+/// Claims recovered from an expired token, for owner attribution.
     expired_claims: Option<Box<Claims>>,
 }
 
@@ -2772,15 +2954,13 @@ impl JwksCache {
     /// [`McpServerConfig::validate`](crate::transport::McpServerConfig::validate)
     /// pipeline) rejects invalid TTLs up front, so the TTL branch is
     /// unreachable for validated configs.
-    pub fn new(config: &OAuthConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+#[expect(clippy::too_many_lines, reason = "deliberate: src/oauth.rs::JwksCache::new keeps the screening, TLS and redirect setup in one reviewable block")]
+    #[inline]
+    pub fn new(config: &OAuthConfig) -> Result<Self, Box<dyn Error + Send + Sync>> {
         // Ensure crypto providers are installed (idempotent -- ok() ignores
         // the error if already installed by another call in the same process).
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .ok();
-        jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER
-            .install_default()
-            .ok();
+        drop(default_provider().install_default());
+        drop(DEFAULT_PROVIDER.install_default());
 
         let ttl = humantime::parse_duration(&config.jwks_cache_ttl).map_err(|error| {
             format!(
@@ -2812,12 +2992,12 @@ impl JwksCache {
         // Compile operator allowlist up-front so misconfiguration is
         // surfaced at startup rather than on first JWKS fetch.
         let allowlist = match config.ssrf_allowlist.as_ref() {
-            Some(raw) => Arc::new(compile_oauth_ssrf_allowlist(raw).map_err(|e| {
-                Box::<dyn std::error::Error + Send + Sync>::from(format!(
-                    "oauth.ssrf_allowlist: {e}"
+            Some(raw) => Arc::new(compile_oauth_ssrf_allowlist(raw).map_err(|error| {
+                Box::<dyn Error + Send + Sync>::from(format!(
+                    "oauth.ssrf_allowlist: {error}"
                 ))
             })?),
-            None => Arc::new(crate::ssrf::CompiledSsrfAllowlist::default()),
+            None => Arc::new(CompiledSsrfAllowlist::default()),
         };
         let redirect_allowlist = Arc::clone(&allowlist);
 
@@ -2846,8 +3026,8 @@ impl JwksCache {
                 reason = "TestLoopbackBypass aliases to Arc<AtomicBool> under cfg(test)/test-helpers and to `()` otherwise; each cfg trips a different clone/arg lint"
             )
         )]
-        let resolver: Arc<dyn reqwest::dns::Resolve> =
-            Arc::new(crate::ssrf_resolver::SsrfScreeningResolver::new(
+        let resolver: Arc<dyn Resolve> =
+            Arc::new(SsrfScreeningResolver::new(
                 Arc::clone(&allowlist),
                 test_bypass.clone(),
             ));
@@ -2858,7 +3038,7 @@ impl JwksCache {
             .dns_resolver(Arc::clone(&resolver))
             .timeout(Duration::from_secs(10))
             .connect_timeout(Duration::from_secs(3))
-            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            .redirect(Policy::custom(move |attempt| {
                 // SECURITY: a redirect from `https` to `http` is *always*
                 // rejected, even when `allow_http_oauth_urls` is true.
                 // The flag controls whether the *original* request URL
@@ -2876,7 +3056,7 @@ impl JwksCache {
                         // itself is URL-free).
                         tracing::warn!(
                             reason = %reason,
-                            target = %crate::ssrf::sanitized_url_for_log(attempt.url()),
+                            target = %sanitized_url_for_log(attempt.url()),
                             "oauth redirect rejected"
                         );
                         attempt.error(reason)
@@ -2884,14 +3064,14 @@ impl JwksCache {
                 }
             }));
 
-        if let Some(ref ca_path) = config.ca_cert_path {
+        if let Some(ca_path) = &config.ca_cert_path {
             // Pre-startup blocking I/O - runs before the runtime begins
             // serving requests, so blocking the current thread here is
             // intentional. Do not wrap in `spawn_blocking`: the constructor
             // is synchronous by contract and is called from `serve()`'s
             // pre-startup phase.
-            let pem = std::fs::read(ca_path)?;
-            let cert = reqwest::tls::Certificate::from_pem(&pem)?;
+            let pem = fs::read(ca_path)?;
+            let cert = Certificate::from_pem(&pem)?;
             http_builder = http_builder.add_root_certificate(cert);
         }
 
@@ -2916,7 +3096,7 @@ impl JwksCache {
             role_claim: config.role_claim.clone(),
             role_mappings: config.role_mappings.clone(),
             last_refresh_attempt: RwLock::new(None),
-            refresh_lock: tokio::sync::Mutex::new(()),
+            refresh_lock: Mutex::new(()),
             allowlist,
             #[cfg(any(test, feature = "test-helpers"))]
             test_allow_loopback_ssrf: test_bypass,
@@ -2942,6 +3122,7 @@ impl JwksCache {
     }
 
     /// Validate a JWT Bearer token. Returns `Some(AuthIdentity)` on success.
+    #[inline]
     pub async fn validate_token(&self, token: &str) -> Option<AuthIdentity> {
         self.validate_token_with_reason(token).await.ok()
     }
@@ -2955,6 +3136,7 @@ impl JwksCache {
     // cancel-safe: composed of cancel-safe `decode_claims` (spawn_blocking
     // decode, no shared state) plus pure, side-effect-free claim checks
     // (`check_audience`, `resolve_role`). No partial state on cancellation.
+    #[inline]
     pub async fn validate_token_with_reason(
         &self,
         token: &str,
@@ -2994,8 +3176,8 @@ impl JwksCache {
         // `require_subject` must also reject a *blank* sub: it is the OAuth
         // session-binding stable id, so a blank one collapses distinct
         // principals to one fingerprint (CWE-384).
-        if self.require_subject && claims.sub.as_deref().is_none_or(|s| s.trim().is_empty()) {
-            core::hint::cold_path();
+        if self.require_subject && claims.sub.as_deref().is_none_or(|name| name.trim().is_empty()) {
+            cold_path();
             tracing::debug!(
                 "JWT rejected: require_subject is set but the token has no non-blank `sub`"
             );
@@ -3063,6 +3245,10 @@ impl JwksCache {
     // refresh) then a `spawn_blocking` decode whose `JoinHandle`, if dropped on
     // cancellation, detaches the verification (it completes off-task). No shared
     // state is mutated on this path.
+///
+/// # Errors
+///
+/// Returns [`DecodeFailure`] carrying the failure classification and any expired claims.
     async fn decode_claims(
         &self,
         token: &str,
@@ -3085,15 +3271,15 @@ impl JwksCache {
         // Move the (cheap) clones into the blocking task so the verifier
         // does not hold a reference into the request's async scope.
         let token_owned = token.to_owned();
-        let dispatch = tracing::dispatcher::get_default(Clone::clone);
-        let join = tokio::task::spawn_blocking(move || {
-            tracing::dispatcher::with_default(&dispatch, || {
+        let dispatch = dispatcher::get_default(Clone::clone);
+        let join = spawn_blocking(move || {
+            dispatcher::with_default(&dispatch, || {
                 let first = decode::<Claims>(&token_owned, &key, &validation);
                 if want_expired_claims
                     && let Err(error) = &first
                     && matches!(
                         error.kind(),
-                        jsonwebtoken::errors::ErrorKind::ExpiredSignature
+                        ErrorKind::ExpiredSignature
                     )
                 {
                     tracing::debug!("JWT expired; re-decoding without exp for owner attribution");
@@ -3110,9 +3296,9 @@ impl JwksCache {
         .await;
 
         let decode_result = match join {
-            Ok(r) => r,
+            Ok(decoded) => decoded,
             Err(join_err) => {
-                core::hint::cold_path();
+                cold_path();
                 tracing::error!(
                     error = %join_err,
                     "JWT decode task panicked or was cancelled"
@@ -3124,14 +3310,14 @@ impl JwksCache {
             }
         };
 
-        decode_result.0.map(|td| td.claims).map_err(|e| {
-            core::hint::cold_path();
-            let failure = if matches!(e.kind(), jsonwebtoken::errors::ErrorKind::ExpiredSignature) {
+        decode_result.0.map(|td| td.claims).map_err(|error| {
+            cold_path();
+            let failure = if matches!(error.kind(), ErrorKind::ExpiredSignature) {
                 JwtValidationFailure::Expired
             } else {
                 JwtValidationFailure::Invalid
             };
-            tracing::debug!(error = %e, ?alg, ?failure, "JWT decode failed");
+            tracing::debug!(error = %error, ?alg, ?failure, "JWT decode failed");
             DecodeFailure {
                 failure,
                 expired_claims: decode_result.1,
@@ -3155,12 +3341,16 @@ impl JwksCache {
         clippy::cognitive_complexity,
         reason = "each failure arm pairs `cold_path()` with a distinct `tracing::debug!` site for observability; collapsing into combinators would lose structured-field log sites without reducing real complexity"
     )]
+///
+/// # Errors
+///
+/// Returns a message when no key in the refreshed JWKS can verify the token.
     async fn select_jwks_key(
         &self,
         token: &str,
     ) -> Result<(DecodingKey, Algorithm), JwtValidationFailure> {
         let Ok(header) = decode_header(token) else {
-            core::hint::cold_path();
+            cold_path();
             tracing::debug!("JWT header decode failed");
             return Err(JwtValidationFailure::Invalid);
         };
@@ -3168,13 +3358,13 @@ impl JwksCache {
         tracing::debug!(alg = ?header.alg, kid = kid.unwrap_or("-"), "JWT header decoded");
 
         if !self.allowed_algorithms.contains(&header.alg) {
-            core::hint::cold_path();
+            cold_path();
             tracing::debug!(alg = ?header.alg, "JWT algorithm not accepted");
             return Err(JwtValidationFailure::Invalid);
         }
 
         let Some(key) = self.find_key(kid, header.alg).await else {
-            core::hint::cold_path();
+            cold_path();
             tracing::debug!(kid = kid.unwrap_or("-"), alg = ?header.alg, "no matching JWKS key found");
             return Err(JwtValidationFailure::Invalid);
         };
@@ -3190,6 +3380,10 @@ impl JwksCache {
     /// `tracing::warn!` per process in [`AudienceValidationMode::Warn`],
     /// and reject in [`AudienceValidationMode::Strict`]. No-claim-match
     /// always rejects.
+///
+/// # Errors
+///
+/// Returns the [`JwtValidationFailure`] classification for the mismatch.
     fn check_audience(&self, claims: &Claims) -> Result<(), JwtValidationFailure> {
         if claims.aud.contains(&self.expected_audience) {
             return Ok(());
@@ -3230,7 +3424,7 @@ impl JwksCache {
                 AudienceValidationMode::Strict => {}
             }
         }
-        core::hint::cold_path();
+        cold_path();
         self.log_audience_mismatch(claims);
         Err(JwtValidationFailure::Invalid)
     }
@@ -3242,7 +3436,7 @@ impl JwksCache {
     /// `expected` and `mode` are local configuration rather than token
     /// material, so they stay visible for debuggability.
     fn log_audience_mismatch(&self, claims: &Claims) {
-        let expose = crate::diagnostics::oauth_claim_values();
+        let expose = oauth_claim_values();
         let aud = if expose {
             claims.aud.log_display()
         } else {
@@ -3267,16 +3461,20 @@ impl JwksCache {
     /// When `role_claim` is set, extract values from the given claim path
     /// and match against `role_mappings`. Otherwise, match space-separated
     /// tokens in the `scope` claim against configured scope mappings.
+///
+/// # Errors
+///
+/// Returns [`JwtValidationFailure::Invalid`] when no mapping matches.
     fn resolve_role(&self, claims: &Claims) -> Result<String, JwtValidationFailure> {
-        if let Some(ref claim_path) = self.role_claim {
+        if let Some(claim_path) = &self.role_claim {
             let owned_first_class: Vec<String> = first_class_claim_values(claims, claim_path);
             let mut values: Vec<&str> = owned_first_class.iter().map(String::as_str).collect();
             values.extend(resolve_claim_path(&claims.extra, claim_path));
             return self
                 .role_mappings
                 .iter()
-                .find(|m| values.contains(&m.claim_value.as_str()))
-                .map(|m| m.role.clone())
+                .find(|mapping| values.contains(&mapping.claim_value.as_str()))
+                .map(|mapping| mapping.role.clone())
                 .ok_or(JwtValidationFailure::Invalid);
         }
 
@@ -3289,8 +3487,8 @@ impl JwksCache {
 
         self.scopes
             .iter()
-            .find(|m| token_scopes.contains(&m.scope.as_str()))
-            .map(|m| m.role.clone())
+            .find(|mapping| token_scopes.contains(&mapping.scope.as_str()))
+            .map(|mapping| mapping.role.clone())
             .ok_or(JwtValidationFailure::Invalid)
     }
 
@@ -3372,7 +3570,12 @@ impl JwksCache {
         }
 
         // Perform the actual fetch.
-        let _ = self.refresh_inner().await;
+        // The error is already logged inside `refresh_inner`; the cooldown
+        // stamp above must stand regardless so a failing upstream cannot be
+        // hammered by fabricated-kid floods.
+        if let Err(error) = self.refresh_inner().await {
+            tracing::debug!(%error, "JWKS refresh failed; 10s cooldown preserved");
+        }
     }
 
     /// Fetch JWKS from the configured URI and update the cache.
@@ -3383,6 +3586,10 @@ impl JwksCache {
     // `*guard = Some(..)` assignment under the `tokio::sync::RwLock` write lock
     // at the end. Cancellation before that point leaves the prior cache intact;
     // it never observes a half-built cache.
+///
+/// # Errors
+///
+/// Returns the `build_key_cache` message when the JWKS exceeds the key cap.
     async fn refresh_inner(&self) -> Result<(), String> {
         let Some(jwks) = self.fetch_jwks().await else {
             return Ok(());
@@ -3447,9 +3654,9 @@ impl JwksCache {
 
         let mut resp = match self.http.get(&self.jwks_uri).send().await {
             Ok(resp) => resp,
-            Err(e) => {
+            Err(error) => {
                 tracing::warn!(
-                    error = %e.without_url(),
+                    error = %error.without_url(),
                     uri = %oauth_request_target_for_log(&self.jwks_uri),
                     "failed to fetch JWKS"
                 );
@@ -3536,16 +3743,18 @@ impl JwksCache {
     }
 }
 
+/// Human-readable identity label: `preferred_username`, else `sub`/`azp`/`client_id`, else
+/// `oauth-client`.
 fn identity_label(claims: &Claims, sub: Option<&str>) -> String {
     claims
         .extra
         .get("preferred_username")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty())
+        .and_then(|value| value.as_str())
+        .filter(|text| !text.trim().is_empty())
         .map(String::from)
-        .or_else(|| sub.filter(|s| !s.trim().is_empty()).map(String::from))
-        .or_else(|| claims.azp.clone().filter(|s| !s.trim().is_empty()))
-        .or_else(|| claims.client_id.clone().filter(|s| !s.trim().is_empty()))
+        .or_else(|| sub.filter(|text| !text.trim().is_empty()).map(String::from))
+        .or_else(|| claims.azp.clone().filter(|text| !text.trim().is_empty()))
+        .or_else(|| claims.client_id.clone().filter(|text| !text.trim().is_empty()))
         .unwrap_or_else(|| "oauth-client".into())
 }
 
@@ -3568,7 +3777,7 @@ fn truncate_kid_for_log(kid: &str) -> (String, bool) {
 }
 
 /// Render a JWK's `kid` for logging, bounded, with a placeholder when absent.
-fn jwk_kid_for_log(jwk: &jsonwebtoken::jwk::Jwk) -> (String, bool) {
+fn jwk_kid_for_log(jwk: &Jwk) -> (String, bool) {
     jwk.common
         .key_id
         .as_deref()
@@ -3580,7 +3789,7 @@ fn jwk_kid_for_log(jwk: &jsonwebtoken::jwk::Jwk) -> (String, bool) {
 /// Returns `None` for every fail-closed case: a key whose declared `use`/
 /// `key_ops` forbid signature verification, a key `jsonwebtoken` cannot decode,
 /// and a key whose algorithm can be neither read nor inferred.
-fn classify_jwk(jwk: &jsonwebtoken::jwk::Jwk) -> Option<(JwkAlg, DecodingKey)> {
+fn classify_jwk(jwk: &Jwk) -> Option<(JwkAlg, DecodingKey)> {
     if !jwk_permits_signature_verification(jwk) {
         let (kid_log, kid_truncated) = jwk_kid_for_log(jwk);
         tracing::debug!(
@@ -3604,12 +3813,16 @@ fn classify_jwk(jwk: &jsonwebtoken::jwk::Jwk) -> Option<(JwkAlg, DecodingKey)> {
     Some((alg, decoding_key))
 }
 
+/// Partition a JWKS into a kid-indexed map plus a list of unnamed keys.
+///
+/// # Errors
+///
+/// Returns a message when the JWKS carries more than `max_keys` keys.
 fn build_key_cache(jwks: &JwkSet, max_keys: usize) -> Result<JwksKeyCache, String> {
     if jwks.keys.len() > max_keys {
         return Err(format!(
-            "jwks_key_count_exceeds_cap: got {} keys, max is {}",
-            jwks.keys.len(),
-            max_keys
+            "jwks_key_count_exceeds_cap: got {} keys, max is {max_keys}",
+            jwks.keys.len()
         ));
     }
     let mut keys = HashMap::new();
@@ -3618,7 +3831,7 @@ fn build_key_cache(jwks: &JwkSet, max_keys: usize) -> Result<JwksKeyCache, Strin
         let Some((alg, decoding_key)) = classify_jwk(jwk) else {
             continue;
         };
-        if let Some(ref kid) = jwk.common.key_id {
+        if let Some(kid) = &jwk.common.key_id {
             if keys.insert(kid.clone(), (alg, decoding_key)).is_some() {
                 let (kid_log, kid_truncated) = truncate_kid_for_log(kid);
                 tracing::warn!(
@@ -3636,12 +3849,12 @@ fn build_key_cache(jwks: &JwkSet, max_keys: usize) -> Result<JwksKeyCache, Strin
 
 /// Look up a key from the cache by kid (if present) or by algorithm.
 fn lookup_key(cached: &CachedKeys, kid: Option<&str>, alg: Algorithm) -> Option<DecodingKey> {
-    if let Some(kid) = kid {
+    if let Some(key_id) = kid {
         // A token carrying a `kid` must match a NAMED JWKS key exactly; it
         // must NOT fall back to an unnamed key. Otherwise an attacker could
         // present an unknown `kid` and be validated against an unrelated
         // unnamed key of the same algorithm (L4, fail-closed key selection).
-        if let Some((cached_alg, key)) = cached.keys.get(kid)
+        if let Some((cached_alg, key)) = cached.keys.get(key_id)
             && cached_alg.accepts(alg)
         {
             return Some(key.clone());
@@ -3652,8 +3865,8 @@ fn lookup_key(cached: &CachedKeys, kid: Option<&str>, alg: Algorithm) -> Option<
     cached
         .unnamed_keys
         .iter()
-        .find(|(a, _)| a.accepts(alg))
-        .map(|(_, k)| k.clone())
+        .find(|(cached_alg, _)| cached_alg.accepts(alg))
+        .map(|(_, key)| key.clone())
 }
 
 /// Whether a JWK is permitted to act as a JWT **signature verification**
@@ -3668,7 +3881,7 @@ fn lookup_key(cached: &CachedKeys, kid: Option<&str>, alg: Algorithm) -> Option<
 /// Both parameters are optional; absent means unconstrained and is accepted
 /// (RFC 7517 says `use` is optional unless the application requires it).
 /// When present they are enforced fail-closed.
-fn jwk_permits_signature_verification(jwk: &jsonwebtoken::jwk::Jwk) -> bool {
+fn jwk_permits_signature_verification(jwk: &Jwk) -> bool {
     use jsonwebtoken::jwk::{KeyOperations, PublicKeyUse};
 
     let use_ok = match jwk.common.public_key_use {
@@ -3692,11 +3905,11 @@ fn jwk_permits_signature_verification(jwk: &jsonwebtoken::jwk::Jwk) -> bool {
 /// `alg` is absent -- which RFC 7517 4.4 explicitly permits, and which Entra
 /// v2.0 always does -- the key type implies the family instead. Returning
 /// `None` drops the key, so unknown or symmetric key types stay fail-closed.
-fn jwk_algorithm(jwk: &jsonwebtoken::jwk::Jwk) -> Option<JwkAlg> {
-    match jwk.common.key_algorithm {
-        Some(declared) => explicit_jwk_algorithm(declared).map(JwkAlg::Explicit),
-        None => infer_jwk_family(jwk).map(JwkAlg::Family),
-    }
+fn jwk_algorithm(jwk: &Jwk) -> Option<JwkAlg> {
+    jwk.common.key_algorithm.map_or_else(
+        || infer_jwk_family(jwk).map(JwkAlg::Family),
+        |declared| explicit_jwk_algorithm(declared).map(JwkAlg::Explicit),
+    )
 }
 
 /// Map a declared JWK `alg` onto a supported JWS algorithm.
@@ -3704,17 +3917,17 @@ fn jwk_algorithm(jwk: &jsonwebtoken::jwk::Jwk) -> Option<JwkAlg> {
     clippy::wildcard_enum_match_arm,
     reason = "jsonwebtoken KeyAlgorithm is a large external enum; only the JWT-signing variants are mappable to `Algorithm`"
 )]
-fn explicit_jwk_algorithm(declared: jsonwebtoken::jwk::KeyAlgorithm) -> Option<Algorithm> {
+const fn explicit_jwk_algorithm(declared: KeyAlgorithm) -> Option<Algorithm> {
     match declared {
-        jsonwebtoken::jwk::KeyAlgorithm::RS256 => Some(Algorithm::RS256),
-        jsonwebtoken::jwk::KeyAlgorithm::RS384 => Some(Algorithm::RS384),
-        jsonwebtoken::jwk::KeyAlgorithm::RS512 => Some(Algorithm::RS512),
-        jsonwebtoken::jwk::KeyAlgorithm::ES256 => Some(Algorithm::ES256),
-        jsonwebtoken::jwk::KeyAlgorithm::ES384 => Some(Algorithm::ES384),
-        jsonwebtoken::jwk::KeyAlgorithm::PS256 => Some(Algorithm::PS256),
-        jsonwebtoken::jwk::KeyAlgorithm::PS384 => Some(Algorithm::PS384),
-        jsonwebtoken::jwk::KeyAlgorithm::PS512 => Some(Algorithm::PS512),
-        jsonwebtoken::jwk::KeyAlgorithm::EdDSA => Some(Algorithm::EdDSA),
+        KeyAlgorithm::RS256 => Some(Algorithm::RS256),
+        KeyAlgorithm::RS384 => Some(Algorithm::RS384),
+        KeyAlgorithm::RS512 => Some(Algorithm::RS512),
+        KeyAlgorithm::ES256 => Some(Algorithm::ES256),
+        KeyAlgorithm::ES384 => Some(Algorithm::ES384),
+        KeyAlgorithm::PS256 => Some(Algorithm::PS256),
+        KeyAlgorithm::PS384 => Some(Algorithm::PS384),
+        KeyAlgorithm::PS512 => Some(Algorithm::PS512),
+        KeyAlgorithm::EdDSA => Some(Algorithm::EdDSA),
         _ => None,
     }
 }
@@ -3731,17 +3944,17 @@ fn explicit_jwk_algorithm(declared: jsonwebtoken::jwk::KeyAlgorithm) -> Option<A
     clippy::wildcard_enum_match_arm,
     reason = "jsonwebtoken AlgorithmParameters and EllipticCurve are both #[non_exhaustive] external enums, so an exhaustive match is impossible; unmatched variants must fail closed to None"
 )]
-fn infer_jwk_family(jwk: &jsonwebtoken::jwk::Jwk) -> Option<JwkKeyFamily> {
+const fn infer_jwk_family(jwk: &Jwk) -> Option<JwkKeyFamily> {
     use jsonwebtoken::jwk::{AlgorithmParameters, EllipticCurve};
 
-    match jwk.algorithm {
+    match &jwk.algorithm {
         AlgorithmParameters::RSA(_) => Some(JwkKeyFamily::Rsa),
-        AlgorithmParameters::EllipticCurve(ref ec) => match ec.curve {
+        AlgorithmParameters::EllipticCurve(ec) => match ec.curve {
             EllipticCurve::P256 => Some(JwkKeyFamily::EcP256),
             EllipticCurve::P384 => Some(JwkKeyFamily::EcP384),
             _ => None,
         },
-        AlgorithmParameters::OctetKeyPair(ref okp) => match okp.curve {
+        AlgorithmParameters::OctetKeyPair(okp) => match okp.curve {
             EllipticCurve::Ed25519 => Some(JwkKeyFamily::Ed25519),
             _ => None,
         },
@@ -3795,10 +4008,10 @@ fn first_class_claim_values(claims: &Claims, path: &str) -> Vec<String> {
 ///
 /// Returns an empty vec if the path does not exist or the leaf is not a
 /// string/array.
-fn resolve_claim_path<'a>(
-    extra: &'a HashMap<String, serde_json::Value>,
+fn resolve_claim_path<'path>(
+    extra: &'path HashMap<String, serde_json::Value>,
     path: &str,
-) -> Vec<&'a str> {
+) -> Vec<&'path str> {
     let mut segments = path.split('.');
     let Some(first) = segments.next() else {
         return Vec::new();
@@ -3807,12 +4020,14 @@ fn resolve_claim_path<'a>(
     let mut current: Option<&serde_json::Value> = extra.get(first);
 
     for segment in segments {
-        current = current.and_then(|v| v.get(segment));
+        current = current.and_then(|node| node.get(segment));
     }
 
     match current {
-        Some(serde_json::Value::String(s)) => s.split_whitespace().collect(),
-        Some(serde_json::Value::Array(arr)) => arr.iter().filter_map(|v| v.as_str()).collect(),
+        Some(serde_json::Value::String(text)) => text.split_whitespace().collect(),
+        Some(serde_json::Value::Array(arr)) => {
+            arr.iter().filter_map(|element| element.as_str()).collect()
+        }
         _ => Vec::new(),
     }
 }
@@ -3846,8 +4061,9 @@ struct Claims {
 struct OneOrMany(Vec<String>);
 
 impl OneOrMany {
+/// Whether any element matches `value` exactly.
     fn contains(&self, value: &str) -> bool {
-        self.0.iter().any(|v| v == value)
+        self.0.iter().any(|candidate| candidate == value)
     }
 
     /// Render the audience list as a single comma-separated string for
@@ -3873,7 +4089,7 @@ impl OneOrMany {
 /// or an unexpected JSON type.
 fn fmt_json_aud(value: Option<&serde_json::Value>) -> String {
     match value {
-        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::String(text)) => text.clone(),
         Some(serde_json::Value::Array(items)) => {
             let joined = items
                 .iter()
@@ -3904,24 +4120,33 @@ fn fmt_json_str(value: Option<&serde_json::Value>) -> &str {
 }
 
 impl<'de> Deserialize<'de> for OneOrMany {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
         use serde::de;
 
         struct Visitor;
         impl<'de> de::Visitor<'de> for Visitor {
             type Value = OneOrMany;
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a string or array of strings")
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a string or array of strings")
             }
-            fn visit_str<E: de::Error>(self, v: &str) -> Result<OneOrMany, E> {
+            fn visit_str<E>(self, v: &str) -> Result<OneOrMany, E>
+            where
+                E: de::Error,
+            {
                 Ok(OneOrMany(vec![v.to_owned()]))
             }
-            fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<OneOrMany, A::Error> {
-                let mut v = Vec::new();
-                while let Some(s) = seq.next_element::<String>()? {
-                    v.push(s);
+            fn visit_seq<A>(self, mut seq: A) -> Result<OneOrMany, A::Error>
+            where
+                A: de::SeqAccess<'de>,
+            {
+                let mut items = Vec::new();
+                while let Some(item) = seq.next_element::<String>()? {
+                    items.push(item);
                 }
-                Ok(OneOrMany(v))
+                Ok(OneOrMany(items))
             }
         }
         deserializer.deserialize_any(Visitor)
@@ -3935,8 +4160,9 @@ impl<'de> Deserialize<'de> for OneOrMany {
 /// Returns true if the token looks like a JWT (3 dot-separated segments
 /// where the first segment decodes to JSON containing `"alg"`).
 #[must_use]
+#[inline]
 pub fn looks_like_jwt(token: &str) -> bool {
-    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
     let mut parts = token.splitn(4, '.');
     let Some(header_b64) = parts.next() else {
@@ -3965,8 +4191,11 @@ pub fn looks_like_jwt(token: &str) -> bool {
 ///
 /// RFC 9728 3.2: a zero-valued claim MUST be omitted, so an empty result means
 /// "leave the field out" rather than "emit `[]`".
-fn resolve_authorization_servers<'a>(server_url: &'a str, config: &'a OAuthConfig) -> Vec<&'a str> {
-    if let Some(ref explicit) = config.authorization_servers {
+fn resolve_authorization_servers<'server>(
+    server_url: &'server str,
+    config: &'server OAuthConfig,
+) -> Vec<&'server str> {
+    if let Some(explicit) = &config.authorization_servers {
         return explicit.iter().map(String::as_str).collect();
     }
     // Advertise this server only when it actually mounts the OAuth endpoints.
@@ -3989,6 +4218,7 @@ fn resolve_authorization_servers<'a>(server_url: &'a str, config: &'a OAuthConfi
 /// the upstream issuer for a plain resource server, this server's own URL
 /// when the built-in proxy is mounted, or an explicit operator override.
 #[must_use]
+#[inline]
 pub fn protected_resource_metadata(
     resource_url: &str,
     server_url: &str,
@@ -4009,7 +4239,7 @@ pub fn protected_resource_metadata(
             serde_json::json!(auth_servers),
         );
     }
-    let scopes: Vec<&str> = config.scopes.iter().map(|s| s.scope.as_str()).collect();
+    let scopes: Vec<&str> = config.scopes.iter().map(|scope| scope.scope.as_str()).collect();
     if !scopes.is_empty() {
         obj.insert("scopes_supported".into(), serde_json::json!(scopes));
     }
@@ -4028,6 +4258,7 @@ pub fn protected_resource_metadata(
 /// [`OAuthConfig::authorization_server_metadata_issuer`] for the legacy
 /// opt-out.
 #[must_use]
+#[inline]
 pub fn authorization_server_metadata(server_url: &str, config: &OAuthConfig) -> serde_json::Value {
     let issuer = config
         .authorization_server_metadata_issuer
@@ -4044,7 +4275,7 @@ pub fn authorization_server_metadata(server_url: &str, config: &OAuthConfig) -> 
         "token_endpoint_auth_methods_supported": ["none"],
     });
     // RFC 8414 3.2: omit zero-valued claims rather than emitting `[]`.
-    let scopes: Vec<&str> = config.scopes.iter().map(|s| s.scope.as_str()).collect();
+    let scopes: Vec<&str> = config.scopes.iter().map(|scope| scope.scope.as_str()).collect();
     if !scopes.is_empty()
         && let Some(obj) = meta.as_object_mut()
     {
@@ -4093,11 +4324,9 @@ pub fn authorization_server_metadata(server_url: &str, config: &OAuthConfig) -> 
 /// redirects the user back to the MCP client's `redirect_uri` with an
 /// authorization code.
 #[must_use]
-pub fn handle_authorize(proxy: &OAuthProxyConfig, query: &str) -> axum::response::Response {
-    use axum::{
-        http::{StatusCode, header},
-        response::IntoResponse,
-    };
+#[inline]
+pub fn handle_authorize(proxy: &OAuthProxyConfig, query: &str) -> Response {
+    use axum::{http::header, response::IntoResponse as _};
 
     // Replace the client_id in the query with the upstream client_id.
     let upstream_query =
@@ -4116,25 +4345,23 @@ pub fn handle_authorize(proxy: &OAuthProxyConfig, query: &str) -> axum::response
 // code may be consumed or a token minted upstream. Cancelling between send
 // and response-forwarding loses the token while the grant is spent, so the
 // client must retry with a fresh code rather than replay this one.
+#[inline]
 pub async fn handle_token(
     http: &OauthHttpClient,
     proxy: &OAuthProxyConfig,
     body: &str,
-) -> axum::response::Response {
-    use axum::{
-        http::{StatusCode, header},
-        response::IntoResponse,
-    };
+) -> Response {
+    use axum::{http::header, response::IntoResponse as _};
 
     // Replace client_id in the form body with the upstream client_id.
     let mut upstream_body =
         rewrite_client_auth_params(body, &proxy.client_id, proxy.strip_resource_param);
 
     // For confidential clients, inject the client_secret.
-    if let Some(ref secret) = proxy.client_secret {
-        use std::fmt::Write;
+    if let Some(secret) = &proxy.client_secret {
+        use core::fmt::Write as _;
 
-        use secrecy::ExposeSecret;
+        use secrecy::ExposeSecret as _;
         let _ = write!(
             upstream_body,
             "&client_secret={}",
@@ -4172,8 +4399,8 @@ pub async fn handle_token(
             )
                 .into_response()
         }
-        Err(e) => {
-            tracing::error!(error = %e, "OAuth token proxy request failed");
+        Err(error) => {
+            tracing::error!(error = %error, "OAuth token proxy request failed");
             (
                 StatusCode::BAD_GATEWAY,
                 [(header::CONTENT_TYPE, "application/json")],
@@ -4191,6 +4418,7 @@ pub async fn handle_token(
 /// and echo back any `redirect_uris` from the request body (required
 /// by the MCP SDK's Zod validation).
 #[must_use]
+#[inline]
 pub fn handle_register(proxy: &OAuthProxyConfig, body: &serde_json::Value) -> serde_json::Value {
     let mut resp = serde_json::json!({
         "client_id": proxy.client_id,
@@ -4216,14 +4444,15 @@ pub fn handle_register(proxy: &OAuthProxyConfig, body: &serde_json::Value) -> se
 /// response as-is.  Requires `proxy.introspection_url` to be `Some`.
 // cancel-safe: introspection is a read-only upstream query; cancelling only
 // discards the answer and leaves no upstream state change.
+#[inline]
 pub async fn handle_introspect(
     http: &OauthHttpClient,
     proxy: &OAuthProxyConfig,
     body: &str,
-) -> axum::response::Response {
-    let Some(ref url) = proxy.introspection_url else {
+) -> Response {
+    let Some(url) = &proxy.introspection_url else {
         return oauth_error_response(
-            axum::http::StatusCode::NOT_FOUND,
+            StatusCode::NOT_FOUND,
             "not_supported",
             "introspection endpoint is not configured",
         );
@@ -4240,14 +4469,15 @@ pub async fn handle_introspect(
 // cancel-safe for security purposes: cancellation cannot un-revoke a token.
 // The caller may lose the confirmation response while the revocation still
 // takes effect upstream, which fails in the safe direction.
+#[inline]
 pub async fn handle_revoke(
     http: &OauthHttpClient,
     proxy: &OAuthProxyConfig,
     body: &str,
-) -> axum::response::Response {
-    let Some(ref url) = proxy.revocation_url else {
+) -> Response {
+    let Some(url) = &proxy.revocation_url else {
         return oauth_error_response(
-            axum::http::StatusCode::NOT_FOUND,
+            StatusCode::NOT_FOUND,
             "not_supported",
             "revocation endpoint is not configured",
         );
@@ -4266,20 +4496,17 @@ async fn proxy_oauth_admin_request(
     proxy: &OAuthProxyConfig,
     upstream_url: &str,
     body: &str,
-) -> axum::response::Response {
-    use axum::{
-        http::{StatusCode, header},
-        response::IntoResponse,
-    };
+) -> Response {
+    use axum::{http::header, response::IntoResponse as _};
 
     // `false`: `resource` is not a parameter of RFC 7662 introspection or
     // RFC 7009 revocation requests, so the strip flag -- which exists purely
     // to satisfy Entra's authorization-code flow -- must not reach this path.
     let mut upstream_body = rewrite_client_auth_params(body, &proxy.client_id, false);
-    if let Some(ref secret) = proxy.client_secret {
-        use std::fmt::Write;
+    if let Some(secret) = &proxy.client_secret {
+        use core::fmt::Write as _;
 
-        use secrecy::ExposeSecret;
+        use secrecy::ExposeSecret as _;
         let _ = write!(
             upstream_body,
             "&client_secret={}",
@@ -4304,7 +4531,7 @@ async fn proxy_oauth_admin_request(
             let content_type = resp
                 .headers()
                 .get(header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
+                .and_then(|value| value.to_str().ok())
                 .unwrap_or("application/json")
                 .to_owned();
             let Ok(body_bytes) =
@@ -4318,9 +4545,9 @@ async fn proxy_oauth_admin_request(
             };
             (status, [(header::CONTENT_TYPE, content_type)], body_bytes).into_response()
         }
-        Err(e) => {
+        Err(error) => {
             tracing::error!(
-                error = %e,
+                error = %error,
                 url = %oauth_request_target_for_log(upstream_url),
                 "OAuth admin proxy request failed"
             );
@@ -4345,6 +4572,10 @@ async fn proxy_oauth_admin_request(
 // cancel-safe: the response body is accumulated in a local `Vec` and returned
 // only after EOF; cancellation during `resp.chunk()` drops the partial buffer
 // and never forwards a truncated OAuth response.
+///
+/// # Errors
+///
+/// Returns `()` after logging the transport or size-cap failure.
 async fn read_response_capped(
     mut resp: reqwest::Response,
     max_bytes: u64,
@@ -4376,12 +4607,13 @@ async fn read_response_capped(
     }
 }
 
+/// Build a JSON OAuth error response with the given status code and description.
 fn oauth_error_response(
-    status: axum::http::StatusCode,
+    status: StatusCode,
     error: &str,
     description: &str,
-) -> axum::response::Response {
-    use axum::{http::header, response::IntoResponse};
+) -> Response {
+    use axum::{http::header, response::IntoResponse as _};
     let body = serde_json::json!({
         "error": error,
         "error_description": description,
@@ -4401,7 +4633,9 @@ fn oauth_error_response(
 /// OAuth error response body from the authorization server.
 #[derive(Debug, Deserialize)]
 struct OAuthErrorResponse {
+/// RFC 6749 §5.2 error code.
     error: String,
+/// Optional human-readable error description (upstream-controlled).
     error_description: Option<String>,
 }
 
@@ -4413,7 +4647,7 @@ struct OAuthErrorResponse {
 /// sibling `error` field is an enumerated RFC 6749 §5.2 / RFC 8693 code rather
 /// than free text, and is logged unconditionally.
 fn upstream_error_description_for_log(description: Option<&str>) -> &str {
-    if crate::diagnostics::upstream_error_bodies() {
+    if upstream_error_bodies() {
         description.unwrap_or("")
     } else {
         "[REDACTED]"
@@ -4464,27 +4698,36 @@ fn sanitize_oauth_error_code(raw: &str) -> &'static str {
 // pre-checks the token, detaches the in-flight exchange rather than dropping it,
 // and audits a token minted after the caller went away. That is a mitigation,
 // not a guarantee -- see its docs for what remains unattainable.
+#[inline]
 pub async fn exchange_token(
     http: &OauthHttpClient,
     config: &TokenExchangeConfig,
     subject_token: &str,
-) -> Result<ExchangedToken, crate::error::RmcpServerKitError> {
+) -> Result<ExchangedToken, RmcpServerKitError> {
     exchange_token_inner(http, config, subject_token, SuccessLogMode::Normal).await
 }
 
+/// Whether a successful exchange logs the exchanged-token metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SuccessLogMode {
+/// Log the exchanged-token metadata.
     Normal,
+/// Stay quiet; the detached caller audits the outcome itself.
     Suppress,
 }
 
+/// Perform the RFC 8693 exchange POST, logging success per `success_log`.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Auth`] with a sanitized code for upstream failures.
 async fn exchange_token_inner(
     http: &OauthHttpClient,
     config: &TokenExchangeConfig,
     subject_token: &str,
     success_log: SuccessLogMode,
-) -> Result<ExchangedToken, crate::error::RmcpServerKitError> {
-    use secrecy::ExposeSecret;
+) -> Result<ExchangedToken, RmcpServerKitError> {
+    use secrecy::ExposeSecret as _;
 
     let client = http.client_for(config);
     let mut req = client
@@ -4501,10 +4744,10 @@ async fn exchange_token_inner(
     // `OAuthConfig::validate` enforces exactly-one-of so neither both
     // nor neither reach this code path.
     if config.client_cert.is_none()
-        && let Some(ref secret) = config.client_secret
+        && let Some(secret) = &config.client_secret
     {
-        use base64::Engine;
-        let credentials = base64::engine::general_purpose::STANDARD.encode(format!(
+        use base64::Engine as _;
+        let credentials = general_purpose::STANDARD.encode(format!(
             "{}:{}",
             urlencoding::encode(&config.client_id),
             urlencoding::encode(secret.expose_secret()),
@@ -4517,10 +4760,10 @@ async fn exchange_token_inner(
     let resp = http
         .send_screened(&config.token_url, req.body(form_body))
         .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "token exchange request failed");
+        .map_err(|error| {
+            tracing::error!(error = %error, "token exchange request failed");
             // Do NOT leak upstream URL, reqwest internals, or DNS detail to clients.
-            crate::error::RmcpServerKitError::Auth("server_error".into())
+            RmcpServerKitError::Auth("server_error".into())
         })?;
 
     let status = resp.status();
@@ -4529,22 +4772,22 @@ async fn exchange_token_inner(
             .await
             .map_err(|()| {
                 // read_response_capped already logged the cause (oversize / transport).
-                crate::error::RmcpServerKitError::Auth("server_error".into())
+                RmcpServerKitError::Auth("server_error".into())
             })?;
 
     if !status.is_success() {
-        core::hint::cold_path();
+        cold_path();
         // Parse upstream error for logging only; client-visible payload is a
         // sanitized short code from the RFC 6749 §5.2 / RFC 8693 allowlist.
         let parsed = serde_json::from_slice::<OAuthErrorResponse>(&body_bytes).ok();
         let short_code = parsed
             .as_ref()
-            .map_or("server_error", |e| sanitize_oauth_error_code(&e.error));
-        if let Some(ref e) = parsed {
-            let description = upstream_error_description_for_log(e.error_description.as_deref());
+            .map_or("server_error", |error| sanitize_oauth_error_code(&error.error));
+        if let Some(error) = &parsed {
+            let description = upstream_error_description_for_log(error.error_description.as_deref());
             tracing::warn!(
                 status = %status,
-                upstream_error = %e.error,
+                upstream_error = %error.error,
                 upstream_error_description = description,
                 client_code = %short_code,
                 "token exchange rejected by authorization server",
@@ -4556,14 +4799,14 @@ async fn exchange_token_inner(
                 "token exchange rejected (unparseable upstream body)",
             );
         }
-        return Err(crate::error::RmcpServerKitError::Auth(short_code.into()));
+        return Err(RmcpServerKitError::Auth(short_code.into()));
     }
 
-    let exchanged = serde_json::from_slice::<ExchangedToken>(&body_bytes).map_err(|e| {
-        tracing::error!(error = %e, "failed to parse token exchange response");
+    let exchanged = serde_json::from_slice::<ExchangedToken>(&body_bytes).map_err(|error| {
+        tracing::error!(error = %error, "failed to parse token exchange response");
         // Avoid surfacing serde internals; map to sanitized short code so
         // RmcpServerKitError::into_response cannot leak parser detail to the client.
-        crate::error::RmcpServerKitError::Auth("server_error".into())
+        RmcpServerKitError::Auth("server_error".into())
     })?;
 
     match success_log {
@@ -4609,25 +4852,26 @@ async fn exchange_token_inner(
 /// [`crate::cancel::DetachOutcome`] and do not construct client-visible error
 /// strings.
 #[must_use = "DetachOutcome must be inspected to distinguish completion from cancel/timeout"]
+#[inline]
 pub async fn exchange_token_with_cancel(
     http: &OauthHttpClient,
     config: &TokenExchangeConfig,
     subject_token: &str,
-    ct: &tokio_util::sync::CancellationToken,
+    ct: &CancellationToken,
     timeout: Option<Duration>,
-) -> crate::cancel::DetachOutcome<Result<ExchangedToken, crate::error::RmcpServerKitError>> {
+) -> DetachOutcome<Result<ExchangedToken, RmcpServerKitError>> {
     // Pre-cancel check FIRST: do not clone config, client, or subject token for
     // an already-abandoned request. In particular, cloning the subject token
     // would allocate and keep credential-adjacent material alive for work that
     // the caller has already told us not to start.
     if ct.is_cancelled() {
-        return crate::cancel::DetachOutcome::Cancelled;
+        return DetachOutcome::Cancelled;
     }
 
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let http = http.clone();
-    let config = config.clone();
-    let subject_token = subject_token.to_owned();
+    let (tx, rx) = oneshot::channel();
+    let http_owned = http.clone();
+    let config_owned = config.clone();
+    let subject_token_owned = subject_token.to_owned();
 
     // This task is intentionally detached on caller cancel/timeout. A plain
     // `run_with_cancel_and_timeout(exchange_token(...))` would drop the
@@ -4638,10 +4882,15 @@ pub async fn exchange_token_with_cancel(
     tokio::spawn(
         async move {
             let result =
-                exchange_token_inner(&http, &config, &subject_token, SuccessLogMode::Suppress)
-                    .await;
-            if let Err(result) = tx.send(result) {
-                audit_abandoned_exchange_result(result);
+                exchange_token_inner(
+                    &http_owned,
+                    &config_owned,
+                    &subject_token_owned,
+                    SuccessLogMode::Suppress,
+                )
+                .await;
+            if let Err(abandoned) = tx.send(result) {
+                audit_abandoned_exchange_result(abandoned);
             }
         }
         .instrument(tracing::Span::current()),
@@ -4650,51 +4899,55 @@ pub async fn exchange_token_with_cancel(
     receive_exchange_result_with_cancel(rx, ct, timeout).await
 }
 
+/// Await the detached exchange result under cancellation and the optional timeout.
 async fn receive_exchange_result_with_cancel(
-    rx: tokio::sync::oneshot::Receiver<Result<ExchangedToken, crate::error::RmcpServerKitError>>,
-    ct: &tokio_util::sync::CancellationToken,
+    rx: oneshot::Receiver<Result<ExchangedToken, RmcpServerKitError>>,
+    ct: &CancellationToken,
     timeout: Option<Duration>,
-) -> crate::cancel::DetachOutcome<Result<ExchangedToken, crate::error::RmcpServerKitError>> {
+) -> DetachOutcome<Result<ExchangedToken, RmcpServerKitError>> {
     // `biased;` is deliberate and matches `cancel::run_with_cancel_and_timeout`:
     // the receiver arm comes first so a ready completion wins over a
     // simultaneously-ready cancellation or timeout. Dropping the receiver on
     // the other arms is not a leak; it is the signal that tells the spawned task
     // to audit an eventual success via `Sender::send`'s returned value.
-    if let Some(t) = timeout {
+    if let Some(deadline) = timeout {
         tokio::select! {
             biased;
             received = rx => map_exchange_receiver(received),
-            () = ct.cancelled() => crate::cancel::DetachOutcome::Cancelled,
-            () = tokio::time::sleep(t) => crate::cancel::DetachOutcome::TimedOut,
+            () = ct.cancelled() => DetachOutcome::Cancelled,
+            () = sleep(deadline) => DetachOutcome::TimedOut,
         }
     } else {
         tokio::select! {
             biased;
             received = rx => map_exchange_receiver(received),
-            () = ct.cancelled() => crate::cancel::DetachOutcome::Cancelled,
+            () = ct.cancelled() => DetachOutcome::Cancelled,
         }
     }
 }
 
+/// Map the oneshot receive into a [`DetachOutcome`], treating a dropped sender as
+/// `server_error`.
 fn map_exchange_receiver(
     received: Result<
-        Result<ExchangedToken, crate::error::RmcpServerKitError>,
-        tokio::sync::oneshot::error::RecvError,
+        Result<ExchangedToken, RmcpServerKitError>,
+        RecvError,
     >,
-) -> crate::cancel::DetachOutcome<Result<ExchangedToken, crate::error::RmcpServerKitError>> {
+) -> DetachOutcome<Result<ExchangedToken, RmcpServerKitError>> {
     match received {
-        Ok(result) => crate::cancel::DetachOutcome::Completed(result),
+        Ok(result) => DetachOutcome::Completed(result),
         Err(error) => {
             tracing::error!(error = %error, "token exchange task ended before returning a result");
-            crate::cancel::DetachOutcome::Completed(Err(
-                crate::error::RmcpServerKitError::Internal("server_error".into()),
+            DetachOutcome::Completed(Err(
+                RmcpServerKitError::Internal("server_error".into()),
             ))
         }
     }
 }
 
+/// Log bounded metadata when a detached exchange mints a token (never token material).
 fn audit_abandoned_exchange_result(
-    result: Result<ExchangedToken, crate::error::RmcpServerKitError>,
+    result: Result<ExchangedToken, RmcpServerKitError>,
 ) {
     match result {
         Ok(token) => {
@@ -4715,6 +4968,7 @@ fn audit_abandoned_exchange_result(
     }
 }
 
+/// Append `&name=value` to a form body, percent-encoding the value.
 fn push_form_param(body: &mut String, name: &str, value: &str) {
     body.push('&');
     body.push_str(name);
@@ -4757,7 +5011,7 @@ fn build_exchange_form(config: &TokenExchangeConfig, subject_token: &str) -> Str
 /// Debug-log the exchanged token. For JWTs, decode and log claim summary;
 /// for opaque tokens, log length + issued type.
 fn log_exchanged_token(exchanged: &ExchangedToken) {
-    use base64::Engine;
+    use base64::Engine as _;
 
     if !looks_like_jwt(&exchanged.access_token) {
         tracing::debug!(
@@ -4771,13 +5025,13 @@ fn log_exchanged_token(exchanged: &ExchangedToken) {
     let Some(payload) = exchanged.access_token.split('.').nth(1) else {
         return;
     };
-    let Ok(decoded) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload) else {
+    let Ok(decoded) = general_purpose::URL_SAFE_NO_PAD.decode(payload) else {
         return;
     };
     let Ok(claims) = serde_json::from_slice::<serde_json::Value>(&decoded) else {
         return;
     };
-    let expose_claims = crate::diagnostics::oauth_claim_values();
+    let expose_claims = oauth_claim_values();
     let sub = gated_claim_str(claims.get("sub"), expose_claims);
     let aud = gated_claim_aud(claims.get("aud"), expose_claims);
     let azp = gated_claim_str(claims.get("azp"), expose_claims);
@@ -4792,6 +5046,7 @@ fn log_exchanged_token(exchanged: &ExchangedToken) {
     );
 }
 
+/// A string claim value for logs: raw when `expose`, else `"[REDACTED]"`.
 fn gated_claim_str(value: Option<&serde_json::Value>, expose: bool) -> &str {
     if expose {
         fmt_json_str(value)
@@ -4800,6 +5055,7 @@ fn gated_claim_str(value: Option<&serde_json::Value>, expose: bool) -> &str {
     }
 }
 
+/// The `aud` claim for logs: rendered when `expose`, else `"[REDACTED]"`.
 fn gated_claim_aud(value: Option<&serde_json::Value>, expose: bool) -> String {
     if expose {
         fmt_json_aud(value)
@@ -4846,8 +5102,8 @@ fn rewrite_client_auth_params(
     upstream_client_id: &str,
     strip_resource: bool,
 ) -> String {
-    let mut out = url::form_urlencoded::Serializer::new(String::new());
-    for (key, value) in url::form_urlencoded::parse(params.as_bytes()) {
+    let mut out = form_urlencoded::Serializer::new(String::new());
+    for (key, value) in form_urlencoded::parse(params.as_bytes()) {
         if CLIENT_AUTH_PARAMS.contains(&key.as_ref()) {
             continue;
         }
