@@ -242,6 +242,10 @@ name = "api_auto_traits"
 path = "tests/unit/api_auto_traits.rs"
 
 [[test]]
+name = "parser_properties"
+path = "tests/unit/parser_properties.rs"
+
+[[test]]
 name = "crl_ssrf"
 path = "tests/integration/crl_ssrf.rs"
 

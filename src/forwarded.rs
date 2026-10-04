@@ -294,9 +294,20 @@ fn is_valid_port(port: &str) -> bool {
 #[cfg(test)]
 mod tests {
 
+    use core::net::{Ipv4Addr, Ipv6Addr};
+
     use axum::http::HeaderValue;
+    use proptest::{collection, prelude::*};
 
     use super::*;
+
+    /// Strategy for an arbitrary IPv4 or IPv6 address.
+    fn prop_ip_strategy() -> impl Strategy<Value = IpAddr> {
+        prop_oneof![
+            any::<[u8; 4]>().prop_map(|octets| IpAddr::from(Ipv4Addr::from(octets))),
+            any::<[u8; 16]>().prop_map(|octets| IpAddr::from(Ipv6Addr::from(octets))),
+        ]
+    }
 
     fn nets(specs: &[&str]) -> Vec<IpNet> {
         specs.iter().map(|s| s.parse().unwrap()).collect()
@@ -691,6 +702,98 @@ mod tests {
                 MAX_SCANNED_ENTRIES,
             );
             assert_eq!(got, Err(FallbackReason::Obfuscated), "value: {value:?}");
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1024))]
+
+        /// Arbitrary peers, chains, trusted sets and scan caps must never
+        /// panic, and an `Ok` result must never name a trusted address.
+        #[test]
+        fn prop_resolution_returns_only_untrusted_clients(
+            direct in prop_ip_strategy(),
+            direct_trusted in any::<bool>(),
+            entries in collection::vec((prop_ip_strategy(), any::<bool>()), 1..6),
+            scan_cap in 0_usize..8,
+        ) {
+            let mut trusted: Vec<IpNet> = Vec::new();
+            for (addr, flag) in &entries {
+                if *flag {
+                    trusted.push(IpNet::from(*addr));
+                }
+            }
+            if direct_trusted {
+                trusted.push(IpNet::from(direct));
+            }
+            let header_text = entries
+                .iter()
+                .map(|(addr, _flag)| addr.to_string())
+                .collect::<Vec<String>>()
+                .join(", ");
+            let mut headers = HeaderMap::new();
+            let _replaced = headers.insert(
+                "x-forwarded-for",
+                HeaderValue::from_str(&header_text).map_err(|error| {
+                    TestCaseError::fail(format!("ip list must be a valid header value: {error}"))
+                })?,
+            );
+
+            let resolved = resolve_client_ip(direct, &headers, &trusted, XFF, scan_cap);
+            if let Ok(client) = resolved {
+                prop_assert!(
+                    !is_trusted(client, &trusted),
+                    "resolved client {} must not be trusted (direct {})",
+                    client,
+                    direct
+                );
+            }
+
+            let expected = if is_trusted(direct, &trusted) {
+                let mut scanned: usize = 0;
+                let mut outcome = Err(FallbackReason::AllEntriesTrusted);
+                for (addr, _flag) in entries.iter().rev() {
+                    scanned = scanned.saturating_add(1);
+                    if scanned > scan_cap {
+                        outcome = Err(FallbackReason::TooManyEntries);
+                        break;
+                    }
+                    if !is_trusted(*addr, &trusted) {
+                        outcome = Ok(*addr);
+                        break;
+                    }
+                }
+                outcome
+            } else {
+                Ok(direct)
+            };
+            prop_assert_eq!(
+                resolved,
+                expected,
+                "resolution must follow the rightmost-untrusted rule"
+            );
+        }
+
+        /// Arbitrary header text must never panic the parser, and any `Ok`
+        /// result must still be an untrusted address.
+        #[test]
+        fn prop_arbitrary_header_text_never_panics(
+            direct in prop_ip_strategy(),
+            header_text in ".{0,80}",
+            trusted in collection::vec(prop_ip_strategy().prop_map(IpNet::from), 0..4),
+            scan_cap in 0_usize..8,
+        ) {
+            let mut headers = HeaderMap::new();
+            if let Ok(value) = HeaderValue::from_str(&header_text) {
+                let _replaced = headers.insert("x-forwarded-for", value);
+            }
+            if let Ok(client) = resolve_client_ip(direct, &headers, &trusted, XFF, scan_cap) {
+                prop_assert!(
+                    !is_trusted(client, &trusted),
+                    "resolved client {} must not be trusted",
+                    client
+                );
+            }
         }
     }
 }
