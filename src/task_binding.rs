@@ -279,7 +279,9 @@ mod tests {
         let fp = fingerprint(&identity("alice"));
         let uuid = "550e8400-e29b-41d4-a716-446655440000";
 
-        let raw_session = RawSessionId::parse(uuid).context("valid uuid")?;
+        let Ok(raw_session) = RawSessionId::parse(uuid) else {
+            anyhow::bail!("valid uuid");
+        };
         let session_token = session_wrap(&binding, &raw_session, &fp);
         assert_eq!(
             unwrap_and_verify(&binding, &session_token, &fp),

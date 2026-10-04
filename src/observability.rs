@@ -844,6 +844,8 @@ fn audit_file_permission_warnings(_file: &fs::File) -> Vec<String> {
 #[expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")]
 #[cfg(test)]
 mod tests {
+    extern crate alloc;
+
     use alloc::sync::Arc;
     use core::{
         sync::atomic::{AtomicBool, AtomicU64, Ordering},
