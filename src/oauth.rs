@@ -2878,8 +2878,8 @@ impl JwksCache {
         // Ensure crypto providers are installed (idempotent -- ok() ignores
         // the error if already installed by another call in the same process).
         drop(default_provider().install_default());
-        if let Err(error) = DEFAULT_PROVIDER.install_default() {
-            tracing::debug!(?error, "jsonwebtoken crypto provider already installed");
+        if let Err(_already_installed) = DEFAULT_PROVIDER.install_default() {
+            tracing::debug!("jsonwebtoken crypto provider already installed");
         }
 
         let ttl = humantime::parse_duration(&config.jwks_cache_ttl).map_err(|error| {
@@ -5066,12 +5066,13 @@ fn rewrite_client_auth_params(
     )
 )]
 #[cfg(test)]
-#[expect(
-    clippy::missing_errors_doc,
-    reason = "test code is not rendered API documentation"
-)]
-#[expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")]
 mod tests {
+    #![expect(
+        clippy::missing_errors_doc,
+        reason = "test code is not rendered API documentation"
+    )]
+    #![expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")]
+
     use core::ptr;
     use std::{env, io, process, sync::Mutex};
 
