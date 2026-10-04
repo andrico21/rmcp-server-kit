@@ -24,13 +24,6 @@
 //!   `Ok(empty)` would yield `reqwest::Error::Connect` with an opaque
 //!   "no addresses" message; an explicit `Err` lets us prefix the
 //!   diagnostic with `"ssrf:"` for log forensics.
-#![cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::std_instead_of_core,
-        reason = "lint-migration: src/ssrf_resolver.rs"
-    )
-)]
 
 extern crate alloc;
 
@@ -212,180 +205,203 @@ pub(crate) fn screen_addrs(
     Ok(addrs.to_vec())
 }
 
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::expect_used, reason = "lint-migration: src/ssrf_resolver.rs")
+#[expect(
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    reason = "test code is not rendered API documentation"
 )]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::shadow_reuse, reason = "lint-migration: src/ssrf_resolver.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::min_ident_chars,
-        reason = "lint-migration: src/ssrf_resolver.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::missing_panics_doc,
-        reason = "test code is not rendered API documentation"
-    )
-)]
-#[cfg_attr(
-    test,
-    expect(redundant_imports, reason = "lint-migration: src/ssrf_resolver.rs")
-)]
+#[expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")]
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use core::net::{Ipv4Addr, Ipv6Addr};
 
     use super::*;
-    use crate::ssrf::{CidrEntry, CompiledSsrfAllowlist};
+    use crate::ssrf::CidrEntry;
 
-    fn sa(ip: IpAddr) -> SocketAddr {
-        SocketAddr::new(ip, 0)
+    /// Build a port-0 `SocketAddr` for tests.
+    fn socket_addr(addr: IpAddr) -> SocketAddr {
+        SocketAddr::new(addr, 0)
     }
 
     fn empty_allowlist() -> CompiledSsrfAllowlist {
         CompiledSsrfAllowlist::default()
     }
 
-    fn allowlist_with(hosts: &[&str], cidrs: &[&str]) -> CompiledSsrfAllowlist {
-        let hosts = hosts.iter().map(|h| (*h).to_lowercase()).collect();
-        let cidrs = cidrs
+    /// Build a compiled allowlist from host and CIDR strings for tests.
+    fn allowlist_with(hosts: &[&str], cidrs: &[&str]) -> anyhow::Result<CompiledSsrfAllowlist> {
+        let host_names = hosts.iter().map(|host| (*host).to_lowercase()).collect();
+        let cidr_entries = cidrs
             .iter()
-            .map(|c| CidrEntry::parse(c).expect("test CIDR parses"))
-            .collect();
-        CompiledSsrfAllowlist::new(hosts, cidrs)
+            .map(|cidr| {
+                CidrEntry::parse(cidr)
+                    .map_err(|reason| anyhow::anyhow!("test CIDR parses: {reason}"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(CompiledSsrfAllowlist::new(host_names, cidr_entries))
     }
 
     #[test]
-    fn rejects_empty_addrs() {
+    /// Pins that an empty resolution is rejected as having no addresses.
+    fn rejects_empty_addrs() -> anyhow::Result<()> {
         let err = screen_addrs(&[], &empty_allowlist(), "example.com", false)
-            .expect_err("empty resolution must error");
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("empty resolution must error"))?;
         assert!(err.contains("returned no addresses"), "{err}");
+        Ok(())
     }
 
     #[test]
-    fn allows_public_ipv4() {
-        let addrs = vec![sa(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)))];
+    /// Pins that a public IPv4 address passes an empty allowlist.
+    fn allows_public_ipv4() -> anyhow::Result<()> {
+        let addrs = vec![socket_addr(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)))];
         let out = screen_addrs(&addrs, &empty_allowlist(), "dns.google", false)
-            .expect("public IPv4 must pass");
+            .map_err(|diag| anyhow::anyhow!("public IPv4 must pass: {diag}"))?;
         assert_eq!(out, addrs);
+        Ok(())
     }
 
     #[test]
-    fn rejects_loopback_under_empty_allowlist() {
-        let addrs = vec![sa(IpAddr::V4(Ipv4Addr::LOCALHOST))];
+    /// Pins that loopback is blocked under an empty allowlist.
+    fn rejects_loopback_under_empty_allowlist() -> anyhow::Result<()> {
+        let addrs = vec![socket_addr(IpAddr::V4(Ipv4Addr::LOCALHOST))];
         let err = screen_addrs(&addrs, &empty_allowlist(), "localhost", false)
-            .expect_err("loopback must be blocked");
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("loopback must be blocked"))?;
         assert!(err.contains("loopback"), "{err}");
+        Ok(())
     }
 
     #[test]
-    fn rejects_private_under_empty_allowlist() {
-        let addrs = vec![sa(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))];
+    /// Pins that private RFC1918 space is blocked under an empty allowlist.
+    fn rejects_private_under_empty_allowlist() -> anyhow::Result<()> {
+        let addrs = vec![socket_addr(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))];
         let err = screen_addrs(&addrs, &empty_allowlist(), "internal", false)
-            .expect_err("private RFC1918 must be blocked");
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("private RFC1918 must be blocked"))?;
         assert!(err.contains("private_rfc1918"), "{err}");
+        Ok(())
     }
 
     #[test]
-    fn rejects_cloud_metadata_even_with_full_allowlist() {
-        let addrs = vec![sa(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)))];
-        let allowlist = allowlist_with(&["meta.example"], &["169.254.0.0/16"]);
+    /// Pins that cloud-metadata stays blocked even with a full allowlist.
+    fn rejects_cloud_metadata_even_with_full_allowlist() -> anyhow::Result<()> {
+        let addrs = vec![socket_addr(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)))];
+        let allowlist = allowlist_with(&["meta.example"], &["169.254.0.0/16"])?;
         let err = screen_addrs(&addrs, &allowlist, "meta.example", false)
-            .expect_err("cloud_metadata must be unbypassable");
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("cloud_metadata must be unbypassable"))?;
         assert!(err.contains("cloud_metadata"), "{err}");
+        Ok(())
     }
 
     #[test]
-    fn rejects_nat64_embedded_metadata_even_with_transition_allowlist() {
+    /// Pins that NAT64-wrapped cloud-metadata stays blocked even when the transition prefix is allowlisted.
+    fn rejects_nat64_embedded_metadata_even_with_transition_allowlist() -> anyhow::Result<()> {
         // NAT64-wrapped 169.254.169.254 must stay blocked even when the
         // transition prefix is allowlisted (M2 regression).
-        let addrs = vec![sa(IpAddr::V6(Ipv6Addr::new(
+        let addrs = vec![socket_addr(IpAddr::V6(Ipv6Addr::new(
             0x0064, 0xff9b, 0, 0, 0, 0, 0xa9fe, 0xa9fe,
         )))];
-        let allowlist = allowlist_with(&[], &["64:ff9b::/96"]);
+        let allowlist = allowlist_with(&[], &["64:ff9b::/96"])?;
         let err = screen_addrs(&addrs, &allowlist, "nat64.example", false)
-            .expect_err("nat64-embedded metadata must be unbypassable");
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("nat64-embedded metadata must be unbypassable"))?;
         assert!(err.contains("cloud_metadata"), "{err}");
+        Ok(())
     }
 
     #[test]
-    fn rejects_cloud_metadata_even_with_loopback_bypass() {
-        let addrs = vec![sa(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)))];
+    /// Pins that cloud-metadata survives the test-only loopback bypass.
+    fn rejects_cloud_metadata_even_with_loopback_bypass() -> anyhow::Result<()> {
+        let addrs = vec![socket_addr(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)))];
         let err = screen_addrs(&addrs, &empty_allowlist(), "meta", true)
-            .expect_err("cloud_metadata must survive loopback bypass");
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("cloud_metadata must survive loopback bypass"))?;
         assert!(err.contains("cloud_metadata"), "{err}");
+        Ok(())
     }
 
     #[test]
-    fn fails_any_blocked_when_mixed() {
+    /// Pins that a mixed answer with any blocked address fails the whole resolution.
+    fn fails_any_blocked_when_mixed() -> anyhow::Result<()> {
         // Mixed answer with one public and one private IP must fail
         // entirely; returning only the public subset would let
         // happy-eyeballs reach the private IP on the next attempt.
         let addrs = vec![
-            sa(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
-            sa(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+            socket_addr(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+            socket_addr(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
         ];
         let err = screen_addrs(&addrs, &empty_allowlist(), "split-horizon", false)
-            .expect_err("any blocked address must fail the whole resolution");
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("any blocked address must fail the whole resolution"))?;
         assert!(err.contains("private_rfc1918"), "{err}");
+        Ok(())
     }
 
     #[test]
-    fn host_allowlist_permits_private() {
-        let addrs = vec![sa(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))];
-        let allowlist = allowlist_with(&["internal.corp"], &[]);
+    /// Pins that a host allowlist permits a private IP.
+    fn host_allowlist_permits_private() -> anyhow::Result<()> {
+        let addrs = vec![socket_addr(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))];
+        let allowlist = allowlist_with(&["internal.corp"], &[])?;
         let out = screen_addrs(&addrs, &allowlist, "internal.corp", false)
-            .expect("host allowlist must permit private IP");
+            .map_err(|diag| anyhow::anyhow!("host allowlist must permit private IP: {diag}"))?;
         assert_eq!(out, addrs);
+        Ok(())
     }
 
     #[test]
-    fn cidr_allowlist_permits_private() {
-        let addrs = vec![sa(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)))];
-        let allowlist = allowlist_with(&[], &["10.0.0.0/8"]);
+    /// Pins that a CIDR allowlist permits an IP inside its range.
+    fn cidr_allowlist_permits_private() -> anyhow::Result<()> {
+        let addrs = vec![socket_addr(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)))];
+        let allowlist = allowlist_with(&[], &["10.0.0.0/8"])?;
         let out = screen_addrs(&addrs, &allowlist, "internal", false)
-            .expect("CIDR allowlist must permit IP in range");
+            .map_err(|diag| anyhow::anyhow!("CIDR allowlist must permit IP in range: {diag}"))?;
         assert_eq!(out, addrs);
+        Ok(())
     }
 
     #[test]
-    fn cidr_allowlist_rejects_out_of_range() {
-        let addrs = vec![sa(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)))];
-        let allowlist = allowlist_with(&[], &["10.0.0.0/8"]);
+    /// Pins that a CIDR allowlist rejects an IP outside its range.
+    fn cidr_allowlist_rejects_out_of_range() -> anyhow::Result<()> {
+        let addrs = vec![socket_addr(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)))];
+        let allowlist = allowlist_with(&[], &["10.0.0.0/8"])?;
         let err = screen_addrs(&addrs, &allowlist, "elsewhere", false)
-            .expect_err("non-allowlisted private IP must fail");
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("non-allowlisted private IP must fail"))?;
         assert!(err.contains("private_rfc1918"), "{err}");
+        Ok(())
     }
 
     #[test]
-    fn loopback_bypass_permits_only_loopback() {
+    /// Pins that the loopback bypass does not permit non-loopback private IPs.
+    fn loopback_bypass_permits_only_loopback() -> anyhow::Result<()> {
         // Loopback bypass must NOT permit non-loopback private IPs.
-        let addrs = vec![sa(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))];
+        let addrs = vec![socket_addr(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))];
         let err = screen_addrs(&addrs, &empty_allowlist(), "internal", true)
-            .expect_err("loopback bypass must not allow RFC1918");
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("loopback bypass must not allow RFC1918"))?;
         assert!(err.contains("private_rfc1918"), "{err}");
+        Ok(())
     }
 
     #[test]
-    fn loopback_bypass_permits_127_0_0_1() {
-        let addrs = vec![sa(IpAddr::V4(Ipv4Addr::LOCALHOST))];
+    /// Pins that the loopback bypass permits `127.0.0.1`.
+    fn loopback_bypass_permits_127_0_0_1() -> anyhow::Result<()> {
+        let addrs = vec![socket_addr(IpAddr::V4(Ipv4Addr::LOCALHOST))];
         let out = screen_addrs(&addrs, &empty_allowlist(), "localhost", true)
-            .expect("loopback bypass must permit 127.0.0.1");
+            .map_err(|diag| anyhow::anyhow!("loopback bypass must permit 127.0.0.1: {diag}"))?;
         assert_eq!(out, addrs);
+        Ok(())
     }
 
     #[test]
-    fn ipv6_loopback_blocked_without_bypass() {
-        let addrs = vec![sa(IpAddr::V6(Ipv6Addr::LOCALHOST))];
+    /// Pins that IPv6 loopback is blocked without the bypass.
+    fn ipv6_loopback_blocked_without_bypass() -> anyhow::Result<()> {
+        let addrs = vec![socket_addr(IpAddr::V6(Ipv6Addr::LOCALHOST))];
         let err = screen_addrs(&addrs, &empty_allowlist(), "localhost", false)
-            .expect_err("IPv6 loopback must be blocked");
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("IPv6 loopback must be blocked"))?;
         assert!(err.contains("loopback"), "{err}");
+        Ok(())
     }
 }
