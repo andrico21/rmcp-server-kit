@@ -5755,141 +5755,6 @@ fn check_mtls_capacity_knobs(mtls: &MtlsConfig) -> Result<(), RmcpServerKitError
     Ok(())
 }
 
-// Temporary test-suite migration blocks (removed by the test-conversion PR).
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::absolute_paths, reason = "lint-migration: src/transport.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::assertions_on_result_states,
-        reason = "lint-migration: src/transport.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::default_numeric_fallback,
-        reason = "lint-migration: src/transport.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::doc_markdown, reason = "lint-migration: src/transport.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::duration_suboptimal_units,
-        reason = "lint-migration: src/transport.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::expect_used, reason = "lint-migration: src/transport.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::indexing_slicing, reason = "lint-migration: src/transport.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::let_underscore_must_use,
-        reason = "lint-migration: src/transport.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::let_underscore_untyped,
-        reason = "lint-migration: src/transport.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::map_err_ignore, reason = "lint-migration: src/transport.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::min_ident_chars, reason = "lint-migration: src/transport.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::missing_errors_doc,
-        reason = "lint-migration: src/transport.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::panic, reason = "lint-migration: src/transport.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::shadow_reuse, reason = "lint-migration: src/transport.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::shadow_unrelated, reason = "lint-migration: src/transport.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::single_char_lifetime_names,
-        reason = "lint-migration: src/transport.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::std_instead_of_core,
-        reason = "lint-migration: src/transport.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::too_long_first_doc_paragraph,
-        reason = "lint-migration: src/transport.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::unused_result_ok, reason = "lint-migration: src/transport.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::unused_trait_names,
-        reason = "lint-migration: src/transport.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::unwrap_used, reason = "lint-migration: src/transport.rs")
-)]
-#[cfg_attr(
-    test,
-    expect(
-        closure_returning_async_block,
-        reason = "lint-migration: src/transport.rs"
-    )
-)]
-#[cfg_attr(test, expect(deprecated, reason = "lint-migration: src/transport.rs"))]
-#[cfg_attr(
-    test,
-    expect(let_underscore_drop, reason = "lint-migration: src/transport.rs")
-)]
-#[cfg_attr(
-    test,
-    expect(unused_results, reason = "lint-migration: src/transport.rs")
-)]
-#[cfg_attr(
-    all(test, feature = "oauth", target_os = "linux"),
-    expect(clippy::non_ascii_literal, reason = "lint-migration: src/transport.rs")
-)]
 #[cfg_attr(
     all(test, target_os = "linux"),
     expect(
@@ -5899,6 +5764,7 @@ fn check_mtls_capacity_knobs(mtls: &MtlsConfig) -> Result<(), RmcpServerKitError
 )]
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
     use axum::{
         body::Body,
         http::{Request, StatusCode, header},
