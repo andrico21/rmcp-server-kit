@@ -1961,6 +1961,9 @@ fn reject_blank_redaction_salt(env_var: &str, value: &str) -> Result<(), RmcpSer
 mod tests {
     use std::net::IpAddr;
 
+    use proptest::{collection, prelude::*};
+    use serde_json::{Map, Number, Value as JsonValue};
+
     use super::*;
     use crate::transport::RateLimitKey;
 
@@ -2850,7 +2853,7 @@ mod tests {
     }
 
     fn tool_call(args: serde_json::Value) -> serde_json::Value {
-        let mut params = serde_json::Map::new();
+        let mut params = Map::new();
         params.insert(
             "name".to_owned(),
             serde_json::Value::String("run".to_owned()),
@@ -4545,5 +4548,85 @@ mod tests {
             msg.contains("typo_roles"),
             "error must name the offending key: {msg}"
         );
+    }
+
+    /// Strategy for an arbitrary JSON value, bounded in depth and size.
+    fn prop_json_value_strategy() -> impl Strategy<Value = JsonValue> {
+        let leaf = prop_oneof![
+            Just(JsonValue::Null),
+            any::<bool>().prop_map(JsonValue::Bool),
+            any::<i64>().prop_map(|number| JsonValue::Number(Number::from(number))),
+            ".*".prop_map(JsonValue::String),
+        ];
+        leaf.prop_recursive(3, 32, 4, |inner| {
+            prop_oneof![
+                collection::vec(inner.clone(), 0..4).prop_map(JsonValue::Array),
+                collection::btree_map("[a-z]{1,8}", inner, 0..4)
+                    .prop_map(|entries| JsonValue::Object(entries.into_iter().collect())),
+            ]
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1024))]
+
+        /// A role with no allowed tools denies every JSON-RPC `tools/call`
+        /// params object, whatever its shape, without panicking.
+        #[test]
+        fn prop_empty_allowlist_denies_arbitrary_json(
+            params in prop_json_value_strategy(),
+        ) {
+            let policy = enabled_policy(RoleConfig::new(
+                "viewer",
+                Vec::new(),
+                vec!["*".to_owned()],
+            ));
+            let response = enforce_tool_policy(
+                &policy,
+                "alice",
+                "viewer",
+                &params,
+                &DenyLogFields::default(),
+            );
+            prop_assert!(
+                response.is_some(),
+                "a role with no allowed tools must deny {:?}",
+                params
+            );
+        }
+
+        /// A tool with an explicit deny entry stays denied for arbitrary
+        /// argument JSON and for any string host.
+        #[test]
+        fn prop_denied_tool_stays_denied(
+            tool in "[a-z_]{1,16}",
+            host in "[a-zA-Z0-9._-]{0,24}",
+            extra in prop_json_value_strategy(),
+        ) {
+            let policy = enabled_policy(
+                RoleConfig::new("viewer", vec!["*".to_owned()], vec!["*".to_owned()])
+                    .with_deny(vec![tool.clone()]),
+            );
+            let mut arguments = Map::new();
+            let _previous_host = arguments.insert("host".to_owned(), JsonValue::String(host));
+            let _previous_extra = arguments.insert("extra".to_owned(), extra);
+            let mut call_params = Map::new();
+            let _previous_name = call_params.insert("name".to_owned(), JsonValue::String(tool.clone()));
+            let _previous_arguments =
+                call_params.insert("arguments".to_owned(), JsonValue::Object(arguments));
+            let params_value = JsonValue::Object(call_params);
+            let response = enforce_tool_policy(
+                &policy,
+                "alice",
+                "viewer",
+                &params_value,
+                &DenyLogFields::default(),
+            );
+            prop_assert!(
+                response.is_some(),
+                "denied tool {:?} must stay denied",
+                tool
+            );
+        }
     }
 }
