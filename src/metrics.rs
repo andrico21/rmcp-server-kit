@@ -11,6 +11,46 @@
 //! collectors against the same registry. This re-exports the [`prometheus`]
 //! crate types as part of `rmcp-server-kit`'s public API; pin the same major version to
 //! avoid type-identity mismatches when registering custom metrics.
+#![cfg_attr(
+    all(feature = "metrics", target_os = "linux"),
+    expect(clippy::absolute_paths, reason = "lint-migration: src/metrics.rs")
+)]
+#![cfg_attr(
+    all(feature = "metrics", target_os = "linux"),
+    expect(clippy::min_ident_chars, reason = "lint-migration: src/metrics.rs")
+)]
+#![cfg_attr(
+    all(feature = "metrics", target_os = "linux"),
+    expect(
+        clippy::missing_inline_in_public_items,
+        reason = "lint-migration: src/metrics.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "metrics", target_os = "linux"),
+    expect(
+        clippy::module_name_repetitions,
+        reason = "lint-migration: src/metrics.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "metrics", target_os = "linux"),
+    expect(
+        clippy::too_long_first_doc_paragraph,
+        reason = "lint-migration: src/metrics.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "metrics", target_os = "linux"),
+    expect(
+        clippy::std_instead_of_alloc,
+        reason = "lint-migration: src/metrics.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "metrics", target_os = "linux"),
+    expect(clippy::unused_trait_names, reason = "lint-migration: src/metrics.rs")
+)]
 
 use std::sync::Arc;
 
@@ -222,18 +262,31 @@ pub(crate) async fn serve_metrics_with_security_headers(
     Ok(())
 }
 
+#[cfg_attr(
+    all(test, feature = "metrics", target_os = "linux"),
+    expect(clippy::expect_used, reason = "lint-migration: src/metrics.rs")
+)]
+#[cfg_attr(
+    all(test, feature = "metrics", target_os = "linux"),
+    expect(clippy::std_instead_of_core, reason = "lint-migration: src/metrics.rs")
+)]
+#[cfg_attr(
+    all(test, feature = "metrics", target_os = "linux"),
+    expect(clippy::unwrap_used, reason = "lint-migration: src/metrics.rs")
+)]
+#[cfg_attr(
+    all(test, feature = "metrics", target_os = "linux"),
+    expect(
+        clippy::missing_panics_doc,
+        reason = "test code is not rendered API documentation"
+    )
+)]
+#[cfg_attr(
+    all(test, feature = "metrics"),
+    expect(unused_results, reason = "lint-migration: src/metrics.rs")
+)]
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::indexing_slicing,
-        clippy::unwrap_in_result,
-        clippy::print_stdout,
-        clippy::print_stderr,
-        reason = "test-only relaxations; production code uses ? and tracing"
-    )]
     use super::*;
 
     #[test]

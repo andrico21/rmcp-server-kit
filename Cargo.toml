@@ -309,80 +309,217 @@ required-features = ["oauth", "test-helpers"]
 ignored = ["humantime-serde", "subtle"]
 
 [lints.rust]
+# Every rustc lint group, at deny (individual entries below override at priority 0)
+future_incompatible = { level = "deny", priority = -1 }
+let_underscore = { level = "deny", priority = -1 }
+nonstandard_style = { level = "deny", priority = -1 }
+rust_2018_idioms = { level = "deny", priority = -1 }
+rust_2018_compatibility = { level = "deny", priority = -1 }
+rust_2021_compatibility = { level = "deny", priority = -1 }
+rust_2024_compatibility = { level = "deny", priority = -1 }
+unused = { level = "deny", priority = -1 }
+keyword_idents = { level = "deny", priority = -1 }
+refining_impl_trait = { level = "deny", priority = -1 }
+deprecated_safe = { level = "deny", priority = -1 }
+unknown_or_malformed_diagnostic_attributes = { level = "deny", priority = -1 }
+# Overridable only by the unsafe-ffi overlay
 unsafe_code = "forbid"
-missing_debug_implementations = "warn"
-missing_docs = "warn"
-trivial_casts = "warn"
-trivial_numeric_casts = "warn"
-unreachable_pub = "warn"
-unused_extern_crates = "warn"
-unused_import_braces = "warn"
-unused_qualifications = "warn"
+# Every allow-by-default rustc lint available on stable, plus warn-by-default ones made explicit
+absolute_paths_not_starting_with_crate = "deny"
+ambiguous_negative_literals = "deny"
+closure_returning_async_block = "deny"
+confusable_idents = "deny"
+dead_code_pub_in_binary = "deny"
+deprecated_in_future = "deny"
+deprecated_safe_2024 = "deny"
+deref_into_dyn_supertrait = "deny"
+edition_2024_expr_fragment_specifier = "deny"
+elided_lifetimes_in_paths = "deny"
+explicit_outlives_requirements = "deny"
+ffi_unwind_calls = "deny"
+if_let_rescope = "deny"
+impl_trait_overcaptures = "deny"
+impl_trait_redundant_captures = "deny"
+keyword_idents_2018 = "deny"
+keyword_idents_2024 = "deny"
+let_underscore_drop = "deny"
+linker_messages = "deny"
+macro_use_extern_crate = "deny"
+meta_variable_misuse = "deny"
+missing_abi = "deny"
+missing_copy_implementations = "deny"
+missing_debug_implementations = "deny"
+missing_docs = "deny"
+missing_unsafe_on_extern = "deny"
+mixed_script_confusables = "deny"
+non_ascii_idents = "deny"
+raw_borrows_via_references = "deny"
+redundant_imports = "deny"
+redundant_lifetimes = "deny"
+renamed_and_removed_lints = "deny"
+rust_2021_incompatible_closure_captures = "deny"
+rust_2021_incompatible_or_patterns = "deny"
+rust_2021_prefixes_incompatible_syntax = "deny"
+rust_2021_prelude_collisions = "deny"
+rust_2024_guarded_string_incompatible_syntax = "deny"
+rust_2024_incompatible_pat = "deny"
+rust_2024_prelude_collisions = "deny"
+single_use_lifetimes = "deny"
+tail_expr_drop_order = "deny"
+text_direction_codepoint_in_comment = "deny"
+text_direction_codepoint_in_literal = "deny"
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+uncommon_codepoints = "deny"
+unexpected_cfgs = "deny"
+unit_bindings = "deny"
+unknown_lints = "deny"
+unnameable_types = "deny"
+unreachable_pub = "deny"
+unsafe_attr_outside_unsafe = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unstable_features = "deny"
+unused_extern_crates = "deny"
+unused_import_braces = "deny"
+unused_lifetimes = "deny"
+unused_macro_rules = "deny"
+unused_qualifications = "deny"
+unused_results = "deny"
+variant_size_differences = "deny"
+
+[lints.rustdoc]
+all = { level = "deny", priority = -1 }
 
 [lints.clippy]
+# Every Clippy group
 all = { level = "deny", priority = -1 }
-pedantic = { level = "warn", priority = -1 }
-# Extra unstable lints that catch patterns pedantic misses (high-signal on
-# AI-touched code, per RUST_GUIDELINES.md §9). Noisy nursery lints may be
-# allowed individually below with a justification comment.
-nursery = { level = "warn", priority = -1 }
-# nursery allow: const-ness on ~40 pub fns is a one-way semver promise
-# (removing `const` later is a breaking change) and the lint is documented
-# as having false positives; opting fns into `const` stays a deliberate,
-# per-fn decision rather than lint-driven churn.
-missing_const_for_fn = "allow"
-# nursery allow: antagonistic to rustc's `unreachable_pub = "warn"` (set in
-# [lints.rust]), which prefers `pub(crate)` over `pub` for crate-internal
-# items; this crate keeps explicit `pub(crate)` visibility markers.
-redundant_pub_crate = "allow"
-# nursery allow: frequently degrades readability here - rewrites would
-# contort the constant-time HMAC fallback (inner #[allow] + SAFETY comment
-# inside a closure), the poisoned-lock `match` idiom used across the crate,
-# and multi-statement tracing arms. Sites are clearer as if/let-else.
-option_if_let_else = "allow"
-unwrap_used = "deny"
-expect_used = "deny"
-panic = "deny"
-todo = "deny"
-unimplemented = "deny"
-unreachable = "warn"
-indexing_slicing = "deny"
-string_slice = "warn"
-await_holding_lock = "deny"
-await_holding_refcell_ref = "deny"
-mem_forget = "deny"
-doc_markdown = "allow"
-duration_suboptimal_units = "allow"
-str_to_string = "warn"
-# `string_to_string` (RUST_GUIDELINES.md §9) is omitted: clippy removed the
-# lint - `implicit_clone` (enabled below) covers those cases.
-fallible_impl_from = "deny"
-wildcard_enum_match_arm = "deny"
-fn_params_excessive_bools = "deny"
-must_use_candidate = "warn"
-unneeded_field_pattern = "warn"
-dbg_macro = "deny"
-print_stdout = "deny"
-print_stderr = "deny"
-redundant_clone = "warn"
-implicit_clone = "warn"
-needless_pass_by_value = "warn"
-large_enum_variant = "warn"
-box_collection = "warn"
-rc_buffer = "warn"
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+# Every `restriction` lint except the documented exclusions (120 of 135)
+absolute_paths = "deny"
+alloc_instead_of_core = "deny"
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+arithmetic_side_effects = "deny"
+as_conversions = "deny"
+as_pointer_underscore = "deny"
+as_underscore = "deny"
+assertions_on_result_states = "deny"
+cfg_not_test = "deny"
 clone_on_ref_ptr = "deny"
-exhaustive_enums = "warn"
-exhaustive_structs = "warn"
-cognitive_complexity = "warn"
-too_many_lines = "warn"
-# Additional LLM-generated-code lints (RUST_GUIDELINES.md §9). The
-# pointer-alignment lints (cast_ptr_alignment / transmute_ptr_to_ref /
-# not_unsafe_ptr_arg_deref) are intentionally omitted -- moot under the
-# crate-level `unsafe_code = "forbid"`.
-large_stack_arrays = "warn"
-large_stack_frames = "warn"
-ptr_as_ptr = "warn"
-cast_lossless = "warn"
+cognitive_complexity = "deny"
+create_dir = "deny"
+dbg_macro = "deny"
+decimal_literal_representation = "deny"
+default_numeric_fallback = "deny"
+default_union_representation = "deny"
+definition_in_module_root = "deny"
+deref_by_slicing = "deny"
+disallowed_script_idents = "deny"
+doc_include_without_cfg = "deny"
+doc_paragraphs_missing_punctuation = "deny"
+else_if_without_else = "deny"
+empty_drop = "deny"
+empty_enum_variants_with_brackets = "deny"
+empty_structs_with_brackets = "deny"
+error_impl_error = "deny"
+exhaustive_enums = "deny"
+exhaustive_structs = "deny"
+exit = "deny"
+expect_used = "deny"
+field_scoped_visibility_modifiers = "deny"
+filetype_is_file = "deny"
+float_arithmetic = "deny"
+float_cmp_const = "deny"
+fn_to_numeric_cast_any = "deny"
+get_unwrap = "deny"
+host_endian_bytes = "deny"
+if_then_some_else_none = "deny"
+impl_trait_in_params = "deny"
+indexing_slicing = "deny"
+infinite_loop = "deny"
+inline_asm_x86_att_syntax = "deny"
+inline_modules = "deny"
+inline_trait_bounds = "deny"
+integer_division = "deny"
+integer_division_remainder_used = "deny"
+iter_over_hash_type = "deny"
+large_include_file = "deny"
+let_underscore_must_use = "deny"
+let_underscore_untyped = "deny"
+lossy_float_literal = "deny"
+map_err_ignore = "deny"
+map_with_unused_argument_over_ranges = "deny"
+mem_forget = "deny"
+min_ident_chars = "deny"
+missing_assert_message = "deny"
+missing_asserts_for_indexing = "deny"
+missing_docs_in_private_items = "deny"
+missing_inline_in_public_items = "deny"
+mixed_read_write_in_expression = "deny"
+mod_module_files = "deny"
+module_name_repetitions = "deny"
+modulo_arithmetic = "deny"
+multiple_inherent_impl = "deny"
+multiple_unsafe_ops_per_block = "deny"
+mutex_atomic = "deny"
+mutex_integer = "deny"
+needless_raw_strings = "deny"
+non_ascii_literal = "deny"
+non_zero_suggestions = "deny"
+panic = "deny"
+panic_in_result_fn = "deny"
+partial_pub_fields = "deny"
+pathbuf_init_then_push = "deny"
+pointer_format = "deny"
+precedence_bits = "deny"
+print_stderr = "deny"
+print_stdout = "deny"
+pub_use = "deny"
+pub_without_shorthand = "deny"                # keeps pub(crate) / pub(super), the form rustfmt writes
+rc_buffer = "deny"
+rc_mutex = "deny"
+redundant_test_prefix = "deny"
+ref_patterns = "deny"
+renamed_function_params = "deny"
+rest_pat_in_fully_bound_structs = "deny"
+rest_pattern_accessible_field = "deny"
+return_and_then = "deny"
+same_name_method = "deny"
+semicolon_inside_block = "deny"
+shadow_reuse = "deny"
+shadow_same = "deny"
+shadow_unrelated = "deny"
+single_char_lifetime_names = "deny"
+std_instead_of_alloc = "deny"
+std_instead_of_core = "deny"
+str_to_string = "deny"
+string_add = "deny"
+string_lit_chars_any = "deny"
+string_slice = "deny"
+suspicious_xor_used_as_pow = "deny"
+tests_outside_test_module = "deny"
+todo = "deny"
+try_err = "deny"
+undocumented_unsafe_blocks = "deny"
+unimplemented = "deny"
+unnecessary_rest_pattern = "deny"
+unnecessary_safety_comment = "deny"
+unnecessary_safety_doc = "deny"
+unnecessary_self_imports = "deny"
+unreachable = "deny"
+unseparated_literal_suffix = "deny"
+unused_result_ok = "deny"
+unused_trait_names = "deny"
+unwrap_in_result = "deny"
+unwrap_used = "deny"
+use_debug = "deny"
+verbose_file_reads = "deny"
+wildcard_enum_match_arm = "deny"
+# Contradiction override: rustc `unreachable_pub` (denied above) and nursery's
+# `redundant_pub_crate` give opposite advice on `pub(crate)`; rustc's wins.
+redundant_pub_crate = "allow"
 
 [profile.release]
 opt-level = 3

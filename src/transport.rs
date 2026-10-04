@@ -1,3 +1,166 @@
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::multiple_inherent_impl,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::unused_trait_names,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::unused_result_ok, reason = "lint-migration: src/transport.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::renamed_function_params,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::let_underscore_untyped,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::let_underscore_must_use,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::integer_division_remainder_used,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::arithmetic_side_effects,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::shadow_reuse, reason = "lint-migration: src/transport.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::ref_patterns, reason = "lint-migration: src/transport.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::option_if_let_else,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_errors_doc,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::impl_trait_in_params,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_const_for_fn,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    all(not(test), target_os = "linux"),
+    expect(
+        clippy::missing_docs_in_private_items,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_inline_in_public_items,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::absolute_paths, reason = "lint-migration: src/transport.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::too_long_first_doc_paragraph,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::min_ident_chars, reason = "lint-migration: src/transport.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::std_instead_of_alloc,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::std_instead_of_core,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    any(
+        all(test, target_os = "linux"),
+        all(feature = "metrics", target_os = "linux")
+    ),
+    expect(
+        clippy::single_char_lifetime_names,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "metrics", target_os = "linux"),
+    expect(
+        clippy::field_scoped_visibility_modifiers,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "metrics", target_os = "linux"),
+    expect(
+        clippy::partial_pub_fields,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#![expect(let_underscore_drop, reason = "lint-migration: src/transport.rs")]
+#![expect(unused_results, reason = "lint-migration: src/transport.rs")]
+#![expect(
+    closure_returning_async_block,
+    reason = "lint-migration: src/transport.rs"
+)]
+#![expect(redundant_imports, reason = "lint-migration: src/transport.rs")]
 use std::{
     future::Future,
     net::{IpAddr, SocketAddr},
@@ -49,7 +212,7 @@ use crate::{
 /// Map an internal `anyhow::Error` chain into a public [`RmcpServerKitError::Startup`]
 /// at the public API boundary, flattening the chain via the alternate
 /// formatter so callers see the full causal path.
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "consumed at .map_err(anyhow_to_startup) call sites; by-value matches the closure shape"
 )]
@@ -62,7 +225,7 @@ fn anyhow_to_startup(e: anyhow::Error) -> RmcpServerKitError {
 /// `From` impl here because startup-phase IO errors (bind, listener) are
 /// semantically distinct from request-time IO errors and should surface
 /// the originating operation in the message.
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "consumed at .map_err(|e| io_to_startup(...)) call sites; by-value matches the closure shape"
 )]
@@ -148,7 +311,7 @@ impl PeerAddr {
 impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerAddr {
     type Rejection = (axum::http::StatusCode, &'static str);
 
-    #[allow(
+    #[expect(
         clippy::unused_async_trait_impl,
         reason = "async is mandated by the axum FromRequestParts trait signature; this impl only reads a request extension synchronously"
     )]
@@ -293,7 +456,7 @@ pub struct SecurityHeadersConfig {
 #[serde(default)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "each field is an independent operator-facing opt-in switch; grouping them into sub-structs would complicate the public API and the TOML surface for no safety gain"
 )]
@@ -384,11 +547,11 @@ impl LogContextConfig {
 }
 
 /// Configuration for the MCP server.
-#[allow(
+#[expect(
     missing_debug_implementations,
     reason = "contains callback/trait objects that don't impl Debug"
 )]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "server configuration naturally has many boolean feature flags"
 )]
@@ -841,10 +1004,6 @@ pub struct McpServerConfig {
 /// serve(config, || H).await
 /// # }
 /// ```
-#[allow(
-    missing_debug_implementations,
-    reason = "wraps T which may not implement Debug; manual impl below avoids leaking inner contents into logs"
-)]
 pub struct Validated<T>(T);
 
 impl<T> std::fmt::Debug for Validated<T> {
@@ -876,7 +1035,7 @@ pub(crate) fn default_request_log_exclude_paths() -> Vec<String> {
     vec!["/healthz".to_owned(), "/readyz".to_owned()]
 }
 
-#[allow(
+#[expect(
     deprecated,
     reason = "internal builders/validators legitimately read/write the deprecated `pub` fields they were designed to manage"
 )]
@@ -1818,7 +1977,7 @@ impl McpServerConfig {
 /// Obtained via [`McpServerConfig::on_reload_ready`].
 /// All swap operations are lock-free and wait-free -- in-flight requests
 /// finish with the old values while new requests see the update immediately.
-#[allow(
+#[expect(
     missing_debug_implementations,
     reason = "contains Arc<AuthState> with non-Debug fields"
 )]
@@ -1914,11 +2073,6 @@ impl ReloadHandle {
 // gated auth/RBAC wiring, and PRM/metrics installation. Further extraction
 // would require threading many `&mut Router` helpers and hurt readability
 // of the layer order (which is security-relevant and must stay visible).
-#[allow(
-    clippy::too_many_lines,
-    clippy::cognitive_complexity,
-    reason = "middleware layer order is security-critical and must remain visible at one glance; extracting `&mut Router` helpers would obscure the auth/RBAC/origin/rate-limit ordering"
-)]
 /// Internal bundle of values produced by [`build_app_router`] and
 /// consumed by [`serve`] / [`serve_with_listener`] when driving the
 /// HTTP listener.
@@ -1981,25 +2135,13 @@ type BindingSecrets = (
 );
 
 fn resolve_binding_secret(config: &McpServerConfig) -> anyhow::Result<BindingSecrets> {
-    #[allow(
-        deprecated,
-        reason = "internal router assembly reads deprecated `pub` config fields by design until 1.0 makes them pub(crate)"
-    )]
     if !config.session_binding && !config.task_binding {
         return Ok((None, None));
     }
-    #[allow(
-        deprecated,
-        reason = "internal router assembly reads deprecated `pub` config fields by design until 1.0 makes them pub(crate)"
-    )]
     let secret = match config.session_binding_secret.as_ref() {
         Some(configured) => configured_session_binding_secret(configured)?,
         None => process_session_binding_secret().clone(),
     };
-    #[allow(
-        deprecated,
-        reason = "internal router assembly reads deprecated `pub` config fields by design until 1.0 makes them pub(crate)"
-    )]
     let pair = (
         config.session_binding.then(|| secret.clone()),
         config.task_binding.then_some(secret),
@@ -2014,11 +2156,11 @@ fn mcp_resource_metadata_url(public_url: &str) -> String {
     )
 }
 
-#[allow(
+#[expect(
     clippy::cognitive_complexity,
     reason = "router assembly is intrinsically sequential; splitting harms readability"
 )]
-#[allow(
+#[expect(
     deprecated,
     reason = "internal router assembly reads deprecated `pub` config fields by design until 1.0 makes them pub(crate)"
 )]
@@ -2321,11 +2463,6 @@ where
         axum::routing::get(healthz)
     };
 
-    #[allow(
-        unused_mut,
-        reason = "the binding is only reassigned when the `oauth` feature adds the \
-                  protected-resource-metadata route below"
-    )]
     let mut router = axum::Router::new()
         .route("/healthz", axum::routing::get(healthz))
         .route("/readyz", readyz_route)
@@ -2774,7 +2911,7 @@ where
     F: Fn() -> H + Send + Sync + Clone + 'static,
 {
     let config = config.into_inner();
-    #[allow(
+    #[expect(
         deprecated,
         reason = "internal serve() reads `bind_addr` to construct the listener; field becomes pub(crate) in 1.0"
     )]
@@ -2892,7 +3029,7 @@ where
 
 /// Emit the standard "listening on …" log lines used by both
 /// [`serve`] and [`serve_with_listener`].
-#[allow(
+#[expect(
     clippy::cognitive_complexity,
     reason = "tracing::info! macro expansions inflate the score; logic is trivial"
 )]
@@ -2925,7 +3062,7 @@ fn log_listening(name: &str, scheme: &str, addr: &str) {
 /// hang indefinitely. The current implementation derives both branches
 /// from a single shared trigger so the timeout race is anchored to the
 /// FIRST (and only) signal.
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     clippy::cognitive_complexity,
     reason = "server start-up threads TLS, reload state, and graceful shutdown through one flow"
@@ -3251,7 +3388,7 @@ fn build_oauth_admin_router(
 /// the bind address, choosing the scheme from whether TLS is configured.
 /// Shared by the OAuth metadata documents and the `WWW-Authenticate`
 /// `resource_metadata` URL so they can never disagree.
-#[allow(
+#[expect(
     deprecated,
     reason = "internal metadata assembly reads deprecated `pub` config fields by design until 1.0 makes them pub(crate)"
 )]
@@ -3772,10 +3909,6 @@ fn build_tls_server_config(
 }
 
 // cancel-safe: builds a constant JSON body with no awaits and no shared state.
-#[allow(
-    clippy::unused_async,
-    reason = "axum route handler signature requires `async fn` even when the body is synchronous"
-)]
 async fn healthz() -> impl IntoResponse {
     axum::Json(serde_json::json!({
         "status": "ok",
@@ -5061,7 +5194,7 @@ fn format_request_headers_for_log(headers: &axum::http::HeaderMap) -> String {
 // NOTE: reported complexity 32/25 is driven entirely by `tracing::*!`
 // macro expansion in this 18-line function (info/warn/info + two matches).
 // There is nothing meaningful to extract; the allow stays.
-#[allow(
+#[expect(
     clippy::cognitive_complexity,
     reason = "complexity is purely tracing macro expansion (info/warn + match arms); 18 lines of straight-line code, nothing meaningful to extract"
 )]
@@ -5088,7 +5221,7 @@ where
     Ok(())
 }
 
-#[allow(
+#[expect(
     deprecated,
     reason = "builder methods are the sanctioned transition layer for deprecated public fields"
 )]
@@ -5335,19 +5468,69 @@ fn check_mtls_capacity_knobs(mtls: &MtlsConfig) -> Result<(), RmcpServerKitError
     Ok(())
 }
 
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::map_err_ignore, reason = "lint-migration: src/transport.rs")
+)]
+#[cfg_attr(
+    all(test, feature = "oauth", target_os = "linux"),
+    expect(clippy::non_ascii_literal, reason = "lint-migration: src/transport.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::panic, reason = "lint-migration: src/transport.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::doc_markdown, reason = "lint-migration: src/transport.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::shadow_unrelated, reason = "lint-migration: src/transport.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::default_numeric_fallback,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::indexing_slicing, reason = "lint-migration: src/transport.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::duration_suboptimal_units,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::unwrap_used, reason = "lint-migration: src/transport.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::assertions_on_result_states,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::expect_used, reason = "lint-migration: src/transport.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::missing_panics_doc,
+        reason = "test code is not rendered API documentation"
+    )
+)]
+#[cfg_attr(test, expect(deprecated, reason = "lint-migration: src/transport.rs"))]
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::indexing_slicing,
-        clippy::unwrap_in_result,
-        clippy::print_stdout,
-        clippy::print_stderr,
-        deprecated,
-        reason = "internal unit tests legitimately read/write the deprecated `pub` fields they were designed to verify"
-    )]
     use std::{sync::Arc, time::Duration};
 
     use axum::{

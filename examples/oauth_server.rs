@@ -18,6 +18,20 @@
 //!
 //! Replace the placeholder issuer / audience / JWKS URL below with values
 //! from your identity provider (Auth0, Okta, Keycloak, Entra ID, …).
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::missing_docs_in_private_items,
+        reason = "lint-migration: examples/oauth_server.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::std_instead_of_alloc,
+        reason = "lint-migration: examples/oauth_server.rs"
+    )
+)]
 
 use std::sync::Arc;
 

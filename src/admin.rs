@@ -17,6 +17,43 @@
 //! `next.run(req).await` and holds no guard, lock, or permit across that
 //! await; downstream route cancel safety is inherited from Axum and the
 //! selected route.
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::absolute_paths, reason = "lint-migration: src/admin.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::min_ident_chars, reason = "lint-migration: src/admin.rs")
+)]
+#![cfg_attr(
+    all(not(test), target_os = "linux"),
+    expect(
+        clippy::missing_docs_in_private_items,
+        reason = "lint-migration: src/admin.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_inline_in_public_items,
+        reason = "lint-migration: src/admin.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::module_name_repetitions,
+        reason = "lint-migration: src/admin.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::unused_trait_names, reason = "lint-migration: src/admin.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::std_instead_of_alloc, reason = "lint-migration: src/admin.rs")
+)]
 
 use std::{
     sync::Arc,
@@ -54,10 +91,6 @@ impl Default for AdminConfig {
 }
 
 /// Shared state used by admin endpoint handlers.
-#[allow(
-    missing_debug_implementations,
-    reason = "contains Arc<AuthState> and ArcSwap<RbacPolicy> without Debug impls"
-)]
 #[derive(Clone)]
 #[non_exhaustive]
 pub(crate) struct AdminState {
@@ -180,13 +213,28 @@ pub(crate) fn admin_router(state: AdminState, config: &AdminConfig) -> Router {
         }))
 }
 
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::indexing_slicing, reason = "lint-migration: src/admin.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::unwrap_used, reason = "lint-migration: src/admin.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::missing_panics_doc,
+        reason = "test code is not rendered API documentation"
+    )
+)]
+#[cfg_attr(test, expect(unused_results, reason = "lint-migration: src/admin.rs"))]
+#[cfg_attr(
+    test,
+    expect(redundant_imports, reason = "lint-migration: src/admin.rs")
+)]
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        reason = "test-only relaxations; production code uses ? and tracing"
-    )]
 
     use axum::http::Request;
     use tower::ServiceExt as _;

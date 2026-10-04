@@ -40,6 +40,24 @@
 //! let exposure = DiagnosticExposure::default();
 //! set_diagnostic_exposure(&exposure);
 //! ```
+#![cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::absolute_paths, reason = "lint-migration: src/diagnostics.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_inline_in_public_items,
+        reason = "lint-migration: src/diagnostics.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::std_instead_of_core,
+        reason = "lint-migration: src/diagnostics.rs"
+    )
+)]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -59,7 +77,7 @@ static UPSTREAM_ERROR_BODIES: AtomicBool = AtomicBool::new(false);
 /// process; see the [module docs](self) for the full warning.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "each field is an independent operator-facing opt-in switch; grouping them into sub-structs would complicate the public API and the TOML surface for no safety gain"
 )]
@@ -115,14 +133,6 @@ pub(crate) fn plaintext_oauth_tokens() -> bool {
 }
 
 /// Whether JWT claim values may be rendered in plaintext.
-#[cfg_attr(
-    not(feature = "oauth"),
-    allow(
-        dead_code,
-        reason = "only consumed by the oauth module; kept unconditional so the \
-                  switch set is uniform across feature combinations"
-    )
-)]
 pub(crate) fn oauth_claim_values() -> bool {
     OAUTH_CLAIM_VALUES.load(Ordering::Relaxed)
 }
@@ -134,11 +144,10 @@ pub(crate) fn tool_call_arguments() -> bool {
 
 /// Whether upstream OAuth error-response bodies may be rendered in plaintext.
 #[cfg_attr(
-    not(feature = "oauth"),
-    allow(
+    all(not(test), not(feature = "oauth")),
+    expect(
         dead_code,
-        reason = "only consumed by the oauth module; kept unconditional so the \
-                  switch set is uniform across feature combinations"
+        reason = "only consumed by the oauth module; kept unconditional so the \n                  switch set is uniform across feature combinations"
     )
 )]
 pub(crate) fn upstream_error_bodies() -> bool {
@@ -187,6 +196,13 @@ impl Drop for ExposureTestGuard {
     }
 }
 
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::missing_panics_doc,
+        reason = "test code is not rendered API documentation"
+    )
+)]
 #[cfg(test)]
 mod tests {
     use super::{

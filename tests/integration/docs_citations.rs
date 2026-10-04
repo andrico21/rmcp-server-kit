@@ -26,12 +26,107 @@
 //! (no path on the line), and prose without a `src/*.rs` mention.
 //!
 //! Drift fixes are easy: re-read the cited code and update the number.
-
-#![allow(
-    clippy::expect_used,
-    clippy::missing_docs_in_private_items,
-    clippy::panic,
-    clippy::print_stderr
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::expect_used,
+        reason = "lint-migration: tests/integration/docs_citations.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::tests_outside_test_module,
+        reason = "lint-migration: tests/integration/docs_citations.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::panic,
+        reason = "lint-migration: tests/integration/docs_citations.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_panics_doc,
+        reason = "lint-migration: tests/integration/docs_citations.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_const_for_fn,
+        reason = "lint-migration: tests/integration/docs_citations.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::shadow_reuse,
+        reason = "lint-migration: tests/integration/docs_citations.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::option_if_let_else,
+        reason = "lint-migration: tests/integration/docs_citations.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::too_long_first_doc_paragraph,
+        reason = "lint-migration: tests/integration/docs_citations.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::arithmetic_side_effects,
+        reason = "lint-migration: tests/integration/docs_citations.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::integer_division_remainder_used,
+        reason = "lint-migration: tests/integration/docs_citations.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::min_ident_chars,
+        reason = "lint-migration: tests/integration/docs_citations.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::std_instead_of_alloc,
+        reason = "lint-migration: tests/integration/docs_citations.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::doc_paragraphs_missing_punctuation,
+        reason = "lint-migration: tests/integration/docs_citations.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::else_if_without_else,
+        reason = "lint-migration: tests/integration/docs_citations.rs"
+    )
+)]
+#![expect(
+    unused_results,
+    reason = "lint-migration: tests/integration/docs_citations.rs"
 )]
 
 use std::{collections::BTreeMap, fs, path::PathBuf};

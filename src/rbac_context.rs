@@ -9,12 +9,63 @@
 //! does not leak roles, tokens, locks, permits, or other guards.  The
 //! wrapped consumer handler's own cancel-safety contract is inherited
 //! unchanged.
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_errors_doc,
+        reason = "lint-migration: src/rbac_context.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::absolute_paths, reason = "lint-migration: src/rbac_context.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::shadow_reuse, reason = "lint-migration: src/rbac_context.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_const_for_fn,
+        reason = "lint-migration: src/rbac_context.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::redundant_pub_crate,
+        reason = "lint-migration: src/rbac_context.rs"
+    )
+)]
+#![cfg_attr(
+    all(not(test), target_os = "linux"),
+    expect(
+        clippy::missing_docs_in_private_items,
+        reason = "lint-migration: src/rbac_context.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::std_instead_of_core,
+        reason = "lint-migration: src/rbac_context.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::std_instead_of_alloc,
+        reason = "lint-migration: src/rbac_context.rs"
+    )
+)]
+#![expect(redundant_imports, reason = "lint-migration: src/rbac_context.rs")]
 
 use std::{borrow::Cow, future::Future, sync::Arc};
 
 use arc_swap::ArcSwap;
 use axum::http::request::Parts;
-#[allow(
+#[expect(
     deprecated,
     reason = "ServerHandler delegation must import legacy logging/subscription parameter types until rmcp removes those methods"
 )]
@@ -196,7 +247,7 @@ macro_rules! delegate_notification {
     };
 }
 
-#[allow(
+#[expect(
     deprecated,
     reason = "ServerHandler delegation must include the legacy subscribe/unsubscribe methods until rmcp removes them"
 )]
@@ -404,6 +455,88 @@ impl<H: ServerHandler> ServerHandler for RbacContextHandler<H> {
     }
 }
 
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::indexing_slicing,
+        reason = "lint-migration: src/rbac_context.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::too_long_first_doc_paragraph,
+        reason = "test code is not rendered API documentation"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::unused_result_ok,
+        reason = "lint-migration: src/rbac_context.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::default_numeric_fallback,
+        reason = "lint-migration: src/rbac_context.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::min_ident_chars,
+        reason = "lint-migration: src/rbac_context.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::panic, reason = "lint-migration: src/rbac_context.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::shadow_unrelated,
+        reason = "lint-migration: src/rbac_context.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::expect_used, reason = "lint-migration: src/rbac_context.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::missing_panics_doc,
+        reason = "test code is not rendered API documentation"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::return_and_then,
+        reason = "lint-migration: src/rbac_context.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::unused_trait_names,
+        reason = "lint-migration: src/rbac_context.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::inline_trait_bounds,
+        reason = "lint-migration: src/rbac_context.rs"
+    )
+)]
+#[cfg_attr(
+    test,
+    expect(unused_results, reason = "lint-migration: src/rbac_context.rs")
+)]
 #[cfg(test)]
 mod tests {
     use std::{collections::VecDeque, convert::Infallible, sync::Arc};
@@ -456,7 +589,7 @@ mod tests {
         }
     }
 
-    #[allow(
+    #[expect(
         clippy::unused_async_trait_impl,
         reason = "rmcp ServerHandler requires async methods; this in-memory test handler returns immediately"
     )]
@@ -505,7 +638,7 @@ mod tests {
         }
     }
 
-    #[allow(
+    #[expect(
         clippy::unused_async_trait_impl,
         reason = "rmcp Transport requires async receive/close; this in-memory test transport returns immediately"
     )]
@@ -819,7 +952,7 @@ mod tests {
         }
     }
 
-    #[allow(
+    #[expect(
         clippy::unused_async_trait_impl,
         reason = "rmcp ServerHandler requires async methods; this in-memory test handler returns immediately"
     )]
@@ -878,7 +1011,7 @@ mod tests {
     /// allow.
     #[derive(Clone, Default)]
     struct PassthroughDefaults<H> {
-        #[allow(
+        #[expect(
             dead_code,
             reason = "deliberately never read: this type overrides nothing, so the probe must stay unreached"
         )]
@@ -1073,10 +1206,6 @@ mod tests {
         send_result: Arc<std::sync::Mutex<Option<String>>>,
     }
 
-    #[allow(
-        clippy::unused_async_trait_impl,
-        reason = "rmcp ServerHandler requires async methods; this in-memory test handler returns immediately"
-    )]
     impl ServerHandler for NotificationProbeHandler {
         fn get_info(&self) -> ServerConfig {
             ServerConfig::new(
@@ -1131,7 +1260,7 @@ mod tests {
         outbound: Arc<std::sync::Mutex<Vec<ServerJsonRpcMessage>>>,
     }
 
-    #[allow(
+    #[expect(
         clippy::unused_async_trait_impl,
         reason = "rmcp Transport requires async receive/close; this in-memory test transport returns immediately"
     )]
@@ -1377,9 +1506,8 @@ mod tests {
         }
     }
 
-    #[allow(
+    #[expect(
         clippy::unused_async_trait_impl,
-        deprecated,
         reason = "coverage drives rmcp's async trait methods, whose probe bodies return immediately"
     )]
     impl ServerHandler for ForwardingProbe {

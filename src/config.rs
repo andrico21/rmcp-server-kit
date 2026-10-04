@@ -1,3 +1,82 @@
+#![cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::field_scoped_visibility_modifiers,
+        reason = "lint-migration: src/config.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::too_long_first_doc_paragraph,
+        reason = "lint-migration: src/config.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::min_ident_chars, reason = "lint-migration: src/config.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::missing_const_for_fn, reason = "lint-migration: src/config.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::arithmetic_side_effects,
+        reason = "lint-migration: src/config.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::map_err_ignore, reason = "lint-migration: src/config.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::shadow_reuse, reason = "lint-migration: src/config.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::missing_errors_doc, reason = "lint-migration: src/config.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_inline_in_public_items,
+        reason = "lint-migration: src/config.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::absolute_paths, reason = "lint-migration: src/config.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::module_name_repetitions,
+        reason = "lint-migration: src/config.rs"
+    )
+)]
+#![cfg_attr(
+    all(not(test), target_os = "linux"),
+    expect(
+        clippy::missing_docs_in_private_items,
+        reason = "lint-migration: src/config.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::std_instead_of_core, reason = "lint-migration: src/config.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::else_if_without_else, reason = "lint-migration: src/config.rs")
+)]
+#![cfg_attr(
+    any(feature = "oauth", test),
+    expect(unused_results, reason = "lint-migration: src/config.rs")
+)]
+#![expect(redundant_imports, reason = "lint-migration: src/config.rs")]
 use std::{path::PathBuf, time::Duration};
 
 use secrecy::{ExposeSecret as _, SecretString};
@@ -313,7 +392,7 @@ pub(crate) const RBAC_REDACTION_SALT_FILE_ENV: &str = "RMCP_SERVER_KIT__RBAC__RE
 /// Server listener configuration (reusable across MCP projects).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "server configuration is a flat TOML schema with independent boolean feature flags"
 )]
@@ -1202,7 +1281,7 @@ fn parse_duration_field(field: &str, value: &str) -> Result<Duration, RmcpServer
 /// Observability settings (reusable across MCP projects).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "observability configuration is a flat TOML schema with independent boolean feature flags"
 )]
@@ -1325,7 +1404,7 @@ pub(crate) enum SharedConfigViolation {
 /// env overrides, bridge behaviour) stays where it is: those inputs are not
 /// common to both types, and folding them in here would change validation
 /// behaviour that no test currently pins.
-#[allow(
+#[expect(
     clippy::fn_params_excessive_bools,
     reason = "these are the five independent predicates both validators evaluate; a params struct would carry the same five bools and only relocate the lint"
 )]
@@ -1743,19 +1822,76 @@ fn default_sse_keep_alive() -> String {
     "15s".into()
 }
 
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::unused_trait_names, reason = "lint-migration: src/config.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::indexing_slicing, reason = "lint-migration: src/config.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::duration_suboptimal_units,
+        reason = "lint-migration: src/config.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::shadow_unrelated, reason = "lint-migration: src/config.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::expect_used, reason = "lint-migration: src/config.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::uninlined_format_args,
+        reason = "lint-migration: src/config.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::panic, reason = "lint-migration: src/config.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::assertions_on_result_states,
+        reason = "lint-migration: src/config.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::unwrap_used, reason = "lint-migration: src/config.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::missing_panics_doc,
+        reason = "test code is not rendered API documentation"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::std_instead_of_alloc, reason = "lint-migration: src/config.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::needless_raw_strings, reason = "lint-migration: src/config.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::single_char_lifetime_names,
+        reason = "lint-migration: src/config.rs"
+    )
+)]
+#[cfg_attr(test, expect(deprecated, reason = "lint-migration: src/config.rs"))]
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::indexing_slicing,
-        clippy::unwrap_in_result,
-        clippy::print_stdout,
-        clippy::print_stderr,
-        deprecated,
-        reason = "test-only relaxations; production code uses ? and tracing"
-    )]
     use std::{collections::HashSet, sync::Arc, time::Duration};
 
     use super::*;
@@ -1839,7 +1975,7 @@ mod tests {
         assert!(!cfg.log_tool_call_arguments);
     }
 
-    #[allow(
+    #[expect(
         clippy::cognitive_complexity,
         reason = "tracing! macro expansions add branches"
     )]

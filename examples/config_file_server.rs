@@ -23,6 +23,41 @@
 //! curl http://127.0.0.1:8080/healthz
 //! curl http://127.0.0.1:8080/readyz
 //! ```
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::shadow_reuse,
+        reason = "lint-migration: examples/config_file_server.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::absolute_paths,
+        reason = "lint-migration: examples/config_file_server.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_docs_in_private_items,
+        reason = "lint-migration: examples/config_file_server.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::std_instead_of_core,
+        reason = "lint-migration: examples/config_file_server.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::std_instead_of_alloc,
+        reason = "lint-migration: examples/config_file_server.rs"
+    )
+)]
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 

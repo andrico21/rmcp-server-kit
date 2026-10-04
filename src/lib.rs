@@ -1,16 +1,15 @@
 #![forbid(unsafe_code)]
+// The crate root is a public facade: every `pub use` here (and in `secret`) is
+// the point of the re-export, so `clippy::pub_use` is expected, not fixed.
+#![expect(clippy::pub_use, reason = "public facade")]
+// `dead_code_pub_in_binary` fires on the public `serve*` entry points only in
+// the lib unit-test binary; rustc accepts an expect for it at crate level
+// alone (the narrowest scope possible).
 #![cfg_attr(
     test,
-    allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::panic_in_result_fn,
-        clippy::indexing_slicing,
-        clippy::unwrap_in_result,
-        clippy::print_stdout,
-        clippy::print_stderr,
-        reason = "test-only relaxations; production code uses ? and tracing"
+    expect(
+        dead_code_pub_in_binary,
+        reason = "public API: unused inside the unit-test harness"
     )
 )]
 
@@ -167,7 +166,7 @@ pub mod mtls_revocation;
 // root's stable API surface -- `cargo-semver-checks` flags removals, not
 // accidental additions, so the mistake would ship unnoticed. Listing the three
 // items keeps the root surface a deliberate choice.
-#[allow(
+#[expect(
     deprecated,
     reason = "`McpxError` is itself deprecated but must stay re-exported at the \
               crate root until its removal in the next major; re-exporting it \

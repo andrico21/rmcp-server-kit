@@ -1,3 +1,36 @@
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::rest_pattern_accessible_field,
+        reason = "lint-migration: src/error.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::std_instead_of_alloc, reason = "lint-migration: src/error.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_inline_in_public_items,
+        reason = "lint-migration: src/error.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::std_instead_of_core, reason = "lint-migration: src/error.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::absolute_paths, reason = "lint-migration: src/error.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::module_name_repetitions,
+        reason = "lint-migration: src/error.rs"
+    )
+)]
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -200,6 +233,44 @@ impl IntoResponse for RmcpServerKitError {
 /// Convenience `Result` alias bound to [`RmcpServerKitError`].
 pub type Result<T> = std::result::Result<T, RmcpServerKitError>;
 
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::min_ident_chars, reason = "lint-migration: src/error.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::arithmetic_side_effects,
+        reason = "lint-migration: src/error.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::shadow_unrelated, reason = "lint-migration: src/error.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::expect_used, reason = "lint-migration: src/error.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::unwrap_used, reason = "lint-migration: src/error.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::missing_panics_doc,
+        reason = "test code is not rendered API documentation"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::unused_trait_names, reason = "lint-migration: src/error.rs")
+)]
+#[cfg_attr(
+    test,
+    expect(redundant_imports, reason = "lint-migration: src/error.rs")
+)]
 #[cfg(test)]
 mod tests {
     use axum::{http::StatusCode, response::IntoResponse};
@@ -535,7 +606,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::literal_string_with_formatting_args,
         reason = "the format-shaped text is the fixture under test, not a format call"
     )]

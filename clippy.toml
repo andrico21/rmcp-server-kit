@@ -1,7 +1,52 @@
-# Clippy threshold configuration.
-# Applied locally within the rmcp-server-kit crate.
-
-cognitive-complexity-threshold = 25
-too-many-lines-threshold = 100
-max-fn-params-bools = 3
-enum-variant-size-threshold = 200
+# clippy.toml - workspace root
+# Lint *levels* live in Cargo.toml (`[lints]`); lint *configuration* lives here.
+avoid-breaking-exported-api = false       # report even when the fix changes public API
+check-private-items = true                # missing_*_doc lints cover private items too
+allow-unwrap-in-tests = false             # tests follow the same panic rules
+allow-expect-in-tests = false
+allow-panic-in-tests = false
+allow-dbg-in-tests = false
+allow-print-in-tests = false
+allow-indexing-slicing-in-tests = false
+warn-on-all-wildcard-imports = true
+allow-mixed-uninlined-format-args = false
+cognitive-complexity-threshold = 25       # drives `cognitive_complexity`
+too-many-lines-threshold = 100            # drives `too_many_lines`
+max-fn-params-bools = 3                   # drives `fn_params_excessive_bools`
+enum-variant-size-threshold = 200         # drives `large_enum_variant`
+# Every unavoidable duplicate, mirrored in deny.toml `[bans] skip`; each
+# chain was reported by `cargo tree -i <crate>@<version> -e normal --all-features`.
+allowed-duplicate-crates = [
+  "base64",         # =0.22.1: jsonwebtoken 11.1.0 -> pem 3.0.6; base64 0.23.1 is the direct dependency
+  "bitflags",       # =1.3.2: windows-permissions 0.2.4 (Windows-only transitive dependency)
+  "block-buffer",   # =0.10.4: digest 0.10.7 via ed25519-dalek 2.2.0 / ecdsa 0.16.9 / elliptic-curve 0.13.8 (jsonwebtoken 11.1.0 RustCrypto 0.10 stack)
+  "const-oid",      # =0.9.6: der 0.7.10 / pkcs1 0.7.5 / pkcs8 0.10.2 via rsa 0.9.10 and ecdsa 0.16.9 (jsonwebtoken 11.1.0)
+  "cpufeatures",    # =0.2.17: curve25519-dalek 4.1.3 and sha2 0.10.9 via jsonwebtoken 11.1.0
+  "crypto-common",  # =0.1.6: digest 0.10.7 of the jsonwebtoken 11.1.0 RustCrypto 0.10 stack
+  "digest",         # =0.10.7: jsonwebtoken 11.1.0 RustCrypto 0.10 stack (ed25519-dalek 2.2.0, ecdsa 0.16.9, hmac 0.12.1)
+  "hmac",           # =0.12.1: hkdf 0.12.4 / rfc6979 0.4.0 via elliptic-curve 0.13.8 and jsonwebtoken 11.1.0
+  "r-efi",          # =5.3.0: getrandom 0.3.4 via governor 0.10.4 (UEFI target only)
+  "rand_chacha",    # =0.3.1: rand 0.8.8 via jsonwebtoken 11.1.0 and num-bigint-dig 0.8.6 -> rsa 0.9.10
+  "sha2",           # =0.10.9: ed25519-dalek 2.2.0 and p256 0.13.2 / p384 0.13.1 via jsonwebtoken 11.1.0
+  "syn",            # =2.0.119: asn1-rs-derive 0.6.0 / curve25519-dalek-derive 0.1.1 via x509-parser 0.18.1 and jsonwebtoken 11.1.0
+  "synstructure",   # =0.13.2: asn1-rs-derive 0.6.0 -> asn1-rs 0.7.2 -> x509-parser 0.18.1
+  "thiserror",      # =1.0.69: protobuf 3.7.2 and protobuf-support 3.7.2 -> prometheus 0.14.0
+  "thiserror-impl", # =1.0.69: thiserror 1.0.69 (proc-macro) via protobuf 3.7.2 -> prometheus 0.14.0
+  "tower-http",     # =0.6.11: reqwest 0.13.5 (dev dependency); tower-http 0.7.1 is the direct dependency
+  "windows-sys",    # =0.52.0: ring 0.17.14 -> rustls 0.23.45 (Windows-only transitive dependency)
+  "getrandom",      # =0.2.17: rand_core 0.6.4 via crypto-bigint 0.5.5 -> elliptic-curve 0.13.8 (jsonwebtoken 11.1.0); =0.3.4: governor 0.10.4 and rand 0.9.5
+  "hashbrown",      # =0.14.5: dashmap 6.2.1 -> governor 0.10.4; =0.16.1: governor 0.10.4
+  "rand",           # =0.8.8: jsonwebtoken 11.1.0 and num-bigint-dig 0.8.6 -> rsa 0.9.10; =0.9.5: governor 0.10.4
+  "rand_core",      # =0.6.4: crypto-bigint 0.5.5 / rsa 0.9.10 via jsonwebtoken 11.1.0; =0.9.5: rand 0.9.5 -> governor 0.10.4 and rand_chacha 0.9.0
+]
+# ".." keeps Clippy's defaults; appended proper nouns keep `doc_markdown`
+# satisfiable without backticking names it only misreads as prose.
+doc-valid-idents = [
+  "..",
+  "DoS",
+  "GeneralizedTime",
+  "HAProxy",
+  "IMDSv2",
+  "IdP",
+  "OpenShift",
+]

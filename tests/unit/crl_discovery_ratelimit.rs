@@ -28,14 +28,77 @@
 //! Component-level testing only: end-to-end exercise via the verifier
 //! requires a full mTLS handshake, which is already covered in
 //! `tests/integration/e2e.rs`.
-
-#![allow(
-    deprecated,
-    reason = "exercises the deprecated ungated test constructors on purpose"
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::tests_outside_test_module,
+        reason = "lint-migration: tests/unit/crl_discovery_ratelimit.rs"
+    )
 )]
-#![allow(clippy::expect_used)]
-#![allow(clippy::unwrap_used)]
-#![allow(clippy::panic)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::too_long_first_doc_paragraph,
+        reason = "lint-migration: tests/unit/crl_discovery_ratelimit.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::shadow_reuse,
+        reason = "lint-migration: tests/unit/crl_discovery_ratelimit.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::let_underscore_untyped,
+        reason = "lint-migration: tests/unit/crl_discovery_ratelimit.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::let_underscore_must_use,
+        reason = "lint-migration: tests/unit/crl_discovery_ratelimit.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::expect_used,
+        reason = "lint-migration: tests/unit/crl_discovery_ratelimit.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::absolute_paths,
+        reason = "lint-migration: tests/unit/crl_discovery_ratelimit.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_panics_doc,
+        reason = "lint-migration: tests/unit/crl_discovery_ratelimit.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::std_instead_of_alloc,
+        reason = "lint-migration: tests/unit/crl_discovery_ratelimit.rs"
+    )
+)]
+#![expect(
+    let_underscore_drop,
+    reason = "lint-migration: tests/unit/crl_discovery_ratelimit.rs"
+)]
+#![expect(
+    deprecated,
+    reason = "lint-migration: tests/unit/crl_discovery_ratelimit.rs"
+)]
 
 use std::sync::Arc;
 

@@ -15,12 +15,118 @@
 //! 3. The cert-bearing client uses `redirect::Policy::none()` so that
 //!    an attacker-controlled 3xx from the token endpoint cannot
 //!    cause the cert to be re-presented to a different host.
-
-#![allow(clippy::expect_used, reason = "tests")]
-#![allow(clippy::unwrap_used, reason = "tests")]
-#![allow(clippy::panic, reason = "tests")]
-#![allow(clippy::print_stderr, reason = "tests")]
-#![allow(clippy::indexing_slicing, reason = "tests")]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::tests_outside_test_module,
+        reason = "lint-migration: tests/integration/e2e_oauth_mtls.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::arithmetic_side_effects,
+        reason = "lint-migration: tests/integration/e2e_oauth_mtls.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::indexing_slicing,
+        reason = "lint-migration: tests/integration/e2e_oauth_mtls.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::print_stderr,
+        reason = "lint-migration: tests/integration/e2e_oauth_mtls.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::min_ident_chars,
+        reason = "lint-migration: tests/integration/e2e_oauth_mtls.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::absolute_paths,
+        reason = "lint-migration: tests/integration/e2e_oauth_mtls.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::let_underscore_untyped,
+        reason = "lint-migration: tests/integration/e2e_oauth_mtls.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::let_underscore_must_use,
+        reason = "lint-migration: tests/integration/e2e_oauth_mtls.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::expect_used,
+        reason = "lint-migration: tests/integration/e2e_oauth_mtls.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::missing_panics_doc,
+        reason = "lint-migration: tests/integration/e2e_oauth_mtls.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::unused_trait_names,
+        reason = "lint-migration: tests/integration/e2e_oauth_mtls.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::std_instead_of_alloc,
+        reason = "lint-migration: tests/integration/e2e_oauth_mtls.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::std_instead_of_core,
+        reason = "lint-migration: tests/integration/e2e_oauth_mtls.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(
+        clippy::unseparated_literal_suffix,
+        reason = "lint-migration: tests/integration/e2e_oauth_mtls.rs"
+    )
+)]
+#![cfg_attr(
+    feature = "oauth-mtls-client",
+    expect(
+        unused_results,
+        reason = "lint-migration: tests/integration/e2e_oauth_mtls.rs"
+    )
+)]
+#![cfg_attr(
+    feature = "oauth-mtls-client",
+    expect(
+        let_underscore_drop,
+        reason = "lint-migration: tests/integration/e2e_oauth_mtls.rs"
+    )
+)]
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 

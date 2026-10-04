@@ -116,6 +116,13 @@ def aggregate(rows_records, root: Path, renamed_removed):
             if not span:
                 continue
             file = span.get("file_name")
+            # Only in-repo source files are keyed. Dependency and external
+            # macro spans (e.g. proptest's `tests_outside_test_module`) carry a
+            # machine-specific absolute registry path and cannot be part of a
+            # portable per-file baseline.
+            if not isinstance(file, str) or not file.startswith(
+                    ("src/", "tests/", "benches/", "examples/")):
+                continue
             line = span.get("line_start")
             col = span.get("column_start")
             key = (code, file, line, col)

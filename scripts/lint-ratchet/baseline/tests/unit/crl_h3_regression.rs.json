@@ -1,0 +1,18 @@
+{
+  "file": "tests/unit/crl_h3_regression.rs",
+  "keys": {
+    "test|clippy::absolute_paths|--all-features": 6,
+    "test|clippy::duration_suboptimal_units|--all-features": 1,
+    "test|clippy::expect_used|--all-features": 8,
+    "test|clippy::let_underscore_must_use|--all-features": 3,
+    "test|clippy::let_underscore_untyped|--all-features": 3,
+    "test|clippy::missing_panics_doc|--all-features": 7,
+    "test|clippy::std_instead_of_alloc|--all-features": 1,
+    "test|clippy::std_instead_of_core|--all-features": 1,
+    "test|clippy::tests_outside_test_module|--all-features": 4,
+    "test|clippy::unseparated_literal_suffix|--all-features": 5,
+    "test|deprecated|--all-features": 1,
+    "test|let_underscore_drop|--all-features": 3
+  },
+  "toolchain": "1.99.0"
+}

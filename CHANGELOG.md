@@ -55,6 +55,17 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ### Changed
 
+- **Strict lint profile adopted, with no public API change** - `Cargo.toml` now
+  carries the vendored Section 9 lint profile unchanged (every rustc group and
+  Clippy group at `deny`, plus the documented `redundant_pub_crate` override),
+  `clippy.toml` carries the matching lint configuration, and every former
+  `#[allow]` became a narrowest-item `#[expect(lint, reason = "...")]`. Warnings
+  remain errors (`build.warnings = "deny"`). Temporary per-file
+  `lint-migration:` expectations keep the build green while the remaining
+  findings are burned down in follow-up PRs; a count gate prevents them from
+  growing and a catalog gate keeps every permanent reason reviewed. Downstream
+  users see the same API and the same runtime behavior, and need Rust 1.99 to
+  build.
 - **Framework INFO lines are visible under the default filter** - the default
   `log_level` is now `"info,rmcp=warn,rmcp_server_kit=info"`. The previous
   default used prefix matching that hid this crate's own INFO lines, including

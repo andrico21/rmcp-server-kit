@@ -1,0 +1,10 @@
+{
+  "file": "examples/oauth_server.rs",
+  "keys": {
+    "test|clippy::missing_docs_in_private_items|--all-features": 1,
+    "test|clippy::missing_docs_in_private_items|--features oauth": 1,
+    "test|clippy::std_instead_of_alloc|--all-features": 1,
+    "test|clippy::std_instead_of_alloc|--features oauth": 1
+  },
+  "toolchain": "1.99.0"
+}

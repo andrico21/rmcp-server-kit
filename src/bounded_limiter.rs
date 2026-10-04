@@ -42,6 +42,84 @@
 //! - The map uses [`std::sync::Mutex`] (not [`tokio::sync::Mutex`]) since
 //!   admission checks must be synchronous and never `.await`.
 //! - We do not log inside the critical section.
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::map_err_ignore,
+        reason = "lint-migration: src/bounded_limiter.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::min_ident_chars,
+        reason = "lint-migration: src/bounded_limiter.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::shadow_unrelated,
+        reason = "lint-migration: src/bounded_limiter.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::arithmetic_side_effects,
+        reason = "lint-migration: src/bounded_limiter.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::absolute_paths,
+        reason = "lint-migration: src/bounded_limiter.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::shadow_reuse,
+        reason = "lint-migration: src/bounded_limiter.rs"
+    )
+)]
+#![cfg_attr(
+    all(not(test), target_os = "linux"),
+    expect(
+        clippy::missing_docs_in_private_items,
+        reason = "lint-migration: src/bounded_limiter.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_inline_in_public_items,
+        reason = "lint-migration: src/bounded_limiter.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::module_name_repetitions,
+        reason = "lint-migration: src/bounded_limiter.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::std_instead_of_alloc,
+        reason = "lint-migration: src/bounded_limiter.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::std_instead_of_core,
+        reason = "lint-migration: src/bounded_limiter.rs"
+    )
+)]
+#![expect(unused_results, reason = "lint-migration: src/bounded_limiter.rs")]
 
 use std::{
     collections::HashMap,
@@ -128,7 +206,7 @@ struct Inner<K: Eq + Hash + Clone> {
 /// Memory-bounded keyed rate limiter.
 ///
 /// Cheaply cloneable; clones share state.
-#[allow(
+#[expect(
     missing_debug_implementations,
     reason = "wraps governor RateLimiter which has no Debug impl"
 )]
@@ -477,6 +555,53 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
     }
 }
 
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::let_underscore_untyped,
+        reason = "lint-migration: src/bounded_limiter.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::let_underscore_must_use,
+        reason = "lint-migration: src/bounded_limiter.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::panic, reason = "lint-migration: src/bounded_limiter.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::assertions_on_result_states,
+        reason = "lint-migration: src/bounded_limiter.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::too_long_first_doc_paragraph,
+        reason = "test code is not rendered API documentation"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::expect_used, reason = "lint-migration: src/bounded_limiter.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::unwrap_used, reason = "lint-migration: src/bounded_limiter.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::missing_panics_doc,
+        reason = "test code is not rendered API documentation"
+    )
+)]
 #[cfg(test)]
 mod tests {
     use std::{

@@ -5,15 +5,103 @@
 //! The metrics listener binds inside `serve_metrics` and does not expose the
 //! chosen port, so each test pre-reserves an ephemeral port, passes the
 //! concrete address, and polls for readiness.
-
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::unwrap_in_result,
-    clippy::print_stdout,
-    clippy::print_stderr
+#![cfg_attr(
+    all(feature = "metrics", target_os = "linux"),
+    expect(
+        clippy::let_underscore_untyped,
+        reason = "lint-migration: tests/integration/metrics_handle.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "metrics", target_os = "linux"),
+    expect(
+        clippy::tests_outside_test_module,
+        reason = "lint-migration: tests/integration/metrics_handle.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "metrics", target_os = "linux"),
+    expect(
+        clippy::panic,
+        reason = "lint-migration: tests/integration/metrics_handle.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "metrics", target_os = "linux"),
+    expect(
+        clippy::default_numeric_fallback,
+        reason = "lint-migration: tests/integration/metrics_handle.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "metrics", target_os = "linux"),
+    expect(
+        clippy::expect_used,
+        reason = "lint-migration: tests/integration/metrics_handle.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "metrics", target_os = "linux"),
+    expect(
+        clippy::shadow_reuse,
+        reason = "lint-migration: tests/integration/metrics_handle.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "metrics", target_os = "linux"),
+    expect(
+        clippy::absolute_paths,
+        reason = "lint-migration: tests/integration/metrics_handle.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "metrics", target_os = "linux"),
+    expect(
+        clippy::unused_result_ok,
+        reason = "lint-migration: tests/integration/metrics_handle.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "metrics", target_os = "linux"),
+    expect(
+        clippy::unwrap_used,
+        reason = "lint-migration: tests/integration/metrics_handle.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "metrics", target_os = "linux"),
+    expect(
+        clippy::missing_panics_doc,
+        reason = "lint-migration: tests/integration/metrics_handle.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "metrics", target_os = "linux"),
+    expect(
+        clippy::std_instead_of_alloc,
+        reason = "lint-migration: tests/integration/metrics_handle.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "metrics", target_os = "linux"),
+    expect(
+        clippy::std_instead_of_core,
+        reason = "lint-migration: tests/integration/metrics_handle.rs"
+    )
+)]
+#![cfg_attr(
+    feature = "metrics",
+    expect(
+        let_underscore_drop,
+        reason = "lint-migration: tests/integration/metrics_handle.rs"
+    )
+)]
+#![cfg_attr(
+    feature = "metrics",
+    expect(
+        unused_results,
+        reason = "lint-migration: tests/integration/metrics_handle.rs"
+    )
 )]
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};

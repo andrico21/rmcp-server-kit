@@ -1,0 +1,21 @@
+{
+  "file": "examples/minimal_server.rs",
+  "keys": {
+    "test|clippy::absolute_paths|": 1,
+    "test|clippy::absolute_paths|--all-features": 1,
+    "test|clippy::absolute_paths|--features metrics": 1,
+    "test|clippy::absolute_paths|--features oauth": 1,
+    "test|clippy::absolute_paths|--no-default-features": 1,
+    "test|clippy::missing_docs_in_private_items|": 1,
+    "test|clippy::missing_docs_in_private_items|--all-features": 1,
+    "test|clippy::missing_docs_in_private_items|--features metrics": 1,
+    "test|clippy::missing_docs_in_private_items|--features oauth": 1,
+    "test|clippy::missing_docs_in_private_items|--no-default-features": 1,
+    "test|clippy::std_instead_of_core|": 1,
+    "test|clippy::std_instead_of_core|--all-features": 1,
+    "test|clippy::std_instead_of_core|--features metrics": 1,
+    "test|clippy::std_instead_of_core|--features oauth": 1,
+    "test|clippy::std_instead_of_core|--no-default-features": 1
+  },
+  "toolchain": "1.99.0"
+}

@@ -290,6 +290,36 @@ jobs:
       - name: Run every lint-ratchet self-test
         run: for s in scripts/lint-ratchet/*.py; do python3 "$s" --self-test; done
 
+  lint-count-gate:
+    name: lint count gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # The committed baseline is measured with the pinned 1.99.0 clippy; the
+      # count gate is a ratchet: a (file, scope, lint, row) key may not exceed
+      # its baseline, and the baseline only moves down (D-6'').
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2.9.1
+      - name: Measure the lint-migration baseline
+        run: python3 scripts/lint-ratchet/measure.py
+      - name: Enforce the count gate
+        run: python3 scripts/lint-ratchet/count_gate.py
+
+  lint-gates:
+    name: lint catalog + allow gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # stdlib-only Python (>= 3.11, tomllib); no Rust toolchain needed.
+      - name: Catalog gate
+        run: python3 scripts/lint-ratchet/catalog_gate.py
+      - name: Allow gate
+        run: python3 scripts/lint-ratchet/allow_gate.py --enforce
+      - name: Profile equality
+        run: python3 scripts/lint-ratchet/profile_eq.py --clippy-toml
+
   # ---------------------------------------------------------------------------
   # Supply-chain advisory jobs (Phase 2 / 1.1.0).
   #

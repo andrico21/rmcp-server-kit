@@ -5,6 +5,147 @@
 //! 2. Bearer token (API key) with Argon2id hash verification
 //!
 //! Includes per-source-IP rate limiting on authentication attempts.
+#![cfg_attr(
+    not(feature = "oauth"),
+    expect(clippy::doc_markdown, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    not(feature = "oauth"),
+    expect(clippy::partial_pub_fields, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::multiple_inherent_impl, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::shadow_same, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::ref_patterns, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::arithmetic_side_effects,
+        reason = "lint-migration: src/auth.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::missing_panics_doc, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::rest_pattern_accessible_field,
+        reason = "lint-migration: src/auth.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::return_and_then, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::option_if_let_else, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::unnecessary_safety_comment,
+        reason = "lint-migration: src/auth.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::shadow_reuse, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::unnecessary_wraps, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::unused_self, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::uninlined_format_args, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::missing_errors_doc, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::impl_trait_in_params, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::min_ident_chars, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::missing_const_for_fn, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    all(not(test), target_os = "linux"),
+    expect(
+        clippy::missing_docs_in_private_items,
+        reason = "lint-migration: src/auth.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_inline_in_public_items,
+        reason = "lint-migration: src/auth.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::absolute_paths, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::module_name_repetitions,
+        reason = "lint-migration: src/auth.rs"
+    )
+)]
+#![cfg_attr(
+    all(not(test), target_os = "linux"),
+    expect(clippy::wildcard_imports, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::unused_trait_names, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::std_instead_of_alloc, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::std_instead_of_core, reason = "lint-migration: src/auth.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::unseparated_literal_suffix,
+        reason = "lint-migration: src/auth.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::field_scoped_visibility_modifiers,
+        reason = "lint-migration: src/auth.rs"
+    )
+)]
+#![expect(unused_results, reason = "lint-migration: src/auth.rs")]
 
 use std::{
     collections::HashSet,
@@ -124,17 +265,17 @@ pub(crate) enum RejectionReason {
     Expired,
     #[cfg_attr(
         not(feature = "oauth"),
-        allow(dead_code, reason = "constructed only by OAuth JWT validation")
+        expect(dead_code, reason = "constructed only by OAuth JWT validation")
     )]
     Audience,
     #[cfg_attr(
         not(feature = "oauth"),
-        allow(dead_code, reason = "constructed only by OAuth JWT validation")
+        expect(dead_code, reason = "constructed only by OAuth JWT validation")
     )]
     Role,
     #[cfg_attr(
         not(feature = "oauth"),
-        allow(dead_code, reason = "constructed only by OAuth JWT validation")
+        expect(dead_code, reason = "constructed only by OAuth JWT validation")
     )]
     Subject,
 }
@@ -467,7 +608,7 @@ impl ApiKeyEntry {
 /// mTLS client certificate authentication configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "mTLS CRL behavior is intentionally configured as independent booleans"
 )]
@@ -954,7 +1095,7 @@ pub struct ApiKeySummary {
 
 /// Snapshot of the enabled authentication methods for admin endpoints.
 #[derive(Debug, Clone, serde::Serialize)]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "this is a flat summary of independent auth-method booleans"
 )]
@@ -1160,10 +1301,6 @@ impl AuthLogContext {
 ///
 /// `api_keys` uses [`ArcSwap`] so the SIGHUP handler can atomically
 /// swap in a new key list without blocking in-flight requests.
-#[allow(
-    missing_debug_implementations,
-    reason = "contains governor RateLimiter and JwksCache without Debug impls"
-)]
 #[non_exhaustive]
 pub(crate) struct AuthState {
     /// Active set of API keys (hot-swappable).
@@ -1368,7 +1505,7 @@ pub fn extract_mtls_identity(cert_der: &[u8], default_role: &str) -> Option<Auth
             .ok()
             .flatten()
             .and_then(|san| {
-                #[allow(
+                #[expect(
                     clippy::wildcard_enum_match_arm,
                     reason = "x509-parser GeneralName is a large external enum; only DNSName is meaningful here"
                 )]
@@ -1506,7 +1643,7 @@ where
 {
     use subtle::ConstantTimeEq as _;
 
-    #[allow(
+    #[expect(
         clippy::expect_used,
         reason = "DUMMY_PHC_HASH is a static LazyLock built from a fixed Argon2id PHC string by construction; PasswordHash::new on it is infallible. See DUMMY_PHC_HASH definition."
     )]
@@ -1594,7 +1731,7 @@ pub(crate) fn verify_bearer_token_verdict(token: &str, keys: &[ApiKeyEntry]) -> 
 /// set by the PHC `m`/`t`/`p` parameters, not by the salt value, so a
 /// fixed salt costs exactly what a random one would.
 static DUMMY_PHC_HASH: LazyLock<String> = LazyLock::new(|| {
-    #[allow(
+    #[expect(
         clippy::expect_used,
         reason = "Argon2::default() over a fixed plaintext and a fixed 16-byte salt is infallible; it fails only on invalid params or salt length, both constants here"
     )]
@@ -1799,15 +1936,6 @@ fn log_auth_failure(
     );
 }
 
-#[cfg_attr(
-    not(feature = "oauth"),
-    allow(
-        unused_variables,
-        reason = "`state` is only read to decide whether to advertise OAuth \
-                  protected-resource metadata; without the `oauth` feature that \
-                  decision is a compile-time `false`"
-    )
-)]
 fn unauthorized_response(state: &AuthState, failure_class: AuthFailureClass) -> Response {
     #[cfg(feature = "oauth")]
     let advertise_resource_metadata = state.jwks_cache.is_some();
@@ -1954,7 +2082,7 @@ fn pre_auth_gate(state: &AuthState, client_key: Option<&RateLimitKey>) -> Option
 
 #[cfg_attr(
     not(feature = "metrics"),
-    allow(
+    expect(
         unused_variables,
         reason = "`extensions` is read only to record the \
                   `rmcp_server_kit_rate_limited_total` metric; without the \
@@ -2084,6 +2212,66 @@ pub(crate) async fn auth_middleware(
     unauthorized_response(&state, failure_class.0)
 }
 
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::indexing_slicing, reason = "lint-migration: src/auth.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::too_long_first_doc_paragraph,
+        reason = "test code is not rendered API documentation"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::deref_by_slicing, reason = "lint-migration: src/auth.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::shadow_unrelated, reason = "lint-migration: src/auth.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::panic, reason = "lint-migration: src/auth.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::default_numeric_fallback,
+        reason = "lint-migration: src/auth.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::assertions_on_result_states,
+        reason = "lint-migration: src/auth.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::unwrap_used, reason = "lint-migration: src/auth.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::expect_used, reason = "lint-migration: src/auth.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::single_char_lifetime_names,
+        reason = "lint-migration: src/auth.rs"
+    )
+)]
+#[cfg_attr(
+    test,
+    expect(closure_returning_async_block, reason = "lint-migration: src/auth.rs")
+)]
+#[cfg_attr(
+    test,
+    expect(redundant_imports, reason = "lint-migration: src/auth.rs")
+)]
 #[cfg(test)]
 mod tests {
     use std::net::IpAddr;

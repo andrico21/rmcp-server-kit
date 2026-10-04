@@ -33,13 +33,70 @@
 //! than spinning up a full MCP server per iteration; that would drown
 //! the hook overhead in transport noise and make the gate unable to
 //! detect regressions in the hook machinery itself.
-
-#![allow(
-    clippy::expect_used,
-    clippy::missing_docs_in_private_items,
-    clippy::unreachable,
-    missing_docs
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::shadow_reuse,
+        reason = "lint-migration: benches/hook_latency.rs"
+    )
 )]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::unreachable,
+        reason = "lint-migration: benches/hook_latency.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::shadow_unrelated,
+        reason = "lint-migration: benches/hook_latency.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::expect_used,
+        reason = "lint-migration: benches/hook_latency.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::min_ident_chars,
+        reason = "lint-migration: benches/hook_latency.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_panics_doc,
+        reason = "lint-migration: benches/hook_latency.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_docs_in_private_items,
+        reason = "lint-migration: benches/hook_latency.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::std_instead_of_alloc,
+        reason = "lint-migration: benches/hook_latency.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::std_instead_of_core,
+        reason = "lint-migration: benches/hook_latency.rs"
+    )
+)]
+#![expect(unused_results, reason = "lint-migration: benches/hook_latency.rs")]
 
 use std::{hint::black_box, sync::Arc};
 

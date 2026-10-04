@@ -1,4 +1,103 @@
 //! Stateless binding between rmcp session IDs and authenticated identities.
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::option_if_let_else,
+        reason = "lint-migration: src/session_binding.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_panics_doc,
+        reason = "lint-migration: src/session_binding.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::min_ident_chars,
+        reason = "lint-migration: src/session_binding.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::shadow_reuse,
+        reason = "lint-migration: src/session_binding.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::map_err_ignore,
+        reason = "lint-migration: src/session_binding.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::arithmetic_side_effects,
+        reason = "lint-migration: src/session_binding.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_const_for_fn,
+        reason = "lint-migration: src/session_binding.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_errors_doc,
+        reason = "lint-migration: src/session_binding.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::std_instead_of_core,
+        reason = "lint-migration: src/session_binding.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::absolute_paths,
+        reason = "lint-migration: src/session_binding.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::redundant_pub_crate,
+        reason = "lint-migration: src/session_binding.rs"
+    )
+)]
+#![cfg_attr(
+    all(not(test), target_os = "linux"),
+    expect(
+        clippy::missing_docs_in_private_items,
+        reason = "lint-migration: src/session_binding.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::unused_trait_names,
+        reason = "lint-migration: src/session_binding.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::unseparated_literal_suffix,
+        reason = "lint-migration: src/session_binding.rs"
+    )
+)]
+#![expect(unused_results, reason = "lint-migration: src/session_binding.rs")]
 
 use std::sync::OnceLock;
 
@@ -287,7 +386,7 @@ pub(crate) fn keyed_mac(secret: &SessionBindingSecret) -> HmacSha256 {
         m
     } else {
         let digest = Sha256::digest(key);
-        #[allow(
+        #[expect(
             clippy::expect_used,
             reason = "32-byte SHA-256 digest is unconditionally valid as an HMAC-SHA256 key (RFC 2104 allows any key length); see surrounding comment"
         )]
@@ -358,6 +457,14 @@ fn is_uuid_shaped(value: &str) -> bool {
         })
 }
 
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::expect_used, reason = "lint-migration: src/session_binding.rs")
+)]
+#[cfg_attr(
+    test,
+    expect(redundant_imports, reason = "lint-migration: src/session_binding.rs")
+)]
 #[cfg(test)]
 mod tests {
     use axum::{

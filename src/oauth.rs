@@ -12,6 +12,174 @@
 //! upstream identity provider (e.g. Keycloak).  MCP clients discover this server as the
 //! authorization server via Protected Resource Metadata (RFC 9728) and
 //! perform the standard Authorization Code + PKCE flow transparently.
+#![cfg_attr(
+    all(not(test), not(feature = "metrics"), feature = "oauth"),
+    expect(clippy::cfg_not_test, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    feature = "oauth",
+    expect(clippy::too_many_lines, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::integer_division_remainder_used,
+        reason = "lint-migration: src/oauth.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::renamed_function_params,
+        reason = "lint-migration: src/oauth.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::option_if_let_else, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::uninlined_format_args, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::let_underscore_untyped,
+        reason = "lint-migration: src/oauth.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::let_underscore_must_use,
+        reason = "lint-migration: src/oauth.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::doc_markdown, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::doc_paragraphs_missing_punctuation,
+        reason = "lint-migration: src/oauth.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::arithmetic_side_effects,
+        reason = "lint-migration: src/oauth.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::non_ascii_literal, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::shadow_unrelated, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::impl_trait_in_params, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::missing_const_for_fn, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::shadow_reuse, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::ref_patterns, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::min_ident_chars, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::unused_result_ok, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::missing_inline_in_public_items,
+        reason = "lint-migration: src/oauth.rs"
+    )
+)]
+#![cfg_attr(
+    all(not(test), feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::missing_docs_in_private_items,
+        reason = "lint-migration: src/oauth.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::module_name_repetitions,
+        reason = "lint-migration: src/oauth.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::too_long_first_doc_paragraph,
+        reason = "lint-migration: src/oauth.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::absolute_paths, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::missing_errors_doc, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::unused_trait_names, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::std_instead_of_core, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::std_instead_of_alloc, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(clippy::inline_trait_bounds, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::single_char_lifetime_names,
+        reason = "lint-migration: src/oauth.rs"
+    )
+)]
+#![cfg_attr(
+    all(feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::field_scoped_visibility_modifiers,
+        reason = "lint-migration: src/oauth.rs"
+    )
+)]
+#![cfg_attr(
+    feature = "oauth",
+    expect(let_underscore_drop, reason = "lint-migration: src/oauth.rs")
+)]
+#![cfg_attr(
+    feature = "oauth",
+    expect(unused_results, reason = "lint-migration: src/oauth.rs")
+)]
 
 use std::{
     collections::HashMap,
@@ -95,7 +263,7 @@ fn evaluate_oauth_redirect(
 /// loopback and is already blocked by the post-DNS IP screen, and an
 /// operator may legitimately reach a local IdP via an explicit loopback
 /// CIDR allowlist.
-#[allow(
+#[expect(
     clippy::case_sensitive_file_extension_comparisons,
     reason = "these are DNS-name suffixes on an already-lowercased host, not file extensions"
 )]
@@ -422,11 +590,23 @@ impl OauthHttpClient {
         // builds and to `()` in production. The `.clone()` is required in
         // test builds; in production the alias is a unit, which is why the
         // unit-value lints are allowed alongside the Arc one.
-        #[allow(
-            clippy::clone_on_ref_ptr,
-            clippy::clone_on_copy,
-            clippy::unit_arg,
-            reason = "TestLoopbackBypass aliases to Arc<AtomicBool> under cfg(test)/test-helpers and to `()` otherwise; each cfg trips a different clone/arg lint"
+        #[cfg_attr(
+            any(
+                not(feature = "oauth"),
+                all(not(test), not(feature = "oauth-mtls-client"))
+            ),
+            expect(
+                clippy::clone_on_copy,
+                clippy::unit_arg,
+                reason = "TestLoopbackBypass aliases to Arc<AtomicBool> under cfg(test)/test-helpers and to `()` otherwise; each cfg trips a different clone/arg lint"
+            )
+        )]
+        #[cfg_attr(
+            any(not(feature = "oauth"), test, feature = "metrics"),
+            expect(
+                clippy::clone_on_ref_ptr,
+                reason = "TestLoopbackBypass aliases to Arc<AtomicBool> under cfg(test)/test-helpers and to `()` otherwise; each cfg trips a different clone/arg lint"
+            )
         )]
         let resolver: Arc<dyn reqwest::dns::Resolve> =
             Arc::new(crate::ssrf_resolver::SsrfScreeningResolver::new(
@@ -1065,7 +1245,7 @@ impl Default for OAuthConfig {
             authorization_servers: None,
             authorization_server_metadata_issuer: None,
             require_subject: false,
-            #[allow(
+            #[expect(
                 deprecated,
                 reason = "default-construct deprecated field for backward compat"
             )]
@@ -1089,7 +1269,7 @@ impl OAuthConfig {
         if let Some(mode) = self.audience_validation_mode {
             return mode;
         }
-        #[allow(deprecated, reason = "intentional: legacy flag resolution path")]
+        #[expect(deprecated, reason = "intentional: legacy flag resolution path")]
         match self.strict_audience_validation {
             Some(true) | None => AudienceValidationMode::Strict,
             Some(false) => AudienceValidationMode::Warn,
@@ -1555,7 +1735,7 @@ fn build_mtls_clients(
             // builds and to `()` in production. We need a value clone here
             // (not Arc::clone) because the type vanishes outside test cfg;
             // the allow is justified by the feature-gated type alias.
-            #[allow(clippy::clone_on_ref_ptr, reason = "type alias varies per feature")]
+            #[expect(clippy::clone_on_ref_ptr, reason = "type alias varies per feature")]
             test_bypass.clone(),
         ));
 
@@ -1786,7 +1966,7 @@ impl OAuthConfigBuilder {
     /// applies.
     #[deprecated(since = "1.7.0", note = "use `audience_validation_mode` instead")]
     pub const fn strict_audience_validation(mut self, strict: bool) -> Self {
-        #[allow(
+        #[expect(
             deprecated,
             reason = "intentional: deprecated builder forwards to deprecated field"
         )]
@@ -2104,7 +2284,7 @@ impl fmt::Debug for ExchangedToken {
 /// server and perform a standard Authorization Code + PKCE flow.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "flat TOML sub-table of independent operator toggles; collapsing them into an enum would break both the public API and the deserialized schema"
 )]
@@ -2397,7 +2577,7 @@ impl CachedKeys {
 ///   endpoint by sending JWTs with fabricated `kid` values.
 /// - **Concurrent deduplication**: Only one refresh in flight at a time;
 ///   concurrent waiters share the same fetch result.
-#[allow(
+#[expect(
     missing_debug_implementations,
     reason = "contains reqwest::Client and DecodingKey cache with no Debug impl"
 )]
@@ -2483,7 +2663,7 @@ const ACCEPTED_ALGS: &[Algorithm] = &[
 /// [`OAuthConfig::allowed_algorithms`], so config parsing and error messages
 /// can never drift from [`ACCEPTED_ALGS`]. `accepted_algorithm_names_cover_accepted_algs`
 /// asserts the two stay in lockstep.
-#[allow(
+#[expect(
     clippy::wildcard_enum_match_arm,
     reason = "jsonwebtoken Algorithm is #[non_exhaustive], so an exhaustive match is impossible; HS*, `none`, and any future variant must fail closed to None"
 )]
@@ -2648,11 +2828,23 @@ impl JwksCache {
         #[cfg(not(any(test, feature = "test-helpers")))]
         let test_bypass: crate::ssrf_resolver::TestLoopbackBypass = ();
 
-        #[allow(
-            clippy::clone_on_ref_ptr,
-            clippy::clone_on_copy,
-            clippy::unit_arg,
-            reason = "TestLoopbackBypass aliases to Arc<AtomicBool> under cfg(test)/test-helpers and to `()` otherwise; each cfg trips a different clone/arg lint"
+        #[cfg_attr(
+            any(
+                not(feature = "oauth"),
+                all(not(test), not(feature = "oauth-mtls-client"))
+            ),
+            expect(
+                clippy::clone_on_copy,
+                clippy::unit_arg,
+                reason = "TestLoopbackBypass aliases to Arc<AtomicBool> under cfg(test)/test-helpers and to `()` otherwise; each cfg trips a different clone/arg lint"
+            )
+        )]
+        #[cfg_attr(
+            any(not(feature = "oauth"), test, feature = "metrics"),
+            expect(
+                clippy::clone_on_ref_ptr,
+                reason = "TestLoopbackBypass aliases to Arc<AtomicBool> under cfg(test)/test-helpers and to `()` otherwise; each cfg trips a different clone/arg lint"
+            )
         )]
         let resolver: Arc<dyn reqwest::dns::Resolve> =
             Arc::new(crate::ssrf_resolver::SsrfScreeningResolver::new(
@@ -2959,7 +3151,7 @@ impl JwksCache {
     // enter `refresh_with_cooldown`. That commits `last_refresh_attempt` before
     // fetching, so a cancellation mid-refresh still consumes the cooldown slot
     // and the next caller may be refused a refresh for the cooldown window.
-    #[allow(
+    #[expect(
         clippy::cognitive_complexity,
         reason = "each failure arm pairs `cold_path()` with a distinct `tracing::debug!` site for observability; collapsing into combinators would lose structured-field log sites without reducing real complexity"
     )]
@@ -3221,7 +3413,7 @@ impl JwksCache {
     }
 
     /// Fetch and parse the JWKS document. Returns `None` and logs on failure.
-    #[allow(
+    #[expect(
         clippy::cognitive_complexity,
         reason = "screening, bounded streaming, and parse logging are intentionally kept in one fetch path"
     )]
@@ -3508,7 +3700,7 @@ fn jwk_algorithm(jwk: &jsonwebtoken::jwk::Jwk) -> Option<JwkAlg> {
 }
 
 /// Map a declared JWK `alg` onto a supported JWS algorithm.
-#[allow(
+#[expect(
     clippy::wildcard_enum_match_arm,
     reason = "jsonwebtoken KeyAlgorithm is a large external enum; only the JWT-signing variants are mappable to `Algorithm`"
 )]
@@ -3535,7 +3727,7 @@ fn explicit_jwk_algorithm(declared: jsonwebtoken::jwk::KeyAlgorithm) -> Option<A
 /// verification key -- and `P-521` yields `None` because `jsonwebtoken` 11
 /// defines no `ES512` variant (its own `EllipticCurve::P521` doc notes the
 /// curve is unsupported by `ring`).
-#[allow(
+#[expect(
     clippy::wildcard_enum_match_arm,
     reason = "jsonwebtoken AlgorithmParameters and EllipticCurve are both #[non_exhaustive] external enums, so an exhaustive match is impossible; unmatched variants must fail closed to None"
 )]
@@ -4671,6 +4863,44 @@ fn rewrite_client_auth_params(
     out.finish()
 }
 
+#[cfg_attr(
+    all(test, feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::default_numeric_fallback,
+        reason = "lint-migration: src/oauth.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, feature = "oauth", target_os = "linux"),
+    expect(clippy::panic, reason = "lint-migration: src/oauth.rs")
+)]
+#[cfg_attr(
+    all(test, feature = "oauth", target_os = "linux"),
+    expect(clippy::expect_used, reason = "lint-migration: src/oauth.rs")
+)]
+#[cfg_attr(
+    all(test, feature = "oauth", target_os = "linux"),
+    expect(clippy::unwrap_used, reason = "lint-migration: src/oauth.rs")
+)]
+#[cfg_attr(
+    all(test, feature = "oauth", target_os = "linux"),
+    expect(clippy::indexing_slicing, reason = "lint-migration: src/oauth.rs")
+)]
+#[cfg_attr(
+    all(test, feature = "oauth", target_os = "linux"),
+    expect(
+        clippy::missing_panics_doc,
+        reason = "test code is not rendered API documentation"
+    )
+)]
+#[cfg_attr(
+    all(test, feature = "oauth"),
+    expect(unit_bindings, reason = "lint-migration: src/oauth.rs")
+)]
+#[cfg_attr(
+    all(test, feature = "oauth"),
+    expect(redundant_imports, reason = "lint-migration: src/oauth.rs")
+)]
 #[cfg(test)]
 mod tests {
     use std::{sync::Arc, time::Instant};
@@ -4936,7 +5166,7 @@ mod tests {
             allowed_algorithms: None,
             authorization_servers: None,
             authorization_server_metadata_issuer: None,
-            #[allow(
+            #[expect(
                 deprecated,
                 reason = "test fixture: explicit value for the deprecated field"
             )]
@@ -5662,7 +5892,7 @@ role = "admin"
             allowed_algorithms: None,
             authorization_servers: None,
             authorization_server_metadata_issuer: None,
-            #[allow(
+            #[expect(
                 deprecated,
                 reason = "test fixture: explicit value for the deprecated field"
             )]
@@ -7893,7 +8123,7 @@ role = "admin"
             allowed_algorithms: None,
             authorization_servers: None,
             authorization_server_metadata_issuer: None,
-            #[allow(
+            #[expect(
                 deprecated,
                 reason = "test fixture: explicit value for the deprecated field"
             )]
@@ -8264,7 +8494,7 @@ role = "admin"
         let mut config = test_config(&jwks_uri);
         // Legacy opt-out: the deprecated bool set to Some(false) with the enum
         // unset must resolve to Warn, preserving the pre-3.2 azp-accepting path.
-        #[allow(deprecated, reason = "covers the legacy bool compat mapping")]
+        #[expect(deprecated, reason = "covers the legacy bool compat mapping")]
         {
             config.strict_audience_validation = Some(false);
         }
@@ -8341,7 +8571,7 @@ role = "admin"
 
         let jwks_uri = format!("{}/jwks.json", mock_server.uri());
         let mut config = test_config(&jwks_uri);
-        #[allow(deprecated, reason = "covers the legacy bool resolution path")]
+        #[expect(deprecated, reason = "covers the legacy bool resolution path")]
         {
             config.strict_audience_validation = Some(true);
         }
@@ -8468,7 +8698,7 @@ role = "admin"
     #[test]
     fn audience_validation_mode_overrides_legacy_bool() {
         let mut config = OAuthConfig::default();
-        #[allow(deprecated, reason = "covers the precedence rule for the legacy bool")]
+        #[expect(deprecated, reason = "covers the precedence rule for the legacy bool")]
         {
             config.strict_audience_validation = Some(false);
         }
@@ -8480,7 +8710,7 @@ role = "admin"
         );
 
         let mut config = OAuthConfig::default();
-        #[allow(deprecated, reason = "covers the precedence rule for the legacy bool")]
+        #[expect(deprecated, reason = "covers the precedence rule for the legacy bool")]
         {
             config.strict_audience_validation = Some(true);
         }
@@ -8505,7 +8735,7 @@ role = "admin"
     #[test]
     fn audience_validation_legacy_bool_true_resolves_to_strict() {
         let mut config = OAuthConfig::default();
-        #[allow(deprecated, reason = "covers the legacy bool resolution path")]
+        #[expect(deprecated, reason = "covers the legacy bool resolution path")]
         {
             config.strict_audience_validation = Some(true);
         }

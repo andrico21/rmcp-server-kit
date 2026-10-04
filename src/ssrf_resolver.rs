@@ -24,6 +24,62 @@
 //!   `Ok(empty)` would yield `reqwest::Error::Connect` with an opaque
 //!   "no addresses" message; an explicit `Err` lets us prefix the
 //!   diagnostic with `"ssrf:"` for log forensics.
+#![cfg_attr(
+    all(not(test), not(feature = "oauth-mtls-client")),
+    expect(clippy::cfg_not_test, reason = "lint-migration: src/ssrf_resolver.rs")
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_errors_doc,
+        reason = "lint-migration: src/ssrf_resolver.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::absolute_paths,
+        reason = "lint-migration: src/ssrf_resolver.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::missing_const_for_fn,
+        reason = "lint-migration: src/ssrf_resolver.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::redundant_pub_crate,
+        reason = "lint-migration: src/ssrf_resolver.rs"
+    )
+)]
+#![cfg_attr(
+    any(
+        all(test, target_os = "linux"),
+        all(feature = "oauth-mtls-client", target_os = "linux")
+    ),
+    expect(
+        clippy::too_long_first_doc_paragraph,
+        reason = "lint-migration: src/ssrf_resolver.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::std_instead_of_alloc,
+        reason = "lint-migration: src/ssrf_resolver.rs"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::std_instead_of_core,
+        reason = "lint-migration: src/ssrf_resolver.rs"
+    )
+)]
 
 #[cfg(any(test, feature = "test-helpers"))]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -64,7 +120,7 @@ pub(crate) struct SsrfScreeningResolver {
     /// Test-only loopback bypass; see `TestLoopbackBypass` doc.
     #[cfg_attr(
         not(any(test, feature = "test-helpers")),
-        allow(
+        expect(
             dead_code,
             reason = "`TestLoopbackBypass` aliases to `()` outside test/test-helpers \
                       builds, so this field is never read there; it is retained so the \
@@ -187,6 +243,32 @@ pub(crate) fn screen_addrs(
     Ok(addrs.to_vec())
 }
 
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::expect_used, reason = "lint-migration: src/ssrf_resolver.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::shadow_reuse, reason = "lint-migration: src/ssrf_resolver.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::min_ident_chars,
+        reason = "lint-migration: src/ssrf_resolver.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::missing_panics_doc,
+        reason = "test code is not rendered API documentation"
+    )
+)]
+#[cfg_attr(
+    test,
+    expect(redundant_imports, reason = "lint-migration: src/ssrf_resolver.rs")
+)]
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
