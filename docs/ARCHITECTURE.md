@@ -646,8 +646,8 @@ recommended.
    - Decodes the JWT header to get `kid` and `alg`.
    - `lookup_key()` looks up by `kid` in the cached JWKS
      (`src/oauth.rs:2456`).
-   - If not found, calls `refresh_with_cooldown()` (`src/oauth.rs:3150`):
-      - Enforces `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:2564`) so multiple
+   - If not found, calls `refresh_with_cooldown()` (`src/oauth.rs:3488`):
+      - Enforces `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:2725`) so multiple
        invalid tokens cannot DoS the JWKS endpoint.
      - Deduplicates concurrent refreshes.
    - Validates signature, `iss`, `aud`, `exp`, `nbf` using `jsonwebtoken`.
