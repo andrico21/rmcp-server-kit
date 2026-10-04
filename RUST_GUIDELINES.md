@@ -298,6 +298,28 @@ entry in the same PR that introduces a deviation.
    refresh cooldown, and the redaction tests' output. Evidence: the task-16
    migration record (`status.txt`, `new-permanent-expects.txt`, `gates.txt`).
 
+16. **2026-10-05 - Small-core-modules lane expectations (task 23).** Under
+   entry 13's frozen-API decision, the public items whose names repeat the
+   containing module keep `clippy::module_name_repetitions` per item:
+   `AdminConfig` and `AdminStatus` (src/admin.rs), `BoundedLimiterError` and
+   `BoundedLimiterDeny` (src/bounded_limiter.rs), `RmcpServerKitError` and the
+   deprecated `McpxError` alias (src/error.rs), and `McpMetrics` plus
+   `serve_metrics` (src/metrics.rs). The `serve_metrics` signature keeps its
+   third-party `prometheus`/`tokio_util` types unchanged (D-7). In `mod tests`
+   the core-blessed documentation/panic expectations are joined by
+   `clippy::unnecessary_wraps`, one per assertion-only test, so every test keeps
+   the uniform `anyhow::Result<()>` signature; `clippy::let_underscore_must_use`
+   sits per typed discard in src/bounded_limiter.rs's tests, and
+   `clippy::panic` on the spawned-panic fixture in src/cancel.rs. Behavior kept
+   exact: `ERROR_BINDINGS` and the synthetic-violation fixture in src/error.rs
+   stay byte-identical (G-7), the CRL-source scanning guard is untouched, no
+   `biased;` was added to the `tokio::select!` arms, and `serve_metrics`'s
+   task-8 headers behavior is unchanged. `pub type Result` in src/error.rs now
+   exposes its error type as a defaulted parameter
+   (`Result<T, E = RmcpServerKitError>`, semver-checks green). Evidence: the
+   task-23 migration record (`assertion-counts.txt`,
+   `new-permanent-expects.txt`, `gates.txt`).
+
 Entries to be added by the work that creates them: "new in `<version>`"
 expects and profile deltas (the toolchain-drift work); the per-item frozen
 public-API expectations (the lint lanes, under entry 13's decision); the GitLab
