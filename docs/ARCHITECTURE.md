@@ -852,8 +852,8 @@ retiring.
 
 **TOML** - the deserializable sections:
 
-- `ServerConfig` - `src/config.rs:400`
-- `ObservabilityConfig` - `src/config.rs:1239`
+- `ServerConfig` - `src/config.rs:363`
+- `ObservabilityConfig` - `src/config.rs:1346`
 - `SecurityHeadersConfig` - `src/transport.rs:417`
 - `AuthConfig`, `MtlsConfig`, `RateLimitConfig` - `src/auth.rs`
 - `RbacConfig` - `src/rbac.rs`
@@ -874,7 +874,7 @@ held. Only the runtime-only fields above survive from the base. It is fallible
 targeted fields: `ServerConfig::apply_env_overrides` (`src/config.rs:596`),
 `ObservabilityConfig::apply_env_overrides` (`src/config.rs:1004`) and
 `RbacConfig::apply_env_overrides` (`src/rbac.rs:1811`). Each returns
-`Vec<EnvOverride>` (`src/config.rs:156`) for audit logging, with `value: None`
+`Vec<EnvOverride>` (`src/config.rs:100`) for audit logging, with `value: None`
 for secret targets. Curated variables under the `RMCP_SERVER_KIT__`
 prefix; `__` separates TOML path segments because field names already contain
 single underscores.

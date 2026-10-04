@@ -1,91 +1,23 @@
-#![cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::field_scoped_visibility_modifiers,
-        reason = "lint-migration: src/config.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::too_long_first_doc_paragraph,
-        reason = "lint-migration: src/config.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::min_ident_chars, reason = "lint-migration: src/config.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::missing_const_for_fn, reason = "lint-migration: src/config.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::arithmetic_side_effects,
-        reason = "lint-migration: src/config.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::map_err_ignore, reason = "lint-migration: src/config.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::shadow_reuse, reason = "lint-migration: src/config.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::missing_errors_doc, reason = "lint-migration: src/config.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_inline_in_public_items,
-        reason = "lint-migration: src/config.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::absolute_paths, reason = "lint-migration: src/config.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::module_name_repetitions,
-        reason = "lint-migration: src/config.rs"
-    )
-)]
-#![cfg_attr(
-    all(not(test), target_os = "linux"),
-    expect(
-        clippy::missing_docs_in_private_items,
-        reason = "lint-migration: src/config.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::std_instead_of_core, reason = "lint-migration: src/config.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::else_if_without_else, reason = "lint-migration: src/config.rs")
-)]
-#![cfg_attr(
-    any(feature = "oauth", test),
-    expect(unused_results, reason = "lint-migration: src/config.rs")
-)]
-#![expect(redundant_imports, reason = "lint-migration: src/config.rs")]
-use std::{path::PathBuf, time::Duration};
+use core::{fmt, str::FromStr, time::Duration};
+use std::{env, fs, path::PathBuf};
 
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 
+#[cfg(feature = "oauth")]
+use crate::oauth;
 use crate::{
+    auth::AuthConfig,
     bounded_limiter::KeyEvictionPolicy,
-    error::RmcpServerKitError,
-    transport::{McpServerConfig, SecurityHeadersConfig},
+    error::{Result as RmcpResult, RmcpServerKitError},
+    forwarded::{MAX_CONFIGURABLE_SCANNED_ENTRIES, MAX_SCANNED_ENTRIES},
+    session_binding,
+    transport::{
+        ForwardedHeaderMode, LogContextConfig, McpServerConfig, SecurityHeadersConfig,
+        default_request_log_exclude_paths, validate_allowed_origin_entry,
+        validate_public_url_value, validate_request_id_header, validate_security_headers,
+        validate_trusted_proxy_entry,
+    },
 };
 
 #[cfg(test)]
@@ -181,6 +113,10 @@ pub enum EnvOverrideSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 #[cfg(test)]
+#[expect(
+    clippy::field_scoped_visibility_modifiers,
+    reason = "deliberate: src/config.rs::EnvOverrideSpec fields keep their explicit `pub(crate)` visibility because the source-scanning tests read the spec table's declared shape"
+)]
 pub(crate) struct EnvOverrideSpec {
     pub(crate) env_var: &'static str,
     pub(crate) target_field: &'static str,
@@ -354,39 +290,62 @@ pub(crate) const ENV_OVERRIDE_SPECS: &[EnvOverrideSpec] = &[
     },
 ];
 
+/// Environment variable name for the `server.listen_addr` override.
 pub(crate) const SERVER_LISTEN_ADDR_ENV: &str = "RMCP_SERVER_KIT__SERVER__LISTEN_ADDR";
+/// Environment variable name for the `server.listen_port` override.
 pub(crate) const SERVER_LISTEN_PORT_ENV: &str = "RMCP_SERVER_KIT__SERVER__LISTEN_PORT";
+/// Environment variable name for the `server.public_url` override.
 pub(crate) const SERVER_PUBLIC_URL_ENV: &str = "RMCP_SERVER_KIT__SERVER__PUBLIC_URL";
+/// Environment variable name for the `server.tls_cert_path` override.
 pub(crate) const SERVER_TLS_CERT_PATH_ENV: &str = "RMCP_SERVER_KIT__SERVER__TLS_CERT_PATH";
+/// Environment variable name for the `server.tls_key_path` override.
 pub(crate) const SERVER_TLS_KEY_PATH_ENV: &str = "RMCP_SERVER_KIT__SERVER__TLS_KEY_PATH";
+/// Environment variable name for the `server.admin_enabled` override.
 pub(crate) const SERVER_ADMIN_ENABLED_ENV: &str = "RMCP_SERVER_KIT__SERVER__ADMIN_ENABLED";
+/// Environment variable name for the `server.key_eviction_policy` override.
 pub(crate) const SERVER_KEY_EVICTION_POLICY_ENV: &str =
     "RMCP_SERVER_KIT__SERVER__KEY_EVICTION_POLICY";
+/// Environment variable name for the direct `server.session_binding_secret` override.
 pub(crate) const SERVER_SESSION_BINDING_SECRET_ENV: &str =
     "RMCP_SERVER_KIT__SERVER__SESSION_BINDING_SECRET";
+/// Environment variable name for the file-backed `server.session_binding_secret` override.
 pub(crate) const SERVER_SESSION_BINDING_SECRET_FILE_ENV: &str =
     "RMCP_SERVER_KIT__SERVER__SESSION_BINDING_SECRET_FILE";
+/// Environment variable name for the `server.auth.oauth.issuer` override.
 pub(crate) const SERVER_OAUTH_ISSUER_ENV: &str = "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ISSUER";
+/// Environment variable name for the `server.auth.oauth.audience` override.
 pub(crate) const SERVER_OAUTH_AUDIENCE_ENV: &str = "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__AUDIENCE";
+/// Environment variable name for the `server.auth.oauth.jwks_uri` override.
 pub(crate) const SERVER_OAUTH_JWKS_URI_ENV: &str = "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__JWKS_URI";
+/// Environment variable name for the `server.auth.oauth.proxy.strip_resource_param` override.
 pub(crate) const SERVER_OAUTH_PROXY_STRIP_RESOURCE_PARAM_ENV: &str =
     "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__STRIP_RESOURCE_PARAM";
+/// Environment variable name for the `server.auth.oauth.allowed_algorithms` override.
 pub(crate) const SERVER_OAUTH_ALLOWED_ALGORITHMS_ENV: &str =
     "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ALLOWED_ALGORITHMS";
+/// Environment variable name for the `observability.log_format` override.
 pub(crate) const OBSERVABILITY_LOG_FORMAT_ENV: &str = "RMCP_SERVER_KIT__OBSERVABILITY__LOG_FORMAT";
+/// Environment variable name for the `observability.metrics_enabled` override.
 pub(crate) const OBSERVABILITY_METRICS_ENABLED_ENV: &str =
     "RMCP_SERVER_KIT__OBSERVABILITY__METRICS_ENABLED";
+/// Environment variable name for the `observability.metrics_bind` override.
 pub(crate) const OBSERVABILITY_METRICS_BIND_ENV: &str =
     "RMCP_SERVER_KIT__OBSERVABILITY__METRICS_BIND";
+/// Environment variable name for the `observability.log_plaintext_oauth_tokens` override.
 pub(crate) const OBSERVABILITY_LOG_PLAINTEXT_OAUTH_TOKENS_ENV: &str =
     "RMCP_SERVER_KIT__OBSERVABILITY__LOG_PLAINTEXT_OAUTH_TOKENS";
+/// Environment variable name for the `observability.log_oauth_claim_values` override.
 pub(crate) const OBSERVABILITY_LOG_OAUTH_CLAIM_VALUES_ENV: &str =
     "RMCP_SERVER_KIT__OBSERVABILITY__LOG_OAUTH_CLAIM_VALUES";
+/// Environment variable name for the `observability.log_tool_call_arguments` override.
 pub(crate) const OBSERVABILITY_LOG_TOOL_CALL_ARGUMENTS_ENV: &str =
     "RMCP_SERVER_KIT__OBSERVABILITY__LOG_TOOL_CALL_ARGUMENTS";
+/// Environment variable name for the `observability.log_upstream_error_bodies` override.
 pub(crate) const OBSERVABILITY_LOG_UPSTREAM_ERROR_BODIES_ENV: &str =
     "RMCP_SERVER_KIT__OBSERVABILITY__LOG_UPSTREAM_ERROR_BODIES";
+/// Environment variable name for the direct `rbac.redaction_salt` override.
 pub(crate) const RBAC_REDACTION_SALT_ENV: &str = "RMCP_SERVER_KIT__RBAC__REDACTION_SALT";
+/// Environment variable name for the file-backed `rbac.redaction_salt` override.
 pub(crate) const RBAC_REDACTION_SALT_FILE_ENV: &str = "RMCP_SERVER_KIT__RBAC__REDACTION_SALT_FILE";
 
 /// Server listener configuration (reusable across MCP projects).
@@ -395,6 +354,10 @@ pub(crate) const RBAC_REDACTION_SALT_FILE_ENV: &str = "RMCP_SERVER_KIT__RBAC__RE
 #[expect(
     clippy::struct_excessive_bools,
     reason = "server configuration is a flat TOML schema with independent boolean feature flags"
+)]
+#[expect(
+    clippy::module_name_repetitions,
+    reason = "public API frozen until the next major release"
 )]
 #[non_exhaustive]
 pub struct ServerConfig {
@@ -470,7 +433,7 @@ pub struct ServerConfig {
     pub request_log_exclude_paths: Vec<String>,
     /// Configuration for client context logging (request ID, client IP, peer IP, etc.).
     #[serde(default)]
-    pub log_context: crate::transport::LogContextConfig,
+    pub log_context: LogContextConfig,
     /// Full-table policy for per-IP rate limiters. Default: `evict_lru`.
     #[serde(default)]
     pub key_eviction_policy: KeyEvictionPolicy,
@@ -490,7 +453,7 @@ pub struct ServerConfig {
     /// Which forwarding header trusted-forwarder mode reads:
     /// `"x-forwarded-for"` (default when unset) or `"forwarded"`
     /// (RFC 7239). Requires `trusted_proxies` to be nonempty.
-    pub forwarded_header: Option<crate::transport::ForwardedHeaderMode>,
+    pub forwarded_header: Option<ForwardedHeaderMode>,
     /// Idle timeout for MCP sessions. Sessions with no activity for this
     /// duration are closed automatically. Default: 20 minutes.
     #[serde(default = "default_session_idle_timeout")]
@@ -546,7 +509,7 @@ pub struct ServerConfig {
     #[serde(default = "default_admin_role")]
     pub admin_role: String,
     /// Authentication configuration (API keys, mTLS, OAuth).
-    pub auth: Option<crate::auth::AuthConfig>,
+    pub auth: Option<AuthConfig>,
     /// Filter `tools/list` through RBAC visibility when RBAC is enabled.
     /// Default: true.
     #[serde(default = "default_tool_list_filtering")]
@@ -569,8 +532,13 @@ pub struct ServerConfig {
 /// Every field is listed deliberately rather than using
 /// `finish_non_exhaustive`, and `server_config_debug_lists_every_field` fails
 /// if a field is added here without being rendered.
-impl std::fmt::Debug for ServerConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for ServerConfig {
+    #[inline]
+    #[expect(
+        clippy::min_ident_chars,
+        reason = "deliberate: src/config.rs::ServerConfig fmt must keep the `Debug` trait's parameter name"
+    )]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ServerConfig")
             .field("listen_addr", &self.listen_addr)
             .field("listen_port", &self.listen_port)
@@ -632,6 +600,7 @@ impl std::fmt::Debug for ServerConfig {
 }
 
 impl Default for ServerConfig {
+    #[inline]
     fn default() -> Self {
         Self {
             listen_addr: default_listen_addr(),
@@ -650,8 +619,8 @@ impl Default for ServerConfig {
             extra_route_rate_limit: None,
             extra_route_rate_limit_burst: None,
             extra_route_rate_limit_exempt_paths: Vec::new(),
-            request_log_exclude_paths: crate::transport::default_request_log_exclude_paths(),
-            log_context: crate::transport::LogContextConfig::default(),
+            request_log_exclude_paths: default_request_log_exclude_paths(),
+            log_context: LogContextConfig::default(),
             key_eviction_policy: KeyEvictionPolicy::default(),
             trusted_proxies: Vec::new(),
             trusted_forwarder_max_entries: default_trusted_forwarder_max_entries(),
@@ -707,6 +676,7 @@ impl ServerConfig {
     /// # Ok(())
     /// # }
     /// ```
+    #[inline]
     pub fn apply_env_overrides(&mut self) -> Result<Vec<EnvOverride>, RmcpServerKitError> {
         let mut applied = Vec::new();
         apply_string_env(
@@ -767,6 +737,12 @@ impl ServerConfig {
         Ok(applied)
     }
 
+    /// Apply the direct or file-backed session-binding secret override.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RmcpServerKitError::Config`] when both sources are set, when the
+    /// file cannot be read, or when the secret fails validation.
     fn apply_session_binding_secret_env(
         &mut self,
         applied: &mut Vec<EnvOverride>,
@@ -789,12 +765,12 @@ impl ServerConfig {
                 Ok(())
             }
             (None, Some(path)) => {
-                let secret = std::fs::read_to_string(PathBuf::from(&path)).map_err(|error| {
+                let raw_secret = fs::read_to_string(PathBuf::from(&path)).map_err(|error| {
                     RmcpServerKitError::Config(format!(
                         "failed to read {SERVER_SESSION_BINDING_SECRET_FILE_ENV} file {path:?}: {error}"
                     ))
                 })?;
-                let secret = normalize_text_secret_file(secret);
+                let secret = normalize_text_secret_file(raw_secret);
                 validate_session_binding_secret_env(
                     SERVER_SESSION_BINDING_SECRET_FILE_ENV,
                     &secret,
@@ -811,6 +787,12 @@ impl ServerConfig {
     }
 
     #[cfg(feature = "oauth")]
+    /// Apply the OAuth environment overrides onto a declared OAuth config.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RmcpServerKitError::Config`] when the OAuth parent tables are
+    /// missing or an override value cannot be parsed.
     fn apply_oauth_env_overrides(
         &mut self,
         oauth_env: OAuthEnvOverrides,
@@ -867,10 +849,14 @@ impl ServerConfig {
                 .collect();
             // Resolve eagerly so an unusable value is reported against the
             // env var that set it, rather than surfacing later as an opaque
-            // `oauth.allowed_algorithms` config error.
-            crate::oauth::resolve_allowed_algorithms(Some(names.as_slice())).map_err(|err| {
-                RmcpServerKitError::Config(format!("{SERVER_OAUTH_ALLOWED_ALGORITHMS_ENV}: {err}"))
-            })?;
+            // `oauth.allowed_algorithms` config error. The resolved list is
+            // validation-only here; the OAuth layer recomputes it.
+            let _resolved =
+                oauth::resolve_allowed_algorithms(Some(names.as_slice())).map_err(|err| {
+                    RmcpServerKitError::Config(format!(
+                        "{SERVER_OAUTH_ALLOWED_ALGORITHMS_ENV}: {err}"
+                    ))
+                })?;
             applied.push(env_report(
                 SERVER_OAUTH_ALLOWED_ALGORITHMS_ENV,
                 "server.auth.oauth.allowed_algorithms",
@@ -936,6 +922,7 @@ impl ServerConfig {
     /// # Ok(())
     /// # }
     /// ```
+    #[inline]
     pub fn apply_to_mcp_config(
         &self,
         base: McpServerConfig,
@@ -1036,6 +1023,7 @@ impl ObservabilityConfig {
     /// # Ok(())
     /// # }
     /// ```
+    #[inline]
     pub fn apply_env_overrides(&mut self) -> Result<Vec<EnvOverride>, RmcpServerKitError> {
         let mut applied = Vec::new();
         apply_string_env(
@@ -1098,16 +1086,22 @@ impl ObservabilityConfig {
     }
 }
 
+/// Read an environment variable, distinguishing absent from non-UTF-8.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when `var` is set but not valid UTF-8.
 pub(crate) fn read_env(var: &str) -> Result<Option<String>, RmcpServerKitError> {
-    match std::env::var(var) {
+    match env::var(var) {
         Ok(value) => Ok(Some(value)),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => Err(RmcpServerKitError::Config(format!(
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => Err(RmcpServerKitError::Config(format!(
             "{var} must contain valid UTF-8"
         ))),
     }
 }
 
+/// Build a non-secret [`EnvOverride`] entry for an applied environment value.
 fn env_report(env_var: &str, target_field: &str, value: String) -> EnvOverride {
     EnvOverride {
         env_var: env_var.to_owned(),
@@ -1117,6 +1111,7 @@ fn env_report(env_var: &str, target_field: &str, value: String) -> EnvOverride {
     }
 }
 
+/// Build a redacted [`EnvOverride`] entry for a secret-typed target.
 pub(crate) fn secret_env_report(
     env_var: &str,
     target_field: &str,
@@ -1130,19 +1125,34 @@ pub(crate) fn secret_env_report(
     }
 }
 
+/// Parse `raw` as `T`, naming `env_var` and `expected` in the failure message.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when `raw` does not parse as `T`.
 fn parse_env_value<T>(env_var: &str, raw: &str, expected: &str) -> Result<T, RmcpServerKitError>
 where
-    T: std::str::FromStr,
+    T: FromStr,
 {
-    raw.parse::<T>().map_err(|_| {
+    raw.parse::<T>().map_err(|_error| {
         RmcpServerKitError::Config(format!("invalid value for {env_var}: expected {expected}"))
     })
 }
 
+/// Parse `raw` as a boolean, naming `env_var` on failure.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when `raw` is not `true` or `false`.
 pub(crate) fn parse_env_bool(env_var: &str, raw: &str) -> Result<bool, RmcpServerKitError> {
     parse_env_value(env_var, raw, "bool")
 }
 
+/// Apply a required string environment override to `target` and record it.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when `env_var` is not valid UTF-8.
 fn apply_string_env(
     env_var: &str,
     target_field: &str,
@@ -1156,6 +1166,11 @@ fn apply_string_env(
     Ok(())
 }
 
+/// Apply an optional string environment override to `target` and record it.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when `env_var` is not valid UTF-8.
 fn apply_optional_string_env(
     env_var: &str,
     target_field: &str,
@@ -1169,6 +1184,11 @@ fn apply_optional_string_env(
     Ok(())
 }
 
+/// Apply an optional path environment override to `target` and record it.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when `env_var` is not valid UTF-8.
 fn apply_optional_path_env(
     env_var: &str,
     target_field: &str,
@@ -1182,31 +1202,50 @@ fn apply_optional_path_env(
     Ok(())
 }
 
+/// Strip one trailing line ending from a secret read from a text file.
 pub(crate) fn normalize_text_secret_file(mut secret: String) -> String {
     if secret.ends_with("\r\n") {
-        secret.truncate(secret.len() - 2);
+        secret.truncate(secret.len().saturating_sub(2));
     } else if secret.ends_with('\n') || secret.ends_with('\r') {
-        secret.truncate(secret.len() - 1);
+        secret.truncate(secret.len().saturating_sub(1));
+    } else {
+        // No trailing line ending to strip.
     }
     secret
 }
 
+/// Validate a session-binding secret read from an environment variable.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when the secret fails validation.
 fn validate_session_binding_secret_env(
     env_var: &str,
     value: &str,
 ) -> Result<(), RmcpServerKitError> {
-    crate::session_binding::validate_configured_secret(env_var, value)
+    session_binding::validate_configured_secret(env_var, value)
 }
 
+/// Raw OAuth-related environment overrides read before being applied.
 struct OAuthEnvOverrides {
+    /// `issuer` override, when set.
     issuer: Option<String>,
+    /// `audience` override, when set.
     audience: Option<String>,
+    /// `jwks_uri` override, when set.
     jwks_uri: Option<String>,
+    /// `allowed_algorithms` override, when set.
     allowed_algorithms: Option<String>,
+    /// `proxy.strip_resource_param` override, when set.
     proxy_strip_resource_param: Option<String>,
 }
 
 impl OAuthEnvOverrides {
+    /// Read every OAuth-related environment override.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RmcpServerKitError::Config`] when a variable is not valid UTF-8.
     fn read() -> Result<Self, RmcpServerKitError> {
         Ok(Self {
             issuer: read_env(SERVER_OAUTH_ISSUER_ENV)?,
@@ -1217,7 +1256,8 @@ impl OAuthEnvOverrides {
         })
     }
 
-    fn is_set(&self) -> bool {
+    /// Whether any OAuth environment override is set.
+    const fn is_set(&self) -> bool {
         self.issuer.is_some()
             || self.audience.is_some()
             || self.jwks_uri.is_some()
@@ -1225,6 +1265,7 @@ impl OAuthEnvOverrides {
             || self.proxy_strip_resource_param.is_some()
     }
 
+    /// Name of the first set OAuth environment variable.
     fn first_set_var(&self) -> &'static str {
         first_set_oauth_env(
             self.issuer.as_deref(),
@@ -1236,9 +1277,15 @@ impl OAuthEnvOverrides {
     }
 }
 
+/// Stable doc anchor for the `ObservabilityConfig` reference section.
 const _OBSERVABILITY_CONFIG_DOC_ANCHOR: &str = "ObservabilityConfig";
 
 #[cfg(not(feature = "oauth"))]
+/// Reject any OAuth environment override when the `oauth` feature is off.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] naming the first set OAuth variable.
 fn reject_oauth_env_overrides(oauth_env: &OAuthEnvOverrides) -> Result<(), RmcpServerKitError> {
     if oauth_env.is_set() {
         let var = oauth_env.first_set_var();
@@ -1250,7 +1297,8 @@ fn reject_oauth_env_overrides(oauth_env: &OAuthEnvOverrides) -> Result<(), RmcpS
     }
 }
 
-fn first_set_oauth_env(
+/// Return the first set OAuth environment variable of the five, for error messages.
+const fn first_set_oauth_env(
     issuer: Option<&str>,
     audience: Option<&str>,
     jwks_uri: Option<&str>,
@@ -1272,6 +1320,11 @@ fn first_set_oauth_env(
     }
 }
 
+/// Parse a human-readable duration, naming `field` and `value` on failure.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when `value` is not a valid duration.
 fn parse_duration_field(field: &str, value: &str) -> Result<Duration, RmcpServerKitError> {
     humantime::parse_duration(value).map_err(|error| {
         RmcpServerKitError::Config(format!("invalid duration for {field}: {value:?}: {error}"))
@@ -1284,6 +1337,10 @@ fn parse_duration_field(field: &str, value: &str) -> Result<Duration, RmcpServer
 #[expect(
     clippy::struct_excessive_bools,
     reason = "observability configuration is a flat TOML schema with independent boolean feature flags"
+)]
+#[expect(
+    clippy::module_name_repetitions,
+    reason = "public API frozen until the next major release"
 )]
 #[non_exhaustive]
 pub struct ObservabilityConfig {
@@ -1339,8 +1396,13 @@ pub struct ObservabilityConfig {
 /// use to find or tamper with the audit trail. Presence is still reported;
 /// only the path is withheld. `observability_config_debug_lists_every_field`
 /// fails if a field is added without being rendered here.
-impl std::fmt::Debug for ObservabilityConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for ObservabilityConfig {
+    #[inline]
+    #[expect(
+        clippy::min_ident_chars,
+        reason = "deliberate: src/config.rs::ObservabilityConfig fmt must keep the `Debug` trait's parameter name"
+    )]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ObservabilityConfig")
             .field("log_level", &self.log_level)
             .field("log_format", &self.log_format)
@@ -1363,6 +1425,7 @@ impl std::fmt::Debug for ObservabilityConfig {
 }
 
 impl Default for ObservabilityConfig {
+    #[inline]
     fn default() -> Self {
         Self {
             log_level: default_log_level(),
@@ -1404,6 +1467,14 @@ pub(crate) enum SharedConfigViolation {
 /// env overrides, bridge behaviour) stays where it is: those inputs are not
 /// common to both types, and folding them in here would change validation
 /// behaviour that no test currently pins.
+///
+/// # Errors
+///
+/// Returns the first violated [`SharedConfigViolation`] in the fixed order.
+#[expect(
+    clippy::missing_const_for_fn,
+    reason = "deliberate: src/config.rs::check_shared_config_invariants is parsed by a source-scanning test that matches its `pub(crate) fn` prefix"
+)]
 #[expect(
     clippy::fn_params_excessive_bools,
     reason = "these are the five independent predicates both validators evaluate; a params struct would carry the same five bools and only relocate the lint"
@@ -1445,9 +1516,12 @@ pub(crate) fn check_shared_config_invariants(
 /// # Errors
 ///
 /// Returns `RmcpServerKitError::Config` on invalid values.
-pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()> {
-    use crate::error::RmcpServerKitError;
-
+#[expect(
+    clippy::module_name_repetitions,
+    reason = "public API frozen until the next major release"
+)]
+#[inline]
+pub fn validate_server_config(server: &ServerConfig) -> RmcpResult<()> {
     if server.listen_port == 0 {
         return Err(RmcpServerKitError::Config(
             "listen_port must be nonzero".into(),
@@ -1464,10 +1538,10 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
     // so full first-error parity is neither achievable nor claimed.
     if let Err(violation) = check_shared_config_invariants(
         server.admin_enabled,
-        server.auth.as_ref().is_some_and(|a| a.enabled),
+        server.auth.as_ref().is_some_and(|auth| auth.enabled),
         server.tls_cert_path.is_some(),
         server.tls_key_path.is_some(),
-        server.auth.as_ref().is_some_and(|a| a.mtls.is_some()),
+        server.auth.as_ref().is_some_and(|auth| auth.mtls.is_some()),
     ) {
         return Err(RmcpServerKitError::Config(
             match violation {
@@ -1500,8 +1574,7 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
     // `McpServerConfig::check` uses, so a TOML-only consumer cannot be told
     // the config is valid and then have `serve()` refuse it at startup.
     for origin in &server.allowed_origins {
-        crate::transport::validate_allowed_origin_entry(origin)
-            .map_err(RmcpServerKitError::Config)?;
+        validate_allowed_origin_entry(origin).map_err(RmcpServerKitError::Config)?;
     }
 
     if server.max_concurrent_requests == Some(0) {
@@ -1527,10 +1600,7 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
     }
 
     if let Some(secret) = &server.session_binding_secret {
-        crate::session_binding::validate_configured_secret(
-            "server.session_binding_secret",
-            secret.expose_secret(),
-        )?;
+        session_binding::validate_configured_secret("server.session_binding_secret", secret.expose_secret())?;
     }
 
     for (field, value) in [
@@ -1556,7 +1626,9 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
     // The handshake deadline must be a positive duration: a zero value
     // would reap every TLS handshake before it could complete. Mirrors
     // check #11 in `McpServerConfig::check`.
-    if humantime::parse_duration(&server.tls_handshake_timeout).is_ok_and(|d| d == Duration::ZERO) {
+    if humantime::parse_duration(&server.tls_handshake_timeout)
+        .is_ok_and(|duration| duration == Duration::ZERO)
+    {
         return Err(RmcpServerKitError::Config(
             "server.tls_handshake_timeout must be greater than zero".into(),
         ));
@@ -1581,19 +1653,22 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
         ));
     }
     if let Some(url) = &server.public_url {
-        crate::transport::validate_public_url_value(url).map_err(RmcpServerKitError::Config)?;
+        validate_public_url_value(url).map_err(RmcpServerKitError::Config)?;
     }
-    crate::transport::validate_security_headers(&server.security_headers)?;
+    validate_security_headers(&server.security_headers)?;
 
     Ok(())
 }
 
-/// Validate the rate-limit burst knobs of a TOML [`ServerConfig`]: zero
-/// bursts and orphan bursts fail fast (mirrors `McpServerConfig::check`;
+/// Validate the rate-limit burst knobs of a TOML [`ServerConfig`].
+///
+/// Zero bursts and orphan bursts fail fast (mirrors `McpServerConfig::check`;
 /// the auth bursts have no orphan rule - their base rates always resolve).
-fn validate_rate_limit_knobs(server: &ServerConfig) -> crate::error::Result<()> {
-    use crate::error::RmcpServerKitError;
-
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when a burst knob is zero or orphaned.
+fn validate_rate_limit_knobs(server: &ServerConfig) -> RmcpResult<()> {
     if server.tool_rate_limit_burst == Some(0) {
         return Err(RmcpServerKitError::Config(
             "server.tool_rate_limit_burst must be greater than zero".into(),
@@ -1639,7 +1714,11 @@ fn validate_rate_limit_knobs(server: &ServerConfig) -> crate::error::Result<()> 
     if let Some(auth) = server.auth.as_ref() {
         auth.check_oauth_feature()?;
     }
-    if let Some(rl) = server.auth.as_ref().and_then(|a| a.rate_limit.as_ref()) {
+    if let Some(rl) = server
+        .auth
+        .as_ref()
+        .and_then(|auth| auth.rate_limit.as_ref())
+    {
         (rl.max_attempts_per_minute != 0).ok_or_else(|| {
             RmcpServerKitError::Config(
                 "auth.rate_limit.max_attempts_per_minute must be nonzero".into(),
@@ -1668,10 +1747,13 @@ fn validate_rate_limit_knobs(server: &ServerConfig) -> crate::error::Result<()> 
     Ok(())
 }
 
-fn validate_mtls_knobs(server: &ServerConfig) -> crate::error::Result<()> {
-    use crate::error::RmcpServerKitError;
-
-    if let Some(mtls) = server.auth.as_ref().and_then(|a| a.mtls.as_ref()) {
+/// Validate the mTLS/CRL knobs of a TOML [`ServerConfig`].
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when a CRL knob is zero.
+fn validate_mtls_knobs(server: &ServerConfig) -> RmcpResult<()> {
+    if let Some(mtls) = server.auth.as_ref().and_then(|auth| auth.mtls.as_ref()) {
         (mtls.crl_max_concurrent_fetches != 0).ok_or_else(|| {
             RmcpServerKitError::Config(
                 "auth.mtls.crl_max_concurrent_fetches must be nonzero".into(),
@@ -1704,12 +1786,14 @@ fn validate_mtls_knobs(server: &ServerConfig) -> crate::error::Result<()> {
 
 /// Validate the trusted-forwarder knobs of a TOML [`ServerConfig`]
 /// (mirrors `McpServerConfig::check_trusted_forwarder`).
-fn validate_trusted_forwarder_config(server: &ServerConfig) -> crate::error::Result<()> {
-    use crate::error::RmcpServerKitError;
-
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when a proxy entry, header, scan cap,
+/// or request-id header setting is invalid.
+fn validate_trusted_forwarder_config(server: &ServerConfig) -> RmcpResult<()> {
     for entry in &server.trusted_proxies {
-        crate::transport::validate_trusted_proxy_entry(entry)
-            .map_err(RmcpServerKitError::Config)?;
+        validate_trusted_proxy_entry(entry).map_err(RmcpServerKitError::Config)?;
     }
     if server.forwarded_header.is_some() && server.trusted_proxies.is_empty() {
         return Err(RmcpServerKitError::Config(
@@ -1717,16 +1801,15 @@ fn validate_trusted_forwarder_config(server: &ServerConfig) -> crate::error::Res
         ));
     }
     if server.trusted_forwarder_max_entries == 0
-        || server.trusted_forwarder_max_entries > crate::forwarded::MAX_CONFIGURABLE_SCANNED_ENTRIES
+        || server.trusted_forwarder_max_entries > MAX_CONFIGURABLE_SCANNED_ENTRIES
     {
         return Err(RmcpServerKitError::Config(format!(
-            "server.trusted_forwarder_max_entries must be in 1..={}, got {}",
-            crate::forwarded::MAX_CONFIGURABLE_SCANNED_ENTRIES,
+            "server.trusted_forwarder_max_entries must be in 1..={MAX_CONFIGURABLE_SCANNED_ENTRIES}, got {}",
             server.trusted_forwarder_max_entries
         )));
     }
-    crate::transport::validate_request_id_header(&server.log_context.request_id_header)
-        .map_err(|e| RmcpServerKitError::Config(format!("server.{e}")))?;
+    validate_request_id_header(&server.log_context.request_id_header)
+        .map_err(|err| RmcpServerKitError::Config(format!("server.{err}")))?;
     if server.log_context.request_id && server.trusted_proxies.is_empty() {
         return Err(RmcpServerKitError::Config(
             "server.log_context.request_id requires server.trusted_proxies to be nonempty".into(),
@@ -1740,10 +1823,13 @@ fn validate_trusted_forwarder_config(server: &ServerConfig) -> crate::error::Res
 /// # Errors
 ///
 /// Returns `RmcpServerKitError::Config` on invalid values.
-pub fn validate_observability_config(obs: &ObservabilityConfig) -> crate::error::Result<()> {
+#[expect(
+    clippy::module_name_repetitions,
+    reason = "public API frozen until the next major release"
+)]
+#[inline]
+pub fn validate_observability_config(obs: &ObservabilityConfig) -> RmcpResult<()> {
     use tracing_subscriber::EnvFilter;
-
-    use crate::error::RmcpServerKitError;
 
     if EnvFilter::try_new(&obs.log_level).is_err() {
         return Err(RmcpServerKitError::Config(format!(
@@ -1764,132 +1850,97 @@ pub fn validate_observability_config(obs: &ObservabilityConfig) -> crate::error:
 
 // - Default value functions -
 
+/// Default listen address: `127.0.0.1`.
 fn default_listen_addr() -> String {
     "127.0.0.1".into()
 }
-fn default_listen_port() -> u16 {
+/// Default listen port: `8443`.
+const fn default_listen_port() -> u16 {
     8443
 }
+/// Default graceful-shutdown timeout: `30s`.
 fn default_shutdown_timeout() -> String {
     "30s".into()
 }
+/// Default per-request timeout: `120s`.
 fn default_request_timeout() -> String {
     "120s".into()
 }
+/// Default maximum request body size: 1 MiB.
 const fn default_max_request_body() -> usize {
     1024 * 1024
 }
+/// Default forwarding-chain scan cap.
 const fn default_trusted_forwarder_max_entries() -> usize {
-    crate::forwarded::MAX_SCANNED_ENTRIES
+    MAX_SCANNED_ENTRIES
 }
+/// Default for exposing build metadata on `/version`.
 const fn default_expose_build_metadata() -> bool {
     false
 }
+/// Default for RBAC-filtering `tools/list`.
 const fn default_tool_list_filtering() -> bool {
     true
 }
+/// Default OWASP security-header overrides.
 fn default_security_headers() -> SecurityHeadersConfig {
     SecurityHeadersConfig::default()
 }
+/// Default `tracing` log filter.
 fn default_log_level() -> String {
     "info,rmcp=warn,rmcp_server_kit=info".into()
 }
+/// Default log output format: `pretty`.
 fn default_log_format() -> String {
     "pretty".into()
 }
+/// Default Prometheus metrics bind address.
 fn default_metrics_bind() -> String {
     "127.0.0.1:9090".into()
 }
+/// Default MCP session idle timeout: `20m`.
 fn default_session_idle_timeout() -> String {
     "20m".into()
 }
+/// Default for binding sessions to the authenticated identity.
 const fn default_session_binding() -> bool {
     true
 }
+/// Default per-handshake TLS deadline: `10s`.
 fn default_tls_handshake_timeout() -> String {
     "10s".into()
 }
+/// Default cap on concurrent TLS handshakes: `256`.
 const fn default_max_concurrent_tls_handshakes() -> usize {
     256
 }
+/// Default RBAC role for admin endpoints: `admin`.
 fn default_admin_role() -> String {
     "admin".into()
 }
-fn default_compression_min_size() -> u16 {
+/// Default compression threshold: 1024 bytes.
+const fn default_compression_min_size() -> u16 {
     1024
 }
+/// Default SSE keep-alive interval: `15s`.
 fn default_sse_keep_alive() -> String {
     "15s".into()
 }
 
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::unused_trait_names, reason = "lint-migration: src/config.rs")
+#[expect(
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    reason = "test code is not rendered API documentation"
 )]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::indexing_slicing, reason = "lint-migration: src/config.rs")
+#[expect(
+    clippy::too_long_first_doc_paragraph,
+    reason = "test code is not rendered API documentation"
 )]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::duration_suboptimal_units,
-        reason = "lint-migration: src/config.rs"
-    )
+#[expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")]
+#[expect(
+    clippy::std_instead_of_alloc,
+    reason = "deliberate: src/config.rs tests link `std` only; the crate root has no `extern crate alloc`"
 )]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::shadow_unrelated, reason = "lint-migration: src/config.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::expect_used, reason = "lint-migration: src/config.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::uninlined_format_args,
-        reason = "lint-migration: src/config.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::panic, reason = "lint-migration: src/config.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::assertions_on_result_states,
-        reason = "lint-migration: src/config.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::unwrap_used, reason = "lint-migration: src/config.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::missing_panics_doc,
-        reason = "test code is not rendered API documentation"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::std_instead_of_alloc, reason = "lint-migration: src/config.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::needless_raw_strings, reason = "lint-migration: src/config.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::single_char_lifetime_names,
-        reason = "lint-migration: src/config.rs"
-    )
-)]
-#[cfg_attr(test, expect(deprecated, reason = "lint-migration: src/config.rs"))]
 #[cfg(test)]
 mod tests {
     use std::{collections::HashSet, sync::Arc, time::Duration};
@@ -2699,24 +2750,21 @@ client_ip = false
 
     #[test]
     fn toml_trusted_forwarder_max_entries_bounds_are_enforced() {
-        let parse = |v: usize| -> crate::error::Result<()> {
+        let parse = |v: usize| -> RmcpResult<()> {
             let cfg: ServerConfig =
                 toml::from_str(&format!("trusted_forwarder_max_entries = {v}")).unwrap();
             validate_server_config(&cfg)
         };
         assert!(parse(0).is_err());
-        assert!(parse(crate::forwarded::MAX_CONFIGURABLE_SCANNED_ENTRIES + 1).is_err());
+        assert!(parse(MAX_CONFIGURABLE_SCANNED_ENTRIES + 1).is_err());
         assert!(parse(1).is_ok());
-        assert!(parse(crate::forwarded::MAX_CONFIGURABLE_SCANNED_ENTRIES).is_ok());
+        assert!(parse(MAX_CONFIGURABLE_SCANNED_ENTRIES).is_ok());
     }
 
     #[test]
     fn toml_trusted_forwarder_max_entries_defaults_and_bridges() {
         let cfg: ServerConfig = toml::from_str("").unwrap();
-        assert_eq!(
-            cfg.trusted_forwarder_max_entries,
-            crate::forwarded::MAX_SCANNED_ENTRIES
-        );
+        assert_eq!(cfg.trusted_forwarder_max_entries, MAX_SCANNED_ENTRIES);
         let base = crate::transport::McpServerConfig::new("127.0.0.1:8080", "t", "0");
         let src: ServerConfig =
             toml::from_str("trusted_forwarder_max_entries = 32").expect("parses");
