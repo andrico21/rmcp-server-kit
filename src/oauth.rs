@@ -474,6 +474,10 @@ impl OauthHttpClient {
         #[cfg(any(test, feature = "test-helpers"))]
         let test_bypass: TestLoopbackBypass = Arc::new(AtomicBool::new(false));
         #[cfg(not(any(test, feature = "test-helpers")))]
+        #[expect(
+            clippy::cfg_not_test,
+            reason = "deliberate: src/oauth.rs::build keeps the test-helpers alias arm cfg-gated"
+        )]
         let test_bypass: TestLoopbackBypass = ();
 
         // M-H2/B1: TestLoopbackBypass aliases to Arc<AtomicBool> in test
@@ -625,6 +629,10 @@ impl OauthHttpClient {
             screen_oauth_target(url, self.allow_http, &self.allowlist).await?;
         }
         #[cfg(not(any(test, feature = "test-helpers")))]
+        #[expect(
+            clippy::cfg_not_test,
+            reason = "deliberate: src/oauth.rs::send_screened keeps the test-helpers alias arm cfg-gated"
+        )]
         screen_oauth_target(url, self.allow_http, &self.allowlist).await?;
         request.send().await.map_err(|error| {
             let target = oauth_request_target_for_log(url);
@@ -712,6 +720,7 @@ impl OauthHttpClient {
         &self.credential_client
     }
 
+    /// Select the credential-bearing client; the mTLS cache is compiled out.
     #[cfg(not(feature = "oauth-mtls-client"))]
     const fn client_for(&self, _cfg: &TokenExchangeConfig) -> &reqwest::Client {
         &self.credential_client
@@ -2873,6 +2882,10 @@ impl JwksCache {
     /// [`McpServerConfig::validate`](crate::transport::McpServerConfig::validate)
     /// pipeline) rejects invalid TTLs up front, so the TTL branch is
     /// unreachable for validated configs.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "deliberate: src/oauth.rs::JwksCache::new keeps the screening, TLS and redirect setup in one reviewable block"
+    )]
     #[inline]
     pub fn new(config: &OAuthConfig) -> Result<Self, Box<dyn Error + Send + Sync>> {
         // Ensure crypto providers are installed (idempotent -- ok() ignores
@@ -2923,6 +2936,10 @@ impl JwksCache {
         #[cfg(any(test, feature = "test-helpers"))]
         let test_bypass: TestLoopbackBypass = Arc::new(AtomicBool::new(false));
         #[cfg(not(any(test, feature = "test-helpers")))]
+        #[expect(
+            clippy::cfg_not_test,
+            reason = "deliberate: src/oauth.rs::new keeps the test-helpers alias arm cfg-gated"
+        )]
         let test_bypass: TestLoopbackBypass = ();
 
         #[cfg_attr(
@@ -3564,6 +3581,10 @@ impl JwksCache {
             screen_oauth_target(&self.jwks_uri, self.allow_http, &self.allowlist).await
         };
         #[cfg(not(any(test, feature = "test-helpers")))]
+        #[expect(
+            clippy::cfg_not_test,
+            reason = "deliberate: src/oauth.rs::fetch_jwks keeps the test-helpers alias arm cfg-gated"
+        )]
         let screening = screen_oauth_target(&self.jwks_uri, self.allow_http, &self.allowlist).await;
 
         if let Err(error) = screening {
@@ -5065,16 +5086,19 @@ fn rewrite_client_auth_params(
         reason = "test code is not rendered API documentation"
     )
 )]
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "test code is not rendered API documentation"
+)]
+#[expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")]
 #[cfg(test)]
 mod tests {
-    #![expect(
-        clippy::missing_errors_doc,
-        reason = "test code is not rendered API documentation"
-    )]
-    #![expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")]
 
+    #[cfg(feature = "oauth-mtls-client")]
     use core::ptr;
-    use std::{env, io, process, sync::Mutex};
+    #[cfg(feature = "oauth-mtls-client")]
+    use std::{env, process};
+    use std::{io, sync::Mutex};
 
     use anyhow::Context as _;
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -5746,7 +5770,7 @@ mod tests {
 
             let mut servers_cfg = validation_https_config();
             servers_cfg.authorization_servers = Some(vec![bad.to_owned()]);
-            let err = cfg
+            let err = servers_cfg
                 .validate()
                 .err()
                 .context("validate must reject this config")?
@@ -5771,7 +5795,8 @@ mod tests {
 
         let mut empty_cfg = validation_https_config();
         empty_cfg.authorization_servers = Some(vec![]);
-        cfg.validate()
+        empty_cfg
+            .validate()
             .context("an empty list is the documented way to omit the claim entirely")?;
 
         Ok(())
@@ -5813,7 +5838,7 @@ mod tests {
         Ok(())
     }
 
-    /// R`ejects max_jw``ks_keys` = 0 with a must-be-nonzero config error.
+    /// Rejects `jwks_max_response_bytes = 0` with a must-be-nonzero config error.
     #[test]
     fn rejects_zero_max_jwks_keys() -> anyhow::Result<()> {
         let mut cfg = validation_https_config();
@@ -6117,7 +6142,7 @@ role = "admin"
         Ok(())
     }
 
-    /// Rejects a non-HTTP scheme such as file:/`/ while demanding HTT`PS.
+    /// Rejects a non-HTTP scheme such as `file://` while demanding HTTPS.
     #[test]
     fn validate_rejects_non_http_scheme() -> anyhow::Result<()> {
         let mut cfg = validation_https_config();
@@ -6443,7 +6468,7 @@ role = "admin"
         Ok((cache, token, mock_server))
     }
 
-    /// Collapses duplicate `kid ent`ries in the JWKS to a single cached key.
+    /// Collapses duplicate `kid` entries in the JWKS to a single cached key.
     #[test]
     fn build_key_cache_last_duplicate_kid_wins() -> anyhow::Result<()> {
         let (_pem, jwks_json) = generate_test_keypair("dup-kid")?;
@@ -6602,7 +6627,7 @@ role = "admin"
         Ok(())
     }
 
-    /// Prevents family inference from accept`ing HMAC algs` against asymmetric keys.
+    /// Prevents family inference from accepting HMAC algs against asymmetric keys.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::alg_less_key_never_accepts_hmac_algorithm_confusion keeps the uniform test signature while it only asserts"
@@ -6664,7 +6689,7 @@ role = "admin"
         Ok(())
     }
 
-    /// Pins a key declaring RS256 to exactly RS256, reje`cting R`S384.
+    /// Pins a key declaring RS256 to exactly RS256, rejecting RS384.
     #[test]
     fn explicit_alg_still_pins_exactly_one_algorithm() -> anyhow::Result<()> {
         // The JWK declares RS256, so an RS384 token must NOT be accepted even
@@ -6749,7 +6774,7 @@ role = "admin"
         Ok(())
     }
 
-    /// Rejects configure`d algorithm names `outside the accepted set.
+    /// Rejects configured algorithm names outside the accepted set.
     #[test]
     fn allowed_algorithms_cannot_widen_beyond_accepted_algs() -> anyhow::Result<()> {
         // SECURITY: the whole point of the narrow-only rule. An operator must
@@ -7072,7 +7097,7 @@ role = "admin"
         Ok(())
     }
 
-    /// Matches a kid-less token again`st an unnamed J`WKS key.
+    /// Matches a kid-less token against an unnamed JWKS key.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::no_kid_token_matches_unnamed_key keeps the uniform test signature while it only asserts"
@@ -7483,7 +7508,7 @@ role = "admin"
     fn build_exchange_form_keeps_rfc_parameter_order() -> anyhow::Result<()> {
         let config = test_token_exchange_config("https://idp.example.com/token".into())
             .with_resource("https://api.example.com/v1")
-            .with_scope("read wri`te")
+            .with_scope("read write")
             .with_requested_token_type(RequestedTokenType::Custom("urn:example:token".into()));
         let body = build_exchange_form(&config, "subj");
         let keys: Vec<&str> = body
@@ -8844,7 +8869,7 @@ role = "admin"
         Ok(())
     }
 
-    /// Names the owner with reason Role w`hen no role map`ping matches.
+    /// Names the owner with reason Role when no role mapping matches.
     #[tokio::test]
     async fn detailed_no_role_names_owner() -> anyhow::Result<()> {
         let kid = "detailed-no-role";
@@ -9149,7 +9174,7 @@ role = "admin"
         Ok(())
     }
 
-    /// Permits an exact allowlisted` internal host, with or wi`thout trailing dot.
+    /// Permits an exact allowlisted internal host, with or without trailing dot.
     #[test]
     fn exact_allowlisted_internal_permitted() -> anyhow::Result<()> {
         let allow = make_allowlist(&["idp.internal"], &[])?;
@@ -9339,7 +9364,7 @@ role = "admin"
         Ok(())
     }
 
-    /// Rejects an azp-onl`y audience match under t`he default Strict policy.
+    /// Rejects an azp-only audience match under the default Strict policy.
     #[tokio::test]
     async fn audience_default_is_strict() -> anyhow::Result<()> {
         let kid = "test-audience-azp-default";
@@ -9379,7 +9404,7 @@ role = "admin"
         Ok(())
     }
 
-    /// Accepts a`n azp-only audience match when a``udience_validation_mode` is Warn.
+    /// Accepts an azp-only audience match when `audience_validation_mode` is Warn.
     #[tokio::test]
     async fn audience_warn_still_accepts_azp() -> anyhow::Result<()> {
         let kid = "test-audience-warn-optin";
@@ -10494,7 +10519,7 @@ role = "admin"
         Ok(())
     }
 
-    /// Pass`es a normal-sized` upstream token response through with status and body intact.
+    /// Passes a normal-sized upstream token response through with status and body intact.
     #[tokio::test]
     async fn token_proxy_passes_through_normal_response() -> anyhow::Result<()> {
         use http_body_util::BodyExt as _;
@@ -10802,9 +10827,9 @@ role = "admin"
             key_path: PathBuf::from("/nonexistent/key.pem"),
         };
         let cfg = https_cfg_with_tx(tx_with(None, Some(cc)));
-        let err = cfg
-            .validate()
-            .expect_err("client_cert without feature must be rejected");
+        let Err(err) = cfg.validate() else {
+            anyhow::bail!("client_cert without feature must be rejected");
+        };
         assert!(
             err.to_string().contains("oauth-mtls-client"),
             "error must reference the cargo feature; got {err}"
