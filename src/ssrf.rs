@@ -1,60 +1,20 @@
+//! SSRF guards for outbound HTTP: scheme/userinfo validation, literal-IP
+//! rejection, cloud-metadata blocking, and the operator host/CIDR allowlist
+//! shared by the OAuth/JWKS and CRL fetch paths.
+
 #![cfg_attr(
-    target_os = "linux",
-    expect(clippy::missing_const_for_fn, reason = "lint-migration: src/ssrf.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::arithmetic_side_effects,
-        reason = "lint-migration: src/ssrf.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::shadow_reuse, reason = "lint-migration: src/ssrf.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::min_ident_chars, reason = "lint-migration: src/ssrf.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::option_if_let_else, reason = "lint-migration: src/ssrf.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::missing_errors_doc, reason = "lint-migration: src/ssrf.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
+    all(test, feature = "oauth", target_os = "linux"),
     expect(
         clippy::too_long_first_doc_paragraph,
         reason = "lint-migration: src/ssrf.rs"
     )
 )]
 #![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::doc_paragraphs_missing_punctuation,
-        reason = "lint-migration: src/ssrf.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::redundant_pub_crate, reason = "lint-migration: src/ssrf.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(clippy::std_instead_of_core, reason = "lint-migration: src/ssrf.rs")
 )]
-#![cfg_attr(
-    all(not(test), target_os = "linux"),
-    expect(
-        clippy::missing_docs_in_private_items,
-        reason = "lint-migration: src/ssrf.rs"
-    )
-)]
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use url::Url;
 
@@ -69,10 +29,11 @@ pub(crate) const CLOUD_METADATA_V4: Ipv4Addr = Ipv4Addr::new(169, 254, 169, 254)
 pub(crate) const CLOUD_METADATA_V4_ALIBABA: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 200);
 
 /// AWS IPv6 instance metadata endpoint (`fd00:ec2::254`, IMDSv2 over IPv6).
+///
 /// Lives inside `fc00::/7` (unique-local) but is treated as cloud-metadata
 /// so it cannot be re-allowed via a `fd00::/8` operator allowlist.
 ///
-/// Source: <https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-metadata-v2-how-it-works.html>
+/// Source: <https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-metadata-v2-how-it-works.html>.
 pub(crate) const CLOUD_METADATA_V6_AWS: Ipv6Addr =
     Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254);
 
@@ -80,7 +41,7 @@ pub(crate) const CLOUD_METADATA_V6_AWS: Ipv6Addr =
 /// `fc00::/7` (unique-local) but is treated as cloud-metadata so it
 /// cannot be re-allowed via a `fc00::/7` operator allowlist.
 ///
-/// Source: <https://cloud.google.com/compute/docs/metadata/overview>
+/// Source: <https://cloud.google.com/compute/docs/metadata/overview>.
 pub(crate) const CLOUD_METADATA_V6_GCP: Ipv6Addr =
     Ipv6Addr::new(0xfd20, 0x00ce, 0, 0, 0, 0, 0, 0x0254);
 
@@ -96,6 +57,13 @@ pub(crate) const CLOUD_METADATA_V6_GCP: Ipv6Addr =
 /// the fetch machinery, error strings, or logs. This mirrors the
 /// userinfo rule already enforced on OAuth redirect targets by
 /// [`redirect_target_reason_with_allowlist`].
+///
+/// # Errors
+///
+/// Returns `invalid_scheme` for any scheme other than `https` (or `http`
+/// when `allow_http` is true), `http_scheme_disallowed` for `http` when
+/// `allow_http` is false, and `userinfo_forbidden` when the URL carries
+/// embedded credentials.
 pub(crate) fn check_scheme(url: &Url, allow_http: bool) -> Result<(), &'static str> {
     match url.scheme() {
         "https" => {}
@@ -118,10 +86,10 @@ pub(crate) fn check_scheme(url: &Url, allow_http: bool) -> Result<(), &'static s
 /// included only when explicitly present in the URL.
 pub(crate) fn sanitized_url_for_log(url: &Url) -> String {
     let host = url.host_str().unwrap_or("<no-host>");
-    match url.port() {
-        Some(port) => format!("{}://{host}:{port}", url.scheme()),
-        None => format!("{}://{host}", url.scheme()),
-    }
+    url.port().map_or_else(
+        || format!("{}://{host}", url.scheme()),
+        |port| format!("{}://{host}:{port}", url.scheme()),
+    )
 }
 
 /// Check whether an IP address must be rejected before any TCP connect.
@@ -170,6 +138,7 @@ pub(crate) fn ip_block_reason(ip: IpAddr) -> Option<&'static str> {
     }
 }
 
+/// Classify an IPv4 address against the blocked ranges, cloud-metadata first.
 fn block_reason_v4(v4: Ipv4Addr) -> Option<&'static str> {
     // Cloud-metadata MUST be checked first so it wins over CGNAT
     // (Alibaba metadata sits inside 100.64.0.0/10) and link-local
@@ -222,6 +191,7 @@ fn block_reason_v4(v4: Ipv4Addr) -> Option<&'static str> {
     None
 }
 
+/// Classify an IPv6 address, delegating embedded IPv4 forms to the IPv4 rules.
 fn block_reason_v6(v6: Ipv6Addr) -> Option<&'static str> {
     // Cloud-metadata MUST be checked first so it wins over the generic
     // unique-local bucket (AWS `fd00:ec2::254` and GCP `fd20:ce::254`
@@ -316,16 +286,17 @@ fn block_reason_v6(v6: Ipv6Addr) -> Option<&'static str> {
 /// Reassemble an IPv4 address embedded in two adjacent IPv6 segments
 /// (`hi` carries the first two octets, `lo` the last two).
 const fn embedded_v4(hi: u16, lo: u16) -> Ipv4Addr {
-    let [a, b] = hi.to_be_bytes();
-    let [c, d] = lo.to_be_bytes();
-    Ipv4Addr::new(a, b, c, d)
+    let [hi_hi, hi_lo] = hi.to_be_bytes();
+    let [lo_hi, lo_lo] = lo.to_be_bytes();
+    Ipv4Addr::new(hi_hi, hi_lo, lo_hi, lo_lo)
 }
 
-/// Sync pre-DNS literal-IP check. Any literal IPv4 or IPv6 host is
-/// rejected at URL-validation time, regardless of whether the address
-/// falls in a private or public range. OAuth operators must use DNS
-/// hostnames; post-DNS runtime checks remain the responsibility of the
-/// fetch path.
+/// Sync pre-DNS literal-IP check.
+///
+/// Any literal IPv4 or IPv6 host is rejected at URL-validation time,
+/// regardless of whether the address falls in a private or public range.
+/// OAuth operators must use DNS hostnames; post-DNS runtime checks remain
+/// the responsibility of the fetch path.
 #[cfg(feature = "oauth")]
 pub(crate) fn check_url_literal_ip(url: &Url) -> Option<&'static str> {
     match url.host()? {
@@ -339,13 +310,16 @@ pub(crate) fn check_url_literal_ip(url: &Url) -> Option<&'static str> {
 // Operator SSRF allowlist (CIDR + host) for OAuth/JWKS targets
 // ---------------------------------------------------------------------------
 
-/// Single CIDR entry as parsed from operator config. Stores the network
-/// address (host bits cleared at parse time) and the prefix length so a
-/// candidate `IpAddr` can be matched against it without re-parsing on
-/// every request.
+/// Single CIDR entry as parsed from operator config.
+///
+/// Stores the network address (host bits cleared at parse time) and the
+/// prefix length so a candidate `IpAddr` can be matched against it without
+/// re-parsing on every request.
 #[derive(Debug, Clone)]
 pub(crate) struct CidrEntry {
+    /// Network address with host bits cleared at parse time.
     network: IpAddr,
+    /// Prefix length in bits (`1..=32` for IPv4, `1..=128` for IPv6).
     prefix_len: u8,
 }
 
@@ -369,21 +343,31 @@ impl CidrEntry {
     /// - Non-zero host bits (`10.0.0.1/8`).
     ///
     /// Uses `std::net` only -- no new dependencies.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the string lacks a `/`, has a non-numeric or
+    /// out-of-range prefix (`0`, `> 32` for IPv4, `> 128` for IPv6), a
+    /// malformed address, non-zero host bits, or an IPv4-mapped IPv6 CIDR.
     #[cfg_attr(
         all(not(test), not(feature = "oauth")),
         expect(dead_code, reason = "consumer is feature-gated")
     )]
-    pub(crate) fn parse(raw: &str) -> Result<Self, String> {
-        let raw = raw.trim();
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "invariant: src/ssrf.rs::CidrEntry::parse bounds prefix_len to 1..=32 (IPv4) / 1..=128 (IPv6), so the mask shift subtraction cannot underflow"
+    )]
+    pub(crate) fn parse(spec: &str) -> Result<Self, String> {
+        let raw = spec.trim();
         let Some((addr_str, prefix_str)) = raw.split_once('/') else {
             return Err(format!("CIDR {raw:?} missing '/' prefix length"));
         };
         let prefix_len: u8 = prefix_str
             .parse()
-            .map_err(|e| format!("CIDR {raw:?}: invalid prefix length {prefix_str:?}: {e}"))?;
+            .map_err(|err| format!("CIDR {raw:?}: invalid prefix length {prefix_str:?}: {err}"))?;
         let addr: IpAddr = addr_str
             .parse()
-            .map_err(|e| format!("CIDR {raw:?}: invalid address {addr_str:?}: {e}"))?;
+            .map_err(|err| format!("CIDR {raw:?}: invalid address {addr_str:?}: {err}"))?;
         if prefix_len == 0 {
             return Err(format!(
                 "CIDR {raw:?}: prefix length 0 is forbidden (would allow every address)"
@@ -443,6 +427,10 @@ impl CidrEntry {
     /// Callers that want IPv4-mapped IPv6 to inherit must normalize the
     /// candidate via [`ip_block_reason`]'s `to_ipv4_mapped()` path before
     /// calling.
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "invariant: src/ssrf.rs::CidrEntry::parse bounds prefix_len to 1..=32 (IPv4) / 1..=128 (IPv6), so the mask shift subtraction cannot underflow"
+    )]
     pub(crate) fn contains(&self, ip: IpAddr) -> bool {
         match (self.network, ip) {
             (IpAddr::V4(net), IpAddr::V4(candidate)) => {
@@ -466,8 +454,9 @@ impl CidrEntry {
     }
 }
 
-/// Compiled, validated form of `crate::oauth::OAuthSsrfAllowlist`. Built
-/// once at `OAuthConfig::validate` time (or at `OauthHttpClient::build` /
+/// Compiled, validated form of `crate::oauth::OAuthSsrfAllowlist`.
+///
+/// Built once at `OAuthConfig::validate` time (or at `OauthHttpClient::build` /
 /// `JwksCache::new` time when no separate validate call is made) and
 /// cached on the runtime types for SSRF screening.
 ///
@@ -493,7 +482,7 @@ impl CompiledSsrfAllowlist {
         all(not(test), not(feature = "oauth")),
         expect(dead_code, reason = "consumer is feature-gated")
     )]
-    pub(crate) fn new(hosts: Vec<String>, cidrs: Vec<CidrEntry>) -> Self {
+    pub(crate) const fn new(hosts: Vec<String>, cidrs: Vec<CidrEntry>) -> Self {
         Self { hosts, cidrs }
     }
 
@@ -517,7 +506,7 @@ impl CompiledSsrfAllowlist {
     /// Returns true iff both `hosts` and `cidrs` are empty -- i.e. the
     /// allowlist is a no-op and the default SSRF guard should apply
     /// unchanged.
-    pub(crate) fn is_empty(&self) -> bool {
+    pub(crate) const fn is_empty(&self) -> bool {
         self.hosts.is_empty() && self.cidrs.is_empty()
     }
 
@@ -526,7 +515,7 @@ impl CompiledSsrfAllowlist {
         not(feature = "oauth"),
         expect(dead_code, reason = "consumer is feature-gated")
     )]
-    pub(crate) fn host_count(&self) -> usize {
+    pub(crate) const fn host_count(&self) -> usize {
         self.hosts.len()
     }
 
@@ -535,7 +524,7 @@ impl CompiledSsrfAllowlist {
         not(feature = "oauth"),
         expect(dead_code, reason = "consumer is feature-gated")
     )]
-    pub(crate) fn cidr_count(&self) -> usize {
+    pub(crate) const fn cidr_count(&self) -> usize {
         self.cidrs.len()
     }
 }

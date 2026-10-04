@@ -15,61 +15,11 @@
 //! falls back to the **direct peer**, never to a header value. Raw header
 //! contents are never logged; callers receive a [`FallbackReason`] code.
 #![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(clippy::min_ident_chars, reason = "lint-migration: src/forwarded.rs")
 )]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::too_long_first_doc_paragraph,
-        reason = "lint-migration: src/forwarded.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::map_err_ignore, reason = "lint-migration: src/forwarded.rs")
-)]
-#![cfg_attr(
-    all(not(test), target_os = "linux"),
-    expect(
-        clippy::missing_docs_in_private_items,
-        reason = "lint-migration: src/forwarded.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::arithmetic_side_effects,
-        reason = "lint-migration: src/forwarded.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::shadow_reuse, reason = "lint-migration: src/forwarded.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_errors_doc,
-        reason = "lint-migration: src/forwarded.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::redundant_pub_crate,
-        reason = "lint-migration: src/forwarded.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::std_instead_of_core,
-        reason = "lint-migration: src/forwarded.rs"
-    )
-)]
 
-use std::net::IpAddr;
+use core::net::IpAddr;
 
 use axum::http::{HeaderMap, HeaderName};
 use ipnet::IpNet;
@@ -119,6 +69,13 @@ pub(crate) enum FallbackReason {
 /// - Direct peer trusted → rightmost-untrusted walk over the **last**
 ///   instance of the configured header; `Ok(client)` on success,
 ///   `Err(reason)` when the caller must fall back to `direct`.
+///
+/// # Errors
+///
+/// Returns a [`FallbackReason`] code when resolution must fall back to
+/// `direct`: the configured header is absent, its last instance is not
+/// valid UTF-8, a scanned entry is malformed or obfuscated, every scanned
+/// entry is a trusted proxy, or the chain exceeds the scan cap.
 pub(crate) fn resolve_client_ip(
     direct: IpAddr,
     headers: &HeaderMap,
@@ -140,13 +97,13 @@ pub(crate) fn resolve_client_ip(
     let Some(value) = headers.get_all(&header_name).iter().next_back() else {
         return Err(FallbackReason::NoHeader);
     };
-    let Ok(value) = value.to_str() else {
+    let Ok(text) = value.to_str() else {
         return Err(FallbackReason::MalformedEntry);
     };
 
     let mut scanned = 0_usize;
-    for raw_entry in value.split(',').rev() {
-        scanned += 1;
+    for raw_entry in text.split(',').rev() {
+        scanned = scanned.saturating_add(1);
         if scanned > max_scanned_entries {
             return Err(FallbackReason::TooManyEntries);
         }
@@ -162,12 +119,18 @@ pub(crate) fn resolve_client_ip(
     Err(FallbackReason::AllEntriesTrusted)
 }
 
+/// Return whether `ip` falls inside any trusted-proxy network in `trusted`.
 pub(crate) fn is_trusted(ip: IpAddr, trusted: &[IpNet]) -> bool {
     trusted.iter().any(|net| net.contains(&ip))
 }
 
 /// Parse one `X-Forwarded-For` list entry: an IP, optionally with a port
 /// (`1.2.3.4:5678`, `[2001:db8::1]:443`) and surrounded by OWS.
+///
+/// # Errors
+///
+/// Returns [`FallbackReason::MalformedEntry`] when the trimmed entry is
+/// empty or is not a valid node identifier.
 fn parse_xff_entry(raw: &str) -> Result<IpAddr, FallbackReason> {
     let token = raw.trim();
     if token.is_empty() {
@@ -180,6 +143,13 @@ fn parse_xff_entry(raw: &str) -> Result<IpAddr, FallbackReason> {
 ///
 /// Stanza shape: `for=X;by=Y;proto=Z` - parameters separated by `;`,
 /// names case-insensitive, values optionally double-quoted.
+///
+/// # Errors
+///
+/// Returns [`FallbackReason::MalformedEntry`] when the stanza is empty, the
+/// `for=` value is neither a token nor a balanced quoted-string, or the
+/// node identifier is invalid; returns [`FallbackReason::Obfuscated`] for
+/// RFC 7239 obfuscated or `unknown` identifiers.
 fn parse_forwarded_entry(raw: &str) -> Result<IpAddr, FallbackReason> {
     let stanza = raw.trim();
     if stanza.is_empty() {
@@ -198,11 +168,11 @@ fn parse_forwarded_entry(raw: &str) -> Result<IpAddr, FallbackReason> {
         // and `"""1.2.3.4"""` are all malformed, and normalizing them into a
         // valid address would create a parser differential with the upstream
         // proxy whose decision we are supposed to be mirroring.
-        let value = value.trim();
-        let Some(value) = (match value.strip_circumfix("\"", "\"") {
+        let trimmed = value.trim();
+        let Some(node) = (match trimmed.strip_circumfix("\"", "\"") {
             Some(inner) => Some(inner),
             // Bare token: legitimately unquoted, so no `"` may appear at all.
-            None if !value.contains('"') => Some(value),
+            None if !trimmed.contains('"') => Some(trimmed),
             // Unbalanced or repeated quotes: neither token nor quoted-string.
             None => None,
         }) else {
@@ -211,16 +181,22 @@ fn parse_forwarded_entry(raw: &str) -> Result<IpAddr, FallbackReason> {
         // RFC 7239 §6: obfuscated identifiers start with '_'; "unknown"
         // means the previous hop could not be identified. Either way the
         // chain cannot be verified past this point.
-        if value.eq_ignore_ascii_case("unknown") || value.starts_with('_') {
+        if node.eq_ignore_ascii_case("unknown") || node.starts_with('_') {
             return Err(FallbackReason::Obfuscated);
         }
-        return parse_node_identifier(value);
+        return parse_node_identifier(node);
     }
     // A stanza without a `for=` parameter cannot identify the hop.
     Err(FallbackReason::MalformedEntry)
 }
 
 /// Parse a node identifier: bare IPv4/IPv6, `v4:port`, or `[v6]:port`.
+///
+/// # Errors
+///
+/// Returns [`FallbackReason::MalformedEntry`] when the token is empty, a
+/// bracketed or `host:port` form carries an invalid port, or the address
+/// fails to parse.
 fn parse_node_identifier(token: &str) -> Result<IpAddr, FallbackReason> {
     if token.is_empty() {
         return Err(FallbackReason::MalformedEntry);
@@ -236,7 +212,7 @@ fn parse_node_identifier(token: &str) -> Result<IpAddr, FallbackReason> {
         }
         return inner
             .parse::<IpAddr>()
-            .map_err(|_| FallbackReason::MalformedEntry);
+            .map_err(|_error| FallbackReason::MalformedEntry);
     }
     // Bare address first: covers IPv4 and unbracketed IPv6 (which contains
     // multiple colons and must NOT be split on ':').
@@ -253,16 +229,20 @@ fn parse_node_identifier(token: &str) -> Result<IpAddr, FallbackReason> {
         }
         return host
             .parse::<IpAddr>()
-            .map_err(|_| FallbackReason::MalformedEntry);
+            .map_err(|_error| FallbackReason::MalformedEntry);
     }
     Err(FallbackReason::MalformedEntry)
 }
 
-/// A forwarding-node port must be a non-empty decimal `u16`. An empty or
-/// non-numeric port marks the entry malformed so resolution falls back to
-/// the direct peer rather than trusting an ambiguous node identifier.
+/// A forwarding-node port must be a non-empty decimal `u16`.
+///
+/// An empty or non-numeric port marks the entry malformed so resolution
+/// falls back to the direct peer rather than trusting an ambiguous node
+/// identifier.
 fn is_valid_port(port: &str) -> bool {
-    !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok()
+    !port.is_empty()
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+        && port.parse::<u16>().is_ok()
 }
 
 #[cfg_attr(

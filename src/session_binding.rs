@@ -1,111 +1,52 @@
 //! Stateless binding between rmcp session IDs and authenticated identities.
 #![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::option_if_let_else,
-        reason = "lint-migration: src/session_binding.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(
         clippy::missing_panics_doc,
         reason = "lint-migration: src/session_binding.rs"
     )
 )]
 #![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::min_ident_chars,
-        reason = "lint-migration: src/session_binding.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(
         clippy::shadow_reuse,
         reason = "lint-migration: src/session_binding.rs"
     )
 )]
 #![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::map_err_ignore,
-        reason = "lint-migration: src/session_binding.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::arithmetic_side_effects,
-        reason = "lint-migration: src/session_binding.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_const_for_fn,
-        reason = "lint-migration: src/session_binding.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_errors_doc,
-        reason = "lint-migration: src/session_binding.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::std_instead_of_core,
-        reason = "lint-migration: src/session_binding.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(
         clippy::absolute_paths,
         reason = "lint-migration: src/session_binding.rs"
     )
 )]
 #![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::redundant_pub_crate,
-        reason = "lint-migration: src/session_binding.rs"
-    )
-)]
-#![cfg_attr(
-    all(not(test), target_os = "linux"),
-    expect(
-        clippy::missing_docs_in_private_items,
-        reason = "lint-migration: src/session_binding.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(
         clippy::unused_trait_names,
         reason = "lint-migration: src/session_binding.rs"
     )
 )]
 #![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(
         clippy::unseparated_literal_suffix,
         reason = "lint-migration: src/session_binding.rs"
     )
 )]
-#![expect(unused_results, reason = "lint-migration: src/session_binding.rs")]
+#![cfg_attr(
+    all(test, target_os = "linux"),
+    expect(unused_results, reason = "lint-migration: src/session_binding.rs")
+)]
 
+use core::{fmt, str};
 use std::sync::OnceLock;
 
 use axum::{
     body::Body,
     http::{HeaderValue, Request, StatusCode, header::HeaderName},
     middleware::Next,
-    response::{IntoResponse, Response},
+    response::{IntoResponse as _, Response},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, KeyInit as _, Mac as _};
@@ -118,13 +59,21 @@ use crate::{
     error::RmcpServerKitError,
 };
 
+/// Token-format version prefix (`v1`).
 const VERSION: &str = "v1";
+/// Domain-separation byte placed between MAC input fields.
 const DOMAIN_SEPARATOR: u8 = 0;
+/// Length in bytes of a raw rmcp session ID (UUID textual form).
 const RAW_SESSION_ID_LEN: usize = 36;
+/// Length in bytes of a base64url-encoded raw session ID without padding.
 const RAW_SESSION_ID_B64_LEN: usize = 48;
+/// Length in bytes of an HMAC-SHA256 tag.
 const MAC_LEN: usize = 32;
+/// Minimum UTF-8 byte length accepted for an operator-configured secret.
 pub(crate) const MIN_CONFIGURED_SECRET_BYTES: usize = 32;
+/// Length in bytes of a base64url-encoded HMAC-SHA256 tag without padding.
 const MAC_B64_LEN: usize = 43;
+/// Maximum byte length of a wrapped session token produced by this module.
 const MAX_WRAPPED_SESSION_TOKEN_LEN: usize =
     VERSION.len() + 1 + RAW_SESSION_ID_B64_LEN + 1 + MAC_B64_LEN;
 
@@ -137,8 +86,8 @@ pub(crate) enum SessionBindingSecret {
     Configured(SecretString),
 }
 
-impl std::fmt::Debug for SessionBindingSecret {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for SessionBindingSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("SessionBindingSecret(<redacted>)")
     }
 }
@@ -159,6 +108,11 @@ impl IdentityFingerprint {
 pub(crate) struct RawSessionId(String);
 
 impl RawSessionId {
+    /// Parse a raw rmcp session ID, requiring the UUID textual shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Reason::Malformed`] when `raw` is not UUID-shaped.
     pub(crate) fn parse(raw: &str) -> Result<Self, Reason> {
         if is_uuid_shaped(raw) {
             Ok(Self(raw.to_owned()))
@@ -180,7 +134,8 @@ pub(crate) enum Reason {
 }
 
 impl Reason {
-    fn as_str(self) -> &'static str {
+    /// Stable lowercase label for logs; never the token itself.
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Malformed => "malformed",
             Self::Unwrapped => "unwrapped",
@@ -193,13 +148,18 @@ impl Reason {
 pub(crate) fn process_session_binding_secret() -> &'static SessionBindingSecret {
     static PROCESS_SECRET: OnceLock<SessionBindingSecret> = OnceLock::new();
     PROCESS_SECRET.get_or_init(|| {
-        let mut bytes = [0u8; MAC_LEN];
+        let mut bytes = [0_u8; MAC_LEN];
         rand::fill(&mut bytes);
         SessionBindingSecret::Process(bytes)
     })
 }
 
 /// Build a session-binding HMAC secret from operator configuration.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when the configured secret is empty,
+/// whitespace-only, or shorter than [`MIN_CONFIGURED_SECRET_BYTES`].
 pub(crate) fn configured_session_binding_secret(
     secret: &SecretString,
 ) -> Result<SessionBindingSecret, RmcpServerKitError> {
@@ -208,6 +168,11 @@ pub(crate) fn configured_session_binding_secret(
 }
 
 /// Validate the configured session-binding secret's strength.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when `value` is empty, whitespace-only,
+/// or shorter than [`MIN_CONFIGURED_SECRET_BYTES`] UTF-8 bytes.
 pub(crate) fn validate_configured_secret(
     field: &str,
     value: &str,
@@ -245,7 +210,11 @@ pub(crate) fn fingerprint(identity: &AuthIdentity) -> IdentityFingerprint {
         !stable_id.trim().is_empty(),
         "session-binding fingerprint stable id must be non-blank; producers are validated upstream"
     );
-    let mut bytes = Vec::with_capacity(method.len() + 1 + stable_id.len());
+    let capacity = method
+        .len()
+        .saturating_add(1)
+        .saturating_add(stable_id.len());
+    let mut bytes = Vec::with_capacity(capacity);
     bytes.extend_from_slice(method);
     bytes.push(DOMAIN_SEPARATOR);
     bytes.extend_from_slice(stable_id.as_bytes());
@@ -267,6 +236,13 @@ pub(crate) fn wrap(
 }
 
 /// Verify an identity-bound token and recover the raw rmcp session ID.
+///
+/// # Errors
+///
+/// Returns [`Reason::Malformed`] when the token is oversized, is not three
+/// dot-separated segments, or is not a base64url-encoded UUID plus MAC;
+/// [`Reason::Unwrapped`] for a bare raw session ID; and [`Reason::MacFailed`]
+/// when the recomputed MAC does not match the presented one.
 pub(crate) fn unwrap_and_verify(
     secret: &SessionBindingSecret,
     token: &str,
@@ -287,22 +263,22 @@ pub(crate) fn unwrap_and_verify(
         return Err(Reason::Malformed);
     }
 
-    let mut mac = [0u8; MAC_LEN];
+    let mut mac = [0_u8; MAC_LEN];
     let mac_len = URL_SAFE_NO_PAD
         .decode_slice(mac_part, &mut mac)
-        .map_err(|_| Reason::Malformed)?;
+        .map_err(|_error| Reason::Malformed)?;
     if mac_len != MAC_LEN {
         return Err(Reason::Malformed);
     }
 
-    let mut raw = [0u8; RAW_SESSION_ID_LEN];
+    let mut raw = [0_u8; RAW_SESSION_ID_LEN];
     let raw_len = URL_SAFE_NO_PAD
         .decode_slice(raw_part, &mut raw)
-        .map_err(|_| Reason::Malformed)?;
+        .map_err(|_error| Reason::Malformed)?;
     if raw_len != RAW_SESSION_ID_LEN {
         return Err(Reason::Malformed);
     }
-    let raw_str = std::str::from_utf8(&raw).map_err(|_| Reason::Malformed)?;
+    let raw_str = str::from_utf8(&raw).map_err(|_error| Reason::Malformed)?;
     let raw_id = RawSessionId::parse(raw_str)?;
     let expected = compute_mac(secret, &raw_id, fp);
     if expected.ct_eq(&mac).into() {
@@ -322,7 +298,7 @@ pub(crate) async fn session_binding_middleware(
     next: Next,
 ) -> Response {
     let identity = req.extensions().get::<AuthIdentity>().cloned();
-    let Some(identity) = identity else {
+    let Some(auth_identity) = identity else {
         return next.run(req).await;
     };
 
@@ -331,15 +307,15 @@ pub(crate) async fn session_binding_middleware(
         let header = req
             .headers()
             .get(session_header_name())
-            .and_then(|h| h.to_str().ok());
+            .and_then(|header| header.to_str().ok());
         let Some(token) = header else {
             return reject(Reason::Malformed);
         };
-        let fp = fingerprint(&identity);
+        let fp = fingerprint(&auth_identity);
         match unwrap_and_verify(&secret, token, &fp) {
             Ok(raw_id) => match HeaderValue::from_str(&raw_id.0) {
                 Ok(value) => {
-                    req.headers_mut().insert(session_header_name(), value);
+                    drop(req.headers_mut().insert(session_header_name(), value));
                 }
                 Err(_) => return reject(Reason::Malformed),
             },
@@ -349,11 +325,17 @@ pub(crate) async fn session_binding_middleware(
 
     let mut response = next.run(req).await;
     if !request_had_session {
-        wrap_response_session(&secret, &identity, &mut response);
+        wrap_response_session(&secret, &auth_identity, &mut response);
     }
     response
 }
 
+/// Split a wrapped token into its raw-ID and MAC segments.
+///
+/// # Errors
+///
+/// Returns [`Reason::Malformed`] unless `token` has exactly three
+/// dot-separated segments.
 fn split_token(token: &str) -> Result<(&str, &str), Reason> {
     let mut parts = token.split('.');
     match (parts.next(), parts.next(), parts.next(), parts.next()) {
@@ -362,12 +344,22 @@ fn split_token(token: &str) -> Result<(&str, &str), Reason> {
     }
 }
 
+/// HMAC-SHA256 instantiation used for session-binding MACs.
 pub(crate) type HmacSha256 = Hmac<Sha256>;
 
 /// Build a keyed HMAC-SHA256 instance from a binding secret.
 ///
 /// Shared by session binding and [`crate::task_binding`] so the defensive
 /// re-key below exists in exactly one place.
+///
+/// # Panics
+///
+/// Cannot panic in practice: the fallback `expect` below is unreachable because
+/// a 32-byte SHA-256 digest is always a valid HMAC-SHA256 key.
+#[expect(
+    clippy::option_if_let_else,
+    reason = "constant-time: src/session_binding.rs::keyed_mac must not branch observably on key material; the fallback keeps the re-key sequence branch-free"
+)]
 pub(crate) fn keyed_mac(secret: &SessionBindingSecret) -> HmacSha256 {
     // HMAC-SHA256 accepts keys of any length (RFC 2104), so construction
     // cannot fail for either the process-random default or configured secret.
@@ -377,23 +369,24 @@ pub(crate) fn keyed_mac(secret: &SessionBindingSecret) -> HmacSha256 {
     let configured_key;
     let key = match secret {
         SessionBindingSecret::Process(bytes) => bytes.as_slice(),
-        SessionBindingSecret::Configured(secret) => {
-            configured_key = secret.expose_secret();
+        SessionBindingSecret::Configured(configured_secret) => {
+            configured_key = configured_secret.expose_secret();
             configured_key.as_bytes()
         }
     };
-    if let Ok(m) = HmacSha256::new_from_slice(key) {
-        m
+    if let Ok(hmac) = HmacSha256::new_from_slice(key) {
+        hmac
     } else {
         let digest = Sha256::digest(key);
         #[expect(
             clippy::expect_used,
-            reason = "32-byte SHA-256 digest is unconditionally valid as an HMAC-SHA256 key (RFC 2104 allows any key length); see surrounding comment"
+            reason = "invariant: src/session_binding.rs::keyed_mac -- a 32-byte SHA-256 digest is unconditionally a valid HMAC-SHA256 key (RFC 2104 allows any key length)"
         )]
         HmacSha256::new_from_slice(&digest).expect("32-byte SHA256 digest is valid HMAC key")
     }
 }
 
+/// Compute the HMAC-SHA256 tag binding `raw_id` and `fp` under `secret`.
 fn compute_mac(
     secret: &SessionBindingSecret,
     raw_id: &RawSessionId,
@@ -408,6 +401,10 @@ fn compute_mac(
     mac.finalize().into_bytes().into()
 }
 
+/// Wrap the response's raw session ID for the authenticated identity.
+///
+/// Leaves the header untouched when absent; removes it and logs when the raw ID
+/// is malformed or cannot be encoded as a header value.
 fn wrap_response_session(
     secret: &SessionBindingSecret,
     identity: &AuthIdentity,
@@ -416,24 +413,25 @@ fn wrap_response_session(
     let raw = response
         .headers()
         .get(session_header_name())
-        .and_then(|h| h.to_str().ok());
-    let Some(raw) = raw else {
+        .and_then(|header| header.to_str().ok());
+    let Some(raw_header) = raw else {
         return;
     };
-    let Ok(raw_id) = RawSessionId::parse(raw) else {
+    let Ok(raw_id) = RawSessionId::parse(raw_header) else {
         tracing::warn!(reason = %Reason::Malformed.as_str(), "mcp session binding skipped invalid response session id");
-        response.headers_mut().remove(session_header_name());
+        drop(response.headers_mut().remove(session_header_name()));
         return;
     };
     let token = wrap(secret, &raw_id, &fingerprint(identity));
     if let Ok(value) = HeaderValue::from_str(&token) {
-        response.headers_mut().insert(session_header_name(), value);
+        drop(response.headers_mut().insert(session_header_name(), value));
     } else {
         tracing::warn!(reason = %Reason::Malformed.as_str(), "mcp session binding failed to encode response session id");
-        response.headers_mut().remove(session_header_name());
+        drop(response.headers_mut().remove(session_header_name()));
     }
 }
 
+/// Build the HTTP rejection response for a failed binding check.
 fn reject(reason: Reason) -> Response {
     tracing::warn!(reason = %reason.as_str(), "mcp session binding rejected request");
     match reason {
@@ -444,10 +442,12 @@ fn reject(reason: Reason) -> Response {
     }
 }
 
-fn session_header_name() -> HeaderName {
+/// Return the canonical `Mcp-Session-Id` header name.
+const fn session_header_name() -> HeaderName {
     HeaderName::from_static("mcp-session-id")
 }
 
+/// Return whether `value` has the 36-byte UUID textual shape.
 fn is_uuid_shaped(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() == RAW_SESSION_ID_LEN

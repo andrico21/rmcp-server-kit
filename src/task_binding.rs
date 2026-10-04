@@ -27,45 +27,7 @@
 //!
 //! Every function here is synchronous and pure, so cancel safety is not
 //! applicable: there is no `.await` and no shared mutable state.
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::std_instead_of_core,
-        reason = "lint-migration: src/task_binding.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::if_then_some_else_none,
-        reason = "lint-migration: src/task_binding.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::absolute_paths, reason = "lint-migration: src/task_binding.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::redundant_pub_crate,
-        reason = "lint-migration: src/task_binding.rs"
-    )
-)]
-#![cfg_attr(
-    all(not(test), target_os = "linux"),
-    expect(
-        clippy::missing_docs_in_private_items,
-        reason = "lint-migration: src/task_binding.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::unseparated_literal_suffix,
-        reason = "lint-migration: src/task_binding.rs"
-    )
-)]
+use core::str;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::Mac as _;
@@ -96,12 +58,15 @@ const TASK_MAC_DOMAIN: &[u8] = b"rmcp-server-kit/task-id-binding/v1";
 /// bound is enforced before any decoding.
 const MAX_RAW_TASK_ID_BYTES: usize = 512;
 
+/// Byte length of the HMAC-SHA256 tag bound into every task token.
 const MAC_LEN: usize = 32;
+/// Character length of `MAC_LEN` bytes encoded with `URL_SAFE_NO_PAD`.
 const MAC_B64_LEN: usize = 43;
 
 /// `URL_SAFE_NO_PAD` expands `n` bytes to `ceil(n * 4 / 3)` characters.
 const MAX_RAW_TASK_ID_B64_LEN: usize = MAX_RAW_TASK_ID_BYTES.div_ceil(3) * 4;
 
+/// Upper bound in bytes on any externally supplied wrapped task token.
 const MAX_WRAPPED_TASK_TOKEN_LEN: usize =
     TASK_VERSION.len() + 1 + MAX_RAW_TASK_ID_B64_LEN + 1 + MAC_B64_LEN;
 
@@ -122,6 +87,7 @@ impl RawTaskId {
         Some(Self(raw.to_owned()))
     }
 
+    /// Borrow the verified raw task ID as a string slice.
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
@@ -162,22 +128,18 @@ pub(crate) fn unwrap_and_verify(
         return None;
     }
 
-    let mut mac = [0u8; MAC_LEN];
+    let mut mac = [0_u8; MAC_LEN];
     let mac_len = URL_SAFE_NO_PAD.decode_slice(mac_part, &mut mac).ok()?;
     if mac_len != MAC_LEN {
         return None;
     }
 
     let raw_bytes = URL_SAFE_NO_PAD.decode(raw_part).ok()?;
-    let raw_str = std::str::from_utf8(&raw_bytes).ok()?;
+    let raw_str = str::from_utf8(&raw_bytes).ok()?;
     let raw_id = RawTaskId::parse(raw_str)?;
 
     let expected = compute_mac(secret, &raw_id, fp);
-    if expected.ct_eq(&mac).into() {
-        Some(raw_id)
-    } else {
-        None
-    }
+    bool::from(expected.ct_eq(&mac)).then_some(raw_id)
 }
 
 /// Split `t1.<raw>.<mac>`, rejecting any other shape.
@@ -189,6 +151,7 @@ fn split_token(token: &str) -> Option<(&str, &str)> {
     }
 }
 
+/// Compute the domain-separated HMAC tag binding `raw_id` to `fp`.
 fn compute_mac(
     secret: &SessionBindingSecret,
     raw_id: &RawTaskId,

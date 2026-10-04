@@ -25,67 +25,21 @@
 //!   "no addresses" message; an explicit `Err` lets us prefix the
 //!   diagnostic with `"ssrf:"` for log forensics.
 #![cfg_attr(
-    all(not(test), not(feature = "oauth-mtls-client")),
-    expect(clippy::cfg_not_test, reason = "lint-migration: src/ssrf_resolver.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_errors_doc,
-        reason = "lint-migration: src/ssrf_resolver.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::absolute_paths,
-        reason = "lint-migration: src/ssrf_resolver.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_const_for_fn,
-        reason = "lint-migration: src/ssrf_resolver.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::redundant_pub_crate,
-        reason = "lint-migration: src/ssrf_resolver.rs"
-    )
-)]
-#![cfg_attr(
-    any(
-        all(test, target_os = "linux"),
-        all(feature = "oauth-mtls-client", target_os = "linux")
-    ),
-    expect(
-        clippy::too_long_first_doc_paragraph,
-        reason = "lint-migration: src/ssrf_resolver.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::std_instead_of_alloc,
-        reason = "lint-migration: src/ssrf_resolver.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(
         clippy::std_instead_of_core,
         reason = "lint-migration: src/ssrf_resolver.rs"
     )
 )]
 
+extern crate alloc;
+
+use alloc::sync::Arc;
 #[cfg(any(test, feature = "test-helpers"))]
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::{
+use core::sync::atomic::{AtomicBool, Ordering};
+use core::{
+    error::Error,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
 };
 
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
@@ -93,12 +47,13 @@ use tokio::net::lookup_host;
 
 use crate::ssrf::{CompiledSsrfAllowlist, ip_block_reason};
 
-/// Test-only loopback bypass. Shared via `Arc<AtomicBool>` so that the
-/// `__test_allow_loopback_ssrf` setter on a client struct flips the
-/// flag for every already-built `reqwest::Client` whose resolver
-/// captured a clone of the same `Arc`. A per-client `bool` snapshot
-/// was rejected by Oracle review B1 (stale flag in cached
-/// `OauthHttpClient`s).
+/// Test-only loopback bypass.
+///
+/// Shared via `Arc<AtomicBool>` so that the `__test_allow_loopback_ssrf`
+/// setter on a client struct flips the flag for every already-built
+/// `reqwest::Client` whose resolver captured a clone of the same `Arc`.
+/// A per-client `bool` snapshot was rejected by Oracle review B1 (stale
+/// flag in cached `OauthHttpClient`s).
 #[cfg(any(test, feature = "test-helpers"))]
 pub(crate) type TestLoopbackBypass = Arc<AtomicBool>;
 
@@ -106,6 +61,10 @@ pub(crate) type TestLoopbackBypass = Arc<AtomicBool>;
 /// the `SsrfScreeningResolver` field layout uniform across feature
 /// combinations without paying for an atomic load on every resolve.
 #[cfg(not(any(test, feature = "test-helpers")))]
+#[expect(
+    clippy::cfg_not_test,
+    reason = "deliberate: src/ssrf_resolver.rs::TestLoopbackBypass keeps the test-helpers alias arm cfg-gated"
+)]
 pub(crate) type TestLoopbackBypass = ();
 
 /// `reqwest::dns::Resolve` implementor that forwards to the system
@@ -134,7 +93,7 @@ impl SsrfScreeningResolver {
     /// Build a resolver that screens DNS answers against `allowlist`.
     /// The `test_bypass` argument has no runtime cost in production
     /// builds (it is the unit type `()`).
-    pub(crate) fn new(
+    pub(crate) const fn new(
         allowlist: Arc<CompiledSsrfAllowlist>,
         test_bypass: TestLoopbackBypass,
     ) -> Self {
@@ -164,6 +123,10 @@ impl Resolve for SsrfScreeningResolver {
             #[cfg(any(test, feature = "test-helpers"))]
             let bypass_loopback = test_bypass.load(Ordering::Relaxed);
             #[cfg(not(any(test, feature = "test-helpers")))]
+            #[expect(
+                clippy::cfg_not_test,
+                reason = "deliberate: src/ssrf_resolver.rs::SsrfScreeningResolver::resolve keeps the test-helpers alias arm cfg-gated"
+            )]
             let bypass_loopback = false;
 
             match screen_addrs(&raw, &allowlist, &host, bypass_loopback) {
@@ -172,8 +135,7 @@ impl Resolve for SsrfScreeningResolver {
                     Ok(iter)
                 }
                 Err(diag) => {
-                    let err: Box<dyn std::error::Error + Send + Sync> =
-                        format!("ssrf: {diag}").into();
+                    let err: Box<dyn Error + Send + Sync> = format!("ssrf: {diag}").into();
                     Err(err)
                 }
             }
@@ -192,6 +154,13 @@ impl Resolve for SsrfScreeningResolver {
 /// `bypass_loopback`: when true, `loopback` block reasons are demoted
 /// so test fixtures bound to `127.0.0.1` can be reached. Cloud-metadata
 /// remains unbypassable in every code path.
+///
+/// # Errors
+///
+/// Returns `Err` when `addrs` is empty, or when any resolved address is
+/// blocked and not permitted by the allowlist. Cloud-metadata is never
+/// bypassable, so it fails the whole resolution even when the host is
+/// allowlisted.
 pub(crate) fn screen_addrs(
     addrs: &[SocketAddr],
     allowlist: &CompiledSsrfAllowlist,

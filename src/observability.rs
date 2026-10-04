@@ -1,126 +1,111 @@
 #![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::option_if_let_else,
-        reason = "lint-migration: src/observability.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(
         clippy::min_ident_chars,
         reason = "lint-migration: src/observability.rs"
     )
 )]
 #![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(
         clippy::arithmetic_side_effects,
         reason = "lint-migration: src/observability.rs"
     )
 )]
 #![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(
         clippy::let_underscore_must_use,
         reason = "lint-migration: src/observability.rs"
     )
 )]
 #![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_errors_doc,
-        reason = "lint-migration: src/observability.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(
         clippy::let_underscore_untyped,
         reason = "lint-migration: src/observability.rs"
     )
 )]
 #![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_inline_in_public_items,
-        reason = "lint-migration: src/observability.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(
         clippy::absolute_paths,
         reason = "lint-migration: src/observability.rs"
     )
 )]
 #![cfg_attr(
-    all(not(test), target_os = "linux"),
-    expect(
-        clippy::missing_docs_in_private_items,
-        reason = "lint-migration: src/observability.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::unused_trait_names,
-        reason = "lint-migration: src/observability.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(
         clippy::std_instead_of_core,
         reason = "lint-migration: src/observability.rs"
     )
 )]
 #![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(
         clippy::std_instead_of_alloc,
         reason = "lint-migration: src/observability.rs"
     )
 )]
 #![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(
         clippy::single_char_lifetime_names,
         reason = "lint-migration: src/observability.rs"
     )
 )]
-#![expect(unused_results, reason = "lint-migration: src/observability.rs")]
-#![expect(let_underscore_drop, reason = "lint-migration: src/observability.rs")]
-use std::{
+#![cfg_attr(
+    test,
+    expect(let_underscore_drop, reason = "lint-migration: src/observability.rs")
+)]
+
+extern crate alloc;
+
+use alloc::sync::Arc;
+use core::{
     fmt,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    time::Duration,
+};
+use std::{
+    fs,
     io::{self, Write as _},
     path::Path,
     sync::{
-        Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        Mutex, OnceLock,
         mpsc::{self, Receiver, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use tracing_subscriber::{
     EnvFilter, Layer as _,
-    fmt::time::FormatTime,
-    layer::SubscriberExt,
-    util::{SubscriberInitExt, TryInitError},
+    filter::LevelFilter,
+    fmt::{MakeWriter, format::Writer, layer, time::FormatTime},
+    layer::SubscriberExt as _,
+    registry::LookupSpan,
+    util::{SubscriberInitExt as _, TryInitError},
 };
 
 use crate::{
     config::ObservabilityConfig,
-    diagnostics::{DiagnosticExposure, set_diagnostic_exposure},
+    diagnostics::{
+        DiagnosticExposure, oauth_claim_values, plaintext_oauth_tokens, set_diagnostic_exposure,
+        tool_call_arguments,
+    },
     error::RmcpServerKitError,
 };
 
+/// Capacity of the bounded audit-log channel; overflow drops newest entries.
 const AUDIT_LOG_CHANNEL_CAPACITY: usize = 1024;
+/// How long the audit writer thread blocks waiting for the next message.
 const AUDIT_WRITER_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Maximum time `Drop` waits for the audit writer thread to finish.
 const AUDIT_WRITER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Park interval used while polling for the audit writer thread to finish.
 const AUDIT_WRITER_JOIN_POLL: Duration = Duration::from_millis(10);
+/// Minimum spacing between repeated audit I/O failure warnings on stderr.
 const AUDIT_IO_FAILURE_WARNING_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Timestamp formatter that emits local time via `chrono::Local`.
@@ -128,7 +113,7 @@ const AUDIT_IO_FAILURE_WARNING_INTERVAL: Duration = Duration::from_secs(60);
 struct LocalTime;
 
 impl FormatTime for LocalTime {
-    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> fmt::Result {
+    fn format_time(&self, w: &mut Writer<'_>) -> fmt::Result {
         write!(
             w,
             "{}",
@@ -160,6 +145,7 @@ impl FormatTime for LocalTime {
     since = "3.8.0",
     note = "use `init_tracing_from_config_strict` and hold the returned `TracingGuard` for process lifetime"
 )]
+#[inline]
 pub fn init_tracing_from_config(config: &ObservabilityConfig) -> Result<(), TryInitError> {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.log_level));
@@ -168,19 +154,14 @@ pub fn init_tracing_from_config(config: &ObservabilityConfig) -> Result<(), TryI
 
     // "pretty" and "text" are aliases for human-readable output.
     let result = if config.log_format == "json" {
-        let subscriber = tracing_subscriber::registry().with(filter).with(
-            tracing_subscriber::fmt::layer()
-                .json()
-                .with_timer(LocalTime)
-                .with_writer(io::stderr),
-        );
+        let subscriber = tracing_subscriber::registry()
+            .with(filter)
+            .with(layer().json().with_timer(LocalTime).with_writer(io::stderr));
         init_with_optional_audit(subscriber, audit_setup.writer)
     } else {
-        let subscriber = tracing_subscriber::registry().with(filter).with(
-            tracing_subscriber::fmt::layer()
-                .with_timer(LocalTime)
-                .with_writer(io::stderr),
-        );
+        let subscriber = tracing_subscriber::registry()
+            .with(filter)
+            .with(layer().with_timer(LocalTime).with_writer(io::stderr));
         init_with_optional_audit(subscriber, audit_setup.writer)
     };
 
@@ -207,34 +188,32 @@ pub fn init_tracing_from_config(config: &ObservabilityConfig) -> Result<(), TryI
 #[must_use = "hold TracingGuard for the process lifetime so audit logs keep draining"]
 #[non_exhaustive]
 pub struct TracingGuard {
+    /// Audit writer guard, present only when an audit log is configured.
     audit: Option<AuditWorkerGuard>,
 }
 
 impl fmt::Debug for TracingGuard {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TracingGuard")
             .field("audit_enabled", &self.audit.is_some())
             .field(
                 "diagnostic_plaintext_oauth_tokens",
-                &crate::diagnostics::plaintext_oauth_tokens(),
+                &plaintext_oauth_tokens(),
             )
-            .field(
-                "diagnostic_oauth_claim_values",
-                &crate::diagnostics::oauth_claim_values(),
-            )
-            .field(
-                "diagnostic_tool_call_arguments",
-                &crate::diagnostics::tool_call_arguments(),
-            )
+            .field("diagnostic_oauth_claim_values", &oauth_claim_values())
+            .field("diagnostic_tool_call_arguments", &tool_call_arguments())
             .finish()
     }
 }
 
 impl TracingGuard {
+    /// Build a guard with no audit writer attached.
     const fn none() -> Self {
         Self { audit: None }
     }
 
+    /// Wrap an audit writer guard so `Drop` drains it.
     const fn audit(audit: AuditWorkerGuard) -> Self {
         Self { audit: Some(audit) }
     }
@@ -245,8 +224,13 @@ impl TracingGuard {
 // (5s) by design, as documented on the type.
 // Drop audit (2026-10-04): no I/O or await here, no panic path.
 impl Drop for TracingGuard {
+    #[inline]
+    #[expect(
+        let_underscore_drop,
+        reason = "deliberate: src/observability.rs::TracingGuard drops the audit guard in place to run its bounded teardown"
+    )]
     fn drop(&mut self) {
-        let _ = self.audit.take();
+        let _: Option<AuditWorkerGuard> = self.audit.take();
     }
 }
 
@@ -268,6 +252,7 @@ impl Drop for TracingGuard {
 /// Returns [`RmcpServerKitError::Startup`] if audit-log directory creation,
 /// audit-log opening, audit writer thread spawning, or global tracing
 /// subscriber installation fails.
+#[inline]
 pub fn init_tracing_from_config_strict(
     config: &ObservabilityConfig,
 ) -> Result<TracingGuard, RmcpServerKitError> {
@@ -277,19 +262,14 @@ pub fn init_tracing_from_config_strict(
 
     // "pretty" and "text" are aliases for human-readable output.
     let result = if config.log_format == "json" {
-        let subscriber = tracing_subscriber::registry().with(filter).with(
-            tracing_subscriber::fmt::layer()
-                .json()
-                .with_timer(LocalTime)
-                .with_writer(io::stderr),
-        );
+        let subscriber = tracing_subscriber::registry()
+            .with(filter)
+            .with(layer().json().with_timer(LocalTime).with_writer(io::stderr));
         init_with_optional_audit(subscriber, audit_setup.writer)
     } else {
-        let subscriber = tracing_subscriber::registry().with(filter).with(
-            tracing_subscriber::fmt::layer()
-                .with_timer(LocalTime)
-                .with_writer(io::stderr),
-        );
+        let subscriber = tracing_subscriber::registry()
+            .with(filter)
+            .with(layer().with_timer(LocalTime).with_writer(io::stderr));
         init_with_optional_audit(subscriber, audit_setup.writer)
     };
 
@@ -323,25 +303,26 @@ pub fn init_tracing_from_config_strict(
 ///
 /// Uses [`SubscriberInitExt::try_init`] so that a previously-installed
 /// global subscriber yields [`TryInitError`] rather than panicking.
+///
+/// # Errors
+///
+/// Returns [`TryInitError`] when a global tracing subscriber is already
+/// installed.
 fn init_with_optional_audit<S>(
     subscriber: S,
     audit_writer: Option<AuditFile>,
 ) -> Result<(), TryInitError>
 where
-    S: tracing::Subscriber
-        + for<'span> tracing_subscriber::registry::LookupSpan<'span>
-        + Send
-        + Sync
-        + 'static,
+    S: tracing::Subscriber + for<'span> LookupSpan<'span> + Send + Sync + 'static,
 {
     if let Some(writer) = audit_writer {
         subscriber
             .with(
-                tracing_subscriber::fmt::layer()
+                layer()
                     .json()
                     .with_timer(LocalTime)
                     .with_writer(writer)
-                    .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+                    .with_filter(LevelFilter::INFO),
             )
             .try_init()
     } else {
@@ -359,14 +340,11 @@ where
 /// Returns [`TryInitError`] if a global tracing subscriber has already
 /// been installed. This makes the function safe to call repeatedly from
 /// tests or embedders without panicking.
+#[inline]
 pub fn init_tracing(default_filter: &str) -> Result<(), TryInitError> {
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter)))
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_timer(LocalTime)
-                .with_writer(io::stderr),
-        )
+        .with(layer().with_timer(LocalTime).with_writer(io::stderr))
         .try_init()
 }
 
@@ -375,14 +353,16 @@ pub fn init_tracing(default_filter: &str) -> Result<(), TryInitError> {
 /// Implements `MakeWriter` so it can be used with `tracing_subscriber::fmt`.
 #[derive(Clone)]
 struct AuditFile {
+    /// Handle to the bounded channel the background writer drains.
     sender: SyncSender<AuditMessage>,
+    /// Shared count of entries dropped when the channel was full.
     dropped: Arc<AtomicU64>,
 }
 
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for AuditFile {
+impl<'writer> MakeWriter<'writer> for AuditFile {
     type Writer = AuditFileWriter;
 
-    fn make_writer(&'a self) -> Self::Writer {
+    fn make_writer(&'writer self) -> Self::Writer {
         AuditFileWriter {
             sender: self.sender.clone(),
             dropped: Arc::clone(&self.dropped),
@@ -392,7 +372,9 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for AuditFile {
 
 /// A non-blocking audit writer handle used directly at tracing call sites.
 struct AuditFileWriter {
+    /// Handle to the bounded channel the background writer drains.
     sender: SyncSender<AuditMessage>,
+    /// Shared count of entries dropped when the channel was full.
     dropped: Arc<AtomicU64>,
 }
 
@@ -411,25 +393,37 @@ impl io::Write for AuditFileWriter {
             self.sender.try_send(AuditMessage::Write(buf.to_vec())),
             Err(TrySendError::Full(_))
         ) {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+            let _previous = self.dropped.fetch_add(1, Ordering::Relaxed);
         }
         Ok(buf.len())
     }
 
+    #[expect(clippy::let_underscore_must_use, reason = "audit writer must not log")]
+    #[expect(
+        let_underscore_drop,
+        reason = "deliberate: src/observability.rs::AuditFileWriter::flush drops the full-channel send result without logging"
+    )]
     fn flush(&mut self) -> io::Result<()> {
-        let _ = self.sender.try_send(AuditMessage::Flush);
+        let _: Result<(), TrySendError<AuditMessage>> = self.sender.try_send(AuditMessage::Flush);
         Ok(())
     }
 }
 
+/// Message sent from the tracing writer layer to the audit writer thread.
 enum AuditMessage {
+    /// Raw bytes to append to the audit log.
     Write(Vec<u8>),
+    /// Request to flush buffered audit output.
     Flush,
 }
 
+/// Shutdown and join handle for the dedicated audit writer thread.
 struct AuditWorkerGuard {
+    /// Set to true to ask the writer thread to stop.
     shutdown: Arc<AtomicBool>,
+    /// Non-blocking wake channel used to nudge the writer thread.
     wake_sender: SyncSender<AuditMessage>,
+    /// Join handle for the writer thread, taken on drop.
     thread: Option<JoinHandle<()>>,
 }
 
@@ -439,9 +433,19 @@ struct AuditWorkerGuard {
 // request worker past the timeout; every fallible return is handled/discarded.
 // Drop audit (2026-10-04): no async work, no panic path; cleanup order fixed.
 impl Drop for AuditWorkerGuard {
+    #[expect(clippy::let_underscore_must_use, reason = "audit writer must not log")]
+    #[expect(
+        let_underscore_drop,
+        reason = "deliberate: src/observability.rs::AuditWorkerGuard::drop drops the flush and join results in place"
+    )]
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "invariant: `Instant::now() + AUDIT_WRITER_JOIN_TIMEOUT` and the later deadline subtraction cannot overflow within the process lifetime"
+    )]
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
-        let _ = self.wake_sender.try_send(AuditMessage::Flush);
+        let _: Result<(), TrySendError<AuditMessage>> =
+            self.wake_sender.try_send(AuditMessage::Flush);
 
         let Some(thread) = self.thread.take() else {
             return;
@@ -454,16 +458,23 @@ impl Drop for AuditWorkerGuard {
             }
             thread::park_timeout((deadline - now).min(AUDIT_WRITER_JOIN_POLL));
         }
-        let _ = thread.join();
+        let _: thread::Result<()> = thread.join();
     }
 }
 
+/// Owner of the audit file handle and its bounded message receiver.
 struct AuditWorker<W> {
+    /// Destination the worker appends audit output to.
     file: W,
+    /// Bounded channel receiving writes and flush requests.
     receiver: Receiver<AuditMessage>,
+    /// Shared shutdown flag set by the guard.
     shutdown: Arc<AtomicBool>,
+    /// Shared count of entries dropped while the channel was full.
     dropped: Arc<AtomicU64>,
+    /// Shared count of audit I/O failures, used for warning throttling.
     io_failures: Arc<AtomicU64>,
+    /// Time of the last stderr I/O-failure warning, if any.
     last_io_failure_warning: Option<Instant>,
 }
 
@@ -471,6 +482,7 @@ impl<W> AuditWorker<W>
 where
     W: io::Write,
 {
+    /// Drain the channel until shutdown, then flush the file.
     fn run(mut self) {
         loop {
             match self.receiver.recv_timeout(AUDIT_WRITER_POLL_INTERVAL) {
@@ -498,6 +510,7 @@ where
         }
     }
 
+    /// Apply one write or flush message, recording any I/O failure.
     fn handle_message(&mut self, message: AuditMessage) {
         match message {
             AuditMessage::Write(bytes) => {
@@ -515,6 +528,7 @@ where
         }
     }
 
+    /// Emit one warning line for entries dropped since the last check.
     fn write_dropped_warning(&mut self) {
         let count = self.dropped.swap(0, Ordering::Relaxed);
         if count == 0 {
@@ -528,13 +542,18 @@ where
         }
     }
 
+    /// Count an I/O failure and warn on stderr when the interval has elapsed.
     fn record_io_failure(&mut self, operation: &'static str, error: &io::Error) {
-        let failure_count = self.io_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        let failure_count = self
+            .io_failures
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
         if self.io_failure_warning_due(Instant::now()) {
             write_audit_io_failure_warning(operation, failure_count, error);
         }
     }
 
+    /// Report whether a new I/O-failure warning is due at `now`.
     fn io_failure_warning_due(&mut self, now: Instant) -> bool {
         let due = self
             .last_io_failure_warning
@@ -546,6 +565,12 @@ where
     }
 }
 
+/// Write one audit I/O failure line to stderr without re-entering tracing.
+#[expect(clippy::let_underscore_must_use, reason = "audit writer must not log")]
+#[expect(
+    let_underscore_drop,
+    reason = "deliberate: src/observability.rs::write_audit_io_failure_warning drops the stderr result without re-entering tracing"
+)]
 fn write_audit_io_failure_warning(
     operation: &'static str,
     failure_count: u64,
@@ -555,19 +580,24 @@ fn write_audit_io_failure_warning(
     // writer that just failed, so re-entering it from the writer thread could
     // recursively enqueue more audit writes or deadlock during shutdown.
     let mut stderr = io::stderr().lock();
-    let _ = writeln!(
+    let _: io::Result<()> = writeln!(
         stderr,
         "rmcp-server-kit audit log {operation} failed; failures_total={failure_count}; error={representative_error}"
     );
 }
 
+/// Result of preparing an audit sink: writer, guard and setup warnings.
 struct AuditSetup {
+    /// Non-blocking writer handed to the tracing layer, when configured.
     writer: Option<AuditFile>,
+    /// Guard that owns the writer thread, when configured.
     guard: TracingGuard,
+    /// Non-fatal problems collected while preparing the audit sink.
     warnings: Vec<String>,
 }
 
 impl AuditSetup {
+    /// Build an empty setup with no audit sink and no warnings.
     const fn none() -> Self {
         Self {
             writer: None,
@@ -593,6 +623,11 @@ impl AuditSetup {
 /// rotator instead renames + recreates the file, this writer will keep writing
 /// to the renamed (rotated) inode until the guard is dropped or the process
 /// restarts.
+///
+/// # Errors
+///
+/// Returns `Err` with a message when the parent directory cannot be created,
+/// the audit log cannot be opened, or its writer thread cannot be spawned.
 fn open_audit_file(path: &Path) -> Result<AuditSetup, String> {
     // Ensure parent directory exists.
     if let Some(parent) = path.parent()
@@ -608,10 +643,10 @@ fn open_audit_file(path: &Path) -> Result<AuditSetup, String> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
         && !parent.exists()
-        && let Err(e) = std::fs::create_dir_all(parent)
+        && let Err(error) = fs::create_dir_all(parent)
     {
         return Err(format!(
-            "failed to create audit log directory {}: {e}",
+            "failed to create audit log directory {}: {error}",
             parent.display()
         ));
     }
@@ -638,9 +673,9 @@ fn open_audit_file(path: &Path) -> Result<AuditSetup, String> {
             }
             .run();
         })
-        .map_err(|e| {
+        .map_err(|error| {
             format!(
-                "failed to spawn audit log writer for {}: {e}",
+                "failed to spawn audit log writer for {}: {error}",
                 path.display()
             )
         })?;
@@ -659,31 +694,41 @@ fn open_audit_file(path: &Path) -> Result<AuditSetup, String> {
     })
 }
 
+/// Open the configured audit log in strict mode, failing closed on error.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Startup`] when the configured audit log cannot
+/// be opened or its writer thread cannot be spawned.
 fn prepare_tracing_audit_strict(
     config: &ObservabilityConfig,
 ) -> Result<AuditSetup, RmcpServerKitError> {
-    match config.audit_log_path.as_deref() {
-        Some(path) => open_audit_file(path).map_err(|error| {
-            RmcpServerKitError::Startup(format!("audit log initialization failed: {error}"))
-        }),
-        None => Ok(AuditSetup::none()),
-    }
+    config.audit_log_path.as_deref().map_or_else(
+        || Ok(AuditSetup::none()),
+        |path| {
+            open_audit_file(path).map_err(|error| {
+                RmcpServerKitError::Startup(format!("audit log initialization failed: {error}"))
+            })
+        },
+    )
 }
 
+/// Open the configured audit log, downgrading setup failures to warnings.
 fn prepare_tracing_audit_lenient(config: &ObservabilityConfig) -> AuditSetup {
-    match config.audit_log_path.as_deref() {
-        Some(path) => match open_audit_file(path) {
+    config
+        .audit_log_path
+        .as_deref()
+        .map_or_else(AuditSetup::none, |path| match open_audit_file(path) {
             Ok(setup) => setup,
             Err(warning) => AuditSetup {
                 writer: None,
                 guard: TracingGuard::none(),
                 warnings: vec![warning],
             },
-        },
-        None => AuditSetup::none(),
-    }
+        })
 }
 
+/// Keep the audit guard alive for the process by storing it in the legacy list.
 fn retain_legacy_guard(guard: TracingGuard) {
     if guard.audit.is_none() {
         return;
@@ -696,6 +741,7 @@ fn retain_legacy_guard(guard: TracingGuard) {
     guards.push(guard);
 }
 
+/// Process-global storage keeping legacy audit guards alive.
 fn legacy_tracing_guards() -> &'static Mutex<Vec<TracingGuard>> {
     static GUARDS: OnceLock<Mutex<Vec<TracingGuard>>> = OnceLock::new();
     GUARDS.get_or_init(|| Mutex::new(Vec::new()))
@@ -708,16 +754,21 @@ fn legacy_tracing_guards() -> &'static Mutex<Vec<TracingGuard>> {
 /// exists with umask-derived permissions, so any local principal can open it
 /// before the mode is tightened. Audit logs carry identities and, under the
 /// diagnostic switches, credential material.
+///
+/// # Errors
+///
+/// Returns `Err` with a message when the audit log cannot be opened with
+/// owner-only permissions.
 #[cfg(unix)]
-fn create_private_audit_file(path: &Path) -> Result<std::fs::File, String> {
+fn create_private_audit_file(path: &Path) -> Result<fs::File, String> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
-    std::fs::OpenOptions::new()
+    fs::OpenOptions::new()
         .mode(0o600)
         .create(true)
         .append(true)
         .open(path)
-        .map_err(|e| format!("failed to open audit log file {}: {e}", path.display()))
+        .map_err(|error| format!("failed to open audit log file {}: {error}", path.display()))
 }
 
 /// Create (or append to) the audit log with an owner-only DACL.
@@ -734,7 +785,7 @@ fn create_private_audit_file(path: &Path) -> Result<std::fs::File, String> {
 /// unprotected audit log may remain on disk. Continuing instead would recreate
 /// the silent security-control failure this replaced.
 #[cfg(windows)]
-fn create_private_audit_file(path: &Path) -> Result<std::fs::File, String> {
+fn create_private_audit_file(path: &Path) -> Result<fs::File, String> {
     use std::ffi::OsString;
 
     use windows_permissions::{
@@ -743,7 +794,7 @@ fn create_private_audit_file(path: &Path) -> Result<std::fs::File, String> {
         wrappers,
     };
 
-    let file = std::fs::OpenOptions::new()
+    let file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
@@ -777,7 +828,7 @@ fn create_private_audit_file(path: &Path) -> Result<std::fs::File, String> {
         Ok(()) => Ok(file),
         Err(reason) => {
             drop(file);
-            let cleanup = match std::fs::remove_file(path) {
+            let cleanup = match fs::remove_file(path) {
                 Ok(()) => "the unprotected file was deleted".to_owned(),
                 Err(e) => format!(
                     "the unprotected file could NOT be deleted and may remain at {}: {e}",
@@ -801,7 +852,7 @@ fn create_private_audit_file(path: &Path) -> Result<std::fs::File, String> {
 /// startup error, and the deprecated lenient init warns and installs no audit
 /// sink.
 #[cfg(not(any(unix, windows)))]
-fn create_private_audit_file(path: &Path) -> Result<std::fs::File, String> {
+fn create_private_audit_file(path: &Path) -> Result<fs::File, String> {
     Err(format!(
         "audit log private permissions are unsupported on this platform: cannot \
          guarantee owner-only access for {}; audit logging disabled",
@@ -809,21 +860,24 @@ fn create_private_audit_file(path: &Path) -> Result<std::fs::File, String> {
     ))
 }
 
+/// Rewrite an existing audit file to owner-only permissions and collect failures.
 #[cfg(unix)]
-fn audit_file_permission_warnings(file: &std::fs::File) -> Vec<String> {
-    use std::os::unix::fs::PermissionsExt;
+fn audit_file_permission_warnings(file: &fs::File) -> Vec<String> {
+    use std::os::unix::fs::PermissionsExt as _;
 
     let mut warnings = Vec::new();
     // A pre-existing file keeps its old mode: `OpenOptions::mode` applies only
     // when `open` creates the file, so tighten it explicitly here.
-    if let Err(e) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
-        warnings.push(format!("failed to set audit log permissions to 0o600: {e}"));
+    if let Err(error) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
+        warnings.push(format!(
+            "failed to set audit log permissions to 0o600: {error}"
+        ));
     }
     warnings
 }
 
 #[cfg(not(unix))]
-fn audit_file_permission_warnings(_file: &std::fs::File) -> Vec<String> {
+fn audit_file_permission_warnings(_file: &fs::File) -> Vec<String> {
     Vec::new()
 }
 
