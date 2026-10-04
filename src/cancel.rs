@@ -112,48 +112,13 @@
 //!   `.instrument(tracing::Span::current())`, so log lines from the
 //!   detached task remain attached to the request span (matching the
 //!   convention in [`crate::tool_hooks`]).
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::too_long_first_doc_paragraph,
-        reason = "lint-migration: src/cancel.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::integer_division_remainder_used,
-        reason = "lint-migration: src/cancel.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::min_ident_chars, reason = "lint-migration: src/cancel.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_inline_in_public_items,
-        reason = "lint-migration: src/cancel.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::absolute_paths, reason = "lint-migration: src/cancel.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::unused_trait_names, reason = "lint-migration: src/cancel.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::std_instead_of_core, reason = "lint-migration: src/cancel.rs")
-)]
 
-use std::time::Duration;
 
+use core::time::Duration;
+
+use tokio::{task::JoinError, time::sleep};
 use tokio_util::sync::CancellationToken;
-use tracing::Instrument;
+use tracing::Instrument as _;
 
 /// Outcome of [`run_with_cancel_and_timeout`].
 ///
@@ -179,7 +144,7 @@ pub enum DetachOutcome<T> {
     /// [`tokio::task::JoinError`] so the caller can decide how to
     /// surface the panic (typical: log + return an internal-error
     /// tool response).
-    Panicked(tokio::task::JoinError),
+    Panicked(JoinError),
 }
 
 /// Race a `'static` future against client cancellation and an optional
@@ -209,14 +174,16 @@ pub enum DetachOutcome<T> {
 /// `fut` MUST be cleanup-safe under self-driven completion: when
 /// detached, only the future's own internal Drop and early-return
 /// paths run; nothing else will help it clean up.
-///
-/// # Cancel-safety
-///
-/// // cancel-safe under composition: the inner future is moved into a
-/// // `tokio::spawn` before we await anything, so the cancel/timeout
-/// // arms can only ever drop the `JoinHandle` (a no-op for the task)
-/// // -- never the inner future itself.
 #[must_use = "DetachOutcome must be inspected to distinguish completion from cancel/timeout/panic"]
+#[inline]
+#[expect(
+    clippy::integer_division_remainder_used,
+    reason = "external macro: tokio::select"
+)]
+// cancel-safe: under composition, the inner future is moved into a
+// `tokio::spawn` before we await anything, so the cancel/timeout arms can
+// only ever drop the `JoinHandle` (a no-op for the task) -- never the inner
+// future itself.
 pub async fn run_with_cancel_and_timeout<F, T>(
     fut: F,
     ct: &CancellationToken,
@@ -238,12 +205,12 @@ where
     // cancel/timeout. Dropping the `JoinHandle` does NOT abort the
     // task -- the spawned future runs to its own completion and cleans
     // up via its own Drop / early-return paths.
-    if let Some(t) = timeout {
+    if let Some(deadline) = timeout {
         tokio::select! {
             biased;
             joined = &mut handle => map_join(joined),
             () = ct.cancelled() => DetachOutcome::Cancelled,
-            () = tokio::time::sleep(t) => DetachOutcome::TimedOut,
+            () = sleep(deadline) => DetachOutcome::TimedOut,
         }
     } else {
         tokio::select! {
@@ -254,14 +221,15 @@ where
     }
 }
 
-/// Translate a [`tokio::task::JoinHandle`] result into a
-/// [`DetachOutcome`]. Panics are surfaced distinctly via
+/// Translate a [`tokio::task::JoinHandle`] result into a [`DetachOutcome`].
+///
+/// Panics are surfaced distinctly via
 /// [`DetachOutcome::Panicked`] so the caller can distinguish them from
 /// cancel/timeout -- do not fold panics into the cancel path, that
 /// loses real failure info.
-fn map_join<T>(joined: Result<T, tokio::task::JoinError>) -> DetachOutcome<T> {
+fn map_join<T>(joined: Result<T, JoinError>) -> DetachOutcome<T> {
     match joined {
-        Ok(v) => DetachOutcome::Completed(v),
+        Ok(value) => DetachOutcome::Completed(value),
         Err(join_err) => DetachOutcome::Panicked(join_err),
     }
 }
@@ -329,20 +297,20 @@ mod tests {
         let done_clone = Arc::clone(&done);
         let ct = CancellationToken::new();
         let fut = async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            sleep(Duration::from_millis(100)).await;
             done_clone.store(true, Ordering::SeqCst);
         };
 
         let ct_for_cancel = ct.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            sleep(Duration::from_millis(10)).await;
             ct_for_cancel.cancel();
         });
         let out = run_with_cancel_and_timeout(fut, &ct, None).await;
         assert!(matches!(out, DetachOutcome::Cancelled));
 
         // The detached task is still running. Give it time to finish.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        sleep(Duration::from_millis(300)).await;
         assert!(
             done.load(Ordering::SeqCst),
             "detached future must run to completion after cancel"
@@ -355,14 +323,14 @@ mod tests {
         let done_clone = Arc::clone(&done);
         let ct = CancellationToken::new();
         let fut = async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            sleep(Duration::from_millis(100)).await;
             done_clone.store(true, Ordering::SeqCst);
         };
 
         let out = run_with_cancel_and_timeout(fut, &ct, Some(Duration::from_millis(10))).await;
         assert!(matches!(out, DetachOutcome::TimedOut));
 
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        sleep(Duration::from_millis(300)).await;
         assert!(
             done.load(Ordering::SeqCst),
             "detached future must run to completion after timeout"
@@ -406,7 +374,7 @@ mod tests {
         assert!(matches!(out, DetachOutcome::Cancelled));
 
         // Give the runtime a chance to run any errant spawn.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
         assert_eq!(
             started.load(Ordering::SeqCst),
             0,

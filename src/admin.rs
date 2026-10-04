@@ -17,48 +17,11 @@
 //! `next.run(req).await` and holds no guard, lock, or permit across that
 //! await; downstream route cancel safety is inherited from Axum and the
 //! selected route.
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::absolute_paths, reason = "lint-migration: src/admin.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::min_ident_chars, reason = "lint-migration: src/admin.rs")
-)]
-#![cfg_attr(
-    all(not(test), target_os = "linux"),
-    expect(
-        clippy::missing_docs_in_private_items,
-        reason = "lint-migration: src/admin.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_inline_in_public_items,
-        reason = "lint-migration: src/admin.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::module_name_repetitions,
-        reason = "lint-migration: src/admin.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::unused_trait_names, reason = "lint-migration: src/admin.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::std_instead_of_alloc, reason = "lint-migration: src/admin.rs")
-)]
 
-use std::{
-    sync::Arc,
-    time::{Instant, SystemTime, UNIX_EPOCH},
-};
+extern crate alloc;
+
+use alloc::sync::Arc;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 use axum::{
@@ -66,23 +29,31 @@ use axum::{
     body::Body,
     extract::{Request, State},
     http::StatusCode,
-    middleware::Next,
-    response::{IntoResponse, Response},
+    middleware::{Next, from_fn},
+    response::{IntoResponse as _, Response},
     routing::get,
 };
 use serde::Serialize;
 
-use crate::{auth::AuthState, rbac::RbacPolicy};
+use crate::{
+    auth::{AuthIdentity, AuthState},
+    rbac::RbacPolicy,
+};
 
 /// Admin endpoint configuration.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
+#[expect(
+    clippy::module_name_repetitions,
+    reason = "public API frozen until the next major release"
+)]
 pub struct AdminConfig {
     /// RBAC role required to access the admin endpoints.
     pub role: String,
 }
 
 impl Default for AdminConfig {
+    #[inline]
     fn default() -> Self {
         Self {
             role: "admin".to_owned(),
@@ -109,6 +80,10 @@ pub(crate) struct AdminState {
 /// `/admin/status` response body.
 #[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
+#[expect(
+    clippy::module_name_repetitions,
+    reason = "public API frozen until the next major release"
+)]
 pub struct AdminStatus {
     /// Server name.
     pub name: String,
@@ -120,10 +95,11 @@ pub struct AdminStatus {
     pub started_at_epoch: u64,
 }
 
+/// Build the `/admin/status` response body from the live state.
 fn admin_status(state: &AdminState) -> AdminStatus {
     let started_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|duration| duration.as_secs())
         .unwrap_or_default()
         .saturating_sub(state.started_at.elapsed().as_secs());
     AdminStatus {
@@ -134,10 +110,22 @@ fn admin_status(state: &AdminState) -> AdminStatus {
     }
 }
 
+/// `/admin/status` handler.
+///
+/// # Cancel safety
+///
+/// Reads only in-memory state and builds a JSON response; holds no guard
+/// across an await.
 async fn status_handler(State(state): State<AdminState>) -> Json<AdminStatus> {
     Json(admin_status(&state))
 }
 
+/// `/admin/auth/keys` handler (metadata only, never the hashes).
+///
+/// # Cancel safety
+///
+/// Reads only in-memory state and builds a JSON response; holds no guard
+/// across an await.
 async fn auth_keys_handler(State(state): State<AdminState>) -> Response {
     state.auth.as_ref().map_or_else(
         || not_available("auth is not configured"),
@@ -145,6 +133,12 @@ async fn auth_keys_handler(State(state): State<AdminState>) -> Response {
     )
 }
 
+/// `/admin/auth/counters` handler.
+///
+/// # Cancel safety
+///
+/// Reads only in-memory state and builds a JSON response; holds no guard
+/// across an await.
 async fn auth_counters_handler(State(state): State<AdminState>) -> Response {
     state.auth.as_ref().map_or_else(
         || not_available("auth is not configured"),
@@ -152,10 +146,17 @@ async fn auth_counters_handler(State(state): State<AdminState>) -> Response {
     )
 }
 
+/// `/admin/rbac` handler.
+///
+/// # Cancel safety
+///
+/// Reads only in-memory state and builds a JSON response; holds no guard
+/// across an await.
 async fn rbac_handler(State(state): State<AdminState>) -> Response {
     Json(state.rbac.load().summary()).into_response()
 }
 
+/// Build the `503` body shared by the not-configured admin handlers.
 fn not_available(reason: &str) -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -172,6 +173,12 @@ fn not_available(reason: &str) -> Response {
 /// Reads the caller's role from the `AuthIdentity` request extension
 /// (populated by the outer auth middleware) and rejects requests whose
 /// role does not match `expected_role`.
+///
+/// # Cancel safety
+///
+/// Performs its role check before `next.run(req).await` and holds no guard,
+/// lock, or permit across that await.
+#[inline]
 pub async fn require_admin_role(
     expected_role: Arc<str>,
     req: Request<Body>,
@@ -179,8 +186,8 @@ pub async fn require_admin_role(
 ) -> Response {
     let role = req
         .extensions()
-        .get::<crate::auth::AuthIdentity>()
-        .map_or("", |id| id.role.as_str());
+        .get::<AuthIdentity>()
+        .map_or("", |identity| identity.role.as_str());
     if role != expected_role.as_ref() {
         return (
             StatusCode::FORBIDDEN,
@@ -207,9 +214,9 @@ pub(crate) fn admin_router(state: AdminState, config: &AdminConfig) -> Router {
         .route("/admin/auth/counters", get(auth_counters_handler))
         .route("/admin/rbac", get(rbac_handler))
         .with_state(state)
-        .layer(axum::middleware::from_fn(move |req, next| {
-            let r = Arc::clone(&role);
-            require_admin_role(r, req, next)
+        .layer(from_fn(move |req, next| {
+            let role_for_check = Arc::clone(&role);
+            require_admin_role(role_for_check, req, next)
         }))
 }
 

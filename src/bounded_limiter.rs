@@ -42,98 +42,27 @@
 //! - The map uses [`std::sync::Mutex`] (not [`tokio::sync::Mutex`]) since
 //!   admission checks must be synchronous and never `.await`.
 //! - We do not log inside the critical section.
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::map_err_ignore,
-        reason = "lint-migration: src/bounded_limiter.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::min_ident_chars,
-        reason = "lint-migration: src/bounded_limiter.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::shadow_unrelated,
-        reason = "lint-migration: src/bounded_limiter.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::arithmetic_side_effects,
-        reason = "lint-migration: src/bounded_limiter.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::absolute_paths,
-        reason = "lint-migration: src/bounded_limiter.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::shadow_reuse,
-        reason = "lint-migration: src/bounded_limiter.rs"
-    )
-)]
-#![cfg_attr(
-    all(not(test), target_os = "linux"),
-    expect(
-        clippy::missing_docs_in_private_items,
-        reason = "lint-migration: src/bounded_limiter.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_inline_in_public_items,
-        reason = "lint-migration: src/bounded_limiter.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::module_name_repetitions,
-        reason = "lint-migration: src/bounded_limiter.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::std_instead_of_alloc,
-        reason = "lint-migration: src/bounded_limiter.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::std_instead_of_core,
-        reason = "lint-migration: src/bounded_limiter.rs"
-    )
-)]
-#![expect(unused_results, reason = "lint-migration: src/bounded_limiter.rs")]
 
-use std::{
-    collections::HashMap,
+extern crate alloc;
+
+use alloc::sync::{Arc, Weak};
+use core::{
     hash::Hash,
     num::{NonZeroU32, NonZeroUsize},
     str::FromStr,
-    sync::{Arc, Mutex, PoisonError, Weak},
-    time::{Duration, Instant},
+    time::Duration,
+};
+use std::{
+    collections::HashMap,
+    sync::{Mutex, PoisonError},
+    time::Instant,
 };
 
 use governor::{
     DefaultDirectRateLimiter, Quota, RateLimiter,
     clock::{Clock as _, DefaultClock},
 };
+use tokio::{runtime::Handle, time::interval};
 
 /// Reason a [`BoundedKeyedLimiter::check_key`] call rejected a request.
 ///
@@ -142,6 +71,10 @@ use governor::{
 /// room for future reasons (e.g. burst-debt or distinct quota classes).
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[expect(
+    clippy::module_name_repetitions,
+    reason = "public API frozen until the next major release"
+)]
 pub enum BoundedLimiterError {
     /// The key has exceeded its per-key quota for the current window.
     #[error("rate limit exceeded for key")]
@@ -151,6 +84,10 @@ pub enum BoundedLimiterError {
 /// Reason a detailed bounded-limiter check denied a request.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[expect(
+    clippy::module_name_repetitions,
+    reason = "public API frozen until the next major release"
+)]
 pub enum BoundedLimiterDeny {
     /// The key has exceeded its per-key quota for the current window.
     #[error("rate limit exceeded; retry after {0:?}")]
@@ -176,6 +113,7 @@ pub enum KeyEvictionPolicy {
 impl FromStr for KeyEvictionPolicy {
     type Err = ();
 
+    #[inline]
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "evict_lru" => Ok(Self::EvictLru),
@@ -188,7 +126,9 @@ impl FromStr for KeyEvictionPolicy {
 /// Per-key limiter entry: the underlying direct limiter plus the wall-clock
 /// timestamp of the most recent admission attempt for this key.
 struct Entry {
+    /// The per-key governor limiter.
     limiter: DefaultDirectRateLimiter,
+    /// Wall-clock time of the most recent admission attempt for this key.
     last_seen: Instant,
 }
 
@@ -196,10 +136,15 @@ struct Entry {
 /// and a [`Weak`] inside the optional background prune task so the task
 /// self-terminates once the limiter is dropped.
 struct Inner<K: Eq + Hash + Clone> {
+    /// Per-key limiter entries, keyed by the tracked key.
     map: Mutex<HashMap<K, Entry>>,
+    /// Per-key quota applied to every entry.
     quota: Quota,
+    /// Hard cap on the number of simultaneously tracked keys.
     max_tracked_keys: usize,
+    /// Idle window after which an entry becomes eligible for pruning.
     idle_eviction: Duration,
+    /// Behaviour applied once the tracked-key table reaches capacity.
     key_eviction_policy: KeyEvictionPolicy,
 }
 
@@ -211,10 +156,12 @@ struct Inner<K: Eq + Hash + Clone> {
     reason = "wraps governor RateLimiter which has no Debug impl"
 )]
 pub struct BoundedKeyedLimiter<K: Eq + Hash + Clone> {
+    /// Shared inner state; clones share this.
     inner: Arc<Inner<K>>,
 }
 
 impl<K: Eq + Hash + Clone> Clone for BoundedKeyedLimiter<K> {
+    #[inline]
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -246,6 +193,7 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
     /// pruning happens lazily on every full-table insert. Both behaviours
     /// are correct.
     #[must_use]
+    #[inline]
     pub(crate) fn new(
         quota: Quota,
         max_tracked_keys: NonZeroUsize,
@@ -261,6 +209,7 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
 
     /// Create a new bounded keyed limiter with explicit full-table behaviour.
     #[must_use]
+    #[inline]
     pub(crate) fn new_with_policy(
         quota: Quota,
         max_tracked_keys: NonZeroUsize,
@@ -293,18 +242,20 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
     /// * `idle_eviction` -- entries whose `last_seen` is older than this
     ///   are eligible for opportunistic pruning.
     #[must_use]
+    #[inline]
     pub fn with_per_minute(
         requests_per_minute: u32,
         max_tracked_keys: usize,
         idle_eviction: Duration,
     ) -> Self {
         let rate = NonZeroU32::new(requests_per_minute.max(1)).unwrap_or(NonZeroU32::MIN);
-        let max_tracked_keys = NonZeroUsize::new(max_tracked_keys).unwrap_or(NonZeroUsize::MIN);
-        Self::new(Quota::per_minute(rate), max_tracked_keys, idle_eviction)
+        let capped_keys = NonZeroUsize::new(max_tracked_keys).unwrap_or(NonZeroUsize::MIN);
+        Self::new(Quota::per_minute(rate), capped_keys, idle_eviction)
     }
 
     /// Construct a [`BoundedKeyedLimiter`] with a per-minute quota and policy.
     #[must_use]
+    #[inline]
     pub fn with_per_minute_and_policy(
         requests_per_minute: u32,
         max_tracked_keys: usize,
@@ -312,10 +263,10 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
         key_eviction_policy: KeyEvictionPolicy,
     ) -> Self {
         let rate = NonZeroU32::new(requests_per_minute.max(1)).unwrap_or(NonZeroU32::MIN);
-        let max_tracked_keys = NonZeroUsize::new(max_tracked_keys).unwrap_or(NonZeroUsize::MIN);
+        let capped_keys = NonZeroUsize::new(max_tracked_keys).unwrap_or(NonZeroUsize::MIN);
         Self::new_with_policy(
             Quota::per_minute(rate),
-            max_tracked_keys,
+            capped_keys,
             idle_eviction,
             key_eviction_policy,
         )
@@ -336,18 +287,20 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
     /// * `idle_eviction` -- entries whose `last_seen` is older than this
     ///   are eligible for opportunistic pruning.
     #[must_use]
+    #[inline]
     pub fn with_per_second(
         requests_per_second: u32,
         max_tracked_keys: usize,
         idle_eviction: Duration,
     ) -> Self {
         let rate = NonZeroU32::new(requests_per_second.max(1)).unwrap_or(NonZeroU32::MIN);
-        let max_tracked_keys = NonZeroUsize::new(max_tracked_keys).unwrap_or(NonZeroUsize::MIN);
-        Self::new(Quota::per_second(rate), max_tracked_keys, idle_eviction)
+        let capped_keys = NonZeroUsize::new(max_tracked_keys).unwrap_or(NonZeroUsize::MIN);
+        Self::new(Quota::per_second(rate), capped_keys, idle_eviction)
     }
 
     /// Construct a [`BoundedKeyedLimiter`] with a per-second quota and policy.
     #[must_use]
+    #[inline]
     pub fn with_per_second_and_policy(
         requests_per_second: u32,
         max_tracked_keys: usize,
@@ -355,10 +308,10 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
         key_eviction_policy: KeyEvictionPolicy,
     ) -> Self {
         let rate = NonZeroU32::new(requests_per_second.max(1)).unwrap_or(NonZeroU32::MIN);
-        let max_tracked_keys = NonZeroUsize::new(max_tracked_keys).unwrap_or(NonZeroUsize::MIN);
+        let capped_keys = NonZeroUsize::new(max_tracked_keys).unwrap_or(NonZeroUsize::MIN);
         Self::new_with_policy(
             Quota::per_second(rate),
-            max_tracked_keys,
+            capped_keys,
             idle_eviction,
             key_eviction_policy,
         )
@@ -367,24 +320,28 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
     /// Spawn the optional background prune task. No-op if there is no
     /// current Tokio runtime.
     fn spawn_prune_task(inner: &Arc<Inner<K>>) {
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        let Ok(handle) = Handle::try_current() else {
             return;
         };
         let weak: Weak<Inner<K>> = Arc::downgrade(inner);
         // Prune at most once every quarter of `idle_eviction`, but never
         // less than once per minute (to avoid waking up too often when
         // operators configure a very long eviction window).
-        let interval = (inner.idle_eviction / 4).max(Duration::from_mins(1));
-        handle.spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
+        let prune_interval = inner
+            .idle_eviction
+            .checked_div(4)
+            .unwrap_or(Duration::ZERO)
+            .max(Duration::from_mins(1));
+        let _prune_task = handle.spawn(async move {
+            let mut ticker = interval(prune_interval);
             // We just woke up from `Handle::spawn`; don't burn the first tick.
-            ticker.tick().await;
+            let _first_tick = ticker.tick().await;
             loop {
-                ticker.tick().await;
-                let Some(inner) = weak.upgrade() else {
+                let _tick = ticker.tick().await;
+                let Some(tracked) = weak.upgrade() else {
                     return;
                 };
-                Self::prune_idle(&inner);
+                Self::prune_idle(&tracked);
             }
         });
     }
@@ -404,9 +361,9 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
         let oldest_key = map
             .iter()
             .min_by_key(|(_, entry)| entry.last_seen)
-            .map(|(k, _)| k.clone());
+            .map(|(key, _)| key.clone());
         if let Some(key) = oldest_key {
-            map.remove(&key);
+            let _removed = map.remove(&key);
         }
     }
 
@@ -426,9 +383,10 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
     ///
     /// Returns [`BoundedLimiterError::RateLimited`] when `key` has
     /// exceeded its per-key quota for the current window.
+    #[inline]
     pub fn check_key(&self, key: &K) -> Result<(), BoundedLimiterError> {
         self.check_key_wait(key)
-            .map_err(|_| BoundedLimiterError::RateLimited)
+            .map_err(|_wait| BoundedLimiterError::RateLimited)
     }
 
     /// Test the per-key quota for `key`, returning the wait time on deny.
@@ -444,6 +402,7 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
     /// governor's default clock at the moment of the failed check. The
     /// value is a raw [`Duration`]; rounding (e.g. ceiling to whole
     /// seconds for a `Retry-After` header) is the caller's concern.
+    #[inline]
     pub fn check_key_wait(&self, key: &K) -> Result<(), Duration> {
         let mut guard = self
             .inner
@@ -474,7 +433,7 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
         let result = limiter
             .check()
             .map_err(|not_until| not_until.wait_time_from(DefaultClock::default().now()));
-        guard.insert(
+        let _previous = guard.insert(
             key.clone(),
             Entry {
                 limiter,
@@ -497,6 +456,7 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
     /// Returns [`BoundedLimiterDeny::RateLimited`] when an established bucket is
     /// over quota, or [`BoundedLimiterDeny::CapacityFull`] when an unseen key is
     /// rejected by [`KeyEvictionPolicy::RejectNew`].
+    #[inline]
     pub fn check_key_detailed(&self, key: &K) -> Result<(), BoundedLimiterDeny> {
         let mut guard = self
             .inner
@@ -528,7 +488,7 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
         let result = limiter.check().map_err(|not_until| {
             BoundedLimiterDeny::RateLimited(not_until.wait_time_from(DefaultClock::default().now()))
         });
-        guard.insert(
+        let _previous = guard.insert(
             key.clone(),
             Entry {
                 limiter,
@@ -540,6 +500,7 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
 
     /// Number of currently tracked keys. Used by tests and admin endpoints.
     #[must_use]
+    #[inline]
     pub fn len(&self) -> usize {
         self.inner
             .map
@@ -550,6 +511,7 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
 
     /// `true` when no keys are currently tracked.
     #[must_use]
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

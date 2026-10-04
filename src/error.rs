@@ -1,41 +1,15 @@
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::rest_pattern_accessible_field,
-        reason = "lint-migration: src/error.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::std_instead_of_alloc, reason = "lint-migration: src/error.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_inline_in_public_items,
-        reason = "lint-migration: src/error.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::std_instead_of_core, reason = "lint-migration: src/error.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::absolute_paths, reason = "lint-migration: src/error.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::module_name_repetitions,
-        reason = "lint-migration: src/error.rs"
-    )
-)]
+extern crate alloc;
+
+use alloc::borrow::Cow;
+use core::{result::Result as CoreResult, time::Duration};
+use std::io::Error as IoError;
+
 use axum::{
-    http::StatusCode,
+    http::{StatusCode, header::RETRY_AFTER},
     response::{IntoResponse, Response},
 };
 use thiserror::Error;
+use toml::de::Error as TomlDeError;
 
 /// Generic MCP server error type.
 ///
@@ -65,6 +39,10 @@ use thiserror::Error;
 /// review.
 #[derive(Debug, Error)]
 #[non_exhaustive]
+#[expect(
+    clippy::module_name_repetitions,
+    reason = "public API frozen until the next major release"
+)]
 pub enum RmcpServerKitError {
     /// Configuration parsing or validation failed.
     #[error("configuration error: {0}")]
@@ -93,12 +71,12 @@ pub enum RmcpServerKitError {
         /// Plain-text client-facing message (response body).
         message: String,
         /// Best-effort wait until the next request could be admitted.
-        retry_after: std::time::Duration,
+        retry_after: Duration,
     },
 
     /// Underlying I/O error.
     #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[from] IoError),
 
     /// JSON (de)serialization error.
     #[error("JSON error: {0}")]
@@ -106,7 +84,7 @@ pub enum RmcpServerKitError {
 
     /// TOML parse error (configuration loading).
     #[error("TOML parse error: {0}")]
-    Toml(#[from] toml::de::Error),
+    Toml(#[from] TomlDeError),
 
     /// TLS configuration failure (certificate load, key parse, rustls config).
     #[error("TLS error: {0}")]
@@ -132,6 +110,10 @@ pub enum RmcpServerKitError {
 }
 
 /// Deprecated compatibility alias for the pre-rename public error type.
+#[expect(
+    clippy::module_name_repetitions,
+    reason = "public API frozen until the next major release"
+)]
 #[deprecated(
     since = "3.7.0",
     note = "renamed to `RmcpServerKitError`; the `mcpx` name predates the crate rename"
@@ -141,7 +123,7 @@ pub type McpxError = RmcpServerKitError;
 /// Render a wait [`Duration`](std::time::Duration) as RFC 9110
 /// `Retry-After` delta-seconds: rounded **up** to whole seconds, never
 /// below `1` (a `0` would invite an immediate retry storm).
-fn retry_after_secs(wait: std::time::Duration) -> u64 {
+fn retry_after_secs(wait: Duration) -> u64 {
     let mut secs = wait.as_secs();
     if wait.subsec_nanos() > 0 {
         secs = secs.saturating_add(1);
@@ -163,11 +145,14 @@ impl RmcpServerKitError {
     /// See the type-level "Client-facing message invariant" for the contract
     /// construction sites must uphold.
     #[must_use]
-    pub fn client_message(&self) -> std::borrow::Cow<'_, str> {
-        use std::borrow::Cow;
+    #[inline]
+    pub fn client_message(&self) -> Cow<'_, str> {
         match self {
             Self::Auth(msg) | Self::Rbac(msg) | Self::RateLimited(msg) => Cow::Borrowed(msg),
-            Self::RateLimitedFor { message, .. } => Cow::Borrowed(message),
+            Self::RateLimitedFor {
+                message,
+                retry_after: _,
+            } => Cow::Borrowed(message),
             // Internal variants: never leak detail to the client.
             Self::Config(_)
             | Self::Io(_)
@@ -183,6 +168,7 @@ impl RmcpServerKitError {
 }
 
 impl IntoResponse for RmcpServerKitError {
+    #[inline]
     fn into_response(self) -> Response {
         let (status, client_msg) = match self {
             Self::Auth(msg) => (StatusCode::UNAUTHORIZED, msg),
@@ -194,10 +180,7 @@ impl IntoResponse for RmcpServerKitError {
             } => {
                 return (
                     StatusCode::TOO_MANY_REQUESTS,
-                    [(
-                        axum::http::header::RETRY_AFTER,
-                        retry_after_secs(retry_after).to_string(),
-                    )],
+                    [(RETRY_AFTER, retry_after_secs(retry_after).to_string())],
                     message,
                 )
                     .into_response();
@@ -231,7 +214,7 @@ impl IntoResponse for RmcpServerKitError {
 }
 
 /// Convenience `Result` alias bound to [`RmcpServerKitError`].
-pub type Result<T> = std::result::Result<T, RmcpServerKitError>;
+pub type Result<T> = CoreResult<T, RmcpServerKitError>;
 
 #[cfg_attr(
     all(test, target_os = "linux"),
@@ -311,7 +294,7 @@ mod tests {
         let resp = RmcpServerKitError::RateLimited("slow down".into()).into_response();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(
-            !resp.headers().contains_key(axum::http::header::RETRY_AFTER),
+            !resp.headers().contains_key(RETRY_AFTER),
             "legacy variant must stay headerless"
         );
     }
@@ -320,13 +303,13 @@ mod tests {
     async fn rate_limited_for_sets_retry_after_header() {
         let resp = RmcpServerKitError::RateLimitedFor {
             message: "slow down".into(),
-            retry_after: std::time::Duration::from_millis(1500),
+            retry_after: Duration::from_millis(1500),
         }
         .into_response();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         let header = resp
             .headers()
-            .get(axum::http::header::RETRY_AFTER)
+            .get(RETRY_AFTER)
             .expect("Retry-After present")
             .to_str()
             .unwrap()
@@ -429,7 +412,7 @@ mod tests {
         assert_eq!(
             RmcpServerKitError::RateLimitedFor {
                 message: "too many".into(),
-                retry_after: std::time::Duration::from_secs(1),
+                retry_after: Duration::from_secs(1),
             }
             .client_message(),
             "too many"

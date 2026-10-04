@@ -40,26 +40,10 @@
 //! let exposure = DiagnosticExposure::default();
 //! set_diagnostic_exposure(&exposure);
 //! ```
-#![cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::absolute_paths, reason = "lint-migration: src/diagnostics.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_inline_in_public_items,
-        reason = "lint-migration: src/diagnostics.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::std_instead_of_core,
-        reason = "lint-migration: src/diagnostics.rs"
-    )
-)]
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 /// Plaintext OAuth access tokens in `Debug` output.
 static PLAINTEXT_OAUTH_TOKENS: AtomicBool = AtomicBool::new(false);
@@ -117,6 +101,7 @@ pub struct DiagnosticExposure {
 ///
 /// This affects every `rmcp-server-kit` server in the process, not just the
 /// one you are about to start. See the [module docs](self).
+#[inline]
 pub fn set_diagnostic_exposure(exposure: &DiagnosticExposure) {
     // Relaxed is sufficient: each flag is an independent boolean that
     // synchronizes no other data, and callers set them during startup before
@@ -165,7 +150,7 @@ pub(crate) fn upstream_error_bodies() -> bool {
 /// on the same thread deadlocks. Never nest guards.
 #[cfg(test)]
 pub(crate) struct ExposureTestGuard {
-    _lock: std::sync::MutexGuard<'static, ()>,
+    _lock: MutexGuard<'static, ()>,
     previous: DiagnosticExposure,
 }
 
@@ -173,10 +158,8 @@ pub(crate) struct ExposureTestGuard {
 impl ExposureTestGuard {
     /// Acquire the global test lock and snapshot the current switch state.
     pub(crate) fn acquire() -> Self {
-        static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let lock = TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        static TEST_LOCK: Mutex<()> = Mutex::new(());
+        let lock = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         Self {
             _lock: lock,
             previous: DiagnosticExposure {
