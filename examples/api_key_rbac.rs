@@ -19,22 +19,9 @@
 //! ```bash
 //! curl -H "Authorization: Bearer $ADMIN_TOKEN" http://127.0.0.1:8080/mcp
 //! ```
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_docs_in_private_items,
-        reason = "lint-migration: examples/api_key_rbac.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::std_instead_of_alloc,
-        reason = "lint-migration: examples/api_key_rbac.rs"
-    )
-)]
+extern crate alloc;
 
-use std::sync::Arc;
+use alloc::sync::Arc;
 
 use rmcp::{
     handler::server::ServerHandler,
@@ -48,6 +35,7 @@ use rmcp_server_kit::{
     transport::{McpServerConfig, serve},
 };
 
+/// Minimal MCP handler for the API-key + RBAC walkthrough.
 #[derive(Clone)]
 struct DemoHandler;
 
@@ -57,6 +45,7 @@ impl ServerHandler for DemoHandler {
     }
 }
 
+// cancel-safe: process entry point; dropping this future tears down the server and its runtime.
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> rmcp_server_kit::Result<()> {
     let mut observability = ObservabilityConfig::default();

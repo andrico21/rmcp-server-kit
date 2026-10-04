@@ -708,7 +708,7 @@ pub trait ToolHooks: Send + Sync + 'static {
 ```
 
 `HookedHandler<H>` implements `rmcp::ServerHandler` for any inner `H: ServerHandler`,
-delegating every method while intercepting `call_tool` (`src/tool_hooks.rs:689`):
+delegating every method while intercepting `call_tool` (`src/tool_hooks.rs:681`):
 1. Captures current identity from task-locals.
 2. Calls `before_call` - may rewrite args, may return early with an error.
 3. Calls inner handler.

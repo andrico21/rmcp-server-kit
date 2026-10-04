@@ -1,31 +1,5 @@
 {
   "file": "examples/config_file_server.rs",
-  "keys": {
-    "test|clippy::absolute_paths|": 4,
-    "test|clippy::absolute_paths|--all-features": 4,
-    "test|clippy::absolute_paths|--features metrics": 4,
-    "test|clippy::absolute_paths|--features oauth": 4,
-    "test|clippy::absolute_paths|--no-default-features": 4,
-    "test|clippy::missing_docs_in_private_items|": 5,
-    "test|clippy::missing_docs_in_private_items|--all-features": 5,
-    "test|clippy::missing_docs_in_private_items|--features metrics": 5,
-    "test|clippy::missing_docs_in_private_items|--features oauth": 5,
-    "test|clippy::missing_docs_in_private_items|--no-default-features": 5,
-    "test|clippy::shadow_reuse|": 2,
-    "test|clippy::shadow_reuse|--all-features": 3,
-    "test|clippy::shadow_reuse|--features metrics": 3,
-    "test|clippy::shadow_reuse|--features oauth": 2,
-    "test|clippy::shadow_reuse|--no-default-features": 2,
-    "test|clippy::std_instead_of_alloc|": 1,
-    "test|clippy::std_instead_of_alloc|--all-features": 1,
-    "test|clippy::std_instead_of_alloc|--features metrics": 1,
-    "test|clippy::std_instead_of_alloc|--features oauth": 1,
-    "test|clippy::std_instead_of_alloc|--no-default-features": 1,
-    "test|clippy::std_instead_of_core|": 1,
-    "test|clippy::std_instead_of_core|--all-features": 1,
-    "test|clippy::std_instead_of_core|--features metrics": 1,
-    "test|clippy::std_instead_of_core|--features oauth": 1,
-    "test|clippy::std_instead_of_core|--no-default-features": 1
-  },
+  "keys": {},
   "toolchain": "1.99.0"
 }
