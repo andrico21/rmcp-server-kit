@@ -4177,7 +4177,9 @@ async fn shutdown_signal() {
 
     #[cfg(not(unix))]
     {
-        ctrl_c.await.ok();
+        if ctrl_c.await.is_err() {
+            tracing::debug!("SIGINT handling unavailable on this platform");
+        }
     }
 }
 
@@ -5869,22 +5871,19 @@ fn check_mtls_capacity_knobs(mtls: &MtlsConfig) -> Result<(), RmcpServerKitError
     expect(clippy::unwrap_used, reason = "lint-migration: src/transport.rs")
 )]
 #[cfg_attr(
-    all(test, target_os = "linux"),
+    test,
     expect(
         closure_returning_async_block,
         reason = "lint-migration: src/transport.rs"
     )
 )]
+#[cfg_attr(test, expect(deprecated, reason = "lint-migration: src/transport.rs"))]
 #[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(deprecated, reason = "lint-migration: src/transport.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
+    test,
     expect(let_underscore_drop, reason = "lint-migration: src/transport.rs")
 )]
 #[cfg_attr(
-    all(test, target_os = "linux"),
+    test,
     expect(unused_results, reason = "lint-migration: src/transport.rs")
 )]
 #[cfg_attr(
