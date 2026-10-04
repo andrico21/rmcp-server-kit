@@ -426,12 +426,12 @@ graph TD
 
 | Area                              | Module / file                           | Notable symbols (file:line)                                                  |
 |-----------------------------------|------------------------------------------|-------------------------------------------------------------------------------|
-| Server entry (HTTP)               | `src/transport.rs`                       | `serve` ~L2856, `McpServerConfig` L387-776, `ReloadHandle` ~L1816              |
-| Server entry (stdio, no auth)     | `src/transport.rs`                       | `serve_stdio` ~L5201                                                          |
+| Server entry (HTTP)               | `src/transport.rs`                       | `serve` ~L2981, `McpServerConfig` L387-776, `ReloadHandle` ~L1816              |
+| Server entry (stdio, no auth)     | `src/transport.rs`                       | `serve_stdio` ~L5424                                                          |
 | Router builder + middleware wire  | `src/transport.rs`                       | `build_app_router` ~L2076, security headers wired ~L2657, peer-addr normalize wired ~L2624, request log wired just inside peer-addr normalize, origin wired ~L2641 |
-| TLS / mTLS acceptor               | `src/transport.rs`                       | `TlsListener` ~L3456                                                          |
-| Origin / security headers (defs)  | `src/transport.rs`                       | `origin_check_middleware` ~L4925, `security_headers_middleware` ~L4014       |
-| Graceful shutdown                 | `src/transport.rs`                       | `shutdown_signal` ~L3993                                                      |
+| TLS / mTLS acceptor               | `src/transport.rs`                       | `TlsListener` ~L3619                                                          |
+| Origin / security headers (defs)  | `src/transport.rs`                       | `origin_check_middleware` ~L5125, `security_headers_middleware` ~L4333       |
+| Graceful shutdown                 | `src/transport.rs`                       | `shutdown_signal` ~L4153                                                      |
 | API key + mTLS auth               | `src/auth.rs`                            | `AuthIdentity` L51, `AuthState` ~L1165, `auth_middleware` L2007              |
 | RBAC engine                       | `src/rbac.rs`                            | `RbacPolicy` L352, task-locals L90-150, `rbac_middleware` L678-825           |
 | Memory-bounded keyed limiter      | `src/bounded_limiter.rs`                 | `BoundedKeyedLimiter` L134                                                    |
