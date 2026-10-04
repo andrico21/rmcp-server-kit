@@ -123,7 +123,7 @@ defined cleanup order, and no panic path. `scripts/lint-ratchet/prose_gates.py
 | Impl | File:line | Finding |
 | ---- | --------- | ------- |
 | `Drop for ExposureTestGuard` | `src/diagnostics.rs:197` | Test-only. Restores the process-global switch snapshot in memory; sync, no I/O or await, no panic path. No defect. |
-| `Drop for PendingUrlGuard` | `src/mtls_revocation.rs:1969` | Clears the in-flight URL marker (poison-recovering mutex); sync, no I/O or await, no panic path. Ordering is explicit via `disarm()` before promotion. No defect. |
+| `Drop for PendingUrlGuard` | `src/mtls_revocation.rs:1953` | Clears the in-flight URL marker (poison-recovering mutex); sync, no I/O or await, no panic path. Ordering is explicit via `disarm()` before promotion. No defect. |
 | `Drop for TracingGuard` | `src/observability.rs:247` | Delegates to `AuditWorkerGuard` by taking the `Option`; sync, no await, no panic path. Bounded by design (5s). No defect. |
 | `Drop for AuditWorkerGuard` | `src/observability.rs:441` | Signals shutdown then parks/joins the writer thread for at most `AUDIT_WRITER_JOIN_TIMEOUT` (5s); no async work or panic path. Bounded blocking is deliberate and documented. No defect. |
 | `Drop for CancelOnDrop` | `src/transport.rs:2866` | Sync, non-blocking `CancellationToken::cancel`; no I/O, await or panic path. Never disarmed on purpose. No defect. |
@@ -297,6 +297,24 @@ entry in the same PR that introduces a deviation.
    `oauth_internal_suffix_blocked` (G-6 suffix rule), the 10-second JWKS
    refresh cooldown, and the redaction tests' output. Evidence: the task-16
    migration record (`status.txt`, `new-permanent-expects.txt`, `gates.txt`).
+
+16. **2026-10-04 - `src/mtls_revocation.rs` lane expectations (frozen API +
+    deliberate).** Under entry 13's frozen-API decision, `CrlSet`'s mixed
+    `pub`/private fields carry a `clippy::partial_pub_fields` expectation
+    (making the private fields public, or the public ones private, is a 4.0
+    change). Deliberate expectations, each cited in-line:
+    `clippy::iter_over_hash_type` on `next_refresh_delay` (it folds every
+    cached deadline with `min`, so iteration order cannot change the result)
+    and `clippy::unnecessary_wraps` in `mod tests`, one per assertion-only
+    test, so every test keeps the uniform `anyhow::Result<()>` signature
+    (core's test pattern). `clippy::integer_division_remainder_used` is
+    expected on `bootstrap_fetch` and `run_crl_refresher`
+    (`external macro: tokio::select`). Behavior-sensitive paths kept exact:
+    the CRL SSRF screening (`check_scheme` plus resolved-IP
+    `ip_block_reason`, at the fetcher, bootstrap and pre-flight), the
+    hash-iteration order, and every error/log string. Evidence: the task-20
+    migration record (`before-after.txt`, `new-permanent-expects.txt`,
+    `gates.txt`).
 
 Entries to be added by the work that creates them: "new in `<version>`"
 expects and profile deltas (the toolchain-drift work); the per-item frozen
