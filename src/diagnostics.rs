@@ -190,6 +190,10 @@ impl ExposureTestGuard {
 }
 
 #[cfg(test)]
+// Test-only guard over process-global switches. Restores the snapshot values,
+// then releases the field lock; the `acquire` poison recovery keeps it
+// panic-free.
+// Drop audit (2026-10-04): no blocking/async work, no panic path.
 impl Drop for ExposureTestGuard {
     fn drop(&mut self) {
         set_diagnostic_exposure(&self.previous);

@@ -240,6 +240,10 @@ impl TracingGuard {
     }
 }
 
+// Takes the `Option<AuditWorkerGuard>`, delegating cleanup to that guard's
+// bounded drain; sync teardown blocks at most `AUDIT_WRITER_JOIN_TIMEOUT`
+// (5s) by design, as documented on the type.
+// Drop audit (2026-10-04): no I/O or await here, no panic path.
 impl Drop for TracingGuard {
     fn drop(&mut self) {
         let _ = self.audit.take();
@@ -429,6 +433,11 @@ struct AuditWorkerGuard {
     thread: Option<JoinHandle<()>>,
 }
 
+// Signals shutdown (atomic store plus non-blocking `try_send`), then parks and
+// joins the writer thread for at most `AUDIT_WRITER_JOIN_TIMEOUT` (5s). The
+// bounded blocking join is deliberate: a last-chance drain that cannot stall a
+// request worker past the timeout; every fallible return is handled/discarded.
+// Drop audit (2026-10-04): no async work, no panic path; cleanup order fixed.
 impl Drop for AuditWorkerGuard {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);

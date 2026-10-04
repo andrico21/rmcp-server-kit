@@ -1962,6 +1962,10 @@ impl PendingUrlGuard {
     }
 }
 
+// Removes the in-flight URL marker from `pending_urls` with a sync std-Mutex
+// lock (poison recovered). Ordering is explicit, not implicit in Drop: callers
+// `disarm()` before promoting to `seen_urls`, so an armed drop only clears.
+// Drop audit (2026-10-04): no blocking/async work, no panic path.
 impl Drop for PendingUrlGuard {
     fn drop(&mut self) {
         if self.armed {
