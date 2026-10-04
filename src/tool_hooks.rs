@@ -48,91 +48,66 @@
 //! let _wrapped = with_hooks(handler, hooks);
 //! ```
 #![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::if_then_some_else_none,
-        reason = "lint-migration: src/tool_hooks.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(clippy::min_ident_chars, reason = "lint-migration: src/tool_hooks.rs")
 )]
 #![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(
         clippy::unused_trait_names,
         reason = "lint-migration: src/tool_hooks.rs"
     )
 )]
 #![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(clippy::shadow_reuse, reason = "lint-migration: src/tool_hooks.rs")
 )]
 #![cfg_attr(
-    all(not(test), target_os = "linux"),
-    expect(
-        clippy::missing_docs_in_private_items,
-        reason = "lint-migration: src/tool_hooks.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_const_for_fn,
-        reason = "lint-migration: src/tool_hooks.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(clippy::absolute_paths, reason = "lint-migration: src/tool_hooks.rs")
 )]
 #![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::impl_trait_in_params,
-        reason = "lint-migration: src/tool_hooks.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_inline_in_public_items,
-        reason = "lint-migration: src/tool_hooks.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(
         clippy::std_instead_of_core,
         reason = "lint-migration: src/tool_hooks.rs"
     )
 )]
 #![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(
         clippy::std_instead_of_alloc,
         reason = "lint-migration: src/tool_hooks.rs"
     )
 )]
 #![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(
         clippy::inline_trait_bounds,
         reason = "lint-migration: src/tool_hooks.rs"
     )
 )]
 #![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(
         clippy::single_char_lifetime_names,
         reason = "lint-migration: src/tool_hooks.rs"
     )
 )]
-#![expect(unused_results, reason = "lint-migration: src/tool_hooks.rs")]
-#![expect(redundant_imports, reason = "lint-migration: src/tool_hooks.rs")]
+#![cfg_attr(
+    all(test, target_os = "linux"),
+    expect(unused_results, reason = "lint-migration: src/tool_hooks.rs")
+)]
+#![cfg_attr(
+    all(test, target_os = "linux"),
+    expect(redundant_imports, reason = "lint-migration: src/tool_hooks.rs")
+)]
 
-use std::{borrow::Cow, fmt, future::Future, io, pin::Pin, sync::Arc};
+extern crate alloc;
+
+use alloc::{borrow::Cow, sync::Arc};
+use core::{error::Error, fmt, pin::Pin};
+use std::io;
 
 #[expect(
     deprecated,
@@ -153,6 +128,8 @@ use rmcp::{
     },
     service::{NotificationContext, RequestContext, SubscriptionContext},
 };
+
+use crate::{diagnostics, rbac};
 
 /// Context passed to before/after hooks for a single tool call.
 #[derive(Clone)]
@@ -201,6 +178,7 @@ impl ToolCallContext {
     ///
     /// Returns `None` when no request id was available.
     #[must_use]
+    #[inline]
     pub fn request_id_for_log(&self) -> Option<String> {
         self.request_id
             .as_deref()
@@ -212,6 +190,11 @@ impl ToolCallContext {
     /// benchmarks of user-supplied hooks; the runtime path populates
     /// these fields from the request and task-local RBAC state.
     #[must_use]
+    #[expect(
+        clippy::impl_trait_in_params,
+        reason = "public API frozen until the next major release"
+    )]
+    #[inline]
     pub fn for_tool(tool_name: impl Into<String>) -> Self {
         Self {
             tool_name: tool_name.into(),
@@ -225,6 +208,7 @@ impl ToolCallContext {
 }
 
 impl fmt::Debug for ToolCallContext {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
             tool_name,
@@ -235,15 +219,15 @@ impl fmt::Debug for ToolCallContext {
             request_id,
         } = self;
         let mut debug = f.debug_struct("ToolCallContext");
-        debug.field("tool_name", tool_name);
-        if crate::diagnostics::tool_call_arguments() {
-            debug
+        let _tool_name_field = debug.field("tool_name", tool_name);
+        if diagnostics::tool_call_arguments() {
+            let _sensitive_fields = debug
                 .field("arguments", arguments)
                 .field("identity", identity)
                 .field("role", role)
                 .field("sub", sub);
         } else {
-            debug
+            let _redacted_fields = debug
                 .field("arguments", &"[REDACTED]")
                 .field("identity", &"[REDACTED]")
                 .field("role", &"[REDACTED]")
@@ -296,7 +280,9 @@ pub enum HookDisposition {
 /// returned future, which avoids forcing implementations to clone the
 /// context for every invocation.
 pub type BeforeHook = Arc<
-    dyn for<'a> Fn(&'a ToolCallContext) -> Pin<Box<dyn Future<Output = HookOutcome> + Send + 'a>>
+    dyn for<'call> Fn(
+            &'call ToolCallContext,
+        ) -> Pin<Box<dyn Future<Output = HookOutcome> + Send + 'call>>
         + Send
         + Sync
         + 'static,
@@ -310,11 +296,11 @@ pub type BeforeHook = Arc<
 /// `tokio::spawn`, so it must not assume it runs before the response is
 /// flushed.
 pub type AfterHook = Arc<
-    dyn for<'a> Fn(
-            &'a ToolCallContext,
+    dyn for<'call> Fn(
+            &'call ToolCallContext,
             HookDisposition,
             usize,
-        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'call>>
         + Send
         + Sync
         + 'static,
@@ -351,12 +337,18 @@ impl ToolHooks {
     /// the `#[non_exhaustive]` restriction that prevents struct-literal
     /// construction from outside the crate.
     #[must_use]
+    #[inline]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Set the serialized result size cap in bytes.
     #[must_use]
+    #[expect(
+        clippy::missing_const_for_fn,
+        reason = "public API frozen until the next major release"
+    )]
+    #[inline]
     pub fn with_max_result_bytes(mut self, max: usize) -> Self {
         self.max_result_bytes = Some(max);
         self
@@ -364,6 +356,7 @@ impl ToolHooks {
 
     /// Set the before-hook.
     #[must_use]
+    #[inline]
     pub fn with_before(mut self, before: BeforeHook) -> Self {
         self.before = Some(before);
         self
@@ -371,15 +364,19 @@ impl ToolHooks {
 
     /// Set the after-hook.
     #[must_use]
+    #[inline]
     pub fn with_after(mut self, after: AfterHook) -> Self {
         self.after = Some(after);
         self
     }
 }
 
+/// Documentation anchor for `mdbook`/rustdoc intra-doc links that must keep
+/// pointing at [`HookedHandler`] even if the type is renamed.
 const _HOOKED_HANDLER_DOC_ANCHOR: &str = "HookedHandler";
 
 impl fmt::Debug for ToolHooks {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ToolHooks")
             .field("max_result_bytes", &self.max_result_bytes)
@@ -392,11 +389,14 @@ impl fmt::Debug for ToolHooks {
 /// `ServerHandler` wrapper that applies [`ToolHooks`].
 #[derive(Clone)]
 pub struct HookedHandler<H: ServerHandler> {
+    /// The wrapped handler; shared so the wrapper stays `Clone`.
     inner: Arc<H>,
+    /// Hooks applied around `call_tool`.
     hooks: Arc<ToolHooks>,
 }
 
 impl<H: ServerHandler> fmt::Debug for HookedHandler<H> {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HookedHandler")
             .field("hooks", &self.hooks)
@@ -411,7 +411,11 @@ impl<H: ServerHandler> fmt::Debug for HookedHandler<H> {
 #[must_use = "HookedHandler must be wired into a ServerHandler (e.g. via \
               `serve(..., || hooked)`) to take effect; dropping the returned \
               value silently disables the supplied hooks"]
-pub fn with_hooks<H: ServerHandler>(inner: H, hooks: Arc<ToolHooks>) -> HookedHandler<H> {
+#[inline]
+pub fn with_hooks<H>(inner: H, hooks: Arc<ToolHooks>) -> HookedHandler<H>
+where
+    H: ServerHandler,
+{
     HookedHandler {
         inner: Arc::new(inner),
         hooks,
@@ -421,17 +425,20 @@ pub fn with_hooks<H: ServerHandler>(inner: H, hooks: Arc<ToolHooks>) -> HookedHa
 impl<H: ServerHandler> HookedHandler<H> {
     /// Access the wrapped handler.
     #[must_use]
+    #[inline]
     pub fn inner(&self) -> &H {
         &self.inner
     }
 
+    /// Build the hook context for one tool call from the request and the
+    /// task-local RBAC state.
     fn build_context(request: &CallToolRequestParams, req_id: Option<String>) -> ToolCallContext {
         ToolCallContext {
             tool_name: request.name.to_string(),
             arguments: request.arguments.clone().map(serde_json::Value::Object),
-            identity: crate::rbac::current_identity(),
-            role: crate::rbac::current_role(),
-            sub: crate::rbac::current_sub(),
+            identity: rbac::current_identity(),
+            role: rbac::current_role(),
+            sub: rbac::current_sub(),
             request_id: req_id,
         }
     }
@@ -444,7 +451,7 @@ impl<H: ServerHandler> HookedHandler<H> {
     /// The spawned task is **instrumented** with the request span via
     /// [`tracing::Instrument`] and re-establishes the per-request RBAC
     /// task-locals (role, identity, token, sub) via
-    /// [`crate::rbac::with_rbac_scope`]. Without this, after-hooks lose
+    /// [`rbac::with_rbac_scope`]. Without this, after-hooks lose
     /// their parent span (breaking trace correlation) and observe
     /// `current_role()` / `current_identity()` as `None`.
     fn spawn_after(
@@ -453,25 +460,27 @@ impl<H: ServerHandler> HookedHandler<H> {
         disposition: HookDisposition,
         size: usize,
     ) {
-        if let Some(after) = after {
-            use tracing::Instrument;
+        if let Some(after_holder) = after {
+            use tracing::{Instrument as _, Span};
 
-            let after = Arc::clone(after);
+            let holder = Arc::clone(after_holder);
             // Capture the request span before leaving the request task so
             // after-hook log lines are correlated with the originating call.
-            let span = tracing::Span::current();
+            let span = Span::current();
             // Snapshot RBAC task-locals; defaults are empty strings so the
             // re-established scope is a no-op when the request had no
             // authenticated identity (e.g. health checks, anonymous tools).
-            let role = crate::rbac::current_role().unwrap_or_default();
-            let identity = crate::rbac::current_identity().unwrap_or_default();
-            let token = crate::rbac::current_token()
-                .unwrap_or_else(|| secrecy::SecretString::from(String::new()));
-            let sub = crate::rbac::current_sub().unwrap_or_default();
-            tokio::spawn(
+            let role = rbac::current_role().unwrap_or_default();
+            let identity = rbac::current_identity().unwrap_or_default();
+            let token =
+                rbac::current_token().unwrap_or_else(|| secrecy::SecretString::from(String::new()));
+            let sub = rbac::current_sub().unwrap_or_default();
+            // Detached on purpose: dropping a `JoinHandle` detaches (never
+            // aborts) the spawned task, so the after-hook still runs.
+            let _after_task = tokio::spawn(
                 async move {
-                    crate::rbac::with_rbac_scope(role, identity, token, sub, async move {
-                        let fut = (after.f)(&ctx, disposition, size);
+                    rbac::with_rbac_scope(role, identity, token, sub, async move {
+                        let fut = (holder.hook)(&ctx, disposition, size);
                         fut.await;
                     })
                     .await;
@@ -486,7 +495,8 @@ impl<H: ServerHandler> HookedHandler<H> {
 /// the *holder* and let the spawned task borrow `ctx` for the lifetime
 /// of the future without lifetime acrobatics in `tokio::spawn`.
 struct AfterHookHolder {
-    f: AfterHook,
+    /// The hook invoked by the spawned task.
+    hook: AfterHook,
 }
 
 /// Structured error body returned when a result exceeds `max_result_bytes`.
@@ -495,8 +505,10 @@ struct AfterHookHolder {
 /// size is unknown. It is rendered as `"unknown"` rather than a fabricated
 /// number -- operators read `actual_bytes` as a measurement.
 fn too_large_result(limit: usize, actual: Option<usize>, tool: &str) -> CallToolResult {
-    let actual_desc =
-        actual.map_or_else(|| "an unmeasurable number of".to_owned(), |n| n.to_string());
+    let actual_desc = actual.map_or_else(
+        || "an unmeasurable number of".to_owned(),
+        |count| count.to_string(),
+    );
     let body = serde_json::json!({
         "error": "result_too_large",
         "message": format!(
@@ -509,9 +521,9 @@ fn too_large_result(limit: usize, actual: Option<usize>, tool: &str) -> CallTool
             serde_json::Value::from,
         ),
     });
-    let mut r = CallToolResult::error(vec![ContentBlock::text(body.to_string())]);
-    r.structured_content = None;
-    r
+    let mut result = CallToolResult::error(vec![ContentBlock::text(body.to_string())]);
+    result.structured_content = None;
+    result
 }
 
 /// Outcome of the `max_result_bytes` policy for a measured -- or
@@ -519,9 +531,17 @@ fn too_large_result(limit: usize, actual: Option<usize>, tool: &str) -> CallTool
 #[derive(Debug, PartialEq, Eq)]
 enum SizeVerdict {
     /// Within the cap, or no cap configured. Carries the measured size.
-    Pass { size: usize },
+    Pass {
+        /// The measured serialized size in bytes.
+        size: usize,
+    },
     /// Over the cap, or unmeasurable while a cap is configured.
-    Replace { limit: usize, actual: Option<usize> },
+    Replace {
+        /// The configured cap.
+        limit: usize,
+        /// The measured size, or `None` when serialization was unmeasurable.
+        actual: Option<usize>,
+    },
     /// Unmeasurable and no cap configured: nothing to enforce.
     PassUnmeasured,
 }
@@ -529,12 +549,12 @@ enum SizeVerdict {
 /// Decide what the size cap does, given an optional size-measurement outcome.
 const fn decide_size(size: Option<SizeMeasure>, max: Option<usize>) -> SizeVerdict {
     match size {
-        Some(SizeMeasure::Exact(size)) => match max {
-            Some(limit) if size > limit => SizeVerdict::Replace {
+        Some(SizeMeasure::Exact(measured)) => match max {
+            Some(limit) if measured > limit => SizeVerdict::Replace {
                 limit,
-                actual: Some(size),
+                actual: Some(measured),
             },
-            Some(_) | None => SizeVerdict::Pass { size },
+            Some(_) | None => SizeVerdict::Pass { size: measured },
         },
         Some(SizeMeasure::Exceeded { limit }) => SizeVerdict::Replace {
             limit,
@@ -558,13 +578,9 @@ fn apply_size_cap(
     max: Option<usize>,
     tool: &str,
 ) -> (CallToolResult, usize, bool) {
-    let size = if max.is_some() {
-        Some(serialized_size(&result, max))
-    } else {
-        None
-    };
+    let size = max.is_some().then(|| serialized_size(&result, max));
     match decide_size(size, max) {
-        SizeVerdict::Pass { size } => (result, size, false),
+        SizeVerdict::Pass { size: measured } => (result, measured, false),
         SizeVerdict::PassUnmeasured => (result, 0, false),
         SizeVerdict::Replace { limit, actual } => {
             tracing::warn!(
@@ -585,14 +601,21 @@ fn apply_size_cap(
     reason = "transparent ServerHandler delegation must include legacy logging/subscription methods until rmcp removes them"
 )]
 impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn ping(&self, context: RequestContext<RoleServer>) -> Result<(), ErrorData> {
         self.inner.ping(context).await
     }
 
+    #[inline]
     fn get_info(&self) -> ServerConfig {
         self.inner.get_info()
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn initialize(
         &self,
         request: InitializeRequestParams,
@@ -604,6 +627,7 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
     // Synchronous negotiation helper: no context and no hooks apply, so plain
     // delegation is the only transparent option -- the trait default would
     // shadow an inner override.
+    #[inline]
     fn negotiate_initialize(
         &self,
         request: &InitializeRequestParams,
@@ -611,6 +635,9 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.negotiate_initialize(request)
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn list_tools(
         &self,
         request: Option<PaginatedRequestParams>,
@@ -619,6 +646,9 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.list_tools(request, context).await
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn complete(
         &self,
         request: CompleteRequestParams,
@@ -627,6 +657,9 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.complete(request, context).await
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn set_level(
         &self,
         request: SetLevelRequestParams,
@@ -635,10 +668,14 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.set_level(request, context).await
     }
 
+    #[inline]
     fn get_tool(&self, name: &str) -> Option<Tool> {
         self.inner.get_tool(name)
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn list_prompts(
         &self,
         request: Option<PaginatedRequestParams>,
@@ -647,6 +684,9 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.list_prompts(request, context).await
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn get_prompt(
         &self,
         request: GetPromptRequestParams,
@@ -655,6 +695,9 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.get_prompt(request, context).await
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn list_resources(
         &self,
         request: Option<PaginatedRequestParams>,
@@ -663,6 +706,9 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.list_resources(request, context).await
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn list_resource_templates(
         &self,
         request: Option<PaginatedRequestParams>,
@@ -671,6 +717,9 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.list_resource_templates(request, context).await
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
@@ -681,11 +730,10 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
 
     // NOT cancel-safe: this awaits consumer-supplied before-hooks and the
     // consumer's inner handler. After-hooks are dispatched only on the normal
-    // Deny/Replace/Ok/Err paths, so a cancellation between the before-hook and
-    // the response drops the paired after-hook -- an audit hook can therefore
-    // record a started call that is never closed out. Consumers needing
-    // guaranteed pairing should make the after-hook idempotent or run the tool
-    // body detached (see `crate::cancel`).
+    // Deny/Replace/Ok/Err paths, so a cancellation between them drops the
+    // paired after-hook -- an audit hook can record a started call that never
+    // closes out. Make the after-hook idempotent or detach the tool body.
+    #[inline]
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
@@ -694,11 +742,11 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         let req_id = Some(context.id.to_string());
         let ctx = Self::build_context(&request, req_id);
         let max = self.hooks.max_result_bytes;
-        let after_holder = self
-            .hooks
-            .after
-            .as_ref()
-            .map(|f| Arc::new(AfterHookHolder { f: Arc::clone(f) }));
+        let after_holder = self.hooks.after.as_ref().map(|hook| {
+            Arc::new(AfterHookHolder {
+                hook: Arc::clone(hook),
+            })
+        });
 
         // Before hook: may Continue, Deny, or Replace.
         if let Some(before) = self.hooks.before.as_ref() {
@@ -746,9 +794,9 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
                 );
                 Ok(other)
             }
-            Err(e) => {
+            Err(error) => {
                 Self::spawn_after(after_holder.as_ref(), ctx, HookDisposition::InnerErrored, 0);
-                Err(e)
+                Err(error)
             }
         }
     }
@@ -756,10 +804,14 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
     // rmcp 3.0 added task/subscription/discovery request handlers with defaults;
     // delegate them to `inner` so wrapping a handler that implements those stays
     // transparent (otherwise the default would shadow the inner implementation).
+    #[inline]
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
         self.inner.supported_protocol_versions()
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn discover(
         &self,
         context: RequestContext<RoleServer>,
@@ -767,6 +819,7 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.discover(context).await
     }
 
+    #[inline]
     fn accepted_subscription_filter(
         &self,
         requested: &SubscriptionFilter,
@@ -774,10 +827,16 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.accepted_subscription_filter(requested)
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn listen(&self, context: SubscriptionContext) -> Result<(), ErrorData> {
         self.inner.listen(context).await
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn subscribe(
         &self,
         request: SubscribeRequestParams,
@@ -786,6 +845,9 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.subscribe(request, context).await
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn unsubscribe(
         &self,
         request: UnsubscribeRequestParams,
@@ -794,6 +856,9 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.unsubscribe(request, context).await
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn get_task(
         &self,
         request: GetTaskParams,
@@ -802,6 +867,9 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.get_task(request, context).await
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn update_task(
         &self,
         request: UpdateTaskParams,
@@ -810,6 +878,9 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.update_task(request, context).await
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn cancel_task(
         &self,
         request: CancelTaskParams,
@@ -818,6 +889,9 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.cancel_task(request, context).await
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn on_custom_request(
         &self,
         request: CustomRequest,
@@ -826,6 +900,9 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.on_custom_request(request, context).await
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn on_cancelled(
         &self,
         notification: CancelledNotificationParam,
@@ -834,6 +911,9 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.on_cancelled(notification, context).await;
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn on_progress(
         &self,
         notification: ProgressNotificationParam,
@@ -842,14 +922,23 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.on_progress(notification, context).await;
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
         self.inner.on_initialized(context).await;
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn on_roots_list_changed(&self, context: NotificationContext<RoleServer>) {
         self.inner.on_roots_list_changed(context).await;
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn on_custom_notification(
         &self,
         notification: CustomNotification,
@@ -861,23 +950,30 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
     }
 }
 
+/// Marker error for the deliberate cap-abort of [`CountingWriter`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SizeLimitExceeded;
 
 impl fmt::Display for SizeLimitExceeded {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("serialized result exceeded configured size cap")
     }
 }
 
-impl std::error::Error for SizeLimitExceeded {}
+impl Error for SizeLimitExceeded {}
 
+/// [`io::Write`] sink that counts bytes and, when bounded, fails with
+/// [`SizeLimitExceeded`] as soon as the count would cross the cap.
 struct CountingWriter {
+    /// Bytes written so far.
     bytes: usize,
+    /// Cap that aborts the write once crossed, or `None` for an unbounded count.
     limit: Option<usize>,
 }
 
 impl CountingWriter {
+    /// Byte counter without a cap.
     const fn unbounded() -> Self {
         Self {
             bytes: 0,
@@ -885,6 +981,7 @@ impl CountingWriter {
         }
     }
 
+    /// Byte counter that aborts the write once `limit` is crossed.
     const fn bounded(limit: usize) -> Self {
         Self {
             bytes: 0,
@@ -915,7 +1012,10 @@ enum SizeMeasure {
     /// Exact serialized size in bytes.
     Exact(usize),
     /// Serialization crossed the configured size cap and stopped early.
-    Exceeded { limit: usize },
+    Exceeded {
+        /// The configured cap that was crossed.
+        limit: usize,
+    },
 }
 
 /// Serialized byte length, or a deliberate cap-abort outcome.
@@ -2378,10 +2478,8 @@ mod tests {
 
     #[test]
     fn tool_call_context_debug_redacts_sensitive_fields_by_default() {
-        let _guard = crate::diagnostics::ExposureTestGuard::acquire();
-        crate::diagnostics::set_diagnostic_exposure(
-            &crate::diagnostics::DiagnosticExposure::default(),
-        );
+        let _guard = diagnostics::ExposureTestGuard::acquire();
+        diagnostics::set_diagnostic_exposure(&diagnostics::DiagnosticExposure::default());
 
         let rendered = format!("{:?}", sensitive_ctx());
 
@@ -2403,10 +2501,10 @@ mod tests {
 
     #[test]
     fn tool_call_context_debug_can_show_sensitive_fields_when_enabled() {
-        let _guard = crate::diagnostics::ExposureTestGuard::acquire();
-        crate::diagnostics::set_diagnostic_exposure(&crate::diagnostics::DiagnosticExposure {
+        let _guard = diagnostics::ExposureTestGuard::acquire();
+        diagnostics::set_diagnostic_exposure(&diagnostics::DiagnosticExposure {
             tool_call_arguments: true,
-            ..crate::diagnostics::DiagnosticExposure::default()
+            ..diagnostics::DiagnosticExposure::default()
         });
 
         let rendered = format!("{:?}", sensitive_ctx());
@@ -2686,7 +2784,7 @@ mod tests {
                 c.fetch_add(1, Ordering::Relaxed);
             })
         });
-        let holder = Arc::new(AfterHookHolder { f: after });
+        let holder = Arc::new(AfterHookHolder { hook: after });
 
         HookedHandler::<TestHandler>::spawn_after(
             Some(&holder),
@@ -2714,7 +2812,7 @@ mod tests {
                 panic!("intentional panic in after-hook");
             })
         });
-        let holder = Arc::new(AfterHookHolder { f: after });
+        let holder = Arc::new(AfterHookHolder { hook: after });
 
         HookedHandler::<TestHandler>::spawn_after(
             Some(&holder),

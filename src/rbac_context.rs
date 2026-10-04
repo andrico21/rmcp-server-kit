@@ -10,58 +10,49 @@
 //! wrapped consumer handler's own cancel-safety contract is inherited
 //! unchanged.
 #![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(
         clippy::missing_errors_doc,
         reason = "lint-migration: src/rbac_context.rs"
     )
 )]
 #![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(clippy::absolute_paths, reason = "lint-migration: src/rbac_context.rs")
 )]
 #![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(clippy::shadow_reuse, reason = "lint-migration: src/rbac_context.rs")
 )]
 #![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_const_for_fn,
-        reason = "lint-migration: src/rbac_context.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(
         clippy::redundant_pub_crate,
         reason = "lint-migration: src/rbac_context.rs"
     )
 )]
 #![cfg_attr(
-    all(not(test), target_os = "linux"),
-    expect(
-        clippy::missing_docs_in_private_items,
-        reason = "lint-migration: src/rbac_context.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(
         clippy::std_instead_of_core,
         reason = "lint-migration: src/rbac_context.rs"
     )
 )]
 #![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(
         clippy::std_instead_of_alloc,
         reason = "lint-migration: src/rbac_context.rs"
     )
 )]
-#![expect(redundant_imports, reason = "lint-migration: src/rbac_context.rs")]
+#![cfg_attr(
+    all(test, target_os = "linux"),
+    expect(redundant_imports, reason = "lint-migration: src/rbac_context.rs")
+)]
 
-use std::{borrow::Cow, future::Future, sync::Arc};
+extern crate alloc;
+
+use alloc::{borrow::Cow, sync::Arc};
 
 use arc_swap::ArcSwap;
 use axum::http::request::Parts;
@@ -72,31 +63,35 @@ use axum::http::request::Parts;
 use rmcp::{
     ErrorData, ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResponse, CancelTaskParams, CancelledNotificationParam,
-        CompleteRequestParams, CompleteResult, CustomNotification, CustomRequest, CustomResult,
-        DiscoverResult, Extensions, GetPromptRequestParams, GetPromptResponse, GetTaskParams,
-        GetTaskResult, InitializeRequestParams, InitializeResult, ListPromptsResult,
-        ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
-        ProgressNotificationParam, ProtocolVersion, ReadResourceRequestParams,
-        ReadResourceResponse, ServerConfig, SetLevelRequestParams, SubscribeRequestParams,
-        SubscriptionFilter, Tool, UnsubscribeRequestParams, UpdateTaskParams,
+        CacheScope, CallToolRequestParams, CallToolResponse, CancelTaskParams,
+        CancelledNotificationParam, CompleteRequestParams, CompleteResult, CustomNotification,
+        CustomRequest, CustomResult, DiscoverResult, Extensions, GetPromptRequestParams,
+        GetPromptResponse, GetTaskParams, GetTaskResult, InitializeRequestParams, InitializeResult,
+        ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
+        PaginatedRequestParams, ProgressNotificationParam, ProtocolVersion,
+        ReadResourceRequestParams, ReadResourceResponse, ServerConfig, SetLevelRequestParams,
+        SubscribeRequestParams, SubscriptionFilter, Tool, UnsubscribeRequestParams,
+        UpdateTaskParams,
     },
     service::{NotificationContext, RequestContext, RoleServer, SubscriptionContext},
 };
 
 use crate::{
     auth::AuthIdentity,
-    rbac::{RbacDecision, RbacPolicy},
+    rbac::{self, RbacDecision, RbacPolicy},
     secret::SecretString,
     session_binding::{IdentityFingerprint, SessionBindingSecret, fingerprint},
     task_binding::{self, RawTaskId},
 };
 
-// Owns RBAC request context and RBAC-derived list visibility.
+/// Owns RBAC request context and RBAC-derived list visibility.
 #[derive(Debug, Clone)]
 pub(crate) struct RbacContextHandler<H> {
+    /// The wrapped handler.
     inner: H,
+    /// Shared, reloadable RBAC policy.
     rbac: Arc<ArcSwap<RbacPolicy>>,
+    /// Whether `tools/list` results are filtered by role.
     tool_list_filtering_enabled: bool,
     /// When `Some`, task IDs crossing this boundary are HMAC-bound to the
     /// authenticated identity. `None` leaves them untouched.
@@ -104,8 +99,9 @@ pub(crate) struct RbacContextHandler<H> {
 }
 
 impl<H> RbacContextHandler<H> {
+    /// Construct a handler around `inner` using `rbac`.
     #[must_use]
-    pub(crate) fn new(
+    pub(crate) const fn new(
         inner: H,
         rbac: Arc<ArcSwap<RbacPolicy>>,
         tool_list_filtering_enabled: bool,
@@ -139,26 +135,28 @@ impl<H> RbacContextHandler<H> {
         Some((secret, fingerprint(&identity)))
     }
 
+    /// Apply role-based filtering to a `tools/list` result.
     fn filtered_tool_list(
         &self,
         mut result: ListToolsResult,
         role: Option<&str>,
     ) -> ListToolsResult {
         let policy = self.rbac.load_full();
-        let Some(role) = role else {
+        let Some(role_name) = role else {
             return result;
         };
-        if !self.tool_list_filtering_enabled || !policy.is_enabled() || role.is_empty() {
+        if !self.tool_list_filtering_enabled || !policy.is_enabled() || role_name.is_empty() {
             return result;
         }
 
         result
             .tools
-            .retain(|tool| policy.check_operation(role, &tool.name) == RbacDecision::Allow);
-        result.with_cache_scope(rmcp::model::CacheScope::Private)
+            .retain(|tool| policy.check_operation(role_name, &tool.name) == RbacDecision::Allow);
+        result.with_cache_scope(CacheScope::Private)
     }
 }
 
+/// Extract the authenticated identity from a request's extensions, if any.
 fn identity_from_request(context: &RequestContext<RoleServer>) -> Option<AuthIdentity> {
     context_identity(&context.extensions)
 }
@@ -170,6 +168,11 @@ fn identity_from_request(context: &RequestContext<RoleServer>) -> Option<AuthIde
 /// that upstream `rmcp` returns for a genuinely unknown task
 /// (`McpError::invalid_params("unknown task: ...")`). Distinguishing them would
 /// turn this into an oracle that confirms a task's existence to a non-owner.
+///
+/// # Errors
+///
+/// Returns the same `unknown task: <id>` error for every verification failure:
+/// malformed, unwrapped, foreign-identity, or rotated-secret IDs.
 fn unbind_task_id(
     secret: &SessionBindingSecret,
     external_id: &str,
@@ -181,14 +184,17 @@ fn unbind_task_id(
     })
 }
 
+/// Extract the authenticated identity from a notification's extensions, if any.
 fn identity_from_notification(context: &NotificationContext<RoleServer>) -> Option<AuthIdentity> {
     context_identity(&context.extensions)
 }
 
+/// Extract the authenticated identity from a subscription's request context.
 fn identity_from_subscription(context: &SubscriptionContext) -> Option<AuthIdentity> {
     identity_from_request(context.request_context())
 }
 
+/// Pull the [`AuthIdentity`] stored in the request extensions, if any.
 fn context_identity(extensions: &Extensions) -> Option<AuthIdentity> {
     extensions
         .get::<Parts>()
@@ -196,25 +202,36 @@ fn context_identity(extensions: &Extensions) -> Option<AuthIdentity> {
         .cloned()
 }
 
+/// Run `call` inside the RBAC task-local scope for `identity`, if any.
+///
+/// A missing identity or an empty role runs `call` unscoped, mirroring the
+/// no-auth deployment behavior.
+// cancel-safe: installs the RBAC task-local scope around `call` and drops it
+// with this future; no role, token or guard outlives cancellation.
 async fn scope_with_identity<T, F, Fut>(identity: Option<AuthIdentity>, call: F) -> T
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = T>,
 {
-    let Some(identity) = identity else {
+    let Some(authenticated) = identity else {
         return call().await;
     };
-    if identity.role.is_empty() {
+    if authenticated.role.is_empty() {
         return call().await;
     }
 
-    let token = identity
+    let token = authenticated
         .raw_token
         .unwrap_or_else(|| SecretString::from(String::new()));
-    let sub = identity.sub.unwrap_or_default();
-    crate::rbac::with_rbac_scope_lazy(identity.role, identity.name, token, sub, call).await
+    let sub = authenticated.sub.unwrap_or_default();
+    rbac::with_rbac_scope_lazy(authenticated.role, authenticated.name, token, sub, call).await
 }
 
+// The methods generated by these two macros delegate through
+// `scope_with_identity`, so they inherit its cancel-safety contract: dropping
+// the future drops the identity scope installed for the delegated call.
+/// Generate request-handling `ServerHandler` methods that scope the request
+/// identity around the inner call.
 macro_rules! delegate_request {
     ($name:ident, $params:ident, $output:ty) => {
         async fn $name(
@@ -238,6 +255,8 @@ macro_rules! delegate_request {
     };
 }
 
+/// Generate notification-handling `ServerHandler` methods that scope the
+/// notification identity around the inner call.
 macro_rules! delegate_notification {
     ($name:ident, $params:ident) => {
         async fn $name(&self, notification: $params, context: NotificationContext<RoleServer>) {
@@ -252,11 +271,15 @@ macro_rules! delegate_notification {
     reason = "ServerHandler delegation must include the legacy subscribe/unsubscribe methods until rmcp removes them"
 )]
 impl<H: ServerHandler> ServerHandler for RbacContextHandler<H> {
+    // cancel-safe: scopes the request identity around the inner call;
+    // cancellation drops only the scoped future.
     async fn ping(&self, context: RequestContext<RoleServer>) -> Result<(), ErrorData> {
         let identity = identity_from_request(&context);
         scope_with_identity(identity, || self.inner.ping(context)).await
     }
 
+    // cancel-safe: scopes the request identity around the inner call;
+    // cancellation drops only the scoped future.
     async fn initialize(
         &self,
         request: InitializeRequestParams,
@@ -280,6 +303,8 @@ impl<H: ServerHandler> ServerHandler for RbacContextHandler<H> {
         self.inner.negotiate_initialize(request)
     }
 
+    // cancel-safe: scopes the request identity around the inner call;
+    // cancellation drops only the scoped future.
     async fn discover(
         &self,
         context: RequestContext<RoleServer>,
@@ -329,6 +354,8 @@ impl<H: ServerHandler> ServerHandler for RbacContextHandler<H> {
     // the wrapping done in `call_tool` and `get_task` below. The test
     // `task_status_notifications_remain_unroutable_until_binding_is_added`
     // fails when that upstream change lands.
+    // cancel-safe: scopes the subscription identity around the inner call;
+    // cancellation drops only the scoped future.
     async fn listen(&self, context: SubscriptionContext) -> Result<(), ErrorData> {
         let identity = identity_from_subscription(&context);
         scope_with_identity(identity, || self.inner.listen(context)).await
@@ -336,6 +363,8 @@ impl<H: ServerHandler> ServerHandler for RbacContextHandler<H> {
 
     delegate_request!(subscribe, SubscribeRequestParams, ());
     delegate_request!(unsubscribe, UnsubscribeRequestParams, ());
+    // cancel-safe: task-ID rewriting happens on local values after the
+    // delegated await; cancellation drops only those locals.
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
@@ -357,13 +386,15 @@ impl<H: ServerHandler> ServerHandler for RbacContextHandler<H> {
         Ok(response)
     }
 
+    // cancel-safe: filtering runs on the local result after the delegated
+    // await; cancellation drops only those locals.
     async fn list_tools(
         &self,
         request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let identity = identity_from_request(&context);
-        let role = identity.as_ref().map(|identity| identity.role.clone());
+        let role = identity.as_ref().map(|auth| auth.role.clone());
         let result =
             scope_with_identity(identity, || self.inner.list_tools(request, context)).await?;
         Ok(self.filtered_tool_list(result, role.as_deref()))
@@ -377,16 +408,22 @@ impl<H: ServerHandler> ServerHandler for RbacContextHandler<H> {
     delegate_notification!(on_cancelled, CancelledNotificationParam);
     delegate_notification!(on_progress, ProgressNotificationParam);
 
+    // cancel-safe: scopes the notification identity around the inner call;
+    // cancellation drops only the scoped future.
     async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
         let identity = identity_from_notification(&context);
         scope_with_identity(identity, || self.inner.on_initialized(context)).await;
     }
 
+    // cancel-safe: scopes the notification identity around the inner call;
+    // cancellation drops only the scoped future.
     async fn on_roots_list_changed(&self, context: NotificationContext<RoleServer>) {
         let identity = identity_from_notification(&context);
         scope_with_identity(identity, || self.inner.on_roots_list_changed(context)).await;
     }
 
+    // cancel-safe: scopes the notification identity around the inner call;
+    // cancellation drops only the scoped future.
     async fn on_custom_notification(
         &self,
         notification: CustomNotification,
@@ -407,6 +444,8 @@ impl<H: ServerHandler> ServerHandler for RbacContextHandler<H> {
     // cannot use `delegate_request!`: the external ID must be verified and
     // rewritten to the raw ID before the inner handler sees it, and rejected
     // without ever reaching that handler when it belongs to another identity.
+    // cancel-safe: task-ID handling runs on local request/result values around
+    // the delegated await; cancellation drops only those locals.
     async fn get_task(
         &self,
         mut request: GetTaskParams,
@@ -428,6 +467,8 @@ impl<H: ServerHandler> ServerHandler for RbacContextHandler<H> {
         Ok(result)
     }
 
+    // cancel-safe: task-ID handling runs on local request values before the
+    // delegated await; cancellation drops only those locals.
     async fn update_task(
         &self,
         mut request: UpdateTaskParams,
@@ -441,6 +482,8 @@ impl<H: ServerHandler> ServerHandler for RbacContextHandler<H> {
         scope_with_identity(identity, || self.inner.update_task(request, context)).await
     }
 
+    // cancel-safe: task-ID handling runs on local request values before the
+    // delegated await; cancellation drops only those locals.
     async fn cancel_task(
         &self,
         mut request: CancelTaskParams,
@@ -604,10 +647,8 @@ mod tests {
             _context: RequestContext<RoleServer>,
         ) -> Result<ListToolsResult, ErrorData> {
             if let Ok(mut role) = self.observed_role.lock() {
-                *role = Some(
-                    crate::rbac::current_role()
-                        .map_or(ObservedRole::Missing, ObservedRole::Present),
-                );
+                *role =
+                    Some(rbac::current_role().map_or(ObservedRole::Missing, ObservedRole::Present));
             }
             let result = self
                 .pages
@@ -906,7 +947,7 @@ mod tests {
             probe.observed_role(),
             Some(ObservedRole::Present("viewer".to_owned()))
         );
-        assert_eq!(crate::rbac::current_role(), None);
+        assert_eq!(rbac::current_role(), None);
         assert_eq!(result.tools, vec![tool("a_x")]);
     }
 
@@ -1467,7 +1508,7 @@ mod tests {
 
     impl ForwardingProbe {
         fn record(&self, method: &'static str) {
-            let role = crate::rbac::current_role();
+            let role = rbac::current_role();
             if let Ok(mut seen) = self.seen.lock() {
                 seen.push((method, role));
             }
