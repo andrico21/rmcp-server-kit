@@ -2335,20 +2335,11 @@ fn asn1_time_to_system_time(time: ASN1Time) -> SystemTime {
     }
 }
 
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::duration_suboptimal_units,
-        reason = "lint-migration: src/mtls_revocation.rs"
-    )
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "test code is not rendered API documentation"
 )]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::integer_division,
-        reason = "lint-migration: src/mtls_revocation.rs"
-    )
-)]
+#[expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")]
 #[cfg_attr(
     all(test, target_os = "linux"),
     expect(
@@ -2359,44 +2350,32 @@ fn asn1_time_to_system_time(time: ASN1Time) -> SystemTime {
 #[cfg_attr(
     all(test, target_os = "linux"),
     expect(
-        clippy::default_numeric_fallback,
-        reason = "lint-migration: src/mtls_revocation.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::shadow_unrelated,
-        reason = "lint-migration: src/mtls_revocation.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::expect_used, reason = "lint-migration: src/mtls_revocation.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
         clippy::missing_panics_doc,
         reason = "test code is not rendered API documentation"
     )
 )]
-#[cfg_attr(
-    test,
-    expect(deprecated, reason = "lint-migration: src/mtls_revocation.rs")
-)]
 #[cfg(test)]
 mod tests {
 
-    use std::sync::{
-        Mutex as StdMutex,
-        atomic::{AtomicUsize, Ordering},
+    use core::{
+        slice,
+        sync::atomic::{AtomicUsize, Ordering},
     };
+    use std::{io, sync::Mutex as StdMutex};
 
+    use anyhow::Context as _;
     use rcgen::{
         BasicConstraints, CertificateParams, CertifiedIssuer, DnType, IsCa, KeyPair,
         KeyUsagePurpose,
     };
+    use rustls::crypto::ring;
+    use serde_json::{from_value, json};
+    use tokio::{
+        task::{spawn_blocking, yield_now},
+        time::timeout,
+    };
+    use tracing::{Level, subscriber};
+    use tracing_subscriber::fmt as subscriber_fmt;
 
     use super::*;
 
@@ -2405,34 +2384,28 @@ mod tests {
 
     impl CapturedLogs {
         fn contents(&self) -> String {
-            let guard = self
-                .0
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let guard = self.0.lock().unwrap_or_else(PoisonError::into_inner);
             String::from_utf8_lossy(&guard).into_owned()
         }
     }
 
     struct CapturedLogsWriter(Arc<StdMutex<Vec<u8>>>);
 
-    impl std::io::Write for CapturedLogsWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    impl io::Write for CapturedLogsWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             {
-                let mut guard = self
-                    .0
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
+                let mut guard = self.0.lock().unwrap_or_else(PoisonError::into_inner);
                 guard.extend_from_slice(buf);
             }
             Ok(buf.len())
         }
 
-        fn flush(&mut self) -> std::io::Result<()> {
+        fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
     }
 
-    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedLogs {
+    impl<'writer> subscriber_fmt::MakeWriter<'writer> for CapturedLogs {
         type Writer = CapturedLogsWriter;
 
         fn make_writer(&'writer self) -> Self::Writer {
@@ -2440,8 +2413,9 @@ mod tests {
         }
     }
 
-    fn asn1(timestamp: i64) -> ASN1Time {
-        ASN1Time::from_timestamp(timestamp).expect("valid ASN.1 timestamp")
+    /// Parse an ASN.1 timestamp, failing the test with the offending value.
+    fn asn1(timestamp: i64) -> anyhow::Result<ASN1Time> {
+        ASN1Time::from_timestamp(timestamp).with_context(|| format!("ASN.1 timestamp {timestamp}"))
     }
 
     fn install_ring_provider() {
@@ -2449,11 +2423,13 @@ mod tests {
         // with `rustls-no-provider`; installing the provider is idempotent and
         // keeps these unit tests independent from whichever integration test
         // happens to initialize crypto first.
-        drop(rustls::crypto::ring::default_provider().install_default());
+        drop(ring::default_provider().install_default());
     }
 
-    fn test_ca_root() -> CertificateDer<'static> {
-        let mut params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    /// Generate the self-signed CA certificate shared by these tests.
+    fn test_ca_root() -> anyhow::Result<CertificateDer<'static>> {
+        let mut params =
+            CertificateParams::new(Vec::<String>::new()).context("CA certificate params")?;
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params.key_usages = vec![
             KeyUsagePurpose::KeyCertSign,
@@ -2463,14 +2439,15 @@ mod tests {
         params
             .distinguished_name
             .push(DnType::CommonName, "mtls-revocation-unit-test-ca");
-        let key = KeyPair::generate().expect("ca key");
+        let key = KeyPair::generate().context("CA key")?;
         let issuer: CertifiedIssuer<'static, KeyPair> =
-            CertifiedIssuer::self_signed(params, key).expect("ca self-signed");
-        issuer.der().clone()
+            CertifiedIssuer::self_signed(params, key).context("self-signed CA")?;
+        Ok(issuer.der().clone())
     }
 
-    fn test_mtls_config() -> MtlsConfig {
-        serde_json::from_value(serde_json::json!({
+    /// Build the mTLS configuration most unit tests start from.
+    fn test_mtls_config() -> anyhow::Result<MtlsConfig> {
+        from_value(json!({
             "ca_cert_path": "memory://ca.pem",
             "required": true,
             "default_role": "viewer",
@@ -2488,21 +2465,26 @@ mod tests {
             "crl_max_seen_urls": 16,
             "crl_max_cache_entries": 16,
         }))
-        .expect("verifier mtls config")
+        .context("verifier mtls config")
     }
 
-    fn test_crl_set_with_receiver() -> (Arc<CrlSet>, mpsc::UnboundedReceiver<String>) {
-        test_crl_set_with_receiver_config(test_mtls_config())
+    fn test_crl_set_with_receiver() -> anyhow::Result<(Arc<CrlSet>, mpsc::UnboundedReceiver<String>)>
+    {
+        test_crl_set_with_receiver_config(test_mtls_config()?)
     }
 
+    #[expect(
+        deprecated,
+        reason = "deliberate: src/mtls_revocation.rs::test_crl_set_with_receiver_config exercises the deprecated test-only constructor, which is the behavior under test"
+    )]
     fn test_crl_set_with_receiver_config(
         config: MtlsConfig,
-    ) -> (Arc<CrlSet>, mpsc::UnboundedReceiver<String>) {
+    ) -> anyhow::Result<(Arc<CrlSet>, mpsc::UnboundedReceiver<String>)> {
         install_ring_provider();
         let mut roots = RootCertStore::empty();
-        roots.add(test_ca_root()).expect("add ca root");
+        roots.add(test_ca_root()?).context("add ca root")?;
         CrlSet::__test_with_kept_receiver(Arc::new(roots), config, vec![])
-            .expect("empty CRL set with kept receiver")
+            .context("empty CRL set with kept receiver")
     }
 
     fn pending_contains(set: &CrlSet, url: &str) -> bool {
@@ -2535,27 +2517,27 @@ mod tests {
     /// probe. The previous form spun a contending thread across 200 attempts
     /// and could pass without ever producing the bad interleaving.
     #[test]
-    fn discovery_does_not_send_before_pending_marker_exists() {
-        let mut config = test_mtls_config();
+    fn discovery_does_not_send_before_pending_marker_exists() -> anyhow::Result<()> {
+        let mut config = test_mtls_config()?;
         config.crl_discovery_rate_per_min = 10_000;
         config.crl_max_seen_urls = 512;
-        let (set, mut discover_rx) = test_crl_set_with_receiver_config(config);
+        let (set, mut discover_rx) = test_crl_set_with_receiver_config(config)?;
 
         let url = "http://pending-order.example.test/crl".to_owned();
         let observed = Arc::new(AtomicUsize::new(0));
         let probe_observed = Arc::clone(&observed);
         let probe_url = url.clone();
 
-        set.__test_set_discovery_send_probe(Arc::new(move |set: &CrlSet, sent: &str| {
+        set.__test_set_discovery_send_probe(Arc::new(move |probe_set: &CrlSet, sent: &str| {
             assert_eq!(sent, probe_url, "probe must observe the discovered URL");
             assert!(
-                pending_contains(set, sent),
+                pending_contains(probe_set, sent),
                 "URL {sent} became observable before its pending marker existed"
             );
             let _count = probe_observed.fetch_add(1, Ordering::Relaxed);
         }));
 
-        let _ = set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&url), &[]);
+        let _accepted = set.__test_note_discovered_urls_by_cert(slice::from_ref(&url), &[]);
 
         assert_eq!(
             discover_rx.try_recv().ok().as_deref(),
@@ -2577,6 +2559,7 @@ mod tests {
             !set.__test_is_seen(&url),
             "settling a failed fetch must leave URL {url} discoverable again"
         );
+        Ok(())
     }
 
     /// Covers the cap-before-publication invariant directly rather than by
@@ -2604,15 +2587,15 @@ mod tests {
     /// If you are here to "improve" this by making it drive `bootstrap_fetch`:
     /// do not add a precheck bypass to `fetch_crl` to do it.
     #[tokio::test]
-    async fn bootstrap_cache_cap_is_applied_before_crl_set_publication() {
-        let cap = 4usize;
-        let mut config = test_mtls_config();
+    async fn bootstrap_cache_cap_is_applied_before_crl_set_publication() -> anyhow::Result<()> {
+        let cap = 4_usize;
+        let mut config = test_mtls_config()?;
         config.crl_max_cache_entries = cap;
         let (discover_tx, _discover_rx) = mpsc::unbounded_channel();
         install_ring_provider();
         let mut roots = RootCertStore::empty();
-        roots.add(test_ca_root()).expect("add ca root");
-        let roots = Arc::new(roots);
+        roots.add(test_ca_root()?).context("add ca root")?;
+        let arc_roots = Arc::new(roots);
         let now = SystemTime::now();
         let initial_cache: HashMap<String, CachedCrl> = (0..cap + 3)
             .rev()
@@ -2624,8 +2607,8 @@ mod tests {
             })
             .collect();
 
-        let set = new_crl_set_from_bootstrap_cache(roots, config, discover_tx, initial_cache)
-            .expect("bootstrap cache should build CRL set");
+        let set = new_crl_set_from_bootstrap_cache(arc_roots, config, discover_tx, initial_cache)
+            .context("bootstrap cache should build CRL set")?;
         let cache_keys = {
             let cache = set.cache_lock().read().await;
             assert_eq!(cache.len(), cap, "bootstrap cache len must be capped");
@@ -2652,35 +2635,42 @@ mod tests {
             cache_keys, expected,
             "bootstrap admission must keep the first cap URLs in sort order"
         );
+        Ok(())
     }
 
-    async fn wait_for_host_fetch_to_block_on_global_permit(set: &CrlSet, host: &str) {
-        tokio::time::timeout(Duration::from_secs(2), async {
+    /// Wait until `set` has an in-flight fetch for `host`, or fail the test.
+    async fn wait_for_host_fetch_to_block_on_global_permit(
+        set: &CrlSet,
+        host: &str,
+    ) -> anyhow::Result<()> {
+        timeout(Duration::from_secs(2), async {
             loop {
                 if set.host_semaphores.lock().await.contains_key(host) {
                     return;
                 }
-                tokio::task::yield_now().await;
+                yield_now().await;
             }
         })
         .await
-        .expect("refresher must reach the CRL fetch path before abort");
+        .context("refresher must reach the CRL fetch path before abort")
     }
 
+    /// Aborting the refresher mid-fetch must clear the in-flight pending marker
+    /// so the same URL can be retried by a later handshake.
     #[tokio::test]
-    async fn aborted_refresher_does_not_strand_pending_url() {
-        let (set, discover_rx) = test_crl_set_with_receiver();
+    async fn aborted_refresher_does_not_strand_pending_url() -> anyhow::Result<()> {
+        let (set, discover_rx) = test_crl_set_with_receiver()?;
         let url = "http://abort.example.test/crl";
         let host = "abort.example.test";
         let held_global_permit = Arc::clone(&set.global_fetch_sem)
             .acquire_owned()
             .await
-            .expect("test semaphore is open");
+            .context("test semaphore is open")?;
 
         assert!(!pending_contains(&set, url));
         assert!(!seen_contains(&set, url));
 
-        let _ = set.__test_note_discovered_urls_by_cert(&[url.to_owned()], &[]);
+        let _queued = set.__test_note_discovered_urls_by_cert(&[url.to_owned()], &[]);
         assert!(
             pending_contains(&set, url),
             "queued URL must be marked in-flight before the fetch starts"
@@ -2696,11 +2686,11 @@ mod tests {
             CancellationToken::new(),
         ));
 
-        wait_for_host_fetch_to_block_on_global_permit(&set, host).await;
+        wait_for_host_fetch_to_block_on_global_permit(&set, host).await?;
         handle.abort();
-        let join_error = handle
-            .await
-            .expect_err("aborted refresher must not complete normally");
+        let Err(join_error) = handle.await else {
+            anyhow::bail!("aborted refresher must not complete normally");
+        };
         assert!(join_error.is_cancelled());
         drop(held_global_permit);
 
@@ -2713,7 +2703,7 @@ mod tests {
             "an aborted fetch must not promote the URL to the permanent dedup set"
         );
 
-        let _ = set.__test_note_discovered_urls(&[url.to_owned()]);
+        let _requeued = set.__test_note_discovered_urls(&[url.to_owned()]);
         assert!(
             pending_contains(&set, url),
             "once the stale marker is gone, the same URL can be queued again"
@@ -2722,11 +2712,13 @@ mod tests {
             !seen_contains(&set, url),
             "retry admission must still be pending-only, not permanent suppression"
         );
+        Ok(())
     }
 
+    /// `Ok(true)` from the settlement must permanently dedup the URL.
     #[test]
-    fn discovered_url_settlement_promotes_only_confirmed_cache_admission() {
-        let (set, _discover_rx) = test_crl_set_with_receiver();
+    fn discovered_url_settlement_promotes_only_confirmed_cache_admission() -> anyhow::Result<()> {
+        let (set, _discover_rx) = test_crl_set_with_receiver()?;
         let url = "http://settle-ok.example.test/crl";
         mark_pending(&set, url);
 
@@ -2741,21 +2733,24 @@ mod tests {
             !pending_contains(&set, url),
             "promotion must remove the transient in-flight marker"
         );
+        Ok(())
     }
 
+    /// A cache-cap rejection must clear the marker, keep the URL retriable,
+    /// and still emit the existing warning.
     #[test]
-    fn discovered_url_settlement_clears_cache_cap_rejection_and_warns() {
-        let (set, _discover_rx) = test_crl_set_with_receiver();
+    fn discovered_url_settlement_clears_cache_cap_rejection_and_warns() -> anyhow::Result<()> {
+        let (set, _discover_rx) = test_crl_set_with_receiver()?;
         let url = "http://settle-cap.example.test/crl";
         mark_pending(&set, url);
         let logs = CapturedLogs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::WARN)
+        let subscriber = subscriber_fmt()
+            .with_max_level(Level::WARN)
             .with_writer(logs.clone())
             .with_ansi(false)
             .without_time()
             .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = subscriber::set_default(subscriber);
 
         let pending_guard = PendingUrlGuard::armed(Arc::clone(&set), url.to_owned());
         settle_discovered_url(pending_guard, Ok(false));
@@ -2775,21 +2770,24 @@ mod tests {
             ),
             "existing cache-cap warning must still be emitted: {contents}"
         );
+        Ok(())
     }
 
+    /// A fetch failure must clear the marker, keep the URL retriable, and
+    /// still emit the existing warning including the fetch error.
     #[test]
-    fn discovered_url_settlement_clears_fetch_failure_and_warns() {
-        let (set, _discover_rx) = test_crl_set_with_receiver();
+    fn discovered_url_settlement_clears_fetch_failure_and_warns() -> anyhow::Result<()> {
+        let (set, _discover_rx) = test_crl_set_with_receiver()?;
         let url = "http://settle-error.example.test/crl";
         mark_pending(&set, url);
         let logs = CapturedLogs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::WARN)
+        let subscriber = subscriber_fmt()
+            .with_max_level(Level::WARN)
             .with_writer(logs.clone())
             .with_ansi(false)
             .without_time()
             .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = subscriber::set_default(subscriber);
 
         let pending_guard = PendingUrlGuard::armed(Arc::clone(&set), url.to_owned());
         settle_discovered_url(
@@ -2814,20 +2812,22 @@ mod tests {
             contents.contains("test-fetch-failed"),
             "existing warning must still include the fetch error: {contents}"
         );
+        Ok(())
     }
 
     /// The userinfo gate fires before DNS resolution (no network needed)
     /// and the surfaced error must not echo the rejected credentials.
     #[tokio::test]
-    async fn fetch_crl_rejects_userinfo_without_echoing_credentials() {
+    async fn fetch_crl_rejects_userinfo_without_echoing_credentials() -> anyhow::Result<()> {
         // reqwest with `rustls-no-provider` requires a process-wide crypto
         // provider before any Client is built (same pattern as the
         // transport/oauth test suites).
-        drop(rustls::crypto::ring::default_provider().install_default());
+        drop(ring::default_provider().install_default());
         let client = Client::new();
-        let err = fetch_crl(&client, "https://u:p@crl.example/ca.crl", false, 1024)
-            .await
-            .expect_err("userinfo-bearing CRL URL must be rejected");
+        let Err(err) = fetch_crl(&client, "https://u:p@crl.example/ca.crl", false, 1024).await
+        else {
+            anyhow::bail!("userinfo-bearing CRL URL must be rejected");
+        };
         let rendered = err.to_string();
         assert!(
             rendered.contains("userinfo_forbidden"),
@@ -2837,59 +2837,65 @@ mod tests {
             !rendered.contains("u:p"),
             "error must not echo the rejected credentials: {rendered}"
         );
+        Ok(())
     }
 
     /// `extract_cdp_urls`'s scheme/userinfo guard reuses the same gate;
     /// the sanitizer keeps credentials out of its debug logging too.
     #[test]
-    fn sanitizer_used_by_rejection_sites_strips_credentials() {
-        let parsed = Url::parse("https://u:p@crl.example/ca.crl").expect("parse");
+    fn sanitizer_used_by_rejection_sites_strips_credentials() -> anyhow::Result<()> {
+        let parsed = Url::parse("https://u:p@crl.example/ca.crl").context("parse")?;
         let sanitized = sanitized_url_for_log(&parsed);
         assert_eq!(sanitized, "https://crl.example");
         assert!(!sanitized.contains("u:p"));
+        Ok(())
     }
 
+    /// Unrepresentable or out-of-range ASN.1 timestamps must clamp toward the
+    /// epoch instead of panicking, and ordinary timestamps must round-trip.
     #[test]
-    fn asn1_time_clamps_unrepresentable_timestamps() {
+    fn asn1_time_clamps_unrepresentable_timestamps() -> anyhow::Result<()> {
         // Year 1500 - pre-1601, NOT representable by Windows `SystemTime`.
         // Pre-fix this panicked on Windows; now it must return a value no
         // later than the epoch on every platform (clamped to UNIX_EPOCH on
         // Windows, the real instant on platforms that can represent it).
-        let year_1500 = asn1_time_to_system_time(asn1(-14_831_769_600));
+        let year_1500 = asn1_time_to_system_time(asn1(-14_831_769_600)?);
         assert!(year_1500 <= UNIX_EPOCH);
         #[cfg(windows)]
         assert_eq!(year_1500, UNIX_EPOCH);
 
         // 1601-01-01T00:00:00Z - the exact Windows epoch boundary, which IS
         // representable everywhere. No clamp, no panic.
-        let year_1601 = asn1_time_to_system_time(asn1(-11_644_473_600));
+        let year_1601 = asn1_time_to_system_time(asn1(-11_644_473_600)?);
         assert!(year_1601 <= UNIX_EPOCH);
 
         // Mildly negative (pre-1970) stays at-or-before the epoch.
-        assert!(asn1_time_to_system_time(asn1(-2)) <= UNIX_EPOCH);
+        assert!(asn1_time_to_system_time(asn1(-2)?) <= UNIX_EPOCH);
 
         // Normal positive timestamps round-trip exactly.
         assert_eq!(
-            asn1_time_to_system_time(asn1(1_700_000_000)),
+            asn1_time_to_system_time(asn1(1_700_000_000)?),
             UNIX_EPOCH + Duration::from_secs(1_700_000_000)
         );
 
         // The ASN.1 maximum (9999-12-31) is representable and preserved.
-        let max = i64::try_from(MAX_ASN1_TIMESTAMP_SECS).expect("fits in i64");
+        let max = i64::try_from(MAX_ASN1_TIMESTAMP_SECS).context("fits in i64")?;
         assert_eq!(
-            asn1_time_to_system_time(asn1(max)),
+            asn1_time_to_system_time(asn1(max)?),
             UNIX_EPOCH + Duration::from_secs(MAX_ASN1_TIMESTAMP_SECS)
         );
+        Ok(())
     }
 
+    /// At the cap, a new host evicts idle semaphores rather than failing.
     #[test]
-    fn host_semaphore_evicts_idle_at_cap() {
+    fn host_semaphore_evicts_idle_at_cap() -> anyhow::Result<()> {
         let mut map = HashMap::new();
-        for i in 0..4 {
+        for i in 0..4_usize {
             // Dropped immediately: only the map holds each semaphore (idle).
             drop(
                 acquire_host_semaphore(&mut map, &format!("idle-{i}.example"), 4)
-                    .expect("under cap"),
+                    .context("under cap")?,
             );
         }
         assert_eq!(map.len(), 4);
@@ -2897,27 +2903,29 @@ mod tests {
         // At the cap, a NEW host must succeed by evicting idle entries -
         // the cap error is not sticky.
         let sem = acquire_host_semaphore(&mut map, "new-host.example", 4)
-            .expect("idle eviction frees space for a new host");
+            .context("idle eviction frees space for a new host")?;
         assert!(map.contains_key("new-host.example"));
         drop(sem);
+        Ok(())
     }
 
+    /// In-flight semaphores survive eviction while idle ones are reclaimed.
     #[test]
-    fn host_semaphore_keeps_inflight_at_cap() {
+    fn host_semaphore_keeps_inflight_at_cap() -> anyhow::Result<()> {
         let mut map = HashMap::new();
         // Held across the cap check: simulates an in-flight fetch.
-        let inflight = acquire_host_semaphore(&mut map, "busy.example", 3).expect("under cap");
-        for i in 0..2 {
+        let inflight = acquire_host_semaphore(&mut map, "busy.example", 3).context("under cap")?;
+        for i in 0..2_usize {
             drop(
                 acquire_host_semaphore(&mut map, &format!("idle-{i}.example"), 3)
-                    .expect("under cap"),
+                    .context("under cap")?,
             );
         }
         assert_eq!(map.len(), 3);
 
         drop(
             acquire_host_semaphore(&mut map, "new-host.example", 3)
-                .expect("idle entries evicted while in-flight survives"),
+                .context("idle entries evicted while in-flight survives")?,
         );
         assert!(
             map.contains_key("busy.example"),
@@ -2925,17 +2933,20 @@ mod tests {
         );
         assert!(map.contains_key("new-host.example"));
         drop(inflight);
+        Ok(())
     }
 
+    /// The cap error is returned only when every entry has an in-flight fetch.
     #[test]
-    fn host_semaphore_cap_error_when_all_inflight() {
+    fn host_semaphore_cap_error_when_all_inflight() -> anyhow::Result<()> {
         let mut map = HashMap::new();
-        let held: Vec<_> = (0..2)
-            .map(|i| {
+        let mut held = Vec::new();
+        for i in 0..2_usize {
+            held.push(
                 acquire_host_semaphore(&mut map, &format!("busy-{i}.example"), 2)
-                    .expect("under cap")
-            })
-            .collect();
+                    .context("under cap")?,
+            );
+        }
 
         let result = acquire_host_semaphore(&mut map, "new-host.example", 2);
         assert!(
@@ -2943,18 +2954,20 @@ mod tests {
             "cap must still reject when every entry has an in-flight fetch"
         );
         drop(held);
+        Ok(())
     }
 
     // ---- CrlSet cache invariant (A1/A2/A3) --------------------------------
 
-    fn tamper_test_config() -> MtlsConfig {
-        let mut config = test_mtls_config();
+    /// Strict fail-closed config with generous caps, for tamper tests.
+    fn tamper_test_config() -> anyhow::Result<MtlsConfig> {
+        let mut config = test_mtls_config()?;
         config.crl_deny_on_unavailable = true;
         config.crl_end_entity_only = false;
         config.crl_discovery_rate_per_min = 10_000;
         config.crl_max_seen_urls = 4096;
         config.crl_max_cache_entries = 4096;
-        config
+        Ok(config)
     }
 
     fn synthetic_entry(now: SystemTime) -> CachedCrl {
@@ -2983,7 +2996,7 @@ mod tests {
     /// identity tuple fails the tests that use this.
     fn same_shape_replacement(entry: &CachedCrl) -> CachedCrl {
         let mut bytes = entry.der.as_ref().to_vec();
-        let middle = bytes.len() / 2;
+        let middle = bytes.len().div_euclid(2);
         if let Some(byte) = bytes.get_mut(middle) {
             *byte ^= 0xFF;
         }
@@ -2996,10 +3009,13 @@ mod tests {
         }
     }
 
-    fn crl_set_with_cached_urls(config: MtlsConfig, count: usize) -> (Arc<CrlSet>, Vec<String>) {
+    fn crl_set_with_cached_urls(
+        config: MtlsConfig,
+        count: usize,
+    ) -> anyhow::Result<(Arc<CrlSet>, Vec<String>)> {
         install_ring_provider();
         let mut roots = RootCertStore::empty();
-        roots.add(test_ca_root()).expect("add ca root");
+        roots.add(test_ca_root()?).context("add ca root")?;
         let now = SystemTime::now();
         let mut initial_cache = HashMap::new();
         let mut urls = Vec::with_capacity(count);
@@ -3011,15 +3027,16 @@ mod tests {
         let (discover_tx, discover_rx) = mpsc::unbounded_channel();
         drop(discover_rx);
         let set = CrlSet::new(Arc::new(roots), config, discover_tx, initial_cache)
-            .expect("crl set with prepopulated cache");
+            .context("crl set with prepopulated cache")?;
         urls.sort();
-        (set, urls)
+        Ok((set, urls))
     }
 
+    /// Identities are seeded by `CrlSet::new` and maintained by each commit.
     #[tokio::test]
-    async fn identity_index_is_seeded_by_new_and_maintained_by_commit() {
+    async fn identity_index_is_seeded_by_new_and_maintained_by_commit() -> anyhow::Result<()> {
         let boot = "https://cdp-000.example.test/crl";
-        let (set, _urls) = crl_set_with_cached_urls(tamper_test_config(), 1);
+        let (set, _urls) = crl_set_with_cached_urls(tamper_test_config()?, 1)?;
 
         // Blocker 1 regression: identities seeded only on commit would read
         // every bootstrap-fetched CRL as mutated and fail mTLS closed at
@@ -3032,7 +3049,7 @@ mod tests {
         let added = "https://added.example.test/crl";
         let now = SystemTime::now();
         set.__test_insert_cache(added, synthetic_entry(now)).await;
-        let added_identity = identity_of(&set, added).expect("commit must record an identity");
+        let added_identity = identity_of(&set, added).context("commit must record an identity")?;
 
         set.__test_insert_cache(added, synthetic_entry(now + Duration::from_secs(3_600)))
             .await;
@@ -3044,15 +3061,21 @@ mod tests {
         let _removed = set
             .commit_cache_update_atomically(Vec::new(), &[added.to_owned()])
             .await
-            .expect("removal commit");
+            .context("removal commit")?;
         assert!(
             identity_of(&set, added).is_none(),
             "removal must drop the identity in the same publication"
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/mtls_revocation.rs::identity_covers_der_bytes_beyond_the_sampled_head_and_tail keeps the uniform test signature while it cannot fail"
+    )]
+    /// The identity covers DER bytes beyond the sampled head and tail.
     #[test]
-    fn identity_covers_der_bytes_beyond_the_sampled_head_and_tail() {
+    fn identity_covers_der_bytes_beyond_the_sampled_head_and_tail() -> anyhow::Result<()> {
         let entry = synthetic_entry(SystemTime::now());
         assert!(
             entry.der.as_ref().len() > 64,
@@ -3062,10 +3085,16 @@ mod tests {
             entry_identity(&entry) != entry_identity(&same_shape_replacement(&entry)),
             "a same-length middle-byte edit must still change the identity"
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/mtls_revocation.rs::identity_covers_every_scalar_field keeps the uniform test signature while it cannot fail"
+    )]
+    /// Every scalar field contributes to the entry identity.
     #[test]
-    fn identity_covers_every_scalar_field() {
+    fn identity_covers_every_scalar_field() -> anyhow::Result<()> {
         let now = SystemTime::now();
         let base = synthetic_entry(now);
         let baseline = entry_identity(&base);
@@ -3090,18 +3119,20 @@ mod tests {
                 "mutating {label} alone must change the identity"
             );
         }
+        Ok(())
     }
 
+    /// Replacing a committed entry through the public cache must deny.
     #[tokio::test]
-    async fn precheck_denies_after_same_key_replace_through_public_cache() {
-        let (set, _rx) = test_crl_set_with_receiver_config(tamper_test_config());
+    async fn precheck_denies_after_same_key_replace_through_public_cache() -> anyhow::Result<()> {
+        let (set, _rx) = test_crl_set_with_receiver_config(tamper_test_config()?)?;
         let url = "https://replace.example.test/crl".to_owned();
         let now = SystemTime::now();
 
         let committed = synthetic_entry(now);
         set.__test_insert_cache(&url, committed.clone()).await;
         assert!(
-            !set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&url), &[]),
+            !set.__test_note_discovered_urls_by_cert(slice::from_ref(&url), &[]),
             "a legitimately committed CRL must admit the handshake"
         );
 
@@ -3120,21 +3151,23 @@ mod tests {
             "precondition: the entry must still be present, so this is a REPLACE and not a removal"
         );
         assert!(
-            set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&url), &[]),
+            set.__test_note_discovered_urls_by_cert(slice::from_ref(&url), &[]),
             "REPLACE through the public cache leaves cached_urls claiming coverage the verifier does not enforce; it must deny"
         );
+        Ok(())
     }
 
+    /// Removing a committed entry through the public cache must deny.
     #[tokio::test]
-    async fn precheck_denies_after_direct_removal_through_public_cache() {
-        let (set, _rx) = test_crl_set_with_receiver_config(tamper_test_config());
+    async fn precheck_denies_after_direct_removal_through_public_cache() -> anyhow::Result<()> {
+        let (set, _rx) = test_crl_set_with_receiver_config(tamper_test_config()?)?;
         let url = "https://remove.example.test/crl".to_owned();
 
         set.__test_insert_cache(&url, synthetic_entry(SystemTime::now()))
             .await;
-        assert!(!set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&url), &[]));
+        assert!(!set.__test_note_discovered_urls_by_cert(slice::from_ref(&url), &[]));
 
-        let _removed_entry = set.cache_lock().write().await.remove(&url);
+        let _removed = set.cache_lock().write().await.remove(&url);
 
         assert!(
             set.verifier_state.load().cached_urls.contains(&url),
@@ -3145,20 +3178,23 @@ mod tests {
             "precondition: the live entry must actually be gone"
         );
         assert!(
-            set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&url), &[]),
+            set.__test_note_discovered_urls_by_cert(slice::from_ref(&url), &[]),
             "cached_urls still claims a URL whose entry was removed out of band; it must deny"
         );
+        Ok(())
     }
 
+    /// Contention on the cache lock is not tamper and must not deny.
     #[tokio::test]
-    async fn precheck_uses_committed_state_when_cache_lock_is_temporarily_unavailable() {
-        let (set, _rx) = test_crl_set_with_receiver_config(tamper_test_config());
+    async fn precheck_uses_committed_state_when_cache_lock_is_temporarily_unavailable()
+    -> anyhow::Result<()> {
+        let (set, _rx) = test_crl_set_with_receiver_config(tamper_test_config()?)?;
         let cached = "https://locked.example.test/crl".to_owned();
         let uncached = "https://locked-uncached.example.test/crl".to_owned();
 
         set.__test_insert_cache(&cached, synthetic_entry(SystemTime::now()))
             .await;
-        assert!(!set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&cached), &[]));
+        assert!(!set.__test_note_discovered_urls_by_cert(slice::from_ref(&cached), &[]));
 
         // Contention is not tamper. `tokio::sync::RwLock` is write-preferring,
         // so denying here would make every legitimate refresh commit deny
@@ -3166,19 +3202,21 @@ mod tests {
         // committed state, which is what makes falling through sound.
         let guard = set.cache_lock().write().await;
         assert!(
-            !set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&cached), &[]),
+            !set.__test_note_discovered_urls_by_cert(slice::from_ref(&cached), &[]),
             "temporary lock contention must not create a spurious denial"
         );
         assert!(
-            set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&uncached), &[]),
+            set.__test_note_discovered_urls_by_cert(slice::from_ref(&uncached), &[]),
             "lock contention must not invent coverage absent from the committed cached_urls"
         );
         drop(guard);
+        Ok(())
     }
 
+    /// The untampered precheck path is unchanged.
     #[tokio::test]
-    async fn precheck_clean_path_is_unchanged() {
-        let (set, _rx) = test_crl_set_with_receiver_config(tamper_test_config());
+    async fn precheck_clean_path_is_unchanged() -> anyhow::Result<()> {
+        let (set, _rx) = test_crl_set_with_receiver_config(tamper_test_config()?)?;
         let cached = "https://cached.example.test/crl".to_owned();
         let uncached = "https://uncached.example.test/crl".to_owned();
 
@@ -3186,36 +3224,40 @@ mod tests {
             .await;
 
         assert!(
-            !set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&cached), &[]),
+            !set.__test_note_discovered_urls_by_cert(slice::from_ref(&cached), &[]),
             "an untampered cached CDP must still admit"
         );
         assert!(
-            set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&uncached), &[]),
+            set.__test_note_discovered_urls_by_cert(slice::from_ref(&uncached), &[]),
             "an uncached CDP must still follow the all(not cached) predicate"
         );
         assert!(
             !set.__test_note_discovered_urls_by_cert(&[cached, uncached], &[]),
             "one cached mirror is sufficient coverage (RFC 5280 4.2.1.13)"
         );
+        Ok(())
     }
 
+    /// Concurrent commits lose no URL and publish a matching coverage hint.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_commits_lose_no_url_and_publish_a_matching_coverage_hint() {
-        let (set, _rx) = test_crl_set_with_receiver_config(tamper_test_config());
+    async fn concurrent_commits_lose_no_url_and_publish_a_matching_coverage_hint()
+    -> anyhow::Result<()> {
+        let (set, _rx) = test_crl_set_with_receiver_config(tamper_test_config()?)?;
         let now = SystemTime::now();
-        let total = 64usize;
+        let total = 64_usize;
 
         // Without `commit_lock` these commits each snapshot the same old cache
         // and clobber one another, so URLs are silently lost.
         let mut tasks = JoinSet::new();
         for index in 0..total {
-            let set = Arc::clone(&set);
+            let task_set = Arc::clone(&set);
             let _task = tasks.spawn(async move {
-                set.__test_insert_cache(
-                    &format!("https://concurrent-{index:03}.example.test/crl"),
-                    synthetic_entry(now),
-                )
-                .await;
+                task_set
+                    .__test_insert_cache(
+                        &format!("https://concurrent-{index:03}.example.test/crl"),
+                        synthetic_entry(now),
+                    )
+                    .await;
             });
         }
         while tasks.join_next().await.is_some() {}
@@ -3237,11 +3279,13 @@ mod tests {
             set.verifier_state.load().cached_urls.clone(),
             "the published coverage hint must exactly match the committed cache"
         );
+        Ok(())
     }
 
+    /// A legitimate refresh is never observed as tampering or half-applied.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn legitimate_refresh_is_never_observed_as_tampering() {
-        let (set, _rx) = test_crl_set_with_receiver_config(tamper_test_config());
+    async fn legitimate_refresh_is_never_observed_as_tampering() -> anyhow::Result<()> {
+        let (set, _rx) = test_crl_set_with_receiver_config(tamper_test_config()?)?;
         let url = "https://coherent.example.test/crl".to_owned();
         set.__test_insert_cache(&url, synthetic_entry(SystemTime::now()))
             .await;
@@ -3251,7 +3295,7 @@ mod tests {
         let writer_url = url.clone();
         let writer_stop = Arc::clone(&stop);
         let writer = tokio::spawn(async move {
-            for round in 0..400u64 {
+            for round in 0..400_u64 {
                 if writer_stop.load(Ordering::Relaxed) {
                     break;
                 }
@@ -3261,7 +3305,7 @@ mod tests {
                         synthetic_entry(SystemTime::now() + Duration::from_secs(round)),
                     )
                     .await;
-                tokio::task::yield_now().await;
+                yield_now().await;
             }
             writer_stop.store(true, Ordering::Relaxed);
         });
@@ -3269,12 +3313,11 @@ mod tests {
         let reader_set = Arc::clone(&set);
         let reader_url = url.clone();
         let reader_stop = Arc::clone(&stop);
-        let (denials, checks) = tokio::task::spawn_blocking(move || {
-            let mut denials = 0usize;
-            let mut checks = 0usize;
+        let (denials, checks) = spawn_blocking(move || {
+            let mut denials = 0_usize;
+            let mut checks = 0_usize;
             while !reader_stop.load(Ordering::Relaxed) || checks < 1_000 {
-                if reader_set
-                    .__test_note_discovered_urls_by_cert(std::slice::from_ref(&reader_url), &[])
+                if reader_set.__test_note_discovered_urls_by_cert(slice::from_ref(&reader_url), &[])
                 {
                     denials += 1;
                 }
@@ -3286,9 +3329,9 @@ mod tests {
             (denials, checks)
         })
         .await
-        .expect("reader task");
+        .context("reader task")?;
 
-        writer.await.expect("writer task");
+        writer.await.context("writer task")?;
         assert_eq!(
             denials, 0,
             "a legitimate refresh must never be reported as tampering, and must never be observed half-applied"
@@ -3298,7 +3341,7 @@ mod tests {
             "the reader must actually exercise the precheck: only {checks} checks ran"
         );
         assert!(
-            !set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&url), &[]),
+            !set.__test_note_discovered_urls_by_cert(slice::from_ref(&url), &[]),
             "the URL must still admit once churn stops"
         );
         assert_eq!(
@@ -3311,6 +3354,7 @@ mod tests {
             set.verifier_state.load().cached_urls.clone(),
             "cache and published coverage hint must agree after churn"
         );
+        Ok(())
     }
 
     /// The commit path must reach `rebuild_verifier` BEFORE taking the cache
@@ -3329,15 +3373,16 @@ mod tests {
     /// `current_thread` the spawned commit cannot advance and the timeout fires
     /// spuriously. Two workers suffice; more only reintroduces oversubscription.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn commit_does_not_hold_the_cache_write_lock_across_the_verifier_rebuild() {
-        let (set, _rx) = test_crl_set_with_receiver_config(tamper_test_config());
+    async fn commit_does_not_hold_the_cache_write_lock_across_the_verifier_rebuild()
+    -> anyhow::Result<()> {
+        let (set, _rx) = test_crl_set_with_receiver_config(tamper_test_config()?)?;
         let url = "https://invalid-rebuild.example.test/crl";
         let now = SystemTime::now();
 
         let invalid = CachedCrl {
             der: CertificateRevocationListDer::from(vec![0_u8]),
             this_update: now,
-            next_update: now.checked_add(Duration::from_secs(24 * 60 * 60)),
+            next_update: now.checked_add(Duration::from_hours(24)),
             fetched_at: now,
             source_url: url.to_owned(),
         };
@@ -3351,17 +3396,17 @@ mod tests {
         let read_guard = set.cache_lock().read().await;
 
         let commit = {
-            let set = Arc::clone(&set);
-            tokio::spawn(async move { set.__test_try_insert_cache(url, invalid).await })
+            let task_set = Arc::clone(&set);
+            tokio::spawn(async move { task_set.__test_try_insert_cache(url, invalid).await })
         };
 
-        let finished_while_reader_held = tokio::time::timeout(Duration::from_secs(5), commit).await;
+        let finished_while_reader_held = timeout(Duration::from_secs(5), commit).await;
 
         drop(read_guard);
 
         let commit_result = finished_while_reader_held
-            .expect("commit must reach rebuild_verifier before waiting for the cache write lock")
-            .expect("commit task must not panic");
+            .context("commit must reach rebuild_verifier before waiting for the cache write lock")?
+            .context("commit task must not panic")?;
 
         assert!(
             commit_result.is_err(),
@@ -3375,19 +3420,26 @@ mod tests {
             !set.__test_cached_url_contains(url),
             "failed commit must not publish invalid CRL coverage into verifier_state"
         );
+        Ok(())
     }
 
     // ---- B3: per-handshake CDP URL cap ------------------------------------
 
-    fn fail_open_config() -> MtlsConfig {
-        let mut config = tamper_test_config();
+    /// Tamper config with fail-open revocation (cap still applies).
+    fn fail_open_config() -> anyhow::Result<MtlsConfig> {
+        let mut config = tamper_test_config()?;
         config.crl_deny_on_unavailable = false;
-        config
+        Ok(config)
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/mtls_revocation.rs::bootstrap_urls_are_capped_to_the_cache_limit keeps the uniform test signature while it cannot fail"
+    )]
+    /// A broad CA bundle is capped to the cache limit.
     #[test]
-    fn bootstrap_urls_are_capped_to_the_cache_limit() {
-        let cap = 4usize;
+    fn bootstrap_urls_are_capped_to_the_cache_limit() -> anyhow::Result<()> {
+        let cap = 4_usize;
         let mut urls: Vec<String> = (0..cap + 9)
             .map(|index| format!("https://ca-{index:02}.example.test/crl"))
             .collect();
@@ -3399,11 +3451,17 @@ mod tests {
             cap,
             "a broad CA bundle must not spawn one fetch task per advertised CDP"
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/mtls_revocation.rs::bootstrap_urls_below_the_cap_are_untouched keeps the uniform test signature while it cannot fail"
+    )]
+    /// An in-bounds CA chain is left untouched by the cap.
     #[test]
-    fn bootstrap_urls_below_the_cap_are_untouched() {
-        let mut urls: Vec<String> = (0..3)
+    fn bootstrap_urls_below_the_cap_are_untouched() -> anyhow::Result<()> {
+        let mut urls: Vec<String> = (0..3_usize)
             .map(|index| format!("https://ca-{index:02}.example.test/crl"))
             .collect();
         let before = urls.clone();
@@ -3411,20 +3469,24 @@ mod tests {
         cap_bootstrap_urls(&mut urls, 16);
 
         assert_eq!(urls, before, "capping must not perturb an in-bounds chain");
+        Ok(())
     }
 
+    /// Under `crl_end_entity_only`, uncapped intermediate CDPs are never
+    /// enqueued for discovery.
     #[tokio::test]
-    async fn end_entity_only_mode_does_not_discover_uncapped_intermediate_cdps() {
-        let mut config = tamper_test_config();
+    async fn end_entity_only_mode_does_not_discover_uncapped_intermediate_cdps()
+    -> anyhow::Result<()> {
+        let mut config = tamper_test_config()?;
         config.crl_end_entity_only = true;
-        let (set, mut rx) = test_crl_set_with_receiver_config(config);
+        let (set, mut rx) = test_crl_set_with_receiver_config(config)?;
 
         let end_entity = vec!["https://ee.example.test/crl".to_owned()];
         let intermediate: Vec<String> = (0..MAX_RELEVANT_CDP_URLS_PER_HANDSHAKE + 10)
             .map(|index| format!("https://int-{index:03}.example.test/crl"))
             .collect();
 
-        let _ = set.__test_note_discovered_urls_by_cert(&end_entity, &intermediate);
+        let _discovered = set.__test_note_discovered_urls_by_cert(&end_entity, &intermediate);
 
         let mut enqueued = Vec::new();
         while let Ok(url) = rx.try_recv() {
@@ -3437,71 +3499,78 @@ mod tests {
              discovery source; intermediate CDPs bypass MAX_RELEVANT_CDP_URLS_PER_HANDSHAKE \
              and must never be enqueued"
         );
+        Ok(())
     }
 
+    /// Exactly the cap admits; one URL past it denies fail-closed.
     #[test]
-    fn cdp_cap_admits_at_the_cap_and_denies_above_it_fail_closed() {
+    fn cdp_cap_admits_at_the_cap_and_denies_above_it_fail_closed() -> anyhow::Result<()> {
         let (at_cap, urls) =
-            crl_set_with_cached_urls(tamper_test_config(), MAX_RELEVANT_CDP_URLS_PER_HANDSHAKE);
+            crl_set_with_cached_urls(tamper_test_config()?, MAX_RELEVANT_CDP_URLS_PER_HANDSHAKE)?;
         assert!(
             !at_cap.__test_note_discovered_urls_by_cert(&urls, &[]),
             "exactly the cap must admit; all URLs are cached so nothing else can deny"
         );
 
-        let (over_cap, urls) = crl_set_with_cached_urls(
-            tamper_test_config(),
+        let (over_cap, urls_over) = crl_set_with_cached_urls(
+            tamper_test_config()?,
             MAX_RELEVANT_CDP_URLS_PER_HANDSHAKE + 1,
-        );
+        )?;
         assert!(
-            over_cap.__test_note_discovered_urls_by_cert(&urls, &[]),
+            over_cap.__test_note_discovered_urls_by_cert(&urls_over, &[]),
             "one URL past the cap must deny even though every URL is cached"
         );
         assert!(
             warned(&over_cap, "cdp_url_cap"),
             "the cap denial must be attributable to the cap, not to some other condition"
         );
+        Ok(())
     }
 
+    /// The malformed-cert cap applies in fail-open mode too.
     #[test]
-    fn cdp_cap_applies_in_fail_open_mode_too() {
+    fn cdp_cap_applies_in_fail_open_mode_too() -> anyhow::Result<()> {
         // The decision recorded in the rev-7 plan: this is a malformed-cert
         // rejection, not a revocation-unavailability denial, so opting out of
         // fail-closed does NOT opt out of the cap. An implementation that puts
         // the cap check inside the fail-closed branch admits here.
         let (over_cap, urls) =
-            crl_set_with_cached_urls(fail_open_config(), MAX_RELEVANT_CDP_URLS_PER_HANDSHAKE + 1);
+            crl_set_with_cached_urls(fail_open_config()?, MAX_RELEVANT_CDP_URLS_PER_HANDSHAKE + 1)?;
         assert!(
             over_cap.__test_note_discovered_urls_by_cert(&urls, &[]),
             "the cap must deny in fail-open mode, where the same amplification is paid"
         );
 
-        let (at_cap, urls) =
-            crl_set_with_cached_urls(fail_open_config(), MAX_RELEVANT_CDP_URLS_PER_HANDSHAKE);
+        let (at_cap, urls_at) =
+            crl_set_with_cached_urls(fail_open_config()?, MAX_RELEVANT_CDP_URLS_PER_HANDSHAKE)?;
         assert!(
-            !at_cap.__test_note_discovered_urls_by_cert(&urls, &[]),
+            !at_cap.__test_note_discovered_urls_by_cert(&urls_at, &[]),
             "the cap must not become a blanket fail-open denial"
         );
+        Ok(())
     }
 
+    /// The cap short-circuits before any per-entry mutation auditing.
     #[test]
-    fn cdp_cap_is_evaluated_before_out_of_band_mutation_detection() {
+    fn cdp_cap_is_evaluated_before_out_of_band_mutation_detection() -> anyhow::Result<()> {
         let (set, urls) = crl_set_with_cached_urls(
-            tamper_test_config(),
+            tamper_test_config()?,
             MAX_RELEVANT_CDP_URLS_PER_HANDSHAKE + 1,
-        );
-        let target = urls.first().expect("at least one url").clone();
+        )?;
+        let target = urls.first().context("at least one url")?.clone();
         let committed = set
             .cache_lock()
             .try_read()
-            .expect("uncontended")
+            .context("uncontended")?
             .get(&target)
             .cloned()
-            .expect("entry present");
-        let _previous = set
-            .cache_lock()
-            .try_write()
-            .expect("uncontended")
-            .insert(target, same_shape_replacement(&committed));
+            .context("entry present")?;
+        drop(
+            set.cache_lock()
+                .try_write()
+                .context("uncontended")?
+                .insert(target, same_shape_replacement(&committed)),
+        );
 
         assert!(set.__test_note_discovered_urls_by_cert(&urls, &[]));
         assert!(
@@ -3512,47 +3581,51 @@ mod tests {
             !warned(&set, "cache_entry_mismatch"),
             "the cap must short-circuit before any per-entry auditing runs"
         );
+        Ok(())
     }
 
     // ---- B4-4 / B2: remaining precheck semantics --------------------------
 
+    /// Committing an unrelated URL must not invalidate another URL's identity.
     #[tokio::test]
-    async fn unrelated_commit_does_not_invalidate_other_urls() {
+    async fn unrelated_commit_does_not_invalidate_other_urls() -> anyhow::Result<()> {
         // RELEASE-CRITICAL. `commit_cache_update_atomically` clones the live
         // cache, and cloning a `CachedCrl` reallocates its DER, so every
         // carried-forward entry gets a new address. An implementation that
         // carries identities forward instead of recomputing them denies every
         // handshake after any unrelated refresh.
-        let (set, _rx) = test_crl_set_with_receiver_config(tamper_test_config());
+        let (set, _rx) = test_crl_set_with_receiver_config(tamper_test_config()?)?;
         let first = "https://first.example.test/crl".to_owned();
         let second = "https://second.example.test/crl".to_owned();
         let now = SystemTime::now();
 
         set.__test_insert_cache(&first, synthetic_entry(now)).await;
-        assert!(!set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&first), &[]));
+        assert!(!set.__test_note_discovered_urls_by_cert(slice::from_ref(&first), &[]));
 
         set.__test_insert_cache(&second, synthetic_entry(now)).await;
 
         assert!(
-            !set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&first), &[]),
+            !set.__test_note_discovered_urls_by_cert(slice::from_ref(&first), &[]),
             "committing an unrelated URL must not invalidate an existing URL's identity"
         );
         assert!(
-            !set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&second), &[]),
+            !set.__test_note_discovered_urls_by_cert(slice::from_ref(&second), &[]),
             "the newly committed URL must admit too"
         );
+        Ok(())
     }
 
+    /// Cache-lock contention is not logged as out-of-band mutation.
     #[tokio::test]
-    async fn lock_contention_is_not_reported_as_out_of_band_mutation() {
-        let (set, _rx) = test_crl_set_with_receiver_config(tamper_test_config());
+    async fn lock_contention_is_not_reported_as_out_of_band_mutation() -> anyhow::Result<()> {
+        let (set, _rx) = test_crl_set_with_receiver_config(tamper_test_config()?)?;
         let url = "https://contended.example.test/crl".to_owned();
         set.__test_insert_cache(&url, synthetic_entry(SystemTime::now()))
             .await;
 
         let guard = set.cache_lock().write().await;
         assert!(
-            !set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&url), &[]),
+            !set.__test_note_discovered_urls_by_cert(slice::from_ref(&url), &[]),
             "contention must fall through to the committed state, not deny"
         );
         assert!(
@@ -3560,11 +3633,13 @@ mod tests {
             "contention must not be logged as out-of-band mutation, or operators chase a phantom"
         );
         drop(guard);
+        Ok(())
     }
 
+    /// Mutation detection only ever adds a denial, never flips one to admit.
     #[tokio::test]
-    async fn mutation_detection_only_ever_adds_a_denial() {
-        let (set, _rx) = test_crl_set_with_receiver_config(tamper_test_config());
+    async fn mutation_detection_only_ever_adds_a_denial() -> anyhow::Result<()> {
+        let (set, _rx) = test_crl_set_with_receiver_config(tamper_test_config()?)?;
         let cached = "https://audited.example.test/crl".to_owned();
         let uncached = "https://never-cached.example.test/crl".to_owned();
         let now = SystemTime::now();
@@ -3572,7 +3647,7 @@ mod tests {
         let committed = synthetic_entry(now);
         set.__test_insert_cache(&cached, committed.clone()).await;
         assert!(
-            set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&uncached), &[]),
+            set.__test_note_discovered_urls_by_cert(slice::from_ref(&uncached), &[]),
             "an all-uncached certificate denies under all(not cached) before any mutation"
         );
 
@@ -3580,18 +3655,20 @@ mod tests {
             .await;
 
         assert!(
-            set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&uncached), &[]),
+            set.__test_note_discovered_urls_by_cert(slice::from_ref(&uncached), &[]),
             "mutating an unrelated cached URL must not flip an all-uncached deny into an admit"
         );
+        Ok(())
     }
 
+    /// Fail-open mode stays fail-open for out-of-band mutation.
     #[tokio::test]
-    async fn fail_open_mode_still_admits_a_mutated_entry() {
+    async fn fail_open_mode_still_admits_a_mutated_entry() -> anyhow::Result<()> {
         // Operators who set `crl_deny_on_unavailable = false` accepted that a
         // revoked cert is admitted when its CRL cannot be trusted. Silently
         // re-enabling denial for them would be a behaviour change they did not
         // opt into; only the malformed-cert cap applies in this mode.
-        let (set, _rx) = test_crl_set_with_receiver_config(fail_open_config());
+        let (set, _rx) = test_crl_set_with_receiver_config(fail_open_config()?)?;
         let url = "https://fail-open.example.test/crl".to_owned();
         let committed = synthetic_entry(SystemTime::now());
 
@@ -3600,9 +3677,10 @@ mod tests {
             .await;
 
         assert!(
-            !set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&url), &[]),
+            !set.__test_note_discovered_urls_by_cert(slice::from_ref(&url), &[]),
             "fail-open must stay fail-open for out-of-band mutation"
         );
+        Ok(())
     }
 
     // ---- WO-R6: per-peer CRL discovery admission ---------------------------
@@ -3613,21 +3691,21 @@ mod tests {
     /// keying removes. Also asserts the attributed path never fires the
     /// unattributed-fallback canary, proving the task-local scope was honoured.
     #[tokio::test]
-    async fn per_peer_discovery_quota_does_not_starve_other_peers() {
-        let mut config = test_mtls_config();
+    async fn per_peer_discovery_quota_does_not_starve_other_peers() -> anyhow::Result<()> {
+        let mut config = test_mtls_config()?;
         config.crl_discovery_rate_per_min = 4;
         config.crl_deny_on_unavailable = false;
-        let (set, _rx) = test_crl_set_with_receiver_config(config);
+        let (set, _rx) = test_crl_set_with_receiver_config(config)?;
 
         let peer_a = IpAddr::from([203, 0, 113, 7]);
         let peer_b = IpAddr::from([203, 0, 113, 8]);
 
-        let attacker_urls: Vec<String> = (0..8)
+        let attacker_urls: Vec<String> = (0..8_usize)
             .map(|i| format!("http://attacker-{i:02}.example.test/crl"))
             .collect();
         CURRENT_HANDSHAKE_PEER
             .scope(peer_a, async {
-                let _ = set.__test_note_discovered_urls_by_cert(&attacker_urls, &[]);
+                let _drained = set.__test_note_discovered_urls_by_cert(&attacker_urls, &[]);
             })
             .await;
 
@@ -3651,8 +3729,8 @@ mod tests {
         let victim_url = "http://victim.example.test/crl".to_owned();
         CURRENT_HANDSHAKE_PEER
             .scope(peer_b, async {
-                let _ =
-                    set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&victim_url), &[]);
+                let _victim =
+                    set.__test_note_discovered_urls_by_cert(slice::from_ref(&victim_url), &[]);
             })
             .await;
 
@@ -3660,6 +3738,7 @@ mod tests {
             set.__test_is_seen(&victim_url),
             "peer_b's not-yet-cached URL must still be admitted after peer_a drained its own quota"
         );
+        Ok(())
     }
 
     /// With no handshake peer scope, admission must fall back to the
@@ -3667,16 +3746,16 @@ mod tests {
     /// the global per-minute quota gates admission and the unattributed canary
     /// fires so a lost scope is observable rather than silent.
     #[tokio::test]
-    async fn unattributed_discovery_falls_back_to_global_limiter() {
-        let mut config = test_mtls_config();
+    async fn unattributed_discovery_falls_back_to_global_limiter() -> anyhow::Result<()> {
+        let mut config = test_mtls_config()?;
         config.crl_discovery_rate_per_min = 4;
         config.crl_deny_on_unavailable = false;
-        let (set, _rx) = test_crl_set_with_receiver_config(config);
+        let (set, _rx) = test_crl_set_with_receiver_config(config)?;
 
-        let urls: Vec<String> = (0..8)
+        let urls: Vec<String> = (0..8_usize)
             .map(|i| format!("http://unattributed-{i:02}.example.test/crl"))
             .collect();
-        let _ = set.__test_note_discovered_urls_by_cert(&urls, &[]);
+        let _admitted = set.__test_note_discovered_urls_by_cert(&urls, &[]);
 
         let admitted = urls
             .iter()
@@ -3694,27 +3773,28 @@ mod tests {
             warned(&set, "discovery_rate_limited"),
             "the global fallback must still fire the rate-limited WARN on drops"
         );
+        Ok(())
     }
 
     /// Per-peer keying widens the aggregate discovery RATE but must never let
     /// many distinct peers push the shared `pending_urls` set past
     /// `crl_max_seen_urls`: memory stays bounded regardless of peer count.
     #[tokio::test]
-    async fn many_peers_cannot_exceed_pending_urls_cap() {
-        let mut config = test_mtls_config();
+    async fn many_peers_cannot_exceed_pending_urls_cap() -> anyhow::Result<()> {
+        let mut config = test_mtls_config()?;
         config.crl_discovery_rate_per_min = 64;
         config.crl_deny_on_unavailable = false;
         let cap = config.crl_max_seen_urls;
-        let (set, _rx) = test_crl_set_with_receiver_config(config);
+        let (set, _rx) = test_crl_set_with_receiver_config(config)?;
 
-        for peer_index in 0..32u8 {
+        for peer_index in 0..32_u8 {
             let peer = IpAddr::from([198, 51, 100, peer_index]);
-            let urls: Vec<String> = (0..4)
-                .map(|u| format!("http://p{peer_index:03}-u{u}.example.test/crl"))
+            let urls: Vec<String> = (0..4_usize)
+                .map(|unit| format!("http://p{peer_index:03}-u{unit}.example.test/crl"))
                 .collect();
             CURRENT_HANDSHAKE_PEER
                 .scope(peer, async {
-                    let _ = set.__test_note_discovered_urls_by_cert(&urls, &[]);
+                    let _peer_admitted = set.__test_note_discovered_urls_by_cert(&urls, &[]);
                 })
                 .await;
         }
@@ -3728,5 +3808,6 @@ mod tests {
             pending <= cap,
             "pending_urls ({pending}) must never exceed crl_max_seen_urls ({cap}) regardless of peer count"
         );
+        Ok(())
     }
 }
