@@ -214,7 +214,10 @@ impl IntoResponse for RmcpServerKitError {
 }
 
 /// Convenience `Result` alias bound to [`RmcpServerKitError`].
-pub type Result<T> = CoreResult<T, RmcpServerKitError>;
+///
+/// The error type is a defaulted parameter so call sites stay short while
+/// callers that need a precise error can still override it.
+pub type Result<T, E = RmcpServerKitError> = CoreResult<T, E>;
 
 #[expect(
     clippy::missing_errors_doc,
