@@ -6,177 +6,77 @@
 //!
 //! Includes per-source-IP rate limiting on authentication attempts.
 #![cfg_attr(
-    not(feature = "oauth"),
-    expect(clippy::doc_markdown, reason = "lint-migration: src/auth.rs")
-)]
-#![cfg_attr(
-    not(feature = "oauth"),
-    expect(clippy::partial_pub_fields, reason = "lint-migration: src/auth.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::multiple_inherent_impl, reason = "lint-migration: src/auth.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::shadow_same, reason = "lint-migration: src/auth.rs")
-)]
-#![cfg_attr(
-    all(feature = "oauth", target_os = "linux"),
-    expect(clippy::ref_patterns, reason = "lint-migration: src/auth.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::arithmetic_side_effects,
-        reason = "lint-migration: src/auth.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(clippy::missing_panics_doc, reason = "lint-migration: src/auth.rs")
 )]
 #![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::rest_pattern_accessible_field,
-        reason = "lint-migration: src/auth.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::return_and_then, reason = "lint-migration: src/auth.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::option_if_let_else, reason = "lint-migration: src/auth.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::unnecessary_safety_comment,
-        reason = "lint-migration: src/auth.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(clippy::shadow_reuse, reason = "lint-migration: src/auth.rs")
 )]
 #![cfg_attr(
-    all(feature = "oauth", target_os = "linux"),
-    expect(clippy::unnecessary_wraps, reason = "lint-migration: src/auth.rs")
-)]
-#![cfg_attr(
-    all(feature = "oauth", target_os = "linux"),
-    expect(clippy::unused_self, reason = "lint-migration: src/auth.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::uninlined_format_args, reason = "lint-migration: src/auth.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::missing_errors_doc, reason = "lint-migration: src/auth.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::impl_trait_in_params, reason = "lint-migration: src/auth.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(clippy::min_ident_chars, reason = "lint-migration: src/auth.rs")
 )]
 #![cfg_attr(
-    target_os = "linux",
-    expect(clippy::missing_const_for_fn, reason = "lint-migration: src/auth.rs")
-)]
-#![cfg_attr(
-    all(not(test), target_os = "linux"),
-    expect(
-        clippy::missing_docs_in_private_items,
-        reason = "lint-migration: src/auth.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_inline_in_public_items,
-        reason = "lint-migration: src/auth.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(clippy::absolute_paths, reason = "lint-migration: src/auth.rs")
 )]
 #![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::module_name_repetitions,
-        reason = "lint-migration: src/auth.rs"
-    )
-)]
-#![cfg_attr(
-    all(not(test), target_os = "linux"),
-    expect(clippy::wildcard_imports, reason = "lint-migration: src/auth.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::unused_trait_names, reason = "lint-migration: src/auth.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::std_instead_of_alloc, reason = "lint-migration: src/auth.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
+    all(test, target_os = "linux"),
     expect(clippy::std_instead_of_core, reason = "lint-migration: src/auth.rs")
 )]
 #![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::unseparated_literal_suffix,
-        reason = "lint-migration: src/auth.rs"
-    )
+    all(test, target_os = "linux"),
+    expect(unused_results, reason = "lint-migration: src/auth.rs")
 )]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::field_scoped_visibility_modifiers,
-        reason = "lint-migration: src/auth.rs"
-    )
-)]
-#![expect(unused_results, reason = "lint-migration: src/auth.rs")]
 
-use std::{
-    collections::HashSet,
-    net::SocketAddr,
+extern crate alloc;
+
+use alloc::{collections::VecDeque, sync::Arc};
+use core::{
+    fmt::{Debug, Display, Formatter, Result as FmtResult},
+    net::{IpAddr, SocketAddr},
     num::{NonZeroU32, NonZeroUsize},
-    path::PathBuf,
-    sync::{
-        Arc, LazyLock, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
+};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::{LazyLock, Mutex, PoisonError},
 };
 
 use arc_swap::ArcSwap;
-use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+use argon2::{Argon2, PasswordHash, PasswordHasher as _, PasswordVerifier as _};
 use axum::{
     body::Body,
     extract::ConnectInfo,
-    http::{Request, StatusCode, header},
+    http::{Extensions, HeaderMap, Method, Request, StatusCode, header},
     middleware::Next,
-    response::{IntoResponse, Response},
+    response::{IntoResponse as _, Response},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use secrecy::{ExposeSecret, SecretString};
-use serde::Deserialize;
-use x509_parser::prelude::*;
+use secrecy::{ExposeSecret as _, SecretString};
+#[cfg(not(feature = "oauth"))]
+use serde::de::IgnoredAny;
+use serde::{Deserialize, de::Error as SerdeDeError};
+use tokio::task::spawn_blocking;
+use tracing::field;
+use x509_parser::prelude::{FromDer as _, GeneralName, X509Certificate};
 
+#[cfg(feature = "metrics")]
+use crate::metrics::record_rate_limit_deny;
+#[cfg(feature = "oauth")]
+use crate::oauth::{JwksCache, JwtValidationFailure, OAuthConfig, looks_like_jwt};
 use crate::{
     bounded_limiter::{BoundedKeyedLimiter, BoundedLimiterDeny, KeyEvictionPolicy},
     error::RmcpServerKitError,
-    transport::{LogContextConfig, RateLimitKey},
+    rbac::{RbacPolicy, redact_with_salt},
+    transport::{
+        LogContextConfig, MAX_LOGGED_HEADER_CHARS, RateLimitKey, limiter_client_ip,
+        limiter_client_key, mcp_hints_for_log, peer_ip_for_log, request_id_for_log,
+        sanitize_for_log,
+    },
 };
 
 /// Identity of an authenticated caller.
@@ -187,6 +87,10 @@ use crate::{
 /// `format!("{identity:?}")`. Only `name`, `role`, and `method` are printed
 /// in the clear; `raw_token` and `sub` are rendered as `<redacted>` /
 /// `<present>` / `<none>` markers.
+#[expect(
+    clippy::module_name_repetitions,
+    reason = "public API frozen until the next major release"
+)]
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct AuthIdentity {
@@ -207,10 +111,11 @@ pub struct AuthIdentity {
     pub sub: Option<String>,
 }
 
-impl std::fmt::Debug for AuthIdentity {
+impl Debug for AuthIdentity {
     /// Redacts `raw_token` and `sub` to prevent secret leakage via
     /// `format!("{:?}")` or `tracing::debug!(?identity)`.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    #[inline]
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("AuthIdentity")
             .field("name", &self.name)
             .field("role", &self.role)
@@ -236,6 +141,10 @@ impl std::fmt::Debug for AuthIdentity {
 }
 
 /// How the caller authenticated.
+#[expect(
+    clippy::module_name_repetitions,
+    reason = "public API frozen until the next major release"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AuthMethod {
@@ -247,10 +156,14 @@ pub enum AuthMethod {
     OAuthJwt,
 }
 
+/// Classification of an authentication failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuthFailureClass {
+    /// No credential was presented.
     MissingCredential,
+    /// A credential was presented but was malformed or wrong.
     InvalidCredential,
+    /// A credential was presented but had expired.
     ExpiredCredential,
     /// Source IP exceeded the post-failure backoff limit.
     RateLimited,
@@ -262,17 +175,21 @@ enum AuthFailureClass {
 /// Reason an authentic credential was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RejectionReason {
+    /// The credential was past its expiry.
     Expired,
+    /// The JWT audience claim did not match configuration.
     #[cfg_attr(
         not(feature = "oauth"),
         expect(dead_code, reason = "constructed only by OAuth JWT validation")
     )]
     Audience,
+    /// The JWT role claim was missing or rejected.
     #[cfg_attr(
         not(feature = "oauth"),
         expect(dead_code, reason = "constructed only by OAuth JWT validation")
     )]
     Role,
+    /// The JWT subject claim was missing or rejected.
     #[cfg_attr(
         not(feature = "oauth"),
         expect(dead_code, reason = "constructed only by OAuth JWT validation")
@@ -281,7 +198,8 @@ pub(crate) enum RejectionReason {
 }
 
 impl RejectionReason {
-    pub(crate) fn as_str(self) -> &'static str {
+    /// Return the `snake_case` wire string for this rejection reason.
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Expired => "expired",
             Self::Audience => "audience",
@@ -292,28 +210,49 @@ impl RejectionReason {
 }
 
 /// Authenticated credential owner and rejection reason for opt-in failure logs.
+#[expect(
+    clippy::field_scoped_visibility_modifiers,
+    reason = "deliberate: src/auth.rs::CredentialOwner fields are constructed by src/oauth.rs"
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CredentialOwner {
+    /// The API-key or JWT owner name (a principal identity).
     pub(crate) name: String,
+    /// Why the owner's credential was rejected.
     pub(crate) reason: RejectionReason,
 }
 
+/// Internal outcome of an authentication attempt: failure class plus owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AuthRejection {
+    /// How the attempt failed.
     failure_class: AuthFailureClass,
+    /// The credential owner, when known and owner logging is enabled.
     owner: Option<CredentialOwner>,
 }
 
 /// API-key verification result from the fixed-work slot scan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ApiKeyVerdict {
-    Active { name: String, role: String },
-    Expired { name: String },
+    /// A slot matched and the key is active.
+    Active {
+        /// Principal identity of the matched key.
+        name: String,
+        /// RBAC role of the matched key.
+        role: String,
+    },
+    /// A slot matched but the key has expired.
+    Expired {
+        /// Principal identity of the matched key.
+        name: String,
+    },
+    /// No slot matched.
     NoMatch,
 }
 
 impl AuthFailureClass {
-    fn as_str(self) -> &'static str {
+    /// Return the `snake_case` wire string for this failure class.
+    const fn as_str(self) -> &'static str {
         match self {
             Self::MissingCredential => "missing_credential",
             Self::InvalidCredential => "invalid_credential",
@@ -323,7 +262,8 @@ impl AuthFailureClass {
         }
     }
 
-    fn bearer_error(self) -> (&'static str, &'static str) {
+    /// Return the RFC 6750 `(error, error_description)` pair for this class.
+    const fn bearer_error(self) -> (&'static str, &'static str) {
         match self {
             Self::MissingCredential => (
                 "invalid_request",
@@ -339,7 +279,8 @@ impl AuthFailureClass {
         }
     }
 
-    fn response_body(self) -> &'static str {
+    /// Return the plain-text HTTP response body for this class.
+    const fn response_body(self) -> &'static str {
         match self {
             Self::MissingCredential => "unauthorized: missing credential",
             Self::InvalidCredential => "unauthorized: invalid credential",
@@ -351,6 +292,10 @@ impl AuthFailureClass {
 }
 
 /// Snapshot of authentication success/failure counters.
+#[expect(
+    clippy::module_name_repetitions,
+    reason = "public API frozen until the next major release"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[non_exhaustive]
 pub struct AuthCountersSnapshot {
@@ -376,54 +321,68 @@ pub struct AuthCountersSnapshot {
 /// Internal atomic counters backing [`AuthCountersSnapshot`].
 #[derive(Debug, Default)]
 pub(crate) struct AuthCounters {
+    /// Count of successful mTLS authentications.
     success_mtls: AtomicU64,
+    /// Count of successful bearer-token authentications.
     success_bearer: AtomicU64,
+    /// Count of successful OAuth JWT authentications.
     success_oauth_jwt: AtomicU64,
+    /// Count of failures where no credential was presented.
     failure_missing_credential: AtomicU64,
+    /// Count of failures from a malformed or wrong credential.
     failure_invalid_credential: AtomicU64,
+    /// Count of failures from an expired credential.
     failure_expired_credential: AtomicU64,
+    /// Count of failures rejected by the post-failure rate limiter.
     failure_rate_limited: AtomicU64,
+    /// Count of failures rejected by the pre-auth abuse gate.
     failure_pre_auth_gate: AtomicU64,
 }
 
 impl AuthCounters {
+    /// Record one successful authentication for the given method.
     fn record_success(&self, method: AuthMethod) {
         match method {
             AuthMethod::MtlsCertificate => {
-                self.success_mtls.fetch_add(1, Ordering::Relaxed);
+                let _previous = self.success_mtls.fetch_add(1, Ordering::Relaxed);
             }
             AuthMethod::BearerToken => {
-                self.success_bearer.fetch_add(1, Ordering::Relaxed);
+                let _previous = self.success_bearer.fetch_add(1, Ordering::Relaxed);
             }
             AuthMethod::OAuthJwt => {
-                self.success_oauth_jwt.fetch_add(1, Ordering::Relaxed);
+                let _previous = self.success_oauth_jwt.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
 
+    /// Record one failed authentication for the given failure class.
     fn record_failure(&self, class: AuthFailureClass) {
         match class {
             AuthFailureClass::MissingCredential => {
-                self.failure_missing_credential
+                let _previous = self
+                    .failure_missing_credential
                     .fetch_add(1, Ordering::Relaxed);
             }
             AuthFailureClass::InvalidCredential => {
-                self.failure_invalid_credential
+                let _previous = self
+                    .failure_invalid_credential
                     .fetch_add(1, Ordering::Relaxed);
             }
             AuthFailureClass::ExpiredCredential => {
-                self.failure_expired_credential
+                let _previous = self
+                    .failure_expired_credential
                     .fetch_add(1, Ordering::Relaxed);
             }
             AuthFailureClass::RateLimited => {
-                self.failure_rate_limited.fetch_add(1, Ordering::Relaxed);
+                let _previous = self.failure_rate_limited.fetch_add(1, Ordering::Relaxed);
             }
             AuthFailureClass::PreAuthGate => {
-                self.failure_pre_auth_gate.fetch_add(1, Ordering::Relaxed);
+                let _previous = self.failure_pre_auth_gate.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
 
+    /// Snapshot the current counter values.
     fn snapshot(&self) -> AuthCountersSnapshot {
         AuthCountersSnapshot {
             success_mtls: self.success_mtls.load(Ordering::Relaxed),
@@ -458,35 +417,48 @@ impl RfcTimestamp {
     ///
     /// # Errors
     ///
-    /// Returns the underlying [`chrono::ParseError`] when `s` is not a valid
+    /// Returns the underlying [`chrono::ParseError`] when `value` is not a valid
     /// RFC 3339 timestamp (e.g. missing the `T` separator, missing the offset
     /// suffix, or out-of-range fields).
-    pub fn parse(s: &str) -> Result<Self, chrono::ParseError> {
-        chrono::DateTime::parse_from_rfc3339(s).map(Self)
+    #[inline]
+    pub fn parse(value: &str) -> Result<Self, chrono::ParseError> {
+        chrono::DateTime::parse_from_rfc3339(value).map(Self)
     }
 
     /// Borrow the underlying [`chrono::DateTime`].
+    #[expect(
+        clippy::missing_const_for_fn,
+        reason = "public API frozen until the next major release"
+    )]
     #[must_use]
+    #[inline]
     pub fn as_datetime(&self) -> &chrono::DateTime<chrono::FixedOffset> {
         &self.0
     }
 
     /// Consume the wrapper and return the underlying [`chrono::DateTime`].
+    #[expect(
+        clippy::missing_const_for_fn,
+        reason = "public API frozen until the next major release"
+    )]
     #[must_use]
+    #[inline]
     pub fn into_inner(self) -> chrono::DateTime<chrono::FixedOffset> {
         self.0
     }
 }
 
-impl std::fmt::Display for RfcTimestamp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for RfcTimestamp {
+    #[inline]
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         // Canonical RFC 3339 form; matches the deserialization input contract.
         write!(f, "{}", self.0.to_rfc3339())
     }
 }
 
-impl std::fmt::Debug for RfcTimestamp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for RfcTimestamp {
+    #[inline]
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         // Render as the canonical RFC 3339 string (not chrono's internal
         // debug form) so existing `ApiKeyEntry` Debug-redaction tests --
         // which look for the literal `"2030-01-01T00:00:00Z"` form in the
@@ -496,6 +468,7 @@ impl std::fmt::Debug for RfcTimestamp {
 }
 
 impl<'de> Deserialize<'de> for RfcTimestamp {
+    #[inline]
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -503,12 +476,13 @@ impl<'de> Deserialize<'de> for RfcTimestamp {
         // Validate at deserialization time: a malformed `expires_at` in
         // TOML or JSON aborts config load with a clear serde error rather
         // than silently producing a key that fails open at runtime.
-        let s = String::deserialize(deserializer)?;
-        Self::parse(&s).map_err(serde::de::Error::custom)
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).map_err(SerdeDeError::custom)
     }
 }
 
 impl serde::Serialize for RfcTimestamp {
+    #[inline]
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -518,6 +492,7 @@ impl serde::Serialize for RfcTimestamp {
 }
 
 impl From<chrono::DateTime<chrono::FixedOffset>> for RfcTimestamp {
+    #[inline]
     fn from(value: chrono::DateTime<chrono::FixedOffset>) -> Self {
         Self(value)
     }
@@ -554,10 +529,11 @@ pub struct ApiKeyEntry {
     pub expires_at: Option<RfcTimestamp>,
 }
 
-impl std::fmt::Debug for ApiKeyEntry {
+impl Debug for ApiKeyEntry {
     /// Redacts the Argon2id `hash` to keep it out of logs, panic backtraces,
     /// and admin-endpoint responses that might `format!("{:?}", …)` an entry.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    #[inline]
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("ApiKeyEntry")
             .field("name", &self.name)
             .field("hash", &"<redacted>")
@@ -569,7 +545,12 @@ impl std::fmt::Debug for ApiKeyEntry {
 
 impl ApiKeyEntry {
     /// Create a new API key entry (no expiry).
+    #[expect(
+        clippy::impl_trait_in_params,
+        reason = "public API frozen until the next major release"
+    )]
     #[must_use]
+    #[inline]
     pub fn new(name: impl Into<String>, hash: impl Into<String>, role: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -583,7 +564,12 @@ impl ApiKeyEntry {
     ///
     /// Takes an already-parsed [`RfcTimestamp`]; for ergonomic construction
     /// from a raw string see [`Self::try_with_expiry`].
+    #[expect(
+        clippy::missing_const_for_fn,
+        reason = "public API frozen until the next major release"
+    )]
     #[must_use]
+    #[inline]
     pub fn with_expiry(mut self, expires_at: RfcTimestamp) -> Self {
         self.expires_at = Some(expires_at);
         self
@@ -596,6 +582,11 @@ impl ApiKeyEntry {
     /// Returns the underlying [`chrono::ParseError`] when `expires_at` is
     /// not a valid RFC 3339 timestamp. This is the fallible counterpart to
     /// [`Self::with_expiry`].
+    #[expect(
+        clippy::impl_trait_in_params,
+        reason = "public API frozen until the next major release"
+    )]
+    #[inline]
     pub fn try_with_expiry(
         mut self,
         expires_at: impl AsRef<str>,
@@ -744,42 +735,52 @@ pub struct MtlsConfig {
     pub crl_max_cache_entries: usize,
 }
 
+/// Serde default for [`MtlsConfig::default_role`].
 fn default_mtls_role() -> String {
     "viewer".into()
 }
 
+/// Serde default for the `true` boolean flags on [`MtlsConfig`].
 const fn default_true() -> bool {
     true
 }
 
+/// Serde default for [`MtlsConfig::crl_fetch_timeout`].
 const fn default_crl_fetch_timeout() -> Duration {
     Duration::from_secs(30)
 }
 
+/// Serde default for [`MtlsConfig::crl_stale_grace`].
 const fn default_crl_stale_grace() -> Duration {
     Duration::from_hours(24)
 }
 
+/// Serde default for [`MtlsConfig::crl_max_concurrent_fetches`].
 const fn default_crl_max_concurrent_fetches() -> usize {
     4
 }
 
+/// Serde default for [`MtlsConfig::crl_max_response_bytes`].
 const fn default_crl_max_response_bytes() -> u64 {
     5 * 1024 * 1024
 }
 
+/// Serde default for [`MtlsConfig::crl_discovery_rate_per_min`].
 const fn default_crl_discovery_rate_per_min() -> u32 {
     60
 }
 
+/// Serde default for [`MtlsConfig::crl_max_host_semaphores`].
 const fn default_crl_max_host_semaphores() -> usize {
     1024
 }
 
+/// Serde default for [`MtlsConfig::crl_max_seen_urls`].
 const fn default_crl_max_seen_urls() -> usize {
     4096
 }
 
+/// Serde default for [`MtlsConfig::crl_max_cache_entries`].
 const fn default_crl_max_cache_entries() -> usize {
     1024
 }
@@ -847,6 +848,7 @@ pub struct RateLimitConfig {
 }
 
 impl Default for RateLimitConfig {
+    #[inline]
     fn default() -> Self {
         Self {
             max_attempts_per_minute: default_max_attempts(),
@@ -865,6 +867,7 @@ impl RateLimitConfig {
     /// Pre-auth gate defaults to `10x` this value at limiter-construction time.
     /// Memory-bound defaults are `10_000` tracked keys with 15-minute idle eviction.
     #[must_use]
+    #[inline]
     pub fn new(max_attempts_per_minute: u32) -> Self {
         Self {
             max_attempts_per_minute,
@@ -874,21 +877,36 @@ impl RateLimitConfig {
 
     /// Override the pre-auth abuse-gate quota (per source IP per minute).
     /// When unset, defaults to `max_attempts_per_minute * 10`.
+    #[expect(
+        clippy::missing_const_for_fn,
+        reason = "public API frozen until the next major release"
+    )]
     #[must_use]
+    #[inline]
     pub fn with_pre_auth_max_per_minute(mut self, quota: u32) -> Self {
         self.pre_auth_max_per_minute = Some(quota);
         self
     }
 
     /// Override the per-limiter cap on tracked source-IP keys (default `10_000`).
+    #[expect(
+        clippy::missing_const_for_fn,
+        reason = "public API frozen until the next major release"
+    )]
     #[must_use]
+    #[inline]
     pub fn with_max_tracked_keys(mut self, max: usize) -> Self {
         self.max_tracked_keys = max;
         self
     }
 
     /// Override the idle-eviction window (default 15 minutes).
+    #[expect(
+        clippy::missing_const_for_fn,
+        reason = "public API frozen until the next major release"
+    )]
     #[must_use]
+    #[inline]
     pub fn with_idle_eviction(mut self, idle: Duration) -> Self {
         self.idle_eviction = idle;
         self
@@ -896,7 +914,12 @@ impl RateLimitConfig {
 
     /// Set the burst capacity for the post-failure limiter. Must be
     /// greater than zero (validated at server-config validation time).
+    #[expect(
+        clippy::missing_const_for_fn,
+        reason = "public API frozen until the next major release"
+    )]
     #[must_use]
+    #[inline]
     pub fn with_burst(mut self, burst: u32) -> Self {
         self.burst = Some(burst);
         self
@@ -904,7 +927,12 @@ impl RateLimitConfig {
 
     /// Set the burst capacity for the pre-auth abuse gate. Must be
     /// greater than zero (validated at server-config validation time).
+    #[expect(
+        clippy::missing_const_for_fn,
+        reason = "public API frozen until the next major release"
+    )]
     #[must_use]
+    #[inline]
     pub fn with_pre_auth_burst(mut self, burst: u32) -> Self {
         self.pre_auth_burst = Some(burst);
         self
@@ -912,25 +940,44 @@ impl RateLimitConfig {
 
     /// Set the tracked-key full-table policy for auth limiters.
     #[must_use]
+    #[inline]
     pub const fn with_key_eviction_policy(mut self, policy: KeyEvictionPolicy) -> Self {
         self.key_eviction_policy = policy;
         self
     }
 }
 
-fn default_max_attempts() -> u32 {
+/// Serde default for [`RateLimitConfig::max_attempts_per_minute`].
+const fn default_max_attempts() -> u32 {
     30
 }
 
-fn default_max_tracked_keys() -> usize {
+/// Serde default for [`RateLimitConfig::max_tracked_keys`].
+const fn default_max_tracked_keys() -> usize {
     10_000
 }
 
-fn default_idle_eviction() -> Duration {
+/// Serde default for [`RateLimitConfig::idle_eviction`].
+const fn default_idle_eviction() -> Duration {
     Duration::from_mins(15)
 }
 
 /// Authentication configuration.
+#[expect(
+    clippy::module_name_repetitions,
+    reason = "public API frozen until the next major release"
+)]
+#[cfg_attr(
+    not(feature = "oauth"),
+    expect(
+        clippy::partial_pub_fields,
+        reason = "public API frozen until the next major release"
+    ),
+    expect(
+        clippy::field_scoped_visibility_modifiers,
+        reason = "deliberate: src/auth.rs::AuthConfig oauth placeholder stays crate-private"
+    )
+)]
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
@@ -947,20 +994,20 @@ pub struct AuthConfig {
     pub rate_limit: Option<RateLimitConfig>,
     /// OAuth 2.1 JWT bearer token authentication.
     #[cfg(feature = "oauth")]
-    pub oauth: Option<crate::oauth::OAuthConfig>,
+    pub oauth: Option<OAuthConfig>,
     /// Presence-only placeholder for `auth.oauth` in builds without the
     /// `oauth` cargo feature.
     ///
     /// `deny_unknown_fields` (above) would otherwise reject an `[auth.oauth]`
-    /// table with `unknown field \`oauth\``, which never mentions the feature
-    /// flag and sends operators hunting for a typo that does not exist.
-    /// Accepting the key here and rejecting it in
+    /// table with an `unknown field` error naming `oauth`, which never mentions
+    /// the feature flag and sends operators hunting for a typo that does not
+    /// exist. Accepting the key here and rejecting it in
     /// [`AuthConfig::check_oauth_feature`] turns that into an actionable
     /// message. `IgnoredAny` records presence without retaining the value, so
     /// no OAuth secret is held in memory by a build that cannot use it.
     #[cfg(not(feature = "oauth"))]
     #[serde(default)]
-    pub(crate) oauth: Option<serde::de::IgnoredAny>,
+    pub(crate) oauth: Option<IgnoredAny>,
 }
 
 /// Validate API-key `name`s as session/task-binding principal identities,
@@ -979,8 +1026,14 @@ pub struct AuthConfig {
 /// Shared by [`AuthConfig::validate_api_key_names`] (startup validation) and
 /// [`AuthState::try_reload_keys`] (hot-reload validation) so both surfaces
 /// enforce the same rule.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] naming the first offending index:
+/// either its `name` is blank, or it reuses an earlier entry's `name` with a
+/// different `role`.
 pub(crate) fn check_api_key_names(keys: &[ApiKeyEntry]) -> Result<(), RmcpServerKitError> {
-    let mut seen: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    let mut seen: HashMap<&str, &str> = HashMap::new();
     for (index, key) in keys.iter().enumerate() {
         if key.name.trim().is_empty() {
             return Err(RmcpServerKitError::Config(format!(
@@ -996,10 +1049,10 @@ pub(crate) fn check_api_key_names(keys: &[ApiKeyEntry]) -> Result<(), RmcpServer
         {
             return Err(RmcpServerKitError::Config(format!(
                 "auth.api_keys[{index}] reuses the name '{}' with role '{}' while an earlier \
-                 entry uses role '{}'. API-key names are the session/task-binding principal \
+                 entry uses role '{prior_role}'. API-key names are the session/task-binding principal \
                  identity, so same-named keys are one principal and must share one role. \
                  Use distinct names for distinct principals.",
-                key.name, key.role, prior_role
+                key.name, key.role
             )));
         }
     }
@@ -1008,7 +1061,12 @@ pub(crate) fn check_api_key_names(keys: &[ApiKeyEntry]) -> Result<(), RmcpServer
 
 impl AuthConfig {
     /// Create an enabled auth config with the given API keys.
+    #[expect(
+        clippy::missing_const_for_fn,
+        reason = "public API frozen until the next major release"
+    )]
     #[must_use]
+    #[inline]
     pub fn with_keys(keys: Vec<ApiKeyEntry>) -> Self {
         Self {
             enabled: true,
@@ -1023,7 +1081,12 @@ impl AuthConfig {
     }
 
     /// Set rate limiting on this auth config.
+    #[expect(
+        clippy::missing_const_for_fn,
+        reason = "public API frozen until the next major release"
+    )]
     #[must_use]
+    #[inline]
     pub fn with_rate_limit(mut self, rate_limit: RateLimitConfig) -> Self {
         self.rate_limit = Some(rate_limit);
         self
@@ -1042,6 +1105,28 @@ impl AuthConfig {
     /// the `oauth` feature is disabled. Always `Ok` when the feature is
     /// enabled, where the table is parsed into
     /// [`oauth::OAuthConfig`](crate::oauth::OAuthConfig) instead.
+    #[cfg_attr(
+        feature = "oauth",
+        expect(
+            clippy::missing_const_for_fn,
+            reason = "public API frozen until the next major release"
+        )
+    )]
+    #[cfg_attr(
+        feature = "oauth",
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "public API frozen until the next major release"
+        )
+    )]
+    #[cfg_attr(
+        feature = "oauth",
+        expect(
+            clippy::unused_self,
+            reason = "public API frozen until the next major release"
+        )
+    )]
+    #[inline]
     pub fn check_oauth_feature(&self) -> Result<(), RmcpServerKitError> {
         #[cfg(not(feature = "oauth"))]
         {
@@ -1073,8 +1158,33 @@ impl AuthConfig {
     /// Returns [`RmcpServerKitError::Config`] naming the first offending
     /// API-key index: either its `name` is blank, or it reuses an earlier
     /// entry's `name` with a different `role`.
+    #[inline]
     pub fn validate_api_key_names(&self) -> Result<(), RmcpServerKitError> {
         check_api_key_names(&self.api_keys)
+    }
+
+    /// Produce a hash-free summary of the auth config for admin endpoints.
+    #[must_use]
+    #[inline]
+    pub fn summary(&self) -> AuthConfigSummary {
+        AuthConfigSummary {
+            enabled: self.enabled,
+            bearer: !self.api_keys.is_empty(),
+            mtls: self.mtls.is_some(),
+            #[cfg(feature = "oauth")]
+            oauth: self.oauth.is_some(),
+            #[cfg(not(feature = "oauth"))]
+            oauth: false,
+            api_keys: self
+                .api_keys
+                .iter()
+                .map(|key| ApiKeySummary {
+                    name: key.name.clone(),
+                    role: key.role.clone(),
+                    expires_at: key.expires_at,
+                })
+                .collect(),
+        }
     }
 }
 
@@ -1094,6 +1204,10 @@ pub struct ApiKeySummary {
 }
 
 /// Snapshot of the enabled authentication methods for admin endpoints.
+#[expect(
+    clippy::module_name_repetitions,
+    reason = "public API frozen until the next major release"
+)]
 #[derive(Debug, Clone, serde::Serialize)]
 #[expect(
     clippy::struct_excessive_bools,
@@ -1111,31 +1225,6 @@ pub struct AuthConfigSummary {
     pub oauth: bool,
     /// Current API-key list (no hashes).
     pub api_keys: Vec<ApiKeySummary>,
-}
-
-impl AuthConfig {
-    /// Produce a hash-free summary of the auth config for admin endpoints.
-    #[must_use]
-    pub fn summary(&self) -> AuthConfigSummary {
-        AuthConfigSummary {
-            enabled: self.enabled,
-            bearer: !self.api_keys.is_empty(),
-            mtls: self.mtls.is_some(),
-            #[cfg(feature = "oauth")]
-            oauth: self.oauth.is_some(),
-            #[cfg(not(feature = "oauth"))]
-            oauth: false,
-            api_keys: self
-                .api_keys
-                .iter()
-                .map(|k| ApiKeySummary {
-                    name: k.name.clone(),
-                    role: k.role.clone(),
-                    expires_at: k.expires_at,
-                })
-                .collect(),
-        }
-    }
 }
 
 /// Keyed rate limiter type (per source IP). Memory-bounded by
@@ -1198,16 +1287,20 @@ const DEFAULT_SEEN_IDENTITY_CAP: usize = 4096;
 /// (only writer is `insert_is_first`, which performs an atomic insert
 /// + bounded eviction; no torn invariants are possible).
 pub(crate) struct SeenIdentitySet {
+    /// Mutex-guarded set plus eviction queue.
     inner: Mutex<SeenInner>,
 }
 
+/// Mutex-guarded state of a [`SeenIdentitySet`].
 struct SeenInner {
+    /// Identities currently remembered.
     set: HashSet<String>,
     /// Insertion-order FIFO used for bounded eviction. Tracking strict LRU
     /// would require touching the queue on every hit (under the mutex);
     /// FIFO is sufficient because the contract only promises "bounded
     /// memory", not "remember the most recently seen identities".
-    order: std::collections::VecDeque<String>,
+    order: VecDeque<String>,
+    /// Maximum number of identities retained.
     cap: usize,
 }
 
@@ -1222,12 +1315,12 @@ impl SeenIdentitySet {
     /// to `1` to keep the invariant `set.len() <= cap` non-vacuous.
     #[must_use]
     pub(crate) fn with_cap(cap: usize) -> Self {
-        let cap = cap.max(1);
+        let resolved_cap = cap.max(1);
         Self {
             inner: Mutex::new(SeenInner {
-                set: HashSet::with_capacity(cap.min(64)),
-                order: std::collections::VecDeque::with_capacity(cap.min(64)),
-                cap,
+                set: HashSet::with_capacity(resolved_cap.min(64)),
+                order: VecDeque::with_capacity(resolved_cap.min(64)),
+                cap: resolved_cap,
             }),
         }
     }
@@ -1239,15 +1332,12 @@ impl SeenIdentitySet {
     /// When the cap is reached, the oldest inserted entry is evicted to
     /// make room. Eviction never blocks the caller.
     pub(crate) fn insert_is_first(&self, name: &str) -> bool {
-        // SAFETY: the only writer is this method; a poisoned set remains
+        // The only writer is this method; a poisoned set remains
         // logically consistent (atomic insert + bounded eviction preserve
         // the `set.len() <= cap` invariant). Continuing past poison only
         // affects diagnostic logging granularity, not correctness or
         // security.
-        let mut guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
 
         if guard.set.contains(name) {
             return false;
@@ -1257,10 +1347,10 @@ impl SeenIdentitySet {
         if guard.set.len() >= guard.cap
             && let Some(evicted) = guard.order.pop_front()
         {
-            guard.set.remove(&evicted);
+            let _removed = guard.set.remove(&evicted);
         }
         let owned = name.to_owned();
-        guard.set.insert(owned.clone());
+        let _inserted = guard.set.insert(owned.clone());
         guard.order.push_back(owned);
         true
     }
@@ -1270,7 +1360,7 @@ impl SeenIdentitySet {
     pub(crate) fn len(&self) -> usize {
         self.inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .set
             .len()
     }
@@ -1282,14 +1372,23 @@ impl Default for SeenIdentitySet {
     }
 }
 
+/// Per-item client context captured for `auth failed` logs.
+#[expect(
+    clippy::field_scoped_visibility_modifiers,
+    reason = "deliberate: src/auth.rs::AuthLogContext fields are constructed by src/transport.rs"
+)]
 #[derive(Clone, Debug, Default)]
 pub(crate) struct AuthLogContext {
+    /// Which request-context fields to include in failure logs.
     pub(crate) fields: LogContextConfig,
+    /// Optional salt for credential-token fingerprints.
     pub(crate) fingerprint_salt: Option<Arc<SecretString>>,
 }
 
 impl AuthLogContext {
-    pub(crate) fn new(fields: &LogContextConfig, rbac: &crate::rbac::RbacPolicy) -> Self {
+    /// Build a log context, deriving the fingerprint salt from `rbac` when
+    /// credential fingerprinting is enabled.
+    pub(crate) fn new(fields: &LogContextConfig, rbac: &RbacPolicy) -> Self {
         Self {
             fields: fields.clone(),
             fingerprint_salt: fields.credential_fingerprint.then(|| rbac.redaction_salt()),
@@ -1312,7 +1411,7 @@ pub(crate) struct AuthState {
     pub pre_auth_limiter: Option<Arc<KeyedLimiter>>,
     #[cfg(feature = "oauth")]
     /// Optional JWKS cache for OAuth JWT validation.
-    pub jwks_cache: Option<Arc<crate::oauth::JwksCache>>,
+    pub jwks_cache: Option<Arc<JwksCache>>,
     /// Tracks identity names that have already been logged at INFO level.
     /// Subsequent auths for the same identity are logged at DEBUG.
     /// Bounded to prevent attacker-driven memory growth via churned
@@ -1381,10 +1480,10 @@ impl AuthState {
         self.api_keys
             .load()
             .iter()
-            .map(|k| ApiKeySummary {
-                name: k.name.clone(),
-                role: k.role.clone(),
-                expires_at: k.expires_at,
+            .map(|key| ApiKeySummary {
+                name: key.name.clone(),
+                role: key.role.clone(),
+                expires_at: key.expires_at,
             })
             .collect()
     }
@@ -1408,17 +1507,16 @@ impl AuthState {
 }
 
 /// Default auth rate limit: 30 attempts per minute per source IP.
-// SAFETY: unwrap() is safe - literal 30 is provably non-zero (const-evaluated).
+// The literal 30 is provably non-zero (const-evaluated).
 const DEFAULT_AUTH_RATE: NonZeroU32 = NonZeroU32::new(30).unwrap();
 
 /// Apply an optional burst capacity to a quota. `None` keeps governor's
 /// default (burst = rate). Zero values are rejected at config-validation
 /// time; the `NonZeroU32` filter here is defensive only.
 fn apply_burst(quota: governor::Quota, burst: Option<u32>) -> governor::Quota {
-    match burst.and_then(NonZeroU32::new) {
-        Some(b) => quota.allow_burst(b),
-        None => quota,
-    }
+    burst
+        .and_then(NonZeroU32::new)
+        .map_or(quota, |resolved_burst| quota.allow_burst(resolved_burst))
 }
 
 /// Create a post-failure rate limiter from config.
@@ -1431,12 +1529,12 @@ pub(crate) fn build_rate_limiter(config: &RateLimitConfig) -> Arc<KeyedLimiter> 
     let quota = governor::Quota::per_minute(
         NonZeroU32::new(config.max_attempts_per_minute).unwrap_or(DEFAULT_AUTH_RATE),
     );
-    let quota = apply_burst(quota, config.burst);
+    let burst_quota = apply_burst(quota, config.burst);
     // Defense in depth: Phase-1 config validation rejects `0` upstream, but
     // tests can still exercise this helper directly with raw config values.
     let max_tracked_keys = NonZeroUsize::new(config.max_tracked_keys).unwrap_or(NonZeroUsize::MIN);
     Arc::new(BoundedKeyedLimiter::new_with_policy(
-        quota,
+        burst_quota,
         max_tracked_keys,
         config.idle_eviction,
         config.key_eviction_policy,
@@ -1458,12 +1556,12 @@ pub(crate) fn build_pre_auth_limiter(config: &RateLimitConfig) -> Arc<KeyedLimit
     });
     let quota =
         governor::Quota::per_minute(NonZeroU32::new(resolved).unwrap_or(DEFAULT_PRE_AUTH_RATE));
-    let quota = apply_burst(quota, config.pre_auth_burst);
+    let burst_quota = apply_burst(quota, config.pre_auth_burst);
     // Defense in depth: Phase-1 config validation rejects `0` upstream, but
     // tests can still exercise this helper directly with raw config values.
     let max_tracked_keys = NonZeroUsize::new(config.max_tracked_keys).unwrap_or(NonZeroUsize::MIN);
     Arc::new(BoundedKeyedLimiter::new_with_policy(
-        quota,
+        burst_quota,
         max_tracked_keys,
         config.idle_eviction,
         config.key_eviction_policy,
@@ -1476,7 +1574,7 @@ const PRE_AUTH_DEFAULT_MULTIPLIER: u32 = 10;
 
 /// Default pre-auth abuse-gate rate (used only if both the configured value
 /// and the multiplied fallback are zero, which `NonZeroU32::new` rejects).
-// SAFETY: unwrap() is safe - literal 300 is provably non-zero (const-evaluated).
+// The literal 300 is provably non-zero (const-evaluated).
 const DEFAULT_PRE_AUTH_RATE: NonZeroU32 = NonZeroU32::new(300).unwrap();
 
 /// Parse an mTLS client certificate and extract an `AuthIdentity`.
@@ -1487,6 +1585,7 @@ const DEFAULT_PRE_AUTH_RATE: NonZeroU32 = NonZeroU32::new(300).unwrap();
 /// yields a non-blank name that also passes the character guard. The role is
 /// taken from the `MtlsConfig`.
 #[must_use]
+#[inline]
 pub fn extract_mtls_identity(cert_der: &[u8], default_role: &str) -> Option<AuthIdentity> {
     let (_, cert) = X509Certificate::from_der(cert_der).ok()?;
 
@@ -1501,37 +1600,34 @@ pub fn extract_mtls_identity(cert_der: &[u8], default_role: &str) -> Option<Auth
         .map(String::from);
 
     let name = cn.or_else(|| {
-        cert.subject_alternative_name()
-            .ok()
-            .flatten()
-            .and_then(|san| {
-                #[expect(
-                    clippy::wildcard_enum_match_arm,
-                    reason = "x509-parser GeneralName is a large external enum; only DNSName is meaningful here"
-                )]
-                san.value.general_names.iter().find_map(|gn| match gn {
-                    GeneralName::DNSName(dns) if !dns.trim().is_empty() => Some((*dns).to_owned()),
-                    _ => None,
-                })
-            })
+        let san = cert.subject_alternative_name().ok().flatten()?;
+        #[expect(
+            clippy::wildcard_enum_match_arm,
+            reason = "x509-parser GeneralName is a large external enum; only DNSName is meaningful here"
+        )]
+        let found = san.value.general_names.iter().find_map(|gn| match gn {
+            GeneralName::DNSName(dns) if !dns.trim().is_empty() => Some((*dns).to_owned()),
+            _ => None,
+        });
+        found
     });
 
-    let Some(name) = name else {
+    let Some(resolved_name) = name else {
         tracing::warn!("mTLS identity rejected: no non-blank CN or DNS SAN present");
         return None;
     };
 
     // Reject identities with characters unsafe for logging and RBAC matching.
-    if !name
+    if !resolved_name
         .chars()
-        .all(|c| c.is_alphanumeric() || matches!(c, '-' | '.' | '_' | '@'))
+        .all(|ch| ch.is_alphanumeric() || matches!(ch, '-' | '.' | '_' | '@'))
     {
-        tracing::warn!(cn = %name, "mTLS identity rejected: invalid characters in CN/SAN");
+        tracing::warn!(cn = %resolved_name, "mTLS identity rejected: invalid characters in CN/SAN");
         return None;
     }
 
     Some(AuthIdentity {
-        name,
+        name: resolved_name,
         role: default_role.to_owned(),
         method: AuthMethod::MtlsCertificate,
         raw_token: None,
@@ -1573,7 +1669,7 @@ fn extract_bearer(value: &str) -> Option<&str> {
         return None;
     }
     let token = rest.trim_start_matches(' ');
-    if token.is_empty() || token.bytes().any(|b| b.is_ascii_whitespace()) {
+    if token.is_empty() || token.bytes().any(|byte| byte.is_ascii_whitespace()) {
         return None;
     }
     Some(token)
@@ -1619,6 +1715,7 @@ fn extract_bearer(value: &str) -> Option<&str> {
 /// This is impossible by construction: the static is generated by
 /// [`argon2::Argon2::hash_password`] which always emits a valid PHC string.
 #[must_use]
+#[inline]
 pub fn verify_bearer_token(token: &str, keys: &[ApiKeyEntry]) -> Option<AuthIdentity> {
     match verify_bearer_token_verdict(token, keys) {
         ApiKeyVerdict::Active { name, role } => Some(AuthIdentity {
@@ -1628,10 +1725,18 @@ pub fn verify_bearer_token(token: &str, keys: &[ApiKeyEntry]) -> Option<AuthIden
             raw_token: None,
             sub: None,
         }),
-        ApiKeyVerdict::Expired { .. } | ApiKeyVerdict::NoMatch => None,
+        ApiKeyVerdict::Expired { name: _ } | ApiKeyVerdict::NoMatch => None,
     }
 }
 
+/// Fixed-work slot scan shared by [`verify_bearer_token`] and
+/// [`verify_bearer_token_verdict`].
+///
+/// # Panics
+///
+/// Panics if the internal dummy PHC hash cannot be parsed as an Argon2id PHC
+/// string. This is impossible by construction: [`DUMMY_PHC_HASH`] is generated
+/// by [`argon2::Argon2::hash_password`], which always emits a valid PHC string.
 fn verify_slots<F>(
     token: &str,
     keys: &[ApiKeyEntry],
@@ -1660,21 +1765,21 @@ where
 
         let real_hash = PasswordHash::new(&key.hash);
         let verify_against = match (&real_hash, expired, any_match) {
-            (Ok(h), true, _) | (Ok(h), false, 0) => h,
+            (Ok(hash), true, _) | (Ok(hash), false, 0) => hash,
             _ => &dummy_hash,
         };
 
         let slot_ok = u8::from(verify(token.as_bytes(), verify_against));
 
         let real_match = slot_ok & u8::from(!expired) & u8::from(real_hash.is_ok());
-        let first_real_match = real_match & (1 - any_match);
+        let first_real_match = real_match & 1_u8.wrapping_sub(any_match);
         if first_real_match.ct_eq(&1).into() {
             matched_index = idx;
         }
         any_match |= real_match;
 
         let expired_hit = slot_ok & u8::from(expired) & u8::from(real_hash.is_ok());
-        let first_expired = expired_hit & (1 - any_expired);
+        let first_expired = expired_hit & 1_u8.wrapping_sub(any_expired);
         if first_expired.ct_eq(&1).into() {
             expired_index = idx;
         }
@@ -1711,8 +1816,8 @@ where
 
 /// Verify an API-key bearer token and preserve active/expired/no-match detail.
 pub(crate) fn verify_bearer_token_verdict(token: &str, keys: &[ApiKeyEntry]) -> ApiKeyVerdict {
-    verify_slots(token, keys, chrono::Utc::now(), |t, h| {
-        Argon2::default().verify_password(t, h).is_ok()
+    verify_slots(token, keys, chrono::Utc::now(), |token_arg, hash| {
+        Argon2::default().verify_password(token_arg, hash).is_ok()
     })
 }
 
@@ -1736,7 +1841,7 @@ static DUMMY_PHC_HASH: LazyLock<String> = LazyLock::new(|| {
         reason = "Argon2::default() over a fixed plaintext and a fixed 16-byte salt is infallible; it fails only on invalid params or salt length, both constants here"
     )]
     Argon2::default()
-        .hash_password_with_salt(b"rmcp-server-kit-dummy", &[0u8; 16])
+        .hash_password_with_salt(b"rmcp-server-kit-dummy", &[0_u8; 16])
         .expect("Argon2 default params hash a fixed plaintext")
         .to_string()
 });
@@ -1750,21 +1855,24 @@ static DUMMY_PHC_HASH: LazyLock<String> = LazyLock::new(|| {
 ///
 /// Returns an error if Argon2id hashing fails (should not happen with valid
 /// inputs, but we avoid panicking).
+#[inline]
 pub fn generate_api_key() -> Result<(String, String), RmcpServerKitError> {
-    let mut token_bytes = [0u8; 32];
+    let mut token_bytes = [0_u8; 32];
     rand::fill(&mut token_bytes);
     let token = URL_SAFE_NO_PAD.encode(token_bytes);
 
-    let mut salt_bytes = [0u8; 16];
+    let mut salt_bytes = [0_u8; 16];
     rand::fill(&mut salt_bytes);
     let hash = Argon2::default()
         .hash_password_with_salt(token.as_bytes(), &salt_bytes)
-        .map_err(|e| RmcpServerKitError::Internal(format!("argon2id hashing failed: {e}")))?
+        .map_err(|error| RmcpServerKitError::Internal(format!("argon2id hashing failed: {error}")))?
         .to_string();
 
     Ok((token, hash))
 }
 
+/// Build the `WWW-Authenticate: Bearer ...` challenge value, including the
+/// `resource_metadata` parameter when a metadata URL is available.
 fn build_www_authenticate_value(
     resource_metadata: Option<&str>,
     failure: AuthFailureClass,
@@ -1778,7 +1886,8 @@ fn build_www_authenticate_value(
     format!("Bearer error=\"{error}\", error_description=\"{error_description}\"")
 }
 
-fn auth_method_label(method: AuthMethod) -> &'static str {
+/// Human-readable label for an authentication method.
+const fn auth_method_label(method: AuthMethod) -> &'static str {
     match method {
         AuthMethod::MtlsCertificate => "mTLS",
         AuthMethod::BearerToken => "bearer token",
@@ -1786,41 +1895,52 @@ fn auth_method_label(method: AuthMethod) -> &'static str {
     }
 }
 
+/// Request-context fields captured for an `auth failed` log line.
 #[derive(Debug, Default)]
 struct AuthFailureFields {
-    client_ip: Option<std::net::IpAddr>,
-    peer_ip: Option<std::net::IpAddr>,
+    /// Resolved client IP (when enabled and available).
+    client_ip: Option<IpAddr>,
+    /// Direct peer IP (when enabled and available).
+    peer_ip: Option<IpAddr>,
+    /// Request id header value, if present.
     request_id: Option<Arc<str>>,
-    method: Option<axum::http::Method>,
+    /// HTTP method.
+    method: Option<Method>,
+    /// Request path (no query string).
     path: Option<String>,
+    /// Sanitized `User-Agent` header value.
     user_agent: Option<String>,
+    /// Lowercased auth scheme label (`bearer`/`basic`/`other`).
     auth_scheme: Option<&'static str>,
+    /// Bearer token shape (`jwt`/`opaque`).
     token_kind: Option<&'static str>,
+    /// Whether MCP session hints were present.
     mcp_session: Option<bool>,
+    /// MCP protocol version header value, if any.
     mcp_protocol_version: Option<String>,
+    /// Redacted credential fingerprint.
     credential_fp: Option<String>,
+    /// Credential owner name (only when owner logging is enabled).
     credential_owner: Option<String>,
+    /// Rejection reason for the credential owner.
     credential_rejection: Option<&'static str>,
 }
 
-fn user_agent_for_log(headers: &axum::http::HeaderMap) -> String {
+/// Build the `User-Agent` value for failure logs, sanitized and truncated.
+fn user_agent_for_log(headers: &HeaderMap) -> String {
     headers.get(header::USER_AGENT).map_or_else(
         || "-".to_owned(),
         |value| {
             value.to_str().map_or_else(
                 |_| "<non-utf8>".to_owned(),
-                |raw| {
-                    crate::transport::sanitize_for_log(
-                        raw,
-                        crate::transport::MAX_LOGGED_HEADER_CHARS,
-                    )
-                },
+                |raw| sanitize_for_log(raw, MAX_LOGGED_HEADER_CHARS),
             )
         },
     )
 }
 
-fn auth_scheme_for_log(headers: &axum::http::HeaderMap) -> &'static str {
+/// Classify the request's `Authorization` scheme for logging.
+fn auth_scheme_for_log(headers: &HeaderMap) -> &'static str {
     let Some(value) = headers.get(header::AUTHORIZATION) else {
         return "none";
     };
@@ -1837,6 +1957,8 @@ fn auth_scheme_for_log(headers: &axum::http::HeaderMap) -> &'static str {
     }
 }
 
+/// Classify a bearer token as `jwt` (three non-empty base64url segments) or
+/// `opaque`.
 fn token_kind(token: &str) -> &'static str {
     let mut parts = token.split('.');
     let Some(first) = parts.next() else {
@@ -1855,11 +1977,12 @@ fn token_kind(token: &str) -> &'static str {
         !part.is_empty()
             && part
                 .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
     });
     if valid { "jwt" } else { "opaque" }
 }
 
+/// Collect the request-context fields for an `auth failed` log line.
 fn auth_failure_fields(
     ctx: &AuthLogContext,
     req: &Request<Body>,
@@ -1872,22 +1995,22 @@ fn auth_failure_fields(
         .and_then(|value| value.to_str().ok())
         .and_then(extract_bearer);
     let (mcp_session, mcp_protocol_version) = if fields.mcp_hints {
-        crate::transport::mcp_hints_for_log(headers)
+        mcp_hints_for_log(headers)
     } else {
         (false, None)
     };
     AuthFailureFields {
         client_ip: fields
             .client_ip
-            .then(|| crate::transport::limiter_client_ip(req.extensions()))
+            .then(|| limiter_client_ip(req.extensions()))
             .flatten(),
         peer_ip: fields
             .peer_ip
-            .then(|| crate::transport::peer_ip_for_log(req.extensions()))
+            .then(|| peer_ip_for_log(req.extensions()))
             .flatten(),
         request_id: fields
             .request_id
-            .then(|| crate::transport::request_id_for_log(req.extensions()))
+            .then(|| request_id_for_log(req.extensions()))
             .flatten(),
         method: fields.request_line.then(|| req.method().clone()),
         path: fields.request_line.then(|| req.uri().path().to_owned()),
@@ -1897,19 +2020,21 @@ fn auth_failure_fields(
         mcp_session: fields.mcp_hints.then_some(mcp_session),
         mcp_protocol_version,
         credential_fp: ctx.fingerprint_salt.as_ref().and_then(|salt| {
-            bearer
-                .map(|token| crate::rbac::redact_with_salt(salt.expose_secret().as_bytes(), token))
+            bearer.map(|token| redact_with_salt(salt.expose_secret().as_bytes(), token))
         }),
-        credential_owner: fields.credential_owner.then_some(owner).flatten().map(|o| {
-            crate::transport::sanitize_for_log(&o.name, crate::transport::MAX_LOGGED_HEADER_CHARS)
-        }),
+        credential_owner: fields
+            .credential_owner
+            .then_some(owner)
+            .flatten()
+            .map(|cred_owner| sanitize_for_log(&cred_owner.name, MAX_LOGGED_HEADER_CHARS)),
         credential_rejection: fields
             .credential_owner
-            .then_some(owner.map(|o| o.reason.as_str()))
+            .then_some(owner.map(|rejected| rejected.reason.as_str()))
             .flatten(),
     }
 }
 
+/// Emit the `auth failed` warn log with the configured context fields.
 fn log_auth_failure(
     failure_class: AuthFailureClass,
     owner: Option<&CredentialOwner>,
@@ -1919,23 +2044,25 @@ fn log_auth_failure(
     let fields = auth_failure_fields(ctx, req, owner);
     tracing::warn!(
         failure_class = %failure_class.as_str(),
-        client_ip = fields.client_ip.map(tracing::field::display),
-        peer_ip = fields.peer_ip.map(tracing::field::display),
+        client_ip = fields.client_ip.map(field::display),
+        peer_ip = fields.peer_ip.map(field::display),
         request_id = fields.request_id.as_deref(),
-        method = fields.method.as_ref().map(tracing::field::display),
-        path = fields.path.as_deref().map(tracing::field::display),
+        method = fields.method.as_ref().map(field::display),
+        path = fields.path.as_deref().map(field::display),
         user_agent = fields.user_agent.as_deref(),
-        auth_scheme = fields.auth_scheme.map(tracing::field::display),
-        token_kind = fields.token_kind.map(tracing::field::display),
+        auth_scheme = fields.auth_scheme.map(field::display),
+        token_kind = fields.token_kind.map(field::display),
         mcp_session = fields.mcp_session,
         mcp_protocol_version = fields.mcp_protocol_version.as_deref(),
-        credential_fp = fields.credential_fp.as_deref().map(tracing::field::display),
+        credential_fp = fields.credential_fp.as_deref().map(field::display),
         credential_owner = fields.credential_owner.as_deref(),
-        credential_rejection = fields.credential_rejection.map(tracing::field::display),
+        credential_rejection = fields.credential_rejection.map(field::display),
         "auth failed"
     );
 }
 
+/// Build the 401 response for a failed authentication, including the
+/// `WWW-Authenticate` challenge and failure-class body.
 fn unauthorized_response(state: &AuthState, failure_class: AuthFailureClass) -> Response {
     #[cfg(feature = "oauth")]
     let advertise_resource_metadata = state.jwks_cache.is_some();
@@ -1957,11 +2084,21 @@ fn unauthorized_response(state: &AuthState, failure_class: AuthFailureClass) -> 
         .into_response()
 }
 
-// cancel-safe: no shared-state mutation. The Argon2 verification is offloaded
-// to `spawn_blocking`; dropping its `JoinHandle` on cancellation detaches the
-// task (the hash completes off-task, harmlessly) rather than tearing partial
-// state. The OAuth branch delegates to `validate_token_detailed`, which is
-// itself cancel-safe (read-only JWKS lookup + pure claim checks).
+/// Authenticate a bearer token via OAuth (when configured) then API keys.
+///
+/// # Errors
+///
+/// Returns [`AuthRejection`] describing the failure class and, when owner
+/// logging is enabled, the matched credential owner, when the token is not a
+/// valid active credential.
+///
+/// # Cancel safety
+///
+/// No shared-state mutation. The Argon2 verification is offloaded to
+/// `spawn_blocking`; dropping its `JoinHandle` on cancellation detaches the
+/// task (the hash completes off-task, harmlessly) rather than tearing partial
+/// state. The OAuth branch delegates to `validate_token_detailed`, which is
+/// itself cancel-safe (read-only JWKS lookup + pure claim checks).
 async fn authenticate_bearer_identity(
     state: &AuthState,
     token: &str,
@@ -1970,8 +2107,8 @@ async fn authenticate_bearer_identity(
     let mut owner = None;
 
     #[cfg(feature = "oauth")]
-    if let Some(ref cache) = state.jwks_cache
-        && crate::oauth::looks_like_jwt(token)
+    if let Some(cache) = &state.jwks_cache
+        && looks_like_jwt(token)
     {
         match cache
             .validate_token_detailed(token, state.log_context.fields.credential_owner)
@@ -1983,25 +2120,21 @@ async fn authenticate_bearer_identity(
             }
             Err(rejection) => {
                 failure_class = match rejection.failure {
-                    crate::oauth::JwtValidationFailure::Expired => {
-                        AuthFailureClass::ExpiredCredential
-                    }
-                    crate::oauth::JwtValidationFailure::Invalid => {
-                        AuthFailureClass::InvalidCredential
-                    }
+                    JwtValidationFailure::Expired => AuthFailureClass::ExpiredCredential,
+                    JwtValidationFailure::Invalid => AuthFailureClass::InvalidCredential,
                 };
                 owner = rejection.owner;
             }
         }
     }
 
-    let token = token.to_owned();
+    let owned_token = token.to_owned();
     let keys = state.api_keys.load_full(); // Arc clone, lock-free
     let keys_for_verify = Arc::clone(&keys);
 
     // Argon2id is CPU-bound - offload to blocking thread pool.
     let verdict =
-        tokio::task::spawn_blocking(move || verify_bearer_token_verdict(&token, &keys_for_verify))
+        spawn_blocking(move || verify_bearer_token_verdict(&owned_token, &keys_for_verify))
             .await
             .ok();
 
@@ -2080,6 +2213,7 @@ fn pre_auth_gate(state: &AuthState, client_key: Option<&RateLimitKey>) -> Option
     }
 }
 
+/// Consult the post-failure limiter and build its rejection response.
 #[cfg_attr(
     not(feature = "metrics"),
     expect(
@@ -2092,13 +2226,13 @@ fn pre_auth_gate(state: &AuthState, client_key: Option<&RateLimitKey>) -> Option
 fn post_failure_rate_limit_response(
     limiter: &KeyedLimiter,
     key: &RateLimitKey,
-    extensions: &axum::http::Extensions,
+    extensions: &Extensions,
 ) -> Option<Response> {
     match limiter.check_key_detailed(key) {
         Ok(()) => None,
         Err(BoundedLimiterDeny::RateLimited(wait)) => {
             #[cfg(feature = "metrics")]
-            crate::metrics::record_rate_limit_deny(extensions, "auth_post");
+            record_rate_limit_deny(extensions, "auth_post");
             tracing::warn!(rate_limit_key = %key, "auth rate limited after repeated failures");
             Some(
                 RmcpServerKitError::RateLimitedFor {
@@ -2137,7 +2271,7 @@ fn post_failure_rate_limit_response(
 // post-failure prices failed auth, and identity extensions die with the request.
 pub(crate) async fn auth_middleware(
     state: Arc<AuthState>,
-    req: Request<Body>,
+    mut req: Request<Body>,
     next: Next,
 ) -> Response {
     // Extract the mTLS identity from ConnectInfo (TLS / mTLS:
@@ -2149,7 +2283,7 @@ pub(crate) async fn auth_middleware(
     // Resolved only when a limiter will actually consult it, so servers
     // with no rate limiting never trip the unattributed-fallback warning.
     let client_key = (state.pre_auth_limiter.is_some() || state.rate_limiter.is_some())
-        .then(|| crate::transport::limiter_client_key(req.extensions()));
+        .then(|| limiter_client_key(req.extensions()));
 
     // 1. Try mTLS identity (extracted by the TLS acceptor during handshake
     //    and attached to the connection itself).
@@ -2159,8 +2293,7 @@ pub(crate) async fn auth_middleware(
     //    so we trust them not to be a CPU-spray attacker.
     if let Some(id) = tls_info.and_then(|ci| ci.0.identity) {
         state.log_auth(&id, "mTLS");
-        let mut req = req;
-        req.extensions_mut().insert(id);
+        let _previous = req.extensions_mut().insert(id);
         return next.run(req).await;
     }
 
@@ -2169,7 +2302,7 @@ pub(crate) async fn auth_middleware(
     //    are exempt; this gate only protects the bearer/JWT verification path.
     if let Some(blocked) = pre_auth_gate(&state, client_key.as_ref()) {
         #[cfg(feature = "metrics")]
-        crate::metrics::record_rate_limit_deny(req.extensions(), "auth_pre");
+        record_rate_limit_deny(req.extensions(), "auth_pre");
         return blocked;
     }
 
@@ -2178,8 +2311,7 @@ pub(crate) async fn auth_middleware(
             Some(token) => match authenticate_bearer_identity(&state, token).await {
                 Ok(id) => {
                     state.log_auth(&id, auth_method_label(id.method));
-                    let mut req = req;
-                    req.extensions_mut().insert(id);
+                    let _previous = req.extensions_mut().insert(id);
                     return next.run(req).await;
                 }
                 Err(rejection) => (rejection.failure_class, rejection.owner),
@@ -3158,7 +3290,7 @@ mod tests {
 
     fn auth_request(uri: &str) -> Request<Body> {
         Request::builder()
-            .method(axum::http::Method::POST)
+            .method(Method::POST)
             .uri(uri)
             .body(Body::empty())
             .expect("request must build")
@@ -3408,7 +3540,7 @@ mod tests {
 
     #[test]
     fn user_agent_for_log_reads_the_header() {
-        let mut headers = axum::http::HeaderMap::new();
+        let mut headers = HeaderMap::new();
         assert_eq!(user_agent_for_log(&headers), "-");
 
         headers.insert(
@@ -3447,7 +3579,7 @@ mod tests {
         let state = test_auth_state(vec![]);
         let app = auth_router(Arc::clone(&state));
         let req = Request::builder()
-            .method(axum::http::Method::POST)
+            .method(Method::POST)
             .uri("/mcp")
             .body(Body::empty())
             .unwrap();
@@ -3477,7 +3609,7 @@ mod tests {
         let state = test_auth_state(keys);
         let app = auth_router(Arc::clone(&state));
         let req = Request::builder()
-            .method(axum::http::Method::POST)
+            .method(Method::POST)
             .uri("/mcp")
             .header("authorization", format!("Bearer {token}"))
             .body(Body::empty())
@@ -3501,7 +3633,7 @@ mod tests {
         let state = test_auth_state(keys);
         let app = auth_router(Arc::clone(&state));
         let req = Request::builder()
-            .method(axum::http::Method::POST)
+            .method(Method::POST)
             .uri("/mcp")
             .header("authorization", "Bearer wrong-token-here")
             .body(Body::empty())
@@ -3526,7 +3658,7 @@ mod tests {
         let state = test_auth_state(vec![key]);
         let app = auth_router(Arc::clone(&state));
         let req = Request::builder()
-            .method(axum::http::Method::POST)
+            .method(Method::POST)
             .uri("/mcp")
             .header(header::AUTHORIZATION, format!("Bearer {ARGON2_0_5_TOKEN}"))
             .body(Body::empty())
@@ -3549,7 +3681,7 @@ mod tests {
         assert_eq!(counters.failure_invalid_credential, 0);
 
         let req = Request::builder()
-            .method(axum::http::Method::POST)
+            .method(Method::POST)
             .uri("/mcp")
             .header(header::AUTHORIZATION, "Bearer garbage-token")
             .body(Body::empty())
@@ -3661,7 +3793,7 @@ mod tests {
 
         // First request: UNAUTHORIZED (no credentials, but not rate limited)
         let req = Request::builder()
-            .method(axum::http::Method::POST)
+            .method(Method::POST)
             .uri("/mcp")
             .body(Body::empty())
             .unwrap();
@@ -3892,7 +4024,7 @@ mod tests {
         // First bad-bearer request: gate has quota, bearer verification runs,
         // returns 401 (invalid credential).
         let mut req1 = Request::builder()
-            .method(axum::http::Method::POST)
+            .method(Method::POST)
             .uri("/mcp")
             .header("authorization", "Bearer obviously-not-a-real-token")
             .body(Body::empty())
@@ -3908,7 +4040,7 @@ mod tests {
         // Second bad-bearer request from same IP: gate quota exhausted, must
         // reject with 429 BEFORE the Argon2 verification path runs.
         let mut req2 = Request::builder()
-            .method(axum::http::Method::POST)
+            .method(Method::POST)
             .uri("/mcp")
             .header("authorization", "Bearer also-not-a-real-token")
             .body(Body::empty())
@@ -3976,7 +4108,7 @@ mod tests {
 
         for i in 0..3 {
             let mut req = Request::builder()
-                .method(axum::http::Method::POST)
+                .method(Method::POST)
                 .uri("/mcp")
                 .body(Body::empty())
                 .unwrap();
@@ -4030,7 +4162,7 @@ mod tests {
         let peer: SocketAddr = "10.0.0.30:54321".parse().expect("addr parses");
         let mk = || {
             let mut req = Request::builder()
-                .method(axum::http::Method::POST)
+                .method(Method::POST)
                 .uri("/mcp")
                 .header("authorization", "Bearer not-a-real-token")
                 .body(Body::empty())
@@ -4081,7 +4213,7 @@ mod tests {
         let peer: SocketAddr = "10.0.0.31:54321".parse().expect("addr parses");
         let mk = || {
             let mut req = Request::builder()
-                .method(axum::http::Method::POST)
+                .method(Method::POST)
                 .uri("/mcp")
                 .header("authorization", "Bearer not-a-real-token")
                 .body(Body::empty())
