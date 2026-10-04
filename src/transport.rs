@@ -9585,17 +9585,22 @@ mod tests {
         Ok(())
     }
 
-    /// Connects to the server, sends a minimal HTTP request, and reads the
-    /// response to EOF.
+    // The client-side stream type and the server-name type are used only by
+    // the mTLS resumption harness, so they are imported next to it.
+    use rustls::pki_types::ServerName;
+    use tokio_rustls::client::TlsStream as ClientTlsStream;
+
+    /// Connects, sends a minimal HTTP request, and reads the response to EOF.
     ///
-    /// The EOF read is required so the client's rustls state machine actually
+    /// Reading to EOF is required so the client's rustls state machine actually
     /// processes any post-handshake `NewSessionTicket` messages before the
     /// stream is dropped. Returns the live stream so the caller can inspect
     /// `handshake_kind()` afterward.
     ///
     /// # Errors
     ///
-    /// Returns an I/O error when connecting, writing, or reading fails.
+    /// Returns an [`io::Error`] when the TCP connect, the TLS handshake, the
+    /// request write, or the timeout-bounded response read fails.
     async fn connect_and_drive(
         connector: &tokio_rustls::TlsConnector,
         addr: SocketAddr,
@@ -9635,20 +9640,20 @@ mod tests {
         calls_after_second: usize,
     }
 
-    /// Stands up a fresh mTLS-verifying TLS server and matching client and
-    /// drives two sequential connections against it.
+    /// Stands up a fresh mTLS-verifying TLS server and a matching client.
     ///
-    /// `disable_resumption` controls the exact fix under test. The first
-    /// connection completes a full handshake; the verifier is then flipped to
-    /// reject everything and a second connection is driven. The outcome
-    /// reports whether the second connection resumed or re-verified.
+    /// `disable_resumption` controls the exact fix under test; the client has
+    /// in-memory session resumption enabled. Drives one full handshake to
+    /// completion, flips the verifier to reject-everything, drives a second
+    /// connection, and reports what happened.
     ///
     /// # Errors
     ///
-    /// Returns an error when the fixture PKI, TLS config, listener, or client
-    /// setup fails.
+    /// Returns an error when building the client verifier, the server TLS
+    /// config, the listener, the client config, or either connection fails
+    /// unexpectedly.
     async fn run_resumption_scenario(disable_resumption: bool) -> anyhow::Result<ScenarioOutcome> {
-        use rustls::server::WebPkiClientVerifier;
+        use rustls::{client::Resumption, server::WebPkiClientVerifier};
 
         let material = build_resumption_test_material()?;
 
@@ -9696,7 +9701,7 @@ mod tests {
             connect_and_drive(&connector, addr, server_name.clone()),
         );
         server_result_1.context("connection 1: server side must complete")?;
-        let _client_stream_1 =
+        let _client_1_stream =
             client_result_1.context("connection 1: full handshake must succeed")?;
 
         let calls_after_first = flip.calls.load(Ordering::SeqCst);
@@ -9720,6 +9725,9 @@ mod tests {
         })
     }
 
+    /// Pins that disabling resumption on an mTLS listener forces rustls to
+    /// re-verify the client certificate on every connection.
+    ///
     /// Regression test for the mTLS session-resumption bypass: rustls
     /// restores `peer_certificates` from cached session state on resumed
     /// handshakes without calling `ClientCertVerifier::verify_client_cert`,
@@ -9734,10 +9742,10 @@ mod tests {
     /// the wrong reason.
     #[tokio::test]
     async fn mtls_resumption_disabled_forces_full_reverification() -> anyhow::Result<()> {
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .ok();
+        use rustls::crypto::ring::default_provider;
 
+        // Another test may already have installed the process-wide provider.
+        let _install_result = default_provider().install_default();
         let fixed = run_resumption_scenario(true).await?;
         assert_eq!(
             fixed.calls_after_first, 1,
@@ -9782,132 +9790,170 @@ mod tests {
     // -- M5: OWASP security headers reach early / fallback responses --
 
     fn assert_owasp_headers(resp: &Response, ctx: &str) {
-        let h = resp.headers();
+        let headers = resp.headers();
         assert!(
-            h.contains_key("x-content-type-options"),
+            headers.contains_key("x-content-type-options"),
             "{ctx}: missing X-Content-Type-Options"
         );
         assert!(
-            h.contains_key("x-frame-options"),
+            headers.contains_key("x-frame-options"),
             "{ctx}: missing X-Frame-Options"
         );
         assert!(
-            h.contains_key("strict-transport-security"),
+            headers.contains_key("strict-transport-security"),
             "{ctx}: missing Strict-Transport-Security"
         );
         assert!(
-            h.contains_key(header::CONTENT_SECURITY_POLICY),
+            headers.contains_key(header::CONTENT_SECURITY_POLICY),
             "{ctx}: missing Content-Security-Policy"
         );
     }
 
-    fn m5_router(configure: impl FnOnce(&mut McpServerConfig)) -> axum::Router {
+    /// Builds the M5 fixture router with an optional global request cap.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `build_app_router` rejects the configured router.
+    fn m5_router(max_concurrent_requests: Option<usize>) -> anyhow::Result<axum::Router> {
         #[derive(Clone)]
-        struct H;
-        impl ServerHandler for H {}
+        struct ProbeHandler;
+        impl ServerHandler for ProbeHandler {}
         // TLS paths make `is_tls` true so HSTS is emitted. The paths are never
         // read: these tests drive only the axum router via `oneshot`, not the
         // TLS listener.
-        let mut config = McpServerConfig::new("127.0.0.1:8080", "test", "0.0.0")
+        let config = McpServerConfig::new("127.0.0.1:8080", "test", "0.0.0")
             .with_allowed_origins(["http://good.example"])
-            .with_tls("unused.crt", "unused.key");
-        configure(&mut config);
-        let (router, _params) = build_app_router(config, || H).expect("build_app_router");
-        router
+            .with_tls("unused.crt", "unused.key")
+            .with_optional_max_concurrent_requests(max_concurrent_requests);
+        let (router, _params) =
+            build_app_router(config, || ProbeHandler).context("build_app_router")?;
+        Ok(router)
     }
 
-    /// An `extra_router` route that exactly overlaps a framework route makes
-    /// `axum::Router::merge` panic during `build_app_router`. This pins that
-    /// upstream behaviour so the documented contract on `with_extra_router`
-    /// cannot silently stop holding.
+    /// Extra-router probe handler answering every request with the same body.
+    async fn extra_router_probe() -> &'static str {
+        "mine"
+    }
+
+    /// Pins that an `extra_router` route exactly overlapping a framework route
+    /// panics during `build_app_router`.
+    ///
+    /// This pins the upstream `axum::Router::merge` behaviour so the documented
+    /// contract on `with_extra_router` cannot silently stop holding.
     #[test]
     #[should_panic(expected = "Overlapping method route")]
     fn extra_router_exact_overlap_with_framework_route_panics() {
+        use axum::routing::get;
+
         #[derive(Clone)]
-        struct H;
-        impl ServerHandler for H {}
-        let config = McpServerConfig::new("127.0.0.1:8080", "test", "0.0.0").with_extra_router(
-            axum::Router::new().route("/healthz", axum::routing::get(|| async { "mine" })),
-        );
-        let _ = build_app_router(config, || H);
+        struct ProbeHandler;
+        impl ServerHandler for ProbeHandler {}
+        let config = McpServerConfig::new("127.0.0.1:8080", "test", "0.0.0")
+            .with_extra_router(axum::Router::new().route("/healthz", get(extra_router_probe)));
+        let _result = build_app_router(config, || ProbeHandler);
     }
 
-    /// The complement: a path *under* a framework prefix that does not exactly
-    /// overlap an existing route is accepted without complaint. Documented as
-    /// the caller's responsibility on `with_extra_router`.
+    /// Pins that a path under a framework prefix which does not exactly overlap
+    /// an existing route is accepted.
+    ///
+    /// Documented as the caller's responsibility on `with_extra_router`.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/transport.rs::extra_router_non_overlapping_path_under_framework_prefix_is_accepted — keeps the uniform IS-7 test signature while it only asserts that the router merge succeeds"
+    )]
     #[test]
-    fn extra_router_non_overlapping_path_under_framework_prefix_is_accepted() {
+    fn extra_router_non_overlapping_path_under_framework_prefix_is_accepted() -> anyhow::Result<()>
+    {
+        use axum::routing::get;
+
         #[derive(Clone)]
-        struct H;
-        impl ServerHandler for H {}
-        let config = McpServerConfig::new("127.0.0.1:8080", "test", "0.0.0").with_extra_router(
-            axum::Router::new().route("/admin/custom", axum::routing::get(|| async { "mine" })),
-        );
+        struct ProbeHandler;
+        impl ServerHandler for ProbeHandler {}
+        let config = McpServerConfig::new("127.0.0.1:8080", "test", "0.0.0")
+            .with_extra_router(axum::Router::new().route("/admin/custom", get(extra_router_probe)));
         assert!(
-            build_app_router(config, || H).is_ok(),
+            build_app_router(config, || ProbeHandler).is_ok(),
             "non-overlapping path under a framework prefix must merge cleanly"
         );
+
+        Ok(())
     }
 
+    /// Pins that a request from a rejected `Origin` still carries the OWASP
+    /// security headers on its 403.
     #[tokio::test]
-    async fn headers_on_rejected_origin_403() {
-        let app = m5_router(|_| {});
+    async fn headers_on_rejected_origin_403() -> anyhow::Result<()> {
+        let app = m5_router(None)?;
         let req = Request::builder()
             .uri("/healthz")
             .header(header::ORIGIN, "http://evil.example")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+            .body(Body::empty())?;
+        let resp = app.oneshot(req).await?;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         assert_owasp_headers(&resp, "origin-403");
+
+        Ok(())
     }
 
+    /// Pins that the CORS preflight response carries the OWASP security
+    /// headers.
     #[tokio::test]
-    async fn headers_on_cors_preflight() {
-        let app = m5_router(|_| {});
+    async fn headers_on_cors_preflight() -> anyhow::Result<()> {
+        let app = m5_router(None)?;
         let req = Request::builder()
             .method(Method::OPTIONS)
             .uri("/mcp")
             .header(header::ORIGIN, "http://good.example")
             .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+            .body(Body::empty())?;
+        let resp = app.oneshot(req).await?;
         assert_owasp_headers(&resp, "cors-preflight");
+
+        Ok(())
     }
 
+    /// Pins that the router's 404 fallback carries the OWASP security headers.
     #[tokio::test]
-    async fn headers_on_404_fallback() {
-        let app = m5_router(|_| {});
+    async fn headers_on_404_fallback() -> anyhow::Result<()> {
+        let app = m5_router(None)?;
         let req = Request::builder()
             .uri("/no-such-route")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+            .body(Body::empty())?;
+        let resp = app.oneshot(req).await?;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         assert_owasp_headers(&resp, "404-fallback");
+
+        Ok(())
     }
 
+    /// Pins that the overload-shed 503 response carries the OWASP security
+    /// headers.
     #[tokio::test]
-    async fn headers_on_overload_503() {
+    async fn headers_on_overload_503() -> anyhow::Result<()> {
         // A zero-permit concurrency cap sheds every request, so a single
         // oneshot deterministically surfaces the overload 503.
-        let app = m5_router(|c| c.max_concurrent_requests = Some(0));
-        let req = Request::builder()
-            .uri("/healthz")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+        let app = m5_router(Some(0))?;
+        let req = Request::builder().uri("/healthz").body(Body::empty())?;
+        let resp = app.oneshot(req).await?;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_owasp_headers(&resp, "overload-503");
+
+        Ok(())
     }
 
     // -- M6: OAuth proxy admin endpoints enforce the admin role --
 
+    /// Builds the M6 auth state holding one admin and one viewer API key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either API key cannot be generated.
     #[cfg(feature = "oauth")]
-    fn m6_auth_state(fields: LogContextConfig) -> (Arc<AuthState>, String, String) {
-        let (admin_token, admin_hash) = crate::auth::generate_api_key().unwrap();
-        let (viewer_token, viewer_hash) = crate::auth::generate_api_key().unwrap();
+    fn m6_auth_state(fields: LogContextConfig) -> anyhow::Result<(Arc<AuthState>, String, String)> {
+        use crate::auth::generate_api_key;
+
+        let (admin_token, admin_hash) = generate_api_key().context("admin api key")?;
+        let (viewer_token, viewer_hash) = generate_api_key().context("viewer api key")?;
         let state = Arc::new(AuthState {
             api_keys: ArcSwap::from_pointee(vec![
                 ApiKeyEntry::new("admin-key", admin_hash, "admin"),
@@ -9924,11 +9970,17 @@ mod tests {
                 fingerprint_salt: None,
             },
         });
-        (state, admin_token, viewer_token)
+        Ok((state, admin_token, viewer_token))
     }
 
+    /// Builds the M6 admin router with admin endpoints gated on the admin role.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the OAuth HTTP client or the admin router cannot
+    /// be built.
     #[cfg(feature = "oauth")]
-    fn m6_admin_router(state: &Arc<AuthState>) -> axum::Router {
+    fn m6_admin_router(state: &Arc<AuthState>) -> anyhow::Result<axum::Router> {
         let proxy = OAuthProxyConfig::builder(
             "https://idp.example/authorize",
             "https://idp.example/token",
@@ -9939,70 +9991,93 @@ mod tests {
         .expose_admin_endpoints(true)
         .require_auth_on_admin_endpoints(true)
         .build();
-        let http = OauthHttpClient::new().expect("oauth http client");
-        build_oauth_admin_router(&proxy, http, Some(state), "admin").expect("admin router")
+        // The client is an opaque handle here: every test asserts on the gate
+        // that rejects the request before any upstream URL is dialled.
+        let oauth_config = OAuthConfig::builder(
+            "https://idp.example/authorize",
+            "https://idp.example/token",
+            "https://idp.example/.well-known/jwks.json",
+        )
+        .build();
+        let http = OauthHttpClient::with_config(&oauth_config).context("oauth http client")?;
+        build_oauth_admin_router(&proxy, http, Some(state), "admin").context("admin router")
     }
 
+    /// Builds a POST request carrying a bearer token and a form body.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request builder rejects the URI or headers.
     #[cfg(feature = "oauth")]
-    fn m6_req(path: &str, token: &str) -> Request<Body> {
-        Request::builder()
+    fn m6_req(path: &str, token: &str) -> anyhow::Result<Request<Body>> {
+        let req = Request::builder()
             .method(Method::POST)
             .uri(path)
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .body(Body::from("token=abc"))
-            .unwrap()
+            .context("build request")?;
+        Ok(req)
     }
 
+    /// Pins that an admin-endpoint auth failure logs the client IP, peer IP,
+    /// and request line.
     #[cfg(feature = "oauth")]
     #[tokio::test]
-    async fn oauth_admin_auth_failure_carries_client_context() {
-        let (state, _admin, _viewer) = m6_auth_state(LogContextConfig::recommended());
+    async fn oauth_admin_auth_failure_carries_client_context() -> anyhow::Result<()> {
+        let (state, _admin, _viewer) = m6_auth_state(LogContextConfig::recommended())?;
         let logs = CapturedLogs::default();
         let _guard = capture_debug_logs(logs.clone());
-        let app = m6_admin_router(&state);
+        let app = m6_admin_router(&state)?;
         let req = Request::builder()
             .method(Method::POST)
             .uri("/introspect")
-            .extension(ConnectInfo("127.0.0.1:5555".parse::<SocketAddr>().unwrap()))
-            .body(Body::empty())
-            .unwrap();
+            .extension(ConnectInfo("127.0.0.1:5555".parse::<SocketAddr>()?))
+            .body(Body::empty())?;
 
-        let resp = app.oneshot(req).await.unwrap();
+        let resp = app.oneshot(req).await?;
 
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         let line = logs
             .lines_containing("auth failed")
             .into_iter()
             .next()
-            .unwrap_or_else(|| panic!("missing auth failed log: {}", logs.contents()));
+            .ok_or_else(|| anyhow::anyhow!("missing auth failed log: {}", logs.contents()))?;
         assert!(line.contains("client_ip=127.0.0.1"), "{line}");
         assert!(line.contains("peer_ip=127.0.0.1"), "{line}");
         assert!(line.contains("method=POST"), "{line}");
         assert!(line.contains("path=/introspect"), "{line}");
+
+        Ok(())
     }
 
+    /// Pins that an authenticated viewer is rejected with 403 on every admin
+    /// endpoint.
     #[cfg(feature = "oauth")]
     #[tokio::test]
-    async fn oauth_proxy_admin_requires_admin_role() {
-        let (state, _admin, viewer) = m6_auth_state(LogContextConfig::default());
+    async fn oauth_proxy_admin_requires_admin_role() -> anyhow::Result<()> {
+        let (state, _admin, viewer) = m6_auth_state(LogContextConfig::default())?;
         for path in ["/introspect", "/revoke"] {
-            let app = m6_admin_router(&state);
-            let resp = app.oneshot(m6_req(path, &viewer)).await.unwrap();
+            let app = m6_admin_router(&state)?;
+            let resp = app.oneshot(m6_req(path, &viewer)?).await?;
             assert_eq!(
                 resp.status(),
                 StatusCode::FORBIDDEN,
                 "an authenticated viewer must be rejected with 403 on {path}"
             );
         }
+
+        Ok(())
     }
 
+    /// Pins that an authenticated admin clears both the auth and the role gate
+    /// on every admin endpoint.
     #[cfg(feature = "oauth")]
     #[tokio::test]
-    async fn oauth_proxy_admin_allows_admin_role() {
-        let (state, admin, _viewer) = m6_auth_state(LogContextConfig::default());
+    async fn oauth_proxy_admin_allows_admin_role() -> anyhow::Result<()> {
+        let (state, admin, _viewer) = m6_auth_state(LogContextConfig::default())?;
         for path in ["/introspect", "/revoke"] {
-            let app = m6_admin_router(&state);
-            let resp = app.oneshot(m6_req(path, &admin)).await.unwrap();
+            let app = m6_admin_router(&state)?;
+            let resp = app.oneshot(m6_req(path, &admin)?).await?;
             // The admin identity clears both the auth and role gates; the
             // downstream introspection call then fails closed (no upstream),
             // so the only guarantee asserted is that it is neither 401 nor 403.
@@ -10017,6 +10092,8 @@ mod tests {
                 "an authenticated admin must pass the auth gate on {path}"
             );
         }
+
+        Ok(())
     }
 
     // -- F3 regression: unbounded Prometheus label cardinality --
@@ -10030,21 +10107,28 @@ mod tests {
     mod metrics_labels_bounded {
         use super::*;
 
-        fn labels_for(method: &str, uri: &str) -> (&'static str, String) {
+        /// Builds a request from `method`/`uri` and returns its metric labels.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error when the request builder rejects `method` or `uri`.
+        fn labels_for(method: &str, uri: &str) -> anyhow::Result<(&'static str, String)> {
             let req = Request::builder()
                 .method(method)
                 .uri(uri)
                 .body(Body::empty())
-                .unwrap();
-            metrics_labels(&req)
+                .context("build request")?;
+            Ok(metrics_labels(&req))
         }
 
+        /// Pins that many unmatched request paths collapse into one
+        /// `<unmatched>` metric label.
         #[test]
-        fn many_unmatched_paths_collapse_to_one_label() {
+        fn many_unmatched_paths_collapse_to_one_label() -> anyhow::Result<()> {
             let mut seen = HashSet::new();
-            for i in 0..500 {
-                let (_, path) = labels_for("GET", &format!("/nonexistent-{i}"));
-                seen.insert(path);
+            for i in 0..500_usize {
+                let (_, path) = labels_for("GET", &format!("/nonexistent-{i}"))?;
+                let _inserted = seen.insert(path);
             }
             assert_eq!(
                 seen.len(),
@@ -10052,50 +10136,65 @@ mod tests {
                 "unmatched paths must collapse to a single label, got {seen:?}"
             );
             assert!(seen.contains("<unmatched>"));
+
+            Ok(())
         }
 
+        /// Pins that nested `/mcp/...` paths collapse to the `/mcp`
+        /// mount-point label.
         #[test]
-        fn nested_mcp_paths_collapse_to_the_mount_point() {
+        fn nested_mcp_paths_collapse_to_the_mount_point() -> anyhow::Result<()> {
             let mut seen = HashSet::new();
-            for i in 0..200 {
-                let (_, path) = labels_for("POST", &format!("/mcp/{i}"));
-                seen.insert(path);
+            for i in 0..200_usize {
+                let (_, path) = labels_for("POST", &format!("/mcp/{i}"))?;
+                let _inserted = seen.insert(path);
             }
-            let (_, root) = labels_for("POST", "/mcp");
-            seen.insert(root);
+            let (_, root) = labels_for("POST", "/mcp")?;
+            let _inserted = seen.insert(root);
             assert_eq!(
                 seen.len(),
                 1,
                 "nested /mcp paths must collapse to one label, got {seen:?}"
             );
             assert!(seen.contains("/mcp"));
+
+            Ok(())
         }
 
+        /// Pins that unusual HTTP methods collapse into the `OTHER` bucket.
         #[test]
-        fn unusual_methods_collapse_to_one_bucket() {
+        fn unusual_methods_collapse_to_one_bucket() -> anyhow::Result<()> {
             let mut seen = HashSet::new();
             for verb in ["FROBNICATE", "WIBBLE", "QUUX", "M-SEARCH"] {
-                let (method, _) = labels_for(verb, "/healthz");
-                seen.insert(method);
+                let (method, _) = labels_for(verb, "/healthz")?;
+                let _inserted = seen.insert(method);
             }
             assert_eq!(seen, HashSet::from(["OTHER"]));
+
+            Ok(())
         }
 
+        /// Pins that known HTTP methods keep their own label identity.
         #[test]
-        fn known_methods_keep_their_identity() {
+        fn known_methods_keep_their_identity() -> anyhow::Result<()> {
             for verb in ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] {
-                let (method, _) = labels_for(verb, "/healthz");
+                let (method, _) = labels_for(verb, "/healthz")?;
                 assert_eq!(method, verb);
             }
+
+            Ok(())
         }
 
+        /// Pins that the raw request path never becomes a metric label value.
         #[test]
-        fn raw_path_never_leaks_into_a_label() {
-            let (_, path) = labels_for("GET", "/secret-token-abc123");
+        fn raw_path_never_leaks_into_a_label() -> anyhow::Result<()> {
+            let (_, path) = labels_for("GET", "/secret-token-abc123")?;
             assert!(
                 !path.contains("secret-token"),
                 "raw request path must never become a label value: {path}"
             );
+
+            Ok(())
         }
     }
 
@@ -10104,15 +10203,25 @@ mod tests {
     mod origin_semantics {
         use super::*;
 
-        fn allowed(entries: &[&str]) -> Vec<AllowedOrigin> {
+        /// Parses every entry into an allowed origin.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error when an entry is not a valid allowed origin.
+        fn allowed(entries: &[&str]) -> anyhow::Result<Vec<AllowedOrigin>> {
             entries
                 .iter()
-                .map(|entry| parse_allowed_origin(entry).expect("valid test entry"))
+                .map(|entry| parse_allowed_origin(entry).context("valid test entry"))
                 .collect()
         }
 
+        /// Pins that request-origin parsing normalizes scheme, host, and ports.
+        #[expect(
+            clippy::unnecessary_wraps,
+            reason = "deliberate: src/transport.rs::request_parse_normalizes_scheme_host_and_ports — keeps the uniform IS-7 test signature while it only asserts on parsed origin tuples"
+        )]
         #[test]
-        fn request_parse_normalizes_scheme_host_and_ports() {
+        fn request_parse_normalizes_scheme_host_and_ports() -> anyhow::Result<()> {
             assert_eq!(
                 parse_request_origin_tuple("https://example.com"),
                 Some(("https".to_owned(), "example.com".to_owned(), 443))
@@ -10134,10 +10243,18 @@ mod tests {
                 parse_request_origin_tuple("https://example.com"),
                 "explicit default port must equal the implicit form"
             );
+
+            Ok(())
         }
 
+        /// Pins that request-origin parsing rejects paths, queries, fragments,
+        /// and odd schemes.
+        #[expect(
+            clippy::unnecessary_wraps,
+            reason = "deliberate: src/transport.rs::request_parse_rejects_paths_queries_fragments_and_odd_schemes — keeps the uniform IS-7 test signature while it only asserts on rejected origin inputs"
+        )]
         #[test]
-        fn request_parse_rejects_paths_queries_fragments_and_odd_schemes() {
+        fn request_parse_rejects_paths_queries_fragments_and_odd_schemes() -> anyhow::Result<()> {
             for value in [
                 "https://example.com/",
                 "https://example.com/path",
@@ -10154,10 +10271,18 @@ mod tests {
                     "{value:?} must be rejected"
                 );
             }
+
+            Ok(())
         }
 
+        /// Pins that config-origin parsing tolerates exactly one trailing slash
+        /// on the root path.
+        #[expect(
+            clippy::unnecessary_wraps,
+            reason = "deliberate: src/transport.rs::config_parse_tolerates_one_root_trailing_slash_only — keeps the uniform IS-7 test signature while it only asserts on parsed config tuples"
+        )]
         #[test]
-        fn config_parse_tolerates_one_root_trailing_slash_only() {
+        fn config_parse_tolerates_one_root_trailing_slash_only() -> anyhow::Result<()> {
             assert_eq!(
                 parse_config_origin_tuple("https://example.com/"),
                 parse_config_origin_tuple("https://example.com")
@@ -10179,34 +10304,44 @@ mod tests {
                     "{value:?} must be rejected"
                 );
             }
+
+            Ok(())
         }
 
+        /// Pins that origin matching compares normalized tuples, not raw
+        /// strings.
         #[test]
-        fn matching_uses_normalized_equality_not_raw_strings() {
-            let set = allowed(&["HTTPS://Example.COM:443/"]);
+        fn matching_uses_normalized_equality_not_raw_strings() -> anyhow::Result<()> {
+            let set = allowed(&["HTTPS://Example.COM:443/"])?;
             assert!(request_origin_allowed("https://example.com", &set));
             assert!(request_origin_allowed("https://EXAMPLE.com:443", &set));
             assert!(
                 !request_origin_allowed("https://example.com:444", &set),
                 "non-default ports must match exactly; there is no wildcard"
             );
+
+            Ok(())
         }
 
+        /// Pins that the `null` origin is opt-in only.
         #[test]
-        fn null_is_opt_in() {
-            let without = allowed(&["https://example.com"]);
+        fn null_is_opt_in() -> anyhow::Result<()> {
+            let without = allowed(&["https://example.com"])?;
             assert!(!request_origin_allowed("null", &without));
             assert!(!request_origin_allowed("NULL", &without));
 
-            let with = allowed(&["null"]);
+            let with = allowed(&["null"])?;
             assert!(request_origin_allowed("null", &with));
             assert!(request_origin_allowed("NULL", &with));
             assert!(!request_origin_allowed("https://example.com", &with));
+
+            Ok(())
         }
 
+        /// Pins that malformed or non-matching request origins fail closed.
         #[test]
-        fn malformed_or_non_matching_origins_fail_closed() {
-            let set = allowed(&["https://example.com"]);
+        fn malformed_or_non_matching_origins_fail_closed() -> anyhow::Result<()> {
+            let set = allowed(&["https://example.com"])?;
             for value in [
                 "",
                 "garbage",
@@ -10219,10 +10354,18 @@ mod tests {
                     "{value:?} must not match"
                 );
             }
+
+            Ok(())
         }
 
+        /// Pins that non-canonical port spellings are rejected on the request
+        /// and config sides.
+        #[expect(
+            clippy::unnecessary_wraps,
+            reason = "deliberate: src/transport.rs::non_canonical_port_spellings_are_rejected — keeps the uniform IS-7 test signature while it only asserts on rejected port spellings"
+        )]
         #[test]
-        fn non_canonical_port_spellings_are_rejected() {
+        fn non_canonical_port_spellings_are_rejected() -> anyhow::Result<()> {
             // `str::parse::<u16>` alone accepts `+443` and ` 443`, and
             // normalizes `0443`; none of those is a canonical origin port.
             for value in [
@@ -10244,10 +10387,14 @@ mod tests {
                     "{value:?} must be rejected in config too"
                 );
             }
+
+            Ok(())
         }
 
+        /// Pins that a request carrying duplicated `Origin` headers is
+        /// rejected.
         #[tokio::test]
-        async fn duplicate_origin_headers_are_rejected() {
+        async fn duplicate_origin_headers_are_rejected() -> anyhow::Result<()> {
             // `Origin` is a single-value field; a request carrying two is
             // malformed and must fail closed regardless of which value matches.
             for values in [
@@ -10259,15 +10406,16 @@ mod tests {
                     .uri("/test")
                     .header(header::ORIGIN, values[0])
                     .header(header::ORIGIN, values[1])
-                    .body(Body::empty())
-                    .unwrap();
-                let resp = app.oneshot(req).await.unwrap();
+                    .body(Body::empty())?;
+                let resp = app.oneshot(req).await?;
                 assert_eq!(
                     resp.status(),
                     StatusCode::FORBIDDEN,
                     "duplicated Origin headers must fail closed: {values:?}"
                 );
             }
+
+            Ok(())
         }
     }
 
@@ -10279,31 +10427,38 @@ mod tests {
 
         use super::*;
 
-        /// A descriptor-equivalent replacement: same name, help, and variable
-        /// labels, but its own storage.
-        fn identical_squatter() -> IntCounterVec {
-            IntCounterVec::new(
+        /// Builds a descriptor-equivalent replacement: same name, help, and
+        /// variable labels, but its own storage.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error when the counter descriptor is rejected.
+        fn identical_squatter() -> anyhow::Result<IntCounterVec> {
+            let squatter = IntCounterVec::new(
                 opts!("rmcp_server_kit_http_requests_total", "Total HTTP requests"),
                 &["method", "path", "status"],
             )
-            .expect("counter builds")
+            .context("counter builds")?;
+            Ok(squatter)
         }
 
+        /// Pins that the guard evicts a descriptor-equivalent squatter and
+        /// rebinds the real collector.
         #[test]
-        fn identical_squatter_is_evicted_and_the_real_collector_rebound() {
-            let metrics = McpMetrics::new().expect("metrics build");
+        fn identical_squatter_is_evicted_and_the_real_collector_rebound() -> anyhow::Result<()> {
+            let metrics = McpMetrics::new().context("metrics build")?;
             // Drop the real collector, then let a same-shape squatter take the
             // name - the state the guard exists to repair.
             metrics
                 .registry
                 .unregister(Box::new(metrics.http_requests_total.clone()))
-                .expect("real collector was registered");
+                .context("real collector was registered")?;
             metrics
                 .registry
-                .register(Box::new(identical_squatter()))
-                .expect("squatter registers under the freed name");
+                .register(Box::new(identical_squatter()?))
+                .context("squatter registers under the freed name")?;
 
-            ensure_framework_metrics_registered(&metrics).expect("guard repairs the registry");
+            ensure_framework_metrics_registered(&metrics).context("guard repairs the registry")?;
 
             // The authoritative binding is restored: incrementing the real
             // collector now reaches the served registry (with a surviving
@@ -10317,19 +10472,22 @@ mod tests {
             let family = gathered
                 .iter()
                 .find(|family| family.name() == "rmcp_server_kit_http_requests_total")
-                .expect("framework family is served");
+                .context("framework family is served")?;
             assert_eq!(
                 family.get_metric().len(),
                 1,
                 "the real collector's sample must be served exactly once"
             );
+
+            Ok(())
         }
 
+        /// Pins that re-running the guard on a healthy registry is a no-op.
         #[test]
-        fn idempotent_on_a_healthy_registry() {
-            let metrics = McpMetrics::new().expect("metrics build");
-            ensure_framework_metrics_registered(&metrics).expect("first call is a no-op");
-            ensure_framework_metrics_registered(&metrics).expect("second call is a no-op");
+        fn idempotent_on_a_healthy_registry() -> anyhow::Result<()> {
+            let metrics = McpMetrics::new().context("metrics build")?;
+            ensure_framework_metrics_registered(&metrics).context("first call is a no-op")?;
+            ensure_framework_metrics_registered(&metrics).context("second call is a no-op")?;
 
             metrics
                 .http_requests_total
@@ -10345,15 +10503,19 @@ mod tests {
                 samples, 1,
                 "re-running the guard must not duplicate families"
             );
+
+            Ok(())
         }
 
+        /// Pins that a same-name, divergent-help squatter is rejected by the
+        /// registry and the guard restores the real collector.
         #[test]
-        fn divergent_help_cannot_be_registered_under_a_reserved_name() {
-            let metrics = McpMetrics::new().expect("metrics build");
+        fn divergent_help_cannot_be_registered_under_a_reserved_name() -> anyhow::Result<()> {
+            let metrics = McpMetrics::new().context("metrics build")?;
             metrics
                 .registry
                 .unregister(Box::new(metrics.http_requests_total.clone()))
-                .expect("real collector was registered");
+                .context("real collector was registered")?;
 
             // Same name, different help => different dim hash. The registry's
             // dim-hash map survives `unregister`, so the reserved namespace is
@@ -10362,11 +10524,12 @@ mod tests {
                 opts!("rmcp_server_kit_http_requests_total", "different help"),
                 &["method", "path", "status"],
             )
-            .expect("counter builds");
+            .context("counter builds")?;
             let error = metrics
                 .registry
                 .register(Box::new(squatter))
-                .expect_err("divergent-help squatter must be rejected");
+                .err()
+                .context("divergent-help squatter must be rejected")?;
             let rendered = format!("{error}");
             assert!(
                 rendered.contains("rmcp_server_kit_http_requests_total")
@@ -10376,16 +10539,21 @@ mod tests {
 
             // The guard then re-establishes the authoritative binding.
             ensure_framework_metrics_registered(&metrics)
-                .expect("guard restores the real collector");
+                .context("guard restores the real collector")?;
+
+            Ok(())
         }
 
+        /// Pins that a squatter adding a const label cannot land under a
+        /// reserved framework name.
         #[test]
-        fn added_const_label_name_cannot_be_registered_under_a_reserved_name() {
-            let metrics = McpMetrics::new().expect("metrics build");
+        fn added_const_label_name_cannot_be_registered_under_a_reserved_name() -> anyhow::Result<()>
+        {
+            let metrics = McpMetrics::new().context("metrics build")?;
             metrics
                 .registry
                 .unregister(Box::new(metrics.rate_limited_total.clone()))
-                .expect("real collector was registered");
+                .context("real collector was registered")?;
 
             let squatter = IntCounterVec::new(
                 prometheus::Opts::new(
@@ -10395,14 +10563,17 @@ mod tests {
                 .const_label("squatter", "yes"),
                 &["limiter"],
             )
-            .expect("counter builds");
-            metrics
+            .context("counter builds")?;
+            let _rejected = metrics
                 .registry
                 .register(Box::new(squatter))
-                .expect_err("const-label-divergent squatter must be rejected");
+                .err()
+                .context("const-label-divergent squatter must be rejected")?;
 
             ensure_framework_metrics_registered(&metrics)
-                .expect("guard restores the real collector");
+                .context("guard restores the real collector")?;
+
+            Ok(())
         }
     }
 }
