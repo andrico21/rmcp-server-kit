@@ -7815,65 +7815,92 @@ mod tests {
         );
     }
 
+    /// Pins that `ForwardedHeaderMode` deserializes from kebab-case wire
+    /// values and rejects `PascalCase` ones.
     #[test]
-    fn forwarded_header_mode_deserializes_kebab_case() {
-        #[derive(serde::Deserialize)]
+    fn forwarded_header_mode_deserializes_kebab_case() -> anyhow::Result<()> {
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
         struct Wrapper {
             mode: ForwardedHeaderMode,
         }
-        let w: Wrapper = toml::from_str(r#"mode = "x-forwarded-for""#).unwrap();
-        assert_eq!(w.mode, ForwardedHeaderMode::XForwardedFor);
-        let w: Wrapper = toml::from_str(r#"mode = "forwarded""#).unwrap();
-        assert_eq!(w.mode, ForwardedHeaderMode::Forwarded);
+        let wrapper_kebab: Wrapper = toml::from_str(r#"mode = "x-forwarded-for""#)?;
+        assert_eq!(wrapper_kebab.mode, ForwardedHeaderMode::XForwardedFor);
+        let wrapper_forwarded: Wrapper = toml::from_str(r#"mode = "forwarded""#)?;
+        assert_eq!(wrapper_forwarded.mode, ForwardedHeaderMode::Forwarded);
         assert!(
             toml::from_str::<Wrapper>(r#"mode = "XForwardedFor""#).is_err(),
             "PascalCase wire value must be rejected"
         );
+
+        Ok(())
     }
 
+    /// Pins that `validate` rejects a trusted-proxy entry that is not a CIDR
+    /// or bare IP.
     #[test]
-    fn validate_rejects_bad_trusted_proxy_entry() {
+    fn validate_rejects_bad_trusted_proxy_entry() -> anyhow::Result<()> {
         let cfg = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0")
             .with_trusted_proxies(["not-a-cidr"]);
-        let err = cfg.validate().expect_err("bad CIDR");
+        let err = cfg.validate().err().context("bad CIDR")?;
         assert!(err.to_string().contains("trusted_proxies"));
+
+        Ok(())
     }
 
+    /// Pins that `validate` rejects a zero-length trusted-proxy prefix.
     #[test]
-    fn validate_rejects_zero_prefix_trusted_proxy() {
+    fn validate_rejects_zero_prefix_trusted_proxy() -> anyhow::Result<()> {
         for entry in ["0.0.0.0/0", "::/0"] {
             let cfg =
                 McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0").with_trusted_proxies([entry]);
-            let err = cfg.validate().expect_err("zero-prefix CIDR");
+            let err = cfg.validate().err().context("zero-prefix CIDR")?;
             assert!(
                 err.to_string().contains("prefix length 0"),
                 "entry {entry}: {err}"
             );
         }
+
+        Ok(())
     }
 
+    /// Pins that trusted-proxy configuration accepts CIDRs and bare IPs.
     #[test]
-    fn validate_accepts_cidr_and_bare_ip_proxy_entries() {
+    fn validate_accepts_cidr_and_bare_ip_proxy_entries() -> anyhow::Result<()> {
         let cfg = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0").with_trusted_proxies([
             "10.0.0.0/8",
             "192.0.2.1",
             "2001:db8::1",
         ]);
-        assert!(cfg.validate().is_ok(), "CIDRs and bare IPs are accepted");
+        let _validated = cfg.validate().context("CIDRs and bare IPs are accepted")?;
+
+        Ok(())
     }
 
+    /// Pins that `validate` rejects a forwarded-header mode configured
+    /// without trusted proxies.
     #[test]
-    fn validate_rejects_forwarded_header_without_proxies() {
+    fn validate_rejects_forwarded_header_without_proxies() -> anyhow::Result<()> {
         let cfg = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0")
             .with_forwarded_header(ForwardedHeaderMode::Forwarded);
-        let err = cfg.validate().expect_err("mode without proxies");
+        let err = cfg.validate().err().context("mode without proxies")?;
         assert!(err.to_string().contains("requires trusted_proxies"));
+
+        Ok(())
     }
 
     // -- origin_check_middleware --
 
+    /// Axum handler shared by the middleware test routers: replies `ok`.
+    async fn ok_handler() -> &'static str {
+        "ok"
+    }
+
     /// Build a test router with origin check middleware and a simple handler.
     fn origin_router(origins: Vec<String>, log_request_headers: bool) -> axum::Router {
+        use axum::{middleware::from_fn, routing::get};
+
         let allowed: Arc<[AllowedOrigin]> = Arc::from(
             origins
                 .into_iter()
@@ -7886,87 +7913,108 @@ mod tests {
             fields: LogContextConfig::default(),
         });
         axum::Router::new()
-            .route("/test", axum::routing::get(|| async { "ok" }))
-            .layer(axum::middleware::from_fn(move |req, next| {
-                let a = Arc::clone(&allowed);
-                let l = Arc::clone(&request_log);
-                origin_check_middleware(a, l, req, next)
+            .route("/test", get(ok_handler))
+            .layer(from_fn(move |req, next| {
+                let allowed_for_middleware = Arc::clone(&allowed);
+                let log_for_middleware = Arc::clone(&request_log);
+                origin_check_middleware(allowed_for_middleware, log_for_middleware, req, next)
             }))
     }
 
+    /// Pins that a request whose Origin is on the allowlist reaches the
+    /// handler.
     #[tokio::test]
-    async fn origin_allowed_passes() {
+    async fn origin_allowed_passes() -> anyhow::Result<()> {
         let app = origin_router(vec!["http://localhost:3000".into()], false);
         let req = Request::builder()
             .uri("/test")
             .header(header::ORIGIN, "http://localhost:3000")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+            .body(Body::empty())?;
+        let resp = app.oneshot(req).await?;
         assert_eq!(resp.status(), StatusCode::OK);
+
+        Ok(())
     }
 
+    /// Pins that a request whose Origin is not on the allowlist is rejected
+    /// with 403.
     #[tokio::test]
-    async fn origin_rejected_returns_403() {
+    async fn origin_rejected_returns_403() -> anyhow::Result<()> {
         let app = origin_router(vec!["http://localhost:3000".into()], false);
         let req = Request::builder()
             .uri("/test")
             .header(header::ORIGIN, "http://evil.com")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+            .body(Body::empty())?;
+        let resp = app.oneshot(req).await?;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        Ok(())
     }
 
+    /// Pins that a request without an Origin header is allowed.
     #[tokio::test]
-    async fn no_origin_header_passes() {
+    async fn no_origin_header_passes() -> anyhow::Result<()> {
         let app = origin_router(vec!["http://localhost:3000".into()], false);
-        let req = Request::builder().uri("/test").body(Body::empty()).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+        let req = Request::builder().uri("/test").body(Body::empty())?;
+        let resp = app.oneshot(req).await?;
         assert_eq!(resp.status(), StatusCode::OK);
+
+        Ok(())
     }
 
+    /// Pins that an empty allowlist rejects any request carrying an Origin.
     #[tokio::test]
-    async fn empty_allowlist_rejects_any_origin() {
+    async fn empty_allowlist_rejects_any_origin() -> anyhow::Result<()> {
         let app = origin_router(vec![], false);
         let req = Request::builder()
             .uri("/test")
             .header(header::ORIGIN, "http://anything.com")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+            .body(Body::empty())?;
+        let resp = app.oneshot(req).await?;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        Ok(())
     }
 
+    /// Pins that an empty allowlist still allows requests without an Origin.
     #[tokio::test]
-    async fn empty_allowlist_passes_without_origin() {
+    async fn empty_allowlist_passes_without_origin() -> anyhow::Result<()> {
         let app = origin_router(vec![], false);
-        let req = Request::builder().uri("/test").body(Body::empty()).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+        let req = Request::builder().uri("/test").body(Body::empty())?;
+        let resp = app.oneshot(req).await?;
         assert_eq!(resp.status(), StatusCode::OK);
+
+        Ok(())
     }
 
+    /// Pins that request-header logging redacts sensitive credential values.
     #[test]
-    fn format_request_headers_redacts_sensitive_values() {
+    fn format_request_headers_redacts_sensitive_values() -> anyhow::Result<()> {
         let mut headers = HeaderMap::new();
-        headers.insert("authorization", "Bearer secret-token".parse().unwrap());
-        headers.insert("cookie", "sid=abc".parse().unwrap());
-        headers.insert("x-request-id", "req-123".parse().unwrap());
+        let _previous_authorization =
+            headers.insert("authorization", "Bearer secret-token".parse()?);
+        let _previous_cookie = headers.insert("cookie", "sid=abc".parse()?);
+        let _previous_request_id = headers.insert("x-request-id", "req-123".parse()?);
 
         let out = format_request_headers_for_log(&headers);
         assert!(out.contains("authorization: [REDACTED]"));
         assert!(out.contains("cookie: [REDACTED]"));
         assert!(out.contains("x-request-id: req-123"));
         assert!(!out.contains("secret-token"));
+
+        Ok(())
     }
 
+    /// Pins that request-header logging redacts client-IP and proxy-topology
+    /// forwarding headers.
     #[test]
-    fn format_request_headers_redacts_forwarding_headers() {
+    fn format_request_headers_redacts_forwarding_headers() -> anyhow::Result<()> {
         let mut headers = HeaderMap::new();
-        headers.insert("forwarded", "for=203.0.113.9;by=10.1.2.3".parse().unwrap());
-        headers.insert("x-forwarded-for", "203.0.113.9, 10.1.2.3".parse().unwrap());
-        headers.insert("x-real-ip", "203.0.113.9".parse().unwrap());
-        headers.insert("x-request-id", "req-123".parse().unwrap());
+        let _previous_forwarded =
+            headers.insert("forwarded", "for=203.0.113.9;by=10.1.2.3".parse()?);
+        let _previous_xff = headers.insert("x-forwarded-for", "203.0.113.9, 10.1.2.3".parse()?);
+        let _previous_xri = headers.insert("x-real-ip", "203.0.113.9".parse()?);
+        let _previous_request_id = headers.insert("x-request-id", "req-123".parse()?);
 
         let out = format_request_headers_for_log(&headers);
         for name in ["forwarded", "x-forwarded-for", "x-real-ip"] {
@@ -7980,6 +8028,8 @@ mod tests {
             "no forwarded address may survive redaction; got {out}"
         );
         assert!(out.contains("x-request-id: req-123"));
+
+        Ok(())
     }
 
     // -- security_headers_middleware --
@@ -7989,98 +8039,173 @@ mod tests {
     }
 
     fn security_router_with(is_tls: bool, cfg: SecurityHeadersConfig) -> axum::Router {
-        let cfg = Arc::new(cfg);
+        use axum::{middleware::from_fn, routing::get};
+
+        let shared_cfg = Arc::new(cfg);
         axum::Router::new()
-            .route("/test", axum::routing::get(|| async { "ok" }))
-            .layer(axum::middleware::from_fn(move |req, next| {
-                let c = Arc::clone(&cfg);
-                security_headers_middleware(is_tls, c, req, next)
+            .route("/test", get(ok_handler))
+            .layer(from_fn(move |req, next| {
+                let cfg_for_middleware = Arc::clone(&shared_cfg);
+                security_headers_middleware(is_tls, cfg_for_middleware, req, next)
             }))
     }
 
+    /// Pins the full default set of security headers emitted on a plaintext
+    /// response, including the absence of HSTS.
     #[tokio::test]
-    async fn security_headers_set_on_response() {
+    async fn security_headers_set_on_response() -> anyhow::Result<()> {
         let app = security_router(false);
-        let req = Request::builder().uri("/test").body(Body::empty()).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+        let req = Request::builder().uri("/test").body(Body::empty())?;
+        let resp = app.oneshot(req).await?;
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let h = resp.headers();
-        assert_eq!(h.get("x-content-type-options").unwrap(), "nosniff");
-        assert_eq!(h.get("x-frame-options").unwrap(), "deny");
-        assert_eq!(h.get("cache-control").unwrap(), "no-store, max-age=0");
-        assert_eq!(h.get("referrer-policy").unwrap(), "no-referrer");
-        assert_eq!(h.get("cross-origin-opener-policy").unwrap(), "same-origin");
+        let headers = resp.headers();
         assert_eq!(
-            h.get("cross-origin-resource-policy").unwrap(),
+            headers
+                .get("x-content-type-options")
+                .context("x-content-type-options must be set")?,
+            "nosniff"
+        );
+        assert_eq!(
+            headers
+                .get("x-frame-options")
+                .context("x-frame-options must be set")?,
+            "deny"
+        );
+        assert_eq!(
+            headers
+                .get("cache-control")
+                .context("cache-control must be set")?,
+            "no-store, max-age=0"
+        );
+        assert_eq!(
+            headers
+                .get("referrer-policy")
+                .context("referrer-policy must be set")?,
+            "no-referrer"
+        );
+        assert_eq!(
+            headers
+                .get("cross-origin-opener-policy")
+                .context("cross-origin-opener-policy must be set")?,
             "same-origin"
         );
         assert_eq!(
-            h.get("cross-origin-embedder-policy").unwrap(),
+            headers
+                .get("cross-origin-resource-policy")
+                .context("cross-origin-resource-policy must be set")?,
+            "same-origin"
+        );
+        assert_eq!(
+            headers
+                .get("cross-origin-embedder-policy")
+                .context("cross-origin-embedder-policy must be set")?,
             "require-corp"
         );
-        assert_eq!(h.get("x-permitted-cross-domain-policies").unwrap(), "none");
+        assert_eq!(
+            headers
+                .get("x-permitted-cross-domain-policies")
+                .context("x-permitted-cross-domain-policies must be set")?,
+            "none"
+        );
         assert!(
-            h.get("permissions-policy")
-                .unwrap()
+            headers
+                .get("permissions-policy")
+                .context("permissions-policy must be set")?
                 .to_str()
-                .unwrap()
+                .context("permissions-policy must be valid ASCII")?
                 .contains("camera=()"),
             "permissions-policy must restrict browser features"
         );
         assert_eq!(
-            h.get("content-security-policy").unwrap(),
+            headers
+                .get("content-security-policy")
+                .context("content-security-policy must be set")?,
             "default-src 'none'; form-action 'self'; object-src 'none'; frame-ancestors 'none'; upgrade-insecure-requests"
         );
-        assert_eq!(h.get("x-dns-prefetch-control").unwrap(), "off");
+        assert_eq!(
+            headers
+                .get("x-dns-prefetch-control")
+                .context("x-dns-prefetch-control must be set")?,
+            "off"
+        );
         // No HSTS when TLS is off.
-        assert!(h.get("strict-transport-security").is_none());
+        assert!(headers.get("strict-transport-security").is_none());
+
+        Ok(())
     }
 
+    /// Pins that HSTS is emitted with a two-year max-age when TLS is enabled.
     #[tokio::test]
-    async fn hsts_set_when_tls_enabled() {
+    async fn hsts_set_when_tls_enabled() -> anyhow::Result<()> {
         let app = security_router(true);
-        let req = Request::builder().uri("/test").body(Body::empty()).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+        let req = Request::builder().uri("/test").body(Body::empty())?;
+        let resp = app.oneshot(req).await?;
 
-        let hsts = resp.headers().get("strict-transport-security").unwrap();
+        let hsts = resp
+            .headers()
+            .get("strict-transport-security")
+            .context("strict-transport-security must be set")?;
         assert!(
-            hsts.to_str().unwrap().contains("max-age=63072000"),
+            hsts.to_str()
+                .context("strict-transport-security must be valid ASCII")?
+                .contains("max-age=63072000"),
             "HSTS must set 2-year max-age"
         );
+
+        Ok(())
     }
 
+    /// Pins that the default Content-Security-Policy matches the documented
+    /// guideline.
     #[tokio::test]
-    async fn default_csp_matches_guideline() {
+    async fn default_csp_matches_guideline() -> anyhow::Result<()> {
         let app = security_router(false);
-        let req = Request::builder().uri("/test").body(Body::empty()).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+        let req = Request::builder().uri("/test").body(Body::empty())?;
+        let resp = app.oneshot(req).await?;
         assert_eq!(
-            resp.headers().get("content-security-policy").unwrap(),
+            resp.headers()
+                .get("content-security-policy")
+                .context("content-security-policy must be set")?,
             "default-src 'none'; form-action 'self'; object-src 'none'; frame-ancestors 'none'; upgrade-insecure-requests"
         );
+
+        Ok(())
     }
 
+    /// Pins that an operator-supplied Content-Security-Policy overrides the
+    /// default.
     #[tokio::test]
-    async fn operator_csp_override_still_wins() {
+    async fn operator_csp_override_still_wins() -> anyhow::Result<()> {
         let cfg = SecurityHeadersConfig {
             content_security_policy: Some("default-src 'self'".into()),
             ..SecurityHeadersConfig::default()
         };
         let app = security_router_with(false, cfg);
-        let req = Request::builder().uri("/test").body(Body::empty()).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+        let req = Request::builder().uri("/test").body(Body::empty())?;
+        let resp = app.oneshot(req).await?;
         assert_eq!(
-            resp.headers().get("content-security-policy").unwrap(),
+            resp.headers()
+                .get("content-security-policy")
+                .context("content-security-policy must be set")?,
             "default-src 'self'"
         );
+
+        Ok(())
     }
 
     // -- SecurityHeadersConfig validation + override semantics --
 
-    /// Build a minimal config with a custom SecurityHeadersConfig and
-    /// drive it through `check()`. Returns the result so individual
-    /// tests can assert on success or specific error messages.
+    /// Build a minimal config with a custom `SecurityHeadersConfig` and drive
+    /// it through `check()`.
+    ///
+    /// Returns the result so individual tests can assert on success or
+    /// specific error messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `RmcpServerKitError` when the configured security headers
+    /// fail validation.
     fn check_with_security_headers(
         headers: SecurityHeadersConfig,
     ) -> Result<(), RmcpServerKitError> {
@@ -8089,16 +8214,21 @@ mod tests {
         cfg.check()
     }
 
+    /// Pins that the default `SecurityHeadersConfig` passes validation.
     #[test]
-    fn security_headers_config_default_validates() {
+    fn security_headers_config_default_validates() -> anyhow::Result<()> {
         check_with_security_headers(SecurityHeadersConfig::default())
-            .expect("default SecurityHeadersConfig must validate");
+            .context("default SecurityHeadersConfig must validate")?;
+
+        Ok(())
     }
 
+    /// Pins that explicitly empty string security-header values validate
+    /// (omit-everything mode).
     #[test]
-    fn security_headers_config_validate_accepts_empty_string() {
+    fn security_headers_config_validate_accepts_empty_string() -> anyhow::Result<()> {
         // All twelve fields explicitly set to "" -> omit-everything mode.
-        let h = SecurityHeadersConfig {
+        let headers_config = SecurityHeadersConfig {
             x_content_type_options: Some(String::new()),
             x_frame_options: Some(String::new()),
             cache_control: Some(String::new()),
@@ -8112,32 +8242,44 @@ mod tests {
             x_dns_prefetch_control: Some(String::new()),
             strict_transport_security: Some(String::new()),
         };
-        check_with_security_headers(h).expect("Some(\"\") on every field must validate (omit-all)");
+        check_with_security_headers(headers_config)
+            .context("Some(\"\") on every field must validate (omit-all)")?;
+
+        Ok(())
     }
 
+    /// Pins that a control character in a security-header value is rejected
+    /// and named in the error.
     #[test]
-    fn security_headers_config_validate_rejects_bad_value() {
+    fn security_headers_config_validate_rejects_bad_value() -> anyhow::Result<()> {
         // 0x07 (BEL) is not a valid HTTP header value char.
-        let h = SecurityHeadersConfig {
+        let headers_config = SecurityHeadersConfig {
             referrer_policy: Some("\u{0007}".into()),
             ..SecurityHeadersConfig::default()
         };
-        let err = check_with_security_headers(h)
-            .expect_err("control char in referrer_policy must reject");
+        let err = check_with_security_headers(headers_config)
+            .err()
+            .context("control char in referrer_policy must reject")?;
         let msg = err.to_string();
         assert!(
             msg.contains("referrer_policy"),
             "error must name the offending field, got: {msg}"
         );
+
+        Ok(())
     }
 
+    /// Pins that an HSTS value containing `preload` is rejected and the error
+    /// names the field and the offending token.
     #[test]
-    fn security_headers_config_validate_rejects_hsts_preload() {
-        let h = SecurityHeadersConfig {
+    fn security_headers_config_validate_rejects_hsts_preload() -> anyhow::Result<()> {
+        let headers_config = SecurityHeadersConfig {
             strict_transport_security: Some("max-age=63072000; includeSubDomains; preload".into()),
             ..SecurityHeadersConfig::default()
         };
-        let err = check_with_security_headers(h).expect_err("HSTS with preload must reject");
+        let err = check_with_security_headers(headers_config)
+            .err()
+            .context("HSTS with preload must reject")?;
         let msg = err.to_string();
         assert!(
             msg.contains("strict_transport_security"),
@@ -8147,44 +8289,64 @@ mod tests {
             msg.to_lowercase().contains("preload"),
             "error must mention `preload`, got: {msg}"
         );
+
+        Ok(())
     }
 
+    /// Pins that the HSTS preload rejection is case-insensitive.
     #[test]
-    fn security_headers_config_validate_rejects_hsts_preload_uppercase() {
+    fn security_headers_config_validate_rejects_hsts_preload_uppercase() -> anyhow::Result<()> {
         // Case-insensitive match.
-        let h = SecurityHeadersConfig {
+        let headers_config = SecurityHeadersConfig {
             strict_transport_security: Some("max-age=600; PRELOAD".into()),
             ..SecurityHeadersConfig::default()
         };
-        check_with_security_headers(h).expect_err("HSTS preload check must be case-insensitive");
+        let error = check_with_security_headers(headers_config)
+            .err()
+            .context("HSTS preload check must be case-insensitive")?;
+        assert!(
+            error.to_string().to_lowercase().contains("preload"),
+            "uppercase PRELOAD must still be rejected, got: {error}"
+        );
+
+        Ok(())
     }
 
+    /// Pins that an operator override of a security header replaces the
+    /// default value.
     #[tokio::test]
-    async fn security_headers_override_honored() {
+    async fn security_headers_override_honored() -> anyhow::Result<()> {
         // Override X-Frame-Options to SAMEORIGIN.
-        let h = SecurityHeadersConfig {
+        let headers_config = SecurityHeadersConfig {
             x_frame_options: Some("SAMEORIGIN".into()),
             ..SecurityHeadersConfig::default()
         };
-        let app = security_router_with(false, h);
-        let req = Request::builder().uri("/test").body(Body::empty()).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+        let app = security_router_with(false, headers_config);
+        let req = Request::builder().uri("/test").body(Body::empty())?;
+        let resp = app.oneshot(req).await?;
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let xfo = resp.headers().get("x-frame-options").unwrap();
+        let xfo = resp
+            .headers()
+            .get("x-frame-options")
+            .context("x-frame-options must be set")?;
         assert_eq!(xfo, "SAMEORIGIN");
+
+        Ok(())
     }
 
+    /// Pins that an empty-string override omits its header while other
+    /// defaults remain set.
     #[tokio::test]
-    async fn security_headers_empty_string_omits() {
+    async fn security_headers_empty_string_omits() -> anyhow::Result<()> {
         // Empty string on referrer-policy -> header absent.
-        let h = SecurityHeadersConfig {
+        let headers_config = SecurityHeadersConfig {
             referrer_policy: Some(String::new()),
             ..SecurityHeadersConfig::default()
         };
-        let app = security_router_with(false, h);
-        let req = Request::builder().uri("/test").body(Body::empty()).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+        let app = security_router_with(false, headers_config);
+        let req = Request::builder().uri("/test").body(Body::empty())?;
+        let resp = app.oneshot(req).await?;
         assert_eq!(resp.status(), StatusCode::OK);
 
         assert!(
@@ -8193,269 +8355,353 @@ mod tests {
         );
         // Other defaults should still be present.
         assert_eq!(
-            resp.headers().get("x-content-type-options").unwrap(),
+            resp.headers()
+                .get("x-content-type-options")
+                .context("x-content-type-options must be set")?,
             "nosniff"
         );
+
+        Ok(())
     }
 
+    /// Pins that HSTS stays absent on plaintext deployments even when an
+    /// override is configured.
     #[tokio::test]
-    async fn security_headers_hsts_only_when_tls() {
+    async fn security_headers_hsts_only_when_tls() -> anyhow::Result<()> {
         // HSTS override is irrelevant when TLS is off.
-        let h = SecurityHeadersConfig {
+        let headers_config = SecurityHeadersConfig {
             strict_transport_security: Some("max-age=600".into()),
             ..SecurityHeadersConfig::default()
         };
-        let app = security_router_with(false, h);
-        let req = Request::builder().uri("/test").body(Body::empty()).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+        let app = security_router_with(false, headers_config);
+        let req = Request::builder().uri("/test").body(Body::empty())?;
+        let resp = app.oneshot(req).await?;
         assert!(
             resp.headers().get("strict-transport-security").is_none(),
             "HSTS must remain absent on plaintext deployments even with override"
         );
+
+        Ok(())
     }
 
     // -- oauth_token_cache_headers_middleware --
 
+    /// Axum handler shared by the OAuth middleware tests: replies `{}`.
+    #[cfg(feature = "oauth")]
+    async fn json_ok_handler() -> &'static str {
+        "{}"
+    }
+
+    /// Axum handler for the Vary-preservation test: replies with a pre-set
+    /// `Vary: Accept-Encoding` header.
+    #[cfg(feature = "oauth")]
+    async fn vary_accept_encoding_handler() -> Response {
+        use axum::http::HeaderValue;
+
+        let mut response = Response::new(Body::from("{}"));
+        let _previous = response
+            .headers_mut()
+            .insert("vary", HeaderValue::from_static("Accept-Encoding"));
+        response
+    }
+
+    /// Pins that the OAuth token-cache middleware sets `Pragma: no-cache` and
+    /// appends `Authorization` to `Vary`.
     #[cfg(feature = "oauth")]
     #[tokio::test]
-    async fn oauth_token_cache_headers_set_pragma_and_vary() {
+    async fn oauth_token_cache_headers_set_pragma_and_vary() -> anyhow::Result<()> {
+        use axum::{middleware::from_fn, routing::post};
+
         let app = axum::Router::new()
-            .route("/token", axum::routing::post(|| async { "{}" }))
-            .layer(axum::middleware::from_fn(
-                oauth_token_cache_headers_middleware,
-            ));
+            .route("/token", post(json_ok_handler))
+            .layer(from_fn(oauth_token_cache_headers_middleware));
         let req = Request::builder()
             .method("POST")
             .uri("/token")
-            .body(Body::from("{}"))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+            .body(Body::from("{}"))?;
+        let resp = app.oneshot(req).await?;
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let h = resp.headers();
+        let headers = resp.headers();
         assert_eq!(
-            h.get("pragma").unwrap(),
+            headers.get("pragma").context("pragma must be set")?,
             "no-cache",
-            "RFC 6749 §5.1: token responses must set Pragma: no-cache"
+            "RFC 6749 \u{a7}5.1: token responses must set Pragma: no-cache"
         );
-        let vary_values: Vec<String> = h
+        let vary_values: Vec<String> = headers
             .get_all("vary")
             .iter()
-            .filter_map(|v| v.to_str().ok().map(str::to_owned))
+            .filter_map(|value| value.to_str().ok().map(str::to_owned))
             .collect();
         assert!(
             vary_values
                 .iter()
-                .any(|v| v.eq_ignore_ascii_case("Authorization")),
-            "RFC 6750 §5.4: Vary must include Authorization, got {vary_values:?}"
+                .any(|value| value.eq_ignore_ascii_case("Authorization")),
+            "RFC 6750 \u{a7}5.4: Vary must include Authorization, got {vary_values:?}"
         );
+
+        Ok(())
     }
 
+    /// Pins that the OAuth token-cache middleware appends `Authorization` to a
+    /// pre-existing `Vary` value instead of replacing it.
     #[cfg(feature = "oauth")]
     #[tokio::test]
-    async fn oauth_token_cache_headers_preserve_existing_vary() {
+    async fn oauth_token_cache_headers_preserve_existing_vary() -> anyhow::Result<()> {
+        use axum::{middleware::from_fn, routing::post};
+
         // Simulates a handler/layer that already set `Vary: Accept-Encoding`
         // (e.g. compression). Our middleware must APPEND, not REPLACE.
         let app = axum::Router::new()
-            .route(
-                "/token",
-                axum::routing::post(|| async {
-                    Response::builder()
-                        .header("vary", "Accept-Encoding")
-                        .body(Body::from("{}"))
-                        .unwrap()
-                }),
-            )
-            .layer(axum::middleware::from_fn(
-                oauth_token_cache_headers_middleware,
-            ));
+            .route("/token", post(vary_accept_encoding_handler))
+            .layer(from_fn(oauth_token_cache_headers_middleware));
         let req = Request::builder()
             .method("POST")
             .uri("/token")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+            .body(Body::empty())?;
+        let resp = app.oneshot(req).await?;
 
         let vary: Vec<String> = resp
             .headers()
             .get_all("vary")
             .iter()
-            .filter_map(|v| v.to_str().ok().map(str::to_owned))
+            .filter_map(|value| value.to_str().ok().map(str::to_owned))
             .collect();
         assert!(
-            vary.iter().any(|v| v.contains("Accept-Encoding")),
+            vary.iter().any(|value| value.contains("Accept-Encoding")),
             "must preserve pre-existing Vary value, got {vary:?}"
         );
         assert!(
-            vary.iter().any(|v| v.contains("Authorization")),
+            vary.iter().any(|value| value.contains("Authorization")),
             "must append Authorization to Vary, got {vary:?}"
         );
+
+        Ok(())
     }
 
     // -- version endpoint --
 
+    /// Pins that the version payload hides build fingerprint fields by
+    /// default.
     #[test]
-    fn version_omits_build_fingerprint_by_default() {
-        let v = version_payload("my-server", "1.2.3", false);
-        assert_eq!(v["name"], "my-server");
-        assert_eq!(v["version"], "1.2.3");
-        assert!(v["rmcp_server_kit_version"].is_string());
+    fn version_omits_build_fingerprint_by_default() -> anyhow::Result<()> {
+        let version = version_payload("my-server", "1.2.3", false);
+        assert_eq!(
+            version.get("name").context("name must be present")?,
+            "my-server"
+        );
+        assert_eq!(
+            version.get("version").context("version must be present")?,
+            "1.2.3"
+        );
         assert!(
-            v.get("build_git_sha").is_none(),
+            version
+                .get("rmcp_server_kit_version")
+                .context("rmcp_server_kit_version must be present")?
+                .is_string()
+        );
+        assert!(
+            version.get("build_git_sha").is_none(),
             "build sha must be hidden by default"
         );
-        assert!(v.get("build_timestamp").is_none());
-        assert!(v.get("rust_version").is_none());
+        assert!(version.get("build_timestamp").is_none());
+        assert!(version.get("rust_version").is_none());
+
+        Ok(())
     }
 
+    /// Pins that the version payload exposes every build field when enabled.
     #[test]
-    fn version_exposes_all_when_enabled() {
-        let v = version_payload("my-server", "1.2.3", true);
-        assert!(v["build_git_sha"].is_string());
-        assert!(v["build_timestamp"].is_string());
-        assert!(v["rust_version"].is_string());
-        assert!(v["rmcp_server_kit_version"].is_string());
+    fn version_exposes_all_when_enabled() -> anyhow::Result<()> {
+        let version = version_payload("my-server", "1.2.3", true);
+        assert!(
+            version
+                .get("build_git_sha")
+                .context("build_git_sha must be present")?
+                .is_string()
+        );
+        assert!(
+            version
+                .get("build_timestamp")
+                .context("build_timestamp must be present")?
+                .is_string()
+        );
+        assert!(
+            version
+                .get("rust_version")
+                .context("rust_version must be present")?
+                .is_string()
+        );
+        assert!(
+            version
+                .get("rmcp_server_kit_version")
+                .context("rmcp_server_kit_version must be present")?
+                .is_string()
+        );
+
+        Ok(())
     }
 
     // -- concurrency limit layer --
 
+    /// Error handler for the concurrency-limit test: maps load shedding to 503.
+    async fn handle_service_unavailable(_err: tower::BoxError) -> StatusCode {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+
+    /// Pins that the concurrency-limit/load-shed layer stack composes and still
+    /// serves a single request below the cap.
     #[tokio::test]
-    async fn concurrency_limit_layer_composes_and_serves() {
+    async fn concurrency_limit_layer_composes_and_serves() -> anyhow::Result<()> {
+        use axum::{error_handling::HandleErrorLayer, routing::get};
+        use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
+
         // We only assert the layer stack compiles and a single request
         // below the cap still succeeds. True back-pressure behaviour
         // requires a live HTTP server and is covered by integration tests.
-        let app = axum::Router::new()
-            .route("/ok", axum::routing::get(|| async { "ok" }))
-            .layer(
-                tower::ServiceBuilder::new()
-                    .layer(axum::error_handling::HandleErrorLayer::new(
-                        |_err: tower::BoxError| async { StatusCode::SERVICE_UNAVAILABLE },
-                    ))
-                    .layer(tower::load_shed::LoadShedLayer::new())
-                    .layer(tower::limit::ConcurrencyLimitLayer::new(4)),
-            );
+        let app = axum::Router::new().route("/ok", get(ok_handler)).layer(
+            tower::ServiceBuilder::new()
+                .layer(HandleErrorLayer::new(handle_service_unavailable))
+                .layer(LoadShedLayer::new())
+                .layer(ConcurrencyLimitLayer::new(4)),
+        );
         let resp = app
-            .oneshot(Request::builder().uri("/ok").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
+            .oneshot(Request::builder().uri("/ok").body(Body::empty())?)
+            .await?;
         assert_eq!(resp.status(), StatusCode::OK);
+
+        Ok(())
     }
 
     // -- compression layer --
 
+    /// Pins that the compression layer gzip-encodes a large response.
     #[tokio::test]
-    async fn compression_layer_gzip_encodes_response() {
-        use tower_http::compression::Predicate as _;
+    async fn compression_layer_gzip_encodes_response() -> anyhow::Result<()> {
+        use core::future::ready;
+
+        use axum::routing::get;
+        use tower_http::compression::{
+            CompressionLayer, DefaultPredicate, Predicate as _, predicate::SizeAbove,
+        };
 
         let big_body = "a".repeat(4096);
         let app = axum::Router::new()
-            .route(
-                "/big",
-                axum::routing::get(move || {
-                    let body = big_body.clone();
-                    async move { body }
-                }),
-            )
+            .route("/big", get(move || ready(big_body.clone())))
             .layer(
-                tower_http::compression::CompressionLayer::new()
+                CompressionLayer::new()
                     .gzip(true)
                     .br(true)
-                    .compress_when(
-                        tower_http::compression::DefaultPredicate::new()
-                            .and(tower_http::compression::predicate::SizeAbove::new(1024)),
-                    ),
+                    .compress_when(DefaultPredicate::new().and(SizeAbove::new(1024))),
             );
 
         let req = Request::builder()
             .uri("/big")
             .header(header::ACCEPT_ENCODING, "gzip")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+            .body(Body::empty())?;
+        let resp = app.oneshot(req).await?;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
-            resp.headers().get(header::CONTENT_ENCODING).unwrap(),
+            resp.headers()
+                .get(header::CONTENT_ENCODING)
+                .context("content-encoding must be set")?,
             "gzip"
         );
+
+        Ok(())
     }
 
+    /// Pins that the compression layer brotli-encodes a large response and
+    /// that the encoded body is shorter than the input.
     #[tokio::test]
-    async fn compression_layer_br_encodes_response() {
-        use tower_http::compression::Predicate as _;
+    async fn compression_layer_br_encodes_response() -> anyhow::Result<()> {
+        use core::future::ready;
+
+        use axum::{body::to_bytes, routing::get};
+        use tower_http::compression::{
+            CompressionLayer, DefaultPredicate, Predicate as _, predicate::SizeAbove,
+        };
 
         let big_body = "a".repeat(4096);
         let app = axum::Router::new()
-            .route(
-                "/big",
-                axum::routing::get(move || {
-                    let body = big_body.clone();
-                    async move { body }
-                }),
-            )
+            .route("/big", get(move || ready(big_body.clone())))
             .layer(
-                tower_http::compression::CompressionLayer::new()
+                CompressionLayer::new()
                     .gzip(true)
                     .br(true)
-                    .compress_when(
-                        tower_http::compression::DefaultPredicate::new()
-                            .and(tower_http::compression::predicate::SizeAbove::new(1024)),
-                    ),
+                    .compress_when(DefaultPredicate::new().and(SizeAbove::new(1024))),
             );
 
         let req = Request::builder()
             .uri("/big")
             .header(header::ACCEPT_ENCODING, "br")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+            .body(Body::empty())?;
+        let resp = app.oneshot(req).await?;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.headers().get(header::CONTENT_ENCODING).unwrap(), "br");
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_ENCODING)
+                .context("content-encoding must be set")?,
+            "br"
+        );
 
         // Reading the body is what drives the encoder - a header-only
         // assertion passes without any brotli code running, so the payload
         // must actually be shorter than the 4096-byte input.
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        let body = to_bytes(resp.into_body(), usize::MAX)
             .await
-            .unwrap();
+            .context("body must be readable")?;
         assert!(
             !body.is_empty() && body.len() < 4096,
             "br-encoded body should be smaller than the 4096-byte payload, got {} bytes",
             body.len()
         );
+
+        Ok(())
     }
 
     // -- TlsListener handshake timeout --
 
+    /// Pins that the TLS listener reaps connections that never complete their
+    /// handshake.
     #[tokio::test]
-    async fn tls_handshake_timeout_reaps_idle_connections() {
-        use tokio::io::AsyncReadExt as _;
+    async fn tls_handshake_timeout_reaps_idle_connections() -> anyhow::Result<()> {
+        use std::{
+            env::temp_dir,
+            time::{SystemTime, UNIX_EPOCH},
+        };
 
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        use rustls::crypto::ring::default_provider;
+        use tokio::{
+            fs::{create_dir_all, write},
+            io::AsyncReadExt as _,
+            time::timeout,
+        };
+
+        let _previous_provider = default_provider().install_default();
 
         // Self-signed cert material on disk (TlsListener::new takes paths).
-        let key = rcgen::KeyPair::generate().expect("generate key");
+        let key = rcgen::KeyPair::generate().context("generate key")?;
         let cert = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
-            .expect("cert params")
+            .context("cert params")?
             .self_signed(&key)
-            .expect("self-signed cert");
-        let dir = std::env::temp_dir().join(format!(
+            .context("self-signed cert")?;
+        let dir = temp_dir().join(format!(
             "rmcp-server-kit-hs-timeout-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock after epoch")
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .context("clock after epoch")?
                 .as_nanos()
         ));
-        tokio::fs::create_dir_all(&dir).await.expect("temp dir");
+        create_dir_all(&dir).await.context("temp dir")?;
         let cert_path = dir.join("server.crt");
         let key_path = dir.join("server.key");
-        tokio::fs::write(&cert_path, cert.pem())
+        write(&cert_path, cert.pem()).await.context("write cert")?;
+        write(&key_path, key.serialize_pem())
             .await
-            .expect("write cert");
-        tokio::fs::write(&key_path, key.serialize_pem())
-            .await
-            .expect("write key");
+            .context("write key")?;
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listener = TcpListener::bind("127.0.0.1:0").await.context("bind")?;
         let tls = TlsListener::new(
             listener,
             &cert_path,
@@ -8465,59 +8711,82 @@ mod tests {
             Duration::from_millis(200),
             8, // custom concurrency cap: proves the plumbing end-to-end
         )
-        .expect("tls listener");
-        let addr = Listener::local_addr(&tls).expect("local addr");
+        .context("tls listener")?;
+        let addr = Listener::local_addr(&tls).context("local addr")?;
 
         // Connect and send NOTHING: the handshake worker must time out
         // after 200ms and drop the stream, which the client observes as
         // EOF or a reset well within the 2s deadline.
-        let mut idle = TcpStream::connect(addr).await.expect("connect");
+        let mut idle = TcpStream::connect(addr).await.context("connect")?;
         let mut buf = [0_u8; 16];
-        let read = tokio::time::timeout(Duration::from_secs(2), idle.read(&mut buf))
+        let read = timeout(Duration::from_secs(2), idle.read(&mut buf))
             .await
-            .expect("server must reap the idle handshake within its timeout");
+            .context("server must reap the idle handshake within its timeout")?;
         match read {
             Ok(0) | Err(_) => {} // EOF or reset: connection was dropped.
-            Ok(n) => panic!("unexpected {n} bytes from server during reaped handshake"),
+            Ok(n) => anyhow::bail!("unexpected {n} bytes from server during reaped handshake"),
         }
 
         drop(tls);
+
+        Ok(())
     }
 
     // -- TLS session resumption disabled for mTLS (WO-T1) --
 
-    use std::sync::atomic::AtomicUsize;
+    use core::sync::atomic::AtomicUsize;
 
     use rustls::{
-        DigitallySignedStruct, DistinguishedName, SignatureScheme,
-        client::danger::HandshakeSignatureValid, server::danger::ClientCertVerified,
+        CertificateError, DigitallySignedStruct, DistinguishedName, SignatureScheme,
+        client::{Resumption, danger::HandshakeSignatureValid},
+        pki_types::{ServerName, UnixTime},
+        server::danger::ClientCertVerified,
     };
+    use tokio_rustls::client::TlsStream as ClientTlsStream;
 
-    fn self_signed_test_material() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
-        let key = rcgen::KeyPair::generate().expect("generate key");
+    /// Generates a self-signed certificate and matching PKCS#8 key for the
+    /// non-mTLS TLS-config tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when key generation or certificate self-signing fails.
+    fn self_signed_test_material()
+    -> anyhow::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+        use rustls::pki_types::PrivatePkcs8KeyDer;
+
+        let key = rcgen::KeyPair::generate().context("generate key")?;
         let cert = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
-            .expect("cert params")
+            .context("cert params")?
             .self_signed(&key)
-            .expect("self-signed cert");
-        (
+            .context("self-signed cert")?;
+        Ok((
             vec![cert.der().clone()],
-            rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
-        )
+            PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+        ))
     }
 
+    /// Pins that an mTLS server config disables session resumption entirely.
     #[test]
-    fn build_tls_server_config_disables_resumption_for_mtls() {
-        let (certs, key) = self_signed_test_material();
+    fn build_tls_server_config_disables_resumption_for_mtls() -> anyhow::Result<()> {
+        use rustls::server::WebPkiClientVerifier;
+
+        let (certs, key) = self_signed_test_material()?;
         let mut roots = RootCertStore::empty();
-        roots.add(certs[0].clone()).expect("add root");
-        let verifier: Arc<dyn ClientCertVerifier> =
-            rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
-                .allow_unauthenticated()
-                .build()
-                .expect("client verifier");
+        roots
+            .add(
+                certs
+                    .first()
+                    .context("self-signed cert must be present")?
+                    .clone(),
+            )
+            .context("add root")?;
+        let verifier: Arc<dyn ClientCertVerifier> = WebPkiClientVerifier::builder(Arc::new(roots))
+            .allow_unauthenticated()
+            .build()
+            .context("client verifier")?;
 
         let cfg = build_tls_server_config_from_verifier(certs, key, verifier, true)
-            .expect("build tls config");
+            .context("build tls config")?;
 
         assert!(
             !cfg.session_storage.can_cache(),
@@ -8535,16 +8804,21 @@ mod tests {
             cfg.send_tls13_tickets, 0,
             "mTLS must not emit TLS 1.3 session tickets"
         );
+
+        Ok(())
     }
 
+    /// Pins that a non-mTLS server config keeps session resumption enabled.
     #[test]
-    fn build_tls_server_config_keeps_resumption_for_non_mtls() {
-        let (certs, key) = self_signed_test_material();
-        let cfg = build_tls_server_config(certs, key, None, None).expect("build tls config");
+    fn build_tls_server_config_keeps_resumption_for_non_mtls() -> anyhow::Result<()> {
+        let (certs, key) = self_signed_test_material()?;
+        let cfg = build_tls_server_config(certs, key, None, None).context("build tls config")?;
         assert!(
             cfg.session_storage.can_cache(),
             "non-mTLS listeners intentionally keep resumption enabled (deliberate scope decision)"
         );
+
+        Ok(())
     }
 
     struct ResumptionTestMaterial {
@@ -8556,10 +8830,19 @@ mod tests {
     }
 
     /// A small CA-backed PKI for the resumption regression test below.
-    /// Deliberately independent of `tests/integration/e2e.rs::crl_tests` (a separate
-    /// test binary that cannot see this module's private helpers).
-    fn build_resumption_test_material() -> ResumptionTestMaterial {
-        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    ///
+    /// Deliberately independent of `tests/integration/e2e.rs::crl_tests` (a
+    /// separate test binary that cannot see this module's private helpers).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when generating or signing any fixture key or
+    /// certificate fails.
+    fn build_resumption_test_material() -> anyhow::Result<ResumptionTestMaterial> {
+        use rustls::pki_types::PrivatePkcs8KeyDer;
+
+        let mut ca_params =
+            rcgen::CertificateParams::new(Vec::<String>::new()).context("ca params")?;
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         ca_params.key_usages = vec![
             rcgen::KeyUsagePurpose::KeyCertSign,
@@ -8568,15 +8851,16 @@ mod tests {
         ca_params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "resumption-test-ca");
-        let ca_key = rcgen::KeyPair::generate().expect("ca key");
-        let ca = rcgen::CertifiedIssuer::self_signed(ca_params, ca_key).expect("ca self-signed");
+        let ca_key = rcgen::KeyPair::generate().context("ca key")?;
+        let ca =
+            rcgen::CertifiedIssuer::self_signed(ca_params, ca_key).context("ca self-signed")?;
 
         let mut roots = RootCertStore::empty();
-        roots.add(ca.der().clone()).expect("add ca root");
+        roots.add(ca.der().clone()).context("add ca root")?;
 
-        let server_key = rcgen::KeyPair::generate().expect("server key");
+        let server_key = rcgen::KeyPair::generate().context("server key")?;
         let mut server_params =
-            rcgen::CertificateParams::new(vec!["localhost".to_owned()]).expect("server params");
+            rcgen::CertificateParams::new(vec!["localhost".to_owned()]).context("server params")?;
         server_params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "localhost");
@@ -8588,11 +8872,11 @@ mod tests {
         server_params.use_authority_key_identifier_extension = true;
         let server_cert = server_params
             .signed_by(&server_key, &ca)
-            .expect("server cert");
+            .context("server cert")?;
 
-        let client_key = rcgen::KeyPair::generate().expect("client key");
+        let client_key = rcgen::KeyPair::generate().context("client key")?;
         let mut client_params =
-            rcgen::CertificateParams::new(Vec::<String>::new()).expect("client params");
+            rcgen::CertificateParams::new(Vec::<String>::new()).context("client params")?;
         client_params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "resumption-test-client");
@@ -8604,17 +8888,15 @@ mod tests {
         client_params.use_authority_key_identifier_extension = true;
         let client_cert = client_params
             .signed_by(&client_key, &ca)
-            .expect("client cert");
+            .context("client cert")?;
 
-        ResumptionTestMaterial {
+        Ok(ResumptionTestMaterial {
             server_certs: vec![server_cert.der().clone()],
-            server_key: rustls::pki_types::PrivatePkcs8KeyDer::from(server_key.serialize_der())
-                .into(),
+            server_key: PrivatePkcs8KeyDer::from(server_key.serialize_der()).into(),
             client_certs: vec![client_cert.der().clone()],
-            client_key: rustls::pki_types::PrivatePkcs8KeyDer::from(client_key.serialize_der())
-                .into(),
+            client_key: PrivatePkcs8KeyDer::from(client_key.serialize_der()).into(),
             roots: Arc::new(roots),
-        }
+        })
     }
 
     /// Counts `verify_client_cert` calls and can be flipped to reject every
@@ -8637,7 +8919,7 @@ mod tests {
     }
 
     impl Debug for FlipVerifier {
-        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
             f.debug_struct("FlipVerifier")
                 .field("calls", &self.calls)
                 .field("reject_after_first", &self.reject_after_first)
@@ -8662,13 +8944,11 @@ mod tests {
             &self,
             end_entity: &CertificateDer<'_>,
             intermediates: &[CertificateDer<'_>],
-            now: rustls::pki_types::UnixTime,
+            now: UnixTime,
         ) -> Result<ClientCertVerified, rustls::Error> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
+            let _previous_calls = self.calls.fetch_add(1, Ordering::SeqCst);
             if self.reject_after_first.load(Ordering::SeqCst) {
-                return Err(rustls::Error::InvalidCertificate(
-                    rustls::CertificateError::Revoked,
-                ));
+                return Err(rustls::Error::InvalidCertificate(CertificateError::Revoked));
             }
             self.inner
                 .verify_client_cert(end_entity, intermediates, now)
@@ -8701,33 +8981,52 @@ mod tests {
         }
     }
 
-    /// Accepts one TLS connection, reads the request to the blank line (or
-    /// EOF) with a timeout, writes a minimal HTTP response, then shuts down
-    /// cleanly. Pairs with `connect_and_drive`'s EOF read so TLS 1.3
-    /// post-handshake `NewSessionTicket` messages are actually delivered.
+    /// Accepts one TLS connection and serves a minimal HTTP response.
+    ///
+    /// Reads the request to the blank line (or EOF) with a timeout, writes a
+    /// minimal HTTP response, then shuts down cleanly. Pairs with
+    /// `connect_and_drive`'s EOF read so TLS 1.3 post-handshake
+    /// `NewSessionTicket` messages are actually delivered.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when accepting, reading, writing, flushing, or
+    /// shutting down the connection fails.
     async fn accept_and_serve(
         listener: &TcpListener,
         acceptor: &tokio_rustls::TlsAcceptor,
     ) -> io::Result<()> {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::{
+            io::{AsyncReadExt as _, AsyncWriteExt as _},
+            time::timeout,
+        };
 
         let (tcp, _addr) = listener.accept().await?;
-        let mut tls = tokio::time::timeout(Duration::from_secs(5), acceptor.accept(tcp))
+        let mut tls = timeout(Duration::from_secs(5), acceptor.accept(tcp))
             .await
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::TimedOut, "server: TLS accept timed out")
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("server: TLS accept timed out: {error}"),
+                )
             })??;
 
         let mut request = Vec::new();
         let mut byte = [0_u8; 1];
         loop {
-            let n = tokio::time::timeout(Duration::from_secs(5), tls.read(&mut byte))
+            let n = timeout(Duration::from_secs(5), tls.read(&mut byte))
                 .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "server: read timed out"))??;
+                .map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("server: read timed out: {error}"),
+                    )
+                })??;
             if n == 0 {
                 break;
             }
-            request.push(byte[0]);
+            let [received] = byte;
+            request.push(received);
             if request.ends_with(b"\r\n\r\n") {
                 break;
             }
@@ -8740,17 +9039,26 @@ mod tests {
         Ok(())
     }
 
-    /// Connects, sends a minimal HTTP request, and reads the response to
-    /// EOF -- required so the client's rustls state machine actually
+    /// Connects to the server, sends a minimal HTTP request, and reads the
+    /// response to EOF.
+    ///
+    /// The EOF read is required so the client's rustls state machine actually
     /// processes any post-handshake `NewSessionTicket` messages before the
     /// stream is dropped. Returns the live stream so the caller can inspect
     /// `handshake_kind()` afterward.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when connecting, writing, or reading fails.
     async fn connect_and_drive(
         connector: &tokio_rustls::TlsConnector,
         addr: SocketAddr,
-        server_name: rustls::pki_types::ServerName<'static>,
-    ) -> io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        server_name: ServerName<'static>,
+    ) -> io::Result<ClientTlsStream<TcpStream>> {
+        use tokio::{
+            io::{AsyncReadExt as _, AsyncWriteExt as _},
+            time::timeout,
+        };
 
         let tcp = TcpStream::connect(addr).await?;
         let mut tls = connector.connect(server_name, tcp).await?;
@@ -8760,9 +9068,14 @@ mod tests {
         tls.flush().await?;
 
         let mut response = Vec::new();
-        tokio::time::timeout(Duration::from_secs(5), tls.read_to_end(&mut response))
+        let _bytes_read = timeout(Duration::from_secs(5), tls.read_to_end(&mut response))
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "client: read timed out"))??;
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("client: read timed out: {error}"),
+                )
+            })??;
 
         Ok(tls)
     }
@@ -8776,18 +9089,27 @@ mod tests {
         calls_after_second: usize,
     }
 
-    /// Stands up a fresh mTLS-verifying TLS server (`disable_resumption`
-    /// controls the exact fix under test) and a matching client with
-    /// in-memory session resumption enabled. Drives one full handshake to
-    /// completion, flips the verifier to reject-everything, drives a second
-    /// connection, and reports what happened.
-    async fn run_resumption_scenario(disable_resumption: bool) -> ScenarioOutcome {
-        let material = build_resumption_test_material();
+    /// Stands up a fresh mTLS-verifying TLS server and matching client and
+    /// drives two sequential connections against it.
+    ///
+    /// `disable_resumption` controls the exact fix under test. The first
+    /// connection completes a full handshake; the verifier is then flipped to
+    /// reject everything and a second connection is driven. The outcome
+    /// reports whether the second connection resumed or re-verified.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the fixture PKI, TLS config, listener, or client
+    /// setup fails.
+    async fn run_resumption_scenario(disable_resumption: bool) -> anyhow::Result<ScenarioOutcome> {
+        use rustls::server::WebPkiClientVerifier;
+
+        let material = build_resumption_test_material()?;
 
         let base_verifier: Arc<dyn ClientCertVerifier> =
-            rustls::server::WebPkiClientVerifier::builder(Arc::clone(&material.roots))
+            WebPkiClientVerifier::builder(Arc::clone(&material.roots))
                 .build()
-                .expect("client verifier");
+                .context("client verifier")?;
         let flip = FlipVerifier::new(base_verifier);
         let flip_for_config: Arc<FlipVerifier> = Arc::clone(&flip);
         let verifier_handle: Arc<dyn ClientCertVerifier> = flip_for_config;
@@ -8798,16 +9120,16 @@ mod tests {
             verifier_handle,
             disable_resumption,
         )
-        .expect("server tls config");
+        .context("server tls config")?;
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("local addr");
+        let listener = TcpListener::bind("127.0.0.1:0").await.context("bind")?;
+        let addr = listener.local_addr().context("local addr")?;
 
         let mut client_config = rustls::ClientConfig::builder()
             .with_root_certificates(Arc::clone(&material.roots))
             .with_client_auth_cert(material.client_certs, material.client_key)
-            .expect("client config");
+            .context("client config")?;
         // `rustls::client::handy::ClientSessionMemoryCache` divides its
         // requested `size` by `MAX_TLS13_TICKETS_PER_SERVER` (8) to get a
         // server-name-slot count. A `size` of 8 or less rounds down to
@@ -8818,18 +9140,18 @@ mod tests {
         // the crate's own server-side default
         // (`ServerSessionMemoryCache::new(256)`), well clear of that
         // one-slot edge for this test's single server name.
-        client_config.resumption = rustls::client::Resumption::in_memory_sessions(256);
+        client_config.resumption = Resumption::in_memory_sessions(256);
         let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
 
-        let server_name =
-            rustls::pki_types::ServerName::try_from("localhost").expect("server name");
+        let server_name = ServerName::try_from("localhost").context("server name")?;
 
         let (server_result_1, client_result_1) = tokio::join!(
             accept_and_serve(&listener, &acceptor),
             connect_and_drive(&connector, addr, server_name.clone()),
         );
-        server_result_1.expect("connection 1: server side must complete");
-        client_result_1.expect("connection 1: full handshake must succeed");
+        server_result_1.context("connection 1: server side must complete")?;
+        let _client_stream_1 =
+            client_result_1.context("connection 1: full handshake must succeed")?;
 
         let calls_after_first = flip.calls.load(Ordering::SeqCst);
         flip.reject_after_first.store(true, Ordering::SeqCst);
@@ -8841,15 +9163,15 @@ mod tests {
 
         let (second_client_result, second_handshake_kind) = match client_result_2 {
             Ok(stream) => (Ok(()), stream.get_ref().1.handshake_kind()),
-            Err(e) => (Err(e), None),
+            Err(error) => (Err(error), None),
         };
 
-        ScenarioOutcome {
+        Ok(ScenarioOutcome {
             calls_after_first,
             second_client_result,
             second_handshake_kind,
             calls_after_second: flip.calls.load(Ordering::SeqCst),
-        }
+        })
     }
 
     /// Regression test for the mTLS session-resumption bypass: rustls
@@ -8865,12 +9187,12 @@ mod tests {
     /// forces full handshakes would make the `fixed` assertions pass for
     /// the wrong reason.
     #[tokio::test]
-    async fn mtls_resumption_disabled_forces_full_reverification() {
+    async fn mtls_resumption_disabled_forces_full_reverification() -> anyhow::Result<()> {
         rustls::crypto::ring::default_provider()
             .install_default()
             .ok();
 
-        let fixed = run_resumption_scenario(true).await;
+        let fixed = run_resumption_scenario(true).await?;
         assert_eq!(
             fixed.calls_after_first, 1,
             "connection 1 must invoke the verifier exactly once"
@@ -8890,7 +9212,7 @@ mod tests {
             "connection 2 must re-invoke the verifier -- this is the fix"
         );
 
-        let control = run_resumption_scenario(false).await;
+        let control = run_resumption_scenario(false).await?;
         assert_eq!(control.calls_after_first, 1);
         assert!(
             control.second_client_result.is_ok(),
@@ -8907,6 +9229,8 @@ mod tests {
             control.calls_after_second, 1,
             "control verifier must NOT be re-invoked -- this is the exact bypass the fix eliminates"
         );
+
+        Ok(())
     }
 
     // -- M5: OWASP security headers reach early / fallback responses --
