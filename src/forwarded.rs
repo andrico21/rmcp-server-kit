@@ -265,7 +265,6 @@ fn is_valid_port(port: &str) -> bool {
     !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok()
 }
 
-#[cfg(test)]
 #[cfg_attr(
     all(test, target_os = "linux"),
     expect(
@@ -292,6 +291,7 @@ fn is_valid_port(port: &str) -> bool {
     test,
     expect(unused_results, reason = "lint-migration: src/forwarded.rs")
 )]
+#[cfg(test)]
 mod tests {
 
     use axum::http::HeaderValue;

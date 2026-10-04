@@ -196,7 +196,6 @@ impl Drop for ExposureTestGuard {
     }
 }
 
-#[cfg(test)]
 #[cfg_attr(
     all(test, target_os = "linux"),
     expect(
@@ -204,6 +203,7 @@ impl Drop for ExposureTestGuard {
         reason = "test code is not rendered API documentation"
     )
 )]
+#[cfg(test)]
 mod tests {
     use super::{
         DiagnosticExposure, ExposureTestGuard, oauth_claim_values, plaintext_oauth_tokens,

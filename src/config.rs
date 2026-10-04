@@ -1822,7 +1822,6 @@ fn default_sse_keep_alive() -> String {
     "15s".into()
 }
 
-#[cfg(test)]
 #[cfg_attr(
     all(test, target_os = "linux"),
     expect(clippy::unused_trait_names, reason = "lint-migration: src/config.rs")
@@ -1891,6 +1890,7 @@ fn default_sse_keep_alive() -> String {
     )
 )]
 #[cfg_attr(test, expect(deprecated, reason = "lint-migration: src/config.rs"))]
+#[cfg(test)]
 mod tests {
     use std::{collections::HashSet, sync::Arc, time::Duration};
 

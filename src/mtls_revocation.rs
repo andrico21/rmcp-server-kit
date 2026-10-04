@@ -2305,7 +2305,6 @@ fn asn1_time_to_system_time(time: x509_parser::time::ASN1Time) -> SystemTime {
     }
 }
 
-#[cfg(test)]
 #[cfg_attr(
     all(test, target_os = "linux"),
     expect(
@@ -2356,6 +2355,7 @@ fn asn1_time_to_system_time(time: x509_parser::time::ASN1Time) -> SystemTime {
     test,
     expect(deprecated, reason = "lint-migration: src/mtls_revocation.rs")
 )]
+#[cfg(test)]
 mod tests {
 
     use std::sync::{

@@ -937,7 +937,6 @@ fn serialized_size(result: &CallToolResult, max: Option<usize>) -> SizeMeasure {
     }
 }
 
-#[cfg(test)]
 #[cfg_attr(
     all(test, target_os = "linux"),
     expect(clippy::unwrap_used, reason = "lint-migration: src/tool_hooks.rs")
@@ -990,6 +989,7 @@ fn serialized_size(result: &CallToolResult, max: Option<usize>) -> SizeMeasure {
     test,
     expect(let_underscore_drop, reason = "lint-migration: src/tool_hooks.rs")
 )]
+#[cfg(test)]
 mod tests {
     use std::sync::{
         Arc,

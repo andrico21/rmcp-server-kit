@@ -555,7 +555,6 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
     }
 }
 
-#[cfg(test)]
 #[cfg_attr(
     all(test, target_os = "linux"),
     expect(
@@ -603,6 +602,7 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
         reason = "test code is not rendered API documentation"
     )
 )]
+#[cfg(test)]
 mod tests {
     use std::{
         net::IpAddr,

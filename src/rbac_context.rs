@@ -455,7 +455,6 @@ impl<H: ServerHandler> ServerHandler for RbacContextHandler<H> {
     }
 }
 
-#[cfg(test)]
 #[cfg_attr(
     all(test, target_os = "linux"),
     expect(
@@ -538,6 +537,7 @@ impl<H: ServerHandler> ServerHandler for RbacContextHandler<H> {
     test,
     expect(unused_results, reason = "lint-migration: src/rbac_context.rs")
 )]
+#[cfg(test)]
 mod tests {
     use std::{collections::VecDeque, convert::Infallible, sync::Arc};
 

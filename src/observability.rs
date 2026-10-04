@@ -818,7 +818,6 @@ fn audit_file_permission_warnings(_file: &std::fs::File) -> Vec<String> {
     Vec::new()
 }
 
-#[cfg(test)]
 #[cfg_attr(
     all(test, target_os = "linux"),
     expect(
@@ -859,6 +858,7 @@ fn audit_file_permission_warnings(_file: &std::fs::File) -> Vec<String> {
         reason = "lint-migration: src/observability.rs"
     )
 )]
+#[cfg(test)]
 mod tests {
     #[cfg(unix)]
     use std::io::Write as _;

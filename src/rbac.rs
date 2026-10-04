@@ -1891,7 +1891,6 @@ fn reject_blank_redaction_salt(env_var: &str, value: &str) -> Result<(), RmcpSer
     Ok(())
 }
 
-#[cfg(test)]
 #[cfg_attr(
     all(test, target_os = "linux"),
     expect(clippy::panic, reason = "lint-migration: src/rbac.rs")
@@ -1958,6 +1957,7 @@ fn reject_blank_redaction_salt(env_var: &str, value: &str) -> Result<(), RmcpSer
     test,
     expect(redundant_imports, reason = "lint-migration: src/rbac.rs")
 )]
+#[cfg(test)]
 mod tests {
     use std::net::IpAddr;
 

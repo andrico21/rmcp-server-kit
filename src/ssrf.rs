@@ -577,7 +577,6 @@ pub(crate) fn redirect_target_reason_with_allowlist(
     Some(reason)
 }
 
-#[cfg(test)]
 #[cfg_attr(
     all(test, target_os = "linux"),
     expect(clippy::shadow_unrelated, reason = "lint-migration: src/ssrf.rs")
@@ -600,6 +599,7 @@ pub(crate) fn redirect_target_reason_with_allowlist(
         reason = "test code is not rendered API documentation"
     )
 )]
+#[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 

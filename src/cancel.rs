@@ -266,7 +266,6 @@ fn map_join<T>(joined: Result<T, tokio::task::JoinError>) -> DetachOutcome<T> {
     }
 }
 
-#[cfg(test)]
 #[cfg_attr(
     all(test, target_os = "linux"),
     expect(
@@ -298,6 +297,7 @@ fn map_join<T>(joined: Result<T, tokio::task::JoinError>) -> DetachOutcome<T> {
     test,
     expect(redundant_imports, reason = "lint-migration: src/cancel.rs")
 )]
+#[cfg(test)]
 mod tests {
 
     use std::sync::{

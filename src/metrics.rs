@@ -262,7 +262,6 @@ pub(crate) async fn serve_metrics_with_security_headers(
     Ok(())
 }
 
-#[cfg(test)]
 #[cfg_attr(
     all(test, feature = "metrics", target_os = "linux"),
     expect(clippy::expect_used, reason = "lint-migration: src/metrics.rs")
@@ -286,6 +285,7 @@ pub(crate) async fn serve_metrics_with_security_headers(
     all(test, feature = "metrics"),
     expect(unused_results, reason = "lint-migration: src/metrics.rs")
 )]
+#[cfg(test)]
 mod tests {
     use super::*;
 

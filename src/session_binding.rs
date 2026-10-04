@@ -457,7 +457,6 @@ fn is_uuid_shaped(value: &str) -> bool {
         })
 }
 
-#[cfg(test)]
 #[cfg_attr(
     all(test, target_os = "linux"),
     expect(clippy::expect_used, reason = "lint-migration: src/session_binding.rs")
@@ -466,6 +465,7 @@ fn is_uuid_shaped(value: &str) -> bool {
     test,
     expect(redundant_imports, reason = "lint-migration: src/session_binding.rs")
 )]
+#[cfg(test)]
 mod tests {
     use axum::{
         Router,

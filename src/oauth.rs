@@ -4863,7 +4863,6 @@ fn rewrite_client_auth_params(
     out.finish()
 }
 
-#[cfg(test)]
 #[cfg_attr(
     all(test, feature = "oauth", target_os = "linux"),
     expect(
@@ -4902,6 +4901,7 @@ fn rewrite_client_auth_params(
     all(test, feature = "oauth"),
     expect(redundant_imports, reason = "lint-migration: src/oauth.rs")
 )]
+#[cfg(test)]
 mod tests {
     use std::{sync::Arc, time::Instant};
 

@@ -203,7 +203,6 @@ fn compute_mac(
     mac.finalize().into_bytes().into()
 }
 
-#[cfg(test)]
 #[cfg_attr(
     all(test, target_os = "linux"),
     expect(clippy::expect_used, reason = "lint-migration: src/task_binding.rs")
@@ -222,6 +221,7 @@ fn compute_mac(
         reason = "test code is not rendered API documentation"
     )
 )]
+#[cfg(test)]
 mod tests {
     use secrecy::SecretString;
 

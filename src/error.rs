@@ -233,7 +233,6 @@ impl IntoResponse for RmcpServerKitError {
 /// Convenience `Result` alias bound to [`RmcpServerKitError`].
 pub type Result<T> = std::result::Result<T, RmcpServerKitError>;
 
-#[cfg(test)]
 #[cfg_attr(
     all(test, target_os = "linux"),
     expect(clippy::min_ident_chars, reason = "lint-migration: src/error.rs")
@@ -272,6 +271,7 @@ pub type Result<T> = std::result::Result<T, RmcpServerKitError>;
     test,
     expect(redundant_imports, reason = "lint-migration: src/error.rs")
 )]
+#[cfg(test)]
 mod tests {
     use axum::{http::StatusCode, response::IntoResponse};
     use http_body_util::BodyExt;

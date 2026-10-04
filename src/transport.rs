@@ -5468,7 +5468,6 @@ fn check_mtls_capacity_knobs(mtls: &MtlsConfig) -> Result<(), RmcpServerKitError
     Ok(())
 }
 
-#[cfg(test)]
 #[cfg_attr(
     all(test, target_os = "linux"),
     expect(clippy::map_err_ignore, reason = "lint-migration: src/transport.rs")
@@ -5530,6 +5529,7 @@ fn check_mtls_capacity_knobs(mtls: &MtlsConfig) -> Result<(), RmcpServerKitError
     )
 )]
 #[cfg_attr(test, expect(deprecated, reason = "lint-migration: src/transport.rs"))]
+#[cfg(test)]
 mod tests {
     use std::{sync::Arc, time::Duration};
 

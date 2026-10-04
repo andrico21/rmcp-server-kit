@@ -213,7 +213,6 @@ pub(crate) fn admin_router(state: AdminState, config: &AdminConfig) -> Router {
         }))
 }
 
-#[cfg(test)]
 #[cfg_attr(
     all(test, target_os = "linux"),
     expect(clippy::indexing_slicing, reason = "lint-migration: src/admin.rs")
@@ -234,6 +233,7 @@ pub(crate) fn admin_router(state: AdminState, config: &AdminConfig) -> Router {
     test,
     expect(redundant_imports, reason = "lint-migration: src/admin.rs")
 )]
+#[cfg(test)]
 mod tests {
 
     use axum::http::Request;

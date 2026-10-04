@@ -243,7 +243,6 @@ pub(crate) fn screen_addrs(
     Ok(addrs.to_vec())
 }
 
-#[cfg(test)]
 #[cfg_attr(
     all(test, target_os = "linux"),
     expect(clippy::expect_used, reason = "lint-migration: src/ssrf_resolver.rs")
@@ -270,6 +269,7 @@ pub(crate) fn screen_addrs(
     test,
     expect(redundant_imports, reason = "lint-migration: src/ssrf_resolver.rs")
 )]
+#[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 

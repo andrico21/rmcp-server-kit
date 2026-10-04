@@ -2212,7 +2212,6 @@ pub(crate) async fn auth_middleware(
     unauthorized_response(&state, failure_class.0)
 }
 
-#[cfg(test)]
 #[cfg_attr(
     all(test, target_os = "linux"),
     expect(clippy::indexing_slicing, reason = "lint-migration: src/auth.rs")
@@ -2273,6 +2272,7 @@ pub(crate) async fn auth_middleware(
     test,
     expect(redundant_imports, reason = "lint-migration: src/auth.rs")
 )]
+#[cfg(test)]
 mod tests {
     use std::net::IpAddr;
 
