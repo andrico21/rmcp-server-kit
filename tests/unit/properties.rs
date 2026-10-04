@@ -20,66 +20,10 @@
 //!    alphanumeric strings + `*` wildcards must never panic when matched
 //!    against arbitrary tool names. (Catches regex/glob-engine
 //!    regressions.)
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::shadow_same,
-        reason = "lint-migration: tests/unit/properties.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::let_underscore_untyped,
-        reason = "lint-migration: tests/unit/properties.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::let_underscore_must_use,
-        reason = "lint-migration: tests/unit/properties.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::min_ident_chars,
-        reason = "lint-migration: tests/unit/properties.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::absolute_paths,
-        reason = "lint-migration: tests/unit/properties.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::shadow_reuse,
-        reason = "lint-migration: tests/unit/properties.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::expect_used,
-        reason = "lint-migration: tests/unit/properties.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::unseparated_literal_suffix,
-        reason = "lint-migration: tests/unit/properties.rs"
-    )
-)]
 
 #[cfg(test)]
 mod tests {
-    use proptest::prelude::*;
+    use proptest::{collection, prelude::*};
     use rmcp_server_kit::{
         auth::{ApiKeyEntry, generate_api_key, verify_bearer_token},
         rbac::{ArgumentAllowlist, RbacConfig, RbacDecision, RbacPolicy, RoleConfig},
@@ -104,20 +48,21 @@ mod tests {
         /// constant-time iteration in `verify_bearer_token` does not affect
         /// correctness of the matching key.
         #[test]
-        fn api_key_generate_verify_roundtrip(extra_keys in 0usize..4) {
-            let (token, hash) = generate_api_key().expect("generate_api_key");
+        fn api_key_generate_verify_roundtrip(extra_keys in 0_usize..4) {
+            let (token, hash) = generate_api_key()?;
             let mut keys = vec![ApiKeyEntry::new("primary", hash, "viewer")];
             // Add decoy keys whose hashes are valid but won't match `token`.
-            for i in 0..extra_keys {
-                let (_decoy_token, decoy_hash) =
-                    generate_api_key().expect("generate_api_key decoy");
-                keys.push(ApiKeyEntry::new(format!("decoy-{i}"), decoy_hash, "viewer"));
+            for index in 0..extra_keys {
+                let (_decoy_token, decoy_hash) = generate_api_key()?;
+                keys.push(ApiKeyEntry::new(format!("decoy-{index}"), decoy_hash, "viewer"));
             }
             let id = verify_bearer_token(&token, &keys);
             prop_assert!(id.is_some(), "freshly generated token must verify");
-            let id = id.expect("verified identity");
-            prop_assert_eq!(id.name, "primary");
-            prop_assert_eq!(id.role, "viewer");
+            let Some(identity) = id else {
+                return Err(TestCaseError::fail("verified identity"));
+            };
+            prop_assert_eq!(identity.name, "primary");
+            prop_assert_eq!(identity.role, "viewer");
         }
     }
 
@@ -141,7 +86,7 @@ mod tests {
         /// [`RbacPolicy::argument_allowed`] is an identity mapping here.
         #[test]
         fn argument_allowed_membership(
-            allowed in proptest::collection::vec(token_strategy(), 1..8),
+            allowed in collection::vec(token_strategy(), 1..8),
             candidate in token_strategy(),
         ) {
             let role = RoleConfig::new(
@@ -159,7 +104,7 @@ mod tests {
             let policy = RbacPolicy::new(&config);
 
             let actual = policy.argument_allowed("viewer", "run_query", "cmd", &candidate);
-            let expected = allowed.iter().any(|v| v == &candidate);
+            let expected = allowed.iter().any(|entry| entry == &candidate);
             prop_assert_eq!(actual, expected,
                 "argument_allowed disagrees with set membership");
         }
@@ -171,7 +116,7 @@ mod tests {
 
     /// Generate a glob pattern: alphanumeric segments separated by `*`.
     fn glob_pattern_strategy() -> impl Strategy<Value = String> {
-        proptest::collection::vec("[a-z]{1,6}", 1..5).prop_map(|parts| parts.join("*"))
+        collection::vec("[a-z]{1,6}", 1..5).prop_map(|parts| parts.join("*"))
     }
 
     proptest! {
@@ -199,9 +144,10 @@ mod tests {
             config.enabled = true;
             let policy = RbacPolicy::new(&config);
 
-            // Both branches must terminate without panicking on any input.
-            let _ = policy.argument_allowed("viewer", &tool, "cmd", "ls");
-            let _ = policy.argument_allowed("viewer", &tool, "cmd", "rm");
+            // Both branches must terminate without panicking on any input;
+            // the boolean decision itself is not asserted here.
+            let _ls_decision = policy.argument_allowed("viewer", &tool, "cmd", "ls");
+            let _rm_decision = policy.argument_allowed("viewer", &tool, "cmd", "rm");
         }
     }
 
@@ -209,12 +155,13 @@ mod tests {
     // 4. Operation deny matching
     // ---------------------------------------------------------------------------
 
+    /// A role that allows every operation on every host.
     fn allow_all_role() -> RoleConfig {
         RoleConfig::new("editor", vec!["*".into()], vec!["*".into()])
     }
 
-    fn enabled_policy(config: RbacConfig) -> RbacPolicy {
-        let mut config = config;
+    /// Build a policy from a config, enabling RBAC.
+    fn enabled_policy(mut config: RbacConfig) -> RbacPolicy {
         config.enabled = true;
         RbacPolicy::new(&config)
     }

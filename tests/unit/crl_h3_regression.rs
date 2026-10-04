@@ -2,82 +2,25 @@
 #![cfg_attr(
     all(feature = "oauth-mtls-client", target_os = "linux"),
     expect(
-        clippy::duration_suboptimal_units,
-        reason = "lint-migration: tests/unit/crl_h3_regression.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::expect_used,
-        reason = "lint-migration: tests/unit/crl_h3_regression.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
+        clippy::missing_errors_doc,
         clippy::missing_panics_doc,
-        reason = "lint-migration: tests/unit/crl_h3_regression.rs"
+        reason = "test code is not rendered API documentation"
     )
 )]
 #![cfg_attr(
     all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::absolute_paths,
-        reason = "lint-migration: tests/unit/crl_h3_regression.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::let_underscore_untyped,
-        reason = "lint-migration: tests/unit/crl_h3_regression.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::let_underscore_must_use,
-        reason = "lint-migration: tests/unit/crl_h3_regression.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::std_instead_of_core,
-        reason = "lint-migration: tests/unit/crl_h3_regression.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::std_instead_of_alloc,
-        reason = "lint-migration: tests/unit/crl_h3_regression.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::unseparated_literal_suffix,
-        reason = "lint-migration: tests/unit/crl_h3_regression.rs"
-    )
-)]
-#![cfg_attr(
-    feature = "oauth-mtls-client",
-    expect(
-        let_underscore_drop,
-        reason = "lint-migration: tests/unit/crl_h3_regression.rs"
-    )
-)]
-#![cfg_attr(
-    feature = "oauth-mtls-client",
-    expect(deprecated, reason = "lint-migration: tests/unit/crl_h3_regression.rs")
+    expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")
 )]
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    extern crate alloc;
 
+    use alloc::sync::Arc;
+    use core::time::Duration;
+    use std::time::SystemTime;
+
+    use anyhow::Context as _;
     use rcgen::{
         BasicConstraints, CertificateParams, CertifiedIssuer, DnType, IsCa, KeyPair,
         KeyUsagePurpose,
@@ -86,14 +29,20 @@ mod tests {
         auth::MtlsConfig,
         mtls_revocation::{CachedCrl, CrlSet},
     };
-    use rustls::{RootCertStore, pki_types::CertificateRevocationListDer};
+    use rustls::{
+        RootCertStore,
+        crypto::ring,
+        pki_types::{CertificateDer, CertificateRevocationListDer},
+    };
 
+    /// Install the ring crypto provider once per test process.
     fn install_ring_provider() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        drop(ring::default_provider().install_default());
     }
 
-    fn build_ca_root() -> rustls::pki_types::CertificateDer<'static> {
-        let mut params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    /// Build a self-signed CA root certificate for the test `CrlSet`s.
+    fn build_ca_root() -> anyhow::Result<CertificateDer<'static>> {
+        let mut params = CertificateParams::new(Vec::<String>::new()).context("ca params")?;
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params.key_usages = vec![
             KeyUsagePurpose::KeyCertSign,
@@ -101,21 +50,23 @@ mod tests {
             KeyUsagePurpose::DigitalSignature,
         ];
         params.distinguished_name.push(DnType::CommonName, "h3-ca");
-        let key = KeyPair::generate().expect("ca key");
+        let key = KeyPair::generate().context("ca key")?;
         let issuer: CertifiedIssuer<'static, KeyPair> =
-            CertifiedIssuer::self_signed(params, key).expect("ca self-signed");
-        issuer.der().clone()
+            CertifiedIssuer::self_signed(params, key).context("ca self-signed")?;
+        Ok(issuer.der().clone())
     }
 
-    fn h3_config(deny_on_unavailable: bool, end_entity_only: bool) -> MtlsConfig {
+    /// Build an `MtlsConfig` with the given precheck knobs.
+    fn h3_config(deny_on_unavailable: bool, end_entity_only: bool) -> anyhow::Result<MtlsConfig> {
         h3_config_with_retention(deny_on_unavailable, end_entity_only, "24h")
     }
 
+    /// Build an `MtlsConfig` with an explicit retry-retention window.
     fn h3_config_with_retention(
         deny_on_unavailable: bool,
         end_entity_only: bool,
         retry_retention: &str,
-    ) -> MtlsConfig {
+    ) -> anyhow::Result<MtlsConfig> {
         serde_json::from_value(serde_json::json!({
             "ca_cert_path": "memory://ca.pem",
             "required": true,
@@ -128,32 +79,43 @@ mod tests {
             "crl_fetch_timeout": "1s",
             "crl_retry_retention": retry_retention,
             "crl_max_concurrent_fetches": 4,
-            "crl_max_response_bytes": 5_242_880u64,
-            "crl_discovery_rate_per_min": 10_000u32,
-            "crl_max_host_semaphores": 1024usize,
-            "crl_max_seen_urls": 4096usize,
-            "crl_max_cache_entries": 1024usize,
+            "crl_max_response_bytes": 5_242_880_u64,
+            "crl_discovery_rate_per_min": 10_000_u32,
+            "crl_max_host_semaphores": 1024_usize,
+            "crl_max_seen_urls": 4096_usize,
+            "crl_max_cache_entries": 1024_usize,
         }))
-        .expect("h3 mtls config")
+        .context("h3 mtls config")
     }
 
-    fn empty_crl_set(deny_on_unavailable: bool, end_entity_only: bool) -> Arc<CrlSet> {
-        empty_crl_set_with_config(h3_config(deny_on_unavailable, end_entity_only))
+    /// Build an empty `CrlSet` with the given precheck flags.
+    fn empty_crl_set(
+        deny_on_unavailable: bool,
+        end_entity_only: bool,
+    ) -> anyhow::Result<Arc<CrlSet>> {
+        empty_crl_set_with_config(h3_config(deny_on_unavailable, end_entity_only)?)
     }
 
-    fn empty_crl_set_with_config(config: MtlsConfig) -> Arc<CrlSet> {
+    /// Build an empty `CrlSet` from an explicit config.
+    fn empty_crl_set_with_config(config: MtlsConfig) -> anyhow::Result<Arc<CrlSet>> {
         install_ring_provider();
         let mut roots = RootCertStore::empty();
-        roots.add(build_ca_root()).expect("add ca root");
-        CrlSet::__test_with_prepopulated_crls(Arc::new(roots), config, Vec::new())
-            .expect("empty CRL set")
+        roots.add(build_ca_root()?).context("add ca root")?;
+        #[expect(
+            deprecated,
+            reason = "deliberate: mtls_revocation::CrlSet::__test_with_prepopulated_crls — the deprecated test-only constructor is the only prepopulated-CrlSet entry point until 4.0"
+        )]
+        let set = CrlSet::__test_with_prepopulated_crls(Arc::new(roots), config, Vec::new())
+            .context("empty CRL set")?;
+        Ok(set)
     }
 
+    /// Pins that a CRL failing the verifier rebuild is neither cached nor advertised.
     #[tokio::test]
-    async fn cached_urls_not_advertised_when_verifier_rebuild_fails() {
-        let set = empty_crl_set(true, false);
+    async fn cached_urls_not_advertised_when_verifier_rebuild_fails() -> anyhow::Result<()> {
+        let set = empty_crl_set(true, false)?;
         let url = "https://bad-crl.example.test/crl";
-        let mut invalid_crl = CachedCrl::__test_synthetic(std::time::SystemTime::now());
+        let mut invalid_crl = CachedCrl::__test_synthetic(SystemTime::now());
         invalid_crl.der = CertificateRevocationListDer::from(vec![0x30, 0x00]);
         invalid_crl.source_url = url.to_owned();
 
@@ -172,17 +134,19 @@ mod tests {
             set.__test_note_discovered_urls(&[url.to_owned()]),
             "deny-on-unavailable precheck must still fail closed"
         );
+        Ok(())
     }
 
+    /// Pins that end-entity-only mode ignores uncached intermediate CDPs.
     #[tokio::test]
-    async fn end_entity_only_ignores_intermediate_cdp() {
-        let set = empty_crl_set(true, true);
+    async fn end_entity_only_ignores_intermediate_cdp() -> anyhow::Result<()> {
+        let set = empty_crl_set(true, true)?;
         let end_entity_url = "https://ee.example.test/crl";
         let intermediate_url = "https://intermediate.example.test/crl";
 
         set.__test_insert_cache(
             end_entity_url,
-            CachedCrl::__test_synthetic(std::time::SystemTime::now()),
+            CachedCrl::__test_synthetic(SystemTime::now()),
         )
         .await;
 
@@ -195,19 +159,18 @@ mod tests {
             !missing,
             "end-entity-only precheck must ignore uncached intermediate CDPs"
         );
+        Ok(())
     }
 
+    /// Pins that one cached CDP is enough for the precheck to pass.
     #[tokio::test]
-    async fn any_of_n_cdp_sufficient() {
-        let set = empty_crl_set(true, false);
+    async fn any_of_n_cdp_sufficient() -> anyhow::Result<()> {
+        let set = empty_crl_set(true, false)?;
         let cached_url = "https://cached.example.test/crl";
         let missing_url = "https://missing.example.test/crl";
 
-        set.__test_insert_cache(
-            cached_url,
-            CachedCrl::__test_synthetic(std::time::SystemTime::now()),
-        )
-        .await;
+        set.__test_insert_cache(cached_url, CachedCrl::__test_synthetic(SystemTime::now()))
+            .await;
 
         let missing =
             set.__test_note_discovered_urls(&[cached_url.to_owned(), missing_url.to_owned()]);
@@ -216,35 +179,37 @@ mod tests {
             !missing,
             "one cached CDP must be enough for webpki to make the authoritative decision"
         );
+        Ok(())
     }
 
+    /// Pins that `crl_retry_retention` and its legacy alias both set the grace window.
     #[tokio::test]
-    async fn retry_retention_alias() {
+    async fn retry_retention_alias() -> anyhow::Result<()> {
         let retry_config: MtlsConfig = serde_json::from_value(serde_json::json!({
             "ca_cert_path": "memory://ca.pem",
             "crl_retry_retention": "1h"
         }))
-        .expect("preferred retry-retention key must deserialize");
+        .context("preferred retry-retention key must deserialize")?;
         let legacy_config: MtlsConfig = serde_json::from_value(serde_json::json!({
             "ca_cert_path": "memory://ca.pem",
             "crl_stale_grace": "1h"
         }))
-        .expect("legacy stale-grace alias must deserialize");
-        assert_eq!(retry_config.crl_stale_grace, Duration::from_secs(3600));
-        assert_eq!(legacy_config.crl_stale_grace, Duration::from_secs(3600));
+        .context("legacy stale-grace alias must deserialize")?;
+        assert_eq!(retry_config.crl_stale_grace, Duration::from_hours(1));
+        assert_eq!(legacy_config.crl_stale_grace, Duration::from_hours(1));
 
-        let set = empty_crl_set_with_config(h3_config_with_retention(false, false, "1h"));
+        let set = empty_crl_set_with_config(h3_config_with_retention(false, false, "1h")?)?;
         let url = "https://retention.example.test/crl";
-        let now = std::time::SystemTime::now();
+        let now = SystemTime::now();
         set.__test_insert_cache(url, CachedCrl::__test_synthetic(now))
             .await;
         set.__test_replace_cache_entry_unverified(
             url,
-            CachedCrl::__test_stale(now - Duration::from_secs(1800)),
+            CachedCrl::__test_stale(now - Duration::from_mins(30)),
         )
         .await;
 
-        let _ = set.__test_trigger_refresh_url(url).await;
+        drop(set.__test_trigger_refresh_url(url).await);
         assert!(
             set.__test_cache_contains(url),
             "failed refresh inside retry-retention window must remain cached for retry"
@@ -254,14 +219,15 @@ mod tests {
             .await;
         set.__test_replace_cache_entry_unverified(
             url,
-            CachedCrl::__test_stale(now - Duration::from_secs(7200)),
+            CachedCrl::__test_stale(now - Duration::from_hours(2)),
         )
         .await;
 
-        let _ = set.__test_trigger_refresh_url(url).await;
+        drop(set.__test_trigger_refresh_url(url).await);
         assert!(
             !set.__test_cache_contains(url),
             "failed refresh past retry-retention window must evict the CRL"
         );
+        Ok(())
     }
 }

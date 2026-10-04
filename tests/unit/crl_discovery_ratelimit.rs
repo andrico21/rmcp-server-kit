@@ -31,82 +31,41 @@
 #![cfg_attr(
     target_os = "linux",
     expect(
-        clippy::too_long_first_doc_paragraph,
-        reason = "lint-migration: tests/unit/crl_discovery_ratelimit.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::shadow_reuse,
-        reason = "lint-migration: tests/unit/crl_discovery_ratelimit.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::let_underscore_untyped,
-        reason = "lint-migration: tests/unit/crl_discovery_ratelimit.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::let_underscore_must_use,
-        reason = "lint-migration: tests/unit/crl_discovery_ratelimit.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::expect_used,
-        reason = "lint-migration: tests/unit/crl_discovery_ratelimit.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::absolute_paths,
-        reason = "lint-migration: tests/unit/crl_discovery_ratelimit.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
+        clippy::missing_errors_doc,
         clippy::missing_panics_doc,
-        reason = "lint-migration: tests/unit/crl_discovery_ratelimit.rs"
+        reason = "test code is not rendered API documentation"
     )
 )]
 #![cfg_attr(
     target_os = "linux",
     expect(
-        clippy::std_instead_of_alloc,
-        reason = "lint-migration: tests/unit/crl_discovery_ratelimit.rs"
+        clippy::too_long_first_doc_paragraph,
+        reason = "test code is not rendered API documentation"
     )
 )]
-#![expect(
-    let_underscore_drop,
-    reason = "lint-migration: tests/unit/crl_discovery_ratelimit.rs"
-)]
-#![expect(
-    deprecated,
-    reason = "lint-migration: tests/unit/crl_discovery_ratelimit.rs"
+#![cfg_attr(
+    target_os = "linux",
+    expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")
 )]
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    extern crate alloc;
 
+    use alloc::sync::Arc;
+
+    use anyhow::Context as _;
     use rcgen::{
         BasicConstraints, CertificateParams, CertifiedIssuer, DnType, IsCa, KeyPair,
         KeyUsagePurpose,
     };
     use rmcp_server_kit::{auth::MtlsConfig, mtls_revocation::CrlSet};
-    use rustls::RootCertStore;
+    use rustls::{RootCertStore, crypto::ring, pki_types::CertificateDer};
     use tokio::sync::mpsc::UnboundedReceiver;
 
-    fn build_ca_root() -> rustls::pki_types::CertificateDer<'static> {
-        let mut params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    /// Build a self-signed CA root certificate for the test `CrlSet`s.
+    fn build_ca_root() -> anyhow::Result<CertificateDer<'static>> {
+        let mut params = CertificateParams::new(Vec::<String>::new()).context("ca params")?;
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params.key_usages = vec![
             KeyUsagePurpose::KeyCertSign,
@@ -116,13 +75,14 @@ mod tests {
         params
             .distinguished_name
             .push(DnType::CommonName, "ratelimit-ca");
-        let key = KeyPair::generate().expect("ca key");
+        let key = KeyPair::generate().context("ca key")?;
         let issuer: CertifiedIssuer<'static, KeyPair> =
-            CertifiedIssuer::self_signed(params, key).expect("ca self-signed");
-        issuer.der().clone()
+            CertifiedIssuer::self_signed(params, key).context("ca self-signed")?;
+        Ok(issuer.der().clone())
     }
 
-    fn build_mtls_config(rate_per_min: u32) -> MtlsConfig {
+    /// Build an `MtlsConfig` with the given per-minute discovery quota.
+    fn build_mtls_config(rate_per_min: u32) -> anyhow::Result<MtlsConfig> {
         serde_json::from_value(serde_json::json!({
             "ca_cert_path": "memory://ca.pem",
             "required": true,
@@ -138,67 +98,92 @@ mod tests {
             "crl_max_response_bytes": 5_242_880,
             "crl_discovery_rate_per_min": rate_per_min,
         }))
-        .expect("verifier mtls config")
+        .context("verifier mtls config")
     }
 
+    /// Install the ring crypto provider once per test process.
     fn install_ring_provider() {
         // CrlSet::new builds a reqwest client whose rustls is built with
         // rustls-no-provider; install ring once for tests.
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        drop(ring::default_provider().install_default());
     }
 
-    fn empty_crl_set(rate_per_min: u32) -> Arc<CrlSet> {
+    /// Build an empty `CrlSet` with the given per-minute discovery quota.
+    fn empty_crl_set(rate_per_min: u32) -> anyhow::Result<Arc<CrlSet>> {
         install_ring_provider();
         let mut roots = RootCertStore::empty();
-        roots.add(build_ca_root()).expect("add ca root");
-        let roots = Arc::new(roots);
-        CrlSet::__test_with_prepopulated_crls(roots, build_mtls_config(rate_per_min), vec![])
-            .expect("crl set with empty CRLs")
+        roots.add(build_ca_root()?).context("add ca root")?;
+        #[expect(
+            deprecated,
+            reason = "deliberate: mtls_revocation::CrlSet::__test_with_prepopulated_crls — the deprecated test-only constructor is the only prepopulated-CrlSet entry point until 4.0"
+        )]
+        let set = CrlSet::__test_with_prepopulated_crls(
+            Arc::new(roots),
+            build_mtls_config(rate_per_min)?,
+            vec![],
+        )
+        .context("crl set with empty CRLs")?;
+        Ok(set)
     }
 
     /// Variant that returns the discover-channel receiver alongside the
     /// `CrlSet` so that channel sends actually succeed (and therefore the
     /// production commit-to-`seen_urls` path executes). The receiver must
     /// stay alive in the test scope; drain or just hold it.
-    fn empty_crl_set_with_receiver(rate_per_min: u32) -> (Arc<CrlSet>, UnboundedReceiver<String>) {
+    fn empty_crl_set_with_receiver(
+        rate_per_min: u32,
+    ) -> anyhow::Result<(Arc<CrlSet>, UnboundedReceiver<String>)> {
         install_ring_provider();
         let mut roots = RootCertStore::empty();
-        roots.add(build_ca_root()).expect("add ca root");
-        let roots = Arc::new(roots);
-        CrlSet::__test_with_kept_receiver(roots, build_mtls_config(rate_per_min), vec![])
-            .expect("crl set with empty CRLs and kept receiver")
+        roots.add(build_ca_root()?).context("add ca root")?;
+        #[expect(
+            deprecated,
+            reason = "deliberate: mtls_revocation::CrlSet::__test_with_kept_receiver — the deprecated test-only constructor is the only kept-receiver entry point until 4.0"
+        )]
+        let set = CrlSet::__test_with_kept_receiver(
+            Arc::new(roots),
+            build_mtls_config(rate_per_min)?,
+            vec![],
+        )
+        .context("crl set with empty CRLs and kept receiver")?;
+        Ok(set)
     }
 
-    fn urls(prefix: &str, n: usize) -> Vec<String> {
+    /// Build `n` distinct CRL URLs under a per-test host prefix.
+    fn crl_urls(prefix: &str, n: usize) -> Vec<String> {
         (0..n)
-            .map(|i| format!("http://crl-{prefix}.example.test/{i}.crl"))
+            .map(|index| format!("http://crl-{prefix}.example.test/{index}.crl"))
             .collect()
     }
 
     // -- Q1: rate limiter accepts N then drops remainder -------------------------
 
+    /// Pins that a burst is admitted up to the quota and the remainder is dropped.
     #[test]
-    fn discovery_rate_limit_drops_excess() {
+    fn discovery_rate_limit_drops_excess() -> anyhow::Result<()> {
         // Configure a rate of 5/minute. Submit 12 distinct URLs in one burst.
         // governor's leaky-bucket starts at full capacity = 5, so the first 5
         // pass and the remaining 7 are dropped.
-        let crl_set = empty_crl_set(5);
-        let urls = urls("excess", 12);
+        let crl_set = empty_crl_set(5)?;
+        let urls = crl_urls("excess", 12);
         let (accepted, dropped) = crl_set.__test_check_discovery_rate(&urls);
         assert_eq!(accepted, 5, "first 5 must pass at rate=5/min");
         assert_eq!(dropped, 7, "remaining 7 must be rejected by limiter");
+        Ok(())
     }
 
     // -- Q2: first burst within quota all pass -----------------------------------
 
+    /// Pins that a burst no larger than the quota is admitted in full.
     #[test]
-    fn discovery_rate_limit_allows_first_burst_within_quota() {
+    fn discovery_rate_limit_allows_first_burst_within_quota() -> anyhow::Result<()> {
         // At rate=10/min, the first 10 URLs in a single burst all pass.
-        let crl_set = empty_crl_set(10);
-        let urls = urls("burst", 10);
+        let crl_set = empty_crl_set(10)?;
+        let urls = crl_urls("burst", 10);
         let (accepted, dropped) = crl_set.__test_check_discovery_rate(&urls);
         assert_eq!(accepted, 10);
         assert_eq!(dropped, 0);
+        Ok(())
     }
 
     // -- Q3: note_discovered_urls dedup runs before the limiter ----------------
@@ -213,8 +198,9 @@ mod tests {
     // fail, no URL is ever marked seen, and re-submitting the same batch
     // would consume limiter capacity a second time, masking the bug.
 
+    /// Pins that re-submitting known URLs consumes no limiter quota.
     #[test]
-    fn note_discovered_urls_dedup_does_not_consume_limiter_quota() {
+    fn note_discovered_urls_dedup_does_not_consume_limiter_quota() -> anyhow::Result<()> {
         // Rate = 10/min. First batch consumes 3 of 10, leaving 7 available.
         // Second batch (same 3 URLs) must consume 0 if dedup works; if dedup
         // is broken it would consume 3 more, leaving only 4. We then probe
@@ -222,11 +208,11 @@ mod tests {
         // accepted; dedup-broken => only 4 accepted, 3 dropped. This
         // distinguishes the two outcomes (unlike a saturated-limiter setup
         // where both outcomes drop everything).
-        let (crl_set, mut rx) = empty_crl_set_with_receiver(10);
-        let batch = urls("dedup", 3);
+        let (crl_set, mut rx) = empty_crl_set_with_receiver(10)?;
+        let batch = crl_urls("dedup", 3);
 
         // First call: 3 distinct URLs admitted and committed to `seen_urls`.
-        let _ = crl_set.__test_note_discovered_urls(&batch);
+        let _: bool = crl_set.__test_note_discovered_urls(&batch);
         while rx.try_recv().is_ok() {}
 
         // Sanity check: the first batch is now in `seen_urls`. If this
@@ -242,7 +228,7 @@ mod tests {
 
         // Second call: SAME 3 URLs. Dedup must drop them all *before*
         // hitting the limiter, so no quota is consumed.
-        let _ = crl_set.__test_note_discovered_urls(&batch);
+        let _: bool = crl_set.__test_note_discovered_urls(&batch);
         while rx.try_recv().is_ok() {}
 
         // Probe remaining quota with 7 fresh URLs. With dedup working:
@@ -250,7 +236,7 @@ mod tests {
         // accepted. With dedup broken: the second `note_discovered_urls`
         // call would have consumed 3 more, leaving only 4, so 3 of the
         // fresh URLs would be dropped.
-        let probe = urls("dedup-probe", 7);
+        let probe = crl_urls("dedup-probe", 7);
         let (accepted, dropped) = crl_set.__test_check_discovery_rate(&probe);
         assert_eq!(
             accepted, 7,
@@ -261,12 +247,14 @@ mod tests {
             dropped, 0,
             "all 7 fresh probe URLs must fit in remaining quota"
         );
+        Ok(())
     }
 
     // -- Q4: B2 regression -- rate-limited URLs are NOT marked seen --------------
 
+    /// Pins that a limiter-dropped URL stays retriable on the next handshake.
     #[test]
-    fn rate_limited_url_remains_retriable_on_next_handshake() {
+    fn rate_limited_url_remains_retriable_on_next_handshake() -> anyhow::Result<()> {
         // B2 regression: prior to the fix, `note_discovered_urls` promoted
         // every input URL to `seen_urls` BEFORE the rate-limiter check. A
         // URL that lost the limiter race was therefore black-holed forever:
@@ -284,14 +272,14 @@ mod tests {
         // We keep the receiver alive so the saturating URL is committed
         // (proving the success path works), then verify the rate-limited
         // target URL is *not* committed (proving the B2 fix).
-        let (crl_set, mut rx) = empty_crl_set_with_receiver(1); // 1/min capacity
-        let saturate = urls("saturate-b2", 1);
-        let target = urls("target-b2", 1);
-        let saturate_url = saturate.first().expect("saturate batch has 1 url");
-        let target_url = target.first().expect("target batch has 1 url");
+        let (crl_set, mut rx) = empty_crl_set_with_receiver(1)?; // 1/min capacity
+        let saturate = crl_urls("saturate-b2", 1);
+        let target = crl_urls("target-b2", 1);
+        let saturate_url = saturate.first().context("saturate batch has 1 url")?;
+        let target_url = target.first().context("target batch has 1 url")?;
 
         // Saturate the limiter (this URL must be admitted and committed).
-        let _ = crl_set.__test_note_discovered_urls(&saturate);
+        let _: bool = crl_set.__test_note_discovered_urls(&saturate);
         while rx.try_recv().is_ok() {}
         assert!(
             crl_set.__test_is_seen(saturate_url),
@@ -301,12 +289,13 @@ mod tests {
         // Target URL: limiter exhausted -- governor must drop it. Under
         // B2 the URL must NOT be marked seen so the next handshake gets
         // a fresh chance once the limiter refills.
-        let _ = crl_set.__test_note_discovered_urls(&target);
+        let _: bool = crl_set.__test_note_discovered_urls(&target);
         while rx.try_recv().is_ok() {}
         assert!(
             !crl_set.__test_is_seen(target_url),
             "B2 regression: rate-limited URL must NOT be marked seen \
              (otherwise it would be permanently black-holed by dedup)"
         );
+        Ok(())
     }
 }
