@@ -17,27 +17,7 @@
 //! curl http://127.0.0.1:8080/healthz
 //! curl http://127.0.0.1:8080/readyz
 //! ```
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::std_instead_of_core,
-        reason = "lint-migration: examples/minimal_server.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::absolute_paths,
-        reason = "lint-migration: examples/minimal_server.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_docs_in_private_items,
-        reason = "lint-migration: examples/minimal_server.rs"
-    )
-)]
+use core::time::Duration;
 
 use rmcp::{
     handler::server::ServerHandler,
@@ -49,6 +29,7 @@ use rmcp_server_kit::{
     transport::{McpServerConfig, serve},
 };
 
+/// Smallest `ServerHandler` the kit accepts: tools capability, no tools.
 #[derive(Clone)]
 struct MinimalHandler;
 
@@ -58,6 +39,7 @@ impl ServerHandler for MinimalHandler {
     }
 }
 
+// cancel-safe: process entry point; dropping this future tears down the server and its runtime.
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> rmcp_server_kit::Result<()> {
     let mut observability = ObservabilityConfig::default();
@@ -69,7 +51,7 @@ async fn main() -> rmcp_server_kit::Result<()> {
         "rmcp-server-kit-minimal-example",
         env!("CARGO_PKG_VERSION"),
     )
-    .with_request_timeout(std::time::Duration::from_secs(30))
+    .with_request_timeout(Duration::from_secs(30))
     .enable_request_header_logging();
 
     serve(config.validate()?, || MinimalHandler).await

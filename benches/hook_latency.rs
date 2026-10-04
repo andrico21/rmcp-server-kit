@@ -33,72 +33,11 @@
 //! than spinning up a full MCP server per iteration; that would drown
 //! the hook overhead in transport noise and make the gate unable to
 //! detect regressions in the hook machinery itself.
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::shadow_reuse,
-        reason = "lint-migration: benches/hook_latency.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::unreachable,
-        reason = "lint-migration: benches/hook_latency.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::shadow_unrelated,
-        reason = "lint-migration: benches/hook_latency.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::expect_used,
-        reason = "lint-migration: benches/hook_latency.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::min_ident_chars,
-        reason = "lint-migration: benches/hook_latency.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_panics_doc,
-        reason = "lint-migration: benches/hook_latency.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_docs_in_private_items,
-        reason = "lint-migration: benches/hook_latency.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::std_instead_of_alloc,
-        reason = "lint-migration: benches/hook_latency.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::std_instead_of_core,
-        reason = "lint-migration: benches/hook_latency.rs"
-    )
-)]
-#![expect(unused_results, reason = "lint-migration: benches/hook_latency.rs")]
 
-use std::{hint::black_box, sync::Arc};
+extern crate alloc;
+
+use alloc::sync::Arc;
+use core::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -107,37 +46,52 @@ use rmcp_server_kit::tool_hooks::{
 };
 use tokio::runtime::Builder;
 
+/// Build the [`ToolCallContext`] shared by both benchmark scenarios.
 fn make_ctx() -> ToolCallContext {
     ToolCallContext::for_tool("bench")
 }
 
+/// Build the small `CallToolResult` both scenarios produce.
 fn make_result() -> CallToolResult {
     CallToolResult::success(vec![ContentBlock::text("ok".to_owned())])
 }
 
-fn bench_hook_latency_bare(c: &mut Criterion) {
-    let rt = Builder::new_current_thread()
+/// Benchmarks the bare inner-handler shape (no hooks, no spawn).
+///
+/// # Panics
+///
+/// Panics if the single-threaded Tokio runtime cannot be built.
+#[expect(clippy::expect_used, unused_results, reason = "criterion API")]
+fn bench_hook_latency_bare(criterion: &mut Criterion) {
+    let runtime = Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("build tokio runtime");
 
-    c.bench_function("hook_latency_bare", |b| {
-        b.iter(|| {
-            rt.block_on(async {
+    criterion.bench_function("hook_latency_bare", |bencher| {
+        bencher.iter(|| {
+            runtime.block_on(async {
                 // Bare floor: an async block produces a CallToolResult,
                 // exactly the inner-handler shape with no instrumentation.
-                let r = async { make_result() }.await;
-                black_box(r);
+                let result = async { make_result() }.await;
+                drop(black_box(result));
             });
         });
     });
 }
 
-fn bench_hook_latency_hooked(c: &mut Criterion) {
+/// Benchmarks the hooked path: before-hook, inner call, `Arc::clone` + spawn.
+///
+/// # Panics
+///
+/// Panics if the multi-threaded Tokio runtime cannot be built, or if the
+/// no-op before-hook does not return [`HookOutcome::Continue`].
+#[expect(clippy::expect_used, unused_results, reason = "criterion API")]
+fn bench_hook_latency_hooked(criterion: &mut Criterion) {
     // Multi-thread runtime so the spawned after-hook can actually run
     // concurrently with the iter loop and we measure real spawn cost,
     // not an artificially serialized current-thread spawn queue.
-    let rt = Builder::new_multi_thread()
+    let runtime = Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
@@ -153,27 +107,29 @@ fn bench_hook_latency_hooked(c: &mut Criterion) {
             .with_after(after),
     );
 
-    c.bench_function("hook_latency_hooked", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                let ctx = make_ctx();
+    criterion.bench_function("hook_latency_hooked", |bencher| {
+        bencher.iter(|| {
+            runtime.block_on(async {
+                let context = make_ctx();
                 // Mirror the call_tool branch order: before -> inner -> spawn after.
-                if let Some(before) = hooks.before.as_ref() {
-                    let outcome = before(&ctx).await;
-                    if !matches!(outcome, HookOutcome::Continue) {
-                        unreachable!("bench expects Continue");
-                    }
+                if let Some(before_hook) = hooks.before.as_ref() {
+                    let outcome = before_hook(&context).await;
+                    assert!(
+                        matches!(outcome, HookOutcome::Continue),
+                        "bench expects Continue"
+                    );
                 }
-                let r = async { make_result() }.await;
-                if let Some(after) = hooks.after.as_ref() {
-                    let after = Arc::clone(after);
-                    let ctx_clone = ctx.clone();
-                    tokio::spawn(async move {
-                        let fut = after(&ctx_clone, HookDisposition::InnerExecuted, 64);
-                        fut.await;
-                    });
+                let result = async { make_result() }.await;
+                if let Some(after_hook) = hooks.after.as_ref() {
+                    let after_hook_clone = Arc::clone(after_hook);
+                    let context_clone = context.clone();
+                    drop(tokio::spawn(async move {
+                        let future =
+                            after_hook_clone(&context_clone, HookDisposition::InnerExecuted, 64);
+                        future.await;
+                    }));
                 }
-                black_box(r);
+                drop(black_box(result));
             });
         });
     });
