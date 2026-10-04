@@ -18,113 +18,36 @@
 #[cfg_attr(
     all(feature = "oauth-mtls-client", target_os = "linux"),
     expect(
-        clippy::arithmetic_side_effects,
-        reason = "lint-migration: tests/integration/e2e_oauth_mtls.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::indexing_slicing,
-        reason = "lint-migration: tests/integration/e2e_oauth_mtls.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::print_stderr,
-        reason = "lint-migration: tests/integration/e2e_oauth_mtls.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::min_ident_chars,
-        reason = "lint-migration: tests/integration/e2e_oauth_mtls.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::absolute_paths,
-        reason = "lint-migration: tests/integration/e2e_oauth_mtls.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::let_underscore_untyped,
-        reason = "lint-migration: tests/integration/e2e_oauth_mtls.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::let_underscore_must_use,
-        reason = "lint-migration: tests/integration/e2e_oauth_mtls.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::expect_used,
-        reason = "lint-migration: tests/integration/e2e_oauth_mtls.rs"
+        clippy::missing_errors_doc,
+        reason = "test code is not rendered API documentation"
     )
 )]
 #[cfg_attr(
     all(feature = "oauth-mtls-client", target_os = "linux"),
     expect(
         clippy::missing_panics_doc,
-        reason = "lint-migration: tests/integration/e2e_oauth_mtls.rs"
+        reason = "test code is not rendered API documentation"
     )
 )]
 #[cfg_attr(
     all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::unused_trait_names,
-        reason = "lint-migration: tests/integration/e2e_oauth_mtls.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::std_instead_of_alloc,
-        reason = "lint-migration: tests/integration/e2e_oauth_mtls.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::std_instead_of_core,
-        reason = "lint-migration: tests/integration/e2e_oauth_mtls.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::unseparated_literal_suffix,
-        reason = "lint-migration: tests/integration/e2e_oauth_mtls.rs"
-    )
-)]
-#[cfg_attr(
-    feature = "oauth-mtls-client",
-    expect(
-        unused_results,
-        reason = "lint-migration: tests/integration/e2e_oauth_mtls.rs"
-    )
-)]
-#[cfg_attr(
-    feature = "oauth-mtls-client",
-    expect(
-        let_underscore_drop,
-        reason = "lint-migration: tests/integration/e2e_oauth_mtls.rs"
-    )
+    expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")
 )]
 #[cfg(test)]
 mod tests {
 
-    use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+    extern crate alloc;
 
+    use alloc::sync::Arc;
+    use core::{net::SocketAddr, time::Duration};
+    use std::{
+        env, fs,
+        io::{Write as _, stderr},
+        path::PathBuf,
+        process,
+    };
+
+    use anyhow::Context as _;
     use rcgen::{
         BasicConstraints, CertificateParams, CertifiedIssuer, DnType, IsCa, KeyPair,
         KeyUsagePurpose,
@@ -134,13 +57,15 @@ mod tests {
     };
     use rustls::{
         RootCertStore, ServerConfig,
+        crypto::ring,
         pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
         server::WebPkiClientVerifier,
     };
     use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
+        io::{AsyncReadExt as _, AsyncWriteExt as _},
         net::TcpListener,
         sync::oneshot,
+        time::timeout,
     };
     use tokio_rustls::TlsAcceptor;
 
@@ -157,8 +82,8 @@ mod tests {
         ca_cert_der: Vec<u8>,
     }
 
-    fn build_mtls_pki() -> MtlsPki {
-        let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    fn build_mtls_pki() -> anyhow::Result<MtlsPki> {
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).context("ca params")?;
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         ca_params.key_usages = vec![
             KeyUsagePurpose::KeyCertSign,
@@ -168,59 +93,59 @@ mod tests {
         ca_params
             .distinguished_name
             .push(DnType::CommonName, "mtls-test-ca");
-        let ca_key = KeyPair::generate().expect("ca key");
+        let ca_key = KeyPair::generate().context("ca key")?;
         let ca_issuer: CertifiedIssuer<'static, KeyPair> =
-            CertifiedIssuer::self_signed(ca_params, ca_key).expect("ca self-signed");
+            CertifiedIssuer::self_signed(ca_params, ca_key).context("ca self-signed")?;
 
         let mut server_params =
-            CertificateParams::new(vec!["localhost".to_owned()]).expect("server params");
+            CertificateParams::new(vec!["localhost".to_owned()]).context("server params")?;
         server_params
             .distinguished_name
             .push(DnType::CommonName, "mtls-test-server");
-        let server_key = KeyPair::generate().expect("server key");
+        let server_key = KeyPair::generate().context("server key")?;
         let server_cert = server_params
             .signed_by(&server_key, &ca_issuer)
-            .expect("server signed");
+            .context("server signed")?;
 
         let mut client_params =
-            CertificateParams::new(Vec::<String>::new()).expect("client params");
+            CertificateParams::new(Vec::<String>::new()).context("client params")?;
         client_params
             .distinguished_name
             .push(DnType::CommonName, "mtls-test-client");
-        let client_key = KeyPair::generate().expect("client key");
+        let client_key = KeyPair::generate().context("client key")?;
         let client_cert = client_params
             .signed_by(&client_key, &ca_issuer)
-            .expect("client signed");
+            .context("client signed")?;
 
-        MtlsPki {
+        Ok(MtlsPki {
             ca_pem: ca_issuer.as_ref().pem(),
             server_cert_der: server_cert.der().to_vec(),
             server_key_der: server_key.serialize_der(),
             client_cert_pem: client_cert.pem(),
             client_key_pem: client_key.serialize_pem(),
             ca_cert_der: ca_issuer.as_ref().der().to_vec(),
-        }
+        })
     }
 
     fn install_crypto_provider() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        drop(ring::default_provider().install_default());
     }
 
-    fn build_mtls_server_config(pki: &MtlsPki) -> Arc<ServerConfig> {
+    fn build_mtls_server_config(pki: &MtlsPki) -> anyhow::Result<Arc<ServerConfig>> {
         let mut roots = RootCertStore::empty();
         roots
             .add(CertificateDer::from(pki.ca_cert_der.clone()))
-            .expect("add ca to roots");
+            .context("add ca to roots")?;
         let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
             .build()
-            .expect("client verifier");
+            .context("client verifier")?;
         let cert = CertificateDer::from(pki.server_cert_der.clone());
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pki.server_key_der.clone()));
         let config = ServerConfig::builder()
             .with_client_cert_verifier(verifier)
             .with_single_cert(vec![cert], key)
-            .expect("server config");
-        Arc::new(config)
+            .context("server config")?;
+        Ok(Arc::new(config))
     }
 
     #[derive(Debug)]
@@ -232,101 +157,127 @@ mod tests {
     async fn spawn_one_shot_mtls_server(
         pki: &MtlsPki,
         response_bytes: Vec<u8>,
-    ) -> (String, oneshot::Receiver<CapturedRequest>) {
+    ) -> anyhow::Result<(String, oneshot::Receiver<CapturedRequest>)> {
         install_crypto_provider();
-        let server_config = build_mtls_server_config(pki);
+        let server_config = build_mtls_server_config(pki)?;
         let acceptor = TlsAcceptor::from(server_config);
 
         let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .await
-            .expect("bind 127.0.0.1:0");
-        let port = listener.local_addr().expect("local_addr").port();
+            .context("bind 127.0.0.1:0")?;
+        let port = listener.local_addr().context("local_addr")?.port();
 
         let (tx, rx) = oneshot::channel::<CapturedRequest>();
 
-        tokio::spawn(async move {
-            let accept_fut = listener.accept();
-            let (tcp, _peer) = match tokio::time::timeout(Duration::from_secs(30), accept_fut).await
-            {
-                Ok(Ok(pair)) => pair,
-                Ok(Err(e)) => {
-                    eprintln!("mtls accept error: {e}");
-                    return;
-                }
-                Err(_) => {
-                    eprintln!("mtls accept timeout");
-                    return;
-                }
-            };
-            let mut tls_stream = match acceptor.accept(tcp).await {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("mtls handshake error: {e}");
-                    return;
-                }
-            };
+        drop(tokio::spawn(serve_one_shot_mtls_connection(
+            acceptor,
+            listener,
+            tx,
+            response_bytes,
+        )));
 
-            let peer_cert_count = {
-                let (_io, conn) = tls_stream.get_ref();
-                conn.peer_certificates().map_or(0, <[_]>::len)
-            };
-
-            let mut buf = vec![0u8; 16 * 1024];
-            let mut filled = 0usize;
-            while filled < buf.len() {
-                let n = match tokio::time::timeout(
-                    Duration::from_secs(5),
-                    tls_stream.read(&mut buf[filled..]),
-                )
-                .await
-                {
-                    Ok(Ok(0)) => break,
-                    Ok(Ok(n)) => n,
-                    Ok(Err(e)) => {
-                        eprintln!("mtls read error: {e}");
-                        return;
-                    }
-                    Err(_) => {
-                        eprintln!("mtls read timeout");
-                        return;
-                    }
-                };
-                filled += n;
-                if buf[..filled].windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            let headers = String::from_utf8_lossy(&buf[..filled]).into_owned();
-
-            if let Err(e) = tls_stream.write_all(&response_bytes).await {
-                eprintln!("mtls write error: {e}");
-            }
-            let _ = tls_stream.shutdown().await;
-
-            let _ = tx.send(CapturedRequest {
-                headers,
-                peer_cert_count,
-            });
-        });
-
-        (format!("https://localhost:{port}/token"), rx)
+        Ok((format!("https://localhost:{port}/token"), rx))
     }
 
-    fn write_pem(name: &str, body: &str) -> PathBuf {
-        let dir = std::env::temp_dir();
-        let pid = std::process::id();
+    async fn serve_one_shot_mtls_connection(
+        acceptor: TlsAcceptor,
+        listener: TcpListener,
+        tx: oneshot::Sender<CapturedRequest>,
+        response_bytes: Vec<u8>,
+    ) -> anyhow::Result<()> {
+        let accept_fut = listener.accept();
+        let (tcp, _peer) = match timeout(Duration::from_secs(30), accept_fut).await {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(error)) => {
+                writeln!(stderr(), "mtls accept error: {error}")
+                    .context("report mtls accept error")?;
+                return Ok(());
+            }
+            Err(_) => {
+                writeln!(stderr(), "mtls accept timeout").context("report mtls accept timeout")?;
+                return Ok(());
+            }
+        };
+        let mut tls_stream = match acceptor.accept(tcp).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                writeln!(stderr(), "mtls handshake error: {error}")
+                    .context("report mtls handshake error")?;
+                return Ok(());
+            }
+        };
+
+        let peer_cert_count = {
+            let (_io, conn) = tls_stream.get_ref();
+            conn.peer_certificates().map_or(0, <[_]>::len)
+        };
+
+        let mut buf = vec![0_u8; 16 * 1024];
+        let mut filled = 0_usize;
+        while filled < buf.len() {
+            let Some(read_slice) = buf.get_mut(filled..) else {
+                return Ok(());
+            };
+            let bytes_read = match timeout(Duration::from_secs(5), tls_stream.read(read_slice))
+                .await
+            {
+                Ok(Ok(0)) => break,
+                Ok(Ok(bytes_read)) => bytes_read,
+                Ok(Err(error)) => {
+                    writeln!(stderr(), "mtls read error: {error}")
+                        .context("report mtls read error")?;
+                    return Ok(());
+                }
+                Err(_) => {
+                    writeln!(stderr(), "mtls read timeout").context("report mtls read timeout")?;
+                    return Ok(());
+                }
+            };
+            let Some(next) = filled.checked_add(bytes_read) else {
+                return Ok(());
+            };
+            filled = next;
+            let Some(head) = buf.get(..filled) else {
+                return Ok(());
+            };
+            if head.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let Some(head) = buf.get(..filled) else {
+            return Ok(());
+        };
+        let headers = String::from_utf8_lossy(head).into_owned();
+
+        if let Err(error) = tls_stream.write_all(&response_bytes).await {
+            writeln!(stderr(), "mtls write error: {error}").context("report mtls write error")?;
+        }
+        drop(tls_stream.shutdown().await);
+
+        drop(tx.send(CapturedRequest {
+            headers,
+            peer_cert_count,
+        }));
+        Ok(())
+    }
+
+    fn write_pem(name: &str, body: &str) -> anyhow::Result<PathBuf> {
+        let dir = env::temp_dir();
+        let pid = process::id();
         let path = dir.join(format!("rmcp-mtls-e2e-{name}-{pid}.pem"));
-        std::fs::write(&path, body).expect("write pem");
-        path
+        fs::write(&path, body).context("write pem")?;
+        Ok(path)
     }
 
     // ---------------------------------------------------------------------------
     // Tests
     // ---------------------------------------------------------------------------
 
+    /// Pins that the mTLS client presents its client certificate at the TLS
+    /// handshake and sends no `Authorization` header on the token exchange.
     #[tokio::test]
-    async fn exchange_token_presents_client_cert_and_omits_authorization() {
-        let pki = build_mtls_pki();
+    async fn exchange_token_presents_client_cert_and_omits_authorization() -> anyhow::Result<()> {
+        let pki = build_mtls_pki()?;
         let body =
             b"{\"access_token\":\"AAA\",\"token_type\":\"Bearer\",\"issued_token_type\":\"x\",\"expires_in\":60}";
         let mut response = format!(
@@ -335,11 +286,11 @@ mod tests {
         )
         .into_bytes();
         response.extend_from_slice(body);
-        let (token_url, captured_rx) = spawn_one_shot_mtls_server(&pki, response).await;
+        let (token_url, captured_rx) = spawn_one_shot_mtls_server(&pki, response).await?;
 
-        let ca_path = write_pem("ca", &pki.ca_pem);
-        let cert_path = write_pem("client-cert", &pki.client_cert_pem);
-        let key_path = write_pem("client-key", &pki.client_key_pem);
+        let ca_path = write_pem("ca", &pki.ca_pem)?;
+        let cert_path = write_pem("client-cert", &pki.client_cert_pem)?;
+        let key_path = write_pem("client-key", &pki.client_key_pem)?;
 
         let cc = ClientCertConfig::new(cert_path.clone(), key_path.clone());
         let tx_cfg = TokenExchangeConfig::new(token_url, "client", None, Some(cc))
@@ -354,25 +305,25 @@ mod tests {
         oauth_cfg.token_exchange = Some(tx_cfg.clone());
         oauth_cfg.ca_cert_path = Some(ca_path.clone());
 
-        oauth_cfg.validate().expect("config validates");
+        oauth_cfg.validate().context("config validates")?;
 
         let http = OauthHttpClient::with_config(&oauth_cfg)
-            .expect("build oauth http client")
+            .context("build oauth http client")?
             .__test_allow_loopback_ssrf();
 
         let exchanged = exchange_token(&http, &tx_cfg, "subject-token-xxx")
             .await
-            .expect("token exchange must succeed");
+            .context("token exchange must succeed")?;
         assert_eq!(exchanged.access_token, "AAA");
 
-        let captured = tokio::time::timeout(Duration::from_secs(30), captured_rx)
+        let captured = timeout(Duration::from_secs(30), captured_rx)
             .await
-            .expect("captured channel timeout")
-            .expect("captured channel closed");
+            .context("captured channel timeout")?
+            .context("captured channel closed")?;
 
-        let _ = std::fs::remove_file(&ca_path);
-        let _ = std::fs::remove_file(&cert_path);
-        let _ = std::fs::remove_file(&key_path);
+        drop(fs::remove_file(&ca_path));
+        drop(fs::remove_file(&cert_path));
+        drop(fs::remove_file(&key_path));
 
         assert!(
             captured.peer_cert_count >= 1,
@@ -392,21 +343,24 @@ mod tests {
             "captured request must look like an RFC 8693 token exchange POST; got:\n{}",
             captured.headers
         );
+        Ok(())
     }
 
+    /// Pins that the cert-bearing mTLS client does not follow a 3xx from the
+    /// token endpoint, surfacing it as a sanitized OAuth error instead.
     #[tokio::test]
-    async fn mtls_client_does_not_follow_redirects() {
-        let pki = build_mtls_pki();
+    async fn mtls_client_does_not_follow_redirects() -> anyhow::Result<()> {
+        let pki = build_mtls_pki()?;
 
         let redirect = b"HTTP/1.1 302 Found\r\n\
             Location: https://attacker.invalid/exfil\r\n\
             Content-Length: 0\r\n\
             \r\n";
-        let (token_url, _captured_rx) = spawn_one_shot_mtls_server(&pki, redirect.to_vec()).await;
+        let (token_url, _captured_rx) = spawn_one_shot_mtls_server(&pki, redirect.to_vec()).await?;
 
-        let ca_path = write_pem("ca-redir", &pki.ca_pem);
-        let cert_path = write_pem("client-cert-redir", &pki.client_cert_pem);
-        let key_path = write_pem("client-key-redir", &pki.client_key_pem);
+        let ca_path = write_pem("ca-redir", &pki.ca_pem)?;
+        let cert_path = write_pem("client-cert-redir", &pki.client_cert_pem)?;
+        let key_path = write_pem("client-key-redir", &pki.client_key_pem)?;
 
         let cc = ClientCertConfig::new(cert_path.clone(), key_path.clone());
         let tx_cfg = TokenExchangeConfig::new(token_url, "client", None, Some(cc))
@@ -421,21 +375,21 @@ mod tests {
         oauth_cfg.token_exchange = Some(tx_cfg.clone());
         oauth_cfg.ca_cert_path = Some(ca_path.clone());
 
-        oauth_cfg.validate().expect("config validates");
+        oauth_cfg.validate().context("config validates")?;
 
         let http = OauthHttpClient::with_config(&oauth_cfg)
-            .expect("build oauth http client")
+            .context("build oauth http client")?
             .__test_allow_loopback_ssrf();
 
         let result = exchange_token(&http, &tx_cfg, "subject-token-xxx").await;
 
-        let _ = std::fs::remove_file(&ca_path);
-        let _ = std::fs::remove_file(&cert_path);
-        let _ = std::fs::remove_file(&key_path);
+        drop(fs::remove_file(&ca_path));
+        drop(fs::remove_file(&cert_path));
+        drop(fs::remove_file(&key_path));
 
-        let err = result.expect_err(
+        let err = result.err().context(
             "302 with Policy::none() must surface as an upstream error, NOT silently follow",
-        );
+        )?;
         let err_msg = format!("{err}");
         assert!(
             err_msg.contains("server_error")
@@ -443,5 +397,6 @@ mod tests {
                 || err_msg.contains("invalid_grant"),
             "302 must map to a sanitized OAuth error short code, NOT a follow-through; got {err_msg}"
         );
+        Ok(())
     }
 }

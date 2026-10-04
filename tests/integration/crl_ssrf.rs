@@ -20,82 +20,38 @@
 #[cfg_attr(
     target_os = "linux",
     expect(
-        clippy::min_ident_chars,
-        reason = "lint-migration: tests/integration/crl_ssrf.rs"
-    )
-)]
-#[cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::indexing_slicing,
-        reason = "lint-migration: tests/integration/crl_ssrf.rs"
-    )
-)]
-#[cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::let_underscore_untyped,
-        reason = "lint-migration: tests/integration/crl_ssrf.rs"
-    )
-)]
-#[cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::let_underscore_must_use,
-        reason = "lint-migration: tests/integration/crl_ssrf.rs"
-    )
-)]
-#[cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::absolute_paths,
-        reason = "lint-migration: tests/integration/crl_ssrf.rs"
-    )
-)]
-#[cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::expect_used,
-        reason = "lint-migration: tests/integration/crl_ssrf.rs"
+        clippy::missing_errors_doc,
+        reason = "test code is not rendered API documentation"
     )
 )]
 #[cfg_attr(
     target_os = "linux",
     expect(
         clippy::missing_panics_doc,
-        reason = "lint-migration: tests/integration/crl_ssrf.rs"
+        reason = "test code is not rendered API documentation"
     )
 )]
 #[cfg_attr(
     target_os = "linux",
-    expect(
-        clippy::std_instead_of_core,
-        reason = "lint-migration: tests/integration/crl_ssrf.rs"
-    )
-)]
-#[cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::unseparated_literal_suffix,
-        reason = "lint-migration: tests/integration/crl_ssrf.rs"
-    )
-)]
-#[expect(
-    let_underscore_drop,
-    reason = "lint-migration: tests/integration/crl_ssrf.rs"
+    expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")
 )]
 #[cfg(test)]
 mod tests {
 
-    use std::time::Duration;
+    use core::time::Duration;
 
+    use anyhow::Context as _;
     use rcgen::{
         BasicConstraints, CertificateParams, CertificateRevocationListParams, CertifiedIssuer,
         CrlDistributionPoint, DnType, IsCa, KeyIdMethod, KeyPair, KeyUsagePurpose,
         RevocationReason, RevokedCertParams, SerialNumber, date_time_ymd,
     };
+    use reqwest::redirect::Policy;
     use rmcp_server_kit::mtls_revocation::extract_cdp_urls;
-    use rustls::pki_types::CertificateRevocationListDer;
+    use rustls::{
+        crypto::ring,
+        pki_types::{CertificateDer, CertificateRevocationListDer},
+    };
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
@@ -103,8 +59,8 @@ mod tests {
 
     // -- helpers -----------------------------------------------------------------
 
-    fn build_ca() -> CertifiedIssuer<'static, KeyPair> {
-        let mut params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    fn build_ca() -> anyhow::Result<CertifiedIssuer<'static, KeyPair>> {
+        let mut params = CertificateParams::new(Vec::<String>::new()).context("ca params")?;
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params.key_usages = vec![
             KeyUsagePurpose::KeyCertSign,
@@ -114,25 +70,25 @@ mod tests {
         params
             .distinguished_name
             .push(DnType::CommonName, "ssrf-ca");
-        let key = KeyPair::generate().expect("ca key");
-        CertifiedIssuer::self_signed(params, key).expect("ca self-signed")
+        let key = KeyPair::generate().context("ca key")?;
+        CertifiedIssuer::self_signed(params, key).context("ca self-signed")
     }
 
-    fn build_cert_with_cdp_urls(uris: Vec<String>) -> rustls::pki_types::CertificateDer<'static> {
-        let ca = build_ca();
-        let mut params = CertificateParams::new(vec!["localhost".to_owned()]).expect("params");
+    fn build_cert_with_cdp_urls(uris: Vec<String>) -> anyhow::Result<CertificateDer<'static>> {
+        let ca = build_ca()?;
+        let mut params = CertificateParams::new(vec!["localhost".to_owned()]).context("params")?;
         params.serial_number = Some(SerialNumber::from(42_u64));
         params
             .distinguished_name
             .push(DnType::CommonName, "ssrf-leaf");
         params.crl_distribution_points = vec![CrlDistributionPoint { uris }];
-        let key = KeyPair::generate().expect("leaf key");
-        let cert = params.signed_by(&key, &ca).expect("leaf signed");
-        cert.der().clone()
+        let key = KeyPair::generate().context("leaf key")?;
+        let cert = params.signed_by(&key, &ca).context("leaf signed")?;
+        Ok(cert.der().clone())
     }
 
-    fn build_test_crl_der() -> Vec<u8> {
-        let ca = build_ca();
+    fn build_test_crl_der() -> anyhow::Result<Vec<u8>> {
+        let ca = build_ca()?;
         let der: CertificateRevocationListDer<'static> = CertificateRevocationListParams {
             this_update: date_time_ymd(2026, 1, 1),
             next_update: date_time_ymd(2027, 1, 1),
@@ -147,82 +103,106 @@ mod tests {
             key_identifier_method: KeyIdMethod::Sha256,
         }
         .signed_by(&ca)
-        .expect("signed crl")
+        .context("signed crl")?
         .into();
-        der.as_ref().to_vec()
+        Ok(der.as_ref().to_vec())
     }
 
     /// Construct the same `reqwest::Client` shape that `CrlSet::new` builds.
     /// Kept here (not imported) so any production-side regression that loosens
     /// the policy is caught by these tests failing.
-    fn build_hardened_client() -> reqwest::Client {
+    fn build_hardened_client() -> anyhow::Result<reqwest::Client> {
         // reqwest is built with rustls-no-provider; install ring for tests.
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        drop(ring::default_provider().install_default());
         reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .connect_timeout(Duration::from_secs(3))
             .tcp_keepalive(None)
-            .redirect(reqwest::redirect::Policy::none())
+            .redirect(Policy::none())
             .user_agent("rmcp-server-kit-test")
             .build()
-            .expect("hardened client builds")
+            .context("hardened client builds")
     }
 
     // -- Q1: extract_cdp_urls schema validation ---------------------------------
 
+    /// Pins that only HTTPS CDP URLs survive when `crl_allow_http` is false.
     #[test]
-    fn extract_cdp_urls_drops_disallowed_schemes() {
+    fn extract_cdp_urls_drops_disallowed_schemes() -> anyhow::Result<()> {
         let cert = build_cert_with_cdp_urls(vec![
             "ldap://example.com/crl".to_owned(),
             "file:///etc/passwd".to_owned(),
             "ftp://example.com/crl.crl".to_owned(),
             "https://crl.example.com/test.crl".to_owned(),
-        ]);
+        ])?;
         let urls = extract_cdp_urls(&cert, false);
         assert_eq!(urls.len(), 1, "only HTTPS should survive: {urls:?}");
-        assert_eq!(urls[0], "https://crl.example.com/test.crl");
+        assert_eq!(
+            urls.first().context("surviving HTTPS CDP URL")?.as_str(),
+            "https://crl.example.com/test.crl"
+        );
+        Ok(())
     }
 
+    /// Pins that `crl_allow_http=false` filters HTTP while `true` keeps it.
     #[test]
-    fn extract_cdp_urls_filters_http_when_disallowed() {
+    fn extract_cdp_urls_filters_http_when_disallowed() -> anyhow::Result<()> {
         let cert = build_cert_with_cdp_urls(vec![
             "http://crl.example.com/x.crl".to_owned(),
             "https://crl.example.com/y.crl".to_owned(),
-        ]);
+        ])?;
         let urls_strict = extract_cdp_urls(&cert, false);
         assert_eq!(urls_strict.len(), 1);
-        assert!(urls_strict[0].starts_with("https://"));
+        assert!(
+            urls_strict
+                .first()
+                .context("strict list keeps the HTTPS URL")?
+                .starts_with("https://")
+        );
 
         let urls_lax = extract_cdp_urls(&cert, true);
         assert_eq!(urls_lax.len(), 2);
+        Ok(())
     }
 
+    /// Pins that malformed CDP URLs are dropped, keeping the valid HTTPS one.
     #[test]
-    fn extract_cdp_urls_drops_malformed() {
+    fn extract_cdp_urls_drops_malformed() -> anyhow::Result<()> {
         let cert = build_cert_with_cdp_urls(vec![
             "not-a-url".to_owned(),
             ":::::broken:::".to_owned(),
             "https://valid.example.com/crl".to_owned(),
-        ]);
+        ])?;
         let urls = extract_cdp_urls(&cert, false);
         assert_eq!(urls.len(), 1);
-        assert_eq!(urls[0], "https://valid.example.com/crl");
+        assert_eq!(
+            urls.first().context("surviving valid CDP URL")?.as_str(),
+            "https://valid.example.com/crl"
+        );
+        Ok(())
     }
 
+    /// Pins that scheme comparison is case-insensitive (normalized lowercase).
     #[test]
-    fn extract_cdp_urls_handles_uppercase_scheme() {
+    fn extract_cdp_urls_handles_uppercase_scheme() -> anyhow::Result<()> {
         // url::Url::parse normalizes scheme to lowercase, which is the
         // behavior we want (case-insensitive).
-        let cert = build_cert_with_cdp_urls(vec!["HTTPS://crl.example.com/X.crl".to_owned()]);
+        let cert = build_cert_with_cdp_urls(vec!["HTTPS://crl.example.com/X.crl".to_owned()])?;
         let urls = extract_cdp_urls(&cert, false);
         assert_eq!(urls.len(), 1);
-        assert!(urls[0].starts_with("https://"));
+        assert!(
+            urls.first()
+                .context("uppercase-scheme URL survives")?
+                .starts_with("https://")
+        );
+        Ok(())
     }
 
     // -- Q2: hardened client refuses redirects ----------------------------------
 
+    /// Pins that the hardened client surfaces a 302 without following it.
     #[tokio::test]
-    async fn hardened_client_refuses_redirect() {
+    async fn hardened_client_refuses_redirect() -> anyhow::Result<()> {
         let mock = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/crl"))
@@ -232,12 +212,12 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let client = build_hardened_client();
+        let client = build_hardened_client()?;
         let url = format!("{}/crl", mock.uri());
         // Policy::none() returns the 302 response itself rather than following it.
         // The Location header points to elsewhere.invalid which would fail to
         // resolve if we followed it; the assertion below proves we did not.
-        let response = client.get(&url).send().await.expect("got 302 back");
+        let response = client.get(&url).send().await.context("got 302 back")?;
         assert_eq!(
             response.status().as_u16(),
             302,
@@ -249,12 +229,14 @@ mod tests {
             "response URL must remain the original (no follow): {}",
             response.url()
         );
+        Ok(())
     }
 
     // -- Q3: hardened client returns 5xx upstream errors as errors --------------
 
+    /// Pins that a 5xx upstream response surfaces as an error.
     #[tokio::test]
-    async fn hardened_client_surfaces_5xx_as_error() {
+    async fn hardened_client_surfaces_5xx_as_error() -> anyhow::Result<()> {
         let mock = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/crl"))
@@ -262,36 +244,39 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let client = build_hardened_client();
+        let client = build_hardened_client()?;
         let url = format!("{}/crl", mock.uri());
         let err = client
             .get(&url)
             .send()
             .await
-            .expect("got 503")
+            .context("got 503")?
             .error_for_status()
-            .expect_err("5xx should error");
-        assert!(err.status().is_some_and(|s| s.as_u16() == 503));
+            .err()
+            .context("5xx should error")?;
+        assert!(err.status().is_some_and(|status| status.as_u16() == 503));
+        Ok(())
     }
 
     // -- Q4: streaming body-cap behavior (chunk-loop semantics) -----------------
 
+    /// Pins that the chunked cap loop trips on an oversized response body.
     #[tokio::test]
-    async fn body_cap_rejects_oversized_response() {
+    async fn body_cap_rejects_oversized_response() -> anyhow::Result<()> {
         // We can't call the private `fetch_crl` directly across crate
         // boundaries, so we re-implement the same chunked-cap loop here and
         // verify the algorithm rejects oversized bodies. This locks the
         // contract: any change to the production loop that loses the cap
         // will fail to be mirrored here and we'll catch it in code review.
         let mock = MockServer::start().await;
-        let big_body = vec![0u8; 8 * 1024]; // 8 KiB
+        let big_body = vec![0_u8; 8 * 1024]; // 8 KiB
         Mock::given(method("GET"))
             .and(path("/big.crl"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(big_body.clone()))
             .mount(&mock)
             .await;
 
-        let client = build_hardened_client();
+        let client = build_hardened_client()?;
         let url = format!("{}/big.crl", mock.uri());
         let max_bytes: u64 = 1024; // cap below body size
 
@@ -299,12 +284,12 @@ mod tests {
             .get(&url)
             .send()
             .await
-            .expect("send")
+            .context("send")?
             .error_for_status()
-            .expect("ok");
+            .context("ok")?;
         let mut body: Vec<u8> = Vec::new();
         let mut hit_cap = false;
-        while let Some(chunk) = response.chunk().await.expect("chunk") {
+        while let Some(chunk) = response.chunk().await.context("chunk")? {
             let chunk_len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
             let body_len = u64::try_from(body.len()).unwrap_or(u64::MAX);
             if body_len.saturating_add(chunk_len) > max_bytes {
@@ -319,11 +304,13 @@ mod tests {
             "body cannot exceed cap: {} vs {max_bytes}",
             body.len()
         );
+        Ok(())
     }
 
+    /// Pins that an undersized body is accepted and matches what was served.
     #[tokio::test]
-    async fn body_cap_allows_undersized_response() {
-        let crl_bytes = build_test_crl_der();
+    async fn body_cap_allows_undersized_response() -> anyhow::Result<()> {
+        let crl_bytes = build_test_crl_der()?;
         let mock = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/small.crl"))
@@ -331,7 +318,7 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let client = build_hardened_client();
+        let client = build_hardened_client()?;
         let url = format!("{}/small.crl", mock.uri());
         let max_bytes: u64 = 5 * 1024 * 1024;
 
@@ -339,11 +326,11 @@ mod tests {
             .get(&url)
             .send()
             .await
-            .expect("send")
+            .context("send")?
             .error_for_status()
-            .expect("ok");
+            .context("ok")?;
         let mut body: Vec<u8> = Vec::new();
-        while let Some(chunk) = response.chunk().await.expect("chunk") {
+        while let Some(chunk) = response.chunk().await.context("chunk")? {
             let chunk_len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
             let body_len = u64::try_from(body.len()).unwrap_or(u64::MAX);
             assert!(
@@ -353,25 +340,34 @@ mod tests {
             body.extend_from_slice(&chunk);
         }
         assert_eq!(body, crl_bytes);
+        Ok(())
     }
 
     // -- Q5: test-cert with no CDP URLs -----------------------------------------
 
+    /// Pins that a cert without a CDP extension yields no URLs.
     #[test]
-    fn cert_without_cdp_returns_empty() {
-        let ca = build_ca();
-        let mut params = CertificateParams::new(vec!["localhost".to_owned()]).expect("params");
+    fn cert_without_cdp_returns_empty() -> anyhow::Result<()> {
+        let ca = build_ca()?;
+        let mut params = CertificateParams::new(vec!["localhost".to_owned()]).context("params")?;
         params.serial_number = Some(SerialNumber::from(7_u64));
         params.distinguished_name.push(DnType::CommonName, "no-cdp");
-        let key = KeyPair::generate().expect("key");
-        let cert = params.signed_by(&key, &ca).expect("signed");
+        let key = KeyPair::generate().context("key")?;
+        let cert = params.signed_by(&key, &ca).context("signed")?;
         let urls = extract_cdp_urls(cert.der(), true);
         assert!(urls.is_empty(), "no CDP extension means no URLs");
+        Ok(())
     }
 
     #[test]
-    fn malformed_cert_der_returns_empty() {
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: tests/integration/crl_ssrf.rs::malformed_cert_der_returns_empty keeps the uniform test signature while it only asserts a non-panic"
+    )]
+    /// Pins that garbage DER is rejected without panicking.
+    fn malformed_cert_der_returns_empty() -> anyhow::Result<()> {
         let urls = extract_cdp_urls(b"not a certificate", true);
         assert!(urls.is_empty(), "garbage DER must not panic");
+        Ok(())
     }
 }

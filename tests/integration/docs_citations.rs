@@ -20,7 +20,7 @@
 //!   `src/<file>.rs:<line>`            (single line)
 //!   `src/<file>.rs:<line>-<line>`     (range)
 //!   `src/<file>.rs` ... `(~line <line>)`   (AGENTS.md table style)
-//!   `src/<file>.rs` ... `~L<line>`         (MINDMAP.md table style)
+//!   `src/<file>.rs` ... `~L<line>`         (MINDMAP.md table style).
 //!
 //! Out of scope: mindmap nodes whose file is implied by a parent node
 //! (no path on the line), and prose without a `src/*.rs` mention.
@@ -29,103 +29,36 @@
 #[cfg_attr(
     target_os = "linux",
     expect(
-        clippy::expect_used,
-        reason = "lint-migration: tests/integration/docs_citations.rs"
-    )
-)]
-#[cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::panic,
-        reason = "lint-migration: tests/integration/docs_citations.rs"
+        clippy::missing_errors_doc,
+        reason = "test code is not rendered API documentation"
     )
 )]
 #[cfg_attr(
     target_os = "linux",
     expect(
         clippy::missing_panics_doc,
-        reason = "lint-migration: tests/integration/docs_citations.rs"
+        reason = "test code is not rendered API documentation"
     )
 )]
 #[cfg_attr(
     target_os = "linux",
-    expect(
-        clippy::missing_const_for_fn,
-        reason = "lint-migration: tests/integration/docs_citations.rs"
-    )
-)]
-#[cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::shadow_reuse,
-        reason = "lint-migration: tests/integration/docs_citations.rs"
-    )
-)]
-#[cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::option_if_let_else,
-        reason = "lint-migration: tests/integration/docs_citations.rs"
-    )
+    expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")
 )]
 #[cfg_attr(
     target_os = "linux",
     expect(
         clippy::too_long_first_doc_paragraph,
-        reason = "lint-migration: tests/integration/docs_citations.rs"
+        reason = "test code is not rendered API documentation"
     )
-)]
-#[cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::arithmetic_side_effects,
-        reason = "lint-migration: tests/integration/docs_citations.rs"
-    )
-)]
-#[cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::integer_division_remainder_used,
-        reason = "lint-migration: tests/integration/docs_citations.rs"
-    )
-)]
-#[cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::min_ident_chars,
-        reason = "lint-migration: tests/integration/docs_citations.rs"
-    )
-)]
-#[cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::std_instead_of_alloc,
-        reason = "lint-migration: tests/integration/docs_citations.rs"
-    )
-)]
-#[cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::doc_paragraphs_missing_punctuation,
-        reason = "lint-migration: tests/integration/docs_citations.rs"
-    )
-)]
-#[cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::else_if_without_else,
-        reason = "lint-migration: tests/integration/docs_citations.rs"
-    )
-)]
-#[expect(
-    unused_results,
-    reason = "lint-migration: tests/integration/docs_citations.rs"
 )]
 #[cfg(test)]
 mod tests {
+    extern crate alloc;
 
-    use std::{collections::BTreeMap, fs, path::PathBuf};
+    use alloc::collections::BTreeMap;
+    use std::{fs, path::PathBuf};
 
+    use anyhow::Context as _;
     use rmcp_server_kit::{
         config::{ObservabilityConfig, ServerConfig},
         rbac::RbacConfig,
@@ -148,7 +81,7 @@ mod tests {
 
     #[derive(Debug, Clone)]
     struct Citation {
-        /// e.g. "src/transport.rs"
+        /// e.g. "src/transport.rs".
         file: String,
         /// 1-based first cited line.
         start: usize,
@@ -181,11 +114,11 @@ mod tests {
 
     /// Leading `[A-Za-z_][A-Za-z0-9_]*` run after skipping any non-identifier
     /// prefix characters (`&`, `[`, `*`, spaces, ...).
-    fn leading_identifier(s: &str) -> Option<&str> {
-        let trimmed = s.trim_start_matches(|c: char| !(c.is_ascii_alphabetic() || c == '_'));
+    fn leading_identifier(input: &str) -> Option<&str> {
+        let trimmed = input.trim_start_matches(|ch: char| !(ch.is_ascii_alphabetic() || ch == '_'));
         let len = trimmed
             .bytes()
-            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
             .count();
         if len == 0 { None } else { trimmed.get(..len) }
     }
@@ -202,7 +135,7 @@ mod tests {
         let stem = file
             .rsplit('/')
             .next()
-            .and_then(|n| n.strip_suffix(".rs"))
+            .and_then(|name| name.strip_suffix(".rs"))
             .unwrap_or("");
         candidate != stem
     }
@@ -213,16 +146,13 @@ mod tests {
     fn extract_anchors(line: &str, file: &str) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         let mut push = |candidate: &str| {
-            if keep_anchor(candidate, file) && !out.iter().any(|a| a == candidate) {
+            if keep_anchor(candidate, file) && !out.iter().any(|anchor| anchor == candidate) {
                 out.push(candidate.to_owned());
             }
         };
 
         // Backticked segments: odd-indexed pieces of a split on '`'.
-        for (idx, segment) in line.split('`').enumerate() {
-            if idx % 2 != 1 {
-                continue;
-            }
+        for segment in line.split('`').skip(1).step_by(2) {
             if let Some(ident) = leading_identifier(segment) {
                 push(ident);
             }
@@ -241,10 +171,13 @@ mod tests {
         // Parenthesized single identifiers: "(build_app_router)".
         let mut tail = line;
         while let Some(open) = tail.find('(') {
-            let inner = tail.get(open + 1..).unwrap_or("");
+            let inner = tail
+                .get(open..)
+                .and_then(|rest| rest.strip_prefix('('))
+                .unwrap_or("");
             let len = inner
                 .bytes()
-                .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
                 .count();
             if len > 0
                 && inner.get(len..).is_some_and(|rest| rest.starts_with(')'))
@@ -269,7 +202,7 @@ mod tests {
 
         let name_len = rest
             .bytes()
-            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
             .count();
         if name_len == 0 {
             return None;
@@ -278,7 +211,10 @@ mod tests {
         let after_name = rest.get(name_len..)?;
 
         let file = format!("src/{name}.rs");
-        let base_consumed = "src/".len() + name_len + ".rs".len();
+        let base_consumed = "src/"
+            .len()
+            .saturating_add(name_len)
+            .saturating_add(".rs".len());
 
         let Some(after_ext) = after_name.strip_prefix(".rs:") else {
             // Bare path (no :NNN) - still a valid file mention.
@@ -295,23 +231,27 @@ mod tests {
         let start: usize = after_ext.get(..start_digits_len)?.parse().ok()?;
         let after_start = after_ext.get(start_digits_len..)?;
 
-        let (end, range_consumed) = if let Some(after_dash) = after_start.strip_prefix('-') {
-            let end_digits_len = after_dash.bytes().take_while(u8::is_ascii_digit).count();
-            if end_digits_len == 0 {
-                (start, 0)
-            } else if let Some(parsed) = after_dash
-                .get(..end_digits_len)
-                .and_then(|d| d.parse::<usize>().ok())
-            {
-                (parsed, 1 + end_digits_len)
-            } else {
-                (start, 0)
-            }
-        } else {
-            (start, 0)
-        };
+        let (end, range_consumed) =
+            after_start
+                .strip_prefix('-')
+                .map_or((start, 0), |after_dash| {
+                    let end_digits_len = after_dash.bytes().take_while(u8::is_ascii_digit).count();
+                    if end_digits_len == 0 {
+                        (start, 0)
+                    } else if let Some(parsed) = after_dash
+                        .get(..end_digits_len)
+                        .and_then(|digits| digits.parse::<usize>().ok())
+                    {
+                        (parsed, end_digits_len.saturating_add(1))
+                    } else {
+                        (start, 0)
+                    }
+                });
 
-        let consumed = base_consumed + ":".len() + start_digits_len + range_consumed;
+        let consumed = base_consumed
+            .saturating_add(":".len())
+            .saturating_add(start_digits_len)
+            .saturating_add(range_consumed);
         Some((file, start, end, consumed))
     }
 
@@ -320,7 +260,10 @@ mod tests {
     fn parse_tilde_line(line: &str) -> Option<usize> {
         let mut tail = line;
         while let Some(pos) = tail.find('~') {
-            let after = tail.get(pos + 1..).unwrap_or("");
+            let after = tail
+                .get(pos..)
+                .and_then(|rest| rest.strip_prefix('~'))
+                .unwrap_or("");
             let digits_part = if let Some(rest) = after.strip_prefix("line ") {
                 rest
             } else if let Some(rest) = after.strip_prefix('L') {
@@ -331,9 +274,11 @@ mod tests {
             };
             let len = digits_part.bytes().take_while(u8::is_ascii_digit).count();
             if len > 0
-                && let Some(n) = digits_part.get(..len).and_then(|d| d.parse::<usize>().ok())
+                && let Some(found) = digits_part
+                    .get(..len)
+                    .and_then(|digits| digits.parse::<usize>().ok())
             {
-                return Some(n);
+                return Some(found);
             }
             tail = after;
         }
@@ -343,14 +288,18 @@ mod tests {
     fn parse_citations(doc: &str) -> Vec<Citation> {
         let mut out = Vec::new();
         for (doc_idx, line) in doc.lines().enumerate() {
-            let doc_line_no = doc_idx + 1;
+            let doc_line_no = doc_idx.saturating_add(1);
             let mut bare_file: Option<String> = None;
 
             let mut tail = line;
             while let Some(rel) = tail.find("src/") {
                 let candidate = tail.get(rel..).unwrap_or("");
                 if let Some((file, start, end, consumed)) = parse_path_at(candidate) {
-                    if start > 0 {
+                    if start == 0 {
+                        if bare_file.is_none() {
+                            bare_file = Some(file);
+                        }
+                    } else {
                         out.push(Citation {
                             anchors: extract_anchors(line, &file),
                             file,
@@ -358,8 +307,6 @@ mod tests {
                             end,
                             doc_line: doc_line_no,
                         });
-                    } else if bare_file.is_none() {
-                        bare_file = Some(file);
                     }
                     tail = candidate.get(consumed..).unwrap_or("");
                 } else {
@@ -369,13 +316,13 @@ mod tests {
 
             // Pair a bare path with a `~line N` / `~LN` locator on the same line.
             if let Some(file) = bare_file
-                && let Some(n) = parse_tilde_line(line)
+                && let Some(found) = parse_tilde_line(line)
             {
                 out.push(Citation {
                     anchors: extract_anchors(line, &file),
                     file,
-                    start: n,
-                    end: n,
+                    start: found,
+                    end: found,
                     doc_line: doc_line_no,
                 });
             }
@@ -390,55 +337,59 @@ mod tests {
         let mut file_lines: BTreeMap<String, Option<Vec<String>>> = BTreeMap::new();
         let mut failures: Vec<String> = Vec::new();
 
-        for c in &citations {
-            let lines = file_lines.entry(c.file.clone()).or_insert_with(|| {
-                fs::read_to_string(root.join(&c.file))
+        for citation in &citations {
+            let cached_lines = file_lines.entry(citation.file.clone()).or_insert_with(|| {
+                fs::read_to_string(root.join(&citation.file))
                     .ok()
-                    .map(|t| t.lines().map(str::to_owned).collect())
+                    .map(|text| text.lines().map(str::to_owned).collect())
             });
 
-            let Some(lines) = lines else {
+            let Some(lines) = cached_lines else {
                 failures.push(format!(
                     "{doc_name}:{} cites {}:{} but the file does not exist",
-                    c.doc_line,
-                    c.file,
-                    fmt_range(c)
+                    citation.doc_line,
+                    citation.file,
+                    fmt_range(citation)
                 ));
                 continue;
             };
-            let n = lines.len();
+            let line_count = lines.len();
 
-            if c.end > n {
+            if citation.end > line_count {
                 failures.push(format!(
-                    "{doc_name}:{} cites {}:{} but file only has {n} lines",
-                    c.doc_line,
-                    c.file,
-                    fmt_range(c)
+                    "{doc_name}:{} cites {}:{} but file only has {line_count} lines",
+                    citation.doc_line,
+                    citation.file,
+                    fmt_range(citation)
                 ));
                 continue;
             }
 
-            if c.anchors.is_empty() {
+            if citation.anchors.is_empty() {
                 continue;
             }
 
             // Window: [start - TOLERANCE, end + TOLERANCE], clamped, 1-based.
-            let win_start = c.start.saturating_sub(TOLERANCE).max(1);
-            let win_end = c.end.saturating_add(TOLERANCE).min(n);
+            let win_start = citation.start.saturating_sub(TOLERANCE).max(1);
+            let win_end = citation.end.saturating_add(TOLERANCE).min(line_count);
             let window: String = lines
-                .get(win_start - 1..win_end)
+                .get(win_start.saturating_sub(1)..win_end)
                 .unwrap_or_default()
                 .join("\n");
 
-            if !c.anchors.iter().any(|a| window_has_anchor(&window, a)) {
+            if !citation
+                .anchors
+                .iter()
+                .any(|anchor| window_has_anchor(&window, anchor))
+            {
                 failures.push(format!(
                     "{doc_name}:{} cites {}:{} but none of the anchor symbols {:?} \
                      appear within {TOLERANCE} lines of the cited location \
                      (searched lines {win_start}-{win_end}); update the citation",
-                    c.doc_line,
-                    c.file,
-                    fmt_range(c),
-                    c.anchors,
+                    citation.doc_line,
+                    citation.file,
+                    fmt_range(citation),
+                    citation.anchors,
                 ));
             }
         }
@@ -452,29 +403,38 @@ mod tests {
     /// anchors like `serve` match inside `server` / `observed`, silently
     /// masking stale citations.
     fn window_has_anchor(window: &str, anchor: &str) -> bool {
-        fn is_ident(b: u8) -> bool {
-            b.is_ascii_alphanumeric() || b == b'_'
+        const fn is_ident(byte: u8) -> bool {
+            byte.is_ascii_alphanumeric() || byte == b'_'
         }
         let bytes = window.as_bytes();
         window.match_indices(anchor).any(|(pos, _)| {
-            let before_ok = pos == 0 || !bytes.get(pos - 1).copied().is_some_and(is_ident);
-            let after_ok = !bytes.get(pos + anchor.len()).copied().is_some_and(is_ident);
+            let before_ok = pos
+                .checked_sub(1)
+                .is_none_or(|index| !bytes.get(index).copied().is_some_and(is_ident));
+            let after_ok = !bytes
+                .get(pos..)
+                .and_then(|rest| rest.get(anchor.len()))
+                .copied()
+                .is_some_and(is_ident);
             before_ok && after_ok
         })
     }
 
-    fn fmt_range(c: &Citation) -> String {
-        if c.end == c.start {
-            format!("{}", c.start)
+    fn fmt_range(citation: &Citation) -> String {
+        if citation.end == citation.start {
+            format!("{}", citation.start)
         } else {
-            format!("{}-{}", c.start, c.end)
+            format!("{}-{}", citation.start, citation.end)
         }
     }
 
-    fn run_doc_test(doc_rel_path: &str) {
+    fn run_doc_test(doc_rel_path: &str) -> anyhow::Result<()> {
         let root = workspace_root();
         let path = root.join(doc_rel_path);
-        let doc = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {doc_rel_path}: {e}"));
+        let doc = match fs::read_to_string(&path) {
+            Ok(doc) => doc,
+            Err(error) => anyhow::bail!("read {doc_rel_path}: {error}"),
+        };
 
         let (total, failures) = check_doc(doc_rel_path, &doc);
         assert!(
@@ -487,6 +447,7 @@ mod tests {
             failures.len(),
             failures.join("\n")
         );
+        Ok(())
     }
 
     fn extract_toml_fences(doc: &str) -> Vec<TomlFence> {
@@ -494,7 +455,7 @@ mod tests {
         let mut open: Option<TomlFence> = None;
 
         for (idx, line) in doc.lines().enumerate() {
-            let line_no = idx + 1;
+            let line_no = idx.saturating_add(1);
             let trimmed = line.trim_start();
 
             if let Some(mut fence) = open.take() {
@@ -508,8 +469,8 @@ mod tests {
                 continue;
             }
 
-            if let Some(info) = trimmed.strip_prefix("```") {
-                let info = info.trim();
+            if let Some(raw_info) = trimmed.strip_prefix("```") {
+                let info = raw_info.trim();
                 if info == "toml" || info.starts_with("toml,") {
                     open = Some(TomlFence {
                         line: line_no,
@@ -533,87 +494,102 @@ mod tests {
         }
     }
 
-    fn assert_operator_config_block_parses(block: &TomlFence) {
-        let table: toml::Table = toml::from_str(&block.body).unwrap_or_else(|error| {
-            panic!(
+    fn assert_operator_config_block_parses(block: &TomlFence) -> anyhow::Result<()> {
+        let table: toml::Table = match toml::from_str(&block.body) {
+            Ok(table) => table,
+            Err(error) => anyhow::bail!(
                 "docs/GUIDE.md:{} operator TOML is not valid TOML: {error}\n{}",
-                block.line, block.body
-            )
-        });
+                block.line,
+                block.body
+            ),
+        };
         assert_operator_root_keys(block, &table);
 
-        let parsed: GuideOperatorConfig = toml::from_str(&block.body).unwrap_or_else(|error| {
-            panic!(
+        let parsed: GuideOperatorConfig = match toml::from_str(&block.body) {
+            Ok(parsed) => parsed,
+            Err(error) => anyhow::bail!(
                 "docs/GUIDE.md:{} operator TOML does not match rmcp-server-kit config schema: {error}\n{}",
-                block.line, block.body
-            )
-        });
+                block.line,
+                block.body
+            ),
+        };
         assert!(
             parsed.server.is_some() || parsed.rbac.is_some() || parsed.observability.is_some(),
             "docs/GUIDE.md:{} operator TOML block must contain server, rbac, or observability config",
             block.line
         );
+        Ok(())
     }
 
-    fn assert_cargo_toml_block_parses(block: &TomlFence) {
-        toml::from_str::<toml::Value>(&block.body).unwrap_or_else(|error| {
-            panic!(
+    fn assert_cargo_toml_block_parses(block: &TomlFence) -> anyhow::Result<()> {
+        if let Err(error) = toml::from_str::<toml::Value>(&block.body) {
+            anyhow::bail!(
                 "docs/GUIDE.md:{} Cargo TOML is not valid TOML: {error}\n{}",
-                block.line, block.body
-            )
-        });
+                block.line,
+                block.body
+            );
+        }
+        Ok(())
     }
 
-    fn assert_toml_fragment_parses(block: &TomlFence) {
-        toml::from_str::<toml::Value>(&block.body).unwrap_or_else(|error| {
-            panic!(
+    fn assert_toml_fragment_parses(block: &TomlFence) -> anyhow::Result<()> {
+        if let Err(error) = toml::from_str::<toml::Value>(&block.body) {
+            anyhow::bail!(
                 "docs/GUIDE.md:{} TOML fragment is not valid TOML: {error}\n{}",
-                block.line, block.body
-            )
-        });
+                block.line,
+                block.body
+            );
+        }
+        Ok(())
     }
 
-    fn extract_embedded_config(source: &str) -> &str {
+    fn extract_embedded_config(source: &str) -> anyhow::Result<&str> {
         let Some((_, tail)) = source.split_once("const EMBEDDED_CONFIG: &str = r#\"") else {
-            panic!("examples/config_file_server.rs no longer declares EMBEDDED_CONFIG")
+            anyhow::bail!("examples/config_file_server.rs no longer declares EMBEDDED_CONFIG");
         };
         let Some((config, _)) = tail.split_once("\"#;") else {
-            panic!("examples/config_file_server.rs EMBEDDED_CONFIG raw string is not terminated")
+            anyhow::bail!(
+                "examples/config_file_server.rs EMBEDDED_CONFIG raw string is not terminated"
+            );
         };
-        config
+        Ok(config)
     }
 
+    /// Pins that every TOML fence in `docs/GUIDE.md` parses with its declared role.
     #[test]
-    fn guide_toml_fences_parse() {
+    fn guide_toml_fences_parse() -> anyhow::Result<()> {
         let root = workspace_root();
-        let doc = fs::read_to_string(root.join("docs/GUIDE.md")).expect("read GUIDE.md");
+        let doc = fs::read_to_string(root.join("docs/GUIDE.md")).context("read GUIDE.md")?;
         let fences = extract_toml_fences(&doc);
 
         assert_eq!(fences.len(), 18, "GUIDE.md TOML fence count drifted");
         for block in &fences {
             match block.info.as_str() {
-                "toml" => assert_operator_config_block_parses(block),
-                "toml,cargo" => assert_cargo_toml_block_parses(block),
-                "toml,fragment" => assert_toml_fragment_parses(block),
-                other => panic!(
+                "toml" => assert_operator_config_block_parses(block)?,
+                "toml,cargo" => assert_cargo_toml_block_parses(block)?,
+                "toml,fragment" => assert_toml_fragment_parses(block)?,
+                other => anyhow::bail!(
                     "docs/GUIDE.md:{} uses unsupported TOML fence info string `{other}`; use `toml` for complete operator config, `toml,cargo` for Cargo snippets, or `toml,fragment` for intentionally incomplete excerpts",
                     block.line
                 ),
             }
         }
+        Ok(())
     }
 
+    /// Pins that the example's embedded config matches the kit config schema.
     #[test]
-    fn config_file_server_embedded_toml_parses() {
+    fn config_file_server_embedded_toml_parses() -> anyhow::Result<()> {
         let root = workspace_root();
         let source = fs::read_to_string(root.join("examples/config_file_server.rs"))
-            .expect("read config_file_server.rs");
-        let config = extract_embedded_config(&source);
-        let parsed: GuideOperatorConfig = toml::from_str(config).unwrap_or_else(|error| {
-            panic!(
+            .context("read config_file_server.rs")?;
+        let config = extract_embedded_config(&source)?;
+        let parsed: GuideOperatorConfig = match toml::from_str(config) {
+            Ok(parsed) => parsed,
+            Err(error) => anyhow::bail!(
                 "examples/config_file_server.rs EMBEDDED_CONFIG does not match rmcp-server-kit config schema: {error}\n{config}"
-            )
-        });
+            ),
+        };
         assert!(
             parsed.server.is_some(),
             "embedded config must include [server]"
@@ -623,6 +599,7 @@ mod tests {
             "embedded config must include [observability]"
         );
         assert!(parsed.rbac.is_some(), "embedded config must include [rbac]");
+        Ok(())
     }
 
     /// The kit's section structs reject unknown *keys*, but only an
@@ -631,17 +608,17 @@ mod tests {
     /// it must keep modelling that; without the attribute a mistyped section is
     /// silently dropped and the server starts with defaults for it.
     #[test]
-    fn config_file_server_root_denies_unknown_tables() {
+    fn config_file_server_root_denies_unknown_tables() -> anyhow::Result<()> {
         let root = workspace_root();
         let source = fs::read_to_string(root.join("examples/config_file_server.rs"))
-            .expect("read config_file_server.rs");
+            .context("read config_file_server.rs")?;
 
         let struct_pos = source
             .find("struct AppConfig")
-            .expect("examples/config_file_server.rs must define the AppConfig root type");
+            .context("examples/config_file_server.rs must define the AppConfig root type")?;
         let preamble = source
             .get(..struct_pos)
-            .expect("struct_pos is a char boundary returned by find");
+            .context("struct_pos is a char boundary returned by find")?;
 
         assert!(
             preamble.contains("#[serde(deny_unknown_fields)]"),
@@ -649,25 +626,37 @@ mod tests {
              #[serde(deny_unknown_fields)] so a misspelled table name is rejected rather than \
              silently ignored"
         );
+        Ok(())
+    }
+
+    /// Pins that every `src/*.rs` citation in `docs/ARCHITECTURE.md` resolves.
+    #[test]
+    fn architecture_citations_resolve() -> anyhow::Result<()> {
+        run_doc_test("docs/ARCHITECTURE.md")?;
+        Ok(())
+    }
+
+    /// Pins that every `src/*.rs` citation in `AGENTS.md` resolves.
+    #[test]
+    fn agents_citations_resolve() -> anyhow::Result<()> {
+        run_doc_test("AGENTS.md")?;
+        Ok(())
+    }
+
+    /// Pins that every `src/*.rs` citation in `docs/MINDMAP.md` resolves.
+    #[test]
+    fn mindmap_citations_resolve() -> anyhow::Result<()> {
+        run_doc_test("docs/MINDMAP.md")?;
+        Ok(())
     }
 
     #[test]
-    fn architecture_citations_resolve() {
-        run_doc_test("docs/ARCHITECTURE.md");
-    }
-
-    #[test]
-    fn agents_citations_resolve() {
-        run_doc_test("AGENTS.md");
-    }
-
-    #[test]
-    fn mindmap_citations_resolve() {
-        run_doc_test("docs/MINDMAP.md");
-    }
-
-    #[test]
-    fn anchor_matching_requires_identifier_boundaries() {
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: tests/integration/docs_citations.rs::anchor_matching_requires_identifier_boundaries keeps the uniform test signature while it only asserts"
+    )]
+    /// Pins that anchor matching only accepts whole identifier tokens.
+    fn anchor_matching_requires_identifier_boundaries() -> anyhow::Result<()> {
         assert!(window_has_anchor("pub async fn serve<H, F>(", "serve"));
         assert!(window_has_anchor("calls serve() here", "serve"));
         assert!(
@@ -677,25 +666,32 @@ mod tests {
         assert!(!window_has_anchor("preserved", "serve"));
         assert!(window_has_anchor("get(healthz)", "healthz"));
         assert!(!window_has_anchor("healthz_returns_ok", "healthz"));
+        Ok(())
     }
 
+    /// Pins that `docs/ARCHITECTURE.md` keeps a healthy number of
+    /// symbol-anchored citations.
     #[test]
-    fn anchored_citations_exist() {
+    fn anchored_citations_exist() -> anyhow::Result<()> {
         // Guard the guard: if anchor extraction silently breaks (returns no
         // anchors for every citation), the symbol check degrades to the old
         // length-only behavior without anyone noticing. ARCHITECTURE.md is
         // dense with backticked symbols, so a healthy parser must find a
         // meaningful number of anchored citations there.
         let root = workspace_root();
-        let doc =
-            fs::read_to_string(root.join("docs/ARCHITECTURE.md")).expect("read ARCHITECTURE.md");
+        let doc = fs::read_to_string(root.join("docs/ARCHITECTURE.md"))
+            .context("read ARCHITECTURE.md")?;
         let citations = parse_citations(&doc);
-        let anchored = citations.iter().filter(|c| !c.anchors.is_empty()).count();
+        let anchored = citations
+            .iter()
+            .filter(|citation| !citation.anchors.is_empty())
+            .count();
         assert!(
             anchored >= 10,
             "expected >=10 symbol-anchored citations in docs/ARCHITECTURE.md, found {anchored} \
              (out of {} citations) - anchor extraction is likely broken",
             citations.len()
         );
+        Ok(())
     }
 }

@@ -33,82 +33,41 @@
 #[cfg_attr(
     all(feature = "oauth-mtls-client", target_os = "linux"),
     expect(
-        clippy::expect_used,
-        reason = "lint-migration: tests/integration/ssrf_resolver.rs"
+        clippy::missing_errors_doc,
+        reason = "test code is not rendered API documentation"
     )
 )]
 #[cfg_attr(
     all(feature = "oauth-mtls-client", target_os = "linux"),
     expect(
         clippy::missing_panics_doc,
-        reason = "lint-migration: tests/integration/ssrf_resolver.rs"
+        reason = "test code is not rendered API documentation"
     )
 )]
 #[cfg_attr(
     all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::absolute_paths,
-        reason = "lint-migration: tests/integration/ssrf_resolver.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::let_underscore_untyped,
-        reason = "lint-migration: tests/integration/ssrf_resolver.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::let_underscore_must_use,
-        reason = "lint-migration: tests/integration/ssrf_resolver.rs"
-    )
+    expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")
 )]
 #[cfg_attr(
     all(feature = "oauth-mtls-client", target_os = "linux"),
     expect(
         clippy::too_long_first_doc_paragraph,
-        reason = "lint-migration: tests/integration/ssrf_resolver.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::unused_trait_names,
-        reason = "lint-migration: tests/integration/ssrf_resolver.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::std_instead_of_core,
-        reason = "lint-migration: tests/integration/ssrf_resolver.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::unseparated_literal_suffix,
-        reason = "lint-migration: tests/integration/ssrf_resolver.rs"
-    )
-)]
-#[cfg_attr(
-    feature = "oauth-mtls-client",
-    expect(
-        let_underscore_drop,
-        reason = "lint-migration: tests/integration/ssrf_resolver.rs"
+        reason = "test code is not rendered API documentation"
     )
 )]
 #[cfg(test)]
 mod tests {
 
-    use std::time::Duration;
+    use core::{error::Error, time::Duration};
 
+    use anyhow::Context as _;
     use rmcp_server_kit::oauth::{OAuthConfig, OauthHttpClient};
+    use rustls::crypto::ring;
     use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
+        io::{AsyncReadExt as _, AsyncWriteExt as _},
         net::TcpListener,
+        runtime::Builder,
+        time::timeout,
     };
 
     /// `reqwest 0.13` requires a process-wide rustls crypto provider even
@@ -116,29 +75,29 @@ mod tests {
     /// `_ =` discards the "already installed" error from earlier tests in
     /// the same process.
     fn install_crypto_provider() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        drop(ring::default_provider().install_default());
     }
 
     /// Build a vanilla `OauthHttpClient` with `allow_http_oauth_urls`
     /// flipped so plain-HTTP loopback URLs (used by the matrix listener)
     /// are not rejected on the scheme check before reaching the resolver.
-    fn build_client(allow_loopback: bool) -> OauthHttpClient {
+    fn build_client(allow_loopback: bool) -> anyhow::Result<OauthHttpClient> {
         install_crypto_provider();
         let mut config = OAuthConfig::default();
         config.allow_http_oauth_urls = true;
-        let client = OauthHttpClient::with_config(&config).expect("client builds");
-        if allow_loopback {
+        let client = OauthHttpClient::with_config(&config).context("client builds")?;
+        Ok(if allow_loopback {
             client.__test_allow_loopback_ssrf()
         } else {
             client
-        }
+        })
     }
 
     /// Walk the `source()` chain so the `ssrf:` diagnostic produced by
     /// `SsrfScreeningResolver::resolve` (which lives several layers under
     /// `reqwest::Error`) is visible to assertions. `format!("{err}")` only
     /// renders the outermost wrapper.
-    fn render_chain(err: &dyn std::error::Error) -> String {
+    fn render_chain(err: &dyn Error) -> String {
         let mut out = err.to_string();
         let mut current = err.source();
         while let Some(inner) = current {
@@ -157,13 +116,17 @@ mod tests {
     // the resolver must reject every address and surface the diagnostic
     // prefix that lets operators distinguish a deliberate policy denial
     // from a generic DNS failure.
+
+    /// Pins that the resolver rejects loopback with an `ssrf:` diagnostic when
+    /// the test-only bypass is off.
     #[tokio::test]
-    async fn resolver_contract_always_err_loopback_blocked() {
-        let client = build_client(false);
+    async fn resolver_contract_always_err_loopback_blocked() -> anyhow::Result<()> {
+        let client = build_client(false)?;
         let err = client
             .__test_get("http://localhost/")
             .await
-            .expect_err("loopback must be blocked without bypass");
+            .err()
+            .context("loopback must be blocked without bypass")?;
         let chain = render_chain(&err);
         assert!(
             chain.contains("ssrf:"),
@@ -173,6 +136,7 @@ mod tests {
             chain.contains("loopback") || chain.contains("blocked IP"),
             "diagnostic must name the block reason; got: {chain}"
         );
+        Ok(())
     }
 
     // ---------------------------------------------------------------------------
@@ -185,18 +149,23 @@ mod tests {
     // Asserting the *absence* of the `ssrf:` prefix is what makes this a
     // regression guard against accidentally classifying NXDOMAIN as a
     // policy denial.
+
+    /// Pins that an unresolvable host surfaces as a plain DNS error and is
+    /// never classified as an SSRF policy denial.
     #[tokio::test]
-    async fn resolver_contract_empty_dns_failure_not_classified_as_ssrf() {
-        let client = build_client(false);
+    async fn resolver_contract_empty_dns_failure_not_classified_as_ssrf() -> anyhow::Result<()> {
+        let client = build_client(false)?;
         let err = client
             .__test_get("http://nonexistent-host-for-server-kit-tests.invalid/")
             .await
-            .expect_err("unresolvable host must surface as error");
+            .err()
+            .context("unresolvable host must surface as error")?;
         let chain = render_chain(&err);
         assert!(
             !chain.contains("ssrf:"),
             "DNS failure must not be tagged as ssrf policy denial; got: {chain}"
         );
+        Ok(())
     }
 
     // ---------------------------------------------------------------------------
@@ -209,30 +178,34 @@ mod tests {
     // through verbatim so the connection actually reaches the listener.
     //
     // This is the inverse of test #1 and proves we did not over-block.
+
+    /// Pins that the resolver passes a resolved loopback address through
+    /// verbatim when the test-only bypass is on.
     #[tokio::test]
-    async fn resolver_contract_verbatim_passthrough_with_bypass() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let port = listener.local_addr().expect("local_addr").port();
+    async fn resolver_contract_verbatim_passthrough_with_bypass() -> anyhow::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.context("bind")?;
+        let port = listener.local_addr().context("local_addr")?.port();
 
         // Spawn a one-shot server. It accepts a single connection, drains
         // the request preamble, writes a 200 OK, and exits.
         let server = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.expect("accept");
-            let mut buf = [0u8; 1024];
+            let (mut sock, _) = listener.accept().await.context("accept")?;
+            let mut buf = [0_u8; 1024];
             // Best-effort read; reqwest may pipeline so we do not enforce
             // a specific byte count here.
-            let _ = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf)).await;
+            drop(timeout(Duration::from_secs(2), sock.read(&mut buf)).await);
             let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
-            let _ = sock.write_all(response).await;
-            let _ = sock.shutdown().await;
+            drop(sock.write_all(response).await);
+            drop(sock.shutdown().await);
+            Ok::<(), anyhow::Error>(())
         });
 
-        let client = build_client(true);
+        let client = build_client(true)?;
         let url = format!("http://127.0.0.1:{port}/");
         let response = client
             .__test_get(&url)
             .await
-            .expect("loopback must succeed with bypass enabled");
+            .context("loopback must succeed with bypass enabled")?;
         assert!(
             response.status().is_success(),
             "expected 2xx; got {}",
@@ -240,8 +213,9 @@ mod tests {
         );
 
         // Drain the body so the server's write completes cleanly.
-        let _ = response.bytes().await;
-        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+        drop(response.bytes().await);
+        drop(timeout(Duration::from_secs(2), server).await);
+        Ok(())
     }
 
     // ---------------------------------------------------------------------------
@@ -272,28 +246,31 @@ mod tests {
     const DECOY_PROXY: &str = "http://192.0.2.1:1"; // TEST-NET-1 (RFC 5737)
     const TARGET_URL: &str = "http://localhost/";
 
-    fn run_with_env(var: &str, value: &str) -> String {
+    fn run_with_env(var: &str, value: &str) -> anyhow::Result<String> {
         // Build a one-thread runtime inside the env scope so the env vars
         // are observable to reqwest's proxy autodetection at client build
         // time.
         temp_env::with_var(var, Some(value), || {
-            let rt = tokio::runtime::Builder::new_current_thread()
+            let rt = Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .expect("rt");
+                .context("rt")?;
             rt.block_on(async {
-                let client = build_client(false);
+                let client = build_client(false)?;
                 let err = client
                     .__test_get(TARGET_URL)
                     .await
-                    .expect_err("loopback target must be rejected");
-                render_chain(&err)
+                    .err()
+                    .context("loopback target must be rejected")?;
+                Ok(render_chain(&err))
             })
         })
     }
 
+    /// Pins that `no_proxy()` defeats every upper- and lower-case proxy
+    /// environment variable so the SSRF resolver still fires.
     #[test]
-    fn no_proxy_defeats_all_env_proxy_variants() {
+    fn no_proxy_defeats_all_env_proxy_variants() -> anyhow::Result<()> {
         // All six variants run inside ONE #[test] so the process-wide env
         // var mutations from temp_env::with_var cannot race against parallel
         // tests on platforms where rustc test runs threads concurrently
@@ -306,11 +283,12 @@ mod tests {
             "https_proxy",
             "all_proxy",
         ] {
-            let chain = run_with_env(var, DECOY_PROXY);
+            let chain = run_with_env(var, DECOY_PROXY)?;
             assert!(
                 chain.contains("ssrf:"),
                 "{var} must not bypass resolver; got: {chain}"
             );
         }
+        Ok(())
     }
 }

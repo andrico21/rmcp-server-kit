@@ -10,92 +10,43 @@
 #[cfg_attr(
     all(feature = "metrics", target_os = "linux"),
     expect(
-        clippy::panic_in_result_fn,
-        reason = "lint-migration: tests/integration/metrics_headers.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "metrics", target_os = "linux"),
-    expect(
-        clippy::shadow_reuse,
-        reason = "lint-migration: tests/integration/metrics_headers.rs"
+        clippy::missing_errors_doc,
+        reason = "test code is not rendered API documentation"
     )
 )]
 #[cfg_attr(
     all(feature = "metrics", target_os = "linux"),
     expect(
         clippy::missing_panics_doc,
-        reason = "lint-migration: tests/integration/metrics_headers.rs"
+        reason = "test code is not rendered API documentation"
     )
 )]
 #[cfg_attr(
     all(feature = "metrics", target_os = "linux"),
-    expect(
-        clippy::unused_result_ok,
-        reason = "lint-migration: tests/integration/metrics_headers.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "metrics", target_os = "linux"),
-    expect(
-        clippy::default_numeric_fallback,
-        reason = "lint-migration: tests/integration/metrics_headers.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "metrics", target_os = "linux"),
-    expect(
-        clippy::absolute_paths,
-        reason = "lint-migration: tests/integration/metrics_headers.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "metrics", target_os = "linux"),
-    expect(
-        clippy::missing_errors_doc,
-        reason = "lint-migration: tests/integration/metrics_headers.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "metrics", target_os = "linux"),
-    expect(
-        clippy::std_instead_of_alloc,
-        reason = "lint-migration: tests/integration/metrics_headers.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "metrics", target_os = "linux"),
-    expect(
-        clippy::std_instead_of_core,
-        reason = "lint-migration: tests/integration/metrics_headers.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "metrics", target_os = "linux"),
-    expect(
-        clippy::unused_trait_names,
-        reason = "lint-migration: tests/integration/metrics_headers.rs"
-    )
-)]
-#[cfg_attr(
-    feature = "metrics",
-    expect(
-        unused_results,
-        reason = "lint-migration: tests/integration/metrics_headers.rs"
-    )
+    expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")
 )]
 #[cfg(test)]
 mod tests {
-    use std::{net::SocketAddr, sync::Arc, time::Duration};
+    extern crate alloc;
 
-    use anyhow::Context;
+    use alloc::sync::Arc;
+    use core::{net::SocketAddr, time::Duration};
+
+    use anyhow::Context as _;
+    use reqwest::{Client, header::HeaderMap};
     use rmcp::{ServerHandler, model::ServerConfig};
     use rmcp_server_kit::{
         RmcpServerKitError,
         metrics::{McpMetrics, serve_metrics},
         transport::{McpServerConfig, SecurityHeadersConfig, serve_with_listener},
     };
-    use tokio::{net::TcpListener, task::JoinHandle};
+    use rustls::crypto::ring;
+    use tokio::{
+        net::TcpListener,
+        sync::oneshot,
+        task::JoinHandle,
+        time::{sleep, timeout},
+    };
     use tokio_util::sync::CancellationToken;
 
     /// The eleven non-HSTS header defaults emitted by
@@ -142,10 +93,10 @@ mod tests {
     }
 
     /// Poll `url` (bounded readiness loop) and return the response headers.
-    async fn fetch_headers(url: &str) -> anyhow::Result<reqwest::header::HeaderMap> {
-        let client = reqwest::Client::new();
+    async fn fetch_headers(url: &str) -> anyhow::Result<HeaderMap> {
+        let client = Client::new();
         let mut last_status = None;
-        for _ in 0..100 {
+        for _ in 0..100_u32 {
             if let Ok(response) = client.get(url).send().await {
                 if response.status().is_success() {
                     let headers = response.headers().clone();
@@ -156,7 +107,7 @@ mod tests {
                 }
                 last_status = Some(response.status());
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            sleep(Duration::from_millis(20)).await;
         }
         anyhow::bail!("{url} never became ready (last status {last_status:?})");
     }
@@ -180,9 +131,7 @@ mod tests {
     /// Install the process-wide rustls provider that reqwest's
     /// `rustls-no-provider` build requires before any client is constructed.
     fn install_crypto_provider() {
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .ok();
+        drop(ring::default_provider().install_default());
     }
 
     /// Spawn the public `serve_metrics` on a fresh ephemeral port.
@@ -224,16 +173,16 @@ mod tests {
             .await
             .context("bind main listener")?;
         let bound: SocketAddr = listener.local_addr().context("read main addr")?;
-        let config = config.with_bind_addr(bound.to_string());
+        let bound_config = config.with_bind_addr(bound.to_string());
 
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<SocketAddr>();
+        let (ready_tx, ready_rx) = oneshot::channel::<SocketAddr>();
         let shutdown = CancellationToken::new();
         let shutdown_for_server = shutdown.clone();
 
         let join = tokio::spawn(async move {
             serve_with_listener(
                 listener,
-                config.validate()?,
+                bound_config.validate()?,
                 || TestHandler,
                 Some(ready_tx),
                 Some(shutdown_for_server),
@@ -241,7 +190,7 @@ mod tests {
             .await
         });
 
-        let signalled = tokio::time::timeout(Duration::from_secs(30), ready_rx)
+        let signalled = timeout(Duration::from_secs(30), ready_rx)
             .await
             .context("server did not signal readiness within 30s")?
             .context("server task aborted before readiness")?;

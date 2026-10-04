@@ -34,134 +34,43 @@
 #[cfg_attr(
     all(feature = "oauth-mtls-client", target_os = "linux"),
     expect(
-        clippy::use_debug,
-        reason = "lint-migration: tests/integration/oauth_http_client.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::missing_const_for_fn,
-        reason = "lint-migration: tests/integration/oauth_http_client.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::arithmetic_side_effects,
-        reason = "lint-migration: tests/integration/oauth_http_client.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::indexing_slicing,
-        reason = "lint-migration: tests/integration/oauth_http_client.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::print_stderr,
-        reason = "lint-migration: tests/integration/oauth_http_client.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::min_ident_chars,
-        reason = "lint-migration: tests/integration/oauth_http_client.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::absolute_paths,
-        reason = "lint-migration: tests/integration/oauth_http_client.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::let_underscore_untyped,
-        reason = "lint-migration: tests/integration/oauth_http_client.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::let_underscore_must_use,
-        reason = "lint-migration: tests/integration/oauth_http_client.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::expect_used,
-        reason = "lint-migration: tests/integration/oauth_http_client.rs"
+        clippy::missing_errors_doc,
+        reason = "test code is not rendered API documentation"
     )
 )]
 #[cfg_attr(
     all(feature = "oauth-mtls-client", target_os = "linux"),
     expect(
         clippy::missing_panics_doc,
-        reason = "lint-migration: tests/integration/oauth_http_client.rs"
+        reason = "test code is not rendered API documentation"
     )
+)]
+#[cfg_attr(
+    all(feature = "oauth-mtls-client", target_os = "linux"),
+    expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")
 )]
 #[cfg_attr(
     all(feature = "oauth-mtls-client", target_os = "linux"),
     expect(
         clippy::too_long_first_doc_paragraph,
-        reason = "lint-migration: tests/integration/oauth_http_client.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::unused_trait_names,
-        reason = "lint-migration: tests/integration/oauth_http_client.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::std_instead_of_alloc,
-        reason = "lint-migration: tests/integration/oauth_http_client.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::std_instead_of_core,
-        reason = "lint-migration: tests/integration/oauth_http_client.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::unseparated_literal_suffix,
-        reason = "lint-migration: tests/integration/oauth_http_client.rs"
-    )
-)]
-#[cfg_attr(
-    feature = "oauth-mtls-client",
-    expect(
-        unused_results,
-        reason = "lint-migration: tests/integration/oauth_http_client.rs"
-    )
-)]
-#[cfg_attr(
-    feature = "oauth-mtls-client",
-    expect(
-        let_underscore_drop,
-        reason = "lint-migration: tests/integration/oauth_http_client.rs"
+        reason = "test code is not rendered API documentation"
     )
 )]
 #[cfg(test)]
 mod tests {
+    extern crate alloc;
 
-    use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+    use alloc::sync::Arc;
+    use core::{error::Error, net::SocketAddr, time::Duration};
+    use std::{
+        env, fs,
+        io::{self, Write as _},
+        path::PathBuf,
+        process,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
+    use anyhow::{Context as _, bail};
     use rcgen::{
         BasicConstraints, CertificateParams, CertifiedIssuer, DnType, IsCa, KeyPair,
         KeyUsagePurpose,
@@ -169,11 +78,13 @@ mod tests {
     use rmcp_server_kit::oauth::{OAuthConfig, OauthHttpClient};
     use rustls::{
         ServerConfig,
+        crypto::ring,
         pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
     };
     use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
+        io::{AsyncReadExt as _, AsyncWriteExt as _},
         net::TcpListener,
+        time::timeout,
     };
     use tokio_rustls::TlsAcceptor;
     use wiremock::{
@@ -203,9 +114,9 @@ mod tests {
         leaf_key_der: Vec<u8>,
     }
 
-    fn build_test_pki() -> TestPki {
+    fn build_test_pki() -> anyhow::Result<TestPki> {
         // CA.
-        let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).context("ca params")?;
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         ca_params.key_usages = vec![
             KeyUsagePurpose::KeyCertSign,
@@ -215,20 +126,20 @@ mod tests {
         ca_params
             .distinguished_name
             .push(DnType::CommonName, "oauth-test-ca");
-        let ca_key = KeyPair::generate().expect("ca key");
+        let ca_key = KeyPair::generate().context("ca key")?;
         let ca_issuer: CertifiedIssuer<'static, KeyPair> =
-            CertifiedIssuer::self_signed(ca_params, ca_key).expect("ca self-signed");
+            CertifiedIssuer::self_signed(ca_params, ca_key).context("ca self-signed")?;
 
         // Leaf, bound to the SAN `localhost`.
         let mut leaf_params =
-            CertificateParams::new(vec!["localhost".to_owned()]).expect("leaf params");
+            CertificateParams::new(vec!["localhost".to_owned()]).context("leaf params")?;
         leaf_params
             .distinguished_name
             .push(DnType::CommonName, "oauth-test-leaf");
-        let leaf_key = KeyPair::generate().expect("leaf key");
+        let leaf_key = KeyPair::generate().context("leaf key")?;
         let leaf_cert = leaf_params
             .signed_by(&leaf_key, &ca_issuer)
-            .expect("leaf signed");
+            .context("leaf signed")?;
 
         let ca_pem = ca_issuer.as_ref().pem();
         let leaf_cert_pem = leaf_cert.pem();
@@ -236,31 +147,31 @@ mod tests {
         let leaf_cert_der = leaf_cert.der().to_vec();
         let leaf_key_der = leaf_key.serialize_der();
 
-        TestPki {
+        Ok(TestPki {
             ca_pem,
             leaf_cert_pem,
             leaf_key_pem,
             leaf_cert_der,
             leaf_key_der,
-        }
+        })
     }
 
     /// Install ring crypto provider once per process. `reqwest` is built
     /// with `rustls-no-provider`; tokio-rustls also needs a provider for
     /// the test server side.
     fn install_crypto_provider() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        drop(ring::default_provider().install_default());
     }
 
     /// Build a rustls `ServerConfig` for the supplied leaf cert + key.
-    fn build_server_config(pki: &TestPki) -> Arc<ServerConfig> {
+    fn build_server_config(pki: &TestPki) -> anyhow::Result<Arc<ServerConfig>> {
         let cert = CertificateDer::from(pki.leaf_cert_der.clone());
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pki.leaf_key_der.clone()));
         let config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(vec![cert], key)
-            .expect("server config");
-        Arc::new(config)
+            .context("server config")?;
+        Ok(Arc::new(config))
     }
 
     /// One-shot TLS server. Accepts a single connection, performs the
@@ -271,102 +182,120 @@ mod tests {
     /// The server lives on a detached task; the caller does not need to
     /// join it (it terminates after one request or after a 5-second
     /// timeout).
-    async fn spawn_one_shot_tls(pki: &TestPki, response_bytes: Vec<u8>) -> String {
+    async fn spawn_one_shot_tls(pki: &TestPki, response_bytes: Vec<u8>) -> anyhow::Result<String> {
         install_crypto_provider();
-        let server_config = build_server_config(pki);
+        let server_config = build_server_config(pki)?;
         let acceptor = TlsAcceptor::from(server_config);
 
         let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .await
-            .expect("bind 127.0.0.1:0");
-        let port = listener.local_addr().expect("local_addr").port();
+            .context("bind 127.0.0.1:0")?;
+        let port = listener.local_addr().context("local_addr")?.port();
 
-        tokio::spawn(async move {
-            let accept_fut = listener.accept();
-            let (tcp, _peer) = match tokio::time::timeout(Duration::from_secs(30), accept_fut).await
-            {
-                Ok(Ok(pair)) => pair,
-                Ok(Err(e)) => {
-                    eprintln!("test tls accept error: {e}");
-                    return;
+        drop(tokio::spawn(serve_one_shot_tls(
+            listener,
+            acceptor,
+            response_bytes,
+        )));
+
+        Ok(format!("https://localhost:{port}/"))
+    }
+
+    /// Serve exactly one accepted connection for [`spawn_one_shot_tls`]:
+    /// handshake, read the request headers (capped at 16 KiB), then write
+    /// the canned response. Connection-level failures are reported to
+    /// stderr because the spawning caller discards the task result.
+    async fn serve_one_shot_tls(
+        listener: TcpListener,
+        acceptor: TlsAcceptor,
+        response_bytes: Vec<u8>,
+    ) -> anyhow::Result<()> {
+        let accept_fut = listener.accept();
+        let (tcp, _peer) = match timeout(Duration::from_secs(30), accept_fut).await {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(error)) => {
+                writeln!(io::stderr(), "test tls accept error: {error}")
+                    .context("write stderr note")?;
+                return Ok(());
+            }
+            Err(_) => {
+                writeln!(io::stderr(), "test tls accept timed out").context("write stderr note")?;
+                return Ok(());
+            }
+        };
+        let mut tls_stream = match acceptor.accept(tcp).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                writeln!(io::stderr(), "test tls handshake error: {error}")
+                    .context("write stderr note")?;
+                return Ok(());
+            }
+        };
+
+        // Read until end of HTTP headers; cap at 16 KiB to avoid
+        // unbounded memory if the client misbehaves.
+        let mut buf = vec![0_u8; 16 * 1024];
+        let mut filled = 0_usize;
+        while filled < buf.len() {
+            let tail = buf.get_mut(filled..).context("buffer tail")?;
+            let count = match timeout(Duration::from_secs(5), tls_stream.read(tail)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(count)) => count,
+                Ok(Err(error)) => {
+                    writeln!(io::stderr(), "test tls read error: {error}")
+                        .context("write stderr note")?;
+                    return Ok(());
                 }
                 Err(_) => {
-                    eprintln!("test tls accept timed out");
-                    return;
+                    writeln!(io::stderr(), "test tls read timed out")
+                        .context("write stderr note")?;
+                    return Ok(());
                 }
             };
-            let mut tls_stream = match acceptor.accept(tcp).await {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("test tls handshake error: {e}");
-                    return;
-                }
-            };
-
-            // Read until end of HTTP headers; cap at 16 KiB to avoid
-            // unbounded memory if the client misbehaves.
-            let mut buf = vec![0u8; 16 * 1024];
-            let mut filled = 0usize;
-            while filled < buf.len() {
-                let n = match tokio::time::timeout(
-                    Duration::from_secs(5),
-                    tls_stream.read(&mut buf[filled..]),
-                )
-                .await
-                {
-                    Ok(Ok(0)) => break,
-                    Ok(Ok(n)) => n,
-                    Ok(Err(e)) => {
-                        eprintln!("test tls read error: {e}");
-                        return;
-                    }
-                    Err(_) => {
-                        eprintln!("test tls read timed out");
-                        return;
-                    }
-                };
-                filled += n;
-                if buf[..filled].windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
+            filled = filled.checked_add(count).context("buffer fill")?;
+            let head = buf.get(..filled).context("buffer head")?;
+            if head.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
             }
+        }
 
-            if let Err(e) = tls_stream.write_all(&response_bytes).await {
-                eprintln!("test tls write error: {e}");
-                return;
-            }
-            let _ = tls_stream.shutdown().await;
-        });
-
-        format!("https://localhost:{port}/")
+        if let Err(error) = tls_stream.write_all(&response_bytes).await {
+            writeln!(io::stderr(), "test tls write error: {error}").context("write stderr note")?;
+            return Ok(());
+        }
+        drop(tls_stream.shutdown().await);
+        Ok(())
     }
 
     /// Build an `OauthHttpClient` with `ca_cert_path` pointing at a temp
     /// file containing the PKI's CA. `allow_http_oauth_urls` is
     /// configurable so the downgrade test can still set it to `true` and
     /// prove that the downgrade is rejected anyway.
-    fn build_client_with_ca(pki: &TestPki, allow_http: bool) -> (OauthHttpClient, PathBuf) {
-        let dir = std::env::temp_dir();
-        let pid = std::process::id();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
+    fn build_client_with_ca(
+        pki: &TestPki,
+        allow_http: bool,
+    ) -> anyhow::Result<(OauthHttpClient, PathBuf)> {
+        let dir = env::temp_dir();
+        let pid = process::id();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
         let ca_path = dir.join(format!("rmcp-oauth-ca-{pid}-{nanos}.pem"));
-        std::fs::write(&ca_path, pki.ca_pem.as_bytes()).expect("write ca pem");
+        fs::write(&ca_path, pki.ca_pem.as_bytes()).context("write ca pem")?;
 
         let mut config = OAuthConfig::default();
         config.ca_cert_path = Some(ca_path.clone());
         config.allow_http_oauth_urls = allow_http;
         let client = OauthHttpClient::with_config(&config)
-            .expect("client builds")
+            .context("client builds")?
             .__test_allow_loopback_ssrf();
-        (client, ca_path)
+        Ok((client, ca_path))
     }
 
     /// Used by Test 2 (positive CA) -- references the unused PEM helpers
     /// to keep `clippy::dead_code` quiet without `#[allow]` attributes.
     fn consume_pem(pki: &TestPki) {
-        let _ = (&pki.leaf_cert_pem, &pki.leaf_key_pem);
+        let _: (&String, &String) = (&pki.leaf_cert_pem, &pki.leaf_key_pem);
     }
 
     /// Stringify an error chain by walking `source()` so messages set via
@@ -374,7 +303,7 @@ mod tests {
     /// source) become visible to assertions. `format!("{err:#}")` only
     /// renders reqwest's outer wrapper ("error following redirect for url
     /// (...)") which omits the redirect-policy reason.
-    fn render_error_chain(err: &dyn std::error::Error) -> String {
+    fn render_error_chain(err: &dyn Error) -> String {
         let mut out = err.to_string();
         let mut current = err.source();
         while let Some(inner) = current {
@@ -390,8 +319,14 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     #[tokio::test]
-    async fn redirect_downgrade_https_to_http_is_rejected() {
-        let pki = build_test_pki();
+    #[expect(
+        clippy::use_debug,
+        reason = "deliberate: tests/integration/oauth_http_client.rs::redirect_downgrade_https_to_http_is_rejected renders the reqwest error with Debug so the race-path diagnostic note keeps its pre-migration bytes"
+    )]
+    /// Pins that an `https -> http` redirect is rejected even when
+    /// `allow_http_oauth_urls` is `true`.
+    async fn redirect_downgrade_https_to_http_is_rejected() -> anyhow::Result<()> {
+        let pki = build_test_pki()?;
         consume_pem(&pki);
 
         // The TLS server replies with a 302 whose Location header points
@@ -403,12 +338,14 @@ mod tests {
             Content-Length: 0\r\n\
             Connection: close\r\n\r\n"
             .to_vec();
-        let url = spawn_one_shot_tls(&pki, response_bytes).await;
+        let url = spawn_one_shot_tls(&pki, response_bytes).await?;
 
-        let (client, _ca_path) = build_client_with_ca(&pki, /* allow_http */ true);
+        let (client, _ca_path) = build_client_with_ca(&pki, /* allow_http */ true)?;
         let result = client.__test_get(&url).await;
 
-        let err = result.expect_err("downgrade must be rejected");
+        let Err(err) = result else {
+            bail!("downgrade must be rejected");
+        };
         let rendered = render_error_chain(&err);
         assert!(
             rendered.contains("downgrade") || rendered.contains("https -> http"),
@@ -421,10 +358,13 @@ mod tests {
         // above (error chain contains the policy reason) already verified
         // correctness; this is informational only.
         if !err.is_redirect() {
-            eprintln!(
+            writeln!(
+                io::stderr(),
                 "note: err.is_redirect()=false (likely transport-layer race under parallel load), got: {err:?}"
-            );
+            )
+            .context("write stderr note")?;
         }
+        Ok(())
     }
 
     // ---------------------------------------------------------------------------
@@ -432,7 +372,13 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     #[tokio::test]
-    async fn redirect_to_non_http_scheme_is_rejected() {
+    #[expect(
+        clippy::use_debug,
+        reason = "deliberate: tests/integration/oauth_http_client.rs::redirect_to_non_http_scheme_is_rejected renders the reqwest error with Debug so the race-path diagnostic note keeps its pre-migration bytes"
+    )]
+    /// Pins that a redirect to a non-HTTP(S) scheme such as `ftp://` is
+    /// rejected.
+    async fn redirect_to_non_http_scheme_is_rejected() -> anyhow::Result<()> {
         install_crypto_provider();
         let mock = MockServer::start().await;
         Mock::given(method("GET"))
@@ -448,12 +394,14 @@ mod tests {
         let mut config = OAuthConfig::default();
         config.allow_http_oauth_urls = true;
         let client = OauthHttpClient::with_config(&config)
-            .expect("client builds")
+            .context("client builds")?
             .__test_allow_loopback_ssrf();
 
         let url = format!("{}/redir", mock.uri());
         let result = client.__test_get(&url).await;
-        let err = result.expect_err("non-HTTP(S) redirect must be rejected");
+        let Err(err) = result else {
+            bail!("non-HTTP(S) redirect must be rejected");
+        };
         let rendered = render_error_chain(&err);
         assert!(
             rendered.contains("non-http")
@@ -463,10 +411,13 @@ mod tests {
         );
         // Secondary observation, informational only - substantive check above is what matters.
         if !err.is_redirect() {
-            eprintln!(
+            writeln!(
+                io::stderr(),
                 "note: err.is_redirect()=false (likely transport-layer race under parallel load), got: {err:?}"
-            );
+            )
+            .context("write stderr note")?;
         }
+        Ok(())
     }
 
     // ---------------------------------------------------------------------------
@@ -474,7 +425,12 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     #[tokio::test]
-    async fn redirect_chain_capped_at_two_hops() {
+    #[expect(
+        clippy::use_debug,
+        reason = "deliberate: tests/integration/oauth_http_client.rs::redirect_chain_capped_at_two_hops renders the reqwest error with Debug so the race-path diagnostic note keeps its pre-migration bytes"
+    )]
+    /// Pins that a redirect chain longer than two hops is rejected.
+    async fn redirect_chain_capped_at_two_hops() -> anyhow::Result<()> {
         install_crypto_provider();
         let mock = MockServer::start().await;
         let base = mock.uri().replace("127.0.0.1", "localhost");
@@ -507,12 +463,14 @@ mod tests {
         let mut config = OAuthConfig::default();
         config.allow_http_oauth_urls = true;
         let client = OauthHttpClient::with_config(&config)
-            .expect("client builds")
+            .context("client builds")?
             .__test_allow_loopback_ssrf();
 
         let url = format!("{base}/a");
         let result = client.__test_get(&url).await;
-        let err = result.expect_err("3-hop redirect must be rejected");
+        let Err(err) = result else {
+            bail!("3-hop redirect must be rejected");
+        };
         let rendered = render_error_chain(&err);
         assert!(
             rendered.contains("too many redirects") || rendered.contains("max 2"),
@@ -520,10 +478,13 @@ mod tests {
         );
         // Secondary observation, informational only - substantive check above is what matters.
         if !err.is_redirect() {
-            eprintln!(
+            writeln!(
+                io::stderr(),
                 "note: err.is_redirect()=false (likely transport-layer race under parallel load), got: {err:?}"
-            );
+            )
+            .context("write stderr note")?;
         }
+        Ok(())
     }
 
     // ---------------------------------------------------------------------------
@@ -542,67 +503,80 @@ mod tests {
                   redirect-policy test (redirect_downgrade_https_to_http_is_rejected) runs \
                   on all platforms including Windows."
     )]
-    async fn ca_cert_path_is_applied_to_oauth_http_client() {
-        let pki = build_test_pki();
+    /// Pins that `OAuthConfig::ca_cert_path` is honoured, so a self-signed
+    /// enterprise CA is trusted.
+    async fn ca_cert_path_is_applied_to_oauth_http_client() -> anyhow::Result<()> {
+        let pki = build_test_pki()?;
 
         // Server replies 200 OK with empty body.
         let response_bytes = b"HTTP/1.1 200 OK\r\n\
             Content-Length: 0\r\n\
             Connection: close\r\n\r\n"
             .to_vec();
-        let url = spawn_one_shot_tls(&pki, response_bytes).await;
+        let url = spawn_one_shot_tls(&pki, response_bytes).await?;
 
         // With ca_cert_path set, the request must succeed.
-        let (client, _ca_path) = build_client_with_ca(&pki, /* allow_http */ false);
+        let (client, _ca_path) = build_client_with_ca(&pki, /* allow_http */ false)?;
         let response = client
             .__test_get(&url)
             .await
-            .expect("request with custom CA must succeed");
+            .context("request with custom CA must succeed")?;
         assert_eq!(response.status().as_u16(), 200);
+        Ok(())
     }
 
+    /// Pins that without `ca_cert_path` a self-signed leaf is rejected at
+    /// the TLS layer.
     #[tokio::test]
-    async fn missing_ca_cert_path_makes_self_signed_request_fail() {
+    async fn missing_ca_cert_path_makes_self_signed_request_fail() -> anyhow::Result<()> {
         // Same server, but the client is built WITHOUT ca_cert_path. The
         // self-signed leaf is not trusted by the system roots, so the
         // handshake must fail.
-        let pki = build_test_pki();
+        let pki = build_test_pki()?;
         let response_bytes = b"HTTP/1.1 200 OK\r\n\
             Content-Length: 0\r\n\
             Connection: close\r\n\r\n"
             .to_vec();
-        let url = spawn_one_shot_tls(&pki, response_bytes).await;
+        let url = spawn_one_shot_tls(&pki, response_bytes).await?;
 
         let config = OAuthConfig::default();
         let client = OauthHttpClient::with_config(&config)
-            .expect("client builds")
+            .context("client builds")?
             .__test_allow_loopback_ssrf();
         let result = client.__test_get(&url).await;
-        let err = result.expect_err("untrusted self-signed leaf must be rejected");
+        let Err(err) = result else {
+            bail!("untrusted self-signed leaf must be rejected");
+        };
         // We don't assert a specific error string (rustls phrasing varies
         // across versions); only that a connect-time failure surfaced.
         assert!(
             err.is_connect() || err.is_request() || err.is_builder() || err.is_decode(),
             "expected TLS-layer failure, got: {err:?}"
         );
+        Ok(())
     }
 
     // ---------------------------------------------------------------------------
     // Test 2 (negative): nonexistent ca_cert_path returns Startup error
     // ---------------------------------------------------------------------------
 
+    /// Pins that a non-existent `ca_cert_path` fails client construction
+    /// with a read error.
     #[test]
-    fn nonexistent_ca_cert_path_returns_startup_error() {
+    fn nonexistent_ca_cert_path_returns_startup_error() -> anyhow::Result<()> {
         let mut config = OAuthConfig::default();
         config.ca_cert_path = Some(PathBuf::from(
             "Z:/this/path/definitely/does/not/exist/ca.pem",
         ));
-        let err = OauthHttpClient::with_config(&config).expect_err("must fail to read CA");
+        let Err(err) = OauthHttpClient::with_config(&config) else {
+            bail!("must fail to read CA");
+        };
         let rendered = format!("{err:#}");
         assert!(
             rendered.contains("ca_cert_path") || rendered.contains("read"),
             "expected ca_cert_path read error, got: {rendered}"
         );
+        Ok(())
     }
 
     // ---------------------------------------------------------------------------
@@ -618,7 +592,13 @@ mod tests {
     // a userinfo check.
 
     #[tokio::test]
-    async fn rejects_per_hop_redirect_to_private_ip_oauth_client() {
+    #[expect(
+        clippy::use_debug,
+        reason = "deliberate: tests/integration/oauth_http_client.rs::rejects_per_hop_redirect_to_private_ip_oauth_client renders the reqwest error with Debug so the race-path diagnostic note keeps its pre-migration bytes"
+    )]
+    /// Pins that a per-hop redirect to a private IP is rejected by the
+    /// SSRF guard.
+    async fn rejects_per_hop_redirect_to_private_ip_oauth_client() -> anyhow::Result<()> {
         install_crypto_provider();
         let mock = MockServer::start().await;
         Mock::given(method("GET"))
@@ -632,12 +612,14 @@ mod tests {
         let mut config = OAuthConfig::default();
         config.allow_http_oauth_urls = true;
         let client = OauthHttpClient::with_config(&config)
-            .expect("client builds")
+            .context("client builds")?
             .__test_allow_loopback_ssrf();
 
         let url = format!("{}/redir", mock.uri());
         let result = client.__test_get(&url).await;
-        let err = result.expect_err("redirect to private IP must be rejected");
+        let Err(err) = result else {
+            bail!("redirect to private IP must be rejected");
+        };
         let rendered = render_error_chain(&err);
         assert!(
             rendered.contains("redirect target forbidden")
@@ -651,14 +633,23 @@ mod tests {
         // categorised as a connection error instead. The substantive check
         // above already verified correctness; this is informational only.
         if !err.is_redirect() {
-            eprintln!(
+            writeln!(
+                io::stderr(),
                 "note: err.is_redirect()=false (likely transport-layer race under parallel load), got: {err:?}"
-            );
+            )
+            .context("write stderr note")?;
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn rejects_per_hop_redirect_to_loopback_oauth_client() {
+    #[expect(
+        clippy::use_debug,
+        reason = "deliberate: tests/integration/oauth_http_client.rs::rejects_per_hop_redirect_to_loopback_oauth_client renders the reqwest error with Debug so the race-path diagnostic note keeps its pre-migration bytes"
+    )]
+    /// Pins that a per-hop redirect to a loopback address is rejected by
+    /// the SSRF guard.
+    async fn rejects_per_hop_redirect_to_loopback_oauth_client() -> anyhow::Result<()> {
         // Same guard, loopback target. Covered separately because
         // `redirect_target_reason` returns distinct reasons for the two
         // categories; we want proof both branches fire.
@@ -675,12 +666,14 @@ mod tests {
         let mut config = OAuthConfig::default();
         config.allow_http_oauth_urls = true;
         let client = OauthHttpClient::with_config(&config)
-            .expect("client builds")
+            .context("client builds")?
             .__test_allow_loopback_ssrf();
 
         let url = format!("{}/redir", mock.uri());
         let result = client.__test_get(&url).await;
-        let err = result.expect_err("redirect to loopback must be rejected");
+        let Err(err) = result else {
+            bail!("redirect to loopback must be rejected");
+        };
         let rendered = render_error_chain(&err);
         assert!(
             rendered.contains("redirect target forbidden") || rendered.contains("loopback"),
@@ -688,14 +681,22 @@ mod tests {
         );
         // Secondary observation, informational only - substantive check above is what matters.
         if !err.is_redirect() {
-            eprintln!(
+            writeln!(
+                io::stderr(),
                 "note: err.is_redirect()=false (likely transport-layer race under parallel load), got: {err:?}"
-            );
+            )
+            .context("write stderr note")?;
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn rejects_redirect_with_userinfo_oauth_client() {
+    #[expect(
+        clippy::use_debug,
+        reason = "deliberate: tests/integration/oauth_http_client.rs::rejects_redirect_with_userinfo_oauth_client renders the reqwest error with Debug so the race-path diagnostic note keeps its pre-migration bytes"
+    )]
+    /// Pins that a redirect whose target embeds userinfo is rejected.
+    async fn rejects_redirect_with_userinfo_oauth_client() -> anyhow::Result<()> {
         install_crypto_provider();
         let mock = MockServer::start().await;
         Mock::given(method("GET"))
@@ -709,11 +710,13 @@ mod tests {
 
         let mut config = OAuthConfig::default();
         config.allow_http_oauth_urls = true;
-        let client = OauthHttpClient::with_config(&config).expect("client builds");
+        let client = OauthHttpClient::with_config(&config).context("client builds")?;
 
         let url = format!("{}/redir", mock.uri());
         let result = client.__test_get(&url).await;
-        let err = result.expect_err("redirect with userinfo must be rejected");
+        let Err(err) = result else {
+            bail!("redirect with userinfo must be rejected");
+        };
         let rendered = render_error_chain(&err);
         assert!(
             rendered.contains("redirect target forbidden")
@@ -723,14 +726,23 @@ mod tests {
         );
         // Secondary observation, informational only - substantive check above is what matters.
         if !err.is_redirect() {
-            eprintln!(
+            writeln!(
+                io::stderr(),
                 "note: err.is_redirect()=false (likely transport-layer race under parallel load), got: {err:?}"
-            );
+            )
+            .context("write stderr note")?;
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn redirect_to_http_with_userinfo_rejected_when_http_allowed() {
+    #[expect(
+        clippy::use_debug,
+        reason = "deliberate: tests/integration/oauth_http_client.rs::redirect_to_http_with_userinfo_rejected_when_http_allowed renders the reqwest error with Debug so the race-path diagnostic note keeps its pre-migration bytes"
+    )]
+    /// Pins that userinfo-only redirects are rejected even when plain HTTP
+    /// is allowed.
+    async fn redirect_to_http_with_userinfo_rejected_when_http_allowed() -> anyhow::Result<()> {
         install_crypto_provider();
         let mock = MockServer::start().await;
         Mock::given(method("GET"))
@@ -744,11 +756,13 @@ mod tests {
 
         let mut config = OAuthConfig::default();
         config.allow_http_oauth_urls = true;
-        let client = OauthHttpClient::with_config(&config).expect("client builds");
+        let client = OauthHttpClient::with_config(&config).context("client builds")?;
 
         let url = format!("{}/redir", mock.uri());
         let result = client.__test_get(&url).await;
-        let err = result.expect_err("http redirect with userinfo must be rejected");
+        let Err(err) = result else {
+            bail!("http redirect with userinfo must be rejected");
+        };
         let rendered = render_error_chain(&err);
         assert!(
             rendered.contains("redirect target forbidden")
@@ -758,9 +772,12 @@ mod tests {
         );
         // Secondary observation, informational only - substantive check above is what matters.
         if !err.is_redirect() {
-            eprintln!(
+            writeln!(
+                io::stderr(),
                 "note: err.is_redirect()=false (likely transport-layer race under parallel load), got: {err:?}"
-            );
+            )
+            .context("write stderr note")?;
         }
+        Ok(())
     }
 }

@@ -18,56 +18,34 @@
 #[cfg_attr(
     all(feature = "oauth-mtls-client", target_os = "linux"),
     expect(
-        clippy::expect_used,
-        reason = "lint-migration: tests/integration/jwks_key_cap.rs"
+        clippy::missing_errors_doc,
+        reason = "test code is not rendered API documentation"
     )
 )]
 #[cfg_attr(
     all(feature = "oauth-mtls-client", target_os = "linux"),
     expect(
         clippy::missing_panics_doc,
-        reason = "lint-migration: tests/integration/jwks_key_cap.rs"
+        reason = "test code is not rendered API documentation"
     )
 )]
 #[cfg_attr(
     all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::absolute_paths,
-        reason = "lint-migration: tests/integration/jwks_key_cap.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::let_underscore_untyped,
-        reason = "lint-migration: tests/integration/jwks_key_cap.rs"
-    )
-)]
-#[cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::let_underscore_must_use,
-        reason = "lint-migration: tests/integration/jwks_key_cap.rs"
-    )
+    expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")
 )]
 #[cfg_attr(
     all(feature = "oauth-mtls-client", target_os = "linux"),
     expect(
         clippy::too_long_first_doc_paragraph,
-        reason = "lint-migration: tests/integration/jwks_key_cap.rs"
-    )
-)]
-#[cfg_attr(
-    feature = "oauth-mtls-client",
-    expect(
-        let_underscore_drop,
-        reason = "lint-migration: tests/integration/jwks_key_cap.rs"
+        reason = "test code is not rendered API documentation"
     )
 )]
 #[cfg(test)]
 mod tests {
 
+    use anyhow::Context as _;
     use rmcp_server_kit::oauth::{JwksCache, OAuthConfig};
+    use rustls::crypto::ring;
     use serde_json::{Value, json};
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -95,11 +73,13 @@ mod tests {
     }
 
     fn install_crypto_provider() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        drop(ring::default_provider().install_default());
     }
 
+    /// Pins that a JWKS document with more keys than `max_jwks_keys` is
+    /// rejected fail-closed, installing no keys at all.
     #[tokio::test]
-    async fn jwks_rejects_excess_keys_fail_closed() {
+    async fn jwks_rejects_excess_keys_fail_closed() -> anyhow::Result<()> {
         install_crypto_provider();
 
         // Wiremock serves a JWKS document with 300 RSA keys.
@@ -123,7 +103,8 @@ mod tests {
 
         // `JwksCache::new` does NOT fetch - only builds the reqwest client.
         let cache = JwksCache::new(&config)
-            .expect("construct cache")
+            .map_err(anyhow::Error::msg)
+            .context("construct cache")?
             .__test_allow_loopback_ssrf();
 
         // Drive the refresh path that would normally happen on first
@@ -131,7 +112,7 @@ mod tests {
         // the `build_key_cache` error string verbatim.
         let result = cache.__test_refresh_now().await;
 
-        let err = result.expect_err("300 keys must exceed cap=256");
+        let err = result.err().context("300 keys must exceed cap=256")?;
         assert!(
             err.contains("jwks_key_count_exceeds_cap"),
             "refresh error must contain literal `jwks_key_count_exceeds_cap`; got: {err}"
@@ -150,10 +131,13 @@ mod tests {
             !cache.__test_has_kid("kid-299").await,
             "cache must remain empty on cap breach (fail-closed, not last-N)"
         );
+        Ok(())
     }
 
+    /// Pins that a JWKS document exactly at `max_jwks_keys` populates the
+    /// cache normally.
     #[tokio::test]
-    async fn jwks_at_cap_populates_successfully() {
+    async fn jwks_at_cap_populates_successfully() -> anyhow::Result<()> {
         install_crypto_provider();
 
         // Exactly at the cap → populate as normal.
@@ -172,12 +156,14 @@ mod tests {
         config.max_jwks_keys = 8;
 
         let cache = JwksCache::new(&config)
-            .expect("construct cache")
+            .map_err(anyhow::Error::msg)
+            .context("construct cache")?
             .__test_allow_loopback_ssrf();
         cache
             .__test_refresh_now()
             .await
-            .expect("refresh at cap must succeed");
+            .map_err(anyhow::Error::msg)
+            .context("refresh at cap must succeed")?;
 
         assert!(
             cache.__test_has_kid("kid-0").await,
@@ -187,5 +173,6 @@ mod tests {
             cache.__test_has_kid("kid-7").await,
             "cache must contain last kid after successful refresh"
         );
+        Ok(())
     }
 }
