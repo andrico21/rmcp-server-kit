@@ -322,6 +322,30 @@ entry in the same PR that introduces a deviation.
    `verify_slots` uses `wrapping_sub` (never `checked_*` + `?`, G-8), and the
    redaction tests' output is unchanged. Evidence: the task-18 migration
    record (`new-permanent-expects.txt`, `gates.txt`).
+17. **2026-10-04 - `src/tool_hooks.rs` + `src/rbac_context.rs` per-item
+   expectations (task 21).** Under entry 13's decision this lane freezes two
+   public items with the catalog reason `public API frozen until the next major
+   release`: `clippy::impl_trait_in_params` on `ToolCallContext::for_tool` and
+   `clippy::missing_const_for_fn` on `ToolHooks::with_max_result_bytes` (the
+   `Option<usize>` assignment is const-able; const-ifying is an API addition
+   kept for the next major). Deliberate, item-level expectations:
+   `clippy::too_many_lines` on `hooked_handler_forwards_listing_methods` (it
+   keeps the positive and mutation-control halves in one driver so the control
+   cannot be skipped); `clippy::panic` on
+   `after_hook_panic_is_isolated_from_response_path` (the panic is the
+   assertion) and on the `get_task_via_service` test helper (its three panics
+   are harness invariants for an unusable frame; preserving them keeps the
+   panic/assert count neutral per LC 2); and `clippy::unnecessary_wraps`, one
+   per assertion-only test in both modules, so every test keeps the uniform
+   `anyhow::Result<()>` signature (core's test pattern). `rbac_context.rs`
+   keeps `pub(crate)` on `RbacContextHandler` because rustc's `unreachable_pub`
+   (denied) forbids the `pub` that nursery's `redundant_pub_crate` suggests;
+   the manifest contradiction override (Cargo.toml) is the narrowest
+   resolution, so that one key intentionally remains in the file's count-gate
+   baseline. The `SEMANTIC_DRIVERS` tables and impl anchors parsed by
+   `tests/integration/delegation_guard.rs` were kept byte-identical. Evidence:
+   the task-21 migration record (`new-permanent-expects.txt`, `gates.txt`,
+   `review.txt`).
 
 Entries to be added by the work that creates them: "new in `<version>`"
 expects and profile deltas (the toolchain-drift work); the per-item frozen
