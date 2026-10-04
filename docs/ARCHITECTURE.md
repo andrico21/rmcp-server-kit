@@ -646,8 +646,8 @@ recommended.
    - Decodes the JWT header to get `kid` and `alg`.
    - `lookup_key()` looks up by `kid` in the cached JWKS
      (`src/oauth.rs:2456`).
-   - If not found, calls `refresh_with_cooldown()` (`src/oauth.rs:3150`):
-      - Enforces `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:2564`) so multiple
+   - If not found, calls `refresh_with_cooldown()` (`src/oauth.rs:3488`):
+      - Enforces `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:2725`) so multiple
        invalid tokens cannot DoS the JWKS endpoint.
      - Deduplicates concurrent refreshes.
    - Validates signature, `iss`, `aud`, `exp`, `nbf` using `jsonwebtoken`.
@@ -852,8 +852,8 @@ retiring.
 
 **TOML** - the deserializable sections:
 
-- `ServerConfig` - `src/config.rs:400`
-- `ObservabilityConfig` - `src/config.rs:1239`
+- `ServerConfig` - `src/config.rs:363`
+- `ObservabilityConfig` - `src/config.rs:1342`
 - `SecurityHeadersConfig` - `src/transport.rs:291`
 - `AuthConfig`, `MtlsConfig`, `RateLimitConfig` - `src/auth.rs`
 - `RbacConfig` - `src/rbac.rs`
@@ -864,17 +864,17 @@ sections into its own root type. `[server]`, `[rbac]` and `[observability]`
 are a convention from [`docs/GUIDE.md`](GUIDE.md), not a type.
 
 `ServerConfig` was schema-only until 3.4.0 - nothing in the crate consumed it.
-`ServerConfig::apply_to_mcp_config` (`src/config.rs:924`) is the bridge that
+`ServerConfig::apply_to_mcp_config` (`src/config.rs:922`) is the bridge that
 makes it reachable. It uses **replacement semantics**: authoritative for every
 bridgeable transport field, with `None`/`false` clearing whatever the base
 held. Only the runtime-only fields above survive from the base. It is fallible
 (duration strings parse here) and never reads the environment.
 
 **Environment (opt-in)** - three inherent methods, one per section owning
-targeted fields: `ServerConfig::apply_env_overrides` (`src/config.rs:596`),
-`ObservabilityConfig::apply_env_overrides` (`src/config.rs:1004`) and
+targeted fields: `ServerConfig::apply_env_overrides` (`src/config.rs:676`),
+`ObservabilityConfig::apply_env_overrides` (`src/config.rs:1023`) and
 `RbacConfig::apply_env_overrides` (`src/rbac.rs:1811`). Each returns
-`Vec<EnvOverride>` (`src/config.rs:156`) for audit logging, with `value: None`
+`Vec<EnvOverride>` (`src/config.rs:100`) for audit logging, with `value: None`
 for secret targets. Curated variables under the `RMCP_SERVER_KIT__`
 prefix; `__` separates TOML path segments because field names already contain
 single underscores.
