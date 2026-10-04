@@ -20,277 +20,220 @@
 //!    alphanumeric strings + `*` wildcards must never panic when matched
 //!    against arbitrary tool names. (Catches regex/glob-engine
 //!    regressions.)
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::shadow_same,
-        reason = "lint-migration: tests/unit/properties.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::let_underscore_untyped,
-        reason = "lint-migration: tests/unit/properties.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::let_underscore_must_use,
-        reason = "lint-migration: tests/unit/properties.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::min_ident_chars,
-        reason = "lint-migration: tests/unit/properties.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::absolute_paths,
-        reason = "lint-migration: tests/unit/properties.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::shadow_reuse,
-        reason = "lint-migration: tests/unit/properties.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::expect_used,
-        reason = "lint-migration: tests/unit/properties.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::tests_outside_test_module,
-        reason = "lint-migration: tests/unit/properties.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::unseparated_literal_suffix,
-        reason = "lint-migration: tests/unit/properties.rs"
-    )
-)]
 
-use proptest::prelude::*;
-use rmcp_server_kit::{
-    auth::{ApiKeyEntry, generate_api_key, verify_bearer_token},
-    rbac::{ArgumentAllowlist, RbacConfig, RbacDecision, RbacPolicy, RoleConfig},
-};
+#[cfg(test)]
+mod tests {
+    use proptest::{collection, prelude::*};
+    use rmcp_server_kit::{
+        auth::{ApiKeyEntry, generate_api_key, verify_bearer_token},
+        rbac::{ArgumentAllowlist, RbacConfig, RbacDecision, RbacPolicy, RoleConfig},
+    };
 
-// Proptest config: ≥1024 cases per target (plan acceptance gate).
-// Argon2id verification is intentionally CPU-expensive, so the API-key
-// round-trip uses a smaller case count to keep total runtime sane while
-// still exceeding the previous default by 4x.
-const PROPTEST_CASES: u32 = 1024;
-const ARGON2_PROPTEST_CASES: u32 = 64;
+    // Proptest config: ≥1024 cases per target (plan acceptance gate).
+    // Argon2id verification is intentionally CPU-expensive, so the API-key
+    // round-trip uses a smaller case count to keep total runtime sane while
+    // still exceeding the previous default by 4x.
+    const PROPTEST_CASES: u32 = 1024;
+    const ARGON2_PROPTEST_CASES: u32 = 64;
 
-// ---------------------------------------------------------------------------
-// 1. API key round-trip
-// ---------------------------------------------------------------------------
+    // ---------------------------------------------------------------------------
+    // 1. API key round-trip
+    // ---------------------------------------------------------------------------
 
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(ARGON2_PROPTEST_CASES))]
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(ARGON2_PROPTEST_CASES))]
 
-    /// `generate_api_key` must always produce a token that verifies.
-    /// The `extra_keys` parameter introduces decoy entries to ensure
-    /// constant-time iteration in `verify_bearer_token` does not affect
-    /// correctness of the matching key.
-    #[test]
-    fn api_key_generate_verify_roundtrip(extra_keys in 0usize..4) {
-        let (token, hash) = generate_api_key().expect("generate_api_key");
-        let mut keys = vec![ApiKeyEntry::new("primary", hash, "viewer")];
-        // Add decoy keys whose hashes are valid but won't match `token`.
-        for i in 0..extra_keys {
-            let (_decoy_token, decoy_hash) =
-                generate_api_key().expect("generate_api_key decoy");
-            keys.push(ApiKeyEntry::new(format!("decoy-{i}"), decoy_hash, "viewer"));
-        }
-        let id = verify_bearer_token(&token, &keys);
-        prop_assert!(id.is_some(), "freshly generated token must verify");
-        let id = id.expect("verified identity");
-        prop_assert_eq!(id.name, "primary");
-        prop_assert_eq!(id.role, "viewer");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 2. argument_allowed monotonicity
-// ---------------------------------------------------------------------------
-
-/// Generate a non-empty alphanumeric token (no whitespace, no slash, no
-/// glob meta-chars).
-fn token_strategy() -> impl Strategy<Value = String> {
-    "[a-zA-Z][a-zA-Z0-9_]{0,15}".prop_map(String::from)
-}
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(PROPTEST_CASES))]
-
-    /// When `allowed` contains `value`, the policy must accept; when
-    /// `allowed` is non-empty and does not contain `value`, it must
-    /// reject. The argument value is the bare token (no whitespace), so
-    /// the first-token / basename normalization in
-    /// [`RbacPolicy::argument_allowed`] is an identity mapping here.
-    #[test]
-    fn argument_allowed_membership(
-        allowed in proptest::collection::vec(token_strategy(), 1..8),
-        candidate in token_strategy(),
-    ) {
-        let role = RoleConfig::new(
-            "viewer",
-            vec!["run_query".into()],
-            vec!["*".into()],
-        )
-        .with_argument_allowlists(vec![ArgumentAllowlist::new(
-            "run_query",
-            "cmd",
-            allowed.clone(),
-        )]);
-        let mut config = RbacConfig::with_roles(vec![role]);
-        config.enabled = true;
-        let policy = RbacPolicy::new(&config);
-
-        let actual = policy.argument_allowed("viewer", "run_query", "cmd", &candidate);
-        let expected = allowed.iter().any(|v| v == &candidate);
-        prop_assert_eq!(actual, expected,
-            "argument_allowed disagrees with set membership");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 3. Tool-name glob safety
-// ---------------------------------------------------------------------------
-
-/// Generate a glob pattern: alphanumeric segments separated by `*`.
-fn glob_pattern_strategy() -> impl Strategy<Value = String> {
-    proptest::collection::vec("[a-z]{1,6}", 1..5).prop_map(|parts| parts.join("*"))
-}
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(PROPTEST_CASES))]
-
-    /// Pattern matching against arbitrary tool names must never panic.
-    /// The result itself is opaque -- this target exists to fuzz the
-    /// `glob_match` path used by per-tool argument allowlists.
-    #[test]
-    fn glob_pattern_never_panics(
-        pattern in glob_pattern_strategy(),
-        tool in "[a-z]{1,12}".prop_map(String::from),
-    ) {
-        let role = RoleConfig::new(
-            "viewer",
-            vec!["*".into()],
-            vec!["*".into()],
-        )
-        .with_argument_allowlists(vec![ArgumentAllowlist::new(
-            pattern,
-            "cmd",
-            vec!["ls".into()],
-        )]);
-        let mut config = RbacConfig::with_roles(vec![role]);
-        config.enabled = true;
-        let policy = RbacPolicy::new(&config);
-
-        // Both branches must terminate without panicking on any input.
-        let _ = policy.argument_allowed("viewer", &tool, "cmd", "ls");
-        let _ = policy.argument_allowed("viewer", &tool, "cmd", "rm");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 4. Operation deny matching
-// ---------------------------------------------------------------------------
-
-fn allow_all_role() -> RoleConfig {
-    RoleConfig::new("editor", vec!["*".into()], vec!["*".into()])
-}
-
-fn enabled_policy(config: RbacConfig) -> RbacPolicy {
-    let mut config = config;
-    config.enabled = true;
-    RbacPolicy::new(&config)
-}
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(PROPTEST_CASES))]
-
-    /// Glob-free deny entries must behave exactly like the pre-glob exact
-    /// matcher. `glob_match` short-circuits to `pattern == text` when the
-    /// pattern contains no `*`, so honouring globs in `deny` cannot change
-    /// the decision for any config that never used a `*`.
-    #[test]
-    fn glob_free_deny_is_exact_equality(
-        denied in "[a-z_]{1,12}",
-        operation in "[a-z_]{1,12}",
-    ) {
-        let policy = enabled_policy(RbacConfig::with_roles(vec![
-            allow_all_role().with_deny(vec![denied.clone()]),
-        ]));
-        let expected = if denied == operation {
-            RbacDecision::Deny
-        } else {
-            RbacDecision::Allow
-        };
-        prop_assert_eq!(policy.check_operation("editor", &operation), expected);
-        prop_assert_eq!(policy.check("editor", &operation, "any-host"), expected);
-    }
-
-    /// Adding a deny entry may only remove capability. A role that denies an
-    /// operation must never allow it, regardless of what `allow` grants --
-    /// this is the monotonicity guarantee the fail-open bug violated.
-    #[test]
-    fn adding_a_deny_entry_never_grants_access(
-        pattern in glob_pattern_strategy(),
-        operation in "[a-z*_]{1,16}",
-    ) {
-        let without = enabled_policy(RbacConfig::with_roles(vec![allow_all_role()]));
-        let with = enabled_policy(RbacConfig::with_roles(vec![
-            allow_all_role().with_deny(vec![pattern.clone()]),
-        ]));
-        if with.check_operation("editor", &operation) == RbacDecision::Allow {
-            prop_assert_eq!(
-                without.check_operation("editor", &operation),
-                RbacDecision::Allow,
-                "deny entry {} turned Deny into Allow for {}",
-                pattern,
-                operation
-            );
+        /// `generate_api_key` must always produce a token that verifies.
+        /// The `extra_keys` parameter introduces decoy entries to ensure
+        /// constant-time iteration in `verify_bearer_token` does not affect
+        /// correctness of the matching key.
+        #[test]
+        fn api_key_generate_verify_roundtrip(extra_keys in 0_usize..4) {
+            let (token, hash) = generate_api_key()?;
+            let mut keys = vec![ApiKeyEntry::new("primary", hash, "viewer")];
+            // Add decoy keys whose hashes are valid but won't match `token`.
+            for index in 0..extra_keys {
+                let (_decoy_token, decoy_hash) = generate_api_key()?;
+                keys.push(ApiKeyEntry::new(format!("decoy-{index}"), decoy_hash, "viewer"));
+            }
+            let id = verify_bearer_token(&token, &keys);
+            prop_assert!(id.is_some(), "freshly generated token must verify");
+            let Some(identity) = id else {
+                return Err(TestCaseError::fail("verified identity"));
+            };
+            prop_assert_eq!(identity.name, "primary");
+            prop_assert_eq!(identity.role, "viewer");
         }
     }
 
-    /// `global_deny` is a pure veto: whatever it matches must be denied, and
-    /// it must never turn a denial into an allow.
-    #[test]
-    fn global_deny_only_removes_capability(
-        pattern in glob_pattern_strategy(),
-        operation in "[a-z*_]{1,16}",
-    ) {
-        let without = enabled_policy(RbacConfig::with_roles(vec![allow_all_role()]));
-        let with = enabled_policy(
-            RbacConfig::with_roles(vec![allow_all_role()])
-                .with_global_deny(vec![pattern.clone()]),
-        );
-        if with.check_operation("editor", &operation) == RbacDecision::Allow {
-            prop_assert_eq!(
-                without.check_operation("editor", &operation),
-                RbacDecision::Allow,
-                "global_deny {} turned Deny into Allow for {}",
+    // ---------------------------------------------------------------------------
+    // 2. argument_allowed monotonicity
+    // ---------------------------------------------------------------------------
+
+    /// Generate a non-empty alphanumeric token (no whitespace, no slash, no
+    /// glob meta-chars).
+    fn token_strategy() -> impl Strategy<Value = String> {
+        "[a-zA-Z][a-zA-Z0-9_]{0,15}".prop_map(String::from)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(PROPTEST_CASES))]
+
+        /// When `allowed` contains `value`, the policy must accept; when
+        /// `allowed` is non-empty and does not contain `value`, it must
+        /// reject. The argument value is the bare token (no whitespace), so
+        /// the first-token / basename normalization in
+        /// [`RbacPolicy::argument_allowed`] is an identity mapping here.
+        #[test]
+        fn argument_allowed_membership(
+            allowed in collection::vec(token_strategy(), 1..8),
+            candidate in token_strategy(),
+        ) {
+            let role = RoleConfig::new(
+                "viewer",
+                vec!["run_query".into()],
+                vec!["*".into()],
+            )
+            .with_argument_allowlists(vec![ArgumentAllowlist::new(
+                "run_query",
+                "cmd",
+                allowed.clone(),
+            )]);
+            let mut config = RbacConfig::with_roles(vec![role]);
+            config.enabled = true;
+            let policy = RbacPolicy::new(&config);
+
+            let actual = policy.argument_allowed("viewer", "run_query", "cmd", &candidate);
+            let expected = allowed.iter().any(|entry| entry == &candidate);
+            prop_assert_eq!(actual, expected,
+                "argument_allowed disagrees with set membership");
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // 3. Tool-name glob safety
+    // ---------------------------------------------------------------------------
+
+    /// Generate a glob pattern: alphanumeric segments separated by `*`.
+    fn glob_pattern_strategy() -> impl Strategy<Value = String> {
+        collection::vec("[a-z]{1,6}", 1..5).prop_map(|parts| parts.join("*"))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(PROPTEST_CASES))]
+
+        /// Pattern matching against arbitrary tool names must never panic.
+        /// The result itself is opaque -- this target exists to fuzz the
+        /// `glob_match` path used by per-tool argument allowlists.
+        #[test]
+        fn glob_pattern_never_panics(
+            pattern in glob_pattern_strategy(),
+            tool in "[a-z]{1,12}".prop_map(String::from),
+        ) {
+            let role = RoleConfig::new(
+                "viewer",
+                vec!["*".into()],
+                vec!["*".into()],
+            )
+            .with_argument_allowlists(vec![ArgumentAllowlist::new(
                 pattern,
-                operation
+                "cmd",
+                vec!["ls".into()],
+            )]);
+            let mut config = RbacConfig::with_roles(vec![role]);
+            config.enabled = true;
+            let policy = RbacPolicy::new(&config);
+
+            // Both branches must terminate without panicking on any input;
+            // the boolean decision itself is not asserted here.
+            let _ls_decision = policy.argument_allowed("viewer", &tool, "cmd", "ls");
+            let _rm_decision = policy.argument_allowed("viewer", &tool, "cmd", "rm");
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // 4. Operation deny matching
+    // ---------------------------------------------------------------------------
+
+    /// A role that allows every operation on every host.
+    fn allow_all_role() -> RoleConfig {
+        RoleConfig::new("editor", vec!["*".into()], vec!["*".into()])
+    }
+
+    /// Build a policy from a config, enabling RBAC.
+    fn enabled_policy(mut config: RbacConfig) -> RbacPolicy {
+        config.enabled = true;
+        RbacPolicy::new(&config)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(PROPTEST_CASES))]
+
+        /// Glob-free deny entries must behave exactly like the pre-glob exact
+        /// matcher. `glob_match` short-circuits to `pattern == text` when the
+        /// pattern contains no `*`, so honouring globs in `deny` cannot change
+        /// the decision for any config that never used a `*`.
+        #[test]
+        fn glob_free_deny_is_exact_equality(
+            denied in "[a-z_]{1,12}",
+            operation in "[a-z_]{1,12}",
+        ) {
+            let policy = enabled_policy(RbacConfig::with_roles(vec![
+                allow_all_role().with_deny(vec![denied.clone()]),
+            ]));
+            let expected = if denied == operation {
+                RbacDecision::Deny
+            } else {
+                RbacDecision::Allow
+            };
+            prop_assert_eq!(policy.check_operation("editor", &operation), expected);
+            prop_assert_eq!(policy.check("editor", &operation, "any-host"), expected);
+        }
+
+        /// Adding a deny entry may only remove capability. A role that denies an
+        /// operation must never allow it, regardless of what `allow` grants --
+        /// this is the monotonicity guarantee the fail-open bug violated.
+        #[test]
+        fn adding_a_deny_entry_never_grants_access(
+            pattern in glob_pattern_strategy(),
+            operation in "[a-z*_]{1,16}",
+        ) {
+            let without = enabled_policy(RbacConfig::with_roles(vec![allow_all_role()]));
+            let with = enabled_policy(RbacConfig::with_roles(vec![
+                allow_all_role().with_deny(vec![pattern.clone()]),
+            ]));
+            if with.check_operation("editor", &operation) == RbacDecision::Allow {
+                prop_assert_eq!(
+                    without.check_operation("editor", &operation),
+                    RbacDecision::Allow,
+                    "deny entry {} turned Deny into Allow for {}",
+                    pattern,
+                    operation
+                );
+            }
+        }
+
+        /// `global_deny` is a pure veto: whatever it matches must be denied, and
+        /// it must never turn a denial into an allow.
+        #[test]
+        fn global_deny_only_removes_capability(
+            pattern in glob_pattern_strategy(),
+            operation in "[a-z*_]{1,16}",
+        ) {
+            let without = enabled_policy(RbacConfig::with_roles(vec![allow_all_role()]));
+            let with = enabled_policy(
+                RbacConfig::with_roles(vec![allow_all_role()])
+                    .with_global_deny(vec![pattern.clone()]),
             );
+            if with.check_operation("editor", &operation) == RbacDecision::Allow {
+                prop_assert_eq!(
+                    without.check_operation("editor", &operation),
+                    RbacDecision::Allow,
+                    "global_deny {} turned Deny into Allow for {}",
+                    pattern,
+                    operation
+                );
+            }
         }
     }
 }

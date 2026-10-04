@@ -34,156 +34,19 @@
 //! path and must never be cited as coverage for it.
 //!
 //! Run with `cargo bench --bench crl_precheck --features test-helpers`.
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::min_ident_chars,
-        reason = "lint-migration: benches/crl_precheck.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(clippy::use_debug, reason = "lint-migration: benches/crl_precheck.rs")
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::print_stdout,
-        reason = "lint-migration: benches/crl_precheck.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::map_with_unused_argument_over_ranges,
-        reason = "lint-migration: benches/crl_precheck.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::absolute_paths,
-        reason = "lint-migration: benches/crl_precheck.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::let_underscore_untyped,
-        reason = "lint-migration: benches/crl_precheck.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::let_underscore_must_use,
-        reason = "lint-migration: benches/crl_precheck.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::arithmetic_side_effects,
-        reason = "lint-migration: benches/crl_precheck.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::integer_division_remainder_used,
-        reason = "lint-migration: benches/crl_precheck.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::integer_division,
-        reason = "lint-migration: benches/crl_precheck.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::default_numeric_fallback,
-        reason = "lint-migration: benches/crl_precheck.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::expect_used,
-        reason = "lint-migration: benches/crl_precheck.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::missing_docs_in_private_items,
-        reason = "lint-migration: benches/crl_precheck.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::missing_panics_doc,
-        reason = "lint-migration: benches/crl_precheck.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::too_long_first_doc_paragraph,
-        reason = "lint-migration: benches/crl_precheck.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::std_instead_of_alloc,
-        reason = "lint-migration: benches/crl_precheck.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::std_instead_of_core,
-        reason = "lint-migration: benches/crl_precheck.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::unseparated_literal_suffix,
-        reason = "lint-migration: benches/crl_precheck.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::inline_trait_bounds,
-        reason = "lint-migration: benches/crl_precheck.rs"
-    )
-)]
-#![cfg_attr(
-    feature = "oauth-mtls-client",
-    expect(unused_results, reason = "lint-migration: benches/crl_precheck.rs")
-)]
-#![cfg_attr(
-    feature = "oauth-mtls-client",
-    expect(
-        let_underscore_drop,
-        reason = "lint-migration: benches/crl_precheck.rs"
-    )
-)]
-#![cfg_attr(
-    feature = "oauth-mtls-client",
-    expect(deprecated, reason = "lint-migration: benches/crl_precheck.rs")
-)]
 
-use std::{
+extern crate alloc;
+
+use alloc::sync::Arc;
+use core::{
     hint::black_box,
-    sync::Arc,
-    time::{Duration, Instant, SystemTime},
+    iter,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
+use std::{
+    io::{self, Write as _},
+    time::{Instant, SystemTime},
 };
 
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -196,7 +59,8 @@ use rmcp_server_kit::{
     auth::MtlsConfig,
     mtls_revocation::{CachedCrl, CrlSet},
 };
-use rustls::{RootCertStore, pki_types::CertificateRevocationListDer};
+use rustls::{RootCertStore, crypto::ring, pki_types::CertificateRevocationListDer};
+use tokio::{runtime::Builder, task::yield_now};
 
 /// CRL sizes swept, in bytes.
 const SIZES: [(&str, usize); 3] = [
@@ -209,9 +73,10 @@ const SIZES: [(&str, usize); 3] = [
 /// certificate listing many CDP URLs that are all already cached.
 const URL_COUNTS: [usize; 4] = [1, 4, 16, 64];
 
-/// A 5 MiB CRL replicated 64 times would allocate ~320 MiB twice over (cache
-/// plus the verifier's own copies) and spend minutes in webpki parsing during
-/// setup, which measures fixture construction rather than the precheck. The
+/// A 5 MiB CRL replicated 64 times would allocate ~320 MiB twice over and
+/// spend minutes in webpki parsing during setup.
+///
+/// That would measure fixture construction rather than the precheck; the
 /// invariance gate only needs `INVARIANCE_URL_COUNT`.
 const MAX_URLS_AT_5MIB: usize = 16;
 
@@ -222,6 +87,12 @@ const MAX_SIZE_SCALING_DELTA: Duration = Duration::from_millis(1);
 /// URL count at which the size-invariance comparison is made.
 const INVARIANCE_URL_COUNT: usize = 16;
 
+/// Build the self-signed CA that signs every benchmark CRL.
+#[expect(
+    clippy::expect_used,
+    clippy::missing_panics_doc,
+    reason = "deliberate: benches/crl_precheck.rs::build_ca — fixture construction panics by design; a broken fixture must abort the benchmark run"
+)]
 fn build_ca() -> CertifiedIssuer<'static, KeyPair> {
     let mut params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -243,9 +114,9 @@ fn build_crl(ca: &CertifiedIssuer<'static, KeyPair>, target_bytes: usize) -> Vec
     // with its revocation time and reason; converge by measuring one small CRL
     // and scaling, then trimming, so the sweep sizes are honest rather than
     // nominal.
-    let mut count = (target_bytes / 40).max(1);
+    let mut count = target_bytes.checked_div(40).unwrap_or(0).max(1);
     let mut der = sign_crl(ca, count);
-    for _ in 0..8 {
+    for _ in 0..8_usize {
         if der.len() >= target_bytes {
             break;
         }
@@ -253,13 +124,19 @@ fn build_crl(ca: &CertifiedIssuer<'static, KeyPair>, target_bytes: usize) -> Vec
             .saturating_mul(target_bytes)
             .checked_div(der.len().max(1))
             .unwrap_or(count)
-            .max(count + 1);
+            .max(count.saturating_add(1));
         count = grown;
         der = sign_crl(ca, count);
     }
     der
 }
 
+/// Sign a CRL revoking `revoked` serials with the benchmark CA.
+#[expect(
+    clippy::expect_used,
+    clippy::missing_panics_doc,
+    reason = "deliberate: benches/crl_precheck.rs::sign_crl — fixture construction panics by design; a broken fixture must abort the benchmark run"
+)]
 fn sign_crl(ca: &CertifiedIssuer<'static, KeyPair>, revoked: usize) -> Vec<u8> {
     let revoked_certs = (0..revoked)
         .map(|serial| RevokedCertParams {
@@ -284,6 +161,12 @@ fn sign_crl(ca: &CertifiedIssuer<'static, KeyPair>, revoked: usize) -> Vec<u8> {
     der.as_ref().to_vec()
 }
 
+/// Build the `MtlsConfig` used by every scenario.
+#[expect(
+    clippy::expect_used,
+    clippy::missing_panics_doc,
+    reason = "deliberate: benches/crl_precheck.rs::bench_config — fixture construction panics by design; a broken fixture must abort the benchmark run"
+)]
 fn bench_config(deny_on_unavailable: bool) -> MtlsConfig {
     let mut config: MtlsConfig = serde_json::from_value(serde_json::json!({
         "ca_cert_path": "memory://ca.pem",
@@ -295,36 +178,49 @@ fn bench_config(deny_on_unavailable: bool) -> MtlsConfig {
         "crl_end_entity_only": false,
         "crl_fetch_timeout": "30s",
         "crl_stale_grace": "24h",
-        "crl_max_concurrent_fetches": 1,
-        "crl_max_response_bytes": 5_242_880,
-        "crl_discovery_rate_per_min": 1_000_000,
-        "crl_max_host_semaphores": 16,
-        "crl_max_seen_urls": 4096,
-        "crl_max_cache_entries": 4096,
+        "crl_max_concurrent_fetches": 1_u32,
+        "crl_max_response_bytes": 5_242_880_u64,
+        "crl_discovery_rate_per_min": 1_000_000_u32,
+        "crl_max_host_semaphores": 16_usize,
+        "crl_max_seen_urls": 4096_usize,
+        "crl_max_cache_entries": 4096_usize,
     }))
     .expect("bench mtls config");
     config.crl_deny_on_unavailable = deny_on_unavailable;
     config
 }
 
+/// One prepared `CrlSet` plus the CDP URLs its certificate would present.
 struct Scenario {
+    /// The prepopulated CRL set under measurement.
     set: Arc<CrlSet>,
+    /// The `memory://` CDP URLs carried by the scenario certificate.
     urls: Vec<String>,
 }
 
+/// Build a scenario with `url_count` prepopulated CRLs.
+#[expect(
+    clippy::expect_used,
+    clippy::missing_panics_doc,
+    reason = "deliberate: benches/crl_precheck.rs::scenario — fixture construction panics by design; a broken fixture must abort the benchmark run"
+)]
 fn scenario(
     ca: &CertifiedIssuer<'static, KeyPair>,
     crl_der: &[u8],
     url_count: usize,
     deny_on_unavailable: bool,
 ) -> Scenario {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    drop(ring::default_provider().install_default());
     let mut roots = RootCertStore::empty();
     roots.add(ca.der().clone()).expect("add ca root");
 
-    let crls = (0..url_count)
-        .map(|_| CertificateRevocationListDer::from(crl_der.to_vec()))
+    let crls = iter::repeat_with(|| CertificateRevocationListDer::from(crl_der.to_vec()))
+        .take(url_count)
         .collect::<Vec<_>>();
+    #[expect(
+        deprecated,
+        reason = "deliberate: mtls_revocation::CrlSet::__test_with_prepopulated_crls — the deprecated test-only constructor is the only prepopulated-CrlSet entry point until 4.0"
+    )]
     let set = CrlSet::__test_with_prepopulated_crls(
         Arc::new(roots),
         bench_config(deny_on_unavailable),
@@ -337,10 +233,11 @@ fn scenario(
         .collect::<Vec<_>>();
 
     // Settle discovery dedup so the measured calls exercise only the precheck.
-    let _ = set.__test_note_discovered_urls_by_cert(&urls, &[]);
+    let _: bool = set.__test_note_discovered_urls_by_cert(&urls, &[]);
     Scenario { set, urls }
 }
 
+/// Compute the p95 of the collected samples.
 fn p95(mut samples: Vec<Duration>) -> Duration {
     samples.sort_unstable();
     let index = samples.len().saturating_mul(95).saturating_div(100);
@@ -350,7 +247,11 @@ fn p95(mut samples: Vec<Duration>) -> Duration {
         .unwrap_or_default()
 }
 
-fn measure<F: FnMut()>(iterations: usize, mut body: F) -> Duration {
+/// Run `body` `iterations` times and return the p95 elapsed time.
+fn measure<F>(iterations: usize, mut body: F) -> Duration
+where
+    F: FnMut(),
+{
     let mut samples = Vec::with_capacity(iterations);
     for _ in 0..iterations {
         let start = Instant::now();
@@ -362,12 +263,19 @@ fn measure<F: FnMut()>(iterations: usize, mut body: F) -> Duration {
 
 /// Print the p95 table the plan requires recorded, and evaluate the
 /// scale-invariance gate explicitly.
+#[expect(
+    clippy::use_debug,
+    reason = "deliberate: benches/crl_precheck.rs::report_p95 — Duration has no Display impl, and the Debug-rendered p95 table is the recorded benchmark output (D-19 byte-identical)"
+)]
 fn report_p95(ca: &CertifiedIssuer<'static, KeyPair>) {
-    println!("\n=== crl_precheck p95 (per handshake) ===");
-    println!(
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    drop(writeln!(out, "\n=== crl_precheck p95 (per handshake) ==="));
+    drop(writeln!(
+        out,
         "{:<8} {:>6} {:>16} {:>16} {:>16}",
         "size", "urls", "precheck p95", "fail-open p95", "audit cost p95"
-    );
+    ));
 
     let mut invariance: Vec<(usize, Duration)> = Vec::new();
 
@@ -382,14 +290,14 @@ fn report_p95(ca: &CertifiedIssuer<'static, KeyPair>) {
             let fail_open = scenario(ca, &crl, url_count, false);
 
             let audited_p95 = measure(200, || {
-                black_box(
+                let _: bool = black_box(
                     audited
                         .set
                         .__test_note_discovered_urls_by_cert(black_box(&audited.urls), &[]),
                 );
             });
             let fail_open_p95 = measure(200, || {
-                black_box(
+                let _: bool = black_box(
                     fail_open
                         .set
                         .__test_note_discovered_urls_by_cert(black_box(&fail_open.urls), &[]),
@@ -397,9 +305,10 @@ fn report_p95(ca: &CertifiedIssuer<'static, KeyPair>) {
             });
             let audit_cost = audited_p95.saturating_sub(fail_open_p95);
 
-            println!(
+            drop(writeln!(
+                out,
                 "{size_label:<8} {url_count:>6} {audited_p95:>16?} {fail_open_p95:>16?} {audit_cost:>16?}"
-            );
+            ));
 
             if url_count == INVARIANCE_URL_COUNT {
                 invariance.push((target, audited_p95));
@@ -413,31 +322,41 @@ fn report_p95(ca: &CertifiedIssuer<'static, KeyPair>) {
     match (smallest, largest) {
         (Some((small_bytes, small_p95)), Some((large_bytes, large_p95))) => {
             let delta = large_p95.saturating_sub(small_p95);
-            println!(
+            drop(writeln!(
+                out,
                 "\nsize-invariance gate at {INVARIANCE_URL_COUNT} relevant cached URLs: \
                  {small_bytes} B -> {small_p95:?}, {large_bytes} B -> {large_p95:?}, \
                  delta {delta:?} (budget {MAX_SIZE_SCALING_DELTA:?})"
-            );
+            ));
             if delta > MAX_SIZE_SCALING_DELTA {
-                println!(
+                drop(writeln!(
+                    out,
                     "FAIL: handshake cost scales with CRL size. Something on the precheck path \
                      is scanning the DER again; that is the 56 ms/CRL amplifier this design \
                      removed. Do not ship."
-                );
+                ));
             } else {
-                println!("PASS: handshake cost is independent of CRL size.");
+                drop(writeln!(
+                    out,
+                    "PASS: handshake cost is independent of CRL size."
+                ));
             }
         }
-        _ => println!("\nFAIL: invariance gate collected no samples; the sweep is misconfigured."),
+        _ => drop(writeln!(
+            out,
+            "\nFAIL: invariance gate collected no samples; the sweep is misconfigured."
+        )),
     }
-    println!();
+    drop(writeln!(out));
 }
 
-fn bench_precheck(c: &mut Criterion) {
+/// Benchmarks the clean precheck across the CRL-size and URL-count sweeps.
+#[expect(unused_results, reason = "criterion API")]
+fn bench_precheck(criterion: &mut Criterion) {
     let ca = build_ca();
     report_p95(&ca);
 
-    let mut group = c.benchmark_group("crl_precheck");
+    let mut group = criterion.benchmark_group("crl_precheck");
     for (size_label, target) in SIZES {
         let crl = build_crl(&ca, target);
         for url_count in URL_COUNTS {
@@ -445,9 +364,9 @@ fn bench_precheck(c: &mut Criterion) {
                 continue;
             }
             let hot = scenario(&ca, &crl, url_count, true);
-            group.bench_function(format!("{size_label}/{url_count}urls/clean"), |b| {
-                b.iter(|| {
-                    black_box(
+            group.bench_function(format!("{size_label}/{url_count}urls/clean"), |bencher| {
+                bencher.iter(|| {
+                    let _: bool = black_box(
                         hot.set
                             .__test_note_discovered_urls_by_cert(black_box(&hot.urls), &[]),
                     );
@@ -460,17 +379,30 @@ fn bench_precheck(c: &mut Criterion) {
 
 /// The out-of-band-mutation paths short-circuit on the first mismatched URL,
 /// so they are measured separately to confirm denial is not *more* expensive
-/// than admission, which would make denial itself the amplifier.
-fn bench_tampered(c: &mut Criterion) {
+/// than admission.
+///
+/// A denial that is more expensive than admission would make denial itself
+/// the amplifier.
+#[expect(
+    clippy::expect_used,
+    clippy::missing_panics_doc,
+    unused_results,
+    reason = "criterion API"
+)]
+fn bench_tampered(criterion: &mut Criterion) {
     let ca = build_ca();
     let crl = build_crl(&ca, 1024 * 1024);
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    let runtime = Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("bench runtime");
 
     let replaced = scenario(&ca, &crl, 16, true);
     runtime.block_on(async {
+        #[expect(
+            deprecated,
+            reason = "deliberate: mtls_revocation::CrlSet::cache — this benchmark intentionally mutates the deprecated public cache field to simulate tampering"
+        )]
         let mut cache = replaced.set.cache.write().await;
         if let Some(entry) = cache.get_mut("memory://crl/0") {
             entry.der = CertificateRevocationListDer::from(vec![0x30, 0x00]);
@@ -480,24 +412,28 @@ fn bench_tampered(c: &mut Criterion) {
 
     let removed = scenario(&ca, &crl, 16, true);
     runtime.block_on(async {
+        #[expect(
+            deprecated,
+            reason = "deliberate: mtls_revocation::CrlSet::cache — this benchmark intentionally mutates the deprecated public cache field to simulate tampering"
+        )]
         let mut cache = removed.set.cache.write().await;
-        cache.remove("memory://crl/0");
+        drop(cache.remove("memory://crl/0"));
         drop(cache);
     });
 
-    let mut group = c.benchmark_group("crl_precheck_mutated");
-    group.bench_function("1MiB/16urls/replaced", |b| {
-        b.iter(|| {
-            black_box(
+    let mut group = criterion.benchmark_group("crl_precheck_mutated");
+    group.bench_function("1MiB/16urls/replaced", |bencher| {
+        bencher.iter(|| {
+            let _: bool = black_box(
                 replaced
                     .set
                     .__test_note_discovered_urls_by_cert(black_box(&replaced.urls), &[]),
             );
         });
     });
-    group.bench_function("1MiB/16urls/removed", |b| {
-        b.iter(|| {
-            black_box(
+    group.bench_function("1MiB/16urls/removed", |bencher| {
+        bencher.iter(|| {
+            let _: bool = black_box(
                 removed
                     .set
                     .__test_note_discovered_urls_by_cert(black_box(&removed.urls), &[]),
@@ -508,24 +444,32 @@ fn bench_tampered(c: &mut Criterion) {
 }
 
 /// Under a concurrent refresh loop the precheck's non-blocking `try_read` can
-/// miss the cache lock. This variant exists so that cost - and any denial
-/// behaviour it triggers - is visible rather than assumed.
-fn bench_writer_contention(c: &mut Criterion) {
+/// miss the cache lock.
+///
+/// This variant exists so that cost - and any denial behaviour it triggers -
+/// is visible rather than assumed.
+#[expect(
+    clippy::expect_used,
+    clippy::missing_panics_doc,
+    unused_results,
+    reason = "criterion API"
+)]
+fn bench_writer_contention(criterion: &mut Criterion) {
     let ca = build_ca();
     let crl = build_crl(&ca, 64 * 1024);
     let hot = scenario(&ca, &crl, 16, true);
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let runtime = Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .expect("bench runtime");
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
     let writer_set = Arc::clone(&hot.set);
     let writer_stop = Arc::clone(&stop);
     let writer = runtime.spawn(async move {
-        let mut round = 0u64;
-        while !writer_stop.load(std::sync::atomic::Ordering::Relaxed) {
+        let mut round = 0_u64;
+        while !writer_stop.load(Ordering::Relaxed) {
             // A real commit, so the precheck's `try_read` genuinely contends
             // with the publication write lock. `force_refresh` would only
             // attempt (and fail) HTTP fetches for these `memory://` URLs and
@@ -537,21 +481,21 @@ fn bench_writer_contention(c: &mut Criterion) {
                 )
                 .await;
             round = round.wrapping_add(1);
-            tokio::task::yield_now().await;
+            yield_now().await;
         }
     });
 
-    c.bench_function("crl_precheck/64KiB/16urls/writer_contention", |b| {
-        b.iter(|| {
-            black_box(
+    criterion.bench_function("crl_precheck/64KiB/16urls/writer_contention", |bencher| {
+        bencher.iter(|| {
+            let _: bool = black_box(
                 hot.set
                     .__test_note_discovered_urls_by_cert(black_box(&hot.urls), &[]),
             );
         });
     });
 
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = runtime.block_on(writer);
+    stop.store(true, Ordering::Relaxed);
+    drop(runtime.block_on(writer));
 }
 
 criterion_group!(

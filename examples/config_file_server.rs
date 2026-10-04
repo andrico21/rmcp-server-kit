@@ -23,45 +23,17 @@
 //! curl http://127.0.0.1:8080/healthz
 //! curl http://127.0.0.1:8080/readyz
 //! ```
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::shadow_reuse,
-        reason = "lint-migration: examples/config_file_server.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::absolute_paths,
-        reason = "lint-migration: examples/config_file_server.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_docs_in_private_items,
-        reason = "lint-migration: examples/config_file_server.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::std_instead_of_core,
-        reason = "lint-migration: examples/config_file_server.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::std_instead_of_alloc,
-        reason = "lint-migration: examples/config_file_server.rs"
-    )
-)]
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+extern crate alloc;
 
-use rmcp::{handler::server::ServerHandler, model::ServerCapabilities};
+use alloc::sync::Arc;
+use core::time::Duration;
+use std::{env, fs, path::PathBuf};
+
+use rmcp::{
+    handler::server::ServerHandler,
+    model::{ServerCapabilities, ServerConfig as RmcpServerConfig},
+};
 use rmcp_server_kit::{
     config::{ObservabilityConfig, ServerConfig, validate_server_config},
     observability::init_tracing_from_config_strict,
@@ -70,6 +42,7 @@ use rmcp_server_kit::{
 };
 use serde::Deserialize;
 
+/// Fallback configuration used when no TOML path is passed on the command line.
 const EMBEDDED_CONFIG: &str = r#"
 [server]
 listen_addr = "127.0.0.1"
@@ -115,27 +88,33 @@ hosts = ["*"]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AppConfig {
+    /// Kit-provided server section.
     server: ServerConfig,
+    /// Kit-provided observability section.
     observability: ObservabilityConfig,
+    /// Kit-provided RBAC section.
     rbac: RbacConfig,
 }
 
+/// Minimal MCP handler used by the configuration walkthrough.
 #[derive(Clone)]
 struct ConfigFileHandler;
 
 impl ServerHandler for ConfigFileHandler {
-    fn get_info(&self) -> rmcp::model::ServerConfig {
-        rmcp::model::ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> RmcpServerConfig {
+        RmcpServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 }
 
+/// Runs the example: load config, apply env overrides, serve.
+// cancel-safe: process entry point; dropping this future tears down the server and its runtime.
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> rmcp_server_kit::Result<()> {
     // With no argument, use the embedded config so this example runs without
     // external files. Passing a path demonstrates the real-file path using
     // `std::fs::read_to_string` at startup.
-    let raw_config = match std::env::args_os().nth(1) {
-        Some(path) => std::fs::read_to_string(PathBuf::from(path))?,
+    let raw_config = match env::args_os().nth(1) {
+        Some(path) => fs::read_to_string(PathBuf::from(path))?,
         None => EMBEDDED_CONFIG.to_owned(),
     };
     let mut app_config: AppConfig = toml::from_str(&raw_config)?;
@@ -165,22 +144,20 @@ async fn main() -> rmcp_server_kit::Result<()> {
         "rmcp-server-kit-config-file-example",
         env!("CARGO_PKG_VERSION"),
     );
-    let mcp_config = app_config.server.apply_to_mcp_config(base)?;
+    let mut mcp_config = app_config.server.apply_to_mcp_config(base)?;
 
     // Runtime-only state cannot live in TOML. Build it from the deserialized
     // section and attach it after the bridge.
     let rbac_policy = Arc::new(RbacPolicy::new(&app_config.rbac));
-    let mcp_config = mcp_config.with_rbac(rbac_policy);
+    mcp_config = mcp_config.with_rbac(rbac_policy);
 
     // Metrics are also runtime-only and feature-gated; the bridge preserves
     // any metrics settings already on the base, so wire ObservabilityConfig
     // explicitly when the binary enables the `metrics` feature.
     #[cfg(feature = "metrics")]
-    let mcp_config = if app_config.observability.metrics_enabled {
-        mcp_config.with_metrics(app_config.observability.metrics_bind.as_str())
-    } else {
-        mcp_config
-    };
+    if app_config.observability.metrics_enabled {
+        mcp_config = mcp_config.with_metrics(app_config.observability.metrics_bind.as_str());
+    }
 
     #[cfg(not(feature = "metrics"))]
     if app_config.observability.metrics_enabled {
@@ -191,7 +168,7 @@ async fn main() -> rmcp_server_kit::Result<()> {
 
     // Application-level builder calls chained after `apply_to_mcp_config` win
     // over TOML, matching the documented precedence chain.
-    let mcp_config = mcp_config.with_request_timeout(Duration::from_secs(30));
+    mcp_config = mcp_config.with_request_timeout(Duration::from_secs(30));
 
     serve(mcp_config.validate()?, || ConfigFileHandler).await
 }
