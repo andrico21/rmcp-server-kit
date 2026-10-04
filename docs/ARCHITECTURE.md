@@ -46,8 +46,8 @@ The crate has two transports:
 
 | Transport          | Function                                            | Auth/RBAC/TLS  | Use case                                         |
 |--------------------|-----------------------------------------------------|----------------|--------------------------------------------------|
-| **Streamable HTTP**| `serve()` - `src/transport.rs:2856`                 | **Yes**        | Production network deployment                    |
-| stdio              | `serve_stdio()` - `src/transport.rs:5201`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
+| **Streamable HTTP**| `serve()` - `src/transport.rs:2981`                 | **Yes**        | Production network deployment                    |
+| stdio              | `serve_stdio()` - `src/transport.rs:5424`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
 
 ---
 
@@ -104,7 +104,7 @@ A complete HTTP request to `/mcp` flows through these layers, top-to-bottom
 `src/transport.rs:1635-2052` (middleware wiring inside `build_app_router`) and in each module.
 
 ```
-TCP / TLS handshake                         src/transport.rs:3456  (TlsListener)
+TCP / TLS handshake                         src/transport.rs:3619  (TlsListener)
    │  - Handshakes run CONCURRENTLY on a background acceptor task
 │    (run_tls_acceptor, src/transport.rs:3223): 256-permit in-flight
    │    cap, 10 s per-handshake timeout; axum receives only completed
@@ -191,12 +191,12 @@ Open endpoints (no auth):
 
 | Path                                       | Handler                                       |
 |--------------------------------------------|-----------------------------------------------|
-| `GET  /healthz`                            | `healthz` (~`src/transport.rs:3912`) |
-| `GET  /readyz`                             | `readyz`  (~`src/transport.rs:3976`) - runs configured readiness check |
-| `GET  /version`                            | `version_payload` (~`src/transport.rs:3927`) |
+| `GET  /healthz`                            | `healthz` (~`src/transport.rs:4065`) |
+| `GET  /readyz`                             | `readyz`  (~`src/transport.rs:4130`) - runs configured readiness check |
+| `GET  /version`                            | `version_payload` (~`src/transport.rs:4080`) |
 | `GET  /metrics`                            | served by `serve_metrics` on a **separate listener** when `feature = "metrics"` (`src/metrics.rs:209`) |
-| `GET  /.well-known/oauth-protected-resource` | feature = `oauth` (`src/transport.rs:2384`) |
-| `GET  /.well-known/oauth-authorization-server` | feature = `oauth` proxy (`src/transport.rs:3202`) |
+| `GET  /.well-known/oauth-protected-resource` | feature = `oauth` (`src/transport.rs:2660`) |
+| `GET  /.well-known/oauth-authorization-server` | feature = `oauth` proxy (`src/transport.rs:3332`) |
 
 Authenticated endpoints:
 
@@ -211,7 +211,7 @@ Authenticated endpoints:
 
 ## 4. Core types
 
-### `McpServerConfig` - `src/transport.rs:387`
+### `McpServerConfig` - `src/transport.rs:443`
 Top-level builder-style config consumed by `serve()`. Holds:
 - bind address (`SocketAddr`)
 - server name + version
@@ -449,7 +449,7 @@ an outbound `Authorization` header for downstream token passthrough.
 
 ## 7. TLS / mTLS
 
-**Custom listener**: `TlsListener` in `src/transport.rs:3456`, implementing
+**Custom listener**: `TlsListener` in `src/transport.rs:3619`, implementing
 `axum::serve::Listener` so axum's hyper machinery accepts it as a drop-in
 replacement for `TcpListener`.
 
@@ -457,7 +457,7 @@ Lifecycle (concurrent-acceptor design, since the 1.8.1 review fixes):
 1. `TlsListener::new(...)` reads PEM cert + key, builds a `rustls::ServerConfig`,
    optionally wraps with mTLS verification using configured root CAs, then
    spawns a dedicated background acceptor task (`run_tls_acceptor`,
-   `src/transport.rs:3513`) that owns the `TcpListener`.
+   `src/transport.rs:3639`) that owns the `TcpListener`.
 2. The acceptor task loops: acquires a permit from a semaphore sized by
    `max_concurrent_tls_handshakes` (default 256 via
    `DEFAULT_MAX_CONCURRENT_TLS_HANDSHAKES`; configurable since 1.9.0 via
@@ -854,7 +854,7 @@ retiring.
 
 - `ServerConfig` - `src/config.rs:400`
 - `ObservabilityConfig` - `src/config.rs:1239`
-- `SecurityHeadersConfig` - `src/transport.rs:417`
+- `SecurityHeadersConfig` - `src/transport.rs:291`
 - `AuthConfig`, `MtlsConfig`, `RateLimitConfig` - `src/auth.rs`
 - `RbacConfig` - `src/rbac.rs`
 - `OAuthConfig` - `src/oauth.rs`
