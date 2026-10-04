@@ -308,12 +308,10 @@ entry in the same PR that introduces a deviation.
    and `ArgumentAllowlist::new`/`new_required`. `redact_with_salt` keeps its
    HMAC key-construction fallback under a `constant-time:` expectation (G-8),
    and its `write!`-into-String discard is a typed `let _: Result<(), FmtError>`
-   under `write! into String cannot fail` (D-11'). Four `deliberate:`
-   expectations record shapes with no behavior-preserving alternative: the
+   under `write! into String cannot fail` (D-11'). One `deliberate:`
+   expectation records a shape with no behavior-preserving alternative: the
    second `impl RbacConfig` block (`multiple_inherent_impl`, environment
-   overrides kept in their own block) and the three middleware closures that
-   clone per-request state before the future (`closure_returning_async_block`;
-   an async closure move-captures and does not implement `FnMut`). In `mod
+   overrides kept in their own block). In `mod
    tests`, `clippy::unnecessary_wraps` is added one per assertion-only test so
    every test keeps the uniform `anyhow::Result<()>` signature, and the
    core-blessed test-module doc/panic expectations cover the rest. The verbose

@@ -1973,9 +1973,9 @@ mod tests {
     };
 
     use anyhow::Context as _;
-    use axum::{Router, http::header::RETRY_AFTER, middleware, routing};
     #[cfg(feature = "metrics")]
     use axum::extract::ConnectInfo;
+    use axum::{Router, http::header::RETRY_AFTER, middleware, routing};
     use proptest::{collection, prelude::*};
     use serde_json::{Map, Number, Value as JsonValue};
     use tower::ServiceExt as _;
@@ -4032,26 +4032,23 @@ mod tests {
         .to_string()
     }
 
-    #[expect(
-        closure_returning_async_block,
-        reason = "deliberate: src/rbac.rs::rbac_router — the per-request clone must run before the future; an async closure move-captures and does not implement FnMut"
-    )]
+    /// Test route handler: a fixed OK body.
+    async fn ok_handler() -> &'static str {
+        "ok"
+    }
+
     fn rbac_router(policy: Arc<RbacPolicy>) -> Router {
         Router::new()
-            .route("/mcp", routing::post(|| async { "ok" }))
+            .route("/mcp", routing::post(ok_handler))
             .layer(middleware::from_fn(move |req, next| {
                 let policy_clone = Arc::clone(&policy);
                 rbac_middleware(policy_clone, None, DenyLogKnobs::default(), req, next)
             }))
     }
 
-    #[expect(
-        closure_returning_async_block,
-        reason = "deliberate: src/rbac.rs::rbac_router_with_identity — the per-request clones must run before the future; an async closure move-captures and does not implement FnMut"
-    )]
     fn rbac_router_with_identity(policy: Arc<RbacPolicy>, identity: AuthIdentity) -> Router {
         Router::new()
-            .route("/mcp", routing::post(|| async { "ok" }))
+            .route("/mcp", routing::post(ok_handler))
             .layer(middleware::from_fn(
                 move |mut req: Request<Body>, next: Next| {
                     let policy_clone = Arc::clone(&policy);
@@ -4065,10 +4062,6 @@ mod tests {
             ))
     }
 
-    #[expect(
-        closure_returning_async_block,
-        reason = "deliberate: src/rbac.rs::rbac_middleware_logs_client_fields_from_extensions — the per-request clones must run before the future; an async closure move-captures and does not implement FnMut"
-    )]
     #[tokio::test]
     /// Rbac middleware logs client fields from extensions.
     async fn rbac_middleware_logs_client_fields_from_extensions() -> anyhow::Result<()> {
@@ -4093,7 +4086,7 @@ mod tests {
         let client_ip: IpAddr = "198.51.100.4".parse().context("ip parses")?;
         let peer_addr: SocketAddr = "10.0.0.1:5555".parse().context("socket parses")?;
         let app = Router::new()
-            .route("/mcp", routing::post(|| async { "ok" }))
+            .route("/mcp", routing::post(ok_handler))
             .layer(middleware::from_fn(move |mut req: Request<Body>, next| {
                 let policy_clone = Arc::clone(&policy);
                 let identity_clone = identity.clone();
@@ -4145,10 +4138,6 @@ mod tests {
     }
 
     #[cfg(feature = "metrics")]
-    #[expect(
-        closure_returning_async_block,
-        reason = "deliberate: src/rbac.rs::tool_limiter_deny_increments_counter — the per-request clones must run before the future; an async closure move-captures and does not implement FnMut"
-    )]
     #[tokio::test]
     /// Tool-limiter deny path must increment the `tool` deny counter via
     /// the metrics handle in the request extensions - and the increment
@@ -4170,7 +4159,7 @@ mod tests {
         let app = {
             let metrics_for_app = Arc::clone(&metrics);
             Router::new()
-                .route("/mcp", routing::post(|| async { "ok" }))
+                .route("/mcp", routing::post(ok_handler))
                 .layer(middleware::from_fn(
                     move |mut req: Request<Body>, next: Next| {
                         let policy_clone = Arc::clone(&policy);
