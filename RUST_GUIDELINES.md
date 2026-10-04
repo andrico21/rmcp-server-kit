@@ -244,6 +244,16 @@ entry in the same PR that introduces a deviation.
    `impl Trait`) are frozen without probing. The lanes add the per-item
    expectations; this entry records the decision that governs them. Evidence:
    the task-12 migration record (`probe.txt`, `probe-converted.txt`).
+14. **2026-10-04 - `src/config.rs` per-item expectations (task 17).** Under
+   entry 13's frozen-API decision, four public items keep names ending in the
+   containing module's name and carry `module_name_repetitions` expectations:
+   `ServerConfig`, `ObservabilityConfig`, `validate_server_config`,
+   `validate_observability_config`. Two `deliberate:` expectations are
+   recorded here because no behavior-preserving alternative exists: the five
+   `pub(crate)` `EnvOverrideSpec` fields (the source-scanning tests read the
+   spec table's declared shape) and `check_shared_config_invariants` staying
+   non-`const` (a source-scanning test matches its `pub(crate) fn` prefix).
+   Evidence: the task-17 migration record (`new-permanent-expects.txt`).
 
 Entries to be added by the work that creates them: "new in `<version>`"
 expects and profile deltas (the toolchain-drift work); the per-item frozen
