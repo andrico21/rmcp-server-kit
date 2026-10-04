@@ -5762,20 +5762,32 @@ fn check_mtls_capacity_knobs(mtls: &MtlsConfig) -> Result<(), RmcpServerKitError
         reason = "test code is not rendered API documentation"
     )
 )]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::missing_errors_doc,
+        reason = "test code is not rendered API documentation"
+    )
+)]
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use anyhow::Context as _;
     use axum::{
         body::Body,
         http::{Request, StatusCode, header},
     };
-    use http_body_util::BodyExt;
+    use http_body_util::BodyExt as _;
+    use rmcp::transport::streamable_http_server::session::{SessionState, SessionStoreError};
     use tower::ServiceExt as _;
+    use tracing::{dispatcher::DefaultGuard, subscriber::set_default};
+    use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
 
     #[derive(Clone, Default)]
-    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
 
     impl CapturedLogs {
         fn contents(&self) -> String {
@@ -5792,7 +5804,7 @@ mod tests {
         }
     }
 
-    struct CapturedLogsWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+    struct CapturedLogsWriter(Arc<Mutex<Vec<u8>>>);
 
     impl io::Write for CapturedLogsWriter {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -5807,28 +5819,32 @@ mod tests {
         }
     }
 
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+    impl<'writer> MakeWriter<'writer> for CapturedLogs {
         type Writer = CapturedLogsWriter;
 
-        fn make_writer(&'a self) -> Self::Writer {
+        fn make_writer(&'writer self) -> Self::Writer {
             CapturedLogsWriter(Arc::clone(&self.0))
         }
     }
 
-    fn capture_debug_logs(logs: CapturedLogs) -> tracing::dispatcher::DefaultGuard {
+    fn capture_debug_logs(logs: CapturedLogs) -> DefaultGuard {
         let subscriber = tracing_subscriber::fmt()
             .with_writer(logs)
             .with_max_level(tracing::Level::DEBUG)
             .with_ansi(false)
             .without_time()
             .finish();
-        tracing::subscriber::set_default(subscriber)
+        set_default(subscriber)
     }
 
     // -- startup task lifecycle --
 
+    /// Pins that the shutdown bridge exits when the server-internal token is
+    /// cancelled even though the external token is not.
     #[tokio::test]
-    async fn external_shutdown_bridge_exits_when_internal_token_cancels() {
+    async fn external_shutdown_bridge_exits_when_internal_token_cancels() -> anyhow::Result<()> {
+        use tokio::time::timeout;
+
         let external = CancellationToken::new();
         let internal = CancellationToken::new();
         let bridge = spawn_external_shutdown_bridge(external.clone(), internal.clone());
@@ -5837,32 +5853,44 @@ mod tests {
         // is, as happens when startup fails after the bridge is spawned.
         internal.cancel();
 
-        let joined = tokio::time::timeout(Duration::from_secs(2), bridge).await;
-        assert!(
-            joined.is_ok(),
+        timeout(Duration::from_secs(2), bridge).await.context(
             "bridge task must exit once the internal token is cancelled, \
-             otherwise it leaks for the lifetime of the process"
-        );
+                 otherwise it leaks for the lifetime of the process",
+        )??;
+
+        Ok(())
     }
 
+    /// Pins that cancelling the external token still propagates to the
+    /// server-internal token through the shutdown bridge.
     #[tokio::test]
-    async fn external_shutdown_bridge_still_forwards_external_cancel() {
+    async fn external_shutdown_bridge_still_forwards_external_cancel() -> anyhow::Result<()> {
+        use tokio::time::timeout;
+
         let external = CancellationToken::new();
         let internal = CancellationToken::new();
         let bridge = spawn_external_shutdown_bridge(external.clone(), internal.clone());
 
         external.cancel();
 
-        let joined = tokio::time::timeout(Duration::from_secs(2), bridge).await;
-        assert!(joined.is_ok(), "bridge task must exit on external cancel");
+        timeout(Duration::from_secs(2), bridge)
+            .await
+            .context("bridge task must exit on external cancel")??;
         assert!(
             internal.is_cancelled(),
             "external cancellation must still propagate to the internal token"
         );
+
+        Ok(())
     }
 
+    /// Pins that dropping the startup guard cancels its token.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/transport.rs::cancel_on_drop_cancels_its_token — keeps the uniform IS-7 test signature while it only constructs values"
+    )]
     #[test]
-    fn cancel_on_drop_cancels_its_token() {
+    fn cancel_on_drop_cancels_its_token() -> anyhow::Result<()> {
         let ct = CancellationToken::new();
         {
             let _guard = CancelOnDrop(ct.clone());
@@ -5872,10 +5900,14 @@ mod tests {
             ct.is_cancelled(),
             "dropping the guard must cancel background startup tasks"
         );
+
+        Ok(())
     }
 
+    /// Pins that mTLS without both TLS paths set is rejected with an error
+    /// naming both path fields.
     #[test]
-    fn validate_rejects_mtls_without_tls() {
+    fn validate_rejects_mtls_without_tls() -> anyhow::Result<()> {
         for (cert, key) in [
             (None, None),
             (Some("cert.pem"), None),
@@ -5883,55 +5915,80 @@ mod tests {
         ] {
             let mut auth = AuthConfig::with_keys(vec![]);
             auth.mtls = Some(valid_mtls_config());
-            let mut cfg = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0").with_auth(auth);
-            cfg.tls_cert_path = cert.map(Into::into);
-            cfg.tls_key_path = key.map(Into::into);
+            let cfg = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0")
+                .with_auth(auth)
+                .with_tls_paths(cert.map(Into::into), key.map(Into::into));
 
             let err = cfg
                 .validate()
-                .expect_err("mTLS without both TLS paths must be rejected");
+                .err()
+                .context("mTLS without both TLS paths must be rejected")?;
             let msg = err.to_string();
             assert!(
                 msg.contains("tls_cert_path") && msg.contains("tls_key_path"),
                 "cert={cert:?} key={key:?}: {msg}"
             );
         }
+
+        Ok(())
     }
 
+    /// Pins that mTLS with both TLS paths set validates.
     #[test]
-    fn validate_accepts_mtls_with_tls() {
+    fn validate_accepts_mtls_with_tls() -> anyhow::Result<()> {
         let mut auth = AuthConfig::with_keys(vec![]);
         auth.mtls = Some(valid_mtls_config());
-        let mut cfg = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0").with_auth(auth);
-        cfg.tls_cert_path = Some("cert.pem".into());
-        cfg.tls_key_path = Some("key.pem".into());
+        let cfg = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0")
+            .with_auth(auth)
+            .with_tls("cert.pem", "key.pem");
 
-        assert!(cfg.validate().is_ok(), "mTLS with both TLS paths is valid");
+        drop(
+            cfg.validate()
+                .context("mTLS with both TLS paths is valid")?,
+        );
+
+        Ok(())
     }
 
+    /// Pins that blank and whitespace-only API-key names are rejected while a
+    /// normal name still validates.
     #[test]
-    fn validate_rejects_blank_api_key_name() {
+    fn validate_rejects_blank_api_key_name() -> anyhow::Result<()> {
         let blank = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0").with_auth(
             AuthConfig::with_keys(vec![ApiKeyEntry::new("", "hash", "viewer")]),
         );
         let err = blank
             .validate()
-            .expect_err("blank API-key name must be rejected");
+            .err()
+            .context("blank API-key name must be rejected")?;
         assert!(err.to_string().contains("api_keys[0]"), "{err}");
 
         let whitespace = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0").with_auth(
             AuthConfig::with_keys(vec![ApiKeyEntry::new("   ", "hash", "viewer")]),
         );
-        assert!(whitespace.validate().is_err());
+        assert!(
+            whitespace.validate().is_err(),
+            "whitespace-only API-key name must be rejected"
+        );
 
         let ok = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0").with_auth(
             AuthConfig::with_keys(vec![ApiKeyEntry::new("viewer-key", "hash", "viewer")]),
         );
-        assert!(ok.validate().is_ok(), "a normal name must still validate");
+        drop(ok.validate().context("a normal name must still validate")?);
+
+        Ok(())
     }
 
-    fn reload_test_state(name: &str) -> (Arc<AuthState>, String) {
-        let (token, hash) = crate::auth::generate_api_key().unwrap();
+    /// Build an `AuthState` holding a single API key and return it together
+    /// with that key's plaintext token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the generated API-key hash cannot be produced.
+    fn reload_test_state(name: &str) -> anyhow::Result<(Arc<AuthState>, String)> {
+        use crate::auth::generate_api_key;
+
+        let (token, hash) = generate_api_key()?;
         let state = Arc::new(AuthState {
             api_keys: ArcSwap::from_pointee(vec![ApiKeyEntry::new(name, hash, "ops")]),
             rate_limiter: None,
@@ -5943,12 +6000,13 @@ mod tests {
             resource_metadata_url: None,
             log_context: AuthLogContext::default(),
         });
-        (state, token)
+        Ok((state, token))
     }
 
+    /// Pins that a blank API-key name is rejected on hot reload.
     #[test]
-    fn try_reload_auth_keys_rejects_blank_name() {
-        let (state, _token) = reload_test_state("prev-key");
+    fn try_reload_auth_keys_rejects_blank_name() -> anyhow::Result<()> {
+        let (state, _token) = reload_test_state("prev-key")?;
         let handle = ReloadHandle {
             auth: Some(state),
             rbac: None,
@@ -5956,13 +6014,20 @@ mod tests {
         };
         let err = handle
             .try_reload_auth_keys(vec![ApiKeyEntry::new("", "h", "ops")])
-            .expect_err("blank API-key name must be rejected on reload");
+            .err()
+            .context("blank API-key name must be rejected on reload")?;
         assert!(err.to_string().contains("api_keys[0]"), "{err}");
+
+        Ok(())
     }
 
+    /// Pins that a rejected reload (blank name) leaves the previously
+    /// installed API keys authenticating.
     #[test]
-    fn reload_auth_keys_blank_name_leaves_previous_keys() {
-        let (state, token) = reload_test_state("prev-key");
+    fn reload_auth_keys_blank_name_leaves_previous_keys() -> anyhow::Result<()> {
+        use crate::auth::verify_bearer_token;
+
+        let (state, token) = reload_test_state("prev-key")?;
         let handle = ReloadHandle {
             auth: Some(Arc::clone(&state)),
             rbac: None,
@@ -5972,15 +6037,27 @@ mod tests {
 
         let installed = state.api_keys.load();
         assert!(
-            crate::auth::verify_bearer_token(&token, &installed).is_some(),
+            verify_bearer_token(&token, &installed).is_some(),
             "the previous key must still authenticate after a rejected reload"
         );
+
+        Ok(())
     }
 
     // -- McpServerConfig --
 
+    /// Pins every default `McpServerConfig::new` leaves in place across
+    /// transport, auth, timeout, and session fields.
+    #[expect(
+        deprecated,
+        reason = "deliberate: src/transport.rs::server_config_new_defaults — exercises deprecated config fields directly"
+    )]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/transport.rs::server_config_new_defaults — keeps the uniform IS-7 test signature while it only constructs values"
+    )]
     #[test]
-    fn server_config_new_defaults() {
+    fn server_config_new_defaults() -> anyhow::Result<()> {
         let cfg = McpServerConfig::new("0.0.0.0:8443", "test-server", "1.0.0");
         assert_eq!(cfg.bind_addr, "0.0.0.0:8443");
         assert_eq!(cfg.name, "test-server");
@@ -6000,6 +6077,8 @@ mod tests {
         assert_eq!(cfg.max_concurrent_tls_handshakes, 256);
         assert!(cfg.session_store.is_none());
         assert!(cfg.session_binding_secret.is_none());
+
+        Ok(())
     }
 
     #[derive(Default)]
@@ -6007,30 +6086,19 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SessionStore for TestSessionStore {
-        async fn load(
-            &self,
-            _session_id: &str,
-        ) -> Result<
-            Option<rmcp::transport::streamable_http_server::session::SessionState>,
-            rmcp::transport::streamable_http_server::session::SessionStoreError,
-        > {
+        async fn load(&self, _session_id: &str) -> Result<Option<SessionState>, SessionStoreError> {
             Ok(None)
         }
 
         async fn store(
             &self,
             _session_id: &str,
-            _state: &rmcp::transport::streamable_http_server::session::SessionState,
-        ) -> Result<(), rmcp::transport::streamable_http_server::session::SessionStoreError>
-        {
+            _state: &SessionState,
+        ) -> Result<(), SessionStoreError> {
             Ok(())
         }
 
-        async fn delete(
-            &self,
-            _session_id: &str,
-        ) -> Result<(), rmcp::transport::streamable_http_server::session::SessionStoreError>
-        {
+        async fn delete(&self, _session_id: &str) -> Result<(), SessionStoreError> {
             Ok(())
         }
     }
@@ -6043,94 +6111,148 @@ mod tests {
         SecretString::from("0123456789abcdef0123456789abcdef")
     }
 
+    /// Pins that a fresh config has no session store attached.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/transport.rs::session_store_defaults_to_none — keeps the uniform IS-7 test signature while it only constructs values"
+    )]
     #[test]
-    fn session_store_defaults_to_none() {
+    fn session_store_defaults_to_none() -> anyhow::Result<()> {
         let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0");
 
         assert!(cfg.session_store.is_none());
+
+        Ok(())
     }
 
+    /// Pins that a fresh config has no event store attached.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/transport.rs::event_store_defaults_to_none — keeps the uniform IS-7 test signature while it only constructs values"
+    )]
     #[test]
-    fn event_store_defaults_to_none() {
+    fn event_store_defaults_to_none() -> anyhow::Result<()> {
         let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0");
 
         assert!(cfg.event_store.is_none());
+
+        Ok(())
     }
 
+    /// Pins that an authenticated shared session store requires a shared
+    /// binding secret, with the error naming both settings.
     #[test]
-    fn validate_rejects_session_store_without_binding_secret() {
+    fn validate_rejects_session_store_without_binding_secret() -> anyhow::Result<()> {
         let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
             .with_auth(AuthConfig::with_keys(vec![]))
             .with_session_store(test_session_store());
 
         let err = cfg
             .validate()
-            .expect_err("authenticated shared-store binding needs a shared secret");
+            .err()
+            .context("authenticated shared-store binding needs a shared secret")?;
         let msg = err.to_string();
         assert!(msg.contains("session_store"), "{msg}");
         assert!(msg.contains("session_binding"), "{msg}");
         assert!(msg.contains("shared secret"), "{msg}");
+
+        Ok(())
     }
 
+    /// Pins that a shared session store plus a shared binding secret
+    /// validates.
     #[test]
-    fn validate_allows_session_store_with_binding_secret() {
+    fn validate_allows_session_store_with_binding_secret() -> anyhow::Result<()> {
         let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
             .with_auth(AuthConfig::with_keys(vec![]))
             .with_session_store(test_session_store())
             .with_session_binding_secret(shared_session_binding_secret());
 
-        assert!(cfg.validate().is_ok());
+        drop(cfg.validate()?);
+
+        Ok(())
     }
 
+    /// Pins that a shared session store validates when session binding is
+    /// explicitly disabled.
     #[test]
-    fn validate_allows_session_store_when_binding_disabled() {
+    fn validate_allows_session_store_when_binding_disabled() -> anyhow::Result<()> {
         let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
             .with_auth(AuthConfig::with_keys(vec![]))
             .with_session_binding(false)
             .with_session_store(test_session_store());
 
-        assert!(cfg.validate().is_ok());
+        drop(cfg.validate()?);
+
+        Ok(())
     }
 
+    /// Pins that a binding secret without any session store validates.
     #[test]
-    fn validate_allows_binding_secret_without_session_store() {
+    fn validate_allows_binding_secret_without_session_store() -> anyhow::Result<()> {
         let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
             .with_auth(AuthConfig::with_keys(vec![]))
             .with_session_binding_secret(shared_session_binding_secret());
 
-        assert!(cfg.validate().is_ok());
+        drop(cfg.validate()?);
+
+        Ok(())
     }
 
+    /// Pins that the TLS handshake timeout and concurrency builders store
+    /// their values on the config.
+    #[expect(
+        deprecated,
+        reason = "deliberate: src/transport.rs::tls_handshake_builders_set_fields — exercises deprecated config fields directly"
+    )]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/transport.rs::tls_handshake_builders_set_fields — keeps the uniform IS-7 test signature while it only constructs values"
+    )]
     #[test]
-    fn tls_handshake_builders_set_fields() {
+    fn tls_handshake_builders_set_fields() -> anyhow::Result<()> {
         let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
             .with_tls_handshake_timeout(Duration::from_secs(3))
             .with_max_concurrent_tls_handshakes(64);
         assert_eq!(cfg.tls_handshake_timeout, Duration::from_secs(3));
         assert_eq!(cfg.max_concurrent_tls_handshakes, 64);
+
+        Ok(())
     }
 
+    /// Pins that a zero TLS handshake timeout is rejected.
     #[test]
-    fn validate_rejects_zero_tls_handshake_timeout() {
+    fn validate_rejects_zero_tls_handshake_timeout() -> anyhow::Result<()> {
         let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
             .with_tls_handshake_timeout(Duration::ZERO);
-        let err = cfg.validate().expect_err("zero handshake timeout");
+        let err = cfg.validate().err().context("zero handshake timeout")?;
         assert!(err.to_string().contains("tls_handshake_timeout"));
+
+        Ok(())
     }
 
+    /// Pins that a zero TLS handshake concurrency cap is rejected.
     #[test]
-    fn validate_rejects_zero_max_concurrent_tls_handshakes() {
+    fn validate_rejects_zero_max_concurrent_tls_handshakes() -> anyhow::Result<()> {
         let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
             .with_max_concurrent_tls_handshakes(0);
-        let err = cfg.validate().expect_err("zero handshake concurrency");
+        let err = cfg.validate().err().context("zero handshake concurrency")?;
         assert!(err.to_string().contains("max_concurrent_tls_handshakes"));
+
+        Ok(())
     }
 
+    /// Pins that `validate` consumes the config into a `Validated` wrapper
+    /// that exposes the inner value, and rejects a zero body cap.
+    #[expect(
+        deprecated,
+        reason = "deliberate: src/transport.rs::validate_consumes_and_proves — exercises deprecated config fields directly"
+    )]
     #[test]
-    fn validate_consumes_and_proves() {
+    fn validate_consumes_and_proves() -> anyhow::Result<()> {
         // Valid config -> Validated wrapper, original is consumed.
         let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0");
-        let validated = cfg.validate().expect("valid config");
+        let validated = cfg.validate().context("valid config")?;
         // as_inner() gives read-only access to inner fields.
         assert_eq!(validated.as_inner().name, "test-server");
         // into_inner recovers the raw value.
@@ -6141,28 +6263,41 @@ mod tests {
         let mut bad = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0");
         bad.max_request_body = 0;
         assert!(bad.validate().is_err(), "zero body cap must fail validate");
+
+        Ok(())
     }
 
+    /// Pins that a zero max-concurrent-requests cap is rejected with an error
+    /// naming the field.
     #[test]
-    fn validate_rejects_zero_max_concurrent_requests() {
+    fn validate_rejects_zero_max_concurrent_requests() -> anyhow::Result<()> {
         let cfg =
             McpServerConfig::new("127.0.0.1:8080", "test", "1.0.0").with_max_concurrent_requests(0);
-        let err = cfg.validate().expect_err("zero concurrency cap must fail");
+        let err = cfg
+            .validate()
+            .err()
+            .context("zero concurrency cap must fail")?;
         assert!(
             format!("{err}").contains("max_concurrent_requests"),
             "error should mention max_concurrent_requests, got: {err}"
         );
+
+        Ok(())
     }
 
+    /// Pins that a zero max-tracked-keys cap is rejected with an error naming
+    /// the field.
     #[test]
-    fn validate_rejects_zero_max_tracked_keys() {
+    fn validate_rejects_zero_max_tracked_keys() -> anyhow::Result<()> {
+        use crate::auth::RateLimitConfig;
+
         // Defaults mirror auth::default_max_attempts / default_idle_eviction
         // (module-private in auth.rs); spelled out here for review clarity.
-        let rl = crate::auth::RateLimitConfig {
+        let rl = RateLimitConfig {
             max_attempts_per_minute: 30,
             pre_auth_max_per_minute: None,
             max_tracked_keys: 0,
-            idle_eviction: Duration::from_secs(15 * 60),
+            idle_eviction: Duration::from_mins(15),
             burst: None,
             pre_auth_burst: None,
             key_eviction_policy: KeyEvictionPolicy::default(),
@@ -6178,44 +6313,69 @@ mod tests {
             oauth: None,
         };
         let cfg = McpServerConfig::new("127.0.0.1:8080", "test", "1.0.0").with_auth(auth_cfg);
-        let err = cfg.validate().expect_err("zero max_tracked_keys must fail");
+        let err = cfg
+            .validate()
+            .err()
+            .context("zero max_tracked_keys must fail")?;
         assert!(
             format!("{err}").contains("max_tracked_keys"),
             "error should mention max_tracked_keys, got: {err}"
         );
+
+        Ok(())
     }
 
+    /// Pins that the derived host allowlist includes the `public_url` host.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/transport.rs::derive_allowed_hosts_includes_public_host — keeps the uniform IS-7 test signature while it only constructs values"
+    )]
     #[test]
-    fn derive_allowed_hosts_includes_public_host() {
+    fn derive_allowed_hosts_includes_public_host() -> anyhow::Result<()> {
         let hosts = derive_allowed_hosts("0.0.0.0:8080", Some("https://mcp.example.com/mcp"));
         assert!(
-            hosts.iter().any(|h| h == "mcp.example.com"),
+            hosts.iter().any(|host| host == "mcp.example.com"),
             "public_url host must be allowed"
         );
+
+        Ok(())
     }
 
+    /// Pins that the derived host allowlist includes both the bind host and
+    /// the bind authority.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/transport.rs::derive_allowed_hosts_includes_bind_authority — keeps the uniform IS-7 test signature while it only constructs values"
+    )]
     #[test]
-    fn derive_allowed_hosts_includes_bind_authority() {
+    fn derive_allowed_hosts_includes_bind_authority() -> anyhow::Result<()> {
         let hosts = derive_allowed_hosts("127.0.0.1:8080", None);
         assert!(
-            hosts.iter().any(|h| h == "127.0.0.1"),
+            hosts.iter().any(|host| host == "127.0.0.1"),
             "bind host must be allowed"
         );
         assert!(
-            hosts.iter().any(|h| h == "127.0.0.1:8080"),
+            hosts.iter().any(|host| host == "127.0.0.1:8080"),
             "bind authority must be allowed"
         );
+
+        Ok(())
     }
 
     // -- healthz --
 
+    /// Pins that `/healthz` answers 200 with `status: ok` and leaks neither
+    /// the server name nor its version.
     #[tokio::test]
-    async fn healthz_returns_ok_json() {
+    async fn healthz_returns_ok_json() -> anyhow::Result<()> {
         let resp = healthz().await.into_response();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = resp.into_body().collect().await.unwrap().to_bytes();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["status"], "ok");
+        let body = resp.into_body().collect().await?.to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(
+            json.get("status").context("healthz must report a status")?,
+            "ok"
+        );
         assert!(
             json.get("name").is_none(),
             "healthz must not expose server name"
@@ -6224,19 +6384,26 @@ mod tests {
             json.get("version").is_none(),
             "healthz must not expose version"
         );
+
+        Ok(())
     }
 
     // -- readyz --
 
+    /// Pins that a ready readiness check yields 200 with the check's fields
+    /// and no name or version leak.
     #[tokio::test]
-    async fn readyz_returns_ok_when_ready() {
+    async fn readyz_returns_ok_when_ready() -> anyhow::Result<()> {
         let check: ReadinessCheck =
             Arc::new(|| Box::pin(async { serde_json::json!({"ready": true, "db": "connected"}) }));
         let resp = readyz(check).await.into_response();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = resp.into_body().collect().await.unwrap().to_bytes();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["ready"], true);
+        let body = resp.into_body().collect().await?.to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(
+            json.get("ready").context("readyz must report readiness")?,
+            true
+        );
         assert!(
             json.get("name").is_none(),
             "readyz must not expose server name"
@@ -6245,24 +6412,37 @@ mod tests {
             json.get("version").is_none(),
             "readyz must not expose version"
         );
-        assert_eq!(json["db"], "connected");
+        assert_eq!(
+            json.get("db")
+                .context("readyz must pass through check fields")?,
+            "connected"
+        );
+
+        Ok(())
     }
 
+    /// Pins that a not-ready readiness check yields 503.
     #[tokio::test]
-    async fn readyz_returns_503_when_not_ready() {
+    async fn readyz_returns_503_when_not_ready() -> anyhow::Result<()> {
         let check: ReadinessCheck =
             Arc::new(|| Box::pin(async { serde_json::json!({"ready": false}) }));
         let resp = readyz(check).await.into_response();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        Ok(())
     }
 
+    /// Pins that a readiness payload missing its `ready` field defaults to
+    /// not-ready and yields 503.
     #[tokio::test]
-    async fn readyz_returns_503_when_ready_missing() {
+    async fn readyz_returns_503_when_ready_missing() -> anyhow::Result<()> {
         let check: ReadinessCheck =
             Arc::new(|| Box::pin(async { serde_json::json!({"status": "starting"}) }));
         let resp = readyz(check).await.into_response();
         // Missing "ready" field defaults to false -> 503
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        Ok(())
     }
 
     // -- normalize_peer_addr_middleware / PeerAddr --
@@ -6270,118 +6450,155 @@ mod tests {
     /// Build a test router that reports the request's peer-address
     /// extensions as `"<ConnectInfo>|<PeerAddr>"` (empty when absent).
     fn peer_probe_router() -> axum::Router {
+        use axum::{middleware::from_fn, routing::get};
+
         async fn probe(req: Request<Body>) -> String {
             let ci = req
                 .extensions()
                 .get::<ConnectInfo<SocketAddr>>()
-                .map(|c| c.0.to_string())
+                .map(|info| info.0.to_string())
                 .unwrap_or_default();
             let pa = req
                 .extensions()
                 .get::<PeerAddr>()
-                .map(|p| p.addr.to_string())
+                .map(|peer| peer.addr.to_string())
                 .unwrap_or_default();
             format!("{ci}|{pa}")
         }
         axum::Router::new()
-            .route("/probe", axum::routing::get(probe))
-            .layer(axum::middleware::from_fn(|req, next| {
+            .route("/probe", get(probe))
+            .layer(from_fn(|req, next| {
                 normalize_peer_addr_middleware(None, req, next)
             }))
     }
 
-    async fn body_string(resp: Response) -> String {
-        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-        String::from_utf8(bytes.to_vec()).unwrap()
+    /// Collect a response body into a `String` for assertions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the body stream fails or the collected bytes are
+    /// not valid UTF-8.
+    async fn body_string(resp: Response) -> anyhow::Result<String> {
+        let bytes = resp.into_body().collect().await?.to_bytes();
+        Ok(String::from_utf8(bytes.to_vec())?)
     }
 
+    /// Pins that an existing plain `ConnectInfo` wins over the TLS one and is
+    /// mirrored into `PeerAddr`.
     #[tokio::test]
-    async fn normalize_preserves_existing_connect_info_and_mirrors_peer_addr() {
+    async fn normalize_preserves_existing_connect_info_and_mirrors_peer_addr() -> anyhow::Result<()>
+    {
         // Precedence proof: when both extensions exist with DIFFERENT
         // addresses, ConnectInfo<SocketAddr> wins and is never overwritten.
-        let plain: SocketAddr = "10.0.0.1:1111".parse().unwrap();
-        let tls: SocketAddr = "10.0.0.2:2222".parse().unwrap();
+        let plain: SocketAddr = "10.0.0.1:1111".parse()?;
+        let tls: SocketAddr = "10.0.0.2:2222".parse()?;
         let req = Request::builder()
             .uri("/probe")
             .extension(ConnectInfo(plain))
             .extension(ConnectInfo(TlsConnInfo::new(tls, None)))
-            .body(Body::empty())
-            .unwrap();
-        let resp = peer_probe_router().oneshot(req).await.unwrap();
+            .body(Body::empty())?;
+        let resp = peer_probe_router().oneshot(req).await?;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(body_string(resp).await, format!("{plain}|{plain}"));
+        assert_eq!(body_string(resp).await?, format!("{plain}|{plain}"));
+
+        Ok(())
     }
 
+    /// Pins that a TLS-only `ConnectInfo` is promoted to a plain
+    /// `ConnectInfo` and mirrored into `PeerAddr`.
     #[tokio::test]
-    async fn normalize_inserts_connect_info_and_peer_addr_from_tls() {
-        let tls: SocketAddr = "192.168.1.7:50443".parse().unwrap();
+    async fn normalize_inserts_connect_info_and_peer_addr_from_tls() -> anyhow::Result<()> {
+        let tls: SocketAddr = "192.168.1.7:50443".parse()?;
         let req = Request::builder()
             .uri("/probe")
             .extension(ConnectInfo(TlsConnInfo::new(tls, None)))
-            .body(Body::empty())
-            .unwrap();
-        let resp = peer_probe_router().oneshot(req).await.unwrap();
+            .body(Body::empty())?;
+        let resp = peer_probe_router().oneshot(req).await?;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(body_string(resp).await, format!("{tls}|{tls}"));
+        assert_eq!(body_string(resp).await?, format!("{tls}|{tls}"));
+
+        Ok(())
     }
 
+    /// Pins that a request with no peer extension at all passes through with
+    /// empty probe fields.
     #[tokio::test]
-    async fn normalize_no_op_without_any_connect_info() {
-        let req = Request::builder()
-            .uri("/probe")
-            .body(Body::empty())
-            .unwrap();
-        let resp = peer_probe_router().oneshot(req).await.unwrap();
+    async fn normalize_no_op_without_any_connect_info() -> anyhow::Result<()> {
+        let req = Request::builder().uri("/probe").body(Body::empty())?;
+        let resp = peer_probe_router().oneshot(req).await?;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(body_string(resp).await, "|");
+        assert_eq!(body_string(resp).await?, "|");
+
+        Ok(())
     }
 
+    /// Pins that the `PeerAddr` extractor rejects with 500 when the
+    /// extension is absent.
     #[tokio::test]
-    async fn peer_addr_extractor_rejects_when_absent() {
-        async fn h(peer: PeerAddr) -> String {
+    async fn peer_addr_extractor_rejects_when_absent() -> anyhow::Result<()> {
+        use axum::routing::get;
+
+        async fn peer_handler(peer: PeerAddr) -> String {
             peer.addr.to_string()
         }
-        let app = axum::Router::new().route("/p", axum::routing::get(h));
-        let req = Request::builder().uri("/p").body(Body::empty()).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+        let app = axum::Router::new().route("/p", get(peer_handler));
+        let req = Request::builder().uri("/p").body(Body::empty())?;
+        let resp = app.oneshot(req).await?;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        Ok(())
     }
 
+    /// Pins that the `PeerAddr` extractor returns the address inserted into
+    /// the request extensions.
     #[tokio::test]
-    async fn peer_addr_extractor_returns_value_when_present() {
-        async fn h(peer: PeerAddr) -> String {
+    async fn peer_addr_extractor_returns_value_when_present() -> anyhow::Result<()> {
+        use axum::routing::get;
+
+        async fn peer_handler(peer: PeerAddr) -> String {
             peer.addr.to_string()
         }
-        let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
-        let app = axum::Router::new().route("/p", axum::routing::get(h));
+        let addr: SocketAddr = "127.0.0.1:9999".parse()?;
+        let app = axum::Router::new().route("/p", get(peer_handler));
         let req = Request::builder()
             .uri("/p")
             .extension(PeerAddr::new(addr))
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+            .body(Body::empty())?;
+        let resp = app.oneshot(req).await?;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(body_string(resp).await, addr.to_string());
+        assert_eq!(body_string(resp).await?, addr.to_string());
+
+        Ok(())
     }
 
+    /// Pins that `PeerAddr` is also readable through the generic
+    /// `axum::Extension` extractor.
     #[tokio::test]
-    async fn peer_addr_via_extension_extractor() {
-        async fn h(axum::Extension(peer): axum::Extension<PeerAddr>) -> String {
+    async fn peer_addr_via_extension_extractor() -> anyhow::Result<()> {
+        use axum::{Extension, routing::get};
+
+        async fn peer_handler(Extension(peer): Extension<PeerAddr>) -> String {
             peer.addr.to_string()
         }
-        let addr: SocketAddr = "127.0.0.1:4242".parse().unwrap();
-        let app = axum::Router::new().route("/p", axum::routing::get(h));
+        let addr: SocketAddr = "127.0.0.1:4242".parse()?;
+        let app = axum::Router::new().route("/p", get(peer_handler));
         let req = Request::builder()
             .uri("/p")
             .extension(PeerAddr::new(addr))
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+            .body(Body::empty())?;
+        let resp = app.oneshot(req).await?;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(body_string(resp).await, addr.to_string());
+        assert_eq!(body_string(resp).await?, addr.to_string());
+
+        Ok(())
     }
 
     // -- extra_route_rate_limit_middleware --
+
+    /// Handler used by the limiter probe routers: always answers `"ok"`.
+    async fn ok_handler() -> &'static str {
+        "ok"
+    }
 
     /// Probe router with the extra-route limiter installed, mirroring
     /// the layer-before-merge wiring in `build_app_router`.
@@ -6402,6 +6619,8 @@ mod tests {
         burst: Option<u32>,
         exempt_paths: &[&str],
     ) -> axum::Router {
+        use axum::{middleware::from_fn, routing::get};
+
         let limiter = build_extra_route_rate_limiter_with_policy(
             per_minute,
             burst,
@@ -6409,52 +6628,74 @@ mod tests {
             NonZeroUsize::new(EXTRA_ROUTE_MAX_TRACKED_KEYS).unwrap_or(NonZeroUsize::MIN),
         );
         let exempt: Arc<HashSet<String>> =
-            Arc::new(exempt_paths.iter().map(|s| (*s).to_owned()).collect());
+            Arc::new(exempt_paths.iter().map(|path| (*path).to_owned()).collect());
         axum::Router::new()
-            .route("/limited", axum::routing::get(|| async { "ok" }))
-            .route("/exempt", axum::routing::get(|| async { "ok" }))
-            .layer(axum::middleware::from_fn(move |req, next| {
-                let l = Arc::clone(&limiter);
-                let e = Arc::clone(&exempt);
-                extra_route_rate_limit_middleware(l, e, req, next)
+            .route("/limited", get(ok_handler))
+            .route("/exempt", get(ok_handler))
+            .layer(from_fn(move |req, next| {
+                let route_limiter = Arc::clone(&limiter);
+                let exempt_set = Arc::clone(&exempt);
+                extra_route_rate_limit_middleware(route_limiter, exempt_set, req, next)
             }))
     }
 
-    fn limited_req(ip: &str) -> Request<Body> {
+    /// Build a limiter-probe request for `ip` targeting `/limited`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `ip` is not a valid IP address or the request
+    /// parts are invalid.
+    fn limited_req(ip: &str) -> anyhow::Result<Request<Body>> {
         limited_req_to(ip, "/limited")
     }
 
-    fn limited_req_to(ip: &str, path: &str) -> Request<Body> {
-        let addr: SocketAddr = format!("{ip}:40000").parse().unwrap();
-        Request::builder()
+    /// Build a limiter-probe request for `ip` at `path`, carrying the peer
+    /// `ConnectInfo` extension.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `ip` is not a valid IP address or the request
+    /// parts are invalid.
+    fn limited_req_to(ip: &str, path: &str) -> anyhow::Result<Request<Body>> {
+        let addr: SocketAddr = format!("{ip}:40000").parse()?;
+        Ok(Request::builder()
             .uri(path)
             .extension(ConnectInfo(addr))
-            .body(Body::empty())
-            .unwrap()
+            .body(Body::empty())?)
     }
 
+    /// Pins that the extra-route limiter denies requests over the per-minute
+    /// quota with the documented 429 body.
     #[tokio::test]
-    async fn extra_route_limiter_denies_over_quota() {
+    async fn extra_route_limiter_denies_over_quota() -> anyhow::Result<()> {
         let app = limited_router(2);
-        for i in 0..2 {
-            let resp = app.clone().oneshot(limited_req("10.1.1.1")).await.unwrap();
+        for i in 0..2_u32 {
+            let resp = app.clone().oneshot(limited_req("10.1.1.1")?).await?;
             assert_eq!(resp.status(), StatusCode::OK, "request {i} should pass");
         }
-        let resp = app.clone().oneshot(limited_req("10.1.1.1")).await.unwrap();
+        let resp = app.clone().oneshot(limited_req("10.1.1.1")?).await?;
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
-        let body = body_string(resp).await;
+        let body = body_string(resp).await?;
         assert!(
             body.contains("too many requests to application routes"),
             "deny body should match the limiter message, got: {body}"
         );
+
+        Ok(())
     }
 
+    /// A `NonZeroUsize` of one, for limiter tests that track a single key.
     fn one_tracked_key() -> NonZeroUsize {
         NonZeroUsize::new(1).unwrap_or(NonZeroUsize::MIN)
     }
 
+    /// Pins that a full capacity-limited bucket rejects a new key with 503
+    /// and no `Retry-After` header.
     #[tokio::test]
-    async fn extra_route_limiter_capacity_full_returns_503_without_retry_after() {
+    async fn extra_route_limiter_capacity_full_returns_503_without_retry_after()
+    -> anyhow::Result<()> {
+        use axum::{middleware::from_fn, routing::get};
+
         let limiter = build_extra_route_rate_limiter_with_policy(
             10,
             None,
@@ -6463,142 +6704,169 @@ mod tests {
         );
         let exempt = Arc::new(HashSet::new());
         let app = axum::Router::new()
-            .route("/limited", axum::routing::get(|| async { "ok" }))
-            .layer(axum::middleware::from_fn(move |req, next| {
-                let l = Arc::clone(&limiter);
-                let e = Arc::clone(&exempt);
-                extra_route_rate_limit_middleware(l, e, req, next)
+            .route("/limited", get(ok_handler))
+            .layer(from_fn(move |req, next| {
+                let route_limiter = Arc::clone(&limiter);
+                let exempt_set = Arc::clone(&exempt);
+                extra_route_rate_limit_middleware(route_limiter, exempt_set, req, next)
             }));
-        let established = app.clone().oneshot(limited_req("10.1.1.1")).await.unwrap();
+        let established = app.clone().oneshot(limited_req("10.1.1.1")?).await?;
         assert_eq!(established.status(), StatusCode::OK);
 
-        let denied = app.clone().oneshot(limited_req("10.1.1.2")).await.unwrap();
+        let denied = app.clone().oneshot(limited_req("10.1.1.2")?).await?;
 
         assert_eq!(denied.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(denied.headers().get(header::RETRY_AFTER).is_none());
+
+        Ok(())
     }
 
+    /// Pins that the extra-route limiter keeps a separate bucket per source
+    /// IP: one exhausted key does not deny a different peer.
     #[tokio::test]
-    async fn extra_route_limiter_isolates_keys() {
+    async fn extra_route_limiter_isolates_keys() -> anyhow::Result<()> {
         let app = limited_router(2);
-        for _ in 0..2 {
-            let resp = app.clone().oneshot(limited_req("10.2.2.2")).await.unwrap();
+        for _ in 0..2_u32 {
+            let resp = app.clone().oneshot(limited_req("10.2.2.2")?).await?;
             assert_eq!(resp.status(), StatusCode::OK);
         }
-        let exhausted = app.clone().oneshot(limited_req("10.2.2.2")).await.unwrap();
+        let exhausted = app.clone().oneshot(limited_req("10.2.2.2")?).await?;
         assert_eq!(exhausted.status(), StatusCode::TOO_MANY_REQUESTS);
         // A different source IP still has a fresh bucket.
-        let other = app.clone().oneshot(limited_req("10.3.3.3")).await.unwrap();
+        let other = app.clone().oneshot(limited_req("10.3.3.3")?).await?;
         assert_eq!(other.status(), StatusCode::OK);
+
+        Ok(())
     }
 
+    /// Pins that requests without a resolvable peer address still share one
+    /// bounded limiter bucket instead of bypassing the limiter.
     #[tokio::test]
-    async fn extra_route_limiter_bounds_requests_without_peer() {
+    async fn extra_route_limiter_bounds_requests_without_peer() -> anyhow::Result<()> {
         // Was `fails_open_without_peer`. A request whose source address
         // cannot be resolved must NOT be exempt from rate limiting; such
         // requests share one bounded `Unattributed` bucket.
         let app = limited_router(1);
-        let mk = || {
-            Request::builder()
-                .uri("/limited")
-                .body(Body::empty())
-                .unwrap()
+        let mk = || -> anyhow::Result<Request<Body>> {
+            Ok(Request::builder().uri("/limited").body(Body::empty())?)
         };
-        let first = app.clone().oneshot(mk()).await.unwrap();
+        let first = app.clone().oneshot(mk()?).await?;
         assert_eq!(
             first.status(),
             StatusCode::OK,
             "first request consumes quota"
         );
-        let second = app.clone().oneshot(mk()).await.unwrap();
+        let second = app.clone().oneshot(mk()?).await?;
         assert_eq!(
             second.status(),
             StatusCode::TOO_MANY_REQUESTS,
             "unattributable requests must share a bounded bucket, not bypass the limiter"
         );
+
+        Ok(())
     }
 
+    /// Pins that requests with no peer address fall back to the shared
+    /// `Unattributed` rate-limit key.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/transport.rs::limiter_client_key_falls_back_to_unattributed — keeps the uniform IS-7 test signature while it only constructs values"
+    )]
     #[test]
-    fn limiter_client_key_falls_back_to_unattributed() {
+    fn limiter_client_key_falls_back_to_unattributed() -> anyhow::Result<()> {
         let empty = Extensions::new();
         assert_eq!(limiter_client_key(&empty), RateLimitKey::Unattributed);
+
+        Ok(())
     }
 
+    /// Pins that the `Unattributed` key is distinct from a `0.0.0.0` sentinel
+    /// key in both equality and hashing.
     #[test]
-    fn unattributed_key_is_distinct_from_unspecified_ip() {
+    fn unattributed_key_is_distinct_from_unspecified_ip() -> anyhow::Result<()> {
         // Regression guard: a sentinel `0.0.0.0` would collide here,
         // because trusted-forwarder mode derives ClientIp from a header
         // and `crate::forwarded` does not filter unspecified addresses.
-        let unspecified = RateLimitKey::Ip("0.0.0.0".parse::<IpAddr>().unwrap());
+        let unspecified = RateLimitKey::Ip("0.0.0.0".parse::<IpAddr>()?);
         assert_ne!(unspecified, RateLimitKey::Unattributed);
 
         let mut set = HashSet::new();
-        set.insert(unspecified);
-        set.insert(RateLimitKey::Unattributed);
+        let _unspecified_is_new = set.insert(unspecified);
+        let _unattributed_is_new = set.insert(RateLimitKey::Unattributed);
         assert_eq!(set.len(), 2, "the two keys must hash to distinct buckets");
+
+        Ok(())
     }
 
+    /// Pins that `RateLimitKey`'s `Display` renders a real IP verbatim and
+    /// never fabricates one for the unattributed key.
     #[test]
-    fn rate_limit_key_display_does_not_fabricate_an_ip() {
+    fn rate_limit_key_display_does_not_fabricate_an_ip() -> anyhow::Result<()> {
         assert_eq!(
-            RateLimitKey::Ip("10.1.2.3".parse::<IpAddr>().unwrap()).to_string(),
+            RateLimitKey::Ip("10.1.2.3".parse::<IpAddr>()?).to_string(),
             "10.1.2.3"
         );
         assert_eq!(RateLimitKey::Unattributed.to_string(), "unattributed");
+
+        Ok(())
     }
 
+    /// Pins that the extra-route limiter keys on the peer address carried by
+    /// a TLS `ConnectInfo` extension.
     #[tokio::test]
-    async fn extra_route_limiter_extracts_tls_conn_info() {
+    async fn extra_route_limiter_extracts_tls_conn_info() -> anyhow::Result<()> {
         let app = limited_router(2);
-        let mk = || {
-            let addr: SocketAddr = "192.168.9.9:55555".parse().unwrap();
-            Request::builder()
+        let mk = || -> anyhow::Result<Request<Body>> {
+            let addr: SocketAddr = "192.168.9.9:55555".parse()?;
+            Ok(Request::builder()
                 .uri("/limited")
                 .extension(ConnectInfo(TlsConnInfo::new(addr, None)))
-                .body(Body::empty())
-                .unwrap()
+                .body(Body::empty())?)
         };
-        for _ in 0..2 {
-            assert_eq!(
-                app.clone().oneshot(mk()).await.unwrap().status(),
-                StatusCode::OK
-            );
+        for _ in 0..2_u32 {
+            assert_eq!(app.clone().oneshot(mk()?).await?.status(), StatusCode::OK);
         }
-        let resp = app.clone().oneshot(mk()).await.unwrap();
+        let resp = app.clone().oneshot(mk()?).await?;
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        Ok(())
     }
 
+    /// Pins that exempt-path traffic passes without consuming limiter budget,
+    /// so the following non-exempt requests still see a full bucket.
     #[tokio::test]
-    async fn extra_route_limiter_exempt_path_bypasses_quota() {
+    async fn extra_route_limiter_exempt_path_bypasses_quota() -> anyhow::Result<()> {
         // rate=1: a single non-exempt request exhausts the bucket, yet
         // repeated exempt-path requests all pass and consume no budget.
         let app = limited_router_full(1, None, &["/exempt"]);
-        for i in 0..5 {
+        for i in 0..5_u32 {
             let resp = app
                 .clone()
-                .oneshot(limited_req_to("10.6.6.6", "/exempt"))
-                .await
-                .unwrap();
+                .oneshot(limited_req_to("10.6.6.6", "/exempt")?)
+                .await?;
             assert_eq!(resp.status(), StatusCode::OK, "exempt request {i}");
         }
         // Budget untouched by exempt traffic: first limited request OK…
-        let resp = app.clone().oneshot(limited_req("10.6.6.6")).await.unwrap();
+        let resp = app.clone().oneshot(limited_req("10.6.6.6")?).await?;
         assert_eq!(resp.status(), StatusCode::OK);
         // …second is denied (exemption did not leak onto /limited).
-        let resp = app.clone().oneshot(limited_req("10.6.6.6")).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let denied = app.clone().oneshot(limited_req("10.6.6.6")?).await?;
+        assert_eq!(denied.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        Ok(())
     }
 
+    /// Pins that exemption matching is a raw exact match: a trailing-slash
+    /// variant routes 404 and still consumes limiter budget.
     #[tokio::test]
-    async fn extra_route_limiter_exemption_is_raw_exact_match() {
+    async fn extra_route_limiter_exemption_is_raw_exact_match() -> anyhow::Result<()> {
         // Trailing-slash and case variants are NOT exempt (fail-closed:
         // a mismatch keeps the request limited, never the reverse).
         let app = limited_router_full(1, None, &["/exempt"]);
         let ok = app
             .clone()
-            .oneshot(limited_req_to("10.7.7.7", "/exempt/"))
-            .await
-            .unwrap();
+            .oneshot(limited_req_to("10.7.7.7", "/exempt/")?)
+            .await?;
         assert_eq!(
             ok.status(),
             StatusCode::NOT_FOUND,
@@ -6607,25 +6875,27 @@ mod tests {
         // The variant consumed limiter budget (it was not exempt):
         let denied = app
             .clone()
-            .oneshot(limited_req_to("10.7.7.7", "/limited"))
-            .await
-            .unwrap();
+            .oneshot(limited_req_to("10.7.7.7", "/limited")?)
+            .await?;
         assert_eq!(denied.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        Ok(())
     }
 
+    /// Pins that only denied (non-exempt) extra-route requests increment the
+    /// `extra_route` rate-limit counter.
     #[cfg(feature = "metrics")]
     #[tokio::test]
-    async fn extra_route_limiter_deny_increments_counter_exempt_does_not() {
-        let metrics = Arc::new(McpMetrics::new().unwrap());
+    async fn extra_route_limiter_deny_increments_counter_exempt_does_not() -> anyhow::Result<()> {
+        let metrics = Arc::new(McpMetrics::new()?);
         let app = limited_router_full(1, None, &["/exempt"]);
-        let mk = |path: &str| {
-            let addr: SocketAddr = "10.8.8.8:40000".parse().unwrap();
-            Request::builder()
+        let mk = |path: &str| -> anyhow::Result<Request<Body>> {
+            let addr: SocketAddr = "10.8.8.8:40000".parse()?;
+            Ok(Request::builder()
                 .uri(path)
                 .extension(ConnectInfo(addr))
                 .extension(Arc::clone(&metrics))
-                .body(Body::empty())
-                .unwrap()
+                .body(Body::empty())?)
         };
         let counter = || {
             metrics
@@ -6634,59 +6904,82 @@ mod tests {
                 .get()
         };
         // Exempt traffic: no budget, no counter.
-        for _ in 0..3 {
+        for _ in 0..3_u32 {
             assert_eq!(
-                app.clone().oneshot(mk("/exempt")).await.unwrap().status(),
+                app.clone().oneshot(mk("/exempt")?).await?.status(),
                 StatusCode::OK
             );
         }
         assert_eq!(counter(), 0, "exempt requests must not count as denies");
         // Exhaust then deny: counter increments exactly on the deny.
         assert_eq!(
-            app.clone().oneshot(mk("/limited")).await.unwrap().status(),
+            app.clone().oneshot(mk("/limited")?).await?.status(),
             StatusCode::OK
         );
         assert_eq!(counter(), 0);
         assert_eq!(
-            app.clone().oneshot(mk("/limited")).await.unwrap().status(),
+            app.clone().oneshot(mk("/limited")?).await?.status(),
             StatusCode::TOO_MANY_REQUESTS
         );
         assert_eq!(counter(), 1, "deny must increment the extra_route label");
+
+        Ok(())
     }
 
+    /// Pins that exempt paths without the base extra-route rate limit are
+    /// rejected.
     #[test]
-    fn validate_rejects_exempt_paths_without_base_knob() {
+    fn validate_rejects_exempt_paths_without_base_knob() -> anyhow::Result<()> {
         let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
             .with_extra_route_rate_limit_exempt_paths(["/ok"]);
-        let err = cfg.validate().expect_err("exempt paths without rate limit");
+        let err = cfg
+            .validate()
+            .err()
+            .context("exempt paths without rate limit")?;
         assert!(err.to_string().contains("requires extra_route_rate_limit"));
+
+        Ok(())
     }
 
+    /// Pins that empty and slash-less exempt paths are rejected with the
+    /// documented message.
     #[test]
-    fn validate_rejects_malformed_exempt_paths() {
+    fn validate_rejects_malformed_exempt_paths() -> anyhow::Result<()> {
         for bad in ["", "no-slash"] {
             let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
                 .with_extra_route_rate_limit(10)
                 .with_extra_route_rate_limit_exempt_paths([bad]);
-            let err = cfg.validate().expect_err("malformed exempt path");
+            let err = cfg.validate().err().context("malformed exempt path")?;
             assert!(
                 err.to_string()
                     .contains("must be non-empty and start with '/'"),
                 "entry {bad:?}: {err}"
             );
         }
+
+        Ok(())
     }
 
+    /// Pins that a well-formed `/.well-known/...` exempt path passes
+    /// validation alongside an enabled extra-route rate limit.
     #[test]
-    fn validate_accepts_wellformed_exempt_paths() {
+    fn validate_accepts_wellformed_exempt_paths() -> anyhow::Result<()> {
         let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
             .with_extra_route_rate_limit(10)
             .with_extra_route_rate_limit_exempt_paths(["/.well-known/oauth-authorization-server"]);
-        assert!(cfg.validate().is_ok());
+        drop(cfg.validate()?);
+
+        Ok(())
     }
 
+    /// Pins the log-related defaults of a fresh `McpServerConfig`: an empty
+    /// `LogContextConfig` and the health-check exclusion list.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/transport.rs::new_config_defaults_log_settings — keeps the uniform IS-7 test signature while it only constructs values"
+    )]
     #[test]
-    fn new_config_defaults_log_settings() {
+    fn new_config_defaults_log_settings() -> anyhow::Result<()> {
         let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0");
         assert_eq!(cfg.log_context, LogContextConfig::default());
         assert!(!cfg.log_context.client_ip);
@@ -6700,10 +6993,14 @@ mod tests {
         assert!(!cfg.log_context.credential_fingerprint);
         assert!(!cfg.log_context.request_completion);
         assert_eq!(cfg.request_log_exclude_paths, vec!["/healthz", "/readyz"]);
+
+        Ok(())
     }
 
+    /// Pins that `LogContextConfig::recommended` enables only the low-risk
+    /// context fields and that its output still validates.
     #[test]
-    fn log_context_recommended_enables_low_risk_set() {
+    fn log_context_recommended_enables_low_risk_set() -> anyhow::Result<()> {
         let recommended = LogContextConfig::recommended();
         assert!(recommended.client_ip);
         assert!(recommended.peer_ip);
@@ -6718,7 +7015,9 @@ mod tests {
 
         let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
             .with_log_context(recommended);
-        assert!(cfg.validate().is_ok());
+        drop(cfg.validate()?);
+
+        Ok(())
     }
 
     #[test]
@@ -6839,22 +7138,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn extra_route_limiter_burst_allows_initial_spike() {
+    async fn extra_route_limiter_burst_allows_initial_spike() -> anyhow::Result<()> {
         let app = limited_router_with_burst(1, Some(3));
         for i in 0..3 {
-            let resp = app.clone().oneshot(limited_req("10.4.4.4")).await.unwrap();
+            let resp = app.clone().oneshot(limited_req("10.4.4.4")?).await.unwrap();
             assert_eq!(resp.status(), StatusCode::OK, "burst request {i}");
         }
-        let resp = app.clone().oneshot(limited_req("10.4.4.4")).await.unwrap();
+        let resp = app.clone().oneshot(limited_req("10.4.4.4")?).await.unwrap();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn extra_route_limiter_deny_sets_retry_after() {
+    async fn extra_route_limiter_deny_sets_retry_after() -> anyhow::Result<()> {
         let app = limited_router(1);
-        let ok = app.clone().oneshot(limited_req("10.5.5.5")).await.unwrap();
+        let ok = app.clone().oneshot(limited_req("10.5.5.5")?).await.unwrap();
         assert_eq!(ok.status(), StatusCode::OK);
-        let denied = app.clone().oneshot(limited_req("10.5.5.5")).await.unwrap();
+        let denied = app.clone().oneshot(limited_req("10.5.5.5")?).await.unwrap();
         assert_eq!(denied.status(), StatusCode::TOO_MANY_REQUESTS);
         let retry_after = denied
             .headers()
@@ -6865,6 +7166,8 @@ mod tests {
             .parse::<u64>()
             .unwrap();
         assert!(retry_after >= 1, "delta-seconds must be >= 1");
+
+        Ok(())
     }
 
     #[test]
@@ -7104,7 +7407,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_id_taken_from_trusted_peer_last_occurrence() {
+    async fn request_id_taken_from_trusted_peer_last_occurrence() -> anyhow::Result<()> {
         let app = request_id_probe_router(Some(request_id_resolver(Some("x-request-id"))));
         let resp = app
             .oneshot(request_id_probe_req(
@@ -7113,28 +7416,32 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(body_string(resp).await, "router-1");
+        assert_eq!(body_string(resp).await?, "router-1");
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn request_id_ignored_from_untrusted_peer() {
+    async fn request_id_ignored_from_untrusted_peer() -> anyhow::Result<()> {
         let app = request_id_probe_router(Some(request_id_resolver(Some("x-request-id"))));
         let resp = app
             .oneshot(request_id_probe_req("10.9.9.9:5555", &["router-1"]))
             .await
             .unwrap();
-        assert_eq!(body_string(resp).await, "");
+        assert_eq!(body_string(resp).await?, "");
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn request_id_sanitized_and_bounded() {
+    async fn request_id_sanitized_and_bounded() -> anyhow::Result<()> {
         let app = request_id_probe_router(Some(request_id_resolver(Some("x-request-id"))));
         let resp = app
             .clone()
             .oneshot(request_id_probe_req("127.0.0.1:5555", &["a\tb"]))
             .await
             .unwrap();
-        assert_eq!(body_string(resp).await, "ab");
+        assert_eq!(body_string(resp).await?, "ab");
 
         let long = "a".repeat(200);
         let resp = app
@@ -7143,7 +7450,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            body_string(resp).await,
+            body_string(resp).await?,
             format!("{}...(truncated)", "a".repeat(128))
         );
 
@@ -7158,17 +7465,21 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(body_string(resp).await, "");
+        assert_eq!(body_string(resp).await?, "");
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn request_id_not_extracted_when_knob_off() {
+    async fn request_id_not_extracted_when_knob_off() -> anyhow::Result<()> {
         let app = request_id_probe_router(Some(request_id_resolver(None)));
         let resp = app
             .oneshot(request_id_probe_req("127.0.0.1:5555", &["router-1"]))
             .await
             .unwrap();
-        assert_eq!(body_string(resp).await, "");
+        assert_eq!(body_string(resp).await?, "");
+
+        Ok(())
     }
 
     fn knobs(f: impl FnOnce(&mut LogContextConfig)) -> LogContextConfig {
@@ -7655,7 +7966,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_api_key_through_real_wiring_names_owner_and_returns_expired_challenge() {
+    async fn expired_api_key_through_real_wiring_names_owner_and_returns_expired_challenge()
+    -> anyhow::Result<()> {
         let logs = CapturedLogs::default();
         let _guard = capture_debug_logs(logs.clone());
         let mut fields = LogContextConfig::recommended();
@@ -7692,7 +8004,7 @@ mod tests {
             .unwrap()
             .to_owned();
         assert!(challenge.contains("error_description=\"token is expired\""));
-        assert_eq!(body_string(resp).await, "unauthorized: expired credential");
+        assert_eq!(body_string(resp).await?, "unauthorized: expired credential");
         let line = logs
             .lines_containing("failure_class=expired_credential")
             .into_iter()
@@ -7700,6 +8012,8 @@ mod tests {
             .unwrap_or_else(|| panic!("missing expired auth failed line: {}", logs.contents()));
         assert!(line.contains("credential_owner=\"old-key\""), "{line}");
         assert!(line.contains("credential_rejection=expired"), "{line}");
+
+        Ok(())
     }
 
     #[tokio::test]
@@ -7759,7 +8073,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_ip_equals_direct_without_resolver() {
+    async fn client_ip_equals_direct_without_resolver() -> anyhow::Result<()> {
         let app = forwarded_probe_router(None);
         let resp = app
             .oneshot(probe_req(
@@ -7769,14 +8083,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            body_string(resp).await,
+            body_string(resp).await?,
             "10.1.2.3|10.1.2.3",
             "feature off: header ignored, ClientIp == direct"
         );
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn client_ip_resolved_for_trusted_peer() {
+    async fn client_ip_resolved_for_trusted_peer() -> anyhow::Result<()> {
         let app = forwarded_probe_router(Some(forward_resolver(
             &["10.0.0.0/8"],
             ForwardedHeaderMode::XForwardedFor,
@@ -7789,14 +8105,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            body_string(resp).await,
+            body_string(resp).await?,
             "10.0.0.1|203.0.113.7",
             "PeerAddr stays direct while ClientIp resolves"
         );
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn client_ip_falls_back_to_direct_on_malformed_header() {
+    async fn client_ip_falls_back_to_direct_on_malformed_header() -> anyhow::Result<()> {
         let app = forwarded_probe_router(Some(forward_resolver(
             &["10.0.0.0/8"],
             ForwardedHeaderMode::XForwardedFor,
@@ -7809,10 +8127,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            body_string(resp).await,
+            body_string(resp).await?,
             "10.0.0.1|10.0.0.1",
             "malformed chain falls back to the direct peer"
         );
+
+        Ok(())
     }
 
     #[test]
