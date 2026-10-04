@@ -1952,83 +1952,45 @@ fn reject_blank_redaction_salt(env_var: &str, value: &str) -> Result<(), RmcpSer
     Ok(())
 }
 
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::panic, reason = "lint-migration: src/rbac.rs")
+#[expect(
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    reason = "test code is not rendered API documentation"
 )]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::non_ascii_literal, reason = "lint-migration: src/rbac.rs")
+#[expect(
+    clippy::too_long_first_doc_paragraph,
+    reason = "test code is not rendered API documentation"
 )]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::too_long_first_doc_paragraph,
-        reason = "test code is not rendered API documentation"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::default_numeric_fallback,
-        reason = "lint-migration: src/rbac.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::unwrap_in_result, reason = "lint-migration: src/rbac.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::let_underscore_untyped, reason = "lint-migration: src/rbac.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::expect_used, reason = "lint-migration: src/rbac.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::indexing_slicing, reason = "lint-migration: src/rbac.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::unwrap_used, reason = "lint-migration: src/rbac.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::needless_raw_strings, reason = "lint-migration: src/rbac.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::single_char_lifetime_names,
-        reason = "lint-migration: src/rbac.rs"
-    )
-)]
-#[cfg_attr(
-    test,
-    expect(closure_returning_async_block, reason = "lint-migration: src/rbac.rs")
-)]
-#[cfg_attr(test, expect(unused_results, reason = "lint-migration: src/rbac.rs"))]
-#[cfg_attr(
-    test,
-    expect(let_underscore_drop, reason = "lint-migration: src/rbac.rs")
-)]
-#[cfg_attr(
-    test,
-    expect(redundant_imports, reason = "lint-migration: src/rbac.rs")
-)]
+#[expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")]
 #[cfg(test)]
 mod tests {
-    use std::net::IpAddr;
+    use core::net::SocketAddr;
+    use std::{
+        env,
+        io::{self, Write},
+        sync::Mutex,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
+    use anyhow::Context as _;
+    use axum::{Router, http::header::RETRY_AFTER, middleware, routing};
+    #[cfg(feature = "metrics")]
+    use axum::extract::ConnectInfo;
     use proptest::{collection, prelude::*};
     use serde_json::{Map, Number, Value as JsonValue};
+    use tower::ServiceExt as _;
+    use tracing::subscriber;
+    use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
-    use crate::transport::RateLimitKey;
+    #[cfg(feature = "metrics")]
+    use crate::metrics::McpMetrics;
+    use crate::{
+        auth::AuthMethod,
+        transport::{ClientIp, PeerAddr, RequestId},
+    };
 
-    fn with_rbac_env<R>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> R) -> R {
+    fn with_rbac_env<R>(vars: &[(&str, Option<&str>)], run: impl FnOnce() -> R) -> R {
         temp_env::with_vars(
             [
                 (RBAC_REDACTION_SALT_ENV, None::<&str>),
@@ -2037,79 +1999,92 @@ mod tests {
             .into_iter()
             .chain(vars.iter().copied())
             .collect::<Vec<_>>(),
-            f,
+            run,
         )
     }
 
+    /// Pins the redaction-salt env override and that its report redacts the value.
+    ///
+    /// # Panics
+    ///
+    /// The assertions panic on failure; tests fail by panicking.
     #[test]
-    fn e6_redaction_salt_env_applies_and_report_redacts_value() {
+    fn e6_redaction_salt_env_applies_and_report_redacts_value() -> anyhow::Result<()> {
         with_rbac_env(
             &[(RBAC_REDACTION_SALT_ENV, Some("s3cret"))],
-            || {
+            || -> anyhow::Result<()> {
                 let mut cfg = RbacConfig::default();
-                let report = cfg.apply_env_overrides().unwrap();
+                let report = cfg.apply_env_overrides()?;
                 assert!(cfg.redaction_salt.is_some());
                 assert_eq!(report.len(), 1);
-                assert_eq!(report[0].env_var, RBAC_REDACTION_SALT_ENV);
-                assert_eq!(report[0].target_field, "rbac.redaction_salt");
-                assert_eq!(report[0].source, EnvOverrideSource::Env);
-                assert!(report[0].value.is_none());
+                let entry = report.first().context("override report has one entry")?;
+                assert_eq!(entry.env_var, RBAC_REDACTION_SALT_ENV);
+                assert_eq!(entry.target_field, "rbac.redaction_salt");
+                assert_eq!(entry.source, EnvOverrideSource::Env);
+                assert!(entry.value.is_none());
                 assert!(!format!("{report:?}").contains("s3cret"));
+                Ok(())
             },
-        );
+        )?;
+        Ok(())
     }
 
+    /// Pins that setting both the direct and file redaction salts is rejected.
     #[test]
-    fn e7_redaction_salt_value_and_file_conflict_fails() {
+    fn e7_redaction_salt_value_and_file_conflict_fails() -> anyhow::Result<()> {
         with_rbac_env(
             &[
                 (RBAC_REDACTION_SALT_ENV, Some("direct")),
-                (
-                    RBAC_REDACTION_SALT_FILE_ENV,
-                    Some("/tmp/secret-file"),
-                ),
+                (RBAC_REDACTION_SALT_FILE_ENV, Some("/tmp/secret-file")),
             ],
-            || {
+            || -> anyhow::Result<()> {
                 let mut cfg = RbacConfig::default();
-                let err = cfg.apply_env_overrides().unwrap_err();
+                let Err(err) = cfg.apply_env_overrides() else {
+                    anyhow::bail!("direct and file redaction salts must conflict");
+                };
                 let msg = err.to_string();
                 assert!(msg.contains(RBAC_REDACTION_SALT_ENV));
                 assert!(msg.contains(RBAC_REDACTION_SALT_FILE_ENV));
+                Ok(())
             },
-        );
+        )?;
+        Ok(())
     }
 
+    /// E8 redaction salt file env reads secret and reports file source.
     #[test]
-    fn e8_redaction_salt_file_env_reads_secret_and_reports_file_source() {
-        let (file_redaction, report) = redaction_from_file("same-salt\n").expect("file salt");
+    fn e8_redaction_salt_file_env_reads_secret_and_reports_file_source() -> anyhow::Result<()> {
+        let (file_redaction, report) = redaction_from_file("same-salt\n").context("file salt")?;
         let direct_redaction = redaction_from_direct_salt("same-salt");
 
         assert_eq!(file_redaction, direct_redaction);
         assert_eq!(report.len(), 1);
-        assert_eq!(
-            report[0].env_var,
-            RBAC_REDACTION_SALT_FILE_ENV
-        );
-        assert_eq!(report[0].target_field, "rbac.redaction_salt");
-        assert_eq!(report[0].source, EnvOverrideSource::File);
-        assert!(report[0].value.is_none());
+        let entry = report.first().context("override report has one entry")?;
+        assert_eq!(entry.env_var, RBAC_REDACTION_SALT_FILE_ENV);
+        assert_eq!(entry.target_field, "rbac.redaction_salt");
+        assert_eq!(entry.source, EnvOverrideSource::File);
+        assert!(entry.value.is_none());
+        Ok(())
     }
 
+    /// Redaction salt file normalizes crlf and preserves spaces.
     #[test]
-    fn redaction_salt_file_normalizes_crlf_and_preserves_spaces() {
-        let (crlf_redaction, _) = redaction_from_file("same-salt\r\n").expect("crlf salt");
+    fn redaction_salt_file_normalizes_crlf_and_preserves_spaces() -> anyhow::Result<()> {
+        let (crlf_redaction, _) = redaction_from_file("same-salt\r\n").context("crlf salt")?;
         assert_eq!(crlf_redaction, redaction_from_direct_salt("same-salt"));
 
-        let (spaced_redaction, _) = redaction_from_file("  same-salt  \n").expect("spaced salt");
+        let (spaced_redaction, _) =
+            redaction_from_file("  same-salt  \n").context("spaced salt")?;
         assert_eq!(
             spaced_redaction,
             redaction_from_direct_salt("  same-salt  ")
         );
         assert_ne!(spaced_redaction, redaction_from_direct_salt("same-salt"));
+        Ok(())
     }
 
     #[derive(Clone, Default)]
-    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
 
     impl CapturedLogs {
         fn contents(&self) -> String {
@@ -2118,25 +2093,25 @@ mod tests {
         }
     }
 
-    struct CapturedLogsWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+    struct CapturedLogsWriter(Arc<Mutex<Vec<u8>>>);
 
-    impl std::io::Write for CapturedLogsWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    impl Write for CapturedLogsWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             if let Ok(mut guard) = self.0.lock() {
                 guard.extend_from_slice(buf);
             }
             Ok(buf.len())
         }
 
-        fn flush(&mut self) -> std::io::Result<()> {
+        fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
     }
 
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+    impl<'writer> MakeWriter<'writer> for CapturedLogs {
         type Writer = CapturedLogsWriter;
 
-        fn make_writer(&'a self) -> Self::Writer {
+        fn make_writer(&'writer self) -> Self::Writer {
             CapturedLogsWriter(Arc::clone(&self.0))
         }
     }
@@ -2155,7 +2130,7 @@ mod tests {
             .with_ansi(false)
             .without_time()
             .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = subscriber::set_default(subscriber);
 
         let _policy = RbacPolicy::new(config);
         logs.contents()
@@ -2168,7 +2143,7 @@ mod tests {
             .with_ansi(false)
             .without_time()
             .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = subscriber::set_default(subscriber);
 
         trigger_all_rbac_deny_lines(fields);
         logs.contents()
@@ -2194,10 +2169,12 @@ mod tests {
             vec!["*".into()],
         ));
         let denied = serde_json::json!({ "name": "forbidden", "arguments": {} });
-        let _ = enforce_tool_policy(&denied_policy, "alice", "viewer", &denied, fields);
+        let _denied_response =
+            enforce_tool_policy(&denied_policy, "alice", "viewer", &denied, fields);
 
         let host_shape = serde_json::json!({ "name": "echo", "arguments": { "host": ["bad"] } });
-        let _ = enforce_tool_policy(&denied_policy, "alice", "viewer", &host_shape, fields);
+        let _host_shape_response =
+            enforce_tool_policy(&denied_policy, "alice", "viewer", &host_shape, fields);
 
         let strict_policy = run_policy(vec![
             ArgumentAllowlist::new_required("run", "cmd", vec!["ls".into()])
@@ -2205,10 +2182,12 @@ mod tests {
         ]);
         let unknown =
             serde_json::json!({ "name": "run", "arguments": { "cmd": "ls", "danger": true } });
-        let _ = enforce_tool_policy(&strict_policy, "alice", "viewer", &unknown, fields);
+        let _unknown_response =
+            enforce_tool_policy(&strict_policy, "alice", "viewer", &unknown, fields);
         let structured =
             serde_json::json!({ "name": "run", "arguments": { "cmd": { "nested": true } } });
-        let _ = enforce_tool_policy(&strict_policy, "alice", "viewer", &structured, fields);
+        let _structured_response =
+            enforce_tool_policy(&strict_policy, "alice", "viewer", &structured, fields);
 
         let required_policy = run_policy(vec![ArgumentAllowlist::new_required(
             "run",
@@ -2216,7 +2195,8 @@ mod tests {
             vec!["ls".into()],
         )]);
         let missing = serde_json::json!({ "name": "run", "arguments": {} });
-        let _ = enforce_tool_policy(&required_policy, "alice", "viewer", &missing, fields);
+        let _missing_response =
+            enforce_tool_policy(&required_policy, "alice", "viewer", &missing, fields);
 
         let allow_policy = run_policy(vec![ArgumentAllowlist::new_required(
             "run",
@@ -2224,9 +2204,11 @@ mod tests {
             vec!["ls".into()],
         )]);
         let non_string = serde_json::json!({ "name": "run", "arguments": { "cmd": true } });
-        let _ = enforce_tool_policy(&allow_policy, "alice", "viewer", &non_string, fields);
+        let _non_string_response =
+            enforce_tool_policy(&allow_policy, "alice", "viewer", &non_string, fields);
         let not_allowed = serde_json::json!({ "name": "run", "arguments": { "cmd": "rm" } });
-        let _ = enforce_tool_policy(&allow_policy, "alice", "viewer", &not_allowed, fields);
+        let _not_allowed_response =
+            enforce_tool_policy(&allow_policy, "alice", "viewer", &not_allowed, fields);
     }
 
     fn assert_all_rbac_deny_messages_present(logs: &str) {
@@ -2243,11 +2225,12 @@ mod tests {
         }
     }
 
+    /// Rbac deny lines carry client fields when enabled.
     #[test]
-    fn rbac_deny_lines_carry_client_fields_when_enabled() {
+    fn rbac_deny_lines_carry_client_fields_when_enabled() -> anyhow::Result<()> {
         let fields = DenyLogFields {
-            client_ip: Some("198.51.100.4".parse().expect("ip parses")),
-            peer_ip: Some("10.0.0.1".parse().expect("ip parses")),
+            client_ip: Some("198.51.100.4".parse().context("ip parses")?),
+            peer_ip: Some("10.0.0.1".parse().context("ip parses")?),
             request_id: Some(Arc::from("qa-3")),
         };
 
@@ -2264,20 +2247,33 @@ mod tests {
             assert!(line.contains("peer_ip=10.0.0.1"), "{line}");
             assert!(line.contains("request_id=\"qa-3\""), "{line}");
         }
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::rbac_deny_lines_omit_client_fields_by_default keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn rbac_deny_lines_omit_client_fields_by_default() {
+    /// Rbac deny lines omit client fields by default.
+    fn rbac_deny_lines_omit_client_fields_by_default() -> anyhow::Result<()> {
         let logs = capture_rbac_deny_logs(&DenyLogFields::default());
 
         assert_all_rbac_deny_messages_present(&logs);
         assert!(!logs.contains("client_ip"), "{logs}");
         assert!(!logs.contains("peer_ip"), "{logs}");
         assert!(!logs.contains("request_id"), "{logs}");
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::optional_non_empty_argument_allowlist_warns_once_at_policy_construction keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn optional_non_empty_argument_allowlist_warns_once_at_policy_construction() {
+    /// Optional non empty argument allowlist warns once at policy construction.
+    fn optional_non_empty_argument_allowlist_warns_once_at_policy_construction()
+    -> anyhow::Result<()> {
         let config =
             allowlist_warning_policy(ArgumentAllowlist::new("run", "cmd", vec!["ls".into()]));
 
@@ -2298,10 +2294,16 @@ mod tests {
             logs.contains("required = true") && logs.contains("new_required"),
             "warning must name the remedy so an operator can act on it: {logs}"
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::required_argument_allowlist_does_not_warn_at_policy_construction keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn required_argument_allowlist_does_not_warn_at_policy_construction() {
+    /// Required argument allowlist does not warn at policy construction.
+    fn required_argument_allowlist_does_not_warn_at_policy_construction() -> anyhow::Result<()> {
         let config = allowlist_warning_policy(
             ArgumentAllowlist::new("run", "cmd", vec!["ls".into()]).with_required(true),
         );
@@ -2312,10 +2314,16 @@ mod tests {
             !logs.contains("argument allowlist is optional and fails open"),
             "required allowlist must not warn: {logs}"
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::new_required_sets_required_and_preserves_value_allowlist_behavior keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn new_required_sets_required_and_preserves_value_allowlist_behavior() {
+    /// New required sets required and preserves value allowlist behavior.
+    fn new_required_sets_required_and_preserves_value_allowlist_behavior() -> anyhow::Result<()> {
         let optional = ArgumentAllowlist::new("run", "cmd", vec!["ls".into()]);
         let required = ArgumentAllowlist::new_required("run", "cmd", vec!["ls".into()]);
 
@@ -2335,34 +2343,38 @@ mod tests {
             optional_policy.argument_allowed("viewer", "run", "cmd", "rm -rf /"),
             required_policy.argument_allowed("viewer", "run", "cmd", "rm -rf /")
         );
+        Ok(())
     }
 
+    /// Pins that blank direct redaction-salt env values fail closed.
     #[test]
-    fn blank_redaction_salt_env_values_fail_closed() {
+    fn blank_redaction_salt_env_values_fail_closed() -> anyhow::Result<()> {
         for value in ["", "\n", "   "] {
             with_rbac_env(
                 &[(RBAC_REDACTION_SALT_ENV, Some(value))],
-                || {
+                || -> anyhow::Result<()> {
                     let mut cfg = RbacConfig::default();
-                    let err = cfg.apply_env_overrides().unwrap_err();
-                    assert!(
-                        err.to_string()
-                            .contains(RBAC_REDACTION_SALT_ENV)
-                    );
+                    let Err(err) = cfg.apply_env_overrides() else {
+                        anyhow::bail!("blank redaction salt must be rejected");
+                    };
+                    assert!(err.to_string().contains(RBAC_REDACTION_SALT_ENV));
+                    Ok(())
                 },
-            );
+            )?;
         }
+        Ok(())
     }
 
+    /// Pins that blank redaction-salt file values fail closed.
     #[test]
-    fn blank_redaction_salt_file_values_fail_closed() {
+    fn blank_redaction_salt_file_values_fail_closed() -> anyhow::Result<()> {
         for value in ["", "\n", "\r\n", "   \n"] {
-            let err = redaction_from_file(value).unwrap_err();
-            assert!(
-                err.to_string()
-                    .contains(RBAC_REDACTION_SALT_FILE_ENV)
-            );
+            let Err(err) = redaction_from_file(value) else {
+                anyhow::bail!("blank redaction salt file must be rejected");
+            };
+            assert!(err.to_string().contains(RBAC_REDACTION_SALT_FILE_ENV));
         }
+        Ok(())
     }
 
     fn redaction_from_direct_salt(salt: &str) -> String {
@@ -2373,31 +2385,26 @@ mod tests {
         .redact_arg("same-argument")
     }
 
-    fn redaction_from_file(
-        content: &str,
-    ) -> Result<(String, Vec<EnvOverride>), RmcpServerKitError> {
-        let path = std::env::temp_dir().join(format!(
+    fn redaction_from_file(content: &str) -> anyhow::Result<(String, Vec<EnvOverride>)> {
+        let path = env::temp_dir().join(format!(
             "rmcp-server-kit-redaction-salt-{}.txt",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock after epoch")
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .context("clock after epoch")?
                 .as_nanos()
         ));
-        fs::write(&path, content).expect("write salt file");
+        fs::write(&path, content).context("write salt file")?;
         let path_string = path.to_string_lossy().to_string();
         let result = with_rbac_env(
-            &[(
-                RBAC_REDACTION_SALT_FILE_ENV,
-                Some(path_string.as_str()),
-            )],
-            || {
+            &[(RBAC_REDACTION_SALT_FILE_ENV, Some(path_string.as_str()))],
+            || -> anyhow::Result<(String, Vec<EnvOverride>)> {
                 let mut cfg = RbacConfig::default();
                 let report = cfg.apply_env_overrides()?;
                 let redaction = RbacPolicy::new(&cfg).redact_arg("same-argument");
                 Ok((redaction, report))
             },
         );
-        fs::remove_file(path).expect("remove salt file");
+        fs::remove_file(path).context("remove salt file")?;
         result
     }
 
@@ -2406,43 +2413,46 @@ mod tests {
     /// Burst capacity admits an initial spike larger than the sustained
     /// rate; the next request within the window is denied.
     #[test]
-    fn tool_limiter_burst_allows_initial_spike() {
+    fn tool_limiter_burst_allows_initial_spike() -> anyhow::Result<()> {
         let limiter = build_tool_rate_limiter_with_policy(2, Some(4), KeyEvictionPolicy::default());
-        let ip = RateLimitKey::Ip("10.9.9.9".parse::<IpAddr>().unwrap());
-        for i in 0..4 {
+        let ip = RateLimitKey::Ip("10.9.9.9".parse::<IpAddr>().context("unexpected value")?);
+        for attempt in 0_usize..4 {
             assert!(
                 limiter.check_key(&ip).is_ok(),
-                "burst request {i} should pass"
+                "burst request {attempt} should pass"
             );
         }
         assert!(
             limiter.check_key(&ip).is_err(),
             "request 5 must exceed the burst bucket"
         );
+        Ok(())
     }
 
     /// The tool-limiter deny response carries a Retry-After header.
     #[test]
-    fn tool_limiter_deny_sets_retry_after() {
+    fn tool_limiter_deny_sets_retry_after() -> anyhow::Result<()> {
         let limiter = build_tool_rate_limiter_with_policy(1, None, KeyEvictionPolicy::default());
-        let ip = RateLimitKey::Ip("10.8.8.8".parse::<IpAddr>().unwrap());
+        let ip = RateLimitKey::Ip("10.8.8.8".parse::<IpAddr>().context("unexpected value")?);
         assert!(enforce_rate_limit(Some(&limiter), Some(&ip)).is_none());
         let resp = enforce_rate_limit(Some(&limiter), Some(&ip))
-            .expect("second call within the window must deny");
-        assert_eq!(resp.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+            .context("second call within the window must deny")?;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         let retry_after = resp
             .headers()
-            .get(axum::http::header::RETRY_AFTER)
-            .expect("Retry-After present")
+            .get(RETRY_AFTER)
+            .context("Retry-After present")?
             .to_str()
-            .unwrap()
+            .context("unexpected value")?
             .parse::<u64>()
-            .unwrap();
+            .context("unexpected value")?;
         assert!(retry_after >= 1, "delta-seconds must be >= 1");
+        Ok(())
     }
 
+    /// Tool limiter capacity full returns 503 without retry after.
     #[test]
-    fn tool_limiter_capacity_full_returns_503_without_retry_after() {
+    fn tool_limiter_capacity_full_returns_503_without_retry_after() -> anyhow::Result<()> {
         let limiter = build_tool_rate_limiter_with_bounds(
             10,
             None,
@@ -2450,19 +2460,17 @@ mod tests {
             Duration::from_hours(1),
             KeyEvictionPolicy::RejectNew,
         );
-        let established = RateLimitKey::Ip("10.8.8.8".parse::<IpAddr>().unwrap());
-        let unseen = RateLimitKey::Ip("10.8.8.9".parse::<IpAddr>().unwrap());
+        let established =
+            RateLimitKey::Ip("10.8.8.8".parse::<IpAddr>().context("unexpected value")?);
+        let unseen = RateLimitKey::Ip("10.8.8.9".parse::<IpAddr>().context("unexpected value")?);
         assert!(enforce_rate_limit(Some(&limiter), Some(&established)).is_none());
 
         let resp = enforce_rate_limit(Some(&limiter), Some(&unseen))
-            .expect("unseen key must be rejected at capacity");
+            .context("unseen key must be rejected at capacity")?;
 
-        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
-        assert!(
-            resp.headers()
-                .get(axum::http::header::RETRY_AFTER)
-                .is_none()
-        );
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(resp.headers().get(RETRY_AFTER).is_none());
+        Ok(())
     }
 
     fn test_policy() -> RbacPolicy {
@@ -2536,58 +2544,99 @@ mod tests {
 
     // -- glob_match tests --
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::glob_exact_match keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn glob_exact_match() {
+    /// Glob exact match.
+    fn glob_exact_match() -> anyhow::Result<()> {
         assert!(glob_match("web-prod-1", "web-prod-1"));
         assert!(!glob_match("web-prod-1", "web-prod-2"));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::glob_star_suffix keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn glob_star_suffix() {
+    /// Glob star suffix.
+    fn glob_star_suffix() -> anyhow::Result<()> {
         assert!(glob_match("web-*", "web-prod-1"));
         assert!(glob_match("web-*", "web-staging"));
         assert!(!glob_match("web-*", "api-prod"));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::glob_star_prefix keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn glob_star_prefix() {
+    /// Glob star prefix.
+    fn glob_star_prefix() -> anyhow::Result<()> {
         assert!(glob_match("*-prod", "web-prod"));
         assert!(glob_match("*-prod", "api-prod"));
         assert!(!glob_match("*-prod", "web-staging"));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::glob_star_middle keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn glob_star_middle() {
+    /// Glob star middle.
+    fn glob_star_middle() -> anyhow::Result<()> {
         assert!(glob_match("web-*-prod", "web-us-prod"));
         assert!(glob_match("web-*-prod", "web-eu-east-prod"));
         assert!(!glob_match("web-*-prod", "web-staging"));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::glob_star_only keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn glob_star_only() {
+    /// Glob star only.
+    fn glob_star_only() -> anyhow::Result<()> {
         assert!(glob_match("*", "anything"));
         assert!(glob_match("*", ""));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::glob_multiple_stars keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn glob_multiple_stars() {
+    /// Glob multiple stars.
+    fn glob_multiple_stars() -> anyhow::Result<()> {
         assert!(glob_match("*web*prod*", "my-web-us-prod-1"));
         assert!(!glob_match("*web*prod*", "my-api-us-staging"));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::glob_match_multibyte_utf8 keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
     /// Pin char-boundary behavior of the `get(..)`-based slicing across
     /// multi-byte UTF-8 text: offsets derived from `starts_with` /
     /// `ends_with` / `find` are always boundary-aligned, and matching
     /// must behave identically to the ASCII cases.
-    #[test]
-    fn glob_match_multibyte_utf8() {
-        assert!(glob_match("hé*llo", "héllo"));
-        assert!(glob_match("*ö*", "wörld"));
-        assert!(glob_match("über*", "übermensch"));
-        assert!(glob_match("*界", "世界"));
-        assert!(!glob_match("hé*llo", "hello"));
-        assert!(!glob_match("界*", "世界"));
-        assert!(glob_match("世*界", "世界"));
+    fn glob_match_multibyte_utf8() -> anyhow::Result<()> {
+        assert!(glob_match("h\u{e9}*llo", "h\u{e9}llo"));
+        assert!(glob_match("*\u{f6}*", "w\u{f6}rld"));
+        assert!(glob_match("\u{fc}ber*", "\u{fc}bermensch"));
+        assert!(glob_match("*\u{754c}", "\u{4e16}\u{754c}"));
+        assert!(!glob_match("h\u{e9}*llo", "hello"));
+        assert!(!glob_match("\u{754c}*", "\u{4e16}\u{754c}"));
+        assert!(glob_match("\u{4e16}*\u{754c}", "\u{4e16}\u{754c}"));
+        Ok(())
     }
 
     // -- glob_match boundary / mutation-coverage tests --
@@ -2597,66 +2646,90 @@ mod tests {
     // CI run #84, May 2026). Each test is annotated with the mutation
     // it kills so the intent survives future refactors.
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::glob_prefix_and_suffix_meet_exactly keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
     /// Kill: `if pos > end` mutated to `pos == end` and `pos >= end`
     /// at `glob_match` line 863. The prefix and suffix exactly meet
     /// (no characters between them); the original code accepts this,
     /// both mutants reject it.
-    #[test]
-    fn glob_prefix_and_suffix_meet_exactly() {
+    fn glob_prefix_and_suffix_meet_exactly() -> anyhow::Result<()> {
         // parts = ["ab", "cd"]; first.len()=2, end=text.len()-last.len()=2.
         // pos == end → original passes the `pos > end` check, mutants fail.
         assert!(glob_match("ab*cd", "abcd"));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::glob_middle_segment_required_with_suffix keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
     /// Kill: `parts.len() - 1` mutated to `parts.len() + 1` at line 868
     /// (middle-parts slice when pattern has a non-empty suffix). The
     /// mutant collapses the middle-parts slice to empty, which would
     /// incorrectly accept patterns whose middle segment isn't present.
-    #[test]
-    fn glob_middle_segment_required_with_suffix() {
+    fn glob_middle_segment_required_with_suffix() -> anyhow::Result<()> {
         // Pattern requires "b" between "a" and "c"; text omits it.
         // Original: middle_parts=["b"], match_middle("xy", ["b"])=false → reject.
         // Mutant `+`: middle_parts=[] (slice out of bounds → unwrap_or_default),
         //             match_middle("xy", [])=true → wrongly accept.
         assert!(!glob_match("a*b*c", "axyc"));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::glob_match_middle_advances_past_matched_part keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
     /// Kill: `idx + part.len()` mutated to `idx - part.len()` at
     /// `match_middle` line 885. The mutant either underflows
     /// (panic in test) or fails to advance past the matched part,
     /// causing it to re-find the same prefix and accept patterns
     /// that should be rejected.
-    #[test]
-    fn glob_match_middle_advances_past_matched_part() {
+    fn glob_match_middle_advances_past_matched_part() -> anyhow::Result<()> {
         // Original: after finding "ab" at idx 2, advance to text[4..]="_yz",
         //           which contains no second "ab" → reject.
         // Mutant `-`: text[2-2..]="xxab_yz" → re-finds "ab" → wrongly accept
         //             (or panics for the smaller-idx variants).
         assert!(!glob_match("*ab*ab*", "xxab_yz"));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::glob_match_middle_uses_addition_not_multiplication keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
     /// Kill: `idx + part.len()` mutated to `idx * part.len()` at
     /// `match_middle` line 885. The mutant computes a different
     /// (usually larger) advance offset that produces an out-of-bounds
     /// slice and panics, or skips over content that should match.
-    #[test]
-    fn glob_match_middle_uses_addition_not_multiplication() {
+    fn glob_match_middle_uses_addition_not_multiplication() -> anyhow::Result<()> {
         // Original: find "abcde" at idx 8 in "yyyyyyyyabcde_X", advance
         //           to text[13..]="_X", find "X" → accept.
         // Mutant `*`: text[8*5..]=text[40..] → out-of-bounds → panic.
         assert!(glob_match("*abcde*X*", "yyyyyyyyabcde_X"));
+        Ok(())
     }
 
     // -- RbacPolicy::argument_allowed mutation-coverage tests --
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::argument_allowed_glob_pattern_with_literal_mismatch_still_enforced keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
     /// Kill: `&&` mutated to `||` at `argument_allowed` line 494.
     /// The original short-circuits the allowlist lookup only when both
     /// the literal name AND the glob fail to match. The mutant
     /// short-circuits when EITHER fails, which means a glob-matched
     /// allowlist (literal mismatch, glob match) is silently skipped
     /// and the call is wrongly allowed.
-    #[test]
-    fn argument_allowed_glob_pattern_with_literal_mismatch_still_enforced() {
+    fn argument_allowed_glob_pattern_with_literal_mismatch_still_enforced() -> anyhow::Result<()> {
         // Allowlist registered against pattern "run-*" with allowed=["ls"].
         // Calling tool="run-foo" - literal "run-*" != "run-foo" (true),
         // but glob_match("run-*", "run-foo") = true.
@@ -2674,12 +2747,18 @@ mod tests {
         config.enabled = true;
         let policy = RbacPolicy::new(&config);
         assert!(!policy.argument_allowed("viewer", "run-foo", "cmd", "rm"));
+        Ok(())
     }
 
     // -- RbacPolicy::check tests --
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::disabled_policy_allows_everything keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn disabled_policy_allows_everything() {
+    /// Disabled policy allows everything.
+    fn disabled_policy_allows_everything() -> anyhow::Result<()> {
         let policy = RbacPolicy::new(&RbacConfig {
             enabled: false,
             roles: vec![],
@@ -2690,19 +2769,31 @@ mod tests {
             policy.check("nonexistent", "resource_delete", "any-host"),
             RbacDecision::Allow
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::unknown_role_denied keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn unknown_role_denied() {
+    /// Unknown role denied.
+    fn unknown_role_denied() -> anyhow::Result<()> {
         let policy = test_policy();
         assert_eq!(
             policy.check("unknown", "resource_list", "web-prod-1"),
             RbacDecision::Deny
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::viewer_allowed_read_ops keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn viewer_allowed_read_ops() {
+    /// Viewer allowed read ops.
+    fn viewer_allowed_read_ops() -> anyhow::Result<()> {
         let policy = test_policy();
         assert_eq!(
             policy.check("viewer", "resource_list", "web-prod-1"),
@@ -2712,10 +2803,16 @@ mod tests {
             policy.check("viewer", "system_info", "db-host"),
             RbacDecision::Allow
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::viewer_denied_write_ops keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn viewer_denied_write_ops() {
+    /// Viewer denied write ops.
+    fn viewer_denied_write_ops() -> anyhow::Result<()> {
         let policy = test_policy();
         assert_eq!(
             policy.check("viewer", "resource_run", "web-prod-1"),
@@ -2725,10 +2822,16 @@ mod tests {
             policy.check("viewer", "resource_delete", "web-prod-1"),
             RbacDecision::Deny
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::deploy_allowed_on_matching_hosts keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn deploy_allowed_on_matching_hosts() {
+    /// Deploy allowed on matching hosts.
+    fn deploy_allowed_on_matching_hosts() -> anyhow::Result<()> {
         let policy = test_policy();
         assert_eq!(
             policy.check("deploy", "resource_run", "web-prod-1"),
@@ -2738,19 +2841,31 @@ mod tests {
             policy.check("deploy", "resource_start", "api-staging"),
             RbacDecision::Allow
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::deploy_denied_on_non_matching_host keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn deploy_denied_on_non_matching_host() {
+    /// Deploy denied on non matching host.
+    fn deploy_denied_on_non_matching_host() -> anyhow::Result<()> {
         let policy = test_policy();
         assert_eq!(
             policy.check("deploy", "resource_run", "db-prod-1"),
             RbacDecision::Deny
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::deny_overrides_allow keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn deny_overrides_allow() {
+    /// Deny overrides allow.
+    fn deny_overrides_allow() -> anyhow::Result<()> {
         let policy = test_policy();
         assert_eq!(
             policy.check("deploy", "resource_delete", "web-prod-1"),
@@ -2760,10 +2875,16 @@ mod tests {
             policy.check("deploy", "resource_exec", "web-prod-1"),
             RbacDecision::Deny
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::ops_wildcard_allows_everything keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn ops_wildcard_allows_everything() {
+    /// Ops wildcard allows everything.
+    fn ops_wildcard_allows_everything() -> anyhow::Result<()> {
         let policy = test_policy();
         assert_eq!(
             policy.check("ops", "resource_delete", "any-host"),
@@ -2773,37 +2894,61 @@ mod tests {
             policy.check("ops", "secret_create", "db-host"),
             RbacDecision::Allow
         );
+        Ok(())
     }
 
     // -- host_visible tests --
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::host_visible_respects_globs keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn host_visible_respects_globs() {
+    /// Host visible respects globs.
+    fn host_visible_respects_globs() -> anyhow::Result<()> {
         let policy = test_policy();
         assert!(policy.host_visible("deploy", "web-prod-1"));
         assert!(policy.host_visible("deploy", "api-staging"));
         assert!(!policy.host_visible("deploy", "db-prod-1"));
         assert!(policy.host_visible("ops", "anything"));
         assert!(policy.host_visible("viewer", "anything"));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::host_visible_unknown_role keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn host_visible_unknown_role() {
+    /// Host visible unknown role.
+    fn host_visible_unknown_role() -> anyhow::Result<()> {
         let policy = test_policy();
         assert!(!policy.host_visible("unknown", "web-prod-1"));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::host_matching_is_ascii_case_insensitive keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn host_matching_is_ascii_case_insensitive() {
+    /// Host matching is ascii case insensitive.
+    fn host_matching_is_ascii_case_insensitive() -> anyhow::Result<()> {
         let policy = test_policy();
         assert!(policy.host_visible("deploy", "WEB-PROD-1"));
         assert!(policy.host_visible("deploy", "Web-Prod-1"));
         assert!(policy.host_visible("deploy", "API-Staging"));
         assert!(!policy.host_visible("deploy", "DB-PROD-1"));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::check_host_matching_is_ascii_case_insensitive keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn check_host_matching_is_ascii_case_insensitive() {
+    /// Check host matching is ascii case insensitive.
+    fn check_host_matching_is_ascii_case_insensitive() -> anyhow::Result<()> {
         let policy = test_policy();
         assert_eq!(
             policy.check("deploy", "resource_run", "WEB-PROD-1"),
@@ -2813,20 +2958,32 @@ mod tests {
             policy.check("deploy", "resource_run", "DB-PROD-1"),
             RbacDecision::Deny
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::check_operation_names_remain_case_sensitive keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn check_operation_names_remain_case_sensitive() {
+    /// Check operation names remain case sensitive.
+    fn check_operation_names_remain_case_sensitive() -> anyhow::Result<()> {
         let policy = test_policy();
         assert_eq!(
             policy.check("deploy", "RESOURCE_RUN", "web-prod-1"),
             RbacDecision::Deny,
             "host normalization must not leak into operation matching"
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::tool_glob_matching_remains_case_sensitive keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn tool_glob_matching_remains_case_sensitive() {
+    /// Tool glob matching remains case sensitive.
+    fn tool_glob_matching_remains_case_sensitive() -> anyhow::Result<()> {
         // Regression guard for the host-normalization change: lowercasing
         // inside `glob_match` would silently widen every tool allowlist.
         let role = RoleConfig::new("viewer", vec!["*".into()], vec!["*".into()])
@@ -2843,20 +3000,32 @@ mod tests {
             "tool patterns must not match case-insensitively"
         );
         assert!(!policy.argument_allowed("viewer", "resource_exec", "cmd", "rm"));
+        Ok(())
     }
 
     // -- argument_allowed tests --
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::argument_allowed_no_allowlist keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn argument_allowed_no_allowlist() {
+    /// Argument allowed no allowlist.
+    fn argument_allowed_no_allowlist() -> anyhow::Result<()> {
         let policy = test_policy();
         // ops has no argument_allowlists -- all values allowed
         assert!(policy.argument_allowed("ops", "resource_exec", "cmd", "rm -rf /"));
         assert!(policy.argument_allowed("ops", "resource_exec", "cmd", "bash"));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::argument_allowed_with_allowlist keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn argument_allowed_with_allowlist() {
+    /// Argument allowed with allowlist.
+    fn argument_allowed_with_allowlist() -> anyhow::Result<()> {
         let policy = test_policy();
         assert!(policy.argument_allowed("restricted-exec", "resource_exec", "cmd", "sh"));
         assert!(policy.argument_allowed(
@@ -2877,10 +3046,16 @@ mod tests {
             "cmd",
             "/usr/bin/ls -la"
         ));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::argument_denied_not_in_allowlist keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn argument_denied_not_in_allowlist() {
+    /// Argument denied not in allowlist.
+    fn argument_denied_not_in_allowlist() -> anyhow::Result<()> {
         let policy = test_policy();
         assert!(!policy.argument_allowed("restricted-exec", "resource_exec", "cmd", "rm -rf /"));
         assert!(!policy.argument_allowed(
@@ -2895,12 +3070,19 @@ mod tests {
             "cmd",
             "/usr/bin/curl evil.com"
         ));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::argument_denied_unknown_role keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn argument_denied_unknown_role() {
+    /// Argument denied unknown role.
+    fn argument_denied_unknown_role() -> anyhow::Result<()> {
         let policy = test_policy();
         assert!(!policy.argument_allowed("unknown", "resource_exec", "cmd", "sh"));
+        Ok(())
     }
 
     // -- M7: strict argument confinement (`deny_unknown_arguments`) --
@@ -2915,16 +3097,21 @@ mod tests {
 
     fn tool_call(args: serde_json::Value) -> serde_json::Value {
         let mut params = Map::new();
-        params.insert(
+        let _previous_name = params.insert(
             "name".to_owned(),
             serde_json::Value::String("run".to_owned()),
         );
-        params.insert("arguments".to_owned(), args);
+        let _previous_arguments = params.insert("arguments".to_owned(), args);
         serde_json::Value::Object(params)
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::unknown_arguments_are_admitted_when_strict_mode_is_off keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn unknown_arguments_are_admitted_when_strict_mode_is_off() {
+    /// Unknown arguments are admitted when strict mode is off.
+    fn unknown_arguments_are_admitted_when_strict_mode_is_off() -> anyhow::Result<()> {
         let policy = strict_test_policy(vec![ArgumentAllowlist::new(
             "run",
             "cmd",
@@ -2936,10 +3123,16 @@ mod tests {
                 .is_none(),
             "default behaviour must be unchanged: unnamed arguments pass"
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::strict_mode_rejects_unknown_arguments keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn strict_mode_rejects_unknown_arguments() {
+    /// Strict mode rejects unknown arguments.
+    fn strict_mode_rejects_unknown_arguments() -> anyhow::Result<()> {
         let policy = strict_test_policy(vec![
             ArgumentAllowlist::new("run", "cmd", vec!["ls".into()])
                 .with_deny_unknown_arguments(true),
@@ -2963,10 +3156,16 @@ mod tests {
             .is_none(),
             "an allowlisted argument must still pass"
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::strict_mode_rejects_structured_argument_values keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn strict_mode_rejects_structured_argument_values() {
+    /// Strict mode rejects structured argument values.
+    fn strict_mode_rejects_structured_argument_values() -> anyhow::Result<()> {
         let policy = strict_test_policy(vec![
             ArgumentAllowlist::new("run", "cmd", vec![]).with_deny_unknown_arguments(true),
         ]);
@@ -2981,10 +3180,16 @@ mod tests {
                 "object/array values cannot be constrained and must be denied"
             );
         }
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::strict_mode_permits_the_union_of_matching_allowlists keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn strict_mode_permits_the_union_of_matching_allowlists() {
+    /// Strict mode permits the union of matching allowlists.
+    fn strict_mode_permits_the_union_of_matching_allowlists() -> anyhow::Result<()> {
         // Only the first entry sets the flag, yet both arguments stay usable:
         // strict mode confines the whole `(role, tool)` pair, not one entry.
         let policy = strict_test_policy(vec![
@@ -2998,6 +3203,7 @@ mod tests {
                 .is_none(),
             "every matching allowlist's argument must remain permitted"
         );
+        Ok(())
     }
 
     // -- shlex-tokenization regression tests (1.4.1) --
@@ -3016,46 +3222,88 @@ mod tests {
         RbacPolicy::new(&config)
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::argument_allowed_matches_quoted_path_with_spaces keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn argument_allowed_matches_quoted_path_with_spaces() {
+    /// Argument allowed matches quoted path with spaces.
+    fn argument_allowed_matches_quoted_path_with_spaces() -> anyhow::Result<()> {
         let policy = shlex_policy(vec!["/usr/bin/my tool".into()]);
         assert!(policy.argument_allowed("viewer", "run", "cmd", r#""/usr/bin/my tool" --flag"#));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::argument_allowed_matches_basename_of_quoted_path keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn argument_allowed_matches_basename_of_quoted_path() {
+    /// Argument allowed matches basename of quoted path.
+    fn argument_allowed_matches_basename_of_quoted_path() -> anyhow::Result<()> {
         let policy = shlex_policy(vec!["my tool".into()]);
         assert!(policy.argument_allowed("viewer", "run", "cmd", r#""/usr/bin/my tool" --flag"#));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::argument_allowed_fails_closed_on_unbalanced_quote keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn argument_allowed_fails_closed_on_unbalanced_quote() {
+    /// Argument allowed fails closed on unbalanced quote.
+    fn argument_allowed_fails_closed_on_unbalanced_quote() -> anyhow::Result<()> {
         let policy = shlex_policy(vec!["unbalanced".into()]);
-        assert!(!policy.argument_allowed("viewer", "run", "cmd", r"unbalanced 'quote"));
+        assert!(!policy.argument_allowed("viewer", "run", "cmd", "unbalanced 'quote"));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::argument_allowed_fails_closed_on_empty_string keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn argument_allowed_fails_closed_on_empty_string() {
+    /// Argument allowed fails closed on empty string.
+    fn argument_allowed_fails_closed_on_empty_string() -> anyhow::Result<()> {
         let policy = shlex_policy(vec![String::new()]);
         assert!(!policy.argument_allowed("viewer", "run", "cmd", ""));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::argument_allowed_handles_single_quoted_executable keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn argument_allowed_handles_single_quoted_executable() {
+    /// Argument allowed handles single quoted executable.
+    fn argument_allowed_handles_single_quoted_executable() -> anyhow::Result<()> {
         let policy = shlex_policy(vec!["/bin/sh".into()]);
-        assert!(policy.argument_allowed("viewer", "run", "cmd", r"'/bin/sh' -c 'echo hi'"));
+        assert!(policy.argument_allowed("viewer", "run", "cmd", "'/bin/sh' -c 'echo hi'"));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::argument_allowed_handles_tab_separator keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn argument_allowed_handles_tab_separator() {
+    /// Argument allowed handles tab separator.
+    fn argument_allowed_handles_tab_separator() -> anyhow::Result<()> {
         let policy = shlex_policy(vec!["ls".into()]);
         assert!(policy.argument_allowed("viewer", "run", "cmd", "ls\t/etc/passwd"));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::argument_allowed_plain_token_unchanged keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn argument_allowed_plain_token_unchanged() {
+    /// Argument allowed plain token unchanged.
+    fn argument_allowed_plain_token_unchanged() -> anyhow::Result<()> {
         let policy = shlex_policy(vec!["ls".into()]);
         assert!(policy.argument_allowed("viewer", "run", "cmd", "ls"));
+        Ok(())
     }
 
     // Per Oracle review: the next four tests pin the cases the original
@@ -3063,17 +3311,28 @@ mod tests {
     // future regression to the old `split_whitespace` semantics would
     // surface as a test failure.
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::argument_allowed_fails_closed_on_quoted_empty_first_token keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn argument_allowed_fails_closed_on_quoted_empty_first_token() {
+    /// Argument allowed fails closed on quoted empty first token.
+    fn argument_allowed_fails_closed_on_quoted_empty_first_token() -> anyhow::Result<()> {
         // value r#""""# parses to Some(vec![""]). An empty argv element
         // is never a runnable executable; deny even when "" is
         // explicitly allowlisted.
         let policy = shlex_policy(vec![String::new()]);
         assert!(!policy.argument_allowed("viewer", "run", "cmd", r#""""#));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::argument_allowed_quoted_literal_token_no_longer_matches keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn argument_allowed_quoted_literal_token_no_longer_matches() {
+    /// Argument allowed quoted literal token no longer matches.
+    fn argument_allowed_quoted_literal_token_no_longer_matches() -> anyhow::Result<()> {
         // 1.4.0 behavior: split_whitespace first token = "'bash'" --
         //                 matched literal allowlist entry "'bash'".
         // 1.4.1 behavior: shlex strips the surrounding quotes -> first
@@ -3081,20 +3340,32 @@ mod tests {
         //                 entry "'bash'". Deny.
         let policy = shlex_policy(vec!["'bash'".into()]);
         assert!(!policy.argument_allowed("viewer", "run", "cmd", "'bash' -c true"));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::argument_allowed_backslash_literal_token_no_longer_matches keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn argument_allowed_backslash_literal_token_no_longer_matches() {
+    /// Argument allowed backslash literal token no longer matches.
+    fn argument_allowed_backslash_literal_token_no_longer_matches() -> anyhow::Result<()> {
         // 1.4.0 behavior: literal first token "foo\\bar" matched.
         // 1.4.1 behavior: POSIX shlex treats backslash as escape ->
         //                 first token = "foobar". Allowlist entry with
         //                 a literal backslash no longer matches. Deny.
         let policy = shlex_policy(vec![r"foo\bar".into()]);
         assert!(!policy.argument_allowed("viewer", "run", "cmd", r"foo\bar --x"));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::argument_allowed_windows_path_no_longer_matches keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn argument_allowed_windows_path_no_longer_matches() {
+    /// Argument allowed windows path no longer matches.
+    fn argument_allowed_windows_path_no_longer_matches() -> anyhow::Result<()> {
         // 1.4.0 behavior: literal Windows path matched.
         // 1.4.1 behavior: POSIX shlex eats backslashes -> path identity
         //                 changes; allowlist entry no longer matches.
@@ -3106,12 +3377,18 @@ mod tests {
             "cmd",
             r"C:\Windows\System32\cmd.exe /c dir"
         ));
+        Ok(())
     }
 
     // -- host_patterns tests --
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::host_patterns_returns_globs keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn host_patterns_returns_globs() {
+    /// Host patterns returns globs.
+    fn host_patterns_returns_globs() -> anyhow::Result<()> {
         let policy = test_policy();
         assert_eq!(
             policy.host_patterns("deploy"),
@@ -3122,12 +3399,18 @@ mod tests {
             Some(vec!["*".to_owned()].as_slice())
         );
         assert!(policy.host_patterns("nonexistent").is_none());
+        Ok(())
     }
 
     // -- check_operation tests (no host check) --
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::check_operation_allows_without_host keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn check_operation_allows_without_host() {
+    /// Check operation allows without host.
+    fn check_operation_allows_without_host() -> anyhow::Result<()> {
         let policy = test_policy();
         assert_eq!(
             policy.check_operation("deploy", "resource_run"),
@@ -3138,28 +3421,46 @@ mod tests {
             policy.check("deploy", "resource_run", "db-prod-1"),
             RbacDecision::Deny
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::check_operation_deny_overrides keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn check_operation_deny_overrides() {
+    /// Check operation deny overrides.
+    fn check_operation_deny_overrides() -> anyhow::Result<()> {
         let policy = test_policy();
         assert_eq!(
             policy.check_operation("deploy", "resource_delete"),
             RbacDecision::Deny
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::check_operation_unknown_role keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn check_operation_unknown_role() {
+    /// Check operation unknown role.
+    fn check_operation_unknown_role() -> anyhow::Result<()> {
         let policy = test_policy();
         assert_eq!(
             policy.check_operation("unknown", "resource_list"),
             RbacDecision::Deny
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::check_operation_disabled keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn check_operation_disabled() {
+    /// Check operation disabled.
+    fn check_operation_disabled() -> anyhow::Result<()> {
         let policy = RbacPolicy::new(&RbacConfig {
             enabled: false,
             roles: vec![],
@@ -3170,6 +3471,7 @@ mod tests {
             policy.check_operation("nonexistent", "anything"),
             RbacDecision::Allow
         );
+        Ok(())
     }
 
     // -- operation glob matching / global_deny tests --
@@ -3185,8 +3487,13 @@ mod tests {
         )
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::deny_glob_blocks_under_allow_all keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn deny_glob_blocks_under_allow_all() {
+    /// Deny glob blocks under allow all.
+    fn deny_glob_blocks_under_allow_all() -> anyhow::Result<()> {
         let policy = op_policy(
             RoleConfig::new("editor", vec!["*".into()], vec!["*".into()])
                 .with_deny(vec!["*_delete_*".into()]),
@@ -3203,10 +3510,16 @@ mod tests {
             policy.check_operation("editor", "jira_get_issue"),
             RbacDecision::Allow
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::deny_glob_blocks_in_host_scoped_check keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn deny_glob_blocks_in_host_scoped_check() {
+    /// Deny glob blocks in host scoped check.
+    fn deny_glob_blocks_in_host_scoped_check() -> anyhow::Result<()> {
         let policy = op_policy(
             RoleConfig::new("editor", vec!["*".into()], vec!["*".into()])
                 .with_deny(vec!["jira_delete_*".into()]),
@@ -3219,10 +3532,16 @@ mod tests {
             policy.check("editor", "jira_get_issue", "web-prod"),
             RbacDecision::Allow
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::deny_without_glob_still_matches_exactly keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn deny_without_glob_still_matches_exactly() {
+    /// Deny without glob still matches exactly.
+    fn deny_without_glob_still_matches_exactly() -> anyhow::Result<()> {
         let policy = op_policy(
             RoleConfig::new("editor", vec!["*".into()], vec!["*".into()])
                 .with_deny(vec!["delete".into()]),
@@ -3239,10 +3558,16 @@ mod tests {
             policy.check_operation("editor", "soft_delete"),
             RbacDecision::Allow
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::allow_glob_is_inert_in_legacy_mode keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn allow_glob_is_inert_in_legacy_mode() {
+    /// Allow glob is inert in legacy mode.
+    fn allow_glob_is_inert_in_legacy_mode() -> anyhow::Result<()> {
         let policy = op_policy(RoleConfig::new(
             "reader",
             vec!["jira_get_*".into()],
@@ -3256,10 +3581,16 @@ mod tests {
             policy.check_operation("reader", "jira_get_*"),
             RbacDecision::Allow
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::allow_glob_is_honored_in_glob_mode keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn allow_glob_is_honored_in_glob_mode() {
+    /// Allow glob is honored in glob mode.
+    fn allow_glob_is_honored_in_glob_mode() -> anyhow::Result<()> {
         let policy = glob_op_policy(RoleConfig::new(
             "reader",
             vec!["jira_get_*".into()],
@@ -3273,10 +3604,16 @@ mod tests {
             policy.check_operation("reader", "confluence_get_page"),
             RbacDecision::Deny
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::allow_glob_mode_preserves_case_sensitivity keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn allow_glob_mode_preserves_case_sensitivity() {
+    /// Allow glob mode preserves case sensitivity.
+    fn allow_glob_mode_preserves_case_sensitivity() -> anyhow::Result<()> {
         let policy = glob_op_policy(RoleConfig::new(
             "reader",
             vec!["Jira_*".into()],
@@ -3290,10 +3627,16 @@ mod tests {
             policy.check_operation("reader", "Jira_get_issue"),
             RbacDecision::Allow
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::allow_exact_entries_behave_identically_in_both_modes keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn allow_exact_entries_behave_identically_in_both_modes() {
+    /// Allow exact entries behave identically in both modes.
+    fn allow_exact_entries_behave_identically_in_both_modes() -> anyhow::Result<()> {
         let role = RoleConfig::new(
             "reader",
             vec!["ping".into(), "list_hosts".into()],
@@ -3308,10 +3651,16 @@ mod tests {
                 "mode divergence on glob-free allow entry for {op}"
             );
         }
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::allow_star_means_all_operations_in_both_modes keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn allow_star_means_all_operations_in_both_modes() {
+    /// Allow star means all operations in both modes.
+    fn allow_star_means_all_operations_in_both_modes() -> anyhow::Result<()> {
         let role = RoleConfig::new("admin", vec!["*".into()], vec!["*".into()]);
         for policy in [op_policy(role.clone()), glob_op_policy(role)] {
             assert_eq!(
@@ -3319,10 +3668,16 @@ mod tests {
                 RbacDecision::Allow
             );
         }
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::global_deny_vetoes_allow_all keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn global_deny_vetoes_allow_all() {
+    /// Global deny vetoes allow all.
+    fn global_deny_vetoes_allow_all() -> anyhow::Result<()> {
         let policy = RbacPolicy::new(
             &RbacConfig::with_roles(vec![RoleConfig::new(
                 "admin",
@@ -3343,10 +3698,16 @@ mod tests {
             policy.check_operation("admin", "jira_get_issue"),
             RbacDecision::Allow
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::global_deny_globs_even_in_legacy_allow_mode keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn global_deny_globs_even_in_legacy_allow_mode() {
+    /// Global deny globs even in legacy allow mode.
+    fn global_deny_globs_even_in_legacy_allow_mode() -> anyhow::Result<()> {
         let policy = RbacPolicy::new(
             &RbacConfig::with_roles(vec![RoleConfig::new(
                 "admin",
@@ -3360,10 +3721,16 @@ mod tests {
             policy.check_operation("admin", "danger_wipe"),
             RbacDecision::Deny
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::global_deny_is_inert_when_rbac_disabled keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn global_deny_is_inert_when_rbac_disabled() {
+    /// Global deny is inert when rbac disabled.
+    fn global_deny_is_inert_when_rbac_disabled() -> anyhow::Result<()> {
         let policy = RbacPolicy::new(&RbacConfig {
             enabled: false,
             global_deny: vec!["*".into()],
@@ -3373,20 +3740,32 @@ mod tests {
             policy.check_operation("anyone", "anything"),
             RbacDecision::Allow
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::global_deny_defaults_to_empty_and_changes_nothing keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn global_deny_defaults_to_empty_and_changes_nothing() {
+    /// Global deny defaults to empty and changes nothing.
+    fn global_deny_defaults_to_empty_and_changes_nothing() -> anyhow::Result<()> {
         let policy = op_policy(RoleConfig::new("admin", vec!["*".into()], vec!["*".into()]));
         assert_eq!(
             policy.check_operation("admin", "jira_delete_issue"),
             RbacDecision::Allow
         );
         assert_eq!(policy.summary().global_deny, 0);
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::empty_deny_entry_denies_only_the_empty_operation keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn empty_deny_entry_denies_only_the_empty_operation() {
+    /// Empty deny entry denies only the empty operation.
+    fn empty_deny_entry_denies_only_the_empty_operation() -> anyhow::Result<()> {
         let policy = op_policy(
             RoleConfig::new("editor", vec!["*".into()], vec!["*".into()])
                 .with_deny(vec![String::new()]),
@@ -3396,10 +3775,16 @@ mod tests {
             policy.check_operation("editor", "anything"),
             RbacDecision::Allow
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::empty_global_deny_entry_denies_only_the_empty_operation keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn empty_global_deny_entry_denies_only_the_empty_operation() {
+    /// Empty global deny entry denies only the empty operation.
+    fn empty_global_deny_entry_denies_only_the_empty_operation() -> anyhow::Result<()> {
         let policy = RbacPolicy::new(
             &RbacConfig::with_roles(vec![RoleConfig::new(
                 "admin",
@@ -3413,10 +3798,16 @@ mod tests {
             policy.check_operation("admin", "anything"),
             RbacDecision::Allow
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::star_deny_entry_denies_every_operation keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn star_deny_entry_denies_every_operation() {
+    /// Star deny entry denies every operation.
+    fn star_deny_entry_denies_every_operation() -> anyhow::Result<()> {
         let policy = op_policy(
             RoleConfig::new("editor", vec!["*".into()], vec!["*".into()])
                 .with_deny(vec!["*".into()]),
@@ -3425,10 +3816,16 @@ mod tests {
             assert_eq!(policy.check_operation("editor", op), RbacDecision::Deny);
             assert_eq!(policy.check("editor", op, "web-prod"), RbacDecision::Deny);
         }
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::star_global_deny_entry_denies_every_operation keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn star_global_deny_entry_denies_every_operation() {
+    /// Star global deny entry denies every operation.
+    fn star_global_deny_entry_denies_every_operation() -> anyhow::Result<()> {
         let policy = RbacPolicy::new(
             &RbacConfig::with_roles(vec![RoleConfig::new(
                 "admin",
@@ -3440,10 +3837,16 @@ mod tests {
         for op in ["", "ping", "jira_delete_issue"] {
             assert_eq!(policy.check_operation("admin", op), RbacDecision::Deny);
         }
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::legacy_allow_matches_a_literal_star_in_an_operation_name keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn legacy_allow_matches_a_literal_star_in_an_operation_name() {
+    /// Legacy allow matches a literal star in an operation name.
+    fn legacy_allow_matches_a_literal_star_in_an_operation_name() -> anyhow::Result<()> {
         let policy = op_policy(RoleConfig::new(
             "odd",
             vec!["weird_*_name".into()],
@@ -3457,26 +3860,34 @@ mod tests {
             policy.check_operation("odd", "weird_thing_name"),
             RbacDecision::Deny
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::deny_glob_matches_multibyte_operation_names keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn deny_glob_matches_multibyte_operation_names() {
+    /// Deny glob matches multibyte operation names.
+    fn deny_glob_matches_multibyte_operation_names() -> anyhow::Result<()> {
         let policy = op_policy(
             RoleConfig::new("editor", vec!["*".into()], vec!["*".into()])
-                .with_deny(vec!["削除_*".into()]),
+                .with_deny(vec!["\u{524a}\u{9664}_*".into()]),
         );
         assert_eq!(
-            policy.check_operation("editor", "削除_ページ"),
+            policy.check_operation("editor", "\u{524a}\u{9664}_\u{30da}\u{30fc}\u{30b8}"),
             RbacDecision::Deny
         );
         assert_eq!(
-            policy.check_operation("editor", "取得_ページ"),
+            policy.check_operation("editor", "\u{53d6}\u{5f97}_\u{30da}\u{30fc}\u{30b8}"),
             RbacDecision::Allow
         );
+        Ok(())
     }
 
+    /// Operation matching fields deserialize from toml.
     #[test]
-    fn operation_matching_fields_deserialize_from_toml() {
+    fn operation_matching_fields_deserialize_from_toml() -> anyhow::Result<()> {
         let cfg: RbacConfig = toml::from_str(
             r#"
             enabled = true
@@ -3489,7 +3900,7 @@ mod tests {
             hosts = ["*"]
             "#,
         )
-        .expect("config parses");
+        .context("config parses")?;
         assert_eq!(
             cfg.allow_operation_matching,
             AllowOperationMatching::Glob,
@@ -3506,29 +3917,45 @@ mod tests {
             policy.check_operation("ops", "jira_purge_project"),
             RbacDecision::Deny
         );
+        Ok(())
     }
 
+    /// Operation matching defaults to legacy when absent from toml.
     #[test]
-    fn operation_matching_defaults_to_legacy_when_absent_from_toml() {
-        let cfg: RbacConfig = toml::from_str("enabled = true").expect("config parses");
+    fn operation_matching_defaults_to_legacy_when_absent_from_toml() -> anyhow::Result<()> {
+        let cfg: RbacConfig = toml::from_str("enabled = true").context("config parses")?;
         assert_eq!(cfg.allow_operation_matching, AllowOperationMatching::Legacy);
         assert_eq!(cfg.global_deny, Vec::<String>::new());
+        Ok(())
     }
 
     // -- current_role / current_identity tests --
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::current_role_returns_none_outside_scope keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn current_role_returns_none_outside_scope() {
+    /// Current role returns none outside scope.
+    fn current_role_returns_none_outside_scope() -> anyhow::Result<()> {
         assert!(current_role().is_none());
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::current_identity_returns_none_outside_scope keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn current_identity_returns_none_outside_scope() {
+    /// Current identity returns none outside scope.
+    fn current_identity_returns_none_outside_scope() -> anyhow::Result<()> {
         assert!(current_identity().is_none());
+        Ok(())
     }
 
+    /// Empty task locals are all absent.
     #[tokio::test]
-    async fn empty_task_locals_are_all_absent() {
+    async fn empty_task_locals_are_all_absent() -> anyhow::Result<()> {
         with_rbac_scope(
             String::new(),
             String::new(),
@@ -3545,10 +3972,12 @@ mod tests {
             },
         )
         .await;
+        Ok(())
     }
 
+    /// Non empty task locals are all present.
     #[tokio::test]
-    async fn non_empty_task_locals_are_all_present() {
+    async fn non_empty_task_locals_are_all_present() -> anyhow::Result<()> {
         with_rbac_scope(
             "viewer".to_owned(),
             "alice".to_owned(),
@@ -3562,6 +3991,7 @@ mod tests {
             },
         )
         .await;
+        Ok(())
     }
 
     /// The reachable shape from the downstream report: a real role with an
@@ -3569,7 +3999,7 @@ mod tests {
     /// must resolve to `None` so a caller's `ok_or_else` guard fires, rather
     /// than yielding `Some("")` and being used as a per-user key.
     #[tokio::test]
-    async fn sub_or_identity_fallback_is_absent_for_empty_identity() {
+    async fn sub_or_identity_fallback_is_absent_for_empty_identity() -> anyhow::Result<()> {
         with_rbac_scope(
             "viewer".to_owned(),
             String::new(),
@@ -3584,20 +4014,15 @@ mod tests {
             },
         )
         .await;
+        Ok(())
     }
 
     // -- rbac_middleware integration tests --
 
-    use axum::{
-        body::Body,
-        http::{Method, Request, StatusCode},
-    };
-    use tower::ServiceExt as _;
-
     fn tool_call_body(tool: &str, args: &serde_json::Value) -> String {
         serde_json::json!({
             "jsonrpc": "2.0",
-            "id": 1,
+            "id": 1_u32,
             "method": "tools/call",
             "params": {
                 "name": tool,
@@ -3607,39 +4032,53 @@ mod tests {
         .to_string()
     }
 
-    fn rbac_router(policy: Arc<RbacPolicy>) -> axum::Router {
-        axum::Router::new()
-            .route("/mcp", axum::routing::post(|| async { "ok" }))
-            .layer(axum::middleware::from_fn(move |req, next| {
-                let p = Arc::clone(&policy);
-                rbac_middleware(p, None, DenyLogKnobs::default(), req, next)
+    #[expect(
+        closure_returning_async_block,
+        reason = "deliberate: src/rbac.rs::rbac_router — the per-request clone must run before the future; an async closure move-captures and does not implement FnMut"
+    )]
+    fn rbac_router(policy: Arc<RbacPolicy>) -> Router {
+        Router::new()
+            .route("/mcp", routing::post(|| async { "ok" }))
+            .layer(middleware::from_fn(move |req, next| {
+                let policy_clone = Arc::clone(&policy);
+                rbac_middleware(policy_clone, None, DenyLogKnobs::default(), req, next)
             }))
     }
 
-    fn rbac_router_with_identity(policy: Arc<RbacPolicy>, identity: AuthIdentity) -> axum::Router {
-        axum::Router::new()
-            .route("/mcp", axum::routing::post(|| async { "ok" }))
-            .layer(axum::middleware::from_fn(
+    #[expect(
+        closure_returning_async_block,
+        reason = "deliberate: src/rbac.rs::rbac_router_with_identity — the per-request clones must run before the future; an async closure move-captures and does not implement FnMut"
+    )]
+    fn rbac_router_with_identity(policy: Arc<RbacPolicy>, identity: AuthIdentity) -> Router {
+        Router::new()
+            .route("/mcp", routing::post(|| async { "ok" }))
+            .layer(middleware::from_fn(
                 move |mut req: Request<Body>, next: Next| {
-                    let p = Arc::clone(&policy);
-                    let id = identity.clone();
+                    let policy_clone = Arc::clone(&policy);
+                    let identity_clone = identity.clone();
                     async move {
-                        req.extensions_mut().insert(id);
-                        rbac_middleware(p, None, DenyLogKnobs::default(), req, next).await
+                        let _previous_identity = req.extensions_mut().insert(identity_clone);
+                        rbac_middleware(policy_clone, None, DenyLogKnobs::default(), req, next)
+                            .await
                     }
                 },
             ))
     }
 
+    #[expect(
+        closure_returning_async_block,
+        reason = "deliberate: src/rbac.rs::rbac_middleware_logs_client_fields_from_extensions — the per-request clones must run before the future; an async closure move-captures and does not implement FnMut"
+    )]
     #[tokio::test]
-    async fn rbac_middleware_logs_client_fields_from_extensions() {
+    /// Rbac middleware logs client fields from extensions.
+    async fn rbac_middleware_logs_client_fields_from_extensions() -> anyhow::Result<()> {
         let policy = Arc::new(enabled_policy(RoleConfig::new(
             "viewer",
             vec!["echo".into()],
             vec!["*".into()],
         )));
         let identity = AuthIdentity {
-            method: crate::auth::AuthMethod::BearerToken,
+            method: AuthMethod::BearerToken,
             name: "alice".into(),
             role: "viewer".into(),
             raw_token: None,
@@ -3651,37 +4090,32 @@ mod tests {
             .with_ansi(false)
             .without_time()
             .finish();
-        let app = axum::Router::new()
-            .route("/mcp", axum::routing::post(|| async { "ok" }))
-            .layer(axum::middleware::from_fn(
-                move |mut req: Request<Body>, next| {
-                    let p = Arc::clone(&policy);
-                    let id = identity.clone();
-                    async move {
-                        req.extensions_mut().insert(id);
-                        req.extensions_mut().insert(crate::transport::ClientIp::new(
-                            "198.51.100.4".parse().expect("ip parses"),
-                        ));
-                        req.extensions_mut().insert(crate::transport::PeerAddr::new(
-                            "10.0.0.1:5555".parse().expect("socket parses"),
-                        ));
-                        req.extensions_mut()
-                            .insert(crate::transport::RequestId::new("qa-4"));
-                        rbac_middleware(
-                            p,
-                            None,
-                            DenyLogKnobs {
-                                client_ip: true,
-                                peer_ip: true,
-                                request_id: true,
-                            },
-                            req,
-                            next,
-                        )
-                        .await
-                    }
-                },
-            ));
+        let client_ip: IpAddr = "198.51.100.4".parse().context("ip parses")?;
+        let peer_addr: SocketAddr = "10.0.0.1:5555".parse().context("socket parses")?;
+        let app = Router::new()
+            .route("/mcp", routing::post(|| async { "ok" }))
+            .layer(middleware::from_fn(move |mut req: Request<Body>, next| {
+                let policy_clone = Arc::clone(&policy);
+                let identity_clone = identity.clone();
+                async move {
+                    let _previous_identity = req.extensions_mut().insert(identity_clone);
+                    let _previous_client_ip = req.extensions_mut().insert(ClientIp::new(client_ip));
+                    let _previous_peer_addr = req.extensions_mut().insert(PeerAddr::new(peer_addr));
+                    let _previous_request_id = req.extensions_mut().insert(RequestId::new("qa-4"));
+                    rbac_middleware(
+                        policy_clone,
+                        None,
+                        DenyLogKnobs {
+                            client_ip: true,
+                            peer_ip: true,
+                            request_id: true,
+                        },
+                        req,
+                        next,
+                    )
+                    .await
+                }
+            }));
         let req = Request::builder()
             .method(Method::POST)
             .uri("/mcp")
@@ -3690,62 +4124,77 @@ mod tests {
                 "forbidden",
                 &serde_json::json!({}),
             )))
-            .unwrap();
+            .context("unexpected value")?;
 
-        let _guard = tracing::subscriber::set_default(subscriber);
-        let status = app.oneshot(req).await.expect("request completes").status();
+        let _guard = subscriber::set_default(subscriber);
+        let status = app
+            .oneshot(req)
+            .await
+            .context("request completes")?
+            .status();
 
         assert_eq!(status, StatusCode::FORBIDDEN);
         let contents = logs.contents();
-        let line = contents
-            .lines()
-            .find(|line| line.contains("RBAC denied"))
-            .unwrap_or_else(|| panic!("missing RBAC denied line: {contents}"));
+        let Some(line) = contents.lines().find(|line| line.contains("RBAC denied")) else {
+            anyhow::bail!("missing RBAC denied line: {contents}");
+        };
         assert!(line.contains("client_ip=198.51.100.4"), "{line}");
         assert!(line.contains("peer_ip=10.0.0.1"), "{line}");
         assert!(line.contains("request_id=\"qa-4\""), "{line}");
+        Ok(())
     }
 
+    #[cfg(feature = "metrics")]
+    #[expect(
+        closure_returning_async_block,
+        reason = "deliberate: src/rbac.rs::tool_limiter_deny_increments_counter — the per-request clones must run before the future; an async closure move-captures and does not implement FnMut"
+    )]
+    #[tokio::test]
     /// Tool-limiter deny path must increment the `tool` deny counter via
     /// the metrics handle in the request extensions - and the increment
     /// must survive the middleware's body-buffer/`from_parts` rebuild.
-    #[cfg(feature = "metrics")]
-    #[tokio::test]
-    async fn tool_limiter_deny_increments_counter() {
-        use axum::extract::ConnectInfo;
-
+    async fn tool_limiter_deny_increments_counter() -> anyhow::Result<()> {
         let policy = Arc::new(test_policy());
         let limiter = build_tool_rate_limiter_with_policy(1, None, KeyEvictionPolicy::default());
-        let metrics = Arc::new(crate::metrics::McpMetrics::new().unwrap());
+        let metrics = Arc::new(McpMetrics::new().context("metrics build")?);
         let identity = AuthIdentity {
-            method: crate::auth::AuthMethod::BearerToken,
+            method: AuthMethod::BearerToken,
             name: "alice".into(),
             role: "viewer".into(),
             raw_token: None,
             sub: None,
         };
+        let peer: SocketAddr = "10.9.9.1:40000"
+            .parse()
+            .context("static socket addr parses")?;
         let app = {
-            let metrics = Arc::clone(&metrics);
-            axum::Router::new()
-                .route("/mcp", axum::routing::post(|| async { "ok" }))
-                .layer(axum::middleware::from_fn(
+            let metrics_for_app = Arc::clone(&metrics);
+            Router::new()
+                .route("/mcp", routing::post(|| async { "ok" }))
+                .layer(middleware::from_fn(
                     move |mut req: Request<Body>, next: Next| {
-                        let p = Arc::clone(&policy);
-                        let l = Arc::clone(&limiter);
-                        let id = identity.clone();
-                        let m = Arc::clone(&metrics);
+                        let policy_clone = Arc::clone(&policy);
+                        let limiter_clone = Arc::clone(&limiter);
+                        let identity_clone = identity.clone();
+                        let metrics_clone = Arc::clone(&metrics_for_app);
                         async move {
-                            req.extensions_mut().insert(id);
-                            req.extensions_mut().insert(m);
-                            let peer: std::net::SocketAddr =
-                                "10.9.9.1:40000".parse().expect("static socket addr parses");
-                            req.extensions_mut().insert(ConnectInfo(peer));
-                            rbac_middleware(p, Some(l), DenyLogKnobs::default(), req, next).await
+                            let _previous_identity = req.extensions_mut().insert(identity_clone);
+                            let _previous_metrics = req.extensions_mut().insert(metrics_clone);
+                            let _previous_connect_info =
+                                req.extensions_mut().insert(ConnectInfo(peer));
+                            rbac_middleware(
+                                policy_clone,
+                                Some(limiter_clone),
+                                DenyLogKnobs::default(),
+                                req,
+                                next,
+                            )
+                            .await
                         }
                     },
                 ))
         };
-        let mk = || {
+        let mk = || -> anyhow::Result<Request<Body>> {
             Request::builder()
                 .method(Method::POST)
                 .uri("/mcp")
@@ -3754,7 +4203,7 @@ mod tests {
                     "resource_list",
                     &serde_json::json!({}),
                 )))
-                .unwrap()
+                .context("request builds")
         };
         let counter = || {
             metrics
@@ -3763,17 +4212,27 @@ mod tests {
                 .get()
         };
 
-        let first = app.clone().oneshot(mk()).await.unwrap();
+        let first = app
+            .clone()
+            .oneshot(mk()?)
+            .await
+            .context("request completes")?;
         assert_eq!(first.status(), StatusCode::OK);
         assert_eq!(counter(), 0, "successful call must not count");
 
-        let denied = app.clone().oneshot(mk()).await.unwrap();
+        let denied = app
+            .clone()
+            .oneshot(mk()?)
+            .await
+            .context("request completes")?;
         assert_eq!(denied.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(counter(), 1, "deny must increment the tool label");
+        Ok(())
     }
 
+    /// Middleware passes non post.
     #[tokio::test]
-    async fn middleware_passes_non_post() {
+    async fn middleware_passes_non_post() -> anyhow::Result<()> {
         let policy = Arc::new(test_policy());
         let app = rbac_router(policy);
         // GET passes through even without identity.
@@ -3781,15 +4240,17 @@ mod tests {
             .method(Method::GET)
             .uri("/mcp")
             .body(Body::empty())
-            .unwrap();
+            .context("unexpected value")?;
         // GET on a POST-only route returns 405, but the middleware itself
         // doesn't block it -- it returns next.run(req).
-        let resp = app.oneshot(req).await.unwrap();
+        let resp = app.oneshot(req).await.context("unexpected value")?;
         assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        Ok(())
     }
 
+    /// Middleware denies without identity.
     #[tokio::test]
-    async fn middleware_denies_without_identity() {
+    async fn middleware_denies_without_identity() -> anyhow::Result<()> {
         let policy = Arc::new(test_policy());
         let app = rbac_router(policy);
         let body = tool_call_body("resource_list", &serde_json::json!({}));
@@ -3798,14 +4259,15 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .body(Body::from(body))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+            .context("unexpected value")?;
+        let resp = app.oneshot(req).await.context("unexpected value")?;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        Ok(())
     }
 
     fn global_deny_identity() -> AuthIdentity {
         AuthIdentity {
-            method: crate::auth::AuthMethod::BearerToken,
+            method: AuthMethod::BearerToken,
             name: "alice".into(),
             role: "admin".into(),
             raw_token: None,
@@ -3824,46 +4286,51 @@ mod tests {
         ))
     }
 
-    async fn global_deny_call(args: serde_json::Value, tool: &str) -> StatusCode {
+    async fn global_deny_call(args: serde_json::Value, tool: &str) -> anyhow::Result<StatusCode> {
         let app = rbac_router_with_identity(global_deny_policy(), global_deny_identity());
         let req = Request::builder()
             .method(Method::POST)
             .uri("/mcp")
             .header("content-type", "application/json")
             .body(Body::from(tool_call_body(tool, &args)))
-            .unwrap();
-        app.oneshot(req).await.unwrap().status()
+            .context("request builds")?;
+        Ok(app.oneshot(req).await?.status())
     }
 
+    /// Middleware global deny blocks hostless tool call.
     #[tokio::test]
-    async fn middleware_global_deny_blocks_hostless_tool_call() {
+    async fn middleware_global_deny_blocks_hostless_tool_call() -> anyhow::Result<()> {
         assert_eq!(
-            global_deny_call(serde_json::json!({}), "jira_delete_issue").await,
+            global_deny_call(serde_json::json!({}), "jira_delete_issue").await?,
             StatusCode::FORBIDDEN
         );
         assert_eq!(
-            global_deny_call(serde_json::json!({}), "jira_get_issue").await,
+            global_deny_call(serde_json::json!({}), "jira_get_issue").await?,
             StatusCode::OK
         );
+        Ok(())
     }
 
+    /// Middleware global deny blocks host scoped tool call.
     #[tokio::test]
-    async fn middleware_global_deny_blocks_host_scoped_tool_call() {
+    async fn middleware_global_deny_blocks_host_scoped_tool_call() -> anyhow::Result<()> {
         assert_eq!(
-            global_deny_call(serde_json::json!({"host": "web-prod"}), "jira_delete_issue").await,
+            global_deny_call(serde_json::json!({"host": "web-prod"}), "jira_delete_issue").await?,
             StatusCode::FORBIDDEN
         );
         assert_eq!(
-            global_deny_call(serde_json::json!({"host": "web-prod"}), "jira_get_issue").await,
+            global_deny_call(serde_json::json!({"host": "web-prod"}), "jira_get_issue").await?,
             StatusCode::OK
         );
+        Ok(())
     }
 
+    /// Middleware allows permitted tool.
     #[tokio::test]
-    async fn middleware_allows_permitted_tool() {
+    async fn middleware_allows_permitted_tool() -> anyhow::Result<()> {
         let policy = Arc::new(test_policy());
         let id = AuthIdentity {
-            method: crate::auth::AuthMethod::BearerToken,
+            method: AuthMethod::BearerToken,
             name: "alice".into(),
             role: "viewer".into(),
             raw_token: None,
@@ -3876,16 +4343,18 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .body(Body::from(body))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+            .context("unexpected value")?;
+        let resp = app.oneshot(req).await.context("unexpected value")?;
         assert_eq!(resp.status(), StatusCode::OK);
+        Ok(())
     }
 
+    /// Middleware denies unpermitted tool.
     #[tokio::test]
-    async fn middleware_denies_unpermitted_tool() {
+    async fn middleware_denies_unpermitted_tool() -> anyhow::Result<()> {
         let policy = Arc::new(test_policy());
         let id = AuthIdentity {
-            method: crate::auth::AuthMethod::BearerToken,
+            method: AuthMethod::BearerToken,
             name: "alice".into(),
             role: "viewer".into(),
             raw_token: None,
@@ -3898,16 +4367,18 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .body(Body::from(body))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+            .context("unexpected value")?;
+        let resp = app.oneshot(req).await.context("unexpected value")?;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        Ok(())
     }
 
+    /// Middleware passes non tool call post.
     #[tokio::test]
-    async fn middleware_passes_non_tool_call_post() {
+    async fn middleware_passes_non_tool_call_post() -> anyhow::Result<()> {
         let policy = Arc::new(test_policy());
         let id = AuthIdentity {
-            method: crate::auth::AuthMethod::BearerToken,
+            method: AuthMethod::BearerToken,
             name: "alice".into(),
             role: "viewer".into(),
             raw_token: None,
@@ -3917,7 +4388,7 @@ mod tests {
         // A non-tools/call JSON-RPC (e.g. resources/list) passes through.
         let body = serde_json::json!({
             "jsonrpc": "2.0",
-            "id": 1,
+            "id": 1_u32,
             "method": "resources/list"
         })
         .to_string();
@@ -3926,16 +4397,18 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .body(Body::from(body))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+            .context("unexpected value")?;
+        let resp = app.oneshot(req).await.context("unexpected value")?;
         assert_eq!(resp.status(), StatusCode::OK);
+        Ok(())
     }
 
+    /// Middleware enforces argument allowlist.
     #[tokio::test]
-    async fn middleware_enforces_argument_allowlist() {
+    async fn middleware_enforces_argument_allowlist() -> anyhow::Result<()> {
         let policy = Arc::new(test_policy());
         let id = AuthIdentity {
-            method: crate::auth::AuthMethod::BearerToken,
+            method: AuthMethod::BearerToken,
             name: "dev".into(),
             role: "restricted-exec".into(),
             raw_token: None,
@@ -3951,27 +4424,32 @@ mod tests {
             .method(Method::POST)
             .uri("/mcp")
             .body(Body::from(body))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+            .context("unexpected value")?;
+        let resp = app.oneshot(req).await.context("unexpected value")?;
         assert_eq!(resp.status(), StatusCode::OK);
 
         // Denied command
-        let app = rbac_router_with_identity(policy, id);
-        let body = tool_call_body(
+        let app_denied = rbac_router_with_identity(policy, id);
+        let body_denied = tool_call_body(
             "resource_exec",
             &serde_json::json!({"cmd": "rm -rf /", "host": "dev-1"}),
         );
-        let req = Request::builder()
+        let req_denied = Request::builder()
             .method(Method::POST)
             .uri("/mcp")
-            .body(Body::from(body))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            .body(Body::from(body_denied))
+            .context("unexpected value")?;
+        let resp_denied = app_denied
+            .oneshot(req_denied)
+            .await
+            .context("unexpected value")?;
+        assert_eq!(resp_denied.status(), StatusCode::FORBIDDEN);
+        Ok(())
     }
 
+    /// Middleware disabled policy passes everything.
     #[tokio::test]
-    async fn middleware_disabled_policy_passes_everything() {
+    async fn middleware_disabled_policy_passes_everything() -> anyhow::Result<()> {
         let policy = Arc::new(RbacPolicy::disabled());
         let app = rbac_router(policy);
         // No identity, disabled policy -- should pass.
@@ -3980,16 +4458,18 @@ mod tests {
             .method(Method::POST)
             .uri("/mcp")
             .body(Body::from(body))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+            .context("unexpected value")?;
+        let resp = app.oneshot(req).await.context("unexpected value")?;
         assert_eq!(resp.status(), StatusCode::OK);
+        Ok(())
     }
 
+    /// Middleware batch all allowed passes.
     #[tokio::test]
-    async fn middleware_batch_all_allowed_passes() {
+    async fn middleware_batch_all_allowed_passes() -> anyhow::Result<()> {
         let policy = Arc::new(test_policy());
         let id = AuthIdentity {
-            method: crate::auth::AuthMethod::BearerToken,
+            method: AuthMethod::BearerToken,
             name: "alice".into(),
             role: "viewer".into(),
             raw_token: None,
@@ -3999,13 +4479,13 @@ mod tests {
         let body = serde_json::json!([
             {
                 "jsonrpc": "2.0",
-                "id": 1,
+                "id": 1_u32,
                 "method": "tools/call",
                 "params": { "name": "resource_list", "arguments": {} }
             },
             {
                 "jsonrpc": "2.0",
-                "id": 2,
+                "id": 2_u32,
                 "method": "tools/call",
                 "params": { "name": "system_info", "arguments": {} }
             }
@@ -4016,16 +4496,18 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .body(Body::from(body))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+            .context("unexpected value")?;
+        let resp = app.oneshot(req).await.context("unexpected value")?;
         assert_eq!(resp.status(), StatusCode::OK);
+        Ok(())
     }
 
+    /// Middleware batch with denied call rejects entire batch.
     #[tokio::test]
-    async fn middleware_batch_with_denied_call_rejects_entire_batch() {
+    async fn middleware_batch_with_denied_call_rejects_entire_batch() -> anyhow::Result<()> {
         let policy = Arc::new(test_policy());
         let id = AuthIdentity {
-            method: crate::auth::AuthMethod::BearerToken,
+            method: AuthMethod::BearerToken,
             name: "alice".into(),
             role: "viewer".into(),
             raw_token: None,
@@ -4035,13 +4517,13 @@ mod tests {
         let body = serde_json::json!([
             {
                 "jsonrpc": "2.0",
-                "id": 1,
+                "id": 1_u32,
                 "method": "tools/call",
                 "params": { "name": "resource_list", "arguments": {} }
             },
             {
                 "jsonrpc": "2.0",
-                "id": 2,
+                "id": 2_u32,
                 "method": "tools/call",
                 "params": { "name": "resource_delete", "arguments": {} }
             }
@@ -4052,16 +4534,18 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .body(Body::from(body))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+            .context("unexpected value")?;
+        let resp = app.oneshot(req).await.context("unexpected value")?;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        Ok(())
     }
 
+    /// Middleware batch mixed allowed and denied rejects.
     #[tokio::test]
-    async fn middleware_batch_mixed_allowed_and_denied_rejects() {
+    async fn middleware_batch_mixed_allowed_and_denied_rejects() -> anyhow::Result<()> {
         let policy = Arc::new(test_policy());
         let id = AuthIdentity {
-            method: crate::auth::AuthMethod::BearerToken,
+            method: AuthMethod::BearerToken,
             name: "dev".into(),
             role: "restricted-exec".into(),
             raw_token: None,
@@ -4071,7 +4555,7 @@ mod tests {
         let body = serde_json::json!([
             {
                 "jsonrpc": "2.0",
-                "id": 1,
+                "id": 1_u32,
                 "method": "tools/call",
                 "params": {
                     "name": "resource_exec",
@@ -4080,7 +4564,7 @@ mod tests {
             },
             {
                 "jsonrpc": "2.0",
-                "id": 2,
+                "id": 2_u32,
                 "method": "tools/call",
                 "params": {
                     "name": "resource_exec",
@@ -4094,48 +4578,72 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .body(Body::from(body))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+            .context("unexpected value")?;
+        let resp = app.oneshot(req).await.context("unexpected value")?;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        Ok(())
     }
 
     // -- redact_arg / redaction_salt tests --
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::redact_with_salt_is_deterministic_per_salt keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn redact_with_salt_is_deterministic_per_salt() {
+    /// Redact with salt is deterministic per salt.
+    fn redact_with_salt_is_deterministic_per_salt() -> anyhow::Result<()> {
         let salt = b"unit-test-salt";
-        let a = redact_with_salt(salt, "rm -rf /");
-        let b = redact_with_salt(salt, "rm -rf /");
-        assert_eq!(a, b, "same input + salt must yield identical hash");
-        assert_eq!(a.len(), 8, "redacted hash is 8 hex chars (4 bytes)");
+        let first = redact_with_salt(salt, "rm -rf /");
+        let second = redact_with_salt(salt, "rm -rf /");
+        assert_eq!(first, second, "same input + salt must yield identical hash");
+        assert_eq!(first.len(), 8, "redacted hash is 8 hex chars (4 bytes)");
         assert!(
-            a.chars().all(|c| c.is_ascii_hexdigit()),
-            "redacted hash must be lowercase hex: {a}"
+            first.chars().all(|ch| ch.is_ascii_hexdigit()),
+            "redacted hash must be lowercase hex: {first}"
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::redact_with_salt_differs_across_salts keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn redact_with_salt_differs_across_salts() {
-        let v = "the-same-value";
-        let h1 = redact_with_salt(b"salt-one", v);
-        let h2 = redact_with_salt(b"salt-two", v);
+    /// Redact with salt differs across salts.
+    fn redact_with_salt_differs_across_salts() -> anyhow::Result<()> {
+        let value = "the-same-value";
+        let h1 = redact_with_salt(b"salt-one", value);
+        let h2 = redact_with_salt(b"salt-two", value);
         assert_ne!(
             h1, h2,
             "different salts must produce different hashes for the same value"
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::redact_with_salt_distinguishes_values keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn redact_with_salt_distinguishes_values() {
+    /// Redact with salt distinguishes values.
+    fn redact_with_salt_distinguishes_values() -> anyhow::Result<()> {
         let salt = b"k";
         let h1 = redact_with_salt(salt, "alpha");
         let h2 = redact_with_salt(salt, "beta");
         // Hash collisions on 32 bits are 1-in-4-billion; safe to assert.
         assert_ne!(h1, h2, "different values must produce different hashes");
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::policy_with_configured_salt_redacts_consistently keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn policy_with_configured_salt_redacts_consistently() {
+    /// Policy with configured salt redacts consistently.
+    fn policy_with_configured_salt_redacts_consistently() -> anyhow::Result<()> {
         let cfg = RbacConfig {
             enabled: true,
             roles: vec![],
@@ -4149,10 +4657,16 @@ mod tests {
             p2.redact_arg("payload"),
             "policies built from the same configured salt must agree"
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::policy_without_configured_salt_uses_process_salt keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn policy_without_configured_salt_uses_process_salt() {
+    /// Policy without configured salt uses process salt.
+    fn policy_without_configured_salt_uses_process_salt() -> anyhow::Result<()> {
         let cfg = RbacConfig {
             enabled: true,
             roles: vec![],
@@ -4167,6 +4681,7 @@ mod tests {
             p2.redact_arg("payload"),
             "process-wide salt must be consistent within one process"
         );
+        Ok(())
     }
 
     // -- enforce_tool_policy identity propagation regression test (BUG H-S3) --
@@ -4181,10 +4696,10 @@ mod tests {
     /// not yet added as a dev-dep; the explicit-parameter signature alone
     /// makes the previous bug structurally impossible.
     #[tokio::test]
-    async fn deny_path_uses_explicit_identity_not_task_local() {
+    async fn deny_path_uses_explicit_identity_not_task_local() -> anyhow::Result<()> {
         let policy = Arc::new(test_policy());
         let id = AuthIdentity {
-            method: crate::auth::AuthMethod::BearerToken,
+            method: AuthMethod::BearerToken,
             name: "alice-the-auditor".into(),
             role: "viewer".into(),
             raw_token: None,
@@ -4198,16 +4713,17 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .body(Body::from(body))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+            .context("unexpected value")?;
+        let resp = app.oneshot(req).await.context("unexpected value")?;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        Ok(())
     }
 
     // -- M2 regression: non-string argument values bypass allowlist --
 
     fn restricted_exec_identity() -> AuthIdentity {
         AuthIdentity {
-            method: crate::auth::AuthMethod::BearerToken,
+            method: AuthMethod::BearerToken,
             name: "carol".into(),
             role: "restricted-exec".into(),
             raw_token: None,
@@ -4215,17 +4731,24 @@ mod tests {
         }
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/rbac.rs::has_argument_allowlist_matches_configured_tool_argument keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn has_argument_allowlist_matches_configured_tool_argument() {
+    /// Has argument allowlist matches configured tool argument.
+    fn has_argument_allowlist_matches_configured_tool_argument() -> anyhow::Result<()> {
         let policy = test_policy();
         assert!(policy.has_argument_allowlist("restricted-exec", "resource_exec", "cmd"));
         assert!(!policy.has_argument_allowlist("restricted-exec", "resource_exec", "host"));
         assert!(!policy.has_argument_allowlist("restricted-exec", "other_tool", "cmd"));
         assert!(!policy.has_argument_allowlist("ops", "resource_exec", "cmd"));
+        Ok(())
     }
 
+    /// Array arg with matching allowlist is denied.
     #[tokio::test]
-    async fn array_arg_with_matching_allowlist_is_denied() {
+    async fn array_arg_with_matching_allowlist_is_denied() -> anyhow::Result<()> {
         let policy = Arc::new(test_policy());
         let app = rbac_router_with_identity(policy, restricted_exec_identity());
         let body = tool_call_body(
@@ -4237,13 +4760,15 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .body(Body::from(body))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+            .context("unexpected value")?;
+        let resp = app.oneshot(req).await.context("unexpected value")?;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        Ok(())
     }
 
+    /// Object arg with matching allowlist is denied.
     #[tokio::test]
-    async fn object_arg_with_matching_allowlist_is_denied() {
+    async fn object_arg_with_matching_allowlist_is_denied() -> anyhow::Result<()> {
         let policy = Arc::new(test_policy());
         let app = rbac_router_with_identity(policy, restricted_exec_identity());
         let body = tool_call_body(
@@ -4255,31 +4780,35 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .body(Body::from(body))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+            .context("unexpected value")?;
+        let resp = app.oneshot(req).await.context("unexpected value")?;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        Ok(())
     }
 
+    /// Number arg with matching allowlist is denied.
     #[tokio::test]
-    async fn number_arg_with_matching_allowlist_is_denied() {
+    async fn number_arg_with_matching_allowlist_is_denied() -> anyhow::Result<()> {
         let policy = Arc::new(test_policy());
         let app = rbac_router_with_identity(policy, restricted_exec_identity());
         let body = tool_call_body(
             "resource_exec",
-            &serde_json::json!({ "host": "dev-1", "cmd": 42 }),
+            &serde_json::json!({ "host": "dev-1", "cmd": 42_u32 }),
         );
         let req = Request::builder()
             .method(Method::POST)
             .uri("/mcp")
             .header("content-type", "application/json")
             .body(Body::from(body))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+            .context("unexpected value")?;
+        let resp = app.oneshot(req).await.context("unexpected value")?;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        Ok(())
     }
 
+    /// Bool arg with matching allowlist is denied.
     #[tokio::test]
-    async fn bool_arg_with_matching_allowlist_is_denied() {
+    async fn bool_arg_with_matching_allowlist_is_denied() -> anyhow::Result<()> {
         let policy = Arc::new(test_policy());
         let app = rbac_router_with_identity(policy, restricted_exec_identity());
         let body = tool_call_body(
@@ -4291,13 +4820,15 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .body(Body::from(body))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+            .context("unexpected value")?;
+        let resp = app.oneshot(req).await.context("unexpected value")?;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        Ok(())
     }
 
+    /// Null arg with matching allowlist is denied.
     #[tokio::test]
-    async fn null_arg_with_matching_allowlist_is_denied() {
+    async fn null_arg_with_matching_allowlist_is_denied() -> anyhow::Result<()> {
         let policy = Arc::new(test_policy());
         let app = rbac_router_with_identity(policy, restricted_exec_identity());
         let body = tool_call_body(
@@ -4309,19 +4840,21 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .body(Body::from(body))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+            .context("unexpected value")?;
+        let resp = app.oneshot(req).await.context("unexpected value")?;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        Ok(())
     }
 
+    /// Non string arg without allowlist is passthrough.
     #[tokio::test]
-    async fn non_string_arg_without_allowlist_is_passthrough() {
+    async fn non_string_arg_without_allowlist_is_passthrough() -> anyhow::Result<()> {
         // ops has no argument_allowlist for any (tool, arg) tuple, so
         // non-string values must reach the handler. resource_exec is in
         // ops's allow list so the call should not be rejected by RBAC.
         let policy = Arc::new(test_policy());
         let id = AuthIdentity {
-            method: crate::auth::AuthMethod::BearerToken,
+            method: AuthMethod::BearerToken,
             name: "olivia".into(),
             role: "ops".into(),
             raw_token: None,
@@ -4337,13 +4870,15 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .body(Body::from(body))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+            .context("unexpected value")?;
+        let resp = app.oneshot(req).await.context("unexpected value")?;
         assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+        Ok(())
     }
 
+    /// String arg in allowlist still passes.
     #[tokio::test]
-    async fn string_arg_in_allowlist_still_passes() {
+    async fn string_arg_in_allowlist_still_passes() -> anyhow::Result<()> {
         let policy = Arc::new(test_policy());
         let app = rbac_router_with_identity(policy, restricted_exec_identity());
         let body = tool_call_body(
@@ -4355,9 +4890,10 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .body(Body::from(body))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+            .context("unexpected value")?;
+        let resp = app.oneshot(req).await.context("unexpected value")?;
         assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+        Ok(())
     }
 
     // -- F4 regression: non-string `host` downgraded the host-glob check --
@@ -4368,7 +4904,7 @@ mod tests {
     // globs entirely -- letting a caller reach `prod-1` by sending the
     // host as an array. Each case below returned 200 before the fix.
 
-    async fn exec_status(args: &serde_json::Value) -> StatusCode {
+    async fn exec_status(args: &serde_json::Value) -> anyhow::Result<StatusCode> {
         let policy = Arc::new(test_policy());
         let app = rbac_router_with_identity(policy, restricted_exec_identity());
         let body = tool_call_body("resource_exec", args);
@@ -4377,47 +4913,54 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .body(Body::from(body))
-            .unwrap();
-        app.oneshot(req).await.unwrap().status()
+            .context("request builds")?;
+        Ok(app.oneshot(req).await?.status())
     }
 
+    /// Non string host is denied for every json type.
     #[tokio::test]
-    async fn non_string_host_is_denied_for_every_json_type() {
+    async fn non_string_host_is_denied_for_every_json_type() -> anyhow::Result<()> {
         for host in [
             serde_json::json!(["prod-1"]),
             serde_json::json!({ "name": "prod-1" }),
-            serde_json::json!(42),
+            serde_json::json!(42_u32),
             serde_json::json!(true),
             serde_json::json!(null),
         ] {
             let args = serde_json::json!({ "host": host, "cmd": "sh" });
             assert_eq!(
-                exec_status(&args).await,
+                exec_status(&args).await?,
                 StatusCode::FORBIDDEN,
                 "non-string host must not bypass host globs: {host:?}"
             );
         }
+        Ok(())
     }
 
+    /// String host outside globs still denied.
     #[tokio::test]
-    async fn string_host_outside_globs_still_denied() {
+    async fn string_host_outside_globs_still_denied() -> anyhow::Result<()> {
         let args = serde_json::json!({ "host": "prod-1", "cmd": "sh" });
-        assert_eq!(exec_status(&args).await, StatusCode::FORBIDDEN);
+        assert_eq!(exec_status(&args).await?, StatusCode::FORBIDDEN);
+        Ok(())
     }
 
+    /// String host inside globs still allowed.
     #[tokio::test]
-    async fn string_host_inside_globs_still_allowed() {
+    async fn string_host_inside_globs_still_allowed() -> anyhow::Result<()> {
         let args = serde_json::json!({ "host": "dev-1", "cmd": "sh" });
-        assert_ne!(exec_status(&args).await, StatusCode::FORBIDDEN);
+        assert_ne!(exec_status(&args).await?, StatusCode::FORBIDDEN);
+        Ok(())
     }
 
     /// Asserts the deliberate scope boundary: an absent `host` still routes
     /// to `check_operation` so hostless tools keep working. Requiring a host
     /// unconditionally would break `ping` / `list_hosts`.
     #[tokio::test]
-    async fn absent_host_still_routes_to_check_operation() {
+    async fn absent_host_still_routes_to_check_operation() -> anyhow::Result<()> {
         let args = serde_json::json!({ "cmd": "sh" });
-        assert_ne!(exec_status(&args).await, StatusCode::FORBIDDEN);
+        assert_ne!(exec_status(&args).await?, StatusCode::FORBIDDEN);
+        Ok(())
     }
 
     // -- F5: opt-in `required` on ArgumentAllowlist --
@@ -4440,7 +4983,7 @@ mod tests {
 
     fn viewer_identity() -> AuthIdentity {
         AuthIdentity {
-            method: crate::auth::AuthMethod::BearerToken,
+            method: AuthMethod::BearerToken,
             name: "viewer-1".into(),
             role: "viewer".into(),
             raw_token: None,
@@ -4448,11 +4991,14 @@ mod tests {
         }
     }
 
-    async fn run_status(policy: RbacPolicy, params: &serde_json::Value) -> StatusCode {
+    async fn run_status(
+        policy: RbacPolicy,
+        params: &serde_json::Value,
+    ) -> anyhow::Result<StatusCode> {
         let app = rbac_router_with_identity(Arc::new(policy), viewer_identity());
         let body = serde_json::json!({
             "jsonrpc": "2.0",
-            "id": 1,
+            "id": 1_u32,
             "method": "tools/call",
             "params": params
         })
@@ -4462,103 +5008,122 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .body(Body::from(body))
-            .unwrap();
-        app.oneshot(req).await.unwrap().status()
+            .context("request builds")?;
+        Ok(app.oneshot(req).await?.status())
     }
 
+    /// Required false still allows omitting the argument.
     #[tokio::test]
-    async fn required_false_still_allows_omitting_the_argument() {
+    async fn required_false_still_allows_omitting_the_argument() -> anyhow::Result<()> {
         let params = serde_json::json!({ "name": "run", "arguments": {} });
         assert_ne!(
-            run_status(required_policy(vec!["ls".into()], false), &params).await,
+            run_status(required_policy(vec!["ls".into()], false), &params).await?,
             StatusCode::FORBIDDEN,
             "default behaviour must be unchanged"
         );
+        Ok(())
     }
 
+    /// Required true denies omitted argument.
     #[tokio::test]
-    async fn required_true_denies_omitted_argument() {
+    async fn required_true_denies_omitted_argument() -> anyhow::Result<()> {
         let params = serde_json::json!({ "name": "run", "arguments": {} });
         assert_eq!(
-            run_status(required_policy(vec!["ls".into()], true), &params).await,
+            run_status(required_policy(vec!["ls".into()], true), &params).await?,
             StatusCode::FORBIDDEN
         );
+        Ok(())
     }
 
+    /// Required true allows permitted value.
     #[tokio::test]
-    async fn required_true_allows_permitted_value() {
+    async fn required_true_allows_permitted_value() -> anyhow::Result<()> {
         let params = serde_json::json!({ "name": "run", "arguments": { "cmd": "ls -la" } });
         assert_ne!(
-            run_status(required_policy(vec!["ls".into()], true), &params).await,
+            run_status(required_policy(vec!["ls".into()], true), &params).await?,
             StatusCode::FORBIDDEN
         );
+        Ok(())
     }
 
+    /// Required true still denies disallowed value.
     #[tokio::test]
-    async fn required_true_still_denies_disallowed_value() {
+    async fn required_true_still_denies_disallowed_value() -> anyhow::Result<()> {
         let params = serde_json::json!({ "name": "run", "arguments": { "cmd": "rm -rf /" } });
         assert_eq!(
-            run_status(required_policy(vec!["ls".into()], true), &params).await,
+            run_status(required_policy(vec!["ls".into()], true), &params).await?,
             StatusCode::FORBIDDEN
         );
+        Ok(())
     }
 
+    /// Required true denies non string value.
     #[tokio::test]
-    async fn required_true_denies_non_string_value() {
+    async fn required_true_denies_non_string_value() -> anyhow::Result<()> {
         let params = serde_json::json!({ "name": "run", "arguments": { "cmd": ["ls"] } });
         assert_eq!(
-            run_status(required_policy(vec!["ls".into()], true), &params).await,
+            run_status(required_policy(vec!["ls".into()], true), &params).await?,
             StatusCode::FORBIDDEN
         );
+        Ok(())
     }
 
+    /// Required true denies absent or non object arguments.
     #[tokio::test]
-    async fn required_true_denies_absent_or_non_object_arguments() {
+    async fn required_true_denies_absent_or_non_object_arguments() -> anyhow::Result<()> {
         for params in [
             serde_json::json!({ "name": "run" }),
             serde_json::json!({ "name": "run", "arguments": "not-an-object" }),
             serde_json::json!({ "name": "run", "arguments": null }),
         ] {
             assert_eq!(
-                run_status(required_policy(vec!["ls".into()], true), &params).await,
+                run_status(required_policy(vec!["ls".into()], true), &params).await?,
                 StatusCode::FORBIDDEN,
                 "omitting the arguments object must not skip `required`: {params:?}"
             );
         }
+        Ok(())
     }
 
     // Empty `allowed` means "unrestricted value". Combined with `required`
     // that is "must be supplied as a string, any value accepted".
+    /// Required true with empty allowed accepts any string.
     #[tokio::test]
-    async fn required_true_with_empty_allowed_accepts_any_string() {
+    async fn required_true_with_empty_allowed_accepts_any_string() -> anyhow::Result<()> {
         let params =
             serde_json::json!({ "name": "run", "arguments": { "cmd": "anything at all" } });
         assert_ne!(
-            run_status(required_policy(vec![], true), &params).await,
+            run_status(required_policy(vec![], true), &params).await?,
             StatusCode::FORBIDDEN
         );
+        Ok(())
     }
 
+    /// Required true with empty allowed denies omitted argument.
     #[tokio::test]
-    async fn required_true_with_empty_allowed_denies_omitted_argument() {
+    async fn required_true_with_empty_allowed_denies_omitted_argument() -> anyhow::Result<()> {
         let params = serde_json::json!({ "name": "run", "arguments": {} });
         assert_eq!(
-            run_status(required_policy(vec![], true), &params).await,
+            run_status(required_policy(vec![], true), &params).await?,
             StatusCode::FORBIDDEN
         );
+        Ok(())
     }
 
+    /// Required true with empty allowed denies non string.
     #[tokio::test]
-    async fn required_true_with_empty_allowed_denies_non_string() {
-        let params = serde_json::json!({ "name": "run", "arguments": { "cmd": 42 } });
+    async fn required_true_with_empty_allowed_denies_non_string() -> anyhow::Result<()> {
+        let params = serde_json::json!({ "name": "run", "arguments": { "cmd": 42_u32 } });
         assert_eq!(
-            run_status(required_policy(vec![], true), &params).await,
+            run_status(required_policy(vec![], true), &params).await?,
             StatusCode::FORBIDDEN
         );
+        Ok(())
     }
 
+    /// Required honours globbed tool patterns.
     #[tokio::test]
-    async fn required_honours_globbed_tool_patterns() {
+    async fn required_honours_globbed_tool_patterns() -> anyhow::Result<()> {
         let role = RoleConfig::new("viewer", vec!["*".into()], vec!["*".into()])
             .with_argument_allowlists(vec![
                 ArgumentAllowlist::new("run-*", "cmd", vec!["ls".into()]).with_required(true),
@@ -4567,14 +5132,16 @@ mod tests {
         config.enabled = true;
         let params = serde_json::json!({ "name": "run-foo", "arguments": {} });
         assert_eq!(
-            run_status(RbacPolicy::new(&config), &params).await,
+            run_status(RbacPolicy::new(&config), &params).await?,
             StatusCode::FORBIDDEN,
             "a globbed tool pattern must enforce presence, not just value"
         );
+        Ok(())
     }
 
+    /// Required defaults to false when absent from toml.
     #[test]
-    fn required_defaults_to_false_when_absent_from_toml() {
+    fn required_defaults_to_false_when_absent_from_toml() -> anyhow::Result<()> {
         let cfg: RbacConfig = toml::from_str(
             r#"
             enabled = true
@@ -4587,28 +5154,34 @@ mod tests {
             allowed = ["ls"]
             "#,
         )
-        .expect("config without `required` must still deserialize");
+        .context("config without `required` must still deserialize")?;
+        let role = cfg.roles.first().context("one role configured")?;
+        let allowlist = role.argument_allowlists.first().context("one allowlist")?;
         assert!(
-            !cfg.roles[0].argument_allowlists[0].required,
+            !allowlist.required,
             "omitted `required` must default to false so existing configs are unchanged"
         );
+        Ok(())
     }
 
+    /// Pins that an unknown top-level RBAC config key is rejected.
     #[test]
-    fn unknown_rbac_config_key_is_rejected() {
-        let err = toml::from_str::<RbacConfig>(
+    fn unknown_rbac_config_key_is_rejected() -> anyhow::Result<()> {
+        let Err(err) = toml::from_str::<RbacConfig>(
             "
             enabled = true
             typo_roles = []
             ",
-        )
-        .unwrap_err();
+        ) else {
+            anyhow::bail!("an unknown config key must be rejected");
+        };
 
         let msg = err.to_string();
         assert!(
             msg.contains("typo_roles"),
             "error must name the offending key: {msg}"
         );
+        Ok(())
     }
 
     /// Strategy for an arbitrary JSON value, bounded in depth and size.
