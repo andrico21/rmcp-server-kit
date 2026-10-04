@@ -7,150 +7,52 @@
 //! Includes an axum middleware that inspects MCP JSON-RPC tool calls
 //! and enforces RBAC and per-IP tool rate limiting before the request
 //! reaches the handler.
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::multiple_inherent_impl, reason = "lint-migration: src/rbac.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::missing_errors_doc, reason = "lint-migration: src/rbac.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::arithmetic_side_effects,
-        reason = "lint-migration: src/rbac.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::ref_patterns, reason = "lint-migration: src/rbac.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::shadow_reuse, reason = "lint-migration: src/rbac.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::shadow_unrelated, reason = "lint-migration: src/rbac.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::let_underscore_must_use,
-        reason = "lint-migration: src/rbac.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::option_if_let_else, reason = "lint-migration: src/rbac.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::missing_panics_doc, reason = "lint-migration: src/rbac.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::missing_const_for_fn, reason = "lint-migration: src/rbac.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::module_name_repetitions,
-        reason = "lint-migration: src/rbac.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::impl_trait_in_params, reason = "lint-migration: src/rbac.rs")
-)]
-#![cfg_attr(
-    all(not(test), target_os = "linux"),
-    expect(
-        clippy::missing_docs_in_private_items,
-        reason = "lint-migration: src/rbac.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_inline_in_public_items,
-        reason = "lint-migration: src/rbac.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::min_ident_chars, reason = "lint-migration: src/rbac.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::unnecessary_safety_comment,
-        reason = "lint-migration: src/rbac.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::absolute_paths, reason = "lint-migration: src/rbac.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::unused_trait_names, reason = "lint-migration: src/rbac.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::std_instead_of_alloc, reason = "lint-migration: src/rbac.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::std_instead_of_core, reason = "lint-migration: src/rbac.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::field_scoped_visibility_modifiers,
-        reason = "lint-migration: src/rbac.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::unseparated_literal_suffix,
-        reason = "lint-migration: src/rbac.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::inline_trait_bounds, reason = "lint-migration: src/rbac.rs")
-)]
 
-use std::{net::IpAddr, num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
+extern crate alloc;
+
+use alloc::sync::Arc;
+use core::{
+    net::IpAddr,
+    num::{NonZeroU32, NonZeroUsize},
+    time::Duration,
+};
+use std::{fs, path::PathBuf, sync::LazyLock};
 
 use axum::{
     body::Body,
-    http::{Method, Request, StatusCode},
+    http::{Extensions, Method, Request, StatusCode},
     middleware::Next,
-    response::{IntoResponse, Response},
+    response::{IntoResponse as _, Response},
 };
-use hmac::{Hmac, KeyInit, Mac};
-use http_body_util::BodyExt;
-use secrecy::{ExposeSecret, SecretString};
+use hmac::{Hmac, KeyInit as _, Mac as _};
+use http_body_util::BodyExt as _;
+use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 use sha2::Sha256;
+use tracing::field;
 
+#[cfg(feature = "metrics")]
+use crate::metrics::record_rate_limit_deny;
 use crate::{
     auth::AuthIdentity,
     bounded_limiter::{BoundedKeyedLimiter, BoundedLimiterDeny, KeyEvictionPolicy},
+    config::{
+        EnvOverride, EnvOverrideSource, RBAC_REDACTION_SALT_ENV, RBAC_REDACTION_SALT_FILE_ENV,
+        normalize_text_secret_file, read_env, secret_env_report,
+    },
     error::RmcpServerKitError,
-    transport::LogContextConfig,
+    transport::{
+        LogContextConfig, RateLimitKey, limiter_client_ip, limiter_client_key, peer_ip_for_log,
+        request_id_for_log,
+    },
 };
 
 /// Per-source-IP rate limiter for tool invocations. Memory-bounded against
 /// IP-spray `DoS` via [`BoundedKeyedLimiter`].
-pub(crate) type ToolRateLimiter = BoundedKeyedLimiter<crate::transport::RateLimitKey>;
+pub(crate) type ToolRateLimiter = BoundedKeyedLimiter<RateLimitKey>;
 
 /// Default tool rate limit: 120 invocations per minute per source IP.
-// SAFETY: unwrap() is safe - literal 120 is provably non-zero (const-evaluated).
+// 120 is a non-zero literal, evaluated at compile time.
 const DEFAULT_TOOL_RATE: NonZeroU32 = NonZeroU32::new(120).unwrap();
 
 /// Default cap on the number of distinct source IPs tracked by the tool
@@ -195,12 +97,12 @@ pub(crate) fn build_tool_rate_limiter_with_bounds(
 ) -> Arc<ToolRateLimiter> {
     let mut quota =
         governor::Quota::per_minute(NonZeroU32::new(max_per_minute).unwrap_or(DEFAULT_TOOL_RATE));
-    if let Some(b) = burst.and_then(NonZeroU32::new) {
-        quota = quota.allow_burst(b);
+    if let Some(burst_override) = burst.and_then(NonZeroU32::new) {
+        quota = quota.allow_burst(burst_override);
     }
     Arc::new(BoundedKeyedLimiter::new_with_policy(
         quota,
-        std::num::NonZeroUsize::new(max_tracked_keys).unwrap_or(std::num::NonZeroUsize::MIN),
+        NonZeroUsize::new(max_tracked_keys).unwrap_or(NonZeroUsize::MIN),
         idle_eviction,
         key_eviction_policy,
     ))
@@ -252,11 +154,12 @@ tokio::task_local! {
 /// resolved role is empty (as happens when authentication is disabled), so
 /// both paths agree.
 #[must_use]
+#[inline]
 pub fn current_role() -> Option<String> {
     CURRENT_ROLE
         .try_with(Clone::clone)
         .ok()
-        .filter(|s| !s.is_empty())
+        .filter(|role| !role.is_empty())
 }
 
 /// Get the current caller's identity name (set by RBAC middleware).
@@ -273,11 +176,12 @@ pub fn current_role() -> Option<String> {
 /// `name`, which remains significant elsewhere (session-binding fingerprints,
 /// admin summaries, audit logs).
 #[must_use]
+#[inline]
 pub fn current_identity() -> Option<String> {
     CURRENT_IDENTITY
         .try_with(Clone::clone)
         .ok()
-        .filter(|s| !s.is_empty())
+        .filter(|identity| !identity.is_empty())
 }
 
 /// Get the raw bearer token for the current request as a [`SecretString`].
@@ -294,13 +198,14 @@ pub fn current_identity() -> Option<String> {
 /// backward compatibility with the prior `Option<String>` API where the
 /// empty default sentinel meant "no token".
 #[must_use]
+#[inline]
 pub fn current_token() -> Option<SecretString> {
     CURRENT_TOKEN
-        .try_with(|t| {
-            if t.expose_secret().is_empty() {
+        .try_with(|token| {
+            if token.expose_secret().is_empty() {
                 None
             } else {
-                Some(t.clone())
+                Some(token.clone())
             }
         })
         .ok()
@@ -311,11 +216,12 @@ pub fn current_token() -> Option<SecretString> {
 /// Returns `None` outside a request context or for non-JWT auth.
 /// Use for stable per-user keying (token store, etc.).
 #[must_use]
+#[inline]
 pub fn current_sub() -> Option<String> {
     CURRENT_SUB
         .try_with(Clone::clone)
         .ok()
-        .filter(|s| !s.is_empty())
+        .filter(|subject| !subject.is_empty())
 }
 
 /// Run a future with `CURRENT_TOKEN` set so that [`current_token()`] returns
@@ -324,8 +230,17 @@ pub fn current_sub() -> Option<String> {
 /// Useful when MCP tool handlers need the raw bearer token but run in a
 /// spawned task where the RBAC middleware's task-local scope is no longer
 /// active.
-pub async fn with_token_scope<F: Future>(token: SecretString, f: F) -> F::Output {
-    CURRENT_TOKEN.scope(token, f).await
+///
+/// # Cancel safety
+///
+/// Cancel-safe: the whole future runs inside `scope`, so dropping it drops
+/// `future` with no state left installed.
+#[inline]
+pub async fn with_token_scope<F>(token: SecretString, future: F) -> F::Output
+where
+    F: Future,
+{
+    CURRENT_TOKEN.scope(token, future).await
 }
 
 /// Run a future with all task-locals (`CURRENT_ROLE`, `CURRENT_IDENTITY`,
@@ -334,22 +249,40 @@ pub async fn with_token_scope<F: Future>(token: SecretString, f: F) -> F::Output
 /// Use this when re-establishing the full RBAC context in spawned tasks
 /// (e.g. rmcp session tasks) where the middleware's scope is no longer
 /// active.
-pub async fn with_rbac_scope<F: Future>(
+///
+/// # Cancel safety
+///
+/// Cancel-safe: the whole future runs inside the nested scopes, so dropping
+/// it drops `future` with no task-locals left installed.
+#[inline]
+pub async fn with_rbac_scope<F>(
     role: String,
     identity: String,
     token: SecretString,
     sub: String,
-    f: F,
-) -> F::Output {
-    with_rbac_scope_lazy(role, identity, token, sub, || f).await
+    future: F,
+) -> F::Output
+where
+    F: Future,
+{
+    with_rbac_scope_lazy(role, identity, token, sub, || future).await
 }
 
+/// Run `make()` inside all four RBAC task-local scopes.
+///
+/// The lazy form lets callers construct the future only once the scopes are
+/// installed (e.g. so `current_role()` is observable during construction).
+///
+/// # Cancel safety
+///
+/// Cancel-safe: the future is polled inside the nested scopes, so dropping
+/// the returned future drops it with no task-locals left installed.
 pub(crate) async fn with_rbac_scope_lazy<T, F, Fut>(
     role: String,
     identity: String,
     token: SecretString,
     sub: String,
-    f: F,
+    make: F,
 ) -> T
 where
     F: FnOnce() -> Fut,
@@ -361,7 +294,7 @@ where
                 .scope(identity, async move {
                     CURRENT_TOKEN
                         .scope(token, async move {
-                            CURRENT_SUB.scope(sub, async move { f().await }).await
+                            CURRENT_SUB.scope(sub, async move { make().await }).await
                         })
                         .await
                 })
@@ -399,6 +332,11 @@ pub struct RoleConfig {
 impl RoleConfig {
     /// Create a role with the given name, allowed operations, and host patterns.
     #[must_use]
+    #[expect(
+        clippy::impl_trait_in_params,
+        reason = "public API frozen until the next major release"
+    )]
+    #[inline]
     pub fn new(name: impl Into<String>, allow: Vec<String>, hosts: Vec<String>) -> Self {
         Self {
             name: name.into(),
@@ -412,6 +350,7 @@ impl RoleConfig {
 
     /// Attach denied operations to this role. Deny entries are glob-matched.
     #[must_use]
+    #[inline]
     pub fn with_deny(mut self, deny: Vec<String>) -> Self {
         self.deny = deny;
         self
@@ -419,6 +358,7 @@ impl RoleConfig {
 
     /// Attach argument allowlists to this role.
     #[must_use]
+    #[inline]
     pub fn with_argument_allowlists(mut self, allowlists: Vec<ArgumentAllowlist>) -> Self {
         self.argument_allowlists = allowlists;
         self
@@ -538,6 +478,11 @@ impl ArgumentAllowlist {
     /// the caller supplies it. Use [`new_required`](Self::new_required) when
     /// omitting the argument must fail closed.
     #[must_use]
+    #[expect(
+        clippy::impl_trait_in_params,
+        reason = "public API frozen until the next major release"
+    )]
+    #[inline]
     pub fn new(tool: impl Into<String>, argument: impl Into<String>, allowed: Vec<String>) -> Self {
         Self {
             tool: tool.into(),
@@ -553,6 +498,11 @@ impl ArgumentAllowlist {
     /// This is the recommended constructor for new policies because it fails
     /// closed when the caller omits the constrained argument.
     #[must_use]
+    #[expect(
+        clippy::impl_trait_in_params,
+        reason = "public API frozen until the next major release"
+    )]
+    #[inline]
     pub fn new_required(
         tool: impl Into<String>,
         argument: impl Into<String>,
@@ -563,6 +513,7 @@ impl ArgumentAllowlist {
 
     /// Require the argument to be present and string-valued.
     #[must_use]
+    #[inline]
     pub const fn with_required(mut self, required: bool) -> Self {
         self.required = required;
         self
@@ -573,12 +524,14 @@ impl ArgumentAllowlist {
     /// Applies to the whole `(role, tool)` pair, not just this entry: see
     /// [`deny_unknown_arguments`](Self::deny_unknown_arguments).
     #[must_use]
+    #[inline]
     pub const fn with_deny_unknown_arguments(mut self, deny: bool) -> Self {
         self.deny_unknown_arguments = deny;
         self
     }
 }
 
+/// Default host patterns: allow every host.
 fn default_hosts() -> Vec<String> {
     vec!["*".into()]
 }
@@ -613,6 +566,10 @@ pub enum AllowOperationMatching {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
+#[expect(
+    clippy::module_name_repetitions,
+    reason = "public API frozen until the next major release"
+)]
 pub struct RbacConfig {
     /// Master switch -- when false, the RBAC middleware is not installed.
     #[serde(default)]
@@ -656,6 +613,7 @@ pub struct RbacConfig {
 impl RbacConfig {
     /// Create an enabled RBAC config with the given roles.
     #[must_use]
+    #[inline]
     pub fn with_roles(roles: Vec<RoleConfig>) -> Self {
         Self {
             enabled: true,
@@ -668,6 +626,7 @@ impl RbacConfig {
 
     /// Set the server-wide operation kill switch. Entries are glob-matched.
     #[must_use]
+    #[inline]
     pub fn with_global_deny(mut self, global_deny: Vec<String>) -> Self {
         self.global_deny = global_deny;
         self
@@ -675,6 +634,11 @@ impl RbacConfig {
 
     /// Opt into glob matching for [`RoleConfig::allow`] entries.
     #[must_use]
+    #[expect(
+        clippy::missing_const_for_fn,
+        reason = "public API frozen until the next major release"
+    )]
+    #[inline]
     pub fn with_allow_operation_matching(mut self, mode: AllowOperationMatching) -> Self {
         self.allow_operation_matching = mode;
         self
@@ -684,6 +648,10 @@ impl RbacConfig {
 /// Result of an RBAC policy check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
+#[expect(
+    clippy::module_name_repetitions,
+    reason = "public API frozen until the next major release"
+)]
 pub enum RbacDecision {
     /// Caller is permitted to perform the requested operation.
     Allow,
@@ -694,6 +662,10 @@ pub enum RbacDecision {
 /// Summary of a single role, produced by [`RbacPolicy::summary`].
 #[derive(Debug, Clone, serde::Serialize)]
 #[non_exhaustive]
+#[expect(
+    clippy::module_name_repetitions,
+    reason = "public API frozen until the next major release"
+)]
 pub struct RbacRoleSummary {
     /// Role name.
     pub name: String,
@@ -710,6 +682,10 @@ pub struct RbacRoleSummary {
 /// Summary of the whole RBAC policy, produced by [`RbacPolicy::summary`].
 #[derive(Debug, Clone, serde::Serialize)]
 #[non_exhaustive]
+#[expect(
+    clippy::module_name_repetitions,
+    reason = "public API frozen until the next major release"
+)]
 pub struct RbacPolicySummary {
     /// Whether RBAC enforcement is active.
     pub enabled: bool,
@@ -726,10 +702,18 @@ pub struct RbacPolicySummary {
 /// (a handful of roles with tens of entries each).
 #[derive(Debug, Clone)]
 #[non_exhaustive]
+#[expect(
+    clippy::module_name_repetitions,
+    reason = "public API frozen until the next major release"
+)]
 pub struct RbacPolicy {
+    /// Compiled role definitions.
     roles: Vec<RoleConfig>,
+    /// Whether enforcement is active (mirrors [`RbacConfig::enabled`]).
     enabled: bool,
+    /// How `allow` entries are matched.
     allow_operation_matching: AllowOperationMatching,
+    /// Server-wide operation vetoes, always glob-matched.
     global_deny: Vec<String>,
     /// HMAC key used to redact argument values in deny logs.
     /// Either a configured stable salt or a per-process random salt.
@@ -740,6 +724,7 @@ impl RbacPolicy {
     /// Build a policy from config.  When `config.enabled` is false, all
     /// checks return [`RbacDecision::Allow`].
     #[must_use]
+    #[inline]
     pub fn new(config: &RbacConfig) -> Self {
         warn_on_optional_value_allowlists(&config.roles);
         warn_on_literal_allow_globs(&config.roles, config.allow_operation_matching);
@@ -759,6 +744,7 @@ impl RbacPolicy {
 
     /// Create a policy that always allows (RBAC disabled).
     #[must_use]
+    #[inline]
     pub fn disabled() -> Self {
         Self {
             roles: Vec::new(),
@@ -771,10 +757,16 @@ impl RbacPolicy {
 
     /// Whether RBAC enforcement is active.
     #[must_use]
+    #[expect(
+        clippy::missing_const_for_fn,
+        reason = "public API frozen until the next major release"
+    )]
+    #[inline]
     pub fn is_enabled(&self) -> bool {
         self.enabled
     }
 
+    /// The HMAC key used to redact argument values in deny logs.
     pub(crate) fn redaction_salt(&self) -> Arc<SecretString> {
         Arc::clone(&self.redaction_salt)
     }
@@ -784,16 +776,17 @@ impl RbacPolicy {
     /// Returns `(enabled, role_count, per_role_stats)` where each stat is
     /// `(name, allow_count, deny_count, host_count, argument_allowlist_count)`.
     #[must_use]
+    #[inline]
     pub fn summary(&self) -> RbacPolicySummary {
         let roles = self
             .roles
             .iter()
-            .map(|r| RbacRoleSummary {
-                name: r.name.clone(),
-                allow: r.allow.len(),
-                deny: r.deny.len(),
-                hosts: r.hosts.len(),
-                argument_allowlists: r.argument_allowlists.len(),
+            .map(|role| RbacRoleSummary {
+                name: role.name.clone(),
+                allow: role.allow.len(),
+                deny: role.deny.len(),
+                hosts: role.hosts.len(),
+                argument_allowlists: role.argument_allowlists.len(),
             })
             .collect();
         RbacPolicySummary {
@@ -808,7 +801,9 @@ impl RbacPolicy {
     /// Always glob-matched, independent of
     /// [`RbacConfig::allow_operation_matching`].
     fn global_denied(&self, operation: &str) -> bool {
-        self.global_deny.iter().any(|d| glob_match(d, operation))
+        self.global_deny
+            .iter()
+            .any(|pattern| glob_match(pattern, operation))
     }
 
     /// Whether `role_cfg` explicitly denies `operation`.
@@ -818,16 +813,19 @@ impl RbacPolicy {
     /// unaffected, while a pattern such as `"*_delete_*"` now denies rather
     /// than silently matching nothing.
     fn role_denies(role_cfg: &RoleConfig, operation: &str) -> bool {
-        role_cfg.deny.iter().any(|d| glob_match(d, operation))
+        role_cfg
+            .deny
+            .iter()
+            .any(|pattern| glob_match(pattern, operation))
     }
 
     /// Whether `role_cfg` allows `operation` under the configured matching mode.
     fn role_allows(&self, role_cfg: &RoleConfig, operation: &str) -> bool {
-        role_cfg.allow.iter().any(|a| {
-            a == "*"
+        role_cfg.allow.iter().any(|entry| {
+            entry == "*"
                 || match self.allow_operation_matching {
-                    AllowOperationMatching::Legacy => a == operation,
-                    AllowOperationMatching::Glob => glob_match(a, operation),
+                    AllowOperationMatching::Legacy => entry == operation,
+                    AllowOperationMatching::Glob => glob_match(entry, operation),
                 }
         })
     }
@@ -837,6 +835,7 @@ impl RbacPolicy {
     /// Use this for tools that don't target a specific host (e.g. `ping`,
     /// `list_hosts`).
     #[must_use]
+    #[inline]
     pub fn check_operation(&self, role: &str, operation: &str) -> RbacDecision {
         if !self.enabled {
             return RbacDecision::Allow;
@@ -866,6 +865,7 @@ impl RbacPolicy {
     /// 4. Check host visibility via glob matching (ASCII-case-insensitive;
     ///    operation names above remain case-sensitive).
     #[must_use]
+    #[inline]
     pub fn check(&self, role: &str, operation: &str, host: &str) -> RbacDecision {
         if !self.enabled {
             return RbacDecision::Allow;
@@ -892,6 +892,7 @@ impl RbacPolicy {
     ///
     /// Host matching is ASCII-case-insensitive.
     #[must_use]
+    #[inline]
     pub fn host_visible(&self, role: &str, host: &str) -> bool {
         if !self.enabled {
             return true;
@@ -904,8 +905,10 @@ impl RbacPolicy {
 
     /// Get the list of hosts patterns for a role.
     #[must_use]
+    #[inline]
     pub fn host_patterns(&self, role: &str) -> Option<&[String]> {
-        self.find_role(role).map(|r| r.hosts.as_slice())
+        self.find_role(role)
+            .map(|role_cfg| role_cfg.hosts.as_slice())
     }
 
     /// Check whether `value` passes the argument allowlists for `tool` under `role`.
@@ -947,6 +950,7 @@ impl RbacPolicy {
     ///   element is never a runnable executable, so we reject even when
     ///   `""` is in the allowlist.
     #[must_use]
+    #[inline]
     pub fn argument_allowed(&self, role: &str, tool: &str, argument: &str, value: &str) -> bool {
         if !self.enabled {
             return true;
@@ -987,7 +991,11 @@ impl RbacPolicy {
                 .rsplit('/')
                 .next()
                 .unwrap_or(first_token.as_str());
-            if !al.allowed.iter().any(|a| a == first_token || a == basename) {
+            if !al
+                .allowed
+                .iter()
+                .any(|allowed| allowed == first_token || allowed == basename)
+            {
                 return false;
             }
         }
@@ -1004,6 +1012,7 @@ impl RbacPolicy {
     /// 403. When this returns `false`, the value is unconstrained by
     /// allowlist policy.
     #[must_use]
+    #[inline]
     pub fn has_argument_allowlist(&self, role: &str, tool: &str, argument: &str) -> bool {
         if !self.enabled {
             return false;
@@ -1046,7 +1055,7 @@ impl RbacPolicy {
 
     /// Return the role config for a given role name.
     fn find_role(&self, name: &str) -> Option<&RoleConfig> {
-        self.roles.iter().find(|r| r.name == name)
+        self.roles.iter().find(|role| role.name == name)
     }
 
     /// Name of the first `required` argument that `args` fails to supply as a
@@ -1078,8 +1087,9 @@ impl RbacPolicy {
             // tool pattern enforce values but not presence.
             .filter(|al| al.tool == tool || glob_match(&al.tool, tool))
             .find(|al| {
-                !args.is_some_and(|a| {
-                    a.get(&al.argument)
+                !args.is_some_and(|arguments| {
+                    arguments
+                        .get(&al.argument)
                         .is_some_and(serde_json::Value::is_string)
                 })
             })
@@ -1111,15 +1121,15 @@ impl RbacPolicy {
         // pattern list stays allocation-free via `eq_ignore_ascii_case`.
         let host_lower = patterns
             .iter()
-            .any(|p| p.contains('*'))
+            .any(|pattern| pattern.contains('*'))
             .then(|| host.to_ascii_lowercase());
-        patterns.iter().any(|p| {
-            if p.contains('*') {
+        patterns.iter().any(|pattern| {
+            if pattern.contains('*') {
                 host_lower
                     .as_deref()
-                    .is_some_and(|h| glob_match(&p.to_ascii_lowercase(), h))
+                    .is_some_and(|lower| glob_match(&pattern.to_ascii_lowercase(), lower))
             } else {
-                p.eq_ignore_ascii_case(host)
+                pattern.eq_ignore_ascii_case(host)
             }
         })
     }
@@ -1133,6 +1143,7 @@ impl RbacPolicy {
     /// guarantees that even short or low-entropy values cannot be
     /// recovered without the key.
     #[must_use]
+    #[inline]
     pub fn redact_arg(&self, value: &str) -> String {
         redact_with_salt(self.redaction_salt.expose_secret().as_bytes(), value)
     }
@@ -1151,7 +1162,11 @@ fn warn_on_literal_allow_globs(roles: &[RoleConfig], mode: AllowOperationMatchin
         AllowOperationMatching::Legacy => {}
     }
     for role in roles {
-        for entry in role.allow.iter().filter(|a| *a != "*" && a.contains('*')) {
+        for entry in role
+            .allow
+            .iter()
+            .filter(|allow_entry| *allow_entry != "*" && allow_entry.contains('*'))
+        {
             tracing::warn!(
                 role = %role.name,
                 operation = %entry,
@@ -1175,6 +1190,8 @@ fn warn_on_inert_global_deny(config: &RbacConfig) {
     }
 }
 
+/// Warn once per role about optional, non-empty argument allowlists, which
+/// fail open when the constrained argument is omitted.
 fn warn_on_optional_value_allowlists(roles: &[RoleConfig]) {
     for role in roles {
         for allowlist in &role.argument_allowlists {
@@ -1200,22 +1217,32 @@ fn warn_on_optional_value_allowlists(roles: &[RoleConfig]) {
 /// Used when [`RbacConfig::redaction_salt`] is `None`.
 fn process_redaction_salt() -> &'static SecretString {
     use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
-    static PROCESS_SALT: std::sync::OnceLock<SecretString> = std::sync::OnceLock::new();
-    PROCESS_SALT.get_or_init(|| {
-        let mut bytes = [0u8; 32];
+    static PROCESS_SALT: LazyLock<SecretString> = LazyLock::new(|| {
+        let mut bytes = [0_u8; 32];
         rand::fill(&mut bytes);
         // base64-encode so the SecretString is valid UTF-8; the HMAC
         // accepts arbitrary key bytes regardless.
         SecretString::from(STANDARD_NO_PAD.encode(bytes))
-    })
+    });
+    &PROCESS_SALT
 }
 
 /// HMAC-SHA256(`salt`, `value`) → first 8 hex chars.
 ///
 /// Pulled out as a free function so it can be unit-tested and benchmarked
 /// without constructing a full [`RbacPolicy`].
+///
+/// # Panics
+///
+/// The fallback HMAC key construction carries an `expect`, but it cannot
+/// panic: a 32-byte SHA-256 digest is a valid HMAC-SHA256 key for any key
+/// length (RFC 2104), so the expectation is always fulfilled.
+#[expect(
+    clippy::option_if_let_else,
+    reason = "constant-time: src/rbac.rs::redact_with_salt keeps the HMAC key-construction fallback branch explicit rather than a combinator (G-8)"
+)]
 pub(crate) fn redact_with_salt(salt: &[u8], value: &str) -> String {
-    use std::fmt::Write as _;
+    use core::fmt::{Error as FmtError, Write as _};
 
     use sha2::Digest as _;
 
@@ -1225,8 +1252,8 @@ pub(crate) fn redact_with_salt(salt: &[u8], value: &str) -> String {
     // infallible here. We still defensively re-key with a SHA-256 of
     // the salt if construction ever fails (e.g. future hmac upstream
     // tightens the contract); both branches produce a valid keyed MAC.
-    let mut mac = if let Ok(m) = HmacSha256::new_from_slice(salt) {
-        m
+    let mut mac = if let Ok(constructed) = HmacSha256::new_from_slice(salt) {
+        constructed
     } else {
         let digest = Sha256::digest(salt);
         #[expect(
@@ -1240,22 +1267,34 @@ pub(crate) fn redact_with_salt(salt: &[u8], value: &str) -> String {
     // 4 bytes → 8 hex chars.
     let prefix = bytes.get(..4).unwrap_or(&[0; 4]);
     let mut out = String::with_capacity(8);
-    for b in prefix {
-        let _ = write!(out, "{b:02x}");
+    for byte in prefix {
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "write! into String cannot fail"
+        )]
+        let _: Result<(), FmtError> = write!(out, "{byte:02x}");
     }
     out
 }
 
 // -- RBAC middleware --
 
+/// Which client-context fields the RBAC deny log may include.
+///
+/// Mirrors the operator's [`LogContextConfig`] toggles; kept separate so the
+/// middleware does not need to thread the whole server config through.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct DenyLogKnobs {
-    pub(crate) client_ip: bool,
-    pub(crate) peer_ip: bool,
-    pub(crate) request_id: bool,
+    /// Include the resolved client IP.
+    client_ip: bool,
+    /// Include the direct peer IP.
+    peer_ip: bool,
+    /// Include the request ID.
+    request_id: bool,
 }
 
 impl DenyLogKnobs {
+    /// Build the knobs from the operator's log-context configuration.
     pub(crate) const fn from_config(cfg: &LogContextConfig) -> Self {
         Self {
             client_ip: cfg.client_ip,
@@ -1265,28 +1304,28 @@ impl DenyLogKnobs {
     }
 }
 
+/// Client-context values attached to RBAC deny log lines.
+///
+/// Each field is populated only when the matching [`DenyLogKnobs`] toggle is
+/// on and the request actually carries the value; absent fields are omitted
+/// from the log line.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DenyLogFields {
-    pub(crate) client_ip: Option<IpAddr>,
-    pub(crate) peer_ip: Option<IpAddr>,
-    pub(crate) request_id: Option<Arc<str>>,
+    /// Resolved client IP, when enabled and present.
+    client_ip: Option<IpAddr>,
+    /// Direct peer IP, when enabled and present.
+    peer_ip: Option<IpAddr>,
+    /// Request ID, when enabled and present.
+    request_id: Option<Arc<str>>,
 }
 
 impl DenyLogFields {
-    fn from_extensions(knobs: DenyLogKnobs, ext: &axum::http::Extensions) -> Self {
+    /// Collect the enabled client-context fields from request extensions.
+    fn from_extensions(knobs: DenyLogKnobs, ext: &Extensions) -> Self {
         Self {
-            client_ip: knobs
-                .client_ip
-                .then(|| crate::transport::limiter_client_ip(ext))
-                .flatten(),
-            peer_ip: knobs
-                .peer_ip
-                .then(|| crate::transport::peer_ip_for_log(ext))
-                .flatten(),
-            request_id: knobs
-                .request_id
-                .then(|| crate::transport::request_id_for_log(ext))
-                .flatten(),
+            client_ip: knobs.client_ip.then(|| limiter_client_ip(ext)).flatten(),
+            peer_ip: knobs.peer_ip.then(|| peer_ip_for_log(ext)).flatten(),
+            request_id: knobs.request_id.then(|| request_id_for_log(ext)).flatten(),
         }
     }
 }
@@ -1331,7 +1370,7 @@ pub(crate) async fn rbac_middleware(
     // unattributed-fallback warning.
     let peer_key = tool_limiter
         .is_some()
-        .then(|| crate::transport::limiter_client_key(req.extensions()));
+        .then(|| limiter_client_key(req.extensions()));
 
     // Extract caller identity and role (may be absent when auth is off).
     let identity = req.extensions().get::<AuthIdentity>();
@@ -1355,8 +1394,8 @@ pub(crate) async fn rbac_middleware(
     let (parts, body) = req.into_parts();
     let bytes = match body.collect().await {
         Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            tracing::error!(error = %e, "failed to read request body");
+        Err(error) => {
+            tracing::error!(error = %error, "failed to read request body");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "failed to read request body",
@@ -1372,7 +1411,7 @@ pub(crate) async fn rbac_middleware(
             for params in tool_calls {
                 if let Some(resp) = enforce_rate_limit(tool_limiter.as_deref(), peer_key.as_ref()) {
                     #[cfg(feature = "metrics")]
-                    crate::metrics::record_rate_limit_deny(&parts.extensions, "tool");
+                    record_rate_limit_deny(&parts.extensions, "tool");
                     return resp;
                 }
                 if policy.is_enabled()
@@ -1387,18 +1426,18 @@ pub(crate) async fn rbac_middleware(
     // Non-parseable or non-tool-call requests pass through.
 
     // Reconstruct the request with the consumed body.
-    let req = Request::from_parts(parts, Body::from(bytes));
+    let rebuilt_req = Request::from_parts(parts, Body::from(bytes));
 
     // Set the caller's role and identity in task-local storage for the handler.
     if role.is_empty() {
-        next.run(req).await
+        next.run(rebuilt_req).await
     } else {
         CURRENT_ROLE
             .scope(
                 role,
                 CURRENT_IDENTITY.scope(
                     identity_name,
-                    CURRENT_TOKEN.scope(raw_token, CURRENT_SUB.scope(sub, next.run(req))),
+                    CURRENT_TOKEN.scope(raw_token, CURRENT_SUB.scope(sub, next.run(rebuilt_req))),
                 ),
             )
             .await
@@ -1445,7 +1484,7 @@ fn extract_tool_calls(value: &serde_json::Value) -> Vec<&serde_json::Value> {
 /// if the caller should be rejected.
 fn enforce_rate_limit(
     tool_limiter: Option<&ToolRateLimiter>,
-    peer_key: Option<&crate::transport::RateLimitKey>,
+    peer_key: Option<&RateLimitKey>,
 ) -> Option<Response> {
     let limiter = tool_limiter?;
     let key = peer_key?;
@@ -1492,8 +1531,13 @@ fn enforce_tool_policy(
     params: &serde_json::Value,
     fields: &DenyLogFields,
 ) -> Option<Response> {
-    let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
-    let host_value = params.get("arguments").and_then(|a| a.get("host"));
+    let tool_name = params
+        .get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let host_value = params
+        .get("arguments")
+        .and_then(|arguments| arguments.get("host"));
 
     // M2 precedent (see `check_argument`): a caller-supplied `host` of the
     // wrong JSON type must not silently downgrade the host-glob check to an
@@ -1510,8 +1554,8 @@ fn enforce_tool_policy(
             role = %role,
             tool = tool_name,
             value_type = json_value_type(value),
-            client_ip = fields.client_ip.map(tracing::field::display),
-            peer_ip = fields.peer_ip.map(tracing::field::display),
+            client_ip = fields.client_ip.map(field::display),
+            peer_ip = fields.peer_ip.map(field::display),
             request_id = fields.request_id.as_deref(),
             "non-string host argument rejected"
         );
@@ -1524,21 +1568,20 @@ fn enforce_tool_policy(
     }
     // Absent `host` still routes to `check_operation` by design: hostless
     // tools (`ping`, `list_hosts`) legitimately carry no host argument.
-    let host = host_value.and_then(|h| h.as_str());
+    let host = host_value.and_then(|host_str| host_str.as_str());
 
-    let decision = if let Some(host) = host {
-        policy.check(role, tool_name, host)
-    } else {
-        policy.check_operation(role, tool_name)
-    };
+    let decision = host.map_or_else(
+        || policy.check_operation(role, tool_name),
+        |host_name| policy.check(role, tool_name, host_name),
+    );
     if decision == RbacDecision::Deny {
         tracing::warn!(
             user = %identity_name,
             role = %role,
             tool = tool_name,
             host = host.unwrap_or("-"),
-            client_ip = fields.client_ip.map(tracing::field::display),
-            peer_ip = fields.peer_ip.map(tracing::field::display),
+            client_ip = fields.client_ip.map(field::display),
+            peer_ip = fields.peer_ip.map(field::display),
             request_id = fields.request_id.as_deref(),
             "RBAC denied"
         );
@@ -1548,11 +1591,13 @@ fn enforce_tool_policy(
         );
     }
 
-    let args = params.get("arguments").and_then(|a| a.as_object());
+    let args = params
+        .get("arguments")
+        .and_then(|arguments| arguments.as_object());
     let strict = policy.strict_argument_names(role, tool_name);
-    if let Some(args) = args {
-        for (arg_key, arg_val) in args {
-            if let Some(ref permitted) = strict
+    if let Some(arguments) = args {
+        for (arg_key, arg_val) in arguments {
+            if let Some(permitted) = &strict
                 && let Some(resp) = check_strict_argument(
                     identity_name,
                     role,
@@ -1600,8 +1645,8 @@ fn check_strict_argument(
             role = %role,
             tool = tool_name,
             argument = arg_key,
-            client_ip = fields.client_ip.map(tracing::field::display),
-            peer_ip = fields.peer_ip.map(tracing::field::display),
+            client_ip = fields.client_ip.map(field::display),
+            peer_ip = fields.peer_ip.map(field::display),
             request_id = fields.request_id.as_deref(),
             "unknown argument rejected by strict allowlist"
         );
@@ -1619,8 +1664,8 @@ fn check_strict_argument(
             tool = tool_name,
             argument = arg_key,
             value_type = json_value_type(arg_val),
-            client_ip = fields.client_ip.map(tracing::field::display),
-            peer_ip = fields.peer_ip.map(tracing::field::display),
+            client_ip = fields.client_ip.map(field::display),
+            peer_ip = fields.peer_ip.map(field::display),
             request_id = fields.request_id.as_deref(),
             "structured argument rejected by strict allowlist"
         );
@@ -1655,8 +1700,8 @@ fn check_required_arguments(
         role = %role,
         tool = tool_name,
         argument = missing,
-        client_ip = fields.client_ip.map(tracing::field::display),
-        peer_ip = fields.peer_ip.map(tracing::field::display),
+        client_ip = fields.client_ip.map(field::display),
+        peer_ip = fields.peer_ip.map(field::display),
         request_id = fields.request_id.as_deref(),
         "required argument missing"
     );
@@ -1668,6 +1713,10 @@ fn check_required_arguments(
     )
 }
 
+/// Deny a present argument whose value is not permitted by its allowlist.
+///
+/// Non-string values for an allowlisted argument are denied (fail closed);
+/// the log records the value's type, never the value itself.
 fn check_argument(
     policy: &RbacPolicy,
     identity_name: &str,
@@ -1692,8 +1741,8 @@ fn check_argument(
             tool = tool_name,
             argument = arg_key,
             value_type = json_value_type(arg_val),
-            client_ip = fields.client_ip.map(tracing::field::display),
-            peer_ip = fields.peer_ip.map(tracing::field::display),
+            client_ip = fields.client_ip.map(field::display),
+            peer_ip = fields.peer_ip.map(field::display),
             request_id = fields.request_id.as_deref(),
             "non-string argument rejected by allowlist"
         );
@@ -1717,8 +1766,8 @@ fn check_argument(
         tool = tool_name,
         argument = arg_key,
         arg_hmac = %policy.redact_arg(val_str),
-        client_ip = fields.client_ip.map(tracing::field::display),
-        peer_ip = fields.peer_ip.map(tracing::field::display),
+        client_ip = fields.client_ip.map(field::display),
+        peer_ip = fields.peer_ip.map(field::display),
         request_id = fields.request_id.as_deref(),
         "argument not in allowlist"
     );
@@ -1730,8 +1779,9 @@ fn check_argument(
     )
 }
 
-fn json_value_type(v: &serde_json::Value) -> &'static str {
-    match v {
+/// Name of the JSON value's type, for shape-only deny log fields.
+const fn json_value_type(value: &serde_json::Value) -> &'static str {
+    match value {
         serde_json::Value::Null => "null",
         serde_json::Value::Bool(_) => "bool",
         serde_json::Value::Number(_) => "number",
@@ -1777,19 +1827,23 @@ fn glob_match(pattern: &str, text: &str) -> bool {
             return false;
         }
         // Shrink the search area so middle parts don't overlap with the suffix.
-        let end = text.len() - last.len();
+        let end = text.len().saturating_sub(last.len());
         if pos > end {
             return false;
         }
         // Check middle parts in the remaining region.
         let middle = text.get(pos..end).unwrap_or_default();
-        let middle_parts = parts.get(1..parts.len() - 1).unwrap_or_default();
+        let middle_parts = parts
+            .get(1..parts.len().saturating_sub(1))
+            .unwrap_or_default();
         return match_middle(middle, middle_parts);
     }
 
     // Pattern ends with * - just check middle parts.
     let middle = text.get(pos..).unwrap_or_default();
-    let middle_parts = parts.get(1..parts.len() - 1).unwrap_or_default();
+    let middle_parts = parts
+        .get(1..parts.len().saturating_sub(1))
+        .unwrap_or_default();
     match_middle(middle, middle_parts)
 }
 
@@ -1800,7 +1854,9 @@ fn match_middle(mut text: &str, parts: &[&str]) -> bool {
             continue;
         }
         if let Some(idx) = text.find(part) {
-            text = text.get(idx + part.len()..).unwrap_or_default();
+            text = text
+                .get(idx.saturating_add(part.len())..)
+                .unwrap_or_default();
         } else {
             return false;
         }
@@ -1808,6 +1864,10 @@ fn match_middle(mut text: &str, parts: &[&str]) -> bool {
     true
 }
 
+#[expect(
+    clippy::multiple_inherent_impl,
+    reason = "deliberate: src/rbac.rs::RbacConfig — the second block groups the environment-override application; merging relocates ~90 lines for no behavior gain"
+)]
 impl RbacConfig {
     /// Applies `RMCP_SERVER_KIT__RBAC__*` environment overrides.
     ///
@@ -1841,47 +1901,48 @@ impl RbacConfig {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn apply_env_overrides(
-        &mut self,
-    ) -> Result<Vec<crate::config::EnvOverride>, RmcpServerKitError> {
-        let direct = crate::config::read_env(crate::config::RBAC_REDACTION_SALT_ENV)?;
-        let file = crate::config::read_env(crate::config::RBAC_REDACTION_SALT_FILE_ENV)?;
+    #[inline]
+    pub fn apply_env_overrides(&mut self) -> Result<Vec<EnvOverride>, RmcpServerKitError> {
+        let direct = read_env(RBAC_REDACTION_SALT_ENV)?;
+        let file = read_env(RBAC_REDACTION_SALT_FILE_ENV)?;
         match (direct, file) {
             (None, None) => Ok(Vec::new()),
             (Some(_), Some(_)) => Err(RmcpServerKitError::Config(format!(
-                "{} and {} must not both be set",
-                crate::config::RBAC_REDACTION_SALT_ENV,
-                crate::config::RBAC_REDACTION_SALT_FILE_ENV
+                "{RBAC_REDACTION_SALT_ENV} and {RBAC_REDACTION_SALT_FILE_ENV} must not both be set"
             ))),
             (Some(value), None) => {
-                reject_blank_redaction_salt(crate::config::RBAC_REDACTION_SALT_ENV, &value)?;
+                reject_blank_redaction_salt(RBAC_REDACTION_SALT_ENV, &value)?;
                 self.redaction_salt = Some(SecretString::from(value));
-                Ok(vec![crate::config::secret_env_report(
-                    crate::config::RBAC_REDACTION_SALT_ENV,
+                Ok(vec![secret_env_report(
+                    RBAC_REDACTION_SALT_ENV,
                     "rbac.redaction_salt",
-                    crate::config::EnvOverrideSource::Env,
+                    EnvOverrideSource::Env,
                 )])
             }
             (None, Some(path)) => {
-                let secret = std::fs::read_to_string(PathBuf::from(&path)).map_err(|error| {
+                let secret = fs::read_to_string(PathBuf::from(&path)).map_err(|error| {
                     RmcpServerKitError::Config(format!(
-                        "failed to read {} file {path:?}: {error}",
-                        crate::config::RBAC_REDACTION_SALT_FILE_ENV
+                        "failed to read {RBAC_REDACTION_SALT_FILE_ENV} file {path:?}: {error}"
                     ))
                 })?;
-                let secret = crate::config::normalize_text_secret_file(secret);
-                reject_blank_redaction_salt(crate::config::RBAC_REDACTION_SALT_FILE_ENV, &secret)?;
-                self.redaction_salt = Some(SecretString::from(secret));
-                Ok(vec![crate::config::secret_env_report(
-                    crate::config::RBAC_REDACTION_SALT_FILE_ENV,
+                let normalized = normalize_text_secret_file(secret);
+                reject_blank_redaction_salt(RBAC_REDACTION_SALT_FILE_ENV, &normalized)?;
+                self.redaction_salt = Some(SecretString::from(normalized));
+                Ok(vec![secret_env_report(
+                    RBAC_REDACTION_SALT_FILE_ENV,
                     "rbac.redaction_salt",
-                    crate::config::EnvOverrideSource::File,
+                    EnvOverrideSource::File,
                 )])
             }
         }
     }
 }
 
+/// Reject a redaction salt that is empty or whitespace-only.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when `value` trims to an empty string.
 fn reject_blank_redaction_salt(env_var: &str, value: &str) -> Result<(), RmcpServerKitError> {
     if value.trim().is_empty() {
         return Err(RmcpServerKitError::Config(format!(
@@ -1970,8 +2031,8 @@ mod tests {
     fn with_rbac_env<R>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> R) -> R {
         temp_env::with_vars(
             [
-                (crate::config::RBAC_REDACTION_SALT_ENV, None::<&str>),
-                (crate::config::RBAC_REDACTION_SALT_FILE_ENV, None::<&str>),
+                (RBAC_REDACTION_SALT_ENV, None::<&str>),
+                (RBAC_REDACTION_SALT_FILE_ENV, None::<&str>),
             ]
             .into_iter()
             .chain(vars.iter().copied())
@@ -1983,15 +2044,15 @@ mod tests {
     #[test]
     fn e6_redaction_salt_env_applies_and_report_redacts_value() {
         with_rbac_env(
-            &[(crate::config::RBAC_REDACTION_SALT_ENV, Some("s3cret"))],
+            &[(RBAC_REDACTION_SALT_ENV, Some("s3cret"))],
             || {
                 let mut cfg = RbacConfig::default();
                 let report = cfg.apply_env_overrides().unwrap();
                 assert!(cfg.redaction_salt.is_some());
                 assert_eq!(report.len(), 1);
-                assert_eq!(report[0].env_var, crate::config::RBAC_REDACTION_SALT_ENV);
+                assert_eq!(report[0].env_var, RBAC_REDACTION_SALT_ENV);
                 assert_eq!(report[0].target_field, "rbac.redaction_salt");
-                assert_eq!(report[0].source, crate::config::EnvOverrideSource::Env);
+                assert_eq!(report[0].source, EnvOverrideSource::Env);
                 assert!(report[0].value.is_none());
                 assert!(!format!("{report:?}").contains("s3cret"));
             },
@@ -2002,9 +2063,9 @@ mod tests {
     fn e7_redaction_salt_value_and_file_conflict_fails() {
         with_rbac_env(
             &[
-                (crate::config::RBAC_REDACTION_SALT_ENV, Some("direct")),
+                (RBAC_REDACTION_SALT_ENV, Some("direct")),
                 (
-                    crate::config::RBAC_REDACTION_SALT_FILE_ENV,
+                    RBAC_REDACTION_SALT_FILE_ENV,
                     Some("/tmp/secret-file"),
                 ),
             ],
@@ -2012,8 +2073,8 @@ mod tests {
                 let mut cfg = RbacConfig::default();
                 let err = cfg.apply_env_overrides().unwrap_err();
                 let msg = err.to_string();
-                assert!(msg.contains(crate::config::RBAC_REDACTION_SALT_ENV));
-                assert!(msg.contains(crate::config::RBAC_REDACTION_SALT_FILE_ENV));
+                assert!(msg.contains(RBAC_REDACTION_SALT_ENV));
+                assert!(msg.contains(RBAC_REDACTION_SALT_FILE_ENV));
             },
         );
     }
@@ -2027,10 +2088,10 @@ mod tests {
         assert_eq!(report.len(), 1);
         assert_eq!(
             report[0].env_var,
-            crate::config::RBAC_REDACTION_SALT_FILE_ENV
+            RBAC_REDACTION_SALT_FILE_ENV
         );
         assert_eq!(report[0].target_field, "rbac.redaction_salt");
-        assert_eq!(report[0].source, crate::config::EnvOverrideSource::File);
+        assert_eq!(report[0].source, EnvOverrideSource::File);
         assert!(report[0].value.is_none());
     }
 
@@ -2280,13 +2341,13 @@ mod tests {
     fn blank_redaction_salt_env_values_fail_closed() {
         for value in ["", "\n", "   "] {
             with_rbac_env(
-                &[(crate::config::RBAC_REDACTION_SALT_ENV, Some(value))],
+                &[(RBAC_REDACTION_SALT_ENV, Some(value))],
                 || {
                     let mut cfg = RbacConfig::default();
                     let err = cfg.apply_env_overrides().unwrap_err();
                     assert!(
                         err.to_string()
-                            .contains(crate::config::RBAC_REDACTION_SALT_ENV)
+                            .contains(RBAC_REDACTION_SALT_ENV)
                     );
                 },
             );
@@ -2299,7 +2360,7 @@ mod tests {
             let err = redaction_from_file(value).unwrap_err();
             assert!(
                 err.to_string()
-                    .contains(crate::config::RBAC_REDACTION_SALT_FILE_ENV)
+                    .contains(RBAC_REDACTION_SALT_FILE_ENV)
             );
         }
     }
@@ -2314,7 +2375,7 @@ mod tests {
 
     fn redaction_from_file(
         content: &str,
-    ) -> Result<(String, Vec<crate::config::EnvOverride>), RmcpServerKitError> {
+    ) -> Result<(String, Vec<EnvOverride>), RmcpServerKitError> {
         let path = std::env::temp_dir().join(format!(
             "rmcp-server-kit-redaction-salt-{}.txt",
             std::time::SystemTime::now()
@@ -2322,11 +2383,11 @@ mod tests {
                 .expect("clock after epoch")
                 .as_nanos()
         ));
-        std::fs::write(&path, content).expect("write salt file");
+        fs::write(&path, content).expect("write salt file");
         let path_string = path.to_string_lossy().to_string();
         let result = with_rbac_env(
             &[(
-                crate::config::RBAC_REDACTION_SALT_FILE_ENV,
+                RBAC_REDACTION_SALT_FILE_ENV,
                 Some(path_string.as_str()),
             )],
             || {
@@ -2336,7 +2397,7 @@ mod tests {
                 Ok((redaction, report))
             },
         );
-        std::fs::remove_file(path).expect("remove salt file");
+        fs::remove_file(path).expect("remove salt file");
         result
     }
 
