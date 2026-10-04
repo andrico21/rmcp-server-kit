@@ -196,8 +196,11 @@ use std::{collections::HashMap, fs, path::PathBuf, time::Instant};
 use axum::{http::StatusCode, response::Response};
 use base64::engine::general_purpose;
 use jsonwebtoken::{
-    Algorithm, DecodingKey, Validation, crypto::rust_crypto::DEFAULT_PROVIDER, decode,
-    decode_header, errors::ErrorKind, jwk::{Jwk, JwkSet, KeyAlgorithm},
+    Algorithm, DecodingKey, Validation,
+    crypto::rust_crypto::DEFAULT_PROVIDER,
+    decode, decode_header,
+    errors::ErrorKind,
+    jwk::{Jwk, JwkSet, KeyAlgorithm},
 };
 use reqwest::{
     dns::Resolve,
@@ -208,11 +211,10 @@ use rustls::crypto::ring::default_provider;
 use serde::Deserialize;
 use tokio::{
     net::lookup_host,
-    sync::{Mutex, RwLock, oneshot},
+    sync::{Mutex, RwLock, oneshot, oneshot::error::RecvError},
     task::spawn_blocking,
     time::sleep,
 };
-use tokio::sync::oneshot::error::RecvError;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument as _, dispatcher};
 use url::form_urlencoded;
@@ -226,7 +228,7 @@ use crate::{
         CidrEntry, CompiledSsrfAllowlist, check_url_literal_ip, ip_block_reason,
         redirect_target_reason_with_allowlist, sanitized_url_for_log,
     },
-    ssrf_resolver::SsrfScreeningResolver,
+    ssrf_resolver::{SsrfScreeningResolver, TestLoopbackBypass},
 };
 
 // ---------------------------------------------------------------------------
@@ -277,8 +279,7 @@ fn evaluate_oauth_redirect(
             return Err("redirect to non-HTTP(S) URL refused".to_owned());
         }
     }
-    if let Some(reason) = redirect_target_reason_with_allowlist(target_url, allowlist)
-    {
+    if let Some(reason) = redirect_target_reason_with_allowlist(target_url, allowlist) {
         return Err(format!("redirect target forbidden: {reason}"));
     }
     if attempt.previous().len() >= 2 {
@@ -287,11 +288,11 @@ fn evaluate_oauth_redirect(
     Ok(())
 }
 
-/// True when `host` ends in a well-known internal suffix (`.localhost`,
-/// `.local`, `.internal`) and is not exactly allow-listed. A trailing
-/// FQDN-root dot is canonicalized first so `idp.internal.` cannot bypass
-/// the check. OAuth targets only -- CRL fetches build an empty allowlist
-/// and are out of scope.
+/// True when `host` ends in a well-known internal suffix and is not allow-listed.
+///
+/// The suffixes are `.localhost`, `.local` and `.internal`. A trailing FQDN-root
+/// dot is canonicalized first so `idp.internal.` cannot bypass the check. OAuth
+/// targets only -- CRL fetches build an empty allowlist and are out of scope.
 ///
 /// Exact `localhost` is deliberately NOT matched here: it resolves to
 /// loopback and is already blocked by the post-DNS IP screen, and an
@@ -301,10 +302,7 @@ fn evaluate_oauth_redirect(
     clippy::case_sensitive_file_extension_comparisons,
     reason = "these are DNS-name suffixes on an already-lowercased host, not file extensions"
 )]
-fn oauth_internal_suffix_blocked(
-    host: &str,
-    allowlist: &CompiledSsrfAllowlist,
-) -> bool {
+fn oauth_internal_suffix_blocked(host: &str, allowlist: &CompiledSsrfAllowlist) -> bool {
     let host_canon = host.strip_suffix('.').unwrap_or(host);
     let host_lower = host_canon.to_ascii_lowercase();
     let is_internal = host_lower.ends_with(".localhost")
@@ -366,15 +364,11 @@ async fn screen_oauth_target_core(
         )));
     }
     let port = parsed.port_or_known_default().ok_or_else(|| {
-        RmcpServerKitError::Config(format!(
-            "OAuth target URL has no known port: {target}"
-        ))
+        RmcpServerKitError::Config(format!("OAuth target URL has no known port: {target}"))
     })?;
 
     let addrs = lookup_host((host, port)).await.map_err(|error| {
-        RmcpServerKitError::Config(format!(
-            "OAuth target DNS resolution {target}: {error}"
-        ))
+        RmcpServerKitError::Config(format!("OAuth target DNS resolution {target}: {error}"))
     })?;
 
     let host_allowed = !allowlist.is_empty() && allowlist.host_allowed(host);
@@ -437,6 +431,11 @@ async fn screen_oauth_target(
 /// Test-only wrapper exposing the loopback-SSRF bypass flag of
 /// [`screen_oauth_target_core`] so higher-level OAuth flows can run
 /// against loopback-backed mock fixtures.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when the target URL is malformed or resolves to a
+/// blocked address.
 #[cfg(any(test, feature = "test-helpers"))]
 async fn screen_oauth_target_with_test_override(
     url: &str,
@@ -487,7 +486,10 @@ async fn screen_oauth_target_with_test_override(
 /// fetch client.
 ///
 /// [`with_config`]: Self::with_config
-#[expect(clippy::module_name_repetitions, reason = "public API frozen until the next major release")]
+#[expect(
+    clippy::module_name_repetitions,
+    reason = "public API frozen until the next major release"
+)]
 #[derive(Clone)]
 pub struct OauthHttpClient {
     /// Screened-redirect JWKS/discovery client: follows redirects, but every
@@ -506,6 +508,7 @@ pub struct OauthHttpClient {
     /// body to another host. Shares `inner`'s `no_proxy`,
     /// `SsrfScreeningResolver`, and CA trust.
     credential_client: reqwest::Client,
+    /// Whether plain-HTTP OAuth URLs are permitted ([`OAuthConfig::allow_http_oauth_urls`]).
     allow_http: bool,
     /// Compiled SSRF allowlist applied to the initial-target screen and
     /// to literal-IP redirect-hop screening. Wrapped in `Arc` so cloning
@@ -524,7 +527,7 @@ pub struct OauthHttpClient {
     /// reach the already-built `reqwest::Client`, so a per-snapshot
     /// `bool` (Oracle review B1) is forbidden.
     #[cfg(any(test, feature = "test-helpers"))]
-    test_allow_loopback_ssrf: crate::ssrf_resolver::TestLoopbackBypass,
+    test_allow_loopback_ssrf: TestLoopbackBypass,
 }
 
 /// M-H4: cache key for cert-bearing `reqwest::Client`s. Path-based
@@ -533,7 +536,9 @@ pub struct OauthHttpClient {
 #[cfg(feature = "oauth-mtls-client")]
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 struct MtlsClientKey {
+    /// Path to the PEM client certificate presented at the TLS handshake.
     cert_path: PathBuf,
+    /// Path to the PEM private key for `cert_path`.
     key_path: PathBuf,
 }
 
@@ -593,12 +598,15 @@ impl OauthHttpClient {
 
     /// Internal builder shared by [`new`](Self::new) (config = `None`)
     /// and [`with_config`](Self::with_config) (config = `Some`).
-#[expect(clippy::too_many_lines, reason = "deliberate: src/oauth.rs::OauthHttpClient::build keeps shared client construction in one reviewable block")]
-///
-/// # Errors
-///
-/// Returns [`RmcpServerKitError::Startup`] when the CA bundle cannot be read or parsed or a
-/// client cannot be constructed.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "deliberate: src/oauth.rs::OauthHttpClient::build keeps shared client construction in one reviewable block"
+    )]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RmcpServerKitError::Startup`] when the CA bundle cannot be read or parsed or a
+    /// client cannot be constructed.
     fn build(config: Option<&OAuthConfig>) -> Result<Self, RmcpServerKitError> {
         // Install the rustls crypto provider before constructing any reqwest
         // client (idempotent -- `ok()` ignores the error when a provider was
@@ -632,10 +640,9 @@ impl OauthHttpClient {
         // the resolver, send_screened, and the cached `inner` client
         // all observe the same atomic.
         #[cfg(any(test, feature = "test-helpers"))]
-        let test_bypass: crate::ssrf_resolver::TestLoopbackBypass =
-            Arc::new(AtomicBool::new(false));
+        let test_bypass: TestLoopbackBypass = Arc::new(AtomicBool::new(false));
         #[cfg(not(any(test, feature = "test-helpers")))]
-        let test_bypass: crate::ssrf_resolver::TestLoopbackBypass = ();
+        let test_bypass: TestLoopbackBypass = ();
 
         // M-H2/B1: TestLoopbackBypass aliases to Arc<AtomicBool> in test
         // builds and to `()` in production. The `.clone()` is required in
@@ -659,11 +666,10 @@ impl OauthHttpClient {
                 reason = "TestLoopbackBypass aliases to Arc<AtomicBool> under cfg(test)/test-helpers and to `()` otherwise; each cfg trips a different clone/arg lint"
             )
         )]
-        let resolver: Arc<dyn Resolve> =
-            Arc::new(SsrfScreeningResolver::new(
-                Arc::clone(&allowlist),
-                test_bypass.clone(),
-            ));
+        let resolver: Arc<dyn Resolve> = Arc::new(SsrfScreeningResolver::new(
+            Arc::clone(&allowlist),
+            test_bypass.clone(),
+        ));
 
         // Read the optional CA bundle once; reused by both clients below.
         // Pre-startup blocking I/O is intentional -- the constructor is sync
@@ -708,27 +714,28 @@ impl OauthHttpClient {
         // backs only the redirect-policy regression tests and is not built in
         // a minimal `oauth` build.
         #[cfg(any(test, feature = "test-helpers"))]
-        let inner =
-            make_base()?
-                .redirect(Policy::custom(move |attempt| {
-                    match evaluate_oauth_redirect(&attempt, allow_http, &redirect_allowlist) {
-                        Ok(()) => attempt.follow(),
-                        Err(reason) => {
-                            tracing::warn!(
-                                reason = %reason,
-                                target = %sanitized_url_for_log(attempt.url()),
-                                "oauth redirect rejected"
-                            );
-                            attempt.error(reason)
-                        }
+        let inner = make_base()?
+            .redirect(Policy::custom(
+                move |attempt| match evaluate_oauth_redirect(
+                    &attempt,
+                    allow_http,
+                    &redirect_allowlist,
+                ) {
+                    Ok(()) => attempt.follow(),
+                    Err(reason) => {
+                        tracing::warn!(
+                            reason = %reason,
+                            target = %sanitized_url_for_log(attempt.url()),
+                            "oauth redirect rejected"
+                        );
+                        attempt.error(reason)
                     }
-                }))
-                .build()
-                .map_err(|error| {
-                    RmcpServerKitError::Startup(format!(
-                        "oauth http client init: {error}"
-                    ))
-                })?;
+                },
+            ))
+            .build()
+            .map_err(|error| {
+                RmcpServerKitError::Startup(format!("oauth http client init: {error}"))
+            })?;
 
         // M7: credential-POST client -- NEVER follows redirects. A 307/308 from
         // a compromised or open-redirecting token/introspection/revocation
@@ -765,6 +772,11 @@ impl OauthHttpClient {
         })
     }
 
+    /// Screen `url` against the SSRF policy, then send the prepared request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RmcpServerKitError::Config`] when screening rejects the target or the send fails.
     // cancel-safe: SSRF screening only reads allowlist/config; `reqwest` owns
     // the request during `send`, so cancellation abandons upstream I/O without
     // mutating OAuth client or JWKS cache state.
@@ -784,8 +796,8 @@ impl OauthHttpClient {
         screen_oauth_target(url, self.allow_http, &self.allowlist).await?;
         request.send().await.map_err(|error| {
             let target = oauth_request_target_for_log(url);
-            let error = error.without_url();
-            RmcpServerKitError::Config(format!("oauth request {target}: {error}"))
+            let scrubbed = error.without_url();
+            RmcpServerKitError::Config(format!("oauth request {target}: {scrubbed}"))
         })
     }
 
@@ -801,6 +813,7 @@ impl OauthHttpClient {
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     #[must_use]
+    #[inline]
     pub fn __test_allow_loopback_ssrf(self) -> Self {
         // M-H2/B1: flip the SHARED atomic so the resolver inside
         // `inner` and the pre-flight check both observe the bypass.
@@ -820,6 +833,7 @@ impl OauthHttpClient {
     /// and its initial-target SSRF and scheme checks for caller-supplied URLs.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
+    #[inline]
     pub async fn __test_get(&self, url: &str) -> reqwest::Result<reqwest::Response> {
         self.inner.get(url).send().await
     }
@@ -837,6 +851,11 @@ impl OauthHttpClient {
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     #[must_use]
+    #[inline]
+    #[expect(
+        clippy::missing_const_for_fn,
+        reason = "public API frozen until the next major release"
+    )]
     pub fn __test_inner_client(&self) -> &reqwest::Client {
         &self.inner
     }
@@ -974,9 +993,7 @@ pub struct OAuthSsrfAllowlist {
 /// # Errors
 ///
 /// Returns the first invalid host or CIDR entry as a message.
-fn compile_oauth_ssrf_allowlist(
-    raw: &OAuthSsrfAllowlist,
-) -> Result<CompiledSsrfAllowlist, String> {
+fn compile_oauth_ssrf_allowlist(raw: &OAuthSsrfAllowlist) -> Result<CompiledSsrfAllowlist, String> {
     let mut hosts: Vec<String> = Vec::with_capacity(raw.hosts.len());
     for (idx, entry) in raw.hosts.iter().enumerate() {
         let trimmed = entry.trim();
@@ -1328,7 +1345,10 @@ impl OAuthConfig {
     /// `azp`-only matches are rejected).
     #[must_use]
     #[inline]
-#[expect(clippy::missing_const_for_fn, reason = "public API frozen until the next major release")]
+    #[expect(
+        clippy::missing_const_for_fn,
+        reason = "public API frozen until the next major release"
+    )]
     pub fn effective_audience_validation_mode(&self) -> AudienceValidationMode {
         if let Some(mode) = self.audience_validation_mode {
             return mode;
@@ -1346,7 +1366,10 @@ impl OAuthConfig {
     /// [`OAuthConfig::default`] (empty scopes/role mappings, no proxy or
     /// token exchange, a JWKS cache TTL of `10m`).
     #[inline]
-#[expect(clippy::impl_trait_in_params, reason = "public API frozen until the next major release")]
+    #[expect(
+        clippy::impl_trait_in_params,
+        reason = "public API frozen until the next major release"
+    )]
     pub fn builder(
         issuer: impl Into<String>,
         audience: impl Into<String>,
@@ -1377,10 +1400,14 @@ impl OAuthConfig {
     ///
     /// Returns [`crate::error::RmcpServerKitError::Config`] when any field fails
     /// to parse or violates the scheme policy.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "deliberate: src/oauth.rs::OAuthConfig::validate is a flat field-by-field walk-through"
+    )]
     #[inline]
     pub fn validate(&self) -> Result<(), RmcpServerKitError> {
         validate_oauth_capacity_knobs(self)?;
-        resolve_allowed_algorithms(self.allowed_algorithms.as_deref())?;
+        let _validated = resolve_allowed_algorithms(self.allowed_algorithms.as_deref())?;
 
         let allow_http = self.allow_http_oauth_urls;
         let issuer_url = check_oauth_url("oauth.issuer", &self.issuer, allow_http)?;
@@ -1423,8 +1450,11 @@ impl OAuthConfig {
                 )));
             }
             if let Some(introspection_url) = &proxy.introspection_url {
-                let parsed =
-                    check_oauth_url("oauth.proxy.introspection_url", introspection_url, allow_http)?;
+                let parsed = check_oauth_url(
+                    "oauth.proxy.introspection_url",
+                    introspection_url,
+                    allow_http,
+                )?;
                 if let Some(reason) = check_url_literal_ip(&parsed) {
                     return Err(RmcpServerKitError::Config(format!(
                         "oauth.proxy.introspection_url forbidden ({reason})"
@@ -1461,7 +1491,8 @@ impl OAuthConfig {
             }
         }
         if let Some(tx) = &self.token_exchange {
-            let exchange_url = check_oauth_url("oauth.token_exchange.token_url", &tx.token_url, allow_http)?;
+            let exchange_url =
+                check_oauth_url("oauth.token_exchange.token_url", &tx.token_url, allow_http)?;
             if let Some(reason) = check_url_literal_ip(&exchange_url) {
                 return Err(RmcpServerKitError::Config(format!(
                     "oauth.token_exchange.token_url forbidden ({reason})"
@@ -1491,7 +1522,7 @@ impl OAuthConfig {
         }
         // Validate jwks_cache_ttl parses as a humantime duration so the
         // limiter constructor can rely on a non-fallback value (M5).
-        humantime::parse_duration(&self.jwks_cache_ttl).map_err(|error| {
+        let _parsed_ttl = humantime::parse_duration(&self.jwks_cache_ttl).map_err(|error| {
             RmcpServerKitError::Config(format!(
                 "oauth.jwks_cache_ttl {:?} is not a valid humantime duration (e.g. \"10m\", \"1h30m\"): {error}",
                 self.jwks_cache_ttl
@@ -1508,10 +1539,11 @@ impl OAuthConfig {
     /// to any caller. They are held to the same policy as every other OAuth
     /// URL: parseable, no userinfo, scheme honouring `allow_http_oauth_urls`,
     /// and no literal-IP target.
-    fn validate_discovery_metadata_urls(
-        &self,
-        allow_http: bool,
-    ) -> Result<(), RmcpServerKitError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RmcpServerKitError::Config`] for the first URL that fails the checks.
+    fn validate_discovery_metadata_urls(&self, allow_http: bool) -> Result<(), RmcpServerKitError> {
         if let Some(issuer) = &self.authorization_server_metadata_issuer {
             let url = check_oauth_url(
                 "oauth.authorization_server_metadata_issuer",
@@ -1541,19 +1573,17 @@ impl OAuthConfig {
     }
 }
 
-/// M-H4: enforce RFC 8705 §2 mutual exclusion (`client_secret` xor
-/// `client_cert`) + cargo-feature gating for token-exchange client
-/// authentication. Without this a `client_cert`-only config silently
-/// disables client auth at the token endpoint (the runtime path
-/// simply omits the Authorization header).
+/// M-H4: enforce RFC 8705 §2 mutual exclusion for token-exchange client auth.
+///
+/// `client_secret` xor `client_cert`, plus cargo-feature gating. Without this a
+/// `client_cert`-only config silently disables client auth at the token endpoint
+/// (the runtime path simply omits the Authorization header).
 ///
 /// # Errors
 ///
 /// Returns [`RmcpServerKitError::Config`] when both or neither client-auth method is set, or
 /// the mTLS feature is missing.
-fn validate_token_exchange_client_auth(
-    tx: &TokenExchangeConfig,
-) -> Result<(), RmcpServerKitError> {
+fn validate_token_exchange_client_auth(tx: &TokenExchangeConfig) -> Result<(), RmcpServerKitError> {
     match (&tx.client_cert, tx.client_secret.is_some()) {
         (Some(_), true) => Err(RmcpServerKitError::Config(
             "oauth.token_exchange: client_cert and client_secret are mutually \
@@ -1661,7 +1691,7 @@ fn validate_token_exchange_optional_params(
                     .into(),
             ));
         }
-        url::Url::parse(uri).map_err(|error| {
+        let _parsed_uri = url::Url::parse(uri).map_err(|error| {
             RmcpServerKitError::Config(format!(
                 "oauth.token_exchange.requested_token_type custom value must be an absolute \
                  URI (RFC 8693 \u{a7}3): {error}"
@@ -1712,9 +1742,7 @@ fn validate_token_exchange_optional_params(
 ///
 /// Returns [`RmcpServerKitError::Config`] when the feature is disabled or the cert/key cannot
 /// be read or parsed.
-fn validate_client_cert_config(
-    cc: &ClientCertConfig,
-) -> Result<(), RmcpServerKitError> {
+fn validate_client_cert_config(cc: &ClientCertConfig) -> Result<(), RmcpServerKitError> {
     #[cfg(not(feature = "oauth-mtls-client"))]
     {
         let _: &ClientCertConfig = cc;
@@ -1742,7 +1770,12 @@ fn validate_client_cert_config(
                 cc.key_path.display()
             ))
         })?;
-        let mut combined = Vec::with_capacity(cert_bytes.len() + 1 + key_bytes.len());
+        let mut combined = Vec::with_capacity(
+            cert_bytes
+                .len()
+                .saturating_add(1)
+                .saturating_add(key_bytes.len()),
+        );
         combined.extend_from_slice(&cert_bytes);
         if !cert_bytes.ends_with(b"\n") {
             combined.push(b'\n');
@@ -1765,13 +1798,13 @@ fn validate_client_cert_config(
     }
 }
 
-/// M-H4: build the `(cert_path, key_path) -> reqwest::Client` cache
-/// consulted by [`OauthHttpClient::client_for`]. Each cert-bearing
-/// client uses `redirect::Policy::none()` (RFC 8705 §2: never present
-/// the client cert to a redirect target the operator did not approve)
-/// and inherits the same `ca_cert_path`, connect/total timeouts as
-/// the shared `inner` client. Returns an empty map when no
-/// `token_exchange.client_cert` is configured.
+/// M-H4: build the `(cert_path, key_path) -> reqwest::Client` cache.
+///
+/// Consulted by [`OauthHttpClient::client_for`]. Each cert-bearing client uses
+/// `redirect::Policy::none()` (RFC 8705 §2: never present the client cert to a
+/// redirect target the operator did not approve) and inherits the same
+/// `ca_cert_path`, connect/total timeouts as the shared `inner` client. Returns
+/// an empty map when no `token_exchange.client_cert` is configured.
 ///
 /// # Errors
 ///
@@ -1781,7 +1814,7 @@ fn validate_client_cert_config(
 fn build_mtls_clients(
     config: Option<&OAuthConfig>,
     allowlist: &Arc<CompiledSsrfAllowlist>,
-    test_bypass: &crate::ssrf_resolver::TestLoopbackBypass,
+    test_bypass: &TestLoopbackBypass,
 ) -> Result<Arc<HashMap<MtlsClientKey, reqwest::Client>>, RmcpServerKitError> {
     let mut map: HashMap<MtlsClientKey, reqwest::Client> = HashMap::new();
     let Some(cfg) = config else {
@@ -1806,7 +1839,12 @@ fn build_mtls_clients(
             cc.key_path.display()
         ))
     })?;
-    let mut combined = Vec::with_capacity(cert_bytes.len() + 1 + key_bytes.len());
+    let mut combined = Vec::with_capacity(
+        cert_bytes
+            .len()
+            .saturating_add(1)
+            .saturating_add(key_bytes.len()),
+    );
     combined.extend_from_slice(&cert_bytes);
     if !cert_bytes.ends_with(b"\n") {
         combined.push(b'\n');
@@ -1820,16 +1858,15 @@ fn build_mtls_clients(
         ))
     })?;
 
-    let resolver: Arc<dyn Resolve> =
-        Arc::new(SsrfScreeningResolver::new(
-            Arc::clone(allowlist),
-            // M-H2/B1: TestLoopbackBypass aliases to Arc<AtomicBool> in test
-            // builds and to `()` in production. We need a value clone here
-            // (not Arc::clone) because the type vanishes outside test cfg;
-            // the allow is justified by the feature-gated type alias.
-            #[expect(clippy::clone_on_ref_ptr, reason = "type alias varies per feature")]
-            test_bypass.clone(),
-        ));
+    let resolver: Arc<dyn Resolve> = Arc::new(SsrfScreeningResolver::new(
+        Arc::clone(allowlist),
+        // M-H2/B1: TestLoopbackBypass aliases to Arc<AtomicBool> in test
+        // builds and to `()` in production. We need a value clone here
+        // (not Arc::clone) because the type vanishes outside test cfg;
+        // the allow is justified by the feature-gated type alias.
+        #[expect(clippy::clone_on_ref_ptr, reason = "type alias varies per feature")]
+        test_bypass.clone(),
+    ));
 
     let mut builder = reqwest::Client::builder()
         // M-H2/N1: same proxy + DNS hardening as the shared client.
@@ -1859,7 +1896,7 @@ fn build_mtls_clients(
     let client = builder.build().map_err(|error| {
         RmcpServerKitError::Startup(format!("oauth http client mTLS init: {error}"))
     })?;
-    map.insert(
+    let _replaced = map.insert(
         MtlsClientKey {
             cert_path: cc.cert_path.clone(),
             key_path: cc.key_path.clone(),
@@ -1886,9 +1923,7 @@ fn check_oauth_url(
     allow_http: bool,
 ) -> Result<url::Url, RmcpServerKitError> {
     let parsed = url::Url::parse(raw).map_err(|error| {
-        RmcpServerKitError::Config(format!(
-            "{field}: invalid URL <unparseable-url>: {error}"
-        ))
+        RmcpServerKitError::Config(format!("{field}: invalid URL <unparseable-url>: {error}"))
     })?;
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(RmcpServerKitError::Config(format!(
@@ -1914,16 +1949,11 @@ fn check_oauth_url(
 /// # Errors
 ///
 /// Returns [`RmcpServerKitError::Config`] when either knob is zero.
-fn validate_oauth_capacity_knobs(
-    config: &OAuthConfig,
-) -> Result<(), RmcpServerKitError> {
-    (config.max_jwks_keys != 0).ok_or_else(|| {
-        RmcpServerKitError::Config("oauth.max_jwks_keys must be nonzero".into())
-    })?;
+fn validate_oauth_capacity_knobs(config: &OAuthConfig) -> Result<(), RmcpServerKitError> {
+    (config.max_jwks_keys != 0)
+        .ok_or_else(|| RmcpServerKitError::Config("oauth.max_jwks_keys must be nonzero".into()))?;
     (config.jwks_max_response_bytes != 0).ok_or_else(|| {
-        RmcpServerKitError::Config(
-            "oauth.jwks_max_response_bytes must be nonzero".into(),
-        )
+        RmcpServerKitError::Config("oauth.jwks_max_response_bytes must be nonzero".into())
     })?;
     Ok(())
 }
@@ -1936,7 +1966,7 @@ fn validate_oauth_capacity_knobs(
 #[derive(Debug, Clone)]
 #[must_use = "builders do nothing until `.build()` is called"]
 pub struct OAuthConfigBuilder {
-/// Configuration under construction.
+    /// Configuration under construction.
     inner: OAuthConfig,
 }
 
@@ -1947,7 +1977,10 @@ impl OAuthConfigBuilder {
     /// [`OAuthConfig::validate`]. See
     /// [`OAuthConfig::allowed_algorithms`].
     #[inline]
-#[expect(clippy::impl_trait_in_params, reason = "public API frozen until the next major release")]
+    #[expect(
+        clippy::impl_trait_in_params,
+        reason = "public API frozen until the next major release"
+    )]
     pub fn allowed_algorithms(
         mut self,
         algorithms: impl IntoIterator<Item = impl Into<String>>,
@@ -1965,7 +1998,10 @@ impl OAuthConfigBuilder {
     /// RFC 9207 caveat on
     /// [`OAuthConfig::authorization_server_metadata_issuer`].
     #[inline]
-#[expect(clippy::impl_trait_in_params, reason = "public API frozen until the next major release")]
+    #[expect(
+        clippy::impl_trait_in_params,
+        reason = "public API frozen until the next major release"
+    )]
     pub fn authorization_server_metadata_issuer(mut self, issuer: impl Into<String>) -> Self {
         self.inner.authorization_server_metadata_issuer = Some(issuer.into());
         self
@@ -1979,7 +2015,10 @@ impl OAuthConfigBuilder {
     /// empty iterator to omit the field. See
     /// [`OAuthConfig::authorization_servers`].
     #[inline]
-#[expect(clippy::impl_trait_in_params, reason = "public API frozen until the next major release")]
+    #[expect(
+        clippy::impl_trait_in_params,
+        reason = "public API frozen until the next major release"
+    )]
     pub fn authorization_servers(
         mut self,
         servers: impl IntoIterator<Item = impl Into<String>>,
@@ -1998,7 +2037,10 @@ impl OAuthConfigBuilder {
 
     /// Append a single scope-to-role mapping.
     #[inline]
-#[expect(clippy::impl_trait_in_params, reason = "public API frozen until the next major release")]
+    #[expect(
+        clippy::impl_trait_in_params,
+        reason = "public API frozen until the next major release"
+    )]
     pub fn scope(mut self, scope: impl Into<String>, role: impl Into<String>) -> Self {
         self.inner.scopes.push(ScopeMapping {
             scope: scope.into(),
@@ -2010,7 +2052,10 @@ impl OAuthConfigBuilder {
     /// Set the JWT claim path used to extract roles directly (without
     /// going through `scope` mappings).
     #[inline]
-#[expect(clippy::impl_trait_in_params, reason = "public API frozen until the next major release")]
+    #[expect(
+        clippy::impl_trait_in_params,
+        reason = "public API frozen until the next major release"
+    )]
     pub fn role_claim(mut self, claim: impl Into<String>) -> Self {
         self.inner.role_claim = Some(claim.into());
         self
@@ -2026,7 +2071,10 @@ impl OAuthConfigBuilder {
     /// Append a single claim-value-to-role mapping (used with
     /// [`Self::role_claim`]).
     #[inline]
-#[expect(clippy::impl_trait_in_params, reason = "public API frozen until the next major release")]
+    #[expect(
+        clippy::impl_trait_in_params,
+        reason = "public API frozen until the next major release"
+    )]
     pub fn role_mapping(mut self, claim_value: impl Into<String>, role: impl Into<String>) -> Self {
         self.inner.role_mappings.push(RoleMapping {
             claim_value: claim_value.into(),
@@ -2038,7 +2086,10 @@ impl OAuthConfigBuilder {
     /// Override the JWKS cache TTL (humantime string, e.g. `"5m"`).
     /// Defaults to `"10m"`.
     #[inline]
-#[expect(clippy::impl_trait_in_params, reason = "public API frozen until the next major release")]
+    #[expect(
+        clippy::impl_trait_in_params,
+        reason = "public API frozen until the next major release"
+    )]
     pub fn jwks_cache_ttl(mut self, ttl: impl Into<String>) -> Self {
         self.inner.jwks_cache_ttl = ttl.into();
         self
@@ -2064,7 +2115,10 @@ impl OAuthConfigBuilder {
     /// `/authorize`, `/token`, `/register`, `/introspect`, `/revoke`,
     /// `/.well-known/oauth-authorization-server` upstream calls).
     #[inline]
-#[expect(clippy::impl_trait_in_params, reason = "public API frozen until the next major release")]
+    #[expect(
+        clippy::impl_trait_in_params,
+        reason = "public API frozen until the next major release"
+    )]
     pub fn ca_cert_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.inner.ca_cert_path = Some(path.into());
         self
@@ -2301,7 +2355,10 @@ impl TokenExchangeConfig {
     /// `with_*` methods.
     #[must_use]
     #[inline]
-#[expect(clippy::impl_trait_in_params, reason = "public API frozen until the next major release")]
+    #[expect(
+        clippy::impl_trait_in_params,
+        reason = "public API frozen until the next major release"
+    )]
     pub fn new(
         token_url: impl Into<String>,
         client_id: impl Into<String>,
@@ -2323,7 +2380,10 @@ impl TokenExchangeConfig {
     /// Set the RFC 8693 `audience` parameter.
     #[must_use]
     #[inline]
-#[expect(clippy::impl_trait_in_params, reason = "public API frozen until the next major release")]
+    #[expect(
+        clippy::impl_trait_in_params,
+        reason = "public API frozen until the next major release"
+    )]
     pub fn with_audience(mut self, audience: impl Into<String>) -> Self {
         self.audience = Some(audience.into());
         self
@@ -2332,7 +2392,10 @@ impl TokenExchangeConfig {
     /// Set the RFC 8693 / RFC 8707 `resource` parameter.
     #[must_use]
     #[inline]
-#[expect(clippy::impl_trait_in_params, reason = "public API frozen until the next major release")]
+    #[expect(
+        clippy::impl_trait_in_params,
+        reason = "public API frozen until the next major release"
+    )]
     pub fn with_resource(mut self, resource: impl Into<String>) -> Self {
         self.resource = Some(resource.into());
         self
@@ -2341,7 +2404,10 @@ impl TokenExchangeConfig {
     /// Set the RFC 8693 `scope` parameter.
     #[must_use]
     #[inline]
-#[expect(clippy::impl_trait_in_params, reason = "public API frozen until the next major release")]
+    #[expect(
+        clippy::impl_trait_in_params,
+        reason = "public API frozen until the next major release"
+    )]
     pub fn with_scope(mut self, scope: impl Into<String>) -> Self {
         self.scope = Some(scope.into());
         self
@@ -2378,7 +2444,10 @@ impl ClientCertConfig {
     /// from outside the crate.
     #[must_use]
     #[inline]
-#[expect(clippy::missing_const_for_fn, reason = "public API frozen until the next major release")]
+    #[expect(
+        clippy::missing_const_for_fn,
+        reason = "public API frozen until the next major release"
+    )]
     pub fn new(cert_path: PathBuf, key_path: PathBuf) -> Self {
         Self {
             cert_path,
@@ -2520,7 +2589,10 @@ impl OAuthProxyConfig {
     /// [`Default`] values and can be set via the corresponding builder
     /// methods.
     #[inline]
-#[expect(clippy::impl_trait_in_params, reason = "public API frozen until the next major release")]
+    #[expect(
+        clippy::impl_trait_in_params,
+        reason = "public API frozen until the next major release"
+    )]
     pub fn builder(
         authorize_url: impl Into<String>,
         token_url: impl Into<String>,
@@ -2545,7 +2617,7 @@ impl OAuthProxyConfig {
 #[derive(Debug, Clone)]
 #[must_use = "builders do nothing until `.build()` is called"]
 pub struct OAuthProxyConfigBuilder {
-/// Proxy configuration under construction.
+    /// Proxy configuration under construction.
     inner: OAuthProxyConfig,
 }
 
@@ -2561,7 +2633,10 @@ impl OAuthProxyConfigBuilder {
     /// advertised and reachable when
     /// [`Self::expose_admin_endpoints`] is also set to `true`.
     #[inline]
-#[expect(clippy::impl_trait_in_params, reason = "public API frozen until the next major release")]
+    #[expect(
+        clippy::impl_trait_in_params,
+        reason = "public API frozen until the next major release"
+    )]
     pub fn introspection_url(mut self, url: impl Into<String>) -> Self {
         self.inner.introspection_url = Some(url.into());
         self
@@ -2571,7 +2646,10 @@ impl OAuthProxyConfigBuilder {
     /// advertised and reachable when
     /// [`Self::expose_admin_endpoints`] is also set to `true`.
     #[inline]
-#[expect(clippy::impl_trait_in_params, reason = "public API frozen until the next major release")]
+    #[expect(
+        clippy::impl_trait_in_params,
+        reason = "public API frozen until the next major release"
+    )]
     pub fn revocation_url(mut self, url: impl Into<String>) -> Self {
         self.inner.revocation_url = Some(url.into());
         self
@@ -2712,13 +2790,13 @@ type JwksKeyCache = (
 
 /// One fetched JWKS snapshot: kid-indexed keys, unnamed keys, and freshness metadata.
 struct CachedKeys {
-    /// `kid` -> (`JwkAlg`, `DecodingKey`)
+    /// `kid` -> (`JwkAlg`, `DecodingKey`).
     keys: HashMap<String, (JwkAlg, DecodingKey)>,
     /// Keys without a kid, indexed by algorithm family.
     unnamed_keys: Vec<(JwkAlg, DecodingKey)>,
-/// When this snapshot was stored.
+    /// When this snapshot was stored.
     fetched_at: Instant,
-/// How long this snapshot stays fresh.
+    /// How long this snapshot stays fresh.
     ttl: Duration,
 }
 
@@ -2726,7 +2804,7 @@ struct CachedKeys {
 const _JWKS_REFRESH_COOLDOWN_DOC_ANCHOR: &str = "JWKS_REFRESH_COOLDOWN";
 
 impl CachedKeys {
-/// Whether the snapshot has outlived its TTL.
+    /// Whether the snapshot has outlived its TTL.
     fn is_expired(&self) -> bool {
         self.fetched_at.elapsed() >= self.ttl
     }
@@ -2746,31 +2824,31 @@ impl CachedKeys {
 )]
 #[non_exhaustive]
 pub struct JwksCache {
-/// The upstream JWKS endpoint.
+    /// The upstream JWKS endpoint.
     jwks_uri: String,
-/// Configured cache TTL for fetched keys.
+    /// Configured cache TTL for fetched keys.
     ttl: Duration,
-/// Upper bound on keys accepted from one JWKS document.
+    /// Upper bound on keys accepted from one JWKS document.
     max_jwks_keys: usize,
     /// Algorithms this cache will verify with. Defaults to [`ACCEPTED_ALGS`];
     /// [`OAuthConfig::allowed_algorithms`] may narrow it but never widen it.
     allowed_algorithms: Vec<Algorithm>,
-/// Upper bound on the JWKS response body size in bytes.
+    /// Upper bound on the JWKS response body size in bytes.
     max_response_bytes: u64,
-/// Whether plain-HTTP JWKS URLs are permitted (`allow_http_oauth_urls`).
+    /// Whether plain-HTTP JWKS URLs are permitted (`allow_http_oauth_urls`).
     allow_http: bool,
-/// Current key snapshot; `None` until the first successful fetch.
+    /// Current key snapshot; `None` until the first successful fetch.
     inner: RwLock<Option<CachedKeys>>,
-/// Fetch client (SSRF-screened, redirect-policy applied).
+    /// Fetch client (SSRF-screened, redirect-policy applied).
     http: reqwest::Client,
-/// Base `Validation` template; per-token validation clones and narrows it.
+    /// Base `Validation` template; per-token validation clones and narrows it.
     validation_template: Validation,
     /// Expected audience value from config; checked against `aud` and,
     /// per `audience_mode`, optionally `azp`.
     expected_audience: String,
-/// How `aud`/`azp` are validated.
+    /// How `aud`/`azp` are validated.
     audience_mode: AudienceValidationMode,
-/// Whether tokens without `sub` are rejected.
+    /// Whether tokens without `sub` are rejected.
     require_subject: bool,
     /// Set to `true` after the first `azp`-only audience match while in
     /// [`AudienceValidationMode::Warn`], so the deprecation warning logs
@@ -2779,11 +2857,11 @@ pub struct JwksCache {
     /// Separate from [`Self::azp_fallback_warned`] on purpose: sharing one
     /// flag would let whichever mode logged first suppress the other.
     azp_permissive_logged: AtomicBool,
-/// Scope-to-role mappings.
+    /// Scope-to-role mappings.
     scopes: Vec<ScopeMapping>,
-/// Claim path that carries roles directly, when set.
+    /// Claim path that carries roles directly, when set.
     role_claim: Option<String>,
-/// Claim-value-to-role mappings.
+    /// Claim-value-to-role mappings.
     role_mappings: Vec<RoleMapping>,
     /// Tracks the last refresh attempt timestamp. Enforces a 10-second cooldown
     /// between refresh attempts to prevent abuse via fabricated JWTs with invalid kids.
@@ -2798,9 +2876,10 @@ pub struct JwksCache {
     /// SSRF resolver inside the cached `reqwest::Client`. See the
     /// matching field on `OauthHttpClient`.
     #[cfg(any(test, feature = "test-helpers"))]
-    test_allow_loopback_ssrf: crate::ssrf_resolver::TestLoopbackBypass,
+    test_allow_loopback_ssrf: TestLoopbackBypass,
 }
 
+/// Minimum interval between refresh attempts triggered by an unknown `kid`.
 const JWKS_REFRESH_COOLDOWN: Duration = Duration::from_secs(10);
 
 /// Upper bound on an upstream OAuth proxy response body (`/token`,
@@ -2887,6 +2966,11 @@ fn accepted_algorithm_names() -> String {
 /// config. An empty list is rejected because it would silently reject every
 /// token -- almost certainly an operator mistake rather than an intent to
 /// disable OAuth.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when the list is empty or names an unsupported
+/// algorithm.
 pub(crate) fn resolve_allowed_algorithms(
     configured: Option<&[String]>,
 ) -> Result<Vec<Algorithm>, RmcpServerKitError> {
@@ -2926,19 +3010,22 @@ pub enum JwtValidationFailure {
 }
 
 /// JWT validation rejection plus optional verified credential owner details.
-#[expect(clippy::field_scoped_visibility_modifiers, reason = "deliberate: src/oauth.rs::JwtRejection fields are read by src/auth.rs; accessors would churn the crate-internal API")]
+#[expect(
+    clippy::field_scoped_visibility_modifiers,
+    reason = "deliberate: src/oauth.rs::JwtRejection fields are read by src/auth.rs; accessors would churn the crate-internal API"
+)]
 pub(crate) struct JwtRejection {
-/// Why validation failed.
+    /// Why validation failed.
     pub(crate) failure: JwtValidationFailure,
-/// Verified credential owner details, when the endpoint wants them.
+    /// Verified credential owner details, when the endpoint wants them.
     pub(crate) owner: Option<CredentialOwner>,
 }
 
 /// A failed decode plus any expired-claim data recovered from it.
 struct DecodeFailure {
-/// Classification of the decode failure.
+    /// Classification of the decode failure.
     failure: JwtValidationFailure,
-/// Claims recovered from an expired token, for owner attribution.
+    /// Claims recovered from an expired token, for owner attribution.
     expired_claims: Option<Box<Claims>>,
 }
 
@@ -2954,13 +3041,22 @@ impl JwksCache {
     /// [`McpServerConfig::validate`](crate::transport::McpServerConfig::validate)
     /// pipeline) rejects invalid TTLs up front, so the TTL branch is
     /// unreachable for validated configs.
-#[expect(clippy::too_many_lines, reason = "deliberate: src/oauth.rs::JwksCache::new keeps the screening, TLS and redirect setup in one reviewable block")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "deliberate: src/oauth.rs::JwksCache::new keeps the screening, TLS and redirect setup in one reviewable block"
+    )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "deliberate: src/oauth.rs::JwksCache::new keeps the screening, TLS and redirect setup in one reviewable block"
+    )]
     #[inline]
     pub fn new(config: &OAuthConfig) -> Result<Self, Box<dyn Error + Send + Sync>> {
         // Ensure crypto providers are installed (idempotent -- ok() ignores
         // the error if already installed by another call in the same process).
         drop(default_provider().install_default());
-        drop(DEFAULT_PROVIDER.install_default());
+        if let Err(error) = DEFAULT_PROVIDER.install_default() {
+            tracing::debug!(?error, "jsonwebtoken crypto provider already installed");
+        }
 
         let ttl = humantime::parse_duration(&config.jwks_cache_ttl).map_err(|error| {
             format!(
@@ -2993,9 +3089,7 @@ impl JwksCache {
         // surfaced at startup rather than on first JWKS fetch.
         let allowlist = match config.ssrf_allowlist.as_ref() {
             Some(raw) => Arc::new(compile_oauth_ssrf_allowlist(raw).map_err(|error| {
-                Box::<dyn Error + Send + Sync>::from(format!(
-                    "oauth.ssrf_allowlist: {error}"
-                ))
+                Box::<dyn Error + Send + Sync>::from(format!("oauth.ssrf_allowlist: {error}"))
             })?),
             None => Arc::new(CompiledSsrfAllowlist::default()),
         };
@@ -3003,10 +3097,9 @@ impl JwksCache {
 
         // M-H2: see OauthHttpClient::build for rationale; same pattern.
         #[cfg(any(test, feature = "test-helpers"))]
-        let test_bypass: crate::ssrf_resolver::TestLoopbackBypass =
-            Arc::new(AtomicBool::new(false));
+        let test_bypass: TestLoopbackBypass = Arc::new(AtomicBool::new(false));
         #[cfg(not(any(test, feature = "test-helpers")))]
-        let test_bypass: crate::ssrf_resolver::TestLoopbackBypass = ();
+        let test_bypass: TestLoopbackBypass = ();
 
         #[cfg_attr(
             any(
@@ -3026,11 +3119,10 @@ impl JwksCache {
                 reason = "TestLoopbackBypass aliases to Arc<AtomicBool> under cfg(test)/test-helpers and to `()` otherwise; each cfg trips a different clone/arg lint"
             )
         )]
-        let resolver: Arc<dyn Resolve> =
-            Arc::new(SsrfScreeningResolver::new(
-                Arc::clone(&allowlist),
-                test_bypass.clone(),
-            ));
+        let resolver: Arc<dyn Resolve> = Arc::new(SsrfScreeningResolver::new(
+            Arc::clone(&allowlist),
+            test_bypass.clone(),
+        ));
 
         let mut http_builder = reqwest::Client::builder()
             // M-H2/N1: see OauthHttpClient::build.
@@ -3114,6 +3206,7 @@ impl JwksCache {
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     #[must_use]
+    #[inline]
     pub fn __test_allow_loopback_ssrf(self) -> Self {
         // M-H2/B1: flip the SHARED atomic so the resolver inside the
         // cached client and the pre-flight check both observe the bypass.
@@ -3151,6 +3244,10 @@ impl JwksCache {
     // decode, no shared state) plus pure claim checks. Owner attribution uses
     // already-verified claims or expired claims from the same blocking decode.
     // No partial state is committed on cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JwtRejection`] carrying the failure classification and optional owner.
     pub(crate) async fn validate_token_detailed(
         &self,
         token: &str,
@@ -3176,7 +3273,12 @@ impl JwksCache {
         // `require_subject` must also reject a *blank* sub: it is the OAuth
         // session-binding stable id, so a blank one collapses distinct
         // principals to one fingerprint (CWE-384).
-        if self.require_subject && claims.sub.as_deref().is_none_or(|name| name.trim().is_empty()) {
+        if self.require_subject
+            && claims
+                .sub
+                .as_deref()
+                .is_none_or(|name| name.trim().is_empty())
+        {
             cold_path();
             tracing::debug!(
                 "JWT rejected: require_subject is set but the token has no non-blank `sub`"
@@ -3245,10 +3347,10 @@ impl JwksCache {
     // refresh) then a `spawn_blocking` decode whose `JoinHandle`, if dropped on
     // cancellation, detaches the verification (it completes off-task). No shared
     // state is mutated on this path.
-///
-/// # Errors
-///
-/// Returns [`DecodeFailure`] carrying the failure classification and any expired claims.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeFailure`] carrying the failure classification and any expired claims.
     async fn decode_claims(
         &self,
         token: &str,
@@ -3277,10 +3379,7 @@ impl JwksCache {
                 let first = decode::<Claims>(&token_owned, &key, &validation);
                 if want_expired_claims
                     && let Err(error) = &first
-                    && matches!(
-                        error.kind(),
-                        ErrorKind::ExpiredSignature
-                    )
+                    && matches!(error.kind(), ErrorKind::ExpiredSignature)
                 {
                     tracing::debug!("JWT expired; re-decoding without exp for owner attribution");
                     let mut expired_validation = validation.clone();
@@ -3341,10 +3440,10 @@ impl JwksCache {
         clippy::cognitive_complexity,
         reason = "each failure arm pairs `cold_path()` with a distinct `tracing::debug!` site for observability; collapsing into combinators would lose structured-field log sites without reducing real complexity"
     )]
-///
-/// # Errors
-///
-/// Returns a message when no key in the refreshed JWKS can verify the token.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when no key in the refreshed JWKS can verify the token.
     async fn select_jwks_key(
         &self,
         token: &str,
@@ -3380,10 +3479,10 @@ impl JwksCache {
     /// `tracing::warn!` per process in [`AudienceValidationMode::Warn`],
     /// and reject in [`AudienceValidationMode::Strict`]. No-claim-match
     /// always rejects.
-///
-/// # Errors
-///
-/// Returns the [`JwtValidationFailure`] classification for the mismatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`JwtValidationFailure`] classification for the mismatch.
     fn check_audience(&self, claims: &Claims) -> Result<(), JwtValidationFailure> {
         if claims.aud.contains(&self.expected_audience) {
             return Ok(());
@@ -3461,10 +3560,10 @@ impl JwksCache {
     /// When `role_claim` is set, extract values from the given claim path
     /// and match against `role_mappings`. Otherwise, match space-separated
     /// tokens in the `scope` claim against configured scope mappings.
-///
-/// # Errors
-///
-/// Returns [`JwtValidationFailure::Invalid`] when no mapping matches.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JwtValidationFailure::Invalid`] when no mapping matches.
     fn resolve_role(&self, claims: &Claims) -> Result<String, JwtValidationFailure> {
         if let Some(claim_path) = &self.role_claim {
             let owned_first_class: Vec<String> = first_class_claim_values(claims, claim_path);
@@ -3586,10 +3685,10 @@ impl JwksCache {
     // `*guard = Some(..)` assignment under the `tokio::sync::RwLock` write lock
     // at the end. Cancellation before that point leaves the prior cache intact;
     // it never observes a half-built cache.
-///
-/// # Errors
-///
-/// Returns the `build_key_cache` message when the JWKS exceeds the key cap.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `build_key_cache` message when the JWKS exceeds the key cap.
     async fn refresh_inner(&self) -> Result<(), String> {
         let Some(jwks) = self.fetch_jwks().await else {
             return Ok(());
@@ -3714,6 +3813,7 @@ impl JwksCache {
     /// identity provider's JWKS endpoint.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
+    #[inline]
     pub async fn __test_refresh_now(&self) -> Result<(), String> {
         let jwks = self
             .fetch_jwks()
@@ -3735,6 +3835,7 @@ impl JwksCache {
     /// supplied kid. Read-only; takes the cache lock briefly.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
+    #[inline]
     pub async fn __test_has_kid(&self, kid: &str) -> bool {
         let guard = self.inner.read().await;
         guard
@@ -3754,7 +3855,12 @@ fn identity_label(claims: &Claims, sub: Option<&str>) -> String {
         .map(String::from)
         .or_else(|| sub.filter(|text| !text.trim().is_empty()).map(String::from))
         .or_else(|| claims.azp.clone().filter(|text| !text.trim().is_empty()))
-        .or_else(|| claims.client_id.clone().filter(|text| !text.trim().is_empty()))
+        .or_else(|| {
+            claims
+                .client_id
+                .clone()
+                .filter(|text| !text.trim().is_empty())
+        })
         .unwrap_or_else(|| "oauth-client".into())
 }
 
@@ -4061,7 +4167,7 @@ struct Claims {
 struct OneOrMany(Vec<String>);
 
 impl OneOrMany {
-/// Whether any element matches `value` exactly.
+    /// Whether any element matches `value` exactly.
     fn contains(&self, value: &str) -> bool {
         self.0.iter().any(|candidate| candidate == value)
     }
@@ -4234,14 +4340,18 @@ pub fn protected_resource_metadata(
     // RFC 9728 3.2: omit zero-valued claims rather than emitting empty arrays.
     let auth_servers = resolve_authorization_servers(server_url, config);
     if !auth_servers.is_empty() {
-        obj.insert(
+        let _inserted_auth_servers = obj.insert(
             "authorization_servers".into(),
             serde_json::json!(auth_servers),
         );
     }
-    let scopes: Vec<&str> = config.scopes.iter().map(|scope| scope.scope.as_str()).collect();
+    let scopes: Vec<&str> = config
+        .scopes
+        .iter()
+        .map(|scope| scope.scope.as_str())
+        .collect();
     if !scopes.is_empty() {
-        obj.insert("scopes_supported".into(), serde_json::json!(scopes));
+        let _inserted_scopes = obj.insert("scopes_supported".into(), serde_json::json!(scopes));
     }
     meta
 }
@@ -4275,34 +4385,38 @@ pub fn authorization_server_metadata(server_url: &str, config: &OAuthConfig) -> 
         "token_endpoint_auth_methods_supported": ["none"],
     });
     // RFC 8414 3.2: omit zero-valued claims rather than emitting `[]`.
-    let scopes: Vec<&str> = config.scopes.iter().map(|scope| scope.scope.as_str()).collect();
+    let scopes: Vec<&str> = config
+        .scopes
+        .iter()
+        .map(|scope| scope.scope.as_str())
+        .collect();
     if !scopes.is_empty()
         && let Some(obj) = meta.as_object_mut()
     {
-        obj.insert("scopes_supported".into(), serde_json::json!(scopes));
+        let _inserted_scopes = obj.insert("scopes_supported".into(), serde_json::json!(scopes));
     }
     if let Some(proxy) = &config.proxy
         && proxy.expose_admin_endpoints
         && let Some(obj) = meta.as_object_mut()
     {
         if proxy.introspection_url.is_some() {
-            obj.insert(
+            let _inserted_introspection = obj.insert(
                 "introspection_endpoint".into(),
                 serde_json::Value::String(format!("{server_url}/introspect")),
             );
         }
         if proxy.revocation_url.is_some() {
-            obj.insert(
+            let _inserted_revocation = obj.insert(
                 "revocation_endpoint".into(),
                 serde_json::Value::String(format!("{server_url}/revoke")),
             );
         }
         if proxy.require_auth_on_admin_endpoints {
-            obj.insert(
+            let _inserted_introspection_auth = obj.insert(
                 "introspection_endpoint_auth_methods_supported".into(),
                 serde_json::json!(["bearer"]),
             );
-            obj.insert(
+            let _inserted_revocation_auth = obj.insert(
                 "revocation_endpoint_auth_methods_supported".into(),
                 serde_json::json!(["bearer"]),
             );
@@ -4362,7 +4476,11 @@ pub async fn handle_token(
         use core::fmt::Write as _;
 
         use secrecy::ExposeSecret as _;
-        let _ = write!(
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "write! into String cannot fail"
+        )]
+        let _: Result<(), fmt::Error> = write!(
             upstream_body,
             "&client_secret={}",
             urlencoding::encode(secret.expose_secret())
@@ -4427,12 +4545,12 @@ pub fn handle_register(proxy: &OAuthProxyConfig, body: &serde_json::Value) -> se
     if let Some(uris) = body.get("redirect_uris")
         && let Some(obj) = resp.as_object_mut()
     {
-        obj.insert("redirect_uris".into(), uris.clone());
+        let _inserted_redirect_uris = obj.insert("redirect_uris".into(), uris.clone());
     }
     if let Some(name) = body.get("client_name")
         && let Some(obj) = resp.as_object_mut()
     {
-        obj.insert("client_name".into(), name.clone());
+        let _inserted_client_name = obj.insert("client_name".into(), name.clone());
     }
     resp
 }
@@ -4507,7 +4625,11 @@ async fn proxy_oauth_admin_request(
         use core::fmt::Write as _;
 
         use secrecy::ExposeSecret as _;
-        let _ = write!(
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "write! into String cannot fail"
+        )]
+        let _: Result<(), fmt::Error> = write!(
             upstream_body,
             "&client_secret={}",
             urlencoding::encode(secret.expose_secret())
@@ -4608,11 +4730,7 @@ async fn read_response_capped(
 }
 
 /// Build a JSON OAuth error response with the given status code and description.
-fn oauth_error_response(
-    status: StatusCode,
-    error: &str,
-    description: &str,
-) -> Response {
+fn oauth_error_response(status: StatusCode, error: &str, description: &str) -> Response {
     use axum::{http::header, response::IntoResponse as _};
     let body = serde_json::json!({
         "error": error,
@@ -4633,9 +4751,9 @@ fn oauth_error_response(
 /// OAuth error response body from the authorization server.
 #[derive(Debug, Deserialize)]
 struct OAuthErrorResponse {
-/// RFC 6749 §5.2 error code.
+    /// RFC 6749 §5.2 error code.
     error: String,
-/// Optional human-readable error description (upstream-controlled).
+    /// Optional human-readable error description (upstream-controlled).
     error_description: Option<String>,
 }
 
@@ -4710,9 +4828,9 @@ pub async fn exchange_token(
 /// Whether a successful exchange logs the exchanged-token metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SuccessLogMode {
-/// Log the exchanged-token metadata.
+    /// Log the exchanged-token metadata.
     Normal,
-/// Stay quiet; the detached caller audits the outcome itself.
+    /// Stay quiet; the detached caller audits the outcome itself.
     Suppress,
 }
 
@@ -4780,11 +4898,12 @@ async fn exchange_token_inner(
         // Parse upstream error for logging only; client-visible payload is a
         // sanitized short code from the RFC 6749 §5.2 / RFC 8693 allowlist.
         let parsed = serde_json::from_slice::<OAuthErrorResponse>(&body_bytes).ok();
-        let short_code = parsed
-            .as_ref()
-            .map_or("server_error", |error| sanitize_oauth_error_code(&error.error));
+        let short_code = parsed.as_ref().map_or("server_error", |error| {
+            sanitize_oauth_error_code(&error.error)
+        });
         if let Some(error) = &parsed {
-            let description = upstream_error_description_for_log(error.error_description.as_deref());
+            let description =
+                upstream_error_description_for_log(error.error_description.as_deref());
             tracing::warn!(
                 status = %status,
                 upstream_error = %error.error,
@@ -4879,16 +4998,15 @@ pub async fn exchange_token_with_cancel(
     // `oneshot::Sender` is the sink: if the receiver is gone, `send` returns
     // the result to this task so an abandoned success can be audited without
     // logging token material.
-    tokio::spawn(
+    let _task = tokio::spawn(
         async move {
-            let result =
-                exchange_token_inner(
-                    &http_owned,
-                    &config_owned,
-                    &subject_token_owned,
-                    SuccessLogMode::Suppress,
-                )
-                .await;
+            let result = exchange_token_inner(
+                &http_owned,
+                &config_owned,
+                &subject_token_owned,
+                SuccessLogMode::Suppress,
+            )
+            .await;
             if let Err(abandoned) = tx.send(result) {
                 audit_abandoned_exchange_result(abandoned);
             }
@@ -4900,6 +5018,10 @@ pub async fn exchange_token_with_cancel(
 }
 
 /// Await the detached exchange result under cancellation and the optional timeout.
+#[expect(
+    clippy::integer_division_remainder_used,
+    reason = "external macro: tokio::select"
+)]
 async fn receive_exchange_result_with_cancel(
     rx: oneshot::Receiver<Result<ExchangedToken, RmcpServerKitError>>,
     ct: &CancellationToken,
@@ -4929,26 +5051,19 @@ async fn receive_exchange_result_with_cancel(
 /// Map the oneshot receive into a [`DetachOutcome`], treating a dropped sender as
 /// `server_error`.
 fn map_exchange_receiver(
-    received: Result<
-        Result<ExchangedToken, RmcpServerKitError>,
-        RecvError,
-    >,
+    received: Result<Result<ExchangedToken, RmcpServerKitError>, RecvError>,
 ) -> DetachOutcome<Result<ExchangedToken, RmcpServerKitError>> {
     match received {
         Ok(result) => DetachOutcome::Completed(result),
         Err(error) => {
             tracing::error!(error = %error, "token exchange task ended before returning a result");
-            DetachOutcome::Completed(Err(
-                RmcpServerKitError::Internal("server_error".into()),
-            ))
+            DetachOutcome::Completed(Err(RmcpServerKitError::Internal("server_error".into())))
         }
     }
 }
 
 /// Log bounded metadata when a detached exchange mints a token (never token material).
-fn audit_abandoned_exchange_result(
-    result: Result<ExchangedToken, RmcpServerKitError>,
-) {
+fn audit_abandoned_exchange_result(result: Result<ExchangedToken, RmcpServerKitError>) {
     match result {
         Ok(token) => {
             let (issued_token_type, issued_token_type_truncated) = token
@@ -5113,9 +5228,9 @@ fn rewrite_client_auth_params(
         if strip_resource && key.as_ref() == "resource" {
             continue;
         }
-        out.append_pair(&key, &value);
+        let _appended = out.append_pair(&key, &value);
     }
-    out.append_pair("client_id", upstream_client_id);
+    let _appended = out.append_pair("client_id", upstream_client_id);
     out.finish()
 }
 
@@ -5184,8 +5299,9 @@ mod tests {
             .collect()
     }
 
+    /// Drops a percent-encoded client_id key so only the proxy's value remains.
     #[test]
-    fn rewrite_drops_percent_encoded_client_id_key() {
+    fn rewrite_drops_percent_encoded_client_id_key() -> anyhow::Result<()> {
         let out = rewrite_client_auth_params("%63lient_id=attacker&scope=read", "proxy-id", false);
         let pairs = decoded_pairs(&out);
         let client_ids: Vec<&String> = pairs
@@ -5194,20 +5310,26 @@ mod tests {
             .map(|(_, v)| v)
             .collect();
         assert_eq!(client_ids, vec!["proxy-id"], "smuggled client_id survived");
+
+        Ok(())
     }
 
+    /// Drops an underscore-encoded client_id key so the attacker value never survives.
     #[test]
-    fn rewrite_drops_underscore_encoded_client_id_key() {
+    fn rewrite_drops_underscore_encoded_client_id_key() -> anyhow::Result<()> {
         let out = rewrite_client_auth_params("client%5Fid=attacker&scope=read", "proxy-id", false);
         let pairs = decoded_pairs(&out);
         assert!(
             !pairs.iter().any(|(_, v)| v == "attacker"),
             "smuggled client_id survived: {pairs:?}"
         );
+
+        Ok(())
     }
 
+    /// Removes any caller-supplied client_secret from the rewritten auth params.
     #[test]
-    fn rewrite_drops_caller_supplied_client_secret() {
+    fn rewrite_drops_caller_supplied_client_secret() -> anyhow::Result<()> {
         let out = rewrite_client_auth_params(
             "client_secret=attacker-secret&scope=read",
             "proxy-id",
@@ -5218,10 +5340,13 @@ mod tests {
             !pairs.iter().any(|(k, _)| k == "client_secret"),
             "caller client_secret survived: {pairs:?}"
         );
+
+        Ok(())
     }
 
+    /// Strips caller-supplied client_assertion and client_assertion_type parameters.
     #[test]
-    fn rewrite_drops_caller_supplied_client_assertion() {
+    fn rewrite_drops_caller_supplied_client_assertion() -> anyhow::Result<()> {
         let out = rewrite_client_auth_params(
             "client_assertion=ey.evil&client_assertion_type=urn:evil&scope=read",
             "proxy-id",
@@ -5234,10 +5359,13 @@ mod tests {
                 .any(|(k, _)| k == "client_assertion" || k == "client_assertion_type"),
             "caller client assertion survived: {pairs:?}"
         );
+
+        Ok(())
     }
 
+    /// Collapses duplicate client_id parameters to a single proxy client_id value.
     #[test]
-    fn rewrite_collapses_duplicate_client_id_to_proxy_value() {
+    fn rewrite_collapses_duplicate_client_id_to_proxy_value() -> anyhow::Result<()> {
         let out =
             rewrite_client_auth_params("client_id=a&client_id=b&scope=read", "proxy-id", false);
         let pairs = decoded_pairs(&out);
@@ -5247,10 +5375,13 @@ mod tests {
             .map(|(_, v)| v)
             .collect();
         assert_eq!(client_ids, vec!["proxy-id"]);
+
+        Ok(())
     }
 
+    /// Preserves non-client parameters in order, duplicates included, unchanged.
     #[test]
-    fn rewrite_preserves_non_client_params_in_order_with_duplicates() {
+    fn rewrite_preserves_non_client_params_in_order_with_duplicates() -> anyhow::Result<()> {
         let out = rewrite_client_auth_params(
             "scope=read&resource=a&state=xyz&resource=b&code_verifier=v",
             "proxy-id",
@@ -5271,10 +5402,13 @@ mod tests {
                 ("code_verifier".to_owned(), "v".to_owned()),
             ]
         );
+
+        Ok(())
     }
 
+    /// Strips every resource parameter when the Entra workaround flag is enabled.
     #[test]
-    fn rewrite_strips_every_resource_param_when_enabled() {
+    fn rewrite_strips_every_resource_param_when_enabled() -> anyhow::Result<()> {
         // Issue #17: Entra rejects `resource` alongside a differing api://
         // scope (AADSTS9010010). All occurrences must go, and everything else
         // must survive in order.
@@ -5295,10 +5429,13 @@ mod tests {
                 ("code_verifier".to_owned(), "v".to_owned()),
             ]
         );
+
+        Ok(())
     }
 
+    /// Strips a percent-encoded resource key, matched after decoding.
     #[test]
-    fn rewrite_strips_percent_encoded_resource_key() {
+    fn rewrite_strips_percent_encoded_resource_key() -> anyhow::Result<()> {
         // The strip filter compares post-decode, so an encoded key cannot
         // smuggle `resource` upstream -- same property that protects
         // CLIENT_AUTH_PARAMS.
@@ -5309,10 +5446,14 @@ mod tests {
             "percent-encoded resource survived: {pairs:?}"
         );
         assert!(pairs.contains(&("scope".to_owned(), "read".to_owned())));
+
+        Ok(())
     }
 
+    /// Never strips PKCE/CSRF/redirect params when resource stripping is enabled.
     #[test]
-    fn rewrite_never_strips_security_params_when_resource_stripping_enabled() {
+    fn rewrite_never_strips_security_params_when_resource_stripping_enabled() -> anyhow::Result<()>
+    {
         // SECURITY: stripping must never reach PKCE, CSRF, or redirect
         // binding. If this ever fails, an operator enabling the Entra
         // workaround would silently lose those protections.
@@ -5340,10 +5481,13 @@ mod tests {
             );
         }
         assert!(!pairs.iter().any(|(k, _)| k == "resource"));
+
+        Ok(())
     }
 
+    /// Round-trips percent-encoded values containing special characters unchanged.
     #[test]
-    fn rewrite_roundtrips_values_with_special_characters() {
+    fn rewrite_roundtrips_values_with_special_characters() -> anyhow::Result<()> {
         let input = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("state", "a&b=c+d")
             .append_pair("scope", "réad ✓")
@@ -5352,50 +5496,71 @@ mod tests {
         let pairs = decoded_pairs(&out);
         assert!(pairs.contains(&("state".to_owned(), "a&b=c+d".to_owned())));
         assert!(pairs.contains(&("scope".to_owned(), "réad ✓".to_owned())));
+
+        Ok(())
     }
 
+    /// Injects the proxy client_id when the incoming form lacks one.
     #[test]
-    fn rewrite_injects_client_id_when_absent() {
+    fn rewrite_injects_client_id_when_absent() -> anyhow::Result<()> {
         let out = rewrite_client_auth_params("scope=read", "proxy-id", false);
         assert!(decoded_pairs(&out).contains(&("client_id".to_owned(), "proxy-id".to_owned())));
+
+        Ok(())
     }
 
+    /// Accepts a three-segment token whose header decodes to alg-bearing JSON.
     #[test]
-    fn looks_like_jwt_valid() {
+    fn looks_like_jwt_valid() -> anyhow::Result<()> {
         // Minimal valid JWT structure: base64({"alg":"RS256"}).base64({}).sig
         let header = URL_SAFE_NO_PAD.encode(b"{\"alg\":\"RS256\",\"typ\":\"JWT\"}");
         let payload = URL_SAFE_NO_PAD.encode(b"{}");
         let token = format!("{header}.{payload}.signature");
         assert!(looks_like_jwt(&token));
+
+        Ok(())
     }
 
+    /// Rejects a single-segment opaque token as not JWT-shaped.
     #[test]
-    fn looks_like_jwt_rejects_opaque_token() {
+    fn looks_like_jwt_rejects_opaque_token() -> anyhow::Result<()> {
         assert!(!looks_like_jwt("dGhpcyBpcyBhbiBvcGFxdWUgdG9rZW4"));
+
+        Ok(())
     }
 
+    /// Rejects a two-segment token as not JWT-shaped.
     #[test]
-    fn looks_like_jwt_rejects_two_segments() {
+    fn looks_like_jwt_rejects_two_segments() -> anyhow::Result<()> {
         let header = URL_SAFE_NO_PAD.encode(b"{\"alg\":\"RS256\"}");
         let token = format!("{header}.payload");
         assert!(!looks_like_jwt(&token));
+
+        Ok(())
     }
 
+    /// Rejects a four-segment token as not JWT-shaped.
     #[test]
-    fn looks_like_jwt_rejects_four_segments() {
+    fn looks_like_jwt_rejects_four_segments() -> anyhow::Result<()> {
         assert!(!looks_like_jwt("a.b.c.d"));
+
+        Ok(())
     }
 
+    /// Rejects a JWT-shaped token whose decoded header lacks an alg member.
     #[test]
-    fn looks_like_jwt_rejects_no_alg() {
+    fn looks_like_jwt_rejects_no_alg() -> anyhow::Result<()> {
         let header = URL_SAFE_NO_PAD.encode(b"{\"typ\":\"JWT\"}");
         let payload = URL_SAFE_NO_PAD.encode(b"{}");
         let token = format!("{header}.{payload}.sig");
         assert!(!looks_like_jwt(&token));
+
+        Ok(())
     }
 
+    /// Populates PRM resource, upstream authorization_servers, scopes, and bearer method.
     #[test]
-    fn protected_resource_metadata_shape() {
+    fn protected_resource_metadata_shape() -> anyhow::Result<()> {
         let config = OAuthConfig {
             require_subject: false,
             issuer: "https://auth.example.com".into(),
@@ -5443,6 +5608,8 @@ mod tests {
         assert_eq!(meta["authorization_servers"][0], "https://auth.example.com");
         assert_eq!(meta["scopes_supported"].as_array().unwrap().len(), 2);
         assert_eq!(meta["bearer_methods_supported"][0], "header");
+
+        Ok(())
     }
 
     /// Build a PRM fixture with the given proxy / override topology.
@@ -5476,16 +5643,20 @@ mod tests {
         .build()
     }
 
+    /// Advertises the local server as AS only when the built-in proxy is configured.
     #[test]
-    fn prm_advertises_local_server_only_when_proxy_mounts_the_endpoints() {
+    fn prm_advertises_local_server_only_when_proxy_mounts_the_endpoints() -> anyhow::Result<()> {
         // With the built-in proxy the local server really does serve
         // /authorize, /token, /register and the AS metadata document.
         let meta = prm_for(Some(demo_proxy()), None, vec![]);
         assert_eq!(meta["authorization_servers"][0], "https://mcp.example.com");
+
+        Ok(())
     }
 
+    /// Lets an explicit authorization_servers override win over proxy topology.
     #[test]
-    fn prm_explicit_override_wins_over_topology() {
+    fn prm_explicit_override_wins_over_topology() -> anyhow::Result<()> {
         // The extra_router case: the application mounts its own OAuth facade
         // without configuring `proxy`, so it must be able to say so.
         let meta = prm_for(
@@ -5505,10 +5676,13 @@ mod tests {
             meta["authorization_servers"][0],
             "https://elsewhere.example"
         );
+
+        Ok(())
     }
 
+    /// Omits zero-valued PRM claims instead of emitting empty arrays.
     #[test]
-    fn prm_omits_zero_valued_claims() {
+    fn prm_omits_zero_valued_claims() -> anyhow::Result<()> {
         // RFC 9728 3.2: claims with zero elements MUST be omitted, not
         // emitted as `[]`.
         let meta = prm_for(None, Some(vec![]), vec![]);
@@ -5521,6 +5695,8 @@ mod tests {
             "no configured scopes must omit the claim: {meta}"
         );
         assert_eq!(meta["resource"], "https://mcp.example.com/mcp");
+
+        Ok(())
     }
 
     fn proxy_as_metadata_config() -> OAuthConfig {
@@ -5533,8 +5709,9 @@ mod tests {
         }
     }
 
+    /// Defaults the AS metadata issuer to the origin the document is served from.
     #[test]
-    fn as_metadata_issuer_defaults_to_the_origin_it_is_served_from() {
+    fn as_metadata_issuer_defaults_to_the_origin_it_is_served_from() -> anyhow::Result<()> {
         // RFC 8414 3.3: the published `issuer` MUST equal the identifier the
         // metadata URL was built from. RFC 8414 6.2 requires clients to reject
         // a mismatch, so publishing the upstream issuer here made the document
@@ -5550,10 +5727,13 @@ mod tests {
             meta.get("scopes_supported").is_none(),
             "RFC 8414 3.2: omit zero-valued claims: {meta}"
         );
+
+        Ok(())
     }
 
+    /// Restores the upstream issuer when authorization_server_metadata_issuer is set.
     #[test]
-    fn as_metadata_issuer_legacy_opt_out_restores_upstream_value() {
+    fn as_metadata_issuer_legacy_opt_out_restores_upstream_value() -> anyhow::Result<()> {
         // Escape hatch for an upstream IdP that emits RFC 9207 `iss` to
         // clients that validate it; the proxy cannot reconcile that because
         // the callback bypasses this process entirely.
@@ -5561,15 +5741,20 @@ mod tests {
         config.authorization_server_metadata_issuer = Some("https://auth.example.com".into());
         let meta = authorization_server_metadata("https://mcp.example.com", &config);
         assert_eq!(meta["issuer"], "https://auth.example.com");
+
+        Ok(())
     }
 
+    /// Keeps config.issuer untouched for token validation when the metadata issuer differs.
     #[test]
-    fn as_metadata_issuer_never_affects_token_validation() {
+    fn as_metadata_issuer_never_affects_token_validation() -> anyhow::Result<()> {
         // Whichever value is published, inbound JWT `iss` is validated against
         // `config.issuer`.
         let mut config = proxy_as_metadata_config();
         config.authorization_server_metadata_issuer = Some("https://mcp.example.com".into());
         assert_eq!(config.issuer, "https://auth.example.com");
+
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -5585,8 +5770,9 @@ mod tests {
         .build()
     }
 
+    /// Rejects non-HTTPS, credentialed, IP-literal, or unparseable discovery metadata URLs.
     #[test]
-    fn validate_rejects_non_conformant_discovery_metadata_urls() {
+    fn validate_rejects_non_conformant_discovery_metadata_urls() -> anyhow::Result<()> {
         for bad in [
             "https://user:pw@as.example.com",
             "http://as.example.com",
@@ -5605,10 +5791,13 @@ mod tests {
                 "error must identify the offending index; got {err:?}"
             );
         }
+
+        Ok(())
     }
 
+    /// Accepts well-formed HTTPS discovery URLs and an empty authorization_servers list.
     #[test]
-    fn validate_accepts_discovery_metadata_urls_and_the_empty_override() {
+    fn validate_accepts_discovery_metadata_urls_and_the_empty_override() -> anyhow::Result<()> {
         let mut cfg = validation_https_config();
         cfg.authorization_server_metadata_issuer = Some("https://as.example.com".to_owned());
         cfg.authorization_servers = Some(vec!["https://as.example.com".to_owned()]);
@@ -5619,16 +5808,22 @@ mod tests {
         cfg.authorization_servers = Some(vec![]);
         cfg.validate()
             .expect("an empty list is the documented way to omit the claim entirely");
+
+        Ok(())
     }
 
+    /// Accepts a config whose URLs are all HTTPS.
     #[test]
-    fn validate_accepts_all_https_urls() {
+    fn validate_accepts_all_https_urls() -> anyhow::Result<()> {
         let cfg = validation_https_config();
         cfg.validate().expect("all-HTTPS config must validate");
+
+        Ok(())
     }
 
+    /// Rejects an empty audience with an error naming oauth.audience.
     #[test]
-    fn validate_rejects_empty_audience() {
+    fn validate_rejects_empty_audience() -> anyhow::Result<()> {
         let mut cfg = validation_https_config();
         cfg.audience = String::new();
         let err = cfg.validate().expect_err("empty audience must be rejected");
@@ -5636,6 +5831,8 @@ mod tests {
             err.to_string().contains("oauth.audience"),
             "error must reference oauth.audience; got {err}"
         );
+
+        Ok(())
     }
 
     fn assert_config_nonzero_error(err: crate::error::RmcpServerKitError, field: &str) {
@@ -5648,28 +5845,36 @@ mod tests {
         );
     }
 
+    /// Rejects max_jwks_keys = 0 with a must-be-nonzero config error.
     #[test]
-    fn rejects_zero_max_jwks_keys() {
+    fn rejects_zero_max_jwks_keys() -> anyhow::Result<()> {
         let mut cfg = validation_https_config();
         cfg.max_jwks_keys = 0;
         let err = cfg
             .validate()
             .expect_err("zero max_jwks_keys must be rejected");
         assert_config_nonzero_error(err, "oauth.max_jwks_keys");
+
+        Ok(())
     }
 
+    /// Rejects jwks_max_response_bytes = 0 with a must-be-nonzero config error.
     #[test]
-    fn rejects_zero_jwks_max_response_bytes() {
+    fn rejects_zero_jwks_max_response_bytes() -> anyhow::Result<()> {
         let mut cfg = validation_https_config();
         cfg.jwks_max_response_bytes = 0;
         let err = cfg
             .validate()
             .expect_err("zero jwks_max_response_bytes must be rejected");
         assert_config_nonzero_error(err, "oauth.jwks_max_response_bytes");
+
+        Ok(())
     }
 
+    /// Deserializes a partial OAuth table via defaults, then rejects empty required fields.
     #[test]
-    fn oauth_config_partial_table_deserializes_then_validate_rejects_empty_fields() {
+    fn oauth_config_partial_table_deserializes_then_validate_rejects_empty_fields()
+    -> anyhow::Result<()> {
         let toml_src = r#"
 role_claim = "realm_access.roles"
 
@@ -5688,10 +5893,13 @@ role = "admin"
         cfg.validate().expect_err(
             "empty issuer/jwks_uri/audience must still fail validate() (parse-don't-validate)",
         );
+
+        Ok(())
     }
 
+    /// Rejects a malformed jwks_cache_ttl naming the offending field.
     #[test]
-    fn validate_rejects_unparseable_jwks_cache_ttl() {
+    fn validate_rejects_unparseable_jwks_cache_ttl() -> anyhow::Result<()> {
         let mut cfg = validation_https_config();
         cfg.jwks_cache_ttl = "not-a-duration".into();
         let err = cfg
@@ -5702,10 +5910,13 @@ role = "admin"
             msg.contains("jwks_cache_ttl"),
             "error must reference offending field; got {msg:?}"
         );
+
+        Ok(())
     }
 
+    /// Rejects an HTTP jwks_uri while demanding HTTPS.
     #[test]
-    fn validate_rejects_http_jwks_uri() {
+    fn validate_rejects_http_jwks_uri() -> anyhow::Result<()> {
         let mut cfg = validation_https_config();
         cfg.jwks_uri = "http://auth.example.com/.well-known/jwks.json".into();
         let err = cfg.validate().expect_err("http jwks_uri must be rejected");
@@ -5714,10 +5925,13 @@ role = "admin"
             msg.contains("oauth.jwks_uri") && msg.contains("https"),
             "error must reference offending field + scheme requirement; got {msg:?}"
         );
+
+        Ok(())
     }
 
+    /// Rejects an HTTP proxy authorize_url naming oauth.proxy.authorize_url.
     #[test]
-    fn validate_rejects_http_proxy_authorize_url() {
+    fn validate_rejects_http_proxy_authorize_url() -> anyhow::Result<()> {
         let mut cfg = validation_https_config();
         cfg.proxy = Some(
             OAuthProxyConfig::builder(
@@ -5734,10 +5948,13 @@ role = "admin"
             err.to_string().contains("oauth.proxy.authorize_url"),
             "error must reference proxy.authorize_url; got {err}"
         );
+
+        Ok(())
     }
 
+    /// Rejects an HTTP proxy token_url naming oauth.proxy.token_url.
     #[test]
-    fn validate_rejects_http_proxy_token_url() {
+    fn validate_rejects_http_proxy_token_url() -> anyhow::Result<()> {
         let mut cfg = validation_https_config();
         cfg.proxy = Some(
             OAuthProxyConfig::builder(
@@ -5752,10 +5969,13 @@ role = "admin"
             err.to_string().contains("oauth.proxy.token_url"),
             "error must reference proxy.token_url; got {err}"
         );
+
+        Ok(())
     }
 
+    /// Rejects HTTP proxy introspection_url and revocation_url fields.
     #[test]
-    fn validate_rejects_http_proxy_introspection_and_revocation_urls() {
+    fn validate_rejects_http_proxy_introspection_and_revocation_urls() -> anyhow::Result<()> {
         let mut cfg = validation_https_config();
         cfg.proxy = Some(
             OAuthProxyConfig::builder(
@@ -5785,12 +6005,15 @@ role = "admin"
             .validate()
             .expect_err("http revocation_url must be rejected");
         assert!(err.to_string().contains("oauth.proxy.revocation_url"));
+
+        Ok(())
     }
 
     // -- M3 regression: unauthenticated /introspect and /revoke must fail validate --
 
+    /// Rejects exposed admin endpoints lacking both auth guards.
     #[test]
-    fn validate_rejects_exposed_admin_endpoints_without_auth() {
+    fn validate_rejects_exposed_admin_endpoints_without_auth() -> anyhow::Result<()> {
         let mut cfg = validation_https_config();
         cfg.proxy = Some(
             OAuthProxyConfig::builder(
@@ -5811,10 +6034,13 @@ role = "admin"
             msg.contains("allow_unauthenticated_admin_endpoints"),
             "{msg}"
         );
+
+        Ok(())
     }
 
+    /// Accepts exposed admin endpoints when auth is required.
     #[test]
-    fn validate_accepts_exposed_admin_endpoints_with_auth() {
+    fn validate_accepts_exposed_admin_endpoints_with_auth() -> anyhow::Result<()> {
         let mut cfg = validation_https_config();
         cfg.proxy = Some(
             OAuthProxyConfig::builder(
@@ -5829,10 +6055,14 @@ role = "admin"
         );
         cfg.validate()
             .expect("authed admin endpoints must validate");
+
+        Ok(())
     }
 
+    /// Accepts exposed admin endpoints with the explicit unauthenticated opt-out.
     #[test]
-    fn validate_accepts_exposed_admin_endpoints_with_explicit_unauth_optout() {
+    fn validate_accepts_exposed_admin_endpoints_with_explicit_unauth_optout() -> anyhow::Result<()>
+    {
         let mut cfg = validation_https_config();
         cfg.proxy = Some(
             OAuthProxyConfig::builder(
@@ -5847,10 +6077,13 @@ role = "admin"
         );
         cfg.validate()
             .expect("explicit unauth opt-out must validate");
+
+        Ok(())
     }
 
+    /// Accepts the default unexposed admin endpoints without auth.
     #[test]
-    fn validate_accepts_unexposed_admin_endpoints_without_auth() {
+    fn validate_accepts_unexposed_admin_endpoints_without_auth() -> anyhow::Result<()> {
         // The default safe shape: expose_admin_endpoints = false. The
         // M3 check must not fire because the routes are not mounted.
         let mut cfg = validation_https_config();
@@ -5865,10 +6098,13 @@ role = "admin"
         );
         cfg.validate()
             .expect("unexposed admin endpoints must validate");
+
+        Ok(())
     }
 
+    /// Rejects an HTTP token_exchange.token_url naming the field.
     #[test]
-    fn validate_rejects_http_token_exchange_url() {
+    fn validate_rejects_http_token_exchange_url() -> anyhow::Result<()> {
         let mut cfg = validation_https_config();
         cfg.token_exchange = Some(
             TokenExchangeConfig::new(
@@ -5886,20 +6122,26 @@ role = "admin"
             err.to_string().contains("oauth.token_exchange.token_url"),
             "error must reference token_exchange.token_url; got {err}"
         );
+
+        Ok(())
     }
 
+    /// Rejects an unparseable URL with an invalid-URL error.
     #[test]
-    fn validate_rejects_unparseable_url() {
+    fn validate_rejects_unparseable_url() -> anyhow::Result<()> {
         let mut cfg = validation_https_config();
         cfg.jwks_uri = "not a url".into();
         let err = cfg
             .validate()
             .expect_err("unparseable URL must be rejected");
         assert!(err.to_string().contains("invalid URL"));
+
+        Ok(())
     }
 
+    /// Rejects a non-HTTP scheme such as file:// while demanding HTTPS.
     #[test]
-    fn validate_rejects_non_http_scheme() {
+    fn validate_rejects_non_http_scheme() -> anyhow::Result<()> {
         let mut cfg = validation_https_config();
         cfg.jwks_uri = "file:///etc/passwd".into();
         let err = cfg.validate().expect_err("file:// scheme must be rejected");
@@ -5908,10 +6150,13 @@ role = "admin"
             msg.contains("must use https scheme") && msg.contains("file"),
             "error must reject non-http(s) schemes; got {msg:?}"
         );
+
+        Ok(())
     }
 
+    /// Accepts HTTP on all six URL fields when allow_http_oauth_urls is set.
     #[test]
-    fn validate_accepts_http_with_escape_hatch() {
+    fn validate_accepts_http_with_escape_hatch() -> anyhow::Result<()> {
         // F2 escape-hatch: `allow_http_oauth_urls = true` permits HTTP for
         // dev/test against local IdPs without TLS. Document the security
         // tradeoff (see field doc) and verify all 6 URL fields are accepted
@@ -5944,10 +6189,13 @@ role = "admin"
         );
         cfg.validate()
             .expect("escape hatch must permit http on all URL fields");
+
+        Ok(())
     }
 
+    /// Still rejects malformed URLs even when the HTTP escape hatch is enabled.
     #[test]
-    fn validate_with_escape_hatch_still_rejects_unparseable() {
+    fn validate_with_escape_hatch_still_rejects_unparseable() -> anyhow::Result<()> {
         // Even with the escape hatch, malformed URLs are rejected so
         // garbage configuration cannot silently degrade to no-op.
         let mut cfg = validation_https_config();
@@ -5955,10 +6203,13 @@ role = "admin"
         cfg.jwks_uri = "::not-a-url::".into();
         cfg.validate()
             .expect_err("escape hatch must NOT bypass URL parsing");
+
+        Ok(())
     }
 
+    /// Requires the redirect policy to refuse a JWKS redirect that downgrades to HTTP.
     #[tokio::test]
-    async fn jwks_cache_rejects_redirect_downgrade_to_http() {
+    async fn jwks_cache_rejects_redirect_downgrade_to_http() -> anyhow::Result<()> {
         // F2.4 (Oracle modification A): even when the configured `jwks_uri`
         // is HTTPS, a `302 Location: http://...` from the JWKS host must
         // be refused by the reqwest redirect policy. Without this guard,
@@ -5992,7 +6243,7 @@ role = "admin"
         // builder in this crate uses SsrfScreeningResolver" holds.
         // Loopback bypass is enabled so the wiremock fixture stays
         // reachable.
-        let test_bypass: crate::ssrf_resolver::TestLoopbackBypass = Arc::new(AtomicBool::new(true));
+        let test_bypass: TestLoopbackBypass = Arc::new(AtomicBool::new(true));
         let allowlist = Arc::new(crate::ssrf::CompiledSsrfAllowlist::default());
         let resolver: Arc<dyn reqwest::dns::Resolve> = Arc::new(
             crate::ssrf_resolver::SsrfScreeningResolver::new(Arc::clone(&allowlist), test_bypass),
@@ -6036,6 +6287,8 @@ role = "admin"
                 || chain.to_lowercase().contains("redirect"),
             "error must surface redirect-policy rejection; got {chain:?}"
         );
+
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -6203,8 +6456,9 @@ role = "admin"
         (cache, token, mock_server)
     }
 
+    /// Collapses duplicate kid entries in the JWKS to a single cached key.
     #[test]
-    fn build_key_cache_last_duplicate_kid_wins() {
+    fn build_key_cache_last_duplicate_kid_wins() -> anyhow::Result<()> {
         let (_pem, jwks_json) = generate_test_keypair("dup-kid");
         let entry = jwks_json["keys"][0].clone();
         let merged = serde_json::json!({ "keys": [entry.clone(), entry] });
@@ -6215,10 +6469,13 @@ role = "admin"
         assert_eq!(keys.len(), 1, "colliding kids collapse to one entry");
         assert!(keys.contains_key("dup-kid"));
         assert!(unnamed.is_empty());
+
+        Ok(())
     }
 
+    /// Drops keys with use=enc or key_ops lacking verify from the verification cache.
     #[test]
-    fn build_key_cache_rejects_keys_not_marked_for_signature_verification() {
+    fn build_key_cache_rejects_keys_not_marked_for_signature_verification() -> anyhow::Result<()> {
         // SECURITY (key-use separation, RFC 7517 4.2/4.3): DecodingKey::from_jwk
         // ignores `use`/`key_ops`, so an issuer publishing an encryption key in
         // the same JWKS must not have it accepted as a verification key.
@@ -6242,10 +6499,13 @@ role = "admin"
         let (keys, unnamed) = build_key_cache(&jwks, 16).expect("under key cap");
         assert!(keys.is_empty(), "key_ops without verify must be rejected");
         assert!(unnamed.is_empty());
+
+        Ok(())
     }
 
+    /// Accepts keys with use=sig/key_ops=verify or with no use/key_ops constraint.
     #[test]
-    fn build_key_cache_accepts_sig_and_unconstrained_keys() {
+    fn build_key_cache_accepts_sig_and_unconstrained_keys() -> anyhow::Result<()> {
         let (_pem, jwks_json) = generate_test_keypair("sig-key");
 
         // Absent `use`/`key_ops` stays accepted (RFC 7517: both are optional).
@@ -6260,6 +6520,8 @@ role = "admin"
             serde_json::from_value(serde_json::json!({ "keys": [sig] })).expect("jwks parses");
         let (keys, _) = build_key_cache(&jwks, 16).expect("under key cap");
         assert!(keys.contains_key("sig-key"));
+
+        Ok(())
     }
 
     // -- Issue #17: JWKS keys that omit the OPTIONAL `alg` member (RFC 7517 4.4) --
@@ -6278,8 +6540,9 @@ role = "admin"
         serde_json::from_value(serde_json::json!({ "keys": [key] })).expect("alg-less jwks parses")
     }
 
+    /// Caches an alg-less RSA key with family Rsa rather than dropping it.
     #[test]
-    fn alg_less_rsa_key_is_cached_as_rsa_family() {
+    fn alg_less_rsa_key_is_cached_as_rsa_family() -> anyhow::Result<()> {
         let (_pem, jwks_json) = generate_test_keypair("entra-kid");
         let jwks = jwks_without_alg(&jwks_json);
         assert!(
@@ -6291,10 +6554,13 @@ role = "admin"
         assert!(unnamed.is_empty());
         let (cached_alg, _) = keys.get("entra-kid").expect("alg-less key must be cached");
         assert_eq!(*cached_alg, JwkAlg::Family(JwkKeyFamily::Rsa));
+
+        Ok(())
     }
 
+    /// Resolves an alg-less RSA key for RS*/PS* algs but not ES256.
     #[test]
-    fn alg_less_rsa_key_accepts_rsa_family_and_rejects_others() {
+    fn alg_less_rsa_key_accepts_rsa_family_and_rejects_others() -> anyhow::Result<()> {
         let (_pem, jwks_json) = generate_test_keypair("entra-kid");
         let cached = CachedKeys {
             keys: build_key_cache(&jwks_without_alg(&jwks_json), 16)
@@ -6322,10 +6588,13 @@ role = "admin"
         assert!(lookup_key(&cached, Some("entra-kid"), Algorithm::ES256).is_none());
         // The kid-strict rule still holds for inferred keys.
         assert!(lookup_key(&cached, Some("unknown"), Algorithm::RS256).is_none());
+
+        Ok(())
     }
 
+    /// Prevents family inference from accepting HMAC algs against asymmetric keys.
     #[test]
-    fn alg_less_key_never_accepts_hmac_algorithm_confusion() {
+    fn alg_less_key_never_accepts_hmac_algorithm_confusion() -> anyhow::Result<()> {
         // Regression guard: the classic attack is to present alg=HS256 and use
         // the issuer's PUBLIC RSA modulus as the HMAC secret. Family inference
         // must never widen an RSA key to a symmetric algorithm. (ACCEPTED_ALGS
@@ -6335,10 +6604,13 @@ role = "admin"
         assert!(!family_accepts(JwkKeyFamily::Rsa, Algorithm::HS512));
         assert!(!family_accepts(JwkKeyFamily::EcP256, Algorithm::HS256));
         assert!(!family_accepts(JwkKeyFamily::Ed25519, Algorithm::HS256));
+
+        Ok(())
     }
 
+    /// Ensures family inference never admits an algorithm outside ACCEPTED_ALGS.
     #[test]
-    fn family_accepts_is_subset_of_accepted_algs() {
+    fn family_accepts_is_subset_of_accepted_algs() -> anyhow::Result<()> {
         // INVARIANT: family inference must never admit an algorithm that the
         // pre-lookup `ACCEPTED_ALGS` screen would reject.
         let every_alg = [
@@ -6370,10 +6642,13 @@ role = "admin"
                 }
             }
         }
+
+        Ok(())
     }
 
+    /// Pins a key declaring RS256 to exactly RS256, rejecting RS384.
     #[test]
-    fn explicit_alg_still_pins_exactly_one_algorithm() {
+    fn explicit_alg_still_pins_exactly_one_algorithm() -> anyhow::Result<()> {
         // The JWK declares RS256, so an RS384 token must NOT be accepted even
         // though both are producible by the same RSA key.
         let (_pem, jwks_json) = generate_test_keypair("pinned");
@@ -6386,10 +6661,13 @@ role = "admin"
         };
         assert!(lookup_key(&cached, Some("pinned"), Algorithm::RS256).is_some());
         assert!(lookup_key(&cached, Some("pinned"), Algorithm::RS384).is_none());
+
+        Ok(())
     }
 
+    /// Still drops alg-less keys excluded by use=enc or key_ops without verify.
     #[test]
-    fn alg_less_key_still_subject_to_use_and_key_ops_gate() {
+    fn alg_less_key_still_subject_to_use_and_key_ops_gate() -> anyhow::Result<()> {
         // Ordering guard: `jwk_permits_signature_verification` runs BEFORE the
         // algorithm step, so inference must not resurrect a key excluded by
         // key-use separation. Covers both branches of that gate.
@@ -6421,12 +6699,15 @@ role = "admin"
             keys.is_empty() && unnamed.is_empty(),
             "key_ops without verify must be dropped"
         );
+
+        Ok(())
     }
 
     // -- allowed_algorithms: operator narrowing of the accepted algorithm set --
 
+    /// Round-trips every accepted algorithm to a configurable name and back.
     #[test]
-    fn accepted_algorithm_names_cover_accepted_algs() {
+    fn accepted_algorithm_names_cover_accepted_algs() -> anyhow::Result<()> {
         // Lockstep contract: every accepted algorithm must have a name an
         // operator can write, and every name must round-trip back.
         for alg in ACCEPTED_ALGS {
@@ -6438,10 +6719,13 @@ role = "admin"
             accepted_algorithm_names().split(", ").count(),
             ACCEPTED_ALGS.len()
         );
+
+        Ok(())
     }
 
+    /// Rejects configured algorithm names outside the accepted set.
     #[test]
-    fn allowed_algorithms_cannot_widen_beyond_accepted_algs() {
+    fn allowed_algorithms_cannot_widen_beyond_accepted_algs() -> anyhow::Result<()> {
         // SECURITY: the whole point of the narrow-only rule. An operator must
         // not be able to re-enable a symmetric or unsigned algorithm and open
         // an algorithm-confusion hole.
@@ -6454,25 +6738,34 @@ role = "admin"
                 .expect_err("must reject non-accepted algorithm");
             assert!(err.to_string().contains("unsupported algorithm"));
         }
+
+        Ok(())
     }
 
+    /// Rejects an empty allowed_algorithms list.
     #[test]
-    fn allowed_algorithms_rejects_empty_list() {
+    fn allowed_algorithms_rejects_empty_list() -> anyhow::Result<()> {
         let err =
             resolve_allowed_algorithms(Some(&[])).expect_err("empty list would reject every token");
         assert!(err.to_string().contains("must not be empty"));
+
+        Ok(())
     }
 
+    /// Defaults allowed_algorithms to the full accepted algorithm set.
     #[test]
-    fn allowed_algorithms_defaults_to_full_accepted_set() {
+    fn allowed_algorithms_defaults_to_full_accepted_set() -> anyhow::Result<()> {
         assert_eq!(
             resolve_allowed_algorithms(None).expect("default resolves"),
             ACCEPTED_ALGS.to_vec()
         );
+
+        Ok(())
     }
 
+    /// Narrows and case-insensitively dedups an allowed_algorithms subset.
     #[test]
-    fn allowed_algorithms_narrows_and_dedups_case_insensitively() {
+    fn allowed_algorithms_narrows_and_dedups_case_insensitively() -> anyhow::Result<()> {
         let resolved = resolve_allowed_algorithms(Some(&[
             "rs256".to_owned(),
             "RS256".to_owned(),
@@ -6480,10 +6773,13 @@ role = "admin"
         ]))
         .expect("valid subset");
         assert_eq!(resolved, vec![Algorithm::RS256, Algorithm::ES384]);
+
+        Ok(())
     }
 
+    /// Surfaces unsupported allowed_algorithms through config validation.
     #[test]
-    fn allowed_algorithms_surfaces_through_config_validate() {
+    fn allowed_algorithms_surfaces_through_config_validate() -> anyhow::Result<()> {
         let mut cfg = test_config("https://idp.test.local/jwks.json");
         cfg.allowed_algorithms = Some(vec!["HS256".to_owned()]);
         let err = cfg.validate().expect_err("HS256 must fail validation");
@@ -6491,10 +6787,14 @@ role = "admin"
 
         cfg.allowed_algorithms = Some(vec!["RS256".to_owned()]);
         cfg.validate().expect("a valid subset must validate");
+
+        Ok(())
     }
 
+    /// Rejects an RS256 token when allowed_algorithms is narrowed to ES384.
     #[tokio::test]
-    async fn narrowed_allowed_algorithms_rejects_excluded_but_otherwise_valid_token() {
+    async fn narrowed_allowed_algorithms_rejects_excluded_but_otherwise_valid_token()
+    -> anyhow::Result<()> {
         // The token is signed RS256 by a key the JWKS serves, so it would
         // normally authenticate; narrowing to ES384 must reject it at the
         // pre-lookup algorithm gate.
@@ -6534,10 +6834,13 @@ role = "admin"
             test_cache(&narrowed).validate_token(&token).await.is_none(),
             "RS256 token must be rejected when only ES384 is allowed"
         );
+
+        Ok(())
     }
 
+    /// Bounds a long kid to MAX_LOGGED_KID_CHARS plus a truncation marker.
     #[test]
-    fn truncate_kid_for_log_bounds_hostile_input() {
+    fn truncate_kid_for_log_bounds_hostile_input() -> anyhow::Result<()> {
         let short = "kid-1";
         assert_eq!(truncate_kid_for_log(short), (short.to_owned(), false));
 
@@ -6549,27 +6852,36 @@ role = "admin"
             truncated.chars().count(),
             MAX_LOGGED_KID_CHARS + "...(truncated)".chars().count()
         );
+
+        Ok(())
     }
 
+    /// Truncates a multibyte kid on a char boundary without panicking.
     #[test]
-    fn truncate_kid_for_log_splits_on_char_boundary() {
+    fn truncate_kid_for_log_splits_on_char_boundary() -> anyhow::Result<()> {
         let multibyte = "\u{1f512}".repeat(MAX_LOGGED_KID_CHARS + 10);
         let (truncated, was_truncated) = truncate_kid_for_log(&multibyte);
         assert!(was_truncated);
         assert!(truncated.starts_with('\u{1f512}'));
         assert!(truncated.ends_with("...(truncated)"));
+
+        Ok(())
     }
 
+    /// Reports a kid exactly at the cap as untruncated.
     #[test]
-    fn truncate_kid_for_log_flag_marks_exact_boundary_as_untruncated() {
+    fn truncate_kid_for_log_flag_marks_exact_boundary_as_untruncated() -> anyhow::Result<()> {
         let exact = "k".repeat(MAX_LOGGED_KID_CHARS);
         let (out, was_truncated) = truncate_kid_for_log(&exact);
         assert!(!was_truncated, "a kid exactly at the cap is not truncated");
         assert_eq!(out, exact);
+
+        Ok(())
     }
 
+    /// Rejects tokens when the JWKS cache expired and refresh fails.
     #[tokio::test]
-    async fn expired_jwks_fails_closed_when_refresh_fails() {
+    async fn expired_jwks_fails_closed_when_refresh_fails() -> anyhow::Result<()> {
         let (cache, token, _mock) = h2_prime_then_break("80ms").await;
         tokio::time::sleep(Duration::from_millis(200)).await;
         let failure = cache
@@ -6577,10 +6889,13 @@ role = "admin"
             .await
             .expect_err("an expired cache whose refresh fails must not serve the stale key");
         assert_eq!(failure, JwtValidationFailure::Invalid);
+
+        Ok(())
     }
 
+    /// Validates a matching token while the JWKS cache is fresh and reachable.
     #[tokio::test]
-    async fn fresh_jwks_still_validates() {
+    async fn fresh_jwks_still_validates() -> anyhow::Result<()> {
         let kid = "test-h2-fresh";
         let (pem, jwks) = generate_test_keypair(kid);
         let mock_server = wiremock::MockServer::start().await;
@@ -6604,10 +6919,13 @@ role = "admin"
             .validate_token_with_reason(&token)
             .await
             .expect("a reachable JWKS must still validate a matching token");
+
+        Ok(())
     }
 
+    /// Fails closed when the expired cache cannot refresh because the cooldown is active.
     #[tokio::test]
-    async fn cooldown_active_plus_expired_fails_closed() {
+    async fn cooldown_active_plus_expired_fails_closed() -> anyhow::Result<()> {
         let (cache, token, _mock) = h2_prime_then_break("80ms").await;
         tokio::time::sleep(Duration::from_millis(200)).await;
         // First attempt: no cooldown yet, so this triggers a (503) refresh that
@@ -6626,10 +6944,13 @@ role = "admin"
             .await
             .expect_err("cooldown-active + expired cache must still fail closed");
         assert_eq!(failure, JwtValidationFailure::Invalid);
+
+        Ok(())
     }
 
+    /// Returns identity name, first mapped role, method, and sub from a valid JWT.
     #[tokio::test]
-    async fn valid_jwt_returns_identity() {
+    async fn valid_jwt_returns_identity() -> anyhow::Result<()> {
         let kid = "test-key-1";
         let (pem, jwks) = generate_test_keypair(kid);
 
@@ -6666,12 +6987,15 @@ role = "admin"
         // and OAuth sessions would break across replicas on refresh, with
         // every other assertion here still passing.
         assert_eq!(id.sub.as_deref(), Some("ci-bot"));
+
+        Ok(())
     }
 
     // -- L4: kid-strict key lookup + require_subject --
 
+    /// Rejects an unknown kid instead of falling back to an unnamed key.
     #[test]
-    fn unknown_kid_with_named_keys_rejected() {
+    fn unknown_kid_with_named_keys_rejected() -> anyhow::Result<()> {
         let mut keys = HashMap::new();
         keys.insert(
             "kid-1".to_owned(),
@@ -6697,10 +7021,13 @@ role = "admin"
         assert!(lookup_key(&cached, Some("unknown"), Algorithm::RS256).is_none());
         // A known kid paired with the wrong algorithm is rejected too.
         assert!(lookup_key(&cached, Some("kid-1"), Algorithm::ES256).is_none());
+
+        Ok(())
     }
 
+    /// Matches a kid-less token against an unnamed JWKS key.
     #[test]
-    fn no_kid_token_matches_unnamed_key() {
+    fn no_kid_token_matches_unnamed_key() -> anyhow::Result<()> {
         let mut keys = HashMap::new();
         keys.insert(
             "kid-1".to_owned(),
@@ -6721,10 +7048,13 @@ role = "admin"
         // A token with no kid falls back to an unnamed key, supporting JWKS
         // entries that legitimately omit `kid`.
         assert!(lookup_key(&cached, None, Algorithm::RS256).is_some());
+
+        Ok(())
     }
 
+    /// Rejects a sub-less token when require_subject is on, accepting one with sub.
     #[tokio::test]
-    async fn require_subject_rejects_subject_less() {
+    async fn require_subject_rejects_subject_less() -> anyhow::Result<()> {
         let kid = "test-key-reqsub";
         let (pem, jwks) = generate_test_keypair(kid);
         let mock_server = wiremock::MockServer::start().await;
@@ -6762,10 +7092,13 @@ role = "admin"
             cache.validate_token(&with_sub).await.is_some(),
             "a token carrying sub must still be accepted"
         );
+
+        Ok(())
     }
 
+    /// Accepts a sub-less token by default and stores no subject.
     #[tokio::test]
-    async fn subject_less_token_accepted_by_default() {
+    async fn subject_less_token_accepted_by_default() -> anyhow::Result<()> {
         let kid = "test-key-nosub-default";
         let (pem, jwks) = generate_test_keypair(kid);
         let mock_server = wiremock::MockServer::start().await;
@@ -6797,6 +7130,8 @@ role = "admin"
             identity.and_then(|id| id.sub).is_none(),
             "a sub-less token must not synthesise a subject"
         );
+
+        Ok(())
     }
 
     fn mint_token_with_extra(
@@ -6842,8 +7177,9 @@ role = "admin"
         (cache, pem, mock_server)
     }
 
+    /// Skips a blank preferred_username and falls through to sub for name.
     #[tokio::test]
-    async fn oauth_blank_preferred_username_falls_through_to_sub() {
+    async fn oauth_blank_preferred_username_falls_through_to_sub() -> anyhow::Result<()> {
         let (cache, pem, _server) = blank_claim_cache(false).await;
         let token = mint_token_with_extra(
             &pem,
@@ -6861,10 +7197,13 @@ role = "admin"
             "blank preferred_username must be skipped"
         );
         assert_eq!(id.sub.as_deref(), Some("real-sub"));
+
+        Ok(())
     }
 
+    /// Falls all-blank claims to the oauth-client sentinel and fingerprints without panic.
     #[tokio::test]
-    async fn oauth_all_blank_claims_yield_non_blank_name_and_fingerprint() {
+    async fn oauth_all_blank_claims_yield_non_blank_name_and_fingerprint() -> anyhow::Result<()> {
         let (cache, pem, _server) = blank_claim_cache(false).await;
         let token = mint_token_with_extra(
             &pem,
@@ -6889,10 +7228,13 @@ role = "admin"
         assert!(id.sub.is_none(), "a blank sub must be stored as None");
         // Exercises the fingerprint debug_assert: a blank stable id would panic.
         let _fingerprint = crate::session_binding::fingerprint(&id);
+
+        Ok(())
     }
 
+    /// Rejects a whitespace-only sub when require_subject is on.
     #[tokio::test]
-    async fn oauth_blank_sub_rejected_when_require_subject() {
+    async fn oauth_blank_sub_rejected_when_require_subject() -> anyhow::Result<()> {
         let (cache, pem, _server) = blank_claim_cache(true).await;
         let token = mint_token_with_extra(
             &pem,
@@ -6905,10 +7247,13 @@ role = "admin"
             cache.validate_token(&token).await.is_none(),
             "require_subject must reject a blank sub"
         );
+
+        Ok(())
     }
 
+    /// Accepts a blank sub by default and stores it as None.
     #[tokio::test]
-    async fn oauth_blank_sub_stored_as_none() {
+    async fn oauth_blank_sub_stored_as_none() -> anyhow::Result<()> {
         let (cache, pem, _server) = blank_claim_cache(false).await;
         let token = mint_token_with_extra(
             &pem,
@@ -6923,10 +7268,13 @@ role = "admin"
             .expect("a blank sub is accepted by default (require_subject off)");
         assert!(id.sub.is_none(), "a blank sub must be stored as None");
         assert_eq!(id.name, "oauth-client");
+
+        Ok(())
     }
 
+    /// Falls through blank sub and preferred_username to a non-blank azp.
     #[tokio::test]
-    async fn oauth_blank_preferred_and_sub_fall_through_to_azp() {
+    async fn oauth_blank_preferred_and_sub_fall_through_to_azp() -> anyhow::Result<()> {
         let (cache, pem, _server) = blank_claim_cache(false).await;
         let token = mint_token_with_extra(
             &pem,
@@ -6944,10 +7292,13 @@ role = "admin"
             "must fall through to a non-blank azp"
         );
         assert!(id.sub.is_none(), "a blank sub must be stored as None");
+
+        Ok(())
     }
 
+    /// Falls through a blank azp to a non-blank client_id.
     #[tokio::test]
-    async fn oauth_blank_azp_falls_through_to_client_id() {
+    async fn oauth_blank_azp_falls_through_to_client_id() -> anyhow::Result<()> {
         let (cache, pem, _server) = blank_claim_cache(false).await;
         let token = mint_token_with_extra(
             &pem,
@@ -6969,10 +7320,13 @@ role = "admin"
             id.name, "svc-client",
             "must fall through past a blank azp to a non-blank client_id"
         );
+
+        Ok(())
     }
 
+    /// Surfaces a 307 from the token endpoint instead of following it with credentials.
     #[tokio::test]
-    async fn credential_post_does_not_follow_redirect() {
+    async fn credential_post_does_not_follow_redirect() -> anyhow::Result<()> {
         // M7: a 307 from the token endpoint must NOT be followed, or the
         // client_secret-bearing body would be re-sent to the redirect host.
         let mock = wiremock::MockServer::start().await;
@@ -7004,6 +7358,8 @@ role = "admin"
             307,
             "credential client must surface the 307 rather than follow it"
         );
+
+        Ok(())
     }
 
     fn test_token_exchange_config(token_url: String) -> TokenExchangeConfig {
@@ -7019,8 +7375,9 @@ role = "admin"
     const ENC_GRANT: &str = "urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange";
     const ENC_ACCESS: &str = "urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token";
 
+    /// Keeps the pre-3.8.0 exchange form byte-identical for legacy configs.
     #[test]
-    fn build_exchange_form_is_byte_identical_to_pre_3_8_0_output() {
+    fn build_exchange_form_is_byte_identical_to_pre_3_8_0_output() -> anyhow::Result<()> {
         let config = test_token_exchange_config("https://idp.example.com/token".into());
         let body = build_exchange_form(&config, "subj-token");
         assert_eq!(
@@ -7032,10 +7389,14 @@ role = "admin"
             ),
             "a config predating 3.8.0 must produce an unchanged request body"
         );
+
+        Ok(())
     }
 
+    /// Emits only the required RFC 8693 params plus client_id when optionals are omitted.
     #[test]
-    fn build_exchange_form_emits_only_required_params_when_all_optional_omitted() {
+    fn build_exchange_form_emits_only_required_params_when_all_optional_omitted()
+    -> anyhow::Result<()> {
         let config =
             TokenExchangeConfig::new("https://idp.example.com/token", "public-client", None, None)
                 .with_requested_token_type(RequestedTokenType::Omit);
@@ -7048,10 +7409,13 @@ role = "admin"
             ),
             "only the three RFC 8693 §2.1 REQUIRED params plus the public-client id"
         );
+
+        Ok(())
     }
 
+    /// Keeps RFC 8693 parameter order and sends a custom token type verbatim.
     #[test]
-    fn build_exchange_form_keeps_rfc_parameter_order() {
+    fn build_exchange_form_keeps_rfc_parameter_order() -> anyhow::Result<()> {
         let config = test_token_exchange_config("https://idp.example.com/token".into())
             .with_resource("https://api.example.com/v1")
             .with_scope("read write")
@@ -7077,10 +7441,13 @@ role = "admin"
             body.contains("&requested_token_type=urn%3Aexample%3Atoken"),
             "custom token type must be sent verbatim: {body}"
         );
+
+        Ok(())
     }
 
+    /// Deserializes a pre-3.8.0 token_exchange table with defaults for new keys.
     #[test]
-    fn token_exchange_toml_omitting_new_keys_still_deserializes() {
+    fn token_exchange_toml_omitting_new_keys_still_deserializes() -> anyhow::Result<()> {
         let cfg: TokenExchangeConfig = toml::from_str(
             "token_url = \"https://idp.example.com/token\"\n\
              client_id = \"client\"\n\
@@ -7091,10 +7458,13 @@ role = "admin"
         assert_eq!(cfg.resource, None);
         assert_eq!(cfg.scope, None);
         assert_eq!(cfg.requested_token_type, RequestedTokenType::AccessToken);
+
+        Ok(())
     }
 
+    /// Redacts the upstream error description unless diagnostics opt in.
     #[test]
-    fn upstream_error_description_is_redacted_by_default() {
+    fn upstream_error_description_is_redacted_by_default() -> anyhow::Result<()> {
         let _guard = crate::diagnostics::ExposureTestGuard::acquire();
         crate::diagnostics::set_diagnostic_exposure(
             &crate::diagnostics::DiagnosticExposure::default(),
@@ -7106,10 +7476,13 @@ role = "admin"
             "upstream free-form text must not reach logs unless opted in"
         );
         assert_eq!(upstream_error_description_for_log(None), "[REDACTED]");
+
+        Ok(())
     }
 
+    /// Shows the upstream error description verbatim when opted in, empty for None.
     #[test]
-    fn upstream_error_description_is_shown_when_opted_in() {
+    fn upstream_error_description_is_shown_when_opted_in() -> anyhow::Result<()> {
         let _guard = crate::diagnostics::ExposureTestGuard::acquire();
         crate::diagnostics::set_diagnostic_exposure(&crate::diagnostics::DiagnosticExposure {
             upstream_error_bodies: true,
@@ -7126,10 +7499,13 @@ role = "admin"
             "",
             "an absent description renders empty, not the redaction marker"
         );
+
+        Ok(())
     }
 
+    /// Deserializes requested_token_type from access_token, omit, or a custom URN.
     #[test]
-    fn requested_token_type_deserializes_from_plain_strings() {
+    fn requested_token_type_deserializes_from_plain_strings() -> anyhow::Result<()> {
         for (raw, expected) in [
             ("access_token", RequestedTokenType::AccessToken),
             ("omit", RequestedTokenType::Omit),
@@ -7146,6 +7522,8 @@ role = "admin"
             .expect("requested_token_type must accept any string");
             assert_eq!(cfg.requested_token_type, expected, "input {raw}");
         }
+
+        Ok(())
     }
 
     fn exchange_response(access_token: &str, issued_token_type: &str) -> serde_json::Value {
@@ -7219,8 +7597,9 @@ role = "admin"
         .expect("detached token exchange must eventually emit its audit log");
     }
 
+    /// Sanitizes the request URL and reqwest error, leaking no path or credentials.
     #[tokio::test]
-    async fn send_screened_request_failure_sanitizes_url_and_reqwest_error() {
+    async fn send_screened_request_failure_sanitizes_url_and_reqwest_error() -> anyhow::Result<()> {
         let client = test_exchange_client();
         let screened_url = unavailable_loopback_token_url();
         let request_url = screened_url.replacen("//", "//u:p@", 1);
@@ -7248,10 +7627,13 @@ role = "admin"
                 "request failure must not echo raw URL component {leaked}: {rendered}"
             );
         }
+
+        Ok(())
     }
 
+    /// Logs only the sanitized origin and keeps the client error sanitized on failure.
     #[tokio::test]
-    async fn exchange_token_request_failure_log_sanitizes_token_url() {
+    async fn exchange_token_request_failure_log_sanitizes_token_url() -> anyhow::Result<()> {
         let logs = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::ERROR)
@@ -7287,10 +7669,13 @@ role = "admin"
                 "exchange failure log must not echo raw URL/token component {leaked}: {contents}"
             );
         }
+
+        Ok(())
     }
 
+    /// Skips sending entirely when the cancellation token is pre-cancelled.
     #[tokio::test]
-    async fn exchange_token_with_cancel_precancel_does_not_send() {
+    async fn exchange_token_with_cancel_precancel_does_not_send() -> anyhow::Result<()> {
         let mock = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/token"))
@@ -7320,10 +7705,13 @@ role = "admin"
             0,
             "pre-cancel check must happen before cloning/spawning/sending"
         );
+
+        Ok(())
     }
 
+    /// Completes a normal exchange and returns the downstream token when uncancelled.
     #[tokio::test]
-    async fn exchange_token_with_cancel_completes_normally() {
+    async fn exchange_token_with_cancel_completes_normally() -> anyhow::Result<()> {
         let mock = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/token"))
@@ -7349,10 +7737,14 @@ role = "admin"
         };
         assert_eq!(token.access_token, "downstream-token");
         mock.verify().await;
+
+        Ok(())
     }
 
+    /// Detaches on cancel, then audits an abandoned token without leaking secrets or claims.
     #[tokio::test]
-    async fn exchange_token_with_cancel_detaches_and_audits_abandoned_token() {
+    async fn exchange_token_with_cancel_detaches_and_audits_abandoned_token() -> anyhow::Result<()>
+    {
         let mock = wiremock::MockServer::start().await;
         let long_issued_token_type = format!(
             "urn:ietf:params:oauth:token-type:{}",
@@ -7456,10 +7848,14 @@ role = "admin"
             !contents.contains("test-client-secret"),
             "audit log must not include client secret material: {contents}"
         );
+
+        Ok(())
     }
 
+    /// Suppresses JWT claim material in logs when a detached exchange later succeeds.
     #[tokio::test]
-    async fn exchange_token_with_cancel_detached_jwt_success_does_not_log_claims() {
+    async fn exchange_token_with_cancel_detached_jwt_success_does_not_log_claims()
+    -> anyhow::Result<()> {
         let mock = wiremock::MockServer::start().await;
         let jwt = unsigned_jwt_with_claims(&serde_json::json!({
             "sub": "detached-subject",
@@ -7535,10 +7931,13 @@ role = "admin"
                 "detached JWT success must not log claim material {leaked}: {contents}"
             );
         }
+
+        Ok(())
     }
 
+    /// Lets a ready completion beat a ready cancellation under biased select.
     #[tokio::test]
-    async fn exchange_token_with_cancel_completion_wins_tie() {
+    async fn exchange_token_with_cancel_completion_wins_tie() -> anyhow::Result<()> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         tx.send(Ok(ExchangedToken {
             access_token: "tie-winner".into(),
@@ -7555,10 +7954,13 @@ role = "admin"
             panic!("ready completion must win over ready cancellation under biased select")
         };
         assert_eq!(token.access_token, "tie-winner");
+
+        Ok(())
     }
 
+    /// Keeps the JWKS client following a redirect that passes the SSRF screen.
     #[tokio::test]
-    async fn jwks_get_still_follows_screened_redirect() {
+    async fn jwks_get_still_follows_screened_redirect() -> anyhow::Result<()> {
         // M7 regression: adding the no-redirect credential client must NOT
         // change the JWKS/discovery client, which still follows a redirect
         // whose every hop passes the SSRF screen. `allow_http` plus a loopback
@@ -7600,10 +8002,13 @@ role = "admin"
             "JWKS client must follow the screened redirect to the final endpoint"
         );
         assert_eq!(resp.text().await.expect("response body"), "reached");
+
+        Ok(())
     }
 
+    /// Rejects a token whose issuer differs from the configured issuer.
     #[tokio::test]
-    async fn wrong_issuer_rejected() {
+    async fn wrong_issuer_rejected() -> anyhow::Result<()> {
         let kid = "test-key-2";
         let (pem, jwks) = generate_test_keypair(kid);
 
@@ -7628,10 +8033,13 @@ role = "admin"
         );
 
         assert!(cache.validate_token(&token).await.is_none());
+
+        Ok(())
     }
 
+    /// Rejects a token whose audience differs from the configured audience.
     #[tokio::test]
-    async fn wrong_audience_rejected() {
+    async fn wrong_audience_rejected() -> anyhow::Result<()> {
         let kid = "test-key-3";
         let (pem, jwks) = generate_test_keypair(kid);
 
@@ -7656,10 +8064,13 @@ role = "admin"
         );
 
         assert!(cache.validate_token(&token).await.is_none());
+
+        Ok(())
     }
 
+    /// Rejects a token expired beyond the leeway.
     #[tokio::test]
-    async fn expired_jwt_rejected() {
+    async fn expired_jwt_rejected() -> anyhow::Result<()> {
         let kid = "test-key-4";
         let (pem, jwks) = generate_test_keypair(kid);
 
@@ -7691,10 +8102,13 @@ role = "admin"
         let token = jsonwebtoken::encode(&header, &claims, &encoding_key).expect("JWT encoding");
 
         assert!(cache.validate_token(&token).await.is_none());
+
+        Ok(())
     }
 
+    /// Classifies an expired token as JwtValidationFailure::Expired.
     #[tokio::test]
-    async fn characterize_expired_jwt_is_classified_expired() {
+    async fn characterize_expired_jwt_is_classified_expired() -> anyhow::Result<()> {
         let kid = "test-key-characterize-expired";
         let (pem, jwks) = generate_test_keypair(kid);
         let mock_server = wiremock::MockServer::start().await;
@@ -7724,10 +8138,13 @@ role = "admin"
             cache.validate_token_with_reason(&token).await,
             Err(JwtValidationFailure::Expired)
         ));
+
+        Ok(())
     }
 
+    /// Classifies wrong-audience, no-role, and sub-less rejections as Invalid.
     #[tokio::test]
-    async fn characterize_rejections_are_invalid_publicly() {
+    async fn characterize_rejections_are_invalid_publicly() -> anyhow::Result<()> {
         let kid = "test-key-characterize-invalid";
         let (pem, jwks) = generate_test_keypair(kid);
         let mock_server = wiremock::MockServer::start().await;
@@ -7778,10 +8195,13 @@ role = "admin"
             cache.validate_token_with_reason(&no_sub).await,
             Err(JwtValidationFailure::Invalid)
         ));
+
+        Ok(())
     }
 
+    /// Rejects a token whose scopes map to no configured role.
     #[tokio::test]
-    async fn no_matching_scope_rejected() {
+    async fn no_matching_scope_rejected() -> anyhow::Result<()> {
         let kid = "test-key-5";
         let (pem, jwks) = generate_test_keypair(kid);
 
@@ -7806,10 +8226,13 @@ role = "admin"
         );
 
         assert!(cache.validate_token(&token).await.is_none());
+
+        Ok(())
     }
 
+    /// Rejects a token signed by a key different from the JWKS public key.
     #[tokio::test]
-    async fn wrong_signing_key_rejected() {
+    async fn wrong_signing_key_rejected() -> anyhow::Result<()> {
         let kid = "test-key-6";
         let (_pem, jwks) = generate_test_keypair(kid);
 
@@ -7838,10 +8261,13 @@ role = "admin"
         );
 
         assert!(cache.validate_token(&token).await.is_none());
+
+        Ok(())
     }
 
+    /// Maps the mcp:admin scope to the ops role.
     #[tokio::test]
-    async fn admin_scope_maps_to_ops_role() {
+    async fn admin_scope_maps_to_ops_role() -> anyhow::Result<()> {
         let kid = "test-key-7";
         let (pem, jwks) = generate_test_keypair(kid);
 
@@ -7871,10 +8297,13 @@ role = "admin"
             .expect("should authenticate");
         assert_eq!(id.role, "ops");
         assert_eq!(id.name, "admin-bot");
+
+        Ok(())
     }
 
+    /// Authenticates end-to-end against an Entra-shaped JWKS whose keys omit alg.
     #[tokio::test]
-    async fn entra_shaped_alg_less_jwks_authenticates_end_to_end() {
+    async fn entra_shaped_alg_less_jwks_authenticates_end_to_end() -> anyhow::Result<()> {
         // Issue #17: the reported Entra failure, reproduced end-to-end. The
         // JWKS omits `alg` exactly as login.microsoftonline.com does; before
         // family inference the key was dropped and this returned None.
@@ -7914,10 +8343,13 @@ role = "admin"
             .await
             .expect("an alg-less JWKS key must still authenticate (issue #17)");
         assert_eq!(id.name, "entra-user");
+
+        Ok(())
     }
 
+    /// Returns None when the JWKS endpoint is unreachable.
     #[tokio::test]
-    async fn jwks_server_down_returns_none() {
+    async fn jwks_server_down_returns_none() -> anyhow::Result<()> {
         // Point to a non-existent server.
         let config = test_config("http://127.0.0.1:1/jwks.json");
         let cache = test_cache(&config);
@@ -7934,14 +8366,17 @@ role = "admin"
         );
 
         assert!(cache.validate_token(&token).await.is_none());
+
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
     // resolve_claim_path tests
     // -----------------------------------------------------------------------
 
+    /// Splits a flat whitespace-delimited string claim into values.
     #[test]
-    fn resolve_claim_path_flat_string() {
+    fn resolve_claim_path_flat_string() -> anyhow::Result<()> {
         let mut extra = HashMap::new();
         extra.insert(
             "scope".into(),
@@ -7949,10 +8384,13 @@ role = "admin"
         );
         let values = resolve_claim_path(&extra, "scope");
         assert_eq!(values, vec!["mcp:read", "mcp:admin"]);
+
+        Ok(())
     }
 
+    /// Returns the elements of a flat JSON array claim.
     #[test]
-    fn resolve_claim_path_flat_array() {
+    fn resolve_claim_path_flat_array() -> anyhow::Result<()> {
         let mut extra = HashMap::new();
         extra.insert(
             "roles".into(),
@@ -7960,10 +8398,13 @@ role = "admin"
         );
         let values = resolve_claim_path(&extra, "roles");
         assert_eq!(values, vec!["mcp-admin", "mcp-viewer"]);
+
+        Ok(())
     }
 
+    /// Resolves a dotted nested path into a Keycloak roles array.
     #[test]
-    fn resolve_claim_path_nested_keycloak() {
+    fn resolve_claim_path_nested_keycloak() -> anyhow::Result<()> {
         let mut extra = HashMap::new();
         extra.insert(
             "realm_access".into(),
@@ -7971,30 +8412,39 @@ role = "admin"
         );
         let values = resolve_claim_path(&extra, "realm_access.roles");
         assert_eq!(values, vec!["uma_authorization", "mcp-admin"]);
+
+        Ok(())
     }
 
+    /// Returns empty for a claim path that does not exist.
     #[test]
-    fn resolve_claim_path_missing_returns_empty() {
+    fn resolve_claim_path_missing_returns_empty() -> anyhow::Result<()> {
         let extra = HashMap::new();
         assert_eq!(
             resolve_claim_path(&extra, "nonexistent.path"),
             Vec::<&str>::new()
         );
+
+        Ok(())
     }
 
+    /// Returns empty for a numeric leaf that is not a string or array.
     #[test]
-    fn resolve_claim_path_numeric_leaf_returns_empty() {
+    fn resolve_claim_path_numeric_leaf_returns_empty() -> anyhow::Result<()> {
         let mut extra = HashMap::new();
         extra.insert("count".into(), serde_json::json!(42));
         assert_eq!(resolve_claim_path(&extra, "count"), Vec::<&str>::new());
+
+        Ok(())
     }
 
     fn make_claims(json: serde_json::Value) -> Claims {
         serde_json::from_value(json).expect("test claims must deserialize")
     }
 
+    /// Splits the first-class scope claim on whitespace.
     #[test]
-    fn first_class_scope_claim_splits_on_whitespace() {
+    fn first_class_scope_claim_splits_on_whitespace() -> anyhow::Result<()> {
         let claims = make_claims(serde_json::json!({
             "iss": "https://issuer.example.com",
             "exp": 9_999_999_999_u64,
@@ -8002,10 +8452,13 @@ role = "admin"
         }));
         let values = first_class_claim_values(&claims, "scope");
         assert_eq!(values, vec!["read", "write", "admin"]);
+
+        Ok(())
     }
 
+    /// Returns the sub claim as a single value.
     #[test]
-    fn first_class_sub_claim_returns_single_value() {
+    fn first_class_sub_claim_returns_single_value() -> anyhow::Result<()> {
         let claims = make_claims(serde_json::json!({
             "iss": "https://issuer.example.com",
             "exp": 9_999_999_999_u64,
@@ -8013,10 +8466,13 @@ role = "admin"
         }));
         let values = first_class_claim_values(&claims, "sub");
         assert_eq!(values, vec!["service-account-orders"]);
+
+        Ok(())
     }
 
+    /// Returns every entry of a multi-valued aud claim.
     #[test]
-    fn first_class_aud_claim_returns_every_audience() {
+    fn first_class_aud_claim_returns_every_audience() -> anyhow::Result<()> {
         let claims = make_claims(serde_json::json!({
             "iss": "https://issuer.example.com",
             "exp": 9_999_999_999_u64,
@@ -8024,10 +8480,13 @@ role = "admin"
         }));
         let values = first_class_claim_values(&claims, "aud");
         assert_eq!(values, vec!["api-a", "api-b"]);
+
+        Ok(())
     }
 
+    /// Returns empty for an unknown first-class claim path.
     #[test]
-    fn first_class_unknown_path_returns_empty() {
+    fn first_class_unknown_path_returns_empty() -> anyhow::Result<()> {
         let claims = make_claims(serde_json::json!({
             "iss": "https://issuer.example.com",
             "exp": 9_999_999_999_u64,
@@ -8036,6 +8495,8 @@ role = "admin"
             first_class_claim_values(&claims, "realm_access.roles"),
             Vec::<String>::new()
         );
+
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -8078,8 +8539,9 @@ role = "admin"
         }
     }
 
+    /// Names the owner for an expired correct-issuer token, logging the re-decode.
     #[tokio::test]
-    async fn detailed_expired_correct_issuer_names_owner() {
+    async fn detailed_expired_correct_issuer_names_owner() -> anyhow::Result<()> {
         let logs = CapturedLogs::default();
         let _guard = capture_debug_logs(logs.clone());
         let kid = "detailed-expired-owner";
@@ -8114,10 +8576,13 @@ role = "admin"
             logs.contents()
                 .contains("JWT expired; re-decoding without exp for owner attribution")
         );
+
+        Ok(())
     }
 
+    /// Skips owner re-decode and leaves no owner when owner attribution is disabled.
     #[tokio::test]
-    async fn detailed_expired_without_owner_does_not_redecode() {
+    async fn detailed_expired_without_owner_does_not_redecode() -> anyhow::Result<()> {
         let logs = CapturedLogs::default();
         let _guard = capture_debug_logs(logs.clone());
         let kid = "detailed-expired-no-owner";
@@ -8149,10 +8614,13 @@ role = "admin"
                 .contents()
                 .contains("JWT expired; re-decoding without exp for owner attribution")
         );
+
+        Ok(())
     }
 
+    /// Leaves no owner for an expired token with a wrong issuer.
     #[tokio::test]
-    async fn detailed_expired_wrong_issuer_has_no_owner() {
+    async fn detailed_expired_wrong_issuer_has_no_owner() -> anyhow::Result<()> {
         let kid = "detailed-expired-wrong-issuer";
         let (pem, jwks) = generate_test_keypair(kid);
         let (cache, _server) = cache_for_jwks(&jwks).await;
@@ -8176,10 +8644,13 @@ role = "admin"
             .unwrap_err();
 
         assert_jwt_owner(&rejection, JwtValidationFailure::Expired, None);
+
+        Ok(())
     }
 
+    /// Leaves no owner for an expired token whose nbf is in the future.
     #[tokio::test]
-    async fn detailed_expired_future_nbf_has_no_owner() {
+    async fn detailed_expired_future_nbf_has_no_owner() -> anyhow::Result<()> {
         let kid = "detailed-expired-future-nbf";
         let (pem, jwks) = generate_test_keypair(kid);
         let (cache, _server) = cache_for_jwks(&jwks).await;
@@ -8204,10 +8675,13 @@ role = "admin"
             .unwrap_err();
 
         assert_jwt_owner(&rejection, JwtValidationFailure::Expired, None);
+
+        Ok(())
     }
 
+    /// Leaves no owner for a token with a bad signature.
     #[tokio::test]
-    async fn detailed_bad_signature_has_no_owner() {
+    async fn detailed_bad_signature_has_no_owner() -> anyhow::Result<()> {
         let logs = CapturedLogs::default();
         let _guard = capture_debug_logs(logs.clone());
         let kid = "detailed-bad-signature";
@@ -8234,10 +8708,13 @@ role = "admin"
                 .contents()
                 .contains("JWT expired; re-decoding without exp for owner attribution")
         );
+
+        Ok(())
     }
 
+    /// Names the owner with reason Audience for a wrong-audience token.
     #[tokio::test]
-    async fn detailed_wrong_audience_names_owner() {
+    async fn detailed_wrong_audience_names_owner() -> anyhow::Result<()> {
         let kid = "detailed-wrong-audience";
         let (pem, jwks) = generate_test_keypair(kid);
         let (cache, _server) = cache_for_jwks(&jwks).await;
@@ -8260,10 +8737,13 @@ role = "admin"
             JwtValidationFailure::Invalid,
             Some(("bob", RejectionReason::Audience)),
         );
+
+        Ok(())
     }
 
+    /// Names the owner with reason Role when no role mapping matches.
     #[tokio::test]
-    async fn detailed_no_role_names_owner() {
+    async fn detailed_no_role_names_owner() -> anyhow::Result<()> {
         let kid = "detailed-no-role";
         let (pem, jwks) = generate_test_keypair(kid);
         let (cache, _server) = cache_for_jwks(&jwks).await;
@@ -8286,10 +8766,13 @@ role = "admin"
             JwtValidationFailure::Invalid,
             Some(("carol", RejectionReason::Role)),
         );
+
+        Ok(())
     }
 
+    /// Names the owner with reason Subject when require_subject rejects a sub-less token.
     #[tokio::test]
-    async fn detailed_require_subject_names_owner() {
+    async fn detailed_require_subject_names_owner() -> anyhow::Result<()> {
         let kid = "detailed-require-subject";
         let (pem, jwks) = generate_test_keypair(kid);
         let mock_server = wiremock::MockServer::start().await;
@@ -8325,10 +8808,13 @@ role = "admin"
             JwtValidationFailure::Invalid,
             Some(("svc", RejectionReason::Subject)),
         );
+
+        Ok(())
     }
 
+    /// Falls back to the oauth-client owner name when no name claims exist.
     #[tokio::test]
-    async fn detailed_no_name_claims_uses_oauth_client_fallback() {
+    async fn detailed_no_name_claims_uses_oauth_client_fallback() -> anyhow::Result<()> {
         let kid = "detailed-no-name-fallback";
         let (pem, jwks) = generate_test_keypair(kid);
         let (cache, _server) = cache_for_jwks(&jwks).await;
@@ -8355,6 +8841,8 @@ role = "admin"
             JwtValidationFailure::Invalid,
             Some(("oauth-client", RejectionReason::Audience)),
         );
+
+        Ok(())
     }
 
     fn test_config_with_role_claim(
@@ -8390,8 +8878,9 @@ role = "admin"
         }
     }
 
+    /// Rejects a literal IPv4 URL target as forbidden.
     #[tokio::test]
-    async fn screen_oauth_target_rejects_literal_ip() {
+    async fn screen_oauth_target_rejects_literal_ip() -> anyhow::Result<()> {
         let err = screen_oauth_target(
             "https://127.0.0.1/jwks.json",
             false,
@@ -8401,10 +8890,13 @@ role = "admin"
         .expect_err("literal IPs must be rejected");
         let msg = err.to_string();
         assert!(msg.contains("literal IPv4 addresses are forbidden"));
+
+        Ok(())
     }
 
+    /// Rejects a hostname resolving to loopback.
     #[tokio::test]
-    async fn screen_oauth_target_rejects_private_dns_resolution() {
+    async fn screen_oauth_target_rejects_private_dns_resolution() -> anyhow::Result<()> {
         let err = screen_oauth_target(
             "https://localhost/jwks.json",
             false,
@@ -8417,10 +8909,13 @@ role = "admin"
             msg.contains("blocked IP") && msg.contains("loopback"),
             "got {msg:?}"
         );
+
+        Ok(())
     }
 
+    /// Rejects a literal IPv4 even when allow_http is set.
     #[tokio::test]
-    async fn screen_oauth_target_rejects_literal_ip_even_with_allow_http() {
+    async fn screen_oauth_target_rejects_literal_ip_even_with_allow_http() -> anyhow::Result<()> {
         let err = screen_oauth_target(
             "http://127.0.0.1/jwks.json",
             true,
@@ -8430,10 +8925,13 @@ role = "admin"
         .expect_err("literal IPs must still be rejected when http is allowed");
         let msg = err.to_string();
         assert!(msg.contains("literal IPv4 addresses are forbidden"));
+
+        Ok(())
     }
 
+    /// Rejects a loopback-resolving hostname even when allow_http is set.
     #[tokio::test]
-    async fn screen_oauth_target_rejects_private_dns_even_with_allow_http() {
+    async fn screen_oauth_target_rejects_private_dns_even_with_allow_http() -> anyhow::Result<()> {
         let err = screen_oauth_target(
             "http://localhost/jwks.json",
             true,
@@ -8446,10 +8944,13 @@ role = "admin"
             msg.contains("blocked IP") && msg.contains("loopback"),
             "got {msg:?}"
         );
+
+        Ok(())
     }
 
+    /// Allows a public hostname through SSRF screening.
     #[tokio::test]
-    async fn screen_oauth_target_allows_public_hostname() {
+    async fn screen_oauth_target_allows_public_hostname() -> anyhow::Result<()> {
         screen_oauth_target(
             "https://example.com/.well-known/jwks.json",
             false,
@@ -8457,6 +8958,8 @@ role = "admin"
         )
         .await
         .expect("public hostname should pass screening");
+
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -8472,8 +8975,9 @@ role = "admin"
         compile_oauth_ssrf_allowlist(&raw).expect("test allowlist compiles")
     }
 
+    /// Lowercases and dedupes host allowlist entries, matching case-insensitively.
     #[test]
-    fn compile_oauth_ssrf_allowlist_lowercases_and_dedupes_hosts() {
+    fn compile_oauth_ssrf_allowlist_lowercases_and_dedupes_hosts() -> anyhow::Result<()> {
         let raw = OAuthSsrfAllowlist {
             hosts: vec!["RHBK.ops.example.com".into(), "rhbk.ops.example.com".into()],
             cidrs: vec![],
@@ -8482,75 +8986,102 @@ role = "admin"
         assert_eq!(compiled.host_count(), 1);
         assert!(compiled.host_allowed("rhbk.ops.example.com"));
         assert!(compiled.host_allowed("RHBK.OPS.EXAMPLE.COM"));
+
+        Ok(())
     }
 
+    /// Rejects a literal IP in the host allowlist.
     #[test]
-    fn compile_oauth_ssrf_allowlist_rejects_literal_ip_in_hosts() {
+    fn compile_oauth_ssrf_allowlist_rejects_literal_ip_in_hosts() -> anyhow::Result<()> {
         let raw = OAuthSsrfAllowlist {
             hosts: vec!["10.0.0.1".into()],
             cidrs: vec![],
         };
         let err = compile_oauth_ssrf_allowlist(&raw).expect_err("literal IP in hosts");
         assert!(err.contains("literal IPs are forbidden"), "got {err:?}");
+
+        Ok(())
     }
 
+    /// Rejects a host allowlist entry containing a port.
     #[test]
-    fn compile_oauth_ssrf_allowlist_rejects_host_with_port() {
+    fn compile_oauth_ssrf_allowlist_rejects_host_with_port() -> anyhow::Result<()> {
         let raw = OAuthSsrfAllowlist {
             hosts: vec!["rhbk.ops.example.com:8443".into()],
             cidrs: vec![],
         };
         let err = compile_oauth_ssrf_allowlist(&raw).expect_err("host:port");
         assert!(err.contains("must be a bare DNS hostname"), "got {err:?}");
+
+        Ok(())
     }
 
     // -- L3: internal-hostname-suffix pre-DNS denylist --
 
+    /// Blocks internal/local/.localhost suffixes when no allowlist entry matches.
     #[test]
-    fn internal_suffix_rejected_by_default() {
+    fn internal_suffix_rejected_by_default() -> anyhow::Result<()> {
         let allow = crate::ssrf::CompiledSsrfAllowlist::default();
         for h in ["idp.internal", "svc.local", "x.localhost", "idp.internal."] {
             assert!(oauth_internal_suffix_blocked(h, &allow), "{h}");
         }
+
+        Ok(())
     }
 
+    /// Permits an exact allowlisted internal host, with or without trailing dot.
     #[test]
-    fn exact_allowlisted_internal_permitted() {
+    fn exact_allowlisted_internal_permitted() -> anyhow::Result<()> {
         let allow = make_allowlist(&["idp.internal"], &[]);
         assert!(!oauth_internal_suffix_blocked("idp.internal", &allow));
         assert!(!oauth_internal_suffix_blocked("idp.internal.", &allow));
+
+        Ok(())
     }
 
+    /// Still rejects a subdomain of an allowlisted internal host.
     #[test]
-    fn subdomain_of_allowlisted_internal_still_rejected() {
+    fn subdomain_of_allowlisted_internal_still_rejected() -> anyhow::Result<()> {
         let allow = make_allowlist(&["idp.internal"], &[]);
         assert!(oauth_internal_suffix_blocked("sub.idp.internal", &allow));
+
+        Ok(())
     }
 
+    /// Does not let a CIDR allowlist bypass the internal suffix denylist.
     #[test]
-    fn cidr_allowlist_does_not_bypass_suffix_denylist() {
+    fn cidr_allowlist_does_not_bypass_suffix_denylist() -> anyhow::Result<()> {
         let allow = make_allowlist(&[], &["10.0.0.0/8"]);
         assert!(oauth_internal_suffix_blocked("idp.internal", &allow));
+
+        Ok(())
     }
 
+    /// Leaves a public hostname unblocked by the internal suffix rule.
     #[test]
-    fn public_hostname_not_blocked_by_suffix() {
+    fn public_hostname_not_blocked_by_suffix() -> anyhow::Result<()> {
         let allow = crate::ssrf::CompiledSsrfAllowlist::default();
         assert!(!oauth_internal_suffix_blocked("idp.example.com", &allow));
+
+        Ok(())
     }
 
+    /// Rejects an invalid CIDR naming the oauth.ssrf_allowlist.cidrs index.
     #[test]
-    fn compile_oauth_ssrf_allowlist_rejects_invalid_cidr() {
+    fn compile_oauth_ssrf_allowlist_rejects_invalid_cidr() -> anyhow::Result<()> {
         let raw = OAuthSsrfAllowlist {
             hosts: vec![],
             cidrs: vec!["not-a-cidr".into()],
         };
         let err = compile_oauth_ssrf_allowlist(&raw).expect_err("invalid CIDR");
         assert!(err.contains("oauth.ssrf_allowlist.cidrs[0]"), "got {err:?}");
+
+        Ok(())
     }
 
+    /// Rejects a misconfigured ssrf_allowlist through config validation.
     #[test]
-    fn validate_rejects_misconfigured_allowlist() {
+    fn validate_rejects_misconfigured_allowlist() -> anyhow::Result<()> {
         let mut cfg = OAuthConfig::builder(
             "https://auth.example.com/",
             "mcp",
@@ -8568,10 +9099,13 @@ role = "admin"
             err.to_string().contains("oauth.ssrf_allowlist"),
             "got {err}"
         );
+
+        Ok(())
     }
 
+    /// Emits a verbose blocked-target error referencing the allowlist and SECURITY.md.
     #[tokio::test]
-    async fn screen_oauth_target_with_allowlist_emits_helpful_error() {
+    async fn screen_oauth_target_with_allowlist_emits_helpful_error() -> anyhow::Result<()> {
         // localhost resolves to loopback; with a *non-empty* allowlist that
         // doesn't cover loopback, we expect the new verbose error referencing
         // the config field.
@@ -8583,10 +9117,13 @@ role = "admin"
         assert!(msg.contains("OAuth target blocked"), "got {msg:?}");
         assert!(msg.contains("oauth.ssrf_allowlist"), "got {msg:?}");
         assert!(msg.contains("SECURITY.md"), "got {msg:?}");
+
+        Ok(())
     }
 
+    /// Keeps the pre-1.4.0 blocked-target wording when the allowlist is empty.
     #[tokio::test]
-    async fn screen_oauth_target_empty_allowlist_uses_legacy_message() {
+    async fn screen_oauth_target_empty_allowlist_uses_legacy_message() -> anyhow::Result<()> {
         // The default (empty) allowlist must continue to emit the
         // pre-1.4.0 wording so existing operator runbooks keep working.
         let err = screen_oauth_target(
@@ -8601,29 +9138,38 @@ role = "admin"
         assert!(msg.contains("loopback"), "got {msg:?}");
         // The legacy message must NOT advertise the new knob.
         assert!(!msg.contains("oauth.ssrf_allowlist"), "got {msg:?}");
+
+        Ok(())
     }
 
+    /// Allows loopback when localhost is host-allowlisted.
     #[tokio::test]
-    async fn screen_oauth_target_allows_loopback_when_host_allowlisted() {
+    async fn screen_oauth_target_allows_loopback_when_host_allowlisted() -> anyhow::Result<()> {
         // localhost -> 127.0.0.1; allowlisting the hostname must let it through.
         let allow = make_allowlist(&["localhost"], &[]);
         screen_oauth_target("https://localhost/jwks.json", false, &allow)
             .await
             .expect("allowlisted host must pass");
+
+        Ok(())
     }
 
+    /// Allows loopback when both loopback CIDRs are allowlisted.
     #[tokio::test]
-    async fn screen_oauth_target_allows_loopback_when_cidr_allowlisted() {
+    async fn screen_oauth_target_allows_loopback_when_cidr_allowlisted() -> anyhow::Result<()> {
         // localhost may resolve to 127.0.0.1 and/or ::1 depending on the OS;
         // allowlist both loopback ranges to make the test stable cross-platform.
         let allow = make_allowlist(&[], &["127.0.0.0/8", "::1/128"]);
         screen_oauth_target("https://localhost/jwks.json", false, &allow)
             .await
             .expect("allowlisted CIDR must pass");
+
+        Ok(())
     }
 
+    /// Fails JwksCache::new for an invalid ssrf_allowlist CIDR.
     #[tokio::test]
-    async fn jwks_cache_rejects_misconfigured_allowlist_at_startup() {
+    async fn jwks_cache_rejects_misconfigured_allowlist_at_startup() -> anyhow::Result<()> {
         let mut cfg = OAuthConfig::builder(
             "https://auth.example.com/",
             "mcp",
@@ -8639,10 +9185,13 @@ role = "admin"
         };
         let msg = err.to_string();
         assert!(msg.contains("oauth.ssrf_allowlist"), "got {msg:?}");
+
+        Ok(())
     }
 
+    /// Returns Err rather than panicking for an invalid jwks_cache_ttl.
     #[tokio::test]
-    async fn jwks_cache_new_invalid_ttl_is_err() {
+    async fn jwks_cache_new_invalid_ttl_is_err() -> anyhow::Result<()> {
         // An unvalidated config with a bogus TTL must surface as Err, not
         // as the formerly-documented panic.
         let cfg = OAuthConfig::builder(
@@ -8657,10 +9206,13 @@ role = "admin"
         };
         let msg = err.to_string();
         assert!(msg.contains("jwks_cache_ttl"), "got {msg:?}");
+
+        Ok(())
     }
 
+    /// Rejects an azp-only audience match under the default Strict policy.
     #[tokio::test]
-    async fn audience_default_is_strict() {
+    async fn audience_default_is_strict() -> anyhow::Result<()> {
         let kid = "test-audience-azp-default";
         let (pem, jwks) = generate_test_keypair(kid);
 
@@ -8695,10 +9247,13 @@ role = "admin"
             .await
             .expect_err("the default policy is Strict and must reject an azp-only match");
         assert_eq!(failure, JwtValidationFailure::Invalid);
+
+        Ok(())
     }
 
+    /// Accepts an azp-only audience match when audience_validation_mode is Warn.
     #[tokio::test]
-    async fn audience_warn_still_accepts_azp() {
+    async fn audience_warn_still_accepts_azp() -> anyhow::Result<()> {
         let kid = "test-audience-warn-optin";
         let (pem, jwks) = generate_test_keypair(kid);
 
@@ -8732,10 +9287,13 @@ role = "admin"
         cache.validate_token_with_reason(&token).await.expect(
             "the audience_validation_mode=warn opt-out must still accept an azp-only match",
         );
+
+        Ok(())
     }
 
+    /// Maps the legacy strict_audience_validation=false to Warn, accepting azp.
     #[tokio::test]
-    async fn legacy_strict_false_maps_to_warn() {
+    async fn legacy_strict_false_maps_to_warn() -> anyhow::Result<()> {
         let kid = "test-audience-legacy-false";
         let (pem, jwks) = generate_test_keypair(kid);
 
@@ -8775,10 +9333,13 @@ role = "admin"
             .validate_token_with_reason(&token)
             .await
             .expect("strict_audience_validation=Some(false) must map to Warn and accept azp");
+
+        Ok(())
     }
 
+    /// Accepts a matching aud even under the Strict default.
     #[tokio::test]
-    async fn aud_match_always_accepts() {
+    async fn aud_match_always_accepts() -> anyhow::Result<()> {
         let kid = "test-audience-aud-match";
         let (pem, jwks) = generate_test_keypair(kid);
 
@@ -8811,10 +9372,13 @@ role = "admin"
             .validate_token_with_reason(&token)
             .await
             .expect("a matching aud must be accepted even under the Strict default");
+
+        Ok(())
     }
 
+    /// Rejects an azp-only match when strict validation is enabled.
     #[tokio::test]
-    async fn strict_audience_validation_rejects_azp_only_match() {
+    async fn strict_audience_validation_rejects_azp_only_match() -> anyhow::Result<()> {
         let kid = "test-audience-azp-strict";
         let (pem, jwks) = generate_test_keypair(kid);
 
@@ -8853,10 +9417,13 @@ role = "admin"
             .await
             .expect_err("strict audience validation must ignore azp fallback");
         assert_eq!(failure, JwtValidationFailure::Invalid);
+
+        Ok(())
     }
 
+    /// Accepts azp-only matches in Warn mode and sets the warn-once flag once.
     #[tokio::test]
-    async fn warn_mode_accepts_azp_only_match_and_warns_once() {
+    async fn warn_mode_accepts_azp_only_match_and_warns_once() -> anyhow::Result<()> {
         let kid = "test-audience-warn-mode";
         let (pem, jwks) = generate_test_keypair(kid);
 
@@ -8903,10 +9470,13 @@ role = "admin"
             cache.azp_fallback_warned.load(Ordering::Relaxed),
             "warn-once flag must remain set; the assertion guards against accidental clearing"
         );
+
+        Ok(())
     }
 
+    /// Accepts azp-only matches silently in Permissive mode without the warn flag.
     #[tokio::test]
-    async fn permissive_mode_accepts_azp_only_match_silently() {
+    async fn permissive_mode_accepts_azp_only_match_silently() -> anyhow::Result<()> {
         let kid = "test-audience-permissive-mode";
         let (pem, jwks) = generate_test_keypair(kid);
 
@@ -8949,10 +9519,13 @@ role = "admin"
             cache.azp_permissive_logged.load(Ordering::Relaxed),
             "permissive mode must record its own once-per-process log flag"
         );
+
+        Ok(())
     }
 
+    /// Lets an explicit audience_validation_mode override the legacy bool either way.
     #[test]
-    fn audience_validation_mode_overrides_legacy_bool() {
+    fn audience_validation_mode_overrides_legacy_bool() -> anyhow::Result<()> {
         let mut config = OAuthConfig::default();
         #[expect(deprecated, reason = "covers the precedence rule for the legacy bool")]
         {
@@ -8976,20 +9549,26 @@ role = "admin"
             AudienceValidationMode::Permissive,
             "explicit mode must override legacy true"
         );
+
+        Ok(())
     }
 
+    /// Resolves unset mode and bool to Strict.
     #[test]
-    fn audience_validation_mode_default_is_strict_when_unset() {
+    fn audience_validation_mode_default_is_strict_when_unset() -> anyhow::Result<()> {
         let config = OAuthConfig::default();
         assert_eq!(
             config.effective_audience_validation_mode(),
             AudienceValidationMode::Strict,
             "unset mode + unset bool must resolve to Strict (the secure default)"
         );
+
+        Ok(())
     }
 
+    /// Resolves the legacy strict_audience_validation=true to Strict.
     #[test]
-    fn audience_validation_legacy_bool_true_resolves_to_strict() {
+    fn audience_validation_legacy_bool_true_resolves_to_strict() -> anyhow::Result<()> {
         let mut config = OAuthConfig::default();
         #[expect(deprecated, reason = "covers the legacy bool resolution path")]
         {
@@ -9000,6 +9579,8 @@ role = "admin"
             AudienceValidationMode::Strict,
             "legacy bool=true must resolve to Strict for backward compat"
         );
+
+        Ok(())
     }
 
     #[derive(Clone, Default)]
@@ -9061,8 +9642,9 @@ role = "admin"
         exchanged_token_for_debug(&format!("{header}.{payload}.signature"))
     }
 
+    /// Redacts the access token in Debug output by default while showing other fields.
     #[test]
-    fn exchanged_token_debug_redacts_access_token_by_default() {
+    fn exchanged_token_debug_redacts_access_token_by_default() -> anyhow::Result<()> {
         let _guard = crate::diagnostics::ExposureTestGuard::acquire();
         crate::diagnostics::set_diagnostic_exposure(
             &crate::diagnostics::DiagnosticExposure::default(),
@@ -9078,10 +9660,13 @@ role = "admin"
         );
         assert!(rendered.contains("expires_in"));
         assert!(rendered.contains("issued_token_type"));
+
+        Ok(())
     }
 
+    /// Shows the plaintext access token in Debug output when opted in.
     #[test]
-    fn exchanged_token_debug_can_show_access_token_when_enabled() {
+    fn exchanged_token_debug_can_show_access_token_when_enabled() -> anyhow::Result<()> {
         let _guard = crate::diagnostics::ExposureTestGuard::acquire();
         crate::diagnostics::set_diagnostic_exposure(&crate::diagnostics::DiagnosticExposure {
             plaintext_oauth_tokens: true,
@@ -9092,10 +9677,13 @@ role = "admin"
         let rendered = format!("{:?}", exchanged_token_for_debug(secret));
 
         assert!(rendered.contains(secret));
+
+        Ok(())
     }
 
+    /// Redacts JWT claim values in the exchanged-token log by default.
     #[test]
-    fn exchanged_token_claim_log_redacts_claim_values_by_default() {
+    fn exchanged_token_claim_log_redacts_claim_values_by_default() -> anyhow::Result<()> {
         let _guard = crate::diagnostics::ExposureTestGuard::acquire();
         crate::diagnostics::set_diagnostic_exposure(
             &crate::diagnostics::DiagnosticExposure::default(),
@@ -9125,10 +9713,13 @@ role = "admin"
             );
         }
         assert!(contents.contains("expires_in"));
+
+        Ok(())
     }
 
+    /// Logs JWT claim values verbatim when oauth_claim_values is enabled.
     #[test]
-    fn exchanged_token_claim_log_can_show_claim_values_when_enabled() {
+    fn exchanged_token_claim_log_can_show_claim_values_when_enabled() -> anyhow::Result<()> {
         let _guard = crate::diagnostics::ExposureTestGuard::acquire();
         crate::diagnostics::set_diagnostic_exposure(&crate::diagnostics::DiagnosticExposure {
             oauth_claim_values: true,
@@ -9157,10 +9748,13 @@ role = "admin"
                 "claim log must contain {secret} when enabled: {contents}"
             );
         }
+
+        Ok(())
     }
 
+    /// Drops an oversized JWKS response and logs a cap-exceeded warning.
     #[tokio::test]
-    async fn jwks_response_size_cap_returns_none_and_logs_warning() {
+    async fn jwks_response_size_cap_returns_none_and_logs_warning() -> anyhow::Result<()> {
         let kid = "oversized-jwks";
         let (_pem, jwks) = generate_test_keypair(kid);
         let mut oversized_body = serde_json::to_string(&jwks).expect("jwks json");
@@ -9197,13 +9791,15 @@ role = "admin"
                 .contains("JWKS response exceeded configured size cap"),
             "expected cap-exceeded warning in logs"
         );
+
+        Ok(())
     }
 
     /// A redirect to a userinfo-bearing target is rejected, and the
     /// rejection warn log must not echo the embedded credentials
     /// (sanitized to scheme+host+port only).
     #[tokio::test]
-    async fn redirect_rejection_log_does_not_echo_credentials() {
+    async fn redirect_rejection_log_does_not_echo_credentials() -> anyhow::Result<()> {
         let mock_server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/jwks.json"))
@@ -9237,10 +9833,13 @@ role = "admin"
             !contents.contains("u:p"),
             "rejection log must not echo userinfo credentials: {contents}"
         );
+
+        Ok(())
     }
 
+    /// Logs only the sanitized JWKS origin on fetch failure, leaking no path or secret.
     #[tokio::test]
-    async fn jwks_fetch_failure_log_sanitizes_url_and_reqwest_error() {
+    async fn jwks_fetch_failure_log_sanitizes_url_and_reqwest_error() -> anyhow::Result<()> {
         let config = test_config("http://127.0.0.1:1/jwks.json?client_secret=super-secret");
         let cache = test_cache(&config);
 
@@ -9273,10 +9872,13 @@ role = "admin"
                 "JWKS failure log must not echo raw URL component {leaked}: {contents}"
             );
         }
+
+        Ok(())
     }
 
+    /// Maps a nested Keycloak realm_access.roles claim to a role.
     #[tokio::test]
-    async fn role_claim_keycloak_nested_array() {
+    async fn role_claim_keycloak_nested_array() -> anyhow::Result<()> {
         let kid = "test-role-1";
         let (pem, jwks) = generate_test_keypair(kid);
 
@@ -9324,10 +9926,13 @@ role = "admin"
             .expect("should authenticate");
         assert_eq!(id.name, "keycloak-user");
         assert_eq!(id.role, "ops");
+
+        Ok(())
     }
 
+    /// Maps a flat roles array claim value to a role.
     #[tokio::test]
-    async fn role_claim_flat_roles_array() {
+    async fn role_claim_flat_roles_array() -> anyhow::Result<()> {
         let kid = "test-role-2";
         let (pem, jwks) = generate_test_keypair(kid);
 
@@ -9375,10 +9980,13 @@ role = "admin"
             .expect("should authenticate");
         assert_eq!(id.name, "azure-ad-user");
         assert_eq!(id.role, "viewer");
+
+        Ok(())
     }
 
+    /// Rejects a token whose role claim value matches no mapping.
     #[tokio::test]
-    async fn role_claim_no_matching_value_rejected() {
+    async fn role_claim_no_matching_value_rejected() -> anyhow::Result<()> {
         let kid = "test-role-3";
         let (pem, jwks) = generate_test_keypair(kid);
 
@@ -9415,10 +10023,13 @@ role = "admin"
         );
 
         assert!(cache.validate_token(&token).await.is_none());
+
+        Ok(())
     }
 
+    /// Maps a whitespace-separated string role claim value to a role.
     #[tokio::test]
-    async fn role_claim_space_separated_string() {
+    async fn role_claim_space_separated_string() -> anyhow::Result<()> {
         let kid = "test-role-4";
         let (pem, jwks) = generate_test_keypair(kid);
 
@@ -9466,10 +10077,13 @@ role = "admin"
             .expect("should authenticate");
         assert_eq!(id.name, "custom-client");
         assert_eq!(id.role, "viewer");
+
+        Ok(())
     }
 
+    /// Keeps the scope-based mapping working when role_claim is None.
     #[tokio::test]
-    async fn scope_backward_compat_without_role_claim() {
+    async fn scope_backward_compat_without_role_claim() -> anyhow::Result<()> {
         // Verify existing `scopes` behavior still works when role_claim is None.
         let kid = "test-compat-1";
         let (pem, jwks) = generate_test_keypair(kid);
@@ -9500,14 +10114,17 @@ role = "admin"
             .expect("should authenticate");
         assert_eq!(id.name, "legacy-bot");
         assert_eq!(id.role, "ops"); // mcp:admin -> ops via scopes
+
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
     // JWKS refresh cooldown tests
     // -----------------------------------------------------------------------
 
+    /// Deduplicates concurrent cache misses into exactly one JWKS fetch.
     #[tokio::test]
-    async fn jwks_refresh_deduplication() {
+    async fn jwks_refresh_deduplication() -> anyhow::Result<()> {
         // Verify that concurrent requests with unknown kids result in exactly
         // one JWKS fetch, not one per request (deduplication via mutex).
         let kid = "test-dedup";
@@ -9548,10 +10165,13 @@ role = "admin"
         }
 
         // The expect(1) assertion on the mock verifies only one fetch occurred.
+
+        Ok(())
     }
 
+    /// Limits rapid unknown-kid misses to one JWKS fetch within the cooldown.
     #[tokio::test]
-    async fn jwks_refresh_cooldown_blocks_rapid_requests() {
+    async fn jwks_refresh_cooldown_blocks_rapid_requests() -> anyhow::Result<()> {
         // Verify that rapid sequential requests with unknown kids (cache misses)
         // only trigger one JWKS fetch due to cooldown.
         let kid = "test-cooldown";
@@ -9586,6 +10206,8 @@ role = "admin"
         let _ = cache.validate_token(fake_token3).await;
 
         // The expect(1) assertion verifies only one fetch occurred.
+
+        Ok(())
     }
 
     // -- introspection / revocation proxy --
@@ -9623,8 +10245,9 @@ role = "admin"
             .__test_allow_loopback_ssrf()
     }
 
+    /// Proxies introspection upstream, injecting the proxy client credentials.
     #[tokio::test]
-    async fn introspect_proxies_and_injects_client_credentials() {
+    async fn introspect_proxies_and_injects_client_credentials() -> anyhow::Result<()> {
         use wiremock::matchers::{body_string_contains, method, path};
 
         let mock_server = wiremock::MockServer::start().await;
@@ -9649,10 +10272,13 @@ role = "admin"
         let http = test_http_client();
         let resp = handle_introspect(&http, &proxy, "token=abc").await;
         assert_eq!(resp.status(), 200);
+
+        Ok(())
     }
 
+    /// Fails closed with 502 and does not forward an oversized upstream token response.
     #[tokio::test]
-    async fn token_proxy_fails_closed_on_oversized_upstream_response() {
+    async fn token_proxy_fails_closed_on_oversized_upstream_response() -> anyhow::Result<()> {
         use http_body_util::BodyExt as _;
         use wiremock::matchers::{method, path};
 
@@ -9692,10 +10318,13 @@ role = "admin"
             !body.windows(8).any(|w| w == b"xxxxxxxx"),
             "the oversized upstream payload must not be forwarded to the client"
         );
+
+        Ok(())
     }
 
+    /// Passes a normal-sized upstream token response through with status and body intact.
     #[tokio::test]
-    async fn token_proxy_passes_through_normal_response() {
+    async fn token_proxy_passes_through_normal_response() -> anyhow::Result<()> {
         use http_body_util::BodyExt as _;
         use wiremock::matchers::{method, path};
 
@@ -9730,18 +10359,24 @@ role = "admin"
         let json: serde_json::Value =
             serde_json::from_slice(&body).expect("upstream JSON preserved");
         assert_eq!(json["access_token"], "at-123");
+
+        Ok(())
     }
 
+    /// Returns 404 for introspection when no introspection_url is configured.
     #[tokio::test]
-    async fn introspect_returns_404_when_not_configured() {
+    async fn introspect_returns_404_when_not_configured() -> anyhow::Result<()> {
         let proxy = proxy_cfg("https://example.invalid/token");
         let http = test_http_client();
         let resp = handle_introspect(&http, &proxy, "token=abc").await;
         assert_eq!(resp.status(), 404);
+
+        Ok(())
     }
 
+    /// Proxies revocation upstream and returns the upstream status.
     #[tokio::test]
-    async fn revoke_proxies_and_returns_upstream_status() {
+    async fn revoke_proxies_and_returns_upstream_status() -> anyhow::Result<()> {
         use wiremock::matchers::{method, path};
 
         let mock_server = wiremock::MockServer::start().await;
@@ -9758,18 +10393,24 @@ role = "admin"
         let http = test_http_client();
         let resp = handle_revoke(&http, &proxy, "token=abc").await;
         assert_eq!(resp.status(), 200);
+
+        Ok(())
     }
 
+    /// Returns 404 for revocation when no revocation_url is configured.
     #[tokio::test]
-    async fn revoke_returns_404_when_not_configured() {
+    async fn revoke_returns_404_when_not_configured() -> anyhow::Result<()> {
         let proxy = proxy_cfg("https://example.invalid/token");
         let http = test_http_client();
         let resp = handle_revoke(&http, &proxy, "token=abc").await;
         assert_eq!(resp.status(), 404);
+
+        Ok(())
     }
 
+    /// Advertises introspection/revocation endpoints only when configured and exposed.
     #[test]
-    fn metadata_advertises_endpoints_only_when_configured() {
+    fn metadata_advertises_endpoints_only_when_configured() -> anyhow::Result<()> {
         let mut cfg = test_config("https://auth.test.local/jwks.json");
         // Without proxy configured, no introspection/revocation advertised.
         let m = authorization_server_metadata("https://mcp.local", &cfg);
@@ -9813,6 +10454,8 @@ role = "admin"
             m["revocation_endpoint"],
             serde_json::Value::String("https://mcp.local/revoke".into())
         );
+
+        Ok(())
     }
 
     // ---------- M-H4: token-exchange client authentication ----------
@@ -9836,8 +10479,9 @@ role = "admin"
         .with_audience("downstream")
     }
 
+    /// Rejects a custom requested_token_type that is not a URI.
     #[test]
-    fn validate_rejects_non_uri_custom_requested_token_type() {
+    fn validate_rejects_non_uri_custom_requested_token_type() -> anyhow::Result<()> {
         for bad in ["acess_token", "not a uri", "urn:bad%zz:token"] {
             let tx = tx_with(Some("s"), None)
                 .with_requested_token_type(RequestedTokenType::Custom(bad.to_owned()));
@@ -9850,10 +10494,14 @@ role = "admin"
                 "error must name the offending field for {bad:?}; got {err:?}"
             );
         }
+
+        Ok(())
     }
 
+    /// Accepts URI custom requested_token_type values, including fragments.
     #[test]
-    fn validate_accepts_uri_custom_requested_token_type_including_fragments() {
+    fn validate_accepts_uri_custom_requested_token_type_including_fragments() -> anyhow::Result<()>
+    {
         for good in [
             "urn:ietf:params:oauth:token-type:saml2",
             "https://vendor.example/token-type",
@@ -9868,10 +10516,13 @@ role = "admin"
                 )
             });
         }
+
+        Ok(())
     }
 
+    /// Rejects empty audience, resource, scope, or custom requested_token_type values.
     #[test]
-    fn validate_rejects_empty_optional_token_exchange_params() {
+    fn validate_rejects_empty_optional_token_exchange_params() -> anyhow::Result<()> {
         let base = || tx_with(Some("s"), None);
         let cases = [
             (base().with_audience(""), "audience"),
@@ -9893,10 +10544,13 @@ role = "admin"
                 "error must name {field} and explain emptiness; got {msg:?}"
             );
         }
+
+        Ok(())
     }
 
+    /// Rejects resource values violating RFC 8707 URI rules.
     #[test]
-    fn validate_rejects_non_conformant_resource_uri() {
+    fn validate_rejects_non_conformant_resource_uri() -> anyhow::Result<()> {
         for (value, expected) in [
             ("not-an-absolute-uri", "absolute URI"),
             ("https://api.example.com/v1#frag", "fragment"),
@@ -9914,20 +10568,26 @@ role = "admin"
                 "error for {value:?} must mention {expected:?}; got {msg:?}"
             );
         }
+
+        Ok(())
     }
 
+    /// Accepts token exchange with every optional RFC 8693 parameter omitted.
     #[test]
-    fn validate_accepts_token_exchange_with_all_optional_params_omitted() {
+    fn validate_accepts_token_exchange_with_all_optional_params_omitted() -> anyhow::Result<()> {
         let mut tx = tx_with(Some("s"), None);
         tx.audience = None;
         tx.requested_token_type = RequestedTokenType::Omit;
         https_cfg_with_tx(tx)
             .validate()
             .expect("omitting every RFC 8693 §2.1 OPTIONAL parameter must be valid");
+
+        Ok(())
     }
 
+    /// Rejects token exchange configured with neither client secret nor cert.
     #[test]
-    fn validate_rejects_token_exchange_without_client_auth() {
+    fn validate_rejects_token_exchange_without_client_auth() -> anyhow::Result<()> {
         let cfg = https_cfg_with_tx(tx_with(None, None));
         let err = cfg
             .validate()
@@ -9937,10 +10597,13 @@ role = "admin"
             msg.contains("requires client authentication"),
             "error must explain missing client auth; got {msg:?}"
         );
+
+        Ok(())
     }
 
+    /// Rejects token exchange configured with both client secret and client cert.
     #[test]
-    fn validate_rejects_token_exchange_with_both_secret_and_cert() {
+    fn validate_rejects_token_exchange_with_both_secret_and_cert() -> anyhow::Result<()> {
         let cc = ClientCertConfig {
             cert_path: PathBuf::from("/nonexistent/cert.pem"),
             key_path: PathBuf::from("/nonexistent/key.pem"),
@@ -9954,11 +10617,14 @@ role = "admin"
             msg.contains("mutually") && msg.contains("exclusive"),
             "error must explain mutual exclusion; got {msg:?}"
         );
+
+        Ok(())
     }
 
+    /// Rejects a client cert config when the oauth-mtls-client feature is disabled.
     #[cfg(not(feature = "oauth-mtls-client"))]
     #[test]
-    fn validate_rejects_client_cert_without_feature() {
+    fn validate_rejects_client_cert_without_feature() -> anyhow::Result<()> {
         let cc = ClientCertConfig {
             cert_path: PathBuf::from("/nonexistent/cert.pem"),
             key_path: PathBuf::from("/nonexistent/key.pem"),
@@ -9971,11 +10637,14 @@ role = "admin"
             err.to_string().contains("oauth-mtls-client"),
             "error must reference the cargo feature; got {err}"
         );
+
+        Ok(())
     }
 
+    /// Rejects a client cert config whose files are unreadable.
     #[cfg(feature = "oauth-mtls-client")]
     #[test]
-    fn validate_rejects_missing_client_cert_files() {
+    fn validate_rejects_missing_client_cert_files() -> anyhow::Result<()> {
         let cc = ClientCertConfig {
             cert_path: PathBuf::from("/nonexistent/cert.pem"),
             key_path: PathBuf::from("/nonexistent/key.pem"),
@@ -9988,11 +10657,14 @@ role = "admin"
             err.to_string().contains("unreadable"),
             "error must call out unreadable file; got {err}"
         );
+
+        Ok(())
     }
 
+    /// Rejects a client cert whose PEM fails to parse.
     #[cfg(feature = "oauth-mtls-client")]
     #[test]
-    fn validate_rejects_malformed_client_cert_pem() {
+    fn validate_rejects_malformed_client_cert_pem() -> anyhow::Result<()> {
         let dir = std::env::temp_dir();
         let cert = dir.join(format!("rmcp-mtls-bad-cert-{}.pem", std::process::id()));
         let key = dir.join(format!("rmcp-mtls-bad-key-{}.pem", std::process::id()));
@@ -10010,6 +10682,8 @@ role = "admin"
             err.to_string().contains("PEM parse failed"),
             "error must call out PEM parse failure; got {err}"
         );
+
+        Ok(())
     }
 
     #[cfg(feature = "oauth-mtls-client")]
@@ -10030,9 +10704,10 @@ role = "admin"
         let _ = rustls::crypto::ring::default_provider().install_default();
     }
 
+    /// Accepts a well-formed self-signed client cert and key.
     #[cfg(feature = "oauth-mtls-client")]
     #[test]
-    fn validate_accepts_well_formed_client_cert() {
+    fn validate_accepts_well_formed_client_cert() -> anyhow::Result<()> {
         install_test_crypto_provider();
         let (cert_path, key_path) = write_self_signed_pem();
         let cc = ClientCertConfig {
@@ -10044,11 +10719,14 @@ role = "admin"
         let _ = std::fs::remove_file(&cert_path);
         let _ = std::fs::remove_file(&key_path);
         res.expect("well-formed cert+key must validate");
+
+        Ok(())
     }
 
+    /// Returns a distinct mTLS client for cert configs versus no-cert configs.
     #[cfg(feature = "oauth-mtls-client")]
     #[test]
-    fn client_for_returns_cached_mtls_client() {
+    fn client_for_returns_cached_mtls_client() -> anyhow::Result<()> {
         install_test_crypto_provider();
         let (cert_path, key_path) = write_self_signed_pem();
         let cc = ClientCertConfig {
@@ -10066,11 +10744,14 @@ role = "admin"
             !std::ptr::eq(cert_client, inner_client),
             "client_for must return distinct clients for cert vs no-cert configs"
         );
+
+        Ok(())
     }
 
+    /// Falls back to the inner client when no cached mTLS client matches.
     #[cfg(feature = "oauth-mtls-client")]
     #[test]
-    fn client_for_falls_back_to_inner_when_cache_miss() {
+    fn client_for_falls_back_to_inner_when_cache_miss() -> anyhow::Result<()> {
         install_test_crypto_provider();
         let cfg = validation_https_config();
         let http = OauthHttpClient::with_config(&cfg).expect("build client");
@@ -10085,5 +10766,7 @@ role = "admin"
             std::ptr::eq(fallback, inner),
             "cache miss must fall back to inner client"
         );
+
+        Ok(())
     }
 }
