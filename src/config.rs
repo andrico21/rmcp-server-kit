@@ -1,91 +1,23 @@
-#![cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::field_scoped_visibility_modifiers,
-        reason = "lint-migration: src/config.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::too_long_first_doc_paragraph,
-        reason = "lint-migration: src/config.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::min_ident_chars, reason = "lint-migration: src/config.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::missing_const_for_fn, reason = "lint-migration: src/config.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::arithmetic_side_effects,
-        reason = "lint-migration: src/config.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::map_err_ignore, reason = "lint-migration: src/config.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::shadow_reuse, reason = "lint-migration: src/config.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::missing_errors_doc, reason = "lint-migration: src/config.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_inline_in_public_items,
-        reason = "lint-migration: src/config.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::absolute_paths, reason = "lint-migration: src/config.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::module_name_repetitions,
-        reason = "lint-migration: src/config.rs"
-    )
-)]
-#![cfg_attr(
-    all(not(test), target_os = "linux"),
-    expect(
-        clippy::missing_docs_in_private_items,
-        reason = "lint-migration: src/config.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::std_instead_of_core, reason = "lint-migration: src/config.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::else_if_without_else, reason = "lint-migration: src/config.rs")
-)]
-#![cfg_attr(
-    any(feature = "oauth", test),
-    expect(unused_results, reason = "lint-migration: src/config.rs")
-)]
-#![expect(redundant_imports, reason = "lint-migration: src/config.rs")]
-use std::{path::PathBuf, time::Duration};
+use core::{fmt, str::FromStr, time::Duration};
+use std::{env, fs, path::PathBuf};
 
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 
+#[cfg(feature = "oauth")]
+use crate::oauth;
 use crate::{
+    auth::AuthConfig,
     bounded_limiter::KeyEvictionPolicy,
-    error::RmcpServerKitError,
-    transport::{McpServerConfig, SecurityHeadersConfig},
+    error::{Result as RmcpResult, RmcpServerKitError},
+    forwarded::{MAX_CONFIGURABLE_SCANNED_ENTRIES, MAX_SCANNED_ENTRIES},
+    session_binding,
+    transport::{
+        ForwardedHeaderMode, LogContextConfig, McpServerConfig, SecurityHeadersConfig,
+        default_request_log_exclude_paths, validate_allowed_origin_entry,
+        validate_public_url_value, validate_request_id_header, validate_security_headers,
+        validate_trusted_proxy_entry,
+    },
 };
 
 #[cfg(test)]
@@ -181,6 +113,10 @@ pub enum EnvOverrideSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 #[cfg(test)]
+#[expect(
+    clippy::field_scoped_visibility_modifiers,
+    reason = "deliberate: src/config.rs::EnvOverrideSpec fields keep their explicit `pub(crate)` visibility because the source-scanning tests read the spec table's declared shape"
+)]
 pub(crate) struct EnvOverrideSpec {
     pub(crate) env_var: &'static str,
     pub(crate) target_field: &'static str,
@@ -354,39 +290,62 @@ pub(crate) const ENV_OVERRIDE_SPECS: &[EnvOverrideSpec] = &[
     },
 ];
 
+/// Environment variable name for the `server.listen_addr` override.
 pub(crate) const SERVER_LISTEN_ADDR_ENV: &str = "RMCP_SERVER_KIT__SERVER__LISTEN_ADDR";
+/// Environment variable name for the `server.listen_port` override.
 pub(crate) const SERVER_LISTEN_PORT_ENV: &str = "RMCP_SERVER_KIT__SERVER__LISTEN_PORT";
+/// Environment variable name for the `server.public_url` override.
 pub(crate) const SERVER_PUBLIC_URL_ENV: &str = "RMCP_SERVER_KIT__SERVER__PUBLIC_URL";
+/// Environment variable name for the `server.tls_cert_path` override.
 pub(crate) const SERVER_TLS_CERT_PATH_ENV: &str = "RMCP_SERVER_KIT__SERVER__TLS_CERT_PATH";
+/// Environment variable name for the `server.tls_key_path` override.
 pub(crate) const SERVER_TLS_KEY_PATH_ENV: &str = "RMCP_SERVER_KIT__SERVER__TLS_KEY_PATH";
+/// Environment variable name for the `server.admin_enabled` override.
 pub(crate) const SERVER_ADMIN_ENABLED_ENV: &str = "RMCP_SERVER_KIT__SERVER__ADMIN_ENABLED";
+/// Environment variable name for the `server.key_eviction_policy` override.
 pub(crate) const SERVER_KEY_EVICTION_POLICY_ENV: &str =
     "RMCP_SERVER_KIT__SERVER__KEY_EVICTION_POLICY";
+/// Environment variable name for the direct `server.session_binding_secret` override.
 pub(crate) const SERVER_SESSION_BINDING_SECRET_ENV: &str =
     "RMCP_SERVER_KIT__SERVER__SESSION_BINDING_SECRET";
+/// Environment variable name for the file-backed `server.session_binding_secret` override.
 pub(crate) const SERVER_SESSION_BINDING_SECRET_FILE_ENV: &str =
     "RMCP_SERVER_KIT__SERVER__SESSION_BINDING_SECRET_FILE";
+/// Environment variable name for the `server.auth.oauth.issuer` override.
 pub(crate) const SERVER_OAUTH_ISSUER_ENV: &str = "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ISSUER";
+/// Environment variable name for the `server.auth.oauth.audience` override.
 pub(crate) const SERVER_OAUTH_AUDIENCE_ENV: &str = "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__AUDIENCE";
+/// Environment variable name for the `server.auth.oauth.jwks_uri` override.
 pub(crate) const SERVER_OAUTH_JWKS_URI_ENV: &str = "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__JWKS_URI";
+/// Environment variable name for the `server.auth.oauth.proxy.strip_resource_param` override.
 pub(crate) const SERVER_OAUTH_PROXY_STRIP_RESOURCE_PARAM_ENV: &str =
     "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__STRIP_RESOURCE_PARAM";
+/// Environment variable name for the `server.auth.oauth.allowed_algorithms` override.
 pub(crate) const SERVER_OAUTH_ALLOWED_ALGORITHMS_ENV: &str =
     "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ALLOWED_ALGORITHMS";
+/// Environment variable name for the `observability.log_format` override.
 pub(crate) const OBSERVABILITY_LOG_FORMAT_ENV: &str = "RMCP_SERVER_KIT__OBSERVABILITY__LOG_FORMAT";
+/// Environment variable name for the `observability.metrics_enabled` override.
 pub(crate) const OBSERVABILITY_METRICS_ENABLED_ENV: &str =
     "RMCP_SERVER_KIT__OBSERVABILITY__METRICS_ENABLED";
+/// Environment variable name for the `observability.metrics_bind` override.
 pub(crate) const OBSERVABILITY_METRICS_BIND_ENV: &str =
     "RMCP_SERVER_KIT__OBSERVABILITY__METRICS_BIND";
+/// Environment variable name for the `observability.log_plaintext_oauth_tokens` override.
 pub(crate) const OBSERVABILITY_LOG_PLAINTEXT_OAUTH_TOKENS_ENV: &str =
     "RMCP_SERVER_KIT__OBSERVABILITY__LOG_PLAINTEXT_OAUTH_TOKENS";
+/// Environment variable name for the `observability.log_oauth_claim_values` override.
 pub(crate) const OBSERVABILITY_LOG_OAUTH_CLAIM_VALUES_ENV: &str =
     "RMCP_SERVER_KIT__OBSERVABILITY__LOG_OAUTH_CLAIM_VALUES";
+/// Environment variable name for the `observability.log_tool_call_arguments` override.
 pub(crate) const OBSERVABILITY_LOG_TOOL_CALL_ARGUMENTS_ENV: &str =
     "RMCP_SERVER_KIT__OBSERVABILITY__LOG_TOOL_CALL_ARGUMENTS";
+/// Environment variable name for the `observability.log_upstream_error_bodies` override.
 pub(crate) const OBSERVABILITY_LOG_UPSTREAM_ERROR_BODIES_ENV: &str =
     "RMCP_SERVER_KIT__OBSERVABILITY__LOG_UPSTREAM_ERROR_BODIES";
+/// Environment variable name for the direct `rbac.redaction_salt` override.
 pub(crate) const RBAC_REDACTION_SALT_ENV: &str = "RMCP_SERVER_KIT__RBAC__REDACTION_SALT";
+/// Environment variable name for the file-backed `rbac.redaction_salt` override.
 pub(crate) const RBAC_REDACTION_SALT_FILE_ENV: &str = "RMCP_SERVER_KIT__RBAC__REDACTION_SALT_FILE";
 
 /// Server listener configuration (reusable across MCP projects).
@@ -395,6 +354,10 @@ pub(crate) const RBAC_REDACTION_SALT_FILE_ENV: &str = "RMCP_SERVER_KIT__RBAC__RE
 #[expect(
     clippy::struct_excessive_bools,
     reason = "server configuration is a flat TOML schema with independent boolean feature flags"
+)]
+#[expect(
+    clippy::module_name_repetitions,
+    reason = "public API frozen until the next major release"
 )]
 #[non_exhaustive]
 pub struct ServerConfig {
@@ -470,7 +433,7 @@ pub struct ServerConfig {
     pub request_log_exclude_paths: Vec<String>,
     /// Configuration for client context logging (request ID, client IP, peer IP, etc.).
     #[serde(default)]
-    pub log_context: crate::transport::LogContextConfig,
+    pub log_context: LogContextConfig,
     /// Full-table policy for per-IP rate limiters. Default: `evict_lru`.
     #[serde(default)]
     pub key_eviction_policy: KeyEvictionPolicy,
@@ -490,7 +453,7 @@ pub struct ServerConfig {
     /// Which forwarding header trusted-forwarder mode reads:
     /// `"x-forwarded-for"` (default when unset) or `"forwarded"`
     /// (RFC 7239). Requires `trusted_proxies` to be nonempty.
-    pub forwarded_header: Option<crate::transport::ForwardedHeaderMode>,
+    pub forwarded_header: Option<ForwardedHeaderMode>,
     /// Idle timeout for MCP sessions. Sessions with no activity for this
     /// duration are closed automatically. Default: 20 minutes.
     #[serde(default = "default_session_idle_timeout")]
@@ -546,7 +509,7 @@ pub struct ServerConfig {
     #[serde(default = "default_admin_role")]
     pub admin_role: String,
     /// Authentication configuration (API keys, mTLS, OAuth).
-    pub auth: Option<crate::auth::AuthConfig>,
+    pub auth: Option<AuthConfig>,
     /// Filter `tools/list` through RBAC visibility when RBAC is enabled.
     /// Default: true.
     #[serde(default = "default_tool_list_filtering")]
@@ -569,8 +532,9 @@ pub struct ServerConfig {
 /// Every field is listed deliberately rather than using
 /// `finish_non_exhaustive`, and `server_config_debug_lists_every_field` fails
 /// if a field is added here without being rendered.
-impl std::fmt::Debug for ServerConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for ServerConfig {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ServerConfig")
             .field("listen_addr", &self.listen_addr)
             .field("listen_port", &self.listen_port)
@@ -632,6 +596,7 @@ impl std::fmt::Debug for ServerConfig {
 }
 
 impl Default for ServerConfig {
+    #[inline]
     fn default() -> Self {
         Self {
             listen_addr: default_listen_addr(),
@@ -650,8 +615,8 @@ impl Default for ServerConfig {
             extra_route_rate_limit: None,
             extra_route_rate_limit_burst: None,
             extra_route_rate_limit_exempt_paths: Vec::new(),
-            request_log_exclude_paths: crate::transport::default_request_log_exclude_paths(),
-            log_context: crate::transport::LogContextConfig::default(),
+            request_log_exclude_paths: default_request_log_exclude_paths(),
+            log_context: LogContextConfig::default(),
             key_eviction_policy: KeyEvictionPolicy::default(),
             trusted_proxies: Vec::new(),
             trusted_forwarder_max_entries: default_trusted_forwarder_max_entries(),
@@ -707,6 +672,7 @@ impl ServerConfig {
     /// # Ok(())
     /// # }
     /// ```
+    #[inline]
     pub fn apply_env_overrides(&mut self) -> Result<Vec<EnvOverride>, RmcpServerKitError> {
         let mut applied = Vec::new();
         apply_string_env(
@@ -767,6 +733,12 @@ impl ServerConfig {
         Ok(applied)
     }
 
+    /// Apply the direct or file-backed session-binding secret override.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RmcpServerKitError::Config`] when both sources are set, when the
+    /// file cannot be read, or when the secret fails validation.
     fn apply_session_binding_secret_env(
         &mut self,
         applied: &mut Vec<EnvOverride>,
@@ -789,12 +761,12 @@ impl ServerConfig {
                 Ok(())
             }
             (None, Some(path)) => {
-                let secret = std::fs::read_to_string(PathBuf::from(&path)).map_err(|error| {
+                let raw_secret = fs::read_to_string(PathBuf::from(&path)).map_err(|error| {
                     RmcpServerKitError::Config(format!(
                         "failed to read {SERVER_SESSION_BINDING_SECRET_FILE_ENV} file {path:?}: {error}"
                     ))
                 })?;
-                let secret = normalize_text_secret_file(secret);
+                let secret = normalize_text_secret_file(raw_secret);
                 validate_session_binding_secret_env(
                     SERVER_SESSION_BINDING_SECRET_FILE_ENV,
                     &secret,
@@ -811,6 +783,12 @@ impl ServerConfig {
     }
 
     #[cfg(feature = "oauth")]
+    /// Apply the OAuth environment overrides onto a declared OAuth config.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RmcpServerKitError::Config`] when the OAuth parent tables are
+    /// missing or an override value cannot be parsed.
     fn apply_oauth_env_overrides(
         &mut self,
         oauth_env: OAuthEnvOverrides,
@@ -867,10 +845,14 @@ impl ServerConfig {
                 .collect();
             // Resolve eagerly so an unusable value is reported against the
             // env var that set it, rather than surfacing later as an opaque
-            // `oauth.allowed_algorithms` config error.
-            crate::oauth::resolve_allowed_algorithms(Some(names.as_slice())).map_err(|err| {
-                RmcpServerKitError::Config(format!("{SERVER_OAUTH_ALLOWED_ALGORITHMS_ENV}: {err}"))
-            })?;
+            // `oauth.allowed_algorithms` config error. The resolved list is
+            // validation-only here; the OAuth layer recomputes it.
+            let _resolved =
+                oauth::resolve_allowed_algorithms(Some(names.as_slice())).map_err(|err| {
+                    RmcpServerKitError::Config(format!(
+                        "{SERVER_OAUTH_ALLOWED_ALGORITHMS_ENV}: {err}"
+                    ))
+                })?;
             applied.push(env_report(
                 SERVER_OAUTH_ALLOWED_ALGORITHMS_ENV,
                 "server.auth.oauth.allowed_algorithms",
@@ -936,6 +918,7 @@ impl ServerConfig {
     /// # Ok(())
     /// # }
     /// ```
+    #[inline]
     pub fn apply_to_mcp_config(
         &self,
         base: McpServerConfig,
@@ -1036,6 +1019,7 @@ impl ObservabilityConfig {
     /// # Ok(())
     /// # }
     /// ```
+    #[inline]
     pub fn apply_env_overrides(&mut self) -> Result<Vec<EnvOverride>, RmcpServerKitError> {
         let mut applied = Vec::new();
         apply_string_env(
@@ -1098,16 +1082,22 @@ impl ObservabilityConfig {
     }
 }
 
+/// Read an environment variable, distinguishing absent from non-UTF-8.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when `var` is set but not valid UTF-8.
 pub(crate) fn read_env(var: &str) -> Result<Option<String>, RmcpServerKitError> {
-    match std::env::var(var) {
+    match env::var(var) {
         Ok(value) => Ok(Some(value)),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => Err(RmcpServerKitError::Config(format!(
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => Err(RmcpServerKitError::Config(format!(
             "{var} must contain valid UTF-8"
         ))),
     }
 }
 
+/// Build a non-secret [`EnvOverride`] entry for an applied environment value.
 fn env_report(env_var: &str, target_field: &str, value: String) -> EnvOverride {
     EnvOverride {
         env_var: env_var.to_owned(),
@@ -1117,6 +1107,7 @@ fn env_report(env_var: &str, target_field: &str, value: String) -> EnvOverride {
     }
 }
 
+/// Build a redacted [`EnvOverride`] entry for a secret-typed target.
 pub(crate) fn secret_env_report(
     env_var: &str,
     target_field: &str,
@@ -1130,19 +1121,34 @@ pub(crate) fn secret_env_report(
     }
 }
 
+/// Parse `raw` as `T`, naming `env_var` and `expected` in the failure message.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when `raw` does not parse as `T`.
 fn parse_env_value<T>(env_var: &str, raw: &str, expected: &str) -> Result<T, RmcpServerKitError>
 where
-    T: std::str::FromStr,
+    T: FromStr,
 {
-    raw.parse::<T>().map_err(|_| {
+    raw.parse::<T>().map_err(|_error| {
         RmcpServerKitError::Config(format!("invalid value for {env_var}: expected {expected}"))
     })
 }
 
+/// Parse `raw` as a boolean, naming `env_var` on failure.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when `raw` is not `true` or `false`.
 pub(crate) fn parse_env_bool(env_var: &str, raw: &str) -> Result<bool, RmcpServerKitError> {
     parse_env_value(env_var, raw, "bool")
 }
 
+/// Apply a required string environment override to `target` and record it.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when `env_var` is not valid UTF-8.
 fn apply_string_env(
     env_var: &str,
     target_field: &str,
@@ -1156,6 +1162,11 @@ fn apply_string_env(
     Ok(())
 }
 
+/// Apply an optional string environment override to `target` and record it.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when `env_var` is not valid UTF-8.
 fn apply_optional_string_env(
     env_var: &str,
     target_field: &str,
@@ -1169,6 +1180,11 @@ fn apply_optional_string_env(
     Ok(())
 }
 
+/// Apply an optional path environment override to `target` and record it.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when `env_var` is not valid UTF-8.
 fn apply_optional_path_env(
     env_var: &str,
     target_field: &str,
@@ -1182,31 +1198,50 @@ fn apply_optional_path_env(
     Ok(())
 }
 
+/// Strip one trailing line ending from a secret read from a text file.
 pub(crate) fn normalize_text_secret_file(mut secret: String) -> String {
     if secret.ends_with("\r\n") {
-        secret.truncate(secret.len() - 2);
+        secret.truncate(secret.len().saturating_sub(2));
     } else if secret.ends_with('\n') || secret.ends_with('\r') {
-        secret.truncate(secret.len() - 1);
+        secret.truncate(secret.len().saturating_sub(1));
+    } else {
+        // No trailing line ending to strip.
     }
     secret
 }
 
+/// Validate a session-binding secret read from an environment variable.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when the secret fails validation.
 fn validate_session_binding_secret_env(
     env_var: &str,
     value: &str,
 ) -> Result<(), RmcpServerKitError> {
-    crate::session_binding::validate_configured_secret(env_var, value)
+    session_binding::validate_configured_secret(env_var, value)
 }
 
+/// Raw OAuth-related environment overrides read before being applied.
 struct OAuthEnvOverrides {
+    /// `issuer` override, when set.
     issuer: Option<String>,
+    /// `audience` override, when set.
     audience: Option<String>,
+    /// `jwks_uri` override, when set.
     jwks_uri: Option<String>,
+    /// `allowed_algorithms` override, when set.
     allowed_algorithms: Option<String>,
+    /// `proxy.strip_resource_param` override, when set.
     proxy_strip_resource_param: Option<String>,
 }
 
 impl OAuthEnvOverrides {
+    /// Read every OAuth-related environment override.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RmcpServerKitError::Config`] when a variable is not valid UTF-8.
     fn read() -> Result<Self, RmcpServerKitError> {
         Ok(Self {
             issuer: read_env(SERVER_OAUTH_ISSUER_ENV)?,
@@ -1217,7 +1252,8 @@ impl OAuthEnvOverrides {
         })
     }
 
-    fn is_set(&self) -> bool {
+    /// Whether any OAuth environment override is set.
+    const fn is_set(&self) -> bool {
         self.issuer.is_some()
             || self.audience.is_some()
             || self.jwks_uri.is_some()
@@ -1225,6 +1261,7 @@ impl OAuthEnvOverrides {
             || self.proxy_strip_resource_param.is_some()
     }
 
+    /// Name of the first set OAuth environment variable.
     fn first_set_var(&self) -> &'static str {
         first_set_oauth_env(
             self.issuer.as_deref(),
@@ -1236,9 +1273,15 @@ impl OAuthEnvOverrides {
     }
 }
 
+/// Stable doc anchor for the `ObservabilityConfig` reference section.
 const _OBSERVABILITY_CONFIG_DOC_ANCHOR: &str = "ObservabilityConfig";
 
 #[cfg(not(feature = "oauth"))]
+/// Reject any OAuth environment override when the `oauth` feature is off.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] naming the first set OAuth variable.
 fn reject_oauth_env_overrides(oauth_env: &OAuthEnvOverrides) -> Result<(), RmcpServerKitError> {
     if oauth_env.is_set() {
         let var = oauth_env.first_set_var();
@@ -1250,7 +1293,8 @@ fn reject_oauth_env_overrides(oauth_env: &OAuthEnvOverrides) -> Result<(), RmcpS
     }
 }
 
-fn first_set_oauth_env(
+/// Return the first set OAuth environment variable of the five, for error messages.
+const fn first_set_oauth_env(
     issuer: Option<&str>,
     audience: Option<&str>,
     jwks_uri: Option<&str>,
@@ -1272,6 +1316,11 @@ fn first_set_oauth_env(
     }
 }
 
+/// Parse a human-readable duration, naming `field` and `value` on failure.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when `value` is not a valid duration.
 fn parse_duration_field(field: &str, value: &str) -> Result<Duration, RmcpServerKitError> {
     humantime::parse_duration(value).map_err(|error| {
         RmcpServerKitError::Config(format!("invalid duration for {field}: {value:?}: {error}"))
@@ -1284,6 +1333,10 @@ fn parse_duration_field(field: &str, value: &str) -> Result<Duration, RmcpServer
 #[expect(
     clippy::struct_excessive_bools,
     reason = "observability configuration is a flat TOML schema with independent boolean feature flags"
+)]
+#[expect(
+    clippy::module_name_repetitions,
+    reason = "public API frozen until the next major release"
 )]
 #[non_exhaustive]
 pub struct ObservabilityConfig {
@@ -1339,8 +1392,9 @@ pub struct ObservabilityConfig {
 /// use to find or tamper with the audit trail. Presence is still reported;
 /// only the path is withheld. `observability_config_debug_lists_every_field`
 /// fails if a field is added without being rendered here.
-impl std::fmt::Debug for ObservabilityConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for ObservabilityConfig {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ObservabilityConfig")
             .field("log_level", &self.log_level)
             .field("log_format", &self.log_format)
@@ -1363,6 +1417,7 @@ impl std::fmt::Debug for ObservabilityConfig {
 }
 
 impl Default for ObservabilityConfig {
+    #[inline]
     fn default() -> Self {
         Self {
             log_level: default_log_level(),
@@ -1404,6 +1459,14 @@ pub(crate) enum SharedConfigViolation {
 /// env overrides, bridge behaviour) stays where it is: those inputs are not
 /// common to both types, and folding them in here would change validation
 /// behaviour that no test currently pins.
+///
+/// # Errors
+///
+/// Returns the first violated [`SharedConfigViolation`] in the fixed order.
+#[expect(
+    clippy::missing_const_for_fn,
+    reason = "deliberate: src/config.rs::check_shared_config_invariants is parsed by a source-scanning test that matches its `pub(crate) fn` prefix"
+)]
 #[expect(
     clippy::fn_params_excessive_bools,
     reason = "these are the five independent predicates both validators evaluate; a params struct would carry the same five bools and only relocate the lint"
@@ -1445,9 +1508,12 @@ pub(crate) fn check_shared_config_invariants(
 /// # Errors
 ///
 /// Returns `RmcpServerKitError::Config` on invalid values.
-pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()> {
-    use crate::error::RmcpServerKitError;
-
+#[expect(
+    clippy::module_name_repetitions,
+    reason = "public API frozen until the next major release"
+)]
+#[inline]
+pub fn validate_server_config(server: &ServerConfig) -> RmcpResult<()> {
     if server.listen_port == 0 {
         return Err(RmcpServerKitError::Config(
             "listen_port must be nonzero".into(),
@@ -1464,10 +1530,10 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
     // so full first-error parity is neither achievable nor claimed.
     if let Err(violation) = check_shared_config_invariants(
         server.admin_enabled,
-        server.auth.as_ref().is_some_and(|a| a.enabled),
+        server.auth.as_ref().is_some_and(|auth| auth.enabled),
         server.tls_cert_path.is_some(),
         server.tls_key_path.is_some(),
-        server.auth.as_ref().is_some_and(|a| a.mtls.is_some()),
+        server.auth.as_ref().is_some_and(|auth| auth.mtls.is_some()),
     ) {
         return Err(RmcpServerKitError::Config(
             match violation {
@@ -1500,8 +1566,7 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
     // `McpServerConfig::check` uses, so a TOML-only consumer cannot be told
     // the config is valid and then have `serve()` refuse it at startup.
     for origin in &server.allowed_origins {
-        crate::transport::validate_allowed_origin_entry(origin)
-            .map_err(RmcpServerKitError::Config)?;
+        validate_allowed_origin_entry(origin).map_err(RmcpServerKitError::Config)?;
     }
 
     if server.max_concurrent_requests == Some(0) {
@@ -1527,7 +1592,7 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
     }
 
     if let Some(secret) = &server.session_binding_secret {
-        crate::session_binding::validate_configured_secret(
+        session_binding::validate_configured_secret(
             "server.session_binding_secret",
             secret.expose_secret(),
         )?;
@@ -1556,7 +1621,9 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
     // The handshake deadline must be a positive duration: a zero value
     // would reap every TLS handshake before it could complete. Mirrors
     // check #11 in `McpServerConfig::check`.
-    if humantime::parse_duration(&server.tls_handshake_timeout).is_ok_and(|d| d == Duration::ZERO) {
+    if humantime::parse_duration(&server.tls_handshake_timeout)
+        .is_ok_and(|duration| duration == Duration::ZERO)
+    {
         return Err(RmcpServerKitError::Config(
             "server.tls_handshake_timeout must be greater than zero".into(),
         ));
@@ -1581,19 +1648,22 @@ pub fn validate_server_config(server: &ServerConfig) -> crate::error::Result<()>
         ));
     }
     if let Some(url) = &server.public_url {
-        crate::transport::validate_public_url_value(url).map_err(RmcpServerKitError::Config)?;
+        validate_public_url_value(url).map_err(RmcpServerKitError::Config)?;
     }
-    crate::transport::validate_security_headers(&server.security_headers)?;
+    validate_security_headers(&server.security_headers)?;
 
     Ok(())
 }
 
-/// Validate the rate-limit burst knobs of a TOML [`ServerConfig`]: zero
-/// bursts and orphan bursts fail fast (mirrors `McpServerConfig::check`;
+/// Validate the rate-limit burst knobs of a TOML [`ServerConfig`].
+///
+/// Zero bursts and orphan bursts fail fast (mirrors `McpServerConfig::check`;
 /// the auth bursts have no orphan rule - their base rates always resolve).
-fn validate_rate_limit_knobs(server: &ServerConfig) -> crate::error::Result<()> {
-    use crate::error::RmcpServerKitError;
-
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when a burst knob is zero or orphaned.
+fn validate_rate_limit_knobs(server: &ServerConfig) -> RmcpResult<()> {
     if server.tool_rate_limit_burst == Some(0) {
         return Err(RmcpServerKitError::Config(
             "server.tool_rate_limit_burst must be greater than zero".into(),
@@ -1639,7 +1709,11 @@ fn validate_rate_limit_knobs(server: &ServerConfig) -> crate::error::Result<()> 
     if let Some(auth) = server.auth.as_ref() {
         auth.check_oauth_feature()?;
     }
-    if let Some(rl) = server.auth.as_ref().and_then(|a| a.rate_limit.as_ref()) {
+    if let Some(rl) = server
+        .auth
+        .as_ref()
+        .and_then(|auth| auth.rate_limit.as_ref())
+    {
         (rl.max_attempts_per_minute != 0).ok_or_else(|| {
             RmcpServerKitError::Config(
                 "auth.rate_limit.max_attempts_per_minute must be nonzero".into(),
@@ -1668,10 +1742,13 @@ fn validate_rate_limit_knobs(server: &ServerConfig) -> crate::error::Result<()> 
     Ok(())
 }
 
-fn validate_mtls_knobs(server: &ServerConfig) -> crate::error::Result<()> {
-    use crate::error::RmcpServerKitError;
-
-    if let Some(mtls) = server.auth.as_ref().and_then(|a| a.mtls.as_ref()) {
+/// Validate the mTLS/CRL knobs of a TOML [`ServerConfig`].
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when a CRL knob is zero.
+fn validate_mtls_knobs(server: &ServerConfig) -> RmcpResult<()> {
+    if let Some(mtls) = server.auth.as_ref().and_then(|auth| auth.mtls.as_ref()) {
         (mtls.crl_max_concurrent_fetches != 0).ok_or_else(|| {
             RmcpServerKitError::Config(
                 "auth.mtls.crl_max_concurrent_fetches must be nonzero".into(),
@@ -1704,12 +1781,14 @@ fn validate_mtls_knobs(server: &ServerConfig) -> crate::error::Result<()> {
 
 /// Validate the trusted-forwarder knobs of a TOML [`ServerConfig`]
 /// (mirrors `McpServerConfig::check_trusted_forwarder`).
-fn validate_trusted_forwarder_config(server: &ServerConfig) -> crate::error::Result<()> {
-    use crate::error::RmcpServerKitError;
-
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when a proxy entry, header, scan cap,
+/// or request-id header setting is invalid.
+fn validate_trusted_forwarder_config(server: &ServerConfig) -> RmcpResult<()> {
     for entry in &server.trusted_proxies {
-        crate::transport::validate_trusted_proxy_entry(entry)
-            .map_err(RmcpServerKitError::Config)?;
+        validate_trusted_proxy_entry(entry).map_err(RmcpServerKitError::Config)?;
     }
     if server.forwarded_header.is_some() && server.trusted_proxies.is_empty() {
         return Err(RmcpServerKitError::Config(
@@ -1717,16 +1796,15 @@ fn validate_trusted_forwarder_config(server: &ServerConfig) -> crate::error::Res
         ));
     }
     if server.trusted_forwarder_max_entries == 0
-        || server.trusted_forwarder_max_entries > crate::forwarded::MAX_CONFIGURABLE_SCANNED_ENTRIES
+        || server.trusted_forwarder_max_entries > MAX_CONFIGURABLE_SCANNED_ENTRIES
     {
         return Err(RmcpServerKitError::Config(format!(
-            "server.trusted_forwarder_max_entries must be in 1..={}, got {}",
-            crate::forwarded::MAX_CONFIGURABLE_SCANNED_ENTRIES,
+            "server.trusted_forwarder_max_entries must be in 1..={MAX_CONFIGURABLE_SCANNED_ENTRIES}, got {}",
             server.trusted_forwarder_max_entries
         )));
     }
-    crate::transport::validate_request_id_header(&server.log_context.request_id_header)
-        .map_err(|e| RmcpServerKitError::Config(format!("server.{e}")))?;
+    validate_request_id_header(&server.log_context.request_id_header)
+        .map_err(|err| RmcpServerKitError::Config(format!("server.{err}")))?;
     if server.log_context.request_id && server.trusted_proxies.is_empty() {
         return Err(RmcpServerKitError::Config(
             "server.log_context.request_id requires server.trusted_proxies to be nonempty".into(),
@@ -1740,10 +1818,13 @@ fn validate_trusted_forwarder_config(server: &ServerConfig) -> crate::error::Res
 /// # Errors
 ///
 /// Returns `RmcpServerKitError::Config` on invalid values.
-pub fn validate_observability_config(obs: &ObservabilityConfig) -> crate::error::Result<()> {
+#[expect(
+    clippy::module_name_repetitions,
+    reason = "public API frozen until the next major release"
+)]
+#[inline]
+pub fn validate_observability_config(obs: &ObservabilityConfig) -> RmcpResult<()> {
     use tracing_subscriber::EnvFilter;
-
-    use crate::error::RmcpServerKitError;
 
     if EnvFilter::try_new(&obs.log_level).is_err() {
         return Err(RmcpServerKitError::Config(format!(
@@ -1764,138 +1845,114 @@ pub fn validate_observability_config(obs: &ObservabilityConfig) -> crate::error:
 
 // - Default value functions -
 
+/// Default listen address: `127.0.0.1`.
 fn default_listen_addr() -> String {
     "127.0.0.1".into()
 }
-fn default_listen_port() -> u16 {
+/// Default listen port: `8443`.
+const fn default_listen_port() -> u16 {
     8443
 }
+/// Default graceful-shutdown timeout: `30s`.
 fn default_shutdown_timeout() -> String {
     "30s".into()
 }
+/// Default per-request timeout: `120s`.
 fn default_request_timeout() -> String {
     "120s".into()
 }
+/// Default maximum request body size: 1 MiB.
 const fn default_max_request_body() -> usize {
     1024 * 1024
 }
+/// Default forwarding-chain scan cap.
 const fn default_trusted_forwarder_max_entries() -> usize {
-    crate::forwarded::MAX_SCANNED_ENTRIES
+    MAX_SCANNED_ENTRIES
 }
+/// Default for exposing build metadata on `/version`.
 const fn default_expose_build_metadata() -> bool {
     false
 }
+/// Default for RBAC-filtering `tools/list`.
 const fn default_tool_list_filtering() -> bool {
     true
 }
+/// Default OWASP security-header overrides.
 fn default_security_headers() -> SecurityHeadersConfig {
     SecurityHeadersConfig::default()
 }
+/// Default `tracing` log filter.
 fn default_log_level() -> String {
     "info,rmcp=warn,rmcp_server_kit=info".into()
 }
+/// Default log output format: `pretty`.
 fn default_log_format() -> String {
     "pretty".into()
 }
+/// Default Prometheus metrics bind address.
 fn default_metrics_bind() -> String {
     "127.0.0.1:9090".into()
 }
+/// Default MCP session idle timeout: `20m`.
 fn default_session_idle_timeout() -> String {
     "20m".into()
 }
+/// Default for binding sessions to the authenticated identity.
 const fn default_session_binding() -> bool {
     true
 }
+/// Default per-handshake TLS deadline: `10s`.
 fn default_tls_handshake_timeout() -> String {
     "10s".into()
 }
+/// Default cap on concurrent TLS handshakes: `256`.
 const fn default_max_concurrent_tls_handshakes() -> usize {
     256
 }
+/// Default RBAC role for admin endpoints: `admin`.
 fn default_admin_role() -> String {
     "admin".into()
 }
-fn default_compression_min_size() -> u16 {
+/// Default compression threshold: 1024 bytes.
+const fn default_compression_min_size() -> u16 {
     1024
 }
+/// Default SSE keep-alive interval: `15s`.
 fn default_sse_keep_alive() -> String {
     "15s".into()
 }
 
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::unused_trait_names, reason = "lint-migration: src/config.rs")
+#[expect(
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    reason = "test code is not rendered API documentation"
 )]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::indexing_slicing, reason = "lint-migration: src/config.rs")
+#[expect(
+    clippy::too_long_first_doc_paragraph,
+    reason = "test code is not rendered API documentation"
 )]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::duration_suboptimal_units,
-        reason = "lint-migration: src/config.rs"
-    )
+#[expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")]
+#[expect(
+    clippy::std_instead_of_alloc,
+    reason = "deliberate: src/config.rs::tests link `std` only; the crate root has no `extern crate alloc`"
 )]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::shadow_unrelated, reason = "lint-migration: src/config.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::expect_used, reason = "lint-migration: src/config.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::uninlined_format_args,
-        reason = "lint-migration: src/config.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::panic, reason = "lint-migration: src/config.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::assertions_on_result_states,
-        reason = "lint-migration: src/config.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::unwrap_used, reason = "lint-migration: src/config.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::missing_panics_doc,
-        reason = "test code is not rendered API documentation"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::std_instead_of_alloc, reason = "lint-migration: src/config.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::needless_raw_strings, reason = "lint-migration: src/config.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::single_char_lifetime_names,
-        reason = "lint-migration: src/config.rs"
-    )
-)]
-#[cfg_attr(test, expect(deprecated, reason = "lint-migration: src/config.rs"))]
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, sync::Arc, time::Duration};
+    use std::{
+        collections::{HashMap, HashSet},
+        io::{self, Write},
+        sync::{Arc, Mutex},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use anyhow::Context as _;
+    use tracing::subscriber::with_default;
+    use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
-    use crate::transport::McpServerConfig;
+    use crate::auth::{ApiKeyEntry, MtlsConfig, RateLimitConfig, generate_api_key};
+    #[cfg(feature = "oauth")]
+    use crate::oauth::{OAuthConfig, OAuthProxyConfig};
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -1904,7 +1961,7 @@ mod tests {
     }
 
     #[derive(Clone, Default)]
-    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
 
     impl CapturedLogs {
         fn contents(&self) -> String {
@@ -1913,37 +1970,44 @@ mod tests {
         }
     }
 
-    struct CapturedLogsWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+    struct CapturedLogsWriter(Arc<Mutex<Vec<u8>>>);
 
-    impl std::io::Write for CapturedLogsWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    impl Write for CapturedLogsWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             if let Ok(mut guard) = self.0.lock() {
                 guard.extend_from_slice(buf);
             }
             Ok(buf.len())
         }
 
-        fn flush(&mut self) -> std::io::Result<()> {
+        fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
     }
 
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+    impl<'writer> MakeWriter<'writer> for CapturedLogs {
         type Writer = CapturedLogsWriter;
 
-        fn make_writer(&'a self) -> Self::Writer {
+        fn make_writer(&'writer self) -> Self::Writer {
             CapturedLogsWriter(Arc::clone(&self.0))
         }
     }
 
-    fn server_from_root_toml(toml: &str) -> ServerConfig {
-        toml::from_str::<RootConfig>(toml).unwrap().server
+    fn server_from_root_toml(toml: &str) -> anyhow::Result<ServerConfig> {
+        Ok(toml::from_str::<RootConfig>(toml)
+            .context("root config TOML must deserialize")?
+            .server)
     }
 
     // -- ServerConfig defaults --
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/config.rs::server_config_defaults keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn server_config_defaults() {
+    /// Pins the default `ServerConfig` field values surfaced to operators.
+    fn server_config_defaults() -> anyhow::Result<()> {
         let cfg = ServerConfig::default();
         assert_eq!(cfg.listen_addr, "127.0.0.1");
         assert_eq!(cfg.listen_port, 8443);
@@ -1959,10 +2023,16 @@ mod tests {
         assert_eq!(cfg.sse_keep_alive, "15s");
         assert!(cfg.public_url.is_none());
         assert!(cfg.tool_list_filtering);
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/config.rs::observability_config_defaults keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn observability_config_defaults() {
+    /// Pins the default `ObservabilityConfig` field values surfaced to operators.
+    fn observability_config_defaults() -> anyhow::Result<()> {
         let cfg = ObservabilityConfig::default();
         assert_eq!(cfg.log_level, "info,rmcp=warn,rmcp_server_kit=info");
         assert_eq!(cfg.log_format, "pretty");
@@ -1973,6 +2043,7 @@ mod tests {
         assert!(!cfg.log_plaintext_oauth_tokens);
         assert!(!cfg.log_oauth_claim_values);
         assert!(!cfg.log_tool_call_arguments);
+        Ok(())
     }
 
     #[expect(
@@ -1986,8 +2057,13 @@ mod tests {
         tracing::warn!(target: "rmcp::service", "probe-sdk-warn");
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/config.rs::default_log_filter_keeps_framework_info keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn default_log_filter_keeps_framework_info() {
+    /// Pins that the default log filter keeps framework info and warning probes.
+    fn default_log_filter_keeps_framework_info() -> anyhow::Result<()> {
         let logs = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::new(
@@ -1998,7 +2074,7 @@ mod tests {
             .without_time()
             .finish();
 
-        tracing::subscriber::with_default(subscriber, emit_log_filter_test_probes);
+        with_default(subscriber, emit_log_filter_test_probes);
 
         let captured = logs.contents();
         assert!(
@@ -2017,53 +2093,73 @@ mod tests {
             !captured.contains("probe-sdk-info"),
             "captured log should NOT contain probe-sdk-info; got: {captured:?}"
         );
+        Ok(())
     }
 
     // -- validate_server_config --
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/config.rs::valid_server_config_passes keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn valid_server_config_passes() {
+    /// Pins that a default `ServerConfig` passes TOML validation.
+    fn valid_server_config_passes() -> anyhow::Result<()> {
         let cfg = ServerConfig::default();
-        assert!(validate_server_config(&cfg).is_ok());
+        assert!(validate_server_config(&cfg).is_ok(), "config must validate");
+        Ok(())
     }
 
     #[test]
-    fn validate_server_config_rejects_blank_api_key_name() {
+    /// Pins that a blank `api_keys` name is rejected while a named key passes.
+    fn validate_server_config_rejects_blank_api_key_name() -> anyhow::Result<()> {
         let blank = ServerConfig {
-            auth: Some(crate::auth::AuthConfig::with_keys(vec![
-                crate::auth::ApiKeyEntry::new("", "hash", "viewer"),
-            ])),
+            auth: Some(AuthConfig::with_keys(vec![ApiKeyEntry::new(
+                "", "hash", "viewer",
+            )])),
             ..ServerConfig::default()
         };
-        let err = validate_server_config(&blank).unwrap_err().to_string();
+        let Err(err) = validate_server_config(&blank) else {
+            anyhow::bail!("blank api key name must be rejected");
+        };
+        let message = err.to_string();
         assert!(
-            err.contains("api_keys[0]"),
-            "must name offending index: {err}"
+            message.contains("api_keys[0]"),
+            "must name offending index: {message}"
+        );
+        let whitespace = ServerConfig {
+            auth: Some(AuthConfig::with_keys(vec![ApiKeyEntry::new(
+                "   ", "hash", "viewer",
+            )])),
+            ..ServerConfig::default()
+        };
+        assert!(
+            validate_server_config(&whitespace).is_err(),
+            "whitespace-only api key name must be rejected"
         );
 
-        let whitespace = ServerConfig {
-            auth: Some(crate::auth::AuthConfig::with_keys(vec![
-                crate::auth::ApiKeyEntry::new("   ", "hash", "viewer"),
-            ])),
-            ..ServerConfig::default()
-        };
-        assert!(validate_server_config(&whitespace).is_err());
-
         let ok = ServerConfig {
-            auth: Some(crate::auth::AuthConfig::with_keys(vec![
-                crate::auth::ApiKeyEntry::new("viewer-key", "hash", "viewer"),
-            ])),
+            auth: Some(AuthConfig::with_keys(vec![ApiKeyEntry::new(
+                "viewer-key",
+                "hash",
+                "viewer",
+            )])),
             ..ServerConfig::default()
         };
-        assert!(validate_server_config(&ok).is_ok());
+        assert!(
+            validate_server_config(&ok).is_ok(),
+            "valid config must validate"
+        );
+        Ok(())
     }
 
     #[test]
-    fn admin_auth_check_precedes_tls_and_mtls_like_the_builder() {
+    /// Pins that admin/auth precedence matches `McpServerConfig::check` ordering.
+    fn admin_auth_check_precedes_tls_and_mtls_like_the_builder() -> anyhow::Result<()> {
         // A config invalid in all three ordered ways must report the same
         // first error here as `McpServerConfig::check` does, otherwise the
         // TOML and builder paths disagree about what is wrong.
-        let mut auth = crate::auth::AuthConfig::with_keys(vec![]);
+        let mut auth = AuthConfig::with_keys(vec![]);
         auth.enabled = false;
         auth.mtls = Some(valid_mtls_config());
         let cfg = ServerConfig {
@@ -2073,65 +2169,71 @@ mod tests {
             tls_key_path: None,
             ..ServerConfig::default()
         };
-        let err = validate_server_config(&cfg).unwrap_err().to_string();
+        let Err(err) = validate_server_config(&cfg) else {
+            anyhow::bail!("admin/auth dependency must be reported");
+        };
+        let message = err.to_string();
         assert!(
-            err.contains("admin_enabled=true requires auth"),
-            "admin/auth must fire before TLS and mTLS checks; got {err}"
+            message.contains("admin_enabled=true requires auth"),
+            "admin/auth must fire before TLS and mTLS checks; got {message}"
         );
+        Ok(())
     }
 
-    fn classify_shared_check(err: RmcpServerKitError) -> SharedCheck {
+    fn classify_shared_check(err: RmcpServerKitError) -> anyhow::Result<SharedCheck> {
         match err {
             RmcpServerKitError::Config(msg) => {
                 if msg.contains("admin_enabled=true requires auth") {
-                    SharedCheck::AdminAuth
+                    Ok(SharedCheck::AdminAuth)
                 } else if msg.contains("must both be set or both omitted")
                     || msg.contains("tls_cert_path is set but tls_key_path is missing")
                     || msg.contains("tls_key_path is set but tls_cert_path is missing")
                 {
-                    SharedCheck::TlsPairing
+                    Ok(SharedCheck::TlsPairing)
                 } else if msg.contains("auth.mtls requires TLS") {
-                    SharedCheck::MtlsRequiresTls
+                    Ok(SharedCheck::MtlsRequiresTls)
                 } else {
-                    panic!("unclassified shared-check config error: {msg}");
+                    anyhow::bail!("unclassified shared-check config error: {msg}");
                 }
             }
             RmcpServerKitError::Auth(msg) => {
-                panic!("expected Config error, got Auth({msg})");
+                anyhow::bail!("expected Config error, got Auth({msg})");
             }
             RmcpServerKitError::Rbac(msg) => {
-                panic!("expected Config error, got Rbac({msg})");
+                anyhow::bail!("expected Config error, got Rbac({msg})");
             }
             RmcpServerKitError::RateLimited(msg) => {
-                panic!("expected Config error, got RateLimited({msg})");
+                anyhow::bail!("expected Config error, got RateLimited({msg})");
             }
             RmcpServerKitError::RateLimitedFor {
                 message,
                 retry_after,
             } => {
-                panic!("expected Config error, got RateLimitedFor({message}, {retry_after:?})");
+                anyhow::bail!(
+                    "expected Config error, got RateLimitedFor({message}, {retry_after:?})"
+                );
             }
             RmcpServerKitError::Io(error) => {
-                panic!("expected Config error, got Io({error})");
+                anyhow::bail!("expected Config error, got Io({error})");
             }
             RmcpServerKitError::Json(error) => {
-                panic!("expected Config error, got Json({error})");
+                anyhow::bail!("expected Config error, got Json({error})");
             }
             RmcpServerKitError::Toml(error) => {
-                panic!("expected Config error, got Toml({error})");
+                anyhow::bail!("expected Config error, got Toml({error})");
             }
             RmcpServerKitError::Tls(msg) => {
-                panic!("expected Config error, got Tls({msg})");
+                anyhow::bail!("expected Config error, got Tls({msg})");
             }
             RmcpServerKitError::Startup(msg) => {
-                panic!("expected Config error, got Startup({msg})");
+                anyhow::bail!("expected Config error, got Startup({msg})");
             }
             RmcpServerKitError::Internal(msg) => {
-                panic!("expected Config error, got Internal({msg})");
+                anyhow::bail!("expected Config error, got Internal({msg})");
             }
             #[cfg(feature = "metrics")]
             RmcpServerKitError::Metrics(msg) => {
-                panic!("expected Config error, got Metrics({msg})");
+                anyhow::bail!("expected Config error, got Metrics({msg})");
             }
         }
     }
@@ -2169,7 +2271,10 @@ mod tests {
     const BOTH_PARTIAL_TLS_DIRECTIONS: &[TlsSetting] = &[TlsSetting::CertOnly, TlsSetting::KeyOnly];
 
     #[test]
-    fn toml_and_builder_validators_report_the_expected_shared_check_order() {
+    /// Pins that the TOML validator and the builder validator report the same first error for a config that is invalid in several ordered ways at once, so the two configuration paths cannot disagree about which check must run before the others.
+    ///
+    /// The case table below covers every ordering pair the two validators share.
+    fn toml_and_builder_validators_report_the_expected_shared_check_order() -> anyhow::Result<()> {
         let cases = [
             SharedCheckCase {
                 name: "case 1: admin/auth dependency only",
@@ -2230,38 +2335,41 @@ mod tests {
         ];
 
         for case in cases {
+            let case_name = case.name;
+            let expected = case.expected;
             for tls in case.tls_variants {
                 let config = shared_check_config(case.admin, *tls, case.mtls);
 
-                let toml_class = classify_toml_validator_error(&config);
+                let toml_class = classify_toml_validator_error(&config)?;
                 assert_eq!(
-                    toml_class, case.expected,
-                    "{} with {:?} must fail TOML validation at {:?}",
-                    case.name, tls, case.expected
+                    toml_class, expected,
+                    "{case_name} with {tls:?} must fail TOML validation at {expected:?}"
                 );
 
-                let builder_class = classify_builder_validator_error(&config);
+                let builder_class = classify_builder_validator_error(&config)?;
                 assert_eq!(
-                    builder_class, case.expected,
-                    "{} with {:?} must fail builder validation at {:?}",
-                    case.name, tls, case.expected
+                    builder_class, expected,
+                    "{case_name} with {tls:?} must fail builder validation at {expected:?}"
                 );
             }
         }
+        Ok(())
     }
 
-    fn classify_toml_validator_error(config: &ServerConfig) -> SharedCheck {
-        let err = validate_server_config(config).expect_err("config must fail TOML validation");
+    fn classify_toml_validator_error(config: &ServerConfig) -> anyhow::Result<SharedCheck> {
+        let Err(err) = validate_server_config(config) else {
+            anyhow::bail!("config must fail TOML validation");
+        };
         classify_shared_check(err)
     }
 
-    fn classify_builder_validator_error(config: &ServerConfig) -> SharedCheck {
+    fn classify_builder_validator_error(config: &ServerConfig) -> anyhow::Result<SharedCheck> {
         let builder_config = config
             .apply_to_mcp_config(McpServerConfig::new("127.0.0.1:1", "t", "0.0.0"))
-            .expect("valid durations must bridge into McpServerConfig");
-        let err = builder_config
-            .validate()
-            .expect_err("config must fail builder validation");
+            .context("valid durations must bridge into McpServerConfig")?;
+        let Err(err) = builder_config.validate() else {
+            anyhow::bail!("config must fail builder validation");
+        };
         classify_shared_check(err)
     }
 
@@ -2284,7 +2392,7 @@ mod tests {
                 config.admin_enabled = true;
                 let auth = config
                     .auth
-                    .get_or_insert_with(|| crate::auth::AuthConfig::with_keys(vec![]));
+                    .get_or_insert_with(|| AuthConfig::with_keys(vec![]));
                 auth.enabled = false;
             }
         }
@@ -2309,14 +2417,14 @@ mod tests {
                 let enabled = matches!(admin, AdminSetting::Valid);
                 let auth = config
                     .auth
-                    .get_or_insert_with(|| crate::auth::AuthConfig::with_keys(vec![]));
+                    .get_or_insert_with(|| AuthConfig::with_keys(vec![]));
                 auth.enabled = enabled;
                 auth.mtls = Some(valid_mtls_config());
             }
             MtlsSetting::WithoutTlsAndInvalidCapacity => {
                 let auth = config
                     .auth
-                    .get_or_insert_with(|| crate::auth::AuthConfig::with_keys(vec![]));
+                    .get_or_insert_with(|| AuthConfig::with_keys(vec![]));
                 auth.enabled = true;
                 let mut mtls_config = valid_mtls_config();
                 mtls_config.crl_max_concurrent_fetches = 0;
@@ -2326,14 +2434,17 @@ mod tests {
     }
 
     #[test]
-    fn allowed_origins_validated_by_toml_validator_too() {
+    /// Pins that the TOML validator rejects origins the builder also rejects.
+    fn allowed_origins_validated_by_toml_validator_too() -> anyhow::Result<()> {
         // Parity with `McpServerConfig::check`: an entry that cannot match must
         // fail the public TOML validator too, not only `serve()` at startup.
         let cfg = ServerConfig {
             allowed_origins: vec!["https://example.com/path".to_owned()],
             ..ServerConfig::default()
         };
-        let err = validate_server_config(&cfg).unwrap_err();
+        let Err(err) = validate_server_config(&cfg) else {
+            anyhow::bail!("unmatchable origin must be rejected");
+        };
         assert!(
             err.to_string().contains("allowed_origins"),
             "TOML validator must reject unmatchable origins: {err}"
@@ -2343,12 +2454,14 @@ mod tests {
             allowed_origins: vec!["https://example.com/".to_owned(), "null".to_owned()],
             ..ServerConfig::default()
         };
-        validate_server_config(&ok).expect("equivalent and null entries stay valid");
+        validate_server_config(&ok).context("equivalent and null entries stay valid")?;
+        Ok(())
     }
 
     #[test]
-    fn mtls_without_tls_rejected() {
-        let mut auth = crate::auth::AuthConfig::with_keys(vec![]);
+    /// Pins that mTLS without a TLS cert/key pair is rejected.
+    fn mtls_without_tls_rejected() -> anyhow::Result<()> {
+        let mut auth = AuthConfig::with_keys(vec![]);
         auth.mtls = Some(valid_mtls_config());
         let cfg = ServerConfig {
             auth: Some(auth),
@@ -2356,17 +2469,25 @@ mod tests {
             tls_key_path: None,
             ..ServerConfig::default()
         };
-        let err = validate_server_config(&cfg).unwrap_err();
+        let Err(err) = validate_server_config(&cfg) else {
+            anyhow::bail!("mTLS without TLS must be rejected");
+        };
         let msg = err.to_string();
         assert!(
             msg.contains("tls_cert_path") && msg.contains("tls_key_path"),
             "{msg}"
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/config.rs::mtls_with_tls_accepted keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn mtls_with_tls_accepted() {
-        let mut auth = crate::auth::AuthConfig::with_keys(vec![]);
+    /// Pins that mTLS with a TLS cert/key pair passes validation.
+    fn mtls_with_tls_accepted() -> anyhow::Result<()> {
+        let mut auth = AuthConfig::with_keys(vec![]);
         auth.mtls = Some(valid_mtls_config());
         let cfg = ServerConfig {
             auth: Some(auth),
@@ -2374,129 +2495,166 @@ mod tests {
             tls_key_path: Some("key.pem".into()),
             ..ServerConfig::default()
         };
-        assert!(validate_server_config(&cfg).is_ok());
+        assert!(validate_server_config(&cfg).is_ok(), "config must validate");
+        Ok(())
     }
 
     #[test]
-    fn zero_port_rejected() {
+    /// Pins that a zero listen port is rejected.
+    fn zero_port_rejected() -> anyhow::Result<()> {
         let cfg = ServerConfig {
             listen_port: 0,
             ..ServerConfig::default()
         };
-        let err = validate_server_config(&cfg).unwrap_err();
+        let Err(err) = validate_server_config(&cfg) else {
+            anyhow::bail!("zero listen port must be rejected");
+        };
         assert!(err.to_string().contains("listen_port"));
+        Ok(())
     }
 
     #[test]
-    fn zero_extra_route_rate_limit_rejected() {
+    /// Pins that a zero extra-route rate limit is rejected.
+    fn zero_extra_route_rate_limit_rejected() -> anyhow::Result<()> {
         let cfg = ServerConfig {
             extra_route_rate_limit: Some(0),
             ..ServerConfig::default()
         };
-        let err = validate_server_config(&cfg).unwrap_err();
+        let Err(err) = validate_server_config(&cfg) else {
+            anyhow::bail!("zero extra-route rate limit must be rejected");
+        };
         assert!(err.to_string().contains("extra_route_rate_limit"));
+        Ok(())
     }
 
     #[test]
-    fn zero_burst_knobs_rejected() {
+    /// Pins that zero burst knobs are rejected for both rate-limit families.
+    fn zero_burst_knobs_rejected() -> anyhow::Result<()> {
         let cfg = ServerConfig {
             tool_rate_limit: Some(10),
             tool_rate_limit_burst: Some(0),
             ..ServerConfig::default()
         };
-        let err = validate_server_config(&cfg).unwrap_err();
+        let Err(err) = validate_server_config(&cfg) else {
+            anyhow::bail!("zero tool burst must be rejected");
+        };
         assert!(err.to_string().contains("tool_rate_limit_burst"));
 
-        let cfg = ServerConfig {
+        let cfg_extra = ServerConfig {
             extra_route_rate_limit: Some(10),
             extra_route_rate_limit_burst: Some(0),
             ..ServerConfig::default()
         };
-        let err = validate_server_config(&cfg).unwrap_err();
-        assert!(err.to_string().contains("extra_route_rate_limit_burst"));
+        let Err(err_extra) = validate_server_config(&cfg_extra) else {
+            anyhow::bail!("zero extra-route burst must be rejected");
+        };
+        assert!(
+            err_extra
+                .to_string()
+                .contains("extra_route_rate_limit_burst")
+        );
+        Ok(())
     }
 
     #[test]
-    fn orphan_burst_knobs_rejected() {
+    /// Pins that burst knobs without their parent rate limit are rejected.
+    fn orphan_burst_knobs_rejected() -> anyhow::Result<()> {
         let cfg = ServerConfig {
             tool_rate_limit_burst: Some(5),
             ..ServerConfig::default()
         };
-        let err = validate_server_config(&cfg).unwrap_err();
+        let Err(err) = validate_server_config(&cfg) else {
+            anyhow::bail!("orphan tool burst must be rejected");
+        };
         assert!(err.to_string().contains("requires server.tool_rate_limit"));
 
-        let cfg = ServerConfig {
+        let cfg_extra = ServerConfig {
             extra_route_rate_limit_burst: Some(5),
             ..ServerConfig::default()
         };
-        let err = validate_server_config(&cfg).unwrap_err();
+        let Err(err_extra) = validate_server_config(&cfg_extra) else {
+            anyhow::bail!("orphan extra-route burst must be rejected");
+        };
         assert!(
-            err.to_string()
+            err_extra
+                .to_string()
                 .contains("requires server.extra_route_rate_limit")
         );
+        Ok(())
     }
 
     #[test]
-    fn exempt_paths_toml_roundtrip_and_validation() {
+    /// Pins exempt-path TOML round-trip and validation.
+    fn exempt_paths_toml_roundtrip_and_validation() -> anyhow::Result<()> {
         let cfg: ServerConfig = toml::from_str(
             r#"
                 extra_route_rate_limit = 60
                 extra_route_rate_limit_exempt_paths = ["/.well-known/oauth-authorization-server"]
             "#,
         )
-        .unwrap();
+        .context("exempt-path TOML must parse")?;
         assert_eq!(
             cfg.extra_route_rate_limit_exempt_paths,
             vec!["/.well-known/oauth-authorization-server".to_owned()]
         );
-        assert!(validate_server_config(&cfg).is_ok());
+        assert!(validate_server_config(&cfg).is_ok(), "config must validate");
+        Ok(())
     }
 
     #[test]
-    fn orphan_exempt_paths_rejected() {
+    /// Pins that exempt paths without their parent rate limit are rejected.
+    fn orphan_exempt_paths_rejected() -> anyhow::Result<()> {
         let cfg = ServerConfig {
             extra_route_rate_limit_exempt_paths: vec!["/ok".into()],
             ..ServerConfig::default()
         };
-        let err = validate_server_config(&cfg).unwrap_err();
+        let Err(err) = validate_server_config(&cfg) else {
+            anyhow::bail!("orphan exempt paths must be rejected");
+        };
         assert!(
             err.to_string()
                 .contains("requires server.extra_route_rate_limit")
         );
+        Ok(())
     }
 
     #[test]
-    fn malformed_exempt_paths_rejected() {
+    /// Pins that malformed exempt paths are rejected with an actionable message.
+    fn malformed_exempt_paths_rejected() -> anyhow::Result<()> {
         for bad in ["", "no-slash"] {
             let cfg = ServerConfig {
                 extra_route_rate_limit: Some(10),
                 extra_route_rate_limit_exempt_paths: vec![bad.into()],
                 ..ServerConfig::default()
             };
-            let err = validate_server_config(&cfg).unwrap_err();
+            let Err(err) = validate_server_config(&cfg) else {
+                anyhow::bail!("malformed exempt path must be rejected");
+            };
             assert!(
                 err.to_string()
                     .contains("must be non-empty and start with '/'"),
                 "entry {bad:?}: {err}"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn request_log_exclude_paths_toml_roundtrip_and_validation() {
+    /// Pins request-log exclude-path TOML round-trip and validation.
+    fn request_log_exclude_paths_toml_roundtrip_and_validation() -> anyhow::Result<()> {
         let cfg: ServerConfig = toml::from_str(
             r#"
                 request_log_exclude_paths = ["/version"]
             "#,
         )
-        .unwrap();
+        .context("exclude-path TOML must parse")?;
         assert_eq!(cfg.request_log_exclude_paths, vec!["/version".to_owned()]);
-        assert!(validate_server_config(&cfg).is_ok());
+        assert!(validate_server_config(&cfg).is_ok(), "config must validate");
 
-        let cfg_default: ServerConfig = toml::from_str("").unwrap();
+        let cfg_default: ServerConfig = toml::from_str("").context("empty TOML must parse")?;
         assert_eq!(
             cfg_default.request_log_exclude_paths,
-            crate::transport::default_request_log_exclude_paths()
+            default_request_log_exclude_paths()
         );
 
         let cfg_empty: ServerConfig = toml::from_str(
@@ -2504,19 +2662,26 @@ mod tests {
                 request_log_exclude_paths = []
             ",
         )
-        .unwrap();
+        .context("empty exclude-path list TOML must parse")?;
         assert_eq!(cfg_empty.request_log_exclude_paths, Vec::<String>::new());
-        assert!(validate_server_config(&cfg_empty).is_ok());
+        assert!(
+            validate_server_config(&cfg_empty).is_ok(),
+            "empty path list must validate"
+        );
+        Ok(())
     }
 
     #[test]
-    fn malformed_request_log_exclude_paths_rejected() {
+    /// Pins that malformed request-log exclude paths are rejected.
+    fn malformed_request_log_exclude_paths_rejected() -> anyhow::Result<()> {
         for bad in ["", "healthz", "no-slash"] {
             let cfg = ServerConfig {
                 request_log_exclude_paths: vec![bad.into()],
                 ..ServerConfig::default()
             };
-            let err = validate_server_config(&cfg).unwrap_err();
+            let Err(err) = validate_server_config(&cfg) else {
+                anyhow::bail!("malformed exclude path must be rejected");
+            };
             assert!(
                 err.to_string().contains(
                     "server.request_log_exclude_paths entries must be non-empty and start with '/'"
@@ -2524,10 +2689,12 @@ mod tests {
                 "entry {bad:?}: {err}"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn log_context_toml_roundtrip_and_bridge() {
+    /// Pins log-context TOML round-trip and bridge into the MCP config.
+    fn log_context_toml_roundtrip_and_bridge() -> anyhow::Result<()> {
         let toml_str = r#"
 [log_context]
 client_ip = true
@@ -2542,7 +2709,7 @@ credential_fingerprint = false
 credential_owner = false
 request_completion = true
         "#;
-        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        let cfg: ServerConfig = toml::from_str(toml_str).context("log_context TOML must parse")?;
         assert!(cfg.log_context.client_ip);
         assert!(cfg.log_context.peer_ip);
         assert!(cfg.log_context.request_line);
@@ -2550,33 +2717,36 @@ request_completion = true
         assert!(cfg.log_context.request_completion);
         assert!(!cfg.log_context.credential_owner);
 
-        let base = crate::transport::McpServerConfig::new("127.0.0.1:8080", "test", "0.1.0");
-        let mcp_cfg = cfg.apply_to_mcp_config(base).unwrap();
+        let base = McpServerConfig::new("127.0.0.1:8080", "test", "0.1.0");
+        let mcp_cfg = cfg
+            .apply_to_mcp_config(base)
+            .context("log_context config must bridge")?;
         assert!(mcp_cfg.log_context.client_ip);
         assert!(mcp_cfg.log_context.peer_ip);
 
-        let cfg_default: ServerConfig = toml::from_str("").unwrap();
-        assert_eq!(
-            cfg_default.log_context,
-            crate::transport::LogContextConfig::default()
-        );
+        let cfg_default: ServerConfig = toml::from_str("").context("empty TOML must parse")?;
+        assert_eq!(cfg_default.log_context, LogContextConfig::default());
+        Ok(())
     }
 
     #[test]
-    fn log_context_credential_owner_toml_roundtrip() {
+    /// Pins that `credential_owner` round-trips and defaults to false.
+    fn log_context_credential_owner_toml_roundtrip() -> anyhow::Result<()> {
         // Test 1: credential_owner = true parses and carries through
-        let toml_str = r"
+        let toml_str = "
 [log_context]
 credential_owner = true
         ";
-        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        let cfg: ServerConfig = toml::from_str(toml_str).context("credential_owner TOML parses")?;
         assert!(
             cfg.log_context.credential_owner,
             "credential_owner must be true"
         );
 
-        let base = crate::transport::McpServerConfig::new("127.0.0.1:8080", "test", "0.1.0");
-        let mcp_cfg = cfg.apply_to_mcp_config(base).unwrap();
+        let base = McpServerConfig::new("127.0.0.1:8080", "test", "0.1.0");
+        let mcp_cfg = cfg
+            .apply_to_mcp_config(base)
+            .context("credential_owner config must bridge")?;
         assert!(
             mcp_cfg.log_context.credential_owner,
             "must carry through to mcp_config"
@@ -2584,30 +2754,34 @@ credential_owner = true
 
         // Test 2: omitted key gives false (default)
         let cfg_default: ServerConfig = toml::from_str(
-            r"
+            "
 [log_context]
 client_ip = false
         ",
         )
-        .unwrap();
+        .context("omitted credential_owner TOML parses")?;
         assert!(
             !cfg_default.log_context.credential_owner,
             "omitted key must default to false"
         );
+        Ok(())
     }
 
     #[test]
-    fn log_context_toml_validation_mirrors_builder() {
+    /// Pins that TOML log-context validation mirrors the builder path.
+    fn log_context_toml_validation_mirrors_builder() -> anyhow::Result<()> {
         // Test 1: request_id requires trusted_proxies
         let cfg = ServerConfig {
-            log_context: crate::transport::LogContextConfig {
+            log_context: LogContextConfig {
                 request_id: true,
-                ..crate::transport::LogContextConfig::default()
+                ..LogContextConfig::default()
             },
             trusted_proxies: vec![],
             ..ServerConfig::default()
         };
-        let err = validate_server_config(&cfg).unwrap_err();
+        let Err(err) = validate_server_config(&cfg) else {
+            anyhow::bail!("request_id without trusted_proxies must be rejected");
+        };
         assert!(
             err.to_string()
                 .contains("server.log_context.request_id requires server.trusted_proxies"),
@@ -2626,16 +2800,18 @@ client_ip = false
             "x-real-ip",
             "Mcp-Session-Id",
         ] {
-            let cfg = ServerConfig {
-                log_context: crate::transport::LogContextConfig {
+            let cfg_header = ServerConfig {
+                log_context: LogContextConfig {
                     request_id_header: bad.to_owned(),
-                    ..crate::transport::LogContextConfig::default()
+                    ..LogContextConfig::default()
                 },
                 trusted_proxies: vec!["127.0.0.1/32".into()],
                 ..ServerConfig::default()
             };
-            let err = validate_server_config(&cfg).unwrap_err();
-            let err_msg = err.to_string();
+            let Err(err_header) = validate_server_config(&cfg_header) else {
+                anyhow::bail!("forbidden request_id_header must be rejected");
+            };
+            let err_msg = err_header.to_string();
             assert!(
                 err_msg.contains("server.log_context.request_id_header"),
                 "Error for header '{bad}' missing 'server.log_context.request_id_header': {err_msg}"
@@ -2646,133 +2822,169 @@ client_ip = false
                 "Error for header '{bad}' contains doubled 'log_context.log_context' prefix: {err_msg}"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn empty_toml_bridges_log_defaults() {
-        let cfg: ServerConfig = toml::from_str("").unwrap();
+    /// Pins that an empty TOML bridges log defaults into the MCP config.
+    fn empty_toml_bridges_log_defaults() -> anyhow::Result<()> {
+        let cfg: ServerConfig = toml::from_str("").context("empty TOML must parse")?;
         assert_eq!(
             cfg.request_log_exclude_paths,
-            crate::transport::default_request_log_exclude_paths()
+            default_request_log_exclude_paths()
         );
-        assert_eq!(
-            cfg.log_context,
-            crate::transport::LogContextConfig::default()
-        );
+        assert_eq!(cfg.log_context, LogContextConfig::default());
 
-        let base = crate::transport::McpServerConfig::new("127.0.0.1:8080", "test", "0.1.0");
-        let mcp_cfg = cfg.apply_to_mcp_config(base).unwrap();
+        let base = McpServerConfig::new("127.0.0.1:8080", "test", "0.1.0");
+        let mcp_cfg = cfg
+            .apply_to_mcp_config(base)
+            .context("empty config must bridge")?;
         assert_eq!(
             mcp_cfg.request_log_exclude_paths,
-            crate::transport::default_request_log_exclude_paths()
+            default_request_log_exclude_paths()
         );
-        assert_eq!(
-            mcp_cfg.log_context,
-            crate::transport::LogContextConfig::default()
-        );
+        assert_eq!(mcp_cfg.log_context, LogContextConfig::default());
+        Ok(())
     }
 
     #[test]
-    fn bad_trusted_proxy_entry_rejected() {
+    /// Pins that a malformed trusted-proxy entry is rejected.
+    fn bad_trusted_proxy_entry_rejected() -> anyhow::Result<()> {
         let cfg = ServerConfig {
             trusted_proxies: vec!["not-a-cidr".into()],
             ..ServerConfig::default()
         };
-        let err = validate_server_config(&cfg).unwrap_err();
+        let Err(err) = validate_server_config(&cfg) else {
+            anyhow::bail!("malformed trusted proxy must be rejected");
+        };
         assert!(err.to_string().contains("trusted_proxies"));
+        Ok(())
     }
 
     #[test]
-    fn zero_prefix_trusted_proxy_rejected() {
+    /// Pins that zero-prefix trusted proxies are rejected.
+    fn zero_prefix_trusted_proxy_rejected() -> anyhow::Result<()> {
         for entry in ["0.0.0.0/0", "::/0"] {
             let cfg = ServerConfig {
                 trusted_proxies: vec![entry.into()],
                 ..ServerConfig::default()
             };
-            let err = validate_server_config(&cfg).unwrap_err();
+            let Err(err) = validate_server_config(&cfg) else {
+                anyhow::bail!("zero-prefix trusted proxy must be rejected");
+            };
             assert!(
                 err.to_string().contains("prefix length 0"),
                 "entry {entry:?}: {err}"
             );
         }
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/config.rs::toml_trusted_forwarder_max_entries_bounds_are_enforced keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn toml_trusted_forwarder_max_entries_bounds_are_enforced() {
-        let parse = |v: usize| -> crate::error::Result<()> {
+    /// Pins the enforced bounds on `trusted_forwarder_max_entries`.
+    fn toml_trusted_forwarder_max_entries_bounds_are_enforced() -> anyhow::Result<()> {
+        let parse = |value: usize| -> RmcpResult<()> {
             let cfg: ServerConfig =
-                toml::from_str(&format!("trusted_forwarder_max_entries = {v}")).unwrap();
+                toml::from_str(&format!("trusted_forwarder_max_entries = {value}"))?;
             validate_server_config(&cfg)
         };
-        assert!(parse(0).is_err());
-        assert!(parse(crate::forwarded::MAX_CONFIGURABLE_SCANNED_ENTRIES + 1).is_err());
-        assert!(parse(1).is_ok());
-        assert!(parse(crate::forwarded::MAX_CONFIGURABLE_SCANNED_ENTRIES).is_ok());
-    }
-
-    #[test]
-    fn toml_trusted_forwarder_max_entries_defaults_and_bridges() {
-        let cfg: ServerConfig = toml::from_str("").unwrap();
-        assert_eq!(
-            cfg.trusted_forwarder_max_entries,
-            crate::forwarded::MAX_SCANNED_ENTRIES
+        assert!(parse(0).is_err(), "zero must be rejected");
+        assert!(
+            parse(MAX_CONFIGURABLE_SCANNED_ENTRIES + 1).is_err(),
+            "over-cap value must be rejected"
         );
-        let base = crate::transport::McpServerConfig::new("127.0.0.1:8080", "t", "0");
-        let src: ServerConfig =
-            toml::from_str("trusted_forwarder_max_entries = 32").expect("parses");
-        let bridged = src.apply_to_mcp_config(base).expect("bridges");
-        assert_eq!(bridged.trusted_forwarder_max_entries, 32);
+        assert!(parse(1).is_ok(), "minimum value must be accepted");
+        assert!(
+            parse(MAX_CONFIGURABLE_SCANNED_ENTRIES).is_ok(),
+            "cap value must be accepted"
+        );
+        Ok(())
     }
 
     #[test]
-    fn cidr_and_bare_ip_proxy_entries_accepted() {
+    /// Pins `trusted_forwarder_max_entries` defaults and bridging.
+    fn toml_trusted_forwarder_max_entries_defaults_and_bridges() -> anyhow::Result<()> {
+        let cfg: ServerConfig = toml::from_str("").context("empty TOML must parse")?;
+        assert_eq!(cfg.trusted_forwarder_max_entries, MAX_SCANNED_ENTRIES);
+        let base = McpServerConfig::new("127.0.0.1:8080", "t", "0");
+        let src: ServerConfig = toml::from_str("trusted_forwarder_max_entries = 32")
+            .context("explicit trusted_forwarder_max_entries parses")?;
+        let bridged = src
+            .apply_to_mcp_config(base)
+            .context("trusted_forwarder_max_entries config must bridge")?;
+        assert_eq!(bridged.trusted_forwarder_max_entries, 32);
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/config.rs::cidr_and_bare_ip_proxy_entries_accepted keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
+    /// Pins that CIDR and bare-IP trusted proxies are accepted.
+    fn cidr_and_bare_ip_proxy_entries_accepted() -> anyhow::Result<()> {
         let cfg = ServerConfig {
             trusted_proxies: vec!["10.0.0.0/8".into(), "192.0.2.1".into()],
             ..ServerConfig::default()
         };
-        assert!(validate_server_config(&cfg).is_ok());
+        assert!(validate_server_config(&cfg).is_ok(), "config must validate");
+        Ok(())
     }
 
     #[test]
-    fn forwarded_header_without_proxies_rejected() {
+    /// Pins that a forwarded header without trusted proxies is rejected.
+    fn forwarded_header_without_proxies_rejected() -> anyhow::Result<()> {
         let cfg = ServerConfig {
-            forwarded_header: Some(crate::transport::ForwardedHeaderMode::Forwarded),
+            forwarded_header: Some(ForwardedHeaderMode::Forwarded),
             ..ServerConfig::default()
         };
-        let err = validate_server_config(&cfg).unwrap_err();
+        let Err(err) = validate_server_config(&cfg) else {
+            anyhow::bail!("forwarded header without proxies must be rejected");
+        };
         assert!(err.to_string().contains("requires server.trusted_proxies"));
+        Ok(())
     }
 
     #[test]
-    fn zero_auth_bursts_rejected() {
-        let auth = crate::auth::AuthConfig::with_keys(vec![])
-            .with_rate_limit(crate::auth::RateLimitConfig::new(10).with_burst(0));
+    /// Pins that zero auth burst knobs are rejected.
+    fn zero_auth_bursts_rejected() -> anyhow::Result<()> {
+        let auth =
+            AuthConfig::with_keys(vec![]).with_rate_limit(RateLimitConfig::new(10).with_burst(0));
         let cfg = ServerConfig {
             auth: Some(auth),
             ..ServerConfig::default()
         };
-        let err = validate_server_config(&cfg).unwrap_err();
+        let Err(err) = validate_server_config(&cfg) else {
+            anyhow::bail!("zero auth burst must be rejected");
+        };
         assert!(err.to_string().contains("rate_limit.burst"));
 
-        let auth = crate::auth::AuthConfig::with_keys(vec![])
-            .with_rate_limit(crate::auth::RateLimitConfig::new(10).with_pre_auth_burst(0));
-        let cfg = ServerConfig {
-            auth: Some(auth),
+        let auth_pre = AuthConfig::with_keys(vec![])
+            .with_rate_limit(RateLimitConfig::new(10).with_pre_auth_burst(0));
+        let cfg_pre = ServerConfig {
+            auth: Some(auth_pre),
             ..ServerConfig::default()
         };
-        let err = validate_server_config(&cfg).unwrap_err();
-        assert!(err.to_string().contains("pre_auth_burst"));
+        let Err(err_pre) = validate_server_config(&cfg_pre) else {
+            anyhow::bail!("zero pre-auth burst must be rejected");
+        };
+        assert!(err_pre.to_string().contains("pre_auth_burst"));
+        Ok(())
     }
 
-    fn valid_mtls_config() -> crate::auth::MtlsConfig {
-        crate::auth::MtlsConfig {
+    fn valid_mtls_config() -> MtlsConfig {
+        MtlsConfig {
             ca_cert_path: "memory://ca.pem".into(),
             required: true,
             default_role: "viewer".into(),
             crl_enabled: true,
             crl_refresh_interval: None,
             crl_fetch_timeout: Duration::from_secs(30),
-            crl_stale_grace: Duration::from_secs(24 * 60 * 60),
+            crl_stale_grace: Duration::from_hours(24),
             crl_deny_on_unavailable: false,
             crl_end_entity_only: false,
             crl_allow_http: true,
@@ -2786,19 +2998,20 @@ client_ip = false
         }
     }
 
-    fn assert_config_nonzero_error(err: RmcpServerKitError, field: &str) {
+    fn assert_config_nonzero_error(err: RmcpServerKitError, field: &str) -> anyhow::Result<()> {
         let RmcpServerKitError::Config(msg) = err else {
-            panic!("expected Config error for {field}");
+            anyhow::bail!("expected Config error for {field}");
         };
         assert!(
             msg.contains(field) && msg.contains("must be nonzero"),
             "error must name {field} and say must be nonzero; got {msg:?}"
         );
+        Ok(())
     }
 
-    fn server_config_with_mtls(mtls: crate::auth::MtlsConfig) -> ServerConfig {
+    fn server_config_with_mtls(mtls: MtlsConfig) -> ServerConfig {
         ServerConfig {
-            auth: Some(crate::auth::AuthConfig {
+            auth: Some(AuthConfig {
                 enabled: true,
                 api_keys: Vec::new(),
                 mtls: Some(mtls),
@@ -2818,197 +3031,269 @@ client_ip = false
     }
 
     #[test]
-    fn rejects_zero_crl_max_cache_entries() {
+    /// Pins that a zero CRL max-cache-entries value is rejected.
+    fn rejects_zero_crl_max_cache_entries() -> anyhow::Result<()> {
         let mut mtls = valid_mtls_config();
         mtls.crl_max_cache_entries = 0;
-        let err = validate_server_config(&server_config_with_mtls(mtls))
-            .expect_err("zero crl_max_cache_entries must be rejected");
-        assert_config_nonzero_error(err, "auth.mtls.crl_max_cache_entries");
+        let Err(err) = validate_server_config(&server_config_with_mtls(mtls)) else {
+            anyhow::bail!("zero crl_max_cache_entries must be rejected");
+        };
+        assert_config_nonzero_error(err, "auth.mtls.crl_max_cache_entries")
     }
 
     #[test]
-    fn rejects_zero_crl_max_concurrent_fetches() {
+    /// Pins that a zero CRL max-concurrent-fetches value is rejected.
+    fn rejects_zero_crl_max_concurrent_fetches() -> anyhow::Result<()> {
         let mut mtls = valid_mtls_config();
         mtls.crl_max_concurrent_fetches = 0;
-        let err = validate_server_config(&server_config_with_mtls(mtls))
-            .expect_err("zero crl_max_concurrent_fetches must be rejected");
-        assert_config_nonzero_error(err, "auth.mtls.crl_max_concurrent_fetches");
+        let Err(err) = validate_server_config(&server_config_with_mtls(mtls)) else {
+            anyhow::bail!("zero crl_max_concurrent_fetches must be rejected");
+        };
+        assert_config_nonzero_error(err, "auth.mtls.crl_max_concurrent_fetches")
     }
 
     #[test]
-    fn rejects_zero_crl_discovery_rate_per_min() {
+    /// Pins that a zero CRL discovery rate is rejected.
+    fn rejects_zero_crl_discovery_rate_per_min() -> anyhow::Result<()> {
         let mut mtls = valid_mtls_config();
         mtls.crl_discovery_rate_per_min = 0;
-        let err = validate_server_config(&server_config_with_mtls(mtls))
-            .expect_err("zero crl_discovery_rate_per_min must be rejected");
-        assert_config_nonzero_error(err, "auth.mtls.crl_discovery_rate_per_min");
+        let Err(err) = validate_server_config(&server_config_with_mtls(mtls)) else {
+            anyhow::bail!("zero crl_discovery_rate_per_min must be rejected");
+        };
+        assert_config_nonzero_error(err, "auth.mtls.crl_discovery_rate_per_min")
     }
 
     #[test]
-    fn rejects_zero_crl_max_host_semaphores() {
+    /// Pins that a zero CRL max-host-semaphores value is rejected.
+    fn rejects_zero_crl_max_host_semaphores() -> anyhow::Result<()> {
         let mut mtls = valid_mtls_config();
         mtls.crl_max_host_semaphores = 0;
-        let err = validate_server_config(&server_config_with_mtls(mtls))
-            .expect_err("zero crl_max_host_semaphores must be rejected");
-        assert_config_nonzero_error(err, "auth.mtls.crl_max_host_semaphores");
+        let Err(err) = validate_server_config(&server_config_with_mtls(mtls)) else {
+            anyhow::bail!("zero crl_max_host_semaphores must be rejected");
+        };
+        assert_config_nonzero_error(err, "auth.mtls.crl_max_host_semaphores")
     }
 
     #[test]
-    fn rejects_zero_crl_max_seen_urls() {
+    /// Pins that a zero CRL max-seen-urls value is rejected.
+    fn rejects_zero_crl_max_seen_urls() -> anyhow::Result<()> {
         let mut mtls = valid_mtls_config();
         mtls.crl_max_seen_urls = 0;
-        let err = validate_server_config(&server_config_with_mtls(mtls))
-            .expect_err("zero crl_max_seen_urls must be rejected");
-        assert_config_nonzero_error(err, "auth.mtls.crl_max_seen_urls");
+        let Err(err) = validate_server_config(&server_config_with_mtls(mtls)) else {
+            anyhow::bail!("zero crl_max_seen_urls must be rejected");
+        };
+        assert_config_nonzero_error(err, "auth.mtls.crl_max_seen_urls")
     }
 
     #[test]
-    fn rejects_zero_crl_max_response_bytes() {
+    /// Pins that a zero CRL max-response-bytes value is rejected.
+    fn rejects_zero_crl_max_response_bytes() -> anyhow::Result<()> {
         let mut mtls = valid_mtls_config();
         mtls.crl_max_response_bytes = 0;
-        let err = validate_server_config(&server_config_with_mtls(mtls))
-            .expect_err("zero crl_max_response_bytes must be rejected");
-        assert_config_nonzero_error(err, "auth.mtls.crl_max_response_bytes");
+        let Err(err) = validate_server_config(&server_config_with_mtls(mtls)) else {
+            anyhow::bail!("zero crl_max_response_bytes must be rejected");
+        };
+        assert_config_nonzero_error(err, "auth.mtls.crl_max_response_bytes")
     }
 
     #[test]
-    fn rejects_zero_auth_rate_limit() {
-        let auth = crate::auth::AuthConfig::with_keys(vec![])
-            .with_rate_limit(crate::auth::RateLimitConfig::new(0));
+    /// Pins that a zero auth rate limit is rejected.
+    fn rejects_zero_auth_rate_limit() -> anyhow::Result<()> {
+        let auth = AuthConfig::with_keys(vec![]).with_rate_limit(RateLimitConfig::new(0));
         let cfg = ServerConfig {
             auth: Some(auth),
             ..ServerConfig::default()
         };
-        let err = validate_server_config(&cfg).expect_err("zero auth rate limit must be rejected");
-        assert_config_nonzero_error(err, "auth.rate_limit.max_attempts_per_minute");
+        let Err(err) = validate_server_config(&cfg) else {
+            anyhow::bail!("zero auth rate limit must be rejected");
+        };
+        assert_config_nonzero_error(err, "auth.rate_limit.max_attempts_per_minute")
     }
 
     #[test]
-    fn rejects_zero_pre_auth_max_per_minute() {
+    /// Pins that a zero pre-auth max-per-minute value is rejected.
+    fn rejects_zero_pre_auth_max_per_minute() -> anyhow::Result<()> {
         // Regression guard: `0` is NOT "unlimited" here. The limiter builder
         // falls back to DEFAULT_PRE_AUTH_RATE, so accepting `0` would raise
         // the pre-auth quota instead of tightening it.
-        let mut rl = crate::auth::RateLimitConfig::new(30);
+        let mut rl = RateLimitConfig::new(30);
         rl.pre_auth_max_per_minute = Some(0);
         let cfg = ServerConfig {
-            auth: Some(crate::auth::AuthConfig::with_keys(vec![]).with_rate_limit(rl)),
+            auth: Some(AuthConfig::with_keys(vec![]).with_rate_limit(rl)),
             ..ServerConfig::default()
         };
-        let err = validate_server_config(&cfg)
-            .expect_err("zero pre_auth_max_per_minute must be rejected");
-        assert_config_nonzero_error(err, "auth.rate_limit.pre_auth_max_per_minute");
+        let Err(err) = validate_server_config(&cfg) else {
+            anyhow::bail!("zero pre_auth_max_per_minute must be rejected");
+        };
+        assert_config_nonzero_error(err, "auth.rate_limit.pre_auth_max_per_minute")
     }
 
     #[test]
-    fn tls_cert_without_key_rejected() {
+    /// Pins that a TLS cert without a key is rejected.
+    fn tls_cert_without_key_rejected() -> anyhow::Result<()> {
         let cfg = ServerConfig {
             tls_cert_path: Some("/tmp/cert.pem".into()),
             ..ServerConfig::default()
         };
-        let err = validate_server_config(&cfg).unwrap_err();
+        let Err(err) = validate_server_config(&cfg) else {
+            anyhow::bail!("TLS cert without key must be rejected");
+        };
         assert!(err.to_string().contains("tls_cert_path"));
+        Ok(())
     }
 
     #[test]
-    fn tls_key_without_cert_rejected() {
+    /// Pins that a TLS key without a cert is rejected.
+    fn tls_key_without_cert_rejected() -> anyhow::Result<()> {
         let cfg = ServerConfig {
             tls_key_path: Some("/tmp/key.pem".into()),
             ..ServerConfig::default()
         };
-        let err = validate_server_config(&cfg).unwrap_err();
+        let Err(err) = validate_server_config(&cfg) else {
+            anyhow::bail!("TLS key without cert must be rejected");
+        };
         assert!(err.to_string().contains("tls_cert_path"));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/config.rs::tls_both_set_passes keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn tls_both_set_passes() {
+    /// Pins that a complete TLS cert/key pair passes validation.
+    fn tls_both_set_passes() -> anyhow::Result<()> {
         let cfg = ServerConfig {
             tls_cert_path: Some("/tmp/cert.pem".into()),
             tls_key_path: Some("/tmp/key.pem".into()),
             ..ServerConfig::default()
         };
-        assert!(validate_server_config(&cfg).is_ok());
+        assert!(validate_server_config(&cfg).is_ok(), "config must validate");
+        Ok(())
     }
 
     #[test]
-    fn invalid_tls_handshake_timeout_rejected() {
+    /// Pins that a malformed TLS handshake timeout is rejected.
+    fn invalid_tls_handshake_timeout_rejected() -> anyhow::Result<()> {
         let cfg = ServerConfig {
             tls_handshake_timeout: "not-a-duration".into(),
             ..ServerConfig::default()
         };
-        let err = validate_server_config(&cfg).unwrap_err();
+        let Err(err) = validate_server_config(&cfg) else {
+            anyhow::bail!("malformed tls_handshake_timeout must be rejected");
+        };
         assert!(err.to_string().contains("tls_handshake_timeout"));
+        Ok(())
     }
 
     #[test]
-    fn zero_tls_handshake_timeout_rejected() {
+    /// Pins that a zero TLS handshake timeout is rejected.
+    fn zero_tls_handshake_timeout_rejected() -> anyhow::Result<()> {
         let cfg = ServerConfig {
             tls_handshake_timeout: "0s".into(),
             ..ServerConfig::default()
         };
-        let err = validate_server_config(&cfg).unwrap_err();
+        let Err(err) = validate_server_config(&cfg) else {
+            anyhow::bail!("zero tls_handshake_timeout must be rejected");
+        };
         assert!(err.to_string().contains("tls_handshake_timeout"));
+        Ok(())
     }
 
     #[test]
-    fn zero_max_concurrent_tls_handshakes_rejected() {
+    /// Pins that zero max-concurrent TLS handshakes is rejected.
+    fn zero_max_concurrent_tls_handshakes_rejected() -> anyhow::Result<()> {
         let cfg = ServerConfig {
             max_concurrent_tls_handshakes: 0,
             ..ServerConfig::default()
         };
-        let err = validate_server_config(&cfg).unwrap_err();
+        let Err(err) = validate_server_config(&cfg) else {
+            anyhow::bail!("zero max_concurrent_tls_handshakes must be rejected");
+        };
         assert!(err.to_string().contains("max_concurrent_tls_handshakes"));
+        Ok(())
     }
 
     #[test]
-    fn invalid_shutdown_timeout_rejected() {
+    /// Pins that a malformed shutdown timeout is rejected.
+    fn invalid_shutdown_timeout_rejected() -> anyhow::Result<()> {
         let cfg = ServerConfig {
             shutdown_timeout: "not-a-duration".into(),
             ..ServerConfig::default()
         };
-        let err = validate_server_config(&cfg).unwrap_err();
+        let Err(err) = validate_server_config(&cfg) else {
+            anyhow::bail!("malformed shutdown_timeout must be rejected");
+        };
         assert!(err.to_string().contains("shutdown_timeout"));
+        Ok(())
     }
 
     #[test]
-    fn invalid_request_timeout_rejected() {
+    /// Pins that a malformed request timeout is rejected.
+    fn invalid_request_timeout_rejected() -> anyhow::Result<()> {
         let cfg = ServerConfig {
             request_timeout: "xyz".into(),
             ..ServerConfig::default()
         };
-        let err = validate_server_config(&cfg).unwrap_err();
+        let Err(err) = validate_server_config(&cfg) else {
+            anyhow::bail!("malformed request_timeout must be rejected");
+        };
         assert!(err.to_string().contains("request_timeout"));
+        Ok(())
     }
 
     // -- validate_observability_config --
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/config.rs::valid_observability_config_passes keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn valid_observability_config_passes() {
+    /// Pins that a default `ObservabilityConfig` passes validation.
+    fn valid_observability_config_passes() -> anyhow::Result<()> {
         let cfg = ObservabilityConfig::default();
-        assert!(validate_observability_config(&cfg).is_ok());
+        assert!(
+            validate_observability_config(&cfg).is_ok(),
+            "default observability config must validate"
+        );
+        Ok(())
     }
 
     #[test]
-    fn invalid_log_level_rejected() {
+    /// Pins that an invalid log level is rejected.
+    fn invalid_log_level_rejected() -> anyhow::Result<()> {
         let cfg = ObservabilityConfig {
             log_level: "[invalid".into(),
             ..ObservabilityConfig::default()
         };
-        let err = validate_observability_config(&cfg).unwrap_err();
+        let Err(err) = validate_observability_config(&cfg) else {
+            anyhow::bail!("invalid log_level must be rejected");
+        };
         assert!(err.to_string().contains("log_level"));
+        Ok(())
     }
 
     #[test]
-    fn invalid_log_format_rejected() {
+    /// Pins that an invalid log format is rejected.
+    fn invalid_log_format_rejected() -> anyhow::Result<()> {
         let cfg = ObservabilityConfig {
             log_format: "yaml".into(),
             ..ObservabilityConfig::default()
         };
-        let err = validate_observability_config(&cfg).unwrap_err();
+        let Err(err) = validate_observability_config(&cfg) else {
+            anyhow::bail!("invalid log_format must be rejected");
+        };
         assert!(err.to_string().contains("log_format"));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/config.rs::all_valid_log_levels_accepted keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn all_valid_log_levels_accepted() {
+    /// Pins that every documented log level is accepted.
+    fn all_valid_log_levels_accepted() -> anyhow::Result<()> {
         for level in &[
             "trace",
             "debug",
@@ -3027,10 +3312,16 @@ client_ip = false
                 "level {level} should be valid"
             );
         }
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/config.rs::all_log_formats_accepted keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn all_log_formats_accepted() {
+    /// Pins that every documented log format is accepted.
+    fn all_log_formats_accepted() -> anyhow::Result<()> {
         for fmt in &["json", "pretty", "text"] {
             let cfg = ObservabilityConfig {
                 log_format: (*fmt).into(),
@@ -3041,21 +3332,25 @@ client_ip = false
                 "format {fmt} should be valid"
             );
         }
+        Ok(())
     }
 
     // -- serde deserialization --
 
     #[test]
-    fn server_config_deserialize_defaults() {
-        let cfg: ServerConfig = toml::from_str("").unwrap();
+    /// Pins the deserialized defaults for a bare `ServerConfig` TOML.
+    fn server_config_deserialize_defaults() -> anyhow::Result<()> {
+        let cfg: ServerConfig = toml::from_str("").context("empty TOML must parse")?;
         assert_eq!(cfg.listen_port, 8443);
         assert_eq!(cfg.listen_addr, "127.0.0.1");
         assert_eq!(cfg.tls_handshake_timeout, "10s");
         assert_eq!(cfg.max_concurrent_tls_handshakes, 256);
+        Ok(())
     }
 
     #[test]
-    fn t1_existing_server_example_deserializes_with_new_defaults() {
+    /// Pins that an existing server example deserializes with the new defaults.
+    fn t1_existing_server_example_deserializes_with_new_defaults() -> anyhow::Result<()> {
         let server = server_from_root_toml(
             r#"
                 [server]
@@ -3068,25 +3363,32 @@ client_ip = false
                 allowed_origins = ["http://localhost:3000", "https://myapp.example.com"]
                 tool_rate_limit = 120
             "#,
-        );
+        )?;
 
         assert_eq!(server.max_request_body, 1024 * 1024);
         assert!(!server.expose_build_metadata);
         assert_eq!(server.security_headers, SecurityHeadersConfig::default());
+        Ok(())
     }
 
     #[test]
-    fn t2_default_bridge_is_no_op_for_mcp_defaults() {
+    /// Pins that the default bridge is a no-op against MCP defaults.
+    fn t2_default_bridge_is_no_op_for_mcp_defaults() -> anyhow::Result<()> {
         let actual = ServerConfig::default()
             .apply_to_mcp_config(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0"))
-            .unwrap();
+            .context("default config must bridge")?;
         let expected = McpServerConfig::new("127.0.0.1:8443", "t", "0.0.0");
 
         assert_default_bridge_core_fields(&actual, &expected);
         assert_default_bridge_limit_fields(&actual, &expected);
         assert_default_bridge_metadata_fields(&actual, &expected);
+        Ok(())
     }
 
+    #[expect(
+        deprecated,
+        reason = "deliberate: src/transport.rs::McpServerConfig deprecated field access is the bridge behavior this test pins"
+    )]
     fn assert_default_bridge_core_fields(actual: &McpServerConfig, expected: &McpServerConfig) {
         assert_eq!(actual.bind_addr, expected.bind_addr);
         assert_eq!(actual.tls_cert_path, expected.tls_cert_path);
@@ -3100,6 +3402,10 @@ client_ip = false
         assert_eq!(actual.version, expected.version);
     }
 
+    #[expect(
+        deprecated,
+        reason = "deliberate: src/transport.rs::McpServerConfig deprecated field access is the bridge behavior this test pins"
+    )]
     fn assert_default_bridge_limit_fields(actual: &McpServerConfig, expected: &McpServerConfig) {
         assert_eq!(actual.tool_rate_limit, expected.tool_rate_limit);
         assert_eq!(actual.tool_rate_limit_burst, expected.tool_rate_limit_burst);
@@ -3123,6 +3429,10 @@ client_ip = false
         );
     }
 
+    #[expect(
+        deprecated,
+        reason = "deliberate: src/transport.rs::McpServerConfig deprecated field access is the bridge behavior this test pins"
+    )]
     fn assert_default_bridge_metadata_fields(actual: &McpServerConfig, expected: &McpServerConfig) {
         assert_eq!(actual.session_idle_timeout, expected.session_idle_timeout);
         assert_eq!(actual.session_binding, expected.session_binding);
@@ -3144,159 +3454,190 @@ client_ip = false
     }
 
     #[test]
-    fn session_binding_toml_roundtrip_and_bridge() {
+    /// Pins `session_binding` TOML round-trip and bridge.
+    fn session_binding_toml_roundtrip_and_bridge() -> anyhow::Result<()> {
         let cfg = server_from_root_toml(
-            r"
+            "
                 [server]
                 session_binding = false
             ",
-        );
+        )?;
         let bridged = cfg
             .apply_to_mcp_config(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0"))
-            .unwrap();
+            .context("session_binding config must bridge")?;
 
         assert!(!cfg.session_binding);
         assert!(!bridged.session_binding);
         assert!(ServerConfig::default().session_binding);
         assert!(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0").session_binding);
+        Ok(())
     }
 
     #[test]
-    fn session_binding_secret_toml_roundtrip_and_bridge() {
+    /// Pins `session_binding_secret` TOML round-trip and bridge.
+    fn session_binding_secret_toml_roundtrip_and_bridge() -> anyhow::Result<()> {
         let cfg = server_from_root_toml(
             r#"
                 [server]
                 session_binding_secret = "0123456789abcdef0123456789abcdef"
             "#,
-        );
+        )?;
         let bridged = cfg
             .apply_to_mcp_config(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0"))
-            .unwrap();
+            .context("session_binding_secret config must bridge")?;
 
         assert!(cfg.session_binding_secret.is_some());
         assert!(bridged.session_binding_secret.is_some());
-        assert!(validate_server_config(&cfg).is_ok());
+        assert!(validate_server_config(&cfg).is_ok(), "config must validate");
+        Ok(())
     }
 
     #[test]
-    fn session_binding_secret_short_toml_rejected() {
+    /// Pins that a too-short binding secret is rejected.
+    fn session_binding_secret_short_toml_rejected() -> anyhow::Result<()> {
         let cfg = server_from_root_toml(
             r#"
                 [server]
                 session_binding_secret = "too-short"
             "#,
-        );
+        )?;
 
-        let err = validate_server_config(&cfg).expect_err("short binding secret fails");
+        let Err(err) = validate_server_config(&cfg) else {
+            anyhow::bail!("short binding secret fails");
+        };
 
         assert!(err.to_string().contains("at least 32 UTF-8 bytes"));
+        Ok(())
     }
 
     #[test]
-    fn tool_list_filtering_toml_roundtrip_and_bridge() {
+    /// Pins `tool_list_filtering` TOML round-trip and bridge.
+    fn tool_list_filtering_toml_roundtrip_and_bridge() -> anyhow::Result<()> {
         let cfg = server_from_root_toml(
-            r"
+            "
                 [server]
                 tool_list_filtering = false
             ",
-        );
+        )?;
         let bridged = cfg
             .apply_to_mcp_config(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0"))
-            .unwrap();
+            .context("tool_list_filtering config must bridge")?;
 
         assert!(!cfg.tool_list_filtering);
         assert!(!bridged.tool_list_filtering);
         assert!(ServerConfig::default().tool_list_filtering);
         assert!(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0").tool_list_filtering);
+        Ok(())
     }
 
     #[test]
-    fn t5_hsts_preload_from_toml_rejected_by_mcp_validate() {
+    /// Pins that an HSTS preload header from TOML is rejected by `validate`.
+    fn t5_hsts_preload_from_toml_rejected_by_mcp_validate() -> anyhow::Result<()> {
         let cfg = server_from_root_toml(
             r#"
                 [server.security_headers]
                 strict_transport_security = "max-age=1; preload"
             "#,
-        );
+        )?;
         let mcp = cfg
             .apply_to_mcp_config(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0"))
-            .unwrap();
+            .context("HSTS preload config must bridge")?;
 
-        let err = mcp.validate().unwrap_err();
+        let Err(err) = mcp.validate() else {
+            anyhow::bail!("HSTS preload must be rejected");
+        };
         let msg = err.to_string();
         assert!(msg.contains("preload"), "error must mention preload: {msg}");
+        Ok(())
     }
 
     #[test]
-    fn t6_bad_security_header_from_toml_rejected_by_mcp_validate() {
+    /// Pins that a bad security header from TOML is rejected by `validate`.
+    fn t6_bad_security_header_from_toml_rejected_by_mcp_validate() -> anyhow::Result<()> {
         let cfg = server_from_root_toml(
             r#"
                 [server.security_headers]
                 content_security_policy = "bad\nvalue"
             "#,
-        );
+        )?;
         let mcp = cfg
             .apply_to_mcp_config(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0"))
-            .unwrap();
+            .context("bad security header config must bridge")?;
 
-        let err = mcp.validate().unwrap_err();
+        let Err(err) = mcp.validate() else {
+            anyhow::bail!("bad security header must be rejected");
+        };
         let msg = err.to_string();
         assert!(
             msg.contains("invalid security_headers.content_security_policy"),
             "error must name invalid header field: {msg}"
         );
+        Ok(())
     }
 
     #[test]
-    fn t7_zero_max_request_body_rejected_by_mcp_validate() {
-        let cfg: ServerConfig = toml::from_str("max_request_body = 0").unwrap();
+    /// Pins that a zero max request body is rejected by `validate`.
+    fn t7_zero_max_request_body_rejected_by_mcp_validate() -> anyhow::Result<()> {
+        let cfg: ServerConfig = toml::from_str("max_request_body = 0")
+            .context("zero max_request_body TOML must parse")?;
         let mcp = cfg
             .apply_to_mcp_config(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0"))
-            .unwrap();
+            .context("zero max_request_body config must bridge")?;
 
-        let err = mcp.validate().unwrap_err();
+        let Err(err) = mcp.validate() else {
+            anyhow::bail!("zero max_request_body must be rejected");
+        };
         assert!(
             err.to_string()
                 .contains("max_request_body must be greater than zero")
         );
+        Ok(())
     }
 
     #[test]
-    fn t9_unknown_security_header_key_is_rejected() {
-        let err = toml::from_str::<RootConfig>(
+    /// Pins that an unknown security-header key is rejected.
+    fn t9_unknown_security_header_key_is_rejected() -> anyhow::Result<()> {
+        let Err(err) = toml::from_str::<RootConfig>(
             r#"
                 [server.security_headers]
                 typo_content_security_policy = "default-src 'self'"
             "#,
-        )
-        .unwrap_err();
+        ) else {
+            anyhow::bail!("unknown security-header key must be rejected");
+        };
 
         let msg = err.to_string();
         assert!(
             msg.contains("typo_content_security_policy"),
             "error must name the offending key: {msg}"
         );
+        Ok(())
     }
 
     #[test]
-    fn unknown_server_config_key_is_rejected() {
-        let err = toml::from_str::<ServerConfig>(
+    /// Pins that an unknown `ServerConfig` key is rejected.
+    fn unknown_server_config_key_is_rejected() -> anyhow::Result<()> {
+        let Err(err) = toml::from_str::<ServerConfig>(
             r#"
                 tls_keypath = "/etc/certs/server.key"
             "#,
-        )
-        .unwrap_err();
+        ) else {
+            anyhow::bail!("unknown server config key must be rejected");
+        };
 
         let msg = err.to_string();
         assert!(
             msg.contains("tls_keypath"),
             "error must name the offending key: {msg}"
         );
+        Ok(())
     }
 
     #[cfg(not(feature = "oauth"))]
     #[test]
-    fn oauth_table_without_oauth_feature_is_rejected_with_actionable_message() {
+    /// Pins that an `[auth.oauth]` table without the oauth feature explains the fix.
+    fn oauth_table_without_oauth_feature_is_rejected_with_actionable_message() -> anyhow::Result<()>
+    {
         // `deny_unknown_fields` on `AuthConfig` would otherwise surface this as
         // `unknown field \`oauth\``, which never mentions the cargo feature.
         // Failing closed matters: silently dropping the table starts a server
@@ -3312,20 +3653,23 @@ client_ip = false
                 issuer = "https://auth.example.com"
             "#,
         )
-        .expect("[auth.oauth] must parse so validation can produce the real message");
+        .context("[auth.oauth] must parse so validation can produce the real message")?;
 
-        let msg = validate_server_config(&server)
-            .expect_err("auth.oauth without the oauth feature must be rejected")
-            .to_string();
+        let Err(err) = validate_server_config(&server) else {
+            anyhow::bail!("auth.oauth without the oauth feature must be rejected");
+        };
+        let msg = err.to_string();
 
         assert!(
             msg.contains("oauth") && msg.contains("--features oauth"),
             "error must name the missing cargo feature and how to fix it: {msg}"
         );
+        Ok(())
     }
 
     #[test]
-    fn all_twelve_security_header_keys_deserialize_from_server_toml() {
+    /// Pins that all twelve security-header keys deserialize from server TOML.
+    fn all_twelve_security_header_keys_deserialize_from_server_toml() -> anyhow::Result<()> {
         let cfg = server_from_root_toml(
             r#"
                 [server.security_headers]
@@ -3342,7 +3686,7 @@ client_ip = false
                 x_dns_prefetch_control = "dns"
                 x_permitted_cross_domain_policies = "cross-domain"
             "#,
-        );
+        )?;
 
         let headers = cfg.security_headers;
         assert_eq!(headers.content_security_policy.as_deref(), Some("csp"));
@@ -3372,24 +3716,26 @@ client_ip = false
             headers.x_permitted_cross_domain_policies.as_deref(),
             Some("cross-domain")
         );
+        Ok(())
     }
 
     /// Extract the `pub` field names of a struct from this file's own source.
-    fn struct_pub_fields(marker: &str) -> Vec<String> {
+    fn struct_pub_fields(marker: &str) -> anyhow::Result<Vec<String>> {
         let source = include_str!("config.rs").replace("\r\n", "\n");
         let (_, after) = source
             .split_once(marker)
-            .unwrap_or_else(|| panic!("struct start marker {marker:?} not found"));
+            .with_context(|| format!("struct start marker {marker:?} not found"))?;
         let (body, _) = after
             .split_once("\n}\n")
-            .expect("struct end marker not found");
-        body.lines()
+            .context("struct end marker not found")?;
+        Ok(body
+            .lines()
             .filter_map(|line| {
                 line.trim()
                     .strip_prefix("pub ")
                     .and_then(|rest| rest.split_once(':').map(|(name, _)| name.trim().to_owned()))
             })
-            .collect()
+            .collect())
     }
 
     /// Config fields deliberately NOT exposed as environment overrides.
@@ -3443,12 +3789,13 @@ client_ip = false
     ];
 
     #[test]
-    fn every_config_field_is_env_overridable_or_excluded() {
+    /// Pins that every config field is either env-overridable or deliberately excluded.
+    fn every_config_field_is_env_overridable_or_excluded() -> anyhow::Result<()> {
         for (marker, prefix) in [
             ("pub struct ServerConfig {", "server"),
             ("pub struct ObservabilityConfig {", "observability"),
         ] {
-            for field in struct_pub_fields(marker) {
+            for field in struct_pub_fields(marker)? {
                 let target = format!("{prefix}.{field}");
                 let overridable = ENV_OVERRIDE_SPECS
                     .iter()
@@ -3465,10 +3812,16 @@ client_ip = false
                 );
             }
         }
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/config.rs::shared_invariants_report_a_fixed_precedence keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn shared_invariants_report_a_fixed_precedence() {
+    /// Pins that shared invariants report a fixed precedence.
+    fn shared_invariants_report_a_fixed_precedence() -> anyhow::Result<()> {
         // All three violated at once: both validators must surface the same
         // one first, which is the drift this helper exists to prevent.
         assert!(matches!(
@@ -3490,31 +3843,44 @@ client_ip = false
             Err(SharedConfigViolation::MtlsRequiresTls)
         ));
         // Fully valid combinations.
-        check_shared_config_invariants(true, true, true, true, true)
-            .unwrap_or_else(|_| panic!("admin+auth with full TLS and mTLS must be valid"));
-        check_shared_config_invariants(false, false, false, false, false)
-            .unwrap_or_else(|_| panic!("an empty config must be valid"));
+        assert!(
+            check_shared_config_invariants(true, true, true, true, true).is_ok(),
+            "admin+auth with full TLS and mTLS must be valid"
+        );
+        assert!(
+            check_shared_config_invariants(false, false, false, false, false).is_ok(),
+            "an empty config must be valid"
+        );
+        Ok(())
     }
 
     #[test]
-    fn toml_validator_surfaces_the_shared_precedence() {
+    /// Pins that the TOML validator surfaces the shared precedence.
+    fn toml_validator_surfaces_the_shared_precedence() -> anyhow::Result<()> {
         let server = ServerConfig {
             admin_enabled: true,
             tls_cert_path: Some(PathBuf::from("/etc/certs/server.crt")),
             ..Default::default()
         };
 
-        let err = validate_server_config(&server)
-            .expect_err("admin without auth must fail")
-            .to_string();
+        let Err(err) = validate_server_config(&server) else {
+            anyhow::bail!("admin without auth must fail");
+        };
+        let message = err.to_string();
         assert!(
-            err.contains("admin_enabled=true requires auth"),
-            "admin must be reported before the TLS pairing failure; got {err:?}"
+            message.contains("admin_enabled=true requires auth"),
+            "admin must be reported before the TLS pairing failure; got {message:?}"
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/config.rs::server_config_debug_redacts_tls_key_path keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn server_config_debug_redacts_tls_key_path() {
+    /// Pins that the `ServerConfig` Debug output redacts the TLS key path.
+    fn server_config_debug_redacts_tls_key_path() -> anyhow::Result<()> {
         let cfg = ServerConfig {
             tls_cert_path: Some(PathBuf::from("/etc/certs/server.crt")),
             tls_key_path: Some(PathBuf::from("/etc/secrets/server.key")),
@@ -3534,10 +3900,16 @@ client_ip = false
             rendered.contains("server.crt"),
             "the certificate path is not secret and must remain visible"
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/config.rs::observability_config_debug_redacts_audit_log_path keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn observability_config_debug_redacts_audit_log_path() {
+    /// Pins that the `ObservabilityConfig` Debug output redacts the audit path.
+    fn observability_config_debug_redacts_audit_log_path() -> anyhow::Result<()> {
         let cfg = ObservabilityConfig {
             audit_log_path: Some(PathBuf::from("/var/log/rmcp/audit.log")),
             ..Default::default()
@@ -3549,28 +3921,32 @@ client_ip = false
             "the audit log location must never render; got {rendered}"
         );
         assert!(rendered.contains("audit_log_path: Some(\"[REDACTED]\")"));
+        Ok(())
     }
 
     #[test]
-    fn server_config_debug_lists_every_field() {
+    /// Pins that the hand-written `ServerConfig` Debug lists every field.
+    fn server_config_debug_lists_every_field() -> anyhow::Result<()> {
         let rendered = format!("{:?}", ServerConfig::default());
-        for field in struct_pub_fields("pub struct ServerConfig {") {
+        for field in struct_pub_fields("pub struct ServerConfig {")? {
             assert!(
                 rendered.contains(&format!("{field}:")),
                 "hand-written Debug omits `{field}`; add it (redacted if sensitive)"
             );
         }
+        Ok(())
     }
 
     /// Fields of `struct` `marker`, including `pub(crate)` ones.
-    fn struct_fields_in(source: &str, marker: &str) -> Vec<String> {
+    fn struct_fields_in(source: &str, marker: &str) -> anyhow::Result<Vec<String>> {
         let (_, after) = source
             .split_once(marker)
-            .unwrap_or_else(|| panic!("struct start marker {marker:?} not found"));
+            .with_context(|| format!("struct start marker {marker:?} not found"))?;
         let (body, _) = after
             .split_once("\n}\n")
-            .expect("struct end marker not found");
-        body.lines()
+            .context("struct end marker not found")?;
+        Ok(body
+            .lines()
             .filter_map(|line| {
                 let trimmed = line.trim();
                 let rest = trimmed
@@ -3578,7 +3954,7 @@ client_ip = false
                     .or_else(|| trimmed.strip_prefix("pub "))?;
                 rest.split_once(':').map(|(name, _)| name.trim().to_owned())
             })
-            .collect()
+            .collect())
     }
 
     /// Bodies of every function at `indent` whose signature line satisfies
@@ -3590,31 +3966,37 @@ client_ip = false
         let inner_indent = format!("{indent}    ");
         let mut out = Vec::new();
         let mut index = 0;
-        while index < lines.len() {
-            let line = lines[index];
+        while let Some(line) = lines.get(index) {
             let at_this_indent = line.starts_with(indent) && !line.starts_with(&inner_indent);
             if at_this_indent && wanted(line) {
-                let mut body = String::from(line);
-                index += 1;
-                while index < lines.len() && lines[index] != close {
-                    body.push_str(lines[index]);
+                let mut body = String::from(*line);
+                index = index.saturating_add(1);
+                while let Some(current) = lines.get(index) {
+                    if *current == close {
+                        break;
+                    }
+                    body.push_str(current);
                     body.push('\n');
-                    index += 1;
+                    index = index.saturating_add(1);
                 }
                 out.push(body);
             }
-            index += 1;
+            index = index.saturating_add(1);
         }
         out
     }
 
     /// Whole-word containment, so `auth` does not match `authorize`.
     fn mentions_identifier(haystack: &str, needle: &str) -> bool {
-        let boundary = |c: Option<char>| c.is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+        let boundary = |character: Option<char>| {
+            character.is_none_or(|next| !(next.is_alphanumeric() || next == '_'))
+        };
         haystack.match_indices(needle).any(|(start, _)| {
-            let end = start + needle.len();
-            let before = haystack.get(..start).and_then(|s| s.chars().next_back());
-            let after = haystack.get(end..).and_then(|s| s.chars().next());
+            let end = start.saturating_add(needle.len());
+            let before = haystack
+                .get(..start)
+                .and_then(|slice| slice.chars().next_back());
+            let after = haystack.get(end..).and_then(|slice| slice.chars().next());
             boundary(before) && boundary(after)
         })
     }
@@ -3660,12 +4042,13 @@ client_ip = false
     ];
 
     #[test]
-    fn every_shared_config_field_is_validated_by_both() {
+    /// Pins that every shared config field is validated by both validators.
+    fn every_shared_config_field_is_validated_by_both() -> anyhow::Result<()> {
         let toml_source = include_str!("config.rs");
         let builder_source = include_str!("transport.rs");
 
-        let toml_fields = struct_fields_in(toml_source, "pub struct ServerConfig {");
-        let builder_fields = struct_fields_in(builder_source, "pub struct McpServerConfig {");
+        let toml_fields = struct_fields_in(toml_source, "pub struct ServerConfig {")?;
+        let builder_fields = struct_fields_in(builder_source, "pub struct McpServerConfig {")?;
         let shared: Vec<String> = toml_fields
             .iter()
             .filter(|field| builder_fields.contains(field))
@@ -3749,28 +4132,32 @@ client_ip = false
                 "VALIDATION_PARITY_EXEMPT lists `{field}`, which is no longer shared by both config types"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn observability_config_debug_lists_every_field() {
+    /// Pins that the hand-written `ObservabilityConfig` Debug lists every field.
+    fn observability_config_debug_lists_every_field() -> anyhow::Result<()> {
         let rendered = format!("{:?}", ObservabilityConfig::default());
-        for field in struct_pub_fields("pub struct ObservabilityConfig {") {
+        for field in struct_pub_fields("pub struct ObservabilityConfig {")? {
             assert!(
                 rendered.contains(&format!("{field}:")),
                 "hand-written Debug omits `{field}`; add it (redacted if sensitive)"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn t10_every_server_config_field_is_classified_for_bridge() {
+    /// Pins that every `ServerConfig` field is classified for bridging.
+    fn t10_every_server_config_field_is_classified_for_bridge() -> anyhow::Result<()> {
         let source = include_str!("config.rs").replace("\r\n", "\n");
         let (_, after_struct_start) = source
             .split_once("pub struct ServerConfig {")
-            .expect("ServerConfig struct start marker");
+            .context("ServerConfig struct start marker")?;
         let (struct_body, _) = after_struct_start
             .split_once("\n}\n\nimpl ServerConfig")
-            .expect("ServerConfig struct end marker");
+            .context("ServerConfig struct end marker")?;
         let actual_fields: HashSet<&str> = struct_body
             .lines()
             .filter_map(|line| {
@@ -3795,35 +4182,43 @@ client_ip = false
         assert!(SERVER_CONFIG_NOT_BRIDGED_FIELDS.contains(&"stdio_enabled"));
         assert!(MCP_SERVER_CONFIG_RUNTIME_ONLY_FIELDS.contains(&"rbac"));
         assert!(MCP_SERVER_CONFIG_RUNTIME_ONLY_FIELDS.contains(&"metrics_bind"));
+        Ok(())
     }
 
     #[test]
-    fn replacement_semantics_clear_base_option_and_false_bool_fields() {
-        let (_token, hash) = crate::auth::generate_api_key().unwrap();
+    #[expect(
+        deprecated,
+        reason = "deliberate: src/transport.rs::McpServerConfig deprecated field access is the bridge behavior this test pins"
+    )]
+    /// Pins bridge replacement semantics for optional and bool fields.
+    fn replacement_semantics_clear_base_option_and_false_bool_fields() -> anyhow::Result<()> {
+        let (_token, hash) = generate_api_key().context("api key generation must succeed")?;
         let base = McpServerConfig::new("127.0.0.1:0", "t", "0.0.0")
             .with_tls("/tmp/base.crt", "/tmp/base.key")
-            .with_auth(crate::auth::AuthConfig::with_keys(vec![
-                crate::auth::ApiKeyEntry::new("base-key", hash, "admin"),
-            ]))
+            .with_auth(AuthConfig::with_keys(vec![ApiKeyEntry::new(
+                "base-key", hash, "admin",
+            )]))
             .with_tool_rate_limit(10)
             .with_tool_rate_limit_burst(20)
             .with_extra_route_rate_limit(30)
             .with_extra_route_rate_limit_burst(40)
             .with_trusted_proxies(["127.0.0.1/32"])
-            .with_forwarded_header(crate::transport::ForwardedHeaderMode::Forwarded)
+            .with_forwarded_header(ForwardedHeaderMode::Forwarded)
             .with_public_url("https://base.example")
             .enable_compression(512)
             .with_max_concurrent_requests(99)
             .enable_admin("admin")
             .expose_build_metadata()
-            .with_log_context(crate::transport::LogContextConfig {
+            .with_log_context(LogContextConfig {
                 client_ip: true,
                 request_id: true,
-                ..crate::transport::LogContextConfig::default()
+                ..LogContextConfig::default()
             })
             .with_request_log_exclude_paths(["/x"]);
 
-        let actual = ServerConfig::default().apply_to_mcp_config(base).unwrap();
+        let actual = ServerConfig::default()
+            .apply_to_mcp_config(base)
+            .context("replacement config must bridge")?;
 
         assert!(actual.tls_cert_path.is_none());
         assert!(actual.tls_key_path.is_none());
@@ -3843,16 +4238,19 @@ client_ip = false
         assert!(!actual.expose_build_metadata);
         assert_eq!(
             actual.request_log_exclude_paths,
-            crate::transport::default_request_log_exclude_paths()
+            default_request_log_exclude_paths()
         );
-        assert_eq!(
-            actual.log_context,
-            crate::transport::LogContextConfig::default()
-        );
+        assert_eq!(actual.log_context, LogContextConfig::default());
+        Ok(())
     }
 
     #[test]
-    fn partial_tls_toml_does_not_inherit_base_key() {
+    #[expect(
+        deprecated,
+        reason = "deliberate: src/transport.rs::McpServerConfig deprecated field access is the bridge behavior this test pins"
+    )]
+    /// Pins that a partial TLS TOML does not inherit the base key.
+    fn partial_tls_toml_does_not_inherit_base_key() -> anyhow::Result<()> {
         let cfg = ServerConfig {
             tls_cert_path: Some("/tmp/toml.crt".into()),
             tls_key_path: None,
@@ -3863,16 +4261,24 @@ client_ip = false
                 McpServerConfig::new("127.0.0.1:0", "t", "0.0.0")
                     .with_tls("/tmp/base.crt", "/tmp/base.key"),
             )
-            .unwrap();
+            .context("partial TLS config must bridge")?;
 
         assert_eq!(mcp.tls_cert_path, Some(PathBuf::from("/tmp/toml.crt")));
         assert!(mcp.tls_key_path.is_none());
-        let err = mcp.validate().unwrap_err();
+        let Err(err) = mcp.validate() else {
+            anyhow::bail!("partial TLS pairing must be rejected");
+        };
         assert!(err.to_string().contains("tls_key_path"));
+        Ok(())
     }
 
     #[test]
-    fn partial_tls_toml_does_not_inherit_base_cert() {
+    #[expect(
+        deprecated,
+        reason = "deliberate: src/transport.rs::McpServerConfig deprecated field access is the bridge behavior this test pins"
+    )]
+    /// Pins that a partial TLS TOML does not inherit the base cert.
+    fn partial_tls_toml_does_not_inherit_base_cert() -> anyhow::Result<()> {
         let cfg = ServerConfig {
             tls_cert_path: None,
             tls_key_path: Some("/tmp/toml.key".into()),
@@ -3883,16 +4289,24 @@ client_ip = false
                 McpServerConfig::new("127.0.0.1:0", "t", "0.0.0")
                     .with_tls("/tmp/base.crt", "/tmp/base.key"),
             )
-            .unwrap();
+            .context("partial TLS config must bridge")?;
 
         assert!(mcp.tls_cert_path.is_none());
         assert_eq!(mcp.tls_key_path, Some(PathBuf::from("/tmp/toml.key")));
-        let err = mcp.validate().unwrap_err();
+        let Err(err) = mcp.validate() else {
+            anyhow::bail!("partial TLS pairing must be rejected");
+        };
         assert!(err.to_string().contains("tls_cert_path"));
+        Ok(())
     }
 
     #[test]
-    fn t11_bridge_maps_bind_addr_and_request_timeout() {
+    #[expect(
+        deprecated,
+        reason = "deliberate: src/transport.rs::McpServerConfig deprecated field access is the bridge behavior this test pins"
+    )]
+    /// Pins that the bridge maps bind address and request timeout.
+    fn t11_bridge_maps_bind_addr_and_request_timeout() -> anyhow::Result<()> {
         let cfg: ServerConfig = toml::from_str(
             r#"
                 listen_addr = "127.0.0.2"
@@ -3900,45 +4314,52 @@ client_ip = false
                 request_timeout = "5s"
             "#,
         )
-        .unwrap();
+        .context("bridge TOML must parse")?;
 
         let mcp = cfg
             .apply_to_mcp_config(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0"))
-            .unwrap();
+            .context("bridge TOML must bridge")?;
 
         assert_eq!(mcp.bind_addr, "127.0.0.2:9000");
         assert_eq!(mcp.request_timeout, Duration::from_secs(5));
+        Ok(())
     }
 
     #[test]
-    fn key_eviction_policy_toml_defaults_and_overrides() {
-        let default_cfg: ServerConfig = toml::from_str("").unwrap();
+    /// Pins key-eviction-policy TOML defaults and overrides.
+    fn key_eviction_policy_toml_defaults_and_overrides() -> anyhow::Result<()> {
+        let default_cfg: ServerConfig = toml::from_str("").context("empty TOML must parse")?;
         assert_eq!(default_cfg.key_eviction_policy, KeyEvictionPolicy::EvictLru);
 
         let reject_new: ServerConfig = toml::from_str(r#"key_eviction_policy = "reject_new""#)
-            .expect("reject_new policy parses");
+            .context("reject_new policy parses")?;
         assert_eq!(reject_new.key_eviction_policy, KeyEvictionPolicy::RejectNew);
         let bridged = reject_new
             .apply_to_mcp_config(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0"))
-            .unwrap();
+            .context("key_eviction_policy config must bridge")?;
         assert_eq!(bridged.key_eviction_policy, KeyEvictionPolicy::RejectNew);
+        Ok(())
     }
 
     #[test]
-    fn t12_bridge_rejects_invalid_request_timeout() {
-        let cfg: ServerConfig = toml::from_str(r#"request_timeout = "not-a-duration""#).unwrap();
+    /// Pins that the bridge rejects an invalid request timeout.
+    fn t12_bridge_rejects_invalid_request_timeout() -> anyhow::Result<()> {
+        let cfg: ServerConfig = toml::from_str(r#"request_timeout = "not-a-duration""#)
+            .context("invalid request_timeout TOML must parse")?;
 
         let Err(err) = cfg.apply_to_mcp_config(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0"))
         else {
-            panic!("invalid request_timeout must fail");
+            anyhow::bail!("invalid request_timeout must fail");
         };
 
         assert!(err.to_string().contains("request_timeout"));
+        Ok(())
     }
 
     #[test]
-    fn observability_config_deserialize_defaults() {
-        let cfg: ObservabilityConfig = toml::from_str("").unwrap();
+    /// Pins the deserialized defaults for a bare `ObservabilityConfig` TOML.
+    fn observability_config_deserialize_defaults() -> anyhow::Result<()> {
+        let cfg: ObservabilityConfig = toml::from_str("").context("empty TOML must parse")?;
         assert_eq!(cfg.log_level, "info,rmcp=warn,rmcp_server_kit=info");
         assert_eq!(cfg.log_format, "pretty");
         assert!(!cfg.log_request_headers);
@@ -3946,42 +4367,48 @@ client_ip = false
         assert!(!cfg.log_plaintext_oauth_tokens);
         assert!(!cfg.log_oauth_claim_values);
         assert!(!cfg.log_tool_call_arguments);
+        Ok(())
     }
 
     #[test]
-    fn observability_diagnostic_knobs_deserialize_true() {
+    /// Pins that the diagnostic knobs deserialize as true.
+    fn observability_diagnostic_knobs_deserialize_true() -> anyhow::Result<()> {
         let cfg: ObservabilityConfig = toml::from_str(
-            r"
+            "
                 log_plaintext_oauth_tokens = true
                 log_oauth_claim_values = true
                 log_tool_call_arguments = true
             ",
         )
-        .unwrap();
+        .context("diagnostic-knob TOML must parse")?;
 
         assert!(cfg.log_plaintext_oauth_tokens);
         assert!(cfg.log_oauth_claim_values);
         assert!(cfg.log_tool_call_arguments);
+        Ok(())
     }
 
     fn all_env_vars() -> Vec<&'static str> {
         ENV_OVERRIDE_SPECS.iter().map(|spec| spec.env_var).collect()
     }
 
-    fn with_env_vars<R>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> R) -> R {
+    fn with_env_vars<R>(vars: &[(&str, Option<&str>)], callback: impl FnOnce() -> R) -> R {
         let mut all = all_env_vars()
             .into_iter()
             .map(|var| (var, None::<&str>))
             .collect::<Vec<_>>();
         all.extend(vars.iter().copied());
-        temp_env::with_vars(all, f)
+        temp_env::with_vars(all, callback)
     }
 
     #[test]
-    fn e1_server_env_overrides_absent_keeps_defaults() {
-        with_env_vars(&[], || {
+    /// Pins that absent env overrides keep server defaults.
+    fn e1_server_env_overrides_absent_keeps_defaults() -> anyhow::Result<()> {
+        with_env_vars(&[], || -> anyhow::Result<()> {
             let mut cfg = ServerConfig::default();
-            let report = cfg.apply_env_overrides().unwrap();
+            let report = cfg
+                .apply_env_overrides()
+                .context("env overrides must apply")?;
             assert_eq!(report, []);
             assert_eq!(cfg.listen_addr, "127.0.0.1");
             assert_eq!(cfg.listen_port, 8443);
@@ -3990,36 +4417,56 @@ client_ip = false
             assert!(cfg.public_url.is_none());
             assert!(!cfg.admin_enabled);
             assert!(cfg.auth.is_none());
-        });
+            Ok(())
+        })?;
+        Ok(())
     }
 
     #[test]
-    fn e2_listen_port_env_override_applies_and_reports() {
-        with_env_vars(&[(SERVER_LISTEN_PORT_ENV, Some("9000"))], || {
-            let mut cfg = ServerConfig::default();
-            let report = cfg.apply_env_overrides().unwrap();
-            assert_eq!(cfg.listen_port, 9000);
-            assert_eq!(report.len(), 1);
-            assert_eq!(report[0].env_var, SERVER_LISTEN_PORT_ENV);
-            assert_eq!(report[0].target_field, "server.listen_port");
-            assert_eq!(report[0].source, EnvOverrideSource::Env);
-            assert_eq!(report[0].value.as_deref(), Some("9000"));
-        });
+    /// Pins that a listen-port env override applies and is reported.
+    fn e2_listen_port_env_override_applies_and_reports() -> anyhow::Result<()> {
+        with_env_vars(
+            &[(SERVER_LISTEN_PORT_ENV, Some("9000"))],
+            || -> anyhow::Result<()> {
+                let mut cfg = ServerConfig::default();
+                let report = cfg
+                    .apply_env_overrides()
+                    .context("listen port override must apply")?;
+                assert_eq!(cfg.listen_port, 9000);
+                assert_eq!(report.len(), 1);
+                let entry = report.first().context("one override must be reported")?;
+                assert_eq!(entry.env_var, SERVER_LISTEN_PORT_ENV);
+                assert_eq!(entry.target_field, "server.listen_port");
+                assert_eq!(entry.source, EnvOverrideSource::Env);
+                assert_eq!(entry.value.as_deref(), Some("9000"));
+                Ok(())
+            },
+        )?;
+        Ok(())
     }
 
     #[test]
-    fn e3_bad_listen_port_env_fails_closed() {
-        with_env_vars(&[(SERVER_LISTEN_PORT_ENV, Some("not-a-number"))], || {
-            let mut cfg = ServerConfig::default();
-            let err = cfg.apply_env_overrides().unwrap_err();
-            let msg = err.to_string();
-            assert!(msg.contains(SERVER_LISTEN_PORT_ENV));
-            assert!(msg.contains("u16"));
-        });
+    /// Pins that a bad listen-port env override fails closed.
+    fn e3_bad_listen_port_env_fails_closed() -> anyhow::Result<()> {
+        with_env_vars(
+            &[(SERVER_LISTEN_PORT_ENV, Some("not-a-number"))],
+            || -> anyhow::Result<()> {
+                let mut cfg = ServerConfig::default();
+                let Err(err) = cfg.apply_env_overrides() else {
+                    anyhow::bail!("bad listen port must fail closed");
+                };
+                let msg = err.to_string();
+                assert!(msg.contains(SERVER_LISTEN_PORT_ENV));
+                assert!(msg.contains("u16"));
+                Ok(())
+            },
+        )?;
+        Ok(())
     }
 
     #[test]
-    fn session_binding_secret_env_and_file_conflict_rejected() {
+    /// Pins that a secret env/file conflict is rejected.
+    fn session_binding_secret_env_and_file_conflict_rejected() -> anyhow::Result<()> {
         with_env_vars(
             &[
                 (
@@ -4028,81 +4475,108 @@ client_ip = false
                 ),
                 (SERVER_SESSION_BINDING_SECRET_FILE_ENV, Some("/tmp/secret")),
             ],
-            || {
+            || -> anyhow::Result<()> {
                 let mut cfg = ServerConfig::default();
-                let err = cfg.apply_env_overrides().unwrap_err();
+                let Err(err) = cfg.apply_env_overrides() else {
+                    anyhow::bail!("secret env/file conflict must be rejected");
+                };
                 let msg = err.to_string();
                 assert!(msg.contains(SERVER_SESSION_BINDING_SECRET_ENV));
                 assert!(msg.contains(SERVER_SESSION_BINDING_SECRET_FILE_ENV));
+                Ok(())
             },
-        );
+        )?;
+        Ok(())
     }
 
     #[test]
-    fn session_binding_secret_blank_rejected() {
+    /// Pins that a blank binding secret is rejected.
+    fn session_binding_secret_blank_rejected() -> anyhow::Result<()> {
         for value in ["", "\n", "   "] {
-            with_env_vars(&[(SERVER_SESSION_BINDING_SECRET_ENV, Some(value))], || {
-                let mut cfg = ServerConfig::default();
-                let err = cfg.apply_env_overrides().unwrap_err();
-                assert!(err.to_string().contains(SERVER_SESSION_BINDING_SECRET_ENV));
-            });
+            with_env_vars(
+                &[(SERVER_SESSION_BINDING_SECRET_ENV, Some(value))],
+                || -> anyhow::Result<()> {
+                    let mut cfg = ServerConfig::default();
+                    let Err(err) = cfg.apply_env_overrides() else {
+                        anyhow::bail!("blank binding secret must be rejected");
+                    };
+                    assert!(err.to_string().contains(SERVER_SESSION_BINDING_SECRET_ENV));
+                    Ok(())
+                },
+            )?;
         }
+        Ok(())
     }
 
     #[test]
-    fn session_binding_secret_file_normalizes_newline_and_reports_file_source() {
-        let path = std::env::temp_dir().join(format!(
+    /// Pins file-source reporting and newline normalization for binding secrets.
+    fn session_binding_secret_file_normalizes_newline_and_reports_file_source() -> anyhow::Result<()>
+    {
+        let path = env::temp_dir().join(format!(
             "rmcp-server-kit-session-binding-secret-{}.txt",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock after epoch")
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .context("clock after epoch")?
                 .as_nanos()
         ));
-        std::fs::write(&path, "0123456789abcdef0123456789abcdef\n").expect("write secret file");
+        fs::write(&path, "0123456789abcdef0123456789abcdef\n").context("write secret file")?;
         let path_string = path.to_string_lossy().to_string();
         let report = with_env_vars(
             &[(
                 SERVER_SESSION_BINDING_SECRET_FILE_ENV,
                 Some(path_string.as_str()),
             )],
-            || {
+            || -> anyhow::Result<Vec<EnvOverride>> {
                 let mut cfg = ServerConfig::default();
-                let report = cfg.apply_env_overrides().unwrap();
+                let report = cfg
+                    .apply_env_overrides()
+                    .context("secret file override must apply")?;
                 assert_eq!(
                     cfg.session_binding_secret
                         .as_ref()
                         .map(SecretString::expose_secret),
                     Some("0123456789abcdef0123456789abcdef")
                 );
-                report
+                Ok(report)
             },
-        );
-        std::fs::remove_file(path).expect("remove secret file");
+        )?;
+        fs::remove_file(path).context("remove secret file")?;
 
         assert_eq!(report.len(), 1);
-        assert_eq!(report[0].env_var, SERVER_SESSION_BINDING_SECRET_FILE_ENV);
-        assert_eq!(report[0].target_field, "server.session_binding_secret");
-        assert_eq!(report[0].source, EnvOverrideSource::File);
-        assert!(report[0].value.is_none());
+        let entry = report.first().context("one override must be reported")?;
+        assert_eq!(entry.env_var, SERVER_SESSION_BINDING_SECRET_FILE_ENV);
+        assert_eq!(entry.target_field, "server.session_binding_secret");
+        assert_eq!(entry.source, EnvOverrideSource::File);
+        assert!(entry.value.is_none());
+        Ok(())
     }
 
     #[test]
-    fn e4_oauth_env_without_auth_parent_fails_closed() {
-        with_env_vars(&[(SERVER_OAUTH_ISSUER_ENV, Some("https://idp/"))], || {
-            let mut cfg = ServerConfig::default();
-            let err = cfg.apply_env_overrides().unwrap_err();
-            let msg = err.to_string();
-            assert!(msg.contains(SERVER_OAUTH_ISSUER_ENV));
-            #[cfg(feature = "oauth")]
-            assert!(msg.contains("[server.auth.oauth]"));
-            #[cfg(not(feature = "oauth"))]
-            assert!(msg.contains("oauth` feature"));
-        });
+    /// Pins that an oauth env var without its auth parent fails closed.
+    fn e4_oauth_env_without_auth_parent_fails_closed() -> anyhow::Result<()> {
+        with_env_vars(
+            &[(SERVER_OAUTH_ISSUER_ENV, Some("https://idp/"))],
+            || -> anyhow::Result<()> {
+                let mut cfg = ServerConfig::default();
+                let Err(err) = cfg.apply_env_overrides() else {
+                    anyhow::bail!("oauth env without auth parent must fail closed");
+                };
+                let msg = err.to_string();
+                assert!(msg.contains(SERVER_OAUTH_ISSUER_ENV));
+                #[cfg(feature = "oauth")]
+                assert!(msg.contains("[server.auth.oauth]"));
+                #[cfg(not(feature = "oauth"))]
+                assert!(msg.contains("oauth` feature"));
+                Ok(())
+            },
+        )?;
+        Ok(())
     }
 
     #[cfg(feature = "oauth")]
     #[test]
-    fn e5_oauth_env_populates_declared_parent_and_validates() {
+    /// Pins that oauth env vars populate a declared parent and validate.
+    fn e5_oauth_env_populates_declared_parent_and_validates() -> anyhow::Result<()> {
         with_env_vars(
             &[
                 (SERVER_OAUTH_ISSUER_ENV, Some("https://idp.example/")),
@@ -4112,35 +4586,40 @@ client_ip = false
                     Some("https://idp.example/.well-known/jwks.json"),
                 ),
             ],
-            || {
-                let mut auth = crate::auth::AuthConfig::with_keys(vec![]);
-                auth.oauth = Some(crate::oauth::OAuthConfig {
+            || -> anyhow::Result<()> {
+                let mut auth = AuthConfig::with_keys(vec![]);
+                auth.oauth = Some(OAuthConfig {
                     role_claim: Some("roles".into()),
-                    ..crate::oauth::OAuthConfig::default()
+                    ..OAuthConfig::default()
                 });
                 let mut cfg = ServerConfig {
                     auth: Some(auth),
                     ..ServerConfig::default()
                 };
 
-                let report = cfg.apply_env_overrides().unwrap();
+                let report = cfg
+                    .apply_env_overrides()
+                    .context("oauth env overrides must apply")?;
                 let oauth = cfg
                     .auth
                     .as_ref()
-                    .and_then(|auth| auth.oauth.as_ref())
-                    .unwrap();
+                    .and_then(|inner| inner.oauth.as_ref())
+                    .context("oauth config must be present")?;
                 assert_eq!(oauth.issuer, "https://idp.example/");
                 assert_eq!(oauth.audience, "mcp");
                 assert_eq!(oauth.jwks_uri, "https://idp.example/.well-known/jwks.json");
-                assert!(oauth.validate().is_ok());
+                assert!(oauth.validate().is_ok(), "oauth config must validate");
                 assert_eq!(report.len(), 3);
+                Ok(())
             },
-        );
+        )?;
+        Ok(())
     }
 
     #[cfg(feature = "oauth")]
     #[test]
-    fn e5b_oauth_env_missing_audience_fails_validate() {
+    /// Pins that a missing oauth audience fails validation.
+    fn e5b_oauth_env_missing_audience_fails_validate() -> anyhow::Result<()> {
         with_env_vars(
             &[
                 (SERVER_OAUTH_ISSUER_ENV, Some("https://idp.example/")),
@@ -4149,206 +4628,246 @@ client_ip = false
                     Some("https://idp.example/.well-known/jwks.json"),
                 ),
             ],
-            || {
-                let mut auth = crate::auth::AuthConfig::with_keys(vec![]);
-                auth.oauth = Some(crate::oauth::OAuthConfig {
+            || -> anyhow::Result<()> {
+                let mut auth = AuthConfig::with_keys(vec![]);
+                auth.oauth = Some(OAuthConfig {
                     role_claim: Some("roles".into()),
-                    ..crate::oauth::OAuthConfig::default()
+                    ..OAuthConfig::default()
                 });
                 let mut cfg = ServerConfig {
                     auth: Some(auth),
                     ..ServerConfig::default()
                 };
 
-                cfg.apply_env_overrides().unwrap();
+                drop(
+                    cfg.apply_env_overrides()
+                        .context("oauth env overrides must apply")?,
+                );
                 let oauth = cfg
                     .auth
                     .as_ref()
-                    .and_then(|auth| auth.oauth.as_ref())
-                    .unwrap();
-                let err = oauth.validate().unwrap_err();
+                    .and_then(|inner| inner.oauth.as_ref())
+                    .context("oauth config must be present")?;
+                let Err(err) = oauth.validate() else {
+                    anyhow::bail!("missing oauth audience must fail validation");
+                };
                 assert!(err.to_string().contains("oauth.audience must not be empty"));
+                Ok(())
             },
-        );
+        )?;
+        Ok(())
     }
 
     #[cfg(feature = "oauth")]
     #[test]
-    fn e5c_oauth_proxy_env_applies_to_declared_proxy() {
+    /// Pins that a proxy env var applies to a declared proxy.
+    fn e5c_oauth_proxy_env_applies_to_declared_proxy() -> anyhow::Result<()> {
         with_env_vars(
             &[(SERVER_OAUTH_PROXY_STRIP_RESOURCE_PARAM_ENV, Some("true"))],
-            || {
-                let mut auth = crate::auth::AuthConfig::with_keys(vec![]);
-                auth.oauth = Some(crate::oauth::OAuthConfig {
+            || -> anyhow::Result<()> {
+                let mut auth = AuthConfig::with_keys(vec![]);
+                auth.oauth = Some(OAuthConfig {
                     proxy: Some(
-                        crate::oauth::OAuthProxyConfig::builder(
+                        OAuthProxyConfig::builder(
                             "https://idp.example/authorize",
                             "https://idp.example/token",
                             "mcp",
                         )
                         .build(),
                     ),
-                    ..crate::oauth::OAuthConfig::default()
+                    ..OAuthConfig::default()
                 });
                 let mut cfg = ServerConfig {
                     auth: Some(auth),
                     ..ServerConfig::default()
                 };
 
-                let report = cfg.apply_env_overrides().unwrap();
+                let report = cfg
+                    .apply_env_overrides()
+                    .context("oauth proxy env overrides must apply")?;
                 let proxy = cfg
                     .auth
                     .as_ref()
-                    .and_then(|auth| auth.oauth.as_ref())
+                    .and_then(|inner| inner.oauth.as_ref())
                     .and_then(|oauth| oauth.proxy.as_ref())
-                    .unwrap();
+                    .context("oauth proxy must be present")?;
                 assert!(proxy.strip_resource_param);
                 assert_eq!(report.len(), 1);
-                assert_eq!(
-                    report[0].env_var,
-                    SERVER_OAUTH_PROXY_STRIP_RESOURCE_PARAM_ENV
-                );
+                let entry = report.first().context("one override must be reported")?;
+                assert_eq!(entry.env_var, SERVER_OAUTH_PROXY_STRIP_RESOURCE_PARAM_ENV);
+                Ok(())
             },
-        );
+        )?;
+        Ok(())
     }
 
     #[cfg(feature = "oauth")]
     #[test]
-    fn e5d_oauth_proxy_env_without_declared_proxy_fails_closed() {
+    /// Pins that a proxy env var without a declared proxy fails closed.
+    fn e5d_oauth_proxy_env_without_declared_proxy_fails_closed() -> anyhow::Result<()> {
         // The var can only populate a field on an existing proxy: the three
         // required proxy fields have no env source, so creating one here would
         // yield a half-configured proxy.
         with_env_vars(
             &[(SERVER_OAUTH_PROXY_STRIP_RESOURCE_PARAM_ENV, Some("true"))],
-            || {
-                let mut auth = crate::auth::AuthConfig::with_keys(vec![]);
-                auth.oauth = Some(crate::oauth::OAuthConfig::default());
+            || -> anyhow::Result<()> {
+                let mut auth = AuthConfig::with_keys(vec![]);
+                auth.oauth = Some(OAuthConfig::default());
                 let mut cfg = ServerConfig {
                     auth: Some(auth),
                     ..ServerConfig::default()
                 };
 
-                let err = cfg.apply_env_overrides().unwrap_err();
+                let Err(err) = cfg.apply_env_overrides() else {
+                    anyhow::bail!("proxy env without declared proxy must fail closed");
+                };
                 let msg = err.to_string();
                 assert!(msg.contains(SERVER_OAUTH_PROXY_STRIP_RESOURCE_PARAM_ENV));
                 assert!(msg.contains("[server.auth.oauth.proxy]"));
+                Ok(())
             },
-        );
+        )?;
+        Ok(())
     }
 
     #[cfg(feature = "oauth")]
     #[test]
-    fn e5e_oauth_proxy_env_rejects_non_bool() {
+    /// Pins that a non-bool proxy env var is rejected.
+    fn e5e_oauth_proxy_env_rejects_non_bool() -> anyhow::Result<()> {
         with_env_vars(
             &[(SERVER_OAUTH_PROXY_STRIP_RESOURCE_PARAM_ENV, Some("maybe"))],
-            || {
-                let mut auth = crate::auth::AuthConfig::with_keys(vec![]);
-                auth.oauth = Some(crate::oauth::OAuthConfig {
+            || -> anyhow::Result<()> {
+                let mut auth = AuthConfig::with_keys(vec![]);
+                auth.oauth = Some(OAuthConfig {
                     proxy: Some(
-                        crate::oauth::OAuthProxyConfig::builder(
+                        OAuthProxyConfig::builder(
                             "https://idp.example/authorize",
                             "https://idp.example/token",
                             "mcp",
                         )
                         .build(),
                     ),
-                    ..crate::oauth::OAuthConfig::default()
+                    ..OAuthConfig::default()
                 });
                 let mut cfg = ServerConfig {
                     auth: Some(auth),
                     ..ServerConfig::default()
                 };
 
-                let msg = cfg.apply_env_overrides().unwrap_err().to_string();
+                let Err(err) = cfg.apply_env_overrides() else {
+                    anyhow::bail!("non-bool proxy env must be rejected");
+                };
+                let msg = err.to_string();
                 assert!(msg.contains(SERVER_OAUTH_PROXY_STRIP_RESOURCE_PARAM_ENV));
                 assert!(msg.contains("bool"));
+                Ok(())
             },
-        );
+        )?;
+        Ok(())
     }
 
     #[cfg(feature = "oauth")]
     #[test]
-    fn e5f_oauth_allowed_algorithms_env_parses_comma_separated_list() {
+    /// Pins that the allowed-algorithms env var parses a comma-separated list.
+    fn e5f_oauth_allowed_algorithms_env_parses_comma_separated_list() -> anyhow::Result<()> {
         with_env_vars(
             &[(SERVER_OAUTH_ALLOWED_ALGORITHMS_ENV, Some("RS256, ES384"))],
-            || {
-                let mut auth = crate::auth::AuthConfig::with_keys(vec![]);
-                auth.oauth = Some(crate::oauth::OAuthConfig::default());
+            || -> anyhow::Result<()> {
+                let mut auth = AuthConfig::with_keys(vec![]);
+                auth.oauth = Some(OAuthConfig::default());
                 let mut cfg = ServerConfig {
                     auth: Some(auth),
                     ..ServerConfig::default()
                 };
 
-                let report = cfg.apply_env_overrides().unwrap();
+                let report = cfg
+                    .apply_env_overrides()
+                    .context("allowed-algorithms env must apply")?;
                 let oauth = cfg
                     .auth
                     .as_ref()
-                    .and_then(|auth| auth.oauth.as_ref())
-                    .unwrap();
+                    .and_then(|inner| inner.oauth.as_ref())
+                    .context("oauth config must be present")?;
                 assert_eq!(
                     oauth.allowed_algorithms.as_deref(),
                     Some(["RS256".to_owned(), "ES384".to_owned()].as_slice())
                 );
                 assert_eq!(report.len(), 1);
+                Ok(())
             },
-        );
+        )?;
+        Ok(())
     }
 
     #[cfg(feature = "oauth")]
     #[test]
-    fn e5g_oauth_allowed_algorithms_env_rejects_non_narrowing_value() {
+    /// Pins that the allowed-algorithms env rejects a non-narrowing value.
+    fn e5g_oauth_allowed_algorithms_env_rejects_non_narrowing_value() -> anyhow::Result<()> {
         // SECURITY: the env path must enforce the same narrow-only rule as
         // TOML, and the error must name the variable that caused it.
         with_env_vars(
             &[(SERVER_OAUTH_ALLOWED_ALGORITHMS_ENV, Some("HS256"))],
-            || {
-                let mut auth = crate::auth::AuthConfig::with_keys(vec![]);
-                auth.oauth = Some(crate::oauth::OAuthConfig::default());
+            || -> anyhow::Result<()> {
+                let mut auth = AuthConfig::with_keys(vec![]);
+                auth.oauth = Some(OAuthConfig::default());
                 let mut cfg = ServerConfig {
                     auth: Some(auth),
                     ..ServerConfig::default()
                 };
 
-                let msg = cfg.apply_env_overrides().unwrap_err().to_string();
+                let Err(err) = cfg.apply_env_overrides() else {
+                    anyhow::bail!("non-narrowing algorithms env must be rejected");
+                };
+                let msg = err.to_string();
                 assert!(msg.contains(SERVER_OAUTH_ALLOWED_ALGORITHMS_ENV));
                 assert!(msg.contains("unsupported algorithm"));
+                Ok(())
             },
-        );
+        )?;
+        Ok(())
     }
 
     #[test]
-    fn e9_bad_observability_bool_env_fails_closed() {
+    /// Pins that a bad observability bool env var fails closed.
+    fn e9_bad_observability_bool_env_fails_closed() -> anyhow::Result<()> {
         with_env_vars(
             &[(OBSERVABILITY_METRICS_ENABLED_ENV, Some("maybe"))],
-            || {
+            || -> anyhow::Result<()> {
                 let mut cfg = ObservabilityConfig::default();
-                let err = cfg.apply_env_overrides().unwrap_err();
+                let Err(err) = cfg.apply_env_overrides() else {
+                    anyhow::bail!("bad observability bool env must fail closed");
+                };
                 let msg = err.to_string();
                 assert!(msg.contains(OBSERVABILITY_METRICS_ENABLED_ENV));
                 assert!(msg.contains("bool"));
+                Ok(())
             },
-        );
+        )?;
+        Ok(())
     }
 
     #[test]
-    fn observability_diagnostic_env_overrides_win_over_toml() {
+    /// Pins that observability diagnostic env overrides win over TOML.
+    fn observability_diagnostic_env_overrides_win_over_toml() -> anyhow::Result<()> {
         with_env_vars(
             &[
                 (OBSERVABILITY_LOG_PLAINTEXT_OAUTH_TOKENS_ENV, Some("false")),
                 (OBSERVABILITY_LOG_OAUTH_CLAIM_VALUES_ENV, Some("false")),
                 (OBSERVABILITY_LOG_TOOL_CALL_ARGUMENTS_ENV, Some("false")),
             ],
-            || {
+            || -> anyhow::Result<()> {
                 let mut cfg: ObservabilityConfig = toml::from_str(
-                    r"
+                    "
                         log_plaintext_oauth_tokens = true
                         log_oauth_claim_values = true
                         log_tool_call_arguments = true
                     ",
                 )
-                .unwrap();
+                .context("diagnostic-knob TOML must parse")?;
 
-                let report = cfg.apply_env_overrides().unwrap();
+                let report = cfg
+                    .apply_env_overrides()
+                    .context("diagnostic env overrides must apply")?;
 
                 assert!(!cfg.log_plaintext_oauth_tokens);
                 assert!(!cfg.log_oauth_claim_values);
@@ -4369,103 +4888,158 @@ client_ip = false
                         && entry.target_field == "observability.log_tool_call_arguments"
                         && entry.value.as_deref() == Some("false")
                 }));
+                Ok(())
             },
-        );
+        )?;
+        Ok(())
     }
 
     #[test]
-    fn bad_observability_diagnostic_bool_env_fails_closed() {
+    /// Pins that a bad diagnostic bool env var fails closed.
+    fn bad_observability_diagnostic_bool_env_fails_closed() -> anyhow::Result<()> {
         for env_var in [
             OBSERVABILITY_LOG_PLAINTEXT_OAUTH_TOKENS_ENV,
             OBSERVABILITY_LOG_OAUTH_CLAIM_VALUES_ENV,
             OBSERVABILITY_LOG_TOOL_CALL_ARGUMENTS_ENV,
         ] {
-            with_env_vars(&[(env_var, Some("notabool"))], || {
+            with_env_vars(&[(env_var, Some("notabool"))], || -> anyhow::Result<()> {
                 let mut cfg = ObservabilityConfig::default();
-                let err = cfg.apply_env_overrides().unwrap_err();
+                let Err(err) = cfg.apply_env_overrides() else {
+                    anyhow::bail!("bad diagnostic bool env must fail closed");
+                };
                 let msg = err.to_string();
                 assert!(msg.contains(env_var));
                 assert!(msg.contains("bool"));
-            });
+                Ok(())
+            })?;
         }
+        Ok(())
     }
 
     #[test]
-    fn e10_env_port_reaches_mcp_bridge() {
-        with_env_vars(&[(SERVER_LISTEN_PORT_ENV, Some("9100"))], || {
-            let mut server: ServerConfig = toml::from_str(r#"listen_addr = "127.0.0.2""#).unwrap();
-            server.apply_env_overrides().unwrap();
-            let mcp = server
-                .apply_to_mcp_config(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0"))
-                .unwrap();
-            assert_eq!(mcp.bind_addr, "127.0.0.2:9100");
-            assert!(mcp.validate().is_ok());
-        });
+    #[expect(
+        deprecated,
+        reason = "deliberate: src/transport.rs::McpServerConfig deprecated field access is the bridge behavior this test pins"
+    )]
+    /// Pins that an env port override reaches the MCP bridge.
+    fn e10_env_port_reaches_mcp_bridge() -> anyhow::Result<()> {
+        with_env_vars(
+            &[(SERVER_LISTEN_PORT_ENV, Some("9100"))],
+            || -> anyhow::Result<()> {
+                let mut server: ServerConfig = toml::from_str(r#"listen_addr = "127.0.0.2""#)
+                    .context("listen_addr TOML must parse")?;
+                drop(
+                    server
+                        .apply_env_overrides()
+                        .context("port env override must apply")?,
+                );
+                let mcp = server
+                    .apply_to_mcp_config(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0"))
+                    .context("enriched server config must bridge")?;
+                assert_eq!(mcp.bind_addr, "127.0.0.2:9100");
+                assert!(mcp.validate().is_ok(), "bridged config must validate");
+                Ok(())
+            },
+        )?;
+        Ok(())
     }
 
     #[test]
-    fn key_eviction_policy_env_override_applies_and_reports() {
+    /// Pins that the key-eviction-policy env override applies and is reported.
+    fn key_eviction_policy_env_override_applies_and_reports() -> anyhow::Result<()> {
         with_env_vars(
             &[(SERVER_KEY_EVICTION_POLICY_ENV, Some("reject_new"))],
-            || {
+            || -> anyhow::Result<()> {
                 let mut cfg: ServerConfig = toml::from_str(r#"key_eviction_policy = "evict_lru""#)
-                    .expect("TOML policy parses");
-                let report = cfg.apply_env_overrides().unwrap();
+                    .context("TOML policy parses")?;
+                let report = cfg
+                    .apply_env_overrides()
+                    .context("key eviction env override must apply")?;
                 assert_eq!(cfg.key_eviction_policy, KeyEvictionPolicy::RejectNew);
                 assert_eq!(report.len(), 1);
-                assert_eq!(report[0].env_var, SERVER_KEY_EVICTION_POLICY_ENV);
-                assert_eq!(report[0].target_field, "server.key_eviction_policy");
-                assert_eq!(report[0].value.as_deref(), Some("reject_new"));
+                let entry = report.first().context("one override must be reported")?;
+                assert_eq!(entry.env_var, SERVER_KEY_EVICTION_POLICY_ENV);
+                assert_eq!(entry.target_field, "server.key_eviction_policy");
+                assert_eq!(entry.value.as_deref(), Some("reject_new"));
+                Ok(())
             },
-        );
+        )?;
+        Ok(())
     }
 
     #[test]
-    fn bad_key_eviction_policy_env_fails_closed() {
+    /// Pins that a bad key-eviction-policy env value fails closed.
+    fn bad_key_eviction_policy_env_fails_closed() -> anyhow::Result<()> {
         with_env_vars(
             &[(SERVER_KEY_EVICTION_POLICY_ENV, Some("drop_random"))],
-            || {
+            || -> anyhow::Result<()> {
                 let mut cfg = ServerConfig::default();
-                let err = cfg.apply_env_overrides().unwrap_err();
+                let Err(err) = cfg.apply_env_overrides() else {
+                    anyhow::bail!("bad key eviction policy env must fail closed");
+                };
                 let msg = err.to_string();
                 assert!(msg.contains(SERVER_KEY_EVICTION_POLICY_ENV));
                 assert!(msg.contains("KeyEvictionPolicy"));
+                Ok(())
             },
-        );
+        )?;
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn non_unicode_env_value_fails_closed() {
-        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+    /// Pins that a non-UTF-8 env value fails closed.
+    fn non_unicode_env_value_fails_closed() -> anyhow::Result<()> {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
 
         let bad = OsString::from_vec(vec![0x66, 0x80, 0x6f]);
-        temp_env::with_var(SERVER_LISTEN_ADDR_ENV, Some(bad), || {
-            let mut cfg = ServerConfig::default();
-            let err = cfg.apply_env_overrides().unwrap_err();
-            let msg = err.to_string();
-            assert!(msg.contains(SERVER_LISTEN_ADDR_ENV));
-            assert!(msg.contains("UTF-8"));
-        });
+        temp_env::with_var(
+            SERVER_LISTEN_ADDR_ENV,
+            Some(bad),
+            || -> anyhow::Result<()> {
+                let mut cfg = ServerConfig::default();
+                let Err(err) = cfg.apply_env_overrides() else {
+                    anyhow::bail!("non-UTF-8 env value must fail closed");
+                };
+                let msg = err.to_string();
+                assert!(msg.contains(SERVER_LISTEN_ADDR_ENV));
+                assert!(msg.contains("UTF-8"));
+                Ok(())
+            },
+        )?;
+        Ok(())
     }
 
     #[cfg(not(feature = "oauth"))]
     #[test]
-    fn e11_oauth_env_feature_off_fails_closed() {
-        with_env_vars(&[(SERVER_OAUTH_ISSUER_ENV, Some("https://idp/"))], || {
-            let mut cfg = ServerConfig {
-                auth: Some(crate::auth::AuthConfig::with_keys(vec![])),
-                ..ServerConfig::default()
-            };
-            let err = cfg.apply_env_overrides().unwrap_err();
-            let msg = err.to_string();
-            assert!(msg.contains(SERVER_OAUTH_ISSUER_ENV));
-            assert!(msg.contains("oauth` feature"));
-        });
+    /// Pins that an oauth env var fails closed when the feature is off.
+    fn e11_oauth_env_feature_off_fails_closed() -> anyhow::Result<()> {
+        with_env_vars(
+            &[(SERVER_OAUTH_ISSUER_ENV, Some("https://idp/"))],
+            || -> anyhow::Result<()> {
+                let mut cfg = ServerConfig {
+                    auth: Some(AuthConfig::with_keys(vec![])),
+                    ..ServerConfig::default()
+                };
+                let Err(err) = cfg.apply_env_overrides() else {
+                    anyhow::bail!("oauth env with feature off must fail closed");
+                };
+                let msg = err.to_string();
+                assert!(msg.contains(SERVER_OAUTH_ISSUER_ENV));
+                assert!(msg.contains("oauth` feature"));
+                Ok(())
+            },
+        )?;
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/config.rs::env_override_spec_matches_expected_set keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn env_override_spec_matches_expected_set() {
+    /// Pins that the code-side env spec matches the expected set.
+    fn env_override_spec_matches_expected_set() -> anyhow::Result<()> {
         let vars = ENV_OVERRIDE_SPECS
             .iter()
             .map(|spec| {
@@ -4488,6 +5062,7 @@ client_ip = false
                 .count(),
             4
         );
+        Ok(())
     }
 
     #[derive(Debug)]
@@ -4635,8 +5210,9 @@ client_ip = false
     // from source text. Source parsing is deliberate: it catches a newly added
     // env variable constant even if no Rust code references the spec table yet.
     #[test]
-    fn guide_env_override_table_matches_code_spec() {
-        let rows = parse_guide_env_override_table();
+    /// Pins that the GUIDE env-override table matches the code-side spec.
+    fn guide_env_override_table_matches_code_spec() -> anyhow::Result<()> {
+        let rows = parse_guide_env_override_table()?;
         assert_eq!(
             rows.len(),
             ENV_OVERRIDE_SPECS.len(),
@@ -4666,9 +5242,8 @@ client_ip = false
             if let Some(feature) = spec.required_feature {
                 assert!(
                     notes_lower.contains(feature),
-                    "{} notes must mention required feature {:?}; notes were {:?}",
+                    "{} notes must mention required feature {feature:?}; notes were {:?}",
                     spec.env_var,
-                    feature,
                     row.notes
                 );
             } else {
@@ -4707,6 +5282,7 @@ client_ip = false
                 "env const {env_var} is defined in src/config.rs but missing from ENV_OVERRIDE_SPECS"
             );
         }
+        Ok(())
     }
 
     // Sibling guard for the canonical TOML example's inline `# env:` comments.
@@ -4715,8 +5291,9 @@ client_ip = false
     // surrounding headings: scanning the whole guide would let unrelated future
     // snippets accidentally satisfy this count/order contract.
     #[test]
-    fn guide_toml_example_env_annotations_match_code_spec() {
-        let annotations = parse_guide_toml_env_annotations();
+    /// Pins that GUIDE TOML inline env annotations match the code-side spec.
+    fn guide_toml_example_env_annotations_match_code_spec() -> anyhow::Result<()> {
+        let annotations = parse_guide_toml_env_annotations()?;
         assert!(
             !annotations.is_empty(),
             "canonical TOML example contains no `# env:` annotations"
@@ -4725,12 +5302,12 @@ client_ip = false
         let spec_by_var = ENV_OVERRIDE_SPECS
             .iter()
             .map(|spec| (spec.env_var, spec))
-            .collect::<std::collections::HashMap<_, _>>();
+            .collect::<HashMap<_, _>>();
         let mut seen = HashSet::new();
 
         for annotation in &annotations {
             let Some(spec) = spec_by_var.get(annotation.env_var.as_str()) else {
-                panic!(
+                anyhow::bail!(
                     "GUIDE inline env annotation {:?} is not present in ENV_OVERRIDE_SPECS",
                     annotation.env_var
                 );
@@ -4744,11 +5321,11 @@ client_ip = false
                 .target_field
                 .rsplit('.')
                 .next()
-                .expect("target_field has at least one segment");
+                .context("target_field has at least one segment")?;
             assert_eq!(
                 annotation.key, expected_key,
-                "{} inline annotation is attached to TOML key {:?}, but code spec target {:?} ends in {:?}",
-                annotation.env_var, annotation.key, spec.target_field, expected_key
+                "{} inline annotation is attached to TOML key {:?}, but code spec target {:?} ends in {expected_key:?}",
+                annotation.env_var, annotation.key, spec.target_field
             );
         }
 
@@ -4756,10 +5333,9 @@ client_ip = false
         assert_eq!(
             annotations.len(),
             expected_count,
-            "GUIDE inline env annotation count {} must equal ENV_OVERRIDE_SPECS count {} minus exemptions {:?}",
+            "GUIDE inline env annotation count {} must equal ENV_OVERRIDE_SPECS count {} minus exemptions {INLINE_ENV_ANNOTATION_EXEMPTIONS:?}",
             annotations.len(),
-            ENV_OVERRIDE_SPECS.len(),
-            INLINE_ENV_ANNOTATION_EXEMPTIONS
+            ENV_OVERRIDE_SPECS.len()
         );
 
         for spec in ENV_OVERRIDE_SPECS {
@@ -4777,38 +5353,39 @@ client_ip = false
                 );
             }
         }
+        Ok(())
     }
 
     fn guide_markdown() -> &'static str {
         include_str!("../docs/GUIDE.md")
     }
 
-    fn parse_guide_env_override_table() -> Vec<GuideEnvRow> {
+    fn parse_guide_env_override_table() -> anyhow::Result<Vec<GuideEnvRow>> {
         let guide = guide_markdown();
         let (_, after_begin) = guide
             .split_once("<!-- BEGIN ENV_OVERRIDE_TABLE -->")
-            .expect("docs/GUIDE.md is missing <!-- BEGIN ENV_OVERRIDE_TABLE --> marker");
+            .context("docs/GUIDE.md is missing <!-- BEGIN ENV_OVERRIDE_TABLE --> marker")?;
         let (table, _) = after_begin
             .split_once("<!-- END ENV_OVERRIDE_TABLE -->")
-            .expect("docs/GUIDE.md is missing <!-- END ENV_OVERRIDE_TABLE --> marker");
+            .context("docs/GUIDE.md is missing <!-- END ENV_OVERRIDE_TABLE --> marker")?;
         let rows = table
             .lines()
-            .filter_map(parse_guide_env_override_row)
-            .collect::<Vec<_>>();
+            .filter_map(|line| parse_guide_env_override_row(line).transpose())
+            .collect::<anyhow::Result<Vec<_>>>()?;
         assert!(
             !rows.is_empty(),
             "docs/GUIDE.md ENV_OVERRIDE_TABLE markers were found but no data rows parsed"
         );
-        rows
+        Ok(rows)
     }
 
-    fn parse_guide_env_override_row(line: &str) -> Option<GuideEnvRow> {
+    fn parse_guide_env_override_row(line: &str) -> anyhow::Result<Option<GuideEnvRow>> {
         let trimmed = line.trim();
         if !trimmed.starts_with('|')
             || trimmed.contains("|---")
             || trimmed.contains("Environment variable")
         {
-            return None;
+            return Ok(None);
         }
         let cells = trimmed
             .trim_matches('|')
@@ -4818,67 +5395,78 @@ client_ip = false
         assert_eq!(
             cells.len(),
             4,
-            "env override GUIDE table row must have four cells, got {} in line {:?}",
-            cells.len(),
-            line
+            "env override GUIDE table row must have four cells, got {} in line {line:?}",
+            cells.len()
         );
-        Some(GuideEnvRow {
-            env_var: unwrap_markdown_code(cells[0], "Environment variable", line),
-            target_field: unwrap_markdown_code(cells[1], "Target TOML path", line),
-            value_type: cells[2].trim().to_owned(),
-            notes: cells[3].trim().to_owned(),
-        })
+        Ok(Some(GuideEnvRow {
+            env_var: unwrap_markdown_code(
+                cells.first().context("Environment variable cell")?,
+                "Environment variable",
+                line,
+            )?,
+            target_field: unwrap_markdown_code(
+                cells.get(1).context("Target TOML path cell")?,
+                "Target TOML path",
+                line,
+            )?,
+            value_type: cells.get(2).context("value type cell")?.trim().to_owned(),
+            notes: cells.get(3).context("notes cell")?.trim().to_owned(),
+        }))
     }
 
-    fn unwrap_markdown_code(cell: &str, column: &str, row: &str) -> String {
+    fn unwrap_markdown_code(cell: &str, column: &str, row: &str) -> anyhow::Result<String> {
         let inner = cell
             .strip_prefix('`')
             .and_then(|value| value.strip_suffix('`'))
-            .unwrap_or_else(|| panic!("{column} cell must be backtick-wrapped in row {row:?}"));
-        inner.trim().to_owned()
+            .with_context(|| format!("{column} cell must be backtick-wrapped in row {row:?}"))?;
+        Ok(inner.trim().to_owned())
     }
 
-    fn parse_guide_toml_env_annotations() -> Vec<GuideEnvAnnotation> {
+    fn parse_guide_toml_env_annotations() -> anyhow::Result<Vec<GuideEnvAnnotation>> {
         let guide = guide_markdown();
         let (_, after_heading) = guide
             .split_once("### Complete TOML configuration reference")
-            .expect("docs/GUIDE.md is missing canonical TOML configuration heading");
+            .context("docs/GUIDE.md is missing canonical TOML configuration heading")?;
         let (section, _) = after_heading
             .split_once("### Bridging TOML config to `McpServerConfig`")
-            .expect("docs/GUIDE.md is missing bridge heading after canonical TOML example");
+            .context("docs/GUIDE.md is missing bridge heading after canonical TOML example")?;
         let (_, after_fence_start) = section
             .split_once("```toml")
-            .expect("canonical TOML section is missing opening ```toml fence");
+            .context("canonical TOML section is missing opening ```toml fence")?;
         let (toml_block, _) = after_fence_start
             .split_once("```")
-            .expect("canonical TOML section is missing closing code fence");
+            .context("canonical TOML section is missing closing code fence")?;
 
         toml_block
             .lines()
-            .filter_map(parse_guide_toml_env_annotation_line)
-            .collect()
+            .filter_map(|line| parse_guide_toml_env_annotation_line(line).transpose())
+            .collect::<anyhow::Result<Vec<_>>>()
     }
 
-    fn parse_guide_toml_env_annotation_line(line: &str) -> Option<GuideEnvAnnotation> {
-        let (before_marker, after_marker) = line.split_once("# env: ")?;
+    fn parse_guide_toml_env_annotation_line(
+        line: &str,
+    ) -> anyhow::Result<Option<GuideEnvAnnotation>> {
+        let Some((before_marker, after_marker)) = line.split_once("# env: ") else {
+            return Ok(None);
+        };
         let env_var = after_marker
             .split_whitespace()
             .next()
-            .unwrap_or_else(|| panic!("missing env var after `# env:` in line {line:?}"));
+            .with_context(|| format!("missing env var after `# env:` in line {line:?}"))?;
         let key_source = before_marker
             .trim_end()
             .strip_prefix('#')
             .map_or_else(|| before_marker.trim_end(), str::trim);
         let key = key_source
             .split_once('=')
-            .unwrap_or_else(|| panic!("missing TOML key before `# env:` in line {line:?}"))
+            .with_context(|| format!("missing TOML key before `# env:` in line {line:?}"))?
             .0
             .trim();
 
-        Some(GuideEnvAnnotation {
+        Ok(Some(GuideEnvAnnotation {
             env_var: env_var.to_owned(),
             key: key.to_owned(),
-        })
+        }))
     }
 
     fn parse_rmcp_env_constants_from_config_source() -> Vec<String> {
