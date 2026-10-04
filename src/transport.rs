@@ -1,182 +1,31 @@
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::multiple_inherent_impl,
-        reason = "lint-migration: src/transport.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::unused_trait_names,
-        reason = "lint-migration: src/transport.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::unused_result_ok, reason = "lint-migration: src/transport.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::renamed_function_params,
-        reason = "lint-migration: src/transport.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::let_underscore_untyped,
-        reason = "lint-migration: src/transport.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::let_underscore_must_use,
-        reason = "lint-migration: src/transport.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::integer_division_remainder_used,
-        reason = "lint-migration: src/transport.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::arithmetic_side_effects,
-        reason = "lint-migration: src/transport.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::shadow_reuse, reason = "lint-migration: src/transport.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::ref_patterns, reason = "lint-migration: src/transport.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::option_if_let_else,
-        reason = "lint-migration: src/transport.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_errors_doc,
-        reason = "lint-migration: src/transport.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::impl_trait_in_params,
-        reason = "lint-migration: src/transport.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_const_for_fn,
-        reason = "lint-migration: src/transport.rs"
-    )
-)]
-#![cfg_attr(
-    all(not(test), target_os = "linux"),
-    expect(
-        clippy::missing_docs_in_private_items,
-        reason = "lint-migration: src/transport.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_inline_in_public_items,
-        reason = "lint-migration: src/transport.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::absolute_paths, reason = "lint-migration: src/transport.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::too_long_first_doc_paragraph,
-        reason = "lint-migration: src/transport.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::min_ident_chars, reason = "lint-migration: src/transport.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::std_instead_of_alloc,
-        reason = "lint-migration: src/transport.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::std_instead_of_core,
-        reason = "lint-migration: src/transport.rs"
-    )
-)]
-#![cfg_attr(
-    any(
-        all(test, target_os = "linux"),
-        all(feature = "metrics", target_os = "linux")
-    ),
-    expect(
-        clippy::single_char_lifetime_names,
-        reason = "lint-migration: src/transport.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "metrics", target_os = "linux"),
-    expect(
-        clippy::field_scoped_visibility_modifiers,
-        reason = "lint-migration: src/transport.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "metrics", target_os = "linux"),
-    expect(
-        clippy::partial_pub_fields,
-        reason = "lint-migration: src/transport.rs"
-    )
-)]
-#![expect(let_underscore_drop, reason = "lint-migration: src/transport.rs")]
-#![expect(unused_results, reason = "lint-migration: src/transport.rs")]
-#![expect(
-    closure_returning_async_block,
-    reason = "lint-migration: src/transport.rs"
-)]
-#![expect(redundant_imports, reason = "lint-migration: src/transport.rs")]
-use std::{
-    future::Future,
+extern crate alloc;
+
+use alloc::sync::Arc;
+use core::{
+    fmt::{Debug, Display, Formatter, Result as FmtResult},
     net::{IpAddr, SocketAddr},
     num::NonZeroUsize,
-    path::{Path, PathBuf},
     pin::Pin,
-    sync::Arc,
+    sync::atomic::{AtomicBool, Ordering},
+    task,
     time::Duration,
+};
+use std::{
+    collections::HashSet,
+    io,
+    io::{IoSlice, Result as IoResult},
+    path::{Path, PathBuf},
+    time::Instant,
 };
 
 use arc_swap::ArcSwap;
 use axum::{
     body::Body,
-    extract::{ConnectInfo, Request},
+    extract::{ConnectInfo, FromRequestParts, Request, connect_info::Connected},
+    http::{Extensions, HeaderMap, HeaderName, Method, StatusCode, request::Parts},
     middleware::Next,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
+    serve::{IncomingStream, Listener},
 };
 use rmcp::{
     ServerHandler,
@@ -185,18 +34,35 @@ use rmcp::{
         session::{EventStore, SessionStore, local::LocalSessionManager},
     },
 };
-use rustls::RootCertStore;
+use rustls::{
+    RootCertStore,
+    pki_types::{CertificateDer, PrivateKeyDer},
+    server::danger::ClientCertVerifier,
+};
 use secrecy::{ExposeSecret as _, SecretString};
 use tokio::{
-    net::TcpListener,
-    sync::{Semaphore, mpsc},
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::{TcpListener, TcpStream},
+    sync::{Semaphore, mpsc, oneshot::Sender},
+    task::JoinHandle,
 };
+use tokio_rustls::server::TlsStream;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(feature = "metrics")]
+use crate::metrics::McpMetrics;
+#[cfg(feature = "oauth")]
+use crate::oauth::JwksCache;
+#[cfg(feature = "oauth")]
+use crate::oauth::OAuthConfig;
+#[cfg(feature = "oauth")]
+use crate::oauth::{OAuthProxyConfig, OauthHttpClient};
 use crate::{
+    admin::AdminState,
     auth::{
-        AuthConfig, AuthIdentity, AuthState, MtlsConfig, TlsConnInfo, auth_middleware,
-        build_rate_limiter, extract_mtls_identity,
+        ApiKeyEntry, AuthConfig, AuthCounters, AuthIdentity, AuthLogContext, AuthState, MtlsConfig,
+        SeenIdentitySet, TlsConnInfo, auth_middleware, build_pre_auth_limiter, build_rate_limiter,
+        extract_mtls_identity,
     },
     bounded_limiter::{BoundedKeyedLimiter, BoundedLimiterDeny, KeyEvictionPolicy},
     error::RmcpServerKitError,
@@ -204,7 +70,7 @@ use crate::{
     rbac::{RbacPolicy, ToolRateLimiter, build_tool_rate_limiter_with_policy, rbac_middleware},
     rbac_context::RbacContextHandler,
     session_binding::{
-        configured_session_binding_secret, process_session_binding_secret,
+        SessionBindingSecret, configured_session_binding_secret, process_session_binding_secret,
         session_binding_middleware,
     },
 };
@@ -216,12 +82,14 @@ use crate::{
     clippy::needless_pass_by_value,
     reason = "consumed at .map_err(anyhow_to_startup) call sites; by-value matches the closure shape"
 )]
-fn anyhow_to_startup(e: anyhow::Error) -> RmcpServerKitError {
-    RmcpServerKitError::Startup(format!("{e:#}"))
+fn anyhow_to_startup(error: anyhow::Error) -> RmcpServerKitError {
+    RmcpServerKitError::Startup(format!("{error:#}"))
 }
 
 /// Map a `std::io::Error` produced during server startup into a public
-/// [`RmcpServerKitError::Startup`]. We deliberately do not use the [`RmcpServerKitError::Io`]
+/// [`RmcpServerKitError::Startup`].
+///
+/// We deliberately do not use the [`RmcpServerKitError::Io`]
 /// `From` impl here because startup-phase IO errors (bind, listener) are
 /// semantically distinct from request-time IO errors and should surface
 /// the originating operation in the message.
@@ -229,8 +97,8 @@ fn anyhow_to_startup(e: anyhow::Error) -> RmcpServerKitError {
     clippy::needless_pass_by_value,
     reason = "consumed at .map_err(|e| io_to_startup(...)) call sites; by-value matches the closure shape"
 )]
-fn io_to_startup(op: &str, e: std::io::Error) -> RmcpServerKitError {
-    RmcpServerKitError::Startup(format!("{op}: {e}"))
+fn io_to_startup(op: &str, error: io::Error) -> RmcpServerKitError {
+    RmcpServerKitError::Startup(format!("{op}: {error}"))
 }
 
 /// Async readiness check callback for the `/readyz` endpoint.
@@ -308,19 +176,21 @@ impl PeerAddr {
 /// A missing `PeerAddr` means the handler is not running under [`serve`]
 /// (e.g. the router was mounted on a hand-rolled listener) - a wiring
 /// bug, not a client error.
-impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerAddr {
-    type Rejection = (axum::http::StatusCode, &'static str);
+impl<S: Send + Sync> FromRequestParts<S> for PeerAddr {
+    type Rejection = (StatusCode, &'static str);
 
+    /// Extract [`PeerAddr`] from request extensions.
+    ///
+    /// No await is performed; nothing can be observed half-updated.
     #[expect(
         clippy::unused_async_trait_impl,
         reason = "async is mandated by the axum FromRequestParts trait signature; this impl only reads a request extension synchronously"
     )]
-    async fn from_request_parts(
-        parts: &mut axum::http::request::Parts,
-        _state: &S,
-    ) -> Result<Self, Self::Rejection> {
+    #[inline]
+    // cancel-safe: reads a request extension synchronously and never awaits.
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         parts.extensions.get::<Self>().copied().ok_or((
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::INTERNAL_SERVER_ERROR,
             "peer address unavailable: not running under rmcp-server-kit serve()",
         ))
     }
@@ -384,10 +254,14 @@ pub enum ForwardedHeaderMode {
 /// Pre-parsed trusted-forwarder configuration captured by the
 /// peer-normalization middleware.
 struct ForwardResolver {
+    /// Trusted-proxy CIDR ranges whose forwarding headers are honoured.
     trusted: Vec<ipnet::IpNet>,
+    /// Which forwarding header trusted-forwarder mode reads.
     mode: ForwardedHeaderMode,
+    /// Upper bound on the number of header entries scanned per request.
     max_scanned_entries: usize,
-    request_id_header: Option<axum::http::HeaderName>,
+    /// Optional request-id header name propagated into logs.
+    request_id_header: Option<HeaderName>,
 }
 
 /// Per-header overrides for the OWASP security headers emitted by the
@@ -506,6 +380,7 @@ pub struct LogContextConfig {
 }
 
 impl Default for LogContextConfig {
+    #[inline]
     fn default() -> Self {
         Self {
             client_ip: false,
@@ -530,6 +405,7 @@ impl LogContextConfig {
     /// `credential_fingerprint`, `credential_owner` and `request_completion`
     /// off, so the result validates without any other configuration.
     #[must_use]
+    #[inline]
     pub fn recommended() -> Self {
         Self {
             client_ip: true,
@@ -554,6 +430,14 @@ impl LogContextConfig {
 #[expect(
     clippy::struct_excessive_bools,
     reason = "server configuration naturally has many boolean feature flags"
+)]
+#[cfg_attr(
+    feature = "metrics",
+    expect(
+        clippy::field_scoped_visibility_modifiers,
+        clippy::partial_pub_fields,
+        reason = "public API frozen until the next major release"
+    )
 )]
 #[non_exhaustive]
 pub struct McpServerConfig {
@@ -915,7 +799,7 @@ pub struct McpServerConfig {
     /// Set via [`Self::with_metrics_handle`]; supplying a handle requires
     /// [`Self::with_metrics`] as well.
     #[cfg(feature = "metrics")]
-    pub(crate) metrics_handle: Option<Arc<crate::metrics::McpMetrics>>,
+    pub(crate) metrics_handle: Option<Arc<McpMetrics>>,
     /// Per-header overrides for the OWASP security headers emitted by
     /// the global response middleware. See [`SecurityHeadersConfig`]
     /// for the three-state semantic and validation rules.
@@ -1006,15 +890,21 @@ pub struct McpServerConfig {
 /// ```
 pub struct Validated<T>(T);
 
-impl<T> std::fmt::Debug for Validated<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<T> Debug for Validated<T> {
+    #[inline]
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("Validated").finish_non_exhaustive()
     }
 }
 
+#[expect(
+    clippy::missing_const_for_fn,
+    reason = "public API frozen until the next major release"
+)]
 impl<T> Validated<T> {
     /// Borrow the inner value.
     #[must_use]
+    #[inline]
     pub fn as_inner(&self) -> &T {
         &self.0
     }
@@ -1024,6 +914,7 @@ impl<T> Validated<T> {
     /// Re-validate before re-using the value with [`serve`] or
     /// [`serve_with_listener`].
     #[must_use]
+    #[inline]
     pub fn into_inner(self) -> T {
         self.0
     }
@@ -1036,6 +927,10 @@ pub(crate) fn default_request_log_exclude_paths() -> Vec<String> {
 }
 
 #[expect(
+    clippy::missing_const_for_fn,
+    reason = "public API frozen until the next major release"
+)]
+#[expect(
     deprecated,
     reason = "internal builders/validators legitimately read/write the deprecated `pub` fields they were designed to manage"
 )]
@@ -1047,12 +942,19 @@ impl McpServerConfig {
     /// customize. Call [`McpServerConfig::validate`] to obtain a
     /// [`Validated<McpServerConfig>`] proof token, which is required by
     /// [`serve`] and [`serve_with_listener`].
+    #[expect(
+        clippy::impl_trait_in_params,
+        reason = "public API frozen until the next major release"
+    )]
     #[must_use]
+    #[inline]
     pub fn new(
         bind_addr: impl Into<String>,
         name: impl Into<String>,
         version: impl Into<String>,
     ) -> Self {
+        use crate::forwarded::MAX_SCANNED_ENTRIES;
+
         Self {
             bind_addr: bind_addr.into(),
             name: name.into(),
@@ -1101,7 +1003,7 @@ impl McpServerConfig {
             extra_route_rate_limit_burst: None,
             extra_route_rate_limit_exempt_paths: Vec::new(),
             key_eviction_policy: KeyEvictionPolicy::default(),
-            trusted_forwarder_max_entries: crate::forwarded::MAX_SCANNED_ENTRIES,
+            trusted_forwarder_max_entries: MAX_SCANNED_ENTRIES,
             trusted_proxies: Vec::new(),
             forwarded_header: None,
         }
@@ -1117,6 +1019,7 @@ impl McpServerConfig {
     /// Attach an authentication configuration. Required for
     /// [`enable_admin`](Self::enable_admin) and any non-public deployment.
     #[must_use]
+    #[inline]
     pub fn with_auth(mut self, auth: AuthConfig) -> Self {
         self.auth = Some(auth);
         self
@@ -1127,6 +1030,7 @@ impl McpServerConfig {
     /// semantic (`None` = default, `Some("")` = omit, `Some(v)` =
     /// override). Values are validated by [`Self::validate`].
     #[must_use]
+    #[inline]
     pub fn with_security_headers(mut self, headers: SecurityHeadersConfig) -> Self {
         self.security_headers = headers;
         self
@@ -1135,7 +1039,12 @@ impl McpServerConfig {
     /// Override the bind address (e.g. `127.0.0.1:8080`). Useful when the
     /// final port is only known after pre-binding an ephemeral listener
     /// (tests, dynamic-port deployments).
+    #[expect(
+        clippy::impl_trait_in_params,
+        reason = "public API frozen until the next major release"
+    )]
     #[must_use]
+    #[inline]
     pub fn with_bind_addr(mut self, addr: impl Into<String>) -> Self {
         self.bind_addr = addr.into();
         self
@@ -1144,6 +1053,7 @@ impl McpServerConfig {
     /// Attach an RBAC policy. Tool calls are checked against the policy
     /// after authentication.
     #[must_use]
+    #[inline]
     pub fn with_rbac(mut self, rbac: Arc<RbacPolicy>) -> Self {
         self.rbac = Some(rbac);
         self
@@ -1155,6 +1065,7 @@ impl McpServerConfig {
     /// an authenticated non-empty role. When active, denied tools are hidden
     /// from the list and the response cache scope is forced to private.
     #[must_use]
+    #[inline]
     pub const fn with_tool_list_filtering(mut self, enabled: bool) -> Self {
         self.tool_list_filtering = enabled;
         self
@@ -1163,7 +1074,12 @@ impl McpServerConfig {
     /// Configure TLS by providing the certificate and private key paths
     /// (PEM). Both must be readable at startup. Without this call, the
     /// server runs plain HTTP.
+    #[expect(
+        clippy::impl_trait_in_params,
+        reason = "public API frozen until the next major release"
+    )]
     #[must_use]
+    #[inline]
     pub fn with_tls(mut self, cert_path: impl Into<PathBuf>, key_path: impl Into<PathBuf>) -> Self {
         self.tls_cert_path = Some(cert_path.into());
         self.tls_key_path = Some(key_path.into());
@@ -1173,7 +1089,12 @@ impl McpServerConfig {
     /// Set the externally reachable base URL (e.g. `https://mcp.example.com`).
     /// Required when binding `0.0.0.0` behind a reverse proxy or inside
     /// a container so OAuth metadata and auto-derived origins resolve correctly.
+    #[expect(
+        clippy::impl_trait_in_params,
+        reason = "public API frozen until the next major release"
+    )]
     #[must_use]
+    #[inline]
     pub fn with_public_url(mut self, url: impl Into<String>) -> Self {
         self.public_url = Some(url.into());
         self
@@ -1183,6 +1104,7 @@ impl McpServerConfig {
     /// When empty and [`with_public_url`](Self::with_public_url) is set,
     /// the origin is auto-derived.
     #[must_use]
+    #[inline]
     pub fn with_allowed_origins<I, S>(mut self, origins: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -1225,6 +1147,7 @@ impl McpServerConfig {
     /// The Prometheus `/metrics` endpoint is unaffected: it is served on its
     /// own listener, not merged here.
     #[must_use]
+    #[inline]
     pub fn with_extra_router(mut self, router: axum::Router) -> Self {
         self.extra_router = Some(router);
         self
@@ -1236,6 +1159,7 @@ impl McpServerConfig {
     /// pin every client to the proxy address, and an unbounded value would
     /// re-open the header-bomb vector the cap exists to close.
     #[must_use]
+    #[inline]
     pub const fn with_trusted_forwarder_max_entries(mut self, max_entries: usize) -> Self {
         self.trusted_forwarder_max_entries = max_entries;
         self
@@ -1244,6 +1168,7 @@ impl McpServerConfig {
     /// Install an async readiness probe for `/readyz`. Without this call,
     /// `/readyz` mirrors `/healthz` (always 200 OK).
     #[must_use]
+    #[inline]
     pub fn with_readiness_check(mut self, check: ReadinessCheck) -> Self {
         self.readiness_check = Some(check);
         self
@@ -1255,6 +1180,7 @@ impl McpServerConfig {
     /// Applies to both layers that can reject an oversized body: the outer
     /// limit layer in front of the router and the MCP service's own limit.
     #[must_use]
+    #[inline]
     pub fn with_max_request_body(mut self, bytes: usize) -> Self {
         self.max_request_body = bytes;
         self
@@ -1266,6 +1192,7 @@ impl McpServerConfig {
     /// is produced. Streaming/response-body transfer after that point is not
     /// covered.
     #[must_use]
+    #[inline]
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
         self
@@ -1273,6 +1200,7 @@ impl McpServerConfig {
 
     /// Override the graceful shutdown grace period. Default: 30 seconds.
     #[must_use]
+    #[inline]
     pub fn with_shutdown_timeout(mut self, timeout: Duration) -> Self {
         self.shutdown_timeout = timeout;
         self
@@ -1280,6 +1208,7 @@ impl McpServerConfig {
 
     /// Override the MCP session idle timeout. Default: 20 minutes.
     #[must_use]
+    #[inline]
     pub fn with_session_idle_timeout(mut self, timeout: Duration) -> Self {
         self.session_idle_timeout = timeout;
         self
@@ -1289,6 +1218,7 @@ impl McpServerConfig {
     /// authenticated identity. Enabled by default; disabling reinstates the
     /// CWE-384 risk from reusable unbound session IDs.
     #[must_use]
+    #[inline]
     pub const fn with_session_binding(mut self, enabled: bool) -> Self {
         self.session_binding = enabled;
         self
@@ -1297,6 +1227,7 @@ impl McpServerConfig {
     /// Set the shared HMAC secret used to bind MCP session IDs to identities.
     /// For cross-instance continuity, combine with [`Self::with_session_store`].
     #[must_use]
+    #[inline]
     pub fn with_session_binding_secret(mut self, secret: SecretString) -> Self {
         self.session_binding_secret = Some(secret);
         self
@@ -1309,6 +1240,7 @@ impl McpServerConfig {
     /// [`Self::with_session_binding_secret`]. See [`Self::task_binding`] for
     /// the compatibility caveat.
     #[must_use]
+    #[inline]
     pub const fn with_task_binding(mut self, enabled: bool) -> Self {
         self.task_binding = enabled;
         self
@@ -1318,6 +1250,7 @@ impl McpServerConfig {
     /// Combine with [`Self::with_session_binding_secret`] to enable cross-instance
     /// session continuity (verification + existence).
     #[must_use]
+    #[inline]
     pub fn with_session_store(mut self, session_store: Arc<dyn SessionStore>) -> Self {
         self.session_store = Some(session_store);
         self
@@ -1328,6 +1261,7 @@ impl McpServerConfig {
     /// See [`McpServerConfig::event_store`] for the stream-isolation
     /// obligation this places on the implementation.
     #[must_use]
+    #[inline]
     pub fn with_event_store(mut self, event_store: Arc<dyn EventStore>) -> Self {
         self.event_store = Some(event_store);
         self
@@ -1335,6 +1269,7 @@ impl McpServerConfig {
 
     /// Override the SSE keep-alive interval. Default: 15 seconds.
     #[must_use]
+    #[inline]
     pub fn with_sse_keep_alive(mut self, interval: Duration) -> Self {
         self.sse_keep_alive = interval;
         self
@@ -1344,6 +1279,7 @@ impl McpServerConfig {
     /// `tower::load_shed`. Excess requests receive 503 Service Unavailable.
     /// Default: unlimited.
     #[must_use]
+    #[inline]
     pub fn with_max_concurrent_requests(mut self, limit: usize) -> Self {
         self.max_concurrent_requests = Some(limit);
         self
@@ -1357,6 +1293,7 @@ impl McpServerConfig {
     /// NOT hot-reloadable via [`ReloadHandle`]. Has no effect unless TLS
     /// is configured via [`Self::with_tls`].
     #[must_use]
+    #[inline]
     pub fn with_tls_handshake_timeout(mut self, timeout: Duration) -> Self {
         self.tls_handshake_timeout = timeout;
         self
@@ -1371,6 +1308,7 @@ impl McpServerConfig {
     /// NOT hot-reloadable via [`ReloadHandle`]. Has no effect unless TLS
     /// is configured via [`Self::with_tls`].
     #[must_use]
+    #[inline]
     pub fn with_max_concurrent_tls_handshakes(mut self, limit: usize) -> Self {
         self.max_concurrent_tls_handshakes = limit;
         self
@@ -1379,6 +1317,7 @@ impl McpServerConfig {
     /// Cap tool invocations per source IP per minute. Enforced on every
     /// `tools/call` request.
     #[must_use]
+    #[inline]
     pub fn with_tool_rate_limit(mut self, per_minute: u32) -> Self {
         self.tool_rate_limit = Some(per_minute);
         self
@@ -1395,6 +1334,7 @@ impl McpServerConfig {
     /// caveats (direct peer only, IPv6 rotation, proxy collapse,
     /// bounded-memory shared-fate under key spray).
     #[must_use]
+    #[inline]
     pub fn with_extra_route_rate_limit(mut self, per_minute: u32) -> Self {
         self.extra_route_rate_limit = Some(per_minute);
         self
@@ -1405,6 +1345,7 @@ impl McpServerConfig {
     /// Requires the tool rate limit to be set; must be greater than zero
     /// (both validated by [`validate`](Self::validate)).
     #[must_use]
+    #[inline]
     pub fn with_tool_rate_limit_burst(mut self, burst: u32) -> Self {
         self.tool_rate_limit_burst = Some(burst);
         self
@@ -1416,6 +1357,7 @@ impl McpServerConfig {
     /// Requires the extra-route rate limit to be set; must be greater
     /// than zero (both validated by [`validate`](Self::validate)).
     #[must_use]
+    #[inline]
     pub fn with_extra_route_rate_limit_burst(mut self, burst: u32) -> Self {
         self.extra_route_rate_limit_burst = Some(burst);
         self
@@ -1441,6 +1383,7 @@ impl McpServerConfig {
     /// each entry must be non-empty and start with `/` (both validated
     /// by [`validate`](Self::validate)). Startup-only.
     #[must_use]
+    #[inline]
     pub fn with_extra_route_rate_limit_exempt_paths<I, S>(mut self, paths: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -1452,6 +1395,7 @@ impl McpServerConfig {
 
     /// Set the tracked-key full-table policy for all per-IP rate limiters.
     #[must_use]
+    #[inline]
     pub const fn with_key_eviction_policy(mut self, policy: KeyEvictionPolicy) -> Self {
         self.key_eviction_policy = policy;
         self
@@ -1469,6 +1413,7 @@ impl McpServerConfig {
     /// proxied clients collapse into the proxy's. Entries are validated
     /// at [`validate`](Self::validate) time. Startup-only.
     #[must_use]
+    #[inline]
     pub fn with_trusted_proxies<I, S>(mut self, proxies: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -1483,6 +1428,7 @@ impl McpServerConfig {
     /// [`with_trusted_proxies`](Self::with_trusted_proxies) to be set
     /// (validated).
     #[must_use]
+    #[inline]
     pub fn with_forwarded_header(mut self, mode: ForwardedHeaderMode) -> Self {
         self.forwarded_header = Some(mode);
         self
@@ -1492,6 +1438,7 @@ impl McpServerConfig {
     /// server is built. Use it to wire SIGHUP-style hot reloads of API
     /// keys and RBAC policy.
     #[must_use]
+    #[inline]
     pub fn with_reload_callback<F>(mut self, callback: F) -> Self
     where
         F: FnOnce(ReloadHandle) + Send + 'static,
@@ -1504,6 +1451,7 @@ impl McpServerConfig {
     /// `min_size` is the smallest body size (bytes) eligible for
     /// compression. Default min size: 1024.
     #[must_use]
+    #[inline]
     pub fn enable_compression(mut self, min_size: u16) -> Self {
         self.compression_enabled = true;
         self.compression_min_size = min_size;
@@ -1514,7 +1462,12 @@ impl McpServerConfig {
     /// [`with_auth`](Self::with_auth) to be set and enabled; otherwise
     /// [`validate`](Self::validate) returns an error. `role` is the RBAC
     /// role gate (default: `"admin"`).
+    #[expect(
+        clippy::impl_trait_in_params,
+        reason = "public API frozen until the next major release"
+    )]
     #[must_use]
+    #[inline]
     pub fn enable_admin(mut self, role: impl Into<String>) -> Self {
         self.admin_enabled = true;
         self.admin_role = role.into();
@@ -1525,6 +1478,7 @@ impl McpServerConfig {
     /// values remain redacted by the logging layer. Paths listed in
     /// [`Self::request_log_exclude_paths`] are not logged.
     #[must_use]
+    #[inline]
     pub fn enable_request_header_logging(mut self) -> Self {
         self.log_request_headers = true;
         self
@@ -1556,6 +1510,7 @@ impl McpServerConfig {
     /// assert!(config.validate().is_ok());
     /// ```
     #[must_use]
+    #[inline]
     pub fn with_log_context(mut self, log_context: LogContextConfig) -> Self {
         self.log_context = log_context;
         self
@@ -1576,6 +1531,7 @@ impl McpServerConfig {
     /// assert!(config.validate().is_ok());
     /// ```
     #[must_use]
+    #[inline]
     pub fn with_request_log_exclude_paths<I, S>(mut self, paths: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -1590,6 +1546,7 @@ impl McpServerConfig {
     /// default so `/version` reveals only `name`, `version`, and
     /// `rmcp_server_kit_version`.
     #[must_use]
+    #[inline]
     pub fn expose_build_metadata(mut self) -> Self {
         self.expose_build_metadata = true;
         self
@@ -1598,7 +1555,12 @@ impl McpServerConfig {
     /// Enable the Prometheus metrics listener on `bind` (e.g.
     /// `127.0.0.1:9090`). Requires the `metrics` crate feature.
     #[cfg(feature = "metrics")]
+    #[expect(
+        clippy::impl_trait_in_params,
+        reason = "public API frozen until the next major release"
+    )]
     #[must_use]
+    #[inline]
     pub fn with_metrics(mut self, bind: impl Into<String>) -> Self {
         self.metrics_enabled = true;
         self.metrics_bind = bind.into();
@@ -1620,7 +1582,8 @@ impl McpServerConfig {
     /// protected monitoring network.
     #[cfg(feature = "metrics")]
     #[must_use]
-    pub fn with_metrics_handle(mut self, handle: Arc<crate::metrics::McpMetrics>) -> Self {
+    #[inline]
+    pub fn with_metrics_handle(mut self, handle: Arc<McpMetrics>) -> Self {
         self.metrics_handle = Some(handle);
         self
     }
@@ -1658,6 +1621,7 @@ impl McpServerConfig {
     ///
     /// Returns [`RmcpServerKitError::Config`] with a human-readable message on
     /// the first validation failure.
+    #[inline]
     pub fn validate(self) -> Result<Validated<Self>, RmcpServerKitError> {
         self.check()?;
         Ok(Validated(self))
@@ -1665,6 +1629,11 @@ impl McpServerConfig {
 
     /// 6b2. A supplied metrics handle without an enabled listener is a
     /// misconfiguration: the handle would never be installed or served.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RmcpServerKitError::Config`] when a metrics handle is set
+    /// while the metrics listener is disabled.
     #[cfg(feature = "metrics")]
     fn check_metrics_handle(&self) -> Result<(), RmcpServerKitError> {
         if self.metrics_handle.is_some() && !self.metrics_enabled {
@@ -1678,6 +1647,11 @@ impl McpServerConfig {
     /// 6e. An empty `admin_role` gates `/admin/*` behind a role no identity can
     /// hold. The TOML validator has always rejected it; the builder now
     /// matches, so the two public validators cannot disagree.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RmcpServerKitError::Config`] when admin is enabled with an
+    /// empty `admin_role`.
     fn check_admin_role(&self) -> Result<(), RmcpServerKitError> {
         if self.admin_enabled && self.admin_role.trim().is_empty() {
             return Err(RmcpServerKitError::Config(
@@ -1693,7 +1667,15 @@ impl McpServerConfig {
     /// (`RateLimitConfig::{burst, pre_auth_burst}`) have no orphan rule:
     /// their base rates always resolve (`max_attempts_per_minute` is
     /// mandatory; the pre-auth base derives from it when unset).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RmcpServerKitError::Config`] when a burst knob is zero, a
+    /// burst is set without its base limiter, or an exempt-path entry is
+    /// malformed.
     fn check_burst_knobs(&self) -> Result<(), RmcpServerKitError> {
+        use crate::forwarded::MAX_CONFIGURABLE_SCANNED_ENTRIES;
+
         if self.tool_rate_limit_burst == Some(0) {
             return Err(RmcpServerKitError::Config(
                 "tool_rate_limit_burst must be greater than zero".into(),
@@ -1705,12 +1687,10 @@ impl McpServerConfig {
             ));
         }
         if self.trusted_forwarder_max_entries == 0
-            || self.trusted_forwarder_max_entries
-                > crate::forwarded::MAX_CONFIGURABLE_SCANNED_ENTRIES
+            || self.trusted_forwarder_max_entries > MAX_CONFIGURABLE_SCANNED_ENTRIES
         {
             return Err(RmcpServerKitError::Config(format!(
-                "trusted_forwarder_max_entries must be in 1..={}, got {}",
-                crate::forwarded::MAX_CONFIGURABLE_SCANNED_ENTRIES,
+                "trusted_forwarder_max_entries must be in 1..={MAX_CONFIGURABLE_SCANNED_ENTRIES}, got {}",
                 self.trusted_forwarder_max_entries
             )));
         }
@@ -1746,7 +1726,7 @@ impl McpServerConfig {
                 )));
             }
         }
-        if let Some(rl) = self.auth.as_ref().and_then(|a| a.rate_limit.as_ref()) {
+        if let Some(rl) = self.auth.as_ref().and_then(|auth| auth.rate_limit.as_ref()) {
             if rl.burst == Some(0) {
                 return Err(RmcpServerKitError::Config(
                     "auth rate_limit.burst must be greater than zero".into(),
@@ -1767,6 +1747,12 @@ impl McpServerConfig {
     /// nonempty proxy list (fail-fast over a silent no-op). Also
     /// validates [`LogContextConfig::request_id_header`] and that
     /// `log_context.request_id` requires `trusted_proxies`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RmcpServerKitError::Config`] when a proxy entry is malformed,
+    /// a forwarding header is set without proxies, or the request-id header
+    /// is invalid.
     fn check_trusted_forwarder(&self) -> Result<(), RmcpServerKitError> {
         for entry in &self.trusted_proxies {
             validate_trusted_proxy_entry(entry).map_err(RmcpServerKitError::Config)?;
@@ -1786,7 +1772,18 @@ impl McpServerConfig {
         Ok(())
     }
 
+    /// Validate the session-binding secret wiring: a cross-instance binding
+    /// secret is required when a session store is configured alongside
+    /// enabled auth, and any configured secret must satisfy the binding
+    /// format rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RmcpServerKitError::Config`] when the secret is missing for
+    /// the configured binding and when a configured secret fails validation.
     fn check_session_binding_config(&self) -> Result<(), RmcpServerKitError> {
+        use crate::session_binding::validate_configured_secret;
+
         if self.session_store.is_some()
             && self.session_binding
             && self.auth.as_ref().is_some_and(|auth| auth.enabled)
@@ -1801,10 +1798,7 @@ impl McpServerConfig {
         }
 
         if let Some(secret) = &self.session_binding_secret {
-            crate::session_binding::validate_configured_secret(
-                "session_binding_secret",
-                secret.expose_secret(),
-            )?;
+            validate_configured_secret("session_binding_secret", secret.expose_secret())?;
         }
         Ok(())
     }
@@ -1812,7 +1806,15 @@ impl McpServerConfig {
     /// Run the validation checks without consuming `self`. Used by
     /// internal call sites (e.g. tests) that need to inspect a config
     /// without taking ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RmcpServerKitError::Config`] on the first invariant the
+    /// configuration violates: admin/auth wiring, TLS cert-key pairing, mTLS
+    /// without TLS, bind address, URL, origin, or size-limit checks.
     fn check(&self) -> Result<(), RmcpServerKitError> {
+        use crate::config::{SharedConfigViolation, check_shared_config_invariants};
+
         // Delegated to `check_shared_config_invariants` so this validator and
         // `validate_server_config` cannot drift in ordering. Wording stays
         // local: this type names which TLS half is missing, the TOML validator
@@ -1827,25 +1829,25 @@ impl McpServerConfig {
         //     the client-certificate identity is never extracted. Accepting
         //     this combination silently disables client-cert authentication
         //     for an operator who believes it is switched on.
-        if let Err(violation) = crate::config::check_shared_config_invariants(
+        if let Err(violation) = check_shared_config_invariants(
             self.admin_enabled,
-            self.auth.as_ref().is_some_and(|a| a.enabled),
+            self.auth.as_ref().is_some_and(|auth| auth.enabled),
             self.tls_cert_path.is_some(),
             self.tls_key_path.is_some(),
-            self.auth.as_ref().is_some_and(|a| a.mtls.is_some()),
+            self.auth.as_ref().is_some_and(|auth| auth.mtls.is_some()),
         ) {
             return Err(RmcpServerKitError::Config(
                 match violation {
-                    crate::config::SharedConfigViolation::AdminRequiresAuth => {
+                    SharedConfigViolation::AdminRequiresAuth => {
                         "admin_enabled=true requires auth to be configured and enabled"
                     }
-                    crate::config::SharedConfigViolation::TlsCertWithoutKey => {
+                    SharedConfigViolation::TlsCertWithoutKey => {
                         "tls_cert_path is set but tls_key_path is missing"
                     }
-                    crate::config::SharedConfigViolation::TlsKeyWithoutCert => {
+                    SharedConfigViolation::TlsKeyWithoutCert => {
                         "tls_key_path is set but tls_cert_path is missing"
                     }
-                    crate::config::SharedConfigViolation::MtlsRequiresTls => {
+                    SharedConfigViolation::MtlsRequiresTls => {
                         "auth.mtls requires TLS: set both tls_cert_path and tls_key_path \
                          (mTLS client certificates cannot be verified on a plaintext listener)"
                     }
@@ -1982,8 +1984,11 @@ impl McpServerConfig {
     reason = "contains Arc<AuthState> with non-Debug fields"
 )]
 pub struct ReloadHandle {
+    /// Auth state whose API-key list can be hot-reloaded.
     auth: Option<Arc<AuthState>>,
+    /// RBAC policy slot swapped atomically on reload.
     rbac: Option<Arc<ArcSwap<RbacPolicy>>>,
+    /// Cached mTLS CRL set refreshed on demand.
     crl_set: Option<Arc<CrlSet>>,
 }
 
@@ -2004,15 +2009,11 @@ impl ReloadHandle {
     ///
     /// Returns [`RmcpServerKitError::Config`] naming the first blank-named
     /// index; the currently installed key list is left untouched.
-    pub fn try_reload_auth_keys(
-        &self,
-        keys: Vec<crate::auth::ApiKeyEntry>,
-    ) -> Result<(), RmcpServerKitError> {
-        if let Some(ref auth) = self.auth {
-            auth.try_reload_keys(keys)
-        } else {
-            Ok(())
-        }
+    #[inline]
+    pub fn try_reload_auth_keys(&self, keys: Vec<ApiKeyEntry>) -> Result<(), RmcpServerKitError> {
+        self.auth
+            .as_ref()
+            .map_or(Ok(()), |auth| auth.try_reload_keys(keys))
     }
 
     /// Atomically replace the API key list used by the auth middleware.
@@ -2023,15 +2024,17 @@ impl ReloadHandle {
     /// untouched, so a bad reload never silently swaps in
     /// session-binding-colliding keys. Prefer [`Self::try_reload_auth_keys`]
     /// to observe and handle the failure directly.
-    pub fn reload_auth_keys(&self, keys: Vec<crate::auth::ApiKeyEntry>) {
+    #[inline]
+    pub fn reload_auth_keys(&self, keys: Vec<ApiKeyEntry>) {
         if let Err(error) = self.try_reload_auth_keys(keys) {
             tracing::error!(%error, "API key hot reload rejected: keys left unchanged");
         }
     }
 
     /// Atomically replace the RBAC policy used by the RBAC middleware.
+    #[inline]
     pub fn reload_rbac(&self, policy: RbacPolicy) {
-        if let Some(ref rbac) = self.rbac {
+        if let Some(rbac) = &self.rbac {
             rbac.store(Arc::new(policy));
             tracing::info!("RBAC policy reloaded");
         }
@@ -2046,8 +2049,9 @@ impl ReloadHandle {
     // fetch locally and publishes the cache and verifier state together under
     // `commit_lock` with no await between them. Cancellation therefore leaves
     // either the previous or the new generation, never a mixed one.
+    #[inline]
     pub async fn refresh_crls(&self) -> Result<(), RmcpServerKitError> {
-        let Some(ref crl_set) = self.crl_set else {
+        let Some(crl_set) = &self.crl_set else {
             return Err(RmcpServerKitError::Config(
                 "CRL refresh requested but mTLS CRL support is not configured".into(),
             ));
@@ -2113,15 +2117,12 @@ struct AppRunParams {
     name: String,
 }
 
-/// Build the full application axum [`axum::Router`] (MCP route +
-/// middleware stack + admin + OAuth + health endpoints + security
-/// headers + CORS + compression + concurrency limit + origin check)
-/// and the [`AppRunParams`] needed to drive it.
+/// Per-feature identity-binding HMAC secrets.
 ///
-/// This is the shared core of [`serve`] and [`serve_with_listener`].
-/// It performs *no* network I/O: callers are responsible for binding
-/// (or accepting a pre-bound) [`TcpListener`] and invoking
-/// [`run_server`].
+/// Holds `(session_binding_secret, task_binding_secret)`; each entry is
+/// `Some` only when the corresponding binding feature is enabled.
+type BindingSecrets = (Option<SessionBindingSecret>, Option<SessionBindingSecret>);
+
 /// Resolve the shared identity-binding HMAC secret for each binding feature.
 ///
 /// Returns `(session_binding_secret, task_binding_secret)`, each `Some` only
@@ -2129,11 +2130,10 @@ struct AppRunParams {
 /// (task binding) and the middleware layer (session binding) both need it, and
 /// the factory is constructed first. A configured secret is therefore now
 /// validated when *either* binding is on.
-type BindingSecrets = (
-    Option<crate::session_binding::SessionBindingSecret>,
-    Option<crate::session_binding::SessionBindingSecret>,
-);
-
+///
+/// # Errors
+///
+/// Returns an error when a configured secret fails validation.
 fn resolve_binding_secret(config: &McpServerConfig) -> anyhow::Result<BindingSecrets> {
     if !config.session_binding && !config.task_binding {
         return Ok((None, None));
@@ -2149,6 +2149,7 @@ fn resolve_binding_secret(config: &McpServerConfig) -> anyhow::Result<BindingSec
     Ok(pair)
 }
 
+/// Build the OAuth protected-resource metadata URL for `public_url`.
 fn mcp_resource_metadata_url(public_url: &str) -> String {
     format!(
         "{}/.well-known/oauth-protected-resource/mcp",
@@ -2156,9 +2157,155 @@ fn mcp_resource_metadata_url(public_url: &str) -> String {
     )
 }
 
+/// Response for a request shed by the global concurrency limit.
+///
+/// A named `async fn` (instead of a closure returning an async block) keeps
+/// the tower `HandleErrorLayer` wiring free of the
+/// `closure_returning_async_block` shape while behaving identically.
+///
+/// cancel-safe: the body never awaits; it just constructs the 503 response.
+async fn overloaded_response<E>(_error: E) -> impl IntoResponse {
+    use axum::Json;
+
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": "overloaded",
+            "error_description": "server is at capacity, retry later"
+        })),
+    )
+}
+
+/// JSON 404 fallback for unmatched routes.
+///
+/// A named `async fn` instead of a closure returning an async block; the
+/// rendered body and status are byte-identical to the previous closure.
+///
+/// cancel-safe: the body never awaits; it just constructs the 404 response.
+async fn not_found_fallback() -> impl IntoResponse {
+    use axum::Json;
+
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": "not_found",
+            "error_description": "The requested endpoint does not exist"
+        })),
+    )
+}
+
+/// Compute the effective allowed-origin set for the outer origin-check layer.
+///
+/// Pre-parsed once at router-build time so the middleware and the CORS layer
+/// match against the same normalized representation, never against the raw
+/// config strings. When `allowed_origins` is empty but `public_url` is set,
+/// the origin is auto-derived from the public URL so MCP clients that send
+/// `Origin: <server-url>` are accepted without explicit configuration.
+#[expect(
+    deprecated,
+    reason = "internal router assembly reads deprecated `pub` config fields by design until 1.0 makes them pub(crate)"
+)]
+fn effective_allowed_origins(config: &McpServerConfig) -> Arc<[AllowedOrigin]> {
+    let mut effective_origins = config.allowed_origins.clone();
+    if effective_origins.is_empty()
+        && let Some(url) = &config.public_url
+    {
+        // Origin = scheme + "://" + host (+ ":" + port if non-default).
+        // Strip any path/query from the public URL. Offsets come from
+        // `find`, so they are char-boundary-aligned; `get(..)` keeps that
+        // machine-checked (a violation degrades to an empty slice).
+        if let Some(scheme_end) = url.find("://") {
+            let after_scheme_at = scheme_end.saturating_add(3);
+            let scheme_with_sep = url.get(..after_scheme_at).unwrap_or_default();
+            let after_scheme = url.get(after_scheme_at..).unwrap_or_default();
+            let host_end = after_scheme.find('/').unwrap_or(after_scheme.len());
+            let host = after_scheme.get(..host_end).unwrap_or_default();
+            let origin = format!("{scheme_with_sep}{host}");
+            tracing::info!(
+                %origin,
+                "auto-derived allowed origin from public_url"
+            );
+            effective_origins.push(origin);
+        }
+    }
+    Arc::from(
+        effective_origins
+            .iter()
+            .filter_map(|origin| parse_allowed_origin(origin))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Merge application `extra_router` routes into `router`.
+///
+/// When a per-IP rate limit is configured, the limiter wraps only the extra
+/// routes (axum layers wrap only the routes already present on the sub-router)
+/// so it can never leak onto `/mcp`, health, admin, or OAuth endpoints.
+#[expect(
+    deprecated,
+    reason = "internal router assembly reads deprecated `pub` config fields by design until 1.0 makes them pub(crate)"
+)]
+fn install_extra_router(router: axum::Router, config: &mut McpServerConfig) -> axum::Router {
+    use axum::middleware::from_fn;
+
+    let Some(extra) = config.extra_router.take() else {
+        return router;
+    };
+    let extra_router = match config.extra_route_rate_limit {
+        Some(per_minute) => {
+            let max_tracked_keys =
+                NonZeroUsize::new(EXTRA_ROUTE_MAX_TRACKED_KEYS).unwrap_or(NonZeroUsize::MIN);
+            let limiter = build_extra_route_rate_limiter_with_policy(
+                per_minute,
+                config.extra_route_rate_limit_burst,
+                config.key_eviction_policy,
+                max_tracked_keys,
+            );
+            let exempt: Arc<HashSet<String>> = Arc::new(
+                config
+                    .extra_route_rate_limit_exempt_paths
+                    .iter()
+                    .cloned()
+                    .collect(),
+            );
+            tracing::info!(
+                per_minute,
+                exempt_paths = exempt.len(),
+                "extra-route per-IP rate limit enabled"
+            );
+            extra.layer(from_fn(move |req, next| {
+                let limiter_clone = Arc::clone(&limiter);
+                let exempt_clone = Arc::clone(&exempt);
+                extra_route_rate_limit_middleware(limiter_clone, exempt_clone, req, next)
+            }))
+        }
+        None => extra,
+    };
+    router.merge(extra_router)
+}
+
+/// Build the full application axum [`axum::Router`] and its [`AppRunParams`].
+///
+/// The router bundles the MCP route, middleware stack, admin, OAuth, health
+/// endpoints, security headers, CORS, compression, concurrency limit, and
+/// origin check.
+///
+/// This is the shared core of [`serve`] and [`serve_with_listener`].
+/// It performs *no* network I/O: callers are responsible for binding
+/// (or accepting a pre-bound) [`TcpListener`] and invoking
+/// [`run_server`].
+///
+/// # Errors
+///
+/// Returns an error when the configuration is invalid or the router cannot be
+/// assembled for the active feature set.
 #[expect(
     clippy::cognitive_complexity,
     reason = "router assembly is intrinsically sequential; splitting harms readability"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "deliberate: src/transport.rs::build_app_router — router assembly is intrinsically sequential; the length is layer wiring, not branching logic"
 )]
 #[expect(
     deprecated,
@@ -2172,6 +2319,32 @@ where
     H: ServerHandler + 'static,
     F: Fn() -> H + Send + Sync + Clone + 'static,
 {
+    use axum::{
+        error_handling::HandleErrorLayer,
+        http::{
+            HeaderValue,
+            header::{AUTHORIZATION, CONTENT_TYPE},
+        },
+        middleware::from_fn,
+        routing::get,
+    };
+    use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
+    use tower_http::{
+        compression::{CompressionLayer, DefaultPredicate, predicate::SizeAbove},
+        cors::{AllowOrigin, CorsLayer},
+        limit::RequestBodyLimitLayer,
+        timeout::TimeoutLayer,
+    };
+
+    #[cfg(feature = "metrics")]
+    use crate::metrics::serve_metrics_with_security_headers;
+    #[cfg(feature = "oauth")]
+    use crate::oauth::protected_resource_metadata;
+    use crate::{
+        admin::{AdminConfig, admin_router},
+        rbac::DenyLogKnobs,
+    };
+
     let ct = CancellationToken::new();
     let session_ct = CancellationToken::new();
 
@@ -2226,8 +2399,8 @@ where
         {
             let mut mgr = LocalSessionManager::default();
             mgr.session_config.keep_alive = Some(config.session_idle_timeout);
-            if let Some(event_store) = event_store {
-                mgr = mgr.with_event_store(event_store);
+            if let Some(store) = event_store {
+                mgr = mgr.with_event_store(store);
             }
             mgr.into()
         },
@@ -2240,21 +2413,18 @@ where
     // Build auth state eagerly when auth is configured so we can wire both
     // the auth middleware *and* the optional admin router against the same
     // state. The middleware itself is installed further down in layer order.
-    let auth_state: Option<Arc<AuthState>> = match config.auth {
-        Some(ref auth_config) if auth_config.enabled => {
+    let auth_state: Option<Arc<AuthState>> = match &config.auth {
+        Some(auth_config) if auth_config.enabled => {
             let rate_limiter = auth_config.rate_limit.as_ref().map(build_rate_limiter);
-            let pre_auth_limiter = auth_config
-                .rate_limit
-                .as_ref()
-                .map(crate::auth::build_pre_auth_limiter);
+            let pre_auth_limiter = auth_config.rate_limit.as_ref().map(build_pre_auth_limiter);
 
             #[cfg(feature = "oauth")]
             let jwks_cache = auth_config
                 .oauth
                 .as_ref()
-                .map(|c| crate::oauth::JwksCache::new(c).map(Arc::new))
+                .map(|oauth_cfg| JwksCache::new(oauth_cfg).map(Arc::new))
                 .transpose()
-                .map_err(|e| std::io::Error::other(format!("JWKS HTTP client: {e}")))?;
+                .map_err(|error| io::Error::other(format!("JWKS HTTP client: {error}")))?;
 
             Some(Arc::new(AuthState {
                 api_keys: ArcSwap::new(Arc::new(auth_config.api_keys.clone())),
@@ -2262,8 +2432,8 @@ where
                 pre_auth_limiter,
                 #[cfg(feature = "oauth")]
                 jwks_cache,
-                seen_identities: crate::auth::SeenIdentitySet::new(),
-                counters: crate::auth::AuthCounters::default(),
+                seen_identities: SeenIdentitySet::new(),
+                counters: AuthCounters::default(),
                 // Absolute only when `public_url` supplies a trustworthy
                 // external origin. Without it `derive_server_url` falls back
                 // to the bind address, which behind a TLS-terminating proxy
@@ -2272,10 +2442,7 @@ where
                 // relative path, which resolves against whatever origin the
                 // client was actually challenged from.
                 resource_metadata_url: config.public_url.as_deref().map(mcp_resource_metadata_url),
-                log_context: crate::auth::AuthLogContext::new(
-                    &config.log_context,
-                    &rbac_swap.load(),
-                ),
+                log_context: AuthLogContext::new(&config.log_context, &rbac_swap.load()),
             }))
         }
         _ => None,
@@ -2284,22 +2451,22 @@ where
     // Optional /admin/* diagnostic routes. Merged BEFORE the
     // body-limit/timeout/RBAC/origin/auth layers so all of them apply.
     if config.admin_enabled {
-        let Some(ref auth_state_ref) = auth_state else {
+        let Some(auth_state_ref) = &auth_state else {
             return Err(anyhow::anyhow!(
                 "admin_enabled=true requires auth to be configured and enabled"
             ));
         };
-        let admin_state = crate::admin::AdminState {
-            started_at: std::time::Instant::now(),
+        let admin_state = AdminState {
+            started_at: Instant::now(),
             name: config.name.clone(),
             version: config.version.clone(),
             auth: Some(Arc::clone(auth_state_ref)),
             rbac: Arc::clone(&rbac_swap),
         };
-        let admin_cfg = crate::admin::AdminConfig {
+        let admin_cfg = AdminConfig {
             role: config.admin_role.clone(),
         };
-        mcp_router = mcp_router.merge(crate::admin::admin_router(admin_state, &admin_cfg));
+        mcp_router = mcp_router.merge(admin_router(admin_state, &admin_cfg));
         tracing::info!(role = %config.admin_role, "/admin/* endpoints enabled");
     }
 
@@ -2335,9 +2502,9 @@ where
     // [0] Session identity-binding layer (innermost; RBAC wraps it so invalid
     // session tool calls are still charged by the RBAC tool-rate limiter).
     if let Some(secret) = binding_secret {
-        mcp_router = mcp_router.layer(axum::middleware::from_fn(move |req, next| {
-            let secret = secret.clone();
-            session_binding_middleware(secret, req, next)
+        mcp_router = mcp_router.layer(from_fn(move |req, next| {
+            let secret_for_mw = secret.clone();
+            session_binding_middleware(secret_for_mw, req, next)
         }));
     }
 
@@ -2361,19 +2528,19 @@ where
         }
 
         let rbac_for_mw = Arc::clone(&rbac_swap);
-        let deny_log_knobs = crate::rbac::DenyLogKnobs::from_config(&config.log_context);
-        mcp_router = mcp_router.layer(axum::middleware::from_fn(move |req, next| {
-            let p = rbac_for_mw.load_full();
+        let deny_log_knobs = DenyLogKnobs::from_config(&config.log_context);
+        mcp_router = mcp_router.layer(from_fn(move |req, next| {
+            let policy = rbac_for_mw.load_full();
             let tl = tool_limiter.clone();
-            rbac_middleware(p, tl, deny_log_knobs, req, next)
+            rbac_middleware(policy, tl, deny_log_knobs, req, next)
         }));
     }
 
     // [2] Auth layer (runs before RBAC so AuthIdentity is in extensions).
-    if let Some(ref auth_config) = config.auth
+    if let Some(auth_config) = &config.auth
         && auth_config.enabled
     {
-        let Some(ref state) = auth_state else {
+        let Some(state) = &auth_state else {
             return Err(anyhow::anyhow!("auth state missing despite enabled config"));
         };
 
@@ -2394,26 +2561,24 @@ where
         );
 
         let state_for_mw = Arc::clone(state);
-        mcp_router = mcp_router.layer(axum::middleware::from_fn(move |req, next| {
-            let s = Arc::clone(&state_for_mw);
-            auth_middleware(s, req, next)
+        mcp_router = mcp_router.layer(from_fn(move |req, next| {
+            let auth_state_clone = Arc::clone(&state_for_mw);
+            auth_middleware(auth_state_clone, req, next)
         }));
     }
 
     // [3] Request timeout (returns 408 on expiry). Bounds the inner service
     // response future: the time until a Response is produced. Response body
     // transfer/streaming (including SSE body frames) is not covered.
-    mcp_router = mcp_router.layer(tower_http::timeout::TimeoutLayer::with_status_code(
-        axum::http::StatusCode::REQUEST_TIMEOUT,
+    mcp_router = mcp_router.layer(TimeoutLayer::with_status_code(
+        StatusCode::REQUEST_TIMEOUT,
         config.request_timeout,
     ));
 
     // [4] Request body size limit (OUTERMOST on /mcp). Prevents OOM /
     // DoS from oversized payloads BEFORE any inner layer (auth, RBAC)
     // attempts to buffer or parse the body.
-    mcp_router = mcp_router.layer(tower_http::limit::RequestBodyLimitLayer::new(
-        config.max_request_body,
-    ));
+    mcp_router = mcp_router.layer(RequestBodyLimitLayer::new(config.max_request_body));
 
     // Compute the effective allowed-origins list for the outer
     // origin-check layer (installed on the merged router below). When
@@ -2421,35 +2586,7 @@ where
     // the origin from the public URL so MCP clients (e.g. Claude Code)
     // that send `Origin: <server-url>` are accepted without explicit
     // config.
-    let mut effective_origins = config.allowed_origins.clone();
-    if effective_origins.is_empty()
-        && let Some(ref url) = config.public_url
-    {
-        // Origin = scheme + "://" + host (+ ":" + port if non-default).
-        // Strip any path/query from the public URL. Offsets come from
-        // `find`, so they are char-boundary-aligned; `get(..)` keeps that
-        // machine-checked (a violation degrades to an empty slice).
-        if let Some(scheme_end) = url.find("://") {
-            let scheme_with_sep = url.get(..scheme_end + 3).unwrap_or_default();
-            let after_scheme = url.get(scheme_end + 3..).unwrap_or_default();
-            let host_end = after_scheme.find('/').unwrap_or(after_scheme.len());
-            let host = after_scheme.get(..host_end).unwrap_or_default();
-            let origin = format!("{scheme_with_sep}{host}");
-            tracing::info!(
-                %origin,
-                "auto-derived allowed origin from public_url"
-            );
-            effective_origins.push(origin);
-        }
-    }
-    // Pre-parse once: the middleware and the CORS layer both match against
-    // this normalized representation, never against the raw config strings.
-    let allowed_origins: Arc<[AllowedOrigin]> = Arc::from(
-        effective_origins
-            .iter()
-            .filter_map(|origin| parse_allowed_origin(origin))
-            .collect::<Vec<_>>(),
-    );
+    let allowed_origins = effective_allowed_origins(&config);
     let cors_origins = Arc::clone(&allowed_origins);
     let request_log = Arc::new(RequestLogConfig {
         log_request_headers: config.log_request_headers,
@@ -2457,18 +2594,17 @@ where
         fields: config.log_context.clone(),
     });
 
-    let readyz_route = if let Some(check) = config.readiness_check.take() {
-        axum::routing::get(move || readyz(Arc::clone(&check)))
-    } else {
-        axum::routing::get(healthz)
-    };
+    let readyz_route = config.readiness_check.take().map_or_else(
+        || get(healthz),
+        |check| get(move || readyz(Arc::clone(&check))),
+    );
 
     let mut router = axum::Router::new()
-        .route("/healthz", axum::routing::get(healthz))
+        .route("/healthz", get(healthz))
         .route("/readyz", readyz_route)
         .route(
             "/version",
-            axum::routing::get({
+            get({
                 // Pre-serialize the version payload once at router-build
                 // time. The handler then serves a cheap `Arc::clone` of the
                 // immutable bytes per request, avoiding `serde_json::Value`
@@ -2479,13 +2615,8 @@ where
                     config.expose_build_metadata,
                 );
                 move || {
-                    let p = Arc::clone(&payload_bytes);
-                    async move {
-                        (
-                            [(axum::http::header::CONTENT_TYPE, "application/json")],
-                            p.to_vec(),
-                        )
-                    }
+                    let payload = Arc::clone(&payload_bytes);
+                    async move { ([(CONTENT_TYPE, "application/json")], payload.to_vec()) }
                 }
             }),
         )
@@ -2497,39 +2628,7 @@ where
     // present on the sub-router, so the limiter can never leak onto
     // `/mcp`, health, admin, or OAuth endpoints, while top-level layers
     // (origin check, peer-address normalization, ...) still run first.
-    if let Some(extra) = config.extra_router.take() {
-        let extra = match config.extra_route_rate_limit {
-            Some(per_minute) => {
-                let max_tracked_keys =
-                    NonZeroUsize::new(EXTRA_ROUTE_MAX_TRACKED_KEYS).unwrap_or(NonZeroUsize::MIN);
-                let limiter = build_extra_route_rate_limiter_with_policy(
-                    per_minute,
-                    config.extra_route_rate_limit_burst,
-                    config.key_eviction_policy,
-                    max_tracked_keys,
-                );
-                let exempt: Arc<std::collections::HashSet<String>> = Arc::new(
-                    config
-                        .extra_route_rate_limit_exempt_paths
-                        .iter()
-                        .cloned()
-                        .collect(),
-                );
-                tracing::info!(
-                    per_minute,
-                    exempt_paths = exempt.len(),
-                    "extra-route per-IP rate limit enabled"
-                );
-                extra.layer(axum::middleware::from_fn(move |req, next| {
-                    let l = Arc::clone(&limiter);
-                    let e = Arc::clone(&exempt);
-                    extra_route_rate_limit_middleware(l, e, req, next)
-                }))
-            }
-            None => extra,
-        };
-        router = router.merge(extra);
-    }
+    router = install_extra_router(router, &mut config);
 
     // RFC 9728: Protected Resource Metadata endpoint.
     // When OAuth is configured, serve full metadata with authorization_servers.
@@ -2541,10 +2640,10 @@ where
     let resource_url = format!("{server_url}/mcp");
 
     #[cfg(feature = "oauth")]
-    let prm_metadata = if let Some(ref auth_config) = config.auth
-        && let Some(ref oauth_config) = auth_config.oauth
+    let prm_metadata = if let Some(auth_config) = &config.auth
+        && let Some(oauth_config) = &auth_config.oauth
     {
-        crate::oauth::protected_resource_metadata(&resource_url, &server_url, oauth_config)
+        protected_resource_metadata(&resource_url, &server_url, oauth_config)
     } else {
         serde_json::json!({ "resource": resource_url })
     };
@@ -2559,16 +2658,16 @@ where
     let prm_root = prm_metadata.clone();
     router = router.route(
         "/.well-known/oauth-protected-resource",
-        axum::routing::get(move || {
-            let m = prm_root.clone();
-            async move { axum::Json(m) }
+        get(move || {
+            let metadata = prm_root.clone();
+            async move { axum::Json(metadata) }
         }),
     );
     router = router.route(
         "/.well-known/oauth-protected-resource/mcp",
-        axum::routing::get(move || {
-            let m = prm_metadata.clone();
-            async move { axum::Json(m) }
+        get(move || {
+            let metadata = prm_metadata.clone();
+            async move { axum::Json(metadata) }
         }),
     );
 
@@ -2577,8 +2676,8 @@ where
     // MCP clients can perform Authorization Code + PKCE against the upstream
     // IdP (e.g. Keycloak) transparently.
     #[cfg(feature = "oauth")]
-    if let Some(ref auth_config) = config.auth
-        && let Some(ref oauth_config) = auth_config.oauth
+    if let Some(auth_config) = &config.auth
+        && let Some(oauth_config) = &auth_config.oauth
         && oauth_config.proxy.is_some()
     {
         router = install_oauth_proxy_routes(
@@ -2605,24 +2704,15 @@ where
         // equal (case, default port, one root trailing slash) is accepted by
         // both layers, and nothing the middleware rejects is granted CORS.
         let cors_allowed = Arc::clone(&cors_origins);
-        let allow_origin = tower_http::cors::AllowOrigin::predicate(
-            move |origin: &axum::http::HeaderValue, _parts: &axum::http::request::Parts| {
-                origin
-                    .to_str()
-                    .is_ok_and(|value| request_origin_allowed(value, &cors_allowed))
-            },
-        );
-        let cors = tower_http::cors::CorsLayer::new()
+        let allow_origin = AllowOrigin::predicate(move |origin: &HeaderValue, _parts: &Parts| {
+            origin
+                .to_str()
+                .is_ok_and(|value| request_origin_allowed(value, &cors_allowed))
+        });
+        let cors = CorsLayer::new()
             .allow_origin(allow_origin)
-            .allow_methods([
-                axum::http::Method::GET,
-                axum::http::Method::POST,
-                axum::http::Method::OPTIONS,
-            ])
-            .allow_headers([
-                axum::http::header::CONTENT_TYPE,
-                axum::http::header::AUTHORIZATION,
-            ]);
+            .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+            .allow_headers([CONTENT_TYPE, AUTHORIZATION]);
         router = router.layer(cors);
     }
 
@@ -2631,13 +2721,10 @@ where
     // uncompressed.
     if config.compression_enabled {
         use tower_http::compression::Predicate as _;
-        let predicate = tower_http::compression::DefaultPredicate::new().and(
-            tower_http::compression::predicate::SizeAbove::new(u64::from(
-                config.compression_min_size,
-            )),
-        );
+        let predicate =
+            DefaultPredicate::new().and(SizeAbove::new(u64::from(config.compression_min_size)));
         router = router.layer(
-            tower_http::compression::CompressionLayer::new()
+            CompressionLayer::new()
                 .gzip(true)
                 .br(true)
                 .compress_when(predicate),
@@ -2652,19 +2739,9 @@ where
     // `ConcurrencyLimit` back-pressure error into 503 instead of hanging.
     if let Some(max) = config.max_concurrent_requests {
         let overload_handler = tower::ServiceBuilder::new()
-            .layer(axum::error_handling::HandleErrorLayer::new(
-                |_err: tower::BoxError| async {
-                    (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        axum::Json(serde_json::json!({
-                            "error": "overloaded",
-                            "error_description": "server is at capacity, retry later"
-                        })),
-                    )
-                },
-            ))
-            .layer(tower::load_shed::LoadShedLayer::new())
-            .layer(tower::limit::ConcurrencyLimitLayer::new(max));
+            .layer(HandleErrorLayer::new(overloaded_response))
+            .layer(LoadShedLayer::new())
+            .layer(ConcurrencyLimitLayer::new(max));
         router = router.layer(overload_handler);
         tracing::info!(max, "global concurrency limit enabled");
     }
@@ -2672,50 +2749,37 @@ where
     // JSON fallback for unmatched routes. Without this, axum returns
     // an empty-body 404 that breaks MCP clients (e.g. Claude Code SDK)
     // when they probe OAuth endpoints like /authorize or /token.
-    router = router.fallback(|| async {
-        (
-            axum::http::StatusCode::NOT_FOUND,
-            axum::Json(serde_json::json!({
-                "error": "not_found",
-                "error_description": "The requested endpoint does not exist"
-            })),
-        )
-    });
+    router = router.fallback(not_found_fallback);
 
     // Prometheus metrics: recording middleware + separate listener.
     #[cfg(feature = "metrics")]
     if config.metrics_enabled {
         // Caller-supplied handle, or a fresh registry. `.take()` moves the
         // handle out of the config (same pattern as the session/event stores).
-        let metrics: Arc<crate::metrics::McpMetrics> =
-            if let Some(handle) = config.metrics_handle.take() {
-                handle
-            } else {
-                Arc::new(
-                    crate::metrics::McpMetrics::new()
-                        .map_err(|e| anyhow::anyhow!("metrics init: {e}"))?,
-                )
-            };
+        let metrics: Arc<McpMetrics> = if let Some(handle) = config.metrics_handle.take() {
+            handle
+        } else {
+            Arc::new(McpMetrics::new().map_err(|error| anyhow::anyhow!("metrics init: {error}"))?)
+        };
         // Security hardening: the three framework collectors must be bound to
         // the served registry whatever the caller pre-registered there.
         // Evict-then-register; a conflict on the reserved namespace fails
         // startup closed instead of serving silently empty telemetry.
-        ensure_framework_metrics_registered(&metrics).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let m = Arc::clone(&metrics);
-        router = router.layer(axum::middleware::from_fn(
-            move |req: Request<Body>, next: Next| {
-                let m = Arc::clone(&m);
-                metrics_middleware(m, req, next)
-            },
-        ));
+        ensure_framework_metrics_registered(&metrics)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let metrics_clone = Arc::clone(&metrics);
+        router = router.layer(from_fn(move |req: Request<Body>, next: Next| {
+            let metrics_for_mw = Arc::clone(&metrics_clone);
+            metrics_middleware(metrics_for_mw, req, next)
+        }));
         let metrics_bind = config.metrics_bind.clone();
         let metrics_shutdown = ct.clone();
         // The metrics listener is plaintext whatever the main server's TLS
         // setting, so clone the operator's effective security-headers config
         // and let the listener apply it with `is_tls = false` (no HSTS).
         let metrics_security_headers = config.security_headers.clone();
-        tokio::spawn(async move {
-            if let Err(e) = crate::metrics::serve_metrics_with_security_headers(
+        let _metrics_task = tokio::spawn(async move {
+            if let Err(error) = serve_metrics_with_security_headers(
                 metrics_bind,
                 metrics,
                 metrics_shutdown,
@@ -2723,7 +2787,7 @@ where
             )
             .await
             {
-                tracing::error!("metrics listener failed: {e}");
+                tracing::error!("metrics listener failed: {error}");
             }
         });
     }
@@ -2751,8 +2815,7 @@ where
                 .unwrap_or(ForwardedHeaderMode::XForwardedFor),
             max_scanned_entries: config.trusted_forwarder_max_entries,
             request_id_header: if config.log_context.request_id {
-                axum::http::HeaderName::from_bytes(config.log_context.request_id_header.as_bytes())
-                    .ok()
+                HeaderName::from_bytes(config.log_context.request_id_header.as_bytes()).ok()
             } else {
                 None
             },
@@ -2769,14 +2832,14 @@ where
     // overload-503s, 404s and auth failures are logged; origin-rejected
     // requests are logged by the origin layer.
     let request_log_inner = Arc::clone(&request_log);
-    router = router.layer(axum::middleware::from_fn(move |req, next| {
+    router = router.layer(from_fn(move |req, next| {
         let cfg = Arc::clone(&request_log_inner);
         request_log_middleware(cfg, req, next)
     }));
 
-    router = router.layer(axum::middleware::from_fn(move |req, next| {
-        let r = forward_resolver.clone();
-        normalize_peer_addr_middleware(r, req, next)
+    router = router.layer(from_fn(move |req, next| {
+        let resolver_clone = forward_resolver.clone();
+        normalize_peer_addr_middleware(resolver_clone, req, next)
     }));
 
     // Origin validation layer (MCP spec: servers MUST validate the
@@ -2790,7 +2853,7 @@ where
     // Origin-less requests (e.g. server-to-server probes, curl, native
     // MCP clients) are permitted; only requests with an Origin header
     // that does not match `effective_origins` are rejected.
-    router = router.layer(axum::middleware::from_fn(move |req, next| {
+    router = router.layer(from_fn(move |req, next| {
         let origins = Arc::clone(&allowed_origins);
         let log_cfg = Arc::clone(&request_log);
         origin_check_middleware(origins, log_cfg, req, next)
@@ -2807,7 +2870,7 @@ where
     let is_tls = config.tls_cert_path.is_some();
     warn_security_header_overrides(&config.security_headers);
     let security_headers_cfg = Arc::new(config.security_headers.clone());
-    router = router.layer(axum::middleware::from_fn(move |req, next| {
+    router = router.layer(from_fn(move |req, next| {
         let cfg = Arc::clone(&security_headers_cfg);
         security_headers_middleware(is_tls, cfg, req, next)
     }));
@@ -2824,7 +2887,11 @@ where
     };
     let tls_handshake_timeout = config.tls_handshake_timeout;
     let max_concurrent_tls_handshakes = config.max_concurrent_tls_handshakes;
-    let mtls_config = config.auth.as_ref().and_then(|a| a.mtls.as_ref()).cloned();
+    let mtls_config = config
+        .auth
+        .as_ref()
+        .and_then(|auth| auth.mtls.as_ref())
+        .cloned();
 
     Ok((
         router,
@@ -2872,10 +2939,14 @@ impl Drop for CancelOnDrop {
 /// Forwards an externally-supplied shutdown token into the server-internal one.
 ///
 /// Returns the task handle so the wiring can be exercised directly in tests.
+#[expect(
+    clippy::integer_division_remainder_used,
+    reason = "external macro: tokio::select"
+)]
 fn spawn_external_shutdown_bridge(
     external: CancellationToken,
     internal: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         // The second arm is load-bearing: without it this task parks forever
         // on a caller token that may never be cancelled, outliving a failed
@@ -2906,6 +2977,7 @@ fn spawn_external_shutdown_bridge(
 // NOT cancel-safe: dropping after `build_app_router` starts metrics, or after
 // `run_server` spawns shutdown/CRL tasks, can detach them; use OS signal or
 // `serve_with_listener`'s shutdown token for cooperative shutdown.
+#[inline]
 pub async fn serve<H, F>(
     config: Validated<McpServerConfig>,
     handler_factory: F,
@@ -2914,18 +2986,19 @@ where
     H: ServerHandler + 'static,
     F: Fn() -> H + Send + Sync + Clone + 'static,
 {
-    let config = config.into_inner();
+    let config_inner = config.into_inner();
     #[expect(
         deprecated,
         reason = "internal serve() reads `bind_addr` to construct the listener; field becomes pub(crate) in 1.0"
     )]
-    let bind_addr = config.bind_addr.clone();
-    let (router, params) = build_app_router(config, handler_factory).map_err(anyhow_to_startup)?;
+    let bind_addr = config_inner.bind_addr.clone();
+    let (router, params) =
+        build_app_router(config_inner, handler_factory).map_err(anyhow_to_startup)?;
     let _cancel_guard = CancelOnDrop(params.ct.clone());
 
     let listener = TcpListener::bind(&bind_addr)
         .await
-        .map_err(|e| io_to_startup(&format!("bind {bind_addr}"), e))?;
+        .map_err(|error| io_to_startup(&format!("bind {bind_addr}"), error))?;
     log_listening(&params.name, params.scheme, &bind_addr);
 
     run_server(
@@ -2978,22 +3051,24 @@ where
 // NOT cancel-safe: the `shutdown` token is the cancellation boundary. Dropping
 // after readiness fires or `run_server` starts can detach shutdown/metrics
 // tasks while callers believe the listener lifetime ended.
+#[inline]
 pub async fn serve_with_listener<H, F>(
     listener: TcpListener,
     config: Validated<McpServerConfig>,
     handler_factory: F,
-    ready_tx: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
+    ready_tx: Option<Sender<SocketAddr>>,
     shutdown: Option<CancellationToken>,
 ) -> Result<(), RmcpServerKitError>
 where
     H: ServerHandler + 'static,
     F: Fn() -> H + Send + Sync + Clone + 'static,
 {
-    let config = config.into_inner();
+    let config_inner = config.into_inner();
     let local_addr = listener
         .local_addr()
-        .map_err(|e| io_to_startup("listener.local_addr", e))?;
-    let (router, params) = build_app_router(config, handler_factory).map_err(anyhow_to_startup)?;
+        .map_err(|error| io_to_startup("listener.local_addr", error))?;
+    let (router, params) =
+        build_app_router(config_inner, handler_factory).map_err(anyhow_to_startup)?;
     let _cancel_guard = CancelOnDrop(params.ct.clone());
 
     log_listening(&params.name, params.scheme, &local_addr.to_string());
@@ -3009,8 +3084,11 @@ where
     // shutdown is wired, but *before* run_server takes ownership of
     // the listener. The receiver can immediately issue requests.
     if let Some(tx) = ready_tx {
-        // Receiver may have been dropped (test gave up). That's fine.
-        let _ = tx.send(local_addr);
+        // Receiver may have been dropped (test gave up). That's fine; the
+        // error only carries this dropped-receiver case.
+        if tx.send(local_addr).is_err() {
+            tracing::debug!("readiness signal receiver dropped before the address was sent");
+        }
     }
 
     run_server(
@@ -3047,6 +3125,12 @@ fn log_listening(name: &str, scheme: &str, addr: &str) {
 /// Drive the chosen axum server variant (TLS or plain) with a graceful
 /// shutdown window. Consumes the router and listener.
 ///
+/// # Errors
+///
+/// Returns an error if the TLS listener cannot be constructed, if the
+/// mTLS client-auth roots cannot be loaded, or if the axum server exits
+/// with an error.
+///
 /// # Shutdown semantics
 ///
 /// A single shutdown trigger (the FIRST of: OS signal via
@@ -3071,6 +3155,10 @@ fn log_listening(name: &str, scheme: &str, addr: &str) {
     clippy::cognitive_complexity,
     reason = "server start-up threads TLS, reload state, and graceful shutdown through one flow"
 )]
+#[expect(
+    clippy::integer_division_remainder_used,
+    reason = "external macro: tokio::select"
+)]
 // NOT cancel-safe: external cancellation is modeled by `ct`. Dropping/aborting
 // can skip `session_ct.cancel()` and leave the spawned shutdown trigger or CRL
 // refresher running with cloned cancellation tokens.
@@ -3088,6 +3176,8 @@ async fn run_server(
     ct: CancellationToken,
     session_ct: CancellationToken,
 ) -> anyhow::Result<()> {
+    use tokio::time::sleep;
+
     // `shutdown_trigger` fires when the FIRST source resolves: either
     // an OS signal (Ctrl-C / SIGTERM) or external cancellation of `ct`
     // (which the test harness uses for deterministic shutdown).
@@ -3095,7 +3185,7 @@ async fn run_server(
     {
         let trigger = shutdown_trigger.clone();
         let parent = ct.clone();
-        tokio::spawn(async move {
+        let _shutdown_trigger_task = tokio::spawn(async move {
             // cancel-safe: both arms (signal future, CancellationToken::cancelled)
             // are cancel-safe; the losing arm holds no state.
             tokio::select! {
@@ -3108,11 +3198,11 @@ async fn run_server(
 
     let graceful = {
         let trigger = shutdown_trigger.clone();
-        let ct = ct.clone();
+        let shutdown_ct = ct.clone();
         async move {
             trigger.cancelled().await;
             tracing::info!("shutting down (grace period: {shutdown_timeout:?})");
-            ct.cancel();
+            shutdown_ct.cancel();
         }
     };
 
@@ -3120,7 +3210,7 @@ async fn run_server(
         let trigger = shutdown_trigger.clone();
         async move {
             trigger.cancelled().await;
-            tokio::time::sleep(shutdown_timeout).await;
+            sleep(shutdown_timeout).await;
         }
     };
 
@@ -3133,7 +3223,7 @@ async fn run_server(
                 mtls_revocation::bootstrap_fetch(roots, &ca_certs, mtls.clone())
                     .await
                     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-            tokio::spawn(mtls_revocation::run_crl_refresher(
+            let _crl_refresher_task = tokio::spawn(mtls_revocation::run_crl_refresher(
                 Arc::clone(&crl_set),
                 discover_rx,
                 ct.clone(),
@@ -3208,70 +3298,74 @@ async fn run_server(
 fn install_oauth_proxy_routes(
     router: axum::Router,
     server_url: &str,
-    oauth_config: &crate::oauth::OAuthConfig,
+    oauth_config: &OAuthConfig,
     auth_state: Option<&Arc<AuthState>>,
     max_request_body: usize,
     admin_role: &str,
 ) -> Result<axum::Router, RmcpServerKitError> {
-    let Some(ref proxy) = oauth_config.proxy else {
+    use axum::{
+        extract::RawQuery,
+        middleware::from_fn,
+        routing::{get, post},
+    };
+    use tower_http::limit::RequestBodyLimitLayer;
+
+    use crate::oauth::{authorization_server_metadata, handle_authorize, handle_token};
+
+    let Some(proxy) = &oauth_config.proxy else {
         return Ok(router);
     };
 
     // Single shared HTTP client for all proxy endpoints. Cloning is
     // cheap (refcounted) and shares the underlying connection pool.
-    let http = crate::oauth::OauthHttpClient::with_config(oauth_config)?;
+    let http = OauthHttpClient::with_config(oauth_config)?;
 
     // Build the proxy endpoints on a DEDICATED sub-router so the request-body
     // cap below applies to exactly these routes and cannot leak onto `/mcp`,
     // health, or `/version`. Without this, the proxy routes would fall back to
     // axum's 2 MB `DefaultBodyLimit` and silently ignore the operator's
     // configured `max_request_body` (rust-review MEDIUM finding).
-    let proxy_router = axum::Router::new();
+    let base_proxy_router = axum::Router::new();
 
-    let asm = crate::oauth::authorization_server_metadata(server_url, oauth_config);
-    let proxy_router = proxy_router.route(
+    let asm = authorization_server_metadata(server_url, oauth_config);
+    let proxy_router_with_metadata = base_proxy_router.route(
         "/.well-known/oauth-authorization-server",
-        axum::routing::get(move || {
-            let m = asm.clone();
-            async move { axum::Json(m) }
+        get(move || {
+            let metadata = asm.clone();
+            async move { axum::Json(metadata) }
         }),
     );
 
     let proxy_authorize = proxy.clone();
-    let proxy_router = proxy_router.route(
+    let proxy_router_with_authorize = proxy_router_with_metadata.route(
         "/authorize",
-        axum::routing::get(
-            move |axum::extract::RawQuery(query): axum::extract::RawQuery| {
-                let p = proxy_authorize.clone();
-                async move { crate::oauth::handle_authorize(&p, &query.unwrap_or_default()) }
-            },
-        ),
+        get(move |RawQuery(query): RawQuery| {
+            let proxy_authorize_clone = proxy_authorize.clone();
+            async move { handle_authorize(&proxy_authorize_clone, &query.unwrap_or_default()) }
+        }),
     );
 
     let proxy_token = proxy.clone();
     let token_http = http.clone();
-    let proxy_router = proxy_router.route(
+    let proxy_router_with_token = proxy_router_with_authorize.route(
         "/token",
-        axum::routing::post(move |body: String| {
-            let p = proxy_token.clone();
-            let h = token_http.clone();
-            async move { crate::oauth::handle_token(&h, &p, &body).await }
+        post(move |body: String| {
+            let proxy_token_clone = proxy_token.clone();
+            let token_http_clone = token_http.clone();
+            async move { handle_token(&token_http_clone, &proxy_token_clone, &body).await }
         })
-        .layer(axum::middleware::from_fn(
-            oauth_token_cache_headers_middleware,
-        )),
+        .layer(from_fn(oauth_token_cache_headers_middleware)),
     );
 
     let proxy_register = proxy.clone();
-    let proxy_router = proxy_router.route(
+    let proxy_router = proxy_router_with_token.route(
         "/register",
-        axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
-            let p = proxy_register;
-            async move { axum::Json(crate::oauth::handle_register(&p, &body)) }
+        post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+            use crate::oauth::handle_register;
+            let proxy_config = proxy_register;
+            async move { axum::Json(handle_register(&proxy_config, &body)) }
         })
-        .layer(axum::middleware::from_fn(
-            oauth_token_cache_headers_middleware,
-        )),
+        .layer(from_fn(oauth_token_cache_headers_middleware)),
     );
 
     let admin_routes_enabled = proxy.expose_admin_endpoints
@@ -3299,14 +3393,11 @@ fn install_oauth_proxy_routes(
     // Merge admin (introspect/revoke) BEFORE applying the body-limit layer so
     // those routes inherit the cap too. `.layer` only wraps routes already
     // present on `proxy_router`, so this cannot affect the outer router.
-    let proxy_router =
-        proxy_router
-            .merge(admin_router)
-            .layer(tower_http::limit::RequestBodyLimitLayer::new(
-                max_request_body,
-            ));
+    let merged_proxy_router = proxy_router
+        .merge(admin_router)
+        .layer(RequestBodyLimitLayer::new(max_request_body));
 
-    let router = router.merge(proxy_router);
+    let merged_router = router.merge(merged_proxy_router);
 
     tracing::info!(
         introspect = proxy.expose_admin_endpoints && proxy.introspection_url.is_some(),
@@ -3314,7 +3405,7 @@ fn install_oauth_proxy_routes(
         max_request_body,
         "OAuth 2.1 proxy endpoints enabled (/authorize, /token, /register)"
     );
-    Ok(router)
+    Ok(merged_router)
 }
 
 /// Build the optional `/introspect` + `/revoke` admin sub-router.
@@ -3322,23 +3413,34 @@ fn install_oauth_proxy_routes(
 /// Layered with [`oauth_token_cache_headers_middleware`] so RFC 6749 §5.1
 /// / RFC 6750 §5.4 cache headers are emitted, and conditionally with the
 /// auth middleware when `proxy.require_auth_on_admin_endpoints` is set.
+///
+/// # Errors
+///
+/// Returns an error if admin endpoints require authentication but no auth
+/// state was provided.
 #[cfg(feature = "oauth")]
 fn build_oauth_admin_router(
-    proxy: &crate::oauth::OAuthProxyConfig,
-    http: crate::oauth::OauthHttpClient,
+    proxy: &OAuthProxyConfig,
+    http: OauthHttpClient,
     auth_state: Option<&Arc<AuthState>>,
     admin_role: &str,
 ) -> Result<axum::Router, RmcpServerKitError> {
+    use axum::{middleware::from_fn, routing::post};
+
+    use crate::{
+        admin::require_admin_role,
+        oauth::{handle_introspect, handle_revoke},
+    };
     let mut admin_router = axum::Router::new();
     if proxy.introspection_url.is_some() {
         let proxy_introspect = proxy.clone();
         let introspect_http = http.clone();
         admin_router = admin_router.route(
             "/introspect",
-            axum::routing::post(move |body: String| {
-                let p = proxy_introspect.clone();
-                let h = introspect_http.clone();
-                async move { crate::oauth::handle_introspect(&h, &p, &body).await }
+            post(move |body: String| {
+                let proxy_config = proxy_introspect.clone();
+                let http_client = introspect_http.clone();
+                async move { handle_introspect(&http_client, &proxy_config, &body).await }
             }),
         );
     }
@@ -3347,17 +3449,16 @@ fn build_oauth_admin_router(
         let revoke_http = http;
         admin_router = admin_router.route(
             "/revoke",
-            axum::routing::post(move |body: String| {
-                let p = proxy_revoke.clone();
-                let h = revoke_http.clone();
-                async move { crate::oauth::handle_revoke(&h, &p, &body).await }
+            post(move |body: String| {
+                let proxy_config = proxy_revoke.clone();
+                let http_client = revoke_http.clone();
+                async move { handle_revoke(&http_client, &proxy_config, &body).await }
             }),
         );
     }
 
-    let admin_router = admin_router.layer(axum::middleware::from_fn(
-        oauth_token_cache_headers_middleware,
-    ));
+    let admin_router_with_headers =
+        admin_router.layer(from_fn(oauth_token_cache_headers_middleware));
 
     if proxy.require_auth_on_admin_endpoints {
         let Some(state) = auth_state else {
@@ -3372,17 +3473,17 @@ fn build_oauth_admin_router(
         // AFTER it at runtime: auth_middleware (outermost) authenticates and
         // populates the AuthIdentity, then require_admin_role rejects any
         // authenticated-but-non-admin caller with 403.
-        Ok(admin_router
-            .layer(axum::middleware::from_fn(move |req, next| {
-                let r = Arc::clone(&required_role);
-                crate::admin::require_admin_role(r, req, next)
+        Ok(admin_router_with_headers
+            .layer(from_fn(move |req, next| {
+                let role = Arc::clone(&required_role);
+                require_admin_role(role, req, next)
             }))
-            .layer(axum::middleware::from_fn(move |req, next| {
-                let s = Arc::clone(&state_for_mw);
-                auth_middleware(s, req, next)
+            .layer(from_fn(move |req, next| {
+                let mw_state = Arc::clone(&state_for_mw);
+                auth_middleware(mw_state, req, next)
             })))
     } else {
-        Ok(admin_router)
+        Ok(admin_router_with_headers)
     }
 }
 
@@ -3415,6 +3516,7 @@ fn derive_server_url(config: &McpServerConfig) -> String {
 /// Includes loopback hosts by default, then augments with host/authority
 /// derived from `public_url` and the server bind address.
 fn derive_allowed_hosts(bind_addr: &str, public_url: Option<&str>) -> Vec<String> {
+    use axum::http::Uri;
     let mut hosts = vec![
         "localhost".to_owned(),
         "127.0.0.1".to_owned(),
@@ -3422,31 +3524,31 @@ fn derive_allowed_hosts(bind_addr: &str, public_url: Option<&str>) -> Vec<String
     ];
 
     if let Some(url) = public_url
-        && let Ok(uri) = url.parse::<axum::http::Uri>()
+        && let Ok(uri) = url.parse::<Uri>()
         && let Some(authority) = uri.authority()
     {
         let host = authority.host().to_owned();
-        if !hosts.iter().any(|h| h == &host) {
+        if !hosts.iter().any(|entry| entry == &host) {
             hosts.push(host);
         }
 
-        let authority = authority.as_str().to_owned();
-        if !hosts.iter().any(|h| h == &authority) {
-            hosts.push(authority);
+        let authority_str = authority.as_str().to_owned();
+        if !hosts.iter().any(|entry| entry == &authority_str) {
+            hosts.push(authority_str);
         }
     }
 
-    if let Ok(uri) = format!("http://{bind_addr}").parse::<axum::http::Uri>()
+    if let Ok(uri) = format!("http://{bind_addr}").parse::<Uri>()
         && let Some(authority) = uri.authority()
     {
         let host = authority.host().to_owned();
-        if !hosts.iter().any(|h| h == &host) {
+        if !hosts.iter().any(|entry| entry == &host) {
             hosts.push(host);
         }
 
-        let authority = authority.as_str().to_owned();
-        if !hosts.iter().any(|h| h == &authority) {
-            hosts.push(authority);
+        let authority_str = authority.as_str().to_owned();
+        if !hosts.iter().any(|entry| entry == &authority_str) {
+            hosts.push(authority_str);
         }
     }
 
@@ -3465,12 +3567,10 @@ fn derive_allowed_hosts(bind_addr: &str, public_url: Option<&str>) -> Vec<String
 /// previous shared-map approach which was vulnerable to ephemeral-port
 /// reuse races (an unauthenticated reconnection from the same `(IP, port)`
 /// pair could alias a stale entry).
-impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, TlsListener>>
-    for TlsConnInfo
-{
-    fn connect_info(target: axum::serve::IncomingStream<'_, TlsListener>) -> Self {
-        let addr = *target.remote_addr();
-        let identity = target.io().identity().cloned();
+impl Connected<IncomingStream<'_, TlsListener>> for TlsConnInfo {
+    fn connect_info(stream: IncomingStream<'_, TlsListener>) -> Self {
+        let addr = *stream.remote_addr();
+        let identity = stream.io().identity().cloned();
         Self::new(addr, identity)
     }
 }
@@ -3483,8 +3583,9 @@ impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, TlsL
 /// [`McpServerConfig::with_tls_handshake_timeout`].
 const DEFAULT_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Default upper bound on concurrently in-flight TLS handshakes. When
-/// saturated, the acceptor task stops pulling new connections from the
+/// Default upper bound on concurrently in-flight TLS handshakes.
+///
+/// When saturated, the acceptor task stops pulling new connections from the
 /// kernel backlog (backpressure) instead of accepting and dropping them
 /// in user space.
 ///
@@ -3493,9 +3594,11 @@ const DEFAULT_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_MAX_CONCURRENT_TLS_HANDSHAKES: usize = 256;
 
 /// Capacity of the completed-handshake queue between the acceptor task and
-/// `axum::serve`'s `accept()` loop. Handshake workers block on `send` when
-/// the queue is full, so a slow accept loop back-pressures handshakes
-/// rather than buffering completed connections unboundedly.
+/// `axum::serve`'s `accept()` loop.
+///
+/// Handshake workers block on `send` when the queue is full, so a slow
+/// accept loop back-pressures handshakes rather than buffering completed
+/// connections unboundedly.
 const TLS_ACCEPT_CHANNEL_CAPACITY: usize = 32;
 
 /// A TLS-wrapping listener that implements axum's `Listener` trait.
@@ -3521,10 +3624,17 @@ struct TlsListener {
     rx: mpsc::Receiver<(AuthenticatedTlsStream, SocketAddr)>,
     /// Background task driving TCP accepts and concurrent TLS handshakes.
     /// Aborted on drop so the listener releases its port deterministically.
-    acceptor_task: tokio::task::JoinHandle<()>,
+    acceptor_task: JoinHandle<()>,
 }
 
 impl TlsListener {
+    /// Build a TLS-wrapping listener that accepts and handshakes connections
+    /// on a dedicated background task.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the certificate or key material cannot be loaded,
+    /// or if the underlying listener address cannot be read.
     fn new(
         inner: TcpListener,
         cert_path: &Path,
@@ -3535,15 +3645,16 @@ impl TlsListener {
         max_concurrent_handshakes: usize,
     ) -> anyhow::Result<Self> {
         // Install the ring crypto provider (ok to call multiple times).
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .ok();
+        use rustls::crypto::ring::default_provider;
+        if default_provider().install_default().is_err() {
+            tracing::debug!("ring crypto provider was already installed");
+        }
 
         let certs = load_certs(cert_path)?;
         let key = load_key(key_path)?;
 
         let mtls_default_role =
-            mtls_config.map_or_else(|| "viewer".to_owned(), |m| m.default_role.clone());
+            mtls_config.map_or_else(|| "viewer".to_owned(), |cfg| cfg.default_role.clone());
 
         let tls_config = build_tls_server_config(certs, key, mtls_config, crl_set)?;
 
@@ -3574,7 +3685,7 @@ impl TlsListener {
     /// Returns `None` if no client certificate was presented or if the
     /// certificate could not be parsed into an [`AuthIdentity`].
     fn extract_handshake_identity(
-        tls_stream: &tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        tls_stream: &TlsStream<TcpStream>,
         default_role: &str,
         addr: SocketAddr,
     ) -> Option<AuthIdentity> {
@@ -3604,6 +3715,7 @@ async fn run_tls_acceptor(
     handshake_timeout: Duration,
     max_concurrent_handshakes: usize,
 ) {
+    use tokio::time::timeout;
     let inflight = Arc::new(Semaphore::new(max_concurrent_handshakes));
     loop {
         // Acquire the permit BEFORE accepting: at saturation, pending
@@ -3615,8 +3727,8 @@ async fn run_tls_acceptor(
         };
         let (stream, addr) = match listener.accept().await {
             Ok(pair) => pair,
-            Err(e) => {
-                tracing::debug!("TCP accept error: {e}");
+            Err(err) => {
+                tracing::debug!("TCP accept error: {err}");
                 continue;
             }
         };
@@ -3624,18 +3736,18 @@ async fn run_tls_acceptor(
             // The listener was dropped (shutdown): stop accepting.
             return;
         }
-        let acceptor = acceptor.clone();
-        let default_role = default_role.clone();
-        let tx = tx.clone();
-        tokio::spawn(async move {
+        let handshake_acceptor = acceptor.clone();
+        let handshake_role = default_role.clone();
+        let completed_tx = tx.clone();
+        let _handshake_task = tokio::spawn(async move {
             let _permit = permit;
             // Attribute this handshake's CRL-discovery admission to the peer IP
             // so one peer cannot drain another peer's discovery budget. rustls
             // calls `verify_client_cert` synchronously inside `accept`'s own
             // poll, and `tokio::time::timeout` polls its wrapped future first,
             // so the scope nests correctly and is not leaked on the timeout arm.
-            let accept_fut = acceptor.accept(stream);
-            match tokio::time::timeout(
+            let accept_fut = handshake_acceptor.accept(stream);
+            match timeout(
                 handshake_timeout,
                 mtls_revocation::CURRENT_HANDSHAKE_PEER.scope(addr.ip(), accept_fut),
             )
@@ -3643,17 +3755,17 @@ async fn run_tls_acceptor(
             {
                 Ok(Ok(tls_stream)) => {
                     let identity =
-                        TlsListener::extract_handshake_identity(&tls_stream, &default_role, addr);
+                        TlsListener::extract_handshake_identity(&tls_stream, &handshake_role, addr);
                     let wrapped = AuthenticatedTlsStream {
                         inner: tls_stream,
                         identity,
                     };
                     // The receiver only disappears during shutdown; discard
                     // the completed connection quietly rather than logging.
-                    let _ = tx.send((wrapped, addr)).await;
+                    drop(completed_tx.send((wrapped, addr)).await);
                 }
-                Ok(Err(e)) => {
-                    tracing::debug!("TLS handshake failed from {addr}: {e}");
+                Ok(Err(err)) => {
+                    tracing::debug!("TLS handshake failed from {addr}: {err}");
                 }
                 Err(_elapsed) => {
                     tracing::debug!(
@@ -3677,7 +3789,9 @@ async fn run_tls_acceptor(
 /// [`tokio::net::TcpStream`] is `Unpin`), so `AsyncRead`/`AsyncWrite`
 /// delegation uses safe pin projection via `Pin::new(&mut self.inner)`.
 pub(crate) struct AuthenticatedTlsStream {
-    inner: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+    /// The wrapped TLS stream carrying the handshake state.
+    inner: TlsStream<TcpStream>,
+    /// Verified mTLS client identity extracted at handshake time, if any.
     identity: Option<AuthIdentity>,
 }
 
@@ -3689,52 +3803,52 @@ impl AuthenticatedTlsStream {
     }
 }
 
-impl std::fmt::Debug for AuthenticatedTlsStream {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for AuthenticatedTlsStream {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("AuthenticatedTlsStream")
             .field("identity", &self.identity.as_ref().map(|id| &id.name))
             .finish_non_exhaustive()
     }
 }
 
-impl tokio::io::AsyncRead for AuthenticatedTlsStream {
+impl AsyncRead for AuthenticatedTlsStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
+        cx: &mut task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> task::Poll<IoResult<()>> {
         Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
 
-impl tokio::io::AsyncWrite for AuthenticatedTlsStream {
+impl AsyncWrite for AuthenticatedTlsStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        cx: &mut task::Context<'_>,
         buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
+    ) -> task::Poll<IoResult<usize>> {
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
 
     fn poll_flush(
         mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
+        cx: &mut task::Context<'_>,
+    ) -> task::Poll<IoResult<()>> {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(
         mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
+        cx: &mut task::Context<'_>,
+    ) -> task::Poll<IoResult<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 
     fn poll_write_vectored(
         mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        bufs: &[std::io::IoSlice<'_>],
-    ) -> std::task::Poll<std::io::Result<usize>> {
+        cx: &mut task::Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> task::Poll<IoResult<usize>> {
         Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
     }
 
@@ -3743,16 +3857,17 @@ impl tokio::io::AsyncWrite for AuthenticatedTlsStream {
     }
 }
 
-impl axum::serve::Listener for TlsListener {
+impl Listener for TlsListener {
     type Io = AuthenticatedTlsStream;
     type Addr = SocketAddr;
 
     /// Yield the next fully-handshaken TLS connection.
     ///
-    /// Cancel-safe: this is a plain `mpsc::Receiver::recv`, so cancelling
+    /// Cancel safety: this is a plain `mpsc::Receiver::recv`, so cancelling
     /// the future (axum selects it against graceful shutdown) never loses
     /// a connection.
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        use core::future::pending;
         if let Some(pair) = self.rx.recv().await {
             return pair;
         }
@@ -3762,10 +3877,10 @@ impl axum::serve::Listener for TlsListener {
         // forbidden, so park forever: existing connections keep being
         // served and graceful shutdown still completes.
         tracing::error!("TLS acceptor task terminated; no further connections will be accepted");
-        std::future::pending().await
+        pending().await
     }
 
-    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+    fn local_addr(&self) -> IoResult<Self::Addr> {
         Ok(self.local_addr)
     }
 }
@@ -3782,12 +3897,18 @@ impl Drop for TlsListener {
     }
 }
 
-fn load_certs(path: &Path) -> anyhow::Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
-    use rustls::pki_types::pem::PemObject;
-    let certs: Vec<_> = rustls::pki_types::CertificateDer::pem_file_iter(path)
-        .map_err(|e| anyhow::anyhow!("failed to read certs from {}: {e}", path.display()))?
+/// Load one or more PEM-encoded certificates from `path`.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read, contains no certificates,
+/// or contains an invalid certificate.
+fn load_certs(path: &Path) -> anyhow::Result<Vec<CertificateDer<'static>>> {
+    use rustls::pki_types::pem::PemObject as _;
+    let certs: Vec<_> = CertificateDer::pem_file_iter(path)
+        .map_err(|err| anyhow::anyhow!("failed to read certs from {}: {err}", path.display()))?
         .collect::<Result<_, _>>()
-        .map_err(|e| anyhow::anyhow!("invalid cert in {}: {e}", path.display()))?;
+        .map_err(|err| anyhow::anyhow!("invalid cert in {}: {err}", path.display()))?;
     anyhow::ensure!(
         !certs.is_empty(),
         "no certificates found in {}",
@@ -3796,12 +3917,15 @@ fn load_certs(path: &Path) -> anyhow::Result<Vec<rustls::pki_types::CertificateD
     Ok(certs)
 }
 
+/// Load the CA certificate chain from `path` and build a root store.
+///
+/// # Errors
+///
+/// Returns an error if the certificate file cannot be read or if any
+/// certificate is invalid.
 fn load_client_auth_roots(
     path: &Path,
-) -> anyhow::Result<(
-    Vec<rustls::pki_types::CertificateDer<'static>>,
-    Arc<RootCertStore>,
-)> {
+) -> anyhow::Result<(Vec<CertificateDer<'static>>, Arc<RootCertStore>)> {
     let ca_certs = load_certs(path)?;
     let mut root_store = RootCertStore::empty();
     for cert in &ca_certs {
@@ -3813,27 +3937,38 @@ fn load_client_auth_roots(
     Ok((ca_certs, Arc::new(root_store)))
 }
 
-fn load_key(path: &Path) -> anyhow::Result<rustls::pki_types::PrivateKeyDer<'static>> {
-    use rustls::pki_types::pem::PemObject;
-    rustls::pki_types::PrivateKeyDer::from_pem_file(path)
-        .map_err(|e| anyhow::anyhow!("failed to read key from {}: {e}", path.display()))
+/// Load a PEM-encoded private key from `path`.
+///
+/// # Errors
+///
+/// Returns an error if the key cannot be read or parsed.
+fn load_key(path: &Path) -> anyhow::Result<PrivateKeyDer<'static>> {
+    use rustls::pki_types::pem::PemObject as _;
+    PrivateKeyDer::from_pem_file(path)
+        .map_err(|err| anyhow::anyhow!("failed to read key from {}: {err}", path.display()))
 }
 
 /// Test/production seam: builds a `ServerConfig` from an explicit verifier
 /// so tests can inject one without file-backed CA/CRL setup. Production
 /// code reaches this only via `build_tls_server_config` below.
+///
+/// # Errors
+///
+/// Returns an error if the certificate/key pair cannot be assembled into a
+/// usable `ServerConfig`.
 fn build_tls_server_config_from_verifier(
-    certs: Vec<rustls::pki_types::CertificateDer<'static>>,
-    key: rustls::pki_types::PrivateKeyDer<'static>,
-    verifier: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+    verifier: Arc<dyn ClientCertVerifier>,
     disable_resumption: bool,
 ) -> anyhow::Result<rustls::ServerConfig> {
-    let mut tls_config = rustls::ServerConfig::builder_with_protocol_versions(&[
-        &rustls::version::TLS12,
-        &rustls::version::TLS13,
-    ])
-    .with_client_cert_verifier(verifier)
-    .with_single_cert(certs, key)?;
+    use rustls::{
+        server::NoServerSessionStorage,
+        version::{TLS12, TLS13},
+    };
+    let mut tls_config = rustls::ServerConfig::builder_with_protocol_versions(&[&TLS12, &TLS13])
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(certs, key)?;
 
     if disable_resumption {
         // SECURITY: rustls restores `peer_certificates` from cached session
@@ -3854,7 +3989,7 @@ fn build_tls_server_config_from_verifier(
         // ticket emission bail). NOTE: this relies on `ticketer` remaining
         // disabled (rustls' default); enabling a ticketer would reintroduce
         // stateless TLS 1.3 resumption and must not be done for mTLS.
-        tls_config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+        tls_config.session_storage = Arc::new(NoServerSessionStorage {});
         tls_config.send_tls13_tickets = 0;
         tracing::info!(
             "TLS session resumption disabled for mTLS listener; every connection performs full client-certificate verification"
@@ -3864,37 +3999,47 @@ fn build_tls_server_config_from_verifier(
     Ok(tls_config)
 }
 
-/// Builds the production verifier (CRL-backed or plain webpki) and disables
-/// session resumption whenever mTLS is configured at all: non-CRL mTLS still
-/// relies on `verify_client_cert` for expiry and chain validation, so
-/// scoping to `crl_enabled` alone would leave that path unprotected. The
-/// non-mTLS branch is untouched -- it requests no client cert, so
-/// resumption there is not security-relevant.
+/// Builds the production verifier (CRL-backed or plain webpki).
+///
+/// Session resumption is disabled whenever mTLS is configured at all: non-CRL
+/// mTLS still relies on `verify_client_cert` for expiry and chain validation,
+/// so scoping to `crl_enabled` alone would leave that path unprotected. The
+/// non-mTLS branch is untouched -- it requests no client cert, so resumption
+/// there is not security-relevant.
+///
+/// # Errors
+///
+/// Returns an error if the CRL verifier is requested without CRL state or if
+/// the CA material cannot be loaded.
 fn build_tls_server_config(
-    certs: Vec<rustls::pki_types::CertificateDer<'static>>,
-    key: rustls::pki_types::PrivateKeyDer<'static>,
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
     mtls_config: Option<&MtlsConfig>,
     crl_set: Option<Arc<CrlSet>>,
 ) -> anyhow::Result<rustls::ServerConfig> {
+    use rustls::{
+        server::WebPkiClientVerifier,
+        version::{TLS12, TLS13},
+    };
     if let Some(mtls) = mtls_config {
-        let verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> = if mtls.crl_enabled {
-            let Some(crl_set) = crl_set else {
+        let verifier: Arc<dyn ClientCertVerifier> = if mtls.crl_enabled {
+            let Some(crl_state) = crl_set else {
                 return Err(anyhow::anyhow!(
                     "mTLS CRL verifier requested but CRL state was not initialized"
                 ));
             };
-            Arc::new(DynamicClientCertVerifier::new(crl_set))
+            Arc::new(DynamicClientCertVerifier::new(crl_state))
         } else {
             let (_, root_store) = load_client_auth_roots(&mtls.ca_cert_path)?;
             if mtls.required {
-                rustls::server::WebPkiClientVerifier::builder(root_store)
+                WebPkiClientVerifier::builder(root_store)
                     .build()
-                    .map_err(|e| anyhow::anyhow!("mTLS verifier error: {e}"))?
+                    .map_err(|err| anyhow::anyhow!("mTLS verifier error: {err}"))?
             } else {
-                rustls::server::WebPkiClientVerifier::builder(root_store)
+                WebPkiClientVerifier::builder(root_store)
                     .allow_unauthenticated()
                     .build()
-                    .map_err(|e| anyhow::anyhow!("mTLS verifier error: {e}"))?
+                    .map_err(|err| anyhow::anyhow!("mTLS verifier error: {err}"))?
             }
         };
 
@@ -3907,16 +4052,16 @@ fn build_tls_server_config(
 
         build_tls_server_config_from_verifier(certs, key, verifier, mtls_config.is_some())
     } else {
-        Ok(rustls::ServerConfig::builder_with_protocol_versions(&[
-            &rustls::version::TLS12,
-            &rustls::version::TLS13,
-        ])
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?)
+        Ok(
+            rustls::ServerConfig::builder_with_protocol_versions(&[&TLS12, &TLS13])
+                .with_no_client_auth()
+                .with_single_cert(certs, key)?,
+        )
     }
 }
 
 // cancel-safe: builds a constant JSON body with no awaits and no shared state.
+/// Liveness probe handler returning a static `{"status":"ok"}` payload.
 async fn healthz() -> impl IntoResponse {
     axum::Json(serde_json::json!({
         "status": "ok",
@@ -3934,26 +4079,26 @@ async fn healthz() -> impl IntoResponse {
 /// unset values resolve to `"unknown"`.
 fn version_payload(name: &str, version: &str, expose_build_metadata: bool) -> serde_json::Value {
     let mut map = serde_json::Map::new();
-    map.insert("name".into(), name.into());
-    map.insert("version".into(), version.into());
-    map.insert(
+    let _name = map.insert("name".into(), name.into());
+    let _version = map.insert("version".into(), version.into());
+    let _kit_version = map.insert(
         "rmcp_server_kit_version".into(),
         env!("CARGO_PKG_VERSION").into(),
     );
     if expose_build_metadata {
-        map.insert(
+        let _build_sha = map.insert(
             "build_git_sha".into(),
             option_env!("RMCP_SERVER_KIT_BUILD_SHA")
                 .unwrap_or("unknown")
                 .into(),
         );
-        map.insert(
+        let _build_time = map.insert(
             "build_timestamp".into(),
             option_env!("RMCP_SERVER_KIT_BUILD_TIME")
                 .unwrap_or("unknown")
                 .into(),
         );
-        map.insert(
+        let _rustc_version = map.insert(
             "rust_version".into(),
             option_env!("RMCP_SERVER_KIT_RUSTC_VERSION")
                 .unwrap_or("unknown")
@@ -3977,10 +4122,11 @@ fn serialize_version_payload(name: &str, version: &str, expose_build_metadata: b
     serde_json::to_vec(&value).map_or_else(|_| Arc::from(&b"{}"[..]), Arc::from)
 }
 
-// NOT cancel-safe in general: the kit itself mutates no state here, but this
-// awaits a consumer-supplied readiness future. Cancellation drops that future
-// at whatever await it is parked on, so cancel safety is the callback author's
+// NOT cancel-safe: the kit itself mutates no state here, but this awaits a
+// consumer-supplied readiness future. Cancellation drops that future at
+// whatever await it is parked on, so cancel safety is the callback author's
 // contract -- a readiness probe must not leave partial state behind.
+/// Readiness probe handler that awaits the configured check.
 async fn readyz(check: ReadinessCheck) -> impl IntoResponse {
     let status = check().await;
     let ready = status
@@ -3988,9 +4134,9 @@ async fn readyz(check: ReadinessCheck) -> impl IntoResponse {
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     let code = if ready {
-        axum::http::StatusCode::OK
+        StatusCode::OK
     } else {
-        axum::http::StatusCode::SERVICE_UNAVAILABLE
+        StatusCode::SERVICE_UNAVAILABLE
     };
     (code, axum::Json(status))
 }
@@ -3998,12 +4144,20 @@ async fn readyz(check: ReadinessCheck) -> impl IntoResponse {
 /// Wait for SIGINT (ctrl-c) or SIGTERM (container stop).
 ///
 /// On non-Unix platforms, only SIGINT is handled.
+#[expect(
+    clippy::integer_division_remainder_used,
+    reason = "external macro: tokio::select"
+)]
+// cancel-safe: signal-listener futures are cancel-safe per tokio docs and no
+// partial state is carried across the select.
 async fn shutdown_signal() {
-    let ctrl_c = tokio::signal::ctrl_c();
+    use tokio::signal;
+    let ctrl_c = signal::ctrl_c();
 
     #[cfg(unix)]
     {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        use tokio::signal::unix::{SignalKind, signal as unix_signal};
+        match unix_signal(SignalKind::terminate()) {
             Ok(mut term) => {
                 // cancel-safe: signal-listener futures are cancel-safe per
                 // tokio docs; no partial state in either arm.
@@ -4012,9 +4166,11 @@ async fn shutdown_signal() {
                     _ = term.recv() => {}
                 }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to register SIGTERM handler, using SIGINT only");
-                ctrl_c.await.ok();
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to register SIGTERM handler, using SIGINT only");
+                if ctrl_c.await.is_err() {
+                    tracing::debug!("SIGINT handling unavailable on this platform");
+                }
             }
         }
     }
@@ -4043,35 +4199,34 @@ async fn shutdown_signal() {
 /// never used as a fallback -- that is precisely the unbounded input.
 #[cfg(feature = "metrics")]
 fn metrics_labels(req: &Request<Body>) -> (&'static str, String) {
+    use axum::extract::MatchedPath;
+
     let method = match *req.method() {
-        axum::http::Method::GET => "GET",
-        axum::http::Method::POST => "POST",
-        axum::http::Method::PUT => "PUT",
-        axum::http::Method::PATCH => "PATCH",
-        axum::http::Method::DELETE => "DELETE",
-        axum::http::Method::HEAD => "HEAD",
-        axum::http::Method::OPTIONS => "OPTIONS",
-        axum::http::Method::TRACE => "TRACE",
-        axum::http::Method::CONNECT => "CONNECT",
+        Method::GET => "GET",
+        Method::POST => "POST",
+        Method::PUT => "PUT",
+        Method::PATCH => "PATCH",
+        Method::DELETE => "DELETE",
+        Method::HEAD => "HEAD",
+        Method::OPTIONS => "OPTIONS",
+        Method::TRACE => "TRACE",
+        Method::CONNECT => "CONNECT",
         // HTTP permits extension methods, so anything else collapses to a
         // single bucket rather than minting a series per invented verb.
         _ => "OTHER",
     };
 
-    let path = req
-        .extensions()
-        .get::<axum::extract::MatchedPath>()
-        .map_or_else(
-            || {
-                let raw = req.uri().path();
-                if raw == "/mcp" || raw.starts_with("/mcp/") {
-                    "/mcp".to_owned()
-                } else {
-                    "<unmatched>".to_owned()
-                }
-            },
-            |matched| matched.as_str().to_owned(),
-        );
+    let path = req.extensions().get::<MatchedPath>().map_or_else(
+        || {
+            let raw = req.uri().path();
+            if raw == "/mcp" || raw.starts_with("/mcp/") {
+                "/mcp".to_owned()
+            } else {
+                "<unmatched>".to_owned()
+            }
+        },
+        |matched| matched.as_str().to_owned(),
+    );
 
     (method, path)
 }
@@ -4091,16 +4246,19 @@ fn metrics_labels(req: &Request<Body>) -> (&'static str, String) {
 /// differ cannot even be registered alongside - it fails its own `register`
 /// with a reserved-name conflict, i.e. the namespace is protected at the
 /// earliest point.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Startup`] if a framework collector cannot be
+/// registered (e.g. a reserved-name conflict that eviction did not clear).
 #[cfg(feature = "metrics")]
-fn ensure_framework_metrics_registered(
-    metrics: &crate::metrics::McpMetrics,
-) -> Result<(), RmcpServerKitError> {
+fn ensure_framework_metrics_registered(metrics: &McpMetrics) -> Result<(), RmcpServerKitError> {
     use prometheus::core::Collector;
 
     // `Box<dyn Collector>` is not `Clone`; each factory hands out a *fresh*
     // boxed clone of the same collector. `MetricVec` clones share one
     // `Arc<MetricVecCore>`, so descriptors and sample storage stay identical.
-    type BoxedFactory<'a> = &'a dyn Fn() -> Box<dyn Collector>;
+    type BoxedFactory<'factory> = &'factory dyn Fn() -> Box<dyn Collector>;
     let factories: [BoxedFactory<'_>; 3] = [
         &|| -> Box<dyn Collector> { Box::new(metrics.http_requests_total.clone()) },
         &|| -> Box<dyn Collector> { Box::new(metrics.http_request_duration_seconds.clone()) },
@@ -4110,7 +4268,7 @@ fn ensure_framework_metrics_registered(
     for make in factories {
         // Evict whatever occupies this collector/descriptor ID. A "collector is
         // not registered" error is expected here and non-fatal.
-        let _ = metrics.registry.unregister(make());
+        drop(metrics.registry.unregister(make()));
         metrics.registry.register(make()).map_err(|error| {
             RmcpServerKitError::Startup(format!(
                 "metrics registry conflict on reserved rmcp_server_kit_* name: {error}"
@@ -4131,17 +4289,19 @@ fn ensure_framework_metrics_registered(
 // leaving a half-updated metric.
 #[cfg(feature = "metrics")]
 async fn metrics_middleware(
-    metrics: Arc<crate::metrics::McpMetrics>,
+    metrics: Arc<McpMetrics>,
     mut req: Request<Body>,
     next: Next,
-) -> axum::response::Response {
-    let (method, path) = metrics_labels(&req);
-    let start = std::time::Instant::now();
+) -> Response {
+    use core::fmt::NumBuffer;
 
-    req.extensions_mut().insert(Arc::clone(&metrics));
+    let (method, path) = metrics_labels(&req);
+    let start = Instant::now();
+
+    let _previous_metrics = req.extensions_mut().insert(Arc::clone(&metrics));
     let response = next.run(req).await;
 
-    let mut status_buf = core::fmt::NumBuffer::<u16>::new();
+    let mut status_buf = NumBuffer::<u16>::new();
     let status = response.status().as_u16().format_into(&mut status_buf);
     let duration = start.elapsed().as_secs_f64();
 
@@ -4175,15 +4335,15 @@ pub(crate) async fn security_headers_middleware(
     cfg: Arc<SecurityHeadersConfig>,
     req: Request<Body>,
     next: Next,
-) -> axum::response::Response {
-    use axum::http::{HeaderName, header};
+) -> Response {
+    use axum::http::header;
 
     let mut resp = next.run(req).await;
     let headers = resp.headers_mut();
 
     // Strip server identity headers to reduce information leakage.
-    headers.remove(header::SERVER);
-    headers.remove(HeaderName::from_static("x-powered-by"));
+    let _removed_server = headers.remove(header::SERVER);
+    let _removed_powered_by = headers.remove(HeaderName::from_static("x-powered-by"));
 
     apply_security_header(
         headers,
@@ -4275,8 +4435,8 @@ pub(crate) async fn security_headers_middleware(
 /// `Validated<McpServerConfig>` type makes that path unreachable in
 /// well-typed code paths.
 fn apply_security_header(
-    headers: &mut axum::http::HeaderMap,
-    name: axum::http::HeaderName,
+    headers: &mut HeaderMap,
+    name: HeaderName,
     override_value: Option<&str>,
     default: &'static str,
 ) {
@@ -4284,14 +4444,14 @@ fn apply_security_header(
 
     match override_value {
         None => {
-            headers.insert(name, HeaderValue::from_static(default));
+            let _previous = headers.insert(name, HeaderValue::from_static(default));
         }
         Some("") => {
             // Operator explicitly opted out of this header.
         }
-        Some(v) => match HeaderValue::from_str(v) {
+        Some(override_text) => match HeaderValue::from_str(override_text) {
             Ok(hv) => {
-                headers.insert(name, hv);
+                let _previous = headers.insert(name, hv);
             }
             Err(err) => {
                 tracing::error!(
@@ -4299,7 +4459,7 @@ fn apply_security_header(
                     error = %err,
                     "invalid security header override reached middleware; using default"
                 );
-                headers.insert(name, HeaderValue::from_static(default));
+                let _previous = headers.insert(name, HeaderValue::from_static(default));
             }
         },
     }
@@ -4315,6 +4475,12 @@ fn apply_security_header(
 ///   want to commit to the HSTS preload list must do so via a future
 ///   explicit `with_hsts_preload(true)` builder, not by smuggling
 ///   `preload` through this knob.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] naming the offending field when an
+/// override value is not a valid header value, or when
+/// `strict_transport_security` smuggles in `preload`.
 pub(crate) fn validate_security_headers(
     cfg: &SecurityHeadersConfig,
 ) -> Result<(), RmcpServerKitError> {
@@ -4360,23 +4526,23 @@ pub(crate) fn validate_security_headers(
     ];
 
     for (field, value) in fields {
-        let Some(v) = value else { continue };
-        if v.is_empty() {
+        let Some(header_value) = value else { continue };
+        if header_value.is_empty() {
             continue;
         }
-        if let Err(err) = HeaderValue::from_str(v) {
+        if let Err(err) = HeaderValue::from_str(header_value) {
             return Err(RmcpServerKitError::Config(format!(
                 "invalid security_headers.{field}: {err}"
             )));
         }
     }
 
-    if let Some(v) = cfg.strict_transport_security.as_deref()
-        && !v.is_empty()
-        && v.to_ascii_lowercase().contains("preload")
+    if let Some(hsts_value) = cfg.strict_transport_security.as_deref()
+        && !hsts_value.is_empty()
+        && hsts_value.to_ascii_lowercase().contains("preload")
     {
         return Err(RmcpServerKitError::Config(format!(
-            "invalid security_headers.strict_transport_security: {v:?} contains the `preload` directive; \
+            "invalid security_headers.strict_transport_security: {hsts_value:?} contains the `preload` directive; \
              HSTS preload must be opted into explicitly via a dedicated builder, not via this knob"
         )));
     }
@@ -4398,17 +4564,17 @@ pub(crate) fn validate_security_headers(
 /// `/register`, `/introspect`, `/revoke`). `Vary` is appended (not
 /// inserted) so any `Vary` value already present (e.g. `Accept-Encoding`
 /// from a compression layer, or `Origin` from a CORS layer) is preserved.
+///
+/// cancel-safe: the only await is `next.run(req)`; header mutation afterwards
+/// is synchronous, so cancellation simply drops the response before it is sent.
 #[cfg(feature = "oauth")]
-async fn oauth_token_cache_headers_middleware(
-    req: Request<Body>,
-    next: Next,
-) -> axum::response::Response {
+async fn oauth_token_cache_headers_middleware(req: Request<Body>, next: Next) -> Response {
     use axum::http::{HeaderValue, header};
 
     let mut resp = next.run(req).await;
     let headers = resp.headers_mut();
-    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
-    headers.append(header::VARY, HeaderValue::from_static("Authorization"));
+    let _previous_pragma = headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    let _vary_appended = headers.append(header::VARY, HeaderValue::from_static("Authorization"));
     resp
 }
 
@@ -4448,7 +4614,9 @@ async fn normalize_peer_addr_middleware(
     resolver: Option<Arc<ForwardResolver>>,
     mut req: Request<Body>,
     next: Next,
-) -> axum::response::Response {
+) -> Response {
+    use crate::forwarded;
+
     let direct = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -4459,36 +4627,38 @@ async fn normalize_peer_addr_middleware(
         .map(|ci| ci.0.addr);
     if let Some(addr) = direct.or(from_tls) {
         if direct.is_none() {
-            req.extensions_mut().insert(ConnectInfo(addr));
+            let _connect_info = req.extensions_mut().insert(ConnectInfo(addr));
         }
-        req.extensions_mut().insert(PeerAddr::new(addr));
-        let client_ip = match &resolver {
-            Some(r) => crate::forwarded::resolve_client_ip(
-                addr.ip(),
-                req.headers(),
-                &r.trusted,
-                r.mode,
-                r.max_scanned_entries,
-            )
-            .unwrap_or_else(|reason| {
-                tracing::debug!(
-                    reason = ?reason,
-                    "forwarded-header resolution fell back to direct peer"
-                );
-                addr.ip()
-            }),
-            None => addr.ip(),
-        };
-        req.extensions_mut().insert(ClientIp::new(client_ip));
-        if let Some(r) = &resolver
-            && let Some(name) = &r.request_id_header
-            && crate::forwarded::is_trusted(addr.ip(), &r.trusted)
+        let _peer_addr = req.extensions_mut().insert(PeerAddr::new(addr));
+        let client_ip = resolver.as_ref().map_or_else(
+            || addr.ip(),
+            |fwd_resolver| {
+                forwarded::resolve_client_ip(
+                    addr.ip(),
+                    req.headers(),
+                    &fwd_resolver.trusted,
+                    fwd_resolver.mode,
+                    fwd_resolver.max_scanned_entries,
+                )
+                .unwrap_or_else(|reason| {
+                    tracing::debug!(
+                        reason = ?reason,
+                        "forwarded-header resolution fell back to direct peer"
+                    );
+                    addr.ip()
+                })
+            },
+        );
+        let _client_ip = req.extensions_mut().insert(ClientIp::new(client_ip));
+        if let Some(fwd_resolver) = &resolver
+            && let Some(name) = &fwd_resolver.request_id_header
+            && forwarded::is_trusted(addr.ip(), &fwd_resolver.trusted)
             && let Some(value) = req.headers().get_all(name).iter().next_back()
             && let Ok(raw) = value.to_str()
         {
             let sanitized = sanitize_for_log(raw, MAX_LOGGED_HEADER_CHARS);
             if !sanitized.is_empty() {
-                req.extensions_mut().insert(RequestId::new(&sanitized));
+                let _request_id = req.extensions_mut().insert(RequestId::new(&sanitized));
             }
         }
     }
@@ -4504,7 +4674,9 @@ fn parse_proxy_net(entry: &str) -> Option<ipnet::IpNet> {
     entry.parse::<IpAddr>().ok().map(ipnet::IpNet::from)
 }
 
-/// Validate one `trusted_proxies` entry. Accepts a CIDR (`ipnet::IpNet`)
+/// Validate one `trusted_proxies` entry.
+///
+/// Accepts a CIDR (`ipnet::IpNet`)
 /// or a bare IP; **rejects a `/0` prefix**, which would mark every peer
 /// trusted and let any client spoof the resolved client IP via forwarding
 /// headers. Shared by the builder ([`McpServerConfig::check_trusted_forwarder`])
@@ -4525,7 +4697,9 @@ pub(crate) fn validate_trusted_proxy_entry(entry: &str) -> Result<(), String> {
     }
 }
 
-/// Validate [`LogContextConfig::request_id_header`]. Requires a
+/// Validate [`LogContextConfig::request_id_header`].
+///
+/// Requires a
 /// syntactically valid HTTP header name that is neither one of
 /// [`REDACTED_LOG_HEADERS`] nor `mcp-session-id` (the session ID must
 /// never reach a log line). Shared by the builder
@@ -4537,7 +4711,7 @@ pub(crate) fn validate_trusted_proxy_entry(entry: &str) -> Result<(), String> {
 /// Returns a message naming `request_id_header` when the name is not a
 /// valid header name or is on the forbidden list.
 pub(crate) fn validate_request_id_header(name: &str) -> Result<(), String> {
-    axum::http::HeaderName::from_bytes(name.as_bytes()).map_err(|_err| {
+    let _validated_name = HeaderName::from_bytes(name.as_bytes()).map_err(|_err| {
         format!("log_context.request_id_header {name:?} is not a valid header name")
     })?;
     let lower = name.to_ascii_lowercase();
@@ -4549,11 +4723,13 @@ pub(crate) fn validate_request_id_header(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Rate-limit key for the current request: the resolved [`ClientIp`]
+/// Rate-limit key for the current request.
+///
+/// The resolved [`ClientIp`]
 /// when present, else the direct peer from either `ConnectInfo` form.
 /// All four built-in limiters key through this helper; it is also the
 /// `client_ip` value used by client-context logging.
-pub(crate) fn limiter_client_ip(extensions: &axum::http::Extensions) -> Option<IpAddr> {
+pub(crate) fn limiter_client_ip(extensions: &Extensions) -> Option<IpAddr> {
     if let Some(client) = extensions.get::<ClientIp>() {
         return Some(client.ip);
     }
@@ -4568,7 +4744,7 @@ pub(crate) fn limiter_client_ip(extensions: &axum::http::Extensions) -> Option<I
 }
 
 /// Extract the direct peer IP address for logging.
-pub(crate) fn peer_ip_for_log(extensions: &axum::http::Extensions) -> Option<IpAddr> {
+pub(crate) fn peer_ip_for_log(extensions: &Extensions) -> Option<IpAddr> {
     extensions
         .get::<PeerAddr>()
         .map(|peer| peer.addr.ip())
@@ -4604,8 +4780,8 @@ pub(crate) enum RateLimitKey {
     Unattributed,
 }
 
-impl std::fmt::Display for RateLimitKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for RateLimitKey {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
             Self::Ip(ip) => write!(f, "{ip}"),
             Self::Unattributed => f.write_str("unattributed"),
@@ -4614,8 +4790,7 @@ impl std::fmt::Display for RateLimitKey {
 }
 
 /// Emitted at most once per process; see [`limiter_client_key`].
-static UNATTRIBUTED_WARNED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static UNATTRIBUTED_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// Rate-limit key for the current request.
 ///
@@ -4627,11 +4802,11 @@ static UNATTRIBUTED_WARNED: std::sync::atomic::AtomicBool =
 /// process rather than per request: a broken invariant holds for *every*
 /// request, so per-request logging would amplify it into its own denial
 /// of service.
-pub(crate) fn limiter_client_key(extensions: &axum::http::Extensions) -> RateLimitKey {
+pub(crate) fn limiter_client_key(extensions: &Extensions) -> RateLimitKey {
     if let Some(ip) = limiter_client_ip(extensions) {
         return RateLimitKey::Ip(ip);
     }
-    if !UNATTRIBUTED_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    if !UNATTRIBUTED_WARNED.swap(true, Ordering::Relaxed) {
         tracing::warn!(
             "request carries no resolvable client address; rate limiting is \
              falling back to a single shared bucket. This indicates \
@@ -4647,6 +4822,7 @@ pub(crate) fn limiter_client_key(extensions: &axum::http::Extensions) -> RateLim
 pub(crate) type ExtraRouteRateLimiter = BoundedKeyedLimiter<RateLimitKey>;
 
 /// Cap on distinct source IPs tracked by the extra-route limiter.
+///
 /// Mirrors the tool limiter's bound: memory stays bounded at saturation
 /// via idle-prune + LRU eviction, at the cost of shared-fate fairness
 /// under key spray (an attacker churning many IPs can reset quieter
@@ -4669,10 +4845,12 @@ fn build_extra_route_rate_limiter_with_policy(
     key_eviction_policy: KeyEvictionPolicy,
     max_tracked_keys: NonZeroUsize,
 ) -> Arc<ExtraRouteRateLimiter> {
-    let rate = std::num::NonZeroU32::new(per_minute.max(1)).unwrap_or(std::num::NonZeroU32::MIN);
+    use core::num::NonZeroU32;
+
+    let rate = NonZeroU32::new(per_minute.max(1)).unwrap_or(NonZeroU32::MIN);
     let mut quota = governor::Quota::per_minute(rate);
-    if let Some(b) = burst.and_then(std::num::NonZeroU32::new) {
-        quota = quota.allow_burst(b);
+    if let Some(burst_value) = burst.and_then(NonZeroU32::new) {
+        quota = quota.allow_burst(burst_value);
     }
     Arc::new(BoundedKeyedLimiter::new_with_policy(
         quota,
@@ -4708,10 +4886,10 @@ fn build_extra_route_rate_limiter_with_policy(
 // request was admitted, so it must cost budget (same posture as auth/rbac).
 async fn extra_route_rate_limit_middleware(
     limiter: Arc<ExtraRouteRateLimiter>,
-    exempt: Arc<std::collections::HashSet<String>>,
+    exempt: Arc<HashSet<String>>,
     req: Request<Body>,
     next: Next,
-) -> axum::response::Response {
+) -> Response {
     if exempt.contains(req.uri().path()) {
         return next.run(req).await;
     }
@@ -4720,7 +4898,10 @@ async fn extra_route_rate_limit_middleware(
         Ok(()) => {}
         Err(BoundedLimiterDeny::RateLimited(wait)) => {
             #[cfg(feature = "metrics")]
-            crate::metrics::record_rate_limit_deny(req.extensions(), "extra_route");
+            {
+                use crate::metrics;
+                metrics::record_rate_limit_deny(req.extensions(), "extra_route");
+            }
             tracing::warn!(rate_limit_key = %peer_key, "extra route request rate limited");
             return RmcpServerKitError::RateLimitedFor {
                 message: "too many requests to application routes from this source".into(),
@@ -4734,7 +4915,7 @@ async fn extra_route_rate_limit_middleware(
                 "extra route limiter rejected unseen key because tracked-key capacity is full"
             );
             return (
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                StatusCode::SERVICE_UNAVAILABLE,
                 "rate limiter capacity exhausted",
             )
                 .into_response();
@@ -4756,8 +4937,8 @@ enum AllowedOrigin {
     Null,
 }
 
-impl std::fmt::Display for AllowedOrigin {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for AllowedOrigin {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
             Self::Tuple(scheme, host, port) => write!(f, "{scheme}://{host}:{port}"),
             Self::Null => f.write_str("null"),
@@ -4803,8 +4984,8 @@ fn parse_port_token(token: &str) -> Option<u16> {
 /// [`parse_config_origin_tuple`].
 fn parse_origin(value: &str, allow_root_slash: bool) -> Option<(String, String, u16)> {
     let (scheme, rest) = value.split_once("://")?;
-    let scheme = scheme.to_ascii_lowercase();
-    let default_port = match scheme.as_str() {
+    let scheme_lower = scheme.to_ascii_lowercase();
+    let default_port = match scheme_lower.as_str() {
         "http" => 80,
         "https" => 443,
         _ => return None,
@@ -4813,16 +4994,16 @@ fn parse_origin(value: &str, allow_root_slash: bool) -> Option<(String, String, 
     if rest.is_empty() {
         return None;
     }
-    let rest = if allow_root_slash {
+    let rest_trimmed = if allow_root_slash {
         rest.strip_suffix('/').unwrap_or(rest)
     } else {
         rest
     };
-    if rest.is_empty() || rest.contains(['/', '?', '#']) {
+    if rest_trimmed.is_empty() || rest_trimmed.contains(['/', '?', '#']) {
         return None;
     }
 
-    let (host, port) = if let Some(after_bracket) = rest.strip_prefix('[') {
+    let (host, port) = if let Some(after_bracket) = rest_trimmed.strip_prefix('[') {
         // Bracketed IPv6 literal: `[::1]` or `[::1]:8080`.
         let (inside, tail) = after_bracket.split_once(']')?;
         if inside.is_empty() {
@@ -4835,28 +5016,28 @@ fn parse_origin(value: &str, allow_root_slash: bool) -> Option<(String, String, 
         };
         (format!("[{inside}]"), port)
     } else {
-        if rest.matches(':').count() > 1 {
+        if rest_trimmed.matches(':').count() > 1 {
             // Unbracketed IPv6 is not a valid origin host.
             return None;
         }
-        match rest.split_once(':') {
+        match rest_trimmed.split_once(':') {
             Some((host, port)) => {
                 if host.is_empty() {
                     return None;
                 }
                 (host.to_owned(), parse_port_token(port)?)
             }
-            None => (rest.to_owned(), default_port),
+            None => (rest_trimmed.to_owned(), default_port),
         }
     };
 
-    if host.is_empty() || host.contains(|c: char| c.is_whitespace() || c.is_control()) {
+    if host.is_empty() || host.contains(|ch: char| ch.is_whitespace() || ch.is_control()) {
         return None;
     }
     if port == 0 {
         return None;
     }
-    Some((scheme, host.to_ascii_lowercase(), port))
+    Some((scheme_lower, host.to_ascii_lowercase(), port))
 }
 
 /// Parse a configured allowlist entry into the runtime match representation.
@@ -4876,6 +5057,10 @@ fn parse_allowed_origin(value: &str) -> Option<AllowedOrigin> {
 ///
 /// Shared by `McpServerConfig::check` and `config::validate_server_config` so
 /// the two public validators cannot disagree.
+///
+/// # Errors
+///
+/// Returns a message when `url` does not start with `http://` or `https://`.
 pub(crate) fn validate_public_url_value(url: &str) -> Result<(), String> {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err(format!(
@@ -4891,6 +5076,11 @@ pub(crate) fn validate_public_url_value(url: &str) -> Result<(), String> {
 /// Shared by `McpServerConfig::check` and `config::validate_server_config` so
 /// the two public validators cannot disagree: a TOML-file consumer must not be
 /// told a config is valid and then have `serve()` refuse it at startup.
+///
+/// # Errors
+///
+/// Returns a message when `entry` is neither `scheme://host[:port]` nor the
+/// literal `null`.
 pub(crate) fn validate_allowed_origin_entry(entry: &str) -> Result<(), String> {
     if parse_allowed_origin(entry).is_none() {
         return Err(format!(
@@ -4921,6 +5111,8 @@ fn request_origin_allowed(value: &str, allowed: &[AllowedOrigin]) -> bool {
     })
 }
 
+/// Reject requests whose `Origin` header is present but not allowed.
+///
 /// Per the MCP spec: if the Origin header is present and its value is not in
 /// the allowed list, respond with 403 Forbidden. Requests without an Origin
 /// header are allowed through (e.g. non-browser clients like curl, SDKs).
@@ -4935,7 +5127,9 @@ async fn origin_check_middleware(
     log_cfg: Arc<RequestLogConfig>,
     req: Request<Body>,
     next: Next,
-) -> axum::response::Response {
+) -> Response {
+    use axum::http::header;
+
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
 
@@ -4943,7 +5137,7 @@ async fn origin_check_middleware(
     // malformed, so fail closed rather than trusting whichever value a
     // different consumer might have read. Requests without the header pass
     // through (curl, SDKs, server-to-server clients).
-    let mut origins = req.headers().get_all(axum::http::header::ORIGIN).iter();
+    let mut origins = req.headers().get_all(header::ORIGIN).iter();
     if let Some(origin) = origins.next() {
         let duplicate_origin_headers = origins.next().is_some();
         let accepted = !duplicate_origin_headers
@@ -4976,11 +5170,7 @@ async fn origin_check_middleware(
                 allowed = %allowed_rendered,
                 "rejected request: Origin not allowed"
             );
-            return (
-                axum::http::StatusCode::FORBIDDEN,
-                "Forbidden: Origin not allowed",
-            )
-                .into_response();
+            return (StatusCode::FORBIDDEN, "Forbidden: Origin not allowed").into_response();
         }
     }
     next.run(req).await
@@ -4993,10 +5183,10 @@ pub(crate) const MAX_LOGGED_HEADER_CHARS: usize = 128;
 pub(crate) fn sanitize_for_log(raw: &str, max_chars: usize) -> String {
     let mut out: String = raw
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|ch| !ch.is_control())
         .take(max_chars)
         .collect();
-    if raw.chars().filter(|c| !c.is_control()).count() > max_chars {
+    if raw.chars().filter(|ch| !ch.is_control()).count() > max_chars {
         out.push_str("...(truncated)");
     }
     out
@@ -5007,18 +5197,19 @@ pub(crate) fn sanitize_for_log(raw: &str, max_chars: usize) -> String {
 pub(crate) struct RequestId(Arc<str>);
 
 impl RequestId {
+    /// Wrap `value` in a fresh request-id handle.
     pub(crate) fn new(value: &str) -> Self {
         Self(Arc::from(value))
     }
 }
 
 /// Extract the request ID from extensions for logging.
-pub(crate) fn request_id_for_log(ext: &axum::http::Extensions) -> Option<Arc<str>> {
+pub(crate) fn request_id_for_log(ext: &Extensions) -> Option<Arc<str>> {
     ext.get::<RequestId>().map(|id| Arc::clone(&id.0))
 }
 
 /// Extract MCP-specific hints (session presence and protocol version) from headers for logging.
-pub(crate) fn mcp_hints_for_log(headers: &axum::http::HeaderMap) -> (bool, Option<String>) {
+pub(crate) fn mcp_hints_for_log(headers: &HeaderMap) -> (bool, Option<String>) {
     let mcp_session = headers.contains_key("mcp-session-id");
     let protocol = headers
         .get("mcp-protocol-version")
@@ -5027,27 +5218,39 @@ pub(crate) fn mcp_hints_for_log(headers: &axum::http::HeaderMap) -> (bool, Optio
     (mcp_session, protocol)
 }
 
+/// Logging knobs controlling what [`request_log_middleware`] emits.
 struct RequestLogConfig {
+    /// Whether the full (redacted) header set is rendered into log lines.
     log_request_headers: bool,
-    exclude_paths: std::collections::HashSet<String>,
+    /// Paths excluded from all request logging.
+    exclude_paths: HashSet<String>,
+    /// Context selectors (client IP, request ID, MCP hints, completion line).
     fields: LogContextConfig,
 }
 
 impl RequestLogConfig {
+    /// True when `path` is not on the exclusion list.
     fn logs(&self, path: &str) -> bool {
         !self.exclude_paths.contains(path)
     }
 }
 
+/// Per-request context values captured for the request log line.
 #[derive(Clone, Default)]
 struct RequestLogFields {
+    /// Resolved client IP, when client-IP logging is enabled.
     client_ip: Option<IpAddr>,
+    /// Direct peer IP, when peer-IP logging is enabled.
     peer_ip: Option<IpAddr>,
+    /// Inbound request ID, when request-ID logging is enabled.
     request_id: Option<Arc<str>>,
+    /// Whether an MCP session header was present, when hints are enabled.
     mcp_session: Option<bool>,
+    /// MCP protocol version header value, when hints are enabled.
     mcp_protocol_version: Option<String>,
 }
 
+/// Build the [`RequestLogFields`] for `req` from the configured selectors.
 fn request_log_fields(cfg: &LogContextConfig, req: &Request<Body>) -> RequestLogFields {
     let (mcp_session, mcp_protocol_version) = if cfg.mcp_hints {
         mcp_hints_for_log(req.headers())
@@ -5072,6 +5275,9 @@ fn request_log_fields(cfg: &LogContextConfig, req: &Request<Body>) -> RequestLog
     }
 }
 
+/// Emit request and completion DEBUG logs around the wrapped handler.
+///
+/// Captures method, path, status, latency, and the configured context fields.
 // cancel-safe: request logging is emitted before `next.run(req)`; completion
 // logging is omitted if the future is dropped (timeout or disconnect). For SSE,
 // latency measures time to the response head, not body streaming duration.
@@ -5079,7 +5285,9 @@ async fn request_log_middleware(
     cfg: Arc<RequestLogConfig>,
     req: Request<Body>,
     next: Next,
-) -> axum::response::Response {
+) -> Response {
+    use tracing::field;
+
     let captured = if cfg.logs(req.uri().path()) {
         let fields = request_log_fields(&cfg.fields, &req);
         let method = req.method().clone();
@@ -5093,7 +5301,7 @@ async fn request_log_middleware(
         );
         cfg.fields
             .request_completion
-            .then(|| (method, path, std::time::Instant::now(), fields))
+            .then(|| (method, path, Instant::now(), fields))
     } else {
         None
     };
@@ -5105,8 +5313,8 @@ async fn request_log_middleware(
             %path,
             status = resp.status().as_u16(),
             latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            client_ip = fields.client_ip.map(tracing::field::display),
-            peer_ip = fields.peer_ip.map(tracing::field::display),
+            client_ip = fields.client_ip.map(field::display),
+            peer_ip = fields.peer_ip.map(field::display),
             request_id = fields.request_id.as_deref(),
             "request completed"
         );
@@ -5116,18 +5324,20 @@ async fn request_log_middleware(
 
 /// Emit a DEBUG log for an incoming request, optionally including the full (redacted) header set.
 fn log_incoming_request(
-    method: &axum::http::Method,
+    method: &Method,
     path: &str,
-    headers: &axum::http::HeaderMap,
+    headers: &HeaderMap,
     log_request_headers: bool,
     fields: &RequestLogFields,
 ) {
+    use tracing::field;
+
     if log_request_headers {
         tracing::debug!(
             %method,
             %path,
-            client_ip = fields.client_ip.map(tracing::field::display),
-            peer_ip = fields.peer_ip.map(tracing::field::display),
+            client_ip = fields.client_ip.map(field::display),
+            peer_ip = fields.peer_ip.map(field::display),
             request_id = fields.request_id.as_deref(),
             mcp_session = fields.mcp_session,
             mcp_protocol_version = fields.mcp_protocol_version.as_deref(),
@@ -5138,8 +5348,8 @@ fn log_incoming_request(
         tracing::debug!(
             %method,
             %path,
-            client_ip = fields.client_ip.map(tracing::field::display),
-            peer_ip = fields.peer_ip.map(tracing::field::display),
+            client_ip = fields.client_ip.map(field::display),
+            peer_ip = fields.peer_ip.map(field::display),
             request_id = fields.request_id.as_deref(),
             mcp_session = fields.mcp_session,
             mcp_protocol_version = fields.mcp_protocol_version.as_deref(),
@@ -5164,15 +5374,17 @@ const REDACTED_LOG_HEADERS: [&str; 6] = [
     "x-real-ip",
 ];
 
-fn format_request_headers_for_log(headers: &axum::http::HeaderMap) -> String {
+/// Render the request header set for logging, redacting credential and
+/// forwarding headers.
+fn format_request_headers_for_log(headers: &HeaderMap) -> String {
     headers
         .iter()
-        .map(|(k, v)| {
-            let name = k.as_str();
+        .map(|(key, value)| {
+            let name = key.as_str();
             if REDACTED_LOG_HEADERS.contains(&name) {
                 format!("{name}: [REDACTED]")
             } else {
-                format!("{name}: {}", v.to_str().unwrap_or("<non-utf8>"))
+                format!("{name}: {}", value.to_str().unwrap_or("<non-utf8>"))
             }
         })
         .collect::<Vec<_>>()
@@ -5206,29 +5418,40 @@ fn format_request_headers_for_log(headers: &axum::http::HeaderMap) -> String {
     clippy::cognitive_complexity,
     reason = "complexity is purely tracing macro expansion (info/warn + match arms); 18 lines of straight-line code, nothing meaningful to extract"
 )]
+#[inline]
+// cancel-safe: stdio framing is read by rmcp's own reader task; this fn only
+// awaits the served session's terminal completion, so cancelling loses no data.
 pub async fn serve_stdio<H>(handler: H) -> Result<(), RmcpServerKitError>
 where
     H: ServerHandler + 'static,
 {
-    use rmcp::ServiceExt as _;
+    use rmcp::{ServiceExt as _, transport::io};
 
     tracing::info!("stdio transport: serving on stdin/stdout");
     tracing::warn!("stdio mode: auth, RBAC, TLS, and Origin checks are DISABLED");
 
-    let transport = rmcp::transport::io::stdio();
+    let transport = io::stdio();
 
     let service = handler
         .serve(transport)
         .await
-        .map_err(|e| RmcpServerKitError::Startup(format!("stdio initialize failed: {e}")))?;
+        .map_err(|err| RmcpServerKitError::Startup(format!("stdio initialize failed: {err}")))?;
 
-    if let Err(e) = service.waiting().await {
-        tracing::warn!(error = %e, "stdio session ended with error");
+    if let Err(err) = service.waiting().await {
+        tracing::warn!(error = %err, "stdio session ended with error");
     }
     tracing::info!("stdio session ended");
     Ok(())
 }
 
+#[expect(
+    clippy::multiple_inherent_impl,
+    reason = "deliberate: src/transport.rs::McpServerConfig — the second block groups the TLS-path and role accessors; merging relocates ~140 lines for no behavior gain"
+)]
+#[expect(
+    clippy::missing_const_for_fn,
+    reason = "public API frozen until the next major release"
+)]
 #[expect(
     deprecated,
     reason = "builder methods are the sanctioned transition layer for deprecated public fields"
@@ -5238,6 +5461,7 @@ impl McpServerConfig {
     /// values. Configuration bridges use this to preserve partial TLS
     /// configuration so validation reports the missing half.
     #[must_use]
+    #[inline]
     pub fn with_tls_paths(mut self, cert_path: Option<PathBuf>, key_path: Option<PathBuf>) -> Self {
         self.tls_cert_path = cert_path;
         self.tls_key_path = key_path;
@@ -5247,7 +5471,12 @@ impl McpServerConfig {
     /// Set only the TLS certificate path. Intended for configuration
     /// bridges that must preserve partial TLS configuration so validation
     /// can report the missing key path.
+    #[expect(
+        clippy::impl_trait_in_params,
+        reason = "public API frozen until the next major release"
+    )]
     #[must_use]
+    #[inline]
     pub fn with_tls_cert_path(mut self, cert_path: impl Into<PathBuf>) -> Self {
         self.tls_cert_path = Some(cert_path.into());
         self
@@ -5256,7 +5485,12 @@ impl McpServerConfig {
     /// Set only the TLS private-key path. Intended for configuration
     /// bridges that must preserve partial TLS configuration so validation
     /// can report the missing certificate path.
+    #[expect(
+        clippy::impl_trait_in_params,
+        reason = "public API frozen until the next major release"
+    )]
     #[must_use]
+    #[inline]
     pub fn with_tls_key_path(mut self, key_path: impl Into<PathBuf>) -> Self {
         self.tls_key_path = Some(key_path.into());
         self
@@ -5264,6 +5498,7 @@ impl McpServerConfig {
 
     /// Replace the optional authentication configuration exactly.
     #[must_use]
+    #[inline]
     pub fn with_optional_auth(mut self, auth: Option<AuthConfig>) -> Self {
         self.auth = auth;
         self
@@ -5271,6 +5506,7 @@ impl McpServerConfig {
 
     /// Choose the configured session-binding secret, or `None` for the default process secret.
     #[must_use]
+    #[inline]
     pub fn with_optional_session_binding_secret(mut self, secret: Option<SecretString>) -> Self {
         self.session_binding_secret = secret;
         self
@@ -5278,6 +5514,7 @@ impl McpServerConfig {
 
     /// Replace the optional tool rate limit exactly.
     #[must_use]
+    #[inline]
     pub fn with_optional_tool_rate_limit(mut self, per_minute: Option<u32>) -> Self {
         self.tool_rate_limit = per_minute;
         self
@@ -5285,6 +5522,7 @@ impl McpServerConfig {
 
     /// Replace the optional tool rate-limit burst exactly.
     #[must_use]
+    #[inline]
     pub fn with_optional_tool_rate_limit_burst(mut self, burst: Option<u32>) -> Self {
         self.tool_rate_limit_burst = burst;
         self
@@ -5292,6 +5530,7 @@ impl McpServerConfig {
 
     /// Replace the optional extra-route rate limit exactly.
     #[must_use]
+    #[inline]
     pub fn with_optional_extra_route_rate_limit(mut self, per_minute: Option<u32>) -> Self {
         self.extra_route_rate_limit = per_minute;
         self
@@ -5299,6 +5538,7 @@ impl McpServerConfig {
 
     /// Replace the optional extra-route rate-limit burst exactly.
     #[must_use]
+    #[inline]
     pub fn with_optional_extra_route_rate_limit_burst(mut self, burst: Option<u32>) -> Self {
         self.extra_route_rate_limit_burst = burst;
         self
@@ -5306,6 +5546,7 @@ impl McpServerConfig {
 
     /// Replace the optional forwarded-header mode exactly.
     #[must_use]
+    #[inline]
     pub fn with_optional_forwarded_header(mut self, mode: Option<ForwardedHeaderMode>) -> Self {
         self.forwarded_header = mode;
         self
@@ -5313,6 +5554,7 @@ impl McpServerConfig {
 
     /// Replace the optional public URL exactly.
     #[must_use]
+    #[inline]
     pub fn with_optional_public_url(mut self, url: Option<String>) -> Self {
         self.public_url = url;
         self
@@ -5322,6 +5564,7 @@ impl McpServerConfig {
     /// compression. This keeps configuration bridges able to carry the
     /// inert threshold independently from the enable flag.
     #[must_use]
+    #[inline]
     pub fn with_compression_min_size(mut self, min_size: u16) -> Self {
         self.compression_min_size = min_size;
         self
@@ -5329,6 +5572,7 @@ impl McpServerConfig {
 
     /// Replace the compression enabled flag exactly.
     #[must_use]
+    #[inline]
     pub fn with_compression_enabled(mut self, enabled: bool) -> Self {
         self.compression_enabled = enabled;
         self
@@ -5336,6 +5580,7 @@ impl McpServerConfig {
 
     /// Replace the optional global in-flight request cap exactly.
     #[must_use]
+    #[inline]
     pub fn with_optional_max_concurrent_requests(mut self, limit: Option<usize>) -> Self {
         self.max_concurrent_requests = limit;
         self
@@ -5343,6 +5588,7 @@ impl McpServerConfig {
 
     /// Replace the admin endpoint enabled flag exactly.
     #[must_use]
+    #[inline]
     pub fn with_admin_enabled(mut self, enabled: bool) -> Self {
         self.admin_enabled = enabled;
         self
@@ -5350,7 +5596,12 @@ impl McpServerConfig {
 
     /// Override the RBAC role required by admin-gated endpoints without
     /// enabling `/admin/*` diagnostics.
+    #[expect(
+        clippy::impl_trait_in_params,
+        reason = "public API frozen until the next major release"
+    )]
     #[must_use]
+    #[inline]
     pub fn with_admin_role(mut self, role: impl Into<String>) -> Self {
         self.admin_role = role.into();
         self
@@ -5358,12 +5609,17 @@ impl McpServerConfig {
 
     /// Replace the build-metadata exposure flag exactly.
     #[must_use]
+    #[inline]
     pub fn with_expose_build_metadata(mut self, enabled: bool) -> Self {
         self.expose_build_metadata = enabled;
         self
     }
 }
 
+/// Warn once per non-empty operator override of a security header.
+///
+/// Emitted at router-build time so operators can audit which defaults were
+/// replaced or omitted without reading the effective response headers.
 fn warn_security_header_overrides(cfg: &SecurityHeadersConfig) {
     for (field, value) in security_header_overrides(cfg) {
         let action = if value.is_empty() {
@@ -5379,6 +5635,7 @@ fn warn_security_header_overrides(cfg: &SecurityHeadersConfig) {
     }
 }
 
+/// Iterate the non-empty operator overrides in `cfg` as `(field, value)` pairs.
 fn security_header_overrides(
     cfg: &SecurityHeadersConfig,
 ) -> impl Iterator<Item = (&'static str, &str)> {
@@ -5421,9 +5678,19 @@ fn security_header_overrides(
         ),
     ]
     .into_iter()
-    .filter_map(|(field, value)| value.map(|v| (field, v)))
+    .filter_map(|(field, value)| value.map(|text| (field, text)))
 }
 
+/// Reject auth rate-limit settings that would silently weaken their gates.
+///
+/// A zero `max_attempts_per_minute` would fall back to the framework default,
+/// and a zero `pre_auth_max_per_minute` would *raise* the pre-auth quota; both
+/// are rejected so an operator typo cannot relax the shield around Argon2.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] naming the offending field when any
+/// auth rate-limit knob is zero, or when mTLS capacity knobs are invalid.
 fn check_auth_capacity_knobs(auth: Option<&AuthConfig>) -> Result<(), RmcpServerKitError> {
     if let Some(auth_cfg) = auth {
         if let Some(rl) = &auth_cfg.rate_limit {
@@ -5450,6 +5717,16 @@ fn check_auth_capacity_knobs(auth: Option<&AuthConfig>) -> Result<(), RmcpServer
     Ok(())
 }
 
+/// Reject zeroed mTLS/CRL capacity knobs.
+///
+/// A zero streaming cap or concurrency bound can make CRL fetching silently
+/// never succeed, which under `crl_deny_on_unavailable = true` fails every
+/// CDP-bearing handshake instead of loudly reporting the misconfiguration.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] naming the offending field when any
+/// `auth.mtls` capacity knob is zero.
 fn check_mtls_capacity_knobs(mtls: &MtlsConfig) -> Result<(), RmcpServerKitError> {
     (mtls.crl_max_concurrent_fetches != 0).ok_or_else(|| {
         RmcpServerKitError::Config("auth.mtls.crl_max_concurrent_fetches must be nonzero".into())
@@ -5476,47 +5753,10 @@ fn check_mtls_capacity_knobs(mtls: &MtlsConfig) -> Result<(), RmcpServerKitError
     Ok(())
 }
 
+// Temporary test-suite migration blocks (removed by the test-conversion PR).
 #[cfg_attr(
     all(test, target_os = "linux"),
-    expect(clippy::map_err_ignore, reason = "lint-migration: src/transport.rs")
-)]
-#[cfg_attr(
-    all(test, feature = "oauth", target_os = "linux"),
-    expect(clippy::non_ascii_literal, reason = "lint-migration: src/transport.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::panic, reason = "lint-migration: src/transport.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::doc_markdown, reason = "lint-migration: src/transport.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::shadow_unrelated, reason = "lint-migration: src/transport.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::default_numeric_fallback,
-        reason = "lint-migration: src/transport.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::indexing_slicing, reason = "lint-migration: src/transport.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::duration_suboptimal_units,
-        reason = "lint-migration: src/transport.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::unwrap_used, reason = "lint-migration: src/transport.rs")
+    expect(clippy::absolute_paths, reason = "lint-migration: src/transport.rs")
 )]
 #[cfg_attr(
     all(test, target_os = "linux"),
@@ -5527,7 +5767,129 @@ fn check_mtls_capacity_knobs(mtls: &MtlsConfig) -> Result<(), RmcpServerKitError
 )]
 #[cfg_attr(
     all(test, target_os = "linux"),
+    expect(
+        clippy::default_numeric_fallback,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::doc_markdown, reason = "lint-migration: src/transport.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::duration_suboptimal_units,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
     expect(clippy::expect_used, reason = "lint-migration: src/transport.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::indexing_slicing, reason = "lint-migration: src/transport.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::let_underscore_must_use,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::let_underscore_untyped,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::map_err_ignore, reason = "lint-migration: src/transport.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::min_ident_chars, reason = "lint-migration: src/transport.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::missing_errors_doc,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::panic, reason = "lint-migration: src/transport.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::shadow_reuse, reason = "lint-migration: src/transport.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::shadow_unrelated, reason = "lint-migration: src/transport.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::single_char_lifetime_names,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::std_instead_of_core,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::too_long_first_doc_paragraph,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::unused_result_ok, reason = "lint-migration: src/transport.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        clippy::unused_trait_names,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::unwrap_used, reason = "lint-migration: src/transport.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(
+        closure_returning_async_block,
+        reason = "lint-migration: src/transport.rs"
+    )
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(deprecated, reason = "lint-migration: src/transport.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(let_underscore_drop, reason = "lint-migration: src/transport.rs")
+)]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(unused_results, reason = "lint-migration: src/transport.rs")
+)]
+#[cfg_attr(
+    all(test, feature = "oauth", target_os = "linux"),
+    expect(clippy::non_ascii_literal, reason = "lint-migration: src/transport.rs")
 )]
 #[cfg_attr(
     all(test, target_os = "linux"),
@@ -5536,15 +5898,11 @@ fn check_mtls_capacity_knobs(mtls: &MtlsConfig) -> Result<(), RmcpServerKitError
         reason = "test code is not rendered API documentation"
     )
 )]
-#[cfg_attr(test, expect(deprecated, reason = "lint-migration: src/transport.rs"))]
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
-
     use axum::{
         body::Body,
         http::{Request, StatusCode, header},
-        response::IntoResponse,
     };
     use http_body_util::BodyExt;
     use tower::ServiceExt as _;
@@ -5571,15 +5929,15 @@ mod tests {
 
     struct CapturedLogsWriter(Arc<std::sync::Mutex<Vec<u8>>>);
 
-    impl std::io::Write for CapturedLogsWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    impl io::Write for CapturedLogsWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             if let Ok(mut guard) = self.0.lock() {
                 guard.extend_from_slice(buf);
             }
             Ok(buf.len())
         }
 
-        fn flush(&mut self) -> std::io::Result<()> {
+        fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
     }
@@ -5689,7 +6047,7 @@ mod tests {
     #[test]
     fn validate_rejects_blank_api_key_name() {
         let blank = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0").with_auth(
-            AuthConfig::with_keys(vec![crate::auth::ApiKeyEntry::new("", "hash", "viewer")]),
+            AuthConfig::with_keys(vec![ApiKeyEntry::new("", "hash", "viewer")]),
         );
         let err = blank
             .validate()
@@ -5697,16 +6055,12 @@ mod tests {
         assert!(err.to_string().contains("api_keys[0]"), "{err}");
 
         let whitespace = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0").with_auth(
-            AuthConfig::with_keys(vec![crate::auth::ApiKeyEntry::new("   ", "hash", "viewer")]),
+            AuthConfig::with_keys(vec![ApiKeyEntry::new("   ", "hash", "viewer")]),
         );
         assert!(whitespace.validate().is_err());
 
         let ok = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0").with_auth(
-            AuthConfig::with_keys(vec![crate::auth::ApiKeyEntry::new(
-                "viewer-key",
-                "hash",
-                "viewer",
-            )]),
+            AuthConfig::with_keys(vec![ApiKeyEntry::new("viewer-key", "hash", "viewer")]),
         );
         assert!(ok.validate().is_ok(), "a normal name must still validate");
     }
@@ -5714,15 +6068,15 @@ mod tests {
     fn reload_test_state(name: &str) -> (Arc<AuthState>, String) {
         let (token, hash) = crate::auth::generate_api_key().unwrap();
         let state = Arc::new(AuthState {
-            api_keys: ArcSwap::from_pointee(vec![crate::auth::ApiKeyEntry::new(name, hash, "ops")]),
+            api_keys: ArcSwap::from_pointee(vec![ApiKeyEntry::new(name, hash, "ops")]),
             rate_limiter: None,
             pre_auth_limiter: None,
             #[cfg(feature = "oauth")]
             jwks_cache: None,
-            seen_identities: crate::auth::SeenIdentitySet::new(),
-            counters: crate::auth::AuthCounters::default(),
+            seen_identities: SeenIdentitySet::new(),
+            counters: AuthCounters::default(),
             resource_metadata_url: None,
-            log_context: crate::auth::AuthLogContext::default(),
+            log_context: AuthLogContext::default(),
         });
         (state, token)
     }
@@ -5736,7 +6090,7 @@ mod tests {
             crl_set: None,
         };
         let err = handle
-            .try_reload_auth_keys(vec![crate::auth::ApiKeyEntry::new("", "h", "ops")])
+            .try_reload_auth_keys(vec![ApiKeyEntry::new("", "h", "ops")])
             .expect_err("blank API-key name must be rejected on reload");
         assert!(err.to_string().contains("api_keys[0]"), "{err}");
     }
@@ -5749,7 +6103,7 @@ mod tests {
             rbac: None,
             crl_set: None,
         };
-        handle.reload_auth_keys(vec![crate::auth::ApiKeyEntry::new("  ", "h", "ops")]);
+        handle.reload_auth_keys(vec![ApiKeyEntry::new("  ", "h", "ops")]);
 
         let installed = state.api_keys.load();
         assert!(
@@ -6071,7 +6425,7 @@ mod tests {
             }))
     }
 
-    async fn body_string(resp: axum::response::Response) -> String {
+    async fn body_string(resp: Response) -> String {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         String::from_utf8(bytes.to_vec()).unwrap()
     }
@@ -6189,7 +6543,7 @@ mod tests {
             KeyEvictionPolicy::default(),
             NonZeroUsize::new(EXTRA_ROUTE_MAX_TRACKED_KEYS).unwrap_or(NonZeroUsize::MIN),
         );
-        let exempt: Arc<std::collections::HashSet<String>> =
+        let exempt: Arc<HashSet<String>> =
             Arc::new(exempt_paths.iter().map(|s| (*s).to_owned()).collect());
         axum::Router::new()
             .route("/limited", axum::routing::get(|| async { "ok" }))
@@ -6242,7 +6596,7 @@ mod tests {
             KeyEvictionPolicy::RejectNew,
             one_tracked_key(),
         );
-        let exempt = Arc::new(std::collections::HashSet::new());
+        let exempt = Arc::new(HashSet::new());
         let app = axum::Router::new()
             .route("/limited", axum::routing::get(|| async { "ok" }))
             .layer(axum::middleware::from_fn(move |req, next| {
@@ -6301,7 +6655,7 @@ mod tests {
 
     #[test]
     fn limiter_client_key_falls_back_to_unattributed() {
-        let empty = axum::http::Extensions::new();
+        let empty = Extensions::new();
         assert_eq!(limiter_client_key(&empty), RateLimitKey::Unattributed);
     }
 
@@ -6313,7 +6667,7 @@ mod tests {
         let unspecified = RateLimitKey::Ip("0.0.0.0".parse::<IpAddr>().unwrap());
         assert_ne!(unspecified, RateLimitKey::Unattributed);
 
-        let mut set = std::collections::HashSet::new();
+        let mut set = HashSet::new();
         set.insert(unspecified);
         set.insert(RateLimitKey::Unattributed);
         assert_eq!(set.len(), 2, "the two keys must hash to distinct buckets");
@@ -6397,7 +6751,7 @@ mod tests {
     #[cfg(feature = "metrics")]
     #[tokio::test]
     async fn extra_route_limiter_deny_increments_counter_exempt_does_not() {
-        let metrics = Arc::new(crate::metrics::McpMetrics::new().unwrap());
+        let metrics = Arc::new(McpMetrics::new().unwrap());
         let app = limited_router_full(1, None, &["/exempt"]);
         let mk = |path: &str| {
             let addr: SocketAddr = "10.8.8.8:40000".parse().unwrap();
@@ -6860,7 +7214,7 @@ mod tests {
             trusted: vec!["127.0.0.1/32".parse().unwrap()],
             mode: ForwardedHeaderMode::XForwardedFor,
             max_scanned_entries: crate::forwarded::MAX_SCANNED_ENTRIES,
-            request_id_header: header.map(axum::http::HeaderName::from_static),
+            request_id_header: header.map(HeaderName::from_static),
         })
     }
 
@@ -6966,7 +7320,7 @@ mod tests {
         build_app_router(config, || H).expect("build_app_router").0
     }
 
-    fn reqlog_req(method: axum::http::Method, path: &str, peer: &str) -> Request<Body> {
+    fn reqlog_req(method: Method, path: &str, peer: &str) -> Request<Body> {
         Request::builder()
             .method(method)
             .uri(path)
@@ -6976,7 +7330,7 @@ mod tests {
     }
 
     fn reqlog_req_with_headers(
-        method: axum::http::Method,
+        method: Method,
         path: &str,
         peer: &str,
         headers: &[(&str, &str)],
@@ -6991,7 +7345,7 @@ mod tests {
         builder.body(Body::empty()).unwrap()
     }
 
-    async fn drive_reqlog(app: &axum::Router, req: Request<Body>) -> axum::response::Response {
+    async fn drive_reqlog(app: &axum::Router, req: Request<Body>) -> Response {
         app.clone().oneshot(req).await.unwrap()
     }
 
@@ -7013,28 +7367,16 @@ mod tests {
 
         for path in ["/healthz", "/readyz"] {
             let before = logs.lines_containing("incoming request").len();
-            let _resp = drive_reqlog(
-                &app,
-                reqlog_req(axum::http::Method::GET, path, "127.0.0.1:5555"),
-            )
-            .await;
+            let _resp = drive_reqlog(&app, reqlog_req(Method::GET, path, "127.0.0.1:5555")).await;
             assert_eq!(logs.lines_containing("incoming request").len(), before);
         }
 
         let before = logs.lines_containing("incoming request").len();
-        let _resp = drive_reqlog(
-            &app,
-            reqlog_req(axum::http::Method::GET, "/version", "127.0.0.1:5555"),
-        )
-        .await;
+        let _resp = drive_reqlog(&app, reqlog_req(Method::GET, "/version", "127.0.0.1:5555")).await;
         assert_eq!(logs.lines_containing("incoming request").len(), before + 1);
 
         let before = logs.lines_containing("incoming request").len();
-        let _resp = drive_reqlog(
-            &app,
-            reqlog_req(axum::http::Method::POST, "/mcp", "127.0.0.1:5555"),
-        )
-        .await;
+        let _resp = drive_reqlog(&app, reqlog_req(Method::POST, "/mcp", "127.0.0.1:5555")).await;
         assert_eq!(logs.lines_containing("incoming request").len(), before + 1);
     }
 
@@ -7046,16 +7388,12 @@ mod tests {
         let healthz = reqlog_lines_after(
             &app,
             &logs,
-            reqlog_req(axum::http::Method::GET, "/healthz", "127.0.0.1:5555"),
+            reqlog_req(Method::GET, "/healthz", "127.0.0.1:5555"),
             "incoming request",
         )
         .await;
         assert_eq!(healthz.len(), 1);
-        let _resp = drive_reqlog(
-            &app,
-            reqlog_req(axum::http::Method::GET, "/version", "127.0.0.1:5555"),
-        )
-        .await;
+        let _resp = drive_reqlog(&app, reqlog_req(Method::GET, "/version", "127.0.0.1:5555")).await;
         assert_eq!(logs.lines_containing("incoming request").len(), 1);
 
         let logs = CapturedLogs::default();
@@ -7064,7 +7402,7 @@ mod tests {
         let lines = reqlog_lines_after(
             &app,
             &logs,
-            reqlog_req(axum::http::Method::GET, "/healthz", "127.0.0.1:5555"),
+            reqlog_req(Method::GET, "/healthz", "127.0.0.1:5555"),
             "incoming request",
         )
         .await;
@@ -7080,7 +7418,7 @@ mod tests {
             &app,
             &logs,
             reqlog_req_with_headers(
-                axum::http::Method::POST,
+                Method::POST,
                 "/mcp",
                 "127.0.0.1:5555",
                 &[("x-forwarded-for", "203.0.113.7"), ("x-request-id", "qa-1")],
@@ -7114,7 +7452,7 @@ mod tests {
             &app,
             &logs,
             reqlog_req_with_headers(
-                axum::http::Method::POST,
+                Method::POST,
                 "/mcp",
                 "127.0.0.1:5555",
                 &[("x-forwarded-for", "203.0.113.7"), ("x-request-id", "qa-1")],
@@ -7131,7 +7469,7 @@ mod tests {
             &app,
             &logs,
             reqlog_req_with_headers(
-                axum::http::Method::POST,
+                Method::POST,
                 "/mcp",
                 "10.9.9.9:5555",
                 &[("x-forwarded-for", "203.0.113.7"), ("x-request-id", "qa-1")],
@@ -7147,12 +7485,12 @@ mod tests {
 
     #[test]
     fn mcp_hints_for_log_bounds_protocol_version() {
-        let mut headers = axum::http::HeaderMap::new();
+        let mut headers = HeaderMap::new();
         let exact = "a".repeat(128);
         headers.insert("mcp-protocol-version", exact.parse().unwrap());
         assert_eq!(mcp_hints_for_log(&headers), (false, Some(exact)));
 
-        let mut headers = axum::http::HeaderMap::new();
+        let mut headers = HeaderMap::new();
         let long = "a".repeat(129);
         headers.insert("mcp-protocol-version", long.parse().unwrap());
         assert_eq!(
@@ -7160,7 +7498,7 @@ mod tests {
             (false, Some(format!("{}...(truncated)", "a".repeat(128))))
         );
 
-        let headers = axum::http::HeaderMap::new();
+        let headers = HeaderMap::new();
         assert_eq!(mcp_hints_for_log(&headers), (false, None));
     }
 
@@ -7173,7 +7511,7 @@ mod tests {
             &app,
             &logs,
             reqlog_req_with_headers(
-                axum::http::Method::POST,
+                Method::POST,
                 "/mcp",
                 "127.0.0.1:5555",
                 &[
@@ -7196,7 +7534,7 @@ mod tests {
         let lines = reqlog_lines_after(
             &app,
             &logs,
-            reqlog_req(axum::http::Method::POST, "/mcp", "127.0.0.1:5555"),
+            reqlog_req(Method::POST, "/mcp", "127.0.0.1:5555"),
             "incoming request",
         )
         .await;
@@ -7218,7 +7556,7 @@ mod tests {
             &app,
             &logs,
             reqlog_req_with_headers(
-                axum::http::Method::POST,
+                Method::POST,
                 "/mcp",
                 "127.0.0.1:5555",
                 &[
@@ -7255,7 +7593,7 @@ mod tests {
         let resp = drive_reqlog(
             &app,
             reqlog_req_with_headers(
-                axum::http::Method::POST,
+                Method::POST,
                 "/mcp",
                 "127.0.0.1:5555",
                 &[("origin", "http://evil.example")],
@@ -7282,7 +7620,7 @@ mod tests {
         let _resp = drive_reqlog(
             &app,
             reqlog_req_with_headers(
-                axum::http::Method::GET,
+                Method::GET,
                 "/healthz",
                 "127.0.0.1:5555",
                 &[("origin", "http://evil.example")],
@@ -7302,10 +7640,7 @@ mod tests {
                 ctx.client_ip = true;
             }))
         });
-        for (method, path) in [
-            (axum::http::Method::POST, "/mcp"),
-            (axum::http::Method::GET, "/version"),
-        ] {
+        for (method, path) in [(Method::POST, "/mcp"), (Method::GET, "/version")] {
             let before = logs.lines_containing("request completed").len();
             let resp = drive_reqlog(&app, reqlog_req(method.clone(), path, "127.0.0.1:5555")).await;
             let lines = logs.lines_containing("request completed");
@@ -7327,11 +7662,7 @@ mod tests {
         let logs = CapturedLogs::default();
         let _guard = capture_debug_logs(logs.clone());
         let app = reqlog_router(|cfg| cfg);
-        let _resp = drive_reqlog(
-            &app,
-            reqlog_req(axum::http::Method::GET, "/version", "127.0.0.1:5555"),
-        )
-        .await;
+        let _resp = drive_reqlog(&app, reqlog_req(Method::GET, "/version", "127.0.0.1:5555")).await;
         assert_eq!(
             logs.lines_containing("request completed"),
             Vec::<String>::new()
@@ -7344,20 +7675,12 @@ mod tests {
                 ctx.request_completion = true;
             }))
         });
-        let _resp = drive_reqlog(
-            &app,
-            reqlog_req(axum::http::Method::GET, "/healthz", "127.0.0.1:5555"),
-        )
-        .await;
+        let _resp = drive_reqlog(&app, reqlog_req(Method::GET, "/healthz", "127.0.0.1:5555")).await;
         assert_eq!(
             logs.lines_containing("request completed"),
             Vec::<String>::new()
         );
-        let _resp = drive_reqlog(
-            &app,
-            reqlog_req(axum::http::Method::GET, "/version", "127.0.0.1:5555"),
-        )
-        .await;
+        let _resp = drive_reqlog(&app, reqlog_req(Method::GET, "/version", "127.0.0.1:5555")).await;
         assert_eq!(logs.lines_containing("request completed").len(), 1);
     }
 
@@ -7372,7 +7695,7 @@ mod tests {
         let app = reqlog_router(|cfg| {
             cfg.with_trusted_proxies(["127.0.0.1/32"])
                 .with_log_context(fields)
-                .with_auth(AuthConfig::with_keys(vec![crate::auth::ApiKeyEntry::new(
+                .with_auth(AuthConfig::with_keys(vec![ApiKeyEntry::new(
                     "viewer-key",
                     hash,
                     "viewer",
@@ -7382,7 +7705,7 @@ mod tests {
         let resp = drive_reqlog(
             &app,
             reqlog_req_with_headers(
-                axum::http::Method::POST,
+                Method::POST,
                 "/mcp",
                 "127.0.0.1:5555",
                 &[
@@ -7411,7 +7734,7 @@ mod tests {
         let resp = drive_reqlog(
             &app,
             reqlog_req_with_headers(
-                axum::http::Method::POST,
+                Method::POST,
                 "/mcp",
                 "10.9.9.9:5555",
                 &[("x-request-id", "untrusted")],
@@ -7427,7 +7750,7 @@ mod tests {
         let resp = drive_reqlog(
             &app,
             reqlog_req_with_headers(
-                axum::http::Method::POST,
+                Method::POST,
                 "/mcp",
                 "127.0.0.1:5555",
                 &[("authorization", "Bearer not-a-key")],
@@ -7447,7 +7770,7 @@ mod tests {
         let resp = drive_reqlog(
             &app,
             reqlog_req_with_headers(
-                axum::http::Method::POST,
+                Method::POST,
                 "/mcp",
                 "127.0.0.1:5555",
                 &[("x-request-id", "qa-ignored")],
@@ -7475,7 +7798,7 @@ mod tests {
         let app = reqlog_router(|cfg| {
             cfg.with_log_context(fields)
                 .with_auth(AuthConfig::with_keys(vec![
-                    crate::auth::ApiKeyEntry::new(
+                    ApiKeyEntry::new(
                         "old-key",
                         "$argon2id$v=19$m=19456,t=2,p=1$BwcHBwcHBwcHBwcHBwcHBw$spS8B9AhHG1LikfhGlssVMfP8mq37+8/mXnl98ps0NU",
                         "viewer",
@@ -7487,7 +7810,7 @@ mod tests {
         let resp = drive_reqlog(
             &app,
             reqlog_req_with_headers(
-                axum::http::Method::POST,
+                Method::POST,
                 "/mcp",
                 "127.0.0.1:5555",
                 &[("authorization", "Bearer golden-vector-token-0p5p3")],
@@ -7526,7 +7849,7 @@ mod tests {
                     ctx.peer_ip = true;
                     ctx.request_id = true;
                 }))
-                .with_auth(AuthConfig::with_keys(vec![crate::auth::ApiKeyEntry::new(
+                .with_auth(AuthConfig::with_keys(vec![ApiKeyEntry::new(
                     "viewer-key",
                     hash,
                     "viewer",
@@ -7547,7 +7870,7 @@ mod tests {
         })
         .to_string();
         let req = Request::builder()
-            .method(axum::http::Method::POST)
+            .method(Method::POST)
             .uri("/mcp")
             .extension(ConnectInfo("127.0.0.1:5555".parse::<SocketAddr>().unwrap()))
             .header("authorization", format!("Bearer {token}"))
@@ -7694,7 +8017,7 @@ mod tests {
         );
         let request_log = Arc::new(RequestLogConfig {
             log_request_headers,
-            exclude_paths: std::collections::HashSet::new(),
+            exclude_paths: HashSet::new(),
             fields: LogContextConfig::default(),
         });
         axum::Router::new()
@@ -7760,7 +8083,7 @@ mod tests {
 
     #[test]
     fn format_request_headers_redacts_sensitive_values() {
-        let mut headers = axum::http::HeaderMap::new();
+        let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer secret-token".parse().unwrap());
         headers.insert("cookie", "sid=abc".parse().unwrap());
         headers.insert("x-request-id", "req-123".parse().unwrap());
@@ -7774,7 +8097,7 @@ mod tests {
 
     #[test]
     fn format_request_headers_redacts_forwarding_headers() {
-        let mut headers = axum::http::HeaderMap::new();
+        let mut headers = HeaderMap::new();
         headers.insert("forwarded", "for=203.0.113.9;by=10.1.2.3".parse().unwrap());
         headers.insert("x-forwarded-for", "203.0.113.9, 10.1.2.3".parse().unwrap());
         headers.insert("x-real-ip", "203.0.113.9".parse().unwrap());
@@ -8072,7 +8395,7 @@ mod tests {
             .route(
                 "/token",
                 axum::routing::post(|| async {
-                    axum::response::Response::builder()
+                    Response::builder()
                         .header("vary", "Accept-Encoding")
                         .body(Body::from("{}"))
                         .unwrap()
@@ -8278,12 +8601,12 @@ mod tests {
             8, // custom concurrency cap: proves the plumbing end-to-end
         )
         .expect("tls listener");
-        let addr = axum::serve::Listener::local_addr(&tls).expect("local addr");
+        let addr = Listener::local_addr(&tls).expect("local addr");
 
         // Connect and send NOTHING: the handshake worker must time out
         // after 200ms and drop the stream, which the client observes as
         // EOF or a reset well within the 2s deadline.
-        let mut idle = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let mut idle = TcpStream::connect(addr).await.expect("connect");
         let mut buf = [0_u8; 16];
         let read = tokio::time::timeout(Duration::from_secs(2), idle.read(&mut buf))
             .await
@@ -8298,18 +8621,14 @@ mod tests {
 
     // -- TLS session resumption disabled for mTLS (WO-T1) --
 
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
 
     use rustls::{
         DigitallySignedStruct, DistinguishedName, SignatureScheme,
-        client::danger::HandshakeSignatureValid,
-        server::danger::{ClientCertVerified, ClientCertVerifier},
+        client::danger::HandshakeSignatureValid, server::danger::ClientCertVerified,
     };
 
-    fn self_signed_test_material() -> (
-        Vec<rustls::pki_types::CertificateDer<'static>>,
-        rustls::pki_types::PrivateKeyDer<'static>,
-    ) {
+    fn self_signed_test_material() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
         let key = rcgen::KeyPair::generate().expect("generate key");
         let cert = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
             .expect("cert params")
@@ -8364,10 +8683,10 @@ mod tests {
     }
 
     struct ResumptionTestMaterial {
-        server_certs: Vec<rustls::pki_types::CertificateDer<'static>>,
-        server_key: rustls::pki_types::PrivateKeyDer<'static>,
-        client_certs: Vec<rustls::pki_types::CertificateDer<'static>>,
-        client_key: rustls::pki_types::PrivateKeyDer<'static>,
+        server_certs: Vec<CertificateDer<'static>>,
+        server_key: PrivateKeyDer<'static>,
+        client_certs: Vec<CertificateDer<'static>>,
+        client_key: PrivateKeyDer<'static>,
         roots: Arc<RootCertStore>,
     }
 
@@ -8452,8 +8771,8 @@ mod tests {
         }
     }
 
-    impl std::fmt::Debug for FlipVerifier {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    impl Debug for FlipVerifier {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("FlipVerifier")
                 .field("calls", &self.calls)
                 .field("reject_after_first", &self.reject_after_first)
@@ -8476,8 +8795,8 @@ mod tests {
 
         fn verify_client_cert(
             &self,
-            end_entity: &rustls::pki_types::CertificateDer<'_>,
-            intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            end_entity: &CertificateDer<'_>,
+            intermediates: &[CertificateDer<'_>],
             now: rustls::pki_types::UnixTime,
         ) -> Result<ClientCertVerified, rustls::Error> {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -8493,7 +8812,7 @@ mod tests {
         fn verify_tls12_signature(
             &self,
             message: &[u8],
-            cert: &rustls::pki_types::CertificateDer<'_>,
+            cert: &CertificateDer<'_>,
             dss: &DigitallySignedStruct,
         ) -> Result<HandshakeSignatureValid, rustls::Error> {
             self.inner.verify_tls12_signature(message, cert, dss)
@@ -8502,7 +8821,7 @@ mod tests {
         fn verify_tls13_signature(
             &self,
             message: &[u8],
-            cert: &rustls::pki_types::CertificateDer<'_>,
+            cert: &CertificateDer<'_>,
             dss: &DigitallySignedStruct,
         ) -> Result<HandshakeSignatureValid, rustls::Error> {
             self.inner.verify_tls13_signature(message, cert, dss)
@@ -8524,14 +8843,14 @@ mod tests {
     async fn accept_and_serve(
         listener: &TcpListener,
         acceptor: &tokio_rustls::TlsAcceptor,
-    ) -> std::io::Result<()> {
+    ) -> io::Result<()> {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let (tcp, _addr) = listener.accept().await?;
         let mut tls = tokio::time::timeout(Duration::from_secs(5), acceptor.accept(tcp))
             .await
             .map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::TimedOut, "server: TLS accept timed out")
+                io::Error::new(io::ErrorKind::TimedOut, "server: TLS accept timed out")
             })??;
 
         let mut request = Vec::new();
@@ -8539,9 +8858,7 @@ mod tests {
         loop {
             let n = tokio::time::timeout(Duration::from_secs(5), tls.read(&mut byte))
                 .await
-                .map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::TimedOut, "server: read timed out")
-                })??;
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "server: read timed out"))??;
             if n == 0 {
                 break;
             }
@@ -8567,10 +8884,10 @@ mod tests {
         connector: &tokio_rustls::TlsConnector,
         addr: SocketAddr,
         server_name: rustls::pki_types::ServerName<'static>,
-    ) -> std::io::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+    ) -> io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-        let tcp = tokio::net::TcpStream::connect(addr).await?;
+        let tcp = TcpStream::connect(addr).await?;
         let mut tls = connector.connect(server_name, tcp).await?;
 
         tls.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
@@ -8580,9 +8897,7 @@ mod tests {
         let mut response = Vec::new();
         tokio::time::timeout(Duration::from_secs(5), tls.read_to_end(&mut response))
             .await
-            .map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::TimedOut, "client: read timed out")
-            })??;
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "client: read timed out"))??;
 
         Ok(tls)
     }
@@ -8591,7 +8906,7 @@ mod tests {
     /// `FlipVerifier`-backed server.
     struct ScenarioOutcome {
         calls_after_first: usize,
-        second_client_result: std::io::Result<()>,
+        second_client_result: io::Result<()>,
         second_handshake_kind: Option<rustls::HandshakeKind>,
         calls_after_second: usize,
     }
@@ -8731,7 +9046,7 @@ mod tests {
 
     // -- M5: OWASP security headers reach early / fallback responses --
 
-    fn assert_owasp_headers(resp: &axum::response::Response, ctx: &str) {
+    fn assert_owasp_headers(resp: &Response, ctx: &str) {
         let h = resp.headers();
         assert!(
             h.contains_key("x-content-type-options"),
@@ -8816,7 +9131,7 @@ mod tests {
     async fn headers_on_cors_preflight() {
         let app = m5_router(|_| {});
         let req = Request::builder()
-            .method(axum::http::Method::OPTIONS)
+            .method(Method::OPTIONS)
             .uri("/mcp")
             .header(header::ORIGIN, "http://good.example")
             .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
@@ -8860,16 +9175,16 @@ mod tests {
         let (viewer_token, viewer_hash) = crate::auth::generate_api_key().unwrap();
         let state = Arc::new(AuthState {
             api_keys: ArcSwap::from_pointee(vec![
-                crate::auth::ApiKeyEntry::new("admin-key", admin_hash, "admin"),
-                crate::auth::ApiKeyEntry::new("viewer-key", viewer_hash, "viewer"),
+                ApiKeyEntry::new("admin-key", admin_hash, "admin"),
+                ApiKeyEntry::new("viewer-key", viewer_hash, "viewer"),
             ]),
             rate_limiter: None,
             pre_auth_limiter: None,
             jwks_cache: None,
-            seen_identities: crate::auth::SeenIdentitySet::new(),
-            counters: crate::auth::AuthCounters::default(),
+            seen_identities: SeenIdentitySet::new(),
+            counters: AuthCounters::default(),
             resource_metadata_url: None,
-            log_context: crate::auth::AuthLogContext {
+            log_context: AuthLogContext {
                 fields,
                 fingerprint_salt: None,
             },
@@ -8879,7 +9194,7 @@ mod tests {
 
     #[cfg(feature = "oauth")]
     fn m6_admin_router(state: &Arc<AuthState>) -> axum::Router {
-        let proxy = crate::oauth::OAuthProxyConfig::builder(
+        let proxy = OAuthProxyConfig::builder(
             "https://idp.example/authorize",
             "https://idp.example/token",
             "client",
@@ -8889,14 +9204,14 @@ mod tests {
         .expose_admin_endpoints(true)
         .require_auth_on_admin_endpoints(true)
         .build();
-        let http = crate::oauth::OauthHttpClient::new().expect("oauth http client");
+        let http = OauthHttpClient::new().expect("oauth http client");
         build_oauth_admin_router(&proxy, http, Some(state), "admin").expect("admin router")
     }
 
     #[cfg(feature = "oauth")]
     fn m6_req(path: &str, token: &str) -> Request<Body> {
         Request::builder()
-            .method(axum::http::Method::POST)
+            .method(Method::POST)
             .uri(path)
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .body(Body::from("token=abc"))
@@ -8911,7 +9226,7 @@ mod tests {
         let _guard = capture_debug_logs(logs.clone());
         let app = m6_admin_router(&state);
         let req = Request::builder()
-            .method(axum::http::Method::POST)
+            .method(Method::POST)
             .uri("/introspect")
             .extension(ConnectInfo("127.0.0.1:5555".parse::<SocketAddr>().unwrap()))
             .body(Body::empty())
@@ -8991,7 +9306,7 @@ mod tests {
 
         #[test]
         fn many_unmatched_paths_collapse_to_one_label() {
-            let mut seen = std::collections::HashSet::new();
+            let mut seen = HashSet::new();
             for i in 0..500 {
                 let (_, path) = labels_for("GET", &format!("/nonexistent-{i}"));
                 seen.insert(path);
@@ -9006,7 +9321,7 @@ mod tests {
 
         #[test]
         fn nested_mcp_paths_collapse_to_the_mount_point() {
-            let mut seen = std::collections::HashSet::new();
+            let mut seen = HashSet::new();
             for i in 0..200 {
                 let (_, path) = labels_for("POST", &format!("/mcp/{i}"));
                 seen.insert(path);
@@ -9023,12 +9338,12 @@ mod tests {
 
         #[test]
         fn unusual_methods_collapse_to_one_bucket() {
-            let mut seen = std::collections::HashSet::new();
+            let mut seen = HashSet::new();
             for verb in ["FROBNICATE", "WIBBLE", "QUUX", "M-SEARCH"] {
                 let (method, _) = labels_for(verb, "/healthz");
                 seen.insert(method);
             }
-            assert_eq!(seen, std::collections::HashSet::from(["OTHER"]));
+            assert_eq!(seen, HashSet::from(["OTHER"]));
         }
 
         #[test]
@@ -9241,7 +9556,7 @@ mod tests {
 
         #[test]
         fn identical_squatter_is_evicted_and_the_real_collector_rebound() {
-            let metrics = crate::metrics::McpMetrics::new().expect("metrics build");
+            let metrics = McpMetrics::new().expect("metrics build");
             // Drop the real collector, then let a same-shape squatter take the
             // name - the state the guard exists to repair.
             metrics
@@ -9277,7 +9592,7 @@ mod tests {
 
         #[test]
         fn idempotent_on_a_healthy_registry() {
-            let metrics = crate::metrics::McpMetrics::new().expect("metrics build");
+            let metrics = McpMetrics::new().expect("metrics build");
             ensure_framework_metrics_registered(&metrics).expect("first call is a no-op");
             ensure_framework_metrics_registered(&metrics).expect("second call is a no-op");
 
@@ -9299,7 +9614,7 @@ mod tests {
 
         #[test]
         fn divergent_help_cannot_be_registered_under_a_reserved_name() {
-            let metrics = crate::metrics::McpMetrics::new().expect("metrics build");
+            let metrics = McpMetrics::new().expect("metrics build");
             metrics
                 .registry
                 .unregister(Box::new(metrics.http_requests_total.clone()))
@@ -9331,7 +9646,7 @@ mod tests {
 
         #[test]
         fn added_const_label_name_cannot_be_registered_under_a_reserved_name() {
-            let metrics = crate::metrics::McpMetrics::new().expect("metrics build");
+            let metrics = McpMetrics::new().expect("metrics build");
             metrics
                 .registry
                 .unregister(Box::new(metrics.rate_limited_total.clone()))
