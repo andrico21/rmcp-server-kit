@@ -1,14 +1,5 @@
 {
   "file": "tests/integration/jwks_key_cap.rs",
-  "keys": {
-    "test|clippy::absolute_paths|--all-features": 1,
-    "test|clippy::expect_used|--all-features": 4,
-    "test|clippy::let_underscore_must_use|--all-features": 1,
-    "test|clippy::let_underscore_untyped|--all-features": 1,
-    "test|clippy::missing_panics_doc|--all-features": 2,
-    "test|clippy::tests_outside_test_module|--all-features": 2,
-    "test|clippy::too_long_first_doc_paragraph|--all-features": 1,
-    "test|let_underscore_drop|--all-features": 1
-  },
+  "keys": {},
   "toolchain": "1.99.0"
 }

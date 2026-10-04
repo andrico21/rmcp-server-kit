@@ -1,25 +1,5 @@
 {
   "file": "tests/integration/oauth_http_client.rs",
-  "keys": {
-    "test|clippy::absolute_paths|--all-features": 9,
-    "test|clippy::arithmetic_side_effects|--all-features": 1,
-    "test|clippy::expect_used|--all-features": 28,
-    "test|clippy::indexing_slicing|--all-features": 2,
-    "test|clippy::let_underscore_must_use|--all-features": 2,
-    "test|clippy::let_underscore_untyped|--all-features": 3,
-    "test|clippy::min_ident_chars|--all-features": 6,
-    "test|clippy::missing_const_for_fn|--all-features": 1,
-    "test|clippy::missing_panics_doc|--all-features": 14,
-    "test|clippy::print_stderr|--all-features": 13,
-    "test|clippy::std_instead_of_alloc|--all-features": 1,
-    "test|clippy::std_instead_of_core|--all-features": 3,
-    "test|clippy::tests_outside_test_module|--all-features": 10,
-    "test|clippy::too_long_first_doc_paragraph|--all-features": 4,
-    "test|clippy::unseparated_literal_suffix|--all-features": 2,
-    "test|clippy::unused_trait_names|--all-features": 2,
-    "test|clippy::use_debug|--all-features": 7,
-    "test|let_underscore_drop|--all-features": 2,
-    "test|unused_results|--all-features": 1
-  },
+  "keys": {},
   "toolchain": "1.99.0"
 }
