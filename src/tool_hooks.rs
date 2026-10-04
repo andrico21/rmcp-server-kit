@@ -47,92 +47,11 @@
 //! );
 //! let _wrapped = with_hooks(handler, hooks);
 //! ```
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::if_then_some_else_none,
-        reason = "lint-migration: src/tool_hooks.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::min_ident_chars, reason = "lint-migration: src/tool_hooks.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::unused_trait_names,
-        reason = "lint-migration: src/tool_hooks.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::shadow_reuse, reason = "lint-migration: src/tool_hooks.rs")
-)]
-#![cfg_attr(
-    all(not(test), target_os = "linux"),
-    expect(
-        clippy::missing_docs_in_private_items,
-        reason = "lint-migration: src/tool_hooks.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_const_for_fn,
-        reason = "lint-migration: src/tool_hooks.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::absolute_paths, reason = "lint-migration: src/tool_hooks.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::impl_trait_in_params,
-        reason = "lint-migration: src/tool_hooks.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_inline_in_public_items,
-        reason = "lint-migration: src/tool_hooks.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::std_instead_of_core,
-        reason = "lint-migration: src/tool_hooks.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::std_instead_of_alloc,
-        reason = "lint-migration: src/tool_hooks.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::inline_trait_bounds,
-        reason = "lint-migration: src/tool_hooks.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::single_char_lifetime_names,
-        reason = "lint-migration: src/tool_hooks.rs"
-    )
-)]
-#![expect(unused_results, reason = "lint-migration: src/tool_hooks.rs")]
-#![expect(redundant_imports, reason = "lint-migration: src/tool_hooks.rs")]
+extern crate alloc;
 
-use std::{borrow::Cow, fmt, future::Future, io, pin::Pin, sync::Arc};
+use alloc::{borrow::Cow, sync::Arc};
+use core::{error::Error, fmt, pin::Pin};
+use std::io;
 
 #[expect(
     deprecated,
@@ -153,6 +72,8 @@ use rmcp::{
     },
     service::{NotificationContext, RequestContext, SubscriptionContext},
 };
+
+use crate::{diagnostics, rbac};
 
 /// Context passed to before/after hooks for a single tool call.
 #[derive(Clone)]
@@ -201,6 +122,7 @@ impl ToolCallContext {
     ///
     /// Returns `None` when no request id was available.
     #[must_use]
+    #[inline]
     pub fn request_id_for_log(&self) -> Option<String> {
         self.request_id
             .as_deref()
@@ -212,6 +134,11 @@ impl ToolCallContext {
     /// benchmarks of user-supplied hooks; the runtime path populates
     /// these fields from the request and task-local RBAC state.
     #[must_use]
+    #[expect(
+        clippy::impl_trait_in_params,
+        reason = "public API frozen until the next major release"
+    )]
+    #[inline]
     pub fn for_tool(tool_name: impl Into<String>) -> Self {
         Self {
             tool_name: tool_name.into(),
@@ -225,6 +152,7 @@ impl ToolCallContext {
 }
 
 impl fmt::Debug for ToolCallContext {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
             tool_name,
@@ -235,15 +163,15 @@ impl fmt::Debug for ToolCallContext {
             request_id,
         } = self;
         let mut debug = f.debug_struct("ToolCallContext");
-        debug.field("tool_name", tool_name);
-        if crate::diagnostics::tool_call_arguments() {
-            debug
+        let _tool_name_field = debug.field("tool_name", tool_name);
+        if diagnostics::tool_call_arguments() {
+            let _sensitive_fields = debug
                 .field("arguments", arguments)
                 .field("identity", identity)
                 .field("role", role)
                 .field("sub", sub);
         } else {
-            debug
+            let _redacted_fields = debug
                 .field("arguments", &"[REDACTED]")
                 .field("identity", &"[REDACTED]")
                 .field("role", &"[REDACTED]")
@@ -296,7 +224,9 @@ pub enum HookDisposition {
 /// returned future, which avoids forcing implementations to clone the
 /// context for every invocation.
 pub type BeforeHook = Arc<
-    dyn for<'a> Fn(&'a ToolCallContext) -> Pin<Box<dyn Future<Output = HookOutcome> + Send + 'a>>
+    dyn for<'call> Fn(
+            &'call ToolCallContext,
+        ) -> Pin<Box<dyn Future<Output = HookOutcome> + Send + 'call>>
         + Send
         + Sync
         + 'static,
@@ -310,11 +240,11 @@ pub type BeforeHook = Arc<
 /// `tokio::spawn`, so it must not assume it runs before the response is
 /// flushed.
 pub type AfterHook = Arc<
-    dyn for<'a> Fn(
-            &'a ToolCallContext,
+    dyn for<'call> Fn(
+            &'call ToolCallContext,
             HookDisposition,
             usize,
-        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'call>>
         + Send
         + Sync
         + 'static,
@@ -351,12 +281,18 @@ impl ToolHooks {
     /// the `#[non_exhaustive]` restriction that prevents struct-literal
     /// construction from outside the crate.
     #[must_use]
+    #[inline]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Set the serialized result size cap in bytes.
     #[must_use]
+    #[expect(
+        clippy::missing_const_for_fn,
+        reason = "public API frozen until the next major release"
+    )]
+    #[inline]
     pub fn with_max_result_bytes(mut self, max: usize) -> Self {
         self.max_result_bytes = Some(max);
         self
@@ -364,6 +300,7 @@ impl ToolHooks {
 
     /// Set the before-hook.
     #[must_use]
+    #[inline]
     pub fn with_before(mut self, before: BeforeHook) -> Self {
         self.before = Some(before);
         self
@@ -371,15 +308,19 @@ impl ToolHooks {
 
     /// Set the after-hook.
     #[must_use]
+    #[inline]
     pub fn with_after(mut self, after: AfterHook) -> Self {
         self.after = Some(after);
         self
     }
 }
 
+/// Documentation anchor for `mdbook`/rustdoc intra-doc links that must keep
+/// pointing at [`HookedHandler`] even if the type is renamed.
 const _HOOKED_HANDLER_DOC_ANCHOR: &str = "HookedHandler";
 
 impl fmt::Debug for ToolHooks {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ToolHooks")
             .field("max_result_bytes", &self.max_result_bytes)
@@ -392,11 +333,14 @@ impl fmt::Debug for ToolHooks {
 /// `ServerHandler` wrapper that applies [`ToolHooks`].
 #[derive(Clone)]
 pub struct HookedHandler<H: ServerHandler> {
+    /// The wrapped handler; shared so the wrapper stays `Clone`.
     inner: Arc<H>,
+    /// Hooks applied around `call_tool`.
     hooks: Arc<ToolHooks>,
 }
 
 impl<H: ServerHandler> fmt::Debug for HookedHandler<H> {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HookedHandler")
             .field("hooks", &self.hooks)
@@ -411,7 +355,11 @@ impl<H: ServerHandler> fmt::Debug for HookedHandler<H> {
 #[must_use = "HookedHandler must be wired into a ServerHandler (e.g. via \
               `serve(..., || hooked)`) to take effect; dropping the returned \
               value silently disables the supplied hooks"]
-pub fn with_hooks<H: ServerHandler>(inner: H, hooks: Arc<ToolHooks>) -> HookedHandler<H> {
+#[inline]
+pub fn with_hooks<H>(inner: H, hooks: Arc<ToolHooks>) -> HookedHandler<H>
+where
+    H: ServerHandler,
+{
     HookedHandler {
         inner: Arc::new(inner),
         hooks,
@@ -421,17 +369,20 @@ pub fn with_hooks<H: ServerHandler>(inner: H, hooks: Arc<ToolHooks>) -> HookedHa
 impl<H: ServerHandler> HookedHandler<H> {
     /// Access the wrapped handler.
     #[must_use]
+    #[inline]
     pub fn inner(&self) -> &H {
         &self.inner
     }
 
+    /// Build the hook context for one tool call from the request and the
+    /// task-local RBAC state.
     fn build_context(request: &CallToolRequestParams, req_id: Option<String>) -> ToolCallContext {
         ToolCallContext {
             tool_name: request.name.to_string(),
             arguments: request.arguments.clone().map(serde_json::Value::Object),
-            identity: crate::rbac::current_identity(),
-            role: crate::rbac::current_role(),
-            sub: crate::rbac::current_sub(),
+            identity: rbac::current_identity(),
+            role: rbac::current_role(),
+            sub: rbac::current_sub(),
             request_id: req_id,
         }
     }
@@ -444,7 +395,7 @@ impl<H: ServerHandler> HookedHandler<H> {
     /// The spawned task is **instrumented** with the request span via
     /// [`tracing::Instrument`] and re-establishes the per-request RBAC
     /// task-locals (role, identity, token, sub) via
-    /// [`crate::rbac::with_rbac_scope`]. Without this, after-hooks lose
+    /// [`rbac::with_rbac_scope`]. Without this, after-hooks lose
     /// their parent span (breaking trace correlation) and observe
     /// `current_role()` / `current_identity()` as `None`.
     fn spawn_after(
@@ -453,25 +404,27 @@ impl<H: ServerHandler> HookedHandler<H> {
         disposition: HookDisposition,
         size: usize,
     ) {
-        if let Some(after) = after {
-            use tracing::Instrument;
+        if let Some(after_holder) = after {
+            use tracing::{Instrument as _, Span};
 
-            let after = Arc::clone(after);
+            let holder = Arc::clone(after_holder);
             // Capture the request span before leaving the request task so
             // after-hook log lines are correlated with the originating call.
-            let span = tracing::Span::current();
+            let span = Span::current();
             // Snapshot RBAC task-locals; defaults are empty strings so the
             // re-established scope is a no-op when the request had no
             // authenticated identity (e.g. health checks, anonymous tools).
-            let role = crate::rbac::current_role().unwrap_or_default();
-            let identity = crate::rbac::current_identity().unwrap_or_default();
-            let token = crate::rbac::current_token()
-                .unwrap_or_else(|| secrecy::SecretString::from(String::new()));
-            let sub = crate::rbac::current_sub().unwrap_or_default();
-            tokio::spawn(
+            let role = rbac::current_role().unwrap_or_default();
+            let identity = rbac::current_identity().unwrap_or_default();
+            let token =
+                rbac::current_token().unwrap_or_else(|| secrecy::SecretString::from(String::new()));
+            let sub = rbac::current_sub().unwrap_or_default();
+            // Detached on purpose: dropping a `JoinHandle` detaches (never
+            // aborts) the spawned task, so the after-hook still runs.
+            let _after_task = tokio::spawn(
                 async move {
-                    crate::rbac::with_rbac_scope(role, identity, token, sub, async move {
-                        let fut = (after.f)(&ctx, disposition, size);
+                    rbac::with_rbac_scope(role, identity, token, sub, async move {
+                        let fut = (holder.hook)(&ctx, disposition, size);
                         fut.await;
                     })
                     .await;
@@ -486,7 +439,8 @@ impl<H: ServerHandler> HookedHandler<H> {
 /// the *holder* and let the spawned task borrow `ctx` for the lifetime
 /// of the future without lifetime acrobatics in `tokio::spawn`.
 struct AfterHookHolder {
-    f: AfterHook,
+    /// The hook invoked by the spawned task.
+    hook: AfterHook,
 }
 
 /// Structured error body returned when a result exceeds `max_result_bytes`.
@@ -495,8 +449,10 @@ struct AfterHookHolder {
 /// size is unknown. It is rendered as `"unknown"` rather than a fabricated
 /// number -- operators read `actual_bytes` as a measurement.
 fn too_large_result(limit: usize, actual: Option<usize>, tool: &str) -> CallToolResult {
-    let actual_desc =
-        actual.map_or_else(|| "an unmeasurable number of".to_owned(), |n| n.to_string());
+    let actual_desc = actual.map_or_else(
+        || "an unmeasurable number of".to_owned(),
+        |count| count.to_string(),
+    );
     let body = serde_json::json!({
         "error": "result_too_large",
         "message": format!(
@@ -509,9 +465,9 @@ fn too_large_result(limit: usize, actual: Option<usize>, tool: &str) -> CallTool
             serde_json::Value::from,
         ),
     });
-    let mut r = CallToolResult::error(vec![ContentBlock::text(body.to_string())]);
-    r.structured_content = None;
-    r
+    let mut result = CallToolResult::error(vec![ContentBlock::text(body.to_string())]);
+    result.structured_content = None;
+    result
 }
 
 /// Outcome of the `max_result_bytes` policy for a measured -- or
@@ -519,9 +475,17 @@ fn too_large_result(limit: usize, actual: Option<usize>, tool: &str) -> CallTool
 #[derive(Debug, PartialEq, Eq)]
 enum SizeVerdict {
     /// Within the cap, or no cap configured. Carries the measured size.
-    Pass { size: usize },
+    Pass {
+        /// The measured serialized size in bytes.
+        size: usize,
+    },
     /// Over the cap, or unmeasurable while a cap is configured.
-    Replace { limit: usize, actual: Option<usize> },
+    Replace {
+        /// The configured cap.
+        limit: usize,
+        /// The measured size, or `None` when serialization was unmeasurable.
+        actual: Option<usize>,
+    },
     /// Unmeasurable and no cap configured: nothing to enforce.
     PassUnmeasured,
 }
@@ -529,12 +493,12 @@ enum SizeVerdict {
 /// Decide what the size cap does, given an optional size-measurement outcome.
 const fn decide_size(size: Option<SizeMeasure>, max: Option<usize>) -> SizeVerdict {
     match size {
-        Some(SizeMeasure::Exact(size)) => match max {
-            Some(limit) if size > limit => SizeVerdict::Replace {
+        Some(SizeMeasure::Exact(measured)) => match max {
+            Some(limit) if measured > limit => SizeVerdict::Replace {
                 limit,
-                actual: Some(size),
+                actual: Some(measured),
             },
-            Some(_) | None => SizeVerdict::Pass { size },
+            Some(_) | None => SizeVerdict::Pass { size: measured },
         },
         Some(SizeMeasure::Exceeded { limit }) => SizeVerdict::Replace {
             limit,
@@ -558,13 +522,9 @@ fn apply_size_cap(
     max: Option<usize>,
     tool: &str,
 ) -> (CallToolResult, usize, bool) {
-    let size = if max.is_some() {
-        Some(serialized_size(&result, max))
-    } else {
-        None
-    };
+    let size = max.is_some().then(|| serialized_size(&result, max));
     match decide_size(size, max) {
-        SizeVerdict::Pass { size } => (result, size, false),
+        SizeVerdict::Pass { size: measured } => (result, measured, false),
         SizeVerdict::PassUnmeasured => (result, 0, false),
         SizeVerdict::Replace { limit, actual } => {
             tracing::warn!(
@@ -585,14 +545,21 @@ fn apply_size_cap(
     reason = "transparent ServerHandler delegation must include legacy logging/subscription methods until rmcp removes them"
 )]
 impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn ping(&self, context: RequestContext<RoleServer>) -> Result<(), ErrorData> {
         self.inner.ping(context).await
     }
 
+    #[inline]
     fn get_info(&self) -> ServerConfig {
         self.inner.get_info()
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn initialize(
         &self,
         request: InitializeRequestParams,
@@ -604,6 +571,7 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
     // Synchronous negotiation helper: no context and no hooks apply, so plain
     // delegation is the only transparent option -- the trait default would
     // shadow an inner override.
+    #[inline]
     fn negotiate_initialize(
         &self,
         request: &InitializeRequestParams,
@@ -611,6 +579,9 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.negotiate_initialize(request)
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn list_tools(
         &self,
         request: Option<PaginatedRequestParams>,
@@ -619,6 +590,9 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.list_tools(request, context).await
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn complete(
         &self,
         request: CompleteRequestParams,
@@ -627,6 +601,9 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.complete(request, context).await
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn set_level(
         &self,
         request: SetLevelRequestParams,
@@ -635,10 +612,14 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.set_level(request, context).await
     }
 
+    #[inline]
     fn get_tool(&self, name: &str) -> Option<Tool> {
         self.inner.get_tool(name)
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn list_prompts(
         &self,
         request: Option<PaginatedRequestParams>,
@@ -647,6 +628,9 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.list_prompts(request, context).await
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn get_prompt(
         &self,
         request: GetPromptRequestParams,
@@ -655,6 +639,9 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.get_prompt(request, context).await
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn list_resources(
         &self,
         request: Option<PaginatedRequestParams>,
@@ -663,6 +650,9 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.list_resources(request, context).await
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn list_resource_templates(
         &self,
         request: Option<PaginatedRequestParams>,
@@ -671,6 +661,9 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.list_resource_templates(request, context).await
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
@@ -681,11 +674,10 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
 
     // NOT cancel-safe: this awaits consumer-supplied before-hooks and the
     // consumer's inner handler. After-hooks are dispatched only on the normal
-    // Deny/Replace/Ok/Err paths, so a cancellation between the before-hook and
-    // the response drops the paired after-hook -- an audit hook can therefore
-    // record a started call that is never closed out. Consumers needing
-    // guaranteed pairing should make the after-hook idempotent or run the tool
-    // body detached (see `crate::cancel`).
+    // Deny/Replace/Ok/Err paths, so a cancellation between them drops the
+    // paired after-hook -- an audit hook can record a started call that never
+    // closes out. Make the after-hook idempotent or detach the tool body.
+    #[inline]
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
@@ -694,11 +686,11 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         let req_id = Some(context.id.to_string());
         let ctx = Self::build_context(&request, req_id);
         let max = self.hooks.max_result_bytes;
-        let after_holder = self
-            .hooks
-            .after
-            .as_ref()
-            .map(|f| Arc::new(AfterHookHolder { f: Arc::clone(f) }));
+        let after_holder = self.hooks.after.as_ref().map(|hook| {
+            Arc::new(AfterHookHolder {
+                hook: Arc::clone(hook),
+            })
+        });
 
         // Before hook: may Continue, Deny, or Replace.
         if let Some(before) = self.hooks.before.as_ref() {
@@ -746,9 +738,9 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
                 );
                 Ok(other)
             }
-            Err(e) => {
+            Err(error) => {
                 Self::spawn_after(after_holder.as_ref(), ctx, HookDisposition::InnerErrored, 0);
-                Err(e)
+                Err(error)
             }
         }
     }
@@ -756,10 +748,14 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
     // rmcp 3.0 added task/subscription/discovery request handlers with defaults;
     // delegate them to `inner` so wrapping a handler that implements those stays
     // transparent (otherwise the default would shadow the inner implementation).
+    #[inline]
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
         self.inner.supported_protocol_versions()
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn discover(
         &self,
         context: RequestContext<RoleServer>,
@@ -767,6 +763,7 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.discover(context).await
     }
 
+    #[inline]
     fn accepted_subscription_filter(
         &self,
         requested: &SubscriptionFilter,
@@ -774,10 +771,16 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.accepted_subscription_filter(requested)
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn listen(&self, context: SubscriptionContext) -> Result<(), ErrorData> {
         self.inner.listen(context).await
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn subscribe(
         &self,
         request: SubscribeRequestParams,
@@ -786,6 +789,9 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.subscribe(request, context).await
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn unsubscribe(
         &self,
         request: UnsubscribeRequestParams,
@@ -794,6 +800,9 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.unsubscribe(request, context).await
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn get_task(
         &self,
         request: GetTaskParams,
@@ -802,6 +811,9 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.get_task(request, context).await
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn update_task(
         &self,
         request: UpdateTaskParams,
@@ -810,6 +822,9 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.update_task(request, context).await
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn cancel_task(
         &self,
         request: CancelTaskParams,
@@ -818,6 +833,9 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.cancel_task(request, context).await
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn on_custom_request(
         &self,
         request: CustomRequest,
@@ -826,6 +844,9 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.on_custom_request(request, context).await
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn on_cancelled(
         &self,
         notification: CancelledNotificationParam,
@@ -834,6 +855,9 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.on_cancelled(notification, context).await;
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn on_progress(
         &self,
         notification: ProgressNotificationParam,
@@ -842,14 +866,23 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
         self.inner.on_progress(notification, context).await;
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
         self.inner.on_initialized(context).await;
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn on_roots_list_changed(&self, context: NotificationContext<RoleServer>) {
         self.inner.on_roots_list_changed(context).await;
     }
 
+    // cancel-safe: pure delegation to the inner handler; the wrapper holds no
+    // state across the await.
+    #[inline]
     async fn on_custom_notification(
         &self,
         notification: CustomNotification,
@@ -861,23 +894,30 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
     }
 }
 
+/// Marker error for the deliberate cap-abort of [`CountingWriter`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SizeLimitExceeded;
 
 impl fmt::Display for SizeLimitExceeded {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("serialized result exceeded configured size cap")
     }
 }
 
-impl std::error::Error for SizeLimitExceeded {}
+impl Error for SizeLimitExceeded {}
 
+/// [`io::Write`] sink that counts bytes and, when bounded, fails with
+/// [`SizeLimitExceeded`] as soon as the count would cross the cap.
 struct CountingWriter {
+    /// Bytes written so far.
     bytes: usize,
+    /// Cap that aborts the write once crossed, or `None` for an unbounded count.
     limit: Option<usize>,
 }
 
 impl CountingWriter {
+    /// Byte counter without a cap.
     const fn unbounded() -> Self {
         Self {
             bytes: 0,
@@ -885,6 +925,7 @@ impl CountingWriter {
         }
     }
 
+    /// Byte counter that aborts the write once `limit` is crossed.
     const fn bounded(limit: usize) -> Self {
         Self {
             bytes: 0,
@@ -915,7 +956,10 @@ enum SizeMeasure {
     /// Exact serialized size in bytes.
     Exact(usize),
     /// Serialization crossed the configured size cap and stopped early.
-    Exceeded { limit: usize },
+    Exceeded {
+        /// The configured cap that was crossed.
+        limit: usize,
+    },
 }
 
 /// Serialized byte length, or a deliberate cap-abort outcome.
@@ -937,98 +981,57 @@ fn serialized_size(result: &CallToolResult, max: Option<usize>) -> SizeMeasure {
     }
 }
 
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::unwrap_used, reason = "lint-migration: src/tool_hooks.rs")
+#[expect(
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    reason = "test code is not rendered API documentation"
 )]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::panic, reason = "lint-migration: src/tool_hooks.rs")
+#[expect(
+    clippy::too_long_first_doc_paragraph,
+    reason = "test code is not rendered API documentation"
 )]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::let_underscore_untyped,
-        reason = "lint-migration: src/tool_hooks.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::shadow_unrelated, reason = "lint-migration: src/tool_hooks.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::indexing_slicing, reason = "lint-migration: src/tool_hooks.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::default_numeric_fallback,
-        reason = "lint-migration: src/tool_hooks.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::too_long_first_doc_paragraph,
-        reason = "test code is not rendered API documentation"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::expect_used, reason = "lint-migration: src/tool_hooks.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::missing_panics_doc,
-        reason = "test code is not rendered API documentation"
-    )
-)]
-#[cfg_attr(
-    test,
-    expect(let_underscore_drop, reason = "lint-migration: src/tool_hooks.rs")
-)]
+#[expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")]
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+    use core::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
     };
+    use std::{sync::Mutex, time::Instant};
 
-    #[expect(
-        deprecated,
-        reason = "delegation tests cover legacy logging/subscription methods"
-    )]
+    use anyhow::Context as _;
     use rmcp::{
-        ErrorData, RoleServer, ServerHandler,
         model::{
-            CallToolRequestParams, CallToolResponse, CallToolResult, CancelledNotificationParam,
-            CompleteRequestParams, CompleteResult, CompletionInfo, ContentBlock,
-            CustomNotification, CustomRequest, CustomResult, DiscoverResult,
-            GetPromptRequestParams, GetPromptResult, GetTaskParams, GetTaskResult,
-            ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
-            PaginatedRequestParams, ProgressNotificationParam, Prompt, PromptMessage,
-            ProtocolVersion, ReadResourceRequestParams, ReadResourceResult, Resource,
-            ResourceContents, ResourceTemplate, Role, ServerConfig, SetLevelRequestParams,
-            SubscribeRequestParams, SubscriptionFilter, UnsubscribeRequestParams, UpdateTaskParams,
+            ClientCapabilities, CompletionInfo, DetailedTask, GetPromptResult, Implementation,
+            JsonObject, Prompt, PromptMessage, ReadResourceResult, Resource, ResourceContents,
+            ResourceTemplate, Role, ServerCapabilities, Task, TaskPayload, TaskStatus,
         },
-        service::{RequestContext, SubscriptionContext},
+        service::{RunningService, serve_directly},
     };
     use serde_json::json;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
+    use tokio::{
+        io::{
+            AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, DuplexStream, ReadHalf, WriteHalf,
+            duplex, split,
+        },
+        sync::Notify,
+        task::yield_now,
+        time::{sleep, timeout},
+    };
+    use tracing::subscriber::set_default;
+    use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
 
     type DelegationTransport = (
         DelegationProbe,
-        BufReader<tokio::io::ReadHalf<DuplexStream>>,
-        tokio::io::WriteHalf<DuplexStream>,
-        rmcp::service::RunningService<RoleServer, HookedHandler<DelegationProbe>>,
+        BufReader<ReadHalf<DuplexStream>>,
+        WriteHalf<DuplexStream>,
+        RunningService<RoleServer, HookedHandler<DelegationProbe>>,
     );
 
     #[derive(Clone, Default)]
-    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
 
     impl CapturedLogs {
         fn contents(&self) -> String {
@@ -1037,7 +1040,7 @@ mod tests {
         }
     }
 
-    struct CapturedLogsWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+    struct CapturedLogsWriter(Arc<Mutex<Vec<u8>>>);
 
     impl io::Write for CapturedLogsWriter {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -1052,10 +1055,10 @@ mod tests {
         }
     }
 
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+    impl<'writer> MakeWriter<'writer> for CapturedLogs {
         type Writer = CapturedLogsWriter;
 
-        fn make_writer(&'a self) -> Self::Writer {
+        fn make_writer(&'writer self) -> Self::Writer {
             CapturedLogsWriter(Arc::clone(&self.0))
         }
     }
@@ -1088,8 +1091,8 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct DelegationProbe {
-        seen: Arc<std::sync::Mutex<Vec<&'static str>>>,
-        notify: Arc<tokio::sync::Notify>,
+        seen: Arc<Mutex<Vec<&'static str>>>,
+        notify: Arc<Notify>,
     }
 
     impl DelegationProbe {
@@ -1107,14 +1110,15 @@ mod tests {
                 .unwrap_or_default()
         }
 
-        async fn wait_for_seen_count(&self, count: usize) {
-            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        async fn wait_for_seen_count(&self, count: usize) -> anyhow::Result<()> {
+            timeout(Duration::from_secs(1), async {
                 while self.seen().len() < count {
                     self.notify.notified().await;
                 }
             })
             .await
-            .expect("delegated handler methods should be observed");
+            .context("delegated handler methods should be observed")?;
+            Ok(())
         }
     }
 
@@ -1140,7 +1144,7 @@ mod tests {
         ) -> Result<CompleteResult, ErrorData> {
             self.record("complete");
             let completion = CompletionInfo::with_all_values(vec!["delegated".to_owned()])
-                .expect("single completion is within rmcp max");
+                .map_err(|message| ErrorData::internal_error(message, None))?;
             Ok(CompleteResult::new(completion))
         }
 
@@ -1257,8 +1261,8 @@ mod tests {
     /// Capabilities the probe advertises so the dispatcher routes prompts,
     /// resources, tools, tool-list-changed subscriptions and tasks to the
     /// wrapper at all.
-    fn probe_capabilities() -> rmcp::model::ServerCapabilities {
-        rmcp::model::ServerCapabilities::builder()
+    fn probe_capabilities() -> ServerCapabilities {
+        ServerCapabilities::builder()
             .enable_prompts()
             .enable_resources()
             .enable_tools()
@@ -1278,7 +1282,7 @@ mod tests {
     /// value differential against [`PassthroughDefaults`] instead.
     #[derive(Clone, Default)]
     struct ForwardingProbe {
-        seen: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        seen: Arc<Mutex<Vec<&'static str>>>,
     }
 
     impl ForwardingProbe {
@@ -1315,7 +1319,7 @@ mod tests {
             Some(Tool::new(
                 name.to_owned(),
                 "forwarding-probe",
-                Arc::new(rmcp::model::JsonObject::default()),
+                Arc::new(JsonObject::default()),
             ))
         }
 
@@ -1350,7 +1354,7 @@ mod tests {
             Ok(ListToolsResult::with_all_items(vec![Tool::new(
                 "sentinel-tool",
                 "forwarding-probe",
-                Arc::new(rmcp::model::JsonObject::default()),
+                Arc::new(JsonObject::default()),
             )]))
         }
 
@@ -1435,14 +1439,14 @@ mod tests {
             _context: RequestContext<RoleServer>,
         ) -> Result<GetTaskResult, ErrorData> {
             self.record("get_task");
-            Ok(GetTaskResult::new(rmcp::model::DetailedTask::new(
-                rmcp::model::Task::new(
+            Ok(GetTaskResult::new(DetailedTask::new(
+                Task::new(
                     request.task_id,
-                    rmcp::model::TaskStatus::Working,
+                    TaskStatus::Working,
                     "2026-01-01T00:00:00Z",
                     "2026-01-01T00:00:00Z",
                 ),
-                rmcp::model::TaskPayload::Working,
+                TaskPayload::Working,
             )))
         }
 
@@ -1469,9 +1473,9 @@ mod tests {
     }
 
     fn delegation_transport(probe: DelegationProbe, hooks: Arc<ToolHooks>) -> DelegationTransport {
-        let (client, server) = tokio::io::duplex(16 * 1024);
-        let (client_read, client_write) = tokio::io::split(client);
-        let service = rmcp::service::serve_directly::<RoleServer, _, _, io::Error, _>(
+        let (client, server) = duplex(16 * 1024);
+        let (client_read, client_write) = split(client);
+        let service = serve_directly::<RoleServer, _, _, io::Error, _>(
             with_hooks(probe.clone(), hooks),
             server,
             None,
@@ -1480,32 +1484,33 @@ mod tests {
     }
 
     async fn send_json_rpc(
-        writer: &mut tokio::io::WriteHalf<DuplexStream>,
-        reader: &mut BufReader<tokio::io::ReadHalf<DuplexStream>>,
+        writer: &mut WriteHalf<DuplexStream>,
+        reader: &mut BufReader<ReadHalf<DuplexStream>>,
         request: serde_json::Value,
-    ) -> serde_json::Value {
+    ) -> anyhow::Result<serde_json::Value> {
         writer
             .write_all(request.to_string().as_bytes())
             .await
-            .expect("write request");
-        writer.write_all(b"\n").await.expect("write newline");
-        writer.flush().await.expect("flush request");
+            .context("write request")?;
+        writer.write_all(b"\n").await.context("write newline")?;
+        writer.flush().await.context("flush request")?;
 
         let mut line = String::new();
-        reader.read_line(&mut line).await.expect("read response");
-        serde_json::from_str(&line).expect("response is JSON")
+        let _bytes_read = reader.read_line(&mut line).await.context("read response")?;
+        serde_json::from_str(&line).context("response is JSON")
     }
 
     async fn send_notification(
-        writer: &mut tokio::io::WriteHalf<DuplexStream>,
+        writer: &mut WriteHalf<DuplexStream>,
         notification: serde_json::Value,
-    ) {
+    ) -> anyhow::Result<()> {
         writer
             .write_all(notification.to_string().as_bytes())
             .await
-            .expect("write notification");
-        writer.write_all(b"\n").await.expect("write newline");
-        writer.flush().await.expect("flush notification");
+            .context("write notification")?;
+        writer.write_all(b"\n").await.context("write newline")?;
+        writer.flush().await.context("flush notification")?;
+        Ok(())
     }
 
     /// Overrides only `negotiate_initialize`, so the sentinel value can only
@@ -1524,18 +1529,19 @@ mod tests {
             &self,
             _request: &InitializeRequestParams,
         ) -> Result<InitializeResult, ErrorData> {
-            let mut info = ServerConfig::new(rmcp::model::ServerCapabilities::default());
+            let mut info = ServerConfig::new(ServerCapabilities::default());
             info.instructions = Some("inner negotiate_initialize override".to_owned());
             Ok(info)
         }
     }
 
     #[test]
-    fn hooked_handler_preserves_inner_negotiate_initialize_override() {
+    /// Pins that the wrapper delegates `negotiate_initialize` to an inner override.
+    fn hooked_handler_preserves_inner_negotiate_initialize_override() -> anyhow::Result<()> {
         let handler = with_hooks(NegotiateProbe, Arc::new(ToolHooks::new()));
         let request = InitializeRequestParams::new(
-            rmcp::model::ClientCapabilities::default(),
-            rmcp::model::Implementation::new("delegation-test-client", "0.0.0"),
+            ClientCapabilities::default(),
+            Implementation::new("delegation-test-client", "0.0.0"),
         );
 
         // Called directly on the wrapper (the HTTP path routes `initialize`,
@@ -1544,33 +1550,37 @@ mod tests {
         // override.
         let result = handler
             .negotiate_initialize(&request)
-            .expect("direct negotiation must succeed");
+            .context("direct negotiation must succeed")?;
 
         assert_eq!(
             result.instructions.as_deref(),
             Some("inner negotiate_initialize override"),
             "wrapper must delegate to the inner `negotiate_initialize` override"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn hooked_handler_delegates_ping() {
+    /// Pins that `ping` is forwarded to the inner handler.
+    async fn hooked_handler_delegates_ping() -> anyhow::Result<()> {
         let (probe, mut reader, mut writer, _service) =
             delegation_transport(DelegationProbe::default(), Arc::new(ToolHooks::new()));
 
         let response = send_json_rpc(
             &mut writer,
             &mut reader,
-            json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }),
+            json!({ "jsonrpc": "2.0", "id": 1_i32, "method": "ping" }),
         )
-        .await;
+        .await?;
 
-        assert_eq!(response["result"], json!({}));
+        assert_eq!(response.get("result"), Some(&json!({})));
         assert_eq!(probe.seen(), vec!["ping"]);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn hooked_handler_delegates_notifications() {
+    /// Pins that every notification method is forwarded to the inner handler.
+    async fn hooked_handler_delegates_notifications() -> anyhow::Result<()> {
         let (probe, _reader, mut writer, _service) =
             delegation_transport(DelegationProbe::default(), Arc::new(ToolHooks::new()));
 
@@ -1579,36 +1589,36 @@ mod tests {
             json!({
                 "jsonrpc": "2.0",
                 "method": "notifications/cancelled",
-                "params": { "requestId": 1, "reason": "test" }
+                "params": { "requestId": 1_i32, "reason": "test" }
             }),
         )
-        .await;
+        .await?;
         send_notification(
             &mut writer,
             json!({
                 "jsonrpc": "2.0",
                 "method": "notifications/progress",
-                "params": { "progressToken": 1, "progress": 0.5 }
+                "params": { "progressToken": 1_i32, "progress": 0.5_f64 }
             }),
         )
-        .await;
+        .await?;
         send_notification(
             &mut writer,
             json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
         )
-        .await;
+        .await?;
         send_notification(
             &mut writer,
             json!({ "jsonrpc": "2.0", "method": "notifications/roots/list_changed" }),
         )
-        .await;
+        .await?;
         send_notification(
             &mut writer,
             json!({ "jsonrpc": "2.0", "method": "notifications/custom/probe" }),
         )
-        .await;
+        .await?;
 
-        probe.wait_for_seen_count(5).await;
+        probe.wait_for_seen_count(5).await?;
         assert_eq!(
             probe.seen(),
             vec![
@@ -1619,10 +1629,12 @@ mod tests {
                 "on_custom_notification"
             ]
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn hooked_handler_delegates_completion_and_level() {
+    /// Pins that `complete` and `set_level` are forwarded to the inner handler.
+    async fn hooked_handler_delegates_completion_and_level() -> anyhow::Result<()> {
         let (probe, mut reader, mut writer, _service) =
             delegation_transport(DelegationProbe::default(), Arc::new(ToolHooks::new()));
 
@@ -1631,7 +1643,7 @@ mod tests {
             &mut reader,
             json!({
                 "jsonrpc": "2.0",
-                "id": 1,
+                "id": 1_i32,
                 "method": "completion/complete",
                 "params": {
                     "ref": { "type": "ref/prompt", "name": "prompt" },
@@ -1639,29 +1651,34 @@ mod tests {
                 }
             }),
         )
-        .await;
+        .await?;
         let level = send_json_rpc(
             &mut writer,
             &mut reader,
             json!({
                 "jsonrpc": "2.0",
-                "id": 2,
+                "id": 2_i32,
                 "method": "logging/setLevel",
                 "params": { "level": "debug" }
             }),
         )
-        .await;
+        .await?;
 
         assert_eq!(
-            completion["result"]["completion"]["values"],
-            json!(["delegated"])
+            completion
+                .get("result")
+                .and_then(|body| body.get("completion"))
+                .and_then(|values| values.get("values")),
+            Some(&json!(["delegated"]))
         );
-        assert_eq!(level["result"], json!({}));
+        assert_eq!(level.get("result"), Some(&json!({})));
         assert_eq!(probe.seen(), vec!["complete", "set_level"]);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn hooked_handler_delegates_subscriptions() {
+    /// Pins that `subscribe` and `unsubscribe` are forwarded to the inner handler.
+    async fn hooked_handler_delegates_subscriptions() -> anyhow::Result<()> {
         let (probe, mut reader, mut writer, _service) =
             delegation_transport(DelegationProbe::default(), Arc::new(ToolHooks::new()));
 
@@ -1670,31 +1687,33 @@ mod tests {
             &mut reader,
             json!({
                 "jsonrpc": "2.0",
-                "id": 1,
+                "id": 1_i32,
                 "method": "resources/subscribe",
                 "params": { "uri": "file:///tmp/a" }
             }),
         )
-        .await;
+        .await?;
         let unsubscribe = send_json_rpc(
             &mut writer,
             &mut reader,
             json!({
                 "jsonrpc": "2.0",
-                "id": 2,
+                "id": 2_i32,
                 "method": "resources/unsubscribe",
                 "params": { "uri": "file:///tmp/a" }
             }),
         )
-        .await;
+        .await?;
 
-        assert_eq!(subscribe["result"], json!({}));
-        assert_eq!(unsubscribe["result"], json!({}));
+        assert_eq!(subscribe.get("result"), Some(&json!({})));
+        assert_eq!(unsubscribe.get("result"), Some(&json!({})));
         assert_eq!(probe.seen(), vec!["subscribe", "unsubscribe"]);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn hooked_handler_delegates_custom_request() {
+    /// Pins that `on_custom_request` is forwarded to the inner handler.
+    async fn hooked_handler_delegates_custom_request() -> anyhow::Result<()> {
         let (probe, mut reader, mut writer, _service) =
             delegation_transport(DelegationProbe::default(), Arc::new(ToolHooks::new()));
 
@@ -1703,38 +1722,40 @@ mod tests {
             &mut reader,
             json!({
                 "jsonrpc": "2.0",
-                "id": 1,
+                "id": 1_i32,
                 "method": "requests/custom/probe",
                 "params": { "x": true }
             }),
         )
-        .await;
+        .await?;
 
-        assert_eq!(response["result"], json!({ "delegated": true }));
+        assert_eq!(response.get("result"), Some(&json!({ "delegated": true })));
         assert_eq!(probe.seen(), vec!["on_custom_request"]);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn hooked_handler_still_applies_hooks_to_call_tool() {
+    /// Pins that before/after hooks and the size cap still apply through `call_tool`.
+    async fn hooked_handler_still_applies_hooks_to_call_tool() -> anyhow::Result<()> {
         let before_count = Arc::new(AtomicUsize::new(0));
         let before_seen = Arc::clone(&before_count);
         let before: BeforeHook = Arc::new(move |_ctx| {
-            let before_seen = Arc::clone(&before_seen);
+            let seen = Arc::clone(&before_seen);
             Box::pin(async move {
-                before_seen.fetch_add(1, Ordering::Relaxed);
+                let _previous = seen.fetch_add(1, Ordering::Relaxed);
                 HookOutcome::Continue
             })
         });
         let after_count = Arc::new(AtomicUsize::new(0));
         let after_seen = Arc::clone(&after_count);
-        let after_notify = Arc::new(tokio::sync::Notify::new());
+        let after_notify = Arc::new(Notify::new());
         let after_notify_seen = Arc::clone(&after_notify);
         let after: AfterHook = Arc::new(move |_ctx, _disp, _size| {
-            let after_seen = Arc::clone(&after_seen);
-            let after_notify_seen = Arc::clone(&after_notify_seen);
+            let seen = Arc::clone(&after_seen);
+            let notify = Arc::clone(&after_notify_seen);
             Box::pin(async move {
-                after_seen.fetch_add(1, Ordering::Relaxed);
-                after_notify_seen.notify_waiters();
+                let _previous = seen.fetch_add(1, Ordering::Relaxed);
+                notify.notify_waiters();
             })
         });
         let hooks = Arc::new(
@@ -1751,24 +1772,32 @@ mod tests {
             &mut reader,
             json!({
                 "jsonrpc": "2.0",
-                "id": 1,
+                "id": 1_i32,
                 "method": "tools/call",
                 "params": { "name": "probe", "arguments": {} }
             }),
         )
-        .await;
+        .await?;
 
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        timeout(Duration::from_secs(1), async {
             while after_count.load(Ordering::Relaxed) == 0 {
                 after_notify.notified().await;
             }
         })
         .await
-        .expect("after hook should run");
-        assert_eq!(response["result"]["content"][0]["text"], "inner");
+        .context("after hook should run")?;
+        assert_eq!(
+            response
+                .get("result")
+                .and_then(|result| result.get("content"))
+                .and_then(|content| content.get(0))
+                .and_then(|item| item.get("text")),
+            Some(&json!("inner"))
+        );
         assert_eq!(probe.seen(), vec!["call_tool"]);
         assert_eq!(before_count.load(Ordering::Relaxed), 1);
         assert_eq!(after_count.load(Ordering::Relaxed), 1);
+        Ok(())
     }
 
     // ----------------------------------------------------------------------
@@ -1865,8 +1894,13 @@ mod tests {
     /// in-crate check keeps the constant referenced (so it cannot rot as dead
     /// code) and rejects duplicate entries, which the source-level parser
     /// cannot see.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/tool_hooks.rs::semantic_drivers_table_is_well_formed keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn semantic_drivers_table_is_well_formed() {
+    /// Pins that the semantic-driver table has no duplicate or empty entries.
+    fn semantic_drivers_table_is_well_formed() -> anyhow::Result<()> {
         assert_ne!(SEMANTIC_DRIVERS, []);
         let mut names: Vec<&str> = SEMANTIC_DRIVERS.iter().map(|(name, _)| *name).collect();
         let total = names.len();
@@ -1877,6 +1911,7 @@ mod tests {
             assert_ne!(*name, "");
             assert_ne!(*driver, "");
         }
+        Ok(())
     }
 
     /// Per-request metadata satisfying every gate the drivers cross: a protocol
@@ -1892,41 +1927,45 @@ mod tests {
     }
 
     /// A request whose `params._meta` carries [`coverage_meta`].
-    fn coverage_request(id: i64, method: &str, mut params: serde_json::Value) -> serde_json::Value {
+    fn coverage_request(
+        id: i64,
+        method: &str,
+        mut params: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
         let object = params
             .as_object_mut()
-            .expect("coverage requests carry an object of params");
-        object.insert("_meta".to_owned(), coverage_meta());
-        json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+            .context("coverage requests carry an object of params")?;
+        let _previous = object.insert("_meta".to_owned(), coverage_meta());
+        Ok(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
     }
 
     /// Read one server frame that is already queued (used where a single
     /// request produces two frames: the subscription acknowledgement, then the
     /// response).
     async fn read_json_rpc(
-        reader: &mut BufReader<tokio::io::ReadHalf<DuplexStream>>,
-    ) -> serde_json::Value {
+        reader: &mut BufReader<ReadHalf<DuplexStream>>,
+    ) -> anyhow::Result<serde_json::Value> {
         let mut line = String::new();
-        reader.read_line(&mut line).await.expect("read response");
-        serde_json::from_str(&line).expect("response is JSON")
+        let _bytes_read = reader.read_line(&mut line).await.context("read response")?;
+        serde_json::from_str(&line).context("response is JSON")
     }
 
     type ForwardingTransport<P> = (
-        BufReader<tokio::io::ReadHalf<DuplexStream>>,
-        tokio::io::WriteHalf<DuplexStream>,
-        rmcp::service::RunningService<RoleServer, HookedHandler<P>>,
+        BufReader<ReadHalf<DuplexStream>>,
+        WriteHalf<DuplexStream>,
+        RunningService<RoleServer, HookedHandler<P>>,
     );
 
     /// Like [`delegation_transport`], but for a caller-chosen inner handler, so
     /// one driver can run against both the real wrapper and
     /// [`PassthroughDefaults`].
-    fn forwarding_transport<P: ServerHandler>(
-        inner: P,
-        hooks: Arc<ToolHooks>,
-    ) -> ForwardingTransport<P> {
-        let (client, server) = tokio::io::duplex(16 * 1024);
-        let (client_read, client_write) = tokio::io::split(client);
-        let service = rmcp::service::serve_directly::<RoleServer, _, _, io::Error, _>(
+    fn forwarding_transport<P>(inner: P, hooks: Arc<ToolHooks>) -> ForwardingTransport<P>
+    where
+        P: ServerHandler,
+    {
+        let (client, server) = duplex(16 * 1024);
+        let (client_read, client_write) = split(client);
+        let service = serve_directly::<RoleServer, _, _, io::Error, _>(
             with_hooks(inner, hooks),
             server,
             None,
@@ -1939,7 +1978,8 @@ mod tests {
     }
 
     #[test]
-    fn hooked_handler_forwards_direct_sync_methods() {
+    /// Pins that `get_info`, `get_tool` and `supported_protocol_versions` forward.
+    fn hooked_handler_forwards_direct_sync_methods() -> anyhow::Result<()> {
         // No record log in this driver: `get_info`, `get_tool` and
         // `supported_protocol_versions` are proven by value differential, so
         // rmcp's ambient calls cannot contaminate the proof.
@@ -1956,7 +1996,7 @@ mod tests {
         // `get_tool`: the default returns `None` unconditionally.
         let tool = wrapper
             .get_tool("sentinel-tool")
-            .expect("inner get_tool must reach the caller");
+            .context("inner get_tool must reach the caller")?;
         assert_eq!(tool.name, "sentinel-tool");
         assert_eq!(control.get_tool("sentinel-tool"), None);
 
@@ -1969,10 +2009,12 @@ mod tests {
             control.supported_protocol_versions().as_ref(),
             SENTINEL_VERSIONS.as_slice()
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn hooked_handler_forwards_initialize_and_discover() {
+    /// Pins that `initialize` and `discover` forward, and the passthrough does not.
+    async fn hooked_handler_forwards_initialize_and_discover() -> anyhow::Result<()> {
         let probe = ForwardingProbe::default();
         let (mut reader, mut writer, _service) =
             forwarding_transport(probe.clone(), coverage_hooks());
@@ -1982,7 +2024,7 @@ mod tests {
             &mut reader,
             json!({
                 "jsonrpc": "2.0",
-                "id": 1,
+                "id": 1_i32,
                 "method": "initialize",
                 "params": {
                     "protocolVersion": "2025-11-25",
@@ -1991,21 +2033,25 @@ mod tests {
                 }
             }),
         )
-        .await;
+        .await?;
         assert_eq!(
-            initialize["result"]["instructions"],
-            json!("forwarding-probe:initialize")
+            initialize
+                .get("result")
+                .and_then(|result| result.get("instructions")),
+            Some(&json!("forwarding-probe:initialize"))
         );
 
         let discover = send_json_rpc(
             &mut writer,
             &mut reader,
-            coverage_request(2, "server/discover", json!({})),
+            coverage_request(2, "server/discover", json!({}))?,
         )
-        .await;
+        .await?;
         assert_eq!(
-            discover["result"]["supportedVersions"],
-            json!(["2025-11-25", "2026-07-28"])
+            discover
+                .get("result")
+                .and_then(|result| result.get("supportedVersions")),
+            Some(&json!(["2025-11-25", "2026-07-28"]))
         );
 
         // Exact full sequence (mechanism 3): the two driven methods and nothing
@@ -2018,14 +2064,14 @@ mod tests {
         // Negative control: with every delegation deleted, both requests are
         // answered by rmcp defaults and the probe stays untouched.
         let control = ForwardingProbe::default();
-        let (mut reader, mut writer, _service) =
+        let (mut control_reader, mut control_writer, _control_service) =
             forwarding_transport(PassthroughDefaults::new(control.clone()), coverage_hooks());
         let control_initialize = send_json_rpc(
-            &mut writer,
-            &mut reader,
+            &mut control_writer,
+            &mut control_reader,
             json!({
                 "jsonrpc": "2.0",
-                "id": 1,
+                "id": 1_i32,
                 "method": "initialize",
                 "params": {
                     "protocolVersion": "2025-11-25",
@@ -2034,26 +2080,36 @@ mod tests {
                 }
             }),
         )
-        .await;
+        .await?;
         let control_discover = send_json_rpc(
-            &mut writer,
-            &mut reader,
-            coverage_request(2, "server/discover", json!({})),
+            &mut control_writer,
+            &mut control_reader,
+            coverage_request(2, "server/discover", json!({}))?,
         )
-        .await;
+        .await?;
         assert_ne!(
-            control_initialize["result"]["instructions"],
-            json!("forwarding-probe:initialize")
+            control_initialize
+                .get("result")
+                .and_then(|result| result.get("instructions")),
+            Some(&json!("forwarding-probe:initialize"))
         );
         assert_ne!(
-            control_discover["result"]["supportedVersions"],
-            json!(["2025-11-25", "2026-07-28"])
+            control_discover
+                .get("result")
+                .and_then(|result| result.get("supportedVersions")),
+            Some(&json!(["2025-11-25", "2026-07-28"]))
         );
         assert_eq!(control.seen(), Vec::<&str>::new());
+        Ok(())
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "deliberate: src/tool_hooks.rs::hooked_handler_forwards_listing_methods keeps the positive and mutation-control halves in one driver so the control cannot be skipped"
+    )]
     #[tokio::test]
-    async fn hooked_handler_forwards_listing_methods() {
+    /// Pins that the four listing methods forward and the passthrough stays empty.
+    async fn hooked_handler_forwards_listing_methods() -> anyhow::Result<()> {
         // Mechanism 1 (ambient-silent probe): the expected log is exactly the
         // driven methods.
         let probe = ForwardingProbe::default();
@@ -2063,40 +2119,59 @@ mod tests {
         let tools = send_json_rpc(
             &mut writer,
             &mut reader,
-            coverage_request(1, "tools/list", json!({})),
+            coverage_request(1, "tools/list", json!({}))?,
         )
-        .await;
+        .await?;
         let prompts = send_json_rpc(
             &mut writer,
             &mut reader,
-            coverage_request(2, "prompts/list", json!({})),
+            coverage_request(2, "prompts/list", json!({}))?,
         )
-        .await;
+        .await?;
         let resources = send_json_rpc(
             &mut writer,
             &mut reader,
-            coverage_request(3, "resources/list", json!({})),
+            coverage_request(3, "resources/list", json!({}))?,
         )
-        .await;
+        .await?;
         let templates = send_json_rpc(
             &mut writer,
             &mut reader,
-            coverage_request(4, "resources/templates/list", json!({})),
+            coverage_request(4, "resources/templates/list", json!({}))?,
         )
-        .await;
+        .await?;
 
-        assert_eq!(tools["result"]["tools"][0]["name"], json!("sentinel-tool"));
         assert_eq!(
-            prompts["result"]["prompts"][0]["name"],
-            json!("sentinel-prompt")
+            tools
+                .get("result")
+                .and_then(|body| body.get("tools"))
+                .and_then(|entries| entries.get(0))
+                .and_then(|tool| tool.get("name")),
+            Some(&json!("sentinel-tool"))
         );
         assert_eq!(
-            resources["result"]["resources"][0]["uri"],
-            json!("test://sentinel-resource")
+            prompts
+                .get("result")
+                .and_then(|body| body.get("prompts"))
+                .and_then(|entries| entries.get(0))
+                .and_then(|prompt| prompt.get("name")),
+            Some(&json!("sentinel-prompt"))
         );
         assert_eq!(
-            templates["result"]["resourceTemplates"][0]["uriTemplate"],
-            json!("test://sentinel/{id}")
+            resources
+                .get("result")
+                .and_then(|body| body.get("resources"))
+                .and_then(|entries| entries.get(0))
+                .and_then(|resource| resource.get("uri")),
+            Some(&json!("test://sentinel-resource"))
+        );
+        assert_eq!(
+            templates
+                .get("result")
+                .and_then(|body| body.get("resourceTemplates"))
+                .and_then(|entries| entries.get(0))
+                .and_then(|template| template.get("uriTemplate")),
+            Some(&json!("test://sentinel/{id}"))
         );
         assert_eq!(
             probe.seen(),
@@ -2111,41 +2186,63 @@ mod tests {
         // Negative control: the same four requests, answered by defaults --
         // empty result sets, probe untouched.
         let control = ForwardingProbe::default();
-        let (mut reader, mut writer, _service) =
+        let (mut control_reader, mut control_writer, _control_service) =
             forwarding_transport(PassthroughDefaults::new(control.clone()), coverage_hooks());
         let control_tools = send_json_rpc(
-            &mut writer,
-            &mut reader,
-            coverage_request(1, "tools/list", json!({})),
+            &mut control_writer,
+            &mut control_reader,
+            coverage_request(1, "tools/list", json!({}))?,
         )
-        .await;
+        .await?;
         let control_prompts = send_json_rpc(
-            &mut writer,
-            &mut reader,
-            coverage_request(2, "prompts/list", json!({})),
+            &mut control_writer,
+            &mut control_reader,
+            coverage_request(2, "prompts/list", json!({}))?,
         )
-        .await;
+        .await?;
         let control_resources = send_json_rpc(
-            &mut writer,
-            &mut reader,
-            coverage_request(3, "resources/list", json!({})),
+            &mut control_writer,
+            &mut control_reader,
+            coverage_request(3, "resources/list", json!({}))?,
         )
-        .await;
+        .await?;
         let control_templates = send_json_rpc(
-            &mut writer,
-            &mut reader,
-            coverage_request(4, "resources/templates/list", json!({})),
+            &mut control_writer,
+            &mut control_reader,
+            coverage_request(4, "resources/templates/list", json!({}))?,
         )
-        .await;
-        assert_eq!(control_tools["result"]["tools"], json!([]));
-        assert_eq!(control_prompts["result"]["prompts"], json!([]));
-        assert_eq!(control_resources["result"]["resources"], json!([]));
-        assert_eq!(control_templates["result"]["resourceTemplates"], json!([]));
+        .await?;
+        assert_eq!(
+            control_tools
+                .get("result")
+                .and_then(|result| result.get("tools")),
+            Some(&json!([]))
+        );
+        assert_eq!(
+            control_prompts
+                .get("result")
+                .and_then(|result| result.get("prompts")),
+            Some(&json!([]))
+        );
+        assert_eq!(
+            control_resources
+                .get("result")
+                .and_then(|result| result.get("resources")),
+            Some(&json!([]))
+        );
+        assert_eq!(
+            control_templates
+                .get("result")
+                .and_then(|result| result.get("resourceTemplates")),
+            Some(&json!([]))
+        );
         assert_eq!(control.seen(), Vec::<&str>::new());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn hooked_handler_forwards_prompt_and_resource_reads() {
+    /// Pins that `get_prompt`/`read_resource` forward and the passthrough errors.
+    async fn hooked_handler_forwards_prompt_and_resource_reads() -> anyhow::Result<()> {
         // Mechanism 1 (ambient-silent probe): the expected log is exactly the
         // driven methods.
         let probe = ForwardingProbe::default();
@@ -2155,9 +2252,9 @@ mod tests {
         let prompt = send_json_rpc(
             &mut writer,
             &mut reader,
-            coverage_request(1, "prompts/get", json!({ "name": "sentinel-prompt" })),
+            coverage_request(1, "prompts/get", json!({ "name": "sentinel-prompt" }))?,
         )
-        .await;
+        .await?;
         let resource = send_json_rpc(
             &mut writer,
             &mut reader,
@@ -2165,48 +2262,69 @@ mod tests {
                 2,
                 "resources/read",
                 json!({ "uri": "test://sentinel-resource" }),
-            ),
+            )?,
         )
-        .await;
+        .await?;
 
         assert_eq!(
-            prompt["result"]["messages"][0]["content"]["text"],
-            json!("forwarding-probe:get_prompt")
+            prompt
+                .get("result")
+                .and_then(|result| result.get("messages"))
+                .and_then(|messages| messages.get(0))
+                .and_then(|message| message.get("content"))
+                .and_then(|content| content.get("text")),
+            Some(&json!("forwarding-probe:get_prompt"))
         );
         assert_eq!(
-            resource["result"]["contents"][0]["text"],
-            json!("forwarding-probe:read_resource")
+            resource
+                .get("result")
+                .and_then(|result| result.get("contents"))
+                .and_then(|contents| contents.get(0))
+                .and_then(|content| content.get("text")),
+            Some(&json!("forwarding-probe:read_resource"))
         );
         assert_eq!(probe.seen(), vec!["get_prompt", "read_resource"]);
 
         // Negative control: both defaults reject with method-not-found, so the
         // client sees an error and the probe is never entered.
         let control = ForwardingProbe::default();
-        let (mut reader, mut writer, _service) =
+        let (mut control_reader, mut control_writer, _control_service) =
             forwarding_transport(PassthroughDefaults::new(control.clone()), coverage_hooks());
         let control_prompt = send_json_rpc(
-            &mut writer,
-            &mut reader,
-            coverage_request(1, "prompts/get", json!({ "name": "sentinel-prompt" })),
+            &mut control_writer,
+            &mut control_reader,
+            coverage_request(1, "prompts/get", json!({ "name": "sentinel-prompt" }))?,
         )
-        .await;
+        .await?;
         let control_resource = send_json_rpc(
-            &mut writer,
-            &mut reader,
+            &mut control_writer,
+            &mut control_reader,
             coverage_request(
                 2,
                 "resources/read",
                 json!({ "uri": "test://sentinel-resource" }),
-            ),
+            )?,
         )
-        .await;
-        assert_eq!(control_prompt["error"]["code"], json!(-32601));
-        assert_eq!(control_resource["error"]["code"], json!(-32601));
+        .await?;
+        assert_eq!(
+            control_prompt
+                .get("error")
+                .and_then(|error| error.get("code")),
+            Some(&json!(-32601_i32))
+        );
+        assert_eq!(
+            control_resource
+                .get("error")
+                .and_then(|error| error.get("code")),
+            Some(&json!(-32601_i32))
+        );
         assert_eq!(control.seen(), Vec::<&str>::new());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn hooked_handler_forwards_task_methods() {
+    /// Pins that the task methods forward and the passthrough is gated off.
+    async fn hooked_handler_forwards_task_methods() -> anyhow::Result<()> {
         // Mechanism 1 (ambient-silent probe): rmcp calls `get_info` for the
         // tasks-capability gate, which this probe does not record, so the
         // expected log is exactly the driven methods.
@@ -2217,9 +2335,9 @@ mod tests {
         let get = send_json_rpc(
             &mut writer,
             &mut reader,
-            coverage_request(1, "tasks/get", json!({ "taskId": "raw-task" })),
+            coverage_request(1, "tasks/get", json!({ "taskId": "raw-task" }))?,
         )
-        .await;
+        .await?;
         let update = send_json_rpc(
             &mut writer,
             &mut reader,
@@ -2227,43 +2345,54 @@ mod tests {
                 2,
                 "tasks/update",
                 json!({ "taskId": "raw-task", "inputResponses": {} }),
-            ),
+            )?,
         )
-        .await;
+        .await?;
         let cancel = send_json_rpc(
             &mut writer,
             &mut reader,
-            coverage_request(3, "tasks/cancel", json!({ "taskId": "raw-task" })),
+            coverage_request(3, "tasks/cancel", json!({ "taskId": "raw-task" }))?,
         )
-        .await;
+        .await?;
 
         // `DetailedTask` inlines the base task fields at the top level of the
         // result, so the echoed sentinel id sits at `result.taskId`.
-        assert_eq!(get["result"]["taskId"], json!("raw-task"));
         assert_eq!(
-            update["error"]["message"],
-            json!("forwarding-probe:update_task")
+            get.get("result").and_then(|result| result.get("taskId")),
+            Some(&json!("raw-task"))
         );
-        assert_eq!(cancel["result"], json!({ "resultType": "complete" }));
+        assert_eq!(
+            update.get("error").and_then(|error| error.get("message")),
+            Some(&json!("forwarding-probe:update_task"))
+        );
+        assert_eq!(
+            cancel.get("result"),
+            Some(&json!({ "resultType": "complete" }))
+        );
         assert_eq!(probe.seen(), vec!["get_task", "update_task", "cancel_task"]);
 
         // Negative control: the tasks capability gate rejects both requests
         // before dispatch (the passthrough advertises no `tasks` extension).
         let control = ForwardingProbe::default();
-        let (mut reader, mut writer, _service) =
+        let (mut control_reader, mut control_writer, _control_service) =
             forwarding_transport(PassthroughDefaults::new(control.clone()), coverage_hooks());
         let control_get = send_json_rpc(
-            &mut writer,
-            &mut reader,
-            coverage_request(1, "tasks/get", json!({ "taskId": "raw-task" })),
+            &mut control_writer,
+            &mut control_reader,
+            coverage_request(1, "tasks/get", json!({ "taskId": "raw-task" }))?,
         )
-        .await;
-        assert_eq!(control_get["error"]["code"], json!(-32601));
+        .await?;
+        assert_eq!(
+            control_get.get("error").and_then(|error| error.get("code")),
+            Some(&json!(-32601_i32))
+        );
         assert_eq!(control.seen(), Vec::<&str>::new());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn hooked_handler_forwards_subscription_lifecycle() {
+    /// Pins that the subscription lifecycle forwards and the default filter rejects.
+    async fn hooked_handler_forwards_subscription_lifecycle() -> anyhow::Result<()> {
         let probe = ForwardingProbe::default();
         let (mut reader, mut writer, _service) =
             forwarding_transport(probe.clone(), coverage_hooks());
@@ -2277,16 +2406,21 @@ mod tests {
                 1,
                 "subscriptions/listen",
                 json!({ "notifications": { "toolsListChanged": true } }),
-            ),
+            )?,
         )
-        .await;
+        .await?;
         assert_eq!(
-            ack["method"],
-            json!("notifications/subscriptions/acknowledged")
+            ack.get("method"),
+            Some(&json!("notifications/subscriptions/acknowledged"))
         );
-        let response = read_json_rpc(&mut reader).await;
-        assert_eq!(response["id"], json!(1));
-        assert_eq!(response["result"]["resultType"], json!("complete"));
+        let response = read_json_rpc(&mut reader).await?;
+        assert_eq!(response.get("id"), Some(&json!(1_i32)));
+        assert_eq!(
+            response
+                .get("result")
+                .and_then(|result| result.get("resultType")),
+            Some(&json!("complete"))
+        );
 
         // Exact full sequence (mechanism 3): this arm calls
         // `accepted_subscription_filter` before `listen`, and both are the
@@ -2297,20 +2431,26 @@ mod tests {
         // Negative control: the default filter hook returns `None`, so rmcp
         // rejects the request before `listen` and the probe stays untouched.
         let control = ForwardingProbe::default();
-        let (mut reader, mut writer, _service) =
+        let (mut control_reader, mut control_writer, _control_service) =
             forwarding_transport(PassthroughDefaults::new(control.clone()), coverage_hooks());
         let control_listen = send_json_rpc(
-            &mut writer,
-            &mut reader,
+            &mut control_writer,
+            &mut control_reader,
             coverage_request(
                 1,
                 "subscriptions/listen",
                 json!({ "notifications": { "toolsListChanged": true } }),
-            ),
+            )?,
         )
-        .await;
-        assert_eq!(control_listen["error"]["code"], json!(-32601));
+        .await?;
+        assert_eq!(
+            control_listen
+                .get("error")
+                .and_then(|error| error.get("code")),
+            Some(&json!(-32601_i32))
+        );
         assert_eq!(control.seen(), Vec::<&str>::new());
+        Ok(())
     }
 
     fn ctx(name: &str) -> ToolCallContext {
@@ -2336,14 +2476,15 @@ mod tests {
     }
 
     #[test]
-    fn request_id_for_log_escapes_control_characters() {
+    /// Pins that control characters in `request_id` are escaped for logs.
+    fn request_id_for_log_escapes_control_characters() -> anyhow::Result<()> {
         let ctx = ToolCallContext {
             request_id: Some("evil\n2026-01-01 INFO forged log line\u{1b}[31m".to_owned()),
             ..ToolCallContext::for_tool("t")
         };
         let escaped = ctx
             .request_id_for_log()
-            .expect("request id is present so the accessor returns Some");
+            .context("request id is present so the accessor returns Some")?;
         assert!(
             !escaped.contains('\n'),
             "a raw newline lets a client forge log lines: {escaped}"
@@ -2356,10 +2497,16 @@ mod tests {
             escaped.starts_with("evil\\n"),
             "the newline must be escaped, not stripped: {escaped}"
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/tool_hooks.rs::request_id_for_log_leaves_ordinary_ids_unquoted keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn request_id_for_log_leaves_ordinary_ids_unquoted() {
+    /// Pins that ordinary request ids survive unquoted and absent ids yield `None`.
+    fn request_id_for_log_leaves_ordinary_ids_unquoted() -> anyhow::Result<()> {
         let ctx = ToolCallContext {
             request_id: Some("abc-123".to_owned()),
             ..ToolCallContext::for_tool("t")
@@ -2374,14 +2521,18 @@ mod tests {
             None,
             "absent request id yields None"
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/tool_hooks.rs::tool_call_context_debug_redacts_sensitive_fields_by_default keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn tool_call_context_debug_redacts_sensitive_fields_by_default() {
-        let _guard = crate::diagnostics::ExposureTestGuard::acquire();
-        crate::diagnostics::set_diagnostic_exposure(
-            &crate::diagnostics::DiagnosticExposure::default(),
-        );
+    /// Pins that the Debug impl redacts hook context secrets by default.
+    fn tool_call_context_debug_redacts_sensitive_fields_by_default() -> anyhow::Result<()> {
+        let _guard = diagnostics::ExposureTestGuard::acquire();
+        diagnostics::set_diagnostic_exposure(&diagnostics::DiagnosticExposure::default());
 
         let rendered = format!("{:?}", sensitive_ctx());
 
@@ -2399,14 +2550,20 @@ mod tests {
                 "ToolCallContext Debug must not contain {secret}: {rendered}"
             );
         }
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/tool_hooks.rs::tool_call_context_debug_can_show_sensitive_fields_when_enabled keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn tool_call_context_debug_can_show_sensitive_fields_when_enabled() {
-        let _guard = crate::diagnostics::ExposureTestGuard::acquire();
-        crate::diagnostics::set_diagnostic_exposure(&crate::diagnostics::DiagnosticExposure {
+    /// Pins that the Debug impl shows context secrets when exposure is enabled.
+    fn tool_call_context_debug_can_show_sensitive_fields_when_enabled() -> anyhow::Result<()> {
+        let _guard = diagnostics::ExposureTestGuard::acquire();
+        diagnostics::set_diagnostic_exposure(&diagnostics::DiagnosticExposure {
             tool_call_arguments: true,
-            ..crate::diagnostics::DiagnosticExposure::default()
+            ..diagnostics::DiagnosticExposure::default()
         });
 
         let rendered = format!("{:?}", sensitive_ctx());
@@ -2422,10 +2579,12 @@ mod tests {
                 "ToolCallContext Debug must contain {secret} when enabled: {rendered}"
             );
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn size_cap_replaces_oversized_result() {
+    /// Pins that a result over the cap is replaced by the structured error.
+    async fn size_cap_replaces_oversized_result() -> anyhow::Result<()> {
         let inner = TestHandler {
             body_bytes: Some(8_192),
         };
@@ -2437,10 +2596,10 @@ mod tests {
         let hooked = with_hooks(inner, hooks);
 
         let small = CallToolResult::success(vec![ContentBlock::text("ok".to_owned())]);
-        assert!(exact_size(&small) < 256);
+        assert!(exact_size(&small)? < 256);
 
         let big = CallToolResult::success(vec![ContentBlock::text("x".repeat(8_192))]);
-        let size = exact_size(&big);
+        let size = exact_size(&big)?;
         assert!(size > 256);
 
         let (replaced, accounted, capped) = apply_size_cap(big, Some(256), "whatever");
@@ -2449,43 +2608,59 @@ mod tests {
         assert_eq!(replaced.is_error, Some(true));
         assert!(matches!(
             replaced.content.first(),
-            Some(rmcp::model::ContentBlock::Text(t)) if t.text.contains("result_too_large")
+            Some(ContentBlock::Text(text)) if text.text.contains("result_too_large")
         ));
 
         // Compile-check that HookedHandler instantiates with the test inner.
-        let _ = hooked;
+        let _hooked = hooked;
+        Ok(())
     }
 
-    fn exact_size(result: &CallToolResult) -> usize {
+    fn exact_size(result: &CallToolResult) -> anyhow::Result<usize> {
         match serialized_size(result, None) {
-            SizeMeasure::Exact(size) => size,
+            SizeMeasure::Exact(size) => Ok(size),
             SizeMeasure::Exceeded { limit } => {
-                panic!("unbounded measurement exceeded impossible limit {limit}");
+                anyhow::bail!("unbounded measurement exceeded impossible limit {limit}");
             }
         }
     }
 
     #[test]
-    fn serialized_size_under_cap_is_exact() {
+    /// Pins that an in-cap serialized size is reported exactly.
+    fn serialized_size_under_cap_is_exact() -> anyhow::Result<()> {
         let result = CallToolResult::success(vec![ContentBlock::text("ok".to_owned())]);
-        let exact = serde_json::to_vec(&result).unwrap().len();
+        let exact = serde_json::to_vec(&result)
+            .context("result serializes for a byte-exact measurement")?
+            .len();
 
         let measured = serialized_size(&result, Some(exact));
 
         assert_eq!(measured, SizeMeasure::Exact(exact));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/tool_hooks.rs::serialized_size_over_cap_stops_with_exceeded keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn serialized_size_over_cap_stops_with_exceeded() {
+    /// Pins that crossing the cap aborts measurement with `Exceeded`.
+    fn serialized_size_over_cap_stops_with_exceeded() -> anyhow::Result<()> {
         let result = CallToolResult::success(vec![ContentBlock::text("x".repeat(8_192))]);
 
         let measured = serialized_size(&result, Some(256));
 
         assert_eq!(measured, SizeMeasure::Exceeded { limit: 256 });
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/tool_hooks.rs::over_cap_replacement_does_not_log_serialization_failure keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn over_cap_replacement_does_not_log_serialization_failure() {
+    /// Pins that a cap abort logs the cap message, never a serialization failure.
+    fn over_cap_replacement_does_not_log_serialization_failure() -> anyhow::Result<()> {
         let logs = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::TRACE)
@@ -2493,7 +2668,7 @@ mod tests {
             .with_ansi(false)
             .without_time()
             .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = set_default(subscriber);
         let result = CallToolResult::success(vec![ContentBlock::text("x".repeat(8_192))]);
 
         let (_final_result, accounted, capped) = apply_size_cap(result, Some(256), "big_tool");
@@ -2509,27 +2684,35 @@ mod tests {
             "cap-abort must not be logged as serialization failure: {}",
             logs.contents()
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/tool_hooks.rs::disabled_result_cap_skips_measurement keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn disabled_result_cap_skips_measurement() {
+    /// Pins that a disabled cap reports zero accounted bytes and no replacement.
+    fn disabled_result_cap_skips_measurement() -> anyhow::Result<()> {
         let result = CallToolResult::success(vec![ContentBlock::text("x".repeat(8_192))]);
 
         let (_final_result, accounted, capped) = apply_size_cap(result, None, "uncapped_tool");
 
         assert!(!capped);
         assert_eq!(accounted, 0);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn before_hook_deny_builds_error() {
+    /// Pins that a `Deny` before-hook outcome builds the denial error.
+    async fn before_hook_deny_builds_error() -> anyhow::Result<()> {
         let counter = Arc::new(AtomicUsize::new(0));
-        let c = Arc::clone(&counter);
+        let before_counter = Arc::clone(&counter);
         let before: BeforeHook = Arc::new(move |ctx_ref| {
-            let c = Arc::clone(&c);
+            let seen = Arc::clone(&before_counter);
             let name = ctx_ref.tool_name.clone();
             Box::pin(async move {
-                c.fetch_add(1, Ordering::Relaxed);
+                let _previous = seen.fetch_add(1, Ordering::Relaxed);
                 if name == "forbidden" {
                     HookOutcome::Deny(ErrorData::invalid_request("nope", None))
                 } else {
@@ -2546,7 +2729,11 @@ mod tests {
         let hooked = with_hooks(TestHandler::default(), hooks);
 
         let bad_ctx = ctx("forbidden");
-        let before_fn = hooked.hooks.before.as_ref().unwrap();
+        let before_fn = hooked
+            .hooks
+            .before
+            .as_ref()
+            .context("the before hook is configured")?;
         let outcome = before_fn(&bad_ctx).await;
         assert!(matches!(outcome, HookOutcome::Deny(_)));
         assert_eq!(counter.load(Ordering::Relaxed), 1);
@@ -2555,20 +2742,28 @@ mod tests {
         let outcome2 = before_fn(&ok_ctx).await;
         assert!(matches!(outcome2, HookOutcome::Continue));
         assert_eq!(counter.load(Ordering::Relaxed), 2);
+        Ok(())
     }
 
     #[test]
-    fn too_large_result_mentions_limit_and_actual() {
-        let r = too_large_result(100, Some(500), "my_tool");
-        let body = serde_json::to_string(&r).unwrap();
+    /// Pins that the too-large body names the tool, limit and actual size.
+    fn too_large_result_mentions_limit_and_actual() -> anyhow::Result<()> {
+        let result = too_large_result(100, Some(500), "my_tool");
+        let body = serde_json::to_string(&result).context("too-large result serializes")?;
         assert!(body.contains("result_too_large"));
         assert!(body.contains("my_tool"));
         assert!(body.contains("100"));
         assert!(body.contains("500"));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/tool_hooks.rs::decide_size_truth_table keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn decide_size_truth_table() {
+    /// Pins the full `decide_size` truth table, including the inclusive cap.
+    fn decide_size_truth_table() -> anyhow::Result<()> {
         assert_eq!(
             decide_size(Some(SizeMeasure::Exact(10)), Some(100)),
             SizeVerdict::Pass { size: 10 }
@@ -2606,22 +2801,26 @@ mod tests {
             },
             "cap-abort is not an exact measurement"
         );
+        Ok(())
     }
 
     #[test]
-    fn too_large_result_does_not_fabricate_a_size_when_unmeasurable() {
-        let r = too_large_result(100, None, "my_tool");
-        let body = serde_json::to_string(&r).unwrap();
+    /// Pins that an unmeasurable size renders as `unknown`, not a fabricated number.
+    fn too_large_result_does_not_fabricate_a_size_when_unmeasurable() -> anyhow::Result<()> {
+        let result = too_large_result(100, None, "my_tool");
+        let body = serde_json::to_string(&result).context("too-large result serializes")?;
         assert!(body.contains("result_too_large"));
         assert!(body.contains("unknown"));
         assert!(
             !body.contains("101"),
             "the over-limit accounting sentinel must not leak into the client payload"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn replace_outcome_skips_inner_and_returns_payload() {
+    /// Pins that a `Replace` outcome bypasses the inner handler and returns its payload.
+    async fn replace_outcome_skips_inner_and_returns_payload() -> anyhow::Result<()> {
         // Returning Replace from before-hook must yield the supplied
         // CallToolResult directly, with no need for the inner handler.
         let before: BeforeHook = Arc::new(|_ctx| {
@@ -2640,9 +2839,13 @@ mod tests {
 
         // Exercise the before-hook closure + apply_size_cap helper directly,
         // matching the established test pattern in this module.
-        let outcome = (hooks.before.as_ref().unwrap())(&ctx("any")).await;
+        let before_fn = hooks
+            .before
+            .as_ref()
+            .context("the before hook is configured")?;
+        let outcome = before_fn(&ctx("any")).await;
         let HookOutcome::Replace(boxed) = outcome else {
-            panic!("expected HookOutcome::Replace");
+            anyhow::bail!("expected HookOutcome::Replace");
         };
         let (result, size, capped) = apply_size_cap(*boxed, None, "any");
         assert!(!capped);
@@ -2650,17 +2853,21 @@ mod tests {
         assert!(!result.is_error.unwrap_or(false));
         assert!(matches!(
             result.content.first(),
-            Some(rmcp::model::ContentBlock::Text(t)) if t.text == "from-replace"
+            Some(ContentBlock::Text(text)) if text.text == "from-replace"
         ));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn replace_outcome_subject_to_size_cap() {
+    /// Pins that a `Replace` payload is still subject to the result-size cap.
+    async fn replace_outcome_subject_to_size_cap() -> anyhow::Result<()> {
         // A Replace payload that exceeds max_result_bytes must be rewritten
         // to result_too_large just like an inner-handler result would be,
         // and the disposition must reflect ResultTooLarge.
         let huge = CallToolResult::success(vec![ContentBlock::text("y".repeat(8_192))]);
-        let huge_size = serde_json::to_vec(&huge).unwrap().len();
+        let huge_size = serde_json::to_vec(&huge)
+            .context("huge result serializes")?
+            .len();
         assert!(huge_size > 256);
 
         let (final_result, accounted, capped) = apply_size_cap(huge, Some(256), "replaced_tool");
@@ -2669,24 +2876,26 @@ mod tests {
         assert_eq!(final_result.is_error, Some(true));
         assert!(matches!(
             final_result.content.first(),
-            Some(rmcp::model::ContentBlock::Text(t)) if t.text.contains("result_too_large")
+            Some(ContentBlock::Text(text)) if text.text.contains("result_too_large")
         ));
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn after_hook_fires_exactly_once_via_spawn() {
+    /// Pins that `spawn_after` enqueues the after-hook exactly once per call.
+    async fn after_hook_fires_exactly_once_via_spawn() -> anyhow::Result<()> {
         // spawn_after must enqueue the after-hook exactly one time per
         // invocation and never block the caller; we wait for the spawned
         // task to run by polling the counter with a short timeout.
         let counter = Arc::new(AtomicUsize::new(0));
-        let c = Arc::clone(&counter);
+        let after_counter = Arc::clone(&counter);
         let after: AfterHook = Arc::new(move |_ctx, _disp, _size| {
-            let c = Arc::clone(&c);
+            let seen = Arc::clone(&after_counter);
             Box::pin(async move {
-                c.fetch_add(1, Ordering::Relaxed);
+                let _previous = seen.fetch_add(1, Ordering::Relaxed);
             })
         });
-        let holder = Arc::new(AfterHookHolder { f: after });
+        let holder = Arc::new(AfterHookHolder { hook: after });
 
         HookedHandler::<TestHandler>::spawn_after(
             Some(&holder),
@@ -2696,16 +2905,22 @@ mod tests {
         );
 
         // Wait up to 1s for the spawned task to run.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        while counter.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
-            tokio::task::yield_now().await;
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while counter.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+            yield_now().await;
+            sleep(Duration::from_millis(5)).await;
         }
         assert_eq!(counter.load(Ordering::Relaxed), 1);
+        Ok(())
     }
 
+    #[expect(
+        clippy::panic,
+        reason = "deliberate: src/tool_hooks.rs::after_hook_panic_is_isolated_from_response_path panics on purpose to prove hook panics stay isolated"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn after_hook_panic_is_isolated_from_response_path() {
+    /// Pins that a panicking after-hook cannot poison the request path.
+    async fn after_hook_panic_is_isolated_from_response_path() -> anyhow::Result<()> {
         // A panicking after-hook must not affect the request task.  We
         // spawn a panicking after-hook and then verify the current task
         // can still complete an unrelated future to completion.
@@ -2714,7 +2929,7 @@ mod tests {
                 panic!("intentional panic in after-hook");
             })
         });
-        let holder = Arc::new(AfterHookHolder { f: after });
+        let holder = Arc::new(AfterHookHolder { hook: after });
 
         HookedHandler::<TestHandler>::spawn_after(
             Some(&holder),
@@ -2725,8 +2940,11 @@ mod tests {
 
         // Give Tokio a chance to run + abort the panicking task, then
         // confirm we're still alive and the runtime is healthy.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let still_alive = tokio::spawn(async { 1_u32 + 2 }).await.unwrap();
+        sleep(Duration::from_millis(50)).await;
+        let still_alive = tokio::spawn(async { 1_u32 + 2 })
+            .await
+            .context("the runtime survives a panicking hook task")?;
         assert_eq!(still_alive, 3);
+        Ok(())
     }
 }

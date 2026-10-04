@@ -22,474 +22,424 @@
 //! * `CrlSet::__test_cache_contains(&self, &str) -> bool`
 //! * `CrlSet::__test_trigger_fetch(&self, &str) -> Result<(), RmcpServerKitError>`
 #![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
+    target_os = "linux",
+    expect(
+        clippy::missing_errors_doc,
+        clippy::missing_panics_doc,
+        reason = "test code is not rendered API documentation"
+    )
+)]
+#![cfg_attr(
+    target_os = "linux",
     expect(
         clippy::too_long_first_doc_paragraph,
-        reason = "lint-migration: tests/unit/crl_map_bounds.rs"
+        reason = "test code is not rendered API documentation"
     )
 )]
 #![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::duration_suboptimal_units,
-        reason = "lint-migration: tests/unit/crl_map_bounds.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::std_instead_of_core,
-        reason = "lint-migration: tests/unit/crl_map_bounds.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::min_ident_chars,
-        reason = "lint-migration: tests/unit/crl_map_bounds.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::default_numeric_fallback,
-        reason = "lint-migration: tests/unit/crl_map_bounds.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::tests_outside_test_module,
-        reason = "lint-migration: tests/unit/crl_map_bounds.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::shadow_reuse,
-        reason = "lint-migration: tests/unit/crl_map_bounds.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::let_underscore_untyped,
-        reason = "lint-migration: tests/unit/crl_map_bounds.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::let_underscore_must_use,
-        reason = "lint-migration: tests/unit/crl_map_bounds.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::expect_used,
-        reason = "lint-migration: tests/unit/crl_map_bounds.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::absolute_paths,
-        reason = "lint-migration: tests/unit/crl_map_bounds.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::missing_panics_doc,
-        reason = "lint-migration: tests/unit/crl_map_bounds.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::std_instead_of_alloc,
-        reason = "lint-migration: tests/unit/crl_map_bounds.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::unseparated_literal_suffix,
-        reason = "lint-migration: tests/unit/crl_map_bounds.rs"
-    )
-)]
-#![cfg_attr(
-    feature = "oauth-mtls-client",
-    expect(
-        let_underscore_drop,
-        reason = "lint-migration: tests/unit/crl_map_bounds.rs"
-    )
-)]
-#![cfg_attr(
-    feature = "oauth-mtls-client",
-    expect(deprecated, reason = "lint-migration: tests/unit/crl_map_bounds.rs")
+    target_os = "linux",
+    expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")
 )]
 
-use std::sync::Arc;
+#[cfg(test)]
+mod tests {
+    extern crate alloc;
 
-use rcgen::{
-    BasicConstraints, CertificateParams, CertifiedIssuer, DnType, IsCa, KeyPair, KeyUsagePurpose,
-};
-use rmcp_server_kit::{auth::MtlsConfig, mtls_revocation::CrlSet};
-use rustls::RootCertStore;
+    use alloc::sync::Arc;
 
-fn build_ca_root() -> rustls::pki_types::CertificateDer<'static> {
-    let mut params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    params.key_usages = vec![
-        KeyUsagePurpose::KeyCertSign,
-        KeyUsagePurpose::CrlSign,
-        KeyUsagePurpose::DigitalSignature,
-    ];
-    params
-        .distinguished_name
-        .push(DnType::CommonName, "mapbounds-ca");
-    let key = KeyPair::generate().expect("ca key");
-    let issuer: CertifiedIssuer<'static, KeyPair> =
-        CertifiedIssuer::self_signed(params, key).expect("ca self-signed");
-    issuer.der().clone()
-}
+    use anyhow::Context as _;
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertifiedIssuer, DnType, IsCa, KeyPair,
+        KeyUsagePurpose,
+    };
+    use rmcp_server_kit::{auth::MtlsConfig, error::RmcpServerKitError, mtls_revocation::CrlSet};
+    use rustls::{RootCertStore, crypto::ring, pki_types::CertificateDer};
+    use tokio::sync::mpsc::UnboundedReceiver;
 
-fn install_ring_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-}
+    /// Build a self-signed CA root certificate for the test `CrlSet`s.
+    fn build_ca_root() -> anyhow::Result<CertificateDer<'static>> {
+        let mut params = CertificateParams::new(Vec::<String>::new()).context("ca params")?;
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "mapbounds-ca");
+        let key = KeyPair::generate().context("ca key")?;
+        let issuer: CertifiedIssuer<'static, KeyPair> =
+            CertifiedIssuer::self_signed(params, key).context("ca self-signed")?;
+        Ok(issuer.der().clone())
+    }
 
-/// Build an `MtlsConfig` with tight caps and liberal everything else,
-/// so the test focuses on the cap under test and nothing collateral
-/// interferes.
-fn bounded_config(
-    max_host_semaphores: usize,
-    max_seen_urls: usize,
-    max_cache_entries: usize,
-) -> MtlsConfig {
-    serde_json::from_value(serde_json::json!({
-        "ca_cert_path": "memory://ca.pem",
-        "required": true,
-        "default_role": "viewer",
-        "crl_enabled": true,
-        "crl_deny_on_unavailable": false,
-        "crl_allow_http": true,
-        "crl_enforce_expiration": true,
-        "crl_end_entity_only": false,
-        "crl_fetch_timeout": "30s",
-        "crl_stale_grace": "24h",
-        "crl_max_concurrent_fetches": 4,
-        "crl_max_response_bytes": 5_242_880u64,
-        // Very high so rate limiting doesn't interact with these tests.
-        "crl_discovery_rate_per_min": 10_000u32,
-        "crl_max_host_semaphores": max_host_semaphores,
-        "crl_max_seen_urls": max_seen_urls,
-        "crl_max_cache_entries": max_cache_entries,
-    }))
-    .expect("bounded mtls config")
-}
+    /// Install the ring crypto provider once per test process.
+    fn install_ring_provider() {
+        drop(ring::default_provider().install_default());
+    }
 
-fn empty_crl_set(
-    max_host_semaphores: usize,
-    max_seen_urls: usize,
-    max_cache_entries: usize,
-) -> Arc<CrlSet> {
-    install_ring_provider();
-    let mut roots = RootCertStore::empty();
-    roots.add(build_ca_root()).expect("add ca root");
-    let roots = Arc::new(roots);
-    CrlSet::__test_with_prepopulated_crls(
-        roots,
-        bounded_config(max_host_semaphores, max_seen_urls, max_cache_entries),
-        vec![],
-    )
-    .expect("empty CRL set")
-}
+    /// Build an `MtlsConfig` with tight caps and liberal everything else,
+    /// so the test focuses on the cap under test and nothing collateral
+    /// interferes.
+    fn bounded_config(
+        max_host_semaphores: usize,
+        max_seen_urls: usize,
+        max_cache_entries: usize,
+    ) -> anyhow::Result<MtlsConfig> {
+        serde_json::from_value(serde_json::json!({
+            "ca_cert_path": "memory://ca.pem",
+            "required": true,
+            "default_role": "viewer",
+            "crl_enabled": true,
+            "crl_deny_on_unavailable": false,
+            "crl_allow_http": true,
+            "crl_enforce_expiration": true,
+            "crl_end_entity_only": false,
+            "crl_fetch_timeout": "30s",
+            "crl_stale_grace": "24h",
+            "crl_max_concurrent_fetches": 4,
+            "crl_max_response_bytes": 5_242_880_u64,
+            // Very high so rate limiting doesn't interact with these tests.
+            "crl_discovery_rate_per_min": 10_000_u32,
+            "crl_max_host_semaphores": max_host_semaphores,
+            "crl_max_seen_urls": max_seen_urls,
+            "crl_max_cache_entries": max_cache_entries,
+        }))
+        .context("bounded mtls config")
+    }
 
-#[tokio::test]
-async fn seen_urls_hard_cap_drops_excess() {
-    // Cap seen_urls at 4; present 6 unique URLs; only the first 4 must
-    // be marked seen. No error is surfaced (silent-drop + warn).
-    let set = empty_crl_set(1024, 4, 1024);
+    /// Build an empty `CrlSet` with the given map caps.
+    fn empty_crl_set(
+        max_host_semaphores: usize,
+        max_seen_urls: usize,
+        max_cache_entries: usize,
+    ) -> anyhow::Result<Arc<CrlSet>> {
+        install_ring_provider();
+        let mut roots = RootCertStore::empty();
+        roots.add(build_ca_root()?).context("add ca root")?;
+        #[expect(
+            deprecated,
+            reason = "deliberate: mtls_revocation::CrlSet::__test_with_prepopulated_crls — the deprecated test-only constructor is the only prepopulated-CrlSet entry point until 4.0"
+        )]
+        let set = CrlSet::__test_with_prepopulated_crls(
+            Arc::new(roots),
+            bounded_config(max_host_semaphores, max_seen_urls, max_cache_entries)?,
+            vec![],
+        )
+        .context("empty CRL set")?;
+        Ok(set)
+    }
 
-    let urls: Vec<String> = (0..6)
-        .map(|i| format!("https://host{i}.example.test/crl"))
-        .collect();
+    /// Pins that `seen_urls` stops admitting URLs once the cap is reached.
+    #[tokio::test]
+    async fn seen_urls_hard_cap_drops_excess() -> anyhow::Result<()> {
+        // Cap seen_urls at 4; present 6 unique URLs; only the first 4 must
+        // be marked seen. No error is surfaced (silent-drop + warn).
+        let set = empty_crl_set(1024, 4, 1024)?;
 
-    // Submit in one batch - the implementation MUST drop admissions
-    // beyond the cap rather than grow the set unboundedly.
-    let _ = set.__test_note_discovered_urls(&urls);
+        let urls: Vec<String> = (0..6_usize)
+            .map(|index| format!("https://host{index}.example.test/crl"))
+            .collect();
 
-    for (i, u) in urls.iter().enumerate() {
-        if i < 4 {
+        // Submit in one batch - the implementation MUST drop admissions
+        // beyond the cap rather than grow the set unboundedly.
+        let _: bool = set.__test_note_discovered_urls(&urls);
+
+        for (index, url) in urls.iter().enumerate() {
+            if index < 4 {
+                assert!(
+                    set.__test_is_seen(url),
+                    "URL #{index} within cap must be marked seen: {url}"
+                );
+            } else {
+                assert!(
+                    !set.__test_is_seen(url),
+                    "URL #{index} beyond cap must NOT be marked seen: {url}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Pins that the host-semaphore cap evicts idle entries instead of erroring.
+    #[tokio::test]
+    async fn host_semaphores_hard_cap_evicts_idle_and_recovers() -> anyhow::Result<()> {
+        // Cap host_semaphores at 2; trigger fetches against 3 distinct hosts
+        // sequentially. Earlier entries are idle (no in-flight fetch) by the
+        // time the third fetch runs, so the map MUST self-heal by evicting an
+        // idle entry instead of returning the formerly-sticky
+        // `crl_host_semaphore_cap_exceeded` error (which permanently locked
+        // out new CRL hosts until restart). The map size must never exceed
+        // the cap; the cap error itself remains reachable only when all
+        // entries have genuinely concurrent in-flight fetches (covered by the
+        // `host_semaphore_cap_error_when_all_inflight` unit test).
+        let set = empty_crl_set(2, 4096, 1024)?;
+
+        let r1 = set
+            .__test_trigger_fetch("https://h1.example.test/crl")
+            .await;
+        // OK-or-network-error is fine; we only care the cap did NOT fire.
+        assert_not_cap_err(&r1, "first host must not hit host-semaphore cap");
+
+        let r2 = set
+            .__test_trigger_fetch("https://h2.example.test/crl")
+            .await;
+        assert_not_cap_err(&r2, "second host must not hit host-semaphore cap");
+
+        let r3 = set
+            .__test_trigger_fetch("https://h3.example.test/crl")
+            .await;
+        assert_not_cap_err(
+            &r3,
+            "third host must evict an idle entry instead of hitting the cap",
+        );
+
+        assert!(
+            set.__test_host_semaphore_count() <= 2,
+            "host_semaphores count must stay <= cap; was {}",
+            set.__test_host_semaphore_count()
+        );
+        Ok(())
+    }
+
+    /// Asserts a fetch result did not hit the host-semaphore cap.
+    fn assert_not_cap_err(result: &Result<(), RmcpServerKitError>, ctx: &str) {
+        if let Err(error) = result {
             assert!(
-                set.__test_is_seen(u),
-                "URL #{i} within cap must be marked seen: {u}"
-            );
-        } else {
-            assert!(
-                !set.__test_is_seen(u),
-                "URL #{i} beyond cap must NOT be marked seen: {u}"
+                !error
+                    .to_string()
+                    .contains("crl_host_semaphore_cap_exceeded"),
+                "{ctx}: unexpectedly hit host-semaphore cap: {error}"
             );
         }
     }
-}
 
-#[tokio::test]
-async fn host_semaphores_hard_cap_evicts_idle_and_recovers() {
-    // Cap host_semaphores at 2; trigger fetches against 3 distinct hosts
-    // sequentially. Earlier entries are idle (no in-flight fetch) by the
-    // time the third fetch runs, so the map MUST self-heal by evicting an
-    // idle entry instead of returning the formerly-sticky
-    // `crl_host_semaphore_cap_exceeded` error (which permanently locked
-    // out new CRL hosts until restart). The map size must never exceed
-    // the cap; the cap error itself remains reachable only when all
-    // entries have genuinely concurrent in-flight fetches (covered by the
-    // `host_semaphore_cap_error_when_all_inflight` unit test).
-    let set = empty_crl_set(2, 4096, 1024);
+    /// Pins that the cache cap rejects the newest entry rather than evicting.
+    #[tokio::test]
+    async fn cache_hard_cap_drops_newest() -> anyhow::Result<()> {
+        // Cap cache at 2; attempt to insert 3 distinct successful entries.
+        // Only the first two are retained; the third is dropped (newest-
+        // rejected, not LRU-evicted).
+        use std::time::SystemTime;
 
-    let r1 = set
-        .__test_trigger_fetch("https://h1.example.test/crl")
-        .await;
-    // OK-or-network-error is fine; we only care the cap did NOT fire.
-    assert_not_cap_err(&r1, "first host must not hit host-semaphore cap");
+        use rmcp_server_kit::mtls_revocation::CachedCrl;
 
-    let r2 = set
-        .__test_trigger_fetch("https://h2.example.test/crl")
-        .await;
-    assert_not_cap_err(&r2, "second host must not hit host-semaphore cap");
+        let set = empty_crl_set(1024, 4096, 2)?;
 
-    let r3 = set
-        .__test_trigger_fetch("https://h3.example.test/crl")
-        .await;
-    assert_not_cap_err(
-        &r3,
-        "third host must evict an idle entry instead of hitting the cap",
-    );
+        let now = SystemTime::now();
 
-    assert!(
-        set.__test_host_semaphore_count() <= 2,
-        "host_semaphores count must stay <= cap; was {}",
-        set.__test_host_semaphore_count()
-    );
-}
+        // NB: We need a public test-only helper to insert into the cache
+        // without running HTTP. We reuse the convention of existing
+        // __test_* helpers. This helper is part of the 1.3.0 deliverables.
+        for url in [
+            "https://a.example.test/crl",
+            "https://b.example.test/crl",
+            "https://c.example.test/crl",
+        ] {
+            set.__test_insert_cache(url, CachedCrl::__test_synthetic(now))
+                .await;
+        }
 
-fn assert_not_cap_err(r: &Result<(), rmcp_server_kit::error::RmcpServerKitError>, ctx: &str) {
-    if let Err(e) = r {
-        assert!(
-            !e.to_string().contains("crl_host_semaphore_cap_exceeded"),
-            "{ctx}: unexpectedly hit host-semaphore cap: {e}"
+        assert_eq!(
+            set.__test_cache_len(),
+            2,
+            "cache len must be clamped to cap"
         );
+        assert!(
+            set.__test_cache_contains("https://a.example.test/crl"),
+            "first insert must be retained"
+        );
+        assert!(
+            set.__test_cache_contains("https://b.example.test/crl"),
+            "second insert must be retained"
+        );
+        assert!(
+            !set.__test_cache_contains("https://c.example.test/crl"),
+            "third insert (newest beyond cap) must be rejected"
+        );
+        Ok(())
     }
-}
 
-#[tokio::test]
-async fn cache_hard_cap_drops_newest() {
-    // Cap cache at 2; attempt to insert 3 distinct successful entries.
-    // Only the first two are retained; the third is dropped (newest-
-    // rejected, not LRU-evicted).
-    use std::time::SystemTime;
+    /// Pins that a stale refresh failure clears both the cache and `seen_urls`.
+    #[tokio::test]
+    async fn stale_removal_also_clears_seen() -> anyhow::Result<()> {
+        // Prepopulate seen_urls and cache with the same URL; make the
+        // cached entry appear stale beyond the grace window; trigger a
+        // refresh that fails; assert BOTH seen_urls and cache drop the
+        // URL (current 1.2.1 only drops from cache + cached_urls).
+        use core::time::Duration;
+        use std::time::SystemTime;
 
-    use rmcp_server_kit::mtls_revocation::CachedCrl;
+        use rmcp_server_kit::mtls_revocation::CachedCrl;
 
-    let set = empty_crl_set(1024, 4096, 2);
+        let set = empty_crl_set(1024, 4096, 1024)?;
+        let url = "https://stale.example.test/crl";
 
-    let now = SystemTime::now();
+        // Mark URL as seen via the production path (simulating a prior
+        // handshake's discovery).
+        let _: bool = set.__test_note_discovered_urls(&[url.to_owned()]);
+        assert!(set.__test_is_seen(url), "precondition: URL should be seen");
 
-    // NB: We need a public test-only helper to insert into the cache
-    // without running HTTP. We reuse the convention of existing
-    // __test_* helpers. This helper is part of the 1.3.0 deliverables.
-    for url in [
-        "https://a.example.test/crl",
-        "https://b.example.test/crl",
-        "https://c.example.test/crl",
-    ] {
-        set.__test_insert_cache(url, CachedCrl::__test_synthetic(now))
+        // Insert a stale cache entry whose next_update + grace is in the
+        // past, so the refresh loop treats fetch-failure as removable.
+        let past = SystemTime::now() - Duration::from_hours(720); // 30 days ago
+        set.__test_insert_cache(url, CachedCrl::__test_synthetic(SystemTime::now()))
             .await;
+        set.__test_replace_cache_entry_unverified(url, CachedCrl::__test_stale(past))
+            .await;
+        assert!(
+            set.__test_cache_contains(url),
+            "precondition: URL should be cached"
+        );
+
+        // Refresh will fail (network-unreachable mocked host) and the
+        // stale-grace predicate will match, so production code must
+        // remove the entry AND clear seen_urls.
+        drop(set.__test_trigger_refresh_url(url).await);
+
+        assert!(
+            !set.__test_cache_contains(url),
+            "stale refresh failure must drop URL from cache"
+        );
+        assert!(
+            !set.__test_is_seen(url),
+            "stale refresh failure must also clear seen_urls (1.3.0 invariant)"
+        );
+        Ok(())
     }
 
-    assert_eq!(
-        set.__test_cache_len(),
-        2,
-        "cache len must be clamped to cap"
-    );
-    assert!(
-        set.__test_cache_contains("https://a.example.test/crl"),
-        "first insert must be retained"
-    );
-    assert!(
-        set.__test_cache_contains("https://b.example.test/crl"),
-        "second insert must be retained"
-    );
-    assert!(
-        !set.__test_cache_contains("https://c.example.test/crl"),
-        "third insert (newest beyond cap) must be rejected"
-    );
-}
+    // -- F1 regression: first-fetch failure permanently suppressed retry --
+    //
+    // A discovered CDP URL was committed to the permanent dedup set as soon as
+    // it was queued. When that first fetch failed, no code path could ever undo
+    // that: `seen_urls` is pruned only for URLs whose CRL was successfully
+    // cached and later went stale. The URL was therefore never re-enqueued for
+    // the process lifetime, so revocation for that CDP was silently disabled
+    // under the pre-3.9 default `crl_deny_on_unavailable = false`, or the
+    // handshake failed forever with it set to `true` -- which is now the default.
+    //
+    // CDP URLs come from the client-presented certificate, so a holder of a
+    // revoked cert could trigger this deliberately by making the first fetch
+    // fail from a host they control.
 
-#[tokio::test]
-async fn stale_removal_also_clears_seen() {
-    // Prepopulate seen_urls and cache with the same URL; make the
-    // cached entry appear stale beyond the grace window; trigger a
-    // refresh that fails; assert BOTH seen_urls and cache drop the
-    // URL (current 1.2.1 only drops from cache + cached_urls).
-    use std::time::{Duration, SystemTime};
+    /// Build a `CrlSet` whose discovery receiver stays alive, so
+    /// `note_discovered_urls` exercises the real limiter + send + mark path
+    /// instead of the closed-channel fallback in `__test_note_discovered_urls`.
+    /// The receiver must be held for the duration of the test.
+    fn crl_set_with_receiver(
+        max_seen_urls: usize,
+        max_cache_entries: usize,
+    ) -> anyhow::Result<(Arc<CrlSet>, UnboundedReceiver<String>)> {
+        install_ring_provider();
+        let mut roots = RootCertStore::empty();
+        roots.add(build_ca_root()?).context("add ca root")?;
+        #[expect(
+            deprecated,
+            reason = "deliberate: mtls_revocation::CrlSet::__test_with_kept_receiver — the deprecated test-only constructor is the only kept-receiver entry point until 4.0"
+        )]
+        let set = CrlSet::__test_with_kept_receiver(
+            Arc::new(roots),
+            bounded_config(1024, max_seen_urls, max_cache_entries)?,
+            vec![],
+        )
+        .context("crl set with receiver")?;
+        Ok(set)
+    }
 
-    use rmcp_server_kit::mtls_revocation::CachedCrl;
+    /// Pins that a failed first fetch leaves the URL retriable.
+    #[tokio::test]
+    async fn failed_first_fetch_does_not_permanently_suppress_url() -> anyhow::Result<()> {
+        let (set, _rx) = crl_set_with_receiver(4096, 1024)?;
+        let url = "https://retry.example.test/crl";
 
-    let set = empty_crl_set(1024, 4096, 1024);
-    let url = "https://stale.example.test/crl";
+        let _: bool = set.__test_note_discovered_urls_by_cert(&[url.to_owned()], &[]);
+        assert!(set.__test_is_seen(url), "queued URL must be in flight");
+        assert!(
+            !set.__test_is_permanently_seen(url),
+            "queueing alone must not promote to the permanent dedup set"
+        );
 
-    // Mark URL as seen via the production path (simulating a prior
-    // handshake's discovery).
-    let _ = set.__test_note_discovered_urls(&[url.to_owned()]);
-    assert!(set.__test_is_seen(url), "precondition: URL should be seen");
+        set.__test_settle_pending(url, false);
 
-    // Insert a stale cache entry whose next_update + grace is in the
-    // past, so the refresh loop treats fetch-failure as removable.
-    let past = SystemTime::now() - Duration::from_secs(60 * 60 * 24 * 30); // 30 days ago
-    set.__test_insert_cache(url, CachedCrl::__test_synthetic(SystemTime::now()))
-        .await;
-    set.__test_replace_cache_entry_unverified(url, CachedCrl::__test_stale(past))
-        .await;
-    assert!(
-        set.__test_cache_contains(url),
-        "precondition: URL should be cached"
-    );
+        assert!(
+            !set.__test_is_permanently_seen(url),
+            "a failed fetch must never reach the permanent dedup set"
+        );
+        assert!(
+            !set.__test_is_seen(url),
+            "a failed fetch must leave the URL retriable"
+        );
 
-    // Refresh will fail (network-unreachable mocked host) and the
-    // stale-grace predicate will match, so production code must
-    // remove the entry AND clear seen_urls.
-    let _ = set.__test_trigger_refresh_url(url).await;
+        let _: bool = set.__test_note_discovered_urls_by_cert(&[url.to_owned()], &[]);
+        assert!(
+            set.__test_is_seen(url),
+            "URL must be re-enqueued by a subsequent handshake"
+        );
+        Ok(())
+    }
 
-    assert!(
-        !set.__test_cache_contains(url),
-        "stale refresh failure must drop URL from cache"
-    );
-    assert!(
-        !set.__test_is_seen(url),
-        "stale refresh failure must also clear seen_urls (1.3.0 invariant)"
-    );
-}
+    /// Pins that a cache-cap-rejected CRL does not become permanently suppressed.
+    #[tokio::test]
+    async fn fetch_rejected_by_cache_cap_does_not_permanently_suppress_url() -> anyhow::Result<()> {
+        // Promoting on "HTTP fetch succeeded" rather than "cache admitted"
+        // recreates the bug through a second route: commit_cache_update_atomically
+        // silently refuses new entries once `crl_max_cache_entries` is reached.
+        let (set, _rx) = crl_set_with_receiver(4096, 1024)?;
+        let url = "https://capped.example.test/crl";
 
-// -- F1 regression: first-fetch failure permanently suppressed retry --
-//
-// A discovered CDP URL was committed to the permanent dedup set as soon as
-// it was queued. When that first fetch failed, no code path could ever undo
-// that: `seen_urls` is pruned only for URLs whose CRL was successfully
-// cached and later went stale. The URL was therefore never re-enqueued for
-// the process lifetime, so revocation for that CDP was silently disabled
-// under the pre-3.9 default `crl_deny_on_unavailable = false`, or the
-// handshake failed forever with it set to `true` -- which is now the default.
-//
-// CDP URLs come from the client-presented certificate, so a holder of a
-// revoked cert could trigger this deliberately by making the first fetch
-// fail from a host they control.
+        let _: bool = set.__test_note_discovered_urls_by_cert(&[url.to_owned()], &[]);
+        assert!(set.__test_is_seen(url));
 
-/// Build a `CrlSet` whose discovery receiver stays alive, so
-/// `note_discovered_urls` exercises the real limiter + send + mark path
-/// instead of the closed-channel fallback in `__test_note_discovered_urls`.
-/// The receiver must be held for the duration of the test.
-fn crl_set_with_receiver(
-    max_seen_urls: usize,
-    max_cache_entries: usize,
-) -> (Arc<CrlSet>, tokio::sync::mpsc::UnboundedReceiver<String>) {
-    install_ring_provider();
-    let mut roots = RootCertStore::empty();
-    roots.add(build_ca_root()).expect("add ca root");
-    CrlSet::__test_with_kept_receiver(
-        Arc::new(roots),
-        bounded_config(1024, max_seen_urls, max_cache_entries),
-        vec![],
-    )
-    .expect("crl set with receiver")
-}
+        set.__test_settle_pending(url, false);
 
-#[tokio::test]
-async fn failed_first_fetch_does_not_permanently_suppress_url() {
-    let (set, _rx) = crl_set_with_receiver(4096, 1024);
-    let url = "https://retry.example.test/crl";
+        assert!(
+            !set.__test_is_permanently_seen(url),
+            "a cache-rejected CRL must not be permanently suppressed"
+        );
+        let _: bool = set.__test_note_discovered_urls_by_cert(&[url.to_owned()], &[]);
+        assert!(
+            set.__test_is_seen(url),
+            "a cache-rejected URL must remain retriable"
+        );
+        Ok(())
+    }
 
-    let _ = set.__test_note_discovered_urls_by_cert(&[url.to_owned()], &[]);
-    assert!(set.__test_is_seen(url), "queued URL must be in flight");
-    assert!(
-        !set.__test_is_permanently_seen(url),
-        "queueing alone must not promote to the permanent dedup set"
-    );
+    /// Pins that a successfully cached CRL is promoted to the permanent dedup set.
+    #[tokio::test]
+    async fn successfully_cached_url_is_permanently_deduped() -> anyhow::Result<()> {
+        let (set, _rx) = crl_set_with_receiver(4096, 1024)?;
+        let url = "https://cached.example.test/crl";
 
-    set.__test_settle_pending(url, false);
+        let _: bool = set.__test_note_discovered_urls_by_cert(&[url.to_owned()], &[]);
+        set.__test_settle_pending(url, true);
 
-    assert!(
-        !set.__test_is_permanently_seen(url),
-        "a failed fetch must never reach the permanent dedup set"
-    );
-    assert!(
-        !set.__test_is_seen(url),
-        "a failed fetch must leave the URL retriable"
-    );
+        assert!(
+            set.__test_is_permanently_seen(url),
+            "a cached CRL must be promoted to the permanent dedup set"
+        );
+        assert!(
+            set.__test_is_seen(url),
+            "a cached CRL must stay suppressed from re-discovery"
+        );
+        Ok(())
+    }
 
-    let _ = set.__test_note_discovered_urls_by_cert(&[url.to_owned()], &[]);
-    assert!(
-        set.__test_is_seen(url),
-        "URL must be re-enqueued by a subsequent handshake"
-    );
-}
+    /// Pins that the in-flight admission set respects `crl_max_seen_urls`.
+    #[tokio::test]
+    async fn in_flight_state_respects_the_configured_cap() -> anyhow::Result<()> {
+        let (set, _rx) = crl_set_with_receiver(4, 1024)?;
+        let urls: Vec<String> = (0..8_usize)
+            .map(|index| format!("https://flood-{index}.example.test/crl"))
+            .collect();
 
-#[tokio::test]
-async fn fetch_rejected_by_cache_cap_does_not_permanently_suppress_url() {
-    // Promoting on "HTTP fetch succeeded" rather than "cache admitted"
-    // recreates the bug through a second route: commit_cache_update_atomically
-    // silently refuses new entries once `crl_max_cache_entries` is reached.
-    let (set, _rx) = crl_set_with_receiver(4096, 1024);
-    let url = "https://capped.example.test/crl";
+        let _: bool = set.__test_note_discovered_urls_by_cert(&urls, &[]);
 
-    let _ = set.__test_note_discovered_urls_by_cert(&[url.to_owned()], &[]);
-    assert!(set.__test_is_seen(url));
-
-    set.__test_settle_pending(url, false);
-
-    assert!(
-        !set.__test_is_permanently_seen(url),
-        "a cache-rejected CRL must not be permanently suppressed"
-    );
-    let _ = set.__test_note_discovered_urls_by_cert(&[url.to_owned()], &[]);
-    assert!(
-        set.__test_is_seen(url),
-        "a cache-rejected URL must remain retriable"
-    );
-}
-
-#[tokio::test]
-async fn successfully_cached_url_is_permanently_deduped() {
-    let (set, _rx) = crl_set_with_receiver(4096, 1024);
-    let url = "https://cached.example.test/crl";
-
-    let _ = set.__test_note_discovered_urls_by_cert(&[url.to_owned()], &[]);
-    set.__test_settle_pending(url, true);
-
-    assert!(
-        set.__test_is_permanently_seen(url),
-        "a cached CRL must be promoted to the permanent dedup set"
-    );
-    assert!(
-        set.__test_is_seen(url),
-        "a cached CRL must stay suppressed from re-discovery"
-    );
-}
-
-#[tokio::test]
-async fn in_flight_state_respects_the_configured_cap() {
-    let (set, _rx) = crl_set_with_receiver(4, 1024);
-    let urls: Vec<String> = (0..8)
-        .map(|i| format!("https://flood-{i}.example.test/crl"))
-        .collect();
-
-    let _ = set.__test_note_discovered_urls_by_cert(&urls, &[]);
-
-    let suppressed = urls.iter().filter(|u| set.__test_is_seen(u)).count();
-    assert!(
-        suppressed <= 4,
-        "in-flight set must respect crl_max_seen_urls; {suppressed} suppressed"
-    );
+        let suppressed = urls.iter().filter(|url| set.__test_is_seen(url)).count();
+        assert!(
+            suppressed <= 4,
+            "in-flight set must respect crl_max_seen_urls; {suppressed} suppressed"
+        );
+        Ok(())
+    }
 }
