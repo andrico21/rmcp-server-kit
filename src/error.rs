@@ -216,91 +216,77 @@ impl IntoResponse for RmcpServerKitError {
 /// Convenience `Result` alias bound to [`RmcpServerKitError`].
 pub type Result<T> = CoreResult<T, RmcpServerKitError>;
 
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::min_ident_chars, reason = "lint-migration: src/error.rs")
+#[expect(
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    reason = "test code is not rendered API documentation"
 )]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::arithmetic_side_effects,
-        reason = "lint-migration: src/error.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::shadow_unrelated, reason = "lint-migration: src/error.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::expect_used, reason = "lint-migration: src/error.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::unwrap_used, reason = "lint-migration: src/error.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::missing_panics_doc,
-        reason = "test code is not rendered API documentation"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::unused_trait_names, reason = "lint-migration: src/error.rs")
-)]
-#[cfg_attr(
-    test,
-    expect(redundant_imports, reason = "lint-migration: src/error.rs")
-)]
+#[expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")]
 #[cfg(test)]
 mod tests {
-    use axum::{http::StatusCode, response::IntoResponse};
-    use http_body_util::BodyExt;
+    use std::{fs, io::ErrorKind, path::Path};
+
+    use anyhow::Context as _;
+    use http_body_util::BodyExt as _;
 
     use super::*;
 
-    async fn status_of(err: RmcpServerKitError) -> (StatusCode, String) {
+    /// Renders `err` and returns its HTTP status and `UTF-8` body.
+    async fn status_of(err: RmcpServerKitError) -> anyhow::Result<(StatusCode, String)> {
         let resp = err.into_response();
         let status = resp.status();
-        let body = resp.into_body().collect().await.unwrap().to_bytes();
-        (status, String::from_utf8(body.to_vec()).unwrap())
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .context("collect the response body")?
+            .to_bytes();
+        let text = String::from_utf8(body.to_vec()).context("body is UTF-8")?;
+        Ok((status, text))
     }
 
     #[tokio::test]
-    async fn auth_error_returns_401() {
-        let (status, body) = status_of(RmcpServerKitError::Auth("bad token".into())).await;
+    /// Pins that an authentication failure maps to 401 and echoes the message.
+    async fn auth_error_returns_401() -> anyhow::Result<()> {
+        let (status, body) = status_of(RmcpServerKitError::Auth("bad token".into())).await?;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert!(body.contains("bad token"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn rbac_error_returns_403() {
-        let (status, body) = status_of(RmcpServerKitError::Rbac("denied".into())).await;
+    /// Pins that an authorization denial maps to 403 and echoes the message.
+    async fn rbac_error_returns_403() -> anyhow::Result<()> {
+        let (status, body) = status_of(RmcpServerKitError::Rbac("denied".into())).await?;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(body.contains("denied"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn rate_limited_error_returns_429() {
-        let (status, body) = status_of(RmcpServerKitError::RateLimited("slow down".into())).await;
+    /// Pins that a legacy rate-limit rejection maps to 429 and echoes the message.
+    async fn rate_limited_error_returns_429() -> anyhow::Result<()> {
+        let (status, body) = status_of(RmcpServerKitError::RateLimited("slow down".into())).await?;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         assert!(body.contains("slow down"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn legacy_rate_limited_has_no_retry_after_header() {
+    /// Pins that the legacy rate-limit variant stays free of a `Retry-After` header.
+    async fn legacy_rate_limited_has_no_retry_after_header() -> anyhow::Result<()> {
         let resp = RmcpServerKitError::RateLimited("slow down".into()).into_response();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(
             !resp.headers().contains_key(RETRY_AFTER),
             "legacy variant must stay headerless"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn rate_limited_for_sets_retry_after_header() {
+    /// Pins that the timed rate-limit variant sets `Retry-After` rounded up.
+    async fn rate_limited_for_sets_retry_after_header() -> anyhow::Result<()> {
         let resp = RmcpServerKitError::RateLimitedFor {
             message: "slow down".into(),
             retry_after: Duration::from_millis(1500),
@@ -310,92 +296,127 @@ mod tests {
         let header = resp
             .headers()
             .get(RETRY_AFTER)
-            .expect("Retry-After present")
+            .context("Retry-After present")?
             .to_str()
-            .unwrap()
+            .context("Retry-After is ASCII")?
             .to_owned();
         assert_eq!(header, "2", "1.5s must round UP to 2");
-        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .context("collect the response body")?
+            .to_bytes();
         assert_eq!(body.as_ref(), b"slow down");
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/error.rs::retry_after_secs_rounds_up_and_never_zero keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn retry_after_secs_rounds_up_and_never_zero() {
-        use std::time::Duration;
+    /// Pins that `retry_after_secs` rounds up and never returns zero.
+    fn retry_after_secs_rounds_up_and_never_zero() -> anyhow::Result<()> {
         assert_eq!(retry_after_secs(Duration::ZERO), 1, "zero floors to 1");
         assert_eq!(retry_after_secs(Duration::from_millis(1)), 1);
         assert_eq!(retry_after_secs(Duration::from_millis(999)), 1);
         assert_eq!(retry_after_secs(Duration::from_secs(1)), 1, "exact stays");
         assert_eq!(retry_after_secs(Duration::from_millis(1001)), 2, "ceil");
         assert_eq!(retry_after_secs(Duration::from_secs(60)), 60);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn config_error_returns_500() {
-        let (status, body) = status_of(RmcpServerKitError::Config("bad".into())).await;
+    /// Pins that a configuration error maps to 500 with a generic body.
+    async fn config_error_returns_500() -> anyhow::Result<()> {
+        let (status, body) = status_of(RmcpServerKitError::Config("bad".into())).await?;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(
             body, "internal server error",
             "must not leak internal detail"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn io_error_returns_500() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "gone");
-        let (status, body) = status_of(RmcpServerKitError::from(io_err)).await;
+    /// Pins that an I/O error maps to 500 with a generic body.
+    async fn io_error_returns_500() -> anyhow::Result<()> {
+        let io_err = IoError::new(ErrorKind::NotFound, "gone");
+        let (status, body) = status_of(RmcpServerKitError::from(io_err)).await?;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(
             body, "internal server error",
             "must not leak internal detail"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn tls_error_returns_500() {
-        let (status, body) = status_of(RmcpServerKitError::Tls("bad cert".into())).await;
+    /// Pins that a TLS error maps to 500 with a generic body.
+    async fn tls_error_returns_500() -> anyhow::Result<()> {
+        let (status, body) = status_of(RmcpServerKitError::Tls("bad cert".into())).await?;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(
             body, "internal server error",
             "must not leak internal detail"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn startup_error_returns_500() {
-        let (status, body) = status_of(RmcpServerKitError::Startup("bind failed".into())).await;
+    /// Pins that a startup error maps to 500 with a generic body.
+    async fn startup_error_returns_500() -> anyhow::Result<()> {
+        let (status, body) = status_of(RmcpServerKitError::Startup("bind failed".into())).await?;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(
             body, "internal server error",
             "must not leak internal detail"
         );
+        Ok(())
     }
 
     #[cfg(feature = "metrics")]
     #[tokio::test]
-    async fn metrics_error_returns_500() {
-        let (status, body) = status_of(RmcpServerKitError::Metrics("dup metric".into())).await;
+    /// Pins that a metrics error maps to 500 with a generic body.
+    async fn metrics_error_returns_500() -> anyhow::Result<()> {
+        let (status, body) = status_of(RmcpServerKitError::Metrics("dup metric".into())).await?;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(
             body, "internal server error",
             "must not leak internal detail"
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/error.rs::display_preserves_message keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn display_preserves_message() {
-        let err = RmcpServerKitError::Auth("unauthorized".into());
-        assert_eq!(err.to_string(), "authentication failed: unauthorized");
+    /// Pins that `Display` keeps each variant's distinct prefix.
+    fn display_preserves_message() -> anyhow::Result<()> {
+        let auth_error = RmcpServerKitError::Auth("unauthorized".into());
+        assert_eq!(
+            auth_error.to_string(),
+            "authentication failed: unauthorized"
+        );
 
-        let err = RmcpServerKitError::Rbac("forbidden".into());
-        assert_eq!(err.to_string(), "authorization denied: forbidden");
+        let rbac_error = RmcpServerKitError::Rbac("forbidden".into());
+        assert_eq!(rbac_error.to_string(), "authorization denied: forbidden");
 
-        let err = RmcpServerKitError::RateLimited("throttled".into());
-        assert_eq!(err.to_string(), "rate limited: throttled");
+        let rate_limited_error = RmcpServerKitError::RateLimited("throttled".into());
+        assert_eq!(rate_limited_error.to_string(), "rate limited: throttled");
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/error.rs::client_message_exposes_client_facing_text_and_hides_internal_detail keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn client_message_exposes_client_facing_text_and_hides_internal_detail() {
+    /// Pins that `client_message` passes client-facing text through and hides internal detail.
+    fn client_message_exposes_client_facing_text_and_hides_internal_detail() -> anyhow::Result<()> {
         // Client-facing variants: message passes through verbatim.
         assert_eq!(
             RmcpServerKitError::Auth("bad token".into()).client_message(),
@@ -419,7 +440,7 @@ mod tests {
         );
 
         // Internal variants: detail is hidden behind a generic body.
-        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "secret/path/leak");
+        let io_err = IoError::new(ErrorKind::NotFound, "secret/path/leak");
         assert_eq!(
             RmcpServerKitError::from(io_err).client_message(),
             "internal server error"
@@ -432,10 +453,12 @@ mod tests {
             RmcpServerKitError::Config("bind 10.0.0.5:8443 failed".into()).client_message(),
             "internal server error"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn client_message_matches_into_response_body() {
+    /// Pins that `client_message` equals the HTTP response body for every tested variant.
+    async fn client_message_matches_into_response_body() -> anyhow::Result<()> {
         // The accessor and the wire body must agree for every variant we test.
         for err in [
             RmcpServerKitError::Auth("a".into()),
@@ -446,32 +469,41 @@ mod tests {
             RmcpServerKitError::Internal("f".into()),
         ] {
             let expected = err.client_message().into_owned();
-            let (_status, body) = status_of(err).await;
+            let (_status, body) = status_of(err).await?;
             assert_eq!(body, expected, "client_message must equal the wire body");
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn internal_variant_is_500_and_leaks_nothing() {
+    /// Pins that the internal variant maps to 500 and leaks no upstream text.
+    async fn internal_variant_is_500_and_leaks_nothing() -> anyhow::Result<()> {
         let (status, body) = status_of(RmcpServerKitError::Internal(
             "argon2id hashing failed: oom".into(),
         ))
-        .await;
+        .await?;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body, "internal server error");
         assert!(
             !body.contains("argon2"),
             "upstream error detail must never reach the client body"
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/error.rs::internal_client_message_is_generic keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn internal_client_message_is_generic() {
+    /// Pins that the internal variant's client message is the generic body.
+    fn internal_client_message_is_generic() -> anyhow::Result<()> {
         assert_eq!(
             RmcpServerKitError::Internal("salt encoding failed: bad length".into())
                 .client_message(),
             "internal server error"
         );
+        Ok(())
     }
 
     // -----------------------------------------------------------------
@@ -514,11 +546,11 @@ mod tests {
     fn production_source(src: &str) -> String {
         let lines: Vec<&str> = src.lines().collect();
         let mut out = String::with_capacity(src.len());
-        for (i, line) in lines.iter().enumerate() {
+        for (index, line) in lines.iter().enumerate() {
             let trimmed = line.trim_start();
             if trimmed == "#[cfg(test)]"
                 && lines
-                    .get(i + 1)
+                    .get(index.saturating_add(1))
                     .is_some_and(|next| next.trim_start().starts_with("mod tests"))
             {
                 break;
@@ -539,39 +571,40 @@ mod tests {
         let mut hits = Vec::new();
         for ctor in CLIENT_FACING_CTORS {
             let mut from = 0_usize;
-            while let Some(rel) = scanned.get(from..).and_then(|s| s.find(ctor)) {
-                let start = from + rel;
+            while let Some(rel) = scanned.get(from..).and_then(|slice| slice.find(ctor)) {
+                let start = from.saturating_add(rel);
                 let rest = scanned.get(start..).unwrap_or_default();
                 // The construction ends at the statement terminator; cap the
                 // window so a missing `;` cannot bleed into later code.
-                let end = rest.find(';').map_or(400, |i| i.min(400));
+                let end = rest.find(';').map_or(400, |index| index.min(400));
                 let window = rest.get(..end).unwrap_or(rest);
-                if ERROR_BINDINGS.iter().any(|b| {
-                    window.contains(&format!("{{{b}}}"))
-                        || window.contains(&format!("{{{b}:"))
-                        || window.contains(&format!(", {b})"))
+                if ERROR_BINDINGS.iter().any(|binding| {
+                    window.contains(&format!("{{{binding}}}"))
+                        || window.contains(&format!("{{{binding}:"))
+                        || window.contains(&format!(", {binding})"))
                 }) {
                     hits.push(window.split_whitespace().collect::<Vec<_>>().join(" "));
                 }
-                from = start + ctor.len();
+                from = start.saturating_add(ctor.len());
             }
         }
         hits
     }
 
     #[test]
-    fn client_facing_variants_do_not_interpolate_upstream_errors() {
-        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let entries = std::fs::read_dir(&src_dir).expect("src/ is readable");
+    /// Pins that no production client-facing variant interpolates an upstream error.
+    fn client_facing_variants_do_not_interpolate_upstream_errors() -> anyhow::Result<()> {
+        let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let entries = fs::read_dir(&src_dir).context("src/ is readable")?;
         let mut offenders: Vec<String> = Vec::new();
         let mut scanned_files = 0_usize;
         for entry in entries {
-            let path = entry.expect("dir entry").path();
+            let path = entry.context("dir entry")?.path();
             if path.extension().is_none_or(|ext| ext != "rs") {
                 continue;
             }
-            let src = std::fs::read_to_string(&path).expect("source file is readable");
-            scanned_files += 1;
+            let src = fs::read_to_string(&path).context("source file is readable")?;
+            scanned_files = scanned_files.saturating_add(1);
             for hit in find_error_interpolations(&src) {
                 offenders.push(format!("{}: {hit}", path.display()));
             }
@@ -586,14 +619,20 @@ mod tests {
              (see the invariant on RmcpServerKitError); use Internal instead:\n{}",
             offenders.join("\n")
         );
+        Ok(())
     }
 
-    #[test]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/error.rs::guard_detects_a_synthetic_violation keeps the uniform test signature while it cannot fail"
+    )]
     #[expect(
         clippy::literal_string_with_formatting_args,
         reason = "the format-shaped text is the fixture under test, not a format call"
     )]
-    fn guard_detects_a_synthetic_violation() {
+    #[test]
+    /// Pins that the source guard detects the synthetic interpolation fixtures.
+    fn guard_detects_a_synthetic_violation() -> anyhow::Result<()> {
         // Without this, a broken matcher would be indistinguishable from a
         // clean codebase and the guard would rot into a no-op.
         let offending = "fn f() { RmcpServerKitError::Auth(format!(\"hashing failed: {e}\")); }";
@@ -604,20 +643,32 @@ mod tests {
 
         let debug_spec = "fn f() { RmcpServerKitError::RateLimited(format!(\"x {error:?}\")); }";
         assert_eq!(find_error_interpolations(debug_spec).len(), 1);
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/error.rs::guard_allows_caller_known_interpolation keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn guard_allows_caller_known_interpolation() {
+    /// Pins that the source guard permits caller-known interpolations.
+    fn guard_allows_caller_known_interpolation() -> anyhow::Result<()> {
         // The five real rbac.rs sites echo caller-supplied names on purpose.
         let allowed = "fn f() { RmcpServerKitError::Rbac(format!(\"{tool_name} denied for role '{role}'\")); }";
         assert_eq!(find_error_interpolations(allowed), Vec::<String>::new());
 
         let arg = "fn f() { RmcpServerKitError::Rbac(format!(\"argument '{arg_key}' must be a string for tool '{tool_name}'\")); }";
         assert_eq!(find_error_interpolations(arg), Vec::<String>::new());
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/error.rs::guard_ignores_comments_and_test_modules keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn guard_ignores_comments_and_test_modules() {
+    /// Pins that the source guard skips comments and the test module.
+    fn guard_ignores_comments_and_test_modules() -> anyhow::Result<()> {
         let in_comment = "/// BAD: RmcpServerKitError::Auth(format!(\"{e}\"))\nfn f() {}";
         assert_eq!(find_error_interpolations(in_comment), Vec::<String>::new());
 
@@ -627,5 +678,6 @@ mod tests {
         // A `#[cfg(test)]` const must NOT truncate the scan (config.rs shape).
         let const_then_code = "#[cfg(test)]\nconst X: &[&str] = &[];\nfn f() { RmcpServerKitError::Auth(format!(\"{e}\")); }";
         assert_eq!(find_error_interpolations(const_then_code).len(), 1);
+        Ok(())
     }
 }

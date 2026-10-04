@@ -183,13 +183,12 @@ impl Drop for ExposureTestGuard {
     }
 }
 
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::missing_panics_doc,
-        reason = "test code is not rendered API documentation"
-    )
+#[expect(
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    reason = "test code is not rendered API documentation"
 )]
+#[expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")]
 #[cfg(test)]
 mod tests {
     use super::{
@@ -197,18 +196,29 @@ mod tests {
         set_diagnostic_exposure, tool_call_arguments,
     };
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/diagnostics.rs::default_exposure_is_fully_redacted keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn default_exposure_is_fully_redacted() {
+    /// Pins that a default [`DiagnosticExposure`] leaves every switch redacted.
+    fn default_exposure_is_fully_redacted() -> anyhow::Result<()> {
         let _guard = ExposureTestGuard::acquire();
         set_diagnostic_exposure(&DiagnosticExposure::default());
 
         assert!(!plaintext_oauth_tokens(), "tokens must default to redacted");
         assert!(!oauth_claim_values(), "claims must default to redacted");
         assert!(!tool_call_arguments(), "arguments must default to redacted");
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/diagnostics.rs::each_switch_is_independently_settable keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn each_switch_is_independently_settable() {
+    /// Pins that each of the three switches can be toggled independently.
+    fn each_switch_is_independently_settable() -> anyhow::Result<()> {
         let _guard = ExposureTestGuard::acquire();
 
         set_diagnostic_exposure(&DiagnosticExposure {
@@ -234,10 +244,16 @@ mod tests {
         assert!(!plaintext_oauth_tokens());
         assert!(!oauth_claim_values());
         assert!(tool_call_arguments());
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/diagnostics.rs::guard_restores_previous_state_on_drop keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn guard_restores_previous_state_on_drop() {
+    /// Pins that dropping [`ExposureTestGuard`] restores the pre-acquire state.
+    fn guard_restores_previous_state_on_drop() -> anyhow::Result<()> {
         let guard = ExposureTestGuard::acquire();
         set_diagnostic_exposure(&DiagnosticExposure {
             plaintext_oauth_tokens: true,
@@ -253,5 +269,6 @@ mod tests {
             !plaintext_oauth_tokens() && !oauth_claim_values() && !tool_call_arguments(),
             "dropping the guard must restore the pre-acquire state"
         );
+        Ok(())
     }
 }

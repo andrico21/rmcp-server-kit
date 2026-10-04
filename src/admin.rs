@@ -220,36 +220,22 @@ pub(crate) fn admin_router(state: AdminState, config: &AdminConfig) -> Router {
         }))
 }
 
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::indexing_slicing, reason = "lint-migration: src/admin.rs")
+#[expect(
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    reason = "test code is not rendered API documentation"
 )]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::unwrap_used, reason = "lint-migration: src/admin.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::missing_panics_doc,
-        reason = "test code is not rendered API documentation"
-    )
-)]
-#[cfg_attr(test, expect(unused_results, reason = "lint-migration: src/admin.rs"))]
-#[cfg_attr(
-    test,
-    expect(redundant_imports, reason = "lint-migration: src/admin.rs")
-)]
+#[expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")]
 #[cfg(test)]
 mod tests {
-
-    use axum::http::Request;
+    use anyhow::Context as _;
+    use axum::{body::to_bytes, http::Request};
     use tower::ServiceExt as _;
 
     use super::*;
     use crate::{
-        auth::{ApiKeyEntry, AuthCounters, AuthIdentity, AuthMethod, AuthState},
-        rbac::{RbacConfig, RbacPolicy, RoleConfig},
+        auth::{ApiKeyEntry, AuthCounters, AuthLogContext, AuthMethod, SeenIdentitySet},
+        rbac::{RbacConfig, RoleConfig},
     };
 
     fn make_auth_state() -> Arc<AuthState> {
@@ -263,10 +249,10 @@ mod tests {
             pre_auth_limiter: None,
             #[cfg(feature = "oauth")]
             jwks_cache: None,
-            seen_identities: crate::auth::SeenIdentitySet::new(),
+            seen_identities: SeenIdentitySet::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
-            log_context: crate::auth::AuthLogContext::default(),
+            log_context: AuthLogContext::default(),
         })
     }
 
@@ -286,78 +272,84 @@ mod tests {
         }
     }
 
-    fn admin_req(uri: &str, role: Option<&str>) -> Request<Body> {
-        let mut req = Request::builder().uri(uri).body(Body::empty()).unwrap();
-        if let Some(r) = role {
-            req.extensions_mut().insert(AuthIdentity {
+    fn admin_req(uri: &str, role: Option<&str>) -> anyhow::Result<Request<Body>> {
+        let mut req = Request::builder().uri(uri).body(Body::empty())?;
+        if let Some(assigned_role) = role {
+            let _previous = req.extensions_mut().insert(AuthIdentity {
                 name: "tester".into(),
-                role: r.to_owned(),
+                role: assigned_role.to_owned(),
                 method: AuthMethod::BearerToken,
                 raw_token: None,
                 sub: None,
             });
         }
-        req
+        Ok(req)
     }
 
+    /// Pins that `/admin/auth/keys` returns key metadata without the hash.
     #[tokio::test]
-    async fn keys_endpoint_omits_hash() {
+    async fn keys_endpoint_omits_hash() -> anyhow::Result<()> {
         let app = admin_router(make_state(), &AdminConfig::default());
         let resp = app
-            .oneshot(admin_req("/admin/auth/keys", Some("admin")))
-            .await
-            .unwrap();
+            .oneshot(admin_req("/admin/auth/keys", Some("admin"))?)
+            .await?;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let arr = json.as_array().unwrap();
+        let body = to_bytes(resp.into_body(), 64 * 1024).await?;
+        let json: serde_json::Value = serde_json::from_slice(&body)?;
+        let arr = json.as_array().context("keys response is a JSON array")?;
         assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0]["name"], "test-key");
-        assert!(arr[0].get("hash").is_none());
+        let first = arr.first().context("one key summary")?;
+        assert_eq!(first.get("name"), Some(&serde_json::json!("test-key")));
+        assert!(first.get("hash").is_none());
+        Ok(())
     }
 
+    /// Pins that a mismatched role gets `403`.
     #[tokio::test]
-    async fn wrong_role_gets_403() {
+    async fn wrong_role_gets_403() -> anyhow::Result<()> {
         let app = admin_router(make_state(), &AdminConfig::default());
         let resp = app
-            .oneshot(admin_req("/admin/status", Some("viewer")))
-            .await
-            .unwrap();
+            .oneshot(admin_req("/admin/status", Some("viewer"))?)
+            .await?;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        Ok(())
     }
 
+    /// Pins that a request without an identity gets `403`.
     #[tokio::test]
-    async fn no_identity_gets_403() {
+    async fn no_identity_gets_403() -> anyhow::Result<()> {
         let app = admin_router(make_state(), &AdminConfig::default());
-        let resp = app.oneshot(admin_req("/admin/status", None)).await.unwrap();
+        let resp = app.oneshot(admin_req("/admin/status", None)?).await?;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        Ok(())
     }
 
+    /// Pins that `/admin/status` returns `200`.
     #[tokio::test]
-    async fn status_returns_uptime() {
+    async fn status_returns_uptime() -> anyhow::Result<()> {
         let app = admin_router(make_state(), &AdminConfig::default());
         let resp = app
-            .oneshot(admin_req("/admin/status", Some("admin")))
-            .await
-            .unwrap();
+            .oneshot(admin_req("/admin/status", Some("admin"))?)
+            .await?;
         assert_eq!(resp.status(), StatusCode::OK);
+        Ok(())
     }
 
+    /// Pins that `/admin/rbac` reports the configured role list.
     #[tokio::test]
-    async fn rbac_summary_includes_role_list() {
+    async fn rbac_summary_includes_role_list() -> anyhow::Result<()> {
         let app = admin_router(make_state(), &AdminConfig::default());
         let resp = app
-            .oneshot(admin_req("/admin/rbac", Some("admin")))
-            .await
-            .unwrap();
+            .oneshot(admin_req("/admin/rbac", Some("admin"))?)
+            .await?;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["enabled"], true);
-        assert_eq!(json["roles"][0]["name"], "admin");
+        let body = to_bytes(resp.into_body(), 64 * 1024).await?;
+        let json: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(json.get("enabled"), Some(&serde_json::Value::Bool(true)));
+        assert_eq!(
+            json.pointer("/roles/0/name"),
+            Some(&serde_json::Value::from("admin"))
+        );
+        Ok(())
     }
 }
