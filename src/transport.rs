@@ -7150,86 +7150,122 @@ mod tests {
         Ok(())
     }
 
+    /// Pins that a denied request advertises a positive `Retry-After`
+    /// delta-seconds header.
     #[tokio::test]
     async fn extra_route_limiter_deny_sets_retry_after() -> anyhow::Result<()> {
         let app = limited_router(1);
-        let ok = app.clone().oneshot(limited_req("10.5.5.5")?).await.unwrap();
+        let ok = app.clone().oneshot(limited_req("10.5.5.5")?).await?;
         assert_eq!(ok.status(), StatusCode::OK);
-        let denied = app.clone().oneshot(limited_req("10.5.5.5")?).await.unwrap();
+        let denied = app.clone().oneshot(limited_req("10.5.5.5")?).await?;
         assert_eq!(denied.status(), StatusCode::TOO_MANY_REQUESTS);
         let retry_after = denied
             .headers()
             .get(header::RETRY_AFTER)
-            .expect("Retry-After present")
+            .context("Retry-After present")?
             .to_str()
-            .unwrap()
+            .context("Retry-After is ASCII")?
             .parse::<u64>()
-            .unwrap();
+            .context("Retry-After parses as delta-seconds")?;
         assert!(retry_after >= 1, "delta-seconds must be >= 1");
 
         Ok(())
     }
 
+    /// Pins that zero tool- and extra-route burst capacities are rejected with
+    /// the offending knob named in the validation error.
     #[test]
-    fn validate_rejects_zero_burst_knobs() {
-        let err = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0")
+    fn validate_rejects_zero_burst_knobs() -> anyhow::Result<()> {
+        let tool_err = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0")
             .with_tool_rate_limit(10)
             .with_tool_rate_limit_burst(0)
             .validate()
-            .expect_err("zero tool burst");
-        assert!(err.to_string().contains("tool_rate_limit_burst"));
+            .err()
+            .context("zero tool burst")?;
+        assert!(tool_err.to_string().contains("tool_rate_limit_burst"));
 
-        let err = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0")
+        let route_err = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0")
             .with_extra_route_rate_limit(10)
             .with_extra_route_rate_limit_burst(0)
             .validate()
-            .expect_err("zero extra route burst");
-        assert!(err.to_string().contains("extra_route_rate_limit_burst"));
+            .err()
+            .context("zero extra route burst")?;
+        assert!(
+            route_err
+                .to_string()
+                .contains("extra_route_rate_limit_burst")
+        );
+
+        Ok(())
     }
 
+    /// Pins that burst knobs set without their base rate limit are rejected as
+    /// orphans by validation.
     #[test]
-    fn validate_rejects_orphan_burst_knobs() {
-        let err = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0")
+    fn validate_rejects_orphan_burst_knobs() -> anyhow::Result<()> {
+        let tool_err = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0")
             .with_tool_rate_limit_burst(5)
             .validate()
-            .expect_err("orphan tool burst");
-        assert!(err.to_string().contains("requires tool_rate_limit"));
+            .err()
+            .context("orphan tool burst")?;
+        assert!(tool_err.to_string().contains("requires tool_rate_limit"));
 
-        let err = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0")
+        let route_err = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0")
             .with_extra_route_rate_limit_burst(5)
             .validate()
-            .expect_err("orphan extra route burst");
-        assert!(err.to_string().contains("requires extra_route_rate_limit"));
+            .err()
+            .context("orphan extra route burst")?;
+        assert!(
+            route_err
+                .to_string()
+                .contains("requires extra_route_rate_limit")
+        );
+
+        Ok(())
     }
 
+    /// Pins that zero burst limits on the auth limiter or its pre-auth limiter
+    /// are rejected, naming `rate_limit.burst` / `pre_auth_burst`.
     #[test]
-    fn validate_rejects_zero_auth_bursts() {
-        let auth = AuthConfig::with_keys(vec![])
-            .with_rate_limit(crate::auth::RateLimitConfig::new(10).with_burst(0));
-        let err = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0")
-            .with_auth(auth)
-            .validate()
-            .expect_err("zero auth burst");
-        assert!(err.to_string().contains("rate_limit.burst"));
+    fn validate_rejects_zero_auth_bursts() -> anyhow::Result<()> {
+        use crate::auth::RateLimitConfig;
 
-        let auth = AuthConfig::with_keys(vec![])
-            .with_rate_limit(crate::auth::RateLimitConfig::new(10).with_pre_auth_burst(0));
-        let err = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0")
-            .with_auth(auth)
+        let burst_auth =
+            AuthConfig::with_keys(vec![]).with_rate_limit(RateLimitConfig::new(10).with_burst(0));
+        let burst_err = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0")
+            .with_auth(burst_auth)
             .validate()
-            .expect_err("zero pre-auth burst");
-        assert!(err.to_string().contains("pre_auth_burst"));
+            .err()
+            .context("zero auth burst")?;
+        assert!(burst_err.to_string().contains("rate_limit.burst"));
+
+        let pre_auth = AuthConfig::with_keys(vec![])
+            .with_rate_limit(RateLimitConfig::new(10).with_pre_auth_burst(0));
+        let pre_auth_err = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0")
+            .with_auth(pre_auth)
+            .validate()
+            .err()
+            .context("zero pre-auth burst")?;
+        assert!(pre_auth_err.to_string().contains("pre_auth_burst"));
+
+        Ok(())
     }
 
+    /// Pins that a zero pre-auth max-per-minute is rejected by validation.
     #[test]
-    fn validate_rejects_zero_pre_auth_max_per_minute() {
+    fn validate_rejects_zero_pre_auth_max_per_minute() -> anyhow::Result<()> {
+        use crate::auth::RateLimitConfig;
+
         let auth = AuthConfig::with_keys(vec![])
-            .with_rate_limit(crate::auth::RateLimitConfig::new(10).with_pre_auth_max_per_minute(0));
+            .with_rate_limit(RateLimitConfig::new(10).with_pre_auth_max_per_minute(0));
         let err = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0")
             .with_auth(auth)
             .validate()
-            .expect_err("zero pre-auth rate");
+            .err()
+            .context("zero pre-auth rate")?;
         assert!(err.to_string().contains("pre_auth_max_per_minute"));
+
+        Ok(())
     }
 
     fn valid_mtls_config() -> MtlsConfig {
@@ -7240,7 +7276,7 @@ mod tests {
             crl_enabled: true,
             crl_refresh_interval: None,
             crl_fetch_timeout: Duration::from_secs(30),
-            crl_stale_grace: Duration::from_secs(24 * 60 * 60),
+            crl_stale_grace: Duration::from_hours(24),
             crl_deny_on_unavailable: false,
             crl_end_entity_only: false,
             crl_allow_http: true,
@@ -7254,8 +7290,10 @@ mod tests {
         }
     }
 
+    /// Pins that a zero CRL max-response-bytes capacity is rejected once the
+    /// required TLS pairing is present.
     #[test]
-    fn validate_rejects_zero_crl_max_response_bytes() {
+    fn validate_rejects_zero_crl_max_response_bytes() -> anyhow::Result<()> {
         let mut mtls = valid_mtls_config();
         mtls.crl_max_response_bytes = 0;
         let mut auth = AuthConfig::with_keys(vec![]);
@@ -7263,81 +7301,112 @@ mod tests {
 
         // TLS paths are required alongside mTLS, else validation reports that
         // pairing error first and never reaches the capacity knobs.
-        let mut cfg = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0").with_auth(auth);
-        cfg.tls_cert_path = Some("cert.pem".into());
-        cfg.tls_key_path = Some("key.pem".into());
+        let cfg = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0")
+            .with_auth(auth)
+            .with_tls_paths(Some("cert.pem".into()), Some("key.pem".into()));
 
-        let err = cfg.validate().expect_err("zero CRL response cap");
+        let err = cfg.validate().err().context("zero CRL response cap")?;
         assert!(err.to_string().contains("crl_max_response_bytes"));
+
+        Ok(())
     }
 
-    /// `pre_auth_burst` without `pre_auth_max_per_minute` is LEGAL: the
-    /// pre-auth base rate always resolves (max_attempts_per_minute x 10).
+    /// Pins that `pre_auth_burst` without `pre_auth_max_per_minute` is legal
+    /// because the pre-auth base rate always resolves.
     #[test]
-    fn validate_accepts_pre_auth_burst_without_explicit_pre_auth_rate() {
+    fn validate_accepts_pre_auth_burst_without_explicit_pre_auth_rate() -> anyhow::Result<()> {
+        use crate::auth::RateLimitConfig;
+
         let auth = AuthConfig::with_keys(vec![])
-            .with_rate_limit(crate::auth::RateLimitConfig::new(10).with_pre_auth_burst(50));
+            .with_rate_limit(RateLimitConfig::new(10).with_pre_auth_burst(50));
         let cfg = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0").with_auth(auth);
-        assert!(cfg.validate().is_ok(), "pre_auth_burst has no orphan rule");
+        let _validated = cfg
+            .validate()
+            .context("pre_auth_burst has no orphan rule")?;
+
+        Ok(())
     }
 
     // -- trusted-forwarder mode (ClientIp / ForwardedHeaderMode) --
 
+    /// Pins that `trusted_forwarder_max_entries` accepts only
+    /// `1..=MAX_SCANNED_ENTRIES` and rejects the configurable ceiling plus one.
     #[test]
-    fn trusted_forwarder_max_entries_bounds_are_enforced() {
-        let cfg = |n: usize| {
+    fn trusted_forwarder_max_entries_bounds_are_enforced() -> anyhow::Result<()> {
+        use crate::forwarded::{MAX_CONFIGURABLE_SCANNED_ENTRIES, MAX_SCANNED_ENTRIES};
+
+        let cfg = |entries: usize| {
             McpServerConfig::new("127.0.0.1:8080", "t", "0")
-                .with_trusted_forwarder_max_entries(n)
+                .with_trusted_forwarder_max_entries(entries)
                 .validate()
         };
         assert!(cfg(0).is_err(), "0 would pin every client to the proxy");
         assert!(
-            cfg(crate::forwarded::MAX_CONFIGURABLE_SCANNED_ENTRIES + 1).is_err(),
+            cfg(MAX_CONFIGURABLE_SCANNED_ENTRIES + 1).is_err(),
             "above the ceiling would re-open the header-bomb vector"
         );
-        assert!(cfg(1).is_ok());
-        assert!(cfg(crate::forwarded::MAX_SCANNED_ENTRIES).is_ok());
-        assert!(cfg(crate::forwarded::MAX_CONFIGURABLE_SCANNED_ENTRIES).is_ok());
+        let _one_entry = cfg(1)?;
+        let _module_default = cfg(MAX_SCANNED_ENTRIES)?;
+        let _configurable_ceiling = cfg(MAX_CONFIGURABLE_SCANNED_ENTRIES)?;
+
+        Ok(())
     }
 
+    /// Pins that `trusted_forwarder_max_entries` defaults to the module's
+    /// `MAX_SCANNED_ENTRIES` constant.
     #[test]
-    fn trusted_forwarder_max_entries_defaults_to_the_module_constant() {
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/transport.rs::trusted_forwarder_max_entries_defaults_to_the_module_constant keeps the uniform IS-7 test signature while it only constructs values"
+    )]
+    fn trusted_forwarder_max_entries_defaults_to_the_module_constant() -> anyhow::Result<()> {
+        use crate::forwarded::MAX_SCANNED_ENTRIES;
+
         let cfg = McpServerConfig::new("127.0.0.1:8080", "t", "0");
-        assert_eq!(
-            cfg.trusted_forwarder_max_entries,
-            crate::forwarded::MAX_SCANNED_ENTRIES
-        );
+        assert_eq!(cfg.trusted_forwarder_max_entries, MAX_SCANNED_ENTRIES);
+
+        Ok(())
     }
 
-    fn forward_resolver(trusted: &[&str], mode: ForwardedHeaderMode) -> Arc<ForwardResolver> {
-        Arc::new(ForwardResolver {
-            trusted: trusted.iter().map(|s| s.parse().unwrap()).collect(),
+    fn forward_resolver(
+        trusted: &[&str],
+        mode: ForwardedHeaderMode,
+    ) -> anyhow::Result<Arc<ForwardResolver>> {
+        use crate::forwarded::MAX_SCANNED_ENTRIES;
+
+        Ok(Arc::new(ForwardResolver {
+            trusted: trusted
+                .iter()
+                .map(|entry| entry.parse().context("test trusted proxy entry"))
+                .collect::<anyhow::Result<Vec<_>>>()?,
             mode,
-            max_scanned_entries: crate::forwarded::MAX_SCANNED_ENTRIES,
+            max_scanned_entries: MAX_SCANNED_ENTRIES,
             request_id_header: None,
-        })
+        }))
     }
 
     /// Probe router reporting `"<PeerAddr ip>|<ClientIp>"`.
     fn forwarded_probe_router(resolver: Option<Arc<ForwardResolver>>) -> axum::Router {
         async fn probe(req: Request<Body>) -> String {
-            let pa = req
+            let peer_ip = req
                 .extensions()
                 .get::<PeerAddr>()
-                .map(|p| p.addr.ip().to_string())
+                .map(|peer| peer.addr.ip().to_string())
                 .unwrap_or_default();
-            let ci = req
+            let client_ip = req
                 .extensions()
                 .get::<ClientIp>()
-                .map(|c| c.ip.to_string())
+                .map(|client| client.ip.to_string())
                 .unwrap_or_default();
-            format!("{pa}|{ci}")
+            format!("{peer_ip}|{client_ip}")
         }
+        use axum::{middleware::from_fn, routing::get};
+
         axum::Router::new()
-            .route("/probe", axum::routing::get(probe))
-            .layer(axum::middleware::from_fn(move |req, next| {
-                let r = resolver.clone();
-                normalize_peer_addr_middleware(r, req, next)
+            .route("/probe", get(probe))
+            .layer(from_fn(move |req, next| {
+                let resolver_clone = resolver.clone();
+                normalize_peer_addr_middleware(resolver_clone, req, next)
             }))
     }
 
@@ -7347,47 +7416,61 @@ mod tests {
                 .map(|id| id.to_string())
                 .unwrap_or_default()
         }
+        use axum::{middleware::from_fn, routing::get};
+
         axum::Router::new()
-            .route("/probe", axum::routing::get(probe))
-            .layer(axum::middleware::from_fn(move |req, next| {
-                let r = resolver.clone();
-                normalize_peer_addr_middleware(r, req, next)
+            .route("/probe", get(probe))
+            .layer(from_fn(move |req, next| {
+                let resolver_clone = resolver.clone();
+                normalize_peer_addr_middleware(resolver_clone, req, next)
             }))
     }
 
-    fn probe_req(peer: &str, header: Option<(&str, &str)>) -> Request<Body> {
-        let addr: SocketAddr = peer.parse().unwrap();
+    fn probe_req(peer: &str, header: Option<(&str, &str)>) -> anyhow::Result<Request<Body>> {
+        let addr: SocketAddr = peer.parse().context("test peer address")?;
         let mut builder = Request::builder()
             .uri("/probe")
             .extension(ConnectInfo(addr));
         if let Some((name, value)) = header {
             builder = builder.header(name, value);
         }
-        builder.body(Body::empty()).unwrap()
+        builder
+            .body(Body::empty())
+            .context("test probe request body")
     }
 
-    fn request_id_probe_req(peer: &str, values: &[&str]) -> Request<Body> {
-        let addr: SocketAddr = peer.parse().unwrap();
+    fn request_id_probe_req(peer: &str, values: &[&str]) -> anyhow::Result<Request<Body>> {
+        let addr: SocketAddr = peer.parse().context("test peer address")?;
         let mut builder = Request::builder()
             .uri("/probe")
             .extension(ConnectInfo(addr));
         for value in values {
             builder = builder.header("x-request-id", *value);
         }
-        builder.body(Body::empty()).unwrap()
+        builder
+            .body(Body::empty())
+            .context("test request-id probe body")
     }
 
-    fn request_id_resolver(header: Option<&'static str>) -> Arc<ForwardResolver> {
-        Arc::new(ForwardResolver {
-            trusted: vec!["127.0.0.1/32".parse().unwrap()],
+    fn request_id_resolver(header: Option<&'static str>) -> anyhow::Result<Arc<ForwardResolver>> {
+        use crate::forwarded::MAX_SCANNED_ENTRIES;
+
+        Ok(Arc::new(ForwardResolver {
+            trusted: vec!["127.0.0.1/32".parse().context("test trusted peer")?],
             mode: ForwardedHeaderMode::XForwardedFor,
-            max_scanned_entries: crate::forwarded::MAX_SCANNED_ENTRIES,
+            max_scanned_entries: MAX_SCANNED_ENTRIES,
             request_id_header: header.map(HeaderName::from_static),
-        })
+        }))
     }
 
+    /// Pins that `sanitize_for_log` strips control characters and truncates to
+    /// `MAX_LOGGED_HEADER_CHARS` with an ellipsis marker.
     #[test]
-    fn sanitize_for_log_strips_controls_and_bounds() {
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/transport.rs::sanitize_for_log_strips_controls_and_bounds keeps the uniform IS-7 test signature while it only constructs values"
+    )]
+    fn sanitize_for_log_strips_controls_and_bounds() -> anyhow::Result<()> {
         assert_eq!(sanitize_for_log("a\r\nb", MAX_LOGGED_HEADER_CHARS), "ab");
         assert_eq!(
             sanitize_for_log("\u{1b}[31m", MAX_LOGGED_HEADER_CHARS),
@@ -7404,105 +7487,118 @@ mod tests {
             "a".repeat(128)
         );
         assert_eq!(sanitize_for_log("", MAX_LOGGED_HEADER_CHARS), "");
+
+        Ok(())
     }
 
+    /// Pins that the request-id hint is taken from the last `x-request-id`
+    /// value when a trusted peer sends several.
     #[tokio::test]
     async fn request_id_taken_from_trusted_peer_last_occurrence() -> anyhow::Result<()> {
-        let app = request_id_probe_router(Some(request_id_resolver(Some("x-request-id"))));
+        let app = request_id_probe_router(Some(request_id_resolver(Some("x-request-id"))?));
         let resp = app
             .oneshot(request_id_probe_req(
                 "127.0.0.1:5555",
                 &["spoofed", "router-1"],
-            ))
-            .await
-            .unwrap();
+            )?)
+            .await?;
         assert_eq!(body_string(resp).await?, "router-1");
 
         Ok(())
     }
 
+    /// Pins that the request-id hint is ignored when the peer is untrusted.
     #[tokio::test]
     async fn request_id_ignored_from_untrusted_peer() -> anyhow::Result<()> {
-        let app = request_id_probe_router(Some(request_id_resolver(Some("x-request-id"))));
+        let app = request_id_probe_router(Some(request_id_resolver(Some("x-request-id"))?));
         let resp = app
-            .oneshot(request_id_probe_req("10.9.9.9:5555", &["router-1"]))
-            .await
-            .unwrap();
+            .oneshot(request_id_probe_req("10.9.9.9:5555", &["router-1"])?)
+            .await?;
         assert_eq!(body_string(resp).await?, "");
 
         Ok(())
     }
 
+    /// Pins that request-id hints are stripped of control bytes, bounded to 128
+    /// characters, and dropped entirely when they are not valid UTF-8.
     #[tokio::test]
     async fn request_id_sanitized_and_bounded() -> anyhow::Result<()> {
-        let app = request_id_probe_router(Some(request_id_resolver(Some("x-request-id"))));
-        let resp = app
+        use axum::http::HeaderValue;
+
+        let app = request_id_probe_router(Some(request_id_resolver(Some("x-request-id"))?));
+        let sanitized = app
             .clone()
-            .oneshot(request_id_probe_req("127.0.0.1:5555", &["a\tb"]))
-            .await
-            .unwrap();
-        assert_eq!(body_string(resp).await?, "ab");
+            .oneshot(request_id_probe_req("127.0.0.1:5555", &["a\tb"])?)
+            .await?;
+        assert_eq!(body_string(sanitized).await?, "ab");
 
         let long = "a".repeat(200);
-        let resp = app
+        let bounded = app
             .clone()
-            .oneshot(request_id_probe_req("127.0.0.1:5555", &[&long]))
-            .await
-            .unwrap();
+            .oneshot(request_id_probe_req("127.0.0.1:5555", &[&long])?)
+            .await?;
         assert_eq!(
-            body_string(resp).await?,
+            body_string(bounded).await?,
             format!("{}...(truncated)", "a".repeat(128))
         );
 
-        let addr: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+        let addr: SocketAddr = "127.0.0.1:5555".parse().context("test peer address")?;
         let req = Request::builder()
             .uri("/probe")
             .extension(ConnectInfo(addr))
             .header(
                 "x-request-id",
-                axum::http::HeaderValue::from_bytes(b"caf\xe9").unwrap(),
+                HeaderValue::from_bytes(b"caf\xe9").context("non-UTF-8 header value")?,
             )
             .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(body_string(resp).await?, "");
+            .context("test request-id body")?;
+        let dropped = app.oneshot(req).await?;
+        assert_eq!(body_string(dropped).await?, "");
 
         Ok(())
     }
 
+    /// Pins that no request id is extracted when the resolver has no
+    /// configured header.
     #[tokio::test]
     async fn request_id_not_extracted_when_knob_off() -> anyhow::Result<()> {
-        let app = request_id_probe_router(Some(request_id_resolver(None)));
+        let app = request_id_probe_router(Some(request_id_resolver(None)?));
         let resp = app
-            .oneshot(request_id_probe_req("127.0.0.1:5555", &["router-1"]))
-            .await
-            .unwrap();
+            .oneshot(request_id_probe_req("127.0.0.1:5555", &["router-1"])?)
+            .await?;
         assert_eq!(body_string(resp).await?, "");
 
         Ok(())
     }
 
-    fn knobs(f: impl FnOnce(&mut LogContextConfig)) -> LogContextConfig {
+    fn knobs(configure: impl FnOnce(&mut LogContextConfig)) -> LogContextConfig {
         let mut cfg = LogContextConfig::default();
-        f(&mut cfg);
+        configure(&mut cfg);
         cfg
     }
 
-    fn reqlog_router(configure: impl FnOnce(McpServerConfig) -> McpServerConfig) -> axum::Router {
+    fn reqlog_router(
+        configure: impl FnOnce(McpServerConfig) -> McpServerConfig,
+    ) -> anyhow::Result<axum::Router> {
         #[derive(Clone)]
-        struct H;
-        impl ServerHandler for H {}
+        struct Handler;
+        impl ServerHandler for Handler {}
         let config = configure(McpServerConfig::new("127.0.0.1:8080", "test", "0.0.0"));
-        build_app_router(config, || H).expect("build_app_router").0
+        Ok(build_app_router(config, || Handler)
+            .context("build_app_router")?
+            .0)
     }
 
-    fn reqlog_req(method: Method, path: &str, peer: &str) -> Request<Body> {
-        Request::builder()
+    fn reqlog_req(method: Method, path: &str, peer: &str) -> anyhow::Result<Request<Body>> {
+        let request = Request::builder()
             .method(method)
             .uri(path)
-            .extension(ConnectInfo(peer.parse::<SocketAddr>().unwrap()))
+            .extension(ConnectInfo(
+                peer.parse::<SocketAddr>().context("test peer address")?,
+            ))
             .body(Body::empty())
-            .unwrap()
+            .context("test request-log body")?;
+        Ok(request)
     }
 
     fn reqlog_req_with_headers(
@@ -7510,19 +7606,24 @@ mod tests {
         path: &str,
         peer: &str,
         headers: &[(&str, &str)],
-    ) -> Request<Body> {
+    ) -> anyhow::Result<Request<Body>> {
         let mut builder = Request::builder()
             .method(method)
             .uri(path)
-            .extension(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+            .extension(ConnectInfo(
+                peer.parse::<SocketAddr>().context("test peer address")?,
+            ));
         for (name, value) in headers {
             builder = builder.header(*name, *value);
         }
-        builder.body(Body::empty()).unwrap()
+        builder.body(Body::empty()).context("test request-log body")
     }
 
-    async fn drive_reqlog(app: &axum::Router, req: Request<Body>) -> Response {
-        app.clone().oneshot(req).await.unwrap()
+    async fn drive_reqlog(app: &axum::Router, req: Request<Body>) -> anyhow::Result<Response> {
+        app.clone()
+            .oneshot(req)
+            .await
+            .context("drive request-log request")
     }
 
     async fn reqlog_lines_after(
@@ -7530,66 +7631,86 @@ mod tests {
         logs: &CapturedLogs,
         req: Request<Body>,
         message: &str,
-    ) -> Vec<String> {
-        let _resp = drive_reqlog(app, req).await;
-        logs.lines_containing(message)
+    ) -> anyhow::Result<Vec<String>> {
+        let _response = drive_reqlog(app, req).await?;
+        Ok(logs.lines_containing(message))
     }
 
+    /// Pins that probe endpoints are excluded from request logging by default
+    /// while `/version` and `/mcp` are logged.
     #[tokio::test]
-    async fn probe_paths_are_not_request_logged_by_default() {
+    async fn probe_paths_are_not_request_logged_by_default() -> anyhow::Result<()> {
         let logs = CapturedLogs::default();
         let _guard = capture_debug_logs(logs.clone());
-        let app = reqlog_router(|cfg| cfg);
+        let app = reqlog_router(|cfg| cfg)?;
 
         for path in ["/healthz", "/readyz"] {
             let before = logs.lines_containing("incoming request").len();
-            let _resp = drive_reqlog(&app, reqlog_req(Method::GET, path, "127.0.0.1:5555")).await;
+            let _probe_response =
+                drive_reqlog(&app, reqlog_req(Method::GET, path, "127.0.0.1:5555")?).await?;
             assert_eq!(logs.lines_containing("incoming request").len(), before);
         }
 
-        let before = logs.lines_containing("incoming request").len();
-        let _resp = drive_reqlog(&app, reqlog_req(Method::GET, "/version", "127.0.0.1:5555")).await;
-        assert_eq!(logs.lines_containing("incoming request").len(), before + 1);
+        let before_version = logs.lines_containing("incoming request").len();
+        let _version_response =
+            drive_reqlog(&app, reqlog_req(Method::GET, "/version", "127.0.0.1:5555")?).await?;
+        assert_eq!(
+            logs.lines_containing("incoming request").len(),
+            before_version + 1
+        );
 
-        let before = logs.lines_containing("incoming request").len();
-        let _resp = drive_reqlog(&app, reqlog_req(Method::POST, "/mcp", "127.0.0.1:5555")).await;
-        assert_eq!(logs.lines_containing("incoming request").len(), before + 1);
+        let before_mcp = logs.lines_containing("incoming request").len();
+        let _mcp_response =
+            drive_reqlog(&app, reqlog_req(Method::POST, "/mcp", "127.0.0.1:5555")?).await?;
+        assert_eq!(
+            logs.lines_containing("incoming request").len(),
+            before_mcp + 1
+        );
+
+        Ok(())
     }
 
+    /// Pins that replacing the request-log exclusion list changes which paths
+    /// are logged.
     #[tokio::test]
-    async fn request_log_exclusion_list_is_replaceable() {
+    async fn request_log_exclusion_list_is_replaceable() -> anyhow::Result<()> {
         let logs = CapturedLogs::default();
         let _guard = capture_debug_logs(logs.clone());
-        let app = reqlog_router(|cfg| cfg.with_request_log_exclude_paths(["/version"]));
+        let app = reqlog_router(|cfg| cfg.with_request_log_exclude_paths(["/version"]))?;
         let healthz = reqlog_lines_after(
             &app,
             &logs,
-            reqlog_req(Method::GET, "/healthz", "127.0.0.1:5555"),
+            reqlog_req(Method::GET, "/healthz", "127.0.0.1:5555")?,
             "incoming request",
         )
-        .await;
+        .await?;
         assert_eq!(healthz.len(), 1);
-        let _resp = drive_reqlog(&app, reqlog_req(Method::GET, "/version", "127.0.0.1:5555")).await;
+        let _version_response =
+            drive_reqlog(&app, reqlog_req(Method::GET, "/version", "127.0.0.1:5555")?).await?;
         assert_eq!(logs.lines_containing("incoming request").len(), 1);
 
-        let logs = CapturedLogs::default();
-        let _guard = capture_debug_logs(logs.clone());
-        let app = reqlog_router(|cfg| cfg.with_request_log_exclude_paths(Vec::<String>::new()));
+        let replacement_logs = CapturedLogs::default();
+        let _replacement_guard = capture_debug_logs(replacement_logs.clone());
+        let replacement_app =
+            reqlog_router(|cfg| cfg.with_request_log_exclude_paths(Vec::<String>::new()))?;
         let lines = reqlog_lines_after(
-            &app,
-            &logs,
-            reqlog_req(Method::GET, "/healthz", "127.0.0.1:5555"),
+            &replacement_app,
+            &replacement_logs,
+            reqlog_req(Method::GET, "/healthz", "127.0.0.1:5555")?,
             "incoming request",
         )
-        .await;
+        .await?;
         assert_eq!(lines.len(), 1);
+
+        Ok(())
     }
 
+    /// Pins that the request log omits client-identifying fields by default.
     #[tokio::test]
-    async fn request_log_omits_client_fields_by_default() {
+    async fn request_log_omits_client_fields_by_default() -> anyhow::Result<()> {
         let logs = CapturedLogs::default();
         let _guard = capture_debug_logs(logs.clone());
-        let app = reqlog_router(|cfg| cfg.with_trusted_proxies(["127.0.0.1/32"]));
+        let app = reqlog_router(|cfg| cfg.with_trusted_proxies(["127.0.0.1/32"]))?;
         let lines = reqlog_lines_after(
             &app,
             &logs,
@@ -7598,22 +7719,26 @@ mod tests {
                 "/mcp",
                 "127.0.0.1:5555",
                 &[("x-forwarded-for", "203.0.113.7"), ("x-request-id", "qa-1")],
-            ),
+            )?,
             "incoming request",
         )
-        .await;
+        .await?;
         assert_eq!(lines.len(), 1);
-        let line = &lines[0];
+        let line = lines.first().context("incoming request line")?;
         for absent in ["client_ip", "peer_ip", "request_id", "mcp_session"] {
             assert!(
                 !line.contains(absent),
                 "{absent} must be absent from {line}"
             );
         }
+
+        Ok(())
     }
 
+    /// Pins that enabling client fields adds `client_ip`, `peer_ip`, and
+    /// `request_id`, with the direct peer winning for untrusted clients.
     #[tokio::test]
-    async fn request_log_carries_enabled_client_fields() {
+    async fn request_log_carries_enabled_client_fields() -> anyhow::Result<()> {
         let logs = CapturedLogs::default();
         let _guard = capture_debug_logs(logs.clone());
         let app = reqlog_router(|cfg| {
@@ -7623,7 +7748,7 @@ mod tests {
                     ctx.peer_ip = true;
                     ctx.request_id = true;
                 }))
-        });
+        })?;
         let lines = reqlog_lines_after(
             &app,
             &logs,
@@ -7632,16 +7757,17 @@ mod tests {
                 "/mcp",
                 "127.0.0.1:5555",
                 &[("x-forwarded-for", "203.0.113.7"), ("x-request-id", "qa-1")],
-            ),
+            )?,
             "incoming request",
         )
-        .await;
+        .await?;
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("client_ip=203.0.113.7"), "{}", lines[0]);
-        assert!(lines[0].contains("peer_ip=127.0.0.1"), "{}", lines[0]);
-        assert!(lines[0].contains("request_id=\"qa-1\""), "{}", lines[0]);
+        let first_line = lines.first().context("first incoming request line")?;
+        assert!(first_line.contains("client_ip=203.0.113.7"), "{first_line}");
+        assert!(first_line.contains("peer_ip=127.0.0.1"), "{first_line}");
+        assert!(first_line.contains("request_id=\"qa-1\""), "{first_line}");
 
-        let lines = reqlog_lines_after(
+        let untrusted_lines = reqlog_lines_after(
             &app,
             &logs,
             reqlog_req_with_headers(
@@ -7649,40 +7775,52 @@ mod tests {
                 "/mcp",
                 "10.9.9.9:5555",
                 &[("x-forwarded-for", "203.0.113.7"), ("x-request-id", "qa-1")],
-            ),
+            )?,
             "incoming request",
         )
-        .await;
-        let line = lines.last().expect("second incoming request line");
+        .await?;
+        let line = untrusted_lines
+            .last()
+            .context("second incoming request line")?;
         assert!(line.contains("client_ip=10.9.9.9"), "{line}");
         assert!(line.contains("peer_ip=10.9.9.9"), "{line}");
         assert!(!line.contains("request_id"), "{line}");
+
+        Ok(())
     }
 
+    /// Pins that `mcp_hints_for_log` reports the protocol-version hint bounded
+    /// to 128 characters, and `None` when it is absent.
     #[test]
-    fn mcp_hints_for_log_bounds_protocol_version() {
-        let mut headers = HeaderMap::new();
+    fn mcp_hints_for_log_bounds_protocol_version() -> anyhow::Result<()> {
+        let mut exact_headers = HeaderMap::new();
         let exact = "a".repeat(128);
-        headers.insert("mcp-protocol-version", exact.parse().unwrap());
-        assert_eq!(mcp_hints_for_log(&headers), (false, Some(exact)));
+        let _previous_exact =
+            exact_headers.insert("mcp-protocol-version", exact.parse().context("exact hint")?);
+        assert_eq!(mcp_hints_for_log(&exact_headers), (false, Some(exact)));
 
-        let mut headers = HeaderMap::new();
+        let mut long_headers = HeaderMap::new();
         let long = "a".repeat(129);
-        headers.insert("mcp-protocol-version", long.parse().unwrap());
+        let _previous_long =
+            long_headers.insert("mcp-protocol-version", long.parse().context("long hint")?);
         assert_eq!(
-            mcp_hints_for_log(&headers),
+            mcp_hints_for_log(&long_headers),
             (false, Some(format!("{}...(truncated)", "a".repeat(128))))
         );
 
-        let headers = HeaderMap::new();
-        assert_eq!(mcp_hints_for_log(&headers), (false, None));
+        let empty_headers = HeaderMap::new();
+        assert_eq!(mcp_hints_for_log(&empty_headers), (false, None));
+
+        Ok(())
     }
 
+    /// Pins that enabling `mcp_hints` logs the session flag and protocol version
+    /// while keeping the session id itself out of the log.
     #[tokio::test]
-    async fn mcp_hints_on_incoming_request() {
+    async fn mcp_hints_on_incoming_request() -> anyhow::Result<()> {
         let logs = CapturedLogs::default();
         let _guard = capture_debug_logs(logs.clone());
-        let app = reqlog_router(|cfg| cfg.with_log_context(knobs(|ctx| ctx.mcp_hints = true)));
+        let app = reqlog_router(|cfg| cfg.with_log_context(knobs(|ctx| ctx.mcp_hints = true)))?;
         let lines = reqlog_lines_after(
             &app,
             &logs,
@@ -7694,40 +7832,46 @@ mod tests {
                     ("mcp-session-id", "secret-session-value"),
                     ("mcp-protocol-version", "2025-06-18"),
                 ],
-            ),
+            )?,
             "incoming request",
         )
-        .await;
+        .await?;
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("mcp_session=true"), "{}", lines[0]);
+        let first_line = lines.first().context("first incoming request line")?;
+        assert!(first_line.contains("mcp_session=true"), "{first_line}");
         assert!(
-            lines[0].contains("mcp_protocol_version=\"2025-06-18\""),
-            "{}",
-            lines[0]
+            first_line.contains("mcp_protocol_version=\"2025-06-18\""),
+            "{first_line}"
         );
         assert!(!logs.contents().contains("secret-session-value"));
 
-        let lines = reqlog_lines_after(
+        let second_lines = reqlog_lines_after(
             &app,
             &logs,
-            reqlog_req(Method::POST, "/mcp", "127.0.0.1:5555"),
+            reqlog_req(Method::POST, "/mcp", "127.0.0.1:5555")?,
             "incoming request",
         )
-        .await;
-        let line = lines.last().expect("second incoming request line");
+        .await?;
+        let line = second_lines
+            .last()
+            .context("second incoming request line")?;
         assert!(line.contains("mcp_session=false"), "{line}");
         assert!(!line.contains("mcp_protocol_version"), "{line}");
+
+        Ok(())
     }
 
+    /// Pins that forwarding headers are redacted in the logged header map while
+    /// the resolved `client_ip` stays visible.
     #[tokio::test]
-    async fn request_log_headers_keep_forwarding_redacted_with_client_ip() {
+    async fn request_log_headers_keep_forwarding_redacted_with_client_ip() -> anyhow::Result<()> {
         let logs = CapturedLogs::default();
         let _guard = capture_debug_logs(logs.clone());
         let app = reqlog_router(|cfg| {
             cfg.enable_request_header_logging()
                 .with_trusted_proxies(["127.0.0.1/32"])
                 .with_log_context(knobs(|ctx| ctx.client_ip = true))
-        });
+        })?;
         let lines = reqlog_lines_after(
             &app,
             &logs,
@@ -7740,21 +7884,26 @@ mod tests {
                     ("x-forwarded-for", "203.0.113.7"),
                     ("x-real-ip", "203.0.113.7"),
                 ],
-            ),
+            )?,
             "incoming request",
         )
-        .await;
-        let line = lines.first().expect("incoming request line");
+        .await?;
+        let line = lines.first().context("incoming request line")?;
         for name in ["forwarded", "x-forwarded-for", "x-real-ip"] {
             assert!(line.contains(&format!("{name}: [REDACTED]")), "{line}");
         }
         assert!(line.contains("client_ip=203.0.113.7"), "{line}");
         let headers_text = line.split("headers=").nth(1).unwrap_or_default();
         assert!(!headers_text.contains("203.0.113.7"), "{line}");
+
+        Ok(())
     }
 
+    /// Pins that a rejected cross-origin request logs exactly one incoming line
+    /// without client fields and no completion line, and `/healthz` stays
+    /// excluded.
     #[tokio::test]
-    async fn origin_rejected_request_logs_once_without_client_fields() {
+    async fn origin_rejected_request_logs_once_without_client_fields() -> anyhow::Result<()> {
         let logs = CapturedLogs::default();
         let _guard = capture_debug_logs(logs.clone());
         let app = reqlog_router(|cfg| {
@@ -7765,7 +7914,7 @@ mod tests {
                     ctx.mcp_hints = true;
                     ctx.request_completion = true;
                 }))
-        });
+        })?;
         let resp = drive_reqlog(
             &app,
             reqlog_req_with_headers(
@@ -7773,14 +7922,15 @@ mod tests {
                 "/mcp",
                 "127.0.0.1:5555",
                 &[("origin", "http://evil.example")],
-            ),
+            )?,
         )
-        .await;
+        .await?;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let incoming = logs.lines_containing("incoming request");
         assert_eq!(incoming.len(), 1);
+        let incoming_line = incoming.first().context("incoming request line")?;
         for absent in ["client_ip", "peer_ip", "mcp_session"] {
-            assert!(!incoming[0].contains(absent), "{}", incoming[0]);
+            assert!(!incoming_line.contains(absent), "{incoming_line}");
         }
         assert_eq!(
             logs.lines_containing("rejected request: Origin not allowed")
@@ -7792,22 +7942,29 @@ mod tests {
             Vec::<String>::new()
         );
 
-        let before = logs.lines_containing("incoming request").len();
-        let _resp = drive_reqlog(
+        let before_healthz = logs.lines_containing("incoming request").len();
+        let _healthz_response = drive_reqlog(
             &app,
             reqlog_req_with_headers(
                 Method::GET,
                 "/healthz",
                 "127.0.0.1:5555",
                 &[("origin", "http://evil.example")],
-            ),
+            )?,
         )
-        .await;
-        assert_eq!(logs.lines_containing("incoming request").len(), before);
+        .await?;
+        assert_eq!(
+            logs.lines_containing("incoming request").len(),
+            before_healthz
+        );
+
+        Ok(())
     }
 
+    /// Pins that completion logging emits one line per served request carrying
+    /// method, path, status, latency, and client ip.
     #[tokio::test]
-    async fn request_completion_line_reports_status_and_latency() {
+    async fn request_completion_line_reports_status_and_latency() -> anyhow::Result<()> {
         let logs = CapturedLogs::default();
         let _guard = capture_debug_logs(logs.clone());
         let app = reqlog_router(|cfg| {
@@ -7815,54 +7972,93 @@ mod tests {
                 ctx.request_completion = true;
                 ctx.client_ip = true;
             }))
-        });
+        })?;
         for (method, path) in [(Method::POST, "/mcp"), (Method::GET, "/version")] {
-            let before = logs.lines_containing("request completed").len();
-            let resp = drive_reqlog(&app, reqlog_req(method.clone(), path, "127.0.0.1:5555")).await;
-            let lines = logs.lines_containing("request completed");
-            assert_eq!(lines.len(), before + 1);
-            let line = lines.last().expect("completion line");
-            assert!(line.contains(&format!("method={method}")), "{line}");
-            assert!(line.contains(&format!("path={path}")), "{line}");
+            let before_completed = logs.lines_containing("request completed").len();
+            let resp =
+                drive_reqlog(&app, reqlog_req(method.clone(), path, "127.0.0.1:5555")?).await?;
+            let completed_lines = logs.lines_containing("request completed");
+            assert_eq!(completed_lines.len(), before_completed + 1);
+            let completed_line = completed_lines.last().context("completion line")?;
             assert!(
-                line.contains(&format!("status={}", resp.status().as_u16())),
-                "{line}"
+                completed_line.contains(&format!("method={method}")),
+                "{completed_line}"
             );
-            assert!(line.contains("latency_ms="), "{line}");
-            assert!(line.contains("client_ip=127.0.0.1"), "{line}");
+            assert!(
+                completed_line.contains(&format!("path={path}")),
+                "{completed_line}"
+            );
+            assert!(
+                completed_line.contains(&format!("status={}", resp.status().as_u16())),
+                "{completed_line}"
+            );
+            assert!(completed_line.contains("latency_ms="), "{completed_line}");
+            assert!(
+                completed_line.contains("client_ip=127.0.0.1"),
+                "{completed_line}"
+            );
         }
+
+        Ok(())
     }
 
+    /// Pins that completion lines are absent by default and for excluded paths,
+    /// but present for a logged path once enabled.
     #[tokio::test]
-    async fn request_completion_line_absent_by_default_and_for_excluded_paths() {
+    async fn request_completion_line_absent_by_default_and_for_excluded_paths() -> anyhow::Result<()>
+    {
         let logs = CapturedLogs::default();
         let _guard = capture_debug_logs(logs.clone());
-        let app = reqlog_router(|cfg| cfg);
-        let _resp = drive_reqlog(&app, reqlog_req(Method::GET, "/version", "127.0.0.1:5555")).await;
+        let app = reqlog_router(|cfg| cfg)?;
+        let _version_response =
+            drive_reqlog(&app, reqlog_req(Method::GET, "/version", "127.0.0.1:5555")?).await?;
         assert_eq!(
             logs.lines_containing("request completed"),
             Vec::<String>::new()
         );
 
-        let logs = CapturedLogs::default();
-        let _guard = capture_debug_logs(logs.clone());
-        let app = reqlog_router(|cfg| {
+        let configured_logs = CapturedLogs::default();
+        let _configured_guard = capture_debug_logs(configured_logs.clone());
+        let configured_app = reqlog_router(|cfg| {
             cfg.with_log_context(knobs(|ctx| {
                 ctx.request_completion = true;
             }))
-        });
-        let _resp = drive_reqlog(&app, reqlog_req(Method::GET, "/healthz", "127.0.0.1:5555")).await;
+        })?;
+        let _healthz_response = drive_reqlog(
+            &configured_app,
+            reqlog_req(Method::GET, "/healthz", "127.0.0.1:5555")?,
+        )
+        .await?;
         assert_eq!(
-            logs.lines_containing("request completed"),
+            configured_logs.lines_containing("request completed"),
             Vec::<String>::new()
         );
-        let _resp = drive_reqlog(&app, reqlog_req(Method::GET, "/version", "127.0.0.1:5555")).await;
-        assert_eq!(logs.lines_containing("request completed").len(), 1);
+        let _configured_version_response = drive_reqlog(
+            &configured_app,
+            reqlog_req(Method::GET, "/version", "127.0.0.1:5555")?,
+        )
+        .await?;
+        assert_eq!(
+            configured_logs.lines_containing("request completed").len(),
+            1
+        );
+
+        Ok(())
     }
 
+    /// Pins that auth failures through the real middleware stack carry resolved
+    /// client, request-id, and credential-classification fields, honored only
+    /// for trusted peers.
     #[tokio::test]
-    async fn auth_failure_through_real_wiring_carries_resolved_client_fields() {
-        let (_token, hash) = crate::auth::generate_api_key().unwrap();
+    #[expect(
+        clippy::too_many_lines,
+        reason = "deliberate: src/transport.rs::auth_failure_through_real_wiring_carries_resolved_client_fields one linear end-to-end scenario; splitting would duplicate the server harness"
+    )]
+    async fn auth_failure_through_real_wiring_carries_resolved_client_fields() -> anyhow::Result<()>
+    {
+        use crate::auth::generate_api_key;
+
+        let (_token, hash) = generate_api_key()?;
         let mut fields = LogContextConfig::recommended();
         fields.request_id = true;
         fields.credential_fingerprint = true;
@@ -7876,7 +8072,7 @@ mod tests {
                     hash,
                     "viewer",
                 )]))
-        });
+        })?;
 
         let resp = drive_reqlog(
             &app,
@@ -7889,15 +8085,15 @@ mod tests {
                     ("x-request-id", "qa-1"),
                     ("user-agent", "probe/1.0"),
                 ],
-            ),
+            )?,
         )
-        .await;
+        .await?;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         let line = logs
             .lines_containing("failure_class=missing_credential")
             .into_iter()
             .next()
-            .unwrap_or_else(|| panic!("missing auth failed line: {}", logs.contents()));
+            .ok_or_else(|| anyhow::anyhow!("missing auth failed line: {}", logs.contents()))?;
         assert!(line.contains("client_ip=203.0.113.7"), "{line}");
         assert!(line.contains("peer_ip=127.0.0.1"), "{line}");
         assert!(line.contains("request_id=\"qa-1\""), "{line}");
@@ -7906,65 +8102,83 @@ mod tests {
         assert!(line.contains("user_agent=\"probe/1.0\""), "{line}");
         assert!(line.contains("auth_scheme=none"), "{line}");
 
-        let before = logs.lines_containing("auth failed").len();
-        let resp = drive_reqlog(
+        let before_untrusted = logs.lines_containing("auth failed").len();
+        let untrusted_resp = drive_reqlog(
             &app,
             reqlog_req_with_headers(
                 Method::POST,
                 "/mcp",
                 "10.9.9.9:5555",
                 &[("x-request-id", "untrusted")],
-            ),
+            )?,
         )
-        .await;
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        let line = logs.lines_containing("auth failed").remove(before);
-        assert!(line.contains("client_ip=10.9.9.9"), "{line}");
-        assert!(!line.contains("request_id"), "{line}");
+        .await?;
+        assert_eq!(untrusted_resp.status(), StatusCode::UNAUTHORIZED);
+        let untrusted_line = logs
+            .lines_containing("auth failed")
+            .remove(before_untrusted);
+        assert!(
+            untrusted_line.contains("client_ip=10.9.9.9"),
+            "{untrusted_line}"
+        );
+        assert!(!untrusted_line.contains("request_id"), "{untrusted_line}");
 
-        let before = logs.lines_containing("auth failed").len();
-        let resp = drive_reqlog(
+        let before_invalid = logs.lines_containing("auth failed").len();
+        let invalid_resp = drive_reqlog(
             &app,
             reqlog_req_with_headers(
                 Method::POST,
                 "/mcp",
                 "127.0.0.1:5555",
                 &[("authorization", "Bearer not-a-key")],
-            ),
+            )?,
         )
-        .await;
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        let line = logs.lines_containing("auth failed").remove(before);
-        assert!(line.contains("failure_class=invalid_credential"), "{line}");
-        assert!(line.contains("token_kind=opaque"), "{line}");
-        assert!(line.contains("credential_fp="), "{line}");
-        assert!(!line.contains("not-a-key"), "{line}");
+        .await?;
+        assert_eq!(invalid_resp.status(), StatusCode::UNAUTHORIZED);
+        let invalid_line = logs.lines_containing("auth failed").remove(before_invalid);
+        assert!(
+            invalid_line.contains("failure_class=invalid_credential"),
+            "{invalid_line}"
+        );
+        assert!(invalid_line.contains("token_kind=opaque"), "{invalid_line}");
+        assert!(invalid_line.contains("credential_fp="), "{invalid_line}");
+        assert!(!invalid_line.contains("not-a-key"), "{invalid_line}");
 
-        let logs = CapturedLogs::default();
-        let _guard = capture_debug_logs(logs.clone());
-        let app = reqlog_router(|cfg| cfg.with_auth(AuthConfig::with_keys(vec![])));
-        let resp = drive_reqlog(
-            &app,
+        let unauthenticated_logs = CapturedLogs::default();
+        let _unauthenticated_guard = capture_debug_logs(unauthenticated_logs.clone());
+        let unauthenticated_app =
+            reqlog_router(|cfg| cfg.with_auth(AuthConfig::with_keys(vec![])))?;
+        let unauthenticated_resp = drive_reqlog(
+            &unauthenticated_app,
             reqlog_req_with_headers(
                 Method::POST,
                 "/mcp",
                 "127.0.0.1:5555",
                 &[("x-request-id", "qa-ignored")],
-            ),
+            )?,
         )
-        .await;
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        let line = logs
+        .await?;
+        assert_eq!(unauthenticated_resp.status(), StatusCode::UNAUTHORIZED);
+        let unauthenticated_line = unauthenticated_logs
             .lines_containing("auth failed")
             .into_iter()
             .next()
-            .unwrap_or_else(|| panic!("missing auth failed line: {}", logs.contents()));
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "missing auth failed line: {}",
+                    unauthenticated_logs.contents()
+                )
+            })?;
         assert!(
-            line.ends_with("auth failed failure_class=missing_credential"),
-            "{line}"
+            unauthenticated_line.ends_with("auth failed failure_class=missing_credential"),
+            "{unauthenticated_line}"
         );
+
+        Ok(())
     }
 
+    /// Pins that an expired configured API key yields a 401 with an `expired`
+    /// challenge and logs the credential owner.
     #[tokio::test]
     async fn expired_api_key_through_real_wiring_names_owner_and_returns_expired_challenge()
     -> anyhow::Result<()> {
@@ -7972,18 +8186,17 @@ mod tests {
         let _guard = capture_debug_logs(logs.clone());
         let mut fields = LogContextConfig::recommended();
         fields.credential_owner = true;
+        let expired_entry = ApiKeyEntry::new(
+            "old-key",
+            "$argon2id$v=19$m=19456,t=2,p=1$BwcHBwcHBwcHBwcHBwcHBw$spS8B9AhHG1LikfhGlssVMfP8mq37+8/mXnl98ps0NU",
+            "viewer",
+        )
+        .try_with_expiry("2020-01-01T00:00:00Z")
+        .context("expiry fixture")?;
         let app = reqlog_router(|cfg| {
             cfg.with_log_context(fields)
-                .with_auth(AuthConfig::with_keys(vec![
-                    ApiKeyEntry::new(
-                        "old-key",
-                        "$argon2id$v=19$m=19456,t=2,p=1$BwcHBwcHBwcHBwcHBwcHBw$spS8B9AhHG1LikfhGlssVMfP8mq37+8/mXnl98ps0NU",
-                        "viewer",
-                    )
-                    .try_with_expiry("2020-01-01T00:00:00Z")
-                    .unwrap(),
-                ]))
-        });
+                .with_auth(AuthConfig::with_keys(vec![expired_entry]))
+        })?;
         let resp = drive_reqlog(
             &app,
             reqlog_req_with_headers(
@@ -7991,17 +8204,17 @@ mod tests {
                 "/mcp",
                 "127.0.0.1:5555",
                 &[("authorization", "Bearer golden-vector-token-0p5p3")],
-            ),
+            )?,
         )
-        .await;
+        .await?;
 
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         let challenge = resp
             .headers()
             .get(header::WWW_AUTHENTICATE)
-            .unwrap()
+            .context("WWW-Authenticate header")?
             .to_str()
-            .unwrap()
+            .context("challenge is ASCII")?
             .to_owned();
         assert!(challenge.contains("error_description=\"token is expired\""));
         assert_eq!(body_string(resp).await?, "unauthorized: expired credential");
@@ -8009,16 +8222,25 @@ mod tests {
             .lines_containing("failure_class=expired_credential")
             .into_iter()
             .next()
-            .unwrap_or_else(|| panic!("missing expired auth failed line: {}", logs.contents()));
+            .ok_or_else(|| {
+                anyhow::anyhow!("missing expired auth failed line: {}", logs.contents())
+            })?;
         assert!(line.contains("credential_owner=\"old-key\""), "{line}");
         assert!(line.contains("credential_rejection=expired"), "{line}");
 
         Ok(())
     }
 
+    /// Pins that an RBAC denial through the real wiring returns 403 and logs the
+    /// resolved client fields.
     #[tokio::test]
-    async fn rbac_denial_through_real_wiring_carries_client_fields() {
-        let (token, hash) = crate::auth::generate_api_key().unwrap();
+    async fn rbac_denial_through_real_wiring_carries_client_fields() -> anyhow::Result<()> {
+        use crate::{
+            auth::generate_api_key,
+            rbac::{RbacConfig, RoleConfig},
+        };
+
+        let (token, hash) = generate_api_key()?;
         let logs = CapturedLogs::default();
         let _guard = capture_debug_logs(logs.clone());
         let app = reqlog_router(|cfg| {
@@ -8033,17 +8255,13 @@ mod tests {
                     hash,
                     "viewer",
                 )]))
-                .with_rbac(Arc::new(RbacPolicy::new(
-                    &crate::rbac::RbacConfig::with_roles(vec![crate::rbac::RoleConfig::new(
-                        "viewer",
-                        vec!["echo".into()],
-                        vec!["*".into()],
-                    )]),
-                )))
-        });
+                .with_rbac(Arc::new(RbacPolicy::new(&RbacConfig::with_roles(vec![
+                    RoleConfig::new("viewer", vec!["echo".into()], vec!["*".into()]),
+                ]))))
+        })?;
         let body = serde_json::json!({
             "jsonrpc": "2.0",
-            "id": 1,
+            "id": 1_i32,
             "method": "tools/call",
             "params": { "name": "forbidden", "arguments": {} }
         })
@@ -8051,27 +8269,35 @@ mod tests {
         let req = Request::builder()
             .method(Method::POST)
             .uri("/mcp")
-            .extension(ConnectInfo("127.0.0.1:5555".parse::<SocketAddr>().unwrap()))
+            .extension(ConnectInfo(
+                "127.0.0.1:5555"
+                    .parse::<SocketAddr>()
+                    .context("test peer address")?,
+            ))
             .header("authorization", format!("Bearer {token}"))
             .header("content-type", "application/json")
             .header("x-forwarded-for", "203.0.113.7")
             .header("x-request-id", "qa-2")
             .body(Body::from(body))
-            .unwrap();
+            .context("test RBAC request body")?;
 
-        let resp = drive_reqlog(&app, req).await;
+        let resp = drive_reqlog(&app, req).await?;
 
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let line = logs
             .lines_containing("RBAC denied")
             .into_iter()
             .next()
-            .unwrap_or_else(|| panic!("missing RBAC denied line: {}", logs.contents()));
+            .ok_or_else(|| anyhow::anyhow!("missing RBAC denied line: {}", logs.contents()))?;
         assert!(line.contains("client_ip=203.0.113.7"), "{line}");
         assert!(line.contains("peer_ip=127.0.0.1"), "{line}");
         assert!(line.contains("request_id=\"qa-2\""), "{line}");
+
+        Ok(())
     }
 
+    /// Pins that with no forward resolver, `ClientIp` equals the direct peer and
+    /// `x-forwarded-for` is ignored.
     #[tokio::test]
     async fn client_ip_equals_direct_without_resolver() -> anyhow::Result<()> {
         let app = forwarded_probe_router(None);
@@ -8079,9 +8305,8 @@ mod tests {
             .oneshot(probe_req(
                 "10.1.2.3:4444",
                 Some(("x-forwarded-for", "203.0.113.7")),
-            ))
-            .await
-            .unwrap();
+            )?)
+            .await?;
         assert_eq!(
             body_string(resp).await?,
             "10.1.2.3|10.1.2.3",
@@ -8091,19 +8316,20 @@ mod tests {
         Ok(())
     }
 
+    /// Pins that a trusted peer's forwarded chain resolves `ClientIp` while
+    /// `PeerAddr` stays direct.
     #[tokio::test]
     async fn client_ip_resolved_for_trusted_peer() -> anyhow::Result<()> {
         let app = forwarded_probe_router(Some(forward_resolver(
             &["10.0.0.0/8"],
             ForwardedHeaderMode::XForwardedFor,
-        )));
+        )?));
         let resp = app
             .oneshot(probe_req(
                 "10.0.0.1:9999",
                 Some(("x-forwarded-for", "203.0.113.7")),
-            ))
-            .await
-            .unwrap();
+            )?)
+            .await?;
         assert_eq!(
             body_string(resp).await?,
             "10.0.0.1|203.0.113.7",
@@ -8113,19 +8339,19 @@ mod tests {
         Ok(())
     }
 
+    /// Pins that a malformed forwarded chain falls back to the direct peer.
     #[tokio::test]
     async fn client_ip_falls_back_to_direct_on_malformed_header() -> anyhow::Result<()> {
         let app = forwarded_probe_router(Some(forward_resolver(
             &["10.0.0.0/8"],
             ForwardedHeaderMode::XForwardedFor,
-        )));
+        )?));
         let resp = app
             .oneshot(probe_req(
                 "10.0.0.1:9999",
                 Some(("x-forwarded-for", "not-an-ip")),
-            ))
-            .await
-            .unwrap();
+            )?)
+            .await?;
         assert_eq!(
             body_string(resp).await?,
             "10.0.0.1|10.0.0.1",
