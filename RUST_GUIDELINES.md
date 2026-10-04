@@ -225,10 +225,30 @@ entry in the same PR that introduces a deviation.
    in lib-test. It is the narrowest scope rustc accepts, together with the
    facade expectation above the only inner expectations in `src/lib.rs`.
    Evidence: the task-11 migration record.
+13. **2026-10-04 - `impl_trait_in_params` is frozen, not converted (task 12
+   probe).** The Section 9 profile denies `clippy::impl_trait_in_params`, so
+   every public `impl Trait`-in-parameter site needs a fix or an expectation.
+   Converting an impl-Trait-only public fn to named generics is treated as a
+   breaking change by the semver arbiter (D-7): a scratch probe converted
+   `ToolCallContext::for_tool(tool_name: impl Into<String>)` to
+   `for_tool<T: Into<String>>(tool_name: T)` and `cargo semver-checks
+   check-release` then failed with
+   `method_requires_different_generic_type_params` ("takes 1 generic types
+   instead of 0"; 222 pass / 1 fail), because an argument-position `impl Trait`
+   counts as zero explicit generic type parameters. The equivalent downstream
+   calls (a plain call and a coercion to a `fn` pointer) still compiled against
+   the converted fn, but D-7 names semver-checks the arbiter, so every public
+   `impl_trait_in_params` site (47 diagnostics / 39 signature lines) is frozen
+   with `#[expect(clippy::impl_trait_in_params, reason = "public API frozen
+   until the next major release")]`, and mixed-shape sites (explicit generics +
+   `impl Trait`) are frozen without probing. The lanes add the per-item
+   expectations; this entry records the decision that governs them. Evidence:
+   the task-12 migration record (`probe.txt`, `probe-converted.txt`).
 
 Entries to be added by the work that creates them: "new in `<version>`"
-expects and profile deltas (the toolchain-drift work); frozen public-API items
-(the lint lanes); the GitLab mirror skew tolerance, if it is ever required.
+expects and profile deltas (the toolchain-drift work); the per-item frozen
+public-API expectations (the lint lanes, under entry 13's decision); the GitLab
+mirror skew tolerance, if it is ever required.
 
 ## Re-vendor procedure
 
