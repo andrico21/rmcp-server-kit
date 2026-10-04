@@ -5,30 +5,6 @@
 //! 2. Bearer token (API key) with Argon2id hash verification
 //!
 //! Includes per-source-IP rate limiting on authentication attempts.
-#![cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::missing_panics_doc, reason = "lint-migration: src/auth.rs")
-)]
-#![cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::shadow_reuse, reason = "lint-migration: src/auth.rs")
-)]
-#![cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::min_ident_chars, reason = "lint-migration: src/auth.rs")
-)]
-#![cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::absolute_paths, reason = "lint-migration: src/auth.rs")
-)]
-#![cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::std_instead_of_core, reason = "lint-migration: src/auth.rs")
-)]
-#![cfg_attr(
-    all(test, target_os = "linux"),
-    expect(unused_results, reason = "lint-migration: src/auth.rs")
-)]
 
 extern crate alloc;
 
@@ -2344,72 +2320,33 @@ pub(crate) async fn auth_middleware(
     unauthorized_response(&state, failure_class.0)
 }
 
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::indexing_slicing, reason = "lint-migration: src/auth.rs")
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "test code is not rendered API documentation"
 )]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::too_long_first_doc_paragraph,
-        reason = "test code is not rendered API documentation"
-    )
+#[expect(
+    clippy::missing_panics_doc,
+    reason = "test code is not rendered API documentation"
 )]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::deref_by_slicing, reason = "lint-migration: src/auth.rs")
+#[expect(
+    clippy::too_long_first_doc_paragraph,
+    reason = "test code is not rendered API documentation"
 )]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::shadow_unrelated, reason = "lint-migration: src/auth.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::panic, reason = "lint-migration: src/auth.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::default_numeric_fallback,
-        reason = "lint-migration: src/auth.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::assertions_on_result_states,
-        reason = "lint-migration: src/auth.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::unwrap_used, reason = "lint-migration: src/auth.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::expect_used, reason = "lint-migration: src/auth.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::single_char_lifetime_names,
-        reason = "lint-migration: src/auth.rs"
-    )
-)]
-#[cfg_attr(
-    test,
-    expect(closure_returning_async_block, reason = "lint-migration: src/auth.rs")
-)]
-#[cfg_attr(
-    test,
-    expect(redundant_imports, reason = "lint-migration: src/auth.rs")
-)]
+#[expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")]
 #[cfg(test)]
 mod tests {
-    use std::net::IpAddr;
+    use core::slice::from_ref;
+    use std::io::{Result as IoResult, Write};
+
+    use anyhow::Context as _;
+    use axum::{http::HeaderValue, middleware::from_fn, routing::post};
+    use tracing::subscriber::set_default;
+    use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
-    use crate::transport::RateLimitKey;
+    #[cfg(feature = "metrics")]
+    use crate::metrics::McpMetrics;
+    use crate::transport::{ClientIp, PeerAddr, RequestId};
 
     #[derive(Clone, Default)]
     struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
@@ -2423,23 +2360,23 @@ mod tests {
 
     struct CapturedLogsWriter(Arc<Mutex<Vec<u8>>>);
 
-    impl std::io::Write for CapturedLogsWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    impl Write for CapturedLogsWriter {
+        fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
             if let Ok(mut guard) = self.0.lock() {
                 guard.extend_from_slice(buf);
             }
             Ok(buf.len())
         }
 
-        fn flush(&mut self) -> std::io::Result<()> {
+        fn flush(&mut self) -> IoResult<()> {
             Ok(())
         }
     }
 
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+    impl<'log> MakeWriter<'log> for CapturedLogs {
         type Writer = CapturedLogsWriter;
 
-        fn make_writer(&'a self) -> Self::Writer {
+        fn make_writer(&'log self) -> Self::Writer {
             CapturedLogsWriter(Arc::clone(&self.0))
         }
     }
@@ -2453,13 +2390,15 @@ mod tests {
     const ARGON2_0_5_TOKEN: &str = "golden-vector-token-0p5p3";
     const ARGON2_0_5_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$BwcHBwcHBwcHBwcHBwcHBw$spS8B9AhHG1LikfhGlssVMfP8mq37+8/mXnl98ps0NU";
 
+    /// Argon2 0 5 produced hash still verifies.
     #[test]
-    fn argon2_0_5_produced_hash_still_verifies() {
+    fn argon2_0_5_produced_hash_still_verifies() -> anyhow::Result<()> {
         let parsed =
-            PasswordHash::new(ARGON2_0_5_HASH).expect("a 0.5-era PHC string must still parse");
+            PasswordHash::new(ARGON2_0_5_HASH).context("a 0.5-era PHC string must still parse")?;
         Argon2::default()
             .verify_password(ARGON2_0_5_TOKEN.as_bytes(), &parsed)
-            .expect("already-deployed API keys must keep verifying across the argon2 upgrade");
+            .context("already-deployed API keys must keep verifying across the argon2 upgrade")?;
+        Ok(())
     }
 
     /// The dummy hash burned on a miss must cost the same as a real one.
@@ -2470,10 +2409,10 @@ mod tests {
     /// measurement. Forcing `DUMMY_PHC_HASH` here also surfaces a `LazyLock`
     /// panic in CI rather than at the first production auth.
     #[test]
-    fn dummy_and_real_hashes_share_cost_parameters() {
-        let (_token, real_hash) = generate_api_key().expect("key generation must succeed");
-        let real = PasswordHash::new(&real_hash).expect("generated hash must parse");
-        let dummy = PasswordHash::new(&DUMMY_PHC_HASH).expect("dummy hash must parse");
+    fn dummy_and_real_hashes_share_cost_parameters() -> anyhow::Result<()> {
+        let (_token, real_hash) = generate_api_key().context("key generation must succeed")?;
+        let real = PasswordHash::new(&real_hash).context("generated hash must parse")?;
+        let dummy = PasswordHash::new(&DUMMY_PHC_HASH).context("dummy hash must parse")?;
 
         assert_eq!(dummy.algorithm, real.algorithm, "algorithm must match");
         assert_eq!(dummy.version, real.version, "PHC version must match");
@@ -2481,11 +2420,13 @@ mod tests {
             dummy.params, real.params,
             "m/t/p must match or the dummy no longer costs what a real verification costs"
         );
+        Ok(())
     }
 
+    /// Generate and verify api key.
     #[test]
-    fn generate_and_verify_api_key() {
-        let (token, hash) = generate_api_key().unwrap();
+    fn generate_and_verify_api_key() -> anyhow::Result<()> {
+        let (token, hash) = generate_api_key()?;
 
         // Token is 43 chars (256-bit base64url, no padding)
         assert_eq!(token.len(), 43);
@@ -2502,33 +2443,37 @@ mod tests {
         }];
         let id = verify_bearer_token(&token, &keys);
         assert!(id.is_some());
-        let id = id.unwrap();
-        assert_eq!(id.name, "test");
-        assert_eq!(id.role, "viewer");
-        assert_eq!(id.method, AuthMethod::BearerToken);
+        let identity = id.context("valid token must yield an identity")?;
+        assert_eq!(identity.name, "test");
+        assert_eq!(identity.role, "viewer");
+        assert_eq!(identity.method, AuthMethod::BearerToken);
+        Ok(())
     }
 
+    /// Verify bearer token uses the matched slot role.
     #[test]
-    fn verify_bearer_token_uses_the_matched_slot_role() {
-        let (admin_token, admin_hash) = generate_api_key().unwrap();
-        let (viewer_token, viewer_hash) = generate_api_key().unwrap();
+    fn verify_bearer_token_uses_the_matched_slot_role() -> anyhow::Result<()> {
+        let (admin_token, admin_hash) = generate_api_key()?;
+        let (viewer_token, viewer_hash) = generate_api_key()?;
         let keys = vec![
             ApiKeyEntry::new("svc", admin_hash, "admin"),
             ApiKeyEntry::new("svc", viewer_hash, "viewer"),
         ];
 
         let viewer = verify_bearer_token(&viewer_token, &keys)
-            .expect("viewer token must authenticate from its own slot");
+            .context("viewer token must authenticate from its own slot")?;
         let admin = verify_bearer_token(&admin_token, &keys)
-            .expect("admin token must authenticate from its own slot");
+            .context("admin token must authenticate from its own slot")?;
 
         assert_eq!(viewer.role, "viewer");
         assert_eq!(admin.role, "admin");
+        Ok(())
     }
 
+    /// Wrong token rejected.
     #[test]
-    fn wrong_token_rejected() {
-        let (_token, hash) = generate_api_key().unwrap();
+    fn wrong_token_rejected() -> anyhow::Result<()> {
+        let (_token, hash) = generate_api_key()?;
         let keys = vec![ApiKeyEntry {
             name: "test".into(),
             hash,
@@ -2536,24 +2481,28 @@ mod tests {
             expires_at: None,
         }];
         assert!(verify_bearer_token("wrong-token", &keys).is_none());
+        Ok(())
     }
 
+    /// Expired key rejected.
     #[test]
-    fn expired_key_rejected() {
-        let (token, hash) = generate_api_key().unwrap();
+    fn expired_key_rejected() -> anyhow::Result<()> {
+        let (token, hash) = generate_api_key()?;
         let keys = vec![ApiKeyEntry {
             name: "test".into(),
             hash,
             role: "viewer".into(),
-            expires_at: Some(RfcTimestamp::parse("2020-01-01T00:00:00Z").unwrap()),
+            expires_at: Some(RfcTimestamp::parse("2020-01-01T00:00:00Z")?),
         }];
         assert!(verify_bearer_token(&token, &keys).is_none());
+        Ok(())
     }
 
+    /// Match in last slot still authenticates.
     #[test]
-    fn match_in_last_slot_still_authenticates() {
-        let (token, hash) = generate_api_key().unwrap();
-        let (_other_token, other_hash) = generate_api_key().unwrap();
+    fn match_in_last_slot_still_authenticates() -> anyhow::Result<()> {
+        let (token, hash) = generate_api_key()?;
+        let (_other_token, other_hash) = generate_api_key()?;
         let keys = vec![
             ApiKeyEntry {
                 name: "first".into(),
@@ -2574,21 +2523,23 @@ mod tests {
                 expires_at: None,
             },
         ];
-        let id = verify_bearer_token(&token, &keys).expect("last-slot match must authenticate");
+        let id = verify_bearer_token(&token, &keys).context("last-slot match must authenticate")?;
         assert_eq!(id.name, "match");
         assert_eq!(id.role, "ops");
+        Ok(())
     }
 
+    /// Expired slot before valid match does not short circuit.
     #[test]
-    fn expired_slot_before_valid_match_does_not_short_circuit() {
-        let (token, hash) = generate_api_key().unwrap();
-        let (_, other_hash) = generate_api_key().unwrap();
+    fn expired_slot_before_valid_match_does_not_short_circuit() -> anyhow::Result<()> {
+        let (token, hash) = generate_api_key()?;
+        let (_, other_hash) = generate_api_key()?;
         let keys = vec![
             ApiKeyEntry {
                 name: "expired".into(),
                 hash: other_hash,
                 role: "viewer".into(),
-                expires_at: Some(RfcTimestamp::parse("2020-01-01T00:00:00Z").unwrap()),
+                expires_at: Some(RfcTimestamp::parse("2020-01-01T00:00:00Z")?),
             },
             ApiKeyEntry {
                 name: "valid".into(),
@@ -2598,13 +2549,15 @@ mod tests {
             },
         ];
         let id = verify_bearer_token(&token, &keys)
-            .expect("valid slot following an expired slot must authenticate");
+            .context("valid slot following an expired slot must authenticate")?;
         assert_eq!(id.name, "valid");
+        Ok(())
     }
 
+    /// Malformed hash slot does not short circuit.
     #[test]
-    fn malformed_hash_slot_does_not_short_circuit() {
-        let (token, hash) = generate_api_key().unwrap();
+    fn malformed_hash_slot_does_not_short_circuit() -> anyhow::Result<()> {
+        let (token, hash) = generate_api_key()?;
         let keys = vec![
             ApiKeyEntry {
                 name: "broken".into(),
@@ -2620,34 +2573,37 @@ mod tests {
             },
         ];
         let id = verify_bearer_token(&token, &keys)
-            .expect("valid slot following a malformed-hash slot must authenticate");
+            .context("valid slot following a malformed-hash slot must authenticate")?;
         assert_eq!(id.name, "valid");
+        Ok(())
     }
 
-    fn fixed_now() -> chrono::DateTime<chrono::Utc> {
-        chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-            .expect("fixed timestamp parses")
-            .with_timezone(&chrono::Utc)
+    fn fixed_now() -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
+        Ok(
+            chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")?
+                .with_timezone(&chrono::Utc),
+        )
     }
 
-    fn slot_key(name: &str, hash: &str, expires_at: Option<&str>) -> ApiKeyEntry {
+    fn slot_key(name: &str, hash: &str, expires_at: Option<&str>) -> anyhow::Result<ApiKeyEntry> {
         let mut key = ApiKeyEntry::new(name, hash, "viewer");
         if let Some(expiry) = expires_at {
-            key.expires_at = Some(RfcTimestamp::parse(expiry).expect("expiry parses"));
+            key.expires_at = Some(RfcTimestamp::parse(expiry)?);
         }
-        key
+        Ok(key)
     }
 
+    /// Slots no match verifies every slot.
     #[test]
-    fn slots_no_match_verifies_every_slot() {
+    fn slots_no_match_verifies_every_slot() -> anyhow::Result<()> {
         let keys = vec![
-            slot_key("a", ARGON2_0_5_HASH, None),
-            slot_key("b", ARGON2_0_5_HASH, None),
-            slot_key("old", ARGON2_0_5_HASH, Some("2020-01-01T00:00:00Z")),
+            slot_key("a", ARGON2_0_5_HASH, None)?,
+            slot_key("b", ARGON2_0_5_HASH, None)?,
+            slot_key("old", ARGON2_0_5_HASH, Some("2020-01-01T00:00:00Z"))?,
         ];
         let mut calls = Vec::new();
 
-        let verdict = verify_slots("unknown", &keys, fixed_now(), |_, hash| {
+        let verdict = verify_slots("unknown", &keys, fixed_now()?, |_, hash| {
             calls.push(hash.to_string());
             false
         });
@@ -2655,17 +2611,19 @@ mod tests {
         assert_eq!(verdict, ApiKeyVerdict::NoMatch);
         assert_eq!(calls.len(), keys.len());
         assert_eq!(calls.get(2).map(String::as_str), Some(ARGON2_0_5_HASH));
+        Ok(())
     }
 
+    /// Slots active then expired same secret.
     #[test]
-    fn slots_active_then_expired_same_secret() {
+    fn slots_active_then_expired_same_secret() -> anyhow::Result<()> {
         let keys = vec![
-            slot_key("new", ARGON2_0_5_HASH, None),
-            slot_key("old", ARGON2_0_5_HASH, Some("2020-01-01T00:00:00Z")),
+            slot_key("new", ARGON2_0_5_HASH, None)?,
+            slot_key("old", ARGON2_0_5_HASH, Some("2020-01-01T00:00:00Z"))?,
         ];
         let mut calls = Vec::new();
 
-        let verdict = verify_slots(ARGON2_0_5_TOKEN, &keys, fixed_now(), |token, hash| {
+        let verdict = verify_slots(ARGON2_0_5_TOKEN, &keys, fixed_now()?, |token, hash| {
             calls.push(hash.to_string());
             hash.to_string() == ARGON2_0_5_HASH && token == ARGON2_0_5_TOKEN.as_bytes()
         });
@@ -2679,16 +2637,18 @@ mod tests {
         );
         assert_eq!(calls.len(), keys.len());
         assert_eq!(calls.get(1).map(String::as_str), Some(ARGON2_0_5_HASH));
+        Ok(())
     }
 
+    /// Slots expired then active same secret.
     #[test]
-    fn slots_expired_then_active_same_secret() {
+    fn slots_expired_then_active_same_secret() -> anyhow::Result<()> {
         let keys = vec![
-            slot_key("old", ARGON2_0_5_HASH, Some("2020-01-01T00:00:00Z")),
-            slot_key("new", ARGON2_0_5_HASH, None),
+            slot_key("old", ARGON2_0_5_HASH, Some("2020-01-01T00:00:00Z"))?,
+            slot_key("new", ARGON2_0_5_HASH, None)?,
         ];
 
-        let verdict = verify_slots(ARGON2_0_5_TOKEN, &keys, fixed_now(), |token, hash| {
+        let verdict = verify_slots(ARGON2_0_5_TOKEN, &keys, fixed_now()?, |token, hash| {
             hash.to_string() == ARGON2_0_5_HASH && token == ARGON2_0_5_TOKEN.as_bytes()
         });
 
@@ -2699,17 +2659,19 @@ mod tests {
                 role: "viewer".into()
             }
         );
+        Ok(())
     }
 
+    /// Slots malformed hash uses dummy.
     #[test]
-    fn slots_malformed_hash_uses_dummy() {
+    fn slots_malformed_hash_uses_dummy() -> anyhow::Result<()> {
         let keys = vec![
-            slot_key("broken", "not-a-phc", None),
-            slot_key("old", ARGON2_0_5_HASH, Some("2020-01-01T00:00:00Z")),
+            slot_key("broken", "not-a-phc", None)?,
+            slot_key("old", ARGON2_0_5_HASH, Some("2020-01-01T00:00:00Z"))?,
         ];
         let mut calls = Vec::new();
 
-        let verdict = verify_slots("unknown", &keys, fixed_now(), |_, hash| {
+        let verdict = verify_slots("unknown", &keys, fixed_now()?, |_, hash| {
             calls.push(hash.to_string());
             false
         });
@@ -2721,16 +2683,18 @@ mod tests {
             Some(DUMMY_PHC_HASH.as_str())
         );
         assert_eq!(calls.get(1).map(String::as_str), Some(ARGON2_0_5_HASH));
+        Ok(())
     }
 
+    /// Slots all expired reports first expired match.
     #[test]
-    fn slots_all_expired_reports_first_expired_match() {
+    fn slots_all_expired_reports_first_expired_match() -> anyhow::Result<()> {
         let keys = vec![
-            slot_key("first", ARGON2_0_5_HASH, Some("2020-01-01T00:00:00Z")),
-            slot_key("second", ARGON2_0_5_HASH, Some("2020-01-01T00:00:00Z")),
+            slot_key("first", ARGON2_0_5_HASH, Some("2020-01-01T00:00:00Z"))?,
+            slot_key("second", ARGON2_0_5_HASH, Some("2020-01-01T00:00:00Z"))?,
         ];
 
-        let verdict = verify_slots(ARGON2_0_5_TOKEN, &keys, fixed_now(), |token, hash| {
+        let verdict = verify_slots(ARGON2_0_5_TOKEN, &keys, fixed_now()?, |token, hash| {
             hash.to_string() == ARGON2_0_5_HASH && token == ARGON2_0_5_TOKEN.as_bytes()
         });
 
@@ -2740,30 +2704,34 @@ mod tests {
                 name: "first".into()
             }
         );
+        Ok(())
     }
 
+    /// Slots blank name expired is no match.
     #[test]
-    fn slots_blank_name_expired_is_no_match() {
+    fn slots_blank_name_expired_is_no_match() -> anyhow::Result<()> {
         let keys = vec![slot_key(
             "  ",
             ARGON2_0_5_HASH,
             Some("2020-01-01T00:00:00Z"),
-        )];
+        )?];
 
-        let verdict = verify_slots(ARGON2_0_5_TOKEN, &keys, fixed_now(), |token, hash| {
+        let verdict = verify_slots(ARGON2_0_5_TOKEN, &keys, fixed_now()?, |token, hash| {
             hash.to_string() == ARGON2_0_5_HASH && token == ARGON2_0_5_TOKEN.as_bytes()
         });
 
         assert_eq!(verdict, ApiKeyVerdict::NoMatch);
+        Ok(())
     }
 
+    /// Verdict reports expired match by name.
     #[test]
-    fn verdict_reports_expired_match_by_name() {
+    fn verdict_reports_expired_match_by_name() -> anyhow::Result<()> {
         let keys = vec![slot_key(
             "old-key",
             ARGON2_0_5_HASH,
             Some("2020-01-01T00:00:00Z"),
-        )];
+        )?];
 
         assert_eq!(
             verify_bearer_token_verdict(ARGON2_0_5_TOKEN, &keys),
@@ -2772,6 +2740,7 @@ mod tests {
             }
         );
         assert!(verify_bearer_token(ARGON2_0_5_TOKEN, &keys).is_none());
+        Ok(())
     }
 
     // Regression tests for H3 (api_key_expires_at_fail_open).
@@ -2784,8 +2753,13 @@ mod tests {
     // deserialization time (no `RfcTimestamp` can ever be malformed),
     // and the runtime check is a pure comparison with no parse path.
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/auth.rs::rfc_timestamp_parse_rejects_malformed keeps the uniform test signature while it only asserts"
+    )]
+    /// Rfc timestamp parse rejects malformed.
     #[test]
-    fn rfc_timestamp_parse_rejects_malformed() {
+    fn rfc_timestamp_parse_rejects_malformed() -> anyhow::Result<()> {
         for bad in [
             "not-a-date",
             "",
@@ -2800,10 +2774,16 @@ mod tests {
                 "RfcTimestamp::parse must reject {bad:?}"
             );
         }
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/auth.rs::rfc_timestamp_parse_accepts_valid keeps the uniform test signature while it only asserts"
+    )]
+    /// Rfc timestamp parse accepts valid.
     #[test]
-    fn rfc_timestamp_parse_accepts_valid() {
+    fn rfc_timestamp_parse_accepts_valid() -> anyhow::Result<()> {
         for good in [
             "2025-01-01T00:00:00Z",
             "2025-01-01T00:00:00+00:00",
@@ -2815,10 +2795,16 @@ mod tests {
                 "RfcTimestamp::parse must accept {good:?}"
             );
         }
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/auth.rs::api_key_entry_deserialize_rejects_malformed_expires_at keeps the uniform test signature while it only asserts"
+    )]
+    /// Api key entry deserialize rejects malformed expires at.
     #[test]
-    fn api_key_entry_deserialize_rejects_malformed_expires_at() {
+    fn api_key_entry_deserialize_rejects_malformed_expires_at() -> anyhow::Result<()> {
         // TOML with a malformed expires_at must fail to deserialize.
         // This is the load-time defense: a typo in auth.toml aborts
         // config load with a clear serde error, instead of producing
@@ -2834,22 +2820,26 @@ mod tests {
             result.is_err(),
             "deserialization must reject malformed expires_at"
         );
+        Ok(())
     }
 
+    /// Api key entry deserialize accepts valid expires at.
     #[test]
-    fn api_key_entry_deserialize_accepts_valid_expires_at() {
+    fn api_key_entry_deserialize_accepts_valid_expires_at() -> anyhow::Result<()> {
         let toml = r#"
             name = "good-key"
             hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$h4sh"
             role = "viewer"
             expires_at = "2099-01-01T00:00:00Z"
         "#;
-        let entry: ApiKeyEntry = toml::from_str(toml).expect("valid RFC 3339 must deserialize");
+        let entry: ApiKeyEntry = toml::from_str(toml).context("valid RFC 3339 must deserialize")?;
         assert!(entry.expires_at.is_some());
+        Ok(())
     }
 
+    /// Api key entry deserialize accepts missing expires at.
     #[test]
-    fn api_key_entry_deserialize_accepts_missing_expires_at() {
+    fn api_key_entry_deserialize_accepts_missing_expires_at() -> anyhow::Result<()> {
         // Omitting expires_at must continue to mean "no expiry"; this
         // is the documented contract and must survive the H3 fix.
         let toml = r#"
@@ -2857,54 +2847,70 @@ mod tests {
             hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$h4sh"
             role = "viewer"
         "#;
-        let entry: ApiKeyEntry = toml::from_str(toml).expect("missing expires_at must deserialize");
+        let entry: ApiKeyEntry =
+            toml::from_str(toml).context("missing expires_at must deserialize")?;
         assert!(entry.expires_at.is_none());
+        Ok(())
     }
 
+    /// Mtls crl deny on unavailable defaults to fail closed.
     #[test]
-    fn mtls_crl_deny_on_unavailable_defaults_to_fail_closed() {
+    fn mtls_crl_deny_on_unavailable_defaults_to_fail_closed() -> anyhow::Result<()> {
         // Every in-crate test helper builds MtlsConfig via a struct literal,
         // which bypasses serde defaults entirely. Only a deserialization from
         // TOML that omits the key exercises the shipped default.
         let toml = r#"
             ca_cert_path = "/etc/certs/clients-ca.pem"
         "#;
-        let cfg: MtlsConfig = toml::from_str(toml).expect("minimal mtls config must deserialize");
+        let cfg: MtlsConfig =
+            toml::from_str(toml).context("minimal mtls config must deserialize")?;
         assert!(
             cfg.crl_deny_on_unavailable,
             "omitting crl_deny_on_unavailable must fail closed (RFC 5280 6.3)"
         );
+        Ok(())
     }
 
+    /// Mtls crl deny on unavailable opt out is honoured.
     #[test]
-    fn mtls_crl_deny_on_unavailable_opt_out_is_honoured() {
+    fn mtls_crl_deny_on_unavailable_opt_out_is_honoured() -> anyhow::Result<()> {
         let toml = r#"
             ca_cert_path = "/etc/certs/clients-ca.pem"
             crl_deny_on_unavailable = false
         "#;
-        let cfg: MtlsConfig = toml::from_str(toml).expect("opt-out config must deserialize");
+        let cfg: MtlsConfig = toml::from_str(toml).context("opt-out config must deserialize")?;
         assert!(
             !cfg.crl_deny_on_unavailable,
             "an explicit false must still select fail-open"
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/auth.rs::try_with_expiry_rejects_malformed keeps the uniform test signature while it only asserts"
+    )]
+    /// Try with expiry rejects malformed.
     #[test]
-    fn try_with_expiry_rejects_malformed() {
+    fn try_with_expiry_rejects_malformed() -> anyhow::Result<()> {
         let entry = ApiKeyEntry::new("k", "hash", "viewer");
-        assert!(entry.try_with_expiry("not-a-date").is_err());
+        assert!(entry.try_with_expiry("not-a-date").err().is_some());
+        Ok(())
     }
 
+    /// Try with expiry accepts valid.
     #[test]
-    fn try_with_expiry_accepts_valid() {
+    fn try_with_expiry_accepts_valid() -> anyhow::Result<()> {
         let entry = ApiKeyEntry::new("k", "hash", "viewer")
             .try_with_expiry("2099-01-01T00:00:00Z")
-            .expect("valid RFC 3339 must be accepted");
+            .context("valid RFC 3339 must be accepted")?;
         assert!(entry.expires_at.is_some());
+        Ok(())
     }
 
+    /// Api key summary serializes expires at as rfc3339.
     #[test]
-    fn api_key_summary_serializes_expires_at_as_rfc3339() {
+    fn api_key_summary_serializes_expires_at_as_rfc3339() -> anyhow::Result<()> {
         // The admin endpoint wire format is `{"expires_at": "RFC 3339 str"}`.
         // Pinning this prevents an accidental serialization-format change
         // (e.g. chrono's debug form, a Unix timestamp) that would silently
@@ -2912,30 +2918,34 @@ mod tests {
         let summary = ApiKeySummary {
             name: "k".into(),
             role: "viewer".into(),
-            expires_at: Some(RfcTimestamp::parse("2030-01-01T00:00:00Z").unwrap()),
+            expires_at: Some(RfcTimestamp::parse("2030-01-01T00:00:00Z")?),
         };
-        let json = serde_json::to_string(&summary).unwrap();
+        let json = serde_json::to_string(&summary)?;
         assert!(
             json.contains(r#""expires_at":"2030-01-01T00:00:00+00:00""#),
             "wire format regressed: {json}"
         );
+        Ok(())
     }
 
+    /// Future expiry accepted.
     #[test]
-    fn future_expiry_accepted() {
-        let (token, hash) = generate_api_key().unwrap();
+    fn future_expiry_accepted() -> anyhow::Result<()> {
+        let (token, hash) = generate_api_key()?;
         let keys = vec![ApiKeyEntry {
             name: "test".into(),
             hash,
             role: "viewer".into(),
-            expires_at: Some(RfcTimestamp::parse("2099-01-01T00:00:00Z").unwrap()),
+            expires_at: Some(RfcTimestamp::parse("2099-01-01T00:00:00Z")?),
         }];
         assert!(verify_bearer_token(&token, &keys).is_some());
+        Ok(())
     }
 
+    /// Multiple keys first match wins.
     #[test]
-    fn multiple_keys_first_match_wins() {
-        let (token, hash) = generate_api_key().unwrap();
+    fn multiple_keys_first_match_wins() -> anyhow::Result<()> {
+        let (token, hash) = generate_api_key()?;
         let keys = vec![
             ApiKeyEntry {
                 name: "wrong".into(),
@@ -2950,13 +2960,15 @@ mod tests {
                 expires_at: None,
             },
         ];
-        let id = verify_bearer_token(&token, &keys).unwrap();
+        let id = verify_bearer_token(&token, &keys).context("correct token must authenticate")?;
         assert_eq!(id.name, "correct");
         assert_eq!(id.role, "deploy");
+        Ok(())
     }
 
+    /// Rate limiter allows within quota.
     #[test]
-    fn rate_limiter_allows_within_quota() {
+    fn rate_limiter_allows_within_quota() -> anyhow::Result<()> {
         let config = RateLimitConfig {
             max_attempts_per_minute: 5,
             pre_auth_max_per_minute: None,
@@ -2967,18 +2979,20 @@ mod tests {
             key_eviction_policy: KeyEvictionPolicy::default(),
         };
         let limiter = build_rate_limiter(&config);
-        let ip = RateLimitKey::Ip("10.0.0.1".parse::<IpAddr>().unwrap());
+        let ip = RateLimitKey::Ip("10.0.0.1".parse::<IpAddr>()?);
 
         // First 5 should succeed.
-        for _ in 0..5 {
-            assert!(limiter.check_key(&ip).is_ok());
+        for _ in 0..5_u32 {
+            assert!(limiter.check_key(&ip).ok().is_some());
         }
         // 6th should fail.
         assert!(limiter.check_key(&ip).is_err());
+        Ok(())
     }
 
+    /// Rate limiter separate ips.
     #[test]
-    fn rate_limiter_separate_ips() {
+    fn rate_limiter_separate_ips() -> anyhow::Result<()> {
         let config = RateLimitConfig {
             max_attempts_per_minute: 2,
             pre_auth_max_per_minute: None,
@@ -2989,115 +3003,127 @@ mod tests {
             key_eviction_policy: KeyEvictionPolicy::default(),
         };
         let limiter = build_rate_limiter(&config);
-        let ip1 = RateLimitKey::Ip("10.0.0.1".parse::<IpAddr>().unwrap());
-        let ip2 = RateLimitKey::Ip("10.0.0.2".parse::<IpAddr>().unwrap());
+        let ip1 = RateLimitKey::Ip("10.0.0.1".parse::<IpAddr>()?);
+        let ip2 = RateLimitKey::Ip("10.0.0.2".parse::<IpAddr>()?);
 
         // Exhaust ip1's quota.
-        assert!(limiter.check_key(&ip1).is_ok());
-        assert!(limiter.check_key(&ip1).is_ok());
+        assert!(limiter.check_key(&ip1).ok().is_some());
+        assert!(limiter.check_key(&ip1).ok().is_some());
         assert!(limiter.check_key(&ip1).is_err());
 
         // ip2 should still have quota.
-        assert!(limiter.check_key(&ip2).is_ok());
+        assert!(limiter.check_key(&ip2).ok().is_some());
+        Ok(())
     }
 
+    /// Extract mtls identity from cn.
     #[test]
-    fn extract_mtls_identity_from_cn() {
+    fn extract_mtls_identity_from_cn() -> anyhow::Result<()> {
         // Generate a cert with explicit CN.
-        let mut params = rcgen::CertificateParams::new(vec!["test-client.local".into()]).unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["test-client.local".into()])?;
         params.distinguished_name = rcgen::DistinguishedName::new();
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "test-client");
-        let cert = params
-            .self_signed(&rcgen::KeyPair::generate().unwrap())
-            .unwrap();
+        let cert = params.self_signed(&rcgen::KeyPair::generate()?)?;
         let der = cert.der();
 
-        let id = extract_mtls_identity(der, "ops").unwrap();
+        let id = extract_mtls_identity(der, "ops").context("certificate must yield an identity")?;
         assert_eq!(id.name, "test-client");
         assert_eq!(id.role, "ops");
         assert_eq!(id.method, AuthMethod::MtlsCertificate);
+        Ok(())
     }
 
+    /// Extract mtls identity falls back to san.
     #[test]
-    fn extract_mtls_identity_falls_back_to_san() {
+    fn extract_mtls_identity_falls_back_to_san() -> anyhow::Result<()> {
         // Cert with no CN but has a DNS SAN.
-        let mut params =
-            rcgen::CertificateParams::new(vec!["san-only.example.com".into()]).unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["san-only.example.com".into()])?;
         params.distinguished_name = rcgen::DistinguishedName::new();
         // No CN set - should fall back to DNS SAN.
-        let cert = params
-            .self_signed(&rcgen::KeyPair::generate().unwrap())
-            .unwrap();
+        let cert = params.self_signed(&rcgen::KeyPair::generate()?)?;
         let der = cert.der();
 
-        let id = extract_mtls_identity(der, "viewer").unwrap();
+        let id =
+            extract_mtls_identity(der, "viewer").context("certificate must yield an identity")?;
         assert_eq!(id.name, "san-only.example.com");
         assert_eq!(id.role, "viewer");
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/auth.rs::extract_mtls_identity_invalid_der keeps the uniform test signature while it only asserts"
+    )]
+    /// Extract mtls identity invalid der.
     #[test]
-    fn extract_mtls_identity_invalid_der() {
+    fn extract_mtls_identity_invalid_der() -> anyhow::Result<()> {
         assert!(extract_mtls_identity(b"not-a-cert", "viewer").is_none());
+        Ok(())
     }
 
+    /// Extract mtls identity blank cn falls back to san.
     #[test]
-    fn extract_mtls_identity_blank_cn_falls_back_to_san() {
+    fn extract_mtls_identity_blank_cn_falls_back_to_san() -> anyhow::Result<()> {
         // A present-but-blank CN must not shadow a usable DNS SAN. The pre-fix
         // `or_else` never reached the SAN here because `Some("")` short-circuited it.
-        let mut params =
-            rcgen::CertificateParams::new(vec!["san-fallback.example.com".into()]).unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["san-fallback.example.com".into()])?;
         params.distinguished_name = rcgen::DistinguishedName::new();
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "");
-        let cert = params
-            .self_signed(&rcgen::KeyPair::generate().unwrap())
-            .unwrap();
+        let cert = params.self_signed(&rcgen::KeyPair::generate()?)?;
 
-        let id = extract_mtls_identity(cert.der(), "viewer").unwrap();
+        let id = extract_mtls_identity(cert.der(), "viewer")
+            .context("certificate must yield an identity")?;
         assert_eq!(id.name, "san-fallback.example.com");
         assert_eq!(id.role, "viewer");
+        Ok(())
     }
 
+    /// Extract mtls identity blank cn without san yields none.
     #[test]
-    fn extract_mtls_identity_blank_cn_without_san_yields_none() {
-        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    fn extract_mtls_identity_blank_cn_without_san_yields_none() -> anyhow::Result<()> {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new())?;
         params.distinguished_name = rcgen::DistinguishedName::new();
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "");
-        let cert = params
-            .self_signed(&rcgen::KeyPair::generate().unwrap())
-            .unwrap();
+        let cert = params.self_signed(&rcgen::KeyPair::generate()?)?;
 
         assert!(extract_mtls_identity(cert.der(), "viewer").is_none());
+        Ok(())
     }
 
+    /// Extract mtls identity whitespace cn behaves as blank.
     #[test]
-    fn extract_mtls_identity_whitespace_cn_behaves_as_blank() {
-        let mut params =
-            rcgen::CertificateParams::new(vec!["san-fallback.example.com".into()]).unwrap();
+    fn extract_mtls_identity_whitespace_cn_behaves_as_blank() -> anyhow::Result<()> {
+        let mut params = rcgen::CertificateParams::new(vec!["san-fallback.example.com".into()])?;
         params.distinguished_name = rcgen::DistinguishedName::new();
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "   ");
-        let cert = params
-            .self_signed(&rcgen::KeyPair::generate().unwrap())
-            .unwrap();
+        let cert = params.self_signed(&rcgen::KeyPair::generate()?)?;
 
-        let id = extract_mtls_identity(cert.der(), "viewer").unwrap();
+        let id = extract_mtls_identity(cert.der(), "viewer")
+            .context("certificate must yield an identity")?;
         assert_eq!(id.name, "san-fallback.example.com");
+        Ok(())
     }
 
+    /// Validate api key names rejects blank and whitespace.
     #[test]
-    fn validate_api_key_names_rejects_blank_and_whitespace() {
+    fn validate_api_key_names_rejects_blank_and_whitespace() -> anyhow::Result<()> {
         let blank = AuthConfig::with_keys(vec![
             ApiKeyEntry::new("ok", "hash", "viewer"),
             ApiKeyEntry::new("", "hash", "viewer"),
         ]);
-        let err = blank.validate_api_key_names().unwrap_err().to_string();
+        let err = blank
+            .validate_api_key_names()
+            .err()
+            .context("blank name must be rejected")?
+            .to_string();
         assert!(
             err.contains("api_keys[1]"),
             "must name offending index: {err}"
@@ -3107,11 +3133,13 @@ mod tests {
         assert!(whitespace.validate_api_key_names().is_err());
 
         let ok = AuthConfig::with_keys(vec![ApiKeyEntry::new("viewer-key", "hash", "viewer")]);
-        assert!(ok.validate_api_key_names().is_ok());
+        assert!(ok.validate_api_key_names().ok().is_some());
+        Ok(())
     }
 
+    /// Check api key names rejects same name different role.
     #[test]
-    fn check_api_key_names_rejects_same_name_different_role() {
+    fn check_api_key_names_rejects_same_name_different_role() -> anyhow::Result<()> {
         // Two entries share a name but declare different roles. The name alone
         // is the session/task-binding principal identity, so this is one label
         // for two authorization profiles -- rejected.
@@ -3119,7 +3147,10 @@ mod tests {
             ApiKeyEntry::new("ops", "hash-a", "admin"),
             ApiKeyEntry::new("ops", "hash-b", "viewer"),
         ];
-        let err = check_api_key_names(&keys).unwrap_err().to_string();
+        let err = check_api_key_names(&keys)
+            .err()
+            .context("same-name different-role keys must be rejected")?
+            .to_string();
         assert!(
             err.contains("api_keys[1]"),
             "must name the offending index: {err}"
@@ -3135,10 +3166,16 @@ mod tests {
                 .is_err(),
             "validate_api_key_names must reject the same contradiction"
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/auth.rs::check_api_key_names_permits_same_name_same_role_rotation keeps the uniform test signature while it only asserts"
+    )]
+    /// Check api key names permits same name same role rotation.
     #[test]
-    fn check_api_key_names_permits_same_name_same_role_rotation() {
+    fn check_api_key_names_permits_same_name_same_role_rotation() -> anyhow::Result<()> {
         // Same name + same role is credential rotation (one principal, two
         // secrets): explicitly allowed so key rollover keeps working.
         let keys = vec![
@@ -3149,18 +3186,28 @@ mod tests {
             check_api_key_names(&keys).is_ok(),
             "same-name same-role rotation must be permitted"
         );
-        assert!(AuthConfig::with_keys(keys).validate_api_key_names().is_ok());
+        assert!(
+            AuthConfig::with_keys(keys)
+                .validate_api_key_names()
+                .ok()
+                .is_some()
+        );
+        Ok(())
     }
 
+    /// Check api key names rejects blank name.
     #[test]
-    fn check_api_key_names_rejects_blank_name() {
+    fn check_api_key_names_rejects_blank_name() -> anyhow::Result<()> {
         // Regression guard: the blank-name rule still fires now that the
         // same-name/different-role rule is enforced alongside it.
         let keys = vec![
             ApiKeyEntry::new("ok", "hash", "viewer"),
             ApiKeyEntry::new("   ", "hash", "viewer"),
         ];
-        let err = check_api_key_names(&keys).unwrap_err().to_string();
+        let err = check_api_key_names(&keys)
+            .err()
+            .context("blank name must be rejected")?
+            .to_string();
         assert!(
             err.contains("api_keys[1]"),
             "must name the blank index: {err}"
@@ -3169,16 +3216,19 @@ mod tests {
             err.contains("blank name"),
             "must cite the blank-name rule: {err}"
         );
+        Ok(())
     }
 
+    /// Try reload keys rejects blank name and keeps previous.
     #[test]
-    fn try_reload_keys_rejects_blank_name_and_keeps_previous() {
-        let (token, hash) = generate_api_key().unwrap();
+    fn try_reload_keys_rejects_blank_name_and_keeps_previous() -> anyhow::Result<()> {
+        let (token, hash) = generate_api_key()?;
         let state = test_auth_state(vec![ApiKeyEntry::new("prev-key", hash, "ops")]);
 
         let err = state
             .try_reload_keys(vec![ApiKeyEntry::new("  ", "unused-hash", "ops")])
-            .unwrap_err()
+            .err()
+            .context("blank name must be rejected")?
             .to_string();
         assert!(
             err.contains("api_keys[0]"),
@@ -3190,11 +3240,13 @@ mod tests {
             verify_bearer_token(&token, &installed).is_some(),
             "the previous key must remain installed after a rejected reload"
         );
+        Ok(())
     }
 
+    /// Verify bearer token rejects blank named key.
     #[test]
-    fn verify_bearer_token_rejects_blank_named_key() {
-        let (token, hash) = generate_api_key().unwrap();
+    fn verify_bearer_token_rejects_blank_named_key() -> anyhow::Result<()> {
+        let (token, hash) = generate_api_key()?;
         let blank = ApiKeyEntry {
             name: String::new(),
             hash: hash.clone(),
@@ -3202,7 +3254,7 @@ mod tests {
             expires_at: None,
         };
         assert!(
-            verify_bearer_token(&token, std::slice::from_ref(&blank)).is_none(),
+            verify_bearer_token(&token, from_ref(&blank)).is_none(),
             "a valid token for a blank-named key must yield no identity"
         );
 
@@ -3213,32 +3265,34 @@ mod tests {
             expires_at: None,
         };
         assert!(
-            verify_bearer_token(&token, std::slice::from_ref(&whitespace)).is_none(),
+            verify_bearer_token(&token, from_ref(&whitespace)).is_none(),
             "a whitespace-only key name must be treated as blank"
         );
 
         let named = ApiKeyEntry::new("real-key", hash, "ops");
         assert!(
-            verify_bearer_token(&token, std::slice::from_ref(&named)).is_some(),
+            verify_bearer_token(&token, from_ref(&named)).is_some(),
             "a non-blank key name must still authenticate"
         );
+        Ok(())
     }
 
     // -- auth_middleware integration tests --
 
-    use axum::{
-        body::Body,
-        http::{Request, StatusCode},
-    };
     use http_body_util::BodyExt as _;
     use tower::ServiceExt as _;
 
+    /// Static `ok` handler for the test router.
+    async fn ok_handler() -> &'static str {
+        "ok"
+    }
+
     fn auth_router(state: Arc<AuthState>) -> axum::Router {
         axum::Router::new()
-            .route("/mcp", axum::routing::post(|| async { "ok" }))
-            .layer(axum::middleware::from_fn(move |req, next| {
-                let s = Arc::clone(&state);
-                auth_middleware(s, req, next)
+            .route("/mcp", post(ok_handler))
+            .layer(from_fn(move |req, next| {
+                let state_clone = Arc::clone(&state);
+                auth_middleware(state_clone, req, next)
             }))
     }
 
@@ -3271,7 +3325,7 @@ mod tests {
     async fn capture_auth_failure_log(
         state: Arc<AuthState>,
         req: Request<Body>,
-    ) -> (StatusCode, String) {
+    ) -> anyhow::Result<(StatusCode, String)> {
         let logs = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(logs.clone())
@@ -3279,53 +3333,50 @@ mod tests {
             .without_time()
             .finish();
         let app = auth_router(state);
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = set_default(subscriber);
         let status = app
             .oneshot(req)
             .await
-            .expect("auth request must complete")
+            .context("auth request must complete")?
             .status();
-        (status, logs.contents())
+        Ok((status, logs.contents()))
     }
 
-    fn auth_request(uri: &str) -> Request<Body> {
-        Request::builder()
+    fn auth_request(uri: &str) -> anyhow::Result<Request<Body>> {
+        Ok(Request::builder()
             .method(Method::POST)
             .uri(uri)
-            .body(Body::empty())
-            .expect("request must build")
+            .body(Body::empty())?)
     }
 
-    fn auth_request_with_all_context() -> Request<Body> {
-        let mut req = auth_request("/mcp?probe=1");
-        req.headers_mut().insert(
-            header::USER_AGENT,
-            axum::http::HeaderValue::from_static("probe/1.0"),
-        );
-        req.headers_mut().insert(
-            "x-request-id",
-            axum::http::HeaderValue::from_static("ignored"),
-        );
-        req.extensions_mut().insert(crate::transport::ClientIp::new(
-            "203.0.113.7".parse().expect("ip parses"),
+    fn auth_request_with_all_context() -> anyhow::Result<Request<Body>> {
+        let mut req = auth_request("/mcp?probe=1")?;
+        let _previous_1 = req
+            .headers_mut()
+            .insert(header::USER_AGENT, HeaderValue::from_static("probe/1.0"));
+        let _previous_2 = req
+            .headers_mut()
+            .insert("x-request-id", HeaderValue::from_static("ignored"));
+        let _previous_17 = req
+            .extensions_mut()
+            .insert(ClientIp::new("203.0.113.7".parse().context("ip parses")?));
+        let _previous_18 = req.extensions_mut().insert(PeerAddr::new(
+            "127.0.0.1:5555".parse().context("socket parses")?,
         ));
-        req.extensions_mut().insert(crate::transport::PeerAddr::new(
-            "127.0.0.1:5555".parse().expect("socket parses"),
-        ));
-        req.extensions_mut()
-            .insert(crate::transport::RequestId::new("qa-1"));
-        req.extensions_mut().insert(ConnectInfo(
+        let _previous_19 = req.extensions_mut().insert(RequestId::new("qa-1"));
+        let _previous_6 = req.extensions_mut().insert(ConnectInfo(
             "127.0.0.1:5555"
                 .parse::<SocketAddr>()
-                .expect("socket parses"),
+                .context("socket parses")?,
         ));
-        req
+        Ok(req)
     }
 
-    fn assert_auth_failed_line<'a>(logs: &'a str, needle: &str) -> &'a str {
-        logs.lines()
-            .find(|line| line.contains(needle))
-            .unwrap_or_else(|| panic!("missing {needle:?} in logs: {logs}"))
+    fn assert_auth_failed_line<'log>(logs: &'log str, needle: &str) -> anyhow::Result<&'log str> {
+        let Some(line) = logs.lines().find(|line| line.contains(needle)) else {
+            anyhow::bail!("missing {needle:?} in logs: {logs}");
+        };
+        Ok(line)
     }
 
     fn knobs(mut configure: impl FnMut(&mut LogContextConfig)) -> LogContextConfig {
@@ -3334,32 +3385,35 @@ mod tests {
         fields
     }
 
+    /// Auth failure log omits client context by default.
     #[tokio::test]
-    async fn auth_failure_log_omits_client_context_by_default() {
+    async fn auth_failure_log_omits_client_context_by_default() -> anyhow::Result<()> {
         let state = test_auth_state(vec![]);
-        let req = auth_request_with_all_context();
+        let req = auth_request_with_all_context()?;
 
-        let (status, logs) = capture_auth_failure_log(state, req).await;
+        let (status, logs) = capture_auth_failure_log(state, req).await?;
 
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        let line = assert_auth_failed_line(&logs, "auth failed");
+        let line = assert_auth_failed_line(&logs, "auth failed")?;
         assert!(
             line.ends_with("auth failed failure_class=missing_credential"),
             "default log must preserve golden suffix: {line}"
         );
+        Ok(())
     }
 
+    /// Auth failure log carries client context.
     #[tokio::test]
-    async fn auth_failure_log_carries_client_context() {
+    async fn auth_failure_log_carries_client_context() -> anyhow::Result<()> {
         let mut fields = LogContextConfig::recommended();
         fields.request_id = true;
         let state = test_auth_state_with_log_context(vec![], fields);
 
         let (status, logs) =
-            capture_auth_failure_log(Arc::clone(&state), auth_request_with_all_context()).await;
+            capture_auth_failure_log(Arc::clone(&state), auth_request_with_all_context()?).await?;
 
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        let line = assert_auth_failed_line(&logs, "failure_class=missing_credential");
+        let line = assert_auth_failed_line(&logs, "failure_class=missing_credential")?;
         assert!(line.contains("client_ip=203.0.113.7"), "{line}");
         assert!(line.contains("peer_ip=127.0.0.1"), "{line}");
         assert!(line.contains("request_id=\"qa-1\""), "{line}");
@@ -3373,54 +3427,61 @@ mod tests {
             "query string must not be logged: {line}"
         );
 
-        let mut bearer = auth_request_with_all_context();
-        bearer.headers_mut().insert(
+        let mut bearer = auth_request_with_all_context()?;
+        let _previous_7 = bearer.headers_mut().insert(
             header::AUTHORIZATION,
-            axum::http::HeaderValue::from_static("Bearer not-a-key"),
+            HeaderValue::from_static("Bearer not-a-key"),
         );
-        let (_, logs) = capture_auth_failure_log(Arc::clone(&state), bearer).await;
-        let line = assert_auth_failed_line(&logs, "failure_class=invalid_credential");
-        assert!(line.contains("auth_scheme=bearer"), "{line}");
-        assert!(line.contains("token_kind=opaque"), "{line}");
+        let (_, bearer_logs) = capture_auth_failure_log(Arc::clone(&state), bearer).await?;
+        let bearer_line =
+            assert_auth_failed_line(&bearer_logs, "failure_class=invalid_credential")?;
+        assert!(bearer_line.contains("auth_scheme=bearer"), "{bearer_line}");
+        assert!(bearer_line.contains("token_kind=opaque"), "{bearer_line}");
         assert!(
-            !line.contains("not-a-key"),
-            "credential must not leak: {line}"
+            !bearer_line.contains("not-a-key"),
+            "credential must not leak: {bearer_line}"
         );
 
-        let mut basic = auth_request_with_all_context();
-        basic.headers_mut().insert(
-            header::AUTHORIZATION,
-            axum::http::HeaderValue::from_static("Basic abc"),
-        );
-        let (_, logs) = capture_auth_failure_log(state, basic).await;
-        let line = assert_auth_failed_line(&logs, "failure_class=invalid_credential");
-        assert!(line.contains("auth_scheme=basic"), "{line}");
+        let mut basic = auth_request_with_all_context()?;
+        let _previous_8 = basic
+            .headers_mut()
+            .insert(header::AUTHORIZATION, HeaderValue::from_static("Basic abc"));
+        let (_, basic_logs) = capture_auth_failure_log(state, basic).await?;
+        let basic_line = assert_auth_failed_line(&basic_logs, "failure_class=invalid_credential")?;
+        assert!(basic_line.contains("auth_scheme=basic"), "{basic_line}");
         assert!(
-            !line.contains("token_kind"),
-            "non-bearer token kind omitted: {line}"
+            !basic_line.contains("token_kind"),
+            "non-bearer token kind omitted: {basic_line}"
         );
-        assert!(!line.contains("abc"), "credential must not leak: {line}");
+        assert!(
+            !basic_line.contains("abc"),
+            "credential must not leak: {basic_line}"
+        );
+        Ok(())
     }
 
+    /// Auth failure client ip falls back to connect info.
     #[tokio::test]
-    async fn auth_failure_client_ip_falls_back_to_connect_info() {
+    async fn auth_failure_client_ip_falls_back_to_connect_info() -> anyhow::Result<()> {
         let fields = knobs(|ctx| ctx.client_ip = true);
         let state = test_auth_state_with_log_context(vec![], fields);
-        let mut req = auth_request("/mcp");
-        req.extensions_mut().insert(ConnectInfo(
+        let mut req = auth_request("/mcp")?;
+        let _previous_9 = req.extensions_mut().insert(ConnectInfo(
             "10.9.8.7:1234"
                 .parse::<SocketAddr>()
-                .expect("socket parses"),
+                .context("socket parses")?,
         ));
 
-        let (_, logs) = capture_auth_failure_log(state, req).await;
-        let line = assert_auth_failed_line(&logs, "auth failed");
+        let (_, logs) = capture_auth_failure_log(state, req).await?;
+        let line = assert_auth_failed_line(&logs, "auth failed")?;
 
         assert!(line.contains("client_ip=10.9.8.7"), "{line}");
+        Ok(())
     }
 
+    /// Auth failure auth shape fields.
     #[tokio::test]
-    async fn auth_failure_auth_shape_fields() {
+    async fn auth_failure_auth_shape_fields() -> anyhow::Result<()> {
         let fields = knobs(|ctx| ctx.auth_scheme = true);
         let state = test_auth_state_with_log_context(vec![], fields);
         let cases = [
@@ -3439,49 +3500,50 @@ mod tests {
             (Some("Digest x"), "auth_scheme=other", None),
         ];
         for (header_value, scheme, kind) in cases {
-            let mut req = auth_request("/mcp");
-            if let Some(header_value) = header_value {
-                req.headers_mut().insert(
-                    header::AUTHORIZATION,
-                    axum::http::HeaderValue::from_static(header_value),
-                );
+            let mut req = auth_request("/mcp")?;
+            if let Some(value) = header_value {
+                let _previous_10 = req
+                    .headers_mut()
+                    .insert(header::AUTHORIZATION, HeaderValue::from_static(value));
             }
-            let (_, logs) = capture_auth_failure_log(Arc::clone(&state), req).await;
-            let line = assert_auth_failed_line(&logs, "auth failed");
+            let (_, logs) = capture_auth_failure_log(Arc::clone(&state), req).await?;
+            let line = assert_auth_failed_line(&logs, "auth failed")?;
             assert!(line.contains(scheme), "{line}");
-            if let Some(kind) = kind {
-                assert!(line.contains(kind), "{line}");
+            if let Some(expected_kind) = kind {
+                assert!(line.contains(expected_kind), "{line}");
             } else {
                 assert!(!line.contains("token_kind"), "{line}");
             }
         }
 
-        let mut req = auth_request("/mcp");
-        req.headers_mut().insert(
+        let mut req = auth_request("/mcp")?;
+        let _previous_11 = req.headers_mut().insert(
             header::AUTHORIZATION,
-            axum::http::HeaderValue::from_bytes(b"\xff").expect("non-utf8 header builds"),
+            HeaderValue::from_bytes(b"\xff").context("non-utf8 header builds")?,
         );
-        let (_, logs) = capture_auth_failure_log(state, req).await;
-        let line = assert_auth_failed_line(&logs, "auth failed");
+        let (_, logs) = capture_auth_failure_log(state, req).await?;
+        let line = assert_auth_failed_line(&logs, "auth failed")?;
         assert!(line.contains("auth_scheme=other"), "{line}");
+        Ok(())
     }
 
+    /// Auth failure mcp hints.
     #[tokio::test]
-    async fn auth_failure_mcp_hints() {
+    async fn auth_failure_mcp_hints() -> anyhow::Result<()> {
         let fields = knobs(|ctx| ctx.mcp_hints = true);
         let state = test_auth_state_with_log_context(vec![], fields);
-        let mut req = auth_request("/mcp");
-        req.headers_mut().insert(
+        let mut req = auth_request("/mcp")?;
+        let _previous_12 = req.headers_mut().insert(
             "mcp-session-id",
-            axum::http::HeaderValue::from_static("secret-session-value"),
+            HeaderValue::from_static("secret-session-value"),
         );
-        req.headers_mut().insert(
+        let _previous_13 = req.headers_mut().insert(
             "mcp-protocol-version",
-            axum::http::HeaderValue::from_static("2025-06-18"),
+            HeaderValue::from_static("2025-06-18"),
         );
 
-        let (_, logs) = capture_auth_failure_log(state, req).await;
-        let line = assert_auth_failed_line(&logs, "auth failed");
+        let (_, logs) = capture_auth_failure_log(state, req).await?;
+        let line = assert_auth_failed_line(&logs, "auth failed")?;
 
         assert!(line.contains("mcp_session=true"), "{line}");
         assert!(
@@ -3489,117 +3551,134 @@ mod tests {
             "{line}"
         );
         assert!(!line.contains("secret-session-value"), "{line}");
+        Ok(())
     }
 
-    fn credential_fp_from_line(line: &str) -> &str {
-        line.split_whitespace()
+    fn credential_fp_from_line(line: &str) -> anyhow::Result<&str> {
+        let Some(found) = line
+            .split_whitespace()
             .find_map(|part| part.strip_prefix("credential_fp="))
-            .unwrap_or_else(|| panic!("credential_fp missing from line: {line}"))
+        else {
+            anyhow::bail!("credential_fp missing from line: {line}");
+        };
+        Ok(found)
     }
 
+    /// Capture the failure log for a bearer request in the given state.
+    async fn run(state: Arc<AuthState>, header_value: &'static str) -> anyhow::Result<String> {
+        let mut req = auth_request("/mcp")?;
+        let _previous_14 = req.headers_mut().insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static(header_value),
+        );
+        Ok(capture_auth_failure_log(state, req).await?.1)
+    }
+
+    /// Auth failure credential fingerprint is stable and bearer only.
     #[tokio::test]
-    async fn auth_failure_credential_fingerprint_is_stable_and_bearer_only() {
+    async fn auth_failure_credential_fingerprint_is_stable_and_bearer_only() -> anyhow::Result<()> {
         let fields = knobs(|ctx| ctx.credential_fingerprint = true);
         let state = test_auth_state_with_log_context(vec![], fields);
-        let run = |state: Arc<AuthState>, header_value: &'static str| async move {
-            let mut req = auth_request("/mcp");
-            req.headers_mut().insert(
-                header::AUTHORIZATION,
-                axum::http::HeaderValue::from_static(header_value),
-            );
-            capture_auth_failure_log(state, req).await.1
-        };
 
-        let logs_a1 = run(Arc::clone(&state), "Bearer tok-A").await;
-        let line_a1 = assert_auth_failed_line(&logs_a1, "auth failed");
-        let fp_a1 = credential_fp_from_line(line_a1);
+        let logs_a1 = run(Arc::clone(&state), "Bearer tok-A").await?;
+        let line_a1 = assert_auth_failed_line(&logs_a1, "auth failed")?;
+        let fp_a1 = credential_fp_from_line(line_a1)?;
         assert_eq!(fp_a1.len(), 8, "{line_a1}");
-        assert!(fp_a1.chars().all(|c| c.is_ascii_hexdigit()), "{line_a1}");
+        assert!(fp_a1.chars().all(|ch| ch.is_ascii_hexdigit()), "{line_a1}");
 
-        let logs_a2 = run(Arc::clone(&state), "Bearer tok-A").await;
-        let fp_a2 = credential_fp_from_line(assert_auth_failed_line(&logs_a2, "auth failed"));
+        let logs_a2 = run(Arc::clone(&state), "Bearer tok-A").await?;
+        let fp_a2 = credential_fp_from_line(assert_auth_failed_line(&logs_a2, "auth failed")?)?;
         assert_eq!(fp_a1, fp_a2);
 
-        let logs_b = run(Arc::clone(&state), "Bearer tok-B").await;
-        let fp_b = credential_fp_from_line(assert_auth_failed_line(&logs_b, "auth failed"));
+        let logs_b = run(Arc::clone(&state), "Bearer tok-B").await?;
+        let fp_b = credential_fp_from_line(assert_auth_failed_line(&logs_b, "auth failed")?)?;
         assert_ne!(fp_a1, fp_b);
 
-        let logs_basic = run(Arc::clone(&state), "Basic tok-A").await;
-        let line_basic = assert_auth_failed_line(&logs_basic, "auth failed");
+        let logs_basic = run(Arc::clone(&state), "Basic tok-A").await?;
+        let line_basic = assert_auth_failed_line(&logs_basic, "auth failed")?;
         assert!(!line_basic.contains("credential_fp"), "{line_basic}");
 
         let all_logs = format!("{logs_a1}{logs_a2}{logs_b}{logs_basic}");
         assert!(!all_logs.contains("tok-A"), "{all_logs}");
         assert!(!all_logs.contains("tok-B"), "{all_logs}");
 
-        let state = test_auth_state_with_log_context(vec![], LogContextConfig::default());
-        let logs = run(state, "Bearer tok-A").await;
-        let line = assert_auth_failed_line(&logs, "auth failed");
-        assert!(!line.contains("credential_fp"), "{line}");
+        let default_state = test_auth_state_with_log_context(vec![], LogContextConfig::default());
+        let default_logs = run(default_state, "Bearer tok-A").await?;
+        let default_line = assert_auth_failed_line(&default_logs, "auth failed")?;
+        assert!(!default_line.contains("credential_fp"), "{default_line}");
+        Ok(())
     }
 
+    /// User agent for log reads the header.
     #[test]
-    fn user_agent_for_log_reads_the_header() {
+    fn user_agent_for_log_reads_the_header() -> anyhow::Result<()> {
         let mut headers = HeaderMap::new();
         assert_eq!(user_agent_for_log(&headers), "-");
 
-        headers.insert(
-            header::USER_AGENT,
-            axum::http::HeaderValue::from_static("probe/1.0"),
-        );
+        let _user_agent_default =
+            headers.insert(header::USER_AGENT, HeaderValue::from_static("probe/1.0"));
         assert_eq!(user_agent_for_log(&headers), "probe/1.0");
 
-        headers.insert(
+        let _user_agent_non_utf8 = headers.insert(
             header::USER_AGENT,
-            axum::http::HeaderValue::from_bytes(b"caf\xe9").expect("non-utf8 header builds"),
+            HeaderValue::from_bytes(b"caf\xe9").context("non-utf8 header builds")?,
         );
         assert_eq!(user_agent_for_log(&headers), "<non-utf8>");
 
         let long = "a".repeat(200);
-        headers.insert(
+        let _user_agent_long = headers.insert(
             header::USER_AGENT,
-            axum::http::HeaderValue::from_str(&long).expect("header builds"),
+            HeaderValue::from_str(&long).context("header builds")?,
         );
         assert_eq!(
             user_agent_for_log(&headers),
             format!("{}...(truncated)", "a".repeat(128))
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/auth.rs::token_kind_classifies_jwt_shape keeps the uniform test signature while it only asserts"
+    )]
+    /// Token kind classifies jwt shape.
     #[test]
-    fn token_kind_classifies_jwt_shape() {
+    fn token_kind_classifies_jwt_shape() -> anyhow::Result<()> {
         assert_eq!(token_kind("aaa.bbb.ccc"), "jwt");
         for opaque in ["a.b", "a..c", "a+b.c.d", "opaque-key"] {
             assert_eq!(token_kind(opaque), "opaque", "{opaque}");
         }
+        Ok(())
     }
 
+    /// Middleware rejects no credentials.
     #[tokio::test]
-    async fn middleware_rejects_no_credentials() {
+    async fn middleware_rejects_no_credentials() -> anyhow::Result<()> {
         let state = test_auth_state(vec![]);
         let app = auth_router(Arc::clone(&state));
         let req = Request::builder()
             .method(Method::POST)
             .uri("/mcp")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+            .body(Body::empty())?;
+        let resp = app.oneshot(req).await?;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         let challenge = resp
             .headers()
             .get(header::WWW_AUTHENTICATE)
-            .unwrap()
+            .context("WWW-Authenticate header must be present")?
             .to_str()
-            .unwrap();
+            .context("WWW-Authenticate must be valid UTF-8")?;
         assert!(challenge.contains("error=\"invalid_request\""));
 
         let counters = state.counters_snapshot();
         assert_eq!(counters.failure_missing_credential, 1);
+        Ok(())
     }
 
+    /// Middleware accepts valid bearer.
     #[tokio::test]
-    async fn middleware_accepts_valid_bearer() {
-        let (token, hash) = generate_api_key().unwrap();
+    async fn middleware_accepts_valid_bearer() -> anyhow::Result<()> {
+        let (token, hash) = generate_api_key()?;
         let keys = vec![ApiKeyEntry {
             name: "test-key".into(),
             hash,
@@ -3612,18 +3691,19 @@ mod tests {
             .method(Method::POST)
             .uri("/mcp")
             .header("authorization", format!("Bearer {token}"))
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+            .body(Body::empty())?;
+        let resp = app.oneshot(req).await?;
         assert_eq!(resp.status(), StatusCode::OK);
 
         let counters = state.counters_snapshot();
         assert_eq!(counters.success_bearer, 1);
+        Ok(())
     }
 
+    /// Middleware rejects wrong bearer.
     #[tokio::test]
-    async fn middleware_rejects_wrong_bearer() {
-        let (_token, hash) = generate_api_key().unwrap();
+    async fn middleware_rejects_wrong_bearer() -> anyhow::Result<()> {
+        let (_token, hash) = generate_api_key()?;
         let keys = vec![ApiKeyEntry {
             name: "test-key".into(),
             hash,
@@ -3636,70 +3716,71 @@ mod tests {
             .method(Method::POST)
             .uri("/mcp")
             .header("authorization", "Bearer wrong-token-here")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+            .body(Body::empty())?;
+        let resp = app.oneshot(req).await?;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         let challenge = resp
             .headers()
             .get(header::WWW_AUTHENTICATE)
-            .unwrap()
+            .context("WWW-Authenticate header must be present")?
             .to_str()
-            .unwrap();
+            .context("WWW-Authenticate must be valid UTF-8")?;
         assert!(challenge.contains("error=\"invalid_token\""));
 
         let counters = state.counters_snapshot();
         assert_eq!(counters.failure_invalid_credential, 1);
+        Ok(())
     }
 
+    /// Expired api key gets expired credential challenge.
     #[tokio::test]
-    async fn expired_api_key_gets_expired_credential_challenge() {
-        let key = slot_key("old-key", ARGON2_0_5_HASH, Some("2020-01-01T00:00:00Z"));
+    async fn expired_api_key_gets_expired_credential_challenge() -> anyhow::Result<()> {
+        let key = slot_key("old-key", ARGON2_0_5_HASH, Some("2020-01-01T00:00:00Z"))?;
         let state = test_auth_state(vec![key]);
         let app = auth_router(Arc::clone(&state));
         let req = Request::builder()
             .method(Method::POST)
             .uri("/mcp")
             .header(header::AUTHORIZATION, format!("Bearer {ARGON2_0_5_TOKEN}"))
-            .body(Body::empty())
-            .unwrap();
+            .body(Body::empty())?;
 
-        let resp = app.clone().oneshot(req).await.unwrap();
+        let resp = app.clone().oneshot(req).await?;
 
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         let challenge = resp
             .headers()
             .get(header::WWW_AUTHENTICATE)
-            .unwrap()
+            .context("WWW-Authenticate header must be present")?
             .to_str()
-            .unwrap();
+            .context("WWW-Authenticate must be valid UTF-8")?;
         assert!(challenge.contains("error_description=\"token is expired\""));
-        let body = resp.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(&body[..], b"unauthorized: expired credential");
+        let body = resp.into_body().collect().await?.to_bytes();
+        assert_eq!(body.to_vec(), b"unauthorized: expired credential");
         let counters = state.counters_snapshot();
         assert_eq!(counters.failure_expired_credential, 1);
         assert_eq!(counters.failure_invalid_credential, 0);
 
-        let req = Request::builder()
+        let req2 = Request::builder()
             .method(Method::POST)
             .uri("/mcp")
             .header(header::AUTHORIZATION, "Bearer garbage-token")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        let challenge = resp
+            .body(Body::empty())?;
+        let resp2 = app.oneshot(req2).await?;
+        let challenge2 = resp2
             .headers()
             .get(header::WWW_AUTHENTICATE)
-            .unwrap()
+            .context("WWW-Authenticate header must be present")?
             .to_str()
-            .unwrap();
-        assert!(challenge.contains("error_description=\"token is invalid\""));
-        let counters = state.counters_snapshot();
-        assert_eq!(counters.failure_invalid_credential, 1);
+            .context("WWW-Authenticate must be valid UTF-8")?;
+        assert!(challenge2.contains("error_description=\"token is invalid\""));
+        let counters2 = state.counters_snapshot();
+        assert_eq!(counters2.failure_invalid_credential, 1);
+        Ok(())
     }
 
+    /// Credential owner logged for expired api key only when enabled.
     #[tokio::test]
-    async fn credential_owner_logged_for_expired_api_key_only_when_enabled() {
+    async fn credential_owner_logged_for_expired_api_key_only_when_enabled() -> anyhow::Result<()> {
         for (enabled, expected_owner) in [(true, true), (false, false)] {
             let fields = LogContextConfig {
                 credential_owner: enabled,
@@ -3710,19 +3791,19 @@ mod tests {
                     "old-key",
                     ARGON2_0_5_HASH,
                     Some("2020-01-01T00:00:00Z"),
-                )],
+                )?],
                 fields,
             );
-            let mut req = auth_request("/mcp");
-            req.headers_mut().insert(
+            let mut req = auth_request("/mcp")?;
+            let _previous_15 = req.headers_mut().insert(
                 header::AUTHORIZATION,
-                axum::http::HeaderValue::from_static("Bearer golden-vector-token-0p5p3"),
+                HeaderValue::from_static("Bearer golden-vector-token-0p5p3"),
             );
 
-            let (status, logs) = capture_auth_failure_log(state, req).await;
+            let (status, logs) = capture_auth_failure_log(state, req).await?;
 
             assert_eq!(status, StatusCode::UNAUTHORIZED);
-            let line = assert_auth_failed_line(&logs, "failure_class=expired_credential");
+            let line = assert_auth_failed_line(&logs, "failure_class=expired_credential")?;
             if expected_owner {
                 assert!(line.contains("credential_owner=\"old-key\""), "{line}");
                 assert!(line.contains("credential_rejection=expired"), "{line}");
@@ -3734,42 +3815,46 @@ mod tests {
             }
             assert!(!logs.contains(ARGON2_0_5_TOKEN), "{logs}");
         }
+        Ok(())
     }
 
+    /// No owner for unknown bearer.
     #[tokio::test]
-    async fn no_owner_for_unknown_bearer() {
+    async fn no_owner_for_unknown_bearer() -> anyhow::Result<()> {
         let fields = knobs(|ctx| ctx.credential_owner = true);
         let state = test_auth_state_with_log_context(
             vec![slot_key(
                 "old-key",
                 ARGON2_0_5_HASH,
                 Some("2020-01-01T00:00:00Z"),
-            )],
+            )?],
             fields,
         );
-        let mut req = auth_request("/mcp");
-        req.headers_mut().insert(
+        let mut req = auth_request("/mcp")?;
+        let _previous_16 = req.headers_mut().insert(
             header::AUTHORIZATION,
-            axum::http::HeaderValue::from_static("Bearer not-a-key"),
+            HeaderValue::from_static("Bearer not-a-key"),
         );
 
-        let (_, logs) = capture_auth_failure_log(Arc::clone(&state), req).await;
+        let (_, logs) = capture_auth_failure_log(Arc::clone(&state), req).await?;
 
-        let line = assert_auth_failed_line(&logs, "failure_class=invalid_credential");
+        let line = assert_auth_failed_line(&logs, "failure_class=invalid_credential")?;
         assert!(!line.contains("credential_owner"), "{line}");
 
-        let mut req = auth_request("/mcp");
-        req.headers_mut().insert(
+        let mut req2 = auth_request("/mcp")?;
+        let _previous_17 = req2.headers_mut().insert(
             header::AUTHORIZATION,
-            axum::http::HeaderValue::from_static("Bearer golden-vector-token-0p5p3"),
+            HeaderValue::from_static("Bearer golden-vector-token-0p5p3"),
         );
-        let (_, logs) = capture_auth_failure_log(state, req).await;
-        let line = assert_auth_failed_line(&logs, "failure_class=expired_credential");
-        assert!(line.contains("credential_owner=\"old-key\""), "{line}");
+        let (_, logs2) = capture_auth_failure_log(state, req2).await?;
+        let line2 = assert_auth_failed_line(&logs2, "failure_class=expired_credential")?;
+        assert!(line2.contains("credential_owner=\"old-key\""), "{line2}");
+        Ok(())
     }
 
+    /// Middleware rate limits.
     #[tokio::test]
-    async fn middleware_rate_limits() {
+    async fn middleware_rate_limits() -> anyhow::Result<()> {
         let state = Arc::new(AuthState {
             api_keys: ArcSwap::new(Arc::new(vec![])),
             rate_limiter: Some(build_rate_limiter(&RateLimitConfig {
@@ -3795,15 +3880,15 @@ mod tests {
         let req = Request::builder()
             .method(Method::POST)
             .uri("/mcp")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
+            .body(Body::empty())?;
+        let resp = app.clone().oneshot(req).await?;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
         // Second request from same "IP" (no ConnectInfo in test, so peer_addr is None
         // and rate limiter won't fire). That's expected -- rate limiting requires
         // ConnectInfo which isn't available in unit tests without a real server.
         // This test verifies the middleware wiring doesn't panic.
+        Ok(())
     }
 
     /// Verify that rate limit semantics: only failed auth attempts consume budget.
@@ -3812,7 +3897,7 @@ mod tests {
     /// is that on auth failure, `check_key` is called; on auth success, it is NOT.
     /// Full e2e tests verify the middleware routing but require `ConnectInfo`.
     #[test]
-    fn rate_limit_semantics_failed_only() {
+    fn rate_limit_semantics_failed_only() -> anyhow::Result<()> {
         let config = RateLimitConfig {
             max_attempts_per_minute: 3,
             pre_auth_max_per_minute: None,
@@ -3823,7 +3908,7 @@ mod tests {
             key_eviction_policy: KeyEvictionPolicy::default(),
         };
         let limiter = build_rate_limiter(&config);
-        let ip = RateLimitKey::Ip("192.168.1.100".parse::<IpAddr>().unwrap());
+        let ip = RateLimitKey::Ip("192.168.1.100".parse::<IpAddr>()?);
 
         // Simulate: 3 failed attempts should exhaust quota.
         assert!(
@@ -3851,6 +3936,7 @@ mod tests {
         //
         // This means N successful requests followed by M failed requests
         // will only count M toward the rate limit, not N+M.
+        Ok(())
     }
 
     // -- pre-auth abuse gate (H-S1) --
@@ -3858,7 +3944,7 @@ mod tests {
     /// The pre-auth gate must default to ~10x the post-failure quota so honest
     /// retry storms never trip it but a Argon2-spray attacker is throttled.
     #[test]
-    fn pre_auth_default_multiplier_is_10x() {
+    fn pre_auth_default_multiplier_is_10x() -> anyhow::Result<()> {
         let config = RateLimitConfig {
             max_attempts_per_minute: 5,
             pre_auth_max_per_minute: None,
@@ -3869,10 +3955,10 @@ mod tests {
             key_eviction_policy: KeyEvictionPolicy::default(),
         };
         let limiter = build_pre_auth_limiter(&config);
-        let ip = RateLimitKey::Ip("10.0.0.1".parse::<IpAddr>().unwrap());
+        let ip = RateLimitKey::Ip("10.0.0.1".parse::<IpAddr>()?);
 
         // Quota should be 50 (5 * 10), not 5. We expect the first 50 to pass.
-        for i in 0..50 {
+        for i in 0..50_u32 {
             assert!(
                 limiter.check_key(&ip).is_ok(),
                 "pre-auth attempt {i} (of expected 50) should be allowed under default 10x multiplier"
@@ -3883,12 +3969,13 @@ mod tests {
             limiter.check_key(&ip).is_err(),
             "pre-auth attempt 51 should be blocked (quota is 50, not unbounded)"
         );
+        Ok(())
     }
 
     /// An explicit `pre_auth_max_per_minute` override must win over the
     /// 10x-multiplier default.
     #[test]
-    fn pre_auth_explicit_override_wins() {
+    fn pre_auth_explicit_override_wins() -> anyhow::Result<()> {
         let config = RateLimitConfig {
             max_attempts_per_minute: 100,     // would default to 1000 pre-auth quota
             pre_auth_max_per_minute: Some(2), // but operator caps at 2
@@ -3899,7 +3986,7 @@ mod tests {
             key_eviction_policy: KeyEvictionPolicy::default(),
         };
         let limiter = build_pre_auth_limiter(&config);
-        let ip = RateLimitKey::Ip("10.0.0.2".parse::<IpAddr>().unwrap());
+        let ip = RateLimitKey::Ip("10.0.0.2".parse::<IpAddr>()?);
 
         assert!(limiter.check_key(&ip).is_ok(), "attempt 1 allowed");
         assert!(limiter.check_key(&ip).is_ok(), "attempt 2 allowed");
@@ -3907,11 +3994,12 @@ mod tests {
             limiter.check_key(&ip).is_err(),
             "attempt 3 must be blocked (explicit override of 2 wins over 10x default of 1000)"
         );
+        Ok(())
     }
 
     /// The pre-auth gate's 429 must carry a Retry-After header.
     #[test]
-    fn pre_auth_gate_deny_sets_retry_after() {
+    fn pre_auth_gate_deny_sets_retry_after() -> anyhow::Result<()> {
         let config = RateLimitConfig::new(100).with_pre_auth_max_per_minute(1);
         let state = AuthState {
             api_keys: ArcSwap::new(Arc::new(vec![])),
@@ -3924,26 +4012,28 @@ mod tests {
             resource_metadata_url: None,
             log_context: AuthLogContext::default(),
         };
-        let ip = RateLimitKey::Ip("10.7.7.7".parse::<IpAddr>().unwrap());
+        let ip = RateLimitKey::Ip("10.7.7.7".parse::<IpAddr>()?);
         assert!(
             pre_auth_gate(&state, Some(&ip)).is_none(),
             "first request within quota"
         );
-        let resp = pre_auth_gate(&state, Some(&ip)).expect("second request must be gated");
+        let resp = pre_auth_gate(&state, Some(&ip)).context("second request must be gated")?;
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         let retry_after = resp
             .headers()
             .get(header::RETRY_AFTER)
-            .expect("Retry-After present")
+            .context("Retry-After present")?
             .to_str()
-            .unwrap()
+            .context("Retry-After must be valid UTF-8")?
             .parse::<u64>()
-            .unwrap();
+            .context("Retry-After must be delta-seconds")?;
         assert!(retry_after >= 1, "delta-seconds must be >= 1");
+        Ok(())
     }
 
+    /// Pre auth gate capacity full returns 503 without retry after.
     #[test]
-    fn pre_auth_gate_capacity_full_returns_503_without_retry_after() {
+    fn pre_auth_gate_capacity_full_returns_503_without_retry_after() -> anyhow::Result<()> {
         let config = RateLimitConfig::new(100)
             .with_pre_auth_max_per_minute(10)
             .with_max_tracked_keys(1)
@@ -3959,29 +4049,31 @@ mod tests {
             resource_metadata_url: None,
             log_context: AuthLogContext::default(),
         };
-        let established = RateLimitKey::Ip("10.7.7.7".parse::<IpAddr>().unwrap());
-        let unseen = RateLimitKey::Ip("10.7.7.8".parse::<IpAddr>().unwrap());
+        let established = RateLimitKey::Ip("10.7.7.7".parse::<IpAddr>()?);
+        let unseen = RateLimitKey::Ip("10.7.7.8".parse::<IpAddr>()?);
         assert!(pre_auth_gate(&state, Some(&established)).is_none());
 
-        let resp = pre_auth_gate(&state, Some(&unseen)).expect("unseen key must be rejected");
+        let resp = pre_auth_gate(&state, Some(&unseen)).context("unseen key must be rejected")?;
 
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(resp.headers().get(header::RETRY_AFTER).is_none());
+        Ok(())
     }
 
     /// Post-failure limiter honors an explicit burst capacity.
     #[test]
-    fn post_failure_limiter_burst_allows_initial_spike() {
+    fn post_failure_limiter_burst_allows_initial_spike() -> anyhow::Result<()> {
         let config = RateLimitConfig::new(1).with_burst(3);
         let limiter = build_rate_limiter(&config);
-        let ip = RateLimitKey::Ip("10.6.6.6".parse::<IpAddr>().unwrap());
-        for i in 0..3 {
+        let ip = RateLimitKey::Ip("10.6.6.6".parse::<IpAddr>()?);
+        for i in 0..3_u32 {
             assert!(limiter.check_key(&ip).is_ok(), "burst attempt {i}");
         }
         assert!(
             limiter.check_key(&ip).is_err(),
             "attempt 4 must exceed the burst bucket"
         );
+        Ok(())
     }
 
     /// End-to-end: the pre-auth gate must reject before the bearer-verification
@@ -3990,8 +4082,8 @@ mod tests {
     /// `pre_auth_gate` failure counter incremented (NOT
     /// `failure_invalid_credential`, which would prove Argon2 ran).
     #[tokio::test]
-    async fn pre_auth_gate_blocks_before_argon2_verification() {
-        let (_token, hash) = generate_api_key().unwrap();
+    async fn pre_auth_gate_blocks_before_argon2_verification() -> anyhow::Result<()> {
+        let (_token, hash) = generate_api_key()?;
         let keys = vec![ApiKeyEntry {
             name: "test-key".into(),
             hash,
@@ -4019,7 +4111,7 @@ mod tests {
             log_context: AuthLogContext::default(),
         });
         let app = auth_router(Arc::clone(&state));
-        let peer: SocketAddr = "10.0.0.10:54321".parse().unwrap();
+        let peer: SocketAddr = "10.0.0.10:54321".parse()?;
 
         // First bad-bearer request: gate has quota, bearer verification runs,
         // returns 401 (invalid credential).
@@ -4027,10 +4119,9 @@ mod tests {
             .method(Method::POST)
             .uri("/mcp")
             .header("authorization", "Bearer obviously-not-a-real-token")
-            .body(Body::empty())
-            .unwrap();
-        req1.extensions_mut().insert(ConnectInfo(peer));
-        let resp1 = app.clone().oneshot(req1).await.unwrap();
+            .body(Body::empty())?;
+        let _previous_18 = req1.extensions_mut().insert(ConnectInfo(peer));
+        let resp1 = app.clone().oneshot(req1).await?;
         assert_eq!(
             resp1.status(),
             StatusCode::UNAUTHORIZED,
@@ -4043,10 +4134,9 @@ mod tests {
             .method(Method::POST)
             .uri("/mcp")
             .header("authorization", "Bearer also-not-a-real-token")
-            .body(Body::empty())
-            .unwrap();
-        req2.extensions_mut().insert(ConnectInfo(peer));
-        let resp2 = app.oneshot(req2).await.unwrap();
+            .body(Body::empty())?;
+        let _previous_19 = req2.extensions_mut().insert(ConnectInfo(peer));
+        let resp2 = app.oneshot(req2).await?;
         assert_eq!(
             resp2.status(),
             StatusCode::TOO_MANY_REQUESTS,
@@ -4065,6 +4155,7 @@ mod tests {
             counters.failure_invalid_credential, 1,
             "bearer verification must run exactly once (only the un-gated first request)"
         );
+        Ok(())
     }
 
     /// mTLS-authenticated requests must bypass the pre-auth gate entirely.
@@ -4074,7 +4165,7 @@ mod tests {
     /// Setup: a pre-auth gate with quota 1 (very tight). Submit two mTLS
     /// requests in quick succession from the same IP. Both must succeed.
     #[tokio::test]
-    async fn pre_auth_gate_does_not_throttle_mtls() {
+    async fn pre_auth_gate_does_not_throttle_mtls() -> anyhow::Result<()> {
         let config = RateLimitConfig {
             max_attempts_per_minute: 100,
             pre_auth_max_per_minute: Some(1), // tight: would block 2nd plain request
@@ -4096,7 +4187,7 @@ mod tests {
             log_context: AuthLogContext::default(),
         });
         let app = auth_router(Arc::clone(&state));
-        let peer: SocketAddr = "10.0.0.20:54321".parse().unwrap();
+        let peer: SocketAddr = "10.0.0.20:54321".parse()?;
         let identity = AuthIdentity {
             name: "cn=test-client".into(),
             role: "viewer".into(),
@@ -4106,14 +4197,13 @@ mod tests {
         };
         let tls_info = TlsConnInfo::new(peer, Some(identity));
 
-        for i in 0..3 {
+        for i in 0..3_u32 {
             let mut req = Request::builder()
                 .method(Method::POST)
                 .uri("/mcp")
-                .body(Body::empty())
-                .unwrap();
-            req.extensions_mut().insert(ConnectInfo(tls_info.clone()));
-            let resp = app.clone().oneshot(req).await.unwrap();
+                .body(Body::empty())?;
+            let _previous_20 = req.extensions_mut().insert(ConnectInfo(tls_info.clone()));
+            let resp = app.clone().oneshot(req).await?;
             assert_eq!(
                 resp.status(),
                 StatusCode::OK,
@@ -4130,13 +4220,14 @@ mod tests {
             counters.success_mtls, 3,
             "all three mTLS requests must have been counted as successful"
         );
+        Ok(())
     }
 
     /// Pre-auth-gate denial must increment the `auth_pre` deny counter
     /// via the metrics handle in the request extensions.
     #[cfg(feature = "metrics")]
     #[tokio::test]
-    async fn pre_auth_gate_deny_increments_counter() {
+    async fn pre_auth_gate_deny_increments_counter() -> anyhow::Result<()> {
         let config = RateLimitConfig {
             max_attempts_per_minute: 100,
             pre_auth_max_per_minute: Some(1),
@@ -4158,36 +4249,37 @@ mod tests {
             log_context: AuthLogContext::default(),
         });
         let app = auth_router(Arc::clone(&state));
-        let metrics = Arc::new(crate::metrics::McpMetrics::new().expect("metrics registry"));
-        let peer: SocketAddr = "10.0.0.30:54321".parse().expect("addr parses");
-        let mk = || {
+        let metrics = Arc::new(McpMetrics::new().context("metrics registry")?);
+        let peer: SocketAddr = "10.0.0.30:54321".parse().context("addr parses")?;
+        let mk = || -> anyhow::Result<Request<Body>> {
             let mut req = Request::builder()
                 .method(Method::POST)
                 .uri("/mcp")
                 .header("authorization", "Bearer not-a-real-token")
                 .body(Body::empty())
-                .expect("request builds");
-            req.extensions_mut().insert(ConnectInfo(peer));
-            req.extensions_mut().insert(Arc::clone(&metrics));
-            req
+                .context("request builds")?;
+            let _connect_info = req.extensions_mut().insert(ConnectInfo(peer));
+            let _metrics_handle = req.extensions_mut().insert(Arc::clone(&metrics));
+            Ok(req)
         };
         let counter = |label: &str| metrics.rate_limited_total.with_label_values(&[label]).get();
 
-        let first = app.clone().oneshot(mk()).await.expect("first request");
+        let first = app.clone().oneshot(mk()?).await.context("first request")?;
         assert_eq!(first.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(counter("auth_pre"), 0, "un-gated request must not count");
 
-        let gated = app.oneshot(mk()).await.expect("second request");
+        let gated = app.oneshot(mk()?).await.context("second request")?;
         assert_eq!(gated.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(counter("auth_pre"), 1, "gated request must count once");
         assert_eq!(counter("auth_post"), 0, "post limiter never fired");
+        Ok(())
     }
 
     /// Post-failure limiter denial must increment the `auth_post` deny
     /// counter via the metrics handle in the request extensions.
     #[cfg(feature = "metrics")]
     #[tokio::test]
-    async fn post_failure_limiter_deny_increments_counter() {
+    async fn post_failure_limiter_deny_increments_counter() -> anyhow::Result<()> {
         let config = RateLimitConfig {
             max_attempts_per_minute: 1, // tight: 2nd failure trips the limiter
             pre_auth_max_per_minute: None,
@@ -4209,44 +4301,56 @@ mod tests {
             log_context: AuthLogContext::default(),
         });
         let app = auth_router(Arc::clone(&state));
-        let metrics = Arc::new(crate::metrics::McpMetrics::new().expect("metrics registry"));
-        let peer: SocketAddr = "10.0.0.31:54321".parse().expect("addr parses");
-        let mk = || {
+        let metrics = Arc::new(McpMetrics::new().context("metrics registry")?);
+        let peer: SocketAddr = "10.0.0.31:54321".parse().context("addr parses")?;
+        let mk = || -> anyhow::Result<Request<Body>> {
             let mut req = Request::builder()
                 .method(Method::POST)
                 .uri("/mcp")
                 .header("authorization", "Bearer not-a-real-token")
                 .body(Body::empty())
-                .expect("request builds");
-            req.extensions_mut().insert(ConnectInfo(peer));
-            req.extensions_mut().insert(Arc::clone(&metrics));
-            req
+                .context("request builds")?;
+            let _connect_info = req.extensions_mut().insert(ConnectInfo(peer));
+            let _metrics_handle = req.extensions_mut().insert(Arc::clone(&metrics));
+            Ok(req)
         };
         let counter = |label: &str| metrics.rate_limited_total.with_label_values(&[label]).get();
 
         // First failure consumes the budget but is NOT itself limited.
-        let first = app.clone().oneshot(mk()).await.expect("first request");
+        let first = app.clone().oneshot(mk()?).await.context("first request")?;
         assert_eq!(first.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(counter("auth_post"), 0);
 
         // Second failure trips the post-failure limiter.
-        let limited = app.oneshot(mk()).await.expect("second request");
+        let limited = app.oneshot(mk()?).await.context("second request")?;
         assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(counter("auth_post"), 1, "deny must count once");
         assert_eq!(counter("auth_pre"), 0, "pre-auth gate disabled here");
+        Ok(())
     }
 
     // -------------------------------------------------------------------
     // RFC 7235 §2.1 case-insensitive scheme parsing for `extract_bearer`.
     // -------------------------------------------------------------------
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/auth.rs::extract_bearer_accepts_canonical_case keeps the uniform test signature while it only asserts"
+    )]
+    /// Extract bearer accepts canonical case.
     #[test]
-    fn extract_bearer_accepts_canonical_case() {
+    fn extract_bearer_accepts_canonical_case() -> anyhow::Result<()> {
         assert_eq!(extract_bearer("Bearer abc123"), Some("abc123"));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/auth.rs::extract_bearer_is_case_insensitive_per_rfc7235 keeps the uniform test signature while it only asserts"
+    )]
+    /// Extract bearer is case insensitive per rfc7235.
     #[test]
-    fn extract_bearer_is_case_insensitive_per_rfc7235() {
+    fn extract_bearer_is_case_insensitive_per_rfc7235() -> anyhow::Result<()> {
         // RFC 7235 §2.1: "auth-scheme is case-insensitive".
         // Real-world clients (curl, browsers, custom HTTP libs) emit varied
         // casings; rejecting any of them is a spec violation.
@@ -4262,41 +4366,71 @@ mod tests {
                 "header {header:?} must parse as a Bearer token (RFC 7235 §2.1)"
             );
         }
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/auth.rs::extract_bearer_rejects_other_schemes keeps the uniform test signature while it only asserts"
+    )]
+    /// Extract bearer rejects other schemes.
     #[test]
-    fn extract_bearer_rejects_other_schemes() {
+    fn extract_bearer_rejects_other_schemes() -> anyhow::Result<()> {
         assert_eq!(extract_bearer("Basic dXNlcjpwYXNz"), None);
         assert_eq!(extract_bearer("Digest username=\"x\""), None);
         assert_eq!(extract_bearer("Token abc123"), None);
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/auth.rs::extract_bearer_rejects_malformed keeps the uniform test signature while it only asserts"
+    )]
+    /// Extract bearer rejects malformed.
     #[test]
-    fn extract_bearer_rejects_malformed() {
+    fn extract_bearer_rejects_malformed() -> anyhow::Result<()> {
         // Empty string, no separator, scheme-only, scheme + only whitespace.
         assert_eq!(extract_bearer(""), None);
         assert_eq!(extract_bearer("Bearer"), None);
         assert_eq!(extract_bearer("Bearer "), None);
         assert_eq!(extract_bearer("Bearer    "), None);
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/auth.rs::extract_bearer_tolerates_extra_separator_whitespace keeps the uniform test signature while it only asserts"
+    )]
+    /// Extract bearer tolerates extra separator whitespace.
     #[test]
-    fn extract_bearer_tolerates_extra_separator_whitespace() {
+    fn extract_bearer_tolerates_extra_separator_whitespace() -> anyhow::Result<()> {
         // Some non-conformant clients emit two spaces; we should still parse.
         assert_eq!(extract_bearer("Bearer  abc123"), Some("abc123"));
         assert_eq!(extract_bearer("Bearer   abc123"), Some("abc123"));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/auth.rs::extract_bearer_rejects_embedded_whitespace keeps the uniform test signature while it only asserts"
+    )]
+    /// Extract bearer rejects embedded whitespace.
     #[test]
-    fn extract_bearer_rejects_embedded_whitespace() {
+    fn extract_bearer_rejects_embedded_whitespace() -> anyhow::Result<()> {
         assert_eq!(extract_bearer("Bearer abc 123"), None);
         assert_eq!(extract_bearer("Bearer abc\t123"), None);
         assert_eq!(extract_bearer("Bearer abc123 "), None);
         assert_eq!(extract_bearer("Bearer abc123\r\n"), None);
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/auth.rs::extract_bearer_still_accepts_opaque_non_token68_credentials keeps the uniform test signature while it only asserts"
+    )]
+    /// Extract bearer still accepts opaque non token68 credentials.
     #[test]
-    fn extract_bearer_still_accepts_opaque_non_token68_credentials() {
+    fn extract_bearer_still_accepts_opaque_non_token68_credentials() -> anyhow::Result<()> {
         // Compatibility guard. `ApiKeyEntry::new` accepts an arbitrary
         // caller-supplied hash, so consumers may have hashed opaque tokens
         // using punctuation outside RFC 7235 `token68`. Narrowing this to a
@@ -4306,17 +4440,20 @@ mod tests {
             Some("aBc!@#$%^&*()")
         );
         assert_eq!(extract_bearer("Bearer tok{en}|v1"), Some("tok{en}|v1"));
+        Ok(())
     }
 
+    /// Extract bearer accepts generated key and jwt shapes.
     #[test]
-    fn extract_bearer_accepts_generated_key_and_jwt_shapes() {
-        let (token, _hash) = generate_api_key().unwrap();
+    fn extract_bearer_accepts_generated_key_and_jwt_shapes() -> anyhow::Result<()> {
+        let (token, _hash) = generate_api_key()?;
         let header = format!("Bearer {token}");
         assert_eq!(extract_bearer(&header), Some(token.as_str()));
 
         let jwt = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln-_bmF0dXJl";
         let jwt_header = format!("Bearer {jwt}");
         assert_eq!(extract_bearer(&jwt_header), Some(jwt));
+        Ok(())
     }
 
     // -------------------------------------------------------------------
@@ -4324,8 +4461,13 @@ mod tests {
     // secret material via `format!("{:?}", …)` or `tracing::debug!(?…)`.
     // -------------------------------------------------------------------
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/auth.rs::auth_identity_debug_redacts_raw_token keeps the uniform test signature while it only asserts"
+    )]
+    /// Auth identity debug redacts raw token.
     #[test]
-    fn auth_identity_debug_redacts_raw_token() {
+    fn auth_identity_debug_redacts_raw_token() -> anyhow::Result<()> {
         let id = AuthIdentity {
             name: "alice".into(),
             role: "admin".into(),
@@ -4353,10 +4495,16 @@ mod tests {
             dbg.contains("<redacted>"),
             "redaction marker missing: {dbg}"
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/auth.rs::auth_identity_debug_marks_absent_secrets keeps the uniform test signature while it only asserts"
+    )]
+    /// Auth identity debug marks absent secrets.
     #[test]
-    fn auth_identity_debug_marks_absent_secrets() {
+    fn auth_identity_debug_marks_absent_secrets() -> anyhow::Result<()> {
         // For non-OAuth identities (mTLS / API key) the secret fields are
         // None; redacted Debug output should distinguish that from "present".
         let id = AuthIdentity {
@@ -4375,16 +4523,18 @@ mod tests {
             !dbg.contains("<redacted>"),
             "no <redacted> marker when secrets are absent: {dbg}"
         );
+        Ok(())
     }
 
+    /// Api key entry debug redacts hash.
     #[test]
-    fn api_key_entry_debug_redacts_hash() {
+    fn api_key_entry_debug_redacts_hash() -> anyhow::Result<()> {
         let entry = ApiKeyEntry {
             name: "viewer-key".into(),
             // Realistic Argon2id PHC string (must NOT leak).
             hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$h4sh3dPa55w0rd".into(),
             role: "viewer".into(),
-            expires_at: Some(RfcTimestamp::parse("2030-01-01T00:00:00Z").unwrap()),
+            expires_at: Some(RfcTimestamp::parse("2030-01-01T00:00:00Z")?),
         };
         let dbg = format!("{entry:?}");
 
@@ -4406,6 +4556,7 @@ mod tests {
             dbg.contains("<redacted>"),
             "redaction marker missing: {dbg}"
         );
+        Ok(())
     }
 
     // -- AuthFailureClass exact-string contract tests --
@@ -4418,8 +4569,13 @@ mod tests {
     // breaking observability change and must be reflected in
     // CHANGELOG.md.
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/auth.rs::auth_failure_class_as_str_exact_strings keeps the uniform test signature while it only asserts"
+    )]
+    /// Auth failure class as str exact strings.
     #[test]
-    fn auth_failure_class_as_str_exact_strings() {
+    fn auth_failure_class_as_str_exact_strings() -> anyhow::Result<()> {
         assert_eq!(
             AuthFailureClass::MissingCredential.as_str(),
             "missing_credential"
@@ -4434,10 +4590,16 @@ mod tests {
         );
         assert_eq!(AuthFailureClass::RateLimited.as_str(), "rate_limited");
         assert_eq!(AuthFailureClass::PreAuthGate.as_str(), "pre_auth_gate");
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/auth.rs::auth_failure_class_response_body_exact_strings keeps the uniform test signature while it only asserts"
+    )]
+    /// Auth failure class response body exact strings.
     #[test]
-    fn auth_failure_class_response_body_exact_strings() {
+    fn auth_failure_class_response_body_exact_strings() -> anyhow::Result<()> {
         assert_eq!(
             AuthFailureClass::MissingCredential.response_body(),
             "unauthorized: missing credential"
@@ -4458,10 +4620,16 @@ mod tests {
             AuthFailureClass::PreAuthGate.response_body(),
             "rate limited (pre-auth)"
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/auth.rs::auth_failure_class_bearer_error_exact_strings keeps the uniform test signature while it only asserts"
+    )]
+    /// Auth failure class bearer error exact strings.
     #[test]
-    fn auth_failure_class_bearer_error_exact_strings() {
+    fn auth_failure_class_bearer_error_exact_strings() -> anyhow::Result<()> {
         assert_eq!(
             AuthFailureClass::MissingCredential.bearer_error(),
             (
@@ -4488,6 +4656,7 @@ mod tests {
                 "too many unauthenticated requests from this source"
             )
         );
+        Ok(())
     }
 
     // -- AuthConfig::summary boolean-flag contract tests --
@@ -4498,36 +4667,62 @@ mod tests {
     // are caught immediately. The summary is consumed by `/admin/*`
     // diagnostics so any inversion is an operator-visible regression.
 
+    /// Auth config summary bearer true when keys present.
     #[test]
-    fn auth_config_summary_bearer_true_when_keys_present() {
-        let (_token, hash) = generate_api_key().unwrap();
+    fn auth_config_summary_bearer_true_when_keys_present() -> anyhow::Result<()> {
+        let (_token, hash) = generate_api_key()?;
         let cfg = AuthConfig::with_keys(vec![ApiKeyEntry::new("k", hash, "viewer")]);
-        let s = cfg.summary();
-        assert!(s.enabled, "summary.enabled must reflect AuthConfig.enabled");
+        let summary = cfg.summary();
         assert!(
-            s.bearer,
+            summary.enabled,
+            "summary.enabled must reflect AuthConfig.enabled"
+        );
+        assert!(
+            summary.bearer,
             "summary.bearer must be true when api_keys is non-empty (kills `!` deletion at L615)"
         );
-        assert!(!s.mtls, "summary.mtls must be false when mtls is None");
-        assert!(!s.oauth, "summary.oauth must be false when oauth is None");
-        assert_eq!(s.api_keys.len(), 1);
-        assert_eq!(s.api_keys[0].name, "k");
-        assert_eq!(s.api_keys[0].role, "viewer");
+        assert!(
+            !summary.mtls,
+            "summary.mtls must be false when mtls is None"
+        );
+        assert!(
+            !summary.oauth,
+            "summary.oauth must be false when oauth is None"
+        );
+        assert_eq!(summary.api_keys.len(), 1);
+        let first = summary
+            .api_keys
+            .first()
+            .context("first API key must exist")?;
+        assert_eq!(first.name, "k");
+        assert_eq!(first.role, "viewer");
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/auth.rs::auth_config_summary_bearer_false_when_no_keys keeps the uniform test signature while it only asserts"
+    )]
+    /// Auth config summary bearer false when no keys.
     #[test]
-    fn auth_config_summary_bearer_false_when_no_keys() {
+    fn auth_config_summary_bearer_false_when_no_keys() -> anyhow::Result<()> {
         let cfg = AuthConfig::with_keys(vec![]);
-        let s = cfg.summary();
+        let summary = cfg.summary();
         assert!(
-            !s.bearer,
+            !summary.bearer,
             "summary.bearer must be false when api_keys is empty (kills `!` deletion at L615)"
         );
-        assert!(s.api_keys.is_empty());
+        assert!(summary.api_keys.is_empty());
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/auth.rs::seen_identity_set_first_then_repeat keeps the uniform test signature while it only asserts"
+    )]
+    /// Seen identity set first then repeat.
     #[test]
-    fn seen_identity_set_first_then_repeat() {
+    fn seen_identity_set_first_then_repeat() -> anyhow::Result<()> {
         let set = SeenIdentitySet::new();
         assert!(set.insert_is_first("alice"), "first sighting is first");
         assert!(
@@ -4536,10 +4731,16 @@ mod tests {
         );
         assert!(set.insert_is_first("bob"));
         assert_eq!(set.len(), 2);
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/auth.rs::seen_identity_set_evicts_oldest_at_cap keeps the uniform test signature while it only asserts"
+    )]
+    /// Seen identity set evicts oldest at cap.
     #[test]
-    fn seen_identity_set_evicts_oldest_at_cap() {
+    fn seen_identity_set_evicts_oldest_at_cap() -> anyhow::Result<()> {
         let set = SeenIdentitySet::with_cap(2);
         assert!(set.insert_is_first("a"));
         assert!(set.insert_is_first("b"));
@@ -4554,24 +4755,36 @@ mod tests {
         // "b" has now been evicted in turn, so it re-fires as "first" too.
         assert!(set.insert_is_first("b"));
         // Sanity: cap is never exceeded regardless of churn pattern.
-        for i in 0..32 {
-            set.insert_is_first(&format!("churn-{i}"));
+        for i in 0..32_u32 {
+            let _churn_seen = set.insert_is_first(&format!("churn-{i}"));
             assert!(set.len() <= 2, "cap invariant must hold");
         }
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/auth.rs::seen_identity_set_cap_zero_is_raised_to_one keeps the uniform test signature while it only asserts"
+    )]
+    /// Seen identity set cap zero is raised to one.
     #[test]
-    fn seen_identity_set_cap_zero_is_raised_to_one() {
+    fn seen_identity_set_cap_zero_is_raised_to_one() -> anyhow::Result<()> {
         let set = SeenIdentitySet::with_cap(0);
         assert!(set.insert_is_first("only"));
         assert_eq!(set.len(), 1);
         // Next insert evicts "only".
         assert!(set.insert_is_first("next"));
         assert_eq!(set.len(), 1);
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/auth.rs::seen_identity_set_fifo_does_not_refresh_on_repeat_hit keeps the uniform test signature while it only asserts"
+    )]
+    /// Seen identity set fifo does not refresh on repeat hit.
     #[test]
-    fn seen_identity_set_fifo_does_not_refresh_on_repeat_hit() {
+    fn seen_identity_set_fifo_does_not_refresh_on_repeat_hit() -> anyhow::Result<()> {
         // Locks in the FIFO contract: repeat hits MUST NOT bump an entry
         // to the back of the eviction queue (that would be LRU).
         let set = SeenIdentitySet::with_cap(2);
@@ -4591,18 +4804,19 @@ mod tests {
         // After the previous step, "a" eviction pushed out "b" as the new
         // oldest, so we must re-add "b" via a fresh insert path. To keep
         // the test deterministic we rebuild a small scenario:
-        let set = SeenIdentitySet::with_cap(2);
-        assert!(set.insert_is_first("x")); // order=[x]
-        assert!(set.insert_is_first("y")); // order=[x,y]
-        assert!(!set.insert_is_first("x")); // repeat hit (under FIFO: order unchanged)
-        assert!(set.insert_is_first("z")); // evicts "x" under FIFO
+        let rebuilt = SeenIdentitySet::with_cap(2);
+        assert!(rebuilt.insert_is_first("x")); // order=[x]
+        assert!(rebuilt.insert_is_first("y")); // order=[x,y]
+        assert!(!rebuilt.insert_is_first("x")); // repeat hit (under FIFO: order unchanged)
+        assert!(rebuilt.insert_is_first("z")); // evicts "x" under FIFO
         assert!(
-            !set.insert_is_first("y"),
+            !rebuilt.insert_is_first("y"),
             "y must still be present (FIFO did not evict it)"
         );
         assert!(
-            set.insert_is_first("x"),
+            rebuilt.insert_is_first("x"),
             "x must have been evicted by FIFO (would NOT have been evicted under LRU)"
         );
+        Ok(())
     }
 }
