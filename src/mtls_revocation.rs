@@ -25,160 +25,22 @@
 //! - `crl_deny_on_unavailable = false` => fail open with warn logs. Restores
 //!   the pre-3.8 behaviour and is strongly discouraged: a revoked
 //!   certificate is accepted whenever its CRL is unreachable.
-#![cfg_attr(
-    all(not(test), not(feature = "oauth-mtls-client")),
-    expect(
-        clippy::cfg_not_test,
-        reason = "lint-migration: src/mtls_revocation.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::min_ident_chars,
-        reason = "lint-migration: src/mtls_revocation.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::iter_over_hash_type,
-        reason = "lint-migration: src/mtls_revocation.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::integer_division_remainder_used,
-        reason = "lint-migration: src/mtls_revocation.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::let_underscore_must_use,
-        reason = "lint-migration: src/mtls_revocation.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::option_if_let_else,
-        reason = "lint-migration: src/mtls_revocation.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::arithmetic_side_effects,
-        reason = "lint-migration: src/mtls_revocation.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::let_underscore_untyped,
-        reason = "lint-migration: src/mtls_revocation.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_const_for_fn,
-        reason = "lint-migration: src/mtls_revocation.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_inline_in_public_items,
-        reason = "lint-migration: src/mtls_revocation.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::shadow_reuse,
-        reason = "lint-migration: src/mtls_revocation.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_errors_doc,
-        reason = "lint-migration: src/mtls_revocation.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::absolute_paths,
-        reason = "lint-migration: src/mtls_revocation.rs"
-    )
-)]
-#![cfg_attr(
-    all(not(test), target_os = "linux"),
-    expect(
-        clippy::missing_docs_in_private_items,
-        reason = "lint-migration: src/mtls_revocation.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::unused_trait_names,
-        reason = "lint-migration: src/mtls_revocation.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::std_instead_of_alloc,
-        reason = "lint-migration: src/mtls_revocation.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::std_instead_of_core,
-        reason = "lint-migration: src/mtls_revocation.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::partial_pub_fields,
-        reason = "lint-migration: src/mtls_revocation.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::inline_trait_bounds,
-        reason = "lint-migration: src/mtls_revocation.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::unseparated_literal_suffix,
-        reason = "lint-migration: src/mtls_revocation.rs"
-    )
-)]
-#![expect(let_underscore_drop, reason = "lint-migration: src/mtls_revocation.rs")]
-#![expect(unused_results, reason = "lint-migration: src/mtls_revocation.rs")]
 
+extern crate alloc;
+
+use alloc::sync::Arc;
+#[cfg(any(test, feature = "test-helpers"))]
+use core::sync::atomic::AtomicBool;
+use core::{fmt, hash::BuildHasher, mem, net::IpAddr, num::NonZeroU32, pin::Pin, time::Duration};
 use std::{
     collections::{HashMap, HashSet},
-    net::IpAddr,
-    num::NonZeroU32,
-    pin::Pin,
-    sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{Mutex, PoisonError},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use arc_swap::ArcSwap;
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
+use reqwest::{Client, dns::Resolve, redirect::Policy};
 use rustls::{
     DigitallySignedStruct, DistinguishedName, Error as TlsError, RootCertStore, SignatureScheme,
     client::danger::HandshakeSignatureValid,
@@ -190,27 +52,34 @@ use rustls::{
 };
 use tokio::{
     net::lookup_host,
-    sync::{RwLock, Semaphore, mpsc},
+    sync::{Mutex as TokioMutex, RwLock, Semaphore, mpsc},
     task::JoinSet,
-    time::{Instant, Sleep},
+    time::{Instant, Sleep, sleep},
 };
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use x509_parser::{
     extensions::{DistributionPointName, GeneralName, ParsedExtension},
-    prelude::{FromDer, X509Certificate},
+    prelude::{FromDer as _, X509Certificate},
     revocation_list::CertificateRevocationList,
+    time::ASN1Time,
 };
 
 use crate::{
     auth::MtlsConfig,
     bounded_limiter::BoundedKeyedLimiter,
     error::RmcpServerKitError,
-    ssrf::{check_scheme, ip_block_reason, sanitized_url_for_log},
+    ssrf::{CompiledSsrfAllowlist, check_scheme, ip_block_reason, sanitized_url_for_log},
+    ssrf_resolver::SsrfScreeningResolver,
 };
 
+/// Total deadline for the startup bootstrap CRL pass.
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Floor for the automatic CRL refresh interval.
 const MIN_AUTO_REFRESH: Duration = Duration::from_mins(10);
+
+/// Ceiling for the automatic CRL refresh interval.
 const MAX_AUTO_REFRESH: Duration = Duration::from_hours(24);
 /// Connection timeout for CRL HTTP fetches. Independent of overall fetch
 /// timeout to bound time spent on unreachable hosts.
@@ -275,8 +144,8 @@ pub(crate) struct VerifierState {
     committed_identities: HashMap<String, EntryIdentity>,
 }
 
-impl std::fmt::Debug for VerifierState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for VerifierState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VerifierState")
             .field("cached_urls_len", &self.cached_urls.len())
             .field("committed_identities_len", &self.committed_identities.len())
@@ -307,13 +176,21 @@ impl std::fmt::Debug for VerifierState {
 /// making `cache` private, which is a 4.0 change.
 #[derive(Clone, PartialEq, Eq)]
 struct EntryIdentity {
+    /// Pointer address of the DER allocation at commit time.
     der_ptr: usize,
+    /// DER length at commit time.
     der_len: usize,
+    /// First 32 DER bytes (or fewer) at commit time.
     head: [u8; 32],
+    /// Last 32 DER bytes (or fewer) at commit time.
     tail: [u8; 32],
+    /// `thisUpdate` at commit time.
     this_update: SystemTime,
+    /// `nextUpdate` at commit time.
     next_update: Option<SystemTime>,
+    /// Fetch time at commit time.
     fetched_at: SystemTime,
+    /// Source URL at commit time.
     source_url: String,
 }
 
@@ -332,8 +209,8 @@ fn entry_identity(entry: &CachedCrl) -> EntryIdentity {
     } = entry;
 
     let bytes = der.as_ref();
-    let mut head = [0u8; 32];
-    let mut tail = [0u8; 32];
+    let mut head = [0_u8; 32];
+    let mut tail = [0_u8; 32];
     let sample = bytes.len().min(32);
     if let Some(source) = bytes.get(..sample)
         && let Some(target) = head.get_mut(..sample)
@@ -359,9 +236,10 @@ fn entry_identity(entry: &CachedCrl) -> EntryIdentity {
 }
 
 /// Fingerprint every entry of a cache map.
-fn crl_cache_identities<S: std::hash::BuildHasher>(
-    cache: &HashMap<String, CachedCrl, S>,
-) -> HashMap<String, EntryIdentity> {
+fn crl_cache_identities<S>(cache: &HashMap<String, CachedCrl, S>) -> HashMap<String, EntryIdentity>
+where
+    S: BuildHasher,
+{
     cache
         .iter()
         .map(|(url, entry)| (url.clone(), entry_identity(entry)))
@@ -393,6 +271,10 @@ fn cache_matches_committed_identities(
 
 /// Shared CRL state backing the dynamic mTLS verifier.
 #[expect(
+    clippy::partial_pub_fields,
+    reason = "public API frozen until the next major release"
+)]
+#[expect(
     missing_debug_implementations,
     reason = "contains ArcSwap and dyn verifier internals"
 )]
@@ -410,7 +292,7 @@ pub struct CrlSet {
     /// Without this mutex, two commits could each snapshot the same old cache
     /// and publish states whose `cached_urls` omit the other's URL, which is
     /// exactly the desynchronisation the digest index exists to prevent.
-    commit_lock: tokio::sync::Mutex<()>,
+    commit_lock: TokioMutex<()>,
     /// Cached CRLs keyed by URL.
     ///
     /// # ⚠️ Deprecated
@@ -432,7 +314,8 @@ pub struct CrlSet {
     pub config: MtlsConfig,
     /// Fire-and-forget discovery channel for newly-seen CDP URLs.
     pub discover_tx: mpsc::UnboundedSender<String>,
-    client: reqwest::Client,
+    /// CRL fetcher with the SSRF-screening resolver installed.
+    client: Client,
     /// URLs whose CRL is confirmed present in `cache`. Permanent dedup: a URL
     /// here is never re-enqueued for discovery.
     seen_urls: Mutex<HashSet<String>>,
@@ -452,7 +335,7 @@ pub struct CrlSet {
     /// by `crl_max_host_semaphores`; at the cap, idle entries are evicted
     /// on demand (see [`acquire_host_semaphore`]), so the cap only rejects
     /// genuinely concurrent fetch floods and is never a permanent lockout.
-    host_semaphores: Arc<tokio::sync::Mutex<HashMap<String, Arc<Semaphore>>>>,
+    host_semaphores: Arc<TokioMutex<HashMap<String, Arc<Semaphore>>>>,
     /// Process-global rate-limiter on discovery URL submissions; the
     /// **fallback** admission path, consulted only when a submission arrives
     /// with no attributed handshake peer (see `discovery_limiter_per_peer`).
@@ -474,6 +357,7 @@ pub struct CrlSet {
     /// Cached cap on per-fetch response body size; copied from `config` so the
     /// hot path doesn't re-read the (rarely changing) config struct.
     max_response_bytes: u64,
+    /// Last time each throttle key emitted a warning, for cooldown accounting.
     last_cap_warn: Mutex<HashMap<&'static str, Instant>>,
     /// Test-only hook fired immediately before a discovered URL becomes
     /// observable on `discover_tx`.
@@ -491,6 +375,11 @@ pub struct CrlSet {
 type DiscoverySendProbe = Arc<dyn Fn(&CrlSet, &str) + Send + Sync>;
 
 impl CrlSet {
+    /// Build a `CrlSet` and its initial verifier generation from prefetched CRLs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client or the initial verifier cannot be built.
     fn new(
         roots: Arc<RootCertStore>,
         config: MtlsConfig,
@@ -504,24 +393,27 @@ impl CrlSet {
         // matching the existing CRL pre-flight posture; operators who
         // need internal CDPs would extend this with the same
         // CompiledSsrfAllowlist plumbing used by oauth.
-        let allowlist = Arc::new(crate::ssrf::CompiledSsrfAllowlist::default());
-        let resolver: Arc<dyn reqwest::dns::Resolve> =
-            Arc::new(crate::ssrf_resolver::SsrfScreeningResolver::new(
-                Arc::clone(&allowlist),
-                #[cfg(any(test, feature = "test-helpers"))]
-                Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                #[cfg(not(any(test, feature = "test-helpers")))]
-                (),
-            ));
+        let allowlist = Arc::new(CompiledSsrfAllowlist::default());
+        let resolver: Arc<dyn Resolve> = Arc::new(SsrfScreeningResolver::new(
+            Arc::clone(&allowlist),
+            #[cfg(any(test, feature = "test-helpers"))]
+            Arc::new(AtomicBool::new(false)),
+            #[expect(
+                clippy::cfg_not_test,
+                reason = "deliberate: src/mtls_revocation.rs::SsrfScreeningResolver::new takes a no-op bypass argument when the test-helpers feature is absent; the inverted cfg is intentional"
+            )]
+            #[cfg(not(any(test, feature = "test-helpers")))]
+            (),
+        ));
 
-        let client = reqwest::Client::builder()
+        let client = Client::builder()
             // M-H2/N1: see oauth.rs::OauthHttpClient::build for rationale.
             .no_proxy()
             .dns_resolver(Arc::clone(&resolver))
             .timeout(config.crl_fetch_timeout)
             .connect_timeout(CRL_CONNECT_TIMEOUT)
             .tcp_keepalive(None)
-            .redirect(reqwest::redirect::Policy::none())
+            .redirect(Policy::none())
             .user_agent(format!("rmcp-server-kit/{}", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|error| {
@@ -545,7 +437,7 @@ impl CrlSet {
         // and test-helper constructors accept a raw `MtlsConfig` directly.
         let concurrency = config.crl_max_concurrent_fetches.max(1);
         let global_fetch_sem = Arc::new(Semaphore::new(concurrency));
-        let host_semaphores = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let host_semaphores = Arc::new(TokioMutex::new(HashMap::new()));
 
         // Same raw-`MtlsConfig` bypass as above; keep a one-token minimum even
         // when callers skip the startup validator.
@@ -566,7 +458,7 @@ impl CrlSet {
         )]
         Ok(Arc::new(Self {
             verifier_state: ArcSwap::from_pointee(initial_state),
-            commit_lock: tokio::sync::Mutex::new(()),
+            commit_lock: TokioMutex::new(()),
             cache: RwLock::new(initial_cache),
             roots,
             config,
@@ -595,48 +487,57 @@ impl CrlSet {
         let probe = self
             .discovery_send_probe
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        if let Some(probe) = probe {
-            probe(self, url);
+        if let Some(callback) = probe {
+            callback(self, url);
         }
     }
 
+    #[expect(
+        clippy::cfg_not_test,
+        reason = "deliberate: src/mtls_revocation.rs::fire_discovery_send_probe the production stub is compiled out when the test-helpers bypass is present; the inverted cfg is intentional"
+    )]
     #[cfg(not(any(test, feature = "test-helpers")))]
     #[inline]
     #[expect(
         clippy::unused_self,
         reason = "the receiver keeps the call site identical across cfgs; production builds compile this to nothing"
     )]
-    fn fire_discovery_send_probe(&self, _url: &str) {}
+    /// Production no-op predecessor of the test-only pre-publication probe.
+    const fn fire_discovery_send_probe(&self, _url: &str) {}
 
     /// Test-only: observe every URL at the instant before it is published to
     /// the discovery channel.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
+    #[inline]
     pub fn __test_set_discovery_send_probe(&self, probe: DiscoverySendProbe) {
         *self
             .discovery_send_probe
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(probe);
+            .unwrap_or_else(PoisonError::into_inner) = Some(probe);
     }
 
+    /// Whether `which` is outside its one-minute cooldown, recording the
+    /// emission when so.
     fn should_warn_throttled(&self, which: &'static str) -> bool {
         let now = Instant::now();
         let cooldown = Duration::from_mins(1);
         let mut guard = self
             .last_cap_warn
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         let should_emit = guard
             .get(which)
             .is_none_or(|last| now.saturating_duration_since(*last) >= cooldown);
         if should_emit {
-            guard.insert(which, now);
+            let _previous = guard.insert(which, now);
         }
         should_emit
     }
 
+    /// Emit the cache-cap warning for `which`, throttled to one line per minute.
     fn warn_cap_exceeded_throttled(&self, which: &'static str) {
         if self.should_warn_throttled(which) {
             tracing::warn!(which = which, "CRL map cap exceeded; dropping newest entry");
@@ -656,10 +557,11 @@ impl CrlSet {
         deprecated,
         reason = "the deprecation targets downstream out-of-band mutation; in-crate reads and the atomic commit path are the supported users of this field"
     )]
-    fn cache_lock(&self) -> &RwLock<HashMap<String, CachedCrl>> {
+    const fn cache_lock(&self) -> &RwLock<HashMap<String, CachedCrl>> {
         &self.cache
     }
 
+    /// Emit the per-handshake CDP-URL cap rejection warning, throttled.
     fn warn_cdp_cap_exceeded_throttled(&self, observed: usize) {
         if self.should_warn_throttled("cdp_url_cap") {
             tracing::warn!(
@@ -716,6 +618,11 @@ impl CrlSet {
         }
     }
 
+    /// Commit a batch of CRL inserts and removals as one atomic generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the verifier cannot be rebuilt for the new cache.
     // cancel-safe: `commit_lock` is held across awaits, but every mutation
     // before publication builds a local candidate. The cache swap and the
     // `verifier_state.store` publication are adjacent with NO await between
@@ -750,12 +657,12 @@ impl CrlSet {
                 self.warn_cap_exceeded_throttled("cache");
                 continue;
             }
-            candidate.insert(url.clone(), cached);
+            let _previous = candidate.insert(url.clone(), cached);
             admitted_urls.push(url);
         }
 
         for url in removals {
-            candidate.remove(url);
+            let _removed = candidate.remove(url);
         }
 
         let verifier = rebuild_verifier(&self.roots, &self.config, &candidate)?;
@@ -776,7 +683,7 @@ impl CrlSet {
 
         {
             let mut cache = self.cache_lock().write().await;
-            let superseded = std::mem::replace(&mut *cache, candidate);
+            let superseded = mem::replace(&mut *cache, candidate);
             self.verifier_state.store(new_state);
             drop(cache);
             // Free the superseded map only AFTER releasing the write lock.
@@ -795,18 +702,18 @@ impl CrlSet {
             let mut seen = self
                 .seen_urls
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(PoisonError::into_inner);
             for url in removals {
-                seen.remove(url);
+                let _removed = seen.remove(url);
             }
         }
         {
             let mut pending = self
                 .pending_urls
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(PoisonError::into_inner);
             for url in removals {
-                pending.remove(url);
+                let _removed = pending.remove(url);
             }
         }
 
@@ -818,6 +725,10 @@ impl CrlSet {
     /// # Errors
     ///
     /// Returns an error if rebuilding the inner verifier fails.
+    // cancel-safe: only snapshots URLs then delegates to `refresh_urls`, whose
+    // commits are whole-cache atomic; dropping this future leaves the previous
+    // fully-published generation in place.
+    #[inline]
     pub async fn force_refresh(&self) -> Result<(), RmcpServerKitError> {
         let urls = {
             let cache = self.cache_lock().read().await;
@@ -826,6 +737,11 @@ impl CrlSet {
         self.refresh_urls(urls).await
     }
 
+    /// Refresh every cached URL whose refresh deadline has passed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the atomic commit fails.
     // cancel-safe: selects due URLs and delegates to refresh_urls, which
     // stages results locally before a single atomic commit.
     async fn refresh_due_urls(&self) -> Result<(), RmcpServerKitError> {
@@ -848,6 +764,11 @@ impl CrlSet {
         self.refresh_urls(urls).await
     }
 
+    /// Fetch each URL and commit the successful results atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the atomic commit fails.
     // cancel-safe: fetch results accumulate in local insert/remove vectors and
     // are applied only by commit_cache_update_atomically. Cancelling before
     // that commit discards the batch and leaves the cache untouched.
@@ -880,7 +801,7 @@ impl CrlSet {
         drop(cache);
 
         if !inserts.is_empty() || !removals.is_empty() {
-            let _ = self
+            let _changed = self
                 .commit_cache_update_atomically(inserts, &removals)
                 .await?;
         }
@@ -897,6 +818,10 @@ impl CrlSet {
     /// the cache may be promoted to the permanent `seen_urls` dedup set -
     /// promoting on fetch success alone would suppress a URL that was never
     /// cached, which is the same revocation-bypass this state split fixes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the fetch or the atomic commit fails.
     // cancel-safe: commits only after gated_fetch returns, so cancellation
     // during the fetch cannot promote a URL into the seen_urls dedup set.
     async fn fetch_and_store_url(&self, url: String) -> Result<bool, RmcpServerKitError> {
@@ -910,7 +835,7 @@ impl CrlSet {
             self.config.crl_max_host_semaphores,
         )
         .await?;
-        let _ = self
+        let _committed = self
             .commit_cache_update_atomically(vec![(url.clone(), cached)], &[])
             .await?;
         Ok(self.cache_lock().read().await.contains_key(&url))
@@ -923,18 +848,18 @@ impl CrlSet {
             let mut pending = self
                 .pending_urls
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            pending.remove(url);
+                .unwrap_or_else(PoisonError::into_inner);
+            let _removed = pending.remove(url);
         }
         let mut seen = self
             .seen_urls
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         if seen.len() >= self.config.crl_max_seen_urls && !seen.contains(url) {
             self.warn_cap_exceeded_throttled("seen_urls");
             return;
         }
-        seen.insert(url.to_owned());
+        let _inserted = seen.insert(url.to_owned());
     }
 
     /// Clear a URL's in-flight marker without promoting it, so a later
@@ -944,8 +869,8 @@ impl CrlSet {
         let mut pending = self
             .pending_urls
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        pending.remove(url);
+            .unwrap_or_else(PoisonError::into_inner);
+        let _removed = pending.remove(url);
     }
 
     /// Enqueue newly-seen CDP URLs and run the synchronous fail-closed
@@ -971,7 +896,11 @@ impl CrlSet {
         // SECURITY: see `DynamicClientCertVerifier::verify_client_cert` for
         // the rationale on why accepting URLs from an unverified cert is
         // safe (no HTTP on this path; fetch is off-path and SSRF-gated).
-        let mut all_urls = Vec::with_capacity(end_entity_urls.len() + intermediate_urls.len());
+        let mut all_urls = Vec::with_capacity(
+            end_entity_urls
+                .len()
+                .saturating_add(intermediate_urls.len()),
+        );
         all_urls.extend_from_slice(end_entity_urls);
         all_urls.extend_from_slice(intermediate_urls);
         all_urls.sort();
@@ -1020,11 +949,11 @@ impl CrlSet {
             let seen = self
                 .seen_urls
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(PoisonError::into_inner);
             let pending = self
                 .pending_urls
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(PoisonError::into_inner);
             relevant_urls
                 .iter()
                 .filter(|url| !seen.contains(*url) && !pending.contains(*url))
@@ -1045,16 +974,17 @@ impl CrlSet {
         // also consulting the global bucket would let a rejected attacker still
         // drain the shared budget, the exact cross-peer starvation this fixes.
         for url in candidates {
-            let admitted = if let Ok(peer) = CURRENT_HANDSHAKE_PEER.try_with(|ip| *ip) {
-                self.discovery_limiter_per_peer.check_key(&peer).is_ok()
-            } else {
-                // No handshake scope: preserve the pre-change process-global
-                // behaviour exactly. Emitted (throttled) so a future
-                // regression dropping the task-local scope is observable
-                // rather than silently reverting to global-only admission.
-                self.warn_unattributed_discovery_throttled();
-                self.discovery_limiter.check().is_ok()
-            };
+            let admitted = CURRENT_HANDSHAKE_PEER.try_with(|ip| *ip).map_or_else(
+                |_| {
+                    // No handshake scope: preserve the pre-change process-global
+                    // behaviour exactly. Emitted (throttled) so a future
+                    // regression dropping the task-local scope is observable
+                    // rather than silently reverting to global-only admission.
+                    self.warn_unattributed_discovery_throttled();
+                    self.discovery_limiter.check().is_ok()
+                },
+                |peer| self.discovery_limiter_per_peer.check_key(&peer).is_ok(),
+            );
             if !admitted {
                 self.warn_discovery_rate_limited_throttled(&url);
                 continue;
@@ -1066,7 +996,7 @@ impl CrlSet {
                 let mut guard = self
                     .pending_urls
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    .unwrap_or_else(PoisonError::into_inner);
                 if guard.contains(&url) {
                     false
                 } else {
@@ -1165,6 +1095,7 @@ impl CrlSet {
         since = "3.8.0",
         note = "test-only constructor that is ungated in 3.x by accident; it becomes feature-gated in 4.0"
     )]
+    #[inline]
     pub fn __test_with_prepopulated_crls(
         roots: Arc<RootCertStore>,
         config: MtlsConfig,
@@ -1177,7 +1108,7 @@ impl CrlSet {
         for (index, der) in prefilled_crls.into_iter().enumerate() {
             let source_url = format!("memory://crl/{index}");
             let (this_update, next_update) = parse_crl_metadata(der.as_ref())?;
-            initial_cache.insert(
+            let _previous = initial_cache.insert(
                 source_url.clone(),
                 CachedCrl {
                     der,
@@ -1204,6 +1135,7 @@ impl CrlSet {
         since = "3.8.0",
         note = "test-only constructor that is ungated in 3.x by accident; it becomes feature-gated in 4.0"
     )]
+    #[inline]
     pub fn __test_with_kept_receiver(
         roots: Arc<RootCertStore>,
         config: MtlsConfig,
@@ -1215,7 +1147,7 @@ impl CrlSet {
         for (index, der) in prefilled_crls.into_iter().enumerate() {
             let source_url = format!("memory://crl/{index}");
             let (this_update, next_update) = parse_crl_metadata(der.as_ref())?;
-            initial_cache.insert(
+            let _previous = initial_cache.insert(
                 source_url.clone(),
                 CachedCrl {
                     der,
@@ -1237,15 +1169,16 @@ impl CrlSet {
     /// discovery quota, and enqueues arbitrary URLs. Fetch-side SSRF, scheme,
     /// and concurrency caps still apply. Ungated public leak.
     #[doc(hidden)]
+    #[inline]
     pub fn __test_check_discovery_rate(&self, urls: &[String]) -> (usize, usize) {
-        let mut accepted = 0usize;
-        let mut dropped = 0usize;
+        let mut accepted = 0_usize;
+        let mut dropped = 0_usize;
         for url in urls {
             if self.discovery_limiter.check().is_ok() {
-                let _ = self.discover_tx.send(url.clone());
-                accepted += 1;
+                let _sent = self.discover_tx.send(url.clone());
+                accepted = accepted.saturating_add(1);
             } else {
-                dropped += 1;
+                dropped = dropped.saturating_add(1);
             }
         }
         (accepted, dropped)
@@ -1257,6 +1190,7 @@ impl CrlSet {
     /// differs from production behaviour and can create state a real closed
     /// discovery channel would not record. Ungated public leak.
     #[doc(hidden)]
+    #[inline]
     pub fn __test_note_discovered_urls(&self, urls: &[String]) -> bool {
         let (missing_cached, _state) = self.note_discovered_urls(urls, &[]);
         if self.discover_tx.is_closed() {
@@ -1264,7 +1198,7 @@ impl CrlSet {
                 let seen = self
                     .seen_urls
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    .unwrap_or_else(PoisonError::into_inner);
                 urls.iter()
                     .filter(|url| seen.contains(*url))
                     .cloned()
@@ -1273,7 +1207,7 @@ impl CrlSet {
             let mut pending = self
                 .pending_urls
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(PoisonError::into_inner);
             for url in urls {
                 if already_seen.contains(url) || pending.contains(url) {
                     continue;
@@ -1282,7 +1216,7 @@ impl CrlSet {
                     self.warn_cap_exceeded_throttled("pending_urls");
                     break;
                 }
-                pending.insert(url.clone());
+                let _inserted = pending.insert(url.clone());
             }
         }
         missing_cached
@@ -1292,6 +1226,7 @@ impl CrlSet {
     /// intermediate CDP sets.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
+    #[inline]
     pub fn __test_note_discovered_urls_by_cert(
         &self,
         end_entity_urls: &[String],
@@ -1305,12 +1240,13 @@ impl CrlSet {
     /// inspection helper, but an ungated public leak available without
     /// `test-helpers`; use only in tests.
     #[doc(hidden)]
+    #[inline]
     pub fn __test_is_seen(&self, url: &str) -> bool {
         let in_seen = {
             let seen = self
                 .seen_urls
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(PoisonError::into_inner);
             seen.contains(url)
         };
         if in_seen {
@@ -1319,7 +1255,7 @@ impl CrlSet {
         let pending = self
             .pending_urls
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         pending.contains(url)
     }
 
@@ -1328,11 +1264,12 @@ impl CrlSet {
     /// A URL that was merely queued, or whose fetch failed, is not counted.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
+    #[inline]
     pub fn __test_is_permanently_seen(&self, url: &str) -> bool {
         let seen = self
             .seen_urls
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         seen.contains(url)
     }
 
@@ -1343,6 +1280,7 @@ impl CrlSet {
     /// for the process lifetime.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
+    #[inline]
     pub fn __test_settle_pending(&self, url: &str, admitted: bool) {
         if admitted {
             self.promote_pending_to_seen(url);
@@ -1355,6 +1293,7 @@ impl CrlSet {
     /// `tests/unit/crl_map_bounds.rs` to assert the cap is enforced.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
+    #[inline]
     pub fn __test_host_semaphore_count(&self) -> usize {
         self.host_semaphores
             .try_lock()
@@ -1364,6 +1303,7 @@ impl CrlSet {
     /// Test-only: current number of entries in the CRL cache.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
+    #[inline]
     pub fn __test_cache_len(&self) -> usize {
         self.cache_lock().try_read().map_or(0, |guard| guard.len())
     }
@@ -1371,6 +1311,7 @@ impl CrlSet {
     /// Test-only: whether a specific URL is currently cached.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
+    #[inline]
     pub fn __test_cache_contains(&self, url: &str) -> bool {
         self.cache_lock()
             .try_read()
@@ -1381,6 +1322,7 @@ impl CrlSet {
     /// present in the live verifier.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
+    #[inline]
     pub fn __test_cached_url_contains(&self, url: &str) -> bool {
         self.verifier_state.load().cached_urls.contains(url)
     }
@@ -1392,6 +1334,7 @@ impl CrlSet {
     /// SSRF, scheme, and concurrency caps still apply.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
+    #[inline]
     pub async fn __test_trigger_fetch(&self, url: &str) -> Result<(), RmcpServerKitError> {
         if let Err(error) = gated_fetch(
             &self.client,
@@ -1422,8 +1365,9 @@ impl CrlSet {
     /// rebuild errors, so an invalid CRL is a silent no-op.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
+    #[inline]
     pub async fn __test_insert_cache(&self, url: &str, cached: CachedCrl) {
-        let _ = self
+        let _result = self
             .commit_cache_update_atomically(vec![(url.to_owned(), cached)], &[])
             .await;
     }
@@ -1431,6 +1375,7 @@ impl CrlSet {
     /// Test-only: direct cache insertion that returns verifier rebuild errors.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
+    #[inline]
     pub async fn __test_try_insert_cache(
         &self,
         url: &str,
@@ -1450,9 +1395,10 @@ impl CrlSet {
     /// unenforceable.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
+    #[inline]
     pub async fn __test_replace_cache_entry_unverified(&self, url: &str, cached: CachedCrl) {
         let mut cache = self.cache_lock().write().await;
-        cache.insert(url.to_owned(), cached);
+        let _previous = cache.insert(url.to_owned(), cached);
     }
 
     /// # ⚠️ Security
@@ -1462,11 +1408,13 @@ impl CrlSet {
     /// checks.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
+    #[inline]
     pub async fn __test_trigger_refresh_url(&self, url: &str) -> Result<(), RmcpServerKitError> {
         self.refresh_urls(vec![url.to_owned()]).await
     }
 
-    // cancel-safe (cache integrity): `join_next` fills a local `Vec`; dropping
+    /// Fetch every URL concurrently, returning each result.
+    // cancel-safe: cache integrity - `join_next` fills a local `Vec`; dropping
     // the `JoinSet` aborts unfinished `gated_fetch` before any cache commit.
     // A cancelled fetch leaves at most an idle bounded host semaphore.
     async fn fetch_url_results(
@@ -1481,7 +1429,7 @@ impl CrlSet {
             let allow_http = self.config.crl_allow_http;
             let max_bytes = self.max_response_bytes;
             let max_host_semaphores = self.config.crl_max_host_semaphores;
-            tasks.spawn(async move {
+            let _task = tasks.spawn(async move {
                 let result = gated_fetch(
                     &client,
                     &global_sem,
@@ -1510,6 +1458,7 @@ impl CrlSet {
     }
 }
 
+/// Minimal CRL-shaped DER used by the test-only synthetic cache entries.
 #[cfg(any(test, feature = "test-helpers"))]
 const SYNTHETIC_TEST_CRL_DER: &[u8] = &[
     48, 129, 199, 48, 110, 2, 1, 1, 48, 10, 6, 8, 42, 134, 72, 206, 61, 4, 3, 2, 48, 14, 49, 12,
@@ -1530,6 +1479,7 @@ impl CachedCrl {
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     #[must_use]
+    #[inline]
     pub fn __test_synthetic(now: SystemTime) -> Self {
         Self {
             der: CertificateRevocationListDer::from(SYNTHETIC_TEST_CRL_DER.to_vec()),
@@ -1546,6 +1496,7 @@ impl CachedCrl {
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     #[must_use]
+    #[inline]
     pub fn __test_stale(reference_past: SystemTime) -> Self {
         Self {
             der: CertificateRevocationListDer::from(vec![0x30, 0x00]),
@@ -1560,13 +1511,16 @@ impl CachedCrl {
 /// Stable outer verifier that delegates all TLS verification behavior to the
 /// atomically swappable inner verifier.
 pub struct DynamicClientCertVerifier {
+    /// Shared CRL state; the verifier delegates every decision to it.
     inner: Arc<CrlSet>,
+    /// Root subject names advertised as hints, snapshotted at construction.
     dn_subjects: Vec<DistinguishedName>,
 }
 
 impl DynamicClientCertVerifier {
     /// Construct a new dynamic verifier from a shared [`CrlSet`].
     #[must_use]
+    #[inline]
     pub fn new(inner: Arc<CrlSet>) -> Self {
         Self {
             dn_subjects: inner.roots.subjects(),
@@ -1575,8 +1529,9 @@ impl DynamicClientCertVerifier {
     }
 }
 
-impl std::fmt::Debug for DynamicClientCertVerifier {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for DynamicClientCertVerifier {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DynamicClientCertVerifier")
             .field("dn_subjects_len", &self.dn_subjects.len())
             .finish_non_exhaustive()
@@ -1584,20 +1539,24 @@ impl std::fmt::Debug for DynamicClientCertVerifier {
 }
 
 impl ClientCertVerifier for DynamicClientCertVerifier {
+    #[inline]
     fn offer_client_auth(&self) -> bool {
         let state = self.inner.verifier_state.load();
         state.verifier.offer_client_auth()
     }
 
+    #[inline]
     fn client_auth_mandatory(&self) -> bool {
         let state = self.inner.verifier_state.load();
         state.verifier.client_auth_mandatory()
     }
 
+    #[inline]
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
         &self.dn_subjects
     }
 
+    #[inline]
     fn verify_client_cert(
         &self,
         end_entity: &CertificateDer<'_>,
@@ -1644,6 +1603,7 @@ impl ClientCertVerifier for DynamicClientCertVerifier {
             .verify_client_cert(end_entity, intermediates, now)
     }
 
+    #[inline]
     fn verify_tls12_signature(
         &self,
         message: &[u8],
@@ -1654,6 +1614,7 @@ impl ClientCertVerifier for DynamicClientCertVerifier {
         state.verifier.verify_tls12_signature(message, cert, dss)
     }
 
+    #[inline]
     fn verify_tls13_signature(
         &self,
         message: &[u8],
@@ -1664,11 +1625,13 @@ impl ClientCertVerifier for DynamicClientCertVerifier {
         state.verifier.verify_tls13_signature(message, cert, dss)
     }
 
+    #[inline]
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         let state = self.inner.verifier_state.load();
         state.verifier.supported_verify_schemes()
     }
 
+    #[inline]
     fn requires_raw_public_keys(&self) -> bool {
         let state = self.inner.verifier_state.load();
         state.verifier.requires_raw_public_keys()
@@ -1684,6 +1647,7 @@ impl ClientCertVerifier for DynamicClientCertVerifier {
 /// IP literals and metadata endpoints are applied later, at fetch time, after
 /// DNS resolution.
 #[must_use]
+#[inline]
 pub fn extract_cdp_urls(cert_der: &[u8], allow_http: bool) -> Vec<String> {
     let Ok((_, cert)) = X509Certificate::from_der(cert_der) else {
         return Vec::new();
@@ -1757,9 +1721,14 @@ fn cap_bootstrap_urls(urls: &mut Vec<String>, cap: usize) {
     clippy::cognitive_complexity,
     reason = "bootstrap coordinates timeout, parallel fetches, and partial-cache recovery"
 )]
+#[expect(
+    clippy::integer_division_remainder_used,
+    reason = "external macro: tokio::select"
+)]
 // cancel-safe: CRL cache state is local until final `CrlSet::new`; timeout or
 // cancellation drops the `JoinSet`, aborting in-flight `gated_fetch` before
 // publication. Bootstrap host semaphores are local and drop with this future.
+#[inline]
 pub async fn bootstrap_fetch(
     roots: Arc<RootCertStore>,
     ca_certs: &[CertificateDer<'static>],
@@ -1778,24 +1747,27 @@ pub async fn bootstrap_fetch(
     // M-H2: same SSRF resolver hardening as CrlSet::new -- bootstrap
     // fetches the same attacker-controlled CDP URLs, just earlier in
     // the lifecycle.
-    let bootstrap_allowlist = Arc::new(crate::ssrf::CompiledSsrfAllowlist::default());
-    let bootstrap_resolver: Arc<dyn reqwest::dns::Resolve> =
-        Arc::new(crate::ssrf_resolver::SsrfScreeningResolver::new(
-            Arc::clone(&bootstrap_allowlist),
-            #[cfg(any(test, feature = "test-helpers"))]
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            #[cfg(not(any(test, feature = "test-helpers")))]
-            (),
-        ));
+    let bootstrap_allowlist = Arc::new(CompiledSsrfAllowlist::default());
+    let bootstrap_resolver: Arc<dyn Resolve> = Arc::new(SsrfScreeningResolver::new(
+        Arc::clone(&bootstrap_allowlist),
+        #[cfg(any(test, feature = "test-helpers"))]
+        Arc::new(AtomicBool::new(false)),
+        #[expect(
+            clippy::cfg_not_test,
+            reason = "deliberate: src/mtls_revocation.rs::SsrfScreeningResolver::new takes a no-op bypass argument when the test-helpers feature is absent; the inverted cfg is intentional"
+        )]
+        #[cfg(not(any(test, feature = "test-helpers")))]
+        (),
+    ));
 
-    let client = reqwest::Client::builder()
+    let client = Client::builder()
         // M-H2/N1: see oauth.rs::OauthHttpClient::build for rationale.
         .no_proxy()
         .dns_resolver(Arc::clone(&bootstrap_resolver))
         .timeout(config.crl_fetch_timeout)
         .connect_timeout(CRL_CONNECT_TIMEOUT)
         .tcp_keepalive(None)
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(Policy::none())
         .user_agent(format!("rmcp-server-kit/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|error| RmcpServerKitError::Startup(format!("CRL HTTP client init: {error}")))?;
@@ -1807,7 +1779,7 @@ pub async fn bootstrap_fetch(
     // so callers can bypass `McpServerConfig::validate`.
     let bootstrap_concurrency = config.crl_max_concurrent_fetches.max(1);
     let global_sem = Arc::new(Semaphore::new(bootstrap_concurrency));
-    let host_semaphores = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let host_semaphores = Arc::new(TokioMutex::new(HashMap::new()));
     let allow_http = config.crl_allow_http;
     let max_bytes = config.crl_max_response_bytes;
     let max_host_semaphores = config.crl_max_host_semaphores;
@@ -1815,26 +1787,26 @@ pub async fn bootstrap_fetch(
     let mut initial_cache = HashMap::new();
     let mut tasks = JoinSet::new();
     for url in &urls {
-        let client = client.clone();
-        let url = url.clone();
-        let global_sem = Arc::clone(&global_sem);
-        let host_semaphores = Arc::clone(&host_semaphores);
-        tasks.spawn(async move {
+        let task_client = client.clone();
+        let task_url = url.clone();
+        let task_global_sem = Arc::clone(&global_sem);
+        let task_host_semaphores = Arc::clone(&host_semaphores);
+        let _task = tasks.spawn(async move {
             let result = gated_fetch(
-                &client,
-                &global_sem,
-                &host_semaphores,
-                &url,
+                &task_client,
+                &task_global_sem,
+                &task_host_semaphores,
+                &task_url,
                 allow_http,
                 max_bytes,
                 max_host_semaphores,
             )
             .await;
-            (url, result)
+            (task_url, result)
         });
     }
 
-    let timeout: Sleep = tokio::time::sleep(BOOTSTRAP_TIMEOUT);
+    let timeout: Sleep = sleep(BOOTSTRAP_TIMEOUT);
     tokio::pin!(timeout);
 
     while !tasks.is_empty() {
@@ -1852,7 +1824,7 @@ pub async fn bootstrap_fetch(
                 };
                 match joined {
                     Ok((url, Ok(cached))) => {
-                        initial_cache.insert(url, cached);
+                        let _previous = initial_cache.insert(url, cached);
                     }
                     Ok((url, Err(error))) => {
                         tracing::warn!(url = %url, error = %error, "CRL bootstrap fetch failed");
@@ -1869,6 +1841,11 @@ pub async fn bootstrap_fetch(
     Ok((set, discover_rx))
 }
 
+/// Apply the cache cap, then build the `CrlSet` from the bootstrap cache.
+///
+/// # Errors
+///
+/// Returns an error if the initial verifier cannot be built.
 fn new_crl_set_from_bootstrap_cache(
     roots: Arc<RootCertStore>,
     config: MtlsConfig,
@@ -1879,6 +1856,7 @@ fn new_crl_set_from_bootstrap_cache(
     CrlSet::new(roots, config, discover_tx, initial_cache)
 }
 
+/// Drop the excess cache entries beyond `max_cache_entries`, in sorted order.
 fn apply_bootstrap_cache_cap(
     initial_cache: &mut HashMap<String, CachedCrl>,
     max_cache_entries: usize,
@@ -1890,17 +1868,23 @@ fn apply_bootstrap_cache_cap(
     let mut urls = initial_cache.keys().cloned().collect::<Vec<_>>();
     urls.sort();
     for url in urls.into_iter().skip(max_cache_entries) {
-        initial_cache.remove(&url);
+        let _removed = initial_cache.remove(&url);
     }
 }
 
 /// Run the CRL refresher loop until shutdown.
-// cancel-safe, including under abort: cooperative `shutdown` breaks the loop at
-// a settlement point, and the discovery arm holds a `PendingUrlGuard` across
-// `fetch_and_store_url`, so a `JoinHandle::abort` that drops the future mid-await
-// still clears the transient `pending_urls` marker via `Drop`. Without that
-// guard a stale marker would suppress re-enqueue forever (see the note above
-// `seen_urls`/`pending_urls` clearing) and silently narrow revocation coverage.
+#[expect(
+    clippy::integer_division_remainder_used,
+    reason = "external macro: tokio::select"
+)]
+// Without the discovery arm's `PendingUrlGuard`, an abort would leave a stale
+// `pending_urls` marker that suppresses re-enqueue forever (see the note above
+// `seen_urls`/`pending_urls` clearing) and silently narrows revocation coverage.
+#[inline]
+// cancel-safe: including under abort - cooperative `shutdown` breaks the loop
+// at a settlement point; the discovery arm holds a `PendingUrlGuard` across
+// `fetch_and_store_url`, so `JoinHandle::abort` dropping the future mid-await
+// still clears the transient marker via `Drop`.
 pub async fn run_crl_refresher(
     set: Arc<CrlSet>,
     mut discover_rx: mpsc::UnboundedReceiver<String>,
@@ -1935,6 +1919,7 @@ pub async fn run_crl_refresher(
     }
 }
 
+/// Owned abort-safety guard for the discovery arm in `run_crl_refresher`.
 // Abort-safety guard for the discovery arm in `run_crl_refresher`. Cooperative
 // shutdown already leaves `pending_urls` consistent because the arm body runs to
 // a normal `Ok`/`Err` settlement point, but `JoinHandle::abort` drops the future
@@ -1943,13 +1928,17 @@ pub async fn run_crl_refresher(
 // the fetch future is dropped before a CRL is confirmed cached, `Drop` removes
 // the transient in-flight marker so the CDP can be retried by a later handshake.
 struct PendingUrlGuard {
+    /// The CRL set whose `pending_urls` marker this guard owns.
     set: Arc<CrlSet>,
+    /// The URL whose in-flight marker this guard owns.
     url: String,
+    /// Whether the guard still owns the marker (disarmed once promoted).
     armed: bool,
 }
 
 impl PendingUrlGuard {
-    fn armed(set: Arc<CrlSet>, url: String) -> Self {
+    /// Arm a guard that clears `url`'s in-flight marker on drop.
+    const fn armed(set: Arc<CrlSet>, url: String) -> Self {
         Self {
             set,
             url,
@@ -1957,7 +1946,8 @@ impl PendingUrlGuard {
         }
     }
 
-    fn disarm(&mut self) {
+    /// Relinquish ownership after the URL is promoted, so drop only clears.
+    const fn disarm(&mut self) {
         self.armed = false;
     }
 }
@@ -1974,6 +1964,7 @@ impl Drop for PendingUrlGuard {
     }
 }
 
+/// Apply a discovery fetch's settlement to the pending/seen dedup state.
 fn settle_discovered_url(
     mut pending_guard: PendingUrlGuard,
     result: Result<bool, RmcpServerKitError>,
@@ -2011,11 +2002,15 @@ fn settle_discovered_url(
 /// # Errors
 ///
 /// Returns an error if rustls rejects the verifier configuration.
-pub fn rebuild_verifier<S: std::hash::BuildHasher>(
+#[inline]
+pub fn rebuild_verifier<S>(
     roots: &Arc<RootCertStore>,
     config: &MtlsConfig,
     cache: &HashMap<String, CachedCrl, S>,
-) -> Result<Arc<dyn ClientCertVerifier>, RmcpServerKitError> {
+) -> Result<Arc<dyn ClientCertVerifier>, RmcpServerKitError>
+where
+    S: BuildHasher,
+{
     let mut builder = WebPkiClientVerifier::builder(Arc::clone(roots));
 
     if !cache.is_empty() {
@@ -2048,6 +2043,7 @@ pub fn rebuild_verifier<S: std::hash::BuildHasher>(
 /// # Errors
 ///
 /// Returns an error if the CRL cannot be parsed.
+#[inline]
 pub fn parse_crl_metadata(
     der: &[u8],
 ) -> Result<(SystemTime, Option<SystemTime>), RmcpServerKitError> {
@@ -2060,15 +2056,27 @@ pub fn parse_crl_metadata(
     ))
 }
 
+/// Compute and box the next refresh sleep deadline.
+// cancel-safe: builds the next sleep deadline from a read lock that is released
+// before this future resolves; no state is mutated, so a cancelled call only
+// delays rescheduling until the next loop iteration.
 async fn schedule_next_refresh(set: &CrlSet) -> Pin<Box<Sleep>> {
     let duration = next_refresh_delay(set).await;
     boxed_sleep(duration)
 }
 
+/// Box a sleep for `duration` from now into a pin-ready `Sleep`.
 fn boxed_sleep(duration: Duration) -> Pin<Box<Sleep>> {
-    Box::pin(tokio::time::sleep_until(Instant::now() + duration))
+    Box::pin(sleep(duration))
 }
 
+/// Compute the delay until the next due refresh, clamped to the house bounds.
+// cancel-safe: takes a read lock, folds cache metadata into a local deadline,
+// and drops the guard before returning; cancellation leaves no partial state.
+#[expect(
+    clippy::iter_over_hash_type,
+    reason = "deliberate: src/mtls_revocation.rs::next_refresh_delay folds every cached deadline with `min`, so iteration order cannot affect the result"
+)]
 async fn next_refresh_delay(set: &CrlSet) -> Duration {
     if let Some(interval) = set.config.crl_refresh_interval {
         return clamp_refresh(interval);
@@ -2098,6 +2106,10 @@ async fn next_refresh_delay(set: &CrlSet) -> Duration {
 /// map lock, and a clone outlives the critical section only while a fetch
 /// is in flight, so an entry with `Arc::strong_count == 1` is provably
 /// idle and safe to drop.
+///
+/// # Errors
+///
+/// Returns an error when the host cap is reached with no idle entry to evict.
 fn acquire_host_semaphore(
     map: &mut HashMap<String, Arc<Semaphore>>,
     host_key: &str,
@@ -2113,14 +2125,16 @@ fn acquire_host_semaphore(
                 "crl_host_semaphore_cap_exceeded: too many distinct CRL hosts in flight".to_owned(),
             ));
         }
-        map.insert(host_key.to_owned(), Arc::new(Semaphore::new(1)));
+        let _previous = map.insert(host_key.to_owned(), Arc::new(Semaphore::new(1)));
     }
-    match map.get(host_key) {
-        Some(semaphore) => Ok(Arc::clone(semaphore)),
-        None => Err(RmcpServerKitError::Tls(
-            "CRL host semaphore missing after insertion".to_owned(),
-        )),
-    }
+    map.get(host_key).map_or_else(
+        || {
+            Err(RmcpServerKitError::Tls(
+                "CRL host semaphore missing after insertion".to_owned(),
+            ))
+        },
+        |semaphore| Ok(Arc::clone(semaphore)),
+    )
 }
 
 /// Fetch a single CRL URL through the global + per-host concurrency caps.
@@ -2130,13 +2144,17 @@ fn acquire_host_semaphore(
 /// (an SSRF amplification defense); at the host cap, idle entries are
 /// evicted on demand. Both permits are dropped when the returned future
 /// completes (whether `Ok` or `Err`).
-// cancel-safe for permits: cancelling queued `acquire_owned` loses only queue
+///
+/// # Errors
+///
+/// Returns an error if a permit is unavailable or the underlying fetch fails.
+// cancel-safe: permits - cancelling queued `acquire_owned` loses only queue
 // position, acquired global/host permits RAII-drop, and host-map insertion can
 // leave only an idle bounded semaphore entry that later self-heals.
 async fn gated_fetch(
-    client: &reqwest::Client,
+    client: &Client,
     global_sem: &Arc<Semaphore>,
-    host_semaphores: &Arc<tokio::sync::Mutex<HashMap<String, Arc<Semaphore>>>>,
+    host_semaphores: &Arc<TokioMutex<HashMap<String, Arc<Semaphore>>>>,
     url: &str,
     allow_http: bool,
     max_bytes: u64,
@@ -2144,7 +2162,7 @@ async fn gated_fetch(
 ) -> Result<CachedCrl, RmcpServerKitError> {
     let host_key = Url::parse(url)
         .ok()
-        .and_then(|u| u.host_str().map(str::to_owned))
+        .and_then(|parsed_url| parsed_url.host_str().map(str::to_owned))
         .unwrap_or_else(|| url.to_owned());
 
     let host_sem = {
@@ -2166,11 +2184,17 @@ async fn gated_fetch(
     fetch_crl(client, url, allow_http, max_bytes).await
 }
 
+/// Fetch and parse a single CRL into a cache entry.
+///
+/// # Errors
+///
+/// Returns an error if the scheme is rejected, DNS screening fails, the HTTP
+/// fetch fails, the body exceeds the cap, or the DER cannot be parsed.
 // cancel-safe: DNS lookup, request send, chunk reads, DER parse, and metadata
 // extraction build only a local `CachedCrl`; CRL cache/verifier state changes
 // happen later, when callers commit the returned value.
 async fn fetch_crl(
-    client: &reqwest::Client,
+    client: &Client,
     url: &str,
     allow_http: bool,
     max_bytes: u64,
@@ -2259,6 +2283,7 @@ async fn fetch_crl(
     })
 }
 
+/// Whether a cached CRL is due for refresh at `now`.
 fn should_refresh_cached(
     cached: &CachedCrl,
     now: SystemTime,
@@ -2276,6 +2301,7 @@ fn should_refresh_cached(
         .is_none_or(|next_update| now >= next_update)
 }
 
+/// Clamp a refresh interval into [`MIN_AUTO_REFRESH`]..=[`MAX_AUTO_REFRESH`].
 fn clamp_refresh(duration: Duration) -> Duration {
     duration.clamp(MIN_AUTO_REFRESH, MAX_AUTO_REFRESH)
 }
@@ -2293,7 +2319,7 @@ const MAX_ASN1_TIMESTAMP_SECS: u64 = 253_402_300_799;
 /// unrepresentable values are clamped toward [`UNIX_EPOCH`], which is the
 /// safe direction: it can only make a CRL look *older* (forcing an
 /// eager refresh), never fresher.
-fn asn1_time_to_system_time(time: x509_parser::time::ASN1Time) -> SystemTime {
+fn asn1_time_to_system_time(time: ASN1Time) -> SystemTime {
     let timestamp = time.timestamp();
     if timestamp >= 0 {
         let seconds = u64::try_from(timestamp)
@@ -2364,7 +2390,7 @@ mod tests {
 
     use std::sync::{
         Mutex as StdMutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     };
 
     use rcgen::{
@@ -2382,7 +2408,7 @@ mod tests {
             let guard = self
                 .0
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(PoisonError::into_inner);
             String::from_utf8_lossy(&guard).into_owned()
         }
     }
@@ -2395,7 +2421,7 @@ mod tests {
                 let mut guard = self
                     .0
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    .unwrap_or_else(PoisonError::into_inner);
                 guard.extend_from_slice(buf);
             }
             Ok(buf.len())
@@ -2414,8 +2440,8 @@ mod tests {
         }
     }
 
-    fn asn1(timestamp: i64) -> x509_parser::time::ASN1Time {
-        x509_parser::time::ASN1Time::from_timestamp(timestamp).expect("valid ASN.1 timestamp")
+    fn asn1(timestamp: i64) -> ASN1Time {
+        ASN1Time::from_timestamp(timestamp).expect("valid ASN.1 timestamp")
     }
 
     fn install_ring_provider() {
@@ -2423,7 +2449,7 @@ mod tests {
         // with `rustls-no-provider`; installing the provider is idempotent and
         // keeps these unit tests independent from whichever integration test
         // happens to initialize crypto first.
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        drop(rustls::crypto::ring::default_provider().install_default());
     }
 
     fn test_ca_root() -> CertificateDer<'static> {
@@ -2482,14 +2508,14 @@ mod tests {
     fn pending_contains(set: &CrlSet, url: &str) -> bool {
         set.pending_urls
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .contains(url)
     }
 
     fn seen_contains(set: &CrlSet, url: &str) -> bool {
         set.seen_urls
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .contains(url)
     }
 
@@ -2497,8 +2523,8 @@ mod tests {
         let mut pending = set
             .pending_urls
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        pending.insert(url.to_owned());
+            .unwrap_or_else(PoisonError::into_inner);
+        let _inserted = pending.insert(url.to_owned());
     }
 
     /// The pending marker must exist before a URL becomes observable on the
@@ -2526,7 +2552,7 @@ mod tests {
                 pending_contains(set, sent),
                 "URL {sent} became observable before its pending marker existed"
             );
-            probe_observed.fetch_add(1, Ordering::Relaxed);
+            let _count = probe_observed.fetch_add(1, Ordering::Relaxed);
         }));
 
         let _ = set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&url), &[]);
@@ -2797,8 +2823,8 @@ mod tests {
         // reqwest with `rustls-no-provider` requires a process-wide crypto
         // provider before any Client is built (same pattern as the
         // transport/oauth test suites).
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = reqwest::Client::new();
+        drop(rustls::crypto::ring::default_provider().install_default());
+        let client = Client::new();
         let err = fetch_crl(&client, "https://u:p@crl.example/ca.crl", false, 1024)
             .await
             .expect_err("userinfo-bearing CRL URL must be rejected");
@@ -2946,7 +2972,7 @@ mod tests {
     fn warned(set: &CrlSet, which: &str) -> bool {
         set.last_cap_warn
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .contains_key(which)
     }
 
@@ -2979,7 +3005,7 @@ mod tests {
         let mut urls = Vec::with_capacity(count);
         for index in 0..count {
             let url = format!("https://cdp-{index:03}.example.test/crl");
-            initial_cache.insert(url.clone(), synthetic_entry(now));
+            let _previous = initial_cache.insert(url.clone(), synthetic_entry(now));
             urls.push(url);
         }
         let (discover_tx, discover_rx) = mpsc::unbounded_channel();
@@ -3015,7 +3041,8 @@ mod tests {
             "legitimate replacement must change the recorded identity"
         );
 
-        set.commit_cache_update_atomically(Vec::new(), &[added.to_owned()])
+        let _removed = set
+            .commit_cache_update_atomically(Vec::new(), &[added.to_owned()])
             .await
             .expect("removal commit");
         assert!(
@@ -3107,7 +3134,7 @@ mod tests {
             .await;
         assert!(!set.__test_note_discovered_urls_by_cert(std::slice::from_ref(&url), &[]));
 
-        set.cache_lock().write().await.remove(&url);
+        let _removed_entry = set.cache_lock().write().await.remove(&url);
 
         assert!(
             set.verifier_state.load().cached_urls.contains(&url),
@@ -3183,7 +3210,7 @@ mod tests {
         let mut tasks = JoinSet::new();
         for index in 0..total {
             let set = Arc::clone(&set);
-            tasks.spawn(async move {
+            let _task = tasks.spawn(async move {
                 set.__test_insert_cache(
                     &format!("https://concurrent-{index:03}.example.test/crl"),
                     synthetic_entry(now),
@@ -3470,7 +3497,8 @@ mod tests {
             .get(&target)
             .cloned()
             .expect("entry present");
-        set.cache_lock()
+        let _previous = set
+            .cache_lock()
             .try_write()
             .expect("uncontended")
             .insert(target, same_shape_replacement(&committed));
@@ -3694,7 +3722,7 @@ mod tests {
         let pending = set
             .pending_urls
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .len();
         assert!(
             pending <= cap,
