@@ -298,7 +298,31 @@ entry in the same PR that introduces a deviation.
    refresh cooldown, and the redaction tests' output. Evidence: the task-16
    migration record (`status.txt`, `new-permanent-expects.txt`, `gates.txt`).
 
-16. **2026-10-04 - `src/tool_hooks.rs` + `src/rbac_context.rs` per-item
+16. **2026-10-04 - `src/auth.rs` lane expectations (frozen API + deliberate).**
+   Under entry 13's decision, five public items keep names ending in the
+   containing module's name and carry `module_name_repetitions` expectations:
+   `AuthIdentity`, `AuthMethod`, `AuthCountersSnapshot`, `AuthConfig` and
+   `AuthConfigSummary`. Two public functions carry the frozen
+   `clippy::impl_trait_in_params` expectation (`ApiKeyEntry::new`,
+   `ApiKeyEntry::try_with_expiry`), and public builders stay non-`const` under
+   the frozen `clippy::missing_const_for_fn` expectation (`RfcTimestamp::
+   as_datetime`, `RfcTimestamp::into_inner`, `ApiKeyEntry::with_expiry`,
+   `RateLimitConfig::{with_pre_auth_max_per_minute, with_max_tracked_keys,
+   with_idle_eviction, with_burst, with_pre_auth_burst}`,
+   `AuthConfig::{with_keys, with_rate_limit, check_oauth_feature}`); the
+   `oauth`-only shape of `AuthConfig::check_oauth_feature` additionally freezes
+   `clippy::unnecessary_wraps` and `clippy::unused_self`, and `AuthConfig`'s
+   `oauth` placeholder (present only without the `oauth` feature) freezes
+   `clippy::partial_pub_fields` and `clippy::field_scoped_visibility_modifiers`
+   on the struct. Three `deliberate:` expectations record crate-internal
+   shapes rather than freezing public API: the `pub(crate)` fields of
+   `CredentialOwner` (constructed by `src/oauth.rs`), the `pub(crate)` fields
+   of `AuthLogContext` (constructed by `src/transport.rs`'s test helper), and
+   the crate-private `oauth` placeholder field. Constant-time arithmetic in
+   `verify_slots` uses `wrapping_sub` (never `checked_*` + `?`, G-8), and the
+   redaction tests' output is unchanged. Evidence: the task-18 migration
+   record (`new-permanent-expects.txt`, `gates.txt`).
+17. **2026-10-04 - `src/tool_hooks.rs` + `src/rbac_context.rs` per-item
    expectations (task 21).** Under entry 13's decision this lane freezes two
    public items with the catalog reason `public API frozen until the next major
    release`: `clippy::impl_trait_in_params` on `ToolCallContext::for_tool` and
