@@ -163,13 +163,13 @@ fn oauth_internal_suffix_blocked(host: &str, allowlist: &CompiledSsrfAllowlist) 
 /// callers go through [`screen_oauth_target`], which hardcodes
 /// `test_allow_loopback_ssrf = false`; the test-only bypass wrapper is
 /// [`screen_oauth_target_with_test_override`].
-// cancel-safe: performs DNS resolution and pure screening, publishing no
-// shared state; cancellation just discards the verdict.
 ///
 /// # Errors
 ///
 /// Returns [`RmcpServerKitError::Config`] when the target URL is malformed or resolves to a
 /// blocked address.
+// cancel-safe: performs DNS resolution and pure screening, publishing no
+// shared state; cancellation just discards the verdict.
 async fn screen_oauth_target_core(
     url: &str,
     allow_http: bool,
@@ -252,6 +252,7 @@ async fn screen_oauth_target_core(
 ///
 /// Returns [`RmcpServerKitError::Config`] when the target URL is malformed or resolves to a
 /// blocked address.
+// cancel-safe: performs DNS resolution and pure screening with no shared state (delegates to screen_oauth_target_core).
 async fn screen_oauth_target(
     url: &str,
     allow_http: bool,
@@ -3057,6 +3058,7 @@ impl JwksCache {
 
     /// Validate a JWT Bearer token. Returns `Some(AuthIdentity)` on success.
     #[inline]
+    // cancel-safe: read-only validation; a cancelled call may leave an idempotent JWKS refresh in flight, which the cache deduplicates.
     pub async fn validate_token(&self, token: &str) -> Option<AuthIdentity> {
         self.validate_token_with_reason(token).await.ok()
     }
@@ -3081,14 +3083,14 @@ impl JwksCache {
     }
 
     /// Validate a JWT Bearer token with internal rejection owner attribution.
-    // cancel-safe: composed of cancel-safe `decode_claims` (spawn_blocking
-    // decode, no shared state) plus pure claim checks. Owner attribution uses
-    // already-verified claims or expired claims from the same blocking decode.
-    // No partial state is committed on cancellation.
     ///
     /// # Errors
     ///
     /// Returns [`JwtRejection`] carrying the failure classification and optional owner.
+    // cancel-safe: composed of cancel-safe `decode_claims` (spawn_blocking
+    // decode, no shared state) plus pure claim checks. Owner attribution uses
+    // already-verified claims or expired claims from the same blocking decode.
+    // No partial state is committed on cancellation.
     pub(crate) async fn validate_token_detailed(
         &self,
         token: &str,
@@ -3184,14 +3186,14 @@ impl JwksCache {
     /// burst of concurrent JWT validations never starves other tasks on
     /// the multi-threaded runtime's worker pool. The blocking pool absorbs
     /// the verification cost; the async path stays responsive.
-    // cancel-safe: `select_jwks_key` (cancel-safe: read-only lookup + idempotent
-    // refresh) then a `spawn_blocking` decode whose `JoinHandle`, if dropped on
-    // cancellation, detaches the verification (it completes off-task). No shared
-    // state is mutated on this path.
     ///
     /// # Errors
     ///
     /// Returns [`DecodeFailure`] carrying the failure classification and any expired claims.
+    // cancel-safe: `select_jwks_key` (cancel-safe: read-only lookup + idempotent
+    // refresh) then a `spawn_blocking` decode whose `JoinHandle`, if dropped on
+    // cancellation, detaches the verification (it completes off-task). No shared
+    // state is mutated on this path.
     async fn decode_claims(
         &self,
         token: &str,
@@ -3273,10 +3275,6 @@ impl JwksCache {
     // failure is observable. Collapsing them into a combinator chain
     // would lose those structured-field log sites without reducing
     // real cognitive load.
-    // NOT cancel-safe: on a cache miss this delegates to `find_key`, which can
-    // enter `refresh_with_cooldown`. That commits `last_refresh_attempt` before
-    // fetching, so a cancellation mid-refresh still consumes the cooldown slot
-    // and the next caller may be refused a refresh for the cooldown window.
     #[expect(
         clippy::cognitive_complexity,
         reason = "each failure arm pairs `cold_path()` with a distinct `tracing::debug!` site for observability; collapsing into combinators would lose structured-field log sites without reducing real complexity"
@@ -3285,6 +3283,10 @@ impl JwksCache {
     /// # Errors
     ///
     /// Returns a message when no key in the refreshed JWKS can verify the token.
+    // NOT cancel-safe: on a cache miss this delegates to `find_key`, which can
+    // enter `refresh_with_cooldown`. That commits `last_refresh_attempt` before
+    // fetching, so a cancellation mid-refresh still consumes the cooldown slot
+    // and the next caller may be refused a refresh for the cooldown window.
     async fn select_jwks_key(
         &self,
         token: &str,
@@ -3522,14 +3524,14 @@ impl JwksCache {
     ///
     /// Internal implementation - callers should use [`Self::refresh_with_cooldown`]
     /// to respect rate limiting.
-    // cancel-safe (cache integrity): the cache is published via a single
-    // `*guard = Some(..)` assignment under the `tokio::sync::RwLock` write lock
-    // at the end. Cancellation before that point leaves the prior cache intact;
-    // it never observes a half-built cache.
     ///
     /// # Errors
     ///
     /// Returns the `build_key_cache` message when the JWKS exceeds the key cap.
+    // cancel-safe: cache integrity - the cache is published via a single
+    // `*guard = Some(..)` assignment under the `tokio::sync::RwLock` write lock
+    // at the end. Cancellation before that point leaves the prior cache intact;
+    // it never observes a half-built cache.
     async fn refresh_inner(&self) -> Result<(), String> {
         let Some(jwks) = self.fetch_jwks().await else {
             return Ok(());
@@ -3564,7 +3566,7 @@ impl JwksCache {
         clippy::cognitive_complexity,
         reason = "screening, bounded streaming, and parse logging are intentionally kept in one fetch path"
     )]
-    // cancel-safe (cache integrity): screening, `send`, chunk reads, and JSON
+    // cancel-safe: cache integrity - screening, `send`, chunk reads, and JSON
     // parse build only a local body/JWK set; cache publication happens later
     // via one `refresh_inner` write-lock assignment, so old cache stays intact.
     async fn fetch_jwks(&self) -> Option<JwkSet> {
@@ -4429,7 +4431,7 @@ pub async fn handle_introspect(
 /// injecting client credentials when configured. Returns the upstream
 /// response as-is (per RFC 7009, typically 200 with empty body).
 /// Requires `proxy.revocation_url` to be `Some`.
-// cancel-safe for security purposes: cancellation cannot un-revoke a token.
+// cancel-safe: for security purposes, cancellation cannot un-revoke a token.
 // The caller may lose the confirmation response while the revocation still
 // takes effect upstream, which fails in the safe direction.
 #[inline]
@@ -4454,6 +4456,7 @@ pub async fn handle_revoke(
 // cancel-safe for local state: credential rewriting is local, and
 // `send_screened`/`read_response_capped` publish no server state. A repeated
 // revocation cannot restore a token; introspection is read-only.
+// cancel-safe: proxies one upstream request with no local state mutation (SSRF screening reads config only); a cancelled call just drops the response.
 async fn proxy_oauth_admin_request(
     http: &OauthHttpClient,
     proxy: &OAuthProxyConfig,
@@ -4536,13 +4539,13 @@ async fn proxy_oauth_admin_request(
 /// this to a generic `502`); it never returns a truncated body that a
 /// caller might forward as if complete. `context` is an authority-only
 /// label for logs (never a full URL with credentials).
-// cancel-safe: the response body is accumulated in a local `Vec` and returned
-// only after EOF; cancellation during `resp.chunk()` drops the partial buffer
-// and never forwards a truncated OAuth response.
 ///
 /// # Errors
 ///
 /// Returns `()` after logging the transport or size-cap failure.
+// cancel-safe: the response body is accumulated in a local `Vec` and returned
+// only after EOF; cancellation during `resp.chunk()` drops the partial buffer
+// and never forwards a truncated OAuth response.
 async fn read_response_capped(
     mut resp: reqwest::Response,
     max_bytes: u64,
@@ -4651,17 +4654,17 @@ fn sanitize_oauth_error_code(raw: &str) -> &'static str {
 ///
 /// Returns an error if the HTTP request fails, the authorization
 /// server rejects the exchange, or the response cannot be parsed.
-// NOT cancel-safe, and NOT fixable at this layer: once `send_screened` puts the
-// RFC 8693 POST on the wire, dropping this future cannot un-send it. The
-// authorization server may mint a downstream token that never reaches the
-// caller and that nothing here records. No local cache is torn, but retries may
-// duplicate upstream issuance.
 //
 // Callers that can be cancelled should use `exchange_token_with_cancel`, which
 // pre-checks the token, detaches the in-flight exchange rather than dropping it,
 // and audits a token minted after the caller went away. That is a mitigation,
 // not a guarantee -- see its docs for what remains unattainable.
 #[inline]
+// NOT cancel-safe: and not fixable at this layer - once `send_screened` puts the
+// RFC 8693 POST on the wire, dropping this future cannot un-send it. The
+// authorization server may mint a downstream token that never reaches the
+// caller and that nothing here records. No local cache is torn, but retries may
+// duplicate upstream issuance.
 pub async fn exchange_token(
     http: &OauthHttpClient,
     config: &TokenExchangeConfig,
@@ -4684,6 +4687,7 @@ enum SuccessLogMode {
 /// # Errors
 ///
 /// Returns [`RmcpServerKitError::Auth`] with a sanitized code for upstream failures.
+// cancel-safe: no - once the POST is sent, cancellation cannot un-send it; callers that can be cancelled use exchange_token_with_cancel.
 async fn exchange_token_inner(
     http: &OauthHttpClient,
     config: &TokenExchangeConfig,
@@ -4817,6 +4821,7 @@ async fn exchange_token_inner(
 /// strings.
 #[must_use = "DetachOutcome must be inspected to distinguish completion from cancel/timeout"]
 #[inline]
+// cancel-safe: yes at the caller boundary - a pre-cancelled token short-circuits before any clone or send, and an in-flight exchange is detached and audited instead of dropped.
 pub async fn exchange_token_with_cancel(
     http: &OauthHttpClient,
     config: &TokenExchangeConfig,
@@ -4867,6 +4872,7 @@ pub async fn exchange_token_with_cancel(
     clippy::integer_division_remainder_used,
     reason = "external macro: tokio::select"
 )]
+// cancel-safe: awaits the detached receiver; on cancel/timeout the spawned task audits an eventual success.
 async fn receive_exchange_result_with_cancel(
     rx: oneshot::Receiver<Result<ExchangedToken, RmcpServerKitError>>,
     ct: &CancellationToken,
@@ -5198,12 +5204,12 @@ mod tests {
             .collect()
     }
 
-    /// Drops a percent-encoded `client_id` key so only the proxy's value remains.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::rewrite_drops_percent_encoded_client_id_key keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Drops a percent-encoded `client_id` key so only the proxy's value remains.
     fn rewrite_drops_percent_encoded_client_id_key() -> anyhow::Result<()> {
         let out = rewrite_client_auth_params("%63lient_id=attacker&scope=read", "proxy-id", false);
         let pairs = decoded_pairs(&out);
@@ -5217,12 +5223,12 @@ mod tests {
         Ok(())
     }
 
-    /// Drops an underscore-encoded `client_id` key so the attacker value never survives.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::rewrite_drops_underscore_encoded_client_id_key keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Drops an underscore-encoded `client_id` key so the attacker value never survives.
     fn rewrite_drops_underscore_encoded_client_id_key() -> anyhow::Result<()> {
         let out = rewrite_client_auth_params("client%5Fid=attacker&scope=read", "proxy-id", false);
         let pairs = decoded_pairs(&out);
@@ -5234,12 +5240,12 @@ mod tests {
         Ok(())
     }
 
-    /// Removes any caller-supplied `client_secret` from the rewritten auth params.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::rewrite_drops_caller_supplied_client_secret keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Removes any caller-supplied `client_secret` from the rewritten auth params.
     fn rewrite_drops_caller_supplied_client_secret() -> anyhow::Result<()> {
         let out = rewrite_client_auth_params(
             "client_secret=attacker-secret&scope=read",
@@ -5257,12 +5263,12 @@ mod tests {
         Ok(())
     }
 
-    /// Strips caller-supplied `client_assertion` and `client_assertion_type` parameters.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::rewrite_drops_caller_supplied_client_assertion keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Strips caller-supplied `client_assertion` and `client_assertion_type` parameters.
     fn rewrite_drops_caller_supplied_client_assertion() -> anyhow::Result<()> {
         let out = rewrite_client_auth_params(
             "client_assertion=ey.evil&client_assertion_type=urn:evil&scope=read",
@@ -5281,12 +5287,12 @@ mod tests {
         Ok(())
     }
 
-    /// Collapses duplicate `client_id` parameters to a single proxy `client_id` value.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::rewrite_collapses_duplicate_client_id_to_proxy_value keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Collapses duplicate `client_id` parameters to a single proxy `client_id` value.
     fn rewrite_collapses_duplicate_client_id_to_proxy_value() -> anyhow::Result<()> {
         let out =
             rewrite_client_auth_params("client_id=a&client_id=b&scope=read", "proxy-id", false);
@@ -5301,12 +5307,12 @@ mod tests {
         Ok(())
     }
 
-    /// Preserves non-client parameters in order, duplicates included, unchanged.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::rewrite_preserves_non_client_params_in_order_with_duplicates keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Preserves non-client parameters in order, duplicates included, unchanged.
     fn rewrite_preserves_non_client_params_in_order_with_duplicates() -> anyhow::Result<()> {
         let out = rewrite_client_auth_params(
             "scope=read&resource=a&state=xyz&resource=b&code_verifier=v",
@@ -5332,12 +5338,12 @@ mod tests {
         Ok(())
     }
 
-    /// Strips every resource parameter when the Entra workaround flag is enabled.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::rewrite_strips_every_resource_param_when_enabled keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Strips every resource parameter when the Entra workaround flag is enabled.
     fn rewrite_strips_every_resource_param_when_enabled() -> anyhow::Result<()> {
         // Issue #17: Entra rejects `resource` alongside a differing api://
         // scope (AADSTS9010010). All occurrences must go, and everything else
@@ -5363,12 +5369,12 @@ mod tests {
         Ok(())
     }
 
-    /// Strips a percent-encoded resource key, matched after decoding.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::rewrite_strips_percent_encoded_resource_key keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Strips a percent-encoded resource key, matched after decoding.
     fn rewrite_strips_percent_encoded_resource_key() -> anyhow::Result<()> {
         // The strip filter compares post-decode, so an encoded key cannot
         // smuggle `resource` upstream -- same property that protects
@@ -5384,12 +5390,12 @@ mod tests {
         Ok(())
     }
 
-    /// Never strips PKCE/CSRF/redirect params when resource stripping is enabled.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::rewrite_never_strips_security_params_when_resource_stripping_enabled keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Never strips PKCE/CSRF/redirect params when resource stripping is enabled.
     fn rewrite_never_strips_security_params_when_resource_stripping_enabled() -> anyhow::Result<()>
     {
         // SECURITY: stripping must never reach PKCE, CSRF, or redirect
@@ -5423,12 +5429,12 @@ mod tests {
         Ok(())
     }
 
-    /// Round-trips percent-encoded values containing special characters unchanged.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::rewrite_roundtrips_values_with_special_characters keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Round-trips percent-encoded values containing special characters unchanged.
     fn rewrite_roundtrips_values_with_special_characters() -> anyhow::Result<()> {
         let input = form_urlencoded::Serializer::new(String::new())
             .append_pair("state", "a&b=c+d")
@@ -5442,12 +5448,12 @@ mod tests {
         Ok(())
     }
 
-    /// Injects the proxy `client_id` when the incoming form lacks one.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::rewrite_injects_client_id_when_absent keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Injects the proxy `client_id` when the incoming form lacks one.
     fn rewrite_injects_client_id_when_absent() -> anyhow::Result<()> {
         let out = rewrite_client_auth_params("scope=read", "proxy-id", false);
         assert!(decoded_pairs(&out).contains(&("client_id".to_owned(), "proxy-id".to_owned())));
@@ -5455,12 +5461,12 @@ mod tests {
         Ok(())
     }
 
-    /// Accepts a three-segment token whose header decodes to alg-bearing JSON.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::looks_like_jwt_valid keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Accepts a three-segment token whose header decodes to alg-bearing JSON.
     fn looks_like_jwt_valid() -> anyhow::Result<()> {
         // Minimal valid JWT structure: base64({"alg":"RS256"}).base64({}).sig
         let header = URL_SAFE_NO_PAD.encode(b"{\"alg\":\"RS256\",\"typ\":\"JWT\"}");
@@ -5471,24 +5477,24 @@ mod tests {
         Ok(())
     }
 
-    /// Rejects a single-segment opaque token as not JWT-shaped.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::looks_like_jwt_rejects_opaque_token keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Rejects a single-segment opaque token as not JWT-shaped.
     fn looks_like_jwt_rejects_opaque_token() -> anyhow::Result<()> {
         assert!(!looks_like_jwt("dGhpcyBpcyBhbiBvcGFxdWUgdG9rZW4"));
 
         Ok(())
     }
 
-    /// Rejects a two-segment token as not JWT-shaped.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::looks_like_jwt_rejects_two_segments keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Rejects a two-segment token as not JWT-shaped.
     fn looks_like_jwt_rejects_two_segments() -> anyhow::Result<()> {
         let header = URL_SAFE_NO_PAD.encode(b"{\"alg\":\"RS256\"}");
         let token = format!("{header}.payload");
@@ -5497,24 +5503,24 @@ mod tests {
         Ok(())
     }
 
-    /// Rejects a four-segment token as not JWT-shaped.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::looks_like_jwt_rejects_four_segments keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Rejects a four-segment token as not JWT-shaped.
     fn looks_like_jwt_rejects_four_segments() -> anyhow::Result<()> {
         assert!(!looks_like_jwt("a.b.c.d"));
 
         Ok(())
     }
 
-    /// Rejects a JWT-shaped token whose decoded header lacks an alg member.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::looks_like_jwt_rejects_no_alg keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Rejects a JWT-shaped token whose decoded header lacks an alg member.
     fn looks_like_jwt_rejects_no_alg() -> anyhow::Result<()> {
         let header = URL_SAFE_NO_PAD.encode(b"{\"typ\":\"JWT\"}");
         let payload = URL_SAFE_NO_PAD.encode(b"{}");
@@ -5726,12 +5732,12 @@ mod tests {
         Ok(())
     }
 
-    /// Keeps config.issuer untouched for token validation when the metadata issuer differs.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::as_metadata_issuer_never_affects_token_validation keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Keeps config.issuer untouched for token validation when the metadata issuer differs.
     fn as_metadata_issuer_never_affects_token_validation() -> anyhow::Result<()> {
         // Whichever value is published, inbound JWT `iss` is validated against
         // `config.issuer`.
@@ -6627,12 +6633,12 @@ role = "admin"
         Ok(())
     }
 
-    /// Prevents family inference from accepting HMAC algs against asymmetric keys.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::alg_less_key_never_accepts_hmac_algorithm_confusion keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Prevents family inference from accepting HMAC algs against asymmetric keys.
     fn alg_less_key_never_accepts_hmac_algorithm_confusion() -> anyhow::Result<()> {
         // Regression guard: the classic attack is to present alg=HS256 and use
         // the issuer's PUBLIC RSA modulus as the HMAC secret. Family inference
@@ -6647,12 +6653,12 @@ role = "admin"
         Ok(())
     }
 
-    /// Ensures family inference never admits an algorithm outside `ACCEPTED_ALGS`.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::family_accepts_is_subset_of_accepted_algs keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Ensures family inference never admits an algorithm outside `ACCEPTED_ALGS`.
     fn family_accepts_is_subset_of_accepted_algs() -> anyhow::Result<()> {
         // INVARIANT: family inference must never admit an algorithm that the
         // pre-lookup `ACCEPTED_ALGS` screen would reject.
@@ -6896,12 +6902,12 @@ role = "admin"
         Ok(())
     }
 
-    /// Bounds a long kid to `MAX_LOGGED_KID_CHARS` plus a truncation marker.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::truncate_kid_for_log_bounds_hostile_input keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Bounds a long kid to `MAX_LOGGED_KID_CHARS` plus a truncation marker.
     fn truncate_kid_for_log_bounds_hostile_input() -> anyhow::Result<()> {
         let short = "kid-1";
         assert_eq!(truncate_kid_for_log(short), (short.to_owned(), false));
@@ -6918,12 +6924,12 @@ role = "admin"
         Ok(())
     }
 
-    /// Truncates a multibyte kid on a char boundary without panicking.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::truncate_kid_for_log_splits_on_char_boundary keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Truncates a multibyte kid on a char boundary without panicking.
     fn truncate_kid_for_log_splits_on_char_boundary() -> anyhow::Result<()> {
         let multibyte = "\u{1f512}".repeat(MAX_LOGGED_KID_CHARS + 10);
         let (truncated, was_truncated) = truncate_kid_for_log(&multibyte);
@@ -6934,12 +6940,12 @@ role = "admin"
         Ok(())
     }
 
-    /// Reports a kid exactly at the cap as untruncated.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::truncate_kid_for_log_flag_marks_exact_boundary_as_untruncated keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Reports a kid exactly at the cap as untruncated.
     fn truncate_kid_for_log_flag_marks_exact_boundary_as_untruncated() -> anyhow::Result<()> {
         let exact = "k".repeat(MAX_LOGGED_KID_CHARS);
         let (out, was_truncated) = truncate_kid_for_log(&exact);
@@ -7061,12 +7067,12 @@ role = "admin"
 
     // -- L4: kid-strict key lookup + require_subject --
 
-    /// Rejects an unknown kid instead of falling back to an unnamed key.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::unknown_kid_with_named_keys_rejected keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Rejects an unknown kid instead of falling back to an unnamed key.
     fn unknown_kid_with_named_keys_rejected() -> anyhow::Result<()> {
         let mut keys = HashMap::new();
         drop(keys.insert(
@@ -7097,12 +7103,12 @@ role = "admin"
         Ok(())
     }
 
-    /// Matches a kid-less token against an unnamed JWKS key.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::no_kid_token_matches_unnamed_key keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Matches a kid-less token against an unnamed JWKS key.
     fn no_kid_token_matches_unnamed_key() -> anyhow::Result<()> {
         let mut keys = HashMap::new();
         drop(keys.insert(
@@ -7453,12 +7459,12 @@ role = "admin"
     const ENC_GRANT: &str = "urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange";
     const ENC_ACCESS: &str = "urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token";
 
-    /// Keeps the pre-3.8.0 exchange form byte-identical for legacy configs.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::build_exchange_form_is_byte_identical_to_pre_3_8_0_output keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Keeps the pre-3.8.0 exchange form byte-identical for legacy configs.
     fn build_exchange_form_is_byte_identical_to_pre_3_8_0_output() -> anyhow::Result<()> {
         let config = test_token_exchange_config("https://idp.example.com/token".into());
         let body = build_exchange_form(&config, "subj-token");
@@ -7475,12 +7481,12 @@ role = "admin"
         Ok(())
     }
 
-    /// Emits only the required RFC 8693 params plus `client_id` when optionals are omitted.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::build_exchange_form_emits_only_required_params_when_all_optional_omitted keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Emits only the required RFC 8693 params plus `client_id` when optionals are omitted.
     fn build_exchange_form_emits_only_required_params_when_all_optional_omitted()
     -> anyhow::Result<()> {
         let config =
@@ -7499,12 +7505,12 @@ role = "admin"
         Ok(())
     }
 
-    /// Keeps RFC 8693 parameter order and sends a custom token type verbatim.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::build_exchange_form_keeps_rfc_parameter_order keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Keeps RFC 8693 parameter order and sends a custom token type verbatim.
     fn build_exchange_form_keeps_rfc_parameter_order() -> anyhow::Result<()> {
         let config = test_token_exchange_config("https://idp.example.com/token".into())
             .with_resource("https://api.example.com/v1")
@@ -7552,12 +7558,12 @@ role = "admin"
         Ok(())
     }
 
-    /// Redacts the upstream error description unless diagnostics opt in.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::upstream_error_description_is_redacted_by_default keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Redacts the upstream error description unless diagnostics opt in.
     fn upstream_error_description_is_redacted_by_default() -> anyhow::Result<()> {
         let _guard = ExposureTestGuard::acquire();
         set_diagnostic_exposure(&DiagnosticExposure::default());
@@ -7572,12 +7578,12 @@ role = "admin"
         Ok(())
     }
 
-    /// Shows the upstream error description verbatim when opted in, empty for `None`.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::upstream_error_description_is_shown_when_opted_in keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Shows the upstream error description verbatim when opted in, empty for `None`.
     fn upstream_error_description_is_shown_when_opted_in() -> anyhow::Result<()> {
         let _guard = ExposureTestGuard::acquire();
         set_diagnostic_exposure(&DiagnosticExposure {
@@ -8479,12 +8485,12 @@ role = "admin"
     // resolve_claim_path tests
     // -----------------------------------------------------------------------
 
-    /// Splits a flat whitespace-delimited string claim into values.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::resolve_claim_path_flat_string keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Splits a flat whitespace-delimited string claim into values.
     fn resolve_claim_path_flat_string() -> anyhow::Result<()> {
         let mut extra = HashMap::new();
         drop(extra.insert(
@@ -8497,12 +8503,12 @@ role = "admin"
         Ok(())
     }
 
-    /// Returns the elements of a flat JSON array claim.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::resolve_claim_path_flat_array keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Returns the elements of a flat JSON array claim.
     fn resolve_claim_path_flat_array() -> anyhow::Result<()> {
         let mut extra = HashMap::new();
         drop(extra.insert(
@@ -8515,12 +8521,12 @@ role = "admin"
         Ok(())
     }
 
-    /// Resolves a dotted nested path into a Keycloak roles array.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::resolve_claim_path_nested_keycloak keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Resolves a dotted nested path into a Keycloak roles array.
     fn resolve_claim_path_nested_keycloak() -> anyhow::Result<()> {
         let mut extra = HashMap::new();
         drop(extra.insert(
@@ -8533,12 +8539,12 @@ role = "admin"
         Ok(())
     }
 
-    /// Returns empty for a claim path that does not exist.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::resolve_claim_path_missing_returns_empty keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Returns empty for a claim path that does not exist.
     fn resolve_claim_path_missing_returns_empty() -> anyhow::Result<()> {
         let extra = HashMap::new();
         assert_eq!(
@@ -8549,12 +8555,12 @@ role = "admin"
         Ok(())
     }
 
-    /// Returns empty for a numeric leaf that is not a string or array.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::resolve_claim_path_numeric_leaf_returns_empty keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Returns empty for a numeric leaf that is not a string or array.
     fn resolve_claim_path_numeric_leaf_returns_empty() -> anyhow::Result<()> {
         let mut extra = HashMap::new();
         drop(extra.insert("count".into(), serde_json::json!(42_i32)));
@@ -9159,12 +9165,12 @@ role = "admin"
 
     // -- L3: internal-hostname-suffix pre-DNS denylist --
 
-    /// Blocks internal/local/.localhost suffixes when no allowlist entry matches.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::internal_suffix_rejected_by_default keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Blocks internal/local/.localhost suffixes when no allowlist entry matches.
     fn internal_suffix_rejected_by_default() -> anyhow::Result<()> {
         let allow = CompiledSsrfAllowlist::default();
         for host in ["idp.internal", "svc.local", "x.localhost", "idp.internal."] {
@@ -9202,12 +9208,12 @@ role = "admin"
         Ok(())
     }
 
-    /// Leaves a public hostname unblocked by the internal suffix rule.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::public_hostname_not_blocked_by_suffix keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Leaves a public hostname unblocked by the internal suffix rule.
     fn public_hostname_not_blocked_by_suffix() -> anyhow::Result<()> {
         let allow = CompiledSsrfAllowlist::default();
         assert!(!oauth_internal_suffix_blocked("idp.example.com", &allow));
@@ -9696,12 +9702,12 @@ role = "admin"
         Ok(())
     }
 
-    // Lets an explicit audience_validation_mode override the legacy bool either way.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::audience_validation_mode_overrides_legacy_bool keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Lets an explicit `audience_validation_mode` override the legacy bool either way.
     fn audience_validation_mode_overrides_legacy_bool() -> anyhow::Result<()> {
         let mut config = OAuthConfig::default();
         #[expect(deprecated, reason = "covers the precedence rule for the legacy bool")]
@@ -9730,12 +9736,12 @@ role = "admin"
         Ok(())
     }
 
-    /// Resolves unset mode and bool to Strict.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::audience_validation_mode_default_is_strict_when_unset keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Resolves unset mode and bool to Strict.
     fn audience_validation_mode_default_is_strict_when_unset() -> anyhow::Result<()> {
         let config = OAuthConfig::default();
         assert_eq!(
@@ -9747,12 +9753,12 @@ role = "admin"
         Ok(())
     }
 
-    /// Resolves the legacy `strict_audience_validation=true` to Strict.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::audience_validation_legacy_bool_true_resolves_to_strict keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Resolves the legacy `strict_audience_validation=true` to Strict.
     fn audience_validation_legacy_bool_true_resolves_to_strict() -> anyhow::Result<()> {
         let mut config = OAuthConfig::default();
         #[expect(deprecated, reason = "covers the legacy bool resolution path")]
@@ -9827,12 +9833,12 @@ role = "admin"
         exchanged_token_for_debug(&format!("{header}.{payload}.signature"))
     }
 
-    /// Redacts the access token in Debug output by default while showing other fields.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::exchanged_token_debug_redacts_access_token_by_default keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Redacts the access token in Debug output by default while showing other fields.
     fn exchanged_token_debug_redacts_access_token_by_default() -> anyhow::Result<()> {
         let _guard = ExposureTestGuard::acquire();
         set_diagnostic_exposure(&DiagnosticExposure::default());
@@ -9851,12 +9857,12 @@ role = "admin"
         Ok(())
     }
 
-    /// Shows the plaintext access token in Debug output when opted in.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::exchanged_token_debug_can_show_access_token_when_enabled keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Shows the plaintext access token in Debug output when opted in.
     fn exchanged_token_debug_can_show_access_token_when_enabled() -> anyhow::Result<()> {
         let _guard = ExposureTestGuard::acquire();
         set_diagnostic_exposure(&DiagnosticExposure {
@@ -9872,12 +9878,12 @@ role = "admin"
         Ok(())
     }
 
-    /// Redacts JWT claim values in the exchanged-token log by default.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::exchanged_token_claim_log_redacts_claim_values_by_default keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Redacts JWT claim values in the exchanged-token log by default.
     fn exchanged_token_claim_log_redacts_claim_values_by_default() -> anyhow::Result<()> {
         let _guard = ExposureTestGuard::acquire();
         set_diagnostic_exposure(&DiagnosticExposure::default());
@@ -9910,12 +9916,12 @@ role = "admin"
         Ok(())
     }
 
-    /// Logs JWT claim values verbatim when `oauth_claim_values` is enabled.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/oauth.rs::exchanged_token_claim_log_can_show_claim_values_when_enabled keeps the uniform test signature while it only asserts"
     )]
     #[test]
+    /// Logs JWT claim values verbatim when `oauth_claim_values` is enabled.
     fn exchanged_token_claim_log_can_show_claim_values_when_enabled() -> anyhow::Result<()> {
         let _guard = ExposureTestGuard::acquire();
         set_diagnostic_exposure(&DiagnosticExposure {
