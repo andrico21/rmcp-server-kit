@@ -476,6 +476,7 @@ mod tests {
         routing::post,
     };
     use http_body_util::BodyExt as _;
+    use proptest::{collection, prelude::*};
     use tower::ServiceExt as _;
 
     use super::*;
@@ -851,5 +852,79 @@ mod tests {
             .to_bytes();
 
         assert_eq!(body, RAW_ID);
+    }
+
+    /// A UUID-shaped string, the only raw session ID shape `parse` accepts.
+    fn prop_uuid_strategy() -> impl Strategy<Value = String> {
+        "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1024))]
+
+        /// Wrapping a raw session ID for an identity and then verifying with
+        /// the same secret and identity must recover exactly that raw ID.
+        #[test]
+        fn prop_wrap_then_verify_roundtrips(
+            secret_byte in any::<u8>(),
+            raw in prop_uuid_strategy(),
+            fingerprint_bytes in collection::vec(any::<u8>(), 0..64),
+        ) {
+            let secret = SessionBindingSecret::Process([secret_byte; MAC_LEN]);
+            let raw_id = RawSessionId::parse(&raw).map_err(|reason| {
+                TestCaseError::fail(format!("uuid-shaped id must parse: {reason:?}"))
+            })?;
+            let identity_fp = IdentityFingerprint(fingerprint_bytes);
+            let token = wrap(&secret, &raw_id, &identity_fp);
+            prop_assert_eq!(
+                unwrap_and_verify(&secret, &token, &identity_fp),
+                Ok(raw_id),
+                "roundtrip must recover the raw session id"
+            );
+        }
+
+        /// Flipping any single character of a valid wrapped token must make
+        /// verification fail instead of accepting the tampered token.
+        #[test]
+        fn prop_any_token_tamper_is_rejected(
+            secret_byte in any::<u8>(),
+            raw in prop_uuid_strategy(),
+            position in any::<prop::sample::Index>(),
+            replacement in any::<char>(),
+        ) {
+            let secret = SessionBindingSecret::Process([secret_byte; MAC_LEN]);
+            let raw_id = RawSessionId::parse(&raw).map_err(|reason| {
+                TestCaseError::fail(format!("uuid-shaped id must parse: {reason:?}"))
+            })?;
+            let identity_fp = IdentityFingerprint(vec![0xAB_u8; 8]);
+            let token = wrap(&secret, &raw_id, &identity_fp);
+
+            let characters = token.chars().collect::<Vec<char>>();
+            let target = position.index(characters.len());
+            let Some(original) = characters.get(target) else {
+                return Ok(());
+            };
+            let replacement_character = if replacement == *original {
+                if *original == '~' { '#' } else { '~' }
+            } else {
+                replacement
+            };
+            let mut mutated = String::with_capacity(token.len());
+            for (offset, character) in characters.iter().enumerate() {
+                if offset == target {
+                    mutated.push(replacement_character);
+                } else {
+                    mutated.push(*character);
+                }
+            }
+            prop_assert_ne!(&mutated, &token, "the mutation must change the token");
+            let outcome = unwrap_and_verify(&secret, &mutated, &identity_fp);
+            prop_assert!(
+                outcome.is_err(),
+                "tampered token {:?} must be rejected, got {:?}",
+                mutated,
+                outcome
+            );
+        }
     }
 }
