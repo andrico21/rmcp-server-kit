@@ -264,6 +264,16 @@ entry in the same PR that introduces a deviation.
    matching the pre-existing `cognitive_complexity` judgement on the same fn).
    The file's temporary test-suite expectations are covered by entry 10 and are
    removed by the test-conversion PR. Evidence: the task-15 migration record.
+15. **2026-10-04 - `src/config.rs` per-item expectations (task 17).** Under
+   entry 13's frozen-API decision, four public items keep names ending in the
+   containing module's name and carry `module_name_repetitions` expectations:
+   `ServerConfig`, `ObservabilityConfig`, `validate_server_config`,
+   `validate_observability_config`. Two `deliberate:` expectations are
+   recorded here because no behavior-preserving alternative exists: the five
+   `pub(crate)` `EnvOverrideSpec` fields (the source-scanning tests read the
+   spec table's declared shape) and `check_shared_config_invariants` staying
+   non-`const` (a source-scanning test matches its `pub(crate) fn` prefix).
+   Evidence: the task-17 migration record (`new-permanent-expects.txt`).
 
 14. **2026-10-04 - `src/oauth.rs` lane expectations (frozen API + deliberate).**
    Under entry 13's decision, the 16 public `impl_trait_in_params` builder
