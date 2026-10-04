@@ -2859,6 +2859,10 @@ where
 /// shutdown signal, and cancelling twice is a no-op.
 struct CancelOnDrop(CancellationToken);
 
+// The guard is never disarmed on purpose: cancelling on both the success and
+// the failure path is intended (cancelling twice is a no-op).
+// Drop audit (2026-10-04): non-blocking, sync `CancellationToken::cancel`; no
+// I/O, no await, no panic path.
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         self.0.cancel();
@@ -3766,6 +3770,10 @@ impl axum::serve::Listener for TlsListener {
     }
 }
 
+// Aborts the acceptor task; in-flight handshake workers observe the closed
+// channel and exit on their own.
+// Drop audit (2026-10-04): non-blocking, sync `JoinHandle::abort`; no I/O, no
+// await, no panic path.
 impl Drop for TlsListener {
     fn drop(&mut self) {
         // Stop accepting immediately and release the bound port. In-flight
