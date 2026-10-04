@@ -275,6 +275,29 @@ entry in the same PR that introduces a deviation.
    non-`const` (a source-scanning test matches its `pub(crate) fn` prefix).
    Evidence: the task-17 migration record (`new-permanent-expects.txt`).
 
+14. **2026-10-04 - `src/oauth.rs` lane expectations (frozen API + deliberate).**
+   Under entry 13's decision, the 16 public `impl_trait_in_params` builder
+   methods (`OAuthConfig::builder`; `OAuthConfigBuilder::{allowed_algorithms,
+   authorization_server_metadata_issuer, authorization_servers, scope,
+   role_claim, role_mapping, jwks_cache_ttl, ca_cert_path}`;
+   `TokenExchangeConfig::{new, with_audience, with_resource, with_scope}`;
+   `OAuthProxyConfigBuilder::{builder, introspection_url, revocation_url}`)
+   carry the per-item frozen expectation. Two more public items are frozen
+   with the same reason: `OauthHttpClient` (`module_name_repetitions`) and
+   `missing_const_for_fn` on `OAuthConfig::effective_audience_validation_mode`
+   and `ClientCertConfig::new` (const-ifying them is an API addition kept for
+   the next major). Deliberate expectations, each cited in-line:
+   `clippy::too_many_lines` on `OauthHttpClient::build` and
+   `OAuthConfig::validate` (one reviewable block each);
+   `clippy::field_scoped_visibility_modifiers` on `JwtRejection` (its fields
+   are read by `src/auth.rs`; accessors would churn the crate-internal API);
+   and, in `mod tests`, `clippy::unnecessary_wraps`, one per assertion-only
+   test, so every test keeps the uniform `anyhow::Result<()>` signature
+   (core's test pattern). Behavior-sensitive paths kept exact:
+   `oauth_internal_suffix_blocked` (G-6 suffix rule), the 10-second JWKS
+   refresh cooldown, and the redaction tests' output. Evidence: the task-16
+   migration record (`status.txt`, `new-permanent-expects.txt`, `gates.txt`).
+
 Entries to be added by the work that creates them: "new in `<version>`"
 expects and profile deltas (the toolchain-drift work); the per-item frozen
 public-API expectations (the lint lanes, under entry 13's decision); the GitLab
