@@ -15,179 +15,177 @@
 //!   `"jwks_key_count_exceeds_cap"` on breach.
 //! * `impl JwksCache { pub async fn __test_refresh_now(&self) -> Result<(), String> }`
 //! * `impl JwksCache { pub async fn __test_has_kid(&self, kid: &str) -> bool }`
-#![cfg_attr(
+#[cfg_attr(
     all(feature = "oauth-mtls-client", target_os = "linux"),
     expect(
         clippy::expect_used,
         reason = "lint-migration: tests/integration/jwks_key_cap.rs"
     )
 )]
-#![cfg_attr(
-    all(feature = "oauth-mtls-client", target_os = "linux"),
-    expect(
-        clippy::tests_outside_test_module,
-        reason = "lint-migration: tests/integration/jwks_key_cap.rs"
-    )
-)]
-#![cfg_attr(
+#[cfg_attr(
     all(feature = "oauth-mtls-client", target_os = "linux"),
     expect(
         clippy::missing_panics_doc,
         reason = "lint-migration: tests/integration/jwks_key_cap.rs"
     )
 )]
-#![cfg_attr(
+#[cfg_attr(
     all(feature = "oauth-mtls-client", target_os = "linux"),
     expect(
         clippy::absolute_paths,
         reason = "lint-migration: tests/integration/jwks_key_cap.rs"
     )
 )]
-#![cfg_attr(
+#[cfg_attr(
     all(feature = "oauth-mtls-client", target_os = "linux"),
     expect(
         clippy::let_underscore_untyped,
         reason = "lint-migration: tests/integration/jwks_key_cap.rs"
     )
 )]
-#![cfg_attr(
+#[cfg_attr(
     all(feature = "oauth-mtls-client", target_os = "linux"),
     expect(
         clippy::let_underscore_must_use,
         reason = "lint-migration: tests/integration/jwks_key_cap.rs"
     )
 )]
-#![cfg_attr(
+#[cfg_attr(
     all(feature = "oauth-mtls-client", target_os = "linux"),
     expect(
         clippy::too_long_first_doc_paragraph,
         reason = "lint-migration: tests/integration/jwks_key_cap.rs"
     )
 )]
-#![cfg_attr(
+#[cfg_attr(
     feature = "oauth-mtls-client",
     expect(
         let_underscore_drop,
         reason = "lint-migration: tests/integration/jwks_key_cap.rs"
     )
 )]
+#[cfg(test)]
+mod tests {
 
-use rmcp_server_kit::oauth::{JwksCache, OAuthConfig};
-use serde_json::{Value, json};
-use wiremock::{
-    Mock, MockServer, ResponseTemplate,
-    matchers::{method, path},
-};
+    use rmcp_server_kit::oauth::{JwksCache, OAuthConfig};
+    use serde_json::{Value, json};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
 
-/// Build a synthetic JWKS document with `n` RSA keys. The key material
-/// is bogus (short base64url `"AQAB"` / `"dummy"`) because the test
-/// exercises the cap path - `build_key_cache` rejects on length BEFORE
-/// it would attempt key decoding, so invalid key bytes are fine.
-fn synthetic_jwks(n: usize) -> Value {
-    let keys: Vec<Value> = (0..n)
-        .map(|i| {
-            json!({
-                "kty": "RSA",
-                "use": "sig",
-                "alg": "RS256",
-                "kid": format!("kid-{i}"),
-                "n": "sXchDaQebHnPiGvyDOAT4saGEUetSyo9MKLOoWFsueri23bOdgWp4Dy1WlUzewbgBHod5pcM9H95GQRV3JDXboIRROSBigeC5yjU1hGzHHyXss8UDprecbAYxknTcQkhslANGRUZmdTOQ5qTRsLAt6BTYuyvVRdhS-uo-0Rwm9uYCKu_yvfZm9LDJ7zXYf8DrK9tYmoPSt4K3fhfB9m9k9MhE7_tR5sQkOA0OiYuVLxbBR-g3nL5yGgGSsj5lmNS_4F9zMzJgJWK5A7K6sH8zDjpwcTWfTUqB2c9yw0yDkBYMHRDHeozs9ybyoUNt4fT7aVRMVAjEhCEPJmSmnyfH_5w",
-                "e": "AQAB"
+    /// Build a synthetic JWKS document with `n` RSA keys. The key material
+    /// is bogus (short base64url `"AQAB"` / `"dummy"`) because the test
+    /// exercises the cap path - `build_key_cache` rejects on length BEFORE
+    /// it would attempt key decoding, so invalid key bytes are fine.
+    fn synthetic_jwks(n: usize) -> Value {
+        let keys: Vec<Value> = (0..n)
+            .map(|i| {
+                json!({
+                    "kty": "RSA",
+                    "use": "sig",
+                    "alg": "RS256",
+                    "kid": format!("kid-{i}"),
+                    "n": "sXchDaQebHnPiGvyDOAT4saGEUetSyo9MKLOoWFsueri23bOdgWp4Dy1WlUzewbgBHod5pcM9H95GQRV3JDXboIRROSBigeC5yjU1hGzHHyXss8UDprecbAYxknTcQkhslANGRUZmdTOQ5qTRsLAt6BTYuyvVRdhS-uo-0Rwm9uYCKu_yvfZm9LDJ7zXYf8DrK9tYmoPSt4K3fhfB9m9k9MhE7_tR5sQkOA0OiYuVLxbBR-g3nL5yGgGSsj5lmNS_4F9zMzJgJWK5A7K6sH8zDjpwcTWfTUqB2c9yw0yDkBYMHRDHeozs9ybyoUNt4fT7aVRMVAjEhCEPJmSmnyfH_5w",
+                    "e": "AQAB"
+                })
             })
-        })
-        .collect();
-    json!({ "keys": keys })
-}
+            .collect();
+        json!({ "keys": keys })
+    }
 
-fn install_crypto_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-}
+    fn install_crypto_provider() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
 
-#[tokio::test]
-async fn jwks_rejects_excess_keys_fail_closed() {
-    install_crypto_provider();
+    #[tokio::test]
+    async fn jwks_rejects_excess_keys_fail_closed() {
+        install_crypto_provider();
 
-    // Wiremock serves a JWKS document with 300 RSA keys.
-    let mock = MockServer::start().await;
-    let jwks_doc = synthetic_jwks(300);
-    Mock::given(method("GET"))
-        .and(path("/.well-known/jwks.json"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(jwks_doc))
-        .mount(&mock)
-        .await;
+        // Wiremock serves a JWKS document with 300 RSA keys.
+        let mock = MockServer::start().await;
+        let jwks_doc = synthetic_jwks(300);
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jwks_doc))
+            .mount(&mock)
+            .await;
 
-    let jwks_uri = format!("{}/.well-known/jwks.json", mock.uri());
-    let mut config = OAuthConfig::builder("https://issuer.example.com/", "aud", &jwks_uri).build();
-    // Permit plain-HTTP wiremock origin for this test (validate() does
-    // not otherwise allow http:// jwks URIs). The allow_http flag is
-    // orthogonal to the key-cap hardening under test.
-    config.allow_http_oauth_urls = true;
-    // Cap = 256; document has 300 → must reject fail-closed.
-    config.max_jwks_keys = 256;
+        let jwks_uri = format!("{}/.well-known/jwks.json", mock.uri());
+        let mut config =
+            OAuthConfig::builder("https://issuer.example.com/", "aud", &jwks_uri).build();
+        // Permit plain-HTTP wiremock origin for this test (validate() does
+        // not otherwise allow http:// jwks URIs). The allow_http flag is
+        // orthogonal to the key-cap hardening under test.
+        config.allow_http_oauth_urls = true;
+        // Cap = 256; document has 300 → must reject fail-closed.
+        config.max_jwks_keys = 256;
 
-    // `JwksCache::new` does NOT fetch - only builds the reqwest client.
-    let cache = JwksCache::new(&config)
-        .expect("construct cache")
-        .__test_allow_loopback_ssrf();
+        // `JwksCache::new` does NOT fetch - only builds the reqwest client.
+        let cache = JwksCache::new(&config)
+            .expect("construct cache")
+            .__test_allow_loopback_ssrf();
 
-    // Drive the refresh path that would normally happen on first
-    // validate_token() call. The new __test_refresh_now helper surfaces
-    // the `build_key_cache` error string verbatim.
-    let result = cache.__test_refresh_now().await;
+        // Drive the refresh path that would normally happen on first
+        // validate_token() call. The new __test_refresh_now helper surfaces
+        // the `build_key_cache` error string verbatim.
+        let result = cache.__test_refresh_now().await;
 
-    let err = result.expect_err("300 keys must exceed cap=256");
-    assert!(
-        err.contains("jwks_key_count_exceeds_cap"),
-        "refresh error must contain literal `jwks_key_count_exceeds_cap`; got: {err}"
-    );
+        let err = result.expect_err("300 keys must exceed cap=256");
+        assert!(
+            err.contains("jwks_key_count_exceeds_cap"),
+            "refresh error must contain literal `jwks_key_count_exceeds_cap`; got: {err}"
+        );
 
-    // Fail-closed: cache MUST be empty afterwards. No keys were installed.
-    assert!(
-        !cache.__test_has_kid("kid-0").await,
-        "cache must remain empty on cap breach (fail-closed, no silent truncation)"
-    );
-    assert!(
-        !cache.__test_has_kid("kid-255").await,
-        "cache must remain empty on cap breach (fail-closed, not first-N truncation)"
-    );
-    assert!(
-        !cache.__test_has_kid("kid-299").await,
-        "cache must remain empty on cap breach (fail-closed, not last-N)"
-    );
-}
+        // Fail-closed: cache MUST be empty afterwards. No keys were installed.
+        assert!(
+            !cache.__test_has_kid("kid-0").await,
+            "cache must remain empty on cap breach (fail-closed, no silent truncation)"
+        );
+        assert!(
+            !cache.__test_has_kid("kid-255").await,
+            "cache must remain empty on cap breach (fail-closed, not first-N truncation)"
+        );
+        assert!(
+            !cache.__test_has_kid("kid-299").await,
+            "cache must remain empty on cap breach (fail-closed, not last-N)"
+        );
+    }
 
-#[tokio::test]
-async fn jwks_at_cap_populates_successfully() {
-    install_crypto_provider();
+    #[tokio::test]
+    async fn jwks_at_cap_populates_successfully() {
+        install_crypto_provider();
 
-    // Exactly at the cap → populate as normal.
-    let mock = MockServer::start().await;
-    let jwks_doc = synthetic_jwks(8);
-    Mock::given(method("GET"))
-        .and(path("/.well-known/jwks.json"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(jwks_doc))
-        .mount(&mock)
-        .await;
+        // Exactly at the cap → populate as normal.
+        let mock = MockServer::start().await;
+        let jwks_doc = synthetic_jwks(8);
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jwks_doc))
+            .mount(&mock)
+            .await;
 
-    let jwks_uri = format!("{}/.well-known/jwks.json", mock.uri());
-    let mut config = OAuthConfig::builder("https://issuer.example.com/", "aud", &jwks_uri).build();
-    config.allow_http_oauth_urls = true;
-    config.max_jwks_keys = 8;
+        let jwks_uri = format!("{}/.well-known/jwks.json", mock.uri());
+        let mut config =
+            OAuthConfig::builder("https://issuer.example.com/", "aud", &jwks_uri).build();
+        config.allow_http_oauth_urls = true;
+        config.max_jwks_keys = 8;
 
-    let cache = JwksCache::new(&config)
-        .expect("construct cache")
-        .__test_allow_loopback_ssrf();
-    cache
-        .__test_refresh_now()
-        .await
-        .expect("refresh at cap must succeed");
+        let cache = JwksCache::new(&config)
+            .expect("construct cache")
+            .__test_allow_loopback_ssrf();
+        cache
+            .__test_refresh_now()
+            .await
+            .expect("refresh at cap must succeed");
 
-    assert!(
-        cache.__test_has_kid("kid-0").await,
-        "cache must contain first kid after successful refresh"
-    );
-    assert!(
-        cache.__test_has_kid("kid-7").await,
-        "cache must contain last kid after successful refresh"
-    );
+        assert!(
+            cache.__test_has_kid("kid-0").await,
+            "cache must contain first kid after successful refresh"
+        );
+        assert!(
+            cache.__test_has_kid("kid-7").await,
+            "cache must contain last kid after successful refresh"
+        );
+    }
 }

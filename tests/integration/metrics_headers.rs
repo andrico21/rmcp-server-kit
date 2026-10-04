@@ -7,84 +7,83 @@
 //! The metrics listener binds inside [`serve_metrics`] and does not expose the
 //! chosen port, so each test pre-reserves an ephemeral port, passes the
 //! concrete address, and polls for readiness.
-#![cfg_attr(
+#[cfg_attr(
     all(feature = "metrics", target_os = "linux"),
     expect(
         clippy::panic_in_result_fn,
         reason = "lint-migration: tests/integration/metrics_headers.rs"
     )
 )]
-#![cfg_attr(
+#[cfg_attr(
     all(feature = "metrics", target_os = "linux"),
     expect(
         clippy::shadow_reuse,
         reason = "lint-migration: tests/integration/metrics_headers.rs"
     )
 )]
-#![cfg_attr(
+#[cfg_attr(
     all(feature = "metrics", target_os = "linux"),
     expect(
         clippy::missing_panics_doc,
         reason = "lint-migration: tests/integration/metrics_headers.rs"
     )
 )]
-#![cfg_attr(
+#[cfg_attr(
     all(feature = "metrics", target_os = "linux"),
     expect(
         clippy::unused_result_ok,
         reason = "lint-migration: tests/integration/metrics_headers.rs"
     )
 )]
-#![cfg_attr(
+#[cfg_attr(
     all(feature = "metrics", target_os = "linux"),
     expect(
         clippy::default_numeric_fallback,
         reason = "lint-migration: tests/integration/metrics_headers.rs"
     )
 )]
-#![cfg_attr(
+#[cfg_attr(
     all(feature = "metrics", target_os = "linux"),
     expect(
         clippy::absolute_paths,
         reason = "lint-migration: tests/integration/metrics_headers.rs"
     )
 )]
-#![cfg_attr(
+#[cfg_attr(
     all(feature = "metrics", target_os = "linux"),
     expect(
         clippy::missing_errors_doc,
         reason = "lint-migration: tests/integration/metrics_headers.rs"
     )
 )]
-#![cfg_attr(
+#[cfg_attr(
     all(feature = "metrics", target_os = "linux"),
     expect(
         clippy::std_instead_of_alloc,
         reason = "lint-migration: tests/integration/metrics_headers.rs"
     )
 )]
-#![cfg_attr(
+#[cfg_attr(
     all(feature = "metrics", target_os = "linux"),
     expect(
         clippy::std_instead_of_core,
         reason = "lint-migration: tests/integration/metrics_headers.rs"
     )
 )]
-#![cfg_attr(
+#[cfg_attr(
     all(feature = "metrics", target_os = "linux"),
     expect(
         clippy::unused_trait_names,
         reason = "lint-migration: tests/integration/metrics_headers.rs"
     )
 )]
-#![cfg_attr(
+#[cfg_attr(
     feature = "metrics",
     expect(
         unused_results,
         reason = "lint-migration: tests/integration/metrics_headers.rs"
     )
 )]
-
 #[cfg(test)]
 mod tests {
     use std::{net::SocketAddr, sync::Arc, time::Duration};
