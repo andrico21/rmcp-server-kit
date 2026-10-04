@@ -156,7 +156,7 @@ axum Router                                  src/transport.rs:2076  (build_app_r
    │      (see `extract_bearer` in src/auth.rs).
    │      On success: sets task-locals via `current_role`, `current_identity`, …
    │
-├── 8. RBAC middleware                    src/rbac.rs:1309 (rbac_middleware) + 1376 (enforce_tool_policy)
+├── 8. RBAC middleware                    src/rbac.rs:1354 (rbac_middleware) + 1527 (enforce_tool_policy)
    │      For POSTs to /mcp:
    │        - Reads body up to limit
    │        - Parses JSON-RPC envelope
@@ -391,7 +391,7 @@ ArgumentAllowlist {                       // src/rbac.rs:275
 ```
 
 ### Decision function
-- `RbacPolicy::check(role, operation, host)` - pure allow/deny (`src/rbac.rs:479`; fn `check`)
+- `RbacPolicy::check(role, operation, host)` - pure allow/deny (`src/rbac.rs:709`; fn `check`)
 - `RbacPolicy::argument_allowed(role, tool, argument, value)` - JSON value match (`src/rbac.rs:739`; fn `argument_allowed`)
 - `RbacPolicy::redact_arg(value)` - HMAC-SHA256 of an argument value with
 the policy's salt, returning an 8-char hex prefix (`src/rbac.rs:749`).
@@ -402,7 +402,7 @@ the policy's salt, returning an 8-char hex prefix (`src/rbac.rs:749`).
   installed *after* enforcement (see "Task-locals" below).
 
 ### Middleware
-`rbac_middleware` (`src/rbac.rs:1315`):
+`rbac_middleware` (`src/rbac.rs:1354`):
 1. Extracts the role + identity name from the `AuthIdentity` request
    extension (set by the auth middleware).
 2. For `POST /mcp`, reads the body (bounded by body-size layer), parses
@@ -427,13 +427,13 @@ making preimage recovery infeasible. See `redact_with_salt`
 (`src/rbac.rs:589`).
 
 ### Task-locals
-`tokio::task_local!` block at `src/rbac.rs:215` defines four task-locals:
+`tokio::task_local!` block at `src/rbac.rs:117` defines four task-locals:
 - `CURRENT_ROLE: String`
 - `CURRENT_IDENTITY: String`
 - `CURRENT_TOKEN: SecretString`
 - `CURRENT_SUB: String`
 
-Public accessors: `current_role()` (`src/rbac.rs:243`),
+Public accessors: `current_role()` (`src/rbac.rs:158`),
 `current_identity()` (`src/rbac.rs:250`), `current_token()`
 (`src/rbac.rs:250`), `current_sub()` (`src/rbac.rs:250`). They return
 `Option<T>` because the task-locals are absent outside the request scope.
@@ -873,7 +873,7 @@ held. Only the runtime-only fields above survive from the base. It is fallible
 **Environment (opt-in)** - three inherent methods, one per section owning
 targeted fields: `ServerConfig::apply_env_overrides` (`src/config.rs:676`),
 `ObservabilityConfig::apply_env_overrides` (`src/config.rs:1023`) and
-`RbacConfig::apply_env_overrides` (`src/rbac.rs:1811`). Each returns
+`RbacConfig::apply_env_overrides` (`src/rbac.rs:1905`). Each returns
 `Vec<EnvOverride>` (`src/config.rs:100`) for audit logging, with `value: None`
 for secret targets. Curated variables under the `RMCP_SERVER_KIT__`
 prefix; `__` separates TOML path segments because field names already contain

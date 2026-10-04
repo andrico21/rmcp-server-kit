@@ -298,6 +298,28 @@ entry in the same PR that introduces a deviation.
    refresh cooldown, and the redaction tests' output. Evidence: the task-16
    migration record (`status.txt`, `new-permanent-expects.txt`, `gates.txt`).
 
+16. **2026-10-04 - `src/rbac.rs` lane expectations (frozen API + deliberate).**
+   Under entry 13's decision, five public items keep names ending in the
+   containing module's name and carry `module_name_repetitions` expectations
+   (`RbacConfig`, `RbacDecision`, `RbacRoleSummary`, `RbacPolicySummary`,
+   `RbacPolicy`); `missing_const_for_fn` is frozen on `RbacPolicy::is_enabled`
+   and `RbacConfig::with_allow_operation_matching`; and
+   `impl_trait_in_params` is frozen on the public constructors `RoleConfig::new`
+   and `ArgumentAllowlist::new`/`new_required`. `redact_with_salt` keeps its
+   HMAC key-construction fallback under a `constant-time:` expectation (G-8),
+   and its `write!`-into-String discard is a typed `let _: Result<(), FmtError>`
+   under `write! into String cannot fail` (D-11'). Four `deliberate:`
+   expectations record shapes with no behavior-preserving alternative: the
+   second `impl RbacConfig` block (`multiple_inherent_impl`, environment
+   overrides kept in their own block) and the three middleware closures that
+   clone per-request state before the future (`closure_returning_async_block`;
+   an async closure move-captures and does not implement `FnMut`). In `mod
+   tests`, `clippy::unnecessary_wraps` is added one per assertion-only test so
+   every test keeps the uniform `anyhow::Result<()>` signature, and the
+   core-blessed test-module doc/panic expectations cover the rest. The verbose
+   deny messages are unchanged (entry 1). Evidence: the task-19 migration
+   record (`new-permanent-expects.txt`, `gates.txt`).
+
 Entries to be added by the work that creates them: "new in `<version>`"
 expects and profile deltas (the toolchain-drift work); the per-item frozen
 public-API expectations (the lint lanes, under entry 13's decision); the GitLab
