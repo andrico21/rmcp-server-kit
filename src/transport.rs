@@ -5769,6 +5769,10 @@ fn check_mtls_capacity_knobs(mtls: &MtlsConfig) -> Result<(), RmcpServerKitError
         reason = "test code is not rendered API documentation"
     )
 )]
+#[cfg_attr(
+    all(test, target_os = "linux"),
+    expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")
+)]
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -5884,12 +5888,12 @@ mod tests {
         Ok(())
     }
 
-    /// Pins that dropping the startup guard cancels its token.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/transport.rs::cancel_on_drop_cancels_its_token — keeps the uniform IS-7 test signature while it only constructs values"
     )]
     #[test]
+    /// Pins that dropping the startup guard cancels its token.
     fn cancel_on_drop_cancels_its_token() -> anyhow::Result<()> {
         let ct = CancellationToken::new();
         {
@@ -6046,8 +6050,6 @@ mod tests {
 
     // -- McpServerConfig --
 
-    /// Pins every default `McpServerConfig::new` leaves in place across
-    /// transport, auth, timeout, and session fields.
     #[expect(
         deprecated,
         reason = "deliberate: src/transport.rs::server_config_new_defaults — exercises deprecated config fields directly"
@@ -6057,6 +6059,8 @@ mod tests {
         reason = "deliberate: src/transport.rs::server_config_new_defaults — keeps the uniform IS-7 test signature while it only constructs values"
     )]
     #[test]
+    /// Pins every default `McpServerConfig::new` leaves in place across
+    /// transport, auth, timeout, and session fields.
     fn server_config_new_defaults() -> anyhow::Result<()> {
         let cfg = McpServerConfig::new("0.0.0.0:8443", "test-server", "1.0.0");
         assert_eq!(cfg.bind_addr, "0.0.0.0:8443");
@@ -6111,12 +6115,12 @@ mod tests {
         SecretString::from("0123456789abcdef0123456789abcdef")
     }
 
-    /// Pins that a fresh config has no session store attached.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/transport.rs::session_store_defaults_to_none — keeps the uniform IS-7 test signature while it only constructs values"
     )]
     #[test]
+    /// Pins that a fresh config has no session store attached.
     fn session_store_defaults_to_none() -> anyhow::Result<()> {
         let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0");
 
@@ -6125,12 +6129,12 @@ mod tests {
         Ok(())
     }
 
-    /// Pins that a fresh config has no event store attached.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/transport.rs::event_store_defaults_to_none — keeps the uniform IS-7 test signature while it only constructs values"
     )]
     #[test]
+    /// Pins that a fresh config has no event store attached.
     fn event_store_defaults_to_none() -> anyhow::Result<()> {
         let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0");
 
@@ -6199,8 +6203,6 @@ mod tests {
         Ok(())
     }
 
-    /// Pins that the TLS handshake timeout and concurrency builders store
-    /// their values on the config.
     #[expect(
         deprecated,
         reason = "deliberate: src/transport.rs::tls_handshake_builders_set_fields — exercises deprecated config fields directly"
@@ -6210,6 +6212,8 @@ mod tests {
         reason = "deliberate: src/transport.rs::tls_handshake_builders_set_fields — keeps the uniform IS-7 test signature while it only constructs values"
     )]
     #[test]
+    /// Pins that the TLS handshake timeout and concurrency builders store
+    /// their values on the config.
     fn tls_handshake_builders_set_fields() -> anyhow::Result<()> {
         let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
             .with_tls_handshake_timeout(Duration::from_secs(3))
@@ -6242,13 +6246,13 @@ mod tests {
         Ok(())
     }
 
-    /// Pins that `validate` consumes the config into a `Validated` wrapper
-    /// that exposes the inner value, and rejects a zero body cap.
     #[expect(
         deprecated,
         reason = "deliberate: src/transport.rs::validate_consumes_and_proves — exercises deprecated config fields directly"
     )]
     #[test]
+    /// Pins that `validate` consumes the config into a `Validated` wrapper
+    /// that exposes the inner value, and rejects a zero body cap.
     fn validate_consumes_and_proves() -> anyhow::Result<()> {
         // Valid config -> Validated wrapper, original is consumed.
         let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0");
@@ -6325,12 +6329,12 @@ mod tests {
         Ok(())
     }
 
-    /// Pins that the derived host allowlist includes the `public_url` host.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/transport.rs::derive_allowed_hosts_includes_public_host — keeps the uniform IS-7 test signature while it only constructs values"
     )]
     #[test]
+    /// Pins that the derived host allowlist includes the `public_url` host.
     fn derive_allowed_hosts_includes_public_host() -> anyhow::Result<()> {
         let hosts = derive_allowed_hosts("0.0.0.0:8080", Some("https://mcp.example.com/mcp"));
         assert!(
@@ -6341,13 +6345,13 @@ mod tests {
         Ok(())
     }
 
-    /// Pins that the derived host allowlist includes both the bind host and
-    /// the bind authority.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/transport.rs::derive_allowed_hosts_includes_bind_authority — keeps the uniform IS-7 test signature while it only constructs values"
     )]
     #[test]
+    /// Pins that the derived host allowlist includes both the bind host and
+    /// the bind authority.
     fn derive_allowed_hosts_includes_bind_authority() -> anyhow::Result<()> {
         let hosts = derive_allowed_hosts("127.0.0.1:8080", None);
         assert!(
@@ -6766,13 +6770,13 @@ mod tests {
         Ok(())
     }
 
-    /// Pins that requests with no peer address fall back to the shared
-    /// `Unattributed` rate-limit key.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/transport.rs::limiter_client_key_falls_back_to_unattributed — keeps the uniform IS-7 test signature while it only constructs values"
     )]
     #[test]
+    /// Pins that requests with no peer address fall back to the shared
+    /// `Unattributed` rate-limit key.
     fn limiter_client_key_falls_back_to_unattributed() -> anyhow::Result<()> {
         let empty = Extensions::new();
         assert_eq!(limiter_client_key(&empty), RateLimitKey::Unattributed);
@@ -6972,13 +6976,13 @@ mod tests {
         Ok(())
     }
 
-    /// Pins the log-related defaults of a fresh `McpServerConfig`: an empty
-    /// `LogContextConfig` and the health-check exclusion list.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/transport.rs::new_config_defaults_log_settings — keeps the uniform IS-7 test signature while it only constructs values"
     )]
     #[test]
+    /// Pins the log-related defaults of a fresh `McpServerConfig`: an empty
+    /// `LogContextConfig` and the health-check exclusion list.
     fn new_config_defaults_log_settings() -> anyhow::Result<()> {
         let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0");
         assert_eq!(cfg.log_context, LogContextConfig::default());
@@ -7020,34 +7024,49 @@ mod tests {
         Ok(())
     }
 
+    /// Pins that `with_request_log_exclude_paths` replaces (not extends) the
+    /// exclusion list and that both forms validate.
     #[test]
-    fn request_log_exclude_paths_builder_replaces_list() {
+    fn request_log_exclude_paths_builder_replaces_list() -> anyhow::Result<()> {
         let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
             .with_request_log_exclude_paths(["/version"]);
         assert_eq!(cfg.request_log_exclude_paths, vec!["/version"]);
-        assert!(cfg.validate().is_ok());
+        drop(cfg.validate()?);
 
-        let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
+        let cfg_without_paths = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
             .with_request_log_exclude_paths(Vec::<String>::new());
-        assert_eq!(cfg.request_log_exclude_paths, Vec::<String>::new());
-        assert!(cfg.validate().is_ok());
+        assert_eq!(
+            cfg_without_paths.request_log_exclude_paths,
+            Vec::<String>::new()
+        );
+        drop(cfg_without_paths.validate()?);
+
+        Ok(())
     }
 
+    /// Pins that malformed `with_request_log_exclude_paths` entries are
+    /// rejected at validation time.
     #[test]
-    fn malformed_request_log_exclude_paths_rejected() {
+    fn malformed_request_log_exclude_paths_rejected() -> anyhow::Result<()> {
         for bad in ["", "healthz"] {
             let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
                 .with_request_log_exclude_paths([bad]);
-            let err = cfg.validate().expect_err("malformed exclude path");
+            let err = cfg
+                .validate()
+                .err()
+                .context("malformed exclude path must be rejected")?;
             assert!(
                 err.to_string().contains("request_log_exclude_paths"),
                 "entry {bad:?}: {err}"
             );
         }
+        Ok(())
     }
 
+    /// Pins that enabling `request_id` without trusted proxies is rejected and
+    /// accepted once a trusted proxy is configured.
     #[test]
-    fn log_context_request_id_requires_trusted_proxies() {
+    fn log_context_request_id_requires_trusted_proxies() -> anyhow::Result<()> {
         let log_context = LogContextConfig {
             request_id: true,
             ..LogContextConfig::default()
@@ -7056,29 +7075,42 @@ mod tests {
             .with_log_context(log_context.clone());
         let err = cfg
             .validate()
-            .expect_err("request_id without trusted_proxies");
+            .err()
+            .context("request_id without trusted_proxies must be rejected")?;
         assert!(
             err.to_string()
                 .contains("log_context.request_id requires trusted_proxies")
         );
 
-        let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
+        let cfg_with_proxy = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
             .with_log_context(log_context)
             .with_trusted_proxies(["127.0.0.1/32"]);
-        assert!(cfg.validate().is_ok());
+        drop(cfg_with_proxy.validate()?);
+
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/transport.rs::log_context_credential_owner_defaults_off_and_not_recommended — keeps the uniform IS-7 test signature while it only asserts on values"
+    )]
     #[test]
-    fn log_context_credential_owner_defaults_off_and_not_recommended() {
+    /// Pins that `credential_owner` is off by default and in the recommended
+    /// context preset.
+    fn log_context_credential_owner_defaults_off_and_not_recommended() -> anyhow::Result<()> {
         let default = LogContextConfig::default();
         assert!(!default.credential_owner, "default must be off");
 
         let recommended = LogContextConfig::recommended();
         assert!(!recommended.credential_owner, "recommended must be off");
+
+        Ok(())
     }
 
+    /// Pins the forbidden `request_id_header` rules (case-insensitive and
+    /// independent of the `request_id` switch) and the accepted names.
     #[test]
-    fn log_context_request_id_header_rules() {
+    fn log_context_request_id_header_rules() -> anyhow::Result<()> {
         for bad in [
             "",
             "x request id",
@@ -7090,61 +7122,81 @@ mod tests {
             "x-real-ip",
             "Mcp-Session-Id",
         ] {
-            let log_context = LogContextConfig {
+            let log_context_without_request_id = LogContextConfig {
                 request_id_header: bad.to_owned(),
                 ..LogContextConfig::default()
             };
             let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
-                .with_log_context(log_context);
-            let err = cfg.validate().expect_err("forbidden request_id_header");
+                .with_log_context(log_context_without_request_id);
+            let err = cfg
+                .validate()
+                .err()
+                .context("forbidden request_id_header must be rejected")?;
             assert!(
                 err.to_string().contains("request_id_header"),
                 "header {bad:?}: {err}"
             );
 
             // The rule applies whether or not request_id is enabled.
-            let log_context = LogContextConfig {
+            let log_context_with_request_id = LogContextConfig {
                 request_id_header: bad.to_owned(),
                 request_id: true,
                 ..LogContextConfig::default()
             };
-            let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
-                .with_log_context(log_context)
+            let cfg_enabled = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
+                .with_log_context(log_context_with_request_id)
                 .with_trusted_proxies(["127.0.0.1/32"]);
-            let err = cfg.validate().expect_err("forbidden request_id_header");
+            let err_enabled = cfg_enabled
+                .validate()
+                .err()
+                .context("forbidden request_id_header must be rejected")?;
             assert!(
-                err.to_string().contains("request_id_header"),
-                "header {bad:?}: {err}"
+                err_enabled.to_string().contains("request_id_header"),
+                "header {bad:?}: {err_enabled}"
             );
         }
 
         for good in ["x-request-id", "unique-id", "X-Correlation-ID"] {
-            let log_context = LogContextConfig {
+            let log_context_accepted = LogContextConfig {
                 request_id_header: good.to_owned(),
                 ..LogContextConfig::default()
             };
-            let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
-                .with_log_context(log_context);
-            assert!(cfg.validate().is_ok(), "header {good:?} should be accepted");
+            let cfg_accepted = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
+                .with_log_context(log_context_accepted);
+            drop(
+                cfg_accepted
+                    .validate()
+                    .with_context(|| format!("header {good:?} should be accepted"))?,
+            );
         }
+
+        Ok(())
     }
 
+    /// Pins that a zero extra-route rate limit is rejected with the knob named.
     #[test]
-    fn validate_rejects_zero_extra_route_rate_limit() {
+    fn validate_rejects_zero_extra_route_rate_limit() -> anyhow::Result<()> {
         let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
             .with_extra_route_rate_limit(0);
-        let err = cfg.validate().expect_err("zero extra route rate limit");
+        let err = cfg
+            .validate()
+            .err()
+            .context("zero extra route rate limit must be rejected")?;
         assert!(err.to_string().contains("extra_route_rate_limit"));
+
+        Ok(())
     }
 
+    /// Pins that a burst allowance admits the initial spike and the next
+    /// request is rate limited.
     #[tokio::test]
     async fn extra_route_limiter_burst_allows_initial_spike() -> anyhow::Result<()> {
         let app = limited_router_with_burst(1, Some(3));
-        for i in 0..3 {
-            let resp = app.clone().oneshot(limited_req("10.4.4.4")?).await.unwrap();
+        for i in 0_i32..3_i32 {
+            let resp = app.clone().oneshot(limited_req("10.4.4.4")?).await?;
             assert_eq!(resp.status(), StatusCode::OK, "burst request {i}");
         }
-        let resp = app.clone().oneshot(limited_req("10.4.4.4")?).await.unwrap();
+        let resp = app.clone().oneshot(limited_req("10.4.4.4")?).await?;
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
 
         Ok(())
@@ -7352,13 +7404,13 @@ mod tests {
         Ok(())
     }
 
-    /// Pins that `trusted_forwarder_max_entries` defaults to the module's
-    /// `MAX_SCANNED_ENTRIES` constant.
     #[test]
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/transport.rs::trusted_forwarder_max_entries_defaults_to_the_module_constant keeps the uniform IS-7 test signature while it only constructs values"
     )]
+    /// Pins that `trusted_forwarder_max_entries` defaults to the module's
+    /// `MAX_SCANNED_ENTRIES` constant.
     fn trusted_forwarder_max_entries_defaults_to_the_module_constant() -> anyhow::Result<()> {
         use crate::forwarded::MAX_SCANNED_ENTRIES;
 
@@ -7463,13 +7515,13 @@ mod tests {
         }))
     }
 
-    /// Pins that `sanitize_for_log` strips control characters and truncates to
-    /// `MAX_LOGGED_HEADER_CHARS` with an ellipsis marker.
     #[test]
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/transport.rs::sanitize_for_log_strips_controls_and_bounds keeps the uniform IS-7 test signature while it only constructs values"
     )]
+    /// Pins that `sanitize_for_log` strips control characters and truncates to
+    /// `MAX_LOGGED_HEADER_CHARS` with an ellipsis marker.
     fn sanitize_for_log_strips_controls_and_bounds() -> anyhow::Result<()> {
         assert_eq!(sanitize_for_log("a\r\nb", MAX_LOGGED_HEADER_CHARS), "ab");
         assert_eq!(
@@ -8046,14 +8098,14 @@ mod tests {
         Ok(())
     }
 
-    /// Pins that auth failures through the real middleware stack carry resolved
-    /// client, request-id, and credential-classification fields, honored only
-    /// for trusted peers.
     #[tokio::test]
     #[expect(
         clippy::too_many_lines,
         reason = "deliberate: src/transport.rs::auth_failure_through_real_wiring_carries_resolved_client_fields one linear end-to-end scenario; splitting would duplicate the server harness"
     )]
+    /// Pins that auth failures through the real middleware stack carry resolved
+    /// client, request-id, and credential-classification fields, honored only
+    /// for trusted peers.
     async fn auth_failure_through_real_wiring_carries_resolved_client_fields() -> anyhow::Result<()>
     {
         use crate::auth::generate_api_key;
@@ -8437,11 +8489,6 @@ mod tests {
     }
 
     // -- origin_check_middleware --
-
-    /// Axum handler shared by the middleware test routers: replies `ok`.
-    async fn ok_handler() -> &'static str {
-        "ok"
-    }
 
     /// Build a test router with origin check middleware and a simple handler.
     fn origin_router(origins: Vec<String>, log_request_headers: bool) -> axum::Router {
@@ -9284,7 +9331,7 @@ mod tests {
 
     use rustls::{
         CertificateError, DigitallySignedStruct, DistinguishedName, SignatureScheme,
-        client::{Resumption, danger::HandshakeSignatureValid},
+        client::danger::HandshakeSignatureValid,
         pki_types::{ServerName, UnixTime},
         server::danger::ClientCertVerified,
     };
@@ -9585,11 +9632,6 @@ mod tests {
         Ok(())
     }
 
-    // The client-side stream type and the server-name type are used only by
-    // the mTLS resumption harness, so they are imported next to it.
-    use rustls::pki_types::ServerName;
-    use tokio_rustls::client::TlsStream as ClientTlsStream;
-
     /// Connects, sends a minimal HTTP request, and reads the response to EOF.
     ///
     /// Reading to EOF is required so the client's rustls state machine actually
@@ -9853,14 +9895,14 @@ mod tests {
         let _result = build_app_router(config, || ProbeHandler);
     }
 
-    /// Pins that a path under a framework prefix which does not exactly overlap
-    /// an existing route is accepted.
-    ///
-    /// Documented as the caller's responsibility on `with_extra_router`.
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/transport.rs::extra_router_non_overlapping_path_under_framework_prefix_is_accepted — keeps the uniform IS-7 test signature while it only asserts that the router merge succeeds"
     )]
+    /// Pins that a path under a framework prefix which does not exactly overlap
+    /// an existing route is accepted.
+    ///
+    /// Documented as the caller's responsibility on `with_extra_router`.
     #[test]
     fn extra_router_non_overlapping_path_under_framework_prefix_is_accepted() -> anyhow::Result<()>
     {
@@ -10215,12 +10257,12 @@ mod tests {
                 .collect()
         }
 
-        /// Pins that request-origin parsing normalizes scheme, host, and ports.
         #[expect(
             clippy::unnecessary_wraps,
             reason = "deliberate: src/transport.rs::request_parse_normalizes_scheme_host_and_ports — keeps the uniform IS-7 test signature while it only asserts on parsed origin tuples"
         )]
         #[test]
+        /// Pins that request-origin parsing normalizes scheme, host, and ports.
         fn request_parse_normalizes_scheme_host_and_ports() -> anyhow::Result<()> {
             assert_eq!(
                 parse_request_origin_tuple("https://example.com"),
@@ -10247,13 +10289,13 @@ mod tests {
             Ok(())
         }
 
-        /// Pins that request-origin parsing rejects paths, queries, fragments,
-        /// and odd schemes.
         #[expect(
             clippy::unnecessary_wraps,
             reason = "deliberate: src/transport.rs::request_parse_rejects_paths_queries_fragments_and_odd_schemes — keeps the uniform IS-7 test signature while it only asserts on rejected origin inputs"
         )]
         #[test]
+        /// Pins that request-origin parsing rejects paths, queries, fragments,
+        /// and odd schemes.
         fn request_parse_rejects_paths_queries_fragments_and_odd_schemes() -> anyhow::Result<()> {
             for value in [
                 "https://example.com/",
@@ -10275,13 +10317,13 @@ mod tests {
             Ok(())
         }
 
-        /// Pins that config-origin parsing tolerates exactly one trailing slash
-        /// on the root path.
         #[expect(
             clippy::unnecessary_wraps,
             reason = "deliberate: src/transport.rs::config_parse_tolerates_one_root_trailing_slash_only — keeps the uniform IS-7 test signature while it only asserts on parsed config tuples"
         )]
         #[test]
+        /// Pins that config-origin parsing tolerates exactly one trailing slash
+        /// on the root path.
         fn config_parse_tolerates_one_root_trailing_slash_only() -> anyhow::Result<()> {
             assert_eq!(
                 parse_config_origin_tuple("https://example.com/"),
@@ -10358,13 +10400,13 @@ mod tests {
             Ok(())
         }
 
-        /// Pins that non-canonical port spellings are rejected on the request
-        /// and config sides.
         #[expect(
             clippy::unnecessary_wraps,
             reason = "deliberate: src/transport.rs::non_canonical_port_spellings_are_rejected — keeps the uniform IS-7 test signature while it only asserts on rejected port spellings"
         )]
         #[test]
+        /// Pins that non-canonical port spellings are rejected on the request
+        /// and config sides.
         fn non_canonical_port_spellings_are_rejected() -> anyhow::Result<()> {
             // `str::parse::<u16>` alone accepts `+443` and ` 443`, and
             // normalizes `0443`; none of those is a canonical origin port.
