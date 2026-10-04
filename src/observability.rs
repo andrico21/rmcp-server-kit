@@ -379,7 +379,7 @@ impl Drop for AuditWorkerGuard {
     )]
     #[expect(
         clippy::arithmetic_side_effects,
-        reason = "invariant: `Instant::now() + AUDIT_WRITER_JOIN_TIMEOUT` and the later deadline subtraction cannot overflow within the process lifetime"
+        reason = "invariant: src/observability.rs::AuditWorkerGuard::drop -- the deadline arithmetic is bounded by AUDIT_WRITER_JOIN_TIMEOUT and cannot overflow within the process lifetime"
     )]
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
@@ -1363,10 +1363,6 @@ mod tests {
         Ok(())
     }
 
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "deliberate: src/observability.rs::lenient_init_warns_and_installs_no_audit_sink keeps the uniform test signature while it cannot fail"
-    )]
     #[test]
     #[cfg(not(any(unix, windows)))]
     /// Pins that lenient init warns and installs no audit sink where permissions are unsupported.
