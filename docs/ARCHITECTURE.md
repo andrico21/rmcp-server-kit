@@ -743,7 +743,7 @@ Useful for debugging hot-reload state and verifying RBAC after a swap.
 
 **File**: `src/observability.rs`.
 
-`init_tracing_from_config(...)` (~`src/observability.rs:163`) initializes
+`init_tracing_from_config(...)` (~`src/observability.rs:88`) initializes
 `tracing-subscriber` with:
 - `EnvFilter` from `RUST_LOG` (or supplied filter string)
 - console layer (pretty when stdout is a TTY, JSON otherwise)
