@@ -207,7 +207,13 @@ entry in the same PR that introduces a deviation.
    `lint count gate` prevents any key from growing, and the stable `clippy` job
    still denies `unknown_lints` and `unfulfilled_lint_expectations`. Evidence:
    `scripts/lint-ratchet/baseline/`, the task-11 migration record, and
-   `blocks.txt`.
+   `blocks.txt`. **Closed 2026-10-05 (task 28):** every `lint-migration:`
+   expectation is gone (`git grep -c 'lint-migration:' -- src tests benches
+   examples` prints 0), so the count-gate machinery that guarded the ratchet was
+   retired with this entry. The permanent catalog, allow, profile-equality and
+   prose gates stay as blocking GitHub jobs. Historical evidence for the
+   blocks-as-generated lives in the task-11 migration record and `blocks.txt`
+   (the `baseline/` tree was deleted in task 28).
 11. **2026-10-04 - `pub_use` facade expectations (D-7'', core 1961-1962,
    2184).** The crate root and `secret` are public facades; their `pub use`
    re-exports are the point, so each module carries a single module-level
@@ -275,7 +281,7 @@ entry in the same PR that introduces a deviation.
    non-`const` (a source-scanning test matches its `pub(crate) fn` prefix).
    Evidence: the task-17 migration record (`new-permanent-expects.txt`).
 
-14. **2026-10-04 - `src/oauth.rs` lane expectations (frozen API + deliberate).**
+16. **2026-10-04 - `src/oauth.rs` lane expectations (frozen API + deliberate).**
    Under entry 13's decision, the 16 public `impl_trait_in_params` builder
    methods (`OAuthConfig::builder`; `OAuthConfigBuilder::{allowed_algorithms,
    authorization_server_metadata_issuer, authorization_servers, scope,
@@ -298,7 +304,7 @@ entry in the same PR that introduces a deviation.
    refresh cooldown, and the redaction tests' output. Evidence: the task-16
    migration record (`status.txt`, `new-permanent-expects.txt`, `gates.txt`).
 
-16. **2026-10-04 - `src/mtls_revocation.rs` lane expectations (frozen API +
+17. **2026-10-04 - `src/mtls_revocation.rs` lane expectations (frozen API +
     deliberate).** Under entry 13's frozen-API decision, `CrlSet`'s mixed
     `pub`/private fields carry a `clippy::partial_pub_fields` expectation
     (making the private fields public, or the public ones private, is a 4.0
@@ -317,7 +323,7 @@ entry in the same PR that introduces a deviation.
     `gates.txt`).
 
 
-17. **2026-10-04 - `src/auth.rs` lane expectations (frozen API + deliberate).**
+18. **2026-10-04 - `src/auth.rs` lane expectations (frozen API + deliberate).**
    Under entry 13's decision, five public items keep names ending in the
    containing module's name and carry `module_name_repetitions` expectations:
    `AuthIdentity`, `AuthMethod`, `AuthCountersSnapshot`, `AuthConfig` and
@@ -341,7 +347,7 @@ entry in the same PR that introduces a deviation.
    `verify_slots` uses `wrapping_sub` (never `checked_*` + `?`, G-8), and the
    redaction tests' output is unchanged. Evidence: the task-18 migration
    record (`new-permanent-expects.txt`, `gates.txt`).
-17. **2026-10-04 - `src/tool_hooks.rs` + `src/rbac_context.rs` per-item
+19. **2026-10-04 - `src/tool_hooks.rs` + `src/rbac_context.rs` per-item
    expectations (task 21).** Under entry 13's decision this lane freezes two
    public items with the catalog reason `public API frozen until the next major
    release`: `clippy::impl_trait_in_params` on `ToolCallContext::for_tool` and
@@ -366,7 +372,7 @@ entry in the same PR that introduces a deviation.
    the task-21 migration record (`new-permanent-expects.txt`, `gates.txt`,
    `review.txt`).
 
-18. **2026-10-05 - Small-core-modules lane expectations (task 23).** Under
+20. **2026-10-05 - Small-core-modules lane expectations (task 23).** Under
    entry 13's frozen-API decision, the public items whose names repeat the
    containing module keep `clippy::module_name_repetitions` per item:
    `AdminConfig` and `AdminStatus` (src/admin.rs), `BoundedLimiterError` and
@@ -388,7 +394,7 @@ entry in the same PR that introduces a deviation.
    task-23 migration record (`assertion-counts.txt`,
    `new-permanent-expects.txt`, `gates.txt`).
 
-19. **2026-10-04 - `src/rbac.rs` lane expectations (frozen API + deliberate).**
+21. **2026-10-04 - `src/rbac.rs` lane expectations (frozen API + deliberate).**
    Under entry 13's decision, five public items keep names ending in the
    containing module's name and carry `module_name_repetitions` expectations
    (`RbacConfig`, `RbacDecision`, `RbacRoleSummary`, `RbacPolicySummary`,
@@ -413,6 +419,13 @@ Entries to be added by the work that creates them: "new in `<version>`"
 expects and profile deltas (the toolchain-drift work); the per-item frozen
 public-API expectations (the lint lanes, under entry 13's decision); the GitLab
 mirror skew tolerance, if it is ever required.
+
+Resolved 2026-10-05 (task 28): the toolchain-drift work never triggered (stable
+stayed 1.99.0 and the dated nightly pin was never bumped), so there are no
+"new in `<version>`" expects and `scripts/lint-ratchet/profile-deltas.toml`
+stays empty; the per-item frozen public-API expectations landed with their lanes
+(entries 13-19); and no GitLab mirror skew tolerance was required. Add a new
+numbered entry only if one of these situations arises later.
 
 ## Re-vendor procedure
 

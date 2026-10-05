@@ -16,5 +16,6 @@
 # level = "warn"
 # toolchain = "1.100"
 #
-# ``measure.py`` also reads this file: diagnostics of lints named as a
-# ``from`` (renamed-from) or ``lint`` (removed) are excluded from the count.
+# ``profile_eq.py`` reads this file to compare Cargo.toml against the vendored
+# profile modulo these recorded deltas. (The retired ``measure.py``/count gate
+# also consulted ``from``/``lint`` names; nothing does now.)

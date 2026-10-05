@@ -1,5 +1,0 @@
-{
-  "file": "tests/integration/ssrf_resolver.rs",
-  "keys": {},
-  "toolchain": "1.99.0"
-}

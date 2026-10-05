@@ -1,5 +1,0 @@
-{
-  "file": "tests/integration/e2e_oauth_mtls.rs",
-  "keys": {},
-  "toolchain": "1.99.0"
-}

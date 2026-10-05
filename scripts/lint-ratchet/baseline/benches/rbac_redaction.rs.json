@@ -1,5 +1,0 @@
-{
-  "file": "benches/rbac_redaction.rs",
-  "keys": {},
-  "toolchain": "1.99.0"
-}
