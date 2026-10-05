@@ -3,7 +3,7 @@
 This guide shows how to wire the standalone `rmcp-server-kit` crate into a
 downstream project, and how to migrate across breaking major releases.
 
-## Migrating to 3.15: logging defaults and per-item client-context logging
+## Migrating to 3.15: logging defaults, MSRV 1.99, and `/metrics` security headers
 
 ### Framework INFO lines are visible under the default filter
 
@@ -126,6 +126,23 @@ The bump interacts with Cargo's dependency resolver:
 The CI MSRV job pins `1.99.0` and builds with `--cap-lints=warn` so it proves
 compile compatibility with `rust-version` only; lints are enforced on the
 latest stable.
+
+### `/metrics` now sends the security headers
+
+The dedicated Prometheus listener now applies the same eleven OWASP security
+response headers as the main router, and the operator's `security_headers`
+overrides and omissions (`Some("")` drops a header) are honoured there too.
+The listener is always plaintext, so no `Strict-Transport-Security` header is
+sent. The public `serve_metrics` signature is unchanged; only the response
+headers on that listener move.
+
+### Public API
+
+There is no breaking public API change in 3.15. The only public-surface change
+is a source-compatible addition: the `error::Result` alias is now generic over
+its error type with the crate error as the default
+(`pub type Result<T, E = RmcpServerKitError>`), so existing `Result<T>` uses
+compile unchanged. `cargo semver-checks` is green.
 
 ## Migrating to 3.14: same-named API keys must map to one role
 
@@ -870,7 +887,12 @@ Section 9), with warnings denied (`.cargo/config.toml` `build.warnings = "deny"`
 plus `-D warnings` on CI). Exceptions are narrowest-item
 `#[expect(lint, reason = "...")]` attributes, never `#[allow]`: no `unwrap` /
 `expect` / `panic` / `println!` in production paths, and `unsafe_code =
-"forbid"`. Downstream crates are free to keep or promote their own workspace
+"forbid"`. Permanent CI gates keep this enforced: the catalog gate reviews
+every `#[expect]` reason against the sanctioned-reason catalog, the allow gate
+forbids `#[allow]` outright, the profile-equality gate pins the committed
+`[lints]` table to the vendored profile, and the prose gates pin the
+cancel-safety and test-signature rules. No temporary migration expectations
+remain. Downstream crates are free to keep or promote their own workspace
 lints independently - the two lint tables do not interact.
 
 ## 4. Build & verify

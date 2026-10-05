@@ -900,27 +900,55 @@ Defaults (chosen for safe production posture):
 
 ## 16. Testing strategy
 
-**Unit tests** live next to code in `#[cfg(test)] mod tests { … }`. They
-cover pure logic (config validation, error mapping, argument allowlist
-matching, JWKS algorithm selection, etc.).
+**Unit tests** live one crate per file under `tests/unit/*.rs`, plus the
+in-module `#[cfg(test)] mod tests { … }` blocks next to `src/` code. They cover
+pure logic (config validation, error mapping, argument allowlist matching, JWKS
+algorithm selection, etc.) with no I/O or network.
 
-**Integration / E2E** tests live in `tests/integration/e2e.rs`. They:
+**Integration / E2E** tests live one crate per file under
+`tests/integration/*.rs` (the largest is `e2e.rs`). They:
 - Spawn `rmcp_server_kit::transport::serve(...)` on an **ephemeral port** via
-  `spawn_server()` (`tests/integration/e2e.rs:115`).
+  `spawn_server()` (`tests/integration/e2e.rs:499`).
 - Use `reqwest` to make real HTTP calls - origin checks, auth, RBAC,
   rate-limiting, readiness, body limits, TLS handshakes.
 - Use `wiremock` for OAuth/JWKS upstreams.
 - Generate test certs at runtime using `rcgen`.
 
+Every test file is declared with an explicit `[[test]]` target in `Cargo.toml`,
+and the feature-gated ones carry `required-features` instead of a crate-level
+`#![cfg(feature = ...)]`: running a gated target without its features is now an
+error, not a silently empty binary. There is no separate `e2e` tier; every test
+is autonomous (loopback ports or `wiremock`, no live external service).
+
 Examples worth reading:
-- `auth_accepts_valid_bearer` - `tests/integration/e2e.rs:244`
-- `rbac_denies_unpermitted_tool` - `tests/integration/e2e.rs:361`
-- `rbac_allows_permitted_tool` - `tests/integration/e2e.rs:390`
-- `rbac_argument_allowlist_enforced` - `tests/integration/e2e.rs:422`
+- `auth_accepts_valid_bearer` - `tests/integration/e2e.rs:1045`
+- `rbac_denies_unpermitted_tool` - `tests/integration/e2e.rs:1164`
+- `rbac_allows_permitted_tool` - `tests/integration/e2e.rs:1194`
+- `rbac_argument_allowlist_enforced` - `tests/integration/e2e.rs:1227`
 
 > When changing behaviour, **add an E2E test first**. The unit tests in
 > `auth.rs`/`rbac.rs` are useful but the E2E suite is what catches
 > middleware-ordering regressions.
+
+### CI and gates
+
+`.github/workflows/ci.yml` is canonical; `.gitlab-ci.yml` mirrors it. Blocking
+jobs: `fmt` (pinned `nightly-2026-10-03`), `clippy`, `test` (Linux/macOS/Windows
++ doctests), the five-row feature matrix, `cargo-semver-checks`, `cargo-deny`,
+`cargo-audit`, `cargo-vet`, `taplo`, `cargo-machete`, `Rustdoc` (pinned nightly
+with `--cfg docsrs`), `Rustdoc (stable)`, `MSRV (1.99.0)` (lint-capped),
+`Memory bounds`, `Validate docs (citations + links)`, the `lint-ratchet`
+self-tests, and the four permanent lint gates. `cargo-geiger` and the nightly
+`Rustdoc (latest nightly canary)` run informational; `cargo-mutants` is
+schedule-only.
+
+The lint gates are stdlib-only Python under `scripts/lint-ratchet/`:
+`catalog_gate.py` (every `#[expect]` reason is in the sanctioned catalog),
+`allow_gate.py` (no `#[allow]`), `profile_eq.py` (the committed `[lints]` table
+equals the vendored profile), and `prose_gates.py` (cancel-safety notes, test
+signatures, docs). Shared helpers live in `common.py`; the counting ratchet and
+its `baseline/` tree were retired once the last `lint-migration:` expectation
+reached zero.
 
 ### Delegation-safety layers (the `ServerHandler` wrappers)
 

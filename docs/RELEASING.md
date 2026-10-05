@@ -22,7 +22,7 @@ onward.
    CI and neither ever reached crates.io; the tags exist but the versions do
    not. Check with `gh run list --limit 5` and confirm the run for your commit
    concluded `success`.
-2. `cargo +nightly fmt --all -- --check` clean.
+2. `cargo +nightly-2026-10-03 fmt --all -- --check` clean.
 3. Clippy clean on **every feature combination CI lints**, not just
    `--all-features`. `--all-features` cannot see code inside
    `#[cfg(not(feature = "..."))]`, which is exactly where the 3.5.0 breakage

@@ -680,8 +680,9 @@ impl OauthHttpClient {
     }
 
     /// Test-only: borrow the inner `reqwest::Client` so the M-H2
-    /// env-proxy matrix test (`tests/integration/e2e.rs::ssrf_no_proxy_*`) can
-    /// drive `.get(...).send()` directly and observe whether the
+    /// env-proxy matrix test
+    /// (`tests/integration/ssrf_resolver.rs::no_proxy_defeats_all_env_proxy_variants`)
+    /// can drive `.get(...).send()` directly and observe whether the
     /// SsrfScreeningResolver fired (vs. the proxy short-circuiting
     /// the request). Not part of the public API.
     ///

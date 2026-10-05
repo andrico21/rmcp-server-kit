@@ -102,10 +102,10 @@ permission. Status of each item at this vendoring:
 
 | # | Deviation | Status | Closure / note |
 | - | --------- | ------ | -------------- |
-| 1 | `pedantic`/`nursery` at `warn`; remove the listed allows; `doc_markdown` -> `doc-valid-idents` | open | Closed by the Section 9 profile switch, which replaces the local lint table wholesale. |
+| 1 | `pedantic`/`nursery` at `warn`; remove the listed allows; `doc_markdown` -> `doc-valid-idents` | closed | Closed by the Section 9 profile switch (PR #40), which replaced the local lint table wholesale with the vendored profile and turned every former `#[allow]` into a narrowest-item `#[expect]`. |
 | 2 | `rust-toolchain.toml` pin and the CI `1.98.0` job contradict the Version Policy | closed | Closed by the MSRV work: the pin file was deleted (PR #29), `rust-version` is `1.99.0`, and the GitHub and GitLab MSRV jobs plus every live 1.98 doc/CI reference are retargeted to 1.99. |
 | 3 | `deny.toml`: `multiple-versions = "warn"` -> `"deny"` | closed | Closed by the core cargo-deny policy adopted in PR #31 (merged into this branch): `multiple-versions = "deny"`, `[graph] all-features`, `unmaintained` / `unsound` scope "all", licenses trimmed to the encountered set, duplicates in `skip` with a reason each. |
-| 4 | `.cargo/config.toml`: `build.warnings = "deny"` not set | open | Closed by the warnings-policy work. |
+| 4 | `.cargo/config.toml`: `build.warnings = "deny"` not set | closed | Closed by PR #32: `.cargo/config.toml` commits `[build] warnings = "deny"` (excluded from the published package) and every CI job inherits it. |
 | 5 | 1.99 lint impact: message-less `assert!(..is_empty())` sites | closed | All 30 test-side sites fixed on 1.99 in PR #30 (before this vendoring); they were never profile-only. The overlay's count is an erratum (30 measured, not 25) for the final report. |
 | 6 | 1.99 idioms: `String::from_utf8_lossy(..).into_owned()` sites | not applicable | False positive: both sites convert borrowed bytes (`&guard`; `&buf[..filled]`), not owned bytes. Upstream erratum. |
 
@@ -366,8 +366,9 @@ entry in the same PR that introduces a deviation.
    keeps `pub(crate)` on `RbacContextHandler` because rustc's `unreachable_pub`
    (denied) forbids the `pub` that nursery's `redundant_pub_crate` suggests;
    the manifest contradiction override (Cargo.toml) is the narrowest
-   resolution, so that one key intentionally remains in the file's count-gate
-   baseline. The `SEMANTIC_DRIVERS` tables and impl anchors parsed by
+   resolution; the `profile-deltas.toml` record of that override is empty,
+   because the manifest override is part of the vendored profile itself, not a
+   local delta. The `SEMANTIC_DRIVERS` tables and impl anchors parsed by
    `tests/integration/delegation_guard.rs` were kept byte-identical. Evidence:
    the task-21 migration record (`new-permanent-expects.txt`, `gates.txt`,
    `review.txt`).
@@ -424,7 +425,7 @@ Resolved 2026-10-05 (task 28): the toolchain-drift work never triggered (stable
 stayed 1.99.0 and the dated nightly pin was never bumped), so there are no
 "new in `<version>`" expects and `scripts/lint-ratchet/profile-deltas.toml`
 stays empty; the per-item frozen public-API expectations landed with their lanes
-(entries 13-19); and no GitLab mirror skew tolerance was required. Add a new
+(entries 13-21); and no GitLab mirror skew tolerance was required. Add a new
 numbered entry only if one of these situations arises later.
 
 ## Re-vendor procedure
@@ -457,7 +458,10 @@ numbered entry only if one of these situations arises later.
    bytes; never write upstream.
 4. Run the gates: `cargo test --all-features --test docs_citations`,
    `lychee --offline --no-progress README.md RUST_GUIDELINES.md docs/*.md`,
-   plus the usual fmt/lint/test set.
+   the four lint gates (`python3 scripts/lint-ratchet/catalog_gate.py`,
+   `allow_gate.py --enforce`, `profile_eq.py --clippy-toml`,
+   `prose_gates.py --enforce`), plus the usual fmt/lint/test set. The retired
+   counting ratchet is not part of the set.
 
 ## Toolchain-bump procedure
 
@@ -467,19 +471,20 @@ merges pause, the drift PR owns every file, then the lanes update from `main`.
 
 1. New lints, and new firings of existing lints (stable): fix them, or add
    item-level `#[expect(<lint>, reason = "new in <version>; pending guidelines
-   re-baseline")]`. These are harmless on the 1.99-pinned jobs: the count gate
-   ignores `unknown_lints` / `unfulfilled_lint_expectations`, and the MSRV job
-   is lint-capped.
+   re-baseline")]`. The stable `clippy` job denies `unknown_lints` and
+   `unfulfilled_lint_expectations`, so every such expect must actually fire;
+   the MSRV job is lint-capped, so it cannot see the new lint at all. There is
+   no counting baseline to refresh - the ratchet was retired in task 28.
 2. A profile lint renamed or removed: apply the rename or removal in `Cargo.toml`
    as a recorded toolchain delta (old -> new, or removed, with the toolchain
-   version) in the register above. A split lint records every successor;
-   "removed" is recorded only when the toolchain's changelog shows no
-   replacement (cite it). An expect naming the lint is renamed in place or
-   deleted; the measurement drops recorded renamed-from and removed lints. The
-   profile semantic-equality check compares against the vendored profile modulo
-   exactly these recorded deltas.
-3. The count gate stays pinned to 1.99.0. Its baseline is regenerated only in
-   the commit that bumps `rust-version`, which is an owner decision.
+   version) in `scripts/lint-ratchet/profile-deltas.toml`. A split lint records
+   every successor; "removed" is recorded only when the toolchain's changelog
+   shows no replacement (cite it). An expect naming the lint is renamed in place
+   or deleted. `profile_eq.py` compares the committed profile against the
+   vendored profile modulo exactly these recorded deltas.
+3. `rust-version` moves only by owner decision. `profile_eq.py` is the
+   authoritative profile comparison and reads the recorded deltas; the retired
+   count gate no longer pins anything.
 4. Nightly drift: the fmt and docsrs jobs use a dated nightly
    (`nightly-YYYY-MM-DD`), the newest that passes those two commands. The pin
    moves only deliberately; a non-blocking canary runs docsrs on the latest
