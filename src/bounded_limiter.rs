@@ -42,98 +42,27 @@
 //! - The map uses [`std::sync::Mutex`] (not [`tokio::sync::Mutex`]) since
 //!   admission checks must be synchronous and never `.await`.
 //! - We do not log inside the critical section.
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::map_err_ignore,
-        reason = "lint-migration: src/bounded_limiter.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::min_ident_chars,
-        reason = "lint-migration: src/bounded_limiter.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::shadow_unrelated,
-        reason = "lint-migration: src/bounded_limiter.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::arithmetic_side_effects,
-        reason = "lint-migration: src/bounded_limiter.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::absolute_paths,
-        reason = "lint-migration: src/bounded_limiter.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::shadow_reuse,
-        reason = "lint-migration: src/bounded_limiter.rs"
-    )
-)]
-#![cfg_attr(
-    all(not(test), target_os = "linux"),
-    expect(
-        clippy::missing_docs_in_private_items,
-        reason = "lint-migration: src/bounded_limiter.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_inline_in_public_items,
-        reason = "lint-migration: src/bounded_limiter.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::module_name_repetitions,
-        reason = "lint-migration: src/bounded_limiter.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::std_instead_of_alloc,
-        reason = "lint-migration: src/bounded_limiter.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::std_instead_of_core,
-        reason = "lint-migration: src/bounded_limiter.rs"
-    )
-)]
-#![expect(unused_results, reason = "lint-migration: src/bounded_limiter.rs")]
 
-use std::{
-    collections::HashMap,
+extern crate alloc;
+
+use alloc::sync::{Arc, Weak};
+use core::{
     hash::Hash,
     num::{NonZeroU32, NonZeroUsize},
     str::FromStr,
-    sync::{Arc, Mutex, PoisonError, Weak},
-    time::{Duration, Instant},
+    time::Duration,
+};
+use std::{
+    collections::HashMap,
+    sync::{Mutex, PoisonError},
+    time::Instant,
 };
 
 use governor::{
     DefaultDirectRateLimiter, Quota, RateLimiter,
     clock::{Clock as _, DefaultClock},
 };
+use tokio::{runtime::Handle, time::interval};
 
 /// Reason a [`BoundedKeyedLimiter::check_key`] call rejected a request.
 ///
@@ -142,6 +71,10 @@ use governor::{
 /// room for future reasons (e.g. burst-debt or distinct quota classes).
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[expect(
+    clippy::module_name_repetitions,
+    reason = "public API frozen until the next major release"
+)]
 pub enum BoundedLimiterError {
     /// The key has exceeded its per-key quota for the current window.
     #[error("rate limit exceeded for key")]
@@ -151,6 +84,10 @@ pub enum BoundedLimiterError {
 /// Reason a detailed bounded-limiter check denied a request.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[expect(
+    clippy::module_name_repetitions,
+    reason = "public API frozen until the next major release"
+)]
 pub enum BoundedLimiterDeny {
     /// The key has exceeded its per-key quota for the current window.
     #[error("rate limit exceeded; retry after {0:?}")]
@@ -176,6 +113,7 @@ pub enum KeyEvictionPolicy {
 impl FromStr for KeyEvictionPolicy {
     type Err = ();
 
+    #[inline]
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "evict_lru" => Ok(Self::EvictLru),
@@ -188,7 +126,9 @@ impl FromStr for KeyEvictionPolicy {
 /// Per-key limiter entry: the underlying direct limiter plus the wall-clock
 /// timestamp of the most recent admission attempt for this key.
 struct Entry {
+    /// The per-key governor limiter.
     limiter: DefaultDirectRateLimiter,
+    /// Wall-clock time of the most recent admission attempt for this key.
     last_seen: Instant,
 }
 
@@ -196,10 +136,15 @@ struct Entry {
 /// and a [`Weak`] inside the optional background prune task so the task
 /// self-terminates once the limiter is dropped.
 struct Inner<K: Eq + Hash + Clone> {
+    /// Per-key limiter entries, keyed by the tracked key.
     map: Mutex<HashMap<K, Entry>>,
+    /// Per-key quota applied to every entry.
     quota: Quota,
+    /// Hard cap on the number of simultaneously tracked keys.
     max_tracked_keys: usize,
+    /// Idle window after which an entry becomes eligible for pruning.
     idle_eviction: Duration,
+    /// Behaviour applied once the tracked-key table reaches capacity.
     key_eviction_policy: KeyEvictionPolicy,
 }
 
@@ -211,10 +156,12 @@ struct Inner<K: Eq + Hash + Clone> {
     reason = "wraps governor RateLimiter which has no Debug impl"
 )]
 pub struct BoundedKeyedLimiter<K: Eq + Hash + Clone> {
+    /// Shared inner state; clones share this.
     inner: Arc<Inner<K>>,
 }
 
 impl<K: Eq + Hash + Clone> Clone for BoundedKeyedLimiter<K> {
+    #[inline]
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -246,6 +193,7 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
     /// pruning happens lazily on every full-table insert. Both behaviours
     /// are correct.
     #[must_use]
+    #[inline]
     pub(crate) fn new(
         quota: Quota,
         max_tracked_keys: NonZeroUsize,
@@ -261,6 +209,7 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
 
     /// Create a new bounded keyed limiter with explicit full-table behaviour.
     #[must_use]
+    #[inline]
     pub(crate) fn new_with_policy(
         quota: Quota,
         max_tracked_keys: NonZeroUsize,
@@ -293,18 +242,20 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
     /// * `idle_eviction` -- entries whose `last_seen` is older than this
     ///   are eligible for opportunistic pruning.
     #[must_use]
+    #[inline]
     pub fn with_per_minute(
         requests_per_minute: u32,
         max_tracked_keys: usize,
         idle_eviction: Duration,
     ) -> Self {
         let rate = NonZeroU32::new(requests_per_minute.max(1)).unwrap_or(NonZeroU32::MIN);
-        let max_tracked_keys = NonZeroUsize::new(max_tracked_keys).unwrap_or(NonZeroUsize::MIN);
-        Self::new(Quota::per_minute(rate), max_tracked_keys, idle_eviction)
+        let capped_keys = NonZeroUsize::new(max_tracked_keys).unwrap_or(NonZeroUsize::MIN);
+        Self::new(Quota::per_minute(rate), capped_keys, idle_eviction)
     }
 
     /// Construct a [`BoundedKeyedLimiter`] with a per-minute quota and policy.
     #[must_use]
+    #[inline]
     pub fn with_per_minute_and_policy(
         requests_per_minute: u32,
         max_tracked_keys: usize,
@@ -312,10 +263,10 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
         key_eviction_policy: KeyEvictionPolicy,
     ) -> Self {
         let rate = NonZeroU32::new(requests_per_minute.max(1)).unwrap_or(NonZeroU32::MIN);
-        let max_tracked_keys = NonZeroUsize::new(max_tracked_keys).unwrap_or(NonZeroUsize::MIN);
+        let capped_keys = NonZeroUsize::new(max_tracked_keys).unwrap_or(NonZeroUsize::MIN);
         Self::new_with_policy(
             Quota::per_minute(rate),
-            max_tracked_keys,
+            capped_keys,
             idle_eviction,
             key_eviction_policy,
         )
@@ -336,18 +287,20 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
     /// * `idle_eviction` -- entries whose `last_seen` is older than this
     ///   are eligible for opportunistic pruning.
     #[must_use]
+    #[inline]
     pub fn with_per_second(
         requests_per_second: u32,
         max_tracked_keys: usize,
         idle_eviction: Duration,
     ) -> Self {
         let rate = NonZeroU32::new(requests_per_second.max(1)).unwrap_or(NonZeroU32::MIN);
-        let max_tracked_keys = NonZeroUsize::new(max_tracked_keys).unwrap_or(NonZeroUsize::MIN);
-        Self::new(Quota::per_second(rate), max_tracked_keys, idle_eviction)
+        let capped_keys = NonZeroUsize::new(max_tracked_keys).unwrap_or(NonZeroUsize::MIN);
+        Self::new(Quota::per_second(rate), capped_keys, idle_eviction)
     }
 
     /// Construct a [`BoundedKeyedLimiter`] with a per-second quota and policy.
     #[must_use]
+    #[inline]
     pub fn with_per_second_and_policy(
         requests_per_second: u32,
         max_tracked_keys: usize,
@@ -355,10 +308,10 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
         key_eviction_policy: KeyEvictionPolicy,
     ) -> Self {
         let rate = NonZeroU32::new(requests_per_second.max(1)).unwrap_or(NonZeroU32::MIN);
-        let max_tracked_keys = NonZeroUsize::new(max_tracked_keys).unwrap_or(NonZeroUsize::MIN);
+        let capped_keys = NonZeroUsize::new(max_tracked_keys).unwrap_or(NonZeroUsize::MIN);
         Self::new_with_policy(
             Quota::per_second(rate),
-            max_tracked_keys,
+            capped_keys,
             idle_eviction,
             key_eviction_policy,
         )
@@ -367,24 +320,28 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
     /// Spawn the optional background prune task. No-op if there is no
     /// current Tokio runtime.
     fn spawn_prune_task(inner: &Arc<Inner<K>>) {
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        let Ok(handle) = Handle::try_current() else {
             return;
         };
         let weak: Weak<Inner<K>> = Arc::downgrade(inner);
         // Prune at most once every quarter of `idle_eviction`, but never
         // less than once per minute (to avoid waking up too often when
         // operators configure a very long eviction window).
-        let interval = (inner.idle_eviction / 4).max(Duration::from_mins(1));
-        handle.spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
+        let prune_interval = inner
+            .idle_eviction
+            .checked_div(4)
+            .unwrap_or(Duration::ZERO)
+            .max(Duration::from_mins(1));
+        let _prune_task = handle.spawn(async move {
+            let mut ticker = interval(prune_interval);
             // We just woke up from `Handle::spawn`; don't burn the first tick.
-            ticker.tick().await;
+            let _first_tick = ticker.tick().await;
             loop {
-                ticker.tick().await;
-                let Some(inner) = weak.upgrade() else {
+                let _tick = ticker.tick().await;
+                let Some(tracked) = weak.upgrade() else {
                     return;
                 };
-                Self::prune_idle(&inner);
+                Self::prune_idle(&tracked);
             }
         });
     }
@@ -404,9 +361,9 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
         let oldest_key = map
             .iter()
             .min_by_key(|(_, entry)| entry.last_seen)
-            .map(|(k, _)| k.clone());
+            .map(|(key, _)| key.clone());
         if let Some(key) = oldest_key {
-            map.remove(&key);
+            let _removed = map.remove(&key);
         }
     }
 
@@ -426,9 +383,10 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
     ///
     /// Returns [`BoundedLimiterError::RateLimited`] when `key` has
     /// exceeded its per-key quota for the current window.
+    #[inline]
     pub fn check_key(&self, key: &K) -> Result<(), BoundedLimiterError> {
         self.check_key_wait(key)
-            .map_err(|_| BoundedLimiterError::RateLimited)
+            .map_err(|_wait| BoundedLimiterError::RateLimited)
     }
 
     /// Test the per-key quota for `key`, returning the wait time on deny.
@@ -444,6 +402,7 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
     /// governor's default clock at the moment of the failed check. The
     /// value is a raw [`Duration`]; rounding (e.g. ceiling to whole
     /// seconds for a `Retry-After` header) is the caller's concern.
+    #[inline]
     pub fn check_key_wait(&self, key: &K) -> Result<(), Duration> {
         let mut guard = self
             .inner
@@ -474,7 +433,7 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
         let result = limiter
             .check()
             .map_err(|not_until| not_until.wait_time_from(DefaultClock::default().now()));
-        guard.insert(
+        let _previous = guard.insert(
             key.clone(),
             Entry {
                 limiter,
@@ -497,6 +456,7 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
     /// Returns [`BoundedLimiterDeny::RateLimited`] when an established bucket is
     /// over quota, or [`BoundedLimiterDeny::CapacityFull`] when an unseen key is
     /// rejected by [`KeyEvictionPolicy::RejectNew`].
+    #[inline]
     pub fn check_key_detailed(&self, key: &K) -> Result<(), BoundedLimiterDeny> {
         let mut guard = self
             .inner
@@ -528,7 +488,7 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
         let result = limiter.check().map_err(|not_until| {
             BoundedLimiterDeny::RateLimited(not_until.wait_time_from(DefaultClock::default().now()))
         });
-        guard.insert(
+        let _previous = guard.insert(
             key.clone(),
             Entry {
                 limiter,
@@ -540,6 +500,7 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
 
     /// Number of currently tracked keys. Used by tests and admin endpoints.
     #[must_use]
+    #[inline]
     pub fn len(&self) -> usize {
         self.inner
             .map
@@ -550,66 +511,32 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
 
     /// `true` when no keys are currently tracked.
     #[must_use]
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 }
 
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::let_underscore_untyped,
-        reason = "lint-migration: src/bounded_limiter.rs"
-    )
+#[expect(
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    reason = "test code is not rendered API documentation"
 )]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::let_underscore_must_use,
-        reason = "lint-migration: src/bounded_limiter.rs"
-    )
+#[expect(
+    clippy::too_long_first_doc_paragraph,
+    reason = "test code is not rendered API documentation"
 )]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::panic, reason = "lint-migration: src/bounded_limiter.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::assertions_on_result_states,
-        reason = "lint-migration: src/bounded_limiter.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::too_long_first_doc_paragraph,
-        reason = "test code is not rendered API documentation"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::expect_used, reason = "lint-migration: src/bounded_limiter.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::unwrap_used, reason = "lint-migration: src/bounded_limiter.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::missing_panics_doc,
-        reason = "test code is not rendered API documentation"
-    )
-)]
+#[expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")]
 #[cfg(test)]
 mod tests {
-    use std::{
+    use core::{
         net::IpAddr,
         num::{NonZeroU32, NonZeroUsize},
         time::Duration,
     };
+    use std::thread::sleep;
 
+    use anyhow::Context as _;
     use governor::Quota;
 
     use super::{BoundedKeyedLimiter, BoundedLimiterDeny, BoundedLimiterError, KeyEvictionPolicy};
@@ -625,19 +552,22 @@ mod tests {
     /// Deny on the existing-key branch must report a positive,
     /// quota-bounded wait time.
     #[test]
-    fn check_key_wait_existing_key_deny_returns_bounded_wait() {
-        let quota = Quota::per_minute(NonZeroU32::new(1).unwrap());
+    fn check_key_wait_existing_key_deny_returns_bounded_wait() -> anyhow::Result<()> {
+        let quota = Quota::per_minute(NonZeroU32::new(1).context("nonzero rate")?);
         let limiter: BoundedKeyedLimiter<IpAddr> =
             BoundedKeyedLimiter::new(quota, cap(10), Duration::from_hours(1));
-        assert!(limiter.check_key_wait(&ip(1)).is_ok(), "burst admits first");
-        let wait = limiter
-            .check_key_wait(&ip(1))
-            .expect_err("second call within the window must deny");
+        let Ok(()) = limiter.check_key_wait(&ip(1)) else {
+            anyhow::bail!("burst admits first");
+        };
+        let Err(wait) = limiter.check_key_wait(&ip(1)) else {
+            anyhow::bail!("second call within the window must deny");
+        };
         assert!(wait > Duration::ZERO, "wait must be positive, got {wait:?}");
         assert!(
             wait <= Duration::from_secs(60),
             "per-minute quota wait must be <= 60s, got {wait:?}"
         );
+        Ok(())
     }
 
     /// The new-key branch always admits the first check: a freshly
@@ -645,41 +575,47 @@ mod tests {
     /// capacity is `NonZeroU32` (>= 1). The deny arm on that branch is
     /// defensive symmetry, not a reachable path.
     #[test]
-    fn check_key_wait_new_key_first_check_admits() {
-        let quota = Quota::per_minute(NonZeroU32::new(1).unwrap());
+    fn check_key_wait_new_key_first_check_admits() -> anyhow::Result<()> {
+        let quota = Quota::per_minute(NonZeroU32::new(1).context("nonzero rate")?);
         let limiter: BoundedKeyedLimiter<IpAddr> =
             BoundedKeyedLimiter::new(quota, cap(10), Duration::from_hours(1));
         for i in 0..5_u32 {
-            assert!(
-                limiter.check_key_wait(&ip(i)).is_ok(),
-                "first check for new key {i} must admit"
-            );
+            let Ok(()) = limiter.check_key_wait(&ip(i)) else {
+                anyhow::bail!("first check for new key {i} must admit");
+            };
         }
+        Ok(())
     }
 
     /// `check_key` delegates to `check_key_wait`: identical admission
     /// decisions, error mapped to the reason-only enum.
     #[test]
-    fn check_key_delegates_to_wait_path() {
-        let quota = Quota::per_minute(NonZeroU32::new(1).unwrap());
+    fn check_key_delegates_to_wait_path() -> anyhow::Result<()> {
+        let quota = Quota::per_minute(NonZeroU32::new(1).context("nonzero rate")?);
         let limiter: BoundedKeyedLimiter<IpAddr> =
             BoundedKeyedLimiter::new(quota, cap(10), Duration::from_hours(1));
-        assert!(limiter.check_key(&ip(7)).is_ok());
+        let Ok(()) = limiter.check_key(&ip(7)) else {
+            anyhow::bail!("first check must admit");
+        };
         assert_eq!(
             limiter.check_key(&ip(7)),
             Err(BoundedLimiterError::RateLimited)
         );
+        Ok(())
     }
 
+    /// Pins that `check_key_detailed` reports a rate-limit wait by default.
     #[test]
-    fn check_key_detailed_reports_rate_limit_wait_under_default_policy() {
-        let quota = Quota::per_minute(NonZeroU32::new(1).unwrap());
+    fn check_key_detailed_reports_rate_limit_wait_under_default_policy() -> anyhow::Result<()> {
+        let quota = Quota::per_minute(NonZeroU32::new(1).context("nonzero rate")?);
         let limiter: BoundedKeyedLimiter<IpAddr> =
             BoundedKeyedLimiter::new(quota, cap(10), Duration::from_hours(1));
-        assert!(limiter.check_key_detailed(&ip(7)).is_ok());
-        let deny = limiter
-            .check_key_detailed(&ip(7))
-            .expect_err("second call within the window must deny");
+        let Ok(()) = limiter.check_key_detailed(&ip(7)) else {
+            anyhow::bail!("first check must admit");
+        };
+        let Err(deny) = limiter.check_key_detailed(&ip(7)) else {
+            anyhow::bail!("second call within the window must deny");
+        };
         match deny {
             BoundedLimiterDeny::RateLimited(wait) => {
                 assert!(wait > Duration::ZERO, "wait must be positive, got {wait:?}");
@@ -688,19 +624,26 @@ mod tests {
                     "per-minute quota wait must be <= 60s, got {wait:?}"
                 );
             }
-            BoundedLimiterDeny::CapacityFull => panic!("default policy must not reject capacity"),
+            BoundedLimiterDeny::CapacityFull => {
+                anyhow::bail!("default policy must not reject capacity");
+            }
         }
+        Ok(())
     }
 
     /// The hard cap on tracked keys must never be exceeded, even under a
     /// stream of distinct keys far larger than the cap.
     #[test]
-    fn never_exceeds_max_tracked_keys() {
-        let quota = Quota::per_minute(NonZeroU32::new(10).unwrap());
+    fn never_exceeds_max_tracked_keys() -> anyhow::Result<()> {
+        let quota = Quota::per_minute(NonZeroU32::new(10).context("nonzero rate")?);
         let limiter: BoundedKeyedLimiter<IpAddr> =
             BoundedKeyedLimiter::new(quota, cap(100), Duration::from_hours(1));
         for i in 0..10_000_u32 {
-            let _ = limiter.check_key(&ip(i));
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "deliberate: src/bounded_limiter.rs::tests discard the per-call verdict; the admission outcome is re-asserted via len() and the follow-up checks"
+            )]
+            let _: Result<(), BoundedLimiterError> = limiter.check_key(&ip(i));
             assert!(
                 limiter.len() <= 100,
                 "tracked keys exceeded cap at iteration {i}: {} > 100",
@@ -708,11 +651,13 @@ mod tests {
             );
         }
         assert_eq!(limiter.len(), 100, "table should be full at the cap");
+        Ok(())
     }
 
+    /// Pins that `RejectNew` denies an unseen key but keeps established ones.
     #[test]
-    fn reject_new_at_cap_denies_unseen_key_but_keeps_established_key() {
-        let quota = Quota::per_minute(NonZeroU32::new(2).unwrap());
+    fn reject_new_at_cap_denies_unseen_key_but_keeps_established_key() -> anyhow::Result<()> {
+        let quota = Quota::per_minute(NonZeroU32::new(2).context("nonzero rate")?);
         let limiter: BoundedKeyedLimiter<IpAddr> = BoundedKeyedLimiter::new_with_policy(
             quota,
             cap(1),
@@ -720,7 +665,9 @@ mod tests {
             KeyEvictionPolicy::RejectNew,
         );
         let established = ip(10);
-        assert!(limiter.check_key_detailed(&established).is_ok());
+        let Ok(()) = limiter.check_key_detailed(&established) else {
+            anyhow::bail!("first check for the established key must admit");
+        };
         assert_eq!(limiter.len(), 1);
 
         let unseen = ip(11);
@@ -729,15 +676,16 @@ mod tests {
             Err(BoundedLimiterDeny::CapacityFull)
         );
         assert_eq!(limiter.len(), 1);
-        assert!(
-            limiter.check_key_detailed(&established).is_ok(),
-            "established key keeps its existing bucket and remaining quota"
-        );
+        let Ok(()) = limiter.check_key_detailed(&established) else {
+            anyhow::bail!("established key keeps its existing bucket and remaining quota");
+        };
+        Ok(())
     }
 
+    /// Pins that `EvictLru` admits a new key by evicting the oldest entry.
     #[test]
-    fn evict_lru_policy_at_cap_admits_new_key_and_evicts_lru() {
-        let quota = Quota::per_minute(NonZeroU32::new(2).unwrap());
+    fn evict_lru_policy_at_cap_admits_new_key_and_evicts_lru() -> anyhow::Result<()> {
+        let quota = Quota::per_minute(NonZeroU32::new(2).context("nonzero rate")?);
         let limiter: BoundedKeyedLimiter<IpAddr> = BoundedKeyedLimiter::new_with_policy(
             quota,
             cap(1),
@@ -745,33 +693,47 @@ mod tests {
             KeyEvictionPolicy::EvictLru,
         );
         let first = ip(20);
-        assert!(limiter.check_key_detailed(&first).is_ok());
-        assert!(limiter.check_key_detailed(&first).is_ok());
-        assert!(limiter.check_key_detailed(&first).is_err());
+        let Ok(()) = limiter.check_key_detailed(&first) else {
+            anyhow::bail!("first check must admit");
+        };
+        let Ok(()) = limiter.check_key_detailed(&first) else {
+            anyhow::bail!("second check within quota must admit");
+        };
+        let Err(_) = limiter.check_key_detailed(&first) else {
+            anyhow::bail!("third check must be denied");
+        };
 
-        std::thread::sleep(Duration::from_millis(5));
-        assert!(limiter.check_key_detailed(&ip(21)).is_ok());
+        sleep(Duration::from_millis(5));
+        let Ok(()) = limiter.check_key_detailed(&ip(21)) else {
+            anyhow::bail!("new key must be admitted after LRU eviction");
+        };
         assert_eq!(limiter.len(), 1);
-        assert!(
-            limiter.check_key_detailed(&first).is_ok(),
-            "LRU-evicted key returns with fresh quota under EvictLru"
-        );
+        let Ok(()) = limiter.check_key_detailed(&first) else {
+            anyhow::bail!("LRU-evicted key returns with fresh quota under EvictLru");
+        };
+        Ok(())
     }
 
     /// When a previously-evicted key reappears, it must get a fresh quota.
     /// This is *documented* behaviour, not a bug: keys under sustained
     /// load keep their `last_seen` updated and therefore are not evicted.
     #[test]
-    fn evicted_keys_get_fresh_quota() {
-        let quota = Quota::per_minute(NonZeroU32::new(2).unwrap());
+    fn evicted_keys_get_fresh_quota() -> anyhow::Result<()> {
+        let quota = Quota::per_minute(NonZeroU32::new(2).context("nonzero rate")?);
         let limiter: BoundedKeyedLimiter<IpAddr> =
             BoundedKeyedLimiter::new(quota, cap(2), Duration::from_hours(1));
 
         let target = ip(1);
         // Burn the quota for `target`.
-        assert!(limiter.check_key(&target).is_ok(), "first ok");
-        assert!(limiter.check_key(&target).is_ok(), "second ok");
-        assert!(limiter.check_key(&target).is_err(), "third blocked");
+        let Ok(()) = limiter.check_key(&target) else {
+            anyhow::bail!("first ok");
+        };
+        let Ok(()) = limiter.check_key(&target) else {
+            anyhow::bail!("second ok");
+        };
+        let Err(_) = limiter.check_key(&target) else {
+            anyhow::bail!("third blocked");
+        };
 
         // Force eviction by inserting two unrelated keys (cap = 2). The
         // attacker (`target`) is rate-limited -- it has a *recent*
@@ -782,24 +744,40 @@ mod tests {
         //
         // Sleep a tiny amount so unrelated keys have strictly newer
         // last_seen than `target`'s last write.
-        std::thread::sleep(Duration::from_millis(5));
-        let _ = limiter.check_key(&ip(2));
-        std::thread::sleep(Duration::from_millis(5));
-        let _ = limiter.check_key(&ip(3));
+        sleep(Duration::from_millis(5));
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "deliberate: src/bounded_limiter.rs::tests discard the per-call verdict; the admission outcome is re-asserted via len() and the follow-up checks"
+        )]
+        let _: Result<(), BoundedLimiterError> = limiter.check_key(&ip(2));
+        sleep(Duration::from_millis(5));
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "deliberate: src/bounded_limiter.rs::tests discard the per-call verdict; the admission outcome is re-asserted via len() and the follow-up checks"
+        )]
+        let _: Result<(), BoundedLimiterError> = limiter.check_key(&ip(3));
         // `target` is now the oldest entry; cap is 2. ip(3) eviction LRU'd
         // either ip(2) or `target`. Inserting ip(4) again forces another
         // eviction. After enough fresh inserts, `target` is gone.
-        std::thread::sleep(Duration::from_millis(5));
-        let _ = limiter.check_key(&ip(4));
-        std::thread::sleep(Duration::from_millis(5));
-        let _ = limiter.check_key(&ip(5));
+        sleep(Duration::from_millis(5));
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "deliberate: src/bounded_limiter.rs::tests discard the per-call verdict; the admission outcome is re-asserted via len() and the follow-up checks"
+        )]
+        let _: Result<(), BoundedLimiterError> = limiter.check_key(&ip(4));
+        sleep(Duration::from_millis(5));
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "deliberate: src/bounded_limiter.rs::tests discard the per-call verdict; the admission outcome is re-asserted via len() and the follow-up checks"
+        )]
+        let _: Result<(), BoundedLimiterError> = limiter.check_key(&ip(5));
 
         // `target` should have been evicted by now -- a fresh check_key
         // re-inserts with a fresh quota.
-        assert!(
-            limiter.check_key(&target).is_ok(),
-            "evicted key gets a fresh quota on reappearance"
-        );
+        let Ok(()) = limiter.check_key(&target) else {
+            anyhow::bail!("evicted key gets a fresh quota on reappearance");
+        };
+        Ok(())
     }
 
     /// An actively over-quota key must NOT be evicted just because new
@@ -807,47 +785,71 @@ mod tests {
     /// rate-limit rejections, so the attacker stays at the front of the
     /// LRU queue. Other (older) entries are evicted instead.
     #[test]
-    fn active_over_quota_key_not_evicted() {
-        let quota = Quota::per_minute(NonZeroU32::new(2).unwrap());
+    fn active_over_quota_key_not_evicted() -> anyhow::Result<()> {
+        let quota = Quota::per_minute(NonZeroU32::new(2).context("nonzero rate")?);
         let limiter: BoundedKeyedLimiter<IpAddr> =
             BoundedKeyedLimiter::new(quota, cap(3), Duration::from_hours(1));
 
         // Seed the table with three idle entries so cap is reached.
         for i in 100..103_u32 {
-            let _ = limiter.check_key(&ip(i));
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "deliberate: src/bounded_limiter.rs::tests discard the per-call verdict; the admission outcome is re-asserted via len() and the follow-up checks"
+            )]
+            let _: Result<(), BoundedLimiterError> = limiter.check_key(&ip(i));
         }
         assert_eq!(limiter.len(), 3);
 
         // The attacker now starts firing. First two are allowed
         // (fills quota), then we expect refusals -- but each refusal
         // updates last_seen so the attacker stays "current".
-        std::thread::sleep(Duration::from_millis(5));
+        sleep(Duration::from_millis(5));
         let attacker = ip(200);
         // Inserting attacker evicts one of the older keys (cap=3).
-        let _ = limiter.check_key(&attacker);
-        let _ = limiter.check_key(&attacker);
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "deliberate: src/bounded_limiter.rs::tests discard the per-call verdict; the admission outcome is re-asserted via len() and the follow-up checks"
+        )]
+        let _: Result<(), BoundedLimiterError> = limiter.check_key(&attacker);
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "deliberate: src/bounded_limiter.rs::tests discard the per-call verdict; the admission outcome is re-asserted via len() and the follow-up checks"
+        )]
+        let _: Result<(), BoundedLimiterError> = limiter.check_key(&attacker);
 
         // Interleave attacker hits with new-key knocks. The attacker
         // keeps firing (last_seen always current), so when new keys
         // arrive and force eviction, the LRU victim must be one of the
         // *other* (older) entries, not the attacker.
         for new_key in 300..310_u32 {
-            std::thread::sleep(Duration::from_millis(2));
-            let _ = limiter.check_key(&attacker); // attacker stays current
-            std::thread::sleep(Duration::from_millis(2));
-            let _ = limiter.check_key(&ip(new_key)); // forces eviction
+            sleep(Duration::from_millis(2));
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "deliberate: src/bounded_limiter.rs::tests discard the per-call verdict; the admission outcome is re-asserted via len() and the follow-up checks"
+            )]
+            let _: Result<(), BoundedLimiterError> = limiter.check_key(&attacker);
+            sleep(Duration::from_millis(2));
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "deliberate: src/bounded_limiter.rs::tests discard the per-call verdict; the admission outcome is re-asserted via len() and the follow-up checks"
+            )]
+            let _: Result<(), BoundedLimiterError> = limiter.check_key(&ip(new_key));
         }
 
         // One final attacker hit immediately before the assertion to
         // ensure no other key has been touched more recently.
-        let _ = limiter.check_key(&attacker);
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "deliberate: src/bounded_limiter.rs::tests discard the per-call verdict; the admission outcome is re-asserted via len() and the follow-up checks"
+        )]
+        let _: Result<(), BoundedLimiterError> = limiter.check_key(&attacker);
 
         // Attacker must STILL be rate-limited (quota exhausted, not a
         // freshly-allocated entry). The check returns Err because the
         // existing entry with exhausted quota is still there.
-        assert!(
-            limiter.check_key(&attacker).is_err(),
-            "actively over-quota attacker must not be evicted into a fresh quota"
-        );
+        let Err(_) = limiter.check_key(&attacker) else {
+            anyhow::bail!("actively over-quota attacker must not be evicted into a fresh quota");
+        };
+        Ok(())
     }
 }

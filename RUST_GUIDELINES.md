@@ -316,6 +316,31 @@ entry in the same PR that introduces a deviation.
     migration record (`before-after.txt`, `new-permanent-expects.txt`,
     `gates.txt`).
 
+
+17. **2026-10-04 - `src/auth.rs` lane expectations (frozen API + deliberate).**
+   Under entry 13's decision, five public items keep names ending in the
+   containing module's name and carry `module_name_repetitions` expectations:
+   `AuthIdentity`, `AuthMethod`, `AuthCountersSnapshot`, `AuthConfig` and
+   `AuthConfigSummary`. Two public functions carry the frozen
+   `clippy::impl_trait_in_params` expectation (`ApiKeyEntry::new`,
+   `ApiKeyEntry::try_with_expiry`), and public builders stay non-`const` under
+   the frozen `clippy::missing_const_for_fn` expectation (`RfcTimestamp::
+   as_datetime`, `RfcTimestamp::into_inner`, `ApiKeyEntry::with_expiry`,
+   `RateLimitConfig::{with_pre_auth_max_per_minute, with_max_tracked_keys,
+   with_idle_eviction, with_burst, with_pre_auth_burst}`,
+   `AuthConfig::{with_keys, with_rate_limit, check_oauth_feature}`); the
+   `oauth`-only shape of `AuthConfig::check_oauth_feature` additionally freezes
+   `clippy::unnecessary_wraps` and `clippy::unused_self`, and `AuthConfig`'s
+   `oauth` placeholder (present only without the `oauth` feature) freezes
+   `clippy::partial_pub_fields` and `clippy::field_scoped_visibility_modifiers`
+   on the struct. Three `deliberate:` expectations record crate-internal
+   shapes rather than freezing public API: the `pub(crate)` fields of
+   `CredentialOwner` (constructed by `src/oauth.rs`), the `pub(crate)` fields
+   of `AuthLogContext` (constructed by `src/transport.rs`'s test helper), and
+   the crate-private `oauth` placeholder field. Constant-time arithmetic in
+   `verify_slots` uses `wrapping_sub` (never `checked_*` + `?`, G-8), and the
+   redaction tests' output is unchanged. Evidence: the task-18 migration
+   record (`new-permanent-expects.txt`, `gates.txt`).
 17. **2026-10-04 - `src/tool_hooks.rs` + `src/rbac_context.rs` per-item
    expectations (task 21).** Under entry 13's decision this lane freezes two
    public items with the catalog reason `public API frozen until the next major
@@ -341,7 +366,49 @@ entry in the same PR that introduces a deviation.
    the task-21 migration record (`new-permanent-expects.txt`, `gates.txt`,
    `review.txt`).
 
+18. **2026-10-05 - Small-core-modules lane expectations (task 23).** Under
+   entry 13's frozen-API decision, the public items whose names repeat the
+   containing module keep `clippy::module_name_repetitions` per item:
+   `AdminConfig` and `AdminStatus` (src/admin.rs), `BoundedLimiterError` and
+   `BoundedLimiterDeny` (src/bounded_limiter.rs), `RmcpServerKitError` and the
+   deprecated `McpxError` alias (src/error.rs), and `McpMetrics` plus
+   `serve_metrics` (src/metrics.rs). The `serve_metrics` signature keeps its
+   third-party `prometheus`/`tokio_util` types unchanged (D-7). In `mod tests`
+   the core-blessed documentation/panic expectations are joined by
+   `clippy::unnecessary_wraps`, one per assertion-only test, so every test keeps
+   the uniform `anyhow::Result<()>` signature; `clippy::let_underscore_must_use`
+   sits per typed discard in src/bounded_limiter.rs's tests, and
+   `clippy::panic` on the spawned-panic fixture in src/cancel.rs. Behavior kept
+   exact: `ERROR_BINDINGS` and the synthetic-violation fixture in src/error.rs
+   stay byte-identical (G-7), the source-scanning guard is untouched, no
+   `biased;` was added to the `tokio::select!` arms, and `serve_metrics`'s
+   task-8 headers behavior is unchanged. `pub type Result` in src/error.rs now
+   exposes its error type as a defaulted parameter
+   (`Result<T, E = RmcpServerKitError>`, semver-checks green). Evidence: the
+   task-23 migration record (`assertion-counts.txt`,
+   `new-permanent-expects.txt`, `gates.txt`).
 
+19. **2026-10-04 - `src/rbac.rs` lane expectations (frozen API + deliberate).**
+   Under entry 13's decision, five public items keep names ending in the
+   containing module's name and carry `module_name_repetitions` expectations
+   (`RbacConfig`, `RbacDecision`, `RbacRoleSummary`, `RbacPolicySummary`,
+   `RbacPolicy`); `missing_const_for_fn` is frozen on `RbacPolicy::is_enabled`
+   and `RbacConfig::with_allow_operation_matching`; and
+   `impl_trait_in_params` is frozen on the public constructors `RoleConfig::new`
+   and `ArgumentAllowlist::new`/`new_required`. `redact_with_salt` keeps its
+   HMAC key-construction fallback under a `constant-time:` expectation (G-8),
+   and its `write!`-into-String discard is a typed `let _: Result<(), FmtError>`
+   under `write! into String cannot fail` (D-11'). One `deliberate:`
+   expectation records a shape with no behavior-preserving alternative: the
+   second `impl RbacConfig` block (`multiple_inherent_impl`, environment
+   overrides kept in their own block). In `mod tests`,
+   `clippy::unnecessary_wraps` is added one per assertion-only test so every
+   test keeps the uniform `anyhow::Result<()>` signature, and the core-blessed
+   test-module doc/panic expectations cover the rest. The four test route
+   handlers use a named `ok_handler` async fn, so no
+   `closure_returning_async_block` expectation is needed. The verbose deny
+   messages are unchanged (entry 1). Evidence: the task-19 migration record
+   (`new-permanent-expects.txt`, `gates.txt`).
 Entries to be added by the work that creates them: "new in `<version>`"
 expects and profile deltas (the toolchain-drift work); the per-item frozen
 public-API expectations (the lint lanes, under entry 13's decision); the GitLab

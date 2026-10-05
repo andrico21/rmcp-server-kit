@@ -144,7 +144,7 @@ axum Router                                  src/transport.rs:2076  (build_app_r
    ├── 6. Optional metrics middleware        src/metrics.rs (records
    │      request count, duration histograms, in-flight gauge)
    │
-├── 7. Auth middleware                    src/auth.rs:2138 (auth_middleware)
+├── 7. Auth middleware                    src/auth.rs:2272 (auth_middleware)
    │      Determines AuthIdentity from one of:
    │        a) Authorization: Bearer <api-key>  → Argon2 verify against
    │           AuthState.api_keys (ArcSwap<Vec<ApiKeyEntry>>)
@@ -156,7 +156,7 @@ axum Router                                  src/transport.rs:2076  (build_app_r
    │      (see `extract_bearer` in src/auth.rs).
    │      On success: sets task-locals via `current_role`, `current_identity`, …
    │
-├── 8. RBAC middleware                    src/rbac.rs:1309 (rbac_middleware) + 1376 (enforce_tool_policy)
+├── 8. RBAC middleware                    src/rbac.rs:1354 (rbac_middleware) + 1527 (enforce_tool_policy)
    │      For POSTs to /mcp:
    │        - Reads body up to limit
    │        - Parses JSON-RPC envelope
@@ -235,7 +235,7 @@ hot-reload. Methods:
 
 Both use `arc-swap`, so live requests are not blocked or interrupted.
 
-### `AuthIdentity` - `src/auth.rs:186`
+### `AuthIdentity` - `src/auth.rs:96`
 Canonical caller record passed through the request scope:
 ```rust
 pub struct AuthIdentity {
@@ -310,9 +310,9 @@ Startup-only.
 
 ### Construction
 `AuthState` is built inside `build_app_router()` at `src/transport.rs:1822`. It contains:
-- `api_keys: ArcSwap<Vec<ApiKeyEntry>>` (`src/auth.rs:1129`)
+- `api_keys: ArcSwap<Vec<ApiKeyEntry>>` (`src/auth.rs:1406`)
 - mTLS identities: stored **per-connection** on the
-  `TlsConnInfo` extension (`src/auth.rs:2138`), read by `auth_middleware` (`src/auth.rs:2138`).
+  `TlsConnInfo` extension (`src/auth.rs:1245`), read by `auth_middleware` (`src/auth.rs:2272`).
   No shared `SocketAddr`-keyed map exists - the previous design was replaced
   to avoid identity-binding races behind load balancers and to remove a
   `RwLock` from the request hot path.
@@ -333,7 +333,7 @@ Startup-only.
 
 ### API key flow
 1. Client sends `Authorization: Bearer <api-key>`.
-2. `auth_middleware` (`src/auth.rs:2138`) first runs the **pre-auth abuse
+2. `auth_middleware` (`src/auth.rs:2272`) first runs the **pre-auth abuse
    gate** keyed by the request's source IP. If the gate is exhausted the
    middleware returns `429` immediately, *without* touching Argon2id.
 3. Otherwise the middleware looks up the key by an indexed prefix
@@ -391,7 +391,7 @@ ArgumentAllowlist {                       // src/rbac.rs:275
 ```
 
 ### Decision function
-- `RbacPolicy::check(role, operation, host)` - pure allow/deny (`src/rbac.rs:479`; fn `check`)
+- `RbacPolicy::check(role, operation, host)` - pure allow/deny (`src/rbac.rs:709`; fn `check`)
 - `RbacPolicy::argument_allowed(role, tool, argument, value)` - JSON value match (`src/rbac.rs:739`; fn `argument_allowed`)
 - `RbacPolicy::redact_arg(value)` - HMAC-SHA256 of an argument value with
 the policy's salt, returning an 8-char hex prefix (`src/rbac.rs:749`).
@@ -402,7 +402,7 @@ the policy's salt, returning an 8-char hex prefix (`src/rbac.rs:749`).
   installed *after* enforcement (see "Task-locals" below).
 
 ### Middleware
-`rbac_middleware` (`src/rbac.rs:1315`):
+`rbac_middleware` (`src/rbac.rs:1354`):
 1. Extracts the role + identity name from the `AuthIdentity` request
    extension (set by the auth middleware).
 2. For `POST /mcp`, reads the body (bounded by body-size layer), parses
@@ -427,13 +427,13 @@ making preimage recovery infeasible. See `redact_with_salt`
 (`src/rbac.rs:589`).
 
 ### Task-locals
-`tokio::task_local!` block at `src/rbac.rs:215` defines four task-locals:
+`tokio::task_local!` block at `src/rbac.rs:117` defines four task-locals:
 - `CURRENT_ROLE: String`
 - `CURRENT_IDENTITY: String`
 - `CURRENT_TOKEN: SecretString`
 - `CURRENT_SUB: String`
 
-Public accessors: `current_role()` (`src/rbac.rs:243`),
+Public accessors: `current_role()` (`src/rbac.rs:158`),
 `current_identity()` (`src/rbac.rs:250`), `current_token()`
 (`src/rbac.rs:250`), `current_sub()` (`src/rbac.rs:250`). They return
 `Option<T>` because the task-locals are absent outside the request scope.
@@ -790,7 +790,7 @@ Two ArcSwaps power runtime reconfiguration:
 
 | State            | Type                           | Defined at                  |
 |------------------|---------------------------------|-----------------------------|
-| API keys         | `ArcSwap<Vec<ApiKeyEntry>>`     | `src/auth.rs:1302`          |
+| API keys         | `ArcSwap<Vec<ApiKeyEntry>>`     | `src/auth.rs:1406`          |
 | RBAC policy      | `ArcSwap<RbacPolicy>`           | `src/transport.rs:1986`      |
 
 Procedure:
@@ -873,7 +873,7 @@ held. Only the runtime-only fields above survive from the base. It is fallible
 **Environment (opt-in)** - three inherent methods, one per section owning
 targeted fields: `ServerConfig::apply_env_overrides` (`src/config.rs:676`),
 `ObservabilityConfig::apply_env_overrides` (`src/config.rs:1023`) and
-`RbacConfig::apply_env_overrides` (`src/rbac.rs:1811`). Each returns
+`RbacConfig::apply_env_overrides` (`src/rbac.rs:1905`). Each returns
 `Vec<EnvOverride>` (`src/config.rs:100`) for audit logging, with `value: None`
 for secret targets. Curated variables under the `RMCP_SERVER_KIT__`
 prefix; `__` separates TOML path segments because field names already contain
