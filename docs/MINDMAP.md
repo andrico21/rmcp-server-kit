@@ -220,8 +220,9 @@ mindmap
       Hot swap arc-swap
       Serde + serde_json + toml
     Tests + Examples
+      tests/unit/ one crate per file no I/O
       tests/integration/e2e.rs
-        spawn_server L46-71
+        spawn_server L499
         Real server on ephemeral ports
         Integration cookbook
       tests/integration/delegation_guard.rs
@@ -234,12 +235,12 @@ mindmap
     Build / verify
       cargo build --all-features
       cargo test --all-features
-      cargo +nightly fmt --all -- --check
+      cargo +nightly-2026-10-03 fmt --all -- --check
       cargo clippy --all-targets --all-features -- -D warnings
       cargo doc --no-deps --all-features
       cargo audit
       cargo deny check
-      cargo +1.99.0 build --all-features
+      CARGO_BUILD_WARNINGS=allow RUSTFLAGS=--cap-lints=warn cargo +1.99.0 build --all-features
       cargo semver-checks check-release
     CI / policy
       .github/workflows/ci.yml canonical
@@ -248,6 +249,8 @@ mindmap
       deny.toml license + ban
       .cargo/audit.toml
       rustfmt.toml
+      scripts/lint-ratchet/ catalog allow profile_eq prose
+      .cargo/config.toml build.warnings deny
     Coding standards
       RUST_GUIDELINES.md index + docs/rust-guidelines/ vendored
       No unwrap / expect prod
@@ -445,7 +448,7 @@ graph TD
 | Prometheus metrics                | `src/metrics.rs` (feature `metrics`)     | `McpMetrics` L26, `serve_metrics` L95                                         |
 | Configuration (TOML)              | `src/config.rs` + `src/transport.rs`     | TOML schema + `McpServerConfig`                                               |
 | Error → HTTP mapping              | `src/error.rs`                           | `RmcpServerKitError` L13, `IntoResponse` L56                                           |
-| Integration reference             | `tests/integration/e2e.rs`               | `spawn_server` L115                                                           |
+| Integration reference             | `tests/integration/e2e.rs`               | `spawn_server` L499                                                           |
 | Runnable examples                 | `examples/`                              | `minimal_server.rs`, `api_key_rbac.rs`, `oauth_server.rs`                    |
 
 ---

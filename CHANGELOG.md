@@ -60,20 +60,25 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   error as the default (`pub type Result<T, E = RmcpServerKitError>`). Existing
   `Result<T>` call sites are source-compatible; `cargo semver-checks` remains
   green. This follows the rule that `Result` aliases expose the error type as a
-  defaulted parameter (the only public-surface addition of the lint-profile
-  migration lane for the small core modules).
+  defaulted parameter (the only public-surface addition of this release).
 
-- **Strict lint profile adopted, with no public API change** - `Cargo.toml` now
+- **Strict lint profile adopted; warnings are errors** - `Cargo.toml` now
   carries the vendored Section 9 lint profile unchanged (every rustc group and
   Clippy group at `deny`, plus the documented `redundant_pub_crate` override),
   `clippy.toml` carries the matching lint configuration, and every former
-  `#[allow]` became a narrowest-item `#[expect(lint, reason = "...")]`. Warnings
-  remain errors (`build.warnings = "deny"`). Temporary per-file
-  `lint-migration:` expectations keep the build green while the remaining
-  findings are burned down in follow-up PRs; a count gate prevents them from
-  growing and a catalog gate keeps every permanent reason reviewed. Downstream
-  users see the same API and the same runtime behavior, and need Rust 1.99 to
-  build.
+  `#[allow]` became a narrowest-item `#[expect(lint, reason = "...")]`.
+  Warnings are errors locally and in CI (`.cargo/config.toml`
+  `build.warnings = "deny"`, plus `-D warnings` on the stable jobs). The
+  migration burn-down is complete: no temporary `lint-migration:` expectations
+  and no counting ratchet remain. Four permanent gates keep the profile honest
+  - the **catalog** gate (every `#[expect]` reason is reviewed against the
+  sanctioned-reason catalog), the **allow** gate (no `#[allow]` anywhere), the
+  **profile-equality** gate (the committed `[lints]` table matches the vendored
+  profile), and the **prose** gates (cancel-safety notes, test signatures and
+  documentation rules). This release therefore makes **no breaking public API
+  change** (`cargo semver-checks` is green): downstream users see the same
+  runtime behavior, and the only public-surface change is the source-compatible
+  `error::Result` addition above.
 - **Framework INFO lines are visible under the default filter** - the default
   `log_level` is now `"info,rmcp=warn,rmcp_server_kit=info"`. The previous
   default used prefix matching that hid this crate's own INFO lines, including
@@ -139,6 +144,9 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   intra-doc paths, so `RUSTDOCFLAGS="-D warnings" cargo +stable doc --no-deps
   --all-features` succeeds. A new `Rustdoc (stable)` CI job guards this on
   GitHub, with a matching step in the GitLab `rustdoc` job.
+- **Stray carriage return removed** - a raw CR byte inside a cancel-safety
+  comment in `src/mtls_revocation.rs` split that line on some tools; the
+  comment is now plain text.
 
 ### Notes
 

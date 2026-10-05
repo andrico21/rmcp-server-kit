@@ -11,9 +11,11 @@ guidelines: start at
 in its load order. The root [RUST_GUIDELINES.md](RUST_GUIDELINES.md) is the
 index (provenance, hashes, open deviations, re-vendor procedure). Before
 opening a PR, review the Quick Reference Checklist at the end of the core;
-reviewers will enforce it. For Rust / Cargo / Clippy 1.95 specifics (new lints,
-new APIs, MSRV policy), see
-[docs/RUST_1_95_NOTES.md](docs/RUST_1_95_NOTES.md).
+reviewers will enforce it. The strictest stable lint profile (core Section 9)
+is committed in `Cargo.toml`, and permanent CI gates keep it honest: the
+catalog, allow, profile-equality and prose gates under `scripts/lint-ratchet/`.
+The `docs/RUST_1_95_NOTES.md` file is a historical record frozen at Rust 1.95;
+the current toolchain policy is the MSRV work in `docs/MIGRATION.md` (3.15).
 
 ## Development prerequisites
 
@@ -35,11 +37,17 @@ authoritative list is [`.github/workflows/ci.yml`](.github/workflows/ci.yml)):
 cargo +nightly-2026-10-03 fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
+cargo test --all-features --test docs_citations
+lychee --offline --no-progress README.md RUST_GUIDELINES.md docs/*.md
 cargo deny check
 cargo audit
 cargo vet --locked
 taplo fmt --check
 (cd docs/rust-guidelines && sha256sum -c SHA256SUMS)
+python3 scripts/lint-ratchet/catalog_gate.py
+python3 scripts/lint-ratchet/allow_gate.py --enforce
+python3 scripts/lint-ratchet/profile_eq.py --clippy-toml
+python3 scripts/lint-ratchet/prose_gates.py --enforce
 ```
 
 All of these must pass.

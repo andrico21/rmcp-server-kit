@@ -154,8 +154,10 @@ Z:\TempPersistent\rmcp-server-kit\
 | Build docs                       | `cargo +nightly-2026-10-03 doc --no-deps --all-features`             |
 | Supply-chain audit               | `cargo audit`                                                        |
 | License/ban policy               | `cargo deny check`                                                   |
-| MSRV check                       | `cargo +1.99.0 build --all-features`                                 |
+| MSRV check (lint-capped)         | `RUSTFLAGS="--cap-lints=warn" CARGO_BUILD_WARNINGS=allow cargo +1.99.0 build --all-features` |
 | Semver check (library)           | `cargo semver-checks check-release`                                  |
+| Lint gates (CI)                  | `python3 scripts/lint-ratchet/catalog_gate.py`; `allow_gate.py --enforce`; `profile_eq.py --clippy-toml`; `prose_gates.py --enforce` |
+| Docs citations + links (CI)      | `cargo test --all-features --test docs_citations` and `lychee --offline --no-progress README.md RUST_GUIDELINES.md docs/*.md` |
 
 **CI definition lives in**:
 
@@ -374,6 +376,9 @@ The core's current-Rust idioms (for example `Vec::push_mut` /
 | Hot-reload of keys / RBAC                      | `src/transport.rs` - `ReloadHandle` (~line 1984)       |
 | Environment variable override mapping          | `src/config.rs` - `ServerConfig::apply_env_overrides`, `ObservabilityConfig::apply_env_overrides`; `src/rbac.rs` - `RbacConfig::apply_env_overrides` |
 | `rmcp` / `rmcp-macros` version bump in `Cargo.toml` / `Cargo.lock` | `docs/RMCP_UPGRADE_CHECKLIST.md` - the checks to run; `tests/integration/delegation_guard.rs` - the trait-surface guard |
+| Lint gates (catalog / allow / profile-equality / prose) | `scripts/lint-ratchet/{catalog_gate,allow_gate,profile_eq,prose_gates}.py`; shared helpers in `scripts/lint-ratchet/common.py` |
+| Vendored-guideline index / deviations register         | `RUST_GUIDELINES.md` (index); `docs/rust-guidelines/` (vendored bytes - never edit) |
+| Test tiers / `required-features` wiring                | `Cargo.toml` `[[test]]` tables; `tests/unit/` and `tests/integration/` |
 
 ---
 
@@ -386,6 +391,10 @@ The core's current-Rust idioms (for example `Vec::push_mut` /
 5. **mTLS identity is bound to the connection stream (`TlsConnInfo`), not to a shared `SocketAddr` map.** If a load balancer terminates TCP and rewrites peer addresses you must terminate TLS at the LB and use a different identity-binding strategy; the in-process binding itself is immune to port-reuse aliasing.
 6. **`ArcSwap` swaps are lock-free but eventually-consistent.** In-flight requests may use the previous policy. This is intentional. Do not switch to `RwLock`.
 7. **TLS session resumption is deliberately disabled for mTLS listeners.** `TlsListener::new` (`src/transport.rs`) builds its `rustls::ServerConfig` via `build_tls_server_config`, which passes `disable_resumption = mtls_config.is_some()` into `build_tls_server_config_from_verifier`. This is not an accidental omission: rustls restores a resumed handshake's peer certificate from cached session state without ever calling `ClientCertVerifier::verify_client_cert`, so resumption would let a revoked or expired certificate keep authenticating. Do not "optimize" this back on, and do not scope it to `crl_enabled` only - non-CRL mTLS still relies on the verifier for expiry and chain validation.
+8. **Warnings are errors, including locally.** `.cargo/config.toml` commits `[build] warnings = "deny"`, so a plain `cargo build` fails on any warning. For a transient work-in-progress check, prefix one command with `CARGO_BUILD_WARNINGS=allow` instead of editing the config (editing it invalidates the shared build cache). The config is excluded from the published package.
+9. **The MSRV job is lint-capped on purpose.** The GitHub `MSRV (1.99.0)` job (and the GitLab `msrv` job) run with `RUSTFLAGS="--cap-lints=warn"` and `CARGO_BUILD_WARNINGS=allow`; they prove the crate *compiles* on `rust-version = "1.99.0"`, not that it is lint-clean. Lint cleanliness is enforced on the latest stable by `clippy` and the feature matrix. Do not "fix" the cap or expect the MSRV job to fail on warnings.
+10. **A feature-gated test target errors instead of skipping.** The `[[test]]` tables carry `required-features`, so `cargo test --test e2e_oauth_mtls` without `--features oauth,test-helpers,oauth-mtls-client` fails with "requires the features" rather than running an empty binary. Locally always use `--all-features`; CI's feature matrix covers the narrower builds.
+11. **The mutants job is schedule-only and lint-capped.** `cargo-mutants` runs from the nightly `schedule` event (not on PRs), with `CARGO_BUILD_WARNINGS: allow` and a 180-minute per-shard cap, because deny-level lints make mutants unviable and a single shard otherwise approaches GitHub's 6-hour ceiling. It is advisory (`continue-on-error`).
 
 ---
 
