@@ -53,6 +53,3 @@ Thumbs.db
 /.codegraph/
 # Local code-review reports (working artifacts; not shipped in the crate)
 /docs/reviews/
-
-# lint-ratchet measurement output (scripts/lint-ratchet/measure.py default)
-/measurement.json

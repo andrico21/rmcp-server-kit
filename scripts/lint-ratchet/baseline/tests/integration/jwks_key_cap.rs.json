@@ -1,5 +1,0 @@
-{
-  "file": "tests/integration/jwks_key_cap.rs",
-  "keys": {},
-  "toolchain": "1.99.0"
-}

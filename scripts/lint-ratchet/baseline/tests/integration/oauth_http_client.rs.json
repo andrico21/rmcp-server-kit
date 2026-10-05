@@ -1,5 +1,0 @@
-{
-  "file": "tests/integration/oauth_http_client.rs",
-  "keys": {},
-  "toolchain": "1.99.0"
-}

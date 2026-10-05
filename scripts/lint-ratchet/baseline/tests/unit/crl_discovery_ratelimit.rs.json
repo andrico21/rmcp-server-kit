@@ -1,5 +1,0 @@
-{
-  "file": "tests/unit/crl_discovery_ratelimit.rs",
-  "keys": {},
-  "toolchain": "1.99.0"
-}
