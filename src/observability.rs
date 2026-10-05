@@ -1,126 +1,50 @@
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::option_if_let_else,
-        reason = "lint-migration: src/observability.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::min_ident_chars,
-        reason = "lint-migration: src/observability.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::arithmetic_side_effects,
-        reason = "lint-migration: src/observability.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::let_underscore_must_use,
-        reason = "lint-migration: src/observability.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_errors_doc,
-        reason = "lint-migration: src/observability.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::let_underscore_untyped,
-        reason = "lint-migration: src/observability.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_inline_in_public_items,
-        reason = "lint-migration: src/observability.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::absolute_paths,
-        reason = "lint-migration: src/observability.rs"
-    )
-)]
-#![cfg_attr(
-    all(not(test), target_os = "linux"),
-    expect(
-        clippy::missing_docs_in_private_items,
-        reason = "lint-migration: src/observability.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::unused_trait_names,
-        reason = "lint-migration: src/observability.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::std_instead_of_core,
-        reason = "lint-migration: src/observability.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::std_instead_of_alloc,
-        reason = "lint-migration: src/observability.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::single_char_lifetime_names,
-        reason = "lint-migration: src/observability.rs"
-    )
-)]
-#![expect(unused_results, reason = "lint-migration: src/observability.rs")]
-#![expect(let_underscore_drop, reason = "lint-migration: src/observability.rs")]
-use std::{
+extern crate alloc;
+
+use alloc::sync::Arc;
+use core::{
     fmt,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    time::Duration,
+};
+use std::{
+    fs,
     io::{self, Write as _},
     path::Path,
     sync::{
-        Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        Mutex, OnceLock,
         mpsc::{self, Receiver, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use tracing_subscriber::{
     EnvFilter, Layer as _,
-    fmt::time::FormatTime,
-    layer::SubscriberExt,
-    util::{SubscriberInitExt, TryInitError},
+    filter::LevelFilter,
+    fmt::{MakeWriter, format::Writer, layer, time::FormatTime},
+    layer::SubscriberExt as _,
+    registry::LookupSpan,
+    util::{SubscriberInitExt as _, TryInitError},
 };
 
 use crate::{
     config::ObservabilityConfig,
-    diagnostics::{DiagnosticExposure, set_diagnostic_exposure},
+    diagnostics::{
+        DiagnosticExposure, oauth_claim_values, plaintext_oauth_tokens, set_diagnostic_exposure,
+        tool_call_arguments,
+    },
     error::RmcpServerKitError,
 };
 
+/// Capacity of the bounded audit-log channel; overflow drops newest entries.
 const AUDIT_LOG_CHANNEL_CAPACITY: usize = 1024;
+/// How long the audit writer thread blocks waiting for the next message.
 const AUDIT_WRITER_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Maximum time `Drop` waits for the audit writer thread to finish.
 const AUDIT_WRITER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Park interval used while polling for the audit writer thread to finish.
 const AUDIT_WRITER_JOIN_POLL: Duration = Duration::from_millis(10);
+/// Minimum spacing between repeated audit I/O failure warnings on stderr.
 const AUDIT_IO_FAILURE_WARNING_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Timestamp formatter that emits local time via `chrono::Local`.
@@ -128,7 +52,7 @@ const AUDIT_IO_FAILURE_WARNING_INTERVAL: Duration = Duration::from_secs(60);
 struct LocalTime;
 
 impl FormatTime for LocalTime {
-    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> fmt::Result {
+    fn format_time(&self, w: &mut Writer<'_>) -> fmt::Result {
         write!(
             w,
             "{}",
@@ -160,6 +84,7 @@ impl FormatTime for LocalTime {
     since = "3.8.0",
     note = "use `init_tracing_from_config_strict` and hold the returned `TracingGuard` for process lifetime"
 )]
+#[inline]
 pub fn init_tracing_from_config(config: &ObservabilityConfig) -> Result<(), TryInitError> {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.log_level));
@@ -168,19 +93,14 @@ pub fn init_tracing_from_config(config: &ObservabilityConfig) -> Result<(), TryI
 
     // "pretty" and "text" are aliases for human-readable output.
     let result = if config.log_format == "json" {
-        let subscriber = tracing_subscriber::registry().with(filter).with(
-            tracing_subscriber::fmt::layer()
-                .json()
-                .with_timer(LocalTime)
-                .with_writer(io::stderr),
-        );
+        let subscriber = tracing_subscriber::registry()
+            .with(filter)
+            .with(layer().json().with_timer(LocalTime).with_writer(io::stderr));
         init_with_optional_audit(subscriber, audit_setup.writer)
     } else {
-        let subscriber = tracing_subscriber::registry().with(filter).with(
-            tracing_subscriber::fmt::layer()
-                .with_timer(LocalTime)
-                .with_writer(io::stderr),
-        );
+        let subscriber = tracing_subscriber::registry()
+            .with(filter)
+            .with(layer().with_timer(LocalTime).with_writer(io::stderr));
         init_with_optional_audit(subscriber, audit_setup.writer)
     };
 
@@ -207,34 +127,32 @@ pub fn init_tracing_from_config(config: &ObservabilityConfig) -> Result<(), TryI
 #[must_use = "hold TracingGuard for the process lifetime so audit logs keep draining"]
 #[non_exhaustive]
 pub struct TracingGuard {
+    /// Audit writer guard, present only when an audit log is configured.
     audit: Option<AuditWorkerGuard>,
 }
 
 impl fmt::Debug for TracingGuard {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TracingGuard")
             .field("audit_enabled", &self.audit.is_some())
             .field(
                 "diagnostic_plaintext_oauth_tokens",
-                &crate::diagnostics::plaintext_oauth_tokens(),
+                &plaintext_oauth_tokens(),
             )
-            .field(
-                "diagnostic_oauth_claim_values",
-                &crate::diagnostics::oauth_claim_values(),
-            )
-            .field(
-                "diagnostic_tool_call_arguments",
-                &crate::diagnostics::tool_call_arguments(),
-            )
+            .field("diagnostic_oauth_claim_values", &oauth_claim_values())
+            .field("diagnostic_tool_call_arguments", &tool_call_arguments())
             .finish()
     }
 }
 
 impl TracingGuard {
+    /// Build a guard with no audit writer attached.
     const fn none() -> Self {
         Self { audit: None }
     }
 
+    /// Wrap an audit writer guard so `Drop` drains it.
     const fn audit(audit: AuditWorkerGuard) -> Self {
         Self { audit: Some(audit) }
     }
@@ -245,8 +163,13 @@ impl TracingGuard {
 // (5s) by design, as documented on the type.
 // Drop audit (2026-10-04): no I/O or await here, no panic path.
 impl Drop for TracingGuard {
+    #[inline]
+    #[expect(
+        let_underscore_drop,
+        reason = "deliberate: src/observability.rs::TracingGuard drops the audit guard in place to run its bounded teardown"
+    )]
     fn drop(&mut self) {
-        let _ = self.audit.take();
+        let _: Option<AuditWorkerGuard> = self.audit.take();
     }
 }
 
@@ -268,6 +191,7 @@ impl Drop for TracingGuard {
 /// Returns [`RmcpServerKitError::Startup`] if audit-log directory creation,
 /// audit-log opening, audit writer thread spawning, or global tracing
 /// subscriber installation fails.
+#[inline]
 pub fn init_tracing_from_config_strict(
     config: &ObservabilityConfig,
 ) -> Result<TracingGuard, RmcpServerKitError> {
@@ -277,19 +201,14 @@ pub fn init_tracing_from_config_strict(
 
     // "pretty" and "text" are aliases for human-readable output.
     let result = if config.log_format == "json" {
-        let subscriber = tracing_subscriber::registry().with(filter).with(
-            tracing_subscriber::fmt::layer()
-                .json()
-                .with_timer(LocalTime)
-                .with_writer(io::stderr),
-        );
+        let subscriber = tracing_subscriber::registry()
+            .with(filter)
+            .with(layer().json().with_timer(LocalTime).with_writer(io::stderr));
         init_with_optional_audit(subscriber, audit_setup.writer)
     } else {
-        let subscriber = tracing_subscriber::registry().with(filter).with(
-            tracing_subscriber::fmt::layer()
-                .with_timer(LocalTime)
-                .with_writer(io::stderr),
-        );
+        let subscriber = tracing_subscriber::registry()
+            .with(filter)
+            .with(layer().with_timer(LocalTime).with_writer(io::stderr));
         init_with_optional_audit(subscriber, audit_setup.writer)
     };
 
@@ -323,25 +242,26 @@ pub fn init_tracing_from_config_strict(
 ///
 /// Uses [`SubscriberInitExt::try_init`] so that a previously-installed
 /// global subscriber yields [`TryInitError`] rather than panicking.
+///
+/// # Errors
+///
+/// Returns [`TryInitError`] when a global tracing subscriber is already
+/// installed.
 fn init_with_optional_audit<S>(
     subscriber: S,
     audit_writer: Option<AuditFile>,
 ) -> Result<(), TryInitError>
 where
-    S: tracing::Subscriber
-        + for<'span> tracing_subscriber::registry::LookupSpan<'span>
-        + Send
-        + Sync
-        + 'static,
+    S: tracing::Subscriber + for<'span> LookupSpan<'span> + Send + Sync + 'static,
 {
     if let Some(writer) = audit_writer {
         subscriber
             .with(
-                tracing_subscriber::fmt::layer()
+                layer()
                     .json()
                     .with_timer(LocalTime)
                     .with_writer(writer)
-                    .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+                    .with_filter(LevelFilter::INFO),
             )
             .try_init()
     } else {
@@ -359,14 +279,11 @@ where
 /// Returns [`TryInitError`] if a global tracing subscriber has already
 /// been installed. This makes the function safe to call repeatedly from
 /// tests or embedders without panicking.
+#[inline]
 pub fn init_tracing(default_filter: &str) -> Result<(), TryInitError> {
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter)))
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_timer(LocalTime)
-                .with_writer(io::stderr),
-        )
+        .with(layer().with_timer(LocalTime).with_writer(io::stderr))
         .try_init()
 }
 
@@ -375,14 +292,16 @@ pub fn init_tracing(default_filter: &str) -> Result<(), TryInitError> {
 /// Implements `MakeWriter` so it can be used with `tracing_subscriber::fmt`.
 #[derive(Clone)]
 struct AuditFile {
+    /// Handle to the bounded channel the background writer drains.
     sender: SyncSender<AuditMessage>,
+    /// Shared count of entries dropped when the channel was full.
     dropped: Arc<AtomicU64>,
 }
 
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for AuditFile {
+impl<'writer> MakeWriter<'writer> for AuditFile {
     type Writer = AuditFileWriter;
 
-    fn make_writer(&'a self) -> Self::Writer {
+    fn make_writer(&'writer self) -> Self::Writer {
         AuditFileWriter {
             sender: self.sender.clone(),
             dropped: Arc::clone(&self.dropped),
@@ -392,7 +311,9 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for AuditFile {
 
 /// A non-blocking audit writer handle used directly at tracing call sites.
 struct AuditFileWriter {
+    /// Handle to the bounded channel the background writer drains.
     sender: SyncSender<AuditMessage>,
+    /// Shared count of entries dropped when the channel was full.
     dropped: Arc<AtomicU64>,
 }
 
@@ -411,25 +332,37 @@ impl io::Write for AuditFileWriter {
             self.sender.try_send(AuditMessage::Write(buf.to_vec())),
             Err(TrySendError::Full(_))
         ) {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+            let _previous = self.dropped.fetch_add(1, Ordering::Relaxed);
         }
         Ok(buf.len())
     }
 
+    #[expect(clippy::let_underscore_must_use, reason = "audit writer must not log")]
+    #[expect(
+        let_underscore_drop,
+        reason = "deliberate: src/observability.rs::AuditFileWriter::flush drops the full-channel send result without logging"
+    )]
     fn flush(&mut self) -> io::Result<()> {
-        let _ = self.sender.try_send(AuditMessage::Flush);
+        let _: Result<(), TrySendError<AuditMessage>> = self.sender.try_send(AuditMessage::Flush);
         Ok(())
     }
 }
 
+/// Message sent from the tracing writer layer to the audit writer thread.
 enum AuditMessage {
+    /// Raw bytes to append to the audit log.
     Write(Vec<u8>),
+    /// Request to flush buffered audit output.
     Flush,
 }
 
+/// Shutdown and join handle for the dedicated audit writer thread.
 struct AuditWorkerGuard {
+    /// Set to true to ask the writer thread to stop.
     shutdown: Arc<AtomicBool>,
+    /// Non-blocking wake channel used to nudge the writer thread.
     wake_sender: SyncSender<AuditMessage>,
+    /// Join handle for the writer thread, taken on drop.
     thread: Option<JoinHandle<()>>,
 }
 
@@ -439,9 +372,19 @@ struct AuditWorkerGuard {
 // request worker past the timeout; every fallible return is handled/discarded.
 // Drop audit (2026-10-04): no async work, no panic path; cleanup order fixed.
 impl Drop for AuditWorkerGuard {
+    #[expect(clippy::let_underscore_must_use, reason = "audit writer must not log")]
+    #[expect(
+        let_underscore_drop,
+        reason = "deliberate: src/observability.rs::AuditWorkerGuard::drop drops the flush and join results in place"
+    )]
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "invariant: src/observability.rs::AuditWorkerGuard::drop -- the deadline arithmetic is bounded by AUDIT_WRITER_JOIN_TIMEOUT and cannot overflow within the process lifetime"
+    )]
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
-        let _ = self.wake_sender.try_send(AuditMessage::Flush);
+        let _: Result<(), TrySendError<AuditMessage>> =
+            self.wake_sender.try_send(AuditMessage::Flush);
 
         let Some(thread) = self.thread.take() else {
             return;
@@ -454,16 +397,23 @@ impl Drop for AuditWorkerGuard {
             }
             thread::park_timeout((deadline - now).min(AUDIT_WRITER_JOIN_POLL));
         }
-        let _ = thread.join();
+        let _: thread::Result<()> = thread.join();
     }
 }
 
+/// Owner of the audit file handle and its bounded message receiver.
 struct AuditWorker<W> {
+    /// Destination the worker appends audit output to.
     file: W,
+    /// Bounded channel receiving writes and flush requests.
     receiver: Receiver<AuditMessage>,
+    /// Shared shutdown flag set by the guard.
     shutdown: Arc<AtomicBool>,
+    /// Shared count of entries dropped while the channel was full.
     dropped: Arc<AtomicU64>,
+    /// Shared count of audit I/O failures, used for warning throttling.
     io_failures: Arc<AtomicU64>,
+    /// Time of the last stderr I/O-failure warning, if any.
     last_io_failure_warning: Option<Instant>,
 }
 
@@ -471,6 +421,7 @@ impl<W> AuditWorker<W>
 where
     W: io::Write,
 {
+    /// Drain the channel until shutdown, then flush the file.
     fn run(mut self) {
         loop {
             match self.receiver.recv_timeout(AUDIT_WRITER_POLL_INTERVAL) {
@@ -498,6 +449,7 @@ where
         }
     }
 
+    /// Apply one write or flush message, recording any I/O failure.
     fn handle_message(&mut self, message: AuditMessage) {
         match message {
             AuditMessage::Write(bytes) => {
@@ -515,6 +467,7 @@ where
         }
     }
 
+    /// Emit one warning line for entries dropped since the last check.
     fn write_dropped_warning(&mut self) {
         let count = self.dropped.swap(0, Ordering::Relaxed);
         if count == 0 {
@@ -528,13 +481,18 @@ where
         }
     }
 
+    /// Count an I/O failure and warn on stderr when the interval has elapsed.
     fn record_io_failure(&mut self, operation: &'static str, error: &io::Error) {
-        let failure_count = self.io_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        let failure_count = self
+            .io_failures
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
         if self.io_failure_warning_due(Instant::now()) {
             write_audit_io_failure_warning(operation, failure_count, error);
         }
     }
 
+    /// Report whether a new I/O-failure warning is due at `now`.
     fn io_failure_warning_due(&mut self, now: Instant) -> bool {
         let due = self
             .last_io_failure_warning
@@ -546,6 +504,12 @@ where
     }
 }
 
+/// Write one audit I/O failure line to stderr without re-entering tracing.
+#[expect(clippy::let_underscore_must_use, reason = "audit writer must not log")]
+#[expect(
+    let_underscore_drop,
+    reason = "deliberate: src/observability.rs::write_audit_io_failure_warning drops the stderr result without re-entering tracing"
+)]
 fn write_audit_io_failure_warning(
     operation: &'static str,
     failure_count: u64,
@@ -555,19 +519,24 @@ fn write_audit_io_failure_warning(
     // writer that just failed, so re-entering it from the writer thread could
     // recursively enqueue more audit writes or deadlock during shutdown.
     let mut stderr = io::stderr().lock();
-    let _ = writeln!(
+    let _: io::Result<()> = writeln!(
         stderr,
         "rmcp-server-kit audit log {operation} failed; failures_total={failure_count}; error={representative_error}"
     );
 }
 
+/// Result of preparing an audit sink: writer, guard and setup warnings.
 struct AuditSetup {
+    /// Non-blocking writer handed to the tracing layer, when configured.
     writer: Option<AuditFile>,
+    /// Guard that owns the writer thread, when configured.
     guard: TracingGuard,
+    /// Non-fatal problems collected while preparing the audit sink.
     warnings: Vec<String>,
 }
 
 impl AuditSetup {
+    /// Build an empty setup with no audit sink and no warnings.
     const fn none() -> Self {
         Self {
             writer: None,
@@ -593,6 +562,11 @@ impl AuditSetup {
 /// rotator instead renames + recreates the file, this writer will keep writing
 /// to the renamed (rotated) inode until the guard is dropped or the process
 /// restarts.
+///
+/// # Errors
+///
+/// Returns `Err` with a message when the parent directory cannot be created,
+/// the audit log cannot be opened, or its writer thread cannot be spawned.
 fn open_audit_file(path: &Path) -> Result<AuditSetup, String> {
     // Ensure parent directory exists.
     if let Some(parent) = path.parent()
@@ -608,10 +582,10 @@ fn open_audit_file(path: &Path) -> Result<AuditSetup, String> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
         && !parent.exists()
-        && let Err(e) = std::fs::create_dir_all(parent)
+        && let Err(error) = fs::create_dir_all(parent)
     {
         return Err(format!(
-            "failed to create audit log directory {}: {e}",
+            "failed to create audit log directory {}: {error}",
             parent.display()
         ));
     }
@@ -638,9 +612,9 @@ fn open_audit_file(path: &Path) -> Result<AuditSetup, String> {
             }
             .run();
         })
-        .map_err(|e| {
+        .map_err(|error| {
             format!(
-                "failed to spawn audit log writer for {}: {e}",
+                "failed to spawn audit log writer for {}: {error}",
                 path.display()
             )
         })?;
@@ -659,31 +633,41 @@ fn open_audit_file(path: &Path) -> Result<AuditSetup, String> {
     })
 }
 
+/// Open the configured audit log in strict mode, failing closed on error.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Startup`] when the configured audit log cannot
+/// be opened or its writer thread cannot be spawned.
 fn prepare_tracing_audit_strict(
     config: &ObservabilityConfig,
 ) -> Result<AuditSetup, RmcpServerKitError> {
-    match config.audit_log_path.as_deref() {
-        Some(path) => open_audit_file(path).map_err(|error| {
-            RmcpServerKitError::Startup(format!("audit log initialization failed: {error}"))
-        }),
-        None => Ok(AuditSetup::none()),
-    }
+    config.audit_log_path.as_deref().map_or_else(
+        || Ok(AuditSetup::none()),
+        |path| {
+            open_audit_file(path).map_err(|error| {
+                RmcpServerKitError::Startup(format!("audit log initialization failed: {error}"))
+            })
+        },
+    )
 }
 
+/// Open the configured audit log, downgrading setup failures to warnings.
 fn prepare_tracing_audit_lenient(config: &ObservabilityConfig) -> AuditSetup {
-    match config.audit_log_path.as_deref() {
-        Some(path) => match open_audit_file(path) {
+    config
+        .audit_log_path
+        .as_deref()
+        .map_or_else(AuditSetup::none, |path| match open_audit_file(path) {
             Ok(setup) => setup,
             Err(warning) => AuditSetup {
                 writer: None,
                 guard: TracingGuard::none(),
                 warnings: vec![warning],
             },
-        },
-        None => AuditSetup::none(),
-    }
+        })
 }
 
+/// Keep the audit guard alive for the process by storing it in the legacy list.
 fn retain_legacy_guard(guard: TracingGuard) {
     if guard.audit.is_none() {
         return;
@@ -696,6 +680,7 @@ fn retain_legacy_guard(guard: TracingGuard) {
     guards.push(guard);
 }
 
+/// Process-global storage keeping legacy audit guards alive.
 fn legacy_tracing_guards() -> &'static Mutex<Vec<TracingGuard>> {
     static GUARDS: OnceLock<Mutex<Vec<TracingGuard>>> = OnceLock::new();
     GUARDS.get_or_init(|| Mutex::new(Vec::new()))
@@ -708,16 +693,21 @@ fn legacy_tracing_guards() -> &'static Mutex<Vec<TracingGuard>> {
 /// exists with umask-derived permissions, so any local principal can open it
 /// before the mode is tightened. Audit logs carry identities and, under the
 /// diagnostic switches, credential material.
+///
+/// # Errors
+///
+/// Returns `Err` with a message when the audit log cannot be opened with
+/// owner-only permissions.
 #[cfg(unix)]
-fn create_private_audit_file(path: &Path) -> Result<std::fs::File, String> {
+fn create_private_audit_file(path: &Path) -> Result<fs::File, String> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
-    std::fs::OpenOptions::new()
+    fs::OpenOptions::new()
         .mode(0o600)
         .create(true)
         .append(true)
         .open(path)
-        .map_err(|e| format!("failed to open audit log file {}: {e}", path.display()))
+        .map_err(|error| format!("failed to open audit log file {}: {error}", path.display()))
 }
 
 /// Create (or append to) the audit log with an owner-only DACL.
@@ -734,7 +724,7 @@ fn create_private_audit_file(path: &Path) -> Result<std::fs::File, String> {
 /// unprotected audit log may remain on disk. Continuing instead would recreate
 /// the silent security-control failure this replaced.
 #[cfg(windows)]
-fn create_private_audit_file(path: &Path) -> Result<std::fs::File, String> {
+fn create_private_audit_file(path: &Path) -> Result<fs::File, String> {
     use std::ffi::OsString;
 
     use windows_permissions::{
@@ -743,7 +733,7 @@ fn create_private_audit_file(path: &Path) -> Result<std::fs::File, String> {
         wrappers,
     };
 
-    let file = std::fs::OpenOptions::new()
+    let file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
@@ -777,7 +767,7 @@ fn create_private_audit_file(path: &Path) -> Result<std::fs::File, String> {
         Ok(()) => Ok(file),
         Err(reason) => {
             drop(file);
-            let cleanup = match std::fs::remove_file(path) {
+            let cleanup = match fs::remove_file(path) {
                 Ok(()) => "the unprotected file was deleted".to_owned(),
                 Err(e) => format!(
                     "the unprotected file could NOT be deleted and may remain at {}: {e}",
@@ -801,7 +791,7 @@ fn create_private_audit_file(path: &Path) -> Result<std::fs::File, String> {
 /// startup error, and the deprecated lenient init warns and installs no audit
 /// sink.
 #[cfg(not(any(unix, windows)))]
-fn create_private_audit_file(path: &Path) -> Result<std::fs::File, String> {
+fn create_private_audit_file(path: &Path) -> Result<fs::File, String> {
     Err(format!(
         "audit log private permissions are unsupported on this platform: cannot \
          guarantee owner-only access for {}; audit logging disabled",
@@ -809,46 +799,27 @@ fn create_private_audit_file(path: &Path) -> Result<std::fs::File, String> {
     ))
 }
 
+/// Rewrite an existing audit file to owner-only permissions and collect failures.
 #[cfg(unix)]
-fn audit_file_permission_warnings(file: &std::fs::File) -> Vec<String> {
-    use std::os::unix::fs::PermissionsExt;
+fn audit_file_permission_warnings(file: &fs::File) -> Vec<String> {
+    use std::os::unix::fs::PermissionsExt as _;
 
     let mut warnings = Vec::new();
     // A pre-existing file keeps its old mode: `OpenOptions::mode` applies only
     // when `open` creates the file, so tighten it explicitly here.
-    if let Err(e) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
-        warnings.push(format!("failed to set audit log permissions to 0o600: {e}"));
+    if let Err(error) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
+        warnings.push(format!(
+            "failed to set audit log permissions to 0o600: {error}"
+        ));
     }
     warnings
 }
 
 #[cfg(not(unix))]
-fn audit_file_permission_warnings(_file: &std::fs::File) -> Vec<String> {
+fn audit_file_permission_warnings(_file: &fs::File) -> Vec<String> {
     Vec::new()
 }
 
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::default_numeric_fallback,
-        reason = "lint-migration: src/observability.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::expect_used, reason = "lint-migration: src/observability.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::too_long_first_doc_paragraph,
-        reason = "test code is not rendered API documentation"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::unwrap_used, reason = "lint-migration: src/observability.rs")
-)]
 #[cfg_attr(
     all(test, target_os = "linux"),
     expect(
@@ -858,95 +829,113 @@ fn audit_file_permission_warnings(_file: &std::fs::File) -> Vec<String> {
 )]
 #[cfg_attr(
     all(test, target_os = "linux"),
-    expect(clippy::doc_markdown, reason = "lint-migration: src/observability.rs")
+    expect(
+        clippy::missing_errors_doc,
+        reason = "test code is not rendered API documentation"
+    )
 )]
 #[cfg_attr(
     all(test, target_os = "linux"),
     expect(
-        clippy::else_if_without_else,
-        reason = "lint-migration: src/observability.rs"
+        clippy::too_long_first_doc_paragraph,
+        reason = "test code is not rendered API documentation"
     )
 )]
+#[expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")]
 #[cfg(test)]
 mod tests {
+    extern crate alloc;
+
+    use alloc::sync::Arc;
+    use core::{
+        sync::atomic::{AtomicBool, AtomicU64, Ordering},
+        time::Duration,
+    };
     #[cfg(unix)]
     use std::io::Write as _;
     use std::{
-        path::PathBuf,
-        sync::{
-            Arc,
-            atomic::{AtomicBool, AtomicU64, Ordering},
-            mpsc,
-        },
-        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+        env, fs, io,
+        path::{Path, PathBuf},
+        process,
+        sync::{Mutex, mpsc},
+        time::{Instant, SystemTime, UNIX_EPOCH},
     };
 
+    use anyhow::Context as _;
+    use tracing::subscriber;
     #[cfg(unix)]
     use tracing_subscriber::fmt::MakeWriter as _;
-    use tracing_subscriber::{Layer as _, layer::SubscriberExt as _};
+    use tracing_subscriber::{Layer as _, filter, fmt, layer::SubscriberExt as _};
 
     #[cfg(not(any(unix, windows)))]
     use super::prepare_tracing_audit_lenient;
     use super::{AuditMessage, AuditWorker, init_tracing, prepare_tracing_audit_strict};
-    use crate::{config::ObservabilityConfig, error::RmcpServerKitError};
+    use crate::{
+        config::ObservabilityConfig,
+        diagnostics::{
+            DiagnosticExposure, ExposureTestGuard, oauth_claim_values, plaintext_oauth_tokens,
+            set_diagnostic_exposure, tool_call_arguments,
+        },
+        error::RmcpServerKitError,
+    };
 
     struct FailingAuditSink;
 
-    impl std::io::Write for FailingAuditSink {
-        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::other("injected audit sink write failure"))
+    impl io::Write for FailingAuditSink {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("injected audit sink write failure"))
         }
 
-        fn flush(&mut self) -> std::io::Result<()> {
-            Err(std::io::Error::other("injected audit sink flush failure"))
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("injected audit sink flush failure"))
         }
     }
 
     // Helper structs for default_filter_reaches_audit_layer test.
-    struct BufferWriter(Arc<std::sync::Mutex<Vec<u8>>>);
-    impl std::io::Write for BufferWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    struct BufferWriter(Arc<Mutex<Vec<u8>>>);
+    impl io::Write for BufferWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             if let Ok(mut guard) = self.0.lock() {
                 guard.extend_from_slice(buf);
             }
             Ok(buf.len())
         }
-        fn flush(&mut self) -> std::io::Result<()> {
+        fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
     }
 
-    struct BufferA(Arc<std::sync::Mutex<Vec<u8>>>);
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufferA {
+    struct BufferA(Arc<Mutex<Vec<u8>>>);
+    impl<'writer> fmt::MakeWriter<'writer> for BufferA {
         type Writer = BufferWriter;
-        fn make_writer(&'a self) -> Self::Writer {
+        fn make_writer(&'writer self) -> Self::Writer {
             BufferWriter(Arc::clone(&self.0))
         }
     }
 
-    struct BufferB(Arc<std::sync::Mutex<Vec<u8>>>);
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufferB {
+    struct BufferB(Arc<Mutex<Vec<u8>>>);
+    impl<'writer> fmt::MakeWriter<'writer> for BufferB {
         type Writer = BufferWriter;
-        fn make_writer(&'a self) -> Self::Writer {
+        fn make_writer(&'writer self) -> Self::Writer {
             BufferWriter(Arc::clone(&self.0))
         }
     }
 
     /// Helper function to build a two-layer subscriber for testing filter reaches.
     fn build_two_layer_test_subscriber(
-        buffer_a: &Arc<std::sync::Mutex<Vec<u8>>>,
-        buffer_b: &Arc<std::sync::Mutex<Vec<u8>>>,
+        buffer_a: &Arc<Mutex<Vec<u8>>>,
+        buffer_b: &Arc<Mutex<Vec<u8>>>,
     ) -> impl tracing::Subscriber {
         tracing_subscriber::registry()
             .with(tracing_subscriber::EnvFilter::new(
                 ObservabilityConfig::default().log_level,
             ))
-            .with(tracing_subscriber::fmt::layer().with_writer(BufferA(Arc::clone(buffer_a))))
+            .with(fmt::layer().with_writer(BufferA(Arc::clone(buffer_a))))
             .with(
-                tracing_subscriber::fmt::layer()
+                fmt::layer()
                     .json()
                     .with_writer(BufferB(Arc::clone(buffer_b)))
-                    .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+                    .with_filter(filter::LevelFilter::INFO),
             )
     }
 
@@ -961,22 +950,36 @@ mod tests {
         tracing::warn!(target: "rmcp::service", "probe-sdk-warn");
     }
 
-    /// Helper function to run filter reach test logic and return (a_contents, b_contents).
-    fn run_filter_reach_probe() -> (String, String) {
-        let buffer_a = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let buffer_b = Arc::new(std::sync::Mutex::new(Vec::new()));
+    /// Helper function to run filter reach test logic and return (`a_contents`, `b_contents`).
+    fn run_filter_reach_probe() -> anyhow::Result<(String, String)> {
+        let buffer_a = Arc::new(Mutex::new(Vec::new()));
+        let buffer_b = Arc::new(Mutex::new(Vec::new()));
 
         let subscriber = build_two_layer_test_subscriber(&buffer_a, &buffer_b);
 
-        tracing::subscriber::with_default(subscriber, emit_filter_test_probes);
+        subscriber::with_default(subscriber, emit_filter_test_probes);
 
-        let a_contents = String::from_utf8(buffer_a.lock().unwrap().clone()).unwrap_or_default();
-        let b_contents = String::from_utf8(buffer_b.lock().unwrap().clone()).unwrap_or_default();
+        let a_bytes = buffer_a
+            .lock()
+            .map_err(|error| anyhow::anyhow!("buffer a mutex is not poisoned: {error}"))?
+            .clone();
+        let b_bytes = buffer_b
+            .lock()
+            .map_err(|error| anyhow::anyhow!("buffer b mutex is not poisoned: {error}"))?
+            .clone();
+        let a_contents = String::from_utf8(a_bytes).unwrap_or_default();
+        let b_contents = String::from_utf8(b_bytes).unwrap_or_default();
 
-        (a_contents, b_contents)
+        Ok((a_contents, b_contents))
     }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/observability.rs::config_format_valid keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn config_format_valid() {
+    /// Pins that the default observability config selects a supported log format.
+    fn config_format_valid() -> anyhow::Result<()> {
         let config = ObservabilityConfig {
             log_level: "debug".into(),
             log_format: "json".into(),
@@ -990,8 +993,15 @@ mod tests {
             log_upstream_error_bodies: false,
         };
         assert!(config.log_format == "json" || config.log_format == "pretty");
+
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/observability.rs::init_tracing_double_init_returns_err_not_panic keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
     /// Calling either `init_tracing` entry point twice in the same process
     /// must NOT panic. The second (and any subsequent) call must return
     /// `Err(TryInitError)` instead. This guards against regressions of the
@@ -1001,12 +1011,11 @@ mod tests {
     /// All four call orderings are exercised in a single test because the
     /// global tracing subscriber is process-wide state - we cannot rely on
     /// test isolation here.
-    #[test]
-    fn init_tracing_double_init_returns_err_not_panic() {
+    fn init_tracing_double_init_returns_err_not_panic() -> anyhow::Result<()> {
         // First call: may succeed or fail depending on whether another
         // test in this binary already installed a subscriber. Either is
         // acceptable; we only require that it does not panic.
-        let _ = init_tracing("info");
+        let _first_init = init_tracing("info");
 
         // Second call: a global subscriber is now guaranteed to exist,
         // so this MUST return Err and MUST NOT panic.
@@ -1038,12 +1047,15 @@ mod tests {
             third.is_err(),
             "init_tracing_from_config must return Err once a global subscriber exists"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn strict_init_fails_when_audit_path_unopenable() {
-        let root_file = unique_temp_path("audit-parent-file");
-        std::fs::write(&root_file, b"not a directory").expect("create parent file fixture");
+    /// Pins that strict tracing setup fails closed when the audit path cannot be opened.
+    fn strict_init_fails_when_audit_path_unopenable() -> anyhow::Result<()> {
+        let root_file = unique_temp_path("audit-parent-file")?;
+        fs::write(&root_file, b"not a directory").context("create parent file fixture")?;
         let audit_path = root_file.join("audit.log");
         let config = observability_config(Some(audit_path));
 
@@ -1053,20 +1065,21 @@ mod tests {
             matches!(result, Err(RmcpServerKitError::Startup(_))),
             "unopenable audit path must fail closed with Startup"
         );
-        std::fs::remove_file(&root_file).expect("remove parent file fixture");
+        fs::remove_file(&root_file).context("remove parent file fixture")?;
+
+        Ok(())
     }
 
     #[test]
-    fn strict_init_leaves_diagnostic_exposure_disarmed_on_startup_failure() {
+    /// Pins that a failed strict init leaves diagnostic exposure disarmed process-wide.
+    fn strict_init_leaves_diagnostic_exposure_disarmed_on_startup_failure() -> anyhow::Result<()> {
         // SECURITY regression: exposure used to be armed before the fallible
         // audit setup, so a failed strict init returned Err with plaintext
         // token/claim logging enabled process-wide.
-        let _guard = crate::diagnostics::ExposureTestGuard::acquire();
-        crate::diagnostics::set_diagnostic_exposure(
-            &crate::diagnostics::DiagnosticExposure::default(),
-        );
-        let root_file = unique_temp_path("audit-parent-file-diagnostics");
-        std::fs::write(&root_file, b"not a directory").expect("create parent file fixture");
+        let _guard = ExposureTestGuard::acquire();
+        set_diagnostic_exposure(&DiagnosticExposure::default());
+        let root_file = unique_temp_path("audit-parent-file-diagnostics")?;
+        fs::write(&root_file, b"not a directory").context("create parent file fixture")?;
         let mut config = observability_config(Some(root_file.join("audit.log")));
         config.log_plaintext_oauth_tokens = true;
         config.log_oauth_claim_values = true;
@@ -1078,45 +1091,55 @@ mod tests {
             matches!(result, Err(RmcpServerKitError::Startup(_))),
             "unopenable audit path must keep subscriber initialization out of this test"
         );
-        assert!(!crate::diagnostics::plaintext_oauth_tokens());
-        assert!(!crate::diagnostics::oauth_claim_values());
-        assert!(!crate::diagnostics::tool_call_arguments());
-        std::fs::remove_file(&root_file).expect("remove parent file fixture");
+        assert!(!plaintext_oauth_tokens());
+        assert!(!oauth_claim_values());
+        assert!(!tool_call_arguments());
+        fs::remove_file(&root_file).context("remove parent file fixture")?;
+
+        Ok(())
     }
 
     #[test]
     #[cfg(unix)]
-    fn strict_init_succeeds_and_writes_audit_line() {
-        let dir = unique_temp_path("audit-dir");
+    /// Pins that strict init installs an audit writer that drains a normal audit line.
+    fn strict_init_succeeds_and_writes_audit_line() -> anyhow::Result<()> {
+        let dir = unique_temp_path("audit-dir")?;
         let audit_path = dir.join("audit.log");
         let config = observability_config(Some(audit_path.clone()));
-        let setup = prepare_tracing_audit_strict(&config).expect("strict audit setup succeeds");
-        let writer = setup.writer.as_ref().expect("audit writer is configured");
+        let setup = prepare_tracing_audit_strict(&config).context("strict audit setup succeeds")?;
+        let writer = setup
+            .writer
+            .as_ref()
+            .context("audit writer is configured")?;
         let subscriber = tracing_subscriber::registry().with(
-            tracing_subscriber::fmt::layer()
+            fmt::layer()
                 .json()
                 .with_writer(writer.clone())
-                .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+                .with_filter(filter::LevelFilter::INFO),
         );
 
-        tracing::subscriber::with_default(subscriber, || {
+        let flush = subscriber::with_default(subscriber, || {
             tracing::info!(event = "phase3-test", "audit event");
             let mut sink = writer.make_writer();
-            sink.flush().expect("enqueue flush");
+            sink.flush()
         });
+        flush.context("enqueue flush")?;
         drop(setup.guard);
 
-        let contents = std::fs::read_to_string(&audit_path).expect("read flushed audit file");
+        let contents = fs::read_to_string(&audit_path).context("read flushed audit file")?;
         assert!(
             contents.contains("audit event"),
             "guard drop should drain this normal audit line before timeout; got {contents:?}"
         );
-        std::fs::remove_dir_all(&dir).expect("remove audit temp dir");
+        fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
     }
 
     #[test]
-    fn default_filter_reaches_audit_layer() {
-        let (a_contents, b_contents) = run_filter_reach_probe();
+    /// Pins that the default filter reaches both JSON and pretty audit layers.
+    fn default_filter_reaches_audit_layer() -> anyhow::Result<()> {
+        let (a_contents, b_contents) = run_filter_reach_probe()?;
 
         // Both layers should see probe-kit and probe-sdk-warn
         assert!(
@@ -1145,10 +1168,17 @@ mod tests {
             !b_contents.contains("probe-sdk-info"),
             "buffer B should NOT contain probe-sdk-info; got: {b_contents:?}"
         );
+
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/observability.rs::audit_worker_counts_write_and_flush_failures_without_panicking keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn audit_worker_counts_write_and_flush_failures_without_panicking() {
+    /// Pins that write and flush failures are counted without panicking the worker.
+    fn audit_worker_counts_write_and_flush_failures_without_panicking() -> anyhow::Result<()> {
         let (_sender, receiver) = mpsc::sync_channel(1);
         let io_failures = Arc::new(AtomicU64::new(0));
         let mut worker = AuditWorker {
@@ -1164,10 +1194,17 @@ mod tests {
         worker.handle_message(AuditMessage::Flush);
 
         assert_eq!(io_failures.load(Ordering::Relaxed), 2);
+
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/observability.rs::audit_worker_io_failure_warning_is_time_throttled keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn audit_worker_io_failure_warning_is_time_throttled() {
+    /// Pins that repeated audit I/O failure warnings are throttled by interval.
+    fn audit_worker_io_failure_warning_is_time_throttled() -> anyhow::Result<()> {
         let (_sender, receiver) = mpsc::sync_channel(1);
         let mut worker = AuditWorker {
             file: FailingAuditSink,
@@ -1185,18 +1222,24 @@ mod tests {
             worker.io_failure_warning_due(first + super::AUDIT_IO_FAILURE_WARNING_INTERVAL),
             "warning should be eligible again after the throttle interval"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn strict_init_succeeds_with_no_audit_path() {
+    /// Pins that strict init without an audit path installs no audit writer.
+    fn strict_init_succeeds_with_no_audit_path() -> anyhow::Result<()> {
         let config = observability_config(None);
 
-        let setup = prepare_tracing_audit_strict(&config).expect("no audit path needs no file I/O");
+        let setup =
+            prepare_tracing_audit_strict(&config).context("no audit path needs no file I/O")?;
 
         assert!(
             setup.writer.is_none(),
             "no audit path should install no audit writer"
         );
+
+        Ok(())
     }
 
     fn observability_config(audit_log_path: Option<PathBuf>) -> ObservabilityConfig {
@@ -1216,17 +1259,18 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn audit_file_is_created_owner_only() {
+    /// Pins that a freshly created audit log is never group- or world-accessible.
+    fn audit_file_is_created_owner_only() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let dir = unique_temp_path("audit-mode");
+        let dir = unique_temp_path("audit-mode")?;
         let audit_path = dir.join("audit.log");
         let config = observability_config(Some(audit_path.clone()));
-        let setup = prepare_tracing_audit_strict(&config).expect("strict audit setup succeeds");
+        let setup = prepare_tracing_audit_strict(&config).context("strict audit setup succeeds")?;
         drop(setup.guard);
 
-        let mode = std::fs::metadata(&audit_path)
-            .expect("audit file exists")
+        let mode = fs::metadata(&audit_path)
+            .context("audit file exists")?
             .permissions()
             .mode();
         assert_eq!(
@@ -1235,7 +1279,9 @@ mod tests {
             "audit log must never be group- or world-accessible, even transiently; \
              got mode {mode:o}"
         );
-        std::fs::remove_dir_all(&dir).expect("remove audit temp dir");
+        fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
     }
 
     /// The audit log must end up with a protected, owner-only DACL: exactly one
@@ -1245,18 +1291,18 @@ mod tests {
     /// `icacls`, so the assertion does not depend on a subprocess.
     #[test]
     #[cfg(windows)]
-    fn audit_file_dacl_is_owner_only() {
+    fn audit_file_dacl_is_owner_only() -> anyhow::Result<()> {
         use windows_permissions::{
             constants::{SeObjectType, SecurityInformation},
-            wrappers,
+            utilities, wrappers,
         };
 
-        let dir = unique_temp_path("audit-dacl");
+        let dir = unique_temp_path("audit-dacl")?;
         let audit_path = dir.join("audit.log");
         let config = observability_config(Some(audit_path.clone()));
 
         let setup = prepare_tracing_audit_strict(&config)
-            .expect("Windows audit logging must succeed once the DACL is applied");
+            .context("Windows audit logging must succeed once the DACL is applied")?;
         drop(setup.guard);
 
         assert!(
@@ -1264,16 +1310,18 @@ mod tests {
             "the audit file must be created on Windows, not refused"
         );
 
-        let sd = wrappers::GetNamedSecurityInfo(
+        let security_descriptor = wrappers::GetNamedSecurityInfo(
             audit_path.as_os_str(),
             SeObjectType::SE_FILE_OBJECT,
             SecurityInformation::Dacl,
         )
-        .expect("reading the audit file security descriptor must succeed");
-        let dacl = sd.dacl().expect("the audit file must carry a DACL");
+        .context("reading the audit file security descriptor must succeed")?;
+        let dacl = security_descriptor
+            .dacl()
+            .context("the audit file must carry a DACL")?;
 
-        let expected = windows_permissions::utilities::current_process_sid()
-            .expect("current process SID must be resolvable");
+        let expected =
+            utilities::current_process_sid().context("current process SID must be resolvable")?;
 
         assert_eq!(
             dacl.len(),
@@ -1281,26 +1329,29 @@ mod tests {
             "a protected owner-only DACL must contain exactly one ACE; \
              more means inherited entries survived"
         );
-        let ace = dacl.get_ace(0).expect("the single ACE must be readable");
+        let ace = dacl.get_ace(0).context("the single ACE must be readable")?;
         assert_eq!(
-            ace.sid().expect("the ACE must name a SID"),
+            ace.sid().context("the ACE must name a SID")?,
             &*expected,
             "the only ACE must grant this process's SID"
         );
 
-        std::fs::remove_dir_all(&dir).expect("remove audit temp dir");
+        fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
     }
 
     #[test]
     #[cfg(not(any(unix, windows)))]
-    fn strict_init_refuses_audit_log_without_private_permissions() {
-        let dir = unique_temp_path("audit-unsupported");
+    /// Pins that strict init refuses audit logging where owner-only access is unguaranteed.
+    fn strict_init_refuses_audit_log_without_private_permissions() -> anyhow::Result<()> {
+        let dir = unique_temp_path("audit-unsupported")?;
         let audit_path = dir.join("audit.log");
         let config = observability_config(Some(audit_path.clone()));
 
         let err = prepare_tracing_audit_strict(&config)
             .err()
-            .expect("audit logging must fail closed where owner-only access is unguaranteed");
+            .context("audit logging must fail closed where owner-only access is unguaranteed")?;
         let msg = err.to_string();
         assert!(
             msg.contains("private permissions are unsupported"),
@@ -1310,12 +1361,15 @@ mod tests {
             !audit_path.exists(),
             "the audit file must NOT be created when its permissions cannot be guaranteed"
         );
+
+        Ok(())
     }
 
     #[test]
     #[cfg(not(any(unix, windows)))]
-    fn lenient_init_warns_and_installs_no_audit_sink() {
-        let dir = unique_temp_path("audit-lenient");
+    /// Pins that lenient init warns and installs no audit sink where permissions are unsupported.
+    fn lenient_init_warns_and_installs_no_audit_sink() -> anyhow::Result<()> {
+        let dir = unique_temp_path("audit-lenient")?;
         let audit_path = dir.join("audit.log");
         let config = observability_config(Some(audit_path.clone()));
 
@@ -1328,22 +1382,22 @@ mod tests {
             setup
                 .warnings
                 .iter()
-                .any(|w| w.contains("private permissions are unsupported")),
+                .any(|warning| warning.contains("private permissions are unsupported")),
             "lenient init must warn rather than fail silently; got {:?}",
             setup.warnings
         );
         assert!(!audit_path.exists(), "no audit file may be created");
+
+        Ok(())
     }
 
-    fn unique_temp_path(label: &str) -> PathBuf {
+    /// Builds a unique temp path for a fixture, failing on a pre-epoch system clock.
+    fn unique_temp_path(label: &str) -> anyhow::Result<PathBuf> {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("system time is after Unix epoch")
+            .context("system time is after Unix epoch")?
             .as_nanos();
-        std::env::temp_dir().join(format!(
-            "rmcp-server-kit-{label}-{}-{nanos}",
-            std::process::id()
-        ))
+        Ok(env::temp_dir().join(format!("rmcp-server-kit-{label}-{}-{nanos}", process::id())))
     }
 
     // -----------------------------------------------------------------
@@ -1364,11 +1418,11 @@ mod tests {
     fn production_source(src: &str) -> String {
         let lines: Vec<&str> = src.lines().collect();
         let mut out = String::with_capacity(src.len());
-        for (i, line) in lines.iter().enumerate() {
+        for (index, line) in lines.iter().enumerate() {
             let trimmed = line.trim_start();
             if trimmed == "#[cfg(test)]"
                 && lines
-                    .get(i + 1)
+                    .get(index.saturating_add(1))
                     .is_some_and(|next| next.trim_start().starts_with("mod tests"))
             {
                 break;
@@ -1385,28 +1439,28 @@ mod tests {
     /// Index of the `)` matching the `(` at byte offset `open`, respecting
     /// nested delimiters and string literals so a `)` or `,` inside a
     /// message string cannot confuse the scan.
-    fn find_matching_paren(s: &str, open: usize) -> Option<usize> {
+    fn find_matching_paren(text: &str, open: usize) -> Option<usize> {
         let mut depth = 0_i32;
         let mut in_string = false;
         let mut escape = false;
-        for (i, c) in s.get(open..)?.char_indices() {
+        for (index, character) in text.get(open..)?.char_indices() {
             if in_string {
                 if escape {
                     escape = false;
-                } else if c == '\\' {
+                } else if character == '\\' {
                     escape = true;
-                } else if c == '"' {
-                    in_string = false;
+                } else {
+                    in_string = character != '"';
                 }
                 continue;
             }
-            match c {
+            match character {
                 '"' => in_string = true,
-                '(' => depth += 1,
+                '(' => depth = depth.saturating_add(1_i32),
                 ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(open + i);
+                    depth = depth.saturating_sub(1_i32);
+                    if depth == 0_i32 {
+                        return Some(open.saturating_add(index));
                     }
                 }
                 _ => {}
@@ -1423,24 +1477,24 @@ mod tests {
         let mut in_string = false;
         let mut escape = false;
         let mut start = 0_usize;
-        for (i, c) in args.char_indices() {
+        for (index, character) in args.char_indices() {
             if in_string {
                 if escape {
                     escape = false;
-                } else if c == '\\' {
+                } else if character == '\\' {
                     escape = true;
-                } else if c == '"' {
-                    in_string = false;
+                } else {
+                    in_string = character != '"';
                 }
                 continue;
             }
-            match c {
+            match character {
                 '"' => in_string = true,
-                '(' | '[' | '{' => depth += 1,
-                ')' | ']' | '}' => depth -= 1,
-                ',' if depth == 0 => {
-                    out.push(args.get(start..i).unwrap_or_default().trim());
-                    start = i + 1;
+                '(' | '[' | '{' => depth = depth.saturating_add(1_i32),
+                ')' | ']' | '}' => depth = depth.saturating_sub(1_i32),
+                ',' if depth == 0_i32 => {
+                    out.push(args.get(start..index).unwrap_or_default().trim());
+                    start = index.saturating_add(1);
                 }
                 _ => {}
             }
@@ -1452,10 +1506,11 @@ mod tests {
         out
     }
 
-    fn is_plain_identifier(s: &str) -> bool {
-        let mut chars = s.chars();
-        matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
-            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    /// Whether `ident` is a plain ASCII identifier, i.e. `[A-Za-z_][A-Za-z0-9_]*`.
+    fn is_plain_identifier(ident: &str) -> bool {
+        let mut chars = ident.chars();
+        matches!(chars.next(), Some(letter) if letter.is_ascii_alphabetic() || letter == '_')
+            && chars.all(|letter| letter.is_ascii_alphanumeric() || letter == '_')
     }
 
     /// Rule A: a `format!(...)` format string that is *only* a single Debug
@@ -1469,7 +1524,7 @@ mod tests {
         unquoted == "{:?}"
             || unquoted
                 .strip_prefix('{')
-                .and_then(|s| s.strip_suffix(":?}"))
+                .and_then(|stripped| stripped.strip_suffix(":?}"))
                 .is_some_and(is_plain_identifier)
     }
 
@@ -1482,21 +1537,28 @@ mod tests {
         let needle = "format!(";
         let mut hits = Vec::new();
         let mut from = 0_usize;
-        while let Some(rel) = scanned.get(from..).and_then(|s| s.find(needle)) {
-            let call_start = from + rel;
-            let open = call_start + needle.len() - 1;
+        while let Some(rel) = scanned
+            .get(from..)
+            .and_then(|haystack| haystack.find(needle))
+        {
+            let call_start = from.saturating_add(rel);
+            let open = call_start.saturating_add(needle.len()).saturating_sub(1);
             let Some(close) = find_matching_paren(&scanned, open) else {
                 break;
             };
-            let args = scanned.get(open + 1..close).unwrap_or_default();
+            let args = scanned
+                .get(open.saturating_add(1)..close)
+                .unwrap_or_default();
             let first_arg = split_top_level_args(args).into_iter().next();
             if let Some(quoted) = first_arg
-                && let Some(unquoted) = quoted.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
+                && let Some(unquoted) = quoted
+                    .strip_prefix('"')
+                    .and_then(|stripped| stripped.strip_suffix('"'))
                 && is_bare_debug_format_string(unquoted)
             {
                 hits.push(scanned.get(call_start..=close).unwrap_or(quoted).to_owned());
             }
-            from = close + 1;
+            from = close.saturating_add(1);
         }
         hits
     }
@@ -1511,12 +1573,12 @@ mod tests {
         let Some(eq) = arg.find('=') else {
             return false;
         };
-        let is_bare_eq = arg.as_bytes().get(eq + 1) != Some(&b'=')
-            && (eq == 0 || arg.as_bytes().get(eq - 1) != Some(&b'='));
+        let is_bare_eq = arg.as_bytes().get(eq.saturating_add(1)) != Some(&b'=')
+            && (eq == 0 || arg.as_bytes().get(eq.saturating_sub(1)) != Some(&b'='));
         is_bare_eq
             && is_plain_identifier(arg.get(..eq).unwrap_or_default().trim())
             && arg
-                .get(eq + 1..)
+                .get(eq.saturating_add(1)..)
                 .unwrap_or_default()
                 .trim_start()
                 .starts_with('?')
@@ -1538,19 +1600,26 @@ mod tests {
         let mut hits = Vec::new();
         for macro_prefix in TRACING_MACROS {
             let mut from = 0_usize;
-            while let Some(rel) = scanned.get(from..).and_then(|s| s.find(macro_prefix)) {
-                let call_start = from + rel;
-                let open = call_start + macro_prefix.len() - 1;
+            while let Some(rel) = scanned
+                .get(from..)
+                .and_then(|haystack| haystack.find(macro_prefix))
+            {
+                let call_start = from.saturating_add(rel);
+                let open = call_start
+                    .saturating_add(macro_prefix.len())
+                    .saturating_sub(1);
                 let Some(close) = find_matching_paren(&scanned, open) else {
                     break;
                 };
-                let args = scanned.get(open + 1..close).unwrap_or_default();
+                let args = scanned
+                    .get(open.saturating_add(1)..close)
+                    .unwrap_or_default();
                 for arg in split_top_level_args(args) {
                     if is_debug_sigil_field(arg) {
                         hits.push(arg.to_owned());
                     }
                 }
-                from = close + 1;
+                from = close.saturating_add(1);
             }
         }
         hits
@@ -1592,36 +1661,39 @@ mod tests {
         ),
     ];
 
+    /// Whether `(file, needle)` appears in the Rule B allowlist.
     fn is_allowlisted(file: &str, needle: &str) -> bool {
         RULE_B_ALLOWLIST
             .iter()
-            .any(|(f, n, _)| *f == file && *n == needle)
+            .any(|(entry_file, entry_needle, _)| *entry_file == file && *entry_needle == needle)
     }
 
-    fn scan_production_src(mut visit: impl FnMut(&std::path::Path, &str)) -> usize {
-        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let entries = std::fs::read_dir(&src_dir).expect("src/ is readable");
+    /// Walks every `src/*.rs` file, calling `visit` with its path and source, and returns the count.
+    fn scan_production_src(mut visit: impl FnMut(&Path, &str)) -> anyhow::Result<usize> {
+        let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let entries = fs::read_dir(&src_dir).context("src/ is readable")?;
         let mut scanned_files = 0_usize;
         for entry in entries {
-            let path = entry.expect("dir entry").path();
+            let path = entry.context("dir entry")?.path();
             if path.extension().is_none_or(|ext| ext != "rs") {
                 continue;
             }
-            let src = std::fs::read_to_string(&path).expect("source file is readable");
-            scanned_files += 1;
+            let src = fs::read_to_string(&path).context("source file is readable")?;
+            scanned_files = scanned_files.saturating_add(1);
             visit(&path, &src);
         }
-        scanned_files
+        Ok(scanned_files)
     }
 
     #[test]
-    fn production_source_has_no_bare_debug_format_calls() {
+    /// Pins that no production `format!` unconditionally Debug-stringifies a value.
+    fn production_source_has_no_bare_debug_format_calls() -> anyhow::Result<()> {
         let mut offenders: Vec<String> = Vec::new();
         let scanned_files = scan_production_src(|path, src| {
             for hit in find_bare_debug_format_calls(src) {
                 offenders.push(format!("{}: {hit}", path.display()));
             }
-        });
+        })?;
         assert!(
             scanned_files > 10,
             "guard scanned only {scanned_files} files; the walk is broken"
@@ -1634,10 +1706,13 @@ mod tests {
              value instead:\n{}",
             offenders.join("\n")
         );
+
+        Ok(())
     }
 
     #[test]
-    fn production_source_has_no_unallowlisted_debug_sigil_tracing_fields() {
+    /// Pins that no production tracing field uses the Debug sigil without allowlisting.
+    fn production_source_has_no_unallowlisted_debug_sigil_tracing_fields() -> anyhow::Result<()> {
         let mut offenders: Vec<String> = Vec::new();
         let scanned_files = scan_production_src(|path, src| {
             let rel = path
@@ -1649,7 +1724,7 @@ mod tests {
                     offenders.push(format!("{rel}: {hit}"));
                 }
             }
-        });
+        })?;
         assert!(
             scanned_files > 10,
             "guard scanned only {scanned_files} files; the walk is broken"
@@ -1662,14 +1737,21 @@ mod tests {
              an entry to RULE_B_ALLOWLIST with a reason if Debug really is intended:\n{}",
             offenders.join("\n")
         );
+
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/observability.rs::rule_a_detects_bare_debug_format_synthetic_violations keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
     #[expect(
         clippy::literal_string_with_formatting_args,
         reason = "the format-shaped text is the fixture under test, not a format call"
     )]
-    fn rule_a_detects_bare_debug_format_synthetic_violations() {
+    /// Pins that Rule A's matcher actually flags synthetic bare-Debug `format!` calls.
+    fn rule_a_detects_bare_debug_format_synthetic_violations() -> anyhow::Result<()> {
         // Without this, a broken matcher would be indistinguishable from a
         // clean codebase and the guard would rot into a no-op.
         assert_eq!(
@@ -1680,14 +1762,22 @@ mod tests {
             find_bare_debug_format_calls("fn f() { let s = format!(\"{value:?}\"); }").len(),
             1
         );
+
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/observability.rs::rule_a_ignores_debug_embedded_in_larger_text_and_tracing_message_strings keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
     #[expect(
         clippy::literal_string_with_formatting_args,
         reason = "the format-shaped text is the fixture under test, not a format call"
     )]
-    fn rule_a_ignores_debug_embedded_in_larger_text_and_tracing_message_strings() {
+    /// Pins that Rule A ignores Debug embedded in prose and tracing message strings.
+    fn rule_a_ignores_debug_embedded_in_larger_text_and_tracing_message_strings()
+    -> anyhow::Result<()> {
         // Diagnostic messages that embed Debug inside human-readable text
         // are outside this bug class -- the quoting is often desirable
         // there (it delimits an untrusted value).
@@ -1711,10 +1801,17 @@ mod tests {
             ),
             Vec::<String>::new()
         );
+
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/observability.rs::rule_b_detects_debug_sigil_field_synthetic_violations keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn rule_b_detects_debug_sigil_field_synthetic_violations() {
+    /// Pins that Rule B's matcher flags synthetic Debug-sigil tracing fields.
+    fn rule_b_detects_debug_sigil_field_synthetic_violations() -> anyhow::Result<()> {
         assert_eq!(
             find_debug_sigil_fields("fn f() { tracing::warn!(allowed = ?value, \"x\"); }").len(),
             1
@@ -1723,20 +1820,34 @@ mod tests {
             find_debug_sigil_fields("fn f() { tracing::debug!(?identity, \"x\"); }").len(),
             1
         );
+
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/observability.rs::rule_b_allows_display_sigil_and_bare_fields keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn rule_b_allows_display_sigil_and_bare_fields() {
+    /// Pins that Rule B ignores Display-sigil and bare (non-Debug) tracing fields.
+    fn rule_b_allows_display_sigil_and_bare_fields() -> anyhow::Result<()> {
         assert_eq!(
             find_debug_sigil_fields(
                 "fn f() { tracing::warn!(origin = logged, duplicate_origin_headers, %method, %path, \"x\"); }"
             ),
             Vec::<String>::new()
         );
+
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/observability.rs::rule_b_ignores_comments_test_modules_and_try_operator keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn rule_b_ignores_comments_test_modules_and_try_operator() {
+    /// Pins that Rule B ignores comments, test modules, and the `?` operator.
+    fn rule_b_ignores_comments_test_modules_and_try_operator() -> anyhow::Result<()> {
         let in_doc_comment = "/// BAD: tracing::debug!(?identity)\nfn f() {}";
         assert_eq!(
             find_debug_sigil_fields(in_doc_comment),
@@ -1756,5 +1867,7 @@ mod tests {
         // scan across a whole function body containing `?` finds nothing.
         let try_operator = "fn f() -> Option<()> { let _ = maybe_thing()?; Some(()) }";
         assert_eq!(find_debug_sigil_fields(try_operator), Vec::<String>::new());
+
+        Ok(())
     }
 }

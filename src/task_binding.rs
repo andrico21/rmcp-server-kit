@@ -27,45 +27,7 @@
 //!
 //! Every function here is synchronous and pure, so cancel safety is not
 //! applicable: there is no `.await` and no shared mutable state.
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::std_instead_of_core,
-        reason = "lint-migration: src/task_binding.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::if_then_some_else_none,
-        reason = "lint-migration: src/task_binding.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::absolute_paths, reason = "lint-migration: src/task_binding.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::redundant_pub_crate,
-        reason = "lint-migration: src/task_binding.rs"
-    )
-)]
-#![cfg_attr(
-    all(not(test), target_os = "linux"),
-    expect(
-        clippy::missing_docs_in_private_items,
-        reason = "lint-migration: src/task_binding.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::unseparated_literal_suffix,
-        reason = "lint-migration: src/task_binding.rs"
-    )
-)]
+use core::str;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::Mac as _;
@@ -96,12 +58,15 @@ const TASK_MAC_DOMAIN: &[u8] = b"rmcp-server-kit/task-id-binding/v1";
 /// bound is enforced before any decoding.
 const MAX_RAW_TASK_ID_BYTES: usize = 512;
 
+/// Byte length of the HMAC-SHA256 tag bound into every task token.
 const MAC_LEN: usize = 32;
+/// Character length of `MAC_LEN` bytes encoded with `URL_SAFE_NO_PAD`.
 const MAC_B64_LEN: usize = 43;
 
 /// `URL_SAFE_NO_PAD` expands `n` bytes to `ceil(n * 4 / 3)` characters.
 const MAX_RAW_TASK_ID_B64_LEN: usize = MAX_RAW_TASK_ID_BYTES.div_ceil(3) * 4;
 
+/// Upper bound in bytes on any externally supplied wrapped task token.
 const MAX_WRAPPED_TASK_TOKEN_LEN: usize =
     TASK_VERSION.len() + 1 + MAX_RAW_TASK_ID_B64_LEN + 1 + MAC_B64_LEN;
 
@@ -122,6 +87,7 @@ impl RawTaskId {
         Some(Self(raw.to_owned()))
     }
 
+    /// Borrow the verified raw task ID as a string slice.
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
@@ -162,22 +128,18 @@ pub(crate) fn unwrap_and_verify(
         return None;
     }
 
-    let mut mac = [0u8; MAC_LEN];
+    let mut mac = [0_u8; MAC_LEN];
     let mac_len = URL_SAFE_NO_PAD.decode_slice(mac_part, &mut mac).ok()?;
     if mac_len != MAC_LEN {
         return None;
     }
 
     let raw_bytes = URL_SAFE_NO_PAD.decode(raw_part).ok()?;
-    let raw_str = std::str::from_utf8(&raw_bytes).ok()?;
+    let raw_str = str::from_utf8(&raw_bytes).ok()?;
     let raw_id = RawTaskId::parse(raw_str)?;
 
     let expected = compute_mac(secret, &raw_id, fp);
-    if expected.ct_eq(&mac).into() {
-        Some(raw_id)
-    } else {
-        None
-    }
+    bool::from(expected.ct_eq(&mac)).then_some(raw_id)
 }
 
 /// Split `t1.<raw>.<mac>`, rejecting any other shape.
@@ -189,6 +151,7 @@ fn split_token(token: &str) -> Option<(&str, &str)> {
     }
 }
 
+/// Compute the domain-separated HMAC tag binding `raw_id` to `fp`.
 fn compute_mac(
     secret: &SessionBindingSecret,
     raw_id: &RawTaskId,
@@ -203,26 +166,15 @@ fn compute_mac(
     mac.finalize().into_bytes().into()
 }
 
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::expect_used, reason = "lint-migration: src/task_binding.rs")
+#[expect(
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    reason = "test code is not rendered API documentation"
 )]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::min_ident_chars,
-        reason = "lint-migration: src/task_binding.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::missing_panics_doc,
-        reason = "test code is not rendered API documentation"
-    )
-)]
+#[expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")]
 #[cfg(test)]
 mod tests {
+    use anyhow::Context as _;
     use proptest::prelude::*;
     use secrecy::SecretString;
 
@@ -235,12 +187,14 @@ mod tests {
         session_binding::{SessionBindingSecret, fingerprint},
     };
 
+    /// Build the fixed operator secret shared by these tests.
     fn secret() -> SessionBindingSecret {
         SessionBindingSecret::Configured(SecretString::from(
             "test-secret-that-is-at-least-32-bytes-long".to_owned(),
         ))
     }
 
+    /// Build a bearer-token identity with the given name.
     fn identity(name: &str) -> AuthIdentity {
         AuthIdentity {
             name: name.to_owned(),
@@ -252,112 +206,149 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_recovers_the_raw_id() {
-        let s = secret();
+    /// Pins that a token wraps and recovers the raw task ID for its identity.
+    fn roundtrip_recovers_the_raw_id() -> anyhow::Result<()> {
+        let binding = secret();
         let fp = fingerprint(&identity("alice"));
-        let raw = RawTaskId::parse("task-abc-123").expect("valid id");
-        let token = wrap(&s, &raw, &fp);
+        let raw = RawTaskId::parse("task-abc-123").context("valid id")?;
+        let token = wrap(&binding, &raw, &fp);
         assert!(token.starts_with("t1."), "token must carry the t1 prefix");
         assert!(
             !token.contains("task-abc-123"),
             "raw id must not appear verbatim in the token"
         );
-        assert_eq!(unwrap_and_verify(&s, &token, &fp), Some(raw));
+        assert_eq!(unwrap_and_verify(&binding, &token, &fp), Some(raw));
+        Ok(())
     }
 
     #[test]
-    fn another_identity_cannot_verify_the_token() {
-        let s = secret();
+    /// Pins that a token minted for one identity does not verify for another.
+    fn another_identity_cannot_verify_the_token() -> anyhow::Result<()> {
+        let binding = secret();
         let alice = fingerprint(&identity("alice"));
         let bob = fingerprint(&identity("bob"));
-        let raw = RawTaskId::parse("task-abc-123").expect("valid id");
-        let token = wrap(&s, &raw, &alice);
+        let raw = RawTaskId::parse("task-abc-123").context("valid id")?;
+        let token = wrap(&binding, &raw, &alice);
         assert_eq!(
-            unwrap_and_verify(&s, &token, &bob),
+            unwrap_and_verify(&binding, &token, &bob),
             None,
             "a token minted for alice must not verify for bob"
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/task_binding.rs::raw_unwrapped_id_is_rejected keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn raw_unwrapped_id_is_rejected() {
-        let s = secret();
+    /// Pins that a bare, unwrapped task ID or UUID is rejected.
+    fn raw_unwrapped_id_is_rejected() -> anyhow::Result<()> {
+        let binding = secret();
         let fp = fingerprint(&identity("alice"));
-        assert_eq!(unwrap_and_verify(&s, "task-abc-123", &fp), None);
+        assert_eq!(unwrap_and_verify(&binding, "task-abc-123", &fp), None);
         assert_eq!(
-            unwrap_and_verify(&s, "550e8400-e29b-41d4-a716-446655440000", &fp),
+            unwrap_and_verify(&binding, "550e8400-e29b-41d4-a716-446655440000", &fp),
             None
         );
+        Ok(())
     }
 
     #[test]
-    fn a_different_secret_does_not_verify() {
+    /// Pins that a token minted under another secret does not verify.
+    fn a_different_secret_does_not_verify() -> anyhow::Result<()> {
         let fp = fingerprint(&identity("alice"));
-        let raw = RawTaskId::parse("task-abc-123").expect("valid id");
+        let raw = RawTaskId::parse("task-abc-123").context("valid id")?;
         let token = wrap(&secret(), &raw, &fp);
         let rotated = SessionBindingSecret::Configured(SecretString::from(
             "a-completely-different-secret-over-32-bytes".to_owned(),
         ));
         assert_eq!(unwrap_and_verify(&rotated, &token, &fp), None);
+        Ok(())
     }
 
     /// SECURITY: the crux of sharing one secret with session binding. A session
     /// token must never verify as a task token, nor the reverse.
     #[test]
-    fn session_and_task_tokens_are_domain_separated() {
+    fn session_and_task_tokens_are_domain_separated() -> anyhow::Result<()> {
         use crate::session_binding::{
             RawSessionId, unwrap_and_verify as session_unwrap, wrap as session_wrap,
         };
 
-        let s = secret();
+        let binding = secret();
         let fp = fingerprint(&identity("alice"));
         let uuid = "550e8400-e29b-41d4-a716-446655440000";
 
-        let raw_session = RawSessionId::parse(uuid).expect("valid uuid");
-        let session_token = session_wrap(&s, &raw_session, &fp);
+        let Ok(raw_session) = RawSessionId::parse(uuid) else {
+            anyhow::bail!("valid uuid");
+        };
+        let session_token = session_wrap(&binding, &raw_session, &fp);
         assert_eq!(
-            unwrap_and_verify(&s, &session_token, &fp),
+            unwrap_and_verify(&binding, &session_token, &fp),
             None,
             "a session token must not verify as a task token"
         );
 
-        let raw_task = RawTaskId::parse(uuid).expect("valid id");
-        let task_token = wrap(&s, &raw_task, &fp);
+        let raw_task = RawTaskId::parse(uuid).context("valid id")?;
+        let task_token = wrap(&binding, &raw_task, &fp);
         assert!(
-            session_unwrap(&s, &task_token, &fp).is_err(),
+            session_unwrap(&binding, &task_token, &fp).is_err(),
             "a task token must not verify as a session token"
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/task_binding.rs::oversized_token_is_rejected_before_decoding keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn oversized_token_is_rejected_before_decoding() {
-        let s = secret();
+    /// Pins that a token over the wrapped-length ceiling is rejected.
+    fn oversized_token_is_rejected_before_decoding() -> anyhow::Result<()> {
+        let binding = secret();
         let fp = fingerprint(&identity("alice"));
         let huge = format!(
             "t1.{}.{}",
             "A".repeat(MAX_WRAPPED_TASK_TOKEN_LEN),
             "B".repeat(43)
         );
-        assert_eq!(unwrap_and_verify(&s, &huge, &fp), None);
+        assert_eq!(unwrap_and_verify(&binding, &huge, &fp), None);
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/task_binding.rs::empty_and_oversized_raw_ids_are_rejected keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn empty_and_oversized_raw_ids_are_rejected() {
+    /// Pins that empty and oversized raw IDs are rejected at parse time.
+    fn empty_and_oversized_raw_ids_are_rejected() -> anyhow::Result<()> {
         assert_eq!(RawTaskId::parse(""), None);
         assert_eq!(
             RawTaskId::parse(&"x".repeat(MAX_RAW_TASK_ID_BYTES + 1)),
             None
         );
         assert!(RawTaskId::parse(&"x".repeat(MAX_RAW_TASK_ID_BYTES)).is_some());
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/task_binding.rs::malformed_shapes_are_rejected keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn malformed_shapes_are_rejected() {
-        let s = secret();
+    /// Pins that token shapes other than `t1.<raw>.<mac>` are rejected.
+    fn malformed_shapes_are_rejected() -> anyhow::Result<()> {
+        let binding = secret();
         let fp = fingerprint(&identity("alice"));
         for bad in ["", "t1", "t1.", "t1.a", "v1.a.b", "t1.a.b.c", "t2.a.b"] {
-            assert_eq!(unwrap_and_verify(&s, bad, &fp), None, "must reject {bad:?}");
+            assert_eq!(
+                unwrap_and_verify(&binding, bad, &fp),
+                None,
+                "must reject {bad:?}"
+            );
         }
+        Ok(())
     }
 
     /// Build a secret that varies per generated byte.

@@ -156,7 +156,7 @@ axum Router                                  src/transport.rs:2076  (build_app_r
    │      (see `extract_bearer` in src/auth.rs).
    │      On success: sets task-locals via `current_role`, `current_identity`, …
    │
-├── 8. RBAC middleware                    src/rbac.rs:1309 (rbac_middleware) + 1376 (enforce_tool_policy)
+├── 8. RBAC middleware                    src/rbac.rs:1354 (rbac_middleware) + 1527 (enforce_tool_policy)
    │      For POSTs to /mcp:
    │        - Reads body up to limit
    │        - Parses JSON-RPC envelope
@@ -391,7 +391,7 @@ ArgumentAllowlist {                       // src/rbac.rs:275
 ```
 
 ### Decision function
-- `RbacPolicy::check(role, operation, host)` - pure allow/deny (`src/rbac.rs:479`; fn `check`)
+- `RbacPolicy::check(role, operation, host)` - pure allow/deny (`src/rbac.rs:709`; fn `check`)
 - `RbacPolicy::argument_allowed(role, tool, argument, value)` - JSON value match (`src/rbac.rs:739`; fn `argument_allowed`)
 - `RbacPolicy::redact_arg(value)` - HMAC-SHA256 of an argument value with
 the policy's salt, returning an 8-char hex prefix (`src/rbac.rs:749`).
@@ -402,7 +402,7 @@ the policy's salt, returning an 8-char hex prefix (`src/rbac.rs:749`).
   installed *after* enforcement (see "Task-locals" below).
 
 ### Middleware
-`rbac_middleware` (`src/rbac.rs:1315`):
+`rbac_middleware` (`src/rbac.rs:1354`):
 1. Extracts the role + identity name from the `AuthIdentity` request
    extension (set by the auth middleware).
 2. For `POST /mcp`, reads the body (bounded by body-size layer), parses
@@ -427,13 +427,13 @@ making preimage recovery infeasible. See `redact_with_salt`
 (`src/rbac.rs:589`).
 
 ### Task-locals
-`tokio::task_local!` block at `src/rbac.rs:215` defines four task-locals:
+`tokio::task_local!` block at `src/rbac.rs:117` defines four task-locals:
 - `CURRENT_ROLE: String`
 - `CURRENT_IDENTITY: String`
 - `CURRENT_TOKEN: SecretString`
 - `CURRENT_SUB: String`
 
-Public accessors: `current_role()` (`src/rbac.rs:243`),
+Public accessors: `current_role()` (`src/rbac.rs:158`),
 `current_identity()` (`src/rbac.rs:250`), `current_token()`
 (`src/rbac.rs:250`), `current_sub()` (`src/rbac.rs:250`). They return
 `Option<T>` because the task-locals are absent outside the request scope.
@@ -509,12 +509,12 @@ alone would be insufficient: non-CRL mTLS still relies on
 `[mtls]` is configured and `crl_enabled = true` (the default).
 
 Lifecycle:
-1. `bootstrap_fetch(roots, config)` (`src/mtls_revocation.rs:1728`) is
+1. `bootstrap_fetch(roots, config)` (`src/mtls_revocation.rs:1729`) is
    called from `run_server` *before* the listener is built. It walks the
    configured CA chain, extracts every X.509 CRL Distribution Point (CDP)
    URL via `extract_cdp_urls`, fetches each via `reqwest` under a 10 s
    total deadline, and seeds the cache.
-2. The returned `Arc<CrlSet>` (`src/mtls_revocation.rs:100`) owns:
+2. The returned `Arc<CrlSet>` (`src/mtls_revocation.rs:290`) owns:
    - `inner_verifier: ArcSwap<VerifierHandle>` - current
      `Arc<dyn ClientCertVerifier>` built from the latest CRL set; swapped
      atomically when CRLs refresh.
@@ -522,14 +522,14 @@ Lifecycle:
    - `discover_tx: mpsc::UnboundedSender<String>` - channel used by the
      handshake path to register newly observed CDP URLs for fetch.
    - `seen_urls: Mutex<HashSet<String>>` - dedupe of URLs already processed.
-3. `DynamicClientCertVerifier` (`src/mtls_revocation.rs:1562`) is the
+3. `DynamicClientCertVerifier` (`src/mtls_revocation.rs:1510`) is the
    `Arc<dyn ClientCertVerifier>` handed to `rustls::ServerConfig`. Its
    trait methods delegate to the inner verifier loaded from
    `inner_verifier.load()`. Because `tokio_rustls::TlsAcceptor` clones
    the verifier `Arc` from the `ServerConfig` at construction, the
    dynamic verifier MUST be the Arc handed to rustls; its inner verifier
    then swaps via the internal `ArcSwap`.
-4. `run_crl_refresher(set, rx, shutdown)` (`src/mtls_revocation.rs:1904`)
+4. `run_crl_refresher(set, rx, shutdown)` (`src/mtls_revocation.rs:1882`)
    is spawned by `run_server`. It:
    - Drains the `discover_tx` receiver and fetches any newly observed CDP URLs.
    - Re-fetches each cached CRL before its `nextUpdate`, clamped to
@@ -590,7 +590,7 @@ reachable:
 
 ### Discovery admission ordering
 
-`note_discovered_urls` (`src/mtls_revocation.rs:961`) implements a
+`note_discovered_urls` (`src/mtls_revocation.rs:886`) implements a
 strict commit-after-admission protocol to keep the discovery rate
 limiter from "leaking" URLs:
 
@@ -617,7 +617,7 @@ implementation would silently drop CDP URLs forever the first time the
 rate limiter engaged, breaking revocation for the affected client
 identities. Per-peer keying additionally stops one peer's spray from
 fail-closing a concurrent legitimate peer. The current ordering is
-verified by `__test_check_discovery_rate` (`src/mtls_revocation.rs:1240`)
+verified by `__test_check_discovery_rate` (`src/mtls_revocation.rs:1170`)
 and by the per-peer isolation test
 (`per_peer_discovery_quota_does_not_starve_other_peers`).
 
@@ -743,7 +743,7 @@ Useful for debugging hot-reload state and verifying RBAC after a swap.
 
 **File**: `src/observability.rs`.
 
-`init_tracing_from_config(...)` (~`src/observability.rs:163`) initializes
+`init_tracing_from_config(...)` (~`src/observability.rs:88`) initializes
 `tracing-subscriber` with:
 - `EnvFilter` from `RUST_LOG` (or supplied filter string)
 - console layer (pretty when stdout is a TTY, JSON otherwise)
@@ -873,7 +873,7 @@ held. Only the runtime-only fields above survive from the base. It is fallible
 **Environment (opt-in)** - three inherent methods, one per section owning
 targeted fields: `ServerConfig::apply_env_overrides` (`src/config.rs:676`),
 `ObservabilityConfig::apply_env_overrides` (`src/config.rs:1023`) and
-`RbacConfig::apply_env_overrides` (`src/rbac.rs:1811`). Each returns
+`RbacConfig::apply_env_overrides` (`src/rbac.rs:1905`). Each returns
 `Vec<EnvOverride>` (`src/config.rs:100`) for audit logging, with `value: None`
 for secret targets. Curated variables under the `RMCP_SERVER_KIT__`
 prefix; `__` separates TOML path segments because field names already contain

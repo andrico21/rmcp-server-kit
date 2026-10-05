@@ -1,60 +1,8 @@
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::missing_const_for_fn, reason = "lint-migration: src/ssrf.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::arithmetic_side_effects,
-        reason = "lint-migration: src/ssrf.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::shadow_reuse, reason = "lint-migration: src/ssrf.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::min_ident_chars, reason = "lint-migration: src/ssrf.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::option_if_let_else, reason = "lint-migration: src/ssrf.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::missing_errors_doc, reason = "lint-migration: src/ssrf.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::too_long_first_doc_paragraph,
-        reason = "lint-migration: src/ssrf.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::doc_paragraphs_missing_punctuation,
-        reason = "lint-migration: src/ssrf.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::redundant_pub_crate, reason = "lint-migration: src/ssrf.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::std_instead_of_core, reason = "lint-migration: src/ssrf.rs")
-)]
-#![cfg_attr(
-    all(not(test), target_os = "linux"),
-    expect(
-        clippy::missing_docs_in_private_items,
-        reason = "lint-migration: src/ssrf.rs"
-    )
-)]
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+//! SSRF guards for outbound HTTP: scheme/userinfo validation, literal-IP
+//! rejection, cloud-metadata blocking, and the operator host/CIDR allowlist
+//! shared by the OAuth/JWKS and CRL fetch paths.
+
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use url::Url;
 
@@ -69,10 +17,11 @@ pub(crate) const CLOUD_METADATA_V4: Ipv4Addr = Ipv4Addr::new(169, 254, 169, 254)
 pub(crate) const CLOUD_METADATA_V4_ALIBABA: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 200);
 
 /// AWS IPv6 instance metadata endpoint (`fd00:ec2::254`, IMDSv2 over IPv6).
+///
 /// Lives inside `fc00::/7` (unique-local) but is treated as cloud-metadata
 /// so it cannot be re-allowed via a `fd00::/8` operator allowlist.
 ///
-/// Source: <https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-metadata-v2-how-it-works.html>
+/// Source: <https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-metadata-v2-how-it-works.html>.
 pub(crate) const CLOUD_METADATA_V6_AWS: Ipv6Addr =
     Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254);
 
@@ -80,7 +29,7 @@ pub(crate) const CLOUD_METADATA_V6_AWS: Ipv6Addr =
 /// `fc00::/7` (unique-local) but is treated as cloud-metadata so it
 /// cannot be re-allowed via a `fc00::/7` operator allowlist.
 ///
-/// Source: <https://cloud.google.com/compute/docs/metadata/overview>
+/// Source: <https://cloud.google.com/compute/docs/metadata/overview>.
 pub(crate) const CLOUD_METADATA_V6_GCP: Ipv6Addr =
     Ipv6Addr::new(0xfd20, 0x00ce, 0, 0, 0, 0, 0, 0x0254);
 
@@ -96,6 +45,13 @@ pub(crate) const CLOUD_METADATA_V6_GCP: Ipv6Addr =
 /// the fetch machinery, error strings, or logs. This mirrors the
 /// userinfo rule already enforced on OAuth redirect targets by
 /// [`redirect_target_reason_with_allowlist`].
+///
+/// # Errors
+///
+/// Returns `invalid_scheme` for any scheme other than `https` (or `http`
+/// when `allow_http` is true), `http_scheme_disallowed` for `http` when
+/// `allow_http` is false, and `userinfo_forbidden` when the URL carries
+/// embedded credentials.
 pub(crate) fn check_scheme(url: &Url, allow_http: bool) -> Result<(), &'static str> {
     match url.scheme() {
         "https" => {}
@@ -118,10 +74,10 @@ pub(crate) fn check_scheme(url: &Url, allow_http: bool) -> Result<(), &'static s
 /// included only when explicitly present in the URL.
 pub(crate) fn sanitized_url_for_log(url: &Url) -> String {
     let host = url.host_str().unwrap_or("<no-host>");
-    match url.port() {
-        Some(port) => format!("{}://{host}:{port}", url.scheme()),
-        None => format!("{}://{host}", url.scheme()),
-    }
+    url.port().map_or_else(
+        || format!("{}://{host}", url.scheme()),
+        |port| format!("{}://{host}:{port}", url.scheme()),
+    )
 }
 
 /// Check whether an IP address must be rejected before any TCP connect.
@@ -170,6 +126,7 @@ pub(crate) fn ip_block_reason(ip: IpAddr) -> Option<&'static str> {
     }
 }
 
+/// Classify an IPv4 address against the blocked ranges, cloud-metadata first.
 fn block_reason_v4(v4: Ipv4Addr) -> Option<&'static str> {
     // Cloud-metadata MUST be checked first so it wins over CGNAT
     // (Alibaba metadata sits inside 100.64.0.0/10) and link-local
@@ -222,6 +179,7 @@ fn block_reason_v4(v4: Ipv4Addr) -> Option<&'static str> {
     None
 }
 
+/// Classify an IPv6 address, delegating embedded IPv4 forms to the IPv4 rules.
 fn block_reason_v6(v6: Ipv6Addr) -> Option<&'static str> {
     // Cloud-metadata MUST be checked first so it wins over the generic
     // unique-local bucket (AWS `fd00:ec2::254` and GCP `fd20:ce::254`
@@ -316,16 +274,17 @@ fn block_reason_v6(v6: Ipv6Addr) -> Option<&'static str> {
 /// Reassemble an IPv4 address embedded in two adjacent IPv6 segments
 /// (`hi` carries the first two octets, `lo` the last two).
 const fn embedded_v4(hi: u16, lo: u16) -> Ipv4Addr {
-    let [a, b] = hi.to_be_bytes();
-    let [c, d] = lo.to_be_bytes();
-    Ipv4Addr::new(a, b, c, d)
+    let [hi_hi, hi_lo] = hi.to_be_bytes();
+    let [lo_hi, lo_lo] = lo.to_be_bytes();
+    Ipv4Addr::new(hi_hi, hi_lo, lo_hi, lo_lo)
 }
 
-/// Sync pre-DNS literal-IP check. Any literal IPv4 or IPv6 host is
-/// rejected at URL-validation time, regardless of whether the address
-/// falls in a private or public range. OAuth operators must use DNS
-/// hostnames; post-DNS runtime checks remain the responsibility of the
-/// fetch path.
+/// Sync pre-DNS literal-IP check.
+///
+/// Any literal IPv4 or IPv6 host is rejected at URL-validation time,
+/// regardless of whether the address falls in a private or public range.
+/// OAuth operators must use DNS hostnames; post-DNS runtime checks remain
+/// the responsibility of the fetch path.
 #[cfg(feature = "oauth")]
 pub(crate) fn check_url_literal_ip(url: &Url) -> Option<&'static str> {
     match url.host()? {
@@ -339,13 +298,16 @@ pub(crate) fn check_url_literal_ip(url: &Url) -> Option<&'static str> {
 // Operator SSRF allowlist (CIDR + host) for OAuth/JWKS targets
 // ---------------------------------------------------------------------------
 
-/// Single CIDR entry as parsed from operator config. Stores the network
-/// address (host bits cleared at parse time) and the prefix length so a
-/// candidate `IpAddr` can be matched against it without re-parsing on
-/// every request.
+/// Single CIDR entry as parsed from operator config.
+///
+/// Stores the network address (host bits cleared at parse time) and the
+/// prefix length so a candidate `IpAddr` can be matched against it without
+/// re-parsing on every request.
 #[derive(Debug, Clone)]
 pub(crate) struct CidrEntry {
+    /// Network address with host bits cleared at parse time.
     network: IpAddr,
+    /// Prefix length in bits (`1..=32` for IPv4, `1..=128` for IPv6).
     prefix_len: u8,
 }
 
@@ -369,21 +331,31 @@ impl CidrEntry {
     /// - Non-zero host bits (`10.0.0.1/8`).
     ///
     /// Uses `std::net` only -- no new dependencies.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the string lacks a `/`, has a non-numeric or
+    /// out-of-range prefix (`0`, `> 32` for IPv4, `> 128` for IPv6), a
+    /// malformed address, non-zero host bits, or an IPv4-mapped IPv6 CIDR.
     #[cfg_attr(
         all(not(test), not(feature = "oauth")),
         expect(dead_code, reason = "consumer is feature-gated")
     )]
-    pub(crate) fn parse(raw: &str) -> Result<Self, String> {
-        let raw = raw.trim();
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "invariant: src/ssrf.rs::CidrEntry::parse bounds prefix_len to 1..=32 (IPv4) / 1..=128 (IPv6), so the mask shift subtraction cannot underflow"
+    )]
+    pub(crate) fn parse(spec: &str) -> Result<Self, String> {
+        let raw = spec.trim();
         let Some((addr_str, prefix_str)) = raw.split_once('/') else {
             return Err(format!("CIDR {raw:?} missing '/' prefix length"));
         };
         let prefix_len: u8 = prefix_str
             .parse()
-            .map_err(|e| format!("CIDR {raw:?}: invalid prefix length {prefix_str:?}: {e}"))?;
+            .map_err(|err| format!("CIDR {raw:?}: invalid prefix length {prefix_str:?}: {err}"))?;
         let addr: IpAddr = addr_str
             .parse()
-            .map_err(|e| format!("CIDR {raw:?}: invalid address {addr_str:?}: {e}"))?;
+            .map_err(|err| format!("CIDR {raw:?}: invalid address {addr_str:?}: {err}"))?;
         if prefix_len == 0 {
             return Err(format!(
                 "CIDR {raw:?}: prefix length 0 is forbidden (would allow every address)"
@@ -443,6 +415,10 @@ impl CidrEntry {
     /// Callers that want IPv4-mapped IPv6 to inherit must normalize the
     /// candidate via [`ip_block_reason`]'s `to_ipv4_mapped()` path before
     /// calling.
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "invariant: src/ssrf.rs::CidrEntry::parse bounds prefix_len to 1..=32 (IPv4) / 1..=128 (IPv6), so the mask shift subtraction cannot underflow"
+    )]
     pub(crate) fn contains(&self, ip: IpAddr) -> bool {
         match (self.network, ip) {
             (IpAddr::V4(net), IpAddr::V4(candidate)) => {
@@ -466,8 +442,9 @@ impl CidrEntry {
     }
 }
 
-/// Compiled, validated form of `crate::oauth::OAuthSsrfAllowlist`. Built
-/// once at `OAuthConfig::validate` time (or at `OauthHttpClient::build` /
+/// Compiled, validated form of `crate::oauth::OAuthSsrfAllowlist`.
+///
+/// Built once at `OAuthConfig::validate` time (or at `OauthHttpClient::build` /
 /// `JwksCache::new` time when no separate validate call is made) and
 /// cached on the runtime types for SSRF screening.
 ///
@@ -493,7 +470,7 @@ impl CompiledSsrfAllowlist {
         all(not(test), not(feature = "oauth")),
         expect(dead_code, reason = "consumer is feature-gated")
     )]
-    pub(crate) fn new(hosts: Vec<String>, cidrs: Vec<CidrEntry>) -> Self {
+    pub(crate) const fn new(hosts: Vec<String>, cidrs: Vec<CidrEntry>) -> Self {
         Self { hosts, cidrs }
     }
 
@@ -517,7 +494,7 @@ impl CompiledSsrfAllowlist {
     /// Returns true iff both `hosts` and `cidrs` are empty -- i.e. the
     /// allowlist is a no-op and the default SSRF guard should apply
     /// unchanged.
-    pub(crate) fn is_empty(&self) -> bool {
+    pub(crate) const fn is_empty(&self) -> bool {
         self.hosts.is_empty() && self.cidrs.is_empty()
     }
 
@@ -526,7 +503,7 @@ impl CompiledSsrfAllowlist {
         not(feature = "oauth"),
         expect(dead_code, reason = "consumer is feature-gated")
     )]
-    pub(crate) fn host_count(&self) -> usize {
+    pub(crate) const fn host_count(&self) -> usize {
         self.hosts.len()
     }
 
@@ -535,7 +512,7 @@ impl CompiledSsrfAllowlist {
         not(feature = "oauth"),
         expect(dead_code, reason = "consumer is feature-gated")
     )]
-    pub(crate) fn cidr_count(&self) -> usize {
+    pub(crate) const fn cidr_count(&self) -> usize {
         self.cidrs.len()
     }
 }
@@ -577,58 +554,64 @@ pub(crate) fn redirect_target_reason_with_allowlist(
     Some(reason)
 }
 
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::shadow_unrelated, reason = "lint-migration: src/ssrf.rs")
+#[expect(
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    reason = "test code is not rendered API documentation"
 )]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::assertions_on_result_states,
-        reason = "lint-migration: src/ssrf.rs"
-    )
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::expect_used, reason = "lint-migration: src/ssrf.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::missing_panics_doc,
-        reason = "test code is not rendered API documentation"
-    )
-)]
+#[expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")]
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use url::Url;
 
     use super::{check_scheme, ip_block_reason, sanitized_url_for_log};
 
     #[test]
-    fn https_always_allowed() {
-        let url = Url::parse("https://crl.example/ca.crl").expect("parse");
-        assert!(check_scheme(&url, false).is_ok());
-        assert!(check_scheme(&url, true).is_ok());
+    /// Pins that `https` URLs are accepted regardless of the `allow_http` flag.
+    fn https_always_allowed() -> anyhow::Result<()> {
+        let url = Url::parse("https://crl.example/ca.crl")?;
+        let Ok(()) = check_scheme(&url, false) else {
+            anyhow::bail!("https must be accepted when allow_http is false");
+        };
+        let Ok(()) = check_scheme(&url, true) else {
+            anyhow::bail!("https must be accepted when allow_http is true");
+        };
+        Ok(())
     }
 
     #[test]
-    fn http_gated_by_flag() {
-        let url = Url::parse("http://crl.example/ca.crl").expect("parse");
+    /// Pins that `http` is rejected unless `allow_http` is true.
+    fn http_gated_by_flag() -> anyhow::Result<()> {
+        let url = Url::parse("http://crl.example/ca.crl")?;
         assert_eq!(check_scheme(&url, false), Err("http_scheme_disallowed"));
-        assert!(check_scheme(&url, true).is_ok());
+        let Ok(()) = check_scheme(&url, true) else {
+            anyhow::bail!("http must be accepted when allow_http is true");
+        };
+        Ok(())
     }
 
     #[test]
-    fn other_schemes_rejected() {
+    /// Pins that other schemes are rejected even when `http` is allowed.
+    fn other_schemes_rejected() -> anyhow::Result<()> {
         for raw in ["ldap://x/", "file:///etc/passwd", "ftp://x/", "gopher://x/"] {
-            let url = Url::parse(raw).expect("parse");
+            let url = Url::parse(raw)?;
             assert_eq!(check_scheme(&url, true), Err("invalid_scheme"));
         }
+        Ok(())
     }
 
+    #[cfg(feature = "oauth")]
+    #[expect(
+        clippy::too_long_first_doc_paragraph,
+        reason = "test code is not rendered API documentation"
+    )]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/ssrf.rs::numeric_ipv4_literal_forms_never_pass_as_hostnames keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
     /// Numeric IPv4 literals must never reach the fetch path as an allowed
     /// DNS name. The WHATWG URL parser normalizes decimal, hex, and octal
     /// forms to `Host::Ipv4` before `check_url_literal_ip` sees them, so the
@@ -637,9 +620,7 @@ mod tests {
     ///
     /// The invariant asserted is "not reachable as a `Domain`": either the
     /// URL fails to parse at all, or the literal-IP guard rejects it.
-    #[cfg(feature = "oauth")]
-    #[test]
-    fn numeric_ipv4_literal_forms_never_pass_as_hostnames() {
+    fn numeric_ipv4_literal_forms_never_pass_as_hostnames() -> anyhow::Result<()> {
         for raw in [
             "https://127.0.0.1/",
             "https://2130706433/",
@@ -656,57 +637,77 @@ mod tests {
                 ),
             }
         }
+        Ok(())
     }
 
     #[cfg(feature = "oauth")]
     #[test]
-    fn dns_hostname_still_passes_the_literal_ip_guard() {
-        let url = Url::parse("https://idp.example.com/realms/main").expect("parse");
+    /// Pins that a DNS hostname still passes the literal-IP guard.
+    fn dns_hostname_still_passes_the_literal_ip_guard() -> anyhow::Result<()> {
+        let url = Url::parse("https://idp.example.com/realms/main")?;
         assert!(super::check_url_literal_ip(&url).is_none());
+        Ok(())
     }
 
     #[test]
-    fn userinfo_rejected_on_accepted_schemes() {
+    /// Pins that embedded credentials are rejected on accepted schemes.
+    fn userinfo_rejected_on_accepted_schemes() -> anyhow::Result<()> {
         for raw in ["https://user:pass@host/", "https://user@host/"] {
-            let url = Url::parse(raw).expect("parse");
+            let url = Url::parse(raw)?;
             assert_eq!(check_scheme(&url, false), Err("userinfo_forbidden"));
             assert_eq!(check_scheme(&url, true), Err("userinfo_forbidden"));
         }
-        let url = Url::parse("http://user:pass@host/").expect("parse");
+        let url = Url::parse("http://user:pass@host/")?;
         assert_eq!(check_scheme(&url, true), Err("userinfo_forbidden"));
         // Scheme rejection still wins when the scheme itself is refused.
         assert_eq!(check_scheme(&url, false), Err("http_scheme_disallowed"));
+        Ok(())
     }
 
     #[test]
-    fn sanitized_url_strips_credentials_path_and_query() {
-        let url = Url::parse("https://u:p@h:8443/secret?token=x#frag").expect("parse");
+    /// Pins that sanitized log rendering strips userinfo, path and query.
+    fn sanitized_url_strips_credentials_path_and_query() -> anyhow::Result<()> {
+        let url = Url::parse("https://u:p@h:8443/secret?token=x#frag")?;
         let sanitized = sanitized_url_for_log(&url);
         assert_eq!(sanitized, "https://h:8443");
         assert!(!sanitized.contains("u:p"));
         assert!(!sanitized.contains("secret"));
         assert!(!sanitized.contains("token"));
+        Ok(())
     }
 
     #[test]
-    fn sanitized_url_default_port_and_hostless() {
-        let url = Url::parse("https://crl.example/ca.crl").expect("parse");
+    /// Pins default-port omission and hostless rendering for sanitized logs.
+    fn sanitized_url_default_port_and_hostless() -> anyhow::Result<()> {
+        let url = Url::parse("https://crl.example/ca.crl")?;
         assert_eq!(sanitized_url_for_log(&url), "https://crl.example");
         // Hostless URL must not panic and must signal the missing host.
-        let url = Url::parse("data:text/plain,hello").expect("parse");
-        assert_eq!(sanitized_url_for_log(&url), "data://<no-host>");
+        let hostless = Url::parse("data:text/plain,hello")?;
+        assert_eq!(sanitized_url_for_log(&hostless), "data://<no-host>");
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/ssrf.rs::cloud_metadata_blocked keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn cloud_metadata_blocked() {
+    /// Pins that the IPv4 cloud-metadata address is blocked.
+    fn cloud_metadata_blocked() -> anyhow::Result<()> {
         assert_eq!(
             ip_block_reason(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))),
             Some("cloud_metadata")
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/ssrf.rs::loopback_blocked keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn loopback_blocked() {
+    /// Pins that IPv4 and IPv6 loopback addresses are blocked.
+    fn loopback_blocked() -> anyhow::Result<()> {
         assert_eq!(
             ip_block_reason(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             Some("loopback")
@@ -715,18 +716,31 @@ mod tests {
             ip_block_reason(IpAddr::V6(Ipv6Addr::LOCALHOST)),
             Some("loopback")
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/ssrf.rs::rfc1918_blocked keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn rfc1918_blocked() {
+    /// Pins that the RFC 1918 private ranges are blocked.
+    fn rfc1918_blocked() -> anyhow::Result<()> {
         for raw in [[10, 0, 0, 1], [172, 16, 0, 1], [192, 168, 1, 1]] {
-            let ip = IpAddr::V4(Ipv4Addr::new(raw[0], raw[1], raw[2], raw[3]));
+            let [first, second, third, fourth] = raw;
+            let ip = IpAddr::V4(Ipv4Addr::new(first, second, third, fourth));
             assert_eq!(ip_block_reason(ip), Some("private_rfc1918"), "{ip}");
         }
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/ssrf.rs::transition_prefix_classification keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn transition_prefix_classification() {
+    /// Pins the classification of NAT64, 6to4 and Teredo transition prefixes.
+    fn transition_prefix_classification() -> anyhow::Result<()> {
         // NAT64 64:ff9b::/96 embedding private 10.0.0.1 -> blocked.
         assert_eq!(
             ip_block_reason(IpAddr::V6(Ipv6Addr::new(
@@ -774,10 +788,16 @@ mod tests {
             ip_block_reason(IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1))),
             Some("documentation")
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/ssrf.rs::nat64_embedded_metadata_is_cloud_metadata keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn nat64_embedded_metadata_is_cloud_metadata() {
+    /// Pins that NAT64-wrapped cloud metadata stays `cloud_metadata`.
+    fn nat64_embedded_metadata_is_cloud_metadata() -> anyhow::Result<()> {
         // 64:ff9b::169.254.169.254 - NAT64-wrapped AWS metadata (M2).
         assert_eq!(
             ip_block_reason(IpAddr::V6(Ipv6Addr::new(
@@ -792,10 +812,16 @@ mod tests {
             ))),
             Some("cloud_metadata")
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/ssrf.rs::sixto4_embedded_metadata_is_cloud_metadata keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn sixto4_embedded_metadata_is_cloud_metadata() {
+    /// Pins that 6to4-wrapped cloud metadata stays `cloud_metadata`.
+    fn sixto4_embedded_metadata_is_cloud_metadata() -> anyhow::Result<()> {
         // 2002:a9fe:a9fe:: - 6to4-wrapped 169.254.169.254 (M2).
         assert_eq!(
             ip_block_reason(IpAddr::V6(Ipv6Addr::new(
@@ -803,10 +829,16 @@ mod tests {
             ))),
             Some("cloud_metadata")
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/ssrf.rs::nat64_embedded_private_keeps_transition_label keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn nat64_embedded_private_keeps_transition_label() {
+    /// Pins that non-metadata NAT64 embeds keep the transition label.
+    fn nat64_embedded_private_keeps_transition_label() -> anyhow::Result<()> {
         // Non-metadata embedded blocks keep their (allowlist-bypassable) label.
         assert_eq!(
             ip_block_reason(IpAddr::V6(Ipv6Addr::new(
@@ -814,10 +846,16 @@ mod tests {
             ))),
             Some("nat64_embedded")
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/ssrf.rs::ipv4_compatible_ipv6_blocked keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn ipv4_compatible_ipv6_blocked() {
+    /// Pins that deprecated IPv4-compatible IPv6 addresses are blocked.
+    fn ipv4_compatible_ipv6_blocked() -> anyhow::Result<()> {
         // Deprecated ::a.b.c.d (::/96) inherits IPv4 classification (M3).
         // ::127.0.0.1
         assert_eq!(
@@ -839,10 +877,16 @@ mod tests {
             ip_block_reason(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0x0808, 0x0808))),
             Some("ipv4_compatible")
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/ssrf.rs::unspecified_and_loopback_v6_carveouts_intact keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn unspecified_and_loopback_v6_carveouts_intact() {
+    /// Pins that `::` and `::1` keep their own classifications.
+    fn unspecified_and_loopback_v6_carveouts_intact() -> anyhow::Result<()> {
         // :: and ::1 must NOT be swallowed by the IPv4-compatible arm.
         assert_eq!(
             ip_block_reason(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
@@ -852,10 +896,16 @@ mod tests {
             ip_block_reason(IpAddr::V6(Ipv6Addr::LOCALHOST)),
             Some("loopback")
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/ssrf.rs::this_network_v4_prefix_blocked_not_just_unspecified keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn this_network_v4_prefix_blocked_not_just_unspecified() {
+    /// Pins that the whole 0.0.0.0/8 prefix is blocked, not just `0.0.0.0`.
+    fn this_network_v4_prefix_blocked_not_just_unspecified() -> anyhow::Result<()> {
         // Regression: `Ipv4Addr::is_unspecified` matches ONLY 0.0.0.0, so the
         // rest of 0.0.0.0/8 used to pass screening. Linux >= 5.3 routes
         // nonzero 0/8 as valid unicast, so the whole prefix must be blocked.
@@ -873,20 +923,32 @@ mod tests {
         }
         // The first address outside the prefix stays reachable.
         assert_eq!(ip_block_reason(IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1))), None);
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/ssrf.rs::this_network_blocked_through_ipv4_mapped_v6 keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn this_network_blocked_through_ipv4_mapped_v6() {
+    /// Pins that `this_network` is inherited through IPv4-mapped IPv6.
+    fn this_network_blocked_through_ipv4_mapped_v6() -> anyhow::Result<()> {
         assert_eq!(
             ip_block_reason(IpAddr::V6(Ipv6Addr::new(
                 0, 0, 0, 0, 0, 0xffff, 0x0001, 0x0203
             ))),
             Some("this_network")
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/ssrf.rs::link_local_blocked_v4_v6 keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn link_local_blocked_v4_v6() {
+    /// Pins that IPv4 and IPv6 link-local addresses are blocked.
+    fn link_local_blocked_v4_v6() -> anyhow::Result<()> {
         assert_eq!(
             ip_block_reason(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1))),
             Some("link_local")
@@ -895,10 +957,16 @@ mod tests {
             ip_block_reason(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1))),
             Some("link_local")
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/ssrf.rs::cgnat_blocked keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn cgnat_blocked() {
+    /// Pins that the CGNAT 100.64.0.0/10 range is blocked.
+    fn cgnat_blocked() -> anyhow::Result<()> {
         assert_eq!(
             ip_block_reason(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))),
             Some("cgnat")
@@ -907,36 +975,61 @@ mod tests {
             ip_block_reason(IpAddr::V4(Ipv4Addr::new(100, 127, 255, 254))),
             Some("cgnat")
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/ssrf.rs::documentation_and_benchmarking_blocked keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn documentation_and_benchmarking_blocked() {
+    /// Pins that documentation and benchmarking ranges are blocked.
+    fn documentation_and_benchmarking_blocked() -> anyhow::Result<()> {
         for raw in [[192, 0, 2, 1], [198, 51, 100, 1], [203, 0, 113, 1]] {
-            let ip = IpAddr::V4(Ipv4Addr::new(raw[0], raw[1], raw[2], raw[3]));
+            let [first, second, third, fourth] = raw;
+            let ip = IpAddr::V4(Ipv4Addr::new(first, second, third, fourth));
             assert_eq!(ip_block_reason(ip), Some("documentation"), "{ip}");
         }
         assert_eq!(
             ip_block_reason(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1))),
             Some("benchmarking")
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/ssrf.rs::unique_local_v6_blocked keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn unique_local_v6_blocked() {
+    /// Pins that IPv6 unique-local addresses are blocked.
+    fn unique_local_v6_blocked() -> anyhow::Result<()> {
         assert_eq!(
             ip_block_reason(IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1))),
             Some("unique_local")
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/ssrf.rs::ipv4_mapped_v6_inherits_block keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn ipv4_mapped_v6_inherits_block() {
+    /// Pins that IPv4-mapped IPv6 inherits the embedded IPv4 block.
+    fn ipv4_mapped_v6_inherits_block() -> anyhow::Result<()> {
         let mapped = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 0x0001));
         assert_eq!(ip_block_reason(mapped), Some("loopback"));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/ssrf.rs::public_ips_allowed keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn public_ips_allowed() {
+    /// Pins that public IPv4 and IPv6 addresses are not blocked.
+    fn public_ips_allowed() -> anyhow::Result<()> {
         assert_eq!(ip_block_reason(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))), None);
         assert_eq!(ip_block_reason(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))), None);
         assert_eq!(
@@ -945,14 +1038,20 @@ mod tests {
             ))),
             None
         );
+        Ok(())
     }
 
     // -----------------------------------------------------------------
     // Cloud-metadata classification (Oracle finding #1, pre-work)
     // -----------------------------------------------------------------
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/ssrf.rs::block_reason_classifies_aws_ipv6_metadata_as_cloud_metadata keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn block_reason_classifies_aws_ipv6_metadata_as_cloud_metadata() {
+    /// Pins that AWS IPv6 metadata is labelled `cloud_metadata`.
+    fn block_reason_classifies_aws_ipv6_metadata_as_cloud_metadata() -> anyhow::Result<()> {
         // fd00:ec2::254 sits inside fc00::/7 (unique-local) but MUST be
         // labelled cloud_metadata so a fd00::/8 operator allowlist
         // cannot re-allow it.
@@ -960,19 +1059,31 @@ mod tests {
             ip_block_reason(IpAddr::V6(super::CLOUD_METADATA_V6_AWS)),
             Some("cloud_metadata")
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/ssrf.rs::block_reason_classifies_gcp_ipv6_metadata_as_cloud_metadata keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn block_reason_classifies_gcp_ipv6_metadata_as_cloud_metadata() {
+    /// Pins that GCP IPv6 metadata is labelled `cloud_metadata`.
+    fn block_reason_classifies_gcp_ipv6_metadata_as_cloud_metadata() -> anyhow::Result<()> {
         // fd20:ce::254 -- GCP IPv6 metadata. Same reasoning as AWS.
         assert_eq!(
             ip_block_reason(IpAddr::V6(super::CLOUD_METADATA_V6_GCP)),
             Some("cloud_metadata")
         );
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/ssrf.rs::block_reason_classifies_alibaba_metadata_as_cloud_metadata keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn block_reason_classifies_alibaba_metadata_as_cloud_metadata() {
+    /// Pins that Alibaba/Tencent metadata is labelled `cloud_metadata`.
+    fn block_reason_classifies_alibaba_metadata_as_cloud_metadata() -> anyhow::Result<()> {
         // 100.100.100.200 sits inside 100.64.0.0/10 (CGNAT) but MUST be
         // labelled cloud_metadata so a 100.64.0.0/10 operator allowlist
         // cannot re-allow it.
@@ -980,6 +1091,7 @@ mod tests {
             ip_block_reason(IpAddr::V4(Ipv4Addr::new(100, 100, 100, 200))),
             Some("cloud_metadata")
         );
+        Ok(())
     }
 
     // -----------------------------------------------------------------
@@ -988,8 +1100,9 @@ mod tests {
 
     #[cfg(feature = "oauth")]
     mod cidr {
-        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+        use anyhow::Error;
         use url::Url;
 
         use super::super::{
@@ -997,218 +1110,289 @@ mod tests {
         };
 
         #[test]
-        fn cidr_parse_ipv4_valid() {
-            let entry = CidrEntry::parse("10.0.0.0/8").expect("parses");
+        /// Pins that a valid IPv4 CIDR parses and matches inside addresses.
+        fn cidr_parse_ipv4_valid() -> anyhow::Result<()> {
+            let entry = CidrEntry::parse("10.0.0.0/8").map_err(Error::msg)?;
             assert!(entry.contains(IpAddr::V4(Ipv4Addr::new(10, 5, 6, 7))));
+            Ok(())
         }
 
         #[test]
-        fn cidr_parse_ipv6_valid() {
-            let entry = CidrEntry::parse("fd00::/8").expect("parses");
+        /// Pins that a valid IPv6 CIDR parses and matches inside addresses.
+        fn cidr_parse_ipv6_valid() -> anyhow::Result<()> {
+            let entry = CidrEntry::parse("fd00::/8").map_err(Error::msg)?;
             assert!(entry.contains(IpAddr::V6(Ipv6Addr::new(0xfd11, 0, 0, 0, 0, 0, 0, 1))));
+            Ok(())
         }
 
         #[test]
-        fn cidr_parse_rejects_host_bits_set() {
-            let err = CidrEntry::parse("10.0.0.1/8").expect_err("must reject");
+        /// Pins that a CIDR with non-zero host bits is rejected.
+        fn cidr_parse_rejects_host_bits_set() -> anyhow::Result<()> {
+            let Err(err) = CidrEntry::parse("10.0.0.1/8") else {
+                anyhow::bail!("must reject");
+            };
             assert!(err.contains("non-zero host bits"), "got {err}");
+            Ok(())
         }
 
         #[test]
-        fn cidr_parse_rejects_bad_prefix() {
-            assert!(CidrEntry::parse("10.0.0.0/33").is_err());
-            assert!(CidrEntry::parse("fd00::/129").is_err());
-            assert!(CidrEntry::parse("10.0.0.0/abc").is_err());
+        /// Pins that out-of-range and non-numeric prefixes are rejected.
+        fn cidr_parse_rejects_bad_prefix() -> anyhow::Result<()> {
+            let Err(_) = CidrEntry::parse("10.0.0.0/33") else {
+                anyhow::bail!("IPv4 prefix above 32 must be rejected");
+            };
+            let Err(_) = CidrEntry::parse("fd00::/129") else {
+                anyhow::bail!("IPv6 prefix above 128 must be rejected");
+            };
+            let Err(_) = CidrEntry::parse("10.0.0.0/abc") else {
+                anyhow::bail!("non-numeric prefix must be rejected");
+            };
+            Ok(())
         }
 
         #[test]
-        fn cidr_parse_rejects_no_slash() {
-            assert!(CidrEntry::parse("10.0.0.0").is_err());
+        /// Pins that a CIDR without a `/` separator is rejected.
+        fn cidr_parse_rejects_no_slash() -> anyhow::Result<()> {
+            let Err(_) = CidrEntry::parse("10.0.0.0") else {
+                anyhow::bail!("a CIDR without a prefix length must be rejected");
+            };
+            Ok(())
         }
 
         #[test]
-        fn cidr_parse_rejects_zero_prefix_v4() {
+        /// Pins that a zero IPv4 prefix is rejected.
+        fn cidr_parse_rejects_zero_prefix_v4() -> anyhow::Result<()> {
             // 0.0.0.0/0 would allow every IPv4 address -- defeats the
             // entire SSRF guard. Operators must enumerate.
-            let err = CidrEntry::parse("0.0.0.0/0").expect_err("must reject");
+            let Err(err) = CidrEntry::parse("0.0.0.0/0") else {
+                anyhow::bail!("must reject");
+            };
             assert!(err.contains("prefix length 0"), "got {err}");
+            Ok(())
         }
 
         #[test]
-        fn cidr_parse_rejects_zero_prefix_v6() {
-            let err = CidrEntry::parse("::/0").expect_err("must reject");
+        /// Pins that a zero IPv6 prefix is rejected.
+        fn cidr_parse_rejects_zero_prefix_v6() -> anyhow::Result<()> {
+            let Err(err) = CidrEntry::parse("::/0") else {
+                anyhow::bail!("must reject");
+            };
             assert!(err.contains("prefix length 0"), "got {err}");
+            Ok(())
         }
 
         #[test]
-        fn cidr_parse_rejects_ipv4_mapped_v6() {
+        /// Pins that IPv4-mapped IPv6 CIDRs are rejected.
+        fn cidr_parse_rejects_ipv4_mapped_v6() -> anyhow::Result<()> {
             // ::ffff:127.0.0.0/104 would map to 127.0.0.0/8 on the
             // candidate side; ip_block_reason normalises mapped v6 ->
             // v4 but contains() is family-strict, so allow only the
             // IPv4 form to avoid the asymmetry.
-            let err = CidrEntry::parse("::ffff:127.0.0.0/104").expect_err("must reject");
+            let Err(err) = CidrEntry::parse("::ffff:127.0.0.0/104") else {
+                anyhow::bail!("must reject");
+            };
             assert!(err.contains("IPv4-mapped"), "got {err}");
+            Ok(())
         }
 
         #[test]
-        fn cidr_parse_rejects_ipv6_zone_id() {
+        /// Pins that IPv6 zone identifiers are rejected.
+        fn cidr_parse_rejects_ipv6_zone_id() -> anyhow::Result<()> {
             // IpAddr::from_str rejects zone identifiers; the parser
             // surfaces the parse error verbatim.
-            assert!(CidrEntry::parse("fe80::1%eth0/64").is_err());
+            let Err(_) = CidrEntry::parse("fe80::1%eth0/64") else {
+                anyhow::bail!("a zone identifier must be rejected");
+            };
+            Ok(())
         }
 
         #[test]
-        fn cidr_contains_ipv4_inside_and_outside() {
-            let entry = CidrEntry::parse("10.0.0.0/8").expect("parses");
+        /// Pins IPv4 inside/outside matching for a CIDR entry.
+        fn cidr_contains_ipv4_inside_and_outside() -> anyhow::Result<()> {
+            let entry = CidrEntry::parse("10.0.0.0/8").map_err(Error::msg)?;
             assert!(entry.contains(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
             assert!(entry.contains(IpAddr::V4(Ipv4Addr::new(10, 255, 255, 255))));
             assert!(!entry.contains(IpAddr::V4(Ipv4Addr::new(11, 0, 0, 1))));
             assert!(!entry.contains(IpAddr::V4(Ipv4Addr::new(9, 255, 255, 255))));
+            Ok(())
         }
 
         #[test]
-        fn cidr_contains_ipv6_inside_and_outside() {
-            let entry = CidrEntry::parse("fd00::/8").expect("parses");
+        /// Pins IPv6 inside/outside matching for a CIDR entry.
+        fn cidr_contains_ipv6_inside_and_outside() -> anyhow::Result<()> {
+            let entry = CidrEntry::parse("fd00::/8").map_err(Error::msg)?;
             assert!(entry.contains(IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1))));
             assert!(entry.contains(IpAddr::V6(Ipv6Addr::new(0xfdff, 0xffff, 0, 0, 0, 0, 0, 0))));
             assert!(!entry.contains(IpAddr::V6(Ipv6Addr::new(0xfe00, 0, 0, 0, 0, 0, 0, 1))));
+            Ok(())
         }
 
         #[test]
-        fn cidr_contains_rejects_family_mismatch() {
-            let v4 = CidrEntry::parse("10.0.0.0/8").expect("parses");
+        /// Pins that a CIDR entry never matches the other IP family.
+        fn cidr_contains_rejects_family_mismatch() -> anyhow::Result<()> {
+            let v4 = CidrEntry::parse("10.0.0.0/8").map_err(Error::msg)?;
             assert!(!v4.contains(IpAddr::V6(Ipv6Addr::LOCALHOST)));
-            let v6 = CidrEntry::parse("fd00::/8").expect("parses");
+            let v6 = CidrEntry::parse("fd00::/8").map_err(Error::msg)?;
             assert!(!v6.contains(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+            Ok(())
         }
 
+        #[expect(
+            clippy::unnecessary_wraps,
+            reason = "deliberate: src/ssrf.rs::tests::cidr::compiled_allowlist_host_allowed_case_insensitive keeps the uniform test signature while it cannot fail"
+        )]
         #[test]
-        fn compiled_allowlist_host_allowed_case_insensitive() {
+        /// Pins case-insensitive hostname matching in the compiled allowlist.
+        fn compiled_allowlist_host_allowed_case_insensitive() -> anyhow::Result<()> {
             let allow =
                 CompiledSsrfAllowlist::new(vec!["keycloak.svc.cluster.local".into()], Vec::new());
             assert!(allow.host_allowed("keycloak.svc.cluster.local"));
             assert!(allow.host_allowed("KEYCLOAK.SVC.CLUSTER.LOCAL"));
             assert!(!allow.host_allowed("other.svc.cluster.local"));
             assert!(!allow.host_allowed(""));
+            Ok(())
         }
 
+        #[expect(
+            clippy::unnecessary_wraps,
+            reason = "deliberate: src/ssrf.rs::tests::cidr::compiled_allowlist_empty_is_empty keeps the uniform test signature while it cannot fail"
+        )]
         #[test]
-        fn compiled_allowlist_empty_is_empty() {
+        /// Pins that a default compiled allowlist reports empty.
+        fn compiled_allowlist_empty_is_empty() -> anyhow::Result<()> {
             let allow = CompiledSsrfAllowlist::default();
             assert!(allow.is_empty());
             assert_eq!(allow.host_count(), 0);
             assert_eq!(allow.cidr_count(), 0);
+            Ok(())
         }
 
         #[test]
-        fn redirect_target_reason_with_allowlist_allows_listed_cidr() {
+        /// Pins that an allowlisted CIDR is accepted for a literal-IP target.
+        fn redirect_target_reason_with_allowlist_allows_listed_cidr() -> anyhow::Result<()> {
             let allow = CompiledSsrfAllowlist::new(
                 Vec::new(),
-                vec![CidrEntry::parse("10.0.0.0/8").expect("parses")],
+                vec![CidrEntry::parse("10.0.0.0/8").map_err(Error::msg)?],
             );
-            let url = Url::parse("https://10.97.137.37/realms/x").expect("parses");
+            let url = Url::parse("https://10.97.137.37/realms/x")?;
             assert_eq!(redirect_target_reason_with_allowlist(&url, &allow), None);
+            Ok(())
         }
 
         #[test]
-        fn redirect_target_reason_with_allowlist_blocks_unlisted_private() {
+        /// Pins that a private target outside the allowlist stays blocked.
+        fn redirect_target_reason_with_allowlist_blocks_unlisted_private() -> anyhow::Result<()> {
             let allow = CompiledSsrfAllowlist::new(
                 Vec::new(),
-                vec![CidrEntry::parse("10.0.0.0/8").expect("parses")],
+                vec![CidrEntry::parse("10.0.0.0/8").map_err(Error::msg)?],
             );
-            let url = Url::parse("https://192.168.1.1/").expect("parses");
+            let url = Url::parse("https://192.168.1.1/")?;
             assert_eq!(
                 redirect_target_reason_with_allowlist(&url, &allow),
                 Some("private_rfc1918")
             );
+            Ok(())
         }
 
         #[test]
-        fn redirect_target_reason_with_allowlist_never_allows_cloud_metadata_v4() {
+        /// Pins that an allowlist cannot re-allow IPv4 cloud metadata.
+        fn redirect_target_reason_with_allowlist_never_allows_cloud_metadata_v4()
+        -> anyhow::Result<()> {
             // Even when 169.254.169.254 is listed via a /16 CIDR, the
             // cloud-metadata short-circuit fires first.
             let allow = CompiledSsrfAllowlist::new(
                 Vec::new(),
-                vec![CidrEntry::parse("169.254.0.0/16").expect("parses")],
+                vec![CidrEntry::parse("169.254.0.0/16").map_err(Error::msg)?],
             );
-            let url = Url::parse("https://169.254.169.254/latest/meta-data/").expect("parses");
+            let url = Url::parse("https://169.254.169.254/latest/meta-data/")?;
             assert_eq!(
                 redirect_target_reason_with_allowlist(&url, &allow),
                 Some("cloud_metadata")
             );
+            Ok(())
         }
 
         #[test]
-        fn redirect_with_fd00_8_allowlist_still_blocks_aws_v6_metadata() {
+        /// Pins that an `fd00::/8` allowlist cannot re-allow AWS v6 metadata.
+        fn redirect_with_fd00_8_allowlist_still_blocks_aws_v6_metadata() -> anyhow::Result<()> {
             // Pins the strongest invariant in this patch: an operator
             // allowlist matching the issue's exact example
             // (`fd00::/8`) MUST NOT re-allow AWS IPv6 metadata.
             let allow = CompiledSsrfAllowlist::new(
                 Vec::new(),
-                vec![CidrEntry::parse("fd00::/8").expect("parses")],
+                vec![CidrEntry::parse("fd00::/8").map_err(Error::msg)?],
             );
-            let url = Url::parse("https://[fd00:ec2::254]/latest/meta-data/").expect("parses");
+            let url = Url::parse("https://[fd00:ec2::254]/latest/meta-data/")?;
             assert_eq!(
                 redirect_target_reason_with_allowlist(&url, &allow),
                 Some("cloud_metadata")
             );
+            Ok(())
         }
 
         #[test]
-        fn redirect_with_fd20_16_allowlist_still_blocks_gcp_v6_metadata() {
+        /// Pins that an `fd20::/16` allowlist cannot re-allow GCP v6 metadata.
+        fn redirect_with_fd20_16_allowlist_still_blocks_gcp_v6_metadata() -> anyhow::Result<()> {
             // Pins the GCP IPv6 metadata invariant: an operator
             // allowlist matching the enclosing /16 (or any other
             // legitimate ULA prefix) MUST NOT re-allow GCP IPv6
             // metadata at `fd20:ce::254`.
             let allow = CompiledSsrfAllowlist::new(
                 Vec::new(),
-                vec![CidrEntry::parse("fd20::/16").expect("parses")],
+                vec![CidrEntry::parse("fd20::/16").map_err(Error::msg)?],
             );
-            let url = Url::parse("https://[fd20:ce::254]/computeMetadata/v1/").expect("parses");
+            let url = Url::parse("https://[fd20:ce::254]/computeMetadata/v1/")?;
             assert_eq!(
                 redirect_target_reason_with_allowlist(&url, &allow),
                 Some("cloud_metadata")
             );
+            Ok(())
         }
 
         #[test]
-        fn redirect_with_cgnat_allowlist_still_blocks_alibaba_metadata() {
+        /// Pins that a CGNAT allowlist cannot re-allow Alibaba metadata.
+        fn redirect_with_cgnat_allowlist_still_blocks_alibaba_metadata() -> anyhow::Result<()> {
             // Same invariant for Alibaba/Tencent IPv4 metadata
             // (sits inside 100.64.0.0/10 CGNAT).
             let allow = CompiledSsrfAllowlist::new(
                 Vec::new(),
-                vec![CidrEntry::parse("100.64.0.0/10").expect("parses")],
+                vec![CidrEntry::parse("100.64.0.0/10").map_err(Error::msg)?],
             );
-            let url = Url::parse("https://100.100.100.200/latest/meta-data/").expect("parses");
+            let url = Url::parse("https://100.100.100.200/latest/meta-data/")?;
             assert_eq!(
                 redirect_target_reason_with_allowlist(&url, &allow),
                 Some("cloud_metadata")
             );
+            Ok(())
         }
 
         #[test]
-        fn allowlist_cannot_bypass_transition_metadata() {
+        /// Pins that a NAT64-prefix allowlist cannot re-allow wrapped metadata.
+        fn allowlist_cannot_bypass_transition_metadata() -> anyhow::Result<()> {
             // An allowlist over the NAT64 prefix must NOT re-allow metadata
             // wrapped in a NAT64 address: 64:ff9b::169.254.169.254 (M2 regression).
             let allow = CompiledSsrfAllowlist::new(
                 Vec::new(),
-                vec![CidrEntry::parse("64:ff9b::/96").expect("parses")],
+                vec![CidrEntry::parse("64:ff9b::/96").map_err(Error::msg)?],
             );
-            let url = Url::parse("https://[64:ff9b::a9fe:a9fe]/latest/meta-data/").expect("parses");
+            let url = Url::parse("https://[64:ff9b::a9fe:a9fe]/latest/meta-data/")?;
             assert_eq!(
                 redirect_target_reason_with_allowlist(&url, &allow),
                 Some("cloud_metadata")
             );
+            Ok(())
         }
 
         #[test]
-        fn redirect_target_reason_with_allowlist_rejects_userinfo() {
+        /// Pins that embedded userinfo is rejected before allowlist checks.
+        fn redirect_target_reason_with_allowlist_rejects_userinfo() -> anyhow::Result<()> {
             let allow = CompiledSsrfAllowlist::default();
-            let url = Url::parse("https://user:pass@example.com/").expect("parses");
+            let url = Url::parse("https://user:pass@example.com/")?;
             assert_eq!(
                 redirect_target_reason_with_allowlist(&url, &allow),
                 Some("userinfo (credentials in URL) forbidden")
             );
+            Ok(())
         }
     }
 }

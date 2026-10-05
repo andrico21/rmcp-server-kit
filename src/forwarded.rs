@@ -14,62 +14,7 @@
 //! identifiers, chains that exhaust into trusted space, header bombs -
 //! falls back to the **direct peer**, never to a header value. Raw header
 //! contents are never logged; callers receive a [`FallbackReason`] code.
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::min_ident_chars, reason = "lint-migration: src/forwarded.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::too_long_first_doc_paragraph,
-        reason = "lint-migration: src/forwarded.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::map_err_ignore, reason = "lint-migration: src/forwarded.rs")
-)]
-#![cfg_attr(
-    all(not(test), target_os = "linux"),
-    expect(
-        clippy::missing_docs_in_private_items,
-        reason = "lint-migration: src/forwarded.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::arithmetic_side_effects,
-        reason = "lint-migration: src/forwarded.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(clippy::shadow_reuse, reason = "lint-migration: src/forwarded.rs")
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_errors_doc,
-        reason = "lint-migration: src/forwarded.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::redundant_pub_crate,
-        reason = "lint-migration: src/forwarded.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::std_instead_of_core,
-        reason = "lint-migration: src/forwarded.rs"
-    )
-)]
-
-use std::net::IpAddr;
+use core::net::IpAddr;
 
 use axum::http::{HeaderMap, HeaderName};
 use ipnet::IpNet;
@@ -119,6 +64,13 @@ pub(crate) enum FallbackReason {
 /// - Direct peer trusted → rightmost-untrusted walk over the **last**
 ///   instance of the configured header; `Ok(client)` on success,
 ///   `Err(reason)` when the caller must fall back to `direct`.
+///
+/// # Errors
+///
+/// Returns a [`FallbackReason`] code when resolution must fall back to
+/// `direct`: the configured header is absent, its last instance is not
+/// valid UTF-8, a scanned entry is malformed or obfuscated, every scanned
+/// entry is a trusted proxy, or the chain exceeds the scan cap.
 pub(crate) fn resolve_client_ip(
     direct: IpAddr,
     headers: &HeaderMap,
@@ -140,13 +92,13 @@ pub(crate) fn resolve_client_ip(
     let Some(value) = headers.get_all(&header_name).iter().next_back() else {
         return Err(FallbackReason::NoHeader);
     };
-    let Ok(value) = value.to_str() else {
+    let Ok(text) = value.to_str() else {
         return Err(FallbackReason::MalformedEntry);
     };
 
     let mut scanned = 0_usize;
-    for raw_entry in value.split(',').rev() {
-        scanned += 1;
+    for raw_entry in text.split(',').rev() {
+        scanned = scanned.saturating_add(1);
         if scanned > max_scanned_entries {
             return Err(FallbackReason::TooManyEntries);
         }
@@ -162,12 +114,18 @@ pub(crate) fn resolve_client_ip(
     Err(FallbackReason::AllEntriesTrusted)
 }
 
+/// Return whether `ip` falls inside any trusted-proxy network in `trusted`.
 pub(crate) fn is_trusted(ip: IpAddr, trusted: &[IpNet]) -> bool {
     trusted.iter().any(|net| net.contains(&ip))
 }
 
 /// Parse one `X-Forwarded-For` list entry: an IP, optionally with a port
 /// (`1.2.3.4:5678`, `[2001:db8::1]:443`) and surrounded by OWS.
+///
+/// # Errors
+///
+/// Returns [`FallbackReason::MalformedEntry`] when the trimmed entry is
+/// empty or is not a valid node identifier.
 fn parse_xff_entry(raw: &str) -> Result<IpAddr, FallbackReason> {
     let token = raw.trim();
     if token.is_empty() {
@@ -180,6 +138,13 @@ fn parse_xff_entry(raw: &str) -> Result<IpAddr, FallbackReason> {
 ///
 /// Stanza shape: `for=X;by=Y;proto=Z` - parameters separated by `;`,
 /// names case-insensitive, values optionally double-quoted.
+///
+/// # Errors
+///
+/// Returns [`FallbackReason::MalformedEntry`] when the stanza is empty, the
+/// `for=` value is neither a token nor a balanced quoted-string, or the
+/// node identifier is invalid; returns [`FallbackReason::Obfuscated`] for
+/// RFC 7239 obfuscated or `unknown` identifiers.
 fn parse_forwarded_entry(raw: &str) -> Result<IpAddr, FallbackReason> {
     let stanza = raw.trim();
     if stanza.is_empty() {
@@ -198,11 +163,11 @@ fn parse_forwarded_entry(raw: &str) -> Result<IpAddr, FallbackReason> {
         // and `"""1.2.3.4"""` are all malformed, and normalizing them into a
         // valid address would create a parser differential with the upstream
         // proxy whose decision we are supposed to be mirroring.
-        let value = value.trim();
-        let Some(value) = (match value.strip_circumfix("\"", "\"") {
+        let trimmed = value.trim();
+        let Some(node) = (match trimmed.strip_circumfix("\"", "\"") {
             Some(inner) => Some(inner),
             // Bare token: legitimately unquoted, so no `"` may appear at all.
-            None if !value.contains('"') => Some(value),
+            None if !trimmed.contains('"') => Some(trimmed),
             // Unbalanced or repeated quotes: neither token nor quoted-string.
             None => None,
         }) else {
@@ -211,16 +176,22 @@ fn parse_forwarded_entry(raw: &str) -> Result<IpAddr, FallbackReason> {
         // RFC 7239 §6: obfuscated identifiers start with '_'; "unknown"
         // means the previous hop could not be identified. Either way the
         // chain cannot be verified past this point.
-        if value.eq_ignore_ascii_case("unknown") || value.starts_with('_') {
+        if node.eq_ignore_ascii_case("unknown") || node.starts_with('_') {
             return Err(FallbackReason::Obfuscated);
         }
-        return parse_node_identifier(value);
+        return parse_node_identifier(node);
     }
     // A stanza without a `for=` parameter cannot identify the hop.
     Err(FallbackReason::MalformedEntry)
 }
 
 /// Parse a node identifier: bare IPv4/IPv6, `v4:port`, or `[v6]:port`.
+///
+/// # Errors
+///
+/// Returns [`FallbackReason::MalformedEntry`] when the token is empty, a
+/// bracketed or `host:port` form carries an invalid port, or the address
+/// fails to parse.
 fn parse_node_identifier(token: &str) -> Result<IpAddr, FallbackReason> {
     if token.is_empty() {
         return Err(FallbackReason::MalformedEntry);
@@ -236,7 +207,7 @@ fn parse_node_identifier(token: &str) -> Result<IpAddr, FallbackReason> {
         }
         return inner
             .parse::<IpAddr>()
-            .map_err(|_| FallbackReason::MalformedEntry);
+            .map_err(|_error| FallbackReason::MalformedEntry);
     }
     // Bare address first: covers IPv4 and unbracketed IPv6 (which contains
     // multiple colons and must NOT be split on ':').
@@ -253,49 +224,33 @@ fn parse_node_identifier(token: &str) -> Result<IpAddr, FallbackReason> {
         }
         return host
             .parse::<IpAddr>()
-            .map_err(|_| FallbackReason::MalformedEntry);
+            .map_err(|_error| FallbackReason::MalformedEntry);
     }
     Err(FallbackReason::MalformedEntry)
 }
 
-/// A forwarding-node port must be a non-empty decimal `u16`. An empty or
-/// non-numeric port marks the entry malformed so resolution falls back to
-/// the direct peer rather than trusting an ambiguous node identifier.
+/// A forwarding-node port must be a non-empty decimal `u16`.
+///
+/// An empty or non-numeric port marks the entry malformed so resolution
+/// falls back to the direct peer rather than trusting an ambiguous node
+/// identifier.
 fn is_valid_port(port: &str) -> bool {
-    !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok()
+    !port.is_empty()
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+        && port.parse::<u16>().is_ok()
 }
 
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::default_numeric_fallback,
-        reason = "lint-migration: src/forwarded.rs"
-    )
+#[expect(
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    reason = "test code is not rendered API documentation"
 )]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::shadow_unrelated, reason = "lint-migration: src/forwarded.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::unwrap_used, reason = "lint-migration: src/forwarded.rs")
-)]
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(
-        clippy::missing_panics_doc,
-        reason = "test code is not rendered API documentation"
-    )
-)]
-#[cfg_attr(
-    test,
-    expect(unused_results, reason = "lint-migration: src/forwarded.rs")
-)]
+#[expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")]
 #[cfg(test)]
 mod tests {
-
     use core::net::{Ipv4Addr, Ipv6Addr};
 
+    use anyhow::Context as _;
     use axum::http::HeaderValue;
     use proptest::{collection, prelude::*};
 
@@ -309,133 +264,157 @@ mod tests {
         ]
     }
 
-    fn nets(specs: &[&str]) -> Vec<IpNet> {
-        specs.iter().map(|s| s.parse().unwrap()).collect()
+    /// Parse a CIDR fixture for the trusted-proxy set.
+    fn nets(specs: &[&str]) -> anyhow::Result<Vec<IpNet>> {
+        specs
+            .iter()
+            .map(|spec| spec.parse::<IpNet>().context("test CIDR must parse"))
+            .collect()
     }
 
-    fn ip(s: &str) -> IpAddr {
-        s.parse().unwrap()
+    /// Parse an IP fixture for a request peer or header value.
+    fn ip(addr: &str) -> anyhow::Result<IpAddr> {
+        addr.parse::<IpAddr>().context("test IP must parse")
     }
 
     #[test]
-    fn scan_cap_is_honoured_from_the_parameter_not_the_constant() {
+    /// Pins that the scan cap comes from the parameter, not the constant.
+    fn scan_cap_is_honoured_from_the_parameter_not_the_constant() -> anyhow::Result<()> {
         // 3 entries, cap of 2: the walk aborts and the caller falls back to
         // the direct peer rather than trusting a truncated chain.
-        let headers = xff(&["1.1.1.1, 10.0.0.2, 10.0.0.3"]);
-        let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), XFF, 2);
+        let headers = xff(&["1.1.1.1, 10.0.0.2, 10.0.0.3"])?;
+        let got = resolve_client_ip(ip("10.0.0.1")?, &headers, &nets(&["10.0.0.0/8"])?, XFF, 2);
         assert_eq!(got, Err(FallbackReason::TooManyEntries));
 
         // Same chain, cap of 3: the untrusted client IP is resolved.
-        let got = resolve_client_ip(ip("10.0.0.1"), &headers, &nets(&["10.0.0.0/8"]), XFF, 3);
-        assert_eq!(got, Ok(ip("1.1.1.1")));
+        let found = resolve_client_ip(ip("10.0.0.1")?, &headers, &nets(&["10.0.0.0/8"])?, XFF, 3);
+        assert_eq!(found, Ok(ip("1.1.1.1")?));
+        Ok(())
     }
 
-    fn xff(values: &[&str]) -> HeaderMap {
-        let mut h = HeaderMap::new();
-        for v in values {
-            h.append("x-forwarded-for", HeaderValue::from_str(v).unwrap());
+    /// Build an `X-Forwarded-For` header map from fixture values.
+    fn xff(values: &[&str]) -> anyhow::Result<HeaderMap> {
+        let mut headers = HeaderMap::new();
+        for value in values {
+            let header = HeaderValue::from_str(value).context("bad header value")?;
+            let _appended = headers.append("x-forwarded-for", header);
         }
-        h
+        Ok(headers)
     }
 
-    fn fwd(values: &[&str]) -> HeaderMap {
-        let mut h = HeaderMap::new();
-        for v in values {
-            h.append("forwarded", HeaderValue::from_str(v).unwrap());
+    /// Build a `Forwarded` header map from fixture values.
+    fn fwd(values: &[&str]) -> anyhow::Result<HeaderMap> {
+        let mut headers = HeaderMap::new();
+        for value in values {
+            let header = HeaderValue::from_str(value).context("bad header value")?;
+            let _appended = headers.append("forwarded", header);
         }
-        h
+        Ok(headers)
     }
 
     const XFF: ForwardedHeaderMode = ForwardedHeaderMode::XForwardedFor;
     const FWD: ForwardedHeaderMode = ForwardedHeaderMode::Forwarded;
 
     #[test]
-    fn untrusted_direct_peer_ignores_header() {
-        let headers = xff(&["203.0.113.7"]);
+    /// Pins that a direct peer outside the trusted set ignores the header.
+    fn untrusted_direct_peer_ignores_header() -> anyhow::Result<()> {
+        let headers = xff(&["203.0.113.7"])?;
         let got = resolve_client_ip(
-            ip("198.51.100.9"),
+            ip("198.51.100.9")?,
             &headers,
-            &nets(&["10.0.0.0/8"]),
+            &nets(&["10.0.0.0/8"])?,
             XFF,
             MAX_SCANNED_ENTRIES,
         );
-        assert_eq!(got, Ok(ip("198.51.100.9")), "header must be ignored");
+        assert_eq!(got, Ok(ip("198.51.100.9")?), "header must be ignored");
+        Ok(())
     }
 
     #[test]
-    fn trusted_peer_single_entry_resolves() {
-        let headers = xff(&["203.0.113.7"]);
+    /// Pins that a single untrusted header entry resolves for a trusted peer.
+    fn trusted_peer_single_entry_resolves() -> anyhow::Result<()> {
+        let headers = xff(&["203.0.113.7"])?;
         let got = resolve_client_ip(
-            ip("10.0.0.1"),
+            ip("10.0.0.1")?,
             &headers,
-            &nets(&["10.0.0.0/8"]),
+            &nets(&["10.0.0.0/8"])?,
             XFF,
             MAX_SCANNED_ENTRIES,
         );
-        assert_eq!(got, Ok(ip("203.0.113.7")));
+        assert_eq!(got, Ok(ip("203.0.113.7")?));
+        Ok(())
     }
 
     #[test]
-    fn multi_hop_chain_skips_trusted_right_to_left() {
+    /// Pins that a multi-hop chain skips trusted proxies right to left.
+    fn multi_hop_chain_skips_trusted_right_to_left() -> anyhow::Result<()> {
         // client -> proxy A (10.0.0.2) -> proxy B (10.0.0.1) -> us
-        let headers = xff(&["203.0.113.7, 10.0.0.2"]);
+        let headers = xff(&["203.0.113.7, 10.0.0.2"])?;
         let got = resolve_client_ip(
-            ip("10.0.0.1"),
+            ip("10.0.0.1")?,
             &headers,
-            &nets(&["10.0.0.0/8"]),
+            &nets(&["10.0.0.0/8"])?,
             XFF,
             MAX_SCANNED_ENTRIES,
         );
-        assert_eq!(got, Ok(ip("203.0.113.7")));
+        assert_eq!(got, Ok(ip("203.0.113.7")?));
+        Ok(())
     }
 
     #[test]
-    fn all_entries_trusted_falls_back() {
-        let headers = xff(&["10.0.0.3, 10.0.0.2"]);
+    /// Pins that a chain with no untrusted hop falls back to the peer.
+    fn all_entries_trusted_falls_back() -> anyhow::Result<()> {
+        let headers = xff(&["10.0.0.3, 10.0.0.2"])?;
         let got = resolve_client_ip(
-            ip("10.0.0.1"),
+            ip("10.0.0.1")?,
             &headers,
-            &nets(&["10.0.0.0/8"]),
+            &nets(&["10.0.0.0/8"])?,
             XFF,
             MAX_SCANNED_ENTRIES,
         );
         assert_eq!(got, Err(FallbackReason::AllEntriesTrusted));
+        Ok(())
     }
 
     #[test]
-    fn missing_header_falls_back() {
+    /// Pins that an absent header falls back with `NoHeader`.
+    fn missing_header_falls_back() -> anyhow::Result<()> {
         let headers = HeaderMap::new();
         let got = resolve_client_ip(
-            ip("10.0.0.1"),
+            ip("10.0.0.1")?,
             &headers,
-            &nets(&["10.0.0.0/8"]),
+            &nets(&["10.0.0.0/8"])?,
             XFF,
             MAX_SCANNED_ENTRIES,
         );
         assert_eq!(got, Err(FallbackReason::NoHeader));
+        Ok(())
     }
 
     #[test]
-    fn malformed_entry_at_decision_point_falls_back() {
-        let headers = xff(&["not-an-ip"]);
+    /// Pins that a malformed entry at the decision point falls back.
+    fn malformed_entry_at_decision_point_falls_back() -> anyhow::Result<()> {
+        let headers = xff(&["not-an-ip"])?;
         let got = resolve_client_ip(
-            ip("10.0.0.1"),
+            ip("10.0.0.1")?,
             &headers,
-            &nets(&["10.0.0.0/8"]),
+            &nets(&["10.0.0.0/8"])?,
             XFF,
             MAX_SCANNED_ENTRIES,
         );
         assert_eq!(got, Err(FallbackReason::MalformedEntry));
+        Ok(())
     }
 
     #[test]
-    fn empty_and_whitespace_tokens_fall_back() {
+    /// Pins that empty and whitespace-only list entries fall back.
+    fn empty_and_whitespace_tokens_fall_back() -> anyhow::Result<()> {
         for value in ["203.0.113.7,,10.0.0.2", "203.0.113.7,   ,10.0.0.2"] {
-            let headers = xff(&[value]);
+            let headers = xff(&[value])?;
             let got = resolve_client_ip(
-                ip("10.0.0.1"),
+                ip("10.0.0.1")?,
                 &headers,
-                &nets(&["10.0.0.0/8"]),
+                &nets(&["10.0.0.0/8"])?,
                 XFF,
                 MAX_SCANNED_ENTRIES,
             );
@@ -443,49 +422,57 @@ mod tests {
             // the empty token at the decision point.
             assert_eq!(got, Err(FallbackReason::MalformedEntry), "value: {value:?}");
         }
+        Ok(())
     }
 
     #[test]
-    fn ows_around_entries_is_trimmed() {
-        let headers = xff(&["  203.0.113.7  ,  10.0.0.2  "]);
+    /// Pins that optional whitespace around entries is trimmed.
+    fn ows_around_entries_is_trimmed() -> anyhow::Result<()> {
+        let headers = xff(&["  203.0.113.7  ,  10.0.0.2  "])?;
         let got = resolve_client_ip(
-            ip("10.0.0.1"),
+            ip("10.0.0.1")?,
             &headers,
-            &nets(&["10.0.0.0/8"]),
+            &nets(&["10.0.0.0/8"])?,
             XFF,
             MAX_SCANNED_ENTRIES,
         );
-        assert_eq!(got, Ok(ip("203.0.113.7")));
+        assert_eq!(got, Ok(ip("203.0.113.7")?));
+        Ok(())
     }
 
     #[test]
-    fn xff_v4_with_port_parses() {
-        let headers = xff(&["203.0.113.7:5678"]);
+    /// Pins that an `X-Forwarded-For` IPv4 entry may carry a port.
+    fn xff_v4_with_port_parses() -> anyhow::Result<()> {
+        let headers = xff(&["203.0.113.7:5678"])?;
         let got = resolve_client_ip(
-            ip("10.0.0.1"),
+            ip("10.0.0.1")?,
             &headers,
-            &nets(&["10.0.0.0/8"]),
+            &nets(&["10.0.0.0/8"])?,
             XFF,
             MAX_SCANNED_ENTRIES,
         );
-        assert_eq!(got, Ok(ip("203.0.113.7")));
+        assert_eq!(got, Ok(ip("203.0.113.7")?));
+        Ok(())
     }
 
     #[test]
-    fn xff_empty_port_falls_back() {
-        let headers = xff(&["203.0.113.7:"]);
+    /// Pins that an empty port marks the entry malformed.
+    fn xff_empty_port_falls_back() -> anyhow::Result<()> {
+        let headers = xff(&["203.0.113.7:"])?;
         let got = resolve_client_ip(
-            ip("10.0.0.1"),
+            ip("10.0.0.1")?,
             &headers,
-            &nets(&["10.0.0.0/8"]),
+            &nets(&["10.0.0.0/8"])?,
             XFF,
             MAX_SCANNED_ENTRIES,
         );
         assert_eq!(got, Err(FallbackReason::MalformedEntry));
+        Ok(())
     }
 
     #[test]
-    fn xff_nonnumeric_port_falls_back() {
+    /// Pins that non-numeric and out-of-range ports are rejected.
+    fn xff_nonnumeric_port_falls_back() -> anyhow::Result<()> {
         for value in [
             "[2001:db8::1]:notaport",
             "203.0.113.7:notaport",
@@ -493,153 +480,173 @@ mod tests {
             "203.0.113.7:+443",
             "[2001:db8::1]:+443",
         ] {
-            let headers = xff(&[value]);
+            let headers = xff(&[value])?;
             let got = resolve_client_ip(
-                ip("10.0.0.1"),
+                ip("10.0.0.1")?,
                 &headers,
-                &nets(&["10.0.0.0/8"]),
+                &nets(&["10.0.0.0/8"])?,
                 XFF,
                 MAX_SCANNED_ENTRIES,
             );
             assert_eq!(got, Err(FallbackReason::MalformedEntry), "value: {value:?}");
         }
+        Ok(())
     }
 
     #[test]
-    fn xff_bracketed_v6_with_port_and_bare_v6_parse() {
-        let headers = xff(&["[2001:db8::1]:443"]);
-        let got = resolve_client_ip(
-            ip("10.0.0.1"),
-            &headers,
-            &nets(&["10.0.0.0/8"]),
+    /// Pins that bracketed IPv6 with a port and bare IPv6 both parse.
+    fn xff_bracketed_v6_with_port_and_bare_v6_parse() -> anyhow::Result<()> {
+        let bracketed_headers = xff(&["[2001:db8::1]:443"])?;
+        let bracketed = resolve_client_ip(
+            ip("10.0.0.1")?,
+            &bracketed_headers,
+            &nets(&["10.0.0.0/8"])?,
             XFF,
             MAX_SCANNED_ENTRIES,
         );
-        assert_eq!(got, Ok(ip("2001:db8::1")));
+        assert_eq!(bracketed, Ok(ip("2001:db8::1")?));
 
-        let headers = xff(&["2001:db8::2"]);
-        let got = resolve_client_ip(
-            ip("10.0.0.1"),
-            &headers,
-            &nets(&["10.0.0.0/8"]),
+        let bare_headers = xff(&["2001:db8::2"])?;
+        let bare = resolve_client_ip(
+            ip("10.0.0.1")?,
+            &bare_headers,
+            &nets(&["10.0.0.0/8"])?,
             XFF,
             MAX_SCANNED_ENTRIES,
         );
-        assert_eq!(got, Ok(ip("2001:db8::2")));
+        assert_eq!(bare, Ok(ip("2001:db8::2")?));
+        Ok(())
     }
 
     #[test]
-    fn multiple_xff_header_instances_last_wins() {
+    /// Pins that only the last `X-Forwarded-For` instance is trusted.
+    fn multiple_xff_header_instances_last_wins() -> anyhow::Result<()> {
         // The first instance is attacker-supplied; only the last was
         // appended by our trusted proxy.
-        let headers = xff(&["6.6.6.6", "203.0.113.7"]);
+        let headers = xff(&["6.6.6.6", "203.0.113.7"])?;
         let got = resolve_client_ip(
-            ip("10.0.0.1"),
+            ip("10.0.0.1")?,
             &headers,
-            &nets(&["10.0.0.0/8"]),
+            &nets(&["10.0.0.0/8"])?,
             XFF,
             MAX_SCANNED_ENTRIES,
         );
-        assert_eq!(got, Ok(ip("203.0.113.7")));
+        assert_eq!(got, Ok(ip("203.0.113.7")?));
+        Ok(())
     }
 
     #[test]
-    fn multiple_forwarded_header_instances_last_wins() {
-        let headers = fwd(&["for=6.6.6.6", "for=203.0.113.9"]);
+    /// Pins that only the last `Forwarded` instance is trusted.
+    fn multiple_forwarded_header_instances_last_wins() -> anyhow::Result<()> {
+        let headers = fwd(&["for=6.6.6.6", "for=203.0.113.9"])?;
         let got = resolve_client_ip(
-            ip("10.0.0.1"),
+            ip("10.0.0.1")?,
             &headers,
-            &nets(&["10.0.0.0/8"]),
+            &nets(&["10.0.0.0/8"])?,
             FWD,
             MAX_SCANNED_ENTRIES,
         );
-        assert_eq!(got, Ok(ip("203.0.113.9")));
+        assert_eq!(got, Ok(ip("203.0.113.9")?));
+        Ok(())
     }
 
     #[test]
-    fn chain_longer_than_cap_falls_back() {
-        let mut entries: Vec<String> = (0..17).map(|i| format!("10.0.{i}.1")).collect();
+    /// Pins that a chain longer than the scan cap is treated as hostile.
+    fn chain_longer_than_cap_falls_back() -> anyhow::Result<()> {
+        let mut entries: Vec<String> = (0_u8..17).map(|idx| format!("10.0.{idx}.1")).collect();
         entries.insert(0, "203.0.113.7".into());
-        let headers = xff(&[entries.join(", ").as_str()]);
+        let headers = xff(&[entries.join(", ").as_str()])?;
         let got = resolve_client_ip(
-            ip("10.0.0.1"),
+            ip("10.0.0.1")?,
             &headers,
-            &nets(&["10.0.0.0/8"]),
+            &nets(&["10.0.0.0/8"])?,
             XFF,
             MAX_SCANNED_ENTRIES,
         );
         assert_eq!(got, Err(FallbackReason::TooManyEntries));
+        Ok(())
     }
 
     #[test]
-    fn forwarded_quoted_bracketed_v6_resolves() {
-        let headers = fwd(&[r#"for="[2001:db8::1]:443";proto=https"#]);
+    /// Pins that a quoted bracketed IPv6 `for=` value resolves.
+    fn forwarded_quoted_bracketed_v6_resolves() -> anyhow::Result<()> {
+        let headers = fwd(&[r#"for="[2001:db8::1]:443";proto=https"#])?;
         let got = resolve_client_ip(
-            ip("10.0.0.1"),
+            ip("10.0.0.1")?,
             &headers,
-            &nets(&["10.0.0.0/8"]),
+            &nets(&["10.0.0.0/8"])?,
             FWD,
             MAX_SCANNED_ENTRIES,
         );
-        assert_eq!(got, Ok(ip("2001:db8::1")));
+        assert_eq!(got, Ok(ip("2001:db8::1")?));
+        Ok(())
     }
 
     #[test]
-    fn forwarded_obfuscated_identifiers_fall_back() {
+    /// Pins that RFC 7239 obfuscated or `unknown` identifiers fall back.
+    fn forwarded_obfuscated_identifiers_fall_back() -> anyhow::Result<()> {
         for value in ["for=_hidden", "for=unknown", "For=UNKNOWN"] {
-            let headers = fwd(&[value]);
+            let headers = fwd(&[value])?;
             let got = resolve_client_ip(
-                ip("10.0.0.1"),
+                ip("10.0.0.1")?,
                 &headers,
-                &nets(&["10.0.0.0/8"]),
+                &nets(&["10.0.0.0/8"])?,
                 FWD,
                 MAX_SCANNED_ENTRIES,
             );
             assert_eq!(got, Err(FallbackReason::Obfuscated), "value: {value:?}");
         }
+        Ok(())
     }
 
     #[test]
-    fn forwarded_param_name_is_case_insensitive() {
-        let headers = fwd(&["By=10.0.0.1;FOR=203.0.113.9;proto=https"]);
+    /// Pins that the `Forwarded` parameter name is case-insensitive.
+    fn forwarded_param_name_is_case_insensitive() -> anyhow::Result<()> {
+        let headers = fwd(&["By=10.0.0.1;FOR=203.0.113.9;proto=https"])?;
         let got = resolve_client_ip(
-            ip("10.0.0.1"),
+            ip("10.0.0.1")?,
             &headers,
-            &nets(&["10.0.0.0/8"]),
+            &nets(&["10.0.0.0/8"])?,
             FWD,
             MAX_SCANNED_ENTRIES,
         );
-        assert_eq!(got, Ok(ip("203.0.113.9")));
+        assert_eq!(got, Ok(ip("203.0.113.9")?));
+        Ok(())
     }
 
     #[test]
-    fn forwarded_stanza_without_for_falls_back() {
-        let headers = fwd(&["by=10.0.0.1;proto=https"]);
+    /// Pins that a stanza without a `for=` parameter falls back.
+    fn forwarded_stanza_without_for_falls_back() -> anyhow::Result<()> {
+        let headers = fwd(&["by=10.0.0.1;proto=https"])?;
         let got = resolve_client_ip(
-            ip("10.0.0.1"),
+            ip("10.0.0.1")?,
             &headers,
-            &nets(&["10.0.0.0/8"]),
+            &nets(&["10.0.0.0/8"])?,
             FWD,
             MAX_SCANNED_ENTRIES,
         );
         assert_eq!(got, Err(FallbackReason::MalformedEntry));
+        Ok(())
     }
 
     #[test]
-    fn forwarded_multi_stanza_skips_trusted() {
-        let headers = fwd(&["for=203.0.113.9, for=10.0.0.2"]);
+    /// Pins that a multi-stanza `Forwarded` value skips trusted hops.
+    fn forwarded_multi_stanza_skips_trusted() -> anyhow::Result<()> {
+        let headers = fwd(&["for=203.0.113.9, for=10.0.0.2"])?;
         let got = resolve_client_ip(
-            ip("10.0.0.1"),
+            ip("10.0.0.1")?,
             &headers,
-            &nets(&["10.0.0.0/8"]),
+            &nets(&["10.0.0.0/8"])?,
             FWD,
             MAX_SCANNED_ENTRIES,
         );
-        assert_eq!(got, Ok(ip("203.0.113.9")));
+        assert_eq!(got, Ok(ip("203.0.113.9")?));
+        Ok(())
     }
 
     #[test]
-    fn forwarded_unbalanced_quotes_fall_back() {
+    /// Pins that unbalanced quotes are rejected instead of normalized.
+    fn forwarded_unbalanced_quotes_fall_back() -> anyhow::Result<()> {
         // RFC 7239 §4: a value is `token / quoted-string`; a quoted-string
         // needs balanced DQUOTE. Trimming each end independently would
         // normalize all of these into a valid address, producing a parser
@@ -651,11 +658,11 @@ mod tests {
             r#"for="[2001:db8::1]:443"#,
             r#"for=2"03.0.113.9"#,
         ] {
-            let headers = fwd(&[value]);
+            let headers = fwd(&[value])?;
             let got = resolve_client_ip(
-                ip("10.0.0.1"),
+                ip("10.0.0.1")?,
                 &headers,
-                &nets(&["10.0.0.0/8"]),
+                &nets(&["10.0.0.0/8"])?,
                 FWD,
                 MAX_SCANNED_ENTRIES,
             );
@@ -665,44 +672,49 @@ mod tests {
                 "unbalanced-quote value must not resolve: {value:?}"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn forwarded_balanced_quotes_still_resolve() {
+    /// Pins that balanced quoted and bare `for=` values still resolve.
+    fn forwarded_balanced_quotes_still_resolve() -> anyhow::Result<()> {
         for (value, want) in [
-            (r#"for="203.0.113.9""#, ip("203.0.113.9")),
-            ("for=203.0.113.9", ip("203.0.113.9")),
-            (r#"for="203.0.113.9:443""#, ip("203.0.113.9")),
-            (r#"for="[2001:db8::1]""#, ip("2001:db8::1")),
+            (r#"for="203.0.113.9""#, ip("203.0.113.9")?),
+            ("for=203.0.113.9", ip("203.0.113.9")?),
+            (r#"for="203.0.113.9:443""#, ip("203.0.113.9")?),
+            (r#"for="[2001:db8::1]""#, ip("2001:db8::1")?),
         ] {
-            let headers = fwd(&[value]);
+            let headers = fwd(&[value])?;
             let got = resolve_client_ip(
-                ip("10.0.0.1"),
+                ip("10.0.0.1")?,
                 &headers,
-                &nets(&["10.0.0.0/8"]),
+                &nets(&["10.0.0.0/8"])?,
                 FWD,
                 MAX_SCANNED_ENTRIES,
             );
             assert_eq!(got, Ok(want), "well-formed value must resolve: {value:?}");
         }
+        Ok(())
     }
 
     #[test]
-    fn forwarded_quoted_obfuscated_still_detected() {
+    /// Pins that a quoted obfuscated identifier is still detected.
+    fn forwarded_quoted_obfuscated_still_detected() -> anyhow::Result<()> {
         // The quote strip must run before the obfuscation check, so a quoted
         // `unknown` / `_secret` still reports Obfuscated rather than being
         // misclassified as a malformed entry.
         for value in [r#"for="unknown""#, r#"for="_secret""#] {
-            let headers = fwd(&[value]);
+            let headers = fwd(&[value])?;
             let got = resolve_client_ip(
-                ip("10.0.0.1"),
+                ip("10.0.0.1")?,
                 &headers,
-                &nets(&["10.0.0.0/8"]),
+                &nets(&["10.0.0.0/8"])?,
                 FWD,
                 MAX_SCANNED_ENTRIES,
             );
             assert_eq!(got, Err(FallbackReason::Obfuscated), "value: {value:?}");
         }
+        Ok(())
     }
 
     proptest! {

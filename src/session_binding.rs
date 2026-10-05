@@ -1,111 +1,13 @@
 //! Stateless binding between rmcp session IDs and authenticated identities.
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::option_if_let_else,
-        reason = "lint-migration: src/session_binding.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_panics_doc,
-        reason = "lint-migration: src/session_binding.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::min_ident_chars,
-        reason = "lint-migration: src/session_binding.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::shadow_reuse,
-        reason = "lint-migration: src/session_binding.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::map_err_ignore,
-        reason = "lint-migration: src/session_binding.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::arithmetic_side_effects,
-        reason = "lint-migration: src/session_binding.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_const_for_fn,
-        reason = "lint-migration: src/session_binding.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::missing_errors_doc,
-        reason = "lint-migration: src/session_binding.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::std_instead_of_core,
-        reason = "lint-migration: src/session_binding.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::absolute_paths,
-        reason = "lint-migration: src/session_binding.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::redundant_pub_crate,
-        reason = "lint-migration: src/session_binding.rs"
-    )
-)]
-#![cfg_attr(
-    all(not(test), target_os = "linux"),
-    expect(
-        clippy::missing_docs_in_private_items,
-        reason = "lint-migration: src/session_binding.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::unused_trait_names,
-        reason = "lint-migration: src/session_binding.rs"
-    )
-)]
-#![cfg_attr(
-    target_os = "linux",
-    expect(
-        clippy::unseparated_literal_suffix,
-        reason = "lint-migration: src/session_binding.rs"
-    )
-)]
-#![expect(unused_results, reason = "lint-migration: src/session_binding.rs")]
 
+use core::{fmt, str};
 use std::sync::OnceLock;
 
 use axum::{
     body::Body,
     http::{HeaderValue, Request, StatusCode, header::HeaderName},
     middleware::Next,
-    response::{IntoResponse, Response},
+    response::{IntoResponse as _, Response},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, KeyInit as _, Mac as _};
@@ -118,13 +20,21 @@ use crate::{
     error::RmcpServerKitError,
 };
 
+/// Token-format version prefix (`v1`).
 const VERSION: &str = "v1";
+/// Domain-separation byte placed between MAC input fields.
 const DOMAIN_SEPARATOR: u8 = 0;
+/// Length in bytes of a raw rmcp session ID (UUID textual form).
 const RAW_SESSION_ID_LEN: usize = 36;
+/// Length in bytes of a base64url-encoded raw session ID without padding.
 const RAW_SESSION_ID_B64_LEN: usize = 48;
+/// Length in bytes of an HMAC-SHA256 tag.
 const MAC_LEN: usize = 32;
+/// Minimum UTF-8 byte length accepted for an operator-configured secret.
 pub(crate) const MIN_CONFIGURED_SECRET_BYTES: usize = 32;
+/// Length in bytes of a base64url-encoded HMAC-SHA256 tag without padding.
 const MAC_B64_LEN: usize = 43;
+/// Maximum byte length of a wrapped session token produced by this module.
 const MAX_WRAPPED_SESSION_TOKEN_LEN: usize =
     VERSION.len() + 1 + RAW_SESSION_ID_B64_LEN + 1 + MAC_B64_LEN;
 
@@ -137,8 +47,8 @@ pub(crate) enum SessionBindingSecret {
     Configured(SecretString),
 }
 
-impl std::fmt::Debug for SessionBindingSecret {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for SessionBindingSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("SessionBindingSecret(<redacted>)")
     }
 }
@@ -159,6 +69,11 @@ impl IdentityFingerprint {
 pub(crate) struct RawSessionId(String);
 
 impl RawSessionId {
+    /// Parse a raw rmcp session ID, requiring the UUID textual shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Reason::Malformed`] when `raw` is not UUID-shaped.
     pub(crate) fn parse(raw: &str) -> Result<Self, Reason> {
         if is_uuid_shaped(raw) {
             Ok(Self(raw.to_owned()))
@@ -180,7 +95,8 @@ pub(crate) enum Reason {
 }
 
 impl Reason {
-    fn as_str(self) -> &'static str {
+    /// Stable lowercase label for logs; never the token itself.
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Malformed => "malformed",
             Self::Unwrapped => "unwrapped",
@@ -193,13 +109,18 @@ impl Reason {
 pub(crate) fn process_session_binding_secret() -> &'static SessionBindingSecret {
     static PROCESS_SECRET: OnceLock<SessionBindingSecret> = OnceLock::new();
     PROCESS_SECRET.get_or_init(|| {
-        let mut bytes = [0u8; MAC_LEN];
+        let mut bytes = [0_u8; MAC_LEN];
         rand::fill(&mut bytes);
         SessionBindingSecret::Process(bytes)
     })
 }
 
 /// Build a session-binding HMAC secret from operator configuration.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when the configured secret is empty,
+/// whitespace-only, or shorter than [`MIN_CONFIGURED_SECRET_BYTES`].
 pub(crate) fn configured_session_binding_secret(
     secret: &SecretString,
 ) -> Result<SessionBindingSecret, RmcpServerKitError> {
@@ -208,6 +129,11 @@ pub(crate) fn configured_session_binding_secret(
 }
 
 /// Validate the configured session-binding secret's strength.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when `value` is empty, whitespace-only,
+/// or shorter than [`MIN_CONFIGURED_SECRET_BYTES`] UTF-8 bytes.
 pub(crate) fn validate_configured_secret(
     field: &str,
     value: &str,
@@ -245,7 +171,11 @@ pub(crate) fn fingerprint(identity: &AuthIdentity) -> IdentityFingerprint {
         !stable_id.trim().is_empty(),
         "session-binding fingerprint stable id must be non-blank; producers are validated upstream"
     );
-    let mut bytes = Vec::with_capacity(method.len() + 1 + stable_id.len());
+    let capacity = method
+        .len()
+        .saturating_add(1)
+        .saturating_add(stable_id.len());
+    let mut bytes = Vec::with_capacity(capacity);
     bytes.extend_from_slice(method);
     bytes.push(DOMAIN_SEPARATOR);
     bytes.extend_from_slice(stable_id.as_bytes());
@@ -267,6 +197,13 @@ pub(crate) fn wrap(
 }
 
 /// Verify an identity-bound token and recover the raw rmcp session ID.
+///
+/// # Errors
+///
+/// Returns [`Reason::Malformed`] when the token is oversized, is not three
+/// dot-separated segments, or is not a base64url-encoded UUID plus MAC;
+/// [`Reason::Unwrapped`] for a bare raw session ID; and [`Reason::MacFailed`]
+/// when the recomputed MAC does not match the presented one.
 pub(crate) fn unwrap_and_verify(
     secret: &SessionBindingSecret,
     token: &str,
@@ -287,22 +224,22 @@ pub(crate) fn unwrap_and_verify(
         return Err(Reason::Malformed);
     }
 
-    let mut mac = [0u8; MAC_LEN];
+    let mut mac = [0_u8; MAC_LEN];
     let mac_len = URL_SAFE_NO_PAD
         .decode_slice(mac_part, &mut mac)
-        .map_err(|_| Reason::Malformed)?;
+        .map_err(|_error| Reason::Malformed)?;
     if mac_len != MAC_LEN {
         return Err(Reason::Malformed);
     }
 
-    let mut raw = [0u8; RAW_SESSION_ID_LEN];
+    let mut raw = [0_u8; RAW_SESSION_ID_LEN];
     let raw_len = URL_SAFE_NO_PAD
         .decode_slice(raw_part, &mut raw)
-        .map_err(|_| Reason::Malformed)?;
+        .map_err(|_error| Reason::Malformed)?;
     if raw_len != RAW_SESSION_ID_LEN {
         return Err(Reason::Malformed);
     }
-    let raw_str = std::str::from_utf8(&raw).map_err(|_| Reason::Malformed)?;
+    let raw_str = str::from_utf8(&raw).map_err(|_error| Reason::Malformed)?;
     let raw_id = RawSessionId::parse(raw_str)?;
     let expected = compute_mac(secret, &raw_id, fp);
     if expected.ct_eq(&mac).into() {
@@ -322,7 +259,7 @@ pub(crate) async fn session_binding_middleware(
     next: Next,
 ) -> Response {
     let identity = req.extensions().get::<AuthIdentity>().cloned();
-    let Some(identity) = identity else {
+    let Some(auth_identity) = identity else {
         return next.run(req).await;
     };
 
@@ -331,15 +268,15 @@ pub(crate) async fn session_binding_middleware(
         let header = req
             .headers()
             .get(session_header_name())
-            .and_then(|h| h.to_str().ok());
+            .and_then(|header| header.to_str().ok());
         let Some(token) = header else {
             return reject(Reason::Malformed);
         };
-        let fp = fingerprint(&identity);
+        let fp = fingerprint(&auth_identity);
         match unwrap_and_verify(&secret, token, &fp) {
             Ok(raw_id) => match HeaderValue::from_str(&raw_id.0) {
                 Ok(value) => {
-                    req.headers_mut().insert(session_header_name(), value);
+                    drop(req.headers_mut().insert(session_header_name(), value));
                 }
                 Err(_) => return reject(Reason::Malformed),
             },
@@ -349,11 +286,17 @@ pub(crate) async fn session_binding_middleware(
 
     let mut response = next.run(req).await;
     if !request_had_session {
-        wrap_response_session(&secret, &identity, &mut response);
+        wrap_response_session(&secret, &auth_identity, &mut response);
     }
     response
 }
 
+/// Split a wrapped token into its raw-ID and MAC segments.
+///
+/// # Errors
+///
+/// Returns [`Reason::Malformed`] unless `token` has exactly three
+/// dot-separated segments.
 fn split_token(token: &str) -> Result<(&str, &str), Reason> {
     let mut parts = token.split('.');
     match (parts.next(), parts.next(), parts.next(), parts.next()) {
@@ -362,12 +305,22 @@ fn split_token(token: &str) -> Result<(&str, &str), Reason> {
     }
 }
 
+/// HMAC-SHA256 instantiation used for session-binding MACs.
 pub(crate) type HmacSha256 = Hmac<Sha256>;
 
 /// Build a keyed HMAC-SHA256 instance from a binding secret.
 ///
 /// Shared by session binding and [`crate::task_binding`] so the defensive
 /// re-key below exists in exactly one place.
+///
+/// # Panics
+///
+/// Cannot panic in practice: the fallback `expect` below is unreachable because
+/// a 32-byte SHA-256 digest is always a valid HMAC-SHA256 key.
+#[expect(
+    clippy::option_if_let_else,
+    reason = "constant-time: src/session_binding.rs::keyed_mac must not branch observably on key material; the fallback keeps the re-key sequence branch-free"
+)]
 pub(crate) fn keyed_mac(secret: &SessionBindingSecret) -> HmacSha256 {
     // HMAC-SHA256 accepts keys of any length (RFC 2104), so construction
     // cannot fail for either the process-random default or configured secret.
@@ -377,23 +330,24 @@ pub(crate) fn keyed_mac(secret: &SessionBindingSecret) -> HmacSha256 {
     let configured_key;
     let key = match secret {
         SessionBindingSecret::Process(bytes) => bytes.as_slice(),
-        SessionBindingSecret::Configured(secret) => {
-            configured_key = secret.expose_secret();
+        SessionBindingSecret::Configured(configured_secret) => {
+            configured_key = configured_secret.expose_secret();
             configured_key.as_bytes()
         }
     };
-    if let Ok(m) = HmacSha256::new_from_slice(key) {
-        m
+    if let Ok(hmac) = HmacSha256::new_from_slice(key) {
+        hmac
     } else {
         let digest = Sha256::digest(key);
         #[expect(
             clippy::expect_used,
-            reason = "32-byte SHA-256 digest is unconditionally valid as an HMAC-SHA256 key (RFC 2104 allows any key length); see surrounding comment"
+            reason = "invariant: src/session_binding.rs::keyed_mac -- a 32-byte SHA-256 digest is unconditionally a valid HMAC-SHA256 key (RFC 2104 allows any key length)"
         )]
         HmacSha256::new_from_slice(&digest).expect("32-byte SHA256 digest is valid HMAC key")
     }
 }
 
+/// Compute the HMAC-SHA256 tag binding `raw_id` and `fp` under `secret`.
 fn compute_mac(
     secret: &SessionBindingSecret,
     raw_id: &RawSessionId,
@@ -408,6 +362,10 @@ fn compute_mac(
     mac.finalize().into_bytes().into()
 }
 
+/// Wrap the response's raw session ID for the authenticated identity.
+///
+/// Leaves the header untouched when absent; removes it and logs when the raw ID
+/// is malformed or cannot be encoded as a header value.
 fn wrap_response_session(
     secret: &SessionBindingSecret,
     identity: &AuthIdentity,
@@ -416,24 +374,25 @@ fn wrap_response_session(
     let raw = response
         .headers()
         .get(session_header_name())
-        .and_then(|h| h.to_str().ok());
-    let Some(raw) = raw else {
+        .and_then(|header| header.to_str().ok());
+    let Some(raw_header) = raw else {
         return;
     };
-    let Ok(raw_id) = RawSessionId::parse(raw) else {
+    let Ok(raw_id) = RawSessionId::parse(raw_header) else {
         tracing::warn!(reason = %Reason::Malformed.as_str(), "mcp session binding skipped invalid response session id");
-        response.headers_mut().remove(session_header_name());
+        drop(response.headers_mut().remove(session_header_name()));
         return;
     };
     let token = wrap(secret, &raw_id, &fingerprint(identity));
     if let Ok(value) = HeaderValue::from_str(&token) {
-        response.headers_mut().insert(session_header_name(), value);
+        drop(response.headers_mut().insert(session_header_name(), value));
     } else {
         tracing::warn!(reason = %Reason::Malformed.as_str(), "mcp session binding failed to encode response session id");
-        response.headers_mut().remove(session_header_name());
+        drop(response.headers_mut().remove(session_header_name()));
     }
 }
 
+/// Build the HTTP rejection response for a failed binding check.
 fn reject(reason: Reason) -> Response {
     tracing::warn!(reason = %reason.as_str(), "mcp session binding rejected request");
     match reason {
@@ -444,10 +403,12 @@ fn reject(reason: Reason) -> Response {
     }
 }
 
-fn session_header_name() -> HeaderName {
+/// Return the canonical `Mcp-Session-Id` header name.
+const fn session_header_name() -> HeaderName {
     HeaderName::from_static("mcp-session-id")
 }
 
+/// Return whether `value` has the 36-byte UUID textual shape.
 fn is_uuid_shaped(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() == RAW_SESSION_ID_LEN
@@ -457,24 +418,16 @@ fn is_uuid_shaped(value: &str) -> bool {
         })
 }
 
-#[cfg_attr(
-    all(test, target_os = "linux"),
-    expect(clippy::expect_used, reason = "lint-migration: src/session_binding.rs")
+#[expect(
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    reason = "test code is not rendered API documentation"
 )]
-#[cfg_attr(
-    test,
-    expect(redundant_imports, reason = "lint-migration: src/session_binding.rs")
-)]
+#[expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")]
 #[cfg(test)]
 mod tests {
-    use axum::{
-        Router,
-        body::Body,
-        http::{Request, StatusCode},
-        middleware,
-        response::IntoResponse,
-        routing::post,
-    };
+    use anyhow::Context as _;
+    use axum::{Router, http::HeaderMap, middleware, routing::post};
     use http_body_util::BodyExt as _;
     use proptest::{collection, prelude::*};
     use tower::ServiceExt as _;
@@ -498,37 +451,49 @@ mod tests {
         }
     }
 
-    fn raw_id(value: &str) -> RawSessionId {
-        RawSessionId::parse(value).expect("test raw session id must be UUID-shaped")
+    /// Parse a UUID-shaped raw session ID for tests.
+    fn raw_id(value: &str) -> anyhow::Result<RawSessionId> {
+        let parsed = RawSessionId::parse(value)
+            .map_err(|reason| anyhow::anyhow!("raw session id must be UUID-shaped: {reason:?}"))?;
+        Ok(parsed)
     }
 
-    fn bound_token(secret: &SessionBindingSecret, identity: &AuthIdentity, raw: &str) -> String {
-        wrap(secret, &raw_id(raw), &fingerprint(identity))
+    /// Wrap `raw` for `identity` under `secret` for tests.
+    fn bound_token(
+        secret: &SessionBindingSecret,
+        identity: &AuthIdentity,
+        raw: &str,
+    ) -> anyhow::Result<String> {
+        let parsed = raw_id(raw)?;
+        Ok(wrap(secret, &parsed, &fingerprint(identity)))
     }
 
     #[test]
-    fn session_binding_secret_from_config_is_used() {
+    /// Pins that the same configured secret verifies a token it produced.
+    fn session_binding_secret_from_config_is_used() -> anyhow::Result<()> {
         let left = configured_session_binding_secret(&SecretString::from("x".repeat(32)))
-            .expect("configured secret valid");
+            .context("configured secret valid")?;
         let right = configured_session_binding_secret(&SecretString::from("x".repeat(32)))
-            .expect("configured secret valid");
+            .context("configured secret valid")?;
         let identity = test_identity("alice", AuthMethod::BearerToken, None);
-        let token = bound_token(&left, &identity, RAW_ID);
+        let token = bound_token(&left, &identity, RAW_ID)?;
 
         let verified = unwrap_and_verify(&right, &token, &fingerprint(&identity))
-            .expect("same configured secret verifies");
+            .map_err(|reason| anyhow::anyhow!("same configured secret must verify: {reason:?}"))?;
 
-        assert_eq!(verified, raw_id(RAW_ID));
+        assert_eq!(verified, raw_id(RAW_ID)?);
+        Ok(())
     }
 
     #[test]
-    fn session_binding_secret_differs_from_process_secret() {
+    /// Pins that a configured secret and the process secret do not verify each other's tokens.
+    fn session_binding_secret_differs_from_process_secret() -> anyhow::Result<()> {
         let configured = configured_session_binding_secret(&SecretString::from("x".repeat(32)))
-            .expect("configured secret valid");
+            .context("configured secret valid")?;
         let process = process_session_binding_secret();
         let identity = test_identity("alice", AuthMethod::BearerToken, None);
-        let configured_token = bound_token(&configured, &identity, RAW_ID);
-        let process_token = bound_token(process, &identity, RAW_ID);
+        let configured_token = bound_token(&configured, &identity, RAW_ID)?;
+        let process_token = bound_token(process, &identity, RAW_ID)?;
 
         let configured_against_process =
             unwrap_and_verify(process, &configured_token, &fingerprint(&identity));
@@ -537,91 +502,114 @@ mod tests {
 
         assert_eq!(configured_against_process, Err(Reason::MacFailed));
         assert_eq!(process_against_configured, Err(Reason::MacFailed));
+        Ok(())
     }
 
     #[test]
-    fn wrap_then_verify_roundtrips() {
+    /// Pins that wrapping then verifying under the same secret and identity roundtrips.
+    fn wrap_then_verify_roundtrips() -> anyhow::Result<()> {
         let secret = test_secret(7);
         let identity = test_identity("alice", AuthMethod::BearerToken, None);
         let fp = fingerprint(&identity);
-        let raw = raw_id(RAW_ID);
+        let raw = raw_id(RAW_ID)?;
 
         let token = wrap(&secret, &raw, &fp);
-        let verified = unwrap_and_verify(&secret, &token, &fp).expect("token verifies");
+        let verified = unwrap_and_verify(&secret, &token, &fp)
+            .map_err(|reason| anyhow::anyhow!("token must verify: {reason:?}"))?;
 
         assert_eq!(verified, raw);
+        Ok(())
     }
 
     #[test]
-    fn verify_rejects_other_identity() {
+    /// Pins that a token bound to one identity fails verification for another.
+    fn verify_rejects_other_identity() -> anyhow::Result<()> {
         let secret = test_secret(7);
         let alice = test_identity("alice", AuthMethod::BearerToken, None);
         let bob = test_identity("bob", AuthMethod::BearerToken, None);
-        let token = bound_token(&secret, &alice, RAW_ID);
+        let token = bound_token(&secret, &alice, RAW_ID)?;
 
         let result = unwrap_and_verify(&secret, &token, &fingerprint(&bob));
 
         assert_eq!(result, Err(Reason::MacFailed));
+        Ok(())
     }
 
     #[test]
-    fn verify_rejects_tampered_mac() {
+    /// Pins that flipping one MAC character makes verification fail.
+    fn verify_rejects_tampered_mac() -> anyhow::Result<()> {
         let secret = test_secret(7);
         let identity = test_identity("alice", AuthMethod::BearerToken, None);
-        let token = bound_token(&secret, &identity, RAW_ID);
+        let token = bound_token(&secret, &identity, RAW_ID)?;
         let mut parts = token.split('.');
-        let version = parts.next().expect("version segment");
-        let raw = parts.next().expect("raw segment");
-        let mac = parts.next().expect("mac segment");
+        let version = parts.next().context("version segment")?;
+        let raw = parts.next().context("raw segment")?;
+        let mac = parts.next().context("mac segment")?;
         let replacement = if mac.starts_with('A') { 'B' } else { 'A' };
-        let suffix = mac.get(1..).expect("base64url MAC segment is ASCII");
+        let suffix = mac.get(1..).context("base64url MAC segment is ASCII")?;
         let tampered = format!("{version}.{raw}.{replacement}{suffix}");
 
         let result = unwrap_and_verify(&secret, &tampered, &fingerprint(&identity));
 
         assert_eq!(result, Err(Reason::MacFailed));
+        Ok(())
     }
 
     #[test]
-    fn verify_rejects_tampered_session_id() {
+    /// Pins that replacing the raw session segment makes verification fail.
+    fn verify_rejects_tampered_session_id() -> anyhow::Result<()> {
         let secret = test_secret(7);
         let identity = test_identity("alice", AuthMethod::BearerToken, None);
-        let token = bound_token(&secret, &identity, RAW_ID);
+        let token = bound_token(&secret, &identity, RAW_ID)?;
         let mut parts = token.split('.');
-        let version = parts.next().expect("version segment");
-        let _raw = parts.next().expect("raw segment");
-        let mac = parts.next().expect("mac segment");
+        let version = parts.next().context("version segment")?;
+        let _raw = parts.next().context("raw segment")?;
+        let mac = parts.next().context("mac segment")?;
         let tampered = format!("{version}.{}.{mac}", URL_SAFE_NO_PAD.encode(OTHER_RAW_ID));
 
         let result = unwrap_and_verify(&secret, &tampered, &fingerprint(&identity));
 
         assert_eq!(result, Err(Reason::MacFailed));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/session_binding.rs::verify_rejects_unwrapped_raw_uuid keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn verify_rejects_unwrapped_raw_uuid() {
+    /// Pins that a bare raw UUID is reported as unwrapped rather than malformed.
+    fn verify_rejects_unwrapped_raw_uuid() -> anyhow::Result<()> {
         let secret = test_secret(7);
         let identity = test_identity("alice", AuthMethod::BearerToken, None);
 
         let result = unwrap_and_verify(&secret, RAW_ID, &fingerprint(&identity));
 
         assert_eq!(result, Err(Reason::Unwrapped));
+        Ok(())
     }
 
     #[test]
-    fn verify_reports_mac_failure_distinctly() {
+    /// Pins that a stale secret reports `MacFailed`, not `Malformed`.
+    fn verify_reports_mac_failure_distinctly() -> anyhow::Result<()> {
         let old_secret = test_secret(7);
         let new_secret = test_secret(9);
         let identity = test_identity("alice", AuthMethod::BearerToken, None);
-        let token = bound_token(&old_secret, &identity, RAW_ID);
+        let token = bound_token(&old_secret, &identity, RAW_ID)?;
 
         let result = unwrap_and_verify(&new_secret, &token, &fingerprint(&identity));
 
         assert_eq!(result, Err(Reason::MacFailed));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/session_binding.rs::decoder_rejects_oversized_and_wrong_segment_counts keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn decoder_rejects_oversized_and_wrong_segment_counts() {
+    /// Pins that oversized tokens and wrong segment counts are `Malformed`.
+    fn decoder_rejects_oversized_and_wrong_segment_counts() -> anyhow::Result<()> {
         let secret = test_secret(7);
         let identity = test_identity("alice", AuthMethod::BearerToken, None);
         let oversized = format!("v1.{}.{}", "A".repeat(200), "A".repeat(MAC_B64_LEN));
@@ -633,65 +621,92 @@ mod tests {
         assert_eq!(oversized_result, Err(Reason::Malformed));
         assert_eq!(too_few, Err(Reason::Malformed));
         assert_eq!(too_many, Err(Reason::Malformed));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/session_binding.rs::verify_rejects_malformed_and_truncated_tokens keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn verify_rejects_malformed_and_truncated_tokens() {
+    /// Pins that malformed and truncated tokens are rejected as `Malformed`.
+    fn verify_rejects_malformed_and_truncated_tokens() -> anyhow::Result<()> {
         let secret = test_secret(7);
         let identity = test_identity("alice", AuthMethod::BearerToken, None);
         for token in ["", "v1.", "v1..", "v2.raw.mac", "v1.bad_base64.@@@@"] {
             let result = unwrap_and_verify(&secret, token, &fingerprint(&identity));
             assert_eq!(result, Err(Reason::Malformed), "token: {token:?}");
         }
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/session_binding.rs::fingerprint_distinguishes_auth_methods keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn fingerprint_distinguishes_auth_methods() {
+    /// Pins that API-key and mTLS identities fingerprint differently.
+    fn fingerprint_distinguishes_auth_methods() -> anyhow::Result<()> {
         let api = test_identity("alice", AuthMethod::BearerToken, None);
         let mtls = test_identity("alice", AuthMethod::MtlsCertificate, None);
 
         assert_ne!(fingerprint(&api), fingerprint(&mtls));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/session_binding.rs::fingerprint_oauth_prefers_sub_over_name keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn fingerprint_oauth_prefers_sub_over_name() {
+    /// Pins that OAuth identities with the same `sub` fingerprint equally.
+    fn fingerprint_oauth_prefers_sub_over_name() -> anyhow::Result<()> {
         let first = test_identity("preferred-a", AuthMethod::OAuthJwt, Some("stable-sub"));
         let second = test_identity("preferred-b", AuthMethod::OAuthJwt, Some("stable-sub"));
 
         assert_eq!(fingerprint(&first), fingerprint(&second));
+        Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/session_binding.rs::fingerprint_oauth_falls_back_to_name_without_sub keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn fingerprint_oauth_falls_back_to_name_without_sub() {
+    /// Pins that OAuth identities without a `sub` fall back to distinct names.
+    fn fingerprint_oauth_falls_back_to_name_without_sub() -> anyhow::Result<()> {
         let first = test_identity("client-a", AuthMethod::OAuthJwt, None);
         let second = test_identity("client-b", AuthMethod::OAuthJwt, None);
 
         assert_ne!(fingerprint(&first), fingerprint(&second));
+        Ok(())
     }
 
     #[test]
-    fn mac_is_full_length() {
+    /// Pins that the wrapped token carries a full-length MAC segment.
+    fn mac_is_full_length() -> anyhow::Result<()> {
         let secret = test_secret(7);
         let identity = test_identity("alice", AuthMethod::BearerToken, None);
-        let token = bound_token(&secret, &identity, RAW_ID);
+        let token = bound_token(&secret, &identity, RAW_ID)?;
         let mac_segment = token
             .split('.')
             .nth(2)
-            .expect("wrapped token carries a MAC segment");
-        let mut mac = [0u8; MAC_LEN];
+            .context("wrapped token carries a MAC segment")?;
+        let mut mac = [0_u8; MAC_LEN];
 
         let len = URL_SAFE_NO_PAD
             .decode_slice(mac_segment, &mut mac)
-            .expect("MAC segment decodes");
+            .context("MAC segment decodes")?;
 
         assert_eq!(len, MAC_LEN);
+        Ok(())
     }
 
     fn router_with_identity(
         secret: SessionBindingSecret,
         identity: Option<AuthIdentity>,
     ) -> Router {
-        async fn echo_session(headers: axum::http::HeaderMap) -> String {
+        async fn echo_session(headers: HeaderMap) -> String {
             headers
                 .get(session_header_name())
                 .and_then(|value| value.to_str().ok())
@@ -701,9 +716,11 @@ mod tests {
 
         async fn mint_session() -> Response {
             let mut response = StatusCode::OK.into_response();
-            response
-                .headers_mut()
-                .insert(session_header_name(), HeaderValue::from_static(RAW_ID));
+            drop(
+                response
+                    .headers_mut()
+                    .insert(session_header_name(), HeaderValue::from_static(RAW_ID)),
+            );
             response
         }
 
@@ -711,15 +728,15 @@ mod tests {
             .route("/echo", post(echo_session))
             .route("/mint", post(mint_session))
             .layer(middleware::from_fn(move |req, next| {
-                let secret = secret.clone();
-                session_binding_middleware(secret, req, next)
+                let bound_secret = secret.clone();
+                session_binding_middleware(bound_secret, req, next)
             }));
         match identity {
             Some(id) => router.layer(middleware::from_fn(
                 move |mut req: Request<Body>, next: Next| {
-                    let id = id.clone();
+                    let owner = id.clone();
                     async move {
-                        req.extensions_mut().insert(id);
+                        drop(req.extensions_mut().insert(owner));
                         next.run(req).await
                     }
                 },
@@ -728,130 +745,156 @@ mod tests {
         }
     }
 
-    async fn post_with_session(router: Router, uri: &str, session: Option<&str>) -> Response {
+    /// Send a POST with an optional session header and return the response.
+    async fn post_with_session(
+        router: Router,
+        uri: &str,
+        session: Option<&str>,
+    ) -> anyhow::Result<Response> {
         let mut builder = Request::builder().method("POST").uri(uri);
-        if let Some(session) = session {
-            builder = builder.header(session_header_name(), session);
+        if let Some(session_value) = session {
+            builder = builder.header(session_header_name(), session_value);
         }
-        let request = builder.body(Body::empty()).expect("test request builds");
-        router.oneshot(request).await.expect("router responds")
+        let request = builder.body(Body::empty()).context("test request builds")?;
+        let response = router.oneshot(request).await.context("router responds")?;
+        Ok(response)
     }
 
     #[tokio::test]
-    async fn session_binding_middleware_request_without_header_passes_through() {
+    /// Pins that a request without a session header passes through unchanged.
+    async fn session_binding_middleware_request_without_header_passes_through() -> anyhow::Result<()>
+    {
         let secret = test_secret(7);
         let identity = test_identity("alice", AuthMethod::BearerToken, None);
         let router = router_with_identity(secret, Some(identity));
 
-        let response = post_with_session(router, "/echo", None).await;
+        let response = post_with_session(router, "/echo", None).await?;
         let body = response
             .into_body()
             .collect()
             .await
-            .expect("body collects")
+            .context("body collects")?
             .to_bytes();
 
         assert_eq!(body, "missing");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn session_binding_middleware_response_minting_session_gets_wrapped_header() {
+    /// Pins that a response-minted raw session header is rewritten as a wrapped token.
+    async fn session_binding_middleware_response_minting_session_gets_wrapped_header()
+    -> anyhow::Result<()> {
         let secret = test_secret(7);
         let identity = test_identity("alice", AuthMethod::BearerToken, None);
         let router = router_with_identity(secret, Some(identity));
 
-        let response = post_with_session(router, "/mint", None).await;
+        let response = post_with_session(router, "/mint", None).await?;
         let header = response
             .headers()
             .get(session_header_name())
-            .expect("session response header")
+            .context("session response header")?
             .to_str()
-            .expect("wrapped session is ascii");
+            .context("wrapped session is ascii")?;
 
         assert_ne!(header, RAW_ID);
         assert!(header.starts_with("v1."));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn session_binding_middleware_same_identity_rewrites_header_to_raw() {
+    /// Pins that a token for the same identity is rewritten back to the raw ID.
+    async fn session_binding_middleware_same_identity_rewrites_header_to_raw() -> anyhow::Result<()>
+    {
         let secret = test_secret(7);
         let identity = test_identity("alice", AuthMethod::BearerToken, None);
-        let token = bound_token(&secret, &identity, RAW_ID);
+        let token = bound_token(&secret, &identity, RAW_ID)?;
         let router = router_with_identity(secret, Some(identity));
 
-        let response = post_with_session(router, "/echo", Some(&token)).await;
+        let response = post_with_session(router, "/echo", Some(&token)).await?;
         let body = response
             .into_body()
             .collect()
             .await
-            .expect("body collects")
+            .context("body collects")?
             .to_bytes();
 
         assert_eq!(body, RAW_ID);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn session_binding_middleware_different_identity_returns_404() {
+    /// Pins that a token for another identity is rejected with 404.
+    async fn session_binding_middleware_different_identity_returns_404() -> anyhow::Result<()> {
         let secret = test_secret(7);
         let alice = test_identity("alice", AuthMethod::BearerToken, None);
         let bob = test_identity("bob", AuthMethod::BearerToken, None);
-        let token = bound_token(&secret, &alice, RAW_ID);
+        let token = bound_token(&secret, &alice, RAW_ID)?;
         let router = router_with_identity(secret, Some(bob));
 
-        let response = post_with_session(router, "/echo", Some(&token)).await;
+        let response = post_with_session(router, "/echo", Some(&token)).await?;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn session_binding_middleware_stale_secret_returns_404() {
+    /// Pins that a token bound under a stale secret is rejected with 404.
+    async fn session_binding_middleware_stale_secret_returns_404() -> anyhow::Result<()> {
         let old_secret = test_secret(7);
         let new_secret = test_secret(9);
         let identity = test_identity("alice", AuthMethod::BearerToken, None);
-        let token = bound_token(&old_secret, &identity, RAW_ID);
+        let token = bound_token(&old_secret, &identity, RAW_ID)?;
         let router = router_with_identity(new_secret, Some(identity));
 
-        let response = post_with_session(router, "/echo", Some(&token)).await;
+        let response = post_with_session(router, "/echo", Some(&token)).await?;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn session_binding_middleware_raw_unwrapped_uuid_returns_403() {
+    /// Pins that a bare raw UUID header is rejected with 403.
+    async fn session_binding_middleware_raw_unwrapped_uuid_returns_403() -> anyhow::Result<()> {
         let secret = test_secret(7);
         let identity = test_identity("alice", AuthMethod::BearerToken, None);
         let router = router_with_identity(secret, Some(identity));
 
-        let response = post_with_session(router, "/echo", Some(RAW_ID)).await;
+        let response = post_with_session(router, "/echo", Some(RAW_ID)).await?;
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn session_binding_middleware_malformed_token_returns_403() {
+    /// Pins that a malformed session header is rejected with 403.
+    async fn session_binding_middleware_malformed_token_returns_403() -> anyhow::Result<()> {
         let secret = test_secret(7);
         let identity = test_identity("alice", AuthMethod::BearerToken, None);
         let router = router_with_identity(secret, Some(identity));
 
-        let response = post_with_session(router, "/echo", Some("malformed")).await;
+        let response = post_with_session(router, "/echo", Some("malformed")).await?;
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn session_binding_middleware_no_auth_identity_passes_through_unmodified() {
+    /// Pins that without an auth identity the raw session header is left unmodified.
+    async fn session_binding_middleware_no_auth_identity_passes_through_unmodified()
+    -> anyhow::Result<()> {
         let secret = test_secret(7);
         let router = router_with_identity(secret, None);
 
-        let response = post_with_session(router, "/echo", Some(RAW_ID)).await;
+        let response = post_with_session(router, "/echo", Some(RAW_ID)).await?;
         let body = response
             .into_body()
             .collect()
             .await
-            .expect("body collects")
+            .context("body collects")?
             .to_bytes();
 
         assert_eq!(body, RAW_ID);
+        Ok(())
     }
 
     /// A UUID-shaped string, the only raw session ID shape `parse` accepts.
