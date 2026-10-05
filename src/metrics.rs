@@ -11,52 +11,17 @@
 //! collectors against the same registry. This re-exports the [`prometheus`]
 //! crate types as part of `rmcp-server-kit`'s public API; pin the same major version to
 //! avoid type-identity mismatches when registering custom metrics.
-#![cfg_attr(
-    all(feature = "metrics", target_os = "linux"),
-    expect(clippy::absolute_paths, reason = "lint-migration: src/metrics.rs")
-)]
-#![cfg_attr(
-    all(feature = "metrics", target_os = "linux"),
-    expect(clippy::min_ident_chars, reason = "lint-migration: src/metrics.rs")
-)]
-#![cfg_attr(
-    all(feature = "metrics", target_os = "linux"),
-    expect(
-        clippy::missing_inline_in_public_items,
-        reason = "lint-migration: src/metrics.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "metrics", target_os = "linux"),
-    expect(
-        clippy::module_name_repetitions,
-        reason = "lint-migration: src/metrics.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "metrics", target_os = "linux"),
-    expect(
-        clippy::too_long_first_doc_paragraph,
-        reason = "lint-migration: src/metrics.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "metrics", target_os = "linux"),
-    expect(
-        clippy::std_instead_of_alloc,
-        reason = "lint-migration: src/metrics.rs"
-    )
-)]
-#![cfg_attr(
-    all(feature = "metrics", target_os = "linux"),
-    expect(clippy::unused_trait_names, reason = "lint-migration: src/metrics.rs")
-)]
 
-use std::sync::Arc;
+extern crate alloc;
 
+use alloc::sync::Arc;
+
+use axum::{http::Extensions, middleware::from_fn, routing::get};
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounterVec, Registry, TextEncoder, opts,
+    Encoder as _, HistogramOpts, HistogramVec, IntCounterVec, Registry, TextEncoder, opts,
 };
+use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     error::RmcpServerKitError,
@@ -64,11 +29,12 @@ use crate::{
 };
 
 /// Default Prometheus histogram buckets for HTTP request latency
-/// (seconds). Tuned for low-latency service work: sub-millisecond
-/// through five seconds, covering health-check fast paths up to slow
-/// outbound dependencies. Operators that need different buckets can
-/// register their own histogram against
-/// [`McpMetrics::registry`].
+/// (seconds).
+///
+/// Tuned for low-latency service work: sub-millisecond through five
+/// seconds, covering health-check fast paths up to slow outbound
+/// dependencies. Operators that need different buckets can register
+/// their own histogram against [`McpMetrics::registry`].
 const HTTP_DURATION_BUCKETS: &[f64] = &[
     0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
 ];
@@ -76,6 +42,10 @@ const HTTP_DURATION_BUCKETS: &[f64] = &[
 /// Collected Prometheus metrics for an MCP server.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
+#[expect(
+    clippy::module_name_repetitions,
+    reason = "public API frozen until the next major release"
+)]
 pub struct McpMetrics {
     /// Prometheus registry holding all counters and histograms.
     pub registry: Registry,
@@ -97,6 +67,7 @@ impl McpMetrics {
     ///
     /// Returns [`RmcpServerKitError::Metrics`] if counter registration fails (should
     /// not happen unless duplicate registrations occur).
+    #[inline]
     pub fn new() -> Result<Self, RmcpServerKitError> {
         let registry = Registry::new();
 
@@ -104,10 +75,10 @@ impl McpMetrics {
             opts!("rmcp_server_kit_http_requests_total", "Total HTTP requests"),
             &["method", "path", "status"],
         )
-        .map_err(|e| RmcpServerKitError::Metrics(e.to_string()))?;
+        .map_err(|error| RmcpServerKitError::Metrics(error.to_string()))?;
         registry
             .register(Box::new(http_requests_total.clone()))
-            .map_err(|e| RmcpServerKitError::Metrics(e.to_string()))?;
+            .map_err(|error| RmcpServerKitError::Metrics(error.to_string()))?;
 
         let http_request_duration_seconds = HistogramVec::new(
             HistogramOpts::new(
@@ -117,10 +88,10 @@ impl McpMetrics {
             .buckets(HTTP_DURATION_BUCKETS.to_vec()),
             &["method", "path"],
         )
-        .map_err(|e| RmcpServerKitError::Metrics(e.to_string()))?;
+        .map_err(|error| RmcpServerKitError::Metrics(error.to_string()))?;
         registry
             .register(Box::new(http_request_duration_seconds.clone()))
-            .map_err(|e| RmcpServerKitError::Metrics(e.to_string()))?;
+            .map_err(|error| RmcpServerKitError::Metrics(error.to_string()))?;
 
         let rate_limited_total = IntCounterVec::new(
             opts!(
@@ -129,10 +100,10 @@ impl McpMetrics {
             ),
             &["limiter"],
         )
-        .map_err(|e| RmcpServerKitError::Metrics(e.to_string()))?;
+        .map_err(|error| RmcpServerKitError::Metrics(error.to_string()))?;
         registry
             .register(Box::new(rate_limited_total.clone()))
-            .map_err(|e| RmcpServerKitError::Metrics(e.to_string()))?;
+            .map_err(|error| RmcpServerKitError::Metrics(error.to_string()))?;
 
         Ok(Self {
             registry,
@@ -149,6 +120,7 @@ impl McpMetrics {
     /// caller-registered collectors admitted, one malformed collector must not
     /// silently blank an entire scrape.
     #[must_use]
+    #[inline]
     pub fn encode(&self) -> String {
         let encoder = TextEncoder::new();
         let metric_families = self.registry.gather();
@@ -187,9 +159,12 @@ fn encode_failure_body(error: &prometheus::Error) -> String {
 /// true; absent the extension this is a no-op, so deny sites behave
 /// identically with metrics disabled. `limiter` is one of `tool`,
 /// `auth_pre`, `auth_post`, `extra_route`.
-pub(crate) fn record_rate_limit_deny(ext: &axum::http::Extensions, limiter: &str) {
-    if let Some(m) = ext.get::<Arc<McpMetrics>>() {
-        m.rate_limited_total.with_label_values(&[limiter]).inc();
+pub(crate) fn record_rate_limit_deny(ext: &Extensions, limiter: &str) {
+    if let Some(handle) = ext.get::<Arc<McpMetrics>>() {
+        handle
+            .rate_limited_total
+            .with_label_values(&[limiter])
+            .inc();
     }
 }
 
@@ -203,13 +178,18 @@ pub(crate) fn record_rate_limit_deny(ext: &axum::http::Extensions, limiter: &str
 ///
 /// Returns [`RmcpServerKitError::Startup`] if the TCP listener cannot bind or the
 /// underlying axum server fails.
+#[inline]
+#[expect(
+    clippy::module_name_repetitions,
+    reason = "public API frozen until the next major release"
+)]
 // cancel-safe: the parent server cancels via `shutdown.cancelled()` inside
 // axum graceful shutdown; dropping this future directly only drops the
 // listener/app, with no metrics registry mutation or detached work.
 pub async fn serve_metrics(
     bind: String,
     metrics: Arc<McpMetrics>,
-    shutdown: tokio_util::sync::CancellationToken,
+    shutdown: CancellationToken,
 ) -> Result<(), RmcpServerKitError> {
     serve_metrics_with_security_headers(bind, metrics, shutdown, SecurityHeadersConfig::default())
         .await
@@ -235,62 +215,59 @@ pub async fn serve_metrics(
 pub(crate) async fn serve_metrics_with_security_headers(
     bind: String,
     metrics: Arc<McpMetrics>,
-    shutdown: tokio_util::sync::CancellationToken,
+    shutdown: CancellationToken,
     security_headers: SecurityHeadersConfig,
 ) -> Result<(), RmcpServerKitError> {
     let cfg = Arc::new(security_headers);
     let app = axum::Router::new()
         .route(
             "/metrics",
-            axum::routing::get(move || {
-                let m = Arc::clone(&metrics);
-                async move { m.encode() }
+            get(move || {
+                let handle = Arc::clone(&metrics);
+                async move { handle.encode() }
             }),
         )
-        .layer(axum::middleware::from_fn(move |req, next| {
+        .layer(from_fn(move |req, next| {
             security_headers_middleware(false, Arc::clone(&cfg), req, next)
         }));
 
-    let listener = tokio::net::TcpListener::bind(&bind)
+    let listener = TcpListener::bind(&bind)
         .await
-        .map_err(|e| RmcpServerKitError::Startup(format!("metrics bind {bind}: {e}")))?;
+        .map_err(|error| RmcpServerKitError::Startup(format!("metrics bind {bind}: {error}")))?;
     tracing::info!("metrics endpoint listening on http://{bind}/metrics");
     axum::serve(listener, app)
         .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await
-        .map_err(|e| RmcpServerKitError::Startup(format!("metrics serve: {e}")))?;
+        .map_err(|error| RmcpServerKitError::Startup(format!("metrics serve: {error}")))?;
     Ok(())
 }
 
-#[cfg_attr(
-    all(test, feature = "metrics", target_os = "linux"),
-    expect(clippy::expect_used, reason = "lint-migration: src/metrics.rs")
+#[expect(
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    reason = "test code is not rendered API documentation"
 )]
-#[cfg_attr(
-    all(test, feature = "metrics", target_os = "linux"),
-    expect(clippy::std_instead_of_core, reason = "lint-migration: src/metrics.rs")
-)]
-#[cfg_attr(
-    all(test, feature = "metrics", target_os = "linux"),
-    expect(clippy::unwrap_used, reason = "lint-migration: src/metrics.rs")
-)]
-#[cfg_attr(
-    all(test, feature = "metrics", target_os = "linux"),
-    expect(
-        clippy::missing_panics_doc,
-        reason = "test code is not rendered API documentation"
-    )
-)]
-#[cfg_attr(
-    all(test, feature = "metrics"),
-    expect(unused_results, reason = "lint-migration: src/metrics.rs")
-)]
+#[expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")]
 #[cfg(test)]
 mod tests {
+    use core::time::Duration;
+    use std::time::Instant;
+
+    use anyhow::Context as _;
+    use tokio::{
+        net::TcpStream,
+        time::{sleep, timeout},
+    };
+
     use super::*;
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/metrics.rs::encode_failure_returns_stable_non_empty_marker keeps the uniform test signature while it cannot fail"
+    )]
     #[test]
-    fn encode_failure_returns_stable_non_empty_marker() {
+    /// Pins that a failed encode serves the stable non-empty marker body.
+    fn encode_failure_returns_stable_non_empty_marker() -> anyhow::Result<()> {
         // The encoder's only failure mode is an IO error from the sink, so the
         // failure branch is driven here through `encode_failure_body` - the
         // exact function `encode` returns through - rather than through a
@@ -306,125 +283,152 @@ mod tests {
             "marker body must be stable for scrapers/alerts: {body:?}"
         );
         assert_eq!(body, ENCODE_FAILURE_MARKER);
+        Ok(())
     }
 
+    /// Pins that `new` registers the HTTP request counters and histogram.
     #[test]
-    fn new_creates_registry_with_counters() {
-        let m = McpMetrics::new().unwrap();
+    fn new_creates_registry_with_counters() -> anyhow::Result<()> {
+        let metrics = McpMetrics::new()?;
         // Incrementing a counter should make it appear in gather output.
-        m.http_requests_total
+        metrics
+            .http_requests_total
             .with_label_values(&["GET", "/test", "200"])
             .inc();
-        m.http_request_duration_seconds
+        metrics
+            .http_request_duration_seconds
             .with_label_values(&["GET", "/test"])
             .observe(0.1);
-        assert_eq!(m.registry.gather().len(), 2);
+        assert_eq!(metrics.registry.gather().len(), 2);
+        Ok(())
     }
 
+    /// Pins that an empty registry still encodes valid output.
     #[test]
-    fn encode_empty_registry() {
-        let m = McpMetrics::new().unwrap();
-        let output = m.encode();
+    fn encode_empty_registry() -> anyhow::Result<()> {
+        let metrics = McpMetrics::new()?;
+        let output = metrics.encode();
         // Empty counters/histograms produce no samples but the output is valid.
         assert!(output.is_empty() || output.contains("rmcp_server_kit_"));
+        Ok(())
     }
 
+    /// Pins that an incremented counter shows up in the encoded output.
     #[test]
-    fn counter_increment_shows_in_encode() {
-        let m = McpMetrics::new().unwrap();
-        m.http_requests_total
+    fn counter_increment_shows_in_encode() -> anyhow::Result<()> {
+        let metrics = McpMetrics::new()?;
+        metrics
+            .http_requests_total
             .with_label_values(&["GET", "/healthz", "200"])
             .inc();
-        let output = m.encode();
+        let output = metrics.encode();
         assert!(output.contains("rmcp_server_kit_http_requests_total"));
         assert!(output.contains("method=\"GET\""));
         assert!(output.contains("path=\"/healthz\""));
         assert!(output.contains("status=\"200\""));
         assert!(output.contains(" 1")); // count = 1
+        Ok(())
     }
 
+    /// Pins that an observed histogram sample shows up in the encoded output.
     #[test]
-    fn histogram_observe_shows_in_encode() {
-        let m = McpMetrics::new().unwrap();
-        m.http_request_duration_seconds
+    fn histogram_observe_shows_in_encode() -> anyhow::Result<()> {
+        let metrics = McpMetrics::new()?;
+        metrics
+            .http_request_duration_seconds
             .with_label_values(&["POST", "/mcp"])
             .observe(0.042);
-        let output = m.encode();
+        let output = metrics.encode();
         assert!(output.contains("rmcp_server_kit_http_request_duration_seconds"));
         assert!(output.contains("method=\"POST\""));
         assert!(output.contains("path=\"/mcp\""));
+        Ok(())
     }
 
+    /// Pins that repeated increments accumulate in the encoded counter.
     #[test]
-    fn multiple_increments_accumulate() {
-        let m = McpMetrics::new().unwrap();
-        let counter = m
+    fn multiple_increments_accumulate() -> anyhow::Result<()> {
+        let metrics = McpMetrics::new()?;
+        let counter = metrics
             .http_requests_total
             .with_label_values(&["POST", "/mcp", "200"]);
         counter.inc();
         counter.inc();
         counter.inc();
-        let output = m.encode();
+        let output = metrics.encode();
         assert!(output.contains(" 3")); // count = 3
+        Ok(())
     }
 
+    /// Pins that a clone observes the same underlying registry.
     #[test]
-    fn clone_shares_registry() {
-        let m = McpMetrics::new().unwrap();
-        let m2 = m.clone();
-        m.http_requests_total
+    fn clone_shares_registry() -> anyhow::Result<()> {
+        let metrics = McpMetrics::new()?;
+        let metrics_clone = metrics.clone();
+        metrics
+            .http_requests_total
             .with_label_values(&["GET", "/test", "200"])
             .inc();
         // The clone should see the same counter value.
-        let output = m2.encode();
+        let output = metrics_clone.encode();
         assert!(output.contains(" 1"));
+        Ok(())
     }
 
+    /// Pins that the rate-limited counter registers and encodes.
     #[test]
-    fn rate_limited_counter_registers_and_encodes() {
-        let m = McpMetrics::new().unwrap();
-        m.rate_limited_total.with_label_values(&["tool"]).inc();
-        let output = m.encode();
+    fn rate_limited_counter_registers_and_encodes() -> anyhow::Result<()> {
+        let metrics = McpMetrics::new()?;
+        metrics
+            .rate_limited_total
+            .with_label_values(&["tool"])
+            .inc();
+        let output = metrics.encode();
         assert!(output.contains("rmcp_server_kit_rate_limited_total"));
         assert!(output.contains("limiter=\"tool\""));
         assert!(output.contains(" 1"));
+        Ok(())
     }
 
+    /// Pins that the deny counter increments only when the handle is present.
     #[test]
-    fn record_rate_limit_deny_increments_via_extension() {
-        let m = Arc::new(McpMetrics::new().unwrap());
-        let mut ext = axum::http::Extensions::new();
-        ext.insert(Arc::clone(&m));
+    fn record_rate_limit_deny_increments_via_extension() -> anyhow::Result<()> {
+        let metrics = Arc::new(McpMetrics::new()?);
+        let mut ext = Extensions::new();
+        let _previous = ext.insert(Arc::clone(&metrics));
         record_rate_limit_deny(&ext, "auth_pre");
         record_rate_limit_deny(&ext, "auth_pre");
         assert_eq!(
-            m.rate_limited_total.with_label_values(&["auth_pre"]).get(),
+            metrics
+                .rate_limited_total
+                .with_label_values(&["auth_pre"])
+                .get(),
             2
         );
         // Absent handle: silent no-op (metrics disabled path).
-        let empty = axum::http::Extensions::new();
+        let empty = Extensions::new();
         record_rate_limit_deny(&empty, "auth_pre");
         assert_eq!(
-            m.rate_limited_total.with_label_values(&["auth_pre"]).get(),
+            metrics
+                .rate_limited_total
+                .with_label_values(&["auth_pre"])
+                .get(),
             2
         );
+        Ok(())
     }
 
-    // M7 regression: cancelling the shutdown token must release the
-    // metrics listener's bound port so a subsequent bind to the same
-    // address succeeds. Prior to M7 the metrics endpoint ran without
-    // graceful_shutdown wiring and would leak the port until process
-    // exit.
+    /// Pins that cancelling the shutdown token releases the metrics listener port.
     #[tokio::test]
-    async fn serve_metrics_releases_port_on_shutdown() {
+    async fn serve_metrics_releases_port_on_shutdown() -> anyhow::Result<()> {
         // Pick an ephemeral port, then drop the probe so serve_metrics
         // can claim it.
-        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = probe.local_addr().unwrap();
+        let probe = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = probe.local_addr().context("probe local addr")?;
         drop(probe);
 
-        let metrics = Arc::new(McpMetrics::new().unwrap());
-        let shutdown = tokio_util::sync::CancellationToken::new();
+        let metrics = Arc::new(McpMetrics::new()?);
+        let shutdown = CancellationToken::new();
         let handle = tokio::spawn(serve_metrics(
             addr.to_string(),
             Arc::clone(&metrics),
@@ -432,30 +436,31 @@ mod tests {
         ));
 
         // Wait until the listener is actually accepting connections.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            if TcpStream::connect(addr).await.is_ok() {
                 break;
             }
             assert!(
-                std::time::Instant::now() < deadline,
+                Instant::now() < deadline,
                 "metrics listener never accepted on {addr}"
             );
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            sleep(Duration::from_millis(20)).await;
         }
 
         // Cancel and await graceful shutdown.
         shutdown.cancel();
-        let join = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+        let join = timeout(Duration::from_secs(5), handle)
             .await
-            .expect("serve_metrics did not return within timeout");
-        join.expect("join error")
-            .expect("serve_metrics returned Err");
+            .context("serve_metrics did not return within timeout")?;
+        join.context("join error")?
+            .context("serve_metrics returned Err")?;
 
         // Port must be immediately rebindable.
-        let rebind = tokio::net::TcpListener::bind(addr)
+        let rebind = TcpListener::bind(addr)
             .await
-            .expect("port not released after shutdown");
+            .context("port not released after shutdown")?;
         drop(rebind);
+        Ok(())
     }
 }
