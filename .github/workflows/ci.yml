@@ -402,16 +402,16 @@ jobs:
       fail-fast: false
       matrix:
         # NOTE: cargo-mutants shards are ZERO-indexed: valid values for
-        # `--shard k/12` are 0..11. Passing 12/12 silently selects an empty
+        # `--shard k/16` are 0..15. Passing 16/16 silently selects an empty
         # shard instead of erroring.
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.9.1
       - name: Install cargo-mutants
         run: cargo install cargo-mutants --locked
-      - name: Run cargo mutants on security-critical modules (shard ${{ matrix.shard }}/12)
+      - name: Run cargo mutants on security-critical modules (shard ${{ matrix.shard }}/16)
         # Scope to the security-critical modules where mutation testing is
         # most informative. `oauth.rs` was previously included but its
         # ~1700 lines dominated runtime (the suite only reached ~30% of
@@ -422,13 +422,13 @@ jobs:
         # prefixes), and mtls_revocation.rs (semaphore eviction, timestamp
         # clamp), so those files joined the scope; to keep each nightly
         # job within the wall-clock budget the mutant list is now split
-        # deterministically across 12 parallel shards (`--shard K/12`).
+        # deterministically across 16 parallel shards (`--shard K/16`).
         # `session_binding.rs`, `rbac_context.rs`, and `task_binding.rs`
         # protect bearer-like MCP identifiers; `tool_hooks.rs` enforces the
         # tool-call result-size cap and before/after hook policy. These files
         # are in scope because silently inverted guards can fail open.
         # Keep this list intentionally small. Before adding files, measure with
-        # `cargo mutants --list -f <file>` and compare against the 12-shard
+        # `cargo mutants --list -f <file>` and compare against the 16-shard
         # 170m wall cap; true mutant count, not line count, is what costs time.
         # Wrap in `timeout` so we exit 0 even if cargo-mutants itself
         # blows past the wall-clock budget (GitHub's job-level
@@ -440,26 +440,51 @@ jobs:
         # baseline time out and silently skip all of its mutants.
         #
         # Budget re-measured 2026-10-05 (task 28, under the final Section 9
-        # profile; 8-shard run 37274533965). The cap governs the DEFAULT-feature
-        # suite, which is what cargo-mutants runs locally (no `--all-features`
-        # in this invocation and no mutants.toml):
+        # profile; 8-shard run 37274533965, then 12-shard run 37294291064). The
+        # cap governs the DEFAULT-feature suite, which is what cargo-mutants
+        # runs locally (no `--all-features` in this invocation and no
+        # mutants.toml):
         #   `cargo test` samples, warm, 4 vCPU, PROPTEST_CASES unset:
         #     218 s, 193 s, 212 s  ->  B = 218 s (max of 3)
         #     (`cargo test --all-features` measured 292 s; it is NOT what the
         #      cap governs - eight test files compile to nothing without the
         #      oauth/test-helpers features)
-        #   2026-10-05 nightly artifacts, per shard: baseline test phase
-        #     110-232 s, generated 162-163 mutants, unviable 0 (0.0%);
-        #     shard 5 finished all 162 in 165.6 min, but shards 1, 3, 6, 7 hit
-        #     the 170m wall with 123-139 of ~163 tested -> TRUNCATED. The worst
-        #     8-shard projection is ~199 min (170 min / 139 mutants * 163).
-        #   2026-09-17 (pre-profile, for context): 1110 mutants, shard wall
-        #     70-126 min, nothing truncated.
-        # Fix: 8 -> 12 shards (matrix below) so each shard gets ~109 mutants;
-        #   projected worst ~199 * 8/12 = ~133 min, ~37 min (~22%) under the
-        #   unchanged 170m cap, with `timeout-minutes: 180` still above it.
-        #   Coverage is unchanged (round-robin over the same scope); the cost is
-        #   four extra baseline suite runs.
+        #   CI baseline, 2026-09-17 nightly artifacts (commit predates the
+        #   delegation work), per shard: test phase 94-214 s, build 76-115 s
+        #   same nightly, for context: mutant test phase median 219 s, max
+        #     351 s against this 360 s cap (9 of 161 test runs >= 330 s);
+        #     shard wall 70-126 min of the 170m cap; nothing truncated
+        #     (generated == tested on all 8 shards)
+        #   mutant count for this scope: 1110 (tool_hooks.rs 71 and
+        #     rbac_context.rs 44 are the two files the delegation work touched)
+        #   2026-10-05, 8 shards (run 37274533965): 1300 mutants generated,
+        #     330 unviable (25.4%; the pre-profile E-4 baseline measured
+        #     ~50-58% unviable, so capping lints helped). Baseline test phase
+        #     99-232 s. Shards 1, 3, 6, 7 hit the 170m wall (completed
+        #     127/123/124/139 of ~163) -> TRUNCATED.
+        #   2026-10-05, 12 shards (run 37294291064): 12/12 shards SUCCESS, no
+        #     truncation, ~108 mutants/shard. Measured "Run cargo mutants" step
+        #     durations (min), margin vs the 170m cap:
+        #       122.4 (47.6) / 89.1 (80.9) / 90.2 (79.8) / 119.3 (50.7)
+        #       130.1 (39.9) / 133.8 (36.2) / 110.9 (59.1) / 142.5 (27.5)
+        #       157.3 (12.7) / 86.4 (83.6) / 156.7 (13.3) / 114.5 (55.5)
+        #     (shard order 0..11; the job wall also includes `cargo install`,
+        #     so the step duration is the comparable quantity). The slowest,
+        #     157.3 min, leaves only 12.7 min (7%) - below the ~15 min
+        #     keep-12 threshold - so the conservative 16-shard split is used.
+        # Fix: 8 -> 16 shards (matrix below). 1300 / 16 ~= 81 mutants/shard;
+        #   at the worst observed rate (157.3 min / 109 = 1.44 min/mutant) a
+        #   shard projects ~117 min, ~53 min (31%) under the unchanged 170m
+        #   cap, and `timeout-minutes: 180` stays above it. Even a 20% slower
+        #   runner remains under the cap. Coverage is unchanged (round-robin
+        #   over the same scope); the cost is extra baseline suite runs.
+        # Timeout-contention erratum (2026-10-05): 31 of the 32 Timeout
+        #   outcomes in the 8-shard run landed on the four slow-runner shards
+        #   (baseline 202-232 s vs 99-172 s elsewhere); e.g. shard 6's
+        #   timeout.txt lists mutants that should not hang. Under that ~1.7x
+        #   contention a full suite near B=218 s exceeds the fixed 360 s
+        #   per-run cap (360/1.7 ~= 212 s) and is counted Timeout. The 360 s
+        #   value is NOT changed here; re-measure if timeouts cluster again.
         # B <= 250 s -> keep the 360 s per-run cap; margin is ~39%. cargo-mutants'
         # own default for this knob is a 5x multiplier; a 2x cap would be a
         # deliberate wall-budget compromise, not upstream best practice - and
@@ -472,7 +497,7 @@ jobs:
           set +e
           timeout 170m cargo mutants --no-shuffle --cap-lints=true \
             --timeout "$MUTANTS_TEST_TIMEOUT" -j 2 \
-            --sharding round-robin --shard ${{ matrix.shard }}/12 \
+            --sharding round-robin --shard ${{ matrix.shard }}/16 \
             -f src/rbac.rs -f src/auth.rs -f src/transport.rs \
             -f src/ssrf.rs -f src/mtls_revocation.rs \
             -f src/session_binding.rs -f src/rbac_context.rs \
@@ -504,7 +529,7 @@ jobs:
       # before testing, and fills outcomes.json in incrementally. If the run is
       # killed at the wall, the untested tail is simply absent from outcomes,
       # so generated-vs-completed is the only way to see how much was skipped.
-      - name: Summarize mutation results (shard ${{ matrix.shard }}/12)
+      - name: Summarize mutation results (shard ${{ matrix.shard }}/16)
         if: always()
         run: |
           out=mutants.out
@@ -521,15 +546,15 @@ jobs:
           # per-run cap exists to cover ("must exceed the FULL suite's
           # runtime"), and its growth is the suite's fault rather than the
           # runner's: on the 2026-09-17 nightly, mutant test phases ran
-          # 1.7-2.4x their own shard baseline purely from contention (12 shards
-          # x -j 2), so a max-mutant-test trigger fired on most shards every
+          # 1.7-2.4x their own shard baseline purely from contention (8 shards
+          # x -j 2), so a max-mutant-test trigger fired on 5 of 8 shards every
           # night - alarm fatigue, one level down from the failure mode this
           # job already avoids.
           baseline_test=$(jq '[.outcomes[] | select(.scenario == "Baseline") | .phase_results[]? | select(.phase == "Test") | .duration] | first // 0' "$out/outcomes.json" 2>/dev/null || echo 0)
           max_test=$(jq '[.outcomes[]? | select(.scenario != "Baseline") | .phase_results[]? | select(.phase == "Test") | .duration] | max // 0' "$out/outcomes.json" 2>/dev/null || echo 0)
           test_cap="${MUTANTS_TEST_TIMEOUT:-360}"
           {
-            echo "### cargo-mutants shard ${{ matrix.shard }}/12"
+            echo "### cargo-mutants shard ${{ matrix.shard }}/16"
             echo ""
             echo "| metric | value |"
             echo "|---|---|"
@@ -539,8 +564,14 @@ jobs:
             echo "| mutants completed | $completed |"
             echo "| baseline test phase | ${baseline_test}s / ${test_cap}s cap |"
             echo "| max mutant test phase | ${max_test}s |"
-            for k in missed caught timeout unviable; do
-              v=$(jq --arg k "$k" '[.outcomes[]? | select(.scenario != "Baseline") | select(.summary == $k)] | length' "$out/outcomes.json" 2>/dev/null || echo 0)
+            # cargo-mutants writes CamelCase summary values in outcomes.json
+            # (MissedMutant / CaughtMutant / Timeout / Unviable); the old loop
+            # compared them against lowercase labels, so this table always
+            # printed 0 for all four. Map label -> value explicitly.
+            for kv in "missed:MissedMutant" "caught:CaughtMutant" "timeout:Timeout" "unviable:Unviable"; do
+              k=${kv%%:*}
+              s=${kv#*:}
+              v=$(jq --arg s "$s" '[.outcomes[]? | select(.scenario != "Baseline") | select(.summary == $s)] | length' "$out/outcomes.json" 2>/dev/null || echo 0)
               echo "| $k | $v |"
             done
           } >> "$GITHUB_STEP_SUMMARY"
@@ -554,7 +585,7 @@ jobs:
             case "$status" in
               0 | 2 | 3 | 124 | 137) ;;
               *)
-                echo "::error::shard ${{ matrix.shard }}/12 left no parseable mutants.out (exit status $status); mutation results were never produced. See the run log."
+                echo "::error::shard ${{ matrix.shard }}/16 left no parseable mutants.out (exit status $status); mutation results were never produced. See the run log."
                 exit 1
                 ;;
             esac
@@ -564,11 +595,11 @@ jobs:
           # exits 4 (not 124/137), so it used to leave a green job with
           # near-zero coverage and no annotation at all.
           if [ "$completed" -lt "$generated" ]; then
-            echo "::error::shard ${{ matrix.shard }}/12 tested $completed of $generated mutants; $((generated - completed)) are absent from outcomes.json. Mutation coverage is incomplete."
+            echo "::error::shard ${{ matrix.shard }}/16 tested $completed of $generated mutants; $((generated - completed)) are absent from outcomes.json. Mutation coverage is incomplete."
             exit 1
           fi
           if [ "${TRUNCATED:-0}" = "1" ]; then
-            echo "::error::shard ${{ matrix.shard }}/12 hit the ${{ '170m' }} wall; $completed of $generated mutants were tested. Mutation coverage is incomplete."
+            echo "::error::shard ${{ matrix.shard }}/16 hit the ${{ '170m' }} wall; $completed of $generated mutants were tested. Mutation coverage is incomplete."
           fi
           # Baseline near-cap warning, deliberately NOT a failure: the cap must
           # exceed the full suite's runtime, so a baseline creeping toward it is
@@ -578,10 +609,10 @@ jobs:
           # see the contention note above. Re-evaluates itself every nightly
           # instead of waiting for someone to remember to re-measure.
           if awk -v b="$baseline_test" -v c="$test_cap" 'BEGIN { exit !(b >= 0.9 * c) }'; then
-            echo "::warning::shard ${{ matrix.shard }}/12: baseline test phase ${baseline_test}s is within 10% of the ${test_cap}s --timeout cap; a slow run would be misclassified as a baseline failure. Raise the cap or make the suite faster."
+            echo "::warning::shard ${{ matrix.shard }}/16: baseline test phase ${baseline_test}s is within 10% of the ${test_cap}s --timeout cap; a slow run would be misclassified as a baseline failure. Raise the cap or make the suite faster."
           fi
 
-      - name: Upload mutants.out (shard ${{ matrix.shard }}/12)
+      - name: Upload mutants.out (shard ${{ matrix.shard }}/16)
         if: always()
         uses: actions/upload-artifact@v4
         with:
