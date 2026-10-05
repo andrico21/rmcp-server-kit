@@ -123,7 +123,7 @@ defined cleanup order, and no panic path. `scripts/lint-ratchet/prose_gates.py
 | Impl | File:line | Finding |
 | ---- | --------- | ------- |
 | `Drop for ExposureTestGuard` | `src/diagnostics.rs:197` | Test-only. Restores the process-global switch snapshot in memory; sync, no I/O or await, no panic path. No defect. |
-| `Drop for PendingUrlGuard` | `src/mtls_revocation.rs:1969` | Clears the in-flight URL marker (poison-recovering mutex); sync, no I/O or await, no panic path. Ordering is explicit via `disarm()` before promotion. No defect. |
+| `Drop for PendingUrlGuard` | `src/mtls_revocation.rs:1953` | Clears the in-flight URL marker (poison-recovering mutex); sync, no I/O or await, no panic path. Ordering is explicit via `disarm()` before promotion. No defect. |
 | `Drop for TracingGuard` | `src/observability.rs:247` | Delegates to `AuditWorkerGuard` by taking the `Option`; sync, no await, no panic path. Bounded by design (5s). No defect. |
 | `Drop for AuditWorkerGuard` | `src/observability.rs:441` | Signals shutdown then parks/joins the writer thread for at most `AUDIT_WRITER_JOIN_TIMEOUT` (5s); no async work or panic path. Bounded blocking is deliberate and documented. No defect. |
 | `Drop for CancelOnDrop` | `src/transport.rs:2866` | Sync, non-blocking `CancellationToken::cancel`; no I/O, await or panic path. Never disarmed on purpose. No defect. |
@@ -298,7 +298,26 @@ entry in the same PR that introduces a deviation.
    refresh cooldown, and the redaction tests' output. Evidence: the task-16
    migration record (`status.txt`, `new-permanent-expects.txt`, `gates.txt`).
 
-16. **2026-10-04 - `src/auth.rs` lane expectations (frozen API + deliberate).**
+16. **2026-10-04 - `src/mtls_revocation.rs` lane expectations (frozen API +
+    deliberate).** Under entry 13's frozen-API decision, `CrlSet`'s mixed
+    `pub`/private fields carry a `clippy::partial_pub_fields` expectation
+    (making the private fields public, or the public ones private, is a 4.0
+    change). Deliberate expectations, each cited in-line:
+    `clippy::iter_over_hash_type` on `next_refresh_delay` (it folds every
+    cached deadline with `min`, so iteration order cannot change the result)
+    and `clippy::unnecessary_wraps` in `mod tests`, one per assertion-only
+    test, so every test keeps the uniform `anyhow::Result<()>` signature
+    (core's test pattern). `clippy::integer_division_remainder_used` is
+    expected on `bootstrap_fetch` and `run_crl_refresher`
+    (`external macro: tokio::select`). Behavior-sensitive paths kept exact:
+    the CRL SSRF screening (`check_scheme` plus resolved-IP
+    `ip_block_reason`, at the fetcher, bootstrap and pre-flight), the
+    hash-iteration order, and every error/log string. Evidence: the task-20
+    migration record (`before-after.txt`, `new-permanent-expects.txt`,
+    `gates.txt`).
+
+
+17. **2026-10-04 - `src/auth.rs` lane expectations (frozen API + deliberate).**
    Under entry 13's decision, five public items keep names ending in the
    containing module's name and carry `module_name_repetitions` expectations:
    `AuthIdentity`, `AuthMethod`, `AuthCountersSnapshot`, `AuthConfig` and
@@ -369,6 +388,27 @@ entry in the same PR that introduces a deviation.
    task-23 migration record (`assertion-counts.txt`,
    `new-permanent-expects.txt`, `gates.txt`).
 
+19. **2026-10-04 - `src/rbac.rs` lane expectations (frozen API + deliberate).**
+   Under entry 13's decision, five public items keep names ending in the
+   containing module's name and carry `module_name_repetitions` expectations
+   (`RbacConfig`, `RbacDecision`, `RbacRoleSummary`, `RbacPolicySummary`,
+   `RbacPolicy`); `missing_const_for_fn` is frozen on `RbacPolicy::is_enabled`
+   and `RbacConfig::with_allow_operation_matching`; and
+   `impl_trait_in_params` is frozen on the public constructors `RoleConfig::new`
+   and `ArgumentAllowlist::new`/`new_required`. `redact_with_salt` keeps its
+   HMAC key-construction fallback under a `constant-time:` expectation (G-8),
+   and its `write!`-into-String discard is a typed `let _: Result<(), FmtError>`
+   under `write! into String cannot fail` (D-11'). One `deliberate:`
+   expectation records a shape with no behavior-preserving alternative: the
+   second `impl RbacConfig` block (`multiple_inherent_impl`, environment
+   overrides kept in their own block). In `mod tests`,
+   `clippy::unnecessary_wraps` is added one per assertion-only test so every
+   test keeps the uniform `anyhow::Result<()>` signature, and the core-blessed
+   test-module doc/panic expectations cover the rest. The four test route
+   handlers use a named `ok_handler` async fn, so no
+   `closure_returning_async_block` expectation is needed. The verbose deny
+   messages are unchanged (entry 1). Evidence: the task-19 migration record
+   (`new-permanent-expects.txt`, `gates.txt`).
 Entries to be added by the work that creates them: "new in `<version>`"
 expects and profile deltas (the toolchain-drift work); the per-item frozen
 public-API expectations (the lint lanes, under entry 13's decision); the GitLab
