@@ -1,28 +1,5 @@
 {
   "file": "benches/crl_precheck.rs",
-  "keys": {
-    "test|clippy::absolute_paths|--all-features": 7,
-    "test|clippy::arithmetic_side_effects|--all-features": 1,
-    "test|clippy::default_numeric_fallback|--all-features": 8,
-    "test|clippy::expect_used|--all-features": 9,
-    "test|clippy::inline_trait_bounds|--all-features": 1,
-    "test|clippy::integer_division_remainder_used|--all-features": 1,
-    "test|clippy::integer_division|--all-features": 1,
-    "test|clippy::let_underscore_must_use|--all-features": 2,
-    "test|clippy::let_underscore_untyped|--all-features": 3,
-    "test|clippy::map_with_unused_argument_over_ranges|--all-features": 1,
-    "test|clippy::min_ident_chars|--all-features": 7,
-    "test|clippy::missing_docs_in_private_items|--all-features": 10,
-    "test|clippy::missing_panics_doc|--all-features": 6,
-    "test|clippy::print_stdout|--all-features": 8,
-    "test|clippy::std_instead_of_alloc|--all-features": 1,
-    "test|clippy::std_instead_of_core|--all-features": 5,
-    "test|clippy::too_long_first_doc_paragraph|--all-features": 2,
-    "test|clippy::unseparated_literal_suffix|--all-features": 1,
-    "test|clippy::use_debug|--all-features": 7,
-    "test|deprecated|--all-features": 3,
-    "test|let_underscore_drop|--all-features": 2,
-    "test|unused_results|--all-features": 11
-  },
+  "keys": {},
   "toolchain": "1.99.0"
 }

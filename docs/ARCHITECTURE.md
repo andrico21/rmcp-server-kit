@@ -144,7 +144,7 @@ axum Router                                  src/transport.rs:2076  (build_app_r
    ├── 6. Optional metrics middleware        src/metrics.rs (records
    │      request count, duration histograms, in-flight gauge)
    │
-├── 7. Auth middleware                    src/auth.rs:2138 (auth_middleware)
+├── 7. Auth middleware                    src/auth.rs:2272 (auth_middleware)
    │      Determines AuthIdentity from one of:
    │        a) Authorization: Bearer <api-key>  → Argon2 verify against
    │           AuthState.api_keys (ArcSwap<Vec<ApiKeyEntry>>)
@@ -235,7 +235,7 @@ hot-reload. Methods:
 
 Both use `arc-swap`, so live requests are not blocked or interrupted.
 
-### `AuthIdentity` - `src/auth.rs:186`
+### `AuthIdentity` - `src/auth.rs:96`
 Canonical caller record passed through the request scope:
 ```rust
 pub struct AuthIdentity {
@@ -310,9 +310,9 @@ Startup-only.
 
 ### Construction
 `AuthState` is built inside `build_app_router()` at `src/transport.rs:1822`. It contains:
-- `api_keys: ArcSwap<Vec<ApiKeyEntry>>` (`src/auth.rs:1129`)
+- `api_keys: ArcSwap<Vec<ApiKeyEntry>>` (`src/auth.rs:1406`)
 - mTLS identities: stored **per-connection** on the
-  `TlsConnInfo` extension (`src/auth.rs:2138`), read by `auth_middleware` (`src/auth.rs:2138`).
+  `TlsConnInfo` extension (`src/auth.rs:1245`), read by `auth_middleware` (`src/auth.rs:2272`).
   No shared `SocketAddr`-keyed map exists - the previous design was replaced
   to avoid identity-binding races behind load balancers and to remove a
   `RwLock` from the request hot path.
@@ -333,7 +333,7 @@ Startup-only.
 
 ### API key flow
 1. Client sends `Authorization: Bearer <api-key>`.
-2. `auth_middleware` (`src/auth.rs:2138`) first runs the **pre-auth abuse
+2. `auth_middleware` (`src/auth.rs:2272`) first runs the **pre-auth abuse
    gate** keyed by the request's source IP. If the gate is exhausted the
    middleware returns `429` immediately, *without* touching Argon2id.
 3. Otherwise the middleware looks up the key by an indexed prefix
@@ -708,7 +708,7 @@ pub trait ToolHooks: Send + Sync + 'static {
 ```
 
 `HookedHandler<H>` implements `rmcp::ServerHandler` for any inner `H: ServerHandler`,
-delegating every method while intercepting `call_tool` (`src/tool_hooks.rs:689`):
+delegating every method while intercepting `call_tool` (`src/tool_hooks.rs:681`):
 1. Captures current identity from task-locals.
 2. Calls `before_call` - may rewrite args, may return early with an error.
 3. Calls inner handler.
@@ -790,7 +790,7 @@ Two ArcSwaps power runtime reconfiguration:
 
 | State            | Type                           | Defined at                  |
 |------------------|---------------------------------|-----------------------------|
-| API keys         | `ArcSwap<Vec<ApiKeyEntry>>`     | `src/auth.rs:1302`          |
+| API keys         | `ArcSwap<Vec<ApiKeyEntry>>`     | `src/auth.rs:1406`          |
 | RBAC policy      | `ArcSwap<RbacPolicy>`           | `src/transport.rs:1986`      |
 
 Procedure:

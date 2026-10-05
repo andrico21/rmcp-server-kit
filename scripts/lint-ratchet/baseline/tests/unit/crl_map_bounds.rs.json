@@ -1,22 +1,5 @@
 {
   "file": "tests/unit/crl_map_bounds.rs",
-  "keys": {
-    "test|clippy::absolute_paths|--all-features": 4,
-    "test|clippy::default_numeric_fallback|--all-features": 4,
-    "test|clippy::duration_suboptimal_units|--all-features": 1,
-    "test|clippy::expect_used|--all-features": 8,
-    "test|clippy::let_underscore_must_use|--all-features": 2,
-    "test|clippy::let_underscore_untyped|--all-features": 10,
-    "test|clippy::min_ident_chars|--all-features": 4,
-    "test|clippy::missing_panics_doc|--all-features": 13,
-    "test|clippy::shadow_reuse|--all-features": 1,
-    "test|clippy::std_instead_of_alloc|--all-features": 1,
-    "test|clippy::std_instead_of_core|--all-features": 1,
-    "test|clippy::tests_outside_test_module|--all-features": 8,
-    "test|clippy::too_long_first_doc_paragraph|--all-features": 1,
-    "test|clippy::unseparated_literal_suffix|--all-features": 2,
-    "test|deprecated|--all-features": 2,
-    "test|let_underscore_drop|--all-features": 2
-  },
+  "keys": {},
   "toolchain": "1.99.0"
 }

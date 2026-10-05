@@ -5877,9 +5877,10 @@ mod tests {
 
         external.cancel();
 
-        timeout(Duration::from_secs(2), bridge)
-            .await
-            .context("bridge task must exit on external cancel")??;
+        let Ok(joined) = timeout(Duration::from_secs(2), bridge).await else {
+            anyhow::bail!("bridge task must exit on external cancel");
+        };
+        joined?;
         assert!(
             internal.is_cancelled(),
             "external cancellation must still propagate to the internal token"
@@ -5946,10 +5947,10 @@ mod tests {
             .with_auth(auth)
             .with_tls("cert.pem", "key.pem");
 
-        drop(
-            cfg.validate()
-                .context("mTLS with both TLS paths is valid")?,
-        );
+        let _validated = match cfg.validate() {
+            Ok(validated) => validated,
+            Err(error) => anyhow::bail!("mTLS with both TLS paths is valid: {error:#}"),
+        };
 
         Ok(())
     }
@@ -5978,7 +5979,10 @@ mod tests {
         let ok = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0").with_auth(
             AuthConfig::with_keys(vec![ApiKeyEntry::new("viewer-key", "hash", "viewer")]),
         );
-        drop(ok.validate().context("a normal name must still validate")?);
+        let _validated = match ok.validate() {
+            Ok(validated) => validated,
+            Err(error) => anyhow::bail!("a normal name must still validate: {error:#}"),
+        };
 
         Ok(())
     }
@@ -6172,7 +6176,10 @@ mod tests {
             .with_session_store(test_session_store())
             .with_session_binding_secret(shared_session_binding_secret());
 
-        drop(cfg.validate()?);
+        let _validated = match cfg.validate() {
+            Ok(validated) => validated,
+            Err(error) => anyhow::bail!("config must validate: {error:#}"),
+        };
 
         Ok(())
     }
@@ -6186,7 +6193,10 @@ mod tests {
             .with_session_binding(false)
             .with_session_store(test_session_store());
 
-        drop(cfg.validate()?);
+        let _validated = match cfg.validate() {
+            Ok(validated) => validated,
+            Err(error) => anyhow::bail!("config must validate: {error:#}"),
+        };
 
         Ok(())
     }
@@ -6198,7 +6208,10 @@ mod tests {
             .with_auth(AuthConfig::with_keys(vec![]))
             .with_session_binding_secret(shared_session_binding_secret());
 
-        drop(cfg.validate()?);
+        let _validated = match cfg.validate() {
+            Ok(validated) => validated,
+            Err(error) => anyhow::bail!("config must validate: {error:#}"),
+        };
 
         Ok(())
     }
@@ -6256,7 +6269,10 @@ mod tests {
     fn validate_consumes_and_proves() -> anyhow::Result<()> {
         // Valid config -> Validated wrapper, original is consumed.
         let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0");
-        let validated = cfg.validate().context("valid config")?;
+        let validated = match cfg.validate() {
+            Ok(validated) => validated,
+            Err(error) => anyhow::bail!("valid config: {error:#}"),
+        };
         // as_inner() gives read-only access to inner fields.
         assert_eq!(validated.as_inner().name, "test-server");
         // into_inner recovers the raw value.
@@ -6971,7 +6987,10 @@ mod tests {
         let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
             .with_extra_route_rate_limit(10)
             .with_extra_route_rate_limit_exempt_paths(["/.well-known/oauth-authorization-server"]);
-        drop(cfg.validate()?);
+        let _validated = match cfg.validate() {
+            Ok(validated) => validated,
+            Err(error) => anyhow::bail!("well-formed exempt paths must validate: {error:#}"),
+        };
 
         Ok(())
     }
@@ -7019,7 +7038,10 @@ mod tests {
 
         let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
             .with_log_context(recommended);
-        drop(cfg.validate()?);
+        let _validated = match cfg.validate() {
+            Ok(validated) => validated,
+            Err(error) => anyhow::bail!("recommended log context must validate: {error:#}"),
+        };
 
         Ok(())
     }
@@ -7031,7 +7053,10 @@ mod tests {
         let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
             .with_request_log_exclude_paths(["/version"]);
         assert_eq!(cfg.request_log_exclude_paths, vec!["/version"]);
-        drop(cfg.validate()?);
+        let _validated = match cfg.validate() {
+            Ok(validated) => validated,
+            Err(error) => anyhow::bail!("config must validate: {error:#}"),
+        };
 
         let cfg_without_paths = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
             .with_request_log_exclude_paths(Vec::<String>::new());
@@ -7039,7 +7064,10 @@ mod tests {
             cfg_without_paths.request_log_exclude_paths,
             Vec::<String>::new()
         );
-        drop(cfg_without_paths.validate()?);
+        let _validated_without_paths = match cfg_without_paths.validate() {
+            Ok(validated) => validated,
+            Err(error) => anyhow::bail!("config must validate: {error:#}"),
+        };
 
         Ok(())
     }
@@ -7085,7 +7113,10 @@ mod tests {
         let cfg_with_proxy = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
             .with_log_context(log_context)
             .with_trusted_proxies(["127.0.0.1/32"]);
-        drop(cfg_with_proxy.validate()?);
+        let _validated = match cfg_with_proxy.validate() {
+            Ok(validated) => validated,
+            Err(error) => anyhow::bail!("config with a trusted proxy must validate: {error:#}"),
+        };
 
         Ok(())
     }
@@ -7372,9 +7403,10 @@ mod tests {
         let auth = AuthConfig::with_keys(vec![])
             .with_rate_limit(RateLimitConfig::new(10).with_pre_auth_burst(50));
         let cfg = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0").with_auth(auth);
-        let _validated = cfg
-            .validate()
-            .context("pre_auth_burst has no orphan rule")?;
+        let _validated = match cfg.validate() {
+            Ok(validated) => validated,
+            Err(error) => anyhow::bail!("pre_auth_burst has no orphan rule: {error:#}"),
+        };
 
         Ok(())
     }
@@ -7397,9 +7429,20 @@ mod tests {
             cfg(MAX_CONFIGURABLE_SCANNED_ENTRIES + 1).is_err(),
             "above the ceiling would re-open the header-bomb vector"
         );
-        let _one_entry = cfg(1)?;
-        let _module_default = cfg(MAX_SCANNED_ENTRIES)?;
-        let _configurable_ceiling = cfg(MAX_CONFIGURABLE_SCANNED_ENTRIES)?;
+        let _one_entry = match cfg(1) {
+            Ok(validated) => validated,
+            Err(error) => {
+                anyhow::bail!("1 entry within the module default must validate: {error:#}")
+            }
+        };
+        let _module_default = match cfg(MAX_SCANNED_ENTRIES) {
+            Ok(validated) => validated,
+            Err(error) => anyhow::bail!("module default must validate: {error:#}"),
+        };
+        let _configurable_ceiling = match cfg(MAX_CONFIGURABLE_SCANNED_ENTRIES) {
+            Ok(validated) => validated,
+            Err(error) => anyhow::bail!("configurable ceiling must validate: {error:#}"),
+        };
 
         Ok(())
     }
@@ -8141,11 +8184,13 @@ mod tests {
         )
         .await?;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        let line = logs
+        let Some(line) = logs
             .lines_containing("failure_class=missing_credential")
             .into_iter()
             .next()
-            .ok_or_else(|| anyhow::anyhow!("missing auth failed line: {}", logs.contents()))?;
+        else {
+            anyhow::bail!("missing auth failed line: {}", logs.contents());
+        };
         assert!(line.contains("client_ip=203.0.113.7"), "{line}");
         assert!(line.contains("peer_ip=127.0.0.1"), "{line}");
         assert!(line.contains("request_id=\"qa-1\""), "{line}");
@@ -8211,16 +8256,16 @@ mod tests {
         )
         .await?;
         assert_eq!(unauthenticated_resp.status(), StatusCode::UNAUTHORIZED);
-        let unauthenticated_line = unauthenticated_logs
+        let Some(unauthenticated_line) = unauthenticated_logs
             .lines_containing("auth failed")
             .into_iter()
             .next()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "missing auth failed line: {}",
-                    unauthenticated_logs.contents()
-                )
-            })?;
+        else {
+            anyhow::bail!(
+                "missing auth failed line: {}",
+                unauthenticated_logs.contents()
+            );
+        };
         assert!(
             unauthenticated_line.ends_with("auth failed failure_class=missing_credential"),
             "{unauthenticated_line}"
@@ -8270,13 +8315,13 @@ mod tests {
             .to_owned();
         assert!(challenge.contains("error_description=\"token is expired\""));
         assert_eq!(body_string(resp).await?, "unauthorized: expired credential");
-        let line = logs
+        let Some(line) = logs
             .lines_containing("failure_class=expired_credential")
             .into_iter()
             .next()
-            .ok_or_else(|| {
-                anyhow::anyhow!("missing expired auth failed line: {}", logs.contents())
-            })?;
+        else {
+            anyhow::bail!("missing expired auth failed line: {}", logs.contents());
+        };
         assert!(line.contains("credential_owner=\"old-key\""), "{line}");
         assert!(line.contains("credential_rejection=expired"), "{line}");
 
@@ -8336,11 +8381,9 @@ mod tests {
         let resp = drive_reqlog(&app, req).await?;
 
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        let line = logs
-            .lines_containing("RBAC denied")
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("missing RBAC denied line: {}", logs.contents()))?;
+        let Some(line) = logs.lines_containing("RBAC denied").into_iter().next() else {
+            anyhow::bail!("missing RBAC denied line: {}", logs.contents());
+        };
         assert!(line.contains("client_ip=203.0.113.7"), "{line}");
         assert!(line.contains("peer_ip=127.0.0.1"), "{line}");
         assert!(line.contains("request_id=\"qa-2\""), "{line}");
@@ -8471,7 +8514,10 @@ mod tests {
             "192.0.2.1",
             "2001:db8::1",
         ]);
-        let _validated = cfg.validate().context("CIDRs and bare IPs are accepted")?;
+        let _validated = match cfg.validate() {
+            Ok(validated) => validated,
+            Err(error) => anyhow::bail!("CIDRs and bare IPs are accepted: {error:#}"),
+        };
 
         Ok(())
     }
@@ -10079,11 +10125,9 @@ mod tests {
         let resp = app.oneshot(req).await?;
 
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        let line = logs
-            .lines_containing("auth failed")
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("missing auth failed log: {}", logs.contents()))?;
+        let Some(line) = logs.lines_containing("auth failed").into_iter().next() else {
+            anyhow::bail!("missing auth failed log: {}", logs.contents());
+        };
         assert!(line.contains("client_ip=127.0.0.1"), "{line}");
         assert!(line.contains("peer_ip=127.0.0.1"), "{line}");
         assert!(line.contains("method=POST"), "{line}");

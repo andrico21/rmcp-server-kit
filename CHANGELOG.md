@@ -55,6 +55,14 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ### Changed
 
+- **`error::Result` now takes an explicit error type** - the public
+  `rmcp_server_kit::Result` alias is generic over its error type with the crate
+  error as the default (`pub type Result<T, E = RmcpServerKitError>`). Existing
+  `Result<T>` call sites are source-compatible; `cargo semver-checks` remains
+  green. This follows the rule that `Result` aliases expose the error type as a
+  defaulted parameter (the only public-surface addition of the lint-profile
+  migration lane for the small core modules).
+
 - **Strict lint profile adopted, with no public API change** - `Cargo.toml` now
   carries the vendored Section 9 lint profile unchanged (every rustc group and
   Clippy group at `deny`, plus the documented `redundant_pub_crate` override),
