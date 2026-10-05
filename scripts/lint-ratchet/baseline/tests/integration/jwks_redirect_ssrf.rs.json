@@ -1,13 +1,5 @@
 {
   "file": "tests/integration/jwks_redirect_ssrf.rs",
-  "keys": {
-    "test|clippy::absolute_paths|--all-features": 3,
-    "test|clippy::expect_used|--all-features": 14,
-    "test|clippy::let_underscore_must_use|--all-features": 1,
-    "test|clippy::let_underscore_untyped|--all-features": 1,
-    "test|clippy::missing_panics_doc|--all-features": 7,
-    "test|clippy::tests_outside_test_module|--all-features": 7,
-    "test|let_underscore_drop|--all-features": 1
-  },
+  "keys": {},
   "toolchain": "1.99.0"
 }
