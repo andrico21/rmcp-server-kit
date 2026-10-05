@@ -369,6 +369,28 @@ entry in the same PR that introduces a deviation.
    task-23 migration record (`assertion-counts.txt`,
    `new-permanent-expects.txt`, `gates.txt`).
 
+19. **2026-10-04 - `src/rbac.rs` lane expectations (frozen API + deliberate).**
+   Under entry 13's decision, five public items keep names ending in the
+   containing module's name and carry `module_name_repetitions` expectations
+   (`RbacConfig`, `RbacDecision`, `RbacRoleSummary`, `RbacPolicySummary`,
+   `RbacPolicy`); `missing_const_for_fn` is frozen on `RbacPolicy::is_enabled`
+   and `RbacConfig::with_allow_operation_matching`; and
+   `impl_trait_in_params` is frozen on the public constructors `RoleConfig::new`
+   and `ArgumentAllowlist::new`/`new_required`. `redact_with_salt` keeps its
+   HMAC key-construction fallback under a `constant-time:` expectation (G-8),
+   and its `write!`-into-String discard is a typed `let _: Result<(), FmtError>`
+   under `write! into String cannot fail` (D-11'). One `deliberate:`
+   expectation records a shape with no behavior-preserving alternative: the
+   second `impl RbacConfig` block (`multiple_inherent_impl`, environment
+   overrides kept in their own block). In `mod tests`,
+   `clippy::unnecessary_wraps` is added one per assertion-only test so every
+   test keeps the uniform `anyhow::Result<()>` signature, and the core-blessed
+   test-module doc/panic expectations cover the rest. The four test route
+   handlers use a named `ok_handler` async fn, so no
+   `closure_returning_async_block` expectation is needed. The verbose deny
+   messages are unchanged (entry 1). Evidence: the task-19 migration record
+   (`new-permanent-expects.txt`, `gates.txt`).
+
 Entries to be added by the work that creates them: "new in `<version>`"
 expects and profile deltas (the toolchain-drift work); the per-item frozen
 public-API expectations (the lint lanes, under entry 13's decision); the GitLab
