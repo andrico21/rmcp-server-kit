@@ -55,6 +55,51 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ### Changed
 
+- **Dependency refresh: 14 semver-compatible lockfile updates, including
+  `rmcp` 3.5.0 -> 3.5.1 and `tokio` 1.53.1 -> 1.53.2** - no `Cargo.toml`
+  requirement changed. `rmcp-macros` moves with the SDK, so the direct moves
+  are `rmcp` / `rmcp-macros` 3.5.0 -> 3.5.1 and `tokio` 1.53.1 -> 1.53.2; the
+  other eleven are transitive: `cc` 1.5.1 -> 1.6.0, `ctutils` 0.4.2 -> 0.4.3,
+  `h2` 0.4.19 -> 0.4.20, `hyper` 1.11.1 -> 1.12.0, `libc` 0.2.189 -> 0.2.190,
+  `mio` 1.2.3 -> 1.2.4, `powerfmt` 0.2.0 -> 0.2.1, `uuid` 1.26.1 -> 1.27.0,
+  `want` 0.3.1 -> 0.3.2, `zerocopy` / `zerocopy-derive` 0.8.59 -> 0.8.60.
+
+  `rmcp` 3.5.1 is an upstream bug-fix release (11 commits over 3.5.0; compare
+  `rmcp-v3.5.0...rmcp-v3.5.1`): default missing cache hints for `2026-07-28`
+  peers, keep handler-generated invalid-params errors in-band, keep the
+  discover lifecycle bootstrap-neutral, export the `object!` macro without the
+  `macros` feature, notify credential stores when a refresh token is rejected,
+  and switch upstream to the MSRV-aware dependency resolver. The
+  `ServerHandler` trait surface is unchanged: the delegation guard passes (the
+  pinned method count and per-wrapper classification tables are untouched),
+  and the checklist's soundness check still holds - zero `self.inner`
+  references in the `server_handler_methods!` macro body. `tokio` 1.53.2 is
+  the 2026-10-03 patch release (buffered-seek overflow fix, an `AsyncFd`
+  deregister revert, and mpsc / semaphore / broadcast / timer-shutdown
+  locking fixes). `h2` 0.4.20 and `hyper` 1.12.0 (both published 2026-10-06)
+  move the HTTP/1.1 + HTTP/2 stack under `axum` and, via `reqwest`, the OAuth
+  fetches: hyper's fixes cover content-length / transfer-encoding interaction,
+  Connection close-vs-keep-alive precedence, hop-by-hop header preservation,
+  and a new server/client `max_header_size` knob; h2's fixes cover
+  stream-concurrency accounting, DATA-frame budget updates, duplicate
+  `content-length` rejection, `:status` validation, and shutdown races, plus
+  HPACK Huffman optimizations.
+
+  Regenerated `supply-chain/config.toml` cargo-vet exemptions for the fourteen
+  packages; `cargo vet --locked` passes. `cargo semver-checks` reports no API
+  change.
+
+  No security urgency: `cargo audit` is clean (1 290 advisories, 392 crates),
+  and every RustSec advisory naming any of the fourteen is already patched at
+  the locked version (`h2 >= 0.4.16`, `hyper >= 0.14.12` on the 0.14 line - no
+  advisory touches 1.x - `mio >= 0.8.11`, `zerocopy >= 0.7.31`,
+  `tokio >= 1.44.2` for the newest of its five, `rmcp >= 1.4.0` -
+  RUSTSEC-2026-0189, the DNS-rebinding advisory patched long before 3.5.1).
+  The two hold-backs are unchanged: `matchit` 0.8.4 (`axum` 0.8.9 requires
+  `=0.8.4` exactly, so 0.8.6 remains unreachable) and `crypto-common` 0.1.6
+  (0.1.7 pins `generic-array = "=0.14.7"` exactly, a net downgrade from the
+  locked 0.14.9 - a wash).
+
 - **`error::Result` now takes an explicit error type** - the public
   `rmcp_server_kit::Result` alias is generic over its error type with the crate
   error as the default (`pub type Result<T, E = RmcpServerKitError>`). Existing

@@ -164,7 +164,7 @@ version = "0.3.0"
 criteria = "safe-to-run"
 
 [[exemptions.cc]]
-version = "1.5.1"
+version = "1.6.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.cfg-if]]
@@ -276,7 +276,7 @@ version = "0.2.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.ctutils]]
-version = "0.4.2"
+version = "0.4.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.curve25519-dalek]]
@@ -468,7 +468,7 @@ version = "0.13.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.h2]]
-version = "0.4.19"
+version = "0.4.20"
 criteria = "safe-to-deploy"
 
 [[exemptions.half]]
@@ -536,7 +536,7 @@ version = "0.4.15"
 criteria = "safe-to-deploy"
 
 [[exemptions.hyper]]
-version = "1.11.1"
+version = "1.12.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.hyper-rustls]]
@@ -640,7 +640,7 @@ version = "1.5.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.libc]]
-version = "0.2.189"
+version = "0.2.190"
 criteria = "safe-to-deploy"
 
 [[exemptions.libm]]
@@ -692,7 +692,7 @@ version = "0.9.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.mio]]
-version = "1.2.3"
+version = "1.2.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.nom]]
@@ -820,7 +820,7 @@ version = "0.1.6"
 criteria = "safe-to-deploy"
 
 [[exemptions.powerfmt]]
-version = "0.2.0"
+version = "0.2.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.ppv-lite86]]
@@ -952,11 +952,11 @@ version = "0.17.14"
 criteria = "safe-to-deploy"
 
 [[exemptions.rmcp]]
-version = "3.5.0"
+version = "3.5.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.rmcp-macros]]
-version = "3.5.0"
+version = "3.5.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.rsa]]
@@ -1232,7 +1232,7 @@ version = "1.2.1"
 criteria = "safe-to-run"
 
 [[exemptions.tokio]]
-version = "1.53.1"
+version = "1.53.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.tokio-macros]]
@@ -1344,7 +1344,7 @@ version = "1.0.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.uuid]]
-version = "1.26.1"
+version = "1.27.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.valuable]]
@@ -1364,7 +1364,7 @@ version = "2.5.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.want]]
-version = "0.3.1"
+version = "0.3.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.wasi]]
@@ -1528,11 +1528,11 @@ version = "0.8.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.zerocopy]]
-version = "0.8.59"
+version = "0.8.60"
 criteria = "safe-to-deploy"
 
 [[exemptions.zerocopy-derive]]
-version = "0.8.59"
+version = "0.8.60"
 criteria = "safe-to-deploy"
 
 [[exemptions.zerofrom]]
