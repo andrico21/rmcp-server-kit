@@ -25,10 +25,12 @@ not as permission.
 
 - Upstream repository: `andrico21/rust-guidelines` (private; readable through
   `gh api`).
-- Pinned commit: `1314cadf42caa88b172bc72d156eb2d3cbf65e7b` (2026-10-03).
-- Nothing is ever written back to that repository. Errata in the vendored text
-  are collected for the final report of the migration that introduced this
-  index, never fixed here.
+- Pinned commit: `9b6ad4c5d6a6a2ebe8f114865b12c3b0dd4b26c2` (2026-10-06).
+- Nothing is ever written back to that repository from this checkout: errata in
+  the vendored text are reported to the owner and collected in the migration's
+  final report, never patched locally. The 2026-10-06 re-vendor picked up
+  upstream's own corrections to this project's overlay (deviation 5's count,
+  deviation 6 marked not applicable).
 
 ## Do not edit; re-vendor to update
 
@@ -56,7 +58,7 @@ Paths are relative to `docs/rust-guidelines/`.
 | `RUST_GUIDELINES.md` | `d8459547e7962dee69889a8b8d717ef50bb657ca681a519d636cfadfc9fd18a7` | `4a13d83d85599b5fbeaf44a3db96ed9c4ac1e7d1` |
 | `overlays/domains/http-services.md` | `120d64975591eb62801c5f83586cebebcfe4495e939ef1b7bd376eb476859d83` | `a80c843f7f8b69e1026cc8bf50e465b253e6ea19` |
 | `overlays/domains/mcp-servers.md` | `58b5a0badc579c13c80d8ae84819e242026fb1b62d78fa340eb7973014b57d7a` | `2d273357d98174573376ef9e8890683f530d8dbc` |
-| `overlays/projects/rmcp-server-kit.md` | `f89cf3bbd4e5f2cdf4e58233b2892dd7968e06491876a8c99f19b61f7e144861` | `c3d9ef6b2dbbf90e8cbba067ed7620df141ba39f` |
+| `overlays/projects/rmcp-server-kit.md` | `38116a2f2d7adf83c20880f35f4c018a38aa6247f811ea764b421dfe4341c819` | `b1e6a44096688bc2e15f5e3b184e9b55242e06f2` |
 
 The blob ids are the upstream git object ids at the pinned commit. Each was
 verified equal to `git hash-object` of the local copy when vendored.
@@ -104,13 +106,16 @@ permission. Status of each item at this vendoring:
 | - | --------- | ------ | -------------- |
 | 1 | `pedantic`/`nursery` at `warn`; remove the listed allows; `doc_markdown` -> `doc-valid-idents` | closed | Closed by the Section 9 profile switch (PR #40), which replaced the local lint table wholesale with the vendored profile and turned every former `#[allow]` into a narrowest-item `#[expect]`. |
 | 2 | `rust-toolchain.toml` pin and the CI `1.98.0` job contradict the Version Policy | closed | Closed by the MSRV work: the pin file was deleted (PR #29), `rust-version` is `1.99.0`, and the GitHub and GitLab MSRV jobs plus every live 1.98 doc/CI reference are retargeted to 1.99. |
-| 3 | `deny.toml`: `multiple-versions = "warn"` -> `"deny"` | closed | Closed by the core cargo-deny policy adopted in PR #31 (merged into this branch): `multiple-versions = "deny"`, `[graph] all-features`, `unmaintained` / `unsound` scope "all", licenses trimmed to the encountered set, duplicates in `skip` with a reason each. |
+| 3 | `deny.toml`: `multiple-versions = "warn"` -> `"deny"` | closed | The core cargo-deny policy is in place: `multiple-versions = "deny"`, `[graph] all-features`, `unmaintained` / `unsound` scope "all", licenses trimmed to the encountered set, duplicates in `skip` with a reason each. The PR number this row carried before the 2026-10-06 re-vendor (#31) has no corroborating reference in this repository's records, unlike every other row; the policy itself is verified in `deny.toml`. |
 | 4 | `.cargo/config.toml`: `build.warnings = "deny"` not set | closed | Closed by PR #32: `.cargo/config.toml` commits `[build] warnings = "deny"` (excluded from the published package) and every CI job inherits it. |
-| 5 | 1.99 lint impact: message-less `assert!(..is_empty())` sites | closed | All 30 test-side sites fixed on 1.99 in PR #30 (before this vendoring); they were never profile-only. The overlay's count is an erratum (30 measured, not 25) for the final report. |
-| 6 | 1.99 idioms: `String::from_utf8_lossy(..).into_owned()` sites | not applicable | False positive: both sites convert borrowed bytes (`&guard`; `&buf[..filled]`), not owned bytes. Upstream erratum. |
+| 5 | 1.99 lint impact: message-less `assert!(..is_empty())` sites | closed | All 30 test-side sites fixed on 1.99 in PR #30 (before this vendoring); they were never profile-only. The count was 26 at baseline `af71781` and 30 at `e05cf91`, not 25; the upstream overlay records that correction as of the 2026-10-06 re-vendor. Six message-less occurrences remain at HEAD (`src/auth.rs:4715`, `src/oauth.rs:6492,6516,6529,6593`, `src/ssrf.rs:1264`) and pass the Clippy job as configured - either `assert_is_empty`'s firing set is narrower than the core documents or these shapes are a profile gap; worth a `cargo clippy --all-targets --all-features` confirmation on 1.99. |
+| 6 | 1.99 idioms: `String::from_utf8_lossy(..).into_owned()` sites | not applicable | False positive: both sites convert borrowed bytes (`&guard`; `&buf[..filled]`), not owned bytes. Upstream erratum; the upstream overlay marks it not applicable as of the 2026-10-06 re-vendor. |
 
-Closure evidence for each row, and every erratum found in the vendored text,
-goes to the final report of the migration; update this table when one lands.
+Closure evidence for each row lives in the migration's final report
+(`.omo/evidence/rust-guidelines-migration/final-report.md`). Errata in the
+vendored text go upstream, never patched here: the 2026-10-06 re-vendor picked
+up the upstream overlay's own corrections for rows 5 and 6, so this table and
+the vendored text now agree.
 
 ## Drop audit (core 1208-1240)
 
