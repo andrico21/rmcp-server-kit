@@ -3,7 +3,7 @@
 This guide shows how to wire the standalone `rmcp-server-kit` crate into a
 downstream project, and how to migrate across breaking major releases.
 
-## Migrating to 3.15: logging defaults, MSRV 1.99, and `/metrics` security headers
+## Migrating to 3.14.4: logging defaults, MSRV 1.99, and `/metrics` security headers
 
 ### Framework INFO lines are visible under the default filter
 
@@ -138,7 +138,7 @@ headers on that listener move.
 
 ### Public API
 
-There is no breaking public API change in 3.15. The only public-surface change
+There is no breaking public API change in 3.14.4. The only public-surface change
 is a source-compatible addition: the `error::Result` alias is now generic over
 its error type with the crate error as the default
 (`pub type Result<T, E = RmcpServerKitError>`), so existing `Result<T>` uses

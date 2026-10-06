@@ -11,6 +11,8 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+## [3.14.4] - 2026-10-06
+
 ### Added
 
 - **Per-item client-context logging controls** - added `LogContextConfig`, the
@@ -168,7 +170,7 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   resolver-2 default can pull this release on `cargo update` and then fail the
   `rust-version` check naming `rustc 1.99.0`. The CI MSRV job now pins 1.99.0
   and builds with `--cap-lints=warn` (compile compatibility only; lints are
-  enforced on the latest stable). See `docs/MIGRATION.md` 3.15.
+  enforced on the latest stable). See `docs/MIGRATION.md` 3.14.4.
 - **Tiered test layout (internal)** - the 17 flat `tests/*.rs` files moved into
   `tests/unit/` and `tests/integration/`, one crate per file, with explicit
   `[[test]]` targets in `Cargo.toml` (names unchanged, so `cargo test --test X`
@@ -195,8 +197,6 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ### Notes
 
-- This is a minor release under the policy above because it changes a runtime
-  default without removing or retyping public API.
 - Client IP on auth and authz lines is deliberately opt-in, a privacy deviation
   from `RUST_GUIDELINES.md` section 10 that uses the guideline's own qualifier.
 - Example auth failure output with user agent enabled:

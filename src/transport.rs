@@ -324,7 +324,7 @@ pub struct SecurityHeadersConfig {
 ///
 /// Every field is off by default: client IPs, user agents and
 /// identifiers are personal data, so each item is an explicit opt-in.
-/// With every knob off, log lines keep their pre-3.15 shape. See
+/// With every knob off, log lines keep their pre-3.14.4 shape. See
 /// [`LogContextConfig::recommended`] for a curated low-risk preset.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(default)]

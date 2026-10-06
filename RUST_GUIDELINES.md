@@ -157,7 +157,7 @@ entry in the same PR that introduces a deviation.
 3. **2026-10-03 - Client context off by default.** Core Section 10 expects auth
    attempts and RBAC denials to be logged with the source IP; `LogContextConfig`
    here keeps `client_ip` and the other client-context fields off unless an
-   operator opts in (see the privacy note in `docs/GUIDE.md` and the 3.15
+   operator opts in (see the privacy note in `docs/GUIDE.md` and the 3.14.4
    migration section). Reason: client context can become personal data
    downstream; opting in is deliberate.
 4. **2026-10-03 - Overlay deviation 6 does not apply.** Both

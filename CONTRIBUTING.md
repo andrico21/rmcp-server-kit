@@ -15,7 +15,7 @@ reviewers will enforce it. The strictest stable lint profile (core Section 9)
 is committed in `Cargo.toml`, and permanent CI gates keep it honest: the
 catalog, allow, profile-equality and prose gates under `scripts/lint-ratchet/`.
 The `docs/RUST_1_95_NOTES.md` file is a historical record frozen at Rust 1.95;
-the current toolchain policy is the MSRV work in `docs/MIGRATION.md` (3.15).
+the current toolchain policy is the MSRV work in `docs/MIGRATION.md` (3.14.4).
 
 ## Development prerequisites
 

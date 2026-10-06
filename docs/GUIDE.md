@@ -1985,7 +1985,7 @@ path matching, with defaults for `/healthz` and `/readyz` to keep Kubernetes
 probes out of DEBUG request logs.
 
 Privacy note: this section is a deliberate, documented deviation from the
-pre-3.15 RUST_GUIDELINES rule that authentication attempts should include the
+pre-3.14.4 RUST_GUIDELINES rule that authentication attempts should include the
 source IP. Client context is now opt-in and off by default. Operators choose
 which fields to add to security-relevant framework lines; the kit still never
 logs raw forwarding headers or credential bytes.

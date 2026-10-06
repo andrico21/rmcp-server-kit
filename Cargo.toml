@@ -1,6 +1,6 @@
 [package]
 name = "rmcp-server-kit"
-version = "3.14.3"
+version = "3.14.4"
 edition = "2024"
 rust-version = "1.99.0"
 license = "MIT OR Apache-2.0"
