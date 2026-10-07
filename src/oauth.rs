@@ -6489,7 +6489,10 @@ role = "admin"
             .context("under key cap")?;
         assert_eq!(keys.len(), 1, "colliding kids collapse to one entry");
         assert!(keys.contains_key("dup-kid"));
-        assert!(unnamed.is_empty());
+        assert!(
+            unnamed.is_empty(),
+            "keys that carry a kid must not land in the unnamed list"
+        );
 
         Ok(())
     }
@@ -6513,7 +6516,10 @@ role = "admin"
             keys.is_empty(),
             "use=enc key must not be a verification key"
         );
-        assert!(unnamed.is_empty());
+        assert!(
+            unnamed.is_empty(),
+            "a use=enc key must not become an unnamed verification key"
+        );
 
         let mut wrap_only = json_first(&jwks_json, "keys")?.clone();
         json_set(&mut wrap_only, "key_ops", serde_json::json!(["wrapKey"]))?;
@@ -6526,7 +6532,10 @@ role = "admin"
             wrap_keys.is_empty(),
             "key_ops without verify must be rejected"
         );
-        assert!(wrap_unnamed.is_empty());
+        assert!(
+            wrap_unnamed.is_empty(),
+            "a key_ops=[wrapKey] key must not become an unnamed verification key"
+        );
 
         Ok(())
     }
@@ -6590,7 +6599,10 @@ role = "admin"
         let (keys, unnamed) = build_key_cache(&jwks, 16)
             .map_err(anyhow::Error::msg)
             .context("under key cap")?;
-        assert!(unnamed.is_empty());
+        assert!(
+            unnamed.is_empty(),
+            "an alg-less key that carries a kid must be cached by kid, not as unnamed"
+        );
         let (cached_alg, _) = keys
             .get("entra-kid")
             .context("alg-less key must be cached")?;

@@ -4712,7 +4712,10 @@ mod tests {
             !summary.bearer,
             "summary.bearer must be false when api_keys is empty (kills `!` deletion at L615)"
         );
-        assert!(summary.api_keys.is_empty());
+        assert!(
+            summary.api_keys.is_empty(),
+            "summary.api_keys must be empty when no API keys are configured"
+        );
         Ok(())
     }
 

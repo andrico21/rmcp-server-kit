@@ -1261,7 +1261,10 @@ mod tests {
         /// Pins that a default compiled allowlist reports empty.
         fn compiled_allowlist_empty_is_empty() -> anyhow::Result<()> {
             let allow = CompiledSsrfAllowlist::default();
-            assert!(allow.is_empty());
+            assert!(
+                allow.is_empty(),
+                "a default compiled allowlist must be empty"
+            );
             assert_eq!(allow.host_count(), 0);
             assert_eq!(allow.cidr_count(), 0);
             Ok(())
