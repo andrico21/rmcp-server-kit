@@ -108,14 +108,15 @@ permission. Status of each item at this vendoring:
 | 2 | `rust-toolchain.toml` pin and the CI `1.98.0` job contradict the Version Policy | closed | Closed by the MSRV work: the pin file was deleted (PR #29), `rust-version` is `1.99.0`, and the GitHub and GitLab MSRV jobs plus every live 1.98 doc/CI reference are retargeted to 1.99. |
 | 3 | `deny.toml`: `multiple-versions = "warn"` -> `"deny"` | closed | Closed by PR #31 (merge commit `8bf446f`): `multiple-versions = "deny"`, `[graph] all-features`, `unmaintained` / `unsound` scope "all", licenses trimmed to the encountered set, duplicates in `skip` with a reason each. |
 | 4 | `.cargo/config.toml`: `build.warnings = "deny"` not set | closed | Closed by PR #32: `.cargo/config.toml` commits `[build] warnings = "deny"` (excluded from the published package) and every CI job inherits it. |
-| 5 | 1.99 lint impact: message-less `assert!(..is_empty())` sites | closed | All 30 test-side sites fixed on 1.99 in PR #30 (before this vendoring); they were never profile-only. The count was 26 at baseline `af71781` and 30 at `e05cf91`, not 25; the upstream overlay records that correction as of the 2026-10-06 re-vendor. Six message-less occurrences remain at HEAD (`src/auth.rs:4715`, `src/oauth.rs:6492,6516,6529,6593`, `src/ssrf.rs:1264`) and pass the Clippy job as configured - either `assert_is_empty`'s firing set is narrower than the core documents or these shapes are a profile gap; worth a `cargo clippy --all-targets --all-features` confirmation on 1.99. |
+| 5 | 1.99 lint impact: message-less `assert!(..is_empty())` sites | closed | All 30 test-side sites fixed on 1.99 in PR #30 (before this vendoring); they were never profile-only. The count was 26 at baseline `af71781` and 30 at `e05cf91`, not 25; the upstream overlay records that correction as of the 2026-10-06 re-vendor. Six further message-less emptiness assertions (in `src/auth.rs`, `src/oauth.rs` and `src/ssrf.rs` tests) were outside `assert_is_empty`'s firing set, not a profile gap: Clippy 1.99 flags only receivers whose `assert_eq!` rewrite compiles, never a custom `is_empty()` method or a collection whose elements lack `PartialEq`. They carry messages since PR #<this PR>, as the core requires for every emptiness assertion, and the prose gate's `emptiness-message` check enforces that. |
 | 6 | 1.99 idioms: `String::from_utf8_lossy(..).into_owned()` sites | not applicable | False positive: both sites convert borrowed bytes (`&guard`; `&buf[..filled]`), not owned bytes. Upstream erratum; the upstream overlay marks it not applicable as of the 2026-10-06 re-vendor. |
 
 Each closed row names the PR that closed it; the migration's detailed evidence
 report is a development-only record kept outside the repository. Errata in the
 vendored text go upstream, never patched here: the 2026-10-06 re-vendor picked
-up the upstream overlay's own corrections for rows 5 and 6, so this table and
-the vendored text now agree.
+up the upstream overlay's own corrections for rows 5 and 6. Row 5's six
+remaining emptiness assertions were fixed after that re-vendor (PR #<this PR>);
+the vendored overlay keeps listing them until upstream re-verifies it.
 
 ## Drop audit (core 1208-1240)
 

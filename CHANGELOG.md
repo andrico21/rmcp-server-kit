@@ -11,6 +11,15 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Changed
+
+- **Every emptiness assertion carries a message (internal)** - six
+  message-less `assert!(x.is_empty())` checks in unit tests now say what they
+  pin, as the vendored core requires for every emptiness assertion. Clippy's
+  `assert_is_empty` cannot see these shapes (a custom `is_empty()` method, or a
+  collection whose elements lack `PartialEq`), so a new `emptiness-message`
+  check in `scripts/lint-ratchet/prose_gates.py` enforces the rule in CI.
+
 ## [3.14.4] - 2026-10-06
 
 ### Added

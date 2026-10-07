@@ -946,7 +946,8 @@ The lint gates are stdlib-only Python under `scripts/lint-ratchet/`:
 `catalog_gate.py` (every `#[expect]` reason is in the sanctioned catalog),
 `allow_gate.py` (no `#[allow]`), `profile_eq.py` (the committed `[lints]` table
 equals the vendored profile), and `prose_gates.py` (cancel-safety notes, test
-signatures, docs). Shared helpers live in `common.py`; the counting ratchet and
+signatures, docs, emptiness-assertion messages). Shared helpers live in
+`common.py`; the counting ratchet and
 its `baseline/` tree were retired once the last `lint-migration:` expectation
 reached zero.
 
