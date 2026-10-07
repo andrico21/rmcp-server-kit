@@ -302,6 +302,8 @@ publish-dryrun:
   needs: []
   rules:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  # Dry-run only. Actual crates.io publishing happens exclusively through
+  # GitHub's .github/workflows/release.yml, never from GitLab (SUP-01).
   script:
     - rtk cargo publish --dry-run --all-features
 

@@ -16,6 +16,13 @@ on:
     - cron: "17 3 * * *"
   workflow_dispatch:
 
+# Least-privilege default (SUP-01 PR-1): every job here only reads the repo
+# and runs cargo/tooling commands, none of them create releases, post PR
+# comments, or exchange an OIDC token, so the read-only default covers the
+# whole workflow and no job below needs its own `permissions:` grant.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # Warnings are denied by the committed .cargo/config.toml ([build] warnings
@@ -26,11 +33,11 @@ jobs:
     name: Rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       # Dated nightly (D-14 v): the newest release that passes both this job
       # and the docsrs job below. Move the pin only through the re-vendor +
       # toolchain-bump procedure in RUST_GUIDELINES.md.
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: nightly-2026-10-03
           components: rustfmt
@@ -40,11 +47,11 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
@@ -55,14 +62,14 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Remove Homebrew rust shim (macOS arm64 PATH precedence)
         if: runner.os == 'macOS'
         run: |
           brew uninstall --ignore-dependencies rustup rust 2>/dev/null || true
           rm -f /opt/homebrew/bin/cargo /opt/homebrew/bin/rustc /opt/homebrew/bin/rustup /opt/homebrew/bin/rustup-init
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
       - run: cargo test --all-features
       - name: Doctests [H-T4]
         run: cargo test --doc --all-features
@@ -80,11 +87,11 @@ jobs:
           - "--features metrics"
           - "--all-features"
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
       - name: Build (${{ matrix.features }})
         run: cargo build ${{ matrix.features }}
       # The top-level `clippy` job only lints `--all-features`, so lints that
@@ -112,9 +119,9 @@ jobs:
       github.event_name == 'pull_request' ||
       (github.event_name == 'push' && github.ref == 'refs/heads/main')
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
       # `--force` and the floor matter together: rust-cache can restore an
       # older cargo-semver-checks from ~/.cargo/bin, and `cargo install`
       # would then skip the upgrade. Versions before 0.50 cannot parse the
@@ -131,9 +138,9 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
       - name: Verify the crate is publishable
         run: cargo publish --dry-run --all-features
 
@@ -144,9 +151,9 @@ jobs:
     # one green run on main (per plan H-T4 / shared bench tooling).
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
       - name: Run rbac_redaction bench
         run: cargo bench --bench rbac_redaction
       - name: Assert redact_arg < 10µs
@@ -162,12 +169,12 @@ jobs:
     env:
       RUSTDOCFLAGS: "-D warnings --cfg docsrs"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       # Dated nightly (D-14 v), the same pin as the `fmt` job.
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: nightly-2026-10-03
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
       - run: cargo +nightly-2026-10-03 doc --no-deps --all-features
       - name: Verify SECURITY.md documents mTLS revocation [H-S4]
         run: |
@@ -196,9 +203,9 @@ jobs:
     env:
       RUSTDOCFLAGS: "-D warnings --cfg docsrs"
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@0e28dd9a7764e5f83064112bb1f24025a14c313c # nightly
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
       - run: cargo +nightly doc --no-deps --all-features
 
   rustdoc-stable:
@@ -209,25 +216,25 @@ jobs:
       # stable toolchain (the nightly job above covers `--cfg docsrs`).
       RUSTDOCFLAGS: "-D warnings"
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
       - run: cargo +stable doc --no-deps --all-features
 
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2
 
   audit:
     name: cargo-audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: Run cargo audit
@@ -246,9 +253,9 @@ jobs:
       RUSTFLAGS: "--cap-lints=warn"
       CARGO_BUILD_WARNINGS: allow
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@70dec6087f2cb6bab9fbac4da23160afbe848e91 # 1.99.0
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
       - run: rustc --version && cargo --version
       - run: cargo build --all-features
 
@@ -256,9 +263,9 @@ jobs:
     name: Memory bounds (Linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
       - name: Run BoundedKeyedLimiter memory regression test
         run: cargo test --release --all-features --test limiter_memory -- --ignored --nocapture
 
@@ -266,15 +273,15 @@ jobs:
     name: Validate docs (citations + links)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
       - name: Verify ARCHITECTURE.md citations resolve
         run: cargo test --all-features --test docs_citations
       - name: Verify vendored guideline checksums
         run: (cd docs/rust-guidelines && sha256sum -c SHA256SUMS)
       - name: Check Markdown links (offline)
-        uses: lycheeverse/lychee-action@v2
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2
         with:
           args: --offline --no-progress README.md RUST_GUIDELINES.md docs/*.md
           fail: true
@@ -283,7 +290,7 @@ jobs:
     name: lint-ratchet self-tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       # stdlib-only Python (>= 3.11, tomllib); no Rust toolchain needed. GitLab
       # deliberately does not run these (image python version unknown; GitHub is
       # the canonical gate).
@@ -294,7 +301,7 @@ jobs:
     name: lint catalog + allow + prose gates
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       # stdlib-only Python (>= 3.11, tomllib); no Rust toolchain needed. The
       # count gate and its measurement machinery were retired in task 28 once
       # every `lint-migration:` expectation reached zero; these four gates are
@@ -325,9 +332,9 @@ jobs:
     # on every release. That policy is gone (see docs/RELEASING.md), so the job
     # is now stable enough to gate merges.
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
       - name: Install cargo-vet
         run: cargo install cargo-vet --locked
       - name: Run cargo vet
@@ -342,9 +349,9 @@ jobs:
     name: TOML format (taplo)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
       - name: Install taplo
         run: cargo install taplo-cli --locked
       - name: Check TOML formatting
@@ -357,9 +364,9 @@ jobs:
     # Blocking: `cargo machete` passes on main, so an unused dependency is a
     # real regression, not advisory signal.
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
       - name: Install cargo-machete
         run: cargo install cargo-machete --locked
       - name: Detect unused dependencies
@@ -373,9 +380,9 @@ jobs:
     # full dependency unsafe-usage picture.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
       - name: Install cargo-geiger
         run: cargo install cargo-geiger --locked
       - name: Run cargo geiger
@@ -406,9 +413,9 @@ jobs:
         # shard instead of erroring.
         shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
       - name: Install cargo-mutants
         run: cargo install cargo-mutants --locked
       - name: Run cargo mutants on security-critical modules (shard ${{ matrix.shard }}/16)
@@ -614,7 +621,7 @@ jobs:
 
       - name: Upload mutants.out (shard ${{ matrix.shard }}/16)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: mutants-shard-${{ matrix.shard }}
           path: mutants.out
