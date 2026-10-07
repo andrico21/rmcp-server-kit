@@ -24,9 +24,13 @@ _TEST_TOKEN_RE = re.compile(r"\btest\b")
 # ---------------------------------------------------------------------------
 # Comment / string stripping
 # ---------------------------------------------------------------------------
-def strip_comments_and_strings(src: str) -> str:
+def strip_comments_and_strings(src: str, *, keep_literals: bool = False) -> str:
     """Blank ``//`` and nested ``/* */`` comments, normal/raw strings and char
     literals, replacing every consumed (non-newline) character with a space.
+
+    With ``keep_literals=True`` only comments are blanked: string, raw-string and
+    char literals are still skipped over (so ``//`` or ``/*`` inside one never
+    starts a comment) but are left intact.
 
     Length and line structure are preserved exactly, so an offset into the
     result is the same offset into *src*.
@@ -38,6 +42,10 @@ def strip_comments_and_strings(src: str) -> str:
         for k in range(a, b):
             if out[k] not in ("\n", "\r"):
                 out[k] = " "
+
+    def blank_literal(a: int, b: int) -> None:
+        if not keep_literals:
+            blank(a, b)
 
     i = 0
     while i < n:
@@ -70,7 +78,7 @@ def strip_comments_and_strings(src: str) -> str:
             q = m.end() - 1
             close = src.find('"' + hashes, q + 1)
             j = n if close < 0 else close + 1 + len(hashes)
-            blank(i, j)
+            blank_literal(i, j)
             i = j
             continue
         if c == '"' or (c in "bc" and i + 1 < n and src[i + 1] == '"'):
@@ -84,7 +92,7 @@ def strip_comments_and_strings(src: str) -> str:
                     j += 1
                     break
                 j += 1
-            blank(i, j)
+            blank_literal(i, j)
             i = j
             continue
         if c == "'" or (c == "b" and i + 1 < n and src[i + 1] == "'"):
@@ -94,11 +102,11 @@ def strip_comments_and_strings(src: str) -> str:
                 while j < n and src[j] != "'":
                     j += 1
                 j = j + 1 if j < n else n
-                blank(i, j)
+                blank_literal(i, j)
                 i = j
                 continue
             if k + 1 < n and src[k + 1] == "'" and src[k] != "'":
-                blank(i, k + 2)
+                blank_literal(i, k + 2)
                 i = k + 2
                 continue
         i += 1
@@ -362,6 +370,13 @@ def _self_test() -> int:
     # raw strings with hashes.
     st3 = strip_comments_and_strings('let r = r#"a \\" b"#; #[allow(y)]')
     check("raw string", "#[allow(y)]" in st3 and "a" not in st3.split("#[")[0])
+
+    # keep_literals: comments blanked, literals kept.
+    kl_src = 'f(x, /* c */ "a // b", \'"\') // t'
+    kl = strip_comments_and_strings(kl_src, keep_literals=True)
+    check("keep_literals length", len(kl) == len(kl_src))
+    check("keep_literals keeps literals", '"a // b"' in kl and "'\"'" in kl)
+    check("keep_literals blanks comments", "/* c */" not in kl and "// t" not in kl)
 
     # nested cfg_attr(expect(..)) with reason.
     nested = '#[cfg_attr(test, expect(clippy::unwrap_used, reason = "lint-migration: src/x.rs"))]'

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Prose-rule gates (D-12).
 
-Four independent checks, each with a ``--only <name>`` selector:
+Five independent checks, each with a ``--only <name>`` selector:
 
 * ``cancel-safety`` - every production ``async fn`` in ``src/`` (outside a
   ``cfg(test)`` item) has ``// cancel-safe:`` within the 6 lines above it, or a
@@ -13,6 +13,10 @@ Four independent checks, each with a ``--only <name>`` selector:
   tests and proptest-generated tests.
 * ``drop-audit``   - every ``impl Drop for`` in ``src/`` has ``// Drop audit``
   within the 3 lines above (the plan's six production Drop impls).
+* ``emptiness-message`` - every ``assert!`` / ``debug_assert!`` whose single
+  condition ends in ``.is_empty()`` carries a message, in ``src/``, ``tests/``,
+  ``benches/`` and ``examples/`` (Clippy's ``assert_is_empty`` misses custom
+  ``is_empty()`` methods and element types without ``PartialEq``).
 
 ``--report`` (default) prints the counts and each violation; ``--enforce`` exits
 1 when a violation exists.  Runnable: ``python3 prose_gates.py --self-test``.
@@ -32,10 +36,12 @@ ROOT = Path(__file__).resolve().parents[2]
 FN_RE = re.compile(r"(?<![A-Za-z0-9_.])fn\s+([A-Za-z_][A-Za-z0-9_]*)")
 DROP_RE = re.compile(r"\bimpl(?:<[^>{}]*>)?\s+Drop\s+for\b")
 PROPTEST_RE = re.compile(r"\bproptest!\s*\{")
+ASSERT_RE = re.compile(r"(?<![\w])(?:debug_)?assert!\s*\(")
+EMPTY_COND_RE = re.compile(r"\.is_empty\(\)$")
 
 CANCEL_LOOKBACK = 6
 DROP_LOOKBACK = 3
-ONLY_CHOICES = ("cancel-safety", "test-docs", "test-result", "drop-audit")
+ONLY_CHOICES = ("cancel-safety", "test-docs", "test-result", "drop-audit", "emptiness-message")
 
 
 def _next_code_pos(stripped: str, pos: int) -> int:
@@ -108,6 +114,19 @@ def _doc_block(orig_lines, item_line: int):
     return out
 
 
+def _has_top_level_logic(cond: str) -> bool:
+    """True when *cond* has ``&&`` or ``||`` outside any bracket."""
+    depth = 0
+    for i, ch in enumerate(cond):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif depth == 0 and cond.startswith(("&&", "||"), i):
+            return True
+    return False
+
+
 def _proptest_ranges(stripped: str):
     ranges = []
     for m in PROPTEST_RE.finditer(stripped):
@@ -170,6 +189,28 @@ def scan_file(path: Path, only: set[str]):
                 continue
             out["drop-audit"].append((line, "impl Drop for"))
 
+    if "emptiness-message" in only:
+        # Comments blanked, literals kept: a later macro argument counts as a
+        # message only if it holds a real token (a string or code), so a
+        # comment-only argument after a trailing comma is still flagged.
+        literals = common.strip_comments_and_strings(original, keep_literals=True)
+        for m in ASSERT_RE.finditer(stripped):
+            open_ = m.end() - 1
+            close = common.match_bracket(stripped, open_)
+            if close is None:
+                continue
+            inner = stripped[open_ + 1:close]
+            spans = common.split_top_level(inner)
+            s0, e0 = spans[0]
+            cond = " ".join(inner[s0:e0].split())
+            if not EMPTY_COND_RE.search(cond) or _has_top_level_logic(cond):
+                continue
+            if any(literals[open_ + 1 + s:open_ + 1 + e].strip() for s, e in spans[1:]):
+                continue
+            out["emptiness-message"].append(
+                (common.line_of(stripped, m.start()), "assert!(... .is_empty()) without a message")
+            )
+
     return out
 
 
@@ -212,6 +253,7 @@ def main(argv=None) -> int:
         "test-docs": "undocumented test fn",
         "test-result": "test fn not returning Result",
         "drop-audit": "unaudited Drop impl",
+        "emptiness-message": "message-less emptiness assertion",
     }
     for gate in ONLY_CHOICES:
         if gate not in only:
@@ -294,6 +336,39 @@ def _self_test() -> int:
         check("test-result flags undocumented", results["test-result"] and results["test-result"][0][0] == 20)
         check("drop-audit count", len(results["drop-audit"]) == 1)
         check("drop-audit flags guard", results["drop-audit"] and results["drop-audit"][0][0] == 30)
+
+        check("emptiness-message ignores fixture A", len(results["emptiness-message"]) == 0)
+
+        empty_src = (
+            "fn emptiness() {\n"                            # 1
+            "    assert!(v.is_empty());\n"                  # 2  flag
+            "    assert!(!v.is_empty());\n"                 # 3  flag
+            "    debug_assert!(v.is_empty());\n"            # 4  flag
+            "    assert!(\n"                                # 5  flag
+            "        v.is_empty()\n"                        # 6
+            "    );\n"                                      # 7
+            "    assert!(v.is_empty(),);\n"                 # 8  flag: trailing comma only
+            "    assert!(v.is_empty(), \"empty\");\n"       # 9
+            "    assert!(v.is_empty(), \"{}\", n);\n"       # 10
+            "    assert!(\n"                                # 11
+            "        v.is_empty(),\n"                       # 12
+            "        \"must be empty\"\n"                   # 13
+            "    );\n"                                      # 14
+            "    prop_assert!(v.is_empty());\n"             # 15
+            "    assert_eq!(v.len(), 0);\n"                 # 16
+            "    // assert!(v.is_empty());\n"               # 17
+            "    let s = \"assert!(v.is_empty())\";\n"      # 18
+            "    assert!(v.is_empty_or(1));\n"              # 19
+            "    assert!(a.is_empty() && b.is_empty());\n"  # 20
+            "    assert!(f(v.is_empty()));\n"               # 21
+            "    assert!(v.is_empty(), /* c */);\n"         # 22 flag: comment-only argument
+            "    assert!(v.is_empty(), \"a // b\");\n"      # 23
+            "}\n"                                           # 24
+        )
+        q = Path(td) / "src" / "empty.rs"
+        q.write_bytes(empty_src.encode("utf-8"))
+        hits = scan_file(q, {"emptiness-message"})["emptiness-message"]
+        check("emptiness-message lines", [h[0] for h in hits] == [2, 3, 4, 5, 8, 22])
 
     if failures:
         for f in failures:
