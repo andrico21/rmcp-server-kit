@@ -1335,6 +1335,8 @@ impl CrlSet {
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     #[inline]
+    // cancel-safe: no local CRL state is published; dropping the future aborts
+    // `gated_fetch` and leaves only bounded semaphore/map state behind.
     pub async fn __test_trigger_fetch(&self, url: &str) -> Result<(), RmcpServerKitError> {
         if let Err(error) = gated_fetch(
             &self.client,
@@ -1366,6 +1368,9 @@ impl CrlSet {
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     #[inline]
+    // cancel-safe: delegates to the atomic cache commit; cancellation before the
+    // commit leaves no update, and cancellation after it leaves a consistent
+    // cache/verifier publication.
     pub async fn __test_insert_cache(&self, url: &str, cached: CachedCrl) {
         let _result = self
             .commit_cache_update_atomically(vec![(url.to_owned(), cached)], &[])
@@ -1376,6 +1381,8 @@ impl CrlSet {
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     #[inline]
+    // cancel-safe: same atomic cache commit as `__test_insert_cache`, with the
+    // commit result returned instead of discarded.
     pub async fn __test_try_insert_cache(
         &self,
         url: &str,
@@ -1396,6 +1403,8 @@ impl CrlSet {
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     #[inline]
+    // cancel-safe: the only awaited operation is acquiring the cache write
+    // lock; once held, the direct insertion is synchronous.
     pub async fn __test_replace_cache_entry_unverified(&self, url: &str, cached: CachedCrl) {
         let mut cache = self.cache_lock().write().await;
         let _previous = cache.insert(url.to_owned(), cached);
@@ -1409,6 +1418,8 @@ impl CrlSet {
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     #[inline]
+    // cancel-safe: delegates to `refresh_urls`, which fetches into locals and
+    // publishes only through the atomic cache commit.
     pub async fn __test_trigger_refresh_url(&self, url: &str) -> Result<(), RmcpServerKitError> {
         self.refresh_urls(vec![url.to_owned()]).await
     }

@@ -18,7 +18,6 @@ LEVELS = ("deny", "warn", "allow", "forbid")
 _LINT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(::[A-Za-z_][A-Za-z0-9_]*)*$")
 _RAW_RE = re.compile(r'(?:[bc]r|r)(#*)?"')
 _LEADING_IDENT_RE = re.compile(r"\s*([A-Za-z_][A-Za-z0-9_]*)")
-_TEST_TOKEN_RE = re.compile(r"\btest\b")
 
 
 # ---------------------------------------------------------------------------
@@ -274,14 +273,42 @@ def attribute_calls(original: str, stripped: str | None = None):
 # cfg(test) scope
 # ---------------------------------------------------------------------------
 def _is_test_cfg(body: str) -> bool:
+    def implies_test(predicate: str) -> bool:
+        predicate = predicate.strip()
+        m = _LEADING_IDENT_RE.match(predicate)
+        if not m:
+            return False
+        name = m.group(1)
+        p = m.end()
+        while p < len(predicate) and predicate[p].isspace():
+            p += 1
+        if name == "test" and p == len(predicate):
+            return True
+        if name not in ("all", "any") or p >= len(predicate) or predicate[p] != "(":
+            return False
+        close = match_bracket(predicate, p)
+        if close is None or predicate[close + 1:].strip():
+            return False
+        inner = predicate[p + 1:close]
+        children = [inner[a:b] for a, b in split_top_level(inner)]
+        if name == "all":
+            return any(implies_test(child) for child in children)
+        return all(implies_test(child) for child in children)
+
     t = body.strip()
-    return t.startswith("cfg(") and bool(_TEST_TOKEN_RE.search(t))
+    if not t.startswith("cfg("):
+        return False
+    open_ = t.find("(")
+    close = match_bracket(t, open_)
+    if close is None or t[close + 1:].strip():
+        return False
+    return implies_test(t[open_ + 1:close])
 
 
 def cfg_test_line_ranges(stripped: str) -> list[tuple[int, int]]:
     """Line ranges (1-based, inclusive) of items gated by a ``cfg`` predicate
-    that mentions ``test`` (string contents are already blanked, so
-    ``feature = "test-helpers"`` alone is not matched)."""
+    that implies ``test``. A feature that also enables an item in non-test
+    builds is not treated as test-only."""
     ranges: list[tuple[int, int]] = []
     for start, end, _inner, body in iter_attributes(stripped):
         if not _is_test_cfg(body):
@@ -394,7 +421,8 @@ def _self_test() -> int:
     check("crlf count", sc.count("\r\n") == 2)
     check("crlf keeps allow", "#[allow(z)]" in sc)
 
-    # cfg(test) module ranges: nested braces handled; feature-only string blanked.
+    # cfg(test) module ranges: nested braces handled; only cfgs that imply test
+    # are treated as test-only.
     modsrc = (
         "#[cfg(test)]\n"
         "mod tests {\n"
@@ -404,12 +432,18 @@ def _self_test() -> int:
         "mod helpers {}\n"
         "#[cfg(any(test, feature = \"test-helpers\"))]\n"
         "mod both {}\n"
+        "#[cfg(all(test, unix))]\n"
+        "mod unix_tests {}\n"
+        "#[cfg(not(test))]\n"
+        "mod not_tests {}\n"
     )
     ms = strip_comments_and_strings(modsrc)
     rng = cfg_test_line_ranges(ms)
     check("cfg(test) module range", (1, 4) in rng)
     check("test-helpers not a test range", not in_ranges(6, rng))
-    check("any(test,..) is a test range", in_ranges(8, rng))
+    check("any(test,..) is not a test range", not in_ranges(8, rng))
+    check("all(test,..) is a test range", in_ranges(10, rng))
+    check("not(test) is not a test range", not in_ranges(12, rng))
 
     if failures:
         for f in failures:

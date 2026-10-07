@@ -270,6 +270,8 @@ async fn screen_oauth_target(
 /// Returns [`RmcpServerKitError::Config`] when the target URL is malformed or resolves to a
 /// blocked address.
 #[cfg(any(test, feature = "test-helpers"))]
+// cancel-safe: performs DNS resolution and pure screening with no shared state;
+// cancellation drops only local resolver/client work.
 async fn screen_oauth_target_with_test_override(
     url: &str,
     allow_http: bool,
@@ -675,6 +677,8 @@ impl OauthHttpClient {
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     #[inline]
+    // cancel-safe: bypasses preflight screening but publishes no local state;
+    // cancellation only drops the in-flight GET/response.
     pub async fn __test_get(&self, url: &str) -> reqwest::Result<reqwest::Response> {
         self.inner.get(url).send().await
     }
@@ -3662,6 +3666,9 @@ impl JwksCache {
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     #[inline]
+    // cancel-safe: fetches and parses into locals before taking the write lock;
+    // cancellation before the lock leaves the cache unchanged, and after the
+    // synchronous assignment leaves a complete cache entry.
     pub async fn __test_refresh_now(&self) -> Result<(), String> {
         let jwks = self
             .fetch_jwks()
@@ -3684,6 +3691,8 @@ impl JwksCache {
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     #[inline]
+    // cancel-safe: read-only cache lookup under a `tokio::sync::RwLock`; a
+    // cancelled waiter or reader leaves no state change.
     pub async fn __test_has_kid(&self, kid: &str) -> bool {
         let guard = self.inner.read().await;
         guard
