@@ -21,8 +21,9 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   that want client context on framework log lines. Every knob is off by default.
   The knobs are `client_ip`, `peer_ip`, `request_id`, `request_id_header`,
   `request_line`, `user_agent`, `auth_scheme`, `mcp_hints`,
-  `credential_fingerprint`, and `request_completion`. `client_ip` adds the
-  resolved `client_ip` field to DEBUG request lines, auth failure lines, and
+  `credential_fingerprint`, `credential_owner`, and `request_completion`.
+  `client_ip` adds the resolved `client_ip` field to DEBUG request lines,
+  auth failure lines, and
   RBAC denial lines. `peer_ip` adds the direct peer address as `peer_ip` on the
   same lines. `request_id` adds a proxy request ID field on those lines, but it
   is trusted only when the immediate peer matches `trusted_proxies`.
@@ -106,8 +107,10 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   `rmcp_server_kit::Result` alias is generic over its error type with the crate
   error as the default (`pub type Result<T, E = RmcpServerKitError>`). Existing
   `Result<T>` call sites are source-compatible; `cargo semver-checks` remains
-  green. This follows the rule that `Result` aliases expose the error type as a
-  defaulted parameter (the only public-surface addition of this release).
+  green. This is a deliberate API choice: call sites stay short, and callers that
+  need a precise error type can name it. It is the only public-surface change of
+  the lint migration; the logging controls under **Added** are this release's
+  other public additions.
 
 - **Strict lint profile adopted; warnings are errors** - `Cargo.toml` now
   carries the vendored Section 9 lint profile unchanged (every rustc group and
@@ -122,10 +125,11 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   sanctioned-reason catalog), the **allow** gate (no `#[allow]` anywhere), the
   **profile-equality** gate (the committed `[lints]` table matches the vendored
   profile), and the **prose** gates (cancel-safety notes, test signatures and
-  documentation rules). This release therefore makes **no breaking public API
-  change** (`cargo semver-checks` is green): downstream users see the same
-  runtime behavior, and the only public-surface change is the source-compatible
-  `error::Result` addition above.
+  documentation rules). The lint migration changes no runtime behavior, and its
+  only public-surface change is the source-compatible `error::Result` addition
+  above; this release's behavior changes are the separate entries in this
+  section. `cargo semver-checks` is green: 3.14.4 makes **no breaking public
+  API change**.
 - **Framework INFO lines are visible under the default filter** - the default
   `log_level` is now `"info,rmcp=warn,rmcp_server_kit=info"`. The previous
   default used prefix matching that hid this crate's own INFO lines, including
@@ -163,14 +167,18 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   (which drops the stale `RUSTSEC-2026-0097`). No dependency version and no
   `Cargo.lock` change.
 - **Minimum supported Rust version is now 1.99.0** - `rust-version` moves from
-  `1.98.0` to `1.99.0`. Under the project's SemVer policy an MSRV bump is a
-  minor-version change. Roots that use resolver 3 (`edition = "2024"` or
-  `resolver = "3"`) consider `rust-version`, so they stay on `3.14.x` while on
-  Rust 1.98 and only move once their toolchain is 1.99+. Roots still on the
-  resolver-2 default can pull this release on `cargo update` and then fail the
-  `rust-version` check naming `rustc 1.99.0`. The CI MSRV job now pins 1.99.0
-  and builds with `--cap-lints=warn` (compile compatibility only; lints are
-  enforced on the latest stable). See `docs/MIGRATION.md` 3.14.4.
+  `1.98.0` to `1.99.0`. The project does not treat an MSRV bump as a breaking
+  change: it can ship in a patch release, as this one does, and is always
+  called out here and in `docs/MIGRATION.md`. Roots that use resolver 3
+  (`edition = "2024"` or `resolver = "3"`) consider `rust-version`: they stay
+  on 3.14.3 while the Rust version they resolve for (their own `rust-version`,
+  or their toolchain when they set none) is below 1.99, and move to 3.14.4
+  once it is 1.99 or newer. Roots still on the resolver-2 default can pull
+  3.14.4 on `cargo update` and then fail the `rust-version` check naming
+  `rustc 1.99.0`; to stay on Rust 1.98, pin `rmcp-server-kit = "=3.14.3"`.
+  The CI MSRV job now pins 1.99.0 and builds with `--cap-lints=warn` (compile
+  compatibility only; lints are enforced on the latest stable). See
+  `docs/MIGRATION.md` 3.14.4.
 - **Tiered test layout (internal)** - the 17 flat `tests/*.rs` files moved into
   `tests/unit/` and `tests/integration/`, one crate per file, with explicit
   `[[test]]` targets in `Cargo.toml` (names unchanged, so `cargo test --test X`
@@ -201,6 +209,10 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   from `RUST_GUIDELINES.md` section 10 that uses the guideline's own qualifier.
 - Example auth failure output with user agent enabled:
   `auth failed failure_class=missing_credential user_agent="probe/1.0"`.
+- **Corrected after release (2026-10-07)** - this entry's knob list, its MSRV
+  policy sentence, its resolver guidance, its public-API scope sentences and the
+  `error::Result` rationale were corrected; the GitHub release notes for 3.14.4
+  match. The crates.io archive of 3.14.4 still carries the original wording.
 
 ## [3.14.3] - 2026-10-01
 
