@@ -107,21 +107,22 @@ rolling back to an older binary, remove those keys from the TOML file.
 
 ### Minimum supported Rust is now 1.99
 
-`rust-version` moves from `1.98.0` to `1.99.0`. Under the project's SemVer
-policy an MSRV bump is a minor-version change, so no `rmcp` SDK major change is
-involved.
+`rust-version` moves from `1.98.0` to `1.99.0`. The project does not treat an
+MSRV bump as a breaking change, so it ships in this patch release; no `rmcp`
+SDK major change is involved.
 
 The bump interacts with Cargo's dependency resolver:
 
 - Roots that use **resolver 3** (`resolver = "3"` in `Cargo.toml`, or
-  `edition = "2024"`) consider `rust-version` during resolution. They stay on a
-  `3.14.x` release while they are on Rust 1.98, and only move to the new minor
-  once their toolchain is 1.99 or newer. No action is needed.
+  `edition = "2024"`) consider `rust-version` during resolution. They stay on
+  3.14.3 while the Rust version they resolve for (their own `rust-version`, or
+  their toolchain when they set none) is below 1.99, and move to 3.14.4 once it
+  is 1.99 or newer. No action is needed.
 - Roots still on the **resolver-2 default** do not consider `rust-version`. On
-  `cargo update` they can pull this crate's next release and then fail the
-  `rust-version` check with an error naming `rustc 1.99.0`. Fix it by upgrading
-  the toolchain to Rust 1.99, or by pinning this crate to a `3.14.x` release
-  until then.
+  `cargo update` they can pull 3.14.4 and then fail the `rust-version` check
+  with an error naming `rustc 1.99.0`. Fix it by upgrading the toolchain to
+  Rust 1.99, or by pinning `rmcp-server-kit = "=3.14.3"` until then; a `"3"`,
+  `"3.14"` or `"~3.14"` requirement still selects 3.14.4.
 
 The CI MSRV job pins `1.99.0` and builds with `--cap-lints=warn` so it proves
 compile compatibility with `rust-version` only; lints are enforced on the
@@ -138,11 +139,17 @@ headers on that listener move.
 
 ### Public API
 
-There is no breaking public API change in 3.14.4. The only public-surface change
-is a source-compatible addition: the `error::Result` alias is now generic over
+There is no breaking public API change in 3.14.4; `cargo semver-checks` is
+green. The public additions are the logging controls described above: the
+`LogContextConfig` type, whose knobs are public fields, with
+`LogContextConfig::recommended()`; public `log_context` and
+`request_log_exclude_paths` fields on `McpServerConfig` and on `ServerConfig`;
+and the `McpServerConfig::with_log_context()` and
+`McpServerConfig::with_request_log_exclude_paths()` builders. The
+`error::Result` alias also changes, source-compatibly: it is now generic over
 its error type with the crate error as the default
 (`pub type Result<T, E = RmcpServerKitError>`), so existing `Result<T>` uses
-compile unchanged. `cargo semver-checks` is green.
+compile unchanged.
 
 ## Migrating to 3.14: same-named API keys must map to one role
 
@@ -919,5 +926,6 @@ Both are opt-in to keep the default dependency footprint small.
 ## 6. Minimum supported Rust
 
 `rmcp-server-kit` targets stable Rust **1.99** or newer (`edition = "2024"`).
-Bumping the MSRV is a minor-version change under the project's SemVer
-policy.
+The project does not treat an MSRV bump as a breaking change: a bump can ship in
+a patch release, and it is always called out in `CHANGELOG.md` and in this
+guide.

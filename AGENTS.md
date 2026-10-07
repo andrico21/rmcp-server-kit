@@ -60,10 +60,12 @@ Z:\TempPersistent\rmcp-server-kit\
 │   └── secret.rs               Re-exports of `secrecy` wrappers
 ├── tests/
 │   ├── unit/                 In-process tests (no I/O)
+│   │   ├── api_auto_traits.rs
 │   │   ├── crl_discovery_ratelimit.rs
 │   │   ├── crl_h3_regression.rs      (feature = "test-helpers")
 │   │   ├── crl_map_bounds.rs         (feature = "test-helpers")
 │   │   ├── oauth_url_validation.rs   (feature = "oauth")
+│   │   ├── parser_properties.rs
 │   │   └── properties.rs
 │   └── integration/          Loopback ports, `wiremock`, or file reads
 │       ├── crl_ssrf.rs
@@ -75,6 +77,7 @@ Z:\TempPersistent\rmcp-server-kit\
 │       ├── jwks_redirect_ssrf.rs    (features = "oauth", "test-helpers")
 │       ├── limiter_memory.rs        (#[ignore]d release RSS gate)
 │       ├── metrics_handle.rs        (feature = "metrics")
+│       ├── metrics_headers.rs       (feature = "metrics")
 │       ├── oauth_http_client.rs     (features = "oauth", "test-helpers")
 │       ├── origin_validation.rs
 │       └── ssrf_resolver.rs         (features = "oauth", "test-helpers")
@@ -178,16 +181,17 @@ ephemeral loopback ports.
 | **Integration** | `tests/integration/*.rs` | loopback ports, `wiremock`, or file reads | `cargo test --all-features` |
 | **Benches** | `benches/rbac_redaction.rs`, `hook_latency.rs` | - | `cargo bench` |
 
-`tests/unit/` (in-process): `crl_discovery_ratelimit`, `crl_h3_regression`,
-`crl_map_bounds`, `oauth_url_validation`, `properties`.
+`tests/unit/` (in-process): `api_auto_traits`, `crl_discovery_ratelimit`,
+`crl_h3_regression`, `crl_map_bounds`, `oauth_url_validation`,
+`parser_properties`, `properties`.
 
 `tests/integration/` (loopback ports, `wiremock` or file reads): `crl_ssrf`,
 `delegation_guard`, `docs_citations`, `e2e`, `e2e_oauth_mtls`, `jwks_key_cap`,
 `jwks_redirect_ssrf`, `limiter_memory` (`#[ignore]`d), `metrics_handle`,
-`oauth_http_client`, `origin_validation`, `ssrf_resolver`.
+`metrics_headers`, `oauth_http_client`, `origin_validation`, `ssrf_resolver`.
 
 **Feature-gated targets.** Each test file is declared with an explicit `[[test]]`
-target in `Cargo.toml`; nine of them carry `required-features`, so running a
+target in `Cargo.toml`; ten of them carry `required-features`, so running a
 gated target without its features now **errors** with "requires the features"
 instead of silently running an empty binary:
 
@@ -195,7 +199,7 @@ instead of silently running an empty binary:
 - `oauth`: `oauth_url_validation`
 - `oauth` **and** `test-helpers`: `jwks_key_cap`, `jwks_redirect_ssrf`,
   `oauth_http_client`, `ssrf_resolver`, `e2e_oauth_mtls`
-- `metrics`: `metrics_handle`
+- `metrics`: `metrics_handle`, `metrics_headers`
 
 Always use `--all-features` locally; CI additionally runs a feature matrix so
 the default-feature build is covered too.

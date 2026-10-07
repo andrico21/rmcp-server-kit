@@ -14,6 +14,16 @@ onward.
   unavoidable; bundle related breaks together and provide a migration
   guide in [`docs/MIGRATION.md`](MIGRATION.md).
 
+The project does not treat an MSRV bump as a breaking change: it can ship in a
+patch release, and it is always called out in `CHANGELOG.md` and in
+[`docs/MIGRATION.md`](MIGRATION.md).
+
+**Recorded exception (2026-10-07):** 3.14.4 is a patch release that also
+added public API: the per-item client-context logging controls listed under
+"Public API" in the 3.14.4 section of [`docs/MIGRATION.md`](MIGRATION.md).
+Under the rules above that is a minor-release change. It is a one-off: the
+release stays as published, and later releases follow the rules above.
+
 ## Pre-flight checklist
 
 1. **All CI jobs green on `main` - verify this before tagging, not after.**
