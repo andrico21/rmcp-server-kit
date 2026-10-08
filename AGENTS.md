@@ -69,6 +69,7 @@ Z:\TempPersistent\rmcp-server-kit\
 │   │   └── properties.rs
 │   └── integration/          Loopback ports, `wiremock`, or file reads
 │       ├── crl_ssrf.rs
+│       ├── crl_trusted_origin.rs    (feature = "test-helpers")
 │       ├── delegation_guard.rs
 │       ├── docs_citations.rs
 │       ├── e2e.rs            Spawns serve() on ephemeral ports
@@ -186,8 +187,8 @@ ephemeral loopback ports.
 `parser_properties`, `properties`.
 
 `tests/integration/` (loopback ports, `wiremock` or file reads): `crl_ssrf`,
-`delegation_guard`, `docs_citations`, `e2e`, `e2e_oauth_mtls`, `jwks_key_cap`,
-`jwks_redirect_ssrf`, `limiter_memory` (`#[ignore]`d), `metrics_handle`,
+`crl_trusted_origin`, `delegation_guard`, `docs_citations`, `e2e`, `e2e_oauth_mtls`,
+`jwks_key_cap`, `jwks_redirect_ssrf`, `limiter_memory` (`#[ignore]`d), `metrics_handle`,
 `metrics_headers`, `oauth_http_client`, `origin_validation`, `ssrf_resolver`.
 
 **Feature-gated targets.** Each test file is declared with an explicit `[[test]]`
@@ -195,7 +196,7 @@ target in `Cargo.toml`; ten of them carry `required-features`, so running a
 gated target without its features now **errors** with "requires the features"
 instead of silently running an empty binary:
 
-- `test-helpers`: `crl_h3_regression`, `crl_map_bounds`
+- `test-helpers`: `crl_h3_regression`, `crl_map_bounds`, `crl_trusted_origin`
 - `oauth`: `oauth_url_validation`
 - `oauth` **and** `test-helpers`: `jwks_key_cap`, `jwks_redirect_ssrf`,
   `oauth_http_client`, `ssrf_resolver`, `e2e_oauth_mtls`

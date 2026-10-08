@@ -57,8 +57,9 @@ use tokio::{
     time::{Instant, Sleep, sleep},
 };
 use tokio_util::sync::CancellationToken;
-use url::Url;
+use url::{Host, Origin, Url};
 use x509_parser::{
+    der_parser::oid,
     extensions::{DistributionPointName, GeneralName, ParsedExtension},
     prelude::{FromDer as _, X509Certificate},
     revocation_list::CertificateRevocationList,
@@ -372,6 +373,13 @@ pub struct CrlSet {
     /// Bounds concurrent CPU-bound CRL parse and verifier-rebuild jobs on the
     /// blocking pool. See [`CRL_CPU_PERMITS`].
     crl_cpu: Arc<Semaphore>,
+    /// Deduplicated http(s) origins named in the CRL Distribution Points and
+    /// Authority Information Access extensions of the operator's configured
+    /// certificates (the mTLS CA bundle and the server certificate chain). A
+    /// CRL fetch whose URL origin is in this set skips the private-address
+    /// block (cloud metadata excepted). Computed once at startup; there is
+    /// no configurable CRL allowlist.
+    trusted_origins: Arc<HashSet<Origin>>,
     /// Test-only hook fired immediately before a discovered URL becomes
     /// observable on `discover_tx`.
     ///
@@ -398,15 +406,16 @@ impl CrlSet {
         config: MtlsConfig,
         discover_tx: mpsc::UnboundedSender<String>,
         initial_cache: HashMap<String, CachedCrl>,
+        trusted_origins: Arc<HashSet<Origin>>,
     ) -> Result<Arc<Self>, RmcpServerKitError> {
         // M-H2: install the SSRF screening resolver on the CRL fetcher.
         // CRL CDP URLs come from attacker-controllable client certs and
         // their hosts are re-resolved per fetch -- exactly the TOCTOU
-        // class M-H2 closes. The allowlist is empty (default-strict),
-        // matching the existing CRL pre-flight posture; operators who
-        // need internal CDPs would extend this with the same
-        // CompiledSsrfAllowlist plumbing used by oauth.
-        let allowlist = Arc::new(CompiledSsrfAllowlist::default());
+        // class M-H2 closes. The allowlist holds the lowercased hostnames
+        // of the operator-trusted origins (the CDP and AIA URIs named in
+        // the configured certificates); there is no configurable CRL
+        // allowlist.
+        let allowlist = Arc::new(build_trusted_origin_allowlist(&trusted_origins));
         let resolver: Arc<dyn Resolve> = Arc::new(SsrfScreeningResolver::new(
             Arc::clone(&allowlist),
             #[cfg(any(test, feature = "test-helpers"))]
@@ -486,6 +495,7 @@ impl CrlSet {
             max_response_bytes,
             last_cap_warn: Mutex::new(HashMap::new()),
             crl_cpu: Arc::new(Semaphore::new(CRL_CPU_PERMITS)),
+            trusted_origins,
             #[cfg(any(test, feature = "test-helpers"))]
             discovery_send_probe: Mutex::new(None),
         }))
@@ -875,6 +885,7 @@ impl CrlSet {
             max_bytes: self.max_response_bytes,
             max_host_semaphores: self.config.crl_max_host_semaphores,
             crl_cpu: &self.crl_cpu,
+            trusted_origins: &self.trusted_origins,
         };
         let cached = gated_fetch(&ctx, &url).await?;
         let _committed = self
@@ -1162,7 +1173,13 @@ impl CrlSet {
             );
         }
 
-        Self::new(roots, config, discover_tx, initial_cache)
+        Self::new(
+            roots,
+            config,
+            discover_tx,
+            initial_cache,
+            Arc::new(HashSet::new()),
+        )
     }
 
     /// Test-only: same as [`Self::__test_with_prepopulated_crls`] but keeps and
@@ -1201,7 +1218,13 @@ impl CrlSet {
             );
         }
 
-        let crl_set = Self::new(roots, config, discover_tx, initial_cache)?;
+        let crl_set = Self::new(
+            roots,
+            config,
+            discover_tx,
+            initial_cache,
+            Arc::new(HashSet::new()),
+        )?;
         Ok((crl_set, discover_rx))
     }
 
@@ -1388,6 +1411,7 @@ impl CrlSet {
             max_bytes: self.max_response_bytes,
             max_host_semaphores: self.config.crl_max_host_semaphores,
             crl_cpu: &self.crl_cpu,
+            trusted_origins: &self.trusted_origins,
         };
         if let Err(error) = gated_fetch(&ctx, url).await {
             if error
@@ -1482,6 +1506,7 @@ impl CrlSet {
             let max_bytes = self.max_response_bytes;
             let max_host_semaphores = self.config.crl_max_host_semaphores;
             let crl_cpu = Arc::clone(&self.crl_cpu);
+            let trusted_origins = Arc::clone(&self.trusted_origins);
             let _task = tasks.spawn(async move {
                 let ctx = CrlFetchContext {
                     client: &client,
@@ -1491,6 +1516,7 @@ impl CrlSet {
                     max_bytes,
                     max_host_semaphores,
                     crl_cpu: &crl_cpu,
+                    trusted_origins: &trusted_origins,
                 };
                 let result = gated_fetch(&ctx, &url).await;
                 (url, result)
@@ -1740,6 +1766,132 @@ pub fn extract_cdp_urls(cert_der: &[u8], allow_http: bool) -> Vec<String> {
     urls
 }
 
+/// Push `name`'s origin onto `origins` when it is an accepted http(s) URI.
+///
+/// Drops non-URI names, parse failures, and rejected schemes (userinfo,
+/// non-http(s)) silently (debug log), matching `extract_cdp_urls`.
+fn collect_uri_origin(name: &GeneralName<'_>, allow_http: bool, origins: &mut Vec<Origin>) {
+    let GeneralName::URI(uri) = name else {
+        return;
+    };
+    let raw = *uri;
+    let Ok(parsed) = Url::parse(raw) else {
+        tracing::debug!(url = ?raw, "trusted CRL origin URI parse failed; dropped");
+        return;
+    };
+    if let Err(reason) = check_scheme(&parsed, allow_http) {
+        tracing::debug!(
+            url = %sanitized_url_for_log(&parsed),
+            reason,
+            "trusted CRL origin URI rejected by scheme guard; dropped"
+        );
+        return;
+    }
+    origins.push(parsed.origin());
+}
+
+/// Collect the http(s) origins named in a certificate's CRL Distribution
+/// Points and Authority Information Access extensions.
+///
+/// Covers `id-ad-caIssuers` and `id-ad-ocsp` (RFC 5280 §4.2.2.1). Mirrors
+/// `extract_cdp_urls`'s scheme and userinfo filtering via `check_scheme`,
+/// but reduces each accepted URL to its origin (scheme, lowercased host,
+/// effective port) instead of keeping the full URL. A certificate that
+/// fails to parse yields no origins (debug log), never an error: this runs
+/// over operator-configured certificates at startup, and a malformed entry
+/// should narrow the trusted set, not abort the server.
+fn extract_trusted_origins(cert_der: &[u8], allow_http: bool) -> Vec<Origin> {
+    let Ok((_, cert)) = X509Certificate::from_der(cert_der) else {
+        tracing::debug!("trusted CRL origin: certificate parse failed; skipped");
+        return Vec::new();
+    };
+
+    let mut origins = Vec::new();
+    for ext in cert.extensions() {
+        let parsed = ext.parsed_extension();
+        if let ParsedExtension::CRLDistributionPoints(cdps) = parsed {
+            for point in cdps.iter() {
+                if let Some(DistributionPointName::FullName(names)) = &point.distribution_point {
+                    for name in names {
+                        collect_uri_origin(name, allow_http, &mut origins);
+                    }
+                }
+            }
+        }
+        if let ParsedExtension::AuthorityInfoAccess(aia) = parsed {
+            for desc in aia.iter() {
+                let is_relevant = desc.access_method == oid!(1.3.6.1.5.5.7.48.2)
+                    || desc.access_method == oid!(1.3.6.1.5.5.7.48.1);
+                if is_relevant {
+                    collect_uri_origin(&desc.access_location, allow_http, &mut origins);
+                }
+            }
+        }
+    }
+    origins
+}
+
+/// Collect the deduplicated trusted CRL/AIA origins named across `ca_certs`
+/// and `server_chain`.
+///
+/// `ca_certs` is the operator's configured mTLS CA bundle; `server_chain` is
+/// the server's own TLS certificate chain. A CRL fetch whose URL origin is
+/// in the returned set skips the private-address block (cloud metadata
+/// excepted); there is no configurable CRL allowlist.
+fn collect_trusted_crl_origins(
+    ca_certs: &[CertificateDer<'_>],
+    server_chain: &[CertificateDer<'_>],
+    allow_http: bool,
+) -> HashSet<Origin> {
+    ca_certs
+        .iter()
+        .chain(server_chain.iter())
+        .flat_map(|cert| extract_trusted_origins(cert.as_ref(), allow_http))
+        .collect()
+}
+
+/// Lowercased hostnames of the hostname-form (non-IP-literal) origins in
+/// `origins`, for the connect-time resolver allowlist.
+///
+/// IP-literal origins are intentionally excluded: `screen_addrs` applies
+/// CIDR entries to every hostname's resolved addresses, so adding an
+/// IP-literal origin as a CIDR would let a rebinding hostname reach that
+/// same address on any port. IP-literal trusted origins are enforced
+/// solely by the pre-flight origin match in `fetch_crl`, which is final:
+/// reqwest never re-resolves a literal.
+fn trusted_hostnames(origins: &HashSet<Origin>) -> Vec<String> {
+    origins
+        .iter()
+        .filter_map(|origin| match origin {
+            Origin::Tuple(_, Host::Domain(domain), _) => Some(domain.clone()),
+            Origin::Tuple(_, Host::Ipv4(_) | Host::Ipv6(_), _) | Origin::Opaque(_) => None,
+        })
+        .collect()
+}
+
+/// Build the CRL fetcher's connect-time resolver allowlist from the trusted
+/// origins.
+///
+/// Hostnames only, never CIDR entries: see [`trusted_hostnames`] for why
+/// IP-literal origins are excluded rather than turned into a CIDR. Shared by
+/// [`CrlSet::new`] and [`bootstrap_fetch_with_server_chain`] so both
+/// entry points build the identical allowlist from the same trusted set.
+fn build_trusted_origin_allowlist(trusted_origins: &HashSet<Origin>) -> CompiledSsrfAllowlist {
+    CompiledSsrfAllowlist::new(trusted_hostnames(trusted_origins), Vec::new())
+}
+
+/// Log the trusted CRL/AIA origins once at startup, so an operator can audit
+/// what bypasses the private-address screening (cloud metadata excepted).
+fn log_trusted_crl_origins(origins: &HashSet<Origin>) {
+    let mut rendered: Vec<String> = origins.iter().map(Origin::ascii_serialization).collect();
+    rendered.sort();
+    tracing::info!(
+        count = rendered.len(),
+        origins = %rendered.join(", "),
+        "CRL fetch: trusted origins named in the configured certificates"
+    );
+}
+
 /// Bound the startup CDP fan-out to the same limit the steady-state cache obeys.
 ///
 /// SECURITY: `bootstrap_fetch` is a public helper taking a raw [`MtlsConfig`]
@@ -1767,6 +1919,12 @@ fn cap_bootstrap_urls(urls: &mut Vec<String>, cap: usize) {
 /// Bootstrap the CRL cache by extracting CDP URLs from the CA chain and
 /// fetching any reachable CRLs with a 10-second total deadline.
 ///
+/// The CRL/AIA origins named in `ca_certs` are trusted automatically (no
+/// configurable CRL allowlist): a CRL fetch whose URL origin is in that set
+/// skips the private-address block, cloud metadata excepted. Callers that
+/// also have the server's own TLS certificate chain available (the mTLS CRL
+/// wiring in `crate::transport::run_server`) extend that trusted set with it.
+///
 /// # Errors
 ///
 /// Returns an error if the initial verifier cannot be built.
@@ -1779,6 +1937,28 @@ pub async fn bootstrap_fetch(
     ca_certs: &[CertificateDer<'static>],
     config: MtlsConfig,
 ) -> Result<(Arc<CrlSet>, mpsc::UnboundedReceiver<String>), RmcpServerKitError> {
+    bootstrap_fetch_with_server_chain(roots, ca_certs, &[], config).await
+}
+
+/// Same as [`bootstrap_fetch`], but also derives the trusted origin set
+/// from `server_chain`.
+///
+/// `server_chain` is the server's own TLS certificate chain.
+/// `crate::transport::run_server` has both chains available and uses this
+/// variant directly; `bootstrap_fetch` delegates here with an empty
+/// `server_chain`.
+///
+/// # Errors
+///
+/// Returns an error if the initial verifier cannot be built.
+// cancel-safe: identical to `bootstrap_fetch` (see its comment); the extra
+// `server_chain` slice is read synchronously before any await.
+pub(crate) async fn bootstrap_fetch_with_server_chain(
+    roots: Arc<RootCertStore>,
+    ca_certs: &[CertificateDer<'static>],
+    server_chain: &[CertificateDer<'static>],
+    config: MtlsConfig,
+) -> Result<(Arc<CrlSet>, mpsc::UnboundedReceiver<String>), RmcpServerKitError> {
     let (discover_tx, discover_rx) = mpsc::unbounded_channel();
 
     let mut urls = ca_certs
@@ -1789,10 +1969,17 @@ pub async fn bootstrap_fetch(
     urls.dedup();
     cap_bootstrap_urls(&mut urls, config.crl_max_cache_entries);
 
-    // M-H2: same SSRF resolver hardening as CrlSet::new -- bootstrap
-    // fetches the same attacker-controlled CDP URLs, just earlier in
-    // the lifecycle.
-    let bootstrap_allowlist = Arc::new(CompiledSsrfAllowlist::default());
+    let trusted_origins = Arc::new(collect_trusted_crl_origins(
+        ca_certs,
+        server_chain,
+        config.crl_allow_http,
+    ));
+    log_trusted_crl_origins(&trusted_origins);
+
+    // M-H2: same SSRF resolver hardening as CrlSet::new. The resolver
+    // allowlist is seeded with the hostnames of the operator-trusted
+    // origins computed above, instead of staying empty.
+    let bootstrap_allowlist = Arc::new(build_trusted_origin_allowlist(&trusted_origins));
     let bootstrap_resolver: Arc<dyn Resolve> = Arc::new(SsrfScreeningResolver::new(
         Arc::clone(&bootstrap_allowlist),
         #[cfg(any(test, feature = "test-helpers"))]
@@ -1842,6 +2029,7 @@ pub async fn bootstrap_fetch(
         max_bytes,
         max_host_semaphores,
         crl_cpu: &bootstrap_crl_cpu,
+        trusted_origins: &trusted_origins,
     };
     let initial_cache = bootstrap_fetch_urls(&fetch_ctx, &urls).await;
 
@@ -1852,8 +2040,15 @@ pub async fn bootstrap_fetch(
             .map_err(|error| {
                 RmcpServerKitError::Tls(format!("CRL CPU semaphore closed: {error}"))
             })?;
-        new_crl_set_from_bootstrap_cache_blocking(roots, config, discover_tx, initial_cache, permit)
-            .await?
+        new_crl_set_from_bootstrap_cache_blocking(
+            roots,
+            config,
+            discover_tx,
+            initial_cache,
+            trusted_origins,
+            permit,
+        )
+        .await?
     };
     Ok((set, discover_rx))
 }
@@ -1883,6 +2078,7 @@ async fn bootstrap_fetch_urls(
         let task_global_sem = Arc::clone(ctx.global_sem);
         let task_host_semaphores = Arc::clone(ctx.host_semaphores);
         let task_crl_cpu = Arc::clone(ctx.crl_cpu);
+        let task_trusted_origins = Arc::clone(ctx.trusted_origins);
         let allow_http = ctx.allow_http;
         let max_bytes = ctx.max_bytes;
         let max_host_semaphores = ctx.max_host_semaphores;
@@ -1895,6 +2091,7 @@ async fn bootstrap_fetch_urls(
                 max_bytes,
                 max_host_semaphores,
                 crl_cpu: &task_crl_cpu,
+                trusted_origins: &task_trusted_origins,
             };
             let result = gated_fetch(&task_ctx, &task_url).await;
             (task_url, result)
@@ -1945,9 +2142,10 @@ fn new_crl_set_from_bootstrap_cache(
     config: MtlsConfig,
     discover_tx: mpsc::UnboundedSender<String>,
     mut initial_cache: HashMap<String, CachedCrl>,
+    trusted_origins: Arc<HashSet<Origin>>,
 ) -> Result<Arc<CrlSet>, RmcpServerKitError> {
     apply_bootstrap_cache_cap(&mut initial_cache, config.crl_max_cache_entries);
-    CrlSet::new(roots, config, discover_tx, initial_cache)
+    CrlSet::new(roots, config, discover_tx, initial_cache, trusted_origins)
 }
 
 /// Build the bootstrap `CrlSet` on the blocking thread pool, bounded by the
@@ -1965,11 +2163,12 @@ async fn new_crl_set_from_bootstrap_cache_blocking(
     config: MtlsConfig,
     discover_tx: mpsc::UnboundedSender<String>,
     initial_cache: HashMap<String, CachedCrl>,
+    trusted_origins: Arc<HashSet<Origin>>,
     permit: OwnedSemaphorePermit,
 ) -> Result<Arc<CrlSet>, RmcpServerKitError> {
     spawn_blocking(move || {
         let _permit = permit;
-        new_crl_set_from_bootstrap_cache(roots, config, discover_tx, initial_cache)
+        new_crl_set_from_bootstrap_cache(roots, config, discover_tx, initial_cache, trusted_origins)
     })
     .await
     .map_err(|error| {
@@ -2346,6 +2545,8 @@ struct CrlFetchContext<'ctx> {
     max_host_semaphores: usize,
     /// Bounds concurrent CPU-bound CRL parse jobs. See [`CRL_CPU_PERMITS`].
     crl_cpu: &'ctx Arc<Semaphore>,
+    /// Operator-trusted origins; see `CrlSet::trusted_origins`.
+    trusted_origins: &'ctx Arc<HashSet<Origin>>,
 }
 
 /// Fetch a single CRL URL through the global + per-host concurrency caps.
@@ -2387,7 +2588,15 @@ async fn gated_fetch(
         .await
         .map_err(|error| RmcpServerKitError::Tls(format!("CRL host semaphore closed: {error}")))?;
 
-    fetch_crl(ctx.client, url, ctx.allow_http, ctx.max_bytes, ctx.crl_cpu).await
+    fetch_crl(
+        ctx.client,
+        url,
+        ctx.allow_http,
+        ctx.max_bytes,
+        ctx.crl_cpu,
+        ctx.trusted_origins,
+    )
+    .await
 }
 
 /// Fetch and parse a single CRL into a cache entry.
@@ -2397,8 +2606,10 @@ async fn gated_fetch(
 ///
 /// # Errors
 ///
-/// Returns an error if the scheme is rejected, DNS screening fails, the HTTP
-/// fetch fails, the body exceeds the cap, or the DER cannot be parsed.
+/// Returns an error if the scheme is rejected, DNS screening fails (unless
+/// the URL's origin is in the operator-trusted set, cloud metadata
+/// excepted), the HTTP fetch fails, the body exceeds the cap, or the DER
+/// cannot be parsed.
 // cancel-safe: DNS lookup, request send, and chunk reads build only a local buffer; CRL
 // cache/verifier state changes happen later, when callers commit the returned value. Dropping
 // this future while the blocking parse is in flight does not cancel it (spawn_blocking cannot be
@@ -2409,6 +2620,7 @@ async fn fetch_crl(
     allow_http: bool,
     max_bytes: u64,
     crl_cpu: &Arc<Semaphore>,
+    trusted_origins: &Arc<HashSet<Origin>>,
 ) -> Result<CachedCrl, RmcpServerKitError> {
     let parsed = Url::parse(url)
         .map_err(|error| RmcpServerKitError::Tls(format!("CRL URL parse {url}: {error}")))?;
@@ -2430,6 +2642,11 @@ async fn fetch_crl(
         .port_or_known_default()
         .ok_or_else(|| RmcpServerKitError::Tls(format!("CRL URL has no known port: {url}")))?;
 
+    // The origin (scheme, host, port) is trusted when it is named in a CRL
+    // Distribution Point or Authority Information Access extension of the
+    // operator's configured certificates; see `CrlSet::trusted_origins`.
+    let trusted_origin = trusted_origins.contains(&parsed.origin());
+
     let addrs = lookup_host((host, port))
         .await
         .map_err(|error| RmcpServerKitError::Tls(format!("CRL DNS resolution {url}: {error}")))?;
@@ -2437,7 +2654,7 @@ async fn fetch_crl(
     let mut any_addr = false;
     for addr in addrs {
         any_addr = true;
-        reject_blocked_crl_ip(url, addr.ip())?;
+        reject_blocked_crl_ip(url, addr.ip(), trusted_origin)?;
     }
     if !any_addr {
         return Err(RmcpServerKitError::Tls(format!(
@@ -2491,13 +2708,25 @@ async fn fetch_crl(
 
 /// Reject a CRL resolved IP when the shared SSRF classifier blocks it.
 ///
+/// Skipped when `trusted_origin` is true - the fetch's URL origin is named
+/// in the operator's configured certificates. Cloud metadata is rejected
+/// either way.
+///
 /// # Errors
 ///
-/// Returns [`RmcpServerKitError::Tls`] when `ip` is in a blocked SSRF class.
-fn reject_blocked_crl_ip(url: &str, ip: IpAddr) -> Result<(), RmcpServerKitError> {
+/// Returns [`RmcpServerKitError::Tls`] when `ip` is in a blocked SSRF class
+/// and either `trusted_origin` is false or the class is cloud metadata.
+fn reject_blocked_crl_ip(
+    url: &str,
+    ip: IpAddr,
+    trusted_origin: bool,
+) -> Result<(), RmcpServerKitError> {
     let Some(reason) = ip_block_reason(ip) else {
         return Ok(());
     };
+    if trusted_origin && reason != "cloud_metadata" {
+        return Ok(());
+    }
     tracing::warn!(
         url = %url,
         resolved_ip = %ip,
@@ -2584,7 +2813,8 @@ fn asn1_time_to_system_time(time: ASN1Time) -> SystemTime {
 mod tests {
 
     use core::{
-        net::Ipv6Addr,
+        iter::once,
+        net::{Ipv4Addr, Ipv6Addr},
         slice,
         sync::atomic::{AtomicUsize, Ordering},
     };
@@ -2593,8 +2823,8 @@ mod tests {
     use anyhow::Context as _;
     use rcgen::{
         BasicConstraints, CertificateParams, CertificateRevocationListParams, CertifiedIssuer,
-        DnType, IsCa, KeyIdMethod, KeyPair, KeyUsagePurpose, RevocationReason, RevokedCertParams,
-        SerialNumber, date_time_ymd,
+        CrlDistributionPoint, CustomExtension, DnType, IsCa, KeyIdMethod, KeyPair, KeyUsagePurpose,
+        RevocationReason, RevokedCertParams, SerialNumber, date_time_ymd,
     };
     use rustls::crypto::ring;
     use serde_json::{from_value, json};
@@ -2694,6 +2924,243 @@ mod tests {
             "crl_max_cache_entries": 16,
         }))
         .context("verifier mtls config")
+    }
+
+    // trusted-origin derivation (operator-trusted CRL/AIA origins)
+
+    /// Minimal DER length encoding (definite form, short or long).
+    fn der_len(len: usize) -> anyhow::Result<Vec<u8>> {
+        if len < 0x80 {
+            return Ok(vec![
+                u8::try_from(len).context("short DER length fits in a byte")?,
+            ]);
+        }
+        let mut bytes = Vec::new();
+        let mut remaining = len;
+        while remaining > 0 {
+            bytes.push(u8::try_from(remaining & 0xff).context("DER length byte")?);
+            remaining >>= 8_u32;
+        }
+        bytes.reverse();
+        let mut out =
+            vec![0x80 | u8::try_from(bytes.len()).context("DER length-of-length fits in 7 bits")?];
+        out.extend(bytes);
+        Ok(out)
+    }
+
+    /// Wrap `content` in a DER TLV with the given tag byte.
+    fn der_tlv(tag: u8, content: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let mut out = vec![tag];
+        out.extend(der_len(content.len())?);
+        out.extend_from_slice(content);
+        Ok(out)
+    }
+
+    /// DER encoding of the `id-ad-caIssuers` OID (1.3.6.1.5.5.7.48.2).
+    const OID_AD_CA_ISSUERS_DER: [u8; 10] =
+        [0x06, 0x08, 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x02];
+    /// DER encoding of the `id-ad-ocsp` OID (1.3.6.1.5.5.7.48.1).
+    const OID_AD_OCSP_DER: [u8; 10] = [0x06, 0x08, 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01];
+
+    /// Hand-encode an `AuthorityInfoAccessSyntax` extension value (RFC 5280
+    /// §4.2.2.1) naming one or more (method OID DER, URI) access
+    /// descriptions. `rcgen` has no native AIA field.
+    fn aia_extension_der(entries: &[(&[u8], &str)]) -> anyhow::Result<Vec<u8>> {
+        let mut access_descriptions = Vec::new();
+        for (oid_der, uri) in entries {
+            // GeneralName's uniformResourceIdentifier is context tag [6]
+            // IMPLICIT IA5String (RFC 5280 appendix A).
+            let general_name = der_tlv(0x86, uri.as_bytes())?;
+            let mut access_description = Vec::new();
+            access_description.extend_from_slice(oid_der);
+            access_description.extend(general_name);
+            access_descriptions.extend(der_tlv(0x30, &access_description)?);
+        }
+        der_tlv(0x30, &access_descriptions)
+    }
+
+    /// Build a self-signed CA certificate carrying a CDP extension with
+    /// `cdp_uris` and an Authority Information Access extension with
+    /// `aia_entries` (method OID DER, URI).
+    fn build_ca_with_cdp_and_aia(
+        common_name: &str,
+        cdp_uris: Vec<String>,
+        aia_entries: &[(&[u8], &str)],
+    ) -> anyhow::Result<CertificateDer<'static>> {
+        let mut params = CertificateParams::new(Vec::<String>::new()).context("ca params")?;
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        params
+            .distinguished_name
+            .push(DnType::CommonName, common_name);
+        if !cdp_uris.is_empty() {
+            params.crl_distribution_points = vec![CrlDistributionPoint { uris: cdp_uris }];
+        }
+        if !aia_entries.is_empty() {
+            let aia_der = aia_extension_der(aia_entries)?;
+            params
+                .custom_extensions
+                .push(CustomExtension::from_oid_content(
+                    &[1, 3, 6, 1, 5, 5, 7, 1, 1],
+                    aia_der,
+                ));
+        }
+        let key = KeyPair::generate().context("ca key")?;
+        let issuer: CertifiedIssuer<'static, KeyPair> =
+            CertifiedIssuer::self_signed(params, key).context("ca self-signed")?;
+        Ok(issuer.der().clone())
+    }
+
+    /// Pins that trusted-origin derivation reads CDP and AIA (caIssuers,
+    /// OCSP) URIs from BOTH the CA-bundle and server-chain inputs, keeps
+    /// only http(s), lowercases hosts, normalizes default ports, keeps
+    /// IP-literal hosts (including a bracketed IPv6 literal), and drops
+    /// userinfo-bearing and non-http(s) URIs.
+    #[test]
+    fn trusted_origins_derived_from_ca_bundle_and_server_chain() -> anyhow::Result<()> {
+        let ca_cert = build_ca_with_cdp_and_aia(
+            "trusted-origin-ca-bundle-cert",
+            vec![
+                "https://ca-cdp.example:443/crl".to_owned(),
+                "https://user:pass@ca-cdp.example/userinfo-crl".to_owned(),
+                "ldap://ca-cdp.example/crl".to_owned(),
+            ],
+            &[
+                (&OID_AD_CA_ISSUERS_DER, "http://ca-issuer.example:80/ca.crt"),
+                (&OID_AD_OCSP_DER, "http://192.0.2.1:8080/ocsp"),
+            ],
+        )?;
+        let server_cert = build_ca_with_cdp_and_aia(
+            "trusted-origin-server-chain-cert",
+            vec![
+                "HTTPS://CRL.Example.COM/x".to_owned(),
+                "https://[2001:db8::1]:8443/crl".to_owned(),
+            ],
+            &[],
+        )?;
+
+        let origins = collect_trusted_crl_origins(
+            slice::from_ref(&ca_cert),
+            slice::from_ref(&server_cert),
+            true,
+        );
+        let mut rendered: Vec<String> = origins.iter().map(Origin::ascii_serialization).collect();
+        rendered.sort();
+
+        assert_eq!(
+            rendered,
+            vec![
+                "http://192.0.2.1:8080".to_owned(),
+                "http://ca-issuer.example".to_owned(),
+                "https://[2001:db8::1]:8443".to_owned(),
+                "https://ca-cdp.example".to_owned(),
+                "https://crl.example.com".to_owned(),
+            ],
+            "exactly the five http(s) origins must survive, with userinfo and ldap:// \
+             dropped, hosts lowercased, and default ports normalized: {rendered:?}"
+        );
+        Ok(())
+    }
+
+    /// Pins that the connect-time resolver allowlist built from an
+    /// IP-literal trusted origin carries no CIDR entries: `screen_addrs`
+    /// applies CIDR entries to every hostname's resolved addresses, so an
+    /// IP-literal origin added as a CIDR would let a rebinding hostname
+    /// reach that same address on any port.
+    #[test]
+    fn ip_literal_trusted_origin_yields_no_resolver_cidr_entries() -> anyhow::Result<()> {
+        let origin = Url::parse("http://127.0.0.1:4242/crl")
+            .context("parse IP-literal origin URL")?
+            .origin();
+        let origins: HashSet<Origin> = once(origin).collect();
+
+        assert!(
+            trusted_hostnames(&origins).is_empty(),
+            "an IP-literal origin must not contribute a resolver hostname"
+        );
+        let allowlist = build_trusted_origin_allowlist(&origins);
+        assert!(
+            !allowlist.ip_allowed(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            "the resolver allowlist must hold no CIDR entry for an IP-literal trusted origin"
+        );
+        Ok(())
+    }
+
+    /// Pins that the trusted-origin match considers the full origin (scheme,
+    /// host, port), not just host and port.
+    ///
+    /// A loopback address trusted only under `https` must stay blocked when
+    /// the same host and port are requested under `http`.
+    #[tokio::test]
+    async fn fetch_crl_trusted_origin_match_is_scheme_sensitive() -> anyhow::Result<()> {
+        install_ring_provider();
+        let client = Client::new();
+        let crl_cpu = Arc::new(Semaphore::new(CRL_CPU_PERMITS));
+        let trusted_origin = Url::parse("https://127.0.0.1:65535/crl")
+            .context("parse https trusted origin")?
+            .origin();
+        let trusted_origins: Arc<HashSet<Origin>> = Arc::new(once(trusted_origin).collect());
+
+        let Err(err) = fetch_crl(
+            &client,
+            "http://127.0.0.1:65535/crl",
+            true,
+            1024,
+            &crl_cpu,
+            &trusted_origins,
+        )
+        .await
+        else {
+            anyhow::bail!(
+                "a loopback origin trusted only under https must stay blocked under http"
+            );
+        };
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("loopback"),
+            "error must carry the loopback block reason: {rendered}"
+        );
+        Ok(())
+    }
+
+    /// Pins that a cloud-metadata address stays blocked even when its
+    /// origin is in the trusted set: the exception in
+    /// `reject_blocked_crl_ip` is unconditional on the block reason, not
+    /// just on `trusted_origin`.
+    #[tokio::test]
+    async fn fetch_crl_cloud_metadata_blocked_even_for_trusted_origin() -> anyhow::Result<()> {
+        install_ring_provider();
+        let client = Client::new();
+        let crl_cpu = Arc::new(Semaphore::new(CRL_CPU_PERMITS));
+        let metadata_url = "http://169.254.169.254/latest/meta-data/";
+        let trusted_origin = Url::parse(metadata_url)
+            .context("parse cloud-metadata origin")?
+            .origin();
+        let trusted_origins: Arc<HashSet<Origin>> = Arc::new(once(trusted_origin).collect());
+
+        let Err(err) = fetch_crl(
+            &client,
+            metadata_url,
+            true,
+            1024,
+            &crl_cpu,
+            &trusted_origins,
+        )
+        .await
+        else {
+            anyhow::bail!("cloud metadata must stay blocked even for a trusted origin");
+        };
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("cloud_metadata"),
+            "error must carry the cloud_metadata block reason, proving the pre-flight check \
+             ran before any network attempt: {rendered}"
+        );
+        Ok(())
     }
 
     fn test_crl_set_with_receiver() -> anyhow::Result<(Arc<CrlSet>, mpsc::UnboundedReceiver<String>)>
@@ -2835,8 +3302,14 @@ mod tests {
             })
             .collect();
 
-        let set = new_crl_set_from_bootstrap_cache(arc_roots, config, discover_tx, initial_cache)
-            .context("bootstrap cache should build CRL set")?;
+        let set = new_crl_set_from_bootstrap_cache(
+            arc_roots,
+            config,
+            discover_tx,
+            initial_cache,
+            Arc::new(HashSet::new()),
+        )
+        .context("bootstrap cache should build CRL set")?;
         let cache_keys = {
             let cache = set.cache_lock().read().await;
             assert_eq!(cache.len(), cap, "bootstrap cache len must be capped");
@@ -3053,12 +3526,14 @@ mod tests {
         drop(ring::default_provider().install_default());
         let client = Client::new();
         let crl_cpu = Arc::new(Semaphore::new(CRL_CPU_PERMITS));
+        let trusted_origins = Arc::new(HashSet::new());
         let Err(err) = fetch_crl(
             &client,
             "https://u:p@crl.example/ca.crl",
             false,
             1024,
             &crl_cpu,
+            &trusted_origins,
         )
         .await
         else {
@@ -3081,7 +3556,7 @@ mod tests {
     async fn crl_preflight_rejects_nat64_local_use_target() -> anyhow::Result<()> {
         let url = "https://crl.example/ca.crl";
         let ip = IpAddr::V6(Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 0, 0, 0x0808, 0x0808));
-        let Err(err) = reject_blocked_crl_ip(url, ip) else {
+        let Err(err) = reject_blocked_crl_ip(url, ip, false) else {
             anyhow::bail!("local-use NAT64 CRL target must be rejected");
         };
         let rendered = err.to_string();
@@ -3278,8 +3753,14 @@ mod tests {
         }
         let (discover_tx, discover_rx) = mpsc::unbounded_channel();
         drop(discover_rx);
-        let set = CrlSet::new(Arc::new(roots), config, discover_tx, initial_cache)
-            .context("crl set with prepopulated cache")?;
+        let set = CrlSet::new(
+            Arc::new(roots),
+            config,
+            discover_tx,
+            initial_cache,
+            Arc::new(HashSet::new()),
+        )
+        .context("crl set with prepopulated cache")?;
         urls.sort();
         Ok((set, urls))
     }
@@ -4304,7 +4785,13 @@ mod tests {
 
         let (discover_tx, discover_rx) = mpsc::unbounded_channel();
         drop(discover_rx);
-        let set = CrlSet::new(Arc::clone(&arc_roots), config, discover_tx, initial_cache)?;
+        let set = CrlSet::new(
+            Arc::clone(&arc_roots),
+            config,
+            discover_tx,
+            initial_cache,
+            Arc::new(HashSet::new()),
+        )?;
 
         let (max_gap, commit_result) = max_ticker_gap_until(async {
             set.__test_try_insert_cache(&extra_url, extra_entry)
@@ -4404,6 +4891,7 @@ mod tests {
             config.clone(),
             discover_tx,
             initial_cache,
+            Arc::new(HashSet::new()),
         )?;
 
         let large_url = "memory://large-new-entry".to_owned();
@@ -4505,7 +4993,13 @@ mod tests {
         roots.add(test_ca_root()?).context("add ca root")?;
         let (discover_tx, discover_rx) = mpsc::unbounded_channel();
         drop(discover_rx);
-        let set = CrlSet::new(Arc::new(roots), config, discover_tx, HashMap::new())?;
+        let set = CrlSet::new(
+            Arc::new(roots),
+            config,
+            discover_tx,
+            HashMap::new(),
+            Arc::new(HashSet::new()),
+        )?;
         set.crl_cpu.close();
 
         let url = "memory://closed-semaphore".to_owned();

@@ -551,10 +551,6 @@ pub(crate) struct CompiledSsrfAllowlist {
 impl CompiledSsrfAllowlist {
     /// Construct a compiled allowlist from already-validated host
     /// entries (lowercased) and CIDR entries.
-    #[cfg_attr(
-        all(not(test), not(feature = "oauth")),
-        expect(dead_code, reason = "consumer is feature-gated")
-    )]
     pub(crate) const fn new(hosts: Vec<String>, cidrs: Vec<CidrEntry>) -> Self {
         Self { hosts, cidrs }
     }

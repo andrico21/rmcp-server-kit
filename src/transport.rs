@@ -3221,10 +3221,15 @@ async fn run_server(
             && mtls.crl_enabled
         {
             let (ca_certs, roots) = load_client_auth_roots(&mtls.ca_cert_path)?;
-            let (crl_set, discover_rx) =
-                mtls_revocation::bootstrap_fetch(roots, &ca_certs, mtls.clone())
-                    .await
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            let server_chain = load_certs(&cert_path)?;
+            let (crl_set, discover_rx) = mtls_revocation::bootstrap_fetch_with_server_chain(
+                roots,
+                &ca_certs,
+                &server_chain,
+                mtls.clone(),
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             let _crl_refresher_task = tokio::spawn(mtls_revocation::run_crl_refresher(
                 Arc::clone(&crl_set),
                 discover_rx,

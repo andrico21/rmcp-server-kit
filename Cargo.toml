@@ -250,6 +250,11 @@ name = "crl_ssrf"
 path = "tests/integration/crl_ssrf.rs"
 
 [[test]]
+name = "crl_trusted_origin"
+path = "tests/integration/crl_trusted_origin.rs"
+required-features = ["test-helpers"]
+
+[[test]]
 name = "delegation_guard"
 path = "tests/integration/delegation_guard.rs"
 

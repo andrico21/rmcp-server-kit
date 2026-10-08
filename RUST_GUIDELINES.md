@@ -156,7 +156,12 @@ entry in the same PR that introduces a deviation.
    connect-time screening in `src/ssrf_resolver.rs`), with pre-flight screening
    on the bootstrap path. The OAuth path does implement the suffix rule.
    Owner-accepted: CRL integrity rests on the CA signature, and a name that
-   resolves only to public IPs is not an internal-service SSRF.
+   resolves only to public IPs is not an internal-service SSRF. Since 3.15,
+   origins named in the operator's configured certificates (the mTLS CA
+   bundle and the server certificate chain) bypass this resolved-address
+   screening automatically, cloud metadata excepted; the finding above is
+   unchanged, since a trusted certificate's hostname suffix is still never
+   inspected.
 3. **2026-10-03 - Client context off by default.** Core Section 10 expects auth
    attempts and RBAC denials to be logged with the source IP; `LogContextConfig`
    here keeps `client_ip` and the other client-context fields off unless an

@@ -646,9 +646,10 @@ pub struct MtlsConfig {
     /// Defaults to `true` because RFC 5280 §4.2.1.13 designates HTTP (and
     /// LDAP) as the canonical transport for CRL distribution points.
     /// SSRF defense for HTTP CDPs is provided by the IP-allowlist guard
-    /// (private/loopback/link-local/multicast/cloud-metadata addresses are
-    /// always rejected), redirect=none, body-size cap, and per-host
-    /// concurrency limit -- not by forcing HTTPS.
+    /// (private/loopback/link-local/multicast addresses are rejected unless
+    /// the URL's origin is named in the operator's configured certificates;
+    /// cloud-metadata addresses are always rejected), redirect=none,
+    /// body-size cap, and per-host concurrency limit - not by forcing HTTPS.
     #[serde(default = "default_true")]
     pub crl_allow_http: bool,
     /// Enforce CRL expiration during certificate validation.

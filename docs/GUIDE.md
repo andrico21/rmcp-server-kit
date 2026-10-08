@@ -488,6 +488,21 @@ by URL and refreshed on a background task before `nextUpdate`, clamped to
 via `ArcSwap` whenever fresh CRLs land, so every new handshake sees the
 latest revocation data without dropping in-flight connections.
 
+**CRL/AIA origins named in your configured certificates are trusted
+automatically; there is no configurable CRL allowlist.** At startup the
+server collects the CRL Distribution Point and Authority Information Access
+(caIssuers, OCSP) URIs in every certificate in `mtls.ca_cert_path` and in the
+server's own TLS certificate chain, and trusts their origins (scheme, host,
+port): a CRL fetch to one of those origins skips the private-address block
+that otherwise rejects loopback, link-local, and other internal addresses.
+Cloud-metadata addresses stay blocked regardless. This is what lets a
+corporate PKI that publishes CRLs on an internal host work with CRL
+checking at all - the trusted origins are logged once at startup (`INFO`
+level) for audit. Residuals, and what to do when neither chain names your
+PKI host (e.g. a bundle holding only a self-signed root with no CDP/AIA
+extension - add the issuing CA certificate to `mtls.ca_cert_path` instead),
+are in [SECURITY.md](../SECURITY.md#operator-trusted-crlaia-origins).
+
 **Since 3.14, TLS session resumption is disabled on mTLS listeners**, which
 is what makes "every new handshake" true rather than "every full handshake."
 Before 3.14, rustls could restore a resumed connection's peer certificate
@@ -1554,10 +1569,14 @@ length that fits inside the `/48` (`/48`, `/56`, `/64` and `/96`). An
 allowlist entry still re-allows every non-metadata address in its range,
 so allowlist the narrowest prefix your NAT64 gateway actually uses.
 
-The CRL fetch path has no SSRF allowlist. A CRL distribution point whose
-hostname resolves into `64:ff9b:1::/48`, `fec0::/10`, `2001:2::/48`,
-`2001:10::/28`, or `2001:20::/28` is blocked; keep CRL hosts on ordinary
-reachable addresses or publish a different CDP hostname.
+The CRL fetch path has no configurable SSRF allowlist. A CRL distribution
+point whose hostname resolves into `64:ff9b:1::/48`, `fec0::/10`,
+`2001:2::/48`, `2001:10::/28`, or `2001:20::/28` is blocked unless its origin
+(scheme, host, port) is named in the operator's configured certificates (the
+mTLS CA bundle or the server's own TLS certificate chain) - see
+[SECURITY.md](../SECURITY.md#operator-trusted-crlaia-origins). Otherwise,
+keep CRL hosts on ordinary reachable addresses or publish a different CDP
+hostname.
 
 ```toml
 [server.auth.oauth]

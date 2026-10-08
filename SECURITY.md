@@ -197,8 +197,10 @@ crl_retry_retention      = "24h"    # keep failed-refresh entries for retry only
   the cache; bootstrap re-fetches everything within the 10 s deadline.
 - **CDP URLs are honoured after SSRF normalisation, not rewritten.**
   rmcp-server-kit does not proxy or pin CDP URLs, but it does enforce a
-  scheme allowlist, reject userinfo, and refuse private/loopback/link-local/
-  cloud-metadata IP literals before issuing the fetch (see
+  scheme allowlist, reject userinfo, and refuse private/loopback/link-local
+  IP literals before issuing the fetch, unless the URL's origin is named in
+  the operator's configured certificates (cloud-metadata literals are
+  refused regardless; see
   [CRL fetch SSRF hardening](#crl-fetch-ssrf-hardening) below).
   Operators must still ensure their issuing CA's CDP host is reachable
   from the server's network.
@@ -248,6 +250,35 @@ operator-unintended host has no security benefit.
 Discovery URLs containing IP literals are normalized
 (rejecting octal/hex/percent-encoded obfuscation) before the SSRF check.
 
+#### Operator-trusted CRL/AIA origins
+
+There is no configurable CRL allowlist. Instead, at startup the server
+collects the URIs in the CRL Distribution Points and Authority Information
+Access (caIssuers, OCSP) extensions of every certificate in `mtls.ca_cert_path`
+and in the server's own TLS certificate chain (`tls_cert_path`), reduces each
+to its origin (scheme, lowercased host, effective port), and trusts that set
+automatically: a CRL fetch whose URL origin is in it skips the
+private-address block above. Cloud-metadata addresses stay blocked even for a
+trusted origin. The trusted origins are logged once at startup (`INFO`,
+count and sorted list) so an operator can audit what bypasses the screening.
+
+Residuals an operator should know:
+
+- An anonymous client can make the server send a GET to any path on a
+  trusted origin (same scheme, host and port), which normally serves only
+  CRLs and CA certificates.
+- Trust is bound to the hostname, not a pinned address: if a trusted host's
+  DNS is compromised, the fetch reaches whatever address it resolves to,
+  with the private-address block skipped for that request.
+- Because the server certificate chain is a source, a publicly issued server
+  certificate makes its CA's public CRL and OCSP hosts trusted too (the
+  startup `INFO` log lists them).
+
+Coverage limit: when neither the CA bundle nor the server chain names the
+PKI host - for example a bundle holding only a self-signed root with no CDP
+or AIA extension - nothing is trusted for that PKI. Add the issuing CA
+certificate (the one carrying the CDP/AIA extensions) to `mtls.ca_cert_path`.
+
 #### IPv6 transition prefixes
 
 The IP range guard shared by the CRL and OAuth fetchers also classifies
@@ -269,7 +300,9 @@ IPv6 transition-mechanism prefixes:
   (RFC 5180), ORCHID `2001:10::/28` (RFC 4843), and ORCHIDv2
   `2001:20::/28` (RFC 7343)**: blocked by default as special-purpose
   IPv6 space. OAuth and JWKS fetches can re-allow them with a narrow
-  operator CIDR allowlist; CRL fetches cannot.
+  operator CIDR allowlist; CRL fetches re-allow them only when the
+  resolved origin is named in the operator's configured certificates (see
+  "Operator-trusted CRL/AIA origins" above), never via a CIDR allowlist.
 
 The classifier intentionally does not decode discard-only `100::/64`
 (RFC 6666), because traffic to that prefix is dropped rather than
@@ -533,11 +566,13 @@ Operational guidance:
 - Audit the `oauth.ssrf_allowlist is configured` warn-level log line on
   every restart and on every config reload.
 
-CRL fetches use the same blocked-IP classifier but intentionally have no
-operator allowlist: CRL integrity rests on the CA signature, so a CRL
-distribution point resolving into `64:ff9b:1::/48`, `fec0::/10`,
-`2001:2::/48`, `2001:10::/28`, or `2001:20::/28` is blocked rather than
-operator-reallowable.
+CRL fetches use the same blocked-IP classifier, with no configurable
+allowlist: instead, the CRL/AIA origins named in the operator's configured
+certificates (the mTLS CA bundle and the server certificate chain) are
+trusted automatically, cloud metadata excepted (see
+"Operator-trusted CRL/AIA origins" above). A CRL distribution point
+resolving into `64:ff9b:1::/48`, `fec0::/10`, `2001:2::/48`, `2001:10::/28`,
+or `2001:20::/28` is blocked unless its origin is in that trusted set.
 
 ### OAuth HTTPS enforcement
 
