@@ -387,6 +387,56 @@ mod tests {
     }
 
     #[test]
+    /// Pins that the new reserved IPv6 classes are blocked by default.
+    fn rejects_reserved_ipv6_classes_under_empty_allowlist() -> anyhow::Result<()> {
+        for (ip, label) in [
+            (Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 1), "site_local"),
+            (
+                Ipv6Addr::new(0x2001, 0x0002, 0, 0, 0, 0, 0, 1),
+                "benchmarking",
+            ),
+            (Ipv6Addr::new(0x2001, 0x0010, 0, 0, 0, 0, 0, 1), "orchid"),
+            (Ipv6Addr::new(0x2001, 0x0020, 0, 0, 0, 0, 0, 1), "orchid"),
+        ] {
+            let addrs = vec![socket_addr(IpAddr::V6(ip))];
+            let err = screen_addrs(&addrs, &empty_allowlist(), "reserved.example", false)
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("reserved IPv6 class must be blocked: {ip}"))?;
+            assert!(err.contains(label), "{err}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    /// Pins that CIDR allowlists admit the re-allowable reserved IPv6 classes.
+    fn cidr_allowlist_permits_reserved_ipv6_classes() -> anyhow::Result<()> {
+        for (ip, cidr) in [
+            (Ipv6Addr::new(0xfed0, 0, 0, 0, 0, 0, 0, 1), "fec0::/10"),
+            (
+                Ipv6Addr::new(0x2001, 0x0002, 0, 0, 0, 0, 0, 1),
+                "2001:2::/48",
+            ),
+            (
+                Ipv6Addr::new(0x2001, 0x0018, 0, 0, 0, 0, 0, 1),
+                "2001:10::/28",
+            ),
+            (
+                Ipv6Addr::new(0x2001, 0x0028, 0, 0, 0, 0, 0, 1),
+                "2001:20::/28",
+            ),
+        ] {
+            let addrs = vec![socket_addr(IpAddr::V6(ip))];
+            let allowlist = allowlist_with(&[], &[cidr])?;
+            let out =
+                screen_addrs(&addrs, &allowlist, "reserved.example", false).map_err(|diag| {
+                    anyhow::anyhow!("reserved IPv6 allowlist must admit {ip}: {diag}")
+                })?;
+            assert_eq!(out, addrs);
+        }
+        Ok(())
+    }
+
+    #[test]
     /// Pins that cloud-metadata survives the test-only loopback bypass.
     fn rejects_cloud_metadata_even_with_loopback_bypass() -> anyhow::Result<()> {
         let addrs = vec![socket_addr(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)))];

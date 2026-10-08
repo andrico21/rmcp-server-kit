@@ -1,8 +1,18 @@
 //! SSRF guards for outbound HTTP: scheme/userinfo validation, literal-IP
-//! rejection, cloud-metadata blocking, and OAuth/JWKS allowlisting.
+//! rejection, cloud-metadata blocking, reserved-address classification, and
+//! OAuth/JWKS allowlisting.
 //!
-//! CRL fetches use the same blocked-IP classifier without an operator
-//! allowlist.
+//! OAuth and JWKS fetches may re-allow non-metadata private, unique-local,
+//! site-local, benchmarking, ORCHID, and other reserved targets through an
+//! operator CIDR allowlist. Cloud-metadata classifications are never
+//! re-allowable. CRL fetches use the same blocked-IP classifier without an
+//! operator allowlist.
+//!
+//! The classifier intentionally does not decode IPv6 discard-only
+//! `100::/64`, because traffic to that prefix is dropped rather than reaching
+//! a confidentiality target. It also does not decode ISATAP interface
+//! identifiers under global prefixes, because the same bit patterns occur in
+//! ordinary global addresses and generic decoding would misclassify them.
 
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -101,9 +111,13 @@ pub(crate) fn sanitized_url_for_log(url: &Url) -> String {
 /// - IPv4 multicast (224/4) and reserved future use (240/4).
 /// - IPv6 loopback (`::1`), unspecified (`::`).
 /// - IPv6 link-local (`fe80::/10`).
+/// - IPv6 site-local (`fec0::/10`, deprecated by RFC 3879).
 /// - IPv6 unique local (`fc00::/7`).
 /// - IPv6 multicast (`ff00::/8`).
 /// - IPv6 documentation (`2001:db8::/32`).
+/// - IPv6 benchmarking (`2001:2::/48`, RFC 5180).
+/// - IPv6 ORCHID (`2001:10::/28`, RFC 4843) and `ORCHIDv2`
+///   (`2001:20::/28`, RFC 7343).
 /// - IPv6 Teredo tunneling (`2001::/32`), blocked outright.
 /// - IPv6 NAT64 (`64:ff9b::/96`) and 6to4 (`2002::/16`) when the
 ///   embedded IPv4 address is itself blocked by any rule above; embedded
@@ -115,6 +129,11 @@ pub(crate) fn sanitized_url_for_log(url: &Url) -> String {
 /// - IPv6 IPv4-compatible (`::a.b.c.d`, deprecated `::/96`): the whole
 ///   prefix is blocked, inheriting any IPv4 rule for the embedded address.
 /// - IPv4-mapped IPv6 inheriting any of the above.
+///
+/// Intentionally not decoded: IPv6 discard-only `100::/64`, because traffic
+/// to that prefix is dropped, and ISATAP interface identifiers under global
+/// prefixes, because their bit patterns are not unique to tunneled private or
+/// metadata targets.
 ///
 /// **Cloud-metadata addresses are checked BEFORE the generic buckets** so
 /// that an operator allowlist (see [`CompiledSsrfAllowlist`]) covering
@@ -239,6 +258,9 @@ fn block_reason_v6(v6: Ipv6Addr) -> Option<&'static str> {
     if let Some(reason) = nat64_local_use_reason(v6) {
         return Some(reason);
     }
+    if let Some(reason) = reserved_ipv6_reason(segments) {
+        return Some(reason);
+    }
     // NAT64 well-known prefix 64:ff9b::/96 (RFC 6052): the trailing 32
     // bits embed an IPv4 address. On DNS64/NAT64 egress networks EVERY
     // public host maps into this prefix, so blocking it wholesale would
@@ -315,6 +337,23 @@ fn nat64_local_use_reason(v6: Ipv6Addr) -> Option<&'static str> {
         }
     }
     Some("nat64_local_use")
+}
+
+/// Classify re-allowable IPv6 special-purpose ranges not covered by `std`.
+const fn reserved_ipv6_reason(segments: [u16; 8]) -> Option<&'static str> {
+    if (segments[0] & 0xffc0) == 0xfec0 {
+        return Some("site_local");
+    }
+    if segments[0] == 0x2001 && segments[1] == 0x0002 && segments[2] == 0 {
+        return Some("benchmarking");
+    }
+    if segments[0] == 0x2001 {
+        let orchid_prefix = segments[1] & 0xfff0;
+        if orchid_prefix == 0x0010 || orchid_prefix == 0x0020 {
+            return Some("orchid");
+        }
+    }
+    None
 }
 
 /// Reassemble an IPv4 address embedded in two adjacent IPv6 segments
@@ -1123,6 +1162,126 @@ mod tests {
             assert_eq!(
                 ip_block_reason(IpAddr::V6(ip)),
                 Some("nat64_local_use"),
+                "{ip}"
+            );
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/ssrf.rs::reserved_ipv6_special_purpose_classification keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
+    /// Pins site-local, benchmarking and ORCHID IPv6 special-purpose classifications.
+    fn reserved_ipv6_special_purpose_classification() -> anyhow::Result<()> {
+        for (ip, expected) in [
+            (
+                Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 0),
+                Some("site_local"),
+            ),
+            (
+                Ipv6Addr::new(0xfed0, 0, 0, 0, 0, 0, 0, 1),
+                Some("site_local"),
+            ),
+            (
+                Ipv6Addr::new(
+                    0xfeff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+                ),
+                Some("site_local"),
+            ),
+            (
+                Ipv6Addr::new(0x2001, 0x0002, 0, 0, 0, 0, 0, 0),
+                Some("benchmarking"),
+            ),
+            (
+                Ipv6Addr::new(0x2001, 0x0002, 0, 0, 0, 0, 0, 1),
+                Some("benchmarking"),
+            ),
+            (
+                Ipv6Addr::new(0x2001, 0x0002, 0, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff),
+                Some("benchmarking"),
+            ),
+            (
+                Ipv6Addr::new(0x2001, 0x0010, 0, 0, 0, 0, 0, 0),
+                Some("orchid"),
+            ),
+            (
+                Ipv6Addr::new(0x2001, 0x0018, 0, 0, 0, 0, 0, 1),
+                Some("orchid"),
+            ),
+            (
+                Ipv6Addr::new(
+                    0x2001, 0x001f, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+                ),
+                Some("orchid"),
+            ),
+            (
+                Ipv6Addr::new(0x2001, 0x0020, 0, 0, 0, 0, 0, 0),
+                Some("orchid"),
+            ),
+            (
+                Ipv6Addr::new(0x2001, 0x0028, 0, 0, 0, 0, 0, 1),
+                Some("orchid"),
+            ),
+            (
+                Ipv6Addr::new(
+                    0x2001, 0x002f, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+                ),
+                Some("orchid"),
+            ),
+            (
+                Ipv6Addr::new(
+                    0xfebf, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+                ),
+                Some("link_local"),
+            ),
+            (
+                Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0),
+                Some("multicast"),
+            ),
+            (
+                Ipv6Addr::new(
+                    0x2001, 0x0001, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+                ),
+                None,
+            ),
+            (Ipv6Addr::new(0x2001, 0x0002, 1, 0, 0, 0, 0, 0), None),
+            (Ipv6Addr::new(0x2001, 0x0003, 0, 0, 0, 0, 0, 0), None),
+            (
+                Ipv6Addr::new(
+                    0x2001, 0x000f, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+                ),
+                None,
+            ),
+            (Ipv6Addr::new(0x2001, 0x0030, 0, 0, 0, 0, 0, 0), None),
+        ] {
+            assert_eq!(ip_block_reason(IpAddr::V6(ip)), expected, "{ip}");
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/ssrf.rs::reserved_ipv6_not_decoded_guards keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
+    /// Pins intentionally undecoded IPv6 patterns and metadata-first ordering.
+    fn reserved_ipv6_not_decoded_guards() -> anyhow::Result<()> {
+        for ip in [
+            Ipv6Addr::new(0x0100, 0, 0, 0, 0, 0, 0, 1),
+            Ipv6Addr::new(0x2001, 0x4860, 0, 0, 0, 0x5efe, 0x0a00, 0x0001),
+            Ipv6Addr::new(0x2001, 0x4860, 0, 0, 0, 0x5efe, 0xa9fe, 0xa9fe),
+        ] {
+            assert_eq!(ip_block_reason(IpAddr::V6(ip)), None, "{ip}");
+        }
+        for ip in [
+            Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254),
+            Ipv6Addr::new(0xfd20, 0x00ce, 0, 0, 0, 0, 0, 0x0254),
+        ] {
+            assert_eq!(
+                ip_block_reason(IpAddr::V6(ip)),
+                Some("cloud_metadata"),
                 "{ip}"
             );
         }

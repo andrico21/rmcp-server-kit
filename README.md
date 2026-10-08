@@ -146,8 +146,8 @@ let oauth = OAuthConfig::builder(
 ```
 
 > The default fail-closed SSRF guard blocks targets that resolve into
-> private (RFC 1918), loopback, CGNAT, unique-local, or RFC 8215
-> local-use NAT64 space. Use
+> private (RFC 1918), loopback, CGNAT, unique-local, site-local,
+> benchmarking, ORCHID, ORCHIDv2, or RFC 8215 local-use NAT64 space. Use
 > `ssrf_allowlist` only when the IdP legitimately lives there (e.g. a
 > Keycloak `Service` ClusterIP or local NAT64 gateway). Cloud-metadata
 > addresses (AWS / GCP / Alibaba) remain unbypassable regardless of the

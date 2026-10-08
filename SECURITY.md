@@ -224,7 +224,9 @@ as a hostile-input network call. Before any HTTP request is issued,
   unspecified/broadcast IPv4 or IPv6 address, including the cloud
   metadata endpoints `169.254.169.254` and `fd00:ec2::254`, IPv4-mapped
   IPv6 `::ffff:0:0/96`, IPv4-compatible IPv6, IPv6 unique-local
-  `fc00::/7`, IPv6 link-local `fe80::/10`, and the IPv6 loopback `::1`.
+  `fc00::/7`, IPv6 site-local `fec0::/10`, IPv6 benchmarking
+  `2001:2::/48`, ORCHID `2001:10::/28`, ORCHIDv2 `2001:20::/28`, IPv6
+  link-local `fe80::/10`, and the IPv6 loopback `::1`.
 
 In addition the fetcher applies four bounded-resource caps to limit
 SSRF/DoS amplification even if a CRL host is reachable:
@@ -263,6 +265,17 @@ IPv6 transition-mechanism prefixes:
   protocol is obsolete, its embedded client address is XOR-obfuscated and
   attacker-chosen, and no legitimate JWKS/CRL endpoint is reachable only
   via Teredo.
+- **Site-local `fec0::/10` (RFC 3879), benchmarking `2001:2::/48`
+  (RFC 5180), ORCHID `2001:10::/28` (RFC 4843), and ORCHIDv2
+  `2001:20::/28` (RFC 7343)**: blocked by default as special-purpose
+  IPv6 space. OAuth and JWKS fetches can re-allow them with a narrow
+  operator CIDR allowlist; CRL fetches cannot.
+
+The classifier intentionally does not decode discard-only `100::/64`
+(RFC 6666), because traffic to that prefix is dropped rather than
+reaching a confidentiality target. It also does not decode ISATAP
+interface identifiers under global prefixes: the same bit patterns occur
+in ordinary global addresses, so generic decoding would misclassify them.
 
 ### CRL discovery under adversarial load
 
@@ -463,9 +476,10 @@ model remains robust against hostile or compromised Identity Providers.
 
 Some deployments terminate OAuth/JWKS at an in-cluster IdP whose
 hostname legitimately resolves into private (RFC 1918), loopback, CGNAT,
-unique-local, or RFC 8215 local-use NAT64 (`64:ff9b:1::/48`) space (for
-example a Keycloak `Service` ClusterIP or a local NAT64 gateway). The
-default fail-closed policy described above blocks those targets.
+unique-local, site-local, benchmarking, ORCHID, ORCHIDv2, or RFC 8215
+local-use NAT64 (`64:ff9b:1::/48`) space (for example a Keycloak
+`Service` ClusterIP or a local NAT64 gateway). The default fail-closed
+policy described above blocks those targets.
 
 `OAuthConfig::ssrf_allowlist` is the **opt-in operator escape hatch**.
 It accepts:
@@ -521,7 +535,8 @@ Operational guidance:
 
 CRL fetches use the same blocked-IP classifier but intentionally have no
 operator allowlist: CRL integrity rests on the CA signature, so a CRL
-distribution point resolving into `64:ff9b:1::/48` is blocked rather than
+distribution point resolving into `64:ff9b:1::/48`, `fec0::/10`,
+`2001:2::/48`, `2001:10::/28`, or `2001:20::/28` is blocked rather than
 operator-reallowable.
 
 ### OAuth HTTPS enforcement
@@ -555,10 +570,11 @@ attacker-supplied input. OAuth URL hardening operates in three layers:
    `OauthHttpClient` and `JwksCache` resolve the target hostname and
    classify every returned IP against the SSRF range guard *before*
    issuing the request, rejecting targets in private, loopback,
-   link-local, multicast, broadcast, unspecified, CGNAT, or
-   cloud-metadata ranges. The opt-in `OAuthConfig::ssrf_allowlist`
-   relaxes this for in-cluster IdPs but cannot bypass cloud-metadata
-   addresses (see the "Operator allowlist" subsection above).
+   link-local, multicast, broadcast, unspecified, CGNAT, site-local,
+   benchmarking, ORCHID, ORCHIDv2, local-use NAT64, or cloud-metadata
+   ranges. The opt-in `OAuthConfig::ssrf_allowlist` relaxes this for
+   in-cluster IdPs but cannot bypass cloud-metadata addresses (see the
+   "Operator allowlist" subsection above).
 3. **Sync per-hop guard on redirects.** A per-hop SSRF range guard runs
    inside both client redirect closures using literal-IP classification
    (no extra DNS), rejecting cross-hop pivots into blocked ranges.

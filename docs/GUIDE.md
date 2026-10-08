@@ -1319,7 +1319,7 @@ role = "viewer"
 | `allow_http_oauth_urls` | `bool` | `false` | Permit `http://` issuer/JWKS/etc. for local dev only. |
 | `audience_validation_mode` | `String` (`"permissive"` \| `"warn"` \| `"strict"`) | `"strict"` | How the resource server treats the legacy `azp` audience fallback. `"strict"` (default) accepts only `aud` matches and rejects `azp`-only matches; `"warn"` accepts `azp`-only matches but emits a one-shot WARN per process to surface IdPs not populating `aud`; `"permissive"` accepts `azp`-only matches silently (pre-1.7 behavior). |
 | `strict_audience_validation` | `Option<bool>` | _unset_ | **Deprecated since 1.7.0** - superseded by `audience_validation_mode`. Consulted only when `audience_validation_mode` is unset: `Some(true)` resolves to `"strict"`, `Some(false)` resolves to `"warn"`, and unset resolves to `"strict"` (the secure default). |
-| `ssrf_allowlist` | `table` | _unset_ | Operator opt-in allowlist of `hosts` and/or `cidrs` whose otherwise-blocked addresses (private/loopback/CGNAT/unique-local/RFC 8215 local-use NAT64) the OAuth/JWKS fetcher is allowed to reach. Cloud-metadata addresses remain blocked. See "Allowing in-cluster IdPs" below and the "Operator allowlist" section in [`SECURITY.md`](../SECURITY.md). |
+| `ssrf_allowlist` | `table` | _unset_ | Operator opt-in allowlist of `hosts` and/or `cidrs` whose otherwise-blocked addresses (private/loopback/CGNAT/unique-local/site-local/benchmarking/ORCHID/ORCHIDv2/RFC 8215 local-use NAT64) the OAuth/JWKS fetcher is allowed to reach. Cloud-metadata addresses remain blocked. See "Allowing in-cluster IdPs" below and the "Operator allowlist" section in [`SECURITY.md`](../SECURITY.md). |
 | `role_claim` | `Option<String>` | `None` | JWT claim path (dot-notation for nested claims) to extract role values from; e.g. `"roles"` or `"realm_access.roles"`. When set, claim values are matched against `role_mappings` instead of `scopes`. Supports space-separated string claims and JSON array claims. Pairs with `role_mappings`. |
 | `role_mappings` | `Vec<RoleMapping>` | `[]` | Claim-value-to-role mappings used when `role_claim` is set. First matching entry wins. See the worked example below. |
 | `require_subject` | `bool` | `false` | Reject tokens that lack a `sub` (subject) claim. Leave `false` for client-credentials / machine-to-machine tokens, which legitimately carry no subject. |
@@ -1488,8 +1488,8 @@ OAuth URL hardening operates in two layers:
 - **At runtime, on every HTTP redirect hop**, both the shared
   `OauthHttpClient` and the `JwksCache` redirect closures run a sync
   per-hop SSRF guard that rejects targets resolving to private, loopback,
-  link-local, multicast, broadcast, unspecified, RFC 8215 local-use NAT64,
-  or cloud-metadata
+  link-local, multicast, broadcast, unspecified, site-local, benchmarking,
+  ORCHID, ORCHIDv2, RFC 8215 local-use NAT64, or cloud-metadata
   IP ranges. `https -> http` downgrades are always rejected; `http -> http`
   is permitted only when `allow_http_oauth_urls = true`.
 - **Before every initial outbound connect**, OAuth/JWKS fetches resolve the
@@ -1519,8 +1519,10 @@ internally and are not configurable knobs.
 
 By default, the post-DNS SSRF guard rejects OAuth/JWKS targets whose
 hostnames resolve to private (RFC 1918), loopback, link-local, CGNAT,
-unique-local, RFC 8215 local-use NAT64 (`64:ff9b:1::/48`), or
-cloud-metadata address space. This is the right default for
+unique-local, site-local (`fec0::/10`), benchmarking (`2001:2::/48`),
+ORCHID (`2001:10::/28`), ORCHIDv2 (`2001:20::/28`), RFC 8215
+local-use NAT64 (`64:ff9b:1::/48`), or cloud-metadata address space.
+This is the right default for
 internet-facing IdPs but blocks legitimate in-cluster deployments where,
 for example, Keycloak resolves to a `10.x.x.x` ClusterIP or an IdP is
 reached through a local-use NAT64 gateway.
@@ -1539,8 +1541,9 @@ allowlist entry still re-allows every non-metadata address in its range,
 so allowlist the narrowest prefix your NAT64 gateway actually uses.
 
 The CRL fetch path has no SSRF allowlist. A CRL distribution point whose
-hostname resolves into `64:ff9b:1::/48` is blocked; keep CRL hosts on
-ordinary reachable addresses or publish a different CDP hostname.
+hostname resolves into `64:ff9b:1::/48`, `fec0::/10`, `2001:2::/48`,
+`2001:10::/28`, or `2001:20::/28` is blocked; keep CRL hosts on ordinary
+reachable addresses or publish a different CDP hostname.
 
 ```toml
 [server.auth.oauth]
