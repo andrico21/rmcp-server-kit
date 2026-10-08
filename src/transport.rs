@@ -2422,7 +2422,9 @@ where
             let jwks_cache = auth_config
                 .oauth
                 .as_ref()
-                .map(|oauth_cfg| JwksCache::new(oauth_cfg).map(Arc::new))
+                .map(|oauth_cfg| {
+                    JwksCache::with_shutdown(oauth_cfg, ct.child_token()).map(Arc::new)
+                })
                 .transpose()
                 .map_err(|error| io::Error::other(format!("JWKS HTTP client: {error}")))?;
 

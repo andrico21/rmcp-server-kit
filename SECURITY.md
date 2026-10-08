@@ -444,6 +444,13 @@ applies three resource-exhaustion caps:
 | `reqwest` default              | `10`          | Hard limit on the number of HTTP redirects followed during a fetch (not user-tunable).       |
 | `OauthHttpClient` timeout      | `30 s`        | Total timeout for an OAuth-bound HTTP request (default).                                     |
 
+JWKS refresh is single-flight per cache: concurrent misses share one upstream
+fetch, and request cancellation only drops that caller's waiter. The shared
+refresh continues until it publishes fresh keys, records failure, or observes
+server/cache shutdown. The 10 s cooldown is still stamped before the fetch and
+failed or cooled-down refreshes still fail closed rather than serving expired
+keys.
+
 Furthermore, `check_oauth_url` (applied at config-construction time
 and redirect time) rejects URLs that:
 - Carry RFC 3986 userinfo (`https://user:pass@host/`).

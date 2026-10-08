@@ -54,7 +54,11 @@ mod tests {
         extract::ConnectInfo,
         routing::{get, post},
     };
+    #[cfg(feature = "oauth")]
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use futures::stream;
+    #[cfg(feature = "oauth")]
+    use jsonwebtoken::Algorithm;
     use reqwest::header::HeaderMap;
     use rmcp::{
         handler::server::ServerHandler,
@@ -80,8 +84,12 @@ mod tests {
         },
         transport::{ForwardedHeaderMode, McpServerConfig, serve_with_listener},
     };
+    #[cfg(feature = "oauth")]
+    use rsa::{pkcs8, pkcs8::EncodePrivateKey as _, rand_core, traits::PublicKeyParts as _};
     use rustls::crypto::ring;
     use secrecy::SecretString;
+    #[cfg(feature = "oauth")]
+    use tokio::io::AsyncWriteExt as _;
     use tokio::{
         fs,
         net::{TcpListener, TcpStream},
@@ -2727,6 +2735,127 @@ mod tests {
         serde_json::from_value(json).context("oauth config deserialization")
     }
 
+    #[cfg(feature = "oauth")]
+    fn generate_oauth_test_keypair(kid: &str) -> anyhow::Result<(String, serde_json::Value)> {
+        let mut rng = rand_core::OsRng;
+        let private_key = rsa::RsaPrivateKey::new(&mut rng, 2048).context("keypair generation")?;
+        let private_pem = private_key
+            .to_pkcs8_pem(pkcs8::LineEnding::LF)
+            .context("PKCS8 PEM export")?
+            .to_string();
+        let public_key = private_key.to_public_key();
+        let jwks = serde_json::json!({
+            "keys": [{
+                "kty": "RSA",
+                "use": "sig",
+                "alg": "RS256",
+                "kid": kid,
+                "n": URL_SAFE_NO_PAD.encode(public_key.n().to_bytes_be()),
+                "e": URL_SAFE_NO_PAD.encode(public_key.e().to_bytes_be())
+            }]
+        });
+        Ok((private_pem, jwks))
+    }
+
+    #[cfg(feature = "oauth")]
+    fn mint_oauth_test_token(private_pem: &str, kid: &str) -> anyhow::Result<String> {
+        let encoding_key = jsonwebtoken::EncodingKey::from_rsa_pem(private_pem.as_bytes())
+            .context("encoding key from PEM")?;
+        let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
+        header.kid = Some(kid.into());
+        let now = jsonwebtoken::get_current_timestamp();
+        let claims = serde_json::json!({
+            "iss": "https://auth.test.local",
+            "aud": "https://mcp.test.local/mcp",
+            "sub": "asy01-http",
+            "scope": "mcp:read",
+            "exp": now.saturating_add(3600),
+            "iat": now
+        });
+        jsonwebtoken::encode(&header, &claims, &encoding_key).context("JWT encoding")
+    }
+
+    #[cfg(feature = "oauth")]
+    fn oauth_auth_config(jwks_uri: &str, ttl: &str) -> anyhow::Result<AuthConfig> {
+        let json = serde_json::json!({
+            "issuer": "https://auth.test.local",
+            "audience": "https://mcp.test.local/mcp",
+            "jwks_uri": jwks_uri,
+            "jwks_cache_ttl": ttl,
+            "allow_http_oauth_urls": true,
+            "ssrf_allowlist": {
+                "hosts": ["localhost"],
+                "cidrs": ["127.0.0.0/8"]
+            },
+            "scopes": [{"scope": "mcp:read", "role": "viewer"}]
+        });
+        let mut auth = AuthConfig::with_keys(vec![]);
+        auth.oauth = Some(serde_json::from_value(json).context("oauth config deserialization")?);
+        Ok(auth)
+    }
+
+    #[cfg(feature = "oauth")]
+    async fn initialize_status(
+        client: &reqwest::Client,
+        base: &str,
+        token: &str,
+    ) -> anyhow::Result<reqwest::StatusCode> {
+        let resp = client
+            .post(format!("{base}/mcp"))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("authorization", format!("Bearer {token}"))
+            .body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1_u32,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": { "name": "e2e", "version": "0.0.1" }
+                    }
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .context("initialize request")?;
+        Ok(resp.status())
+    }
+
+    #[cfg(feature = "oauth")]
+    async fn cancel_initialize_mid_request(base: &str, token: &str) -> anyhow::Result<()> {
+        let addr = base
+            .strip_prefix("http://")
+            .context("test base must be plain HTTP")?;
+        let mut stream = TcpStream::connect(addr)
+            .await
+            .context("connect raw client")?;
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1_u32,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "e2e", "version": "0.0.1" }
+            }
+        })
+        .to_string();
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .context("write raw initialize")?;
+        sleep(Duration::from_millis(50)).await;
+        drop(stream);
+        Ok(())
+    }
+
     /// Regression test for C3: by default (`expose_admin_endpoints = false`),
     /// `/introspect` and `/revoke` must NOT be mounted and must NOT be
     /// advertised in the authorization-server metadata document. This is the
@@ -2881,6 +3010,41 @@ mod tests {
             403,
             "authenticated caller must reach the proxy handler"
         );
+        Ok(())
+    }
+
+    /// Cancelled OAuth HTTP auth waits do not abort the shared JWKS refresh.
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn asy01_cancelled_http_request_does_not_burn_jwks_cooldown() -> anyhow::Result<()> {
+        use wiremock::{Mock, ResponseTemplate, matchers};
+
+        let kid = "asy01-http";
+        let (pem, jwks) = generate_oauth_test_keypair(kid)?;
+        let token = mint_oauth_test_token(&pem, kid)?;
+        let mock = wiremock::MockServer::start().await;
+        Mock::given(matchers::method("GET"))
+            .and(matchers::path("/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(&jwks)
+                    .set_delay(Duration::from_millis(500)),
+            )
+            .mount(&mock)
+            .await;
+
+        let jwks_uri = format!("http://localhost:{}/jwks.json", mock.address().port());
+        let port = free_port().await?;
+        let cfg = config_on_port(port)
+            .with_auth(oauth_auth_config(&jwks_uri, "10m")?)
+            .with_public_url(format!("http://127.0.0.1:{port}"));
+        let base = spawn_server(cfg).await?;
+        let client = reqwest::Client::new();
+
+        cancel_initialize_mid_request(&base.base, &token).await?;
+        sleep(Duration::from_millis(700)).await;
+        assert_eq!(initialize_status(&client, &base.base, &token).await?, 200);
+
         Ok(())
     }
 

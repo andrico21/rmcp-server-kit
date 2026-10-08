@@ -1326,6 +1326,14 @@ role = "viewer"
 | `authorization_servers` | `Option<Vec<String>>` | _unset_ (topology) | RFC 9728 Protected Resource Metadata `authorization_servers`. **Unset resolves from topology**: the upstream `issuer` when `proxy` is absent, this server's own public URL (from `public_url`) when `proxy` is set. **Set it explicitly when your application mounts its own `/authorize` + `/token` via `with_extra_router` without `proxy`** - the crate cannot detect that case and would otherwise advertise the upstream issuer at a URL that 404s. An empty list omits the claim entirely (RFC 9728 §3.2). Validated at startup: no userinfo, no literal-IP host, scheme per `allow_http_oauth_urls`. See "OAuth discovery metadata" below. |
 | `authorization_server_metadata_issuer` | `Option<String>` | _unset_ (own URL) | RFC 8414 Authorization Server Metadata `issuer`, served by the proxy at `/.well-known/oauth-authorization-server`. **Unset publishes this server's own public URL (from `public_url`)**, as RFC 8414 §3.3 / §6.2 require. Legacy opt-out: set to your upstream `issuer` only when the IdP emits RFC 9207 `iss` and clients validate it. Validated at startup as above. |
 
+On-demand JWKS refresh is shared per cache. If several callers miss or observe
+an expired cache at once, they wait for the same upstream fetch. If one caller
+disconnects or times out, only that caller's wait is cancelled; the shared
+refresh continues until it publishes keys, records failure, or server/cache
+shutdown cancels it. The refresh cooldown and fail-closed stale-cache behavior
+are unchanged: the 10 s cooldown is consumed before the fetch, and failed or
+cooled-down refreshes do not make expired keys usable.
+
 ##### `ScopeMapping`
 
 | Field | Type | Description |

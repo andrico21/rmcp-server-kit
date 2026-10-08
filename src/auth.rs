@@ -2070,11 +2070,11 @@ fn unauthorized_response(state: &AuthState, failure_class: AuthFailureClass) -> 
 ///
 /// # Cancel safety
 ///
-/// No shared-state mutation. The Argon2 verification is offloaded to
-/// `spawn_blocking`; dropping its `JoinHandle` on cancellation detaches the
-/// task (the hash completes off-task, harmlessly) rather than tearing partial
-/// state. The OAuth branch delegates to `validate_token_detailed`, which is
-/// itself cancel-safe (read-only JWKS lookup + pure claim checks).
+/// No request-owned partial state is committed. The Argon2 verification is
+/// offloaded to `spawn_blocking`; dropping its `JoinHandle` on cancellation
+/// detaches the task (the hash completes off-task, harmlessly). The OAuth
+/// branch delegates to `validate_token_detailed`, whose JWKS refresh waits on a
+/// detached single-flight task rather than owning the upstream fetch.
 async fn authenticate_bearer_identity(
     state: &AuthState,
     token: &str,
