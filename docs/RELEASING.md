@@ -132,6 +132,11 @@ The `release.yml` workflow then:
    `published=false`), this step is skipped, because the run that truly
    uploaded the bytes already created that release.
 
+`CARGO_REGISTRY_TOKEN` is a long-lived, publish-scoped secret exposed to the
+full `cargo publish` build (including dependency build scripts); it is not
+rotated automatically. Mitigate by rotating the token periodically and keeping
+the publish job's own dependency surface minimal.
+
 ### Recovering a missing GitHub release
 
 Because "Create GitHub release" is now gated on `steps.publish.outputs.published
