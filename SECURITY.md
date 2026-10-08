@@ -463,7 +463,8 @@ model remains robust against hostile or compromised Identity Providers.
 
 Some deployments terminate OAuth/JWKS at an in-cluster IdP whose
 hostname legitimately resolves into private (RFC 1918), loopback, CGNAT,
-or unique-local space (for example a Keycloak `Service` ClusterIP). The
+unique-local, or RFC 8215 local-use NAT64 (`64:ff9b:1::/48`) space (for
+example a Keycloak `Service` ClusterIP or a local NAT64 gateway). The
 default fail-closed policy described above blocks those targets.
 
 `OAuthConfig::ssrf_allowlist` is the **opt-in operator escape hatch**.
@@ -483,6 +484,12 @@ The allowlist is checked **after** the IP-block classifier runs, and
    generic `unique_local` / `cgnat` / `link_local` buckets, so listing
    `fd00::/8`, `100.64.0.0/10`, or `169.254.0.0/16` in `cidrs` never
    re-allows the metadata addresses themselves.
+   Even when `64:ff9b:1::/48` is allowlisted, addresses that embed a
+   cloud-metadata IPv4 address in the RFC 6052 `/96` layout (the last 32
+   bits) remain blocked, exactly as for the well-known NAT64 prefix.
+   Other RFC 6052 prefix lengths are not decoded, so an allowlist entry
+   covering the whole `/48` also re-allows every other address in it:
+   allowlist the narrowest prefix your NAT64 gateway actually uses.
 2. The empty (default) allowlist preserves the pre-1.4.0 behaviour
    verbatim, including the exact wording of the "OAuth target resolved
    to blocked IP" error message, so existing operator runbooks and
@@ -505,9 +512,16 @@ Operational guidance:
   range. Hostname allowlists trust DNS to remain truthful; CIDR
   allowlists do not.
 - Keep the allowlist as narrow as possible. `10.0.0.0/8` is much
-  weaker than the actual `/24` of the IdP's `Service` subnet.
+  weaker than the actual `/24` of the IdP's `Service` subnet, and
+  `64:ff9b:1::/48` is weaker than the specific local-use NAT64 prefix your
+  OAuth/JWKS endpoint needs.
 - Audit the `oauth.ssrf_allowlist is configured` warn-level log line on
   every restart and on every config reload.
+
+CRL fetches use the same blocked-IP classifier but intentionally have no
+operator allowlist: CRL integrity rests on the CA signature, so a CRL
+distribution point resolving into `64:ff9b:1::/48` is blocked rather than
+operator-reallowable.
 
 ### OAuth HTTPS enforcement
 

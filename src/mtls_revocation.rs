@@ -2237,17 +2237,7 @@ async fn fetch_crl(
     let mut any_addr = false;
     for addr in addrs {
         any_addr = true;
-        if let Some(reason) = ip_block_reason(addr.ip()) {
-            tracing::warn!(
-                url = %url,
-                resolved_ip = %addr.ip(),
-                reason,
-                "CRL fetch denied: blocked IP"
-            );
-            return Err(RmcpServerKitError::Tls(format!(
-                "CRL host resolved to blocked IP ({reason}): {url}"
-            )));
-        }
+        reject_blocked_crl_ip(url, addr.ip())?;
     }
     if !any_addr {
         return Err(RmcpServerKitError::Tls(format!(
@@ -2292,6 +2282,26 @@ async fn fetch_crl(
         fetched_at: SystemTime::now(),
         source_url: url.to_owned(),
     })
+}
+
+/// Reject a CRL resolved IP when the shared SSRF classifier blocks it.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Tls`] when `ip` is in a blocked SSRF class.
+fn reject_blocked_crl_ip(url: &str, ip: IpAddr) -> Result<(), RmcpServerKitError> {
+    let Some(reason) = ip_block_reason(ip) else {
+        return Ok(());
+    };
+    tracing::warn!(
+        url = %url,
+        resolved_ip = %ip,
+        reason,
+        "CRL fetch denied: blocked IP"
+    );
+    Err(RmcpServerKitError::Tls(format!(
+        "CRL host resolved to blocked IP ({reason}): {url}"
+    )))
 }
 
 /// Whether a cached CRL is due for refresh at `now`.
@@ -2369,6 +2379,7 @@ fn asn1_time_to_system_time(time: ASN1Time) -> SystemTime {
 mod tests {
 
     use core::{
+        net::Ipv6Addr,
         slice,
         sync::atomic::{AtomicUsize, Ordering},
     };
@@ -2847,6 +2858,22 @@ mod tests {
         assert!(
             !rendered.contains("u:p"),
             "error must not echo the rejected credentials: {rendered}"
+        );
+        Ok(())
+    }
+
+    /// Pins that CRL fetch preflight rejects RFC 8215 local-use NAT64 targets.
+    #[tokio::test]
+    async fn crl_preflight_rejects_nat64_local_use_target() -> anyhow::Result<()> {
+        let url = "https://crl.example/ca.crl";
+        let ip = IpAddr::V6(Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 0, 0, 0x0808, 0x0808));
+        let Err(err) = reject_blocked_crl_ip(url, ip) else {
+            anyhow::bail!("local-use NAT64 CRL target must be rejected");
+        };
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("nat64_local_use"),
+            "error must carry the local-use NAT64 reason: {rendered}"
         );
         Ok(())
     }

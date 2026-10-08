@@ -1,6 +1,8 @@
 //! SSRF guards for outbound HTTP: scheme/userinfo validation, literal-IP
-//! rejection, cloud-metadata blocking, and the operator host/CIDR allowlist
-//! shared by the OAuth/JWKS and CRL fetch paths.
+//! rejection, cloud-metadata blocking, and OAuth/JWKS allowlisting.
+//!
+//! CRL fetches use the same blocked-IP classifier without an operator
+//! allowlist.
 
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -107,6 +109,9 @@ pub(crate) fn sanitized_url_for_log(url: &Url) -> String {
 ///   embedded IPv4 address is itself blocked by any rule above; embedded
 ///   cloud-metadata is re-labelled `cloud_metadata` so an operator
 ///   allowlist covering the transition prefix cannot re-allow it.
+/// - IPv6 NAT64 local-use (`64:ff9b:1::/48`) as `nat64_local_use`,
+///   re-allowable via the operator allowlist except when the RFC 6052
+///   `/96` layout embeds cloud metadata in the final 32 bits.
 /// - IPv6 IPv4-compatible (`::a.b.c.d`, deprecated `::/96`): the whole
 ///   prefix is blocked, inheriting any IPv4 rule for the embedded address.
 /// - IPv4-mapped IPv6 inheriting any of the above.
@@ -231,6 +236,9 @@ fn block_reason_v6(v6: Ipv6Addr) -> Option<&'static str> {
     if segments[0] == 0x2001 && segments[1] == 0x0000 {
         return Some("teredo");
     }
+    if let Some(reason) = nat64_local_use_reason(&segments) {
+        return Some(reason);
+    }
     // NAT64 well-known prefix 64:ff9b::/96 (RFC 6052): the trailing 32
     // bits embed an IPv4 address. On DNS64/NAT64 egress networks EVERY
     // public host maps into this prefix, so blocking it wholesale would
@@ -269,6 +277,17 @@ fn block_reason_v6(v6: Ipv6Addr) -> Option<&'static str> {
         return None;
     }
     None
+}
+
+/// Classify RFC 8215 local-use NAT64, preserving embedded metadata.
+fn nat64_local_use_reason(segments: &[u16; 8]) -> Option<&'static str> {
+    if segments[0] != 0x0064 || segments[1] != 0xff9b || segments[2] != 0x0001 {
+        return None;
+    }
+    if block_reason_v4(embedded_v4(segments[6], segments[7])) == Some("cloud_metadata") {
+        return Some("cloud_metadata");
+    }
+    Some("nat64_local_use")
 }
 
 /// Reassemble an IPv4 address embedded in two adjacent IPv6 segments
@@ -846,6 +865,54 @@ mod tests {
             ))),
             Some("nat64_embedded")
         );
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/ssrf.rs::nat64_local_use_classification keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
+    /// Pins RFC 8215 local-use NAT64 classification and adjacent boundaries.
+    fn nat64_local_use_classification() -> anyhow::Result<()> {
+        for (ip, expected) in [
+            (
+                Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 0, 0, 0xa9fe, 0xa9fe),
+                Some("cloud_metadata"),
+            ),
+            (
+                Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 0, 0, 0x6464, 0x64c8),
+                Some("cloud_metadata"),
+            ),
+            (
+                Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 0, 0, 0x0a00, 0x0001),
+                Some("nat64_local_use"),
+            ),
+            (
+                Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 0, 0, 0x0808, 0x0808),
+                Some("nat64_local_use"),
+            ),
+            (
+                Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 1, 0, 0, 1),
+                Some("nat64_local_use"),
+            ),
+            (
+                Ipv6Addr::new(0x0064, 0xff9b, 1, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff),
+                Some("nat64_local_use"),
+            ),
+            (Ipv6Addr::new(0x0064, 0xff9b, 2, 0, 0, 0, 0, 1), None),
+            (Ipv6Addr::new(0x0064, 0xff9b, 0, 1, 0, 0, 0x0a00, 1), None),
+            (
+                Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0x0a00, 1),
+                Some("nat64_embedded"),
+            ),
+            (
+                Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0xa9fe, 0xa9fe),
+                Some("cloud_metadata"),
+            ),
+        ] {
+            assert_eq!(ip_block_reason(IpAddr::V6(ip)), expected, "{ip}");
+        }
         Ok(())
     }
 

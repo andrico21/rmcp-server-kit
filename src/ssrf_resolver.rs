@@ -311,6 +311,64 @@ mod tests {
     }
 
     #[test]
+    /// Pins that local-use NAT64 is blocked by default for private-shaped addresses.
+    fn rejects_nat64_local_use_private_under_empty_allowlist() -> anyhow::Result<()> {
+        let addrs = vec![socket_addr(IpAddr::V6(Ipv6Addr::new(
+            0x0064, 0xff9b, 1, 0, 0, 0, 0x0a00, 0x0001,
+        )))];
+        let err = screen_addrs(&addrs, &empty_allowlist(), "nat64-private.example", false)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("local-use NAT64 private-shaped IP must be blocked"))?;
+        assert!(err.contains("nat64_local_use"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    /// Pins that local-use NAT64 is blocked by default for public-shaped addresses.
+    fn rejects_nat64_local_use_public_under_empty_allowlist() -> anyhow::Result<()> {
+        let addrs = vec![socket_addr(IpAddr::V6(Ipv6Addr::new(
+            0x0064, 0xff9b, 1, 0, 0, 0, 0x0808, 0x0808,
+        )))];
+        let err = screen_addrs(&addrs, &empty_allowlist(), "nat64-public.example", false)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("local-use NAT64 public-shaped IP must be blocked"))?;
+        assert!(err.contains("nat64_local_use"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    /// Pins that a local-use NAT64 CIDR allowlist admits non-metadata addresses.
+    fn cidr_allowlist_permits_nat64_local_use_non_metadata() -> anyhow::Result<()> {
+        let addrs = vec![
+            socket_addr(IpAddr::V6(Ipv6Addr::new(
+                0x0064, 0xff9b, 1, 0, 0, 0, 0x0a00, 0x0001,
+            ))),
+            socket_addr(IpAddr::V6(Ipv6Addr::new(
+                0x0064, 0xff9b, 1, 0, 0, 0, 0x0808, 0x0808,
+            ))),
+        ];
+        let allowlist = allowlist_with(&[], &["64:ff9b:1::/48"])?;
+        let out = screen_addrs(&addrs, &allowlist, "nat64.example", false)
+            .map_err(|diag| anyhow::anyhow!("local-use NAT64 allowlist must admit: {diag}"))?;
+        assert_eq!(out, addrs);
+        Ok(())
+    }
+
+    #[test]
+    /// Pins that local-use NAT64 metadata stays blocked even with a `/48` allowlist.
+    fn rejects_nat64_local_use_metadata_even_with_allowlist() -> anyhow::Result<()> {
+        let addrs = vec![socket_addr(IpAddr::V6(Ipv6Addr::new(
+            0x0064, 0xff9b, 1, 0, 0, 0, 0xa9fe, 0xa9fe,
+        )))];
+        let allowlist = allowlist_with(&[], &["64:ff9b:1::/48"])?;
+        let err = screen_addrs(&addrs, &allowlist, "nat64-meta.example", false)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("local-use NAT64 metadata must be unbypassable"))?;
+        assert!(err.contains("cloud_metadata"), "{err}");
+        Ok(())
+    }
+
+    #[test]
     /// Pins that cloud-metadata survives the test-only loopback bypass.
     fn rejects_cloud_metadata_even_with_loopback_bypass() -> anyhow::Result<()> {
         let addrs = vec![socket_addr(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)))];

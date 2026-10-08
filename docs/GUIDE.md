@@ -1319,7 +1319,7 @@ role = "viewer"
 | `allow_http_oauth_urls` | `bool` | `false` | Permit `http://` issuer/JWKS/etc. for local dev only. |
 | `audience_validation_mode` | `String` (`"permissive"` \| `"warn"` \| `"strict"`) | `"strict"` | How the resource server treats the legacy `azp` audience fallback. `"strict"` (default) accepts only `aud` matches and rejects `azp`-only matches; `"warn"` accepts `azp`-only matches but emits a one-shot WARN per process to surface IdPs not populating `aud`; `"permissive"` accepts `azp`-only matches silently (pre-1.7 behavior). |
 | `strict_audience_validation` | `Option<bool>` | _unset_ | **Deprecated since 1.7.0** - superseded by `audience_validation_mode`. Consulted only when `audience_validation_mode` is unset: `Some(true)` resolves to `"strict"`, `Some(false)` resolves to `"warn"`, and unset resolves to `"strict"` (the secure default). |
-| `ssrf_allowlist` | `table` | _unset_ | Operator opt-in allowlist of `hosts` and/or `cidrs` whose otherwise-blocked addresses (private/loopback/CGNAT/unique-local) the OAuth/JWKS fetcher is allowed to reach. Cloud-metadata addresses remain blocked. See "Allowing in-cluster IdPs" below and the "Operator allowlist" section in [`SECURITY.md`](../SECURITY.md). |
+| `ssrf_allowlist` | `table` | _unset_ | Operator opt-in allowlist of `hosts` and/or `cidrs` whose otherwise-blocked addresses (private/loopback/CGNAT/unique-local/RFC 8215 local-use NAT64) the OAuth/JWKS fetcher is allowed to reach. Cloud-metadata addresses remain blocked. See "Allowing in-cluster IdPs" below and the "Operator allowlist" section in [`SECURITY.md`](../SECURITY.md). |
 | `role_claim` | `Option<String>` | `None` | JWT claim path (dot-notation for nested claims) to extract role values from; e.g. `"roles"` or `"realm_access.roles"`. When set, claim values are matched against `role_mappings` instead of `scopes`. Supports space-separated string claims and JSON array claims. Pairs with `role_mappings`. |
 | `role_mappings` | `Vec<RoleMapping>` | `[]` | Claim-value-to-role mappings used when `role_claim` is set. First matching entry wins. See the worked example below. |
 | `require_subject` | `bool` | `false` | Reject tokens that lack a `sub` (subject) claim. Leave `false` for client-credentials / machine-to-machine tokens, which legitimately carry no subject. |
@@ -1488,7 +1488,8 @@ OAuth URL hardening operates in two layers:
 - **At runtime, on every HTTP redirect hop**, both the shared
   `OauthHttpClient` and the `JwksCache` redirect closures run a sync
   per-hop SSRF guard that rejects targets resolving to private, loopback,
-  link-local, multicast, broadcast, unspecified, or cloud-metadata
+  link-local, multicast, broadcast, unspecified, RFC 8215 local-use NAT64,
+  or cloud-metadata
   IP ranges. `https -> http` downgrades are always rejected; `http -> http`
   is permitted only when `allow_http_oauth_urls = true`.
 - **Before every initial outbound connect**, OAuth/JWKS fetches resolve the
@@ -1518,15 +1519,28 @@ internally and are not configurable knobs.
 
 By default, the post-DNS SSRF guard rejects OAuth/JWKS targets whose
 hostnames resolve to private (RFC 1918), loopback, link-local, CGNAT,
-unique-local, or cloud-metadata address space. This is the right default
-for internet-facing IdPs but blocks legitimate in-cluster deployments
-where, for example, Keycloak resolves to a `10.x.x.x` ClusterIP.
+unique-local, RFC 8215 local-use NAT64 (`64:ff9b:1::/48`), or
+cloud-metadata address space. This is the right default for
+internet-facing IdPs but blocks legitimate in-cluster deployments where,
+for example, Keycloak resolves to a `10.x.x.x` ClusterIP or an IdP is
+reached through a local-use NAT64 gateway.
 
 Operators can opt in to **specific** trust by listing the hostnames or
 CIDR blocks the fetcher is permitted to reach. Cloud-metadata addresses
 (AWS/GCP/Alibaba IPv4 + IPv6) remain blocked **unconditionally**, even
 if a containing CIDR is listed -- see [`SECURITY.md`](../SECURITY.md)
 under "Operator allowlist" for the full trust model.
+
+Even when `64:ff9b:1::/48` is allowlisted, addresses that embed a
+cloud-metadata IPv4 address in the RFC 6052 `/96` layout (the last 32
+bits) remain blocked, exactly as for the well-known NAT64 prefix. Other
+RFC 6052 prefix lengths are not decoded, so an allowlist entry covering
+the whole `/48` also re-allows every other address in it: allowlist the
+narrowest prefix your NAT64 gateway actually uses.
+
+The CRL fetch path has no SSRF allowlist. A CRL distribution point whose
+hostname resolves into `64:ff9b:1::/48` is blocked; keep CRL hosts on
+ordinary reachable addresses or publish a different CDP hostname.
 
 ```toml
 [server.auth.oauth]
@@ -1537,6 +1551,8 @@ jwks_uri = "https://rhbk.ops.example.com/realms/ops/protocol/openid-connect/cert
 [server.auth.oauth.ssrf_allowlist]
 hosts = ["rhbk.ops.example.com"]
 cidrs = ["10.0.0.0/8"]
+# or the narrow local-use NAT64 prefix your IdP actually needs, e.g.
+# cidrs = ["64:ff9b:1:1234::/64"]
 ```
 
 Builder API:

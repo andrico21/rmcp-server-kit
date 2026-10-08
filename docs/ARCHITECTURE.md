@@ -561,9 +561,9 @@ The shared SSRF helpers live in `src/ssrf.rs` and split into two layers:
 - **Runtime per-hop guard** (`redirect_target_reason`, called from inside
   the `OauthHttpClient`, `JwksCache`, and CRL redirect closures): rejects
   targets resolving to private, loopback, link-local, multicast,
-  broadcast, unspecified, or cloud-metadata IP ranges. Public IPs are
-  permitted because legitimate DNS resolution may yield them. The closures
-  are sync (no async DNS inside policy).
+  broadcast, unspecified, RFC 8215 local-use NAT64, or cloud-metadata IP
+  ranges. Public IPs are permitted because legitimate DNS resolution may
+  yield them. The closures are sync (no async DNS inside policy).
 
 For OAuth, the guard covers:
 - All six configured URL fields at startup (`issuer`, `jwks_uri`,
