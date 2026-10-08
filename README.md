@@ -152,7 +152,7 @@ let oauth = OAuthConfig::builder(
 > Keycloak `Service` ClusterIP or local NAT64 gateway). Cloud-metadata
 > addresses (AWS / GCP / Alibaba) remain unbypassable regardless of the
 > allowlist contents, including when embedded in `64:ff9b:1::/48` using
-> the RFC 6052 `/96` layout.
+> any RFC 6052 layout that fits inside the `/48`.
 > See [`docs/GUIDE.md`](docs/GUIDE.md#allowing-in-cluster-idps) and the
 > "Operator allowlist" subsection of [`SECURITY.md`](SECURITY.md#operator-allowlist)
 > for the full trust model.

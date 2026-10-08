@@ -1531,12 +1531,12 @@ CIDR blocks the fetcher is permitted to reach. Cloud-metadata addresses
 if a containing CIDR is listed -- see [`SECURITY.md`](../SECURITY.md)
 under "Operator allowlist" for the full trust model.
 
-Even when `64:ff9b:1::/48` is allowlisted, addresses that embed a
-cloud-metadata IPv4 address in the RFC 6052 `/96` layout (the last 32
-bits) remain blocked, exactly as for the well-known NAT64 prefix. Other
-RFC 6052 prefix lengths are not decoded, so an allowlist entry covering
-the whole `/48` also re-allows every other address in it: allowlist the
-narrowest prefix your NAT64 gateway actually uses.
+Even when `64:ff9b:1::/48` is allowlisted, addresses whose RFC 6052
+embedded IPv4 decodes to a cloud-metadata address remain blocked, exactly
+as for the well-known NAT64 prefix. This holds in every RFC 6052 prefix
+length that fits inside the `/48` (`/48`, `/56`, `/64` and `/96`). An
+allowlist entry still re-allows every non-metadata address in its range,
+so allowlist the narrowest prefix your NAT64 gateway actually uses.
 
 The CRL fetch path has no SSRF allowlist. A CRL distribution point whose
 hostname resolves into `64:ff9b:1::/48` is blocked; keep CRL hosts on

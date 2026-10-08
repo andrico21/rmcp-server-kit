@@ -484,12 +484,13 @@ The allowlist is checked **after** the IP-block classifier runs, and
    generic `unique_local` / `cgnat` / `link_local` buckets, so listing
    `fd00::/8`, `100.64.0.0/10`, or `169.254.0.0/16` in `cidrs` never
    re-allows the metadata addresses themselves.
-   Even when `64:ff9b:1::/48` is allowlisted, addresses that embed a
-   cloud-metadata IPv4 address in the RFC 6052 `/96` layout (the last 32
-   bits) remain blocked, exactly as for the well-known NAT64 prefix.
-   Other RFC 6052 prefix lengths are not decoded, so an allowlist entry
-   covering the whole `/48` also re-allows every other address in it:
-   allowlist the narrowest prefix your NAT64 gateway actually uses.
+   Even when `64:ff9b:1::/48` is allowlisted, addresses whose RFC 6052
+   embedded IPv4 decodes to a cloud-metadata address remain blocked,
+   exactly as for the well-known NAT64 prefix. This holds in every RFC
+   6052 prefix length that fits inside the `/48` (`/48`, `/56`, `/64`,
+   and `/96`). An allowlist entry still re-allows every non-metadata
+   address in its range, so allowlist the narrowest prefix your NAT64
+   gateway actually uses.
 2. The empty (default) allowlist preserves the pre-1.4.0 behaviour
    verbatim, including the exact wording of the "OAuth target resolved
    to blocked IP" error message, so existing operator runbooks and

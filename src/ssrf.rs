@@ -110,8 +110,8 @@ pub(crate) fn sanitized_url_for_log(url: &Url) -> String {
 ///   cloud-metadata is re-labelled `cloud_metadata` so an operator
 ///   allowlist covering the transition prefix cannot re-allow it.
 /// - IPv6 NAT64 local-use (`64:ff9b:1::/48`) as `nat64_local_use`,
-///   re-allowable via the operator allowlist except when the RFC 6052
-///   `/96` layout embeds cloud metadata in the final 32 bits.
+///   re-allowable via the operator allowlist except when any RFC 6052
+///   layout that fits inside the `/48` embeds cloud metadata.
 /// - IPv6 IPv4-compatible (`::a.b.c.d`, deprecated `::/96`): the whole
 ///   prefix is blocked, inheriting any IPv4 rule for the embedded address.
 /// - IPv4-mapped IPv6 inheriting any of the above.
@@ -236,7 +236,7 @@ fn block_reason_v6(v6: Ipv6Addr) -> Option<&'static str> {
     if segments[0] == 0x2001 && segments[1] == 0x0000 {
         return Some("teredo");
     }
-    if let Some(reason) = nat64_local_use_reason(&segments) {
+    if let Some(reason) = nat64_local_use_reason(v6) {
         return Some(reason);
     }
     // NAT64 well-known prefix 64:ff9b::/96 (RFC 6052): the trailing 32
@@ -280,12 +280,39 @@ fn block_reason_v6(v6: Ipv6Addr) -> Option<&'static str> {
 }
 
 /// Classify RFC 8215 local-use NAT64, preserving embedded metadata.
-fn nat64_local_use_reason(segments: &[u16; 8]) -> Option<&'static str> {
-    if segments[0] != 0x0064 || segments[1] != 0xff9b || segments[2] != 0x0001 {
+fn nat64_local_use_reason(v6: Ipv6Addr) -> Option<&'static str> {
+    let [
+        o0,
+        o1,
+        o2,
+        o3,
+        o4,
+        o5,
+        o6,
+        o7,
+        _u,
+        o9,
+        o10,
+        o11,
+        o12,
+        o13,
+        o14,
+        o15,
+    ] = v6.octets();
+    if [o0, o1, o2, o3, o4, o5] != [0x00, 0x64, 0xff, 0x9b, 0x00, 0x01] {
         return None;
     }
-    if block_reason_v4(embedded_v4(segments[6], segments[7])) == Some("cloud_metadata") {
-        return Some("cloud_metadata");
+    // /32 and /40 cannot encode metadata inside this /48: their first IPv4
+    // octet would be fixed at 0 or 1 by `64:ff9b:1::/48`.
+    for embedded in [
+        Ipv4Addr::new(o6, o7, o9, o10),
+        Ipv4Addr::new(o7, o9, o10, o11),
+        Ipv4Addr::new(o9, o10, o11, o12),
+        Ipv4Addr::new(o12, o13, o14, o15),
+    ] {
+        if block_reason_v4(embedded) == Some("cloud_metadata") {
+            return Some("cloud_metadata");
+        }
     }
     Some("nat64_local_use")
 }
@@ -585,7 +612,121 @@ mod tests {
 
     use url::Url;
 
-    use super::{check_scheme, ip_block_reason, sanitized_url_for_log};
+    use super::{
+        CLOUD_METADATA_V4, CLOUD_METADATA_V4_ALIBABA, check_scheme, ip_block_reason,
+        sanitized_url_for_log,
+    };
+
+    #[derive(Clone, Copy)]
+    enum Rfc6052Layout {
+        Prefix48,
+        Prefix56,
+        Prefix64,
+        Prefix96,
+    }
+
+    impl Rfc6052Layout {
+        const ALL: [Self; 4] = [
+            Self::Prefix48,
+            Self::Prefix56,
+            Self::Prefix64,
+            Self::Prefix96,
+        ];
+
+        const fn name(self) -> &'static str {
+            match self {
+                Self::Prefix48 => "/48",
+                Self::Prefix56 => "/56",
+                Self::Prefix64 => "/64",
+                Self::Prefix96 => "/96",
+            }
+        }
+    }
+
+    fn embed_rfc6052_local_use(
+        layout: Rfc6052Layout,
+        ipv4: Ipv4Addr,
+        u_octet: u8,
+        suffix: [u8; 3],
+    ) -> Ipv6Addr {
+        let [v4_first, v4_second, v4_third, v4_fourth] = ipv4.octets();
+        let [suffix_first, suffix_second, suffix_third] = suffix;
+        let octets = match layout {
+            Rfc6052Layout::Prefix48 => [
+                0x00,
+                0x64,
+                0xff,
+                0x9b,
+                0x00,
+                0x01,
+                v4_first,
+                v4_second,
+                u_octet,
+                v4_third,
+                v4_fourth,
+                suffix_first,
+                suffix_second,
+                suffix_third,
+                0,
+                0,
+            ],
+            Rfc6052Layout::Prefix56 => [
+                0x00,
+                0x64,
+                0xff,
+                0x9b,
+                0x00,
+                0x01,
+                0,
+                v4_first,
+                u_octet,
+                v4_second,
+                v4_third,
+                v4_fourth,
+                suffix_first,
+                suffix_second,
+                suffix_third,
+                0,
+            ],
+            Rfc6052Layout::Prefix64 => [
+                0x00,
+                0x64,
+                0xff,
+                0x9b,
+                0x00,
+                0x01,
+                0,
+                0,
+                u_octet,
+                v4_first,
+                v4_second,
+                v4_third,
+                v4_fourth,
+                suffix_first,
+                suffix_second,
+                suffix_third,
+            ],
+            Rfc6052Layout::Prefix96 => [
+                0x00,
+                0x64,
+                0xff,
+                0x9b,
+                0x00,
+                0x01,
+                suffix_first,
+                suffix_second,
+                u_octet,
+                suffix_third,
+                0,
+                0,
+                v4_first,
+                v4_second,
+                v4_third,
+                v4_fourth,
+            ],
+        };
+        Ipv6Addr::from(octets)
+    }
 
     #[test]
     /// Pins that `https` URLs are accepted regardless of the `allow_http` flag.
@@ -912,6 +1053,78 @@ mod tests {
             ),
         ] {
             assert_eq!(ip_block_reason(IpAddr::V6(ip)), expected, "{ip}");
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/ssrf.rs::nat64_local_use_metadata_in_all_rfc6052_layouts keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
+    /// Pins metadata blocking for every RFC 6052 layout that fits in local-use NAT64.
+    fn nat64_local_use_metadata_in_all_rfc6052_layouts() -> anyhow::Result<()> {
+        for layout in Rfc6052Layout::ALL {
+            for ipv4 in [CLOUD_METADATA_V4, CLOUD_METADATA_V4_ALIBABA] {
+                for u_octet in [0, 0x87] {
+                    for suffix in [[0, 0, 0], [0x12, 0x34, 0x56]] {
+                        let ip = embed_rfc6052_local_use(layout, ipv4, u_octet, suffix);
+                        assert_eq!(
+                            ip_block_reason(IpAddr::V6(ip)),
+                            Some("cloud_metadata"),
+                            "layout={} ipv4={ipv4} u={u_octet:#04x} suffix={suffix:02x?} ip={ip}",
+                            layout.name()
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/ssrf.rs::nat64_local_use_non_metadata_in_all_rfc6052_layouts keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
+    /// Pins non-metadata embedded IPv4 values keep the local-use NAT64 label.
+    fn nat64_local_use_non_metadata_in_all_rfc6052_layouts() -> anyhow::Result<()> {
+        for layout in Rfc6052Layout::ALL {
+            for ipv4 in [
+                Ipv4Addr::new(10, 0, 0, 1),
+                Ipv4Addr::new(8, 8, 8, 8),
+                Ipv4Addr::new(169, 254, 169, 253),
+                Ipv4Addr::new(100, 100, 100, 201),
+            ] {
+                let ip = embed_rfc6052_local_use(layout, ipv4, 0x87, [0x12, 0x34, 0x56]);
+                assert_eq!(
+                    ip_block_reason(IpAddr::V6(ip)),
+                    Some("nat64_local_use"),
+                    "layout={} ipv4={ipv4} ip={ip}",
+                    layout.name()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/ssrf.rs::nat64_local_use_unaligned_metadata_bytes_keep_local_use_label keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
+    /// Pins that metadata-like bytes at no RFC 6052 layout position keep the local-use label.
+    fn nat64_local_use_unaligned_metadata_bytes_keep_local_use_label() -> anyhow::Result<()> {
+        for ip in [
+            Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 0, 0xa9fe, 0xa9fe, 0),
+            Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 0xa9fe, 0xa9fe, 0, 0),
+            Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 0, 0, 0xfea9, 0xfea9),
+        ] {
+            assert_eq!(
+                ip_block_reason(IpAddr::V6(ip)),
+                Some("nat64_local_use"),
+                "{ip}"
+            );
         }
         Ok(())
     }
