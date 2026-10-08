@@ -592,6 +592,20 @@ crl_max_cache_entries      = 1024      # caps parsed CRLs held in memory
 > CRLs stay small. It is **not** a lever for bounding per-handshake cost:
 > that cost is independent of CRL size by design. See
 > [SECURITY.md](../SECURITY.md#why-crl_max_response_bytes-stays-at-5-mib).
+>
+> **CRL parsing and verifier rebuilds run on the blocking pool, not the
+> async runtime, at most two at a time.** Parsing a large CRL and rebuilding
+> the `rustls` verifier over a deep cache are both CPU-bound work that would
+> otherwise occupy a Tokio worker thread for as long as it takes - a large or
+> crafted CRL can no longer stall request handling elsewhere on the server.
+> This bound is independent of `crl_max_concurrent_fetches` (which limits
+> outbound network fetches, not CPU work) and is not operator-tunable.
+> Rebuilds still serialize one commit at a time, so throughput under a deep
+> cache is unchanged; only where the CPU work runs has changed. If a commit's
+> caller is cancelled (for example, a timeout) while its bounded rebuild is
+> still running, that rebuild runs to completion in the background and its
+> result is discarded: the previously published cache and verifier are
+> unaffected, never a late or out-of-order publication.
 
 
 ##### Defence-in-depth (still recommended even with CRL enabled)

@@ -52,8 +52,8 @@ use rustls::{
 };
 use tokio::{
     net::lookup_host,
-    sync::{Mutex as TokioMutex, RwLock, Semaphore, mpsc},
-    task::JoinSet,
+    sync::{Mutex as TokioMutex, OwnedSemaphorePermit, RwLock, Semaphore, mpsc},
+    task::{JoinSet, spawn_blocking},
     time::{Instant, Sleep, sleep},
 };
 use tokio_util::sync::CancellationToken;
@@ -99,6 +99,16 @@ const MAX_RELEVANT_CDP_URLS_PER_HANDSHAKE: usize = 64;
 const CRL_DISCOVERY_MAX_TRACKED_PEERS: usize = 10_000;
 /// Idle-eviction window for CRL discovery peer keys. Matches the house pair.
 const CRL_DISCOVERY_PEER_IDLE_EVICTION: Duration = Duration::from_mins(15);
+
+/// Max concurrent CPU-bound CRL parse and verifier-rebuild jobs.
+///
+/// Shared across every handshake, refresh and discovery commit on one
+/// `CrlSet` (bootstrap uses its own, separate semaphore of the same size;
+/// see `bootstrap_fetch`). Deliberately independent of
+/// `crl_max_concurrent_fetches`, which bounds network fetch concurrency, not
+/// CPU parallelism. Deliberately a private constant rather than a config
+/// field: no operator should need to tune it.
+const CRL_CPU_PERMITS: usize = 2;
 
 tokio::task_local! {
     /// Peer IP of the TLS handshake being verified on this task. Set by the
@@ -174,7 +184,7 @@ impl fmt::Debug for VerifierState {
 /// same 32-byte head and tail, would not be detected. Such a caller already
 /// holds the cache write lock and is inside the trust boundary. The real fix is
 /// making `cache` private, which is a 4.0 change.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct EntryIdentity {
     /// Pointer address of the DER allocation at commit time.
     der_ptr: usize,
@@ -359,6 +369,9 @@ pub struct CrlSet {
     max_response_bytes: u64,
     /// Last time each throttle key emitted a warning, for cooldown accounting.
     last_cap_warn: Mutex<HashMap<&'static str, Instant>>,
+    /// Bounds concurrent CPU-bound CRL parse and verifier-rebuild jobs on the
+    /// blocking pool. See [`CRL_CPU_PERMITS`].
+    crl_cpu: Arc<Semaphore>,
     /// Test-only hook fired immediately before a discovered URL becomes
     /// observable on `discover_tx`.
     ///
@@ -472,6 +485,7 @@ impl CrlSet {
             discovery_limiter_per_peer,
             max_response_bytes,
             last_cap_warn: Mutex::new(HashMap::new()),
+            crl_cpu: Arc::new(Semaphore::new(CRL_CPU_PERMITS)),
             #[cfg(any(test, feature = "test-helpers"))]
             discovery_send_probe: Mutex::new(None),
         }))
@@ -620,14 +634,26 @@ impl CrlSet {
 
     /// Commit a batch of CRL inserts and removals as one atomic generation.
     ///
+    /// The verifier rebuild and identity recomputation for the candidate
+    /// cache run on the blocking pool (see
+    /// [`build_verifier_state_blocking`]), bounded by [`CRL_CPU_PERMITS`]. If
+    /// this future is dropped while that blocking work is running (caller
+    /// cancellation, a timeout), the bounded build still runs to completion
+    /// in the background and its result is simply discarded: the committed
+    /// cache and the published verifier stay at the previous generation,
+    /// never a late, out-of-order publication.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the verifier cannot be rebuilt for the new cache.
-    // cancel-safe: `commit_lock` is held across awaits, but every mutation
-    // before publication builds a local candidate. The cache swap and the
-    // `verifier_state.store` publication are adjacent with NO await between
-    // them, so a cancelled commit leaves either the old or the new generation
-    // -- never a half-applied mix.
+    /// Returns an error if the verifier cannot be rebuilt for the new cache,
+    /// or if the blocking rebuild task cannot be joined (including a panic
+    /// inside it).
+    // cancel-safe: `commit_lock` is held across awaits, but every mutation before publication
+    // builds a local candidate; the cache swap and `verifier_state.store` publication are
+    // adjacent with NO await between them, so a cancelled commit leaves the old or the new
+    // generation, never a half-applied mix. Dropping this future while the blocking rebuild runs
+    // does not cancel it (spawn_blocking cannot be aborted); the bounded build finishes and its
+    // result is discarded.
     async fn commit_cache_update_atomically(
         &self,
         inserts: Vec<(String, CachedCrl)>,
@@ -639,7 +665,10 @@ impl CrlSet {
         // `verifier_state.store(..)` publication, so readers synchronising on
         // that same `RwLock` can never observe a commit half-applied, while
         // `rebuild_verifier` and digesting stay off-lock and out of the
-        // verifier path's way.
+        // verifier path's way. Lock order is `commit_lock` then the
+        // `crl_cpu` permit acquired below; the fetch path (`fetch_crl`)
+        // acquires only the permit, never `commit_lock`, so there is no
+        // cycle.
         let _commit = self.commit_lock.lock().await;
 
         let mut candidate = self.cache_lock().read().await.clone();
@@ -665,8 +694,6 @@ impl CrlSet {
             let _removed = candidate.remove(url);
         }
 
-        let verifier = rebuild_verifier(&self.roots, &self.config, &candidate)?;
-
         // SECURITY: identities are recomputed for EVERY entry, not only for
         // what this commit wrote. `candidate` is a clone of the live cache and
         // cloning a `CachedCrl` reallocates its DER, so every carried-forward
@@ -674,16 +701,31 @@ impl CrlSet {
         // unrelated commit invalidate every other URL and deny every later
         // handshake. Recomputation is O(entries) pointer and scalar reads with
         // no hashing, so there is nothing to gain by being incremental.
+        let (rebuilt_cache, verifier, identities) = {
+            let permit = Arc::clone(&self.crl_cpu)
+                .acquire_owned()
+                .await
+                .map_err(|error| {
+                    RmcpServerKitError::Tls(format!("CRL CPU semaphore closed: {error}"))
+                })?;
+            build_verifier_state_blocking(
+                Arc::clone(&self.roots),
+                self.config.clone(),
+                candidate,
+                permit,
+            )
+            .await?
+        };
         let new_state = Arc::new(VerifierState {
             verifier,
-            cached_urls: candidate.keys().cloned().collect(),
-            committed_identities: crl_cache_identities(&candidate),
+            cached_urls: rebuilt_cache.keys().cloned().collect(),
+            committed_identities: identities,
         });
         let changed = !admitted_urls.is_empty() || !removals.is_empty();
 
         {
             let mut cache = self.cache_lock().write().await;
-            let superseded = mem::replace(&mut *cache, candidate);
+            let superseded = mem::replace(&mut *cache, rebuilt_cache);
             self.verifier_state.store(new_state);
             drop(cache);
             // Free the superseded map only AFTER releasing the write lock.
@@ -825,16 +867,16 @@ impl CrlSet {
     // cancel-safe: commits only after gated_fetch returns, so cancellation
     // during the fetch cannot promote a URL into the seen_urls dedup set.
     async fn fetch_and_store_url(&self, url: String) -> Result<bool, RmcpServerKitError> {
-        let cached = gated_fetch(
-            &self.client,
-            &self.global_fetch_sem,
-            &self.host_semaphores,
-            &url,
-            self.config.crl_allow_http,
-            self.max_response_bytes,
-            self.config.crl_max_host_semaphores,
-        )
-        .await?;
+        let ctx = CrlFetchContext {
+            client: &self.client,
+            global_sem: &self.global_fetch_sem,
+            host_semaphores: &self.host_semaphores,
+            allow_http: self.config.crl_allow_http,
+            max_bytes: self.max_response_bytes,
+            max_host_semaphores: self.config.crl_max_host_semaphores,
+            crl_cpu: &self.crl_cpu,
+        };
+        let cached = gated_fetch(&ctx, &url).await?;
         let _committed = self
             .commit_cache_update_atomically(vec![(url.clone(), cached)], &[])
             .await?;
@@ -1338,17 +1380,16 @@ impl CrlSet {
     // cancel-safe: no local CRL state is published; dropping the future aborts
     // `gated_fetch` and leaves only bounded semaphore/map state behind.
     pub async fn __test_trigger_fetch(&self, url: &str) -> Result<(), RmcpServerKitError> {
-        if let Err(error) = gated_fetch(
-            &self.client,
-            &self.global_fetch_sem,
-            &self.host_semaphores,
-            url,
-            self.config.crl_allow_http,
-            self.max_response_bytes,
-            self.config.crl_max_host_semaphores,
-        )
-        .await
-        {
+        let ctx = CrlFetchContext {
+            client: &self.client,
+            global_sem: &self.global_fetch_sem,
+            host_semaphores: &self.host_semaphores,
+            allow_http: self.config.crl_allow_http,
+            max_bytes: self.max_response_bytes,
+            max_host_semaphores: self.config.crl_max_host_semaphores,
+            crl_cpu: &self.crl_cpu,
+        };
+        if let Err(error) = gated_fetch(&ctx, url).await {
             if error
                 .to_string()
                 .contains("crl_host_semaphore_cap_exceeded")
@@ -1440,17 +1481,18 @@ impl CrlSet {
             let allow_http = self.config.crl_allow_http;
             let max_bytes = self.max_response_bytes;
             let max_host_semaphores = self.config.crl_max_host_semaphores;
+            let crl_cpu = Arc::clone(&self.crl_cpu);
             let _task = tasks.spawn(async move {
-                let result = gated_fetch(
-                    &client,
-                    &global_sem,
-                    &host_map,
-                    &url,
+                let ctx = CrlFetchContext {
+                    client: &client,
+                    global_sem: &global_sem,
+                    host_semaphores: &host_map,
                     allow_http,
                     max_bytes,
                     max_host_semaphores,
-                )
-                .await;
+                    crl_cpu: &crl_cpu,
+                };
+                let result = gated_fetch(&ctx, &url).await;
                 (url, result)
             });
         }
@@ -1728,18 +1770,10 @@ fn cap_bootstrap_urls(urls: &mut Vec<String>, cap: usize) {
 /// # Errors
 ///
 /// Returns an error if the initial verifier cannot be built.
-#[expect(
-    clippy::cognitive_complexity,
-    reason = "bootstrap coordinates timeout, parallel fetches, and partial-cache recovery"
-)]
-#[expect(
-    clippy::integer_division_remainder_used,
-    reason = "external macro: tokio::select"
-)]
-// cancel-safe: CRL cache state is local until final `CrlSet::new`; timeout or
-// cancellation drops the `JoinSet`, aborting in-flight `gated_fetch` before
-// publication. Bootstrap host semaphores are local and drop with this future.
 #[inline]
+// cancel-safe: CRL cache state is local until final `CrlSet::new`; timeout or cancellation drops
+// the `JoinSet`, aborting in-flight `gated_fetch` before publication. Bootstrap host semaphores
+// are local and drop with this future.
 pub async fn bootstrap_fetch(
     roots: Arc<RootCertStore>,
     ca_certs: &[CertificateDer<'static>],
@@ -1794,25 +1828,75 @@ pub async fn bootstrap_fetch(
     let allow_http = config.crl_allow_http;
     let max_bytes = config.crl_max_response_bytes;
     let max_host_semaphores = config.crl_max_host_semaphores;
+    // Bounds CPU-bound CRL parse jobs during bootstrap. Separate from the
+    // `crl_cpu` field the resulting `CrlSet` gets in `CrlSet::new`: bootstrap
+    // runs before that `CrlSet` exists, so its fetch tasks and its one-shot
+    // initial verifier build below share this bootstrap-local semaphore.
+    let bootstrap_crl_cpu = Arc::new(Semaphore::new(CRL_CPU_PERMITS));
 
+    let fetch_ctx = CrlFetchContext {
+        client: &client,
+        global_sem: &global_sem,
+        host_semaphores: &host_semaphores,
+        allow_http,
+        max_bytes,
+        max_host_semaphores,
+        crl_cpu: &bootstrap_crl_cpu,
+    };
+    let initial_cache = bootstrap_fetch_urls(&fetch_ctx, &urls).await;
+
+    let set = {
+        let permit = Arc::clone(&bootstrap_crl_cpu)
+            .acquire_owned()
+            .await
+            .map_err(|error| {
+                RmcpServerKitError::Tls(format!("CRL CPU semaphore closed: {error}"))
+            })?;
+        new_crl_set_from_bootstrap_cache_blocking(roots, config, discover_tx, initial_cache, permit)
+            .await?
+    };
+    Ok((set, discover_rx))
+}
+
+/// Fetch every bootstrap CDP URL concurrently under [`BOOTSTRAP_TIMEOUT`],
+/// returning whatever was fetched successfully before the deadline.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "bootstrap coordinates timeout, parallel fetches, and partial-cache recovery"
+)]
+#[expect(
+    clippy::integer_division_remainder_used,
+    reason = "external macro: tokio::select"
+)]
+// cancel-safe: results accumulate in a local map; the deadline elapsing, or
+// this future being dropped, only stops collecting further results - nothing
+// is published here, the caller commits the returned map itself.
+async fn bootstrap_fetch_urls(
+    ctx: &CrlFetchContext<'_>,
+    urls: &[String],
+) -> HashMap<String, CachedCrl> {
     let mut initial_cache = HashMap::new();
     let mut tasks = JoinSet::new();
-    for url in &urls {
-        let task_client = client.clone();
+    for url in urls {
         let task_url = url.clone();
-        let task_global_sem = Arc::clone(&global_sem);
-        let task_host_semaphores = Arc::clone(&host_semaphores);
+        let task_client = ctx.client.clone();
+        let task_global_sem = Arc::clone(ctx.global_sem);
+        let task_host_semaphores = Arc::clone(ctx.host_semaphores);
+        let task_crl_cpu = Arc::clone(ctx.crl_cpu);
+        let allow_http = ctx.allow_http;
+        let max_bytes = ctx.max_bytes;
+        let max_host_semaphores = ctx.max_host_semaphores;
         let _task = tasks.spawn(async move {
-            let result = gated_fetch(
-                &task_client,
-                &task_global_sem,
-                &task_host_semaphores,
-                &task_url,
+            let task_ctx = CrlFetchContext {
+                client: &task_client,
+                global_sem: &task_global_sem,
+                host_semaphores: &task_host_semaphores,
                 allow_http,
                 max_bytes,
                 max_host_semaphores,
-            )
-            .await;
+                crl_cpu: &task_crl_cpu,
+            };
+            let result = gated_fetch(&task_ctx, &task_url).await;
             (task_url, result)
         });
     }
@@ -1848,8 +1932,7 @@ pub async fn bootstrap_fetch(
         }
     }
 
-    let set = new_crl_set_from_bootstrap_cache(roots, config, discover_tx, initial_cache)?;
-    Ok((set, discover_rx))
+    initial_cache
 }
 
 /// Apply the cache cap, then build the `CrlSet` from the bootstrap cache.
@@ -1865,6 +1948,33 @@ fn new_crl_set_from_bootstrap_cache(
 ) -> Result<Arc<CrlSet>, RmcpServerKitError> {
     apply_bootstrap_cache_cap(&mut initial_cache, config.crl_max_cache_entries);
     CrlSet::new(roots, config, discover_tx, initial_cache)
+}
+
+/// Build the bootstrap `CrlSet` on the blocking thread pool, bounded by the
+/// bootstrap-local CRL CPU semaphore (see `bootstrap_fetch`).
+///
+/// # Errors
+///
+/// Returns an error if [`new_crl_set_from_bootstrap_cache`] fails, or if the
+/// blocking task cannot be joined (including a panic inside it).
+// cancel-safe: every input, including the semaphore permit, is moved into the
+// blocking closure, so a dropped future lets the bounded build finish and
+// discards its result; bootstrap has published nothing yet in that case.
+async fn new_crl_set_from_bootstrap_cache_blocking(
+    roots: Arc<RootCertStore>,
+    config: MtlsConfig,
+    discover_tx: mpsc::UnboundedSender<String>,
+    initial_cache: HashMap<String, CachedCrl>,
+    permit: OwnedSemaphorePermit,
+) -> Result<Arc<CrlSet>, RmcpServerKitError> {
+    spawn_blocking(move || {
+        let _permit = permit;
+        new_crl_set_from_bootstrap_cache(roots, config, discover_tx, initial_cache)
+    })
+    .await
+    .map_err(|error| {
+        RmcpServerKitError::Tls(format!("CRL bootstrap verifier build task failed: {error}"))
+    })?
 }
 
 /// Drop the excess cache entries beyond `max_cache_entries`, in sorted order.
@@ -2049,6 +2159,47 @@ where
         .map_err(|error| RmcpServerKitError::Tls(format!("mTLS verifier error: {error}")))
 }
 
+/// Rebuild the verifier and recompute every entry's identity for a candidate
+/// cache on the blocking thread pool, bounded by the shared CRL CPU
+/// semaphore.
+///
+/// Takes the candidate cache by value and returns it unchanged alongside the
+/// rebuilt verifier and identity index, so the caller can publish all three
+/// together without re-reading the candidate after the blocking call.
+///
+/// # Errors
+///
+/// Returns an error if [`rebuild_verifier`] fails for the candidate cache, or
+/// if the blocking task cannot be joined (including a panic inside it).
+// cancel-safe: the semaphore permit and the candidate cache are both moved
+// into the blocking closure, so a dropped future lets the bounded rebuild
+// finish and discards its result; nothing is published in that case because
+// the caller never reaches its own publication step.
+async fn build_verifier_state_blocking(
+    roots: Arc<RootCertStore>,
+    config: MtlsConfig,
+    candidate: HashMap<String, CachedCrl>,
+    permit: OwnedSemaphorePermit,
+) -> Result<
+    (
+        HashMap<String, CachedCrl>,
+        Arc<dyn ClientCertVerifier>,
+        HashMap<String, EntryIdentity>,
+    ),
+    RmcpServerKitError,
+> {
+    spawn_blocking(move || {
+        let _permit = permit;
+        let verifier = rebuild_verifier(&roots, &config, &candidate)?;
+        let identities = crl_cache_identities(&candidate);
+        Ok((candidate, verifier, identities))
+    })
+    .await
+    .map_err(|error| {
+        RmcpServerKitError::Tls(format!("CRL verifier rebuild task failed: {error}"))
+    })?
+}
+
 /// Parse `thisUpdate` and `nextUpdate` metadata from a DER-encoded CRL.
 ///
 /// # Errors
@@ -2065,6 +2216,33 @@ pub fn parse_crl_metadata(
         asn1_time_to_system_time(crl.last_update()),
         crl.next_update().map(asn1_time_to_system_time),
     ))
+}
+
+/// Parse CRL metadata on the blocking thread pool, bounded by the shared CRL
+/// CPU semaphore.
+///
+/// Takes the DER bytes by value and returns them unchanged alongside the
+/// parsed metadata, so the caller can build a [`CachedCrl`] without
+/// re-reading the bytes after the blocking call.
+///
+/// # Errors
+///
+/// Returns an error if [`parse_crl_metadata`] fails for the DER bytes, or if
+/// the blocking task cannot be joined (including a panic inside it).
+// cancel-safe: the semaphore permit and the DER bytes are both moved into the
+// blocking closure, so a dropped future lets the bounded parse finish and
+// discards its result; no caller ever observes a partially-parsed `CachedCrl`.
+async fn parse_crl_metadata_blocking(
+    der: Vec<u8>,
+    permit: OwnedSemaphorePermit,
+) -> Result<(Vec<u8>, SystemTime, Option<SystemTime>), RmcpServerKitError> {
+    spawn_blocking(move || {
+        let _permit = permit;
+        let (this_update, next_update) = parse_crl_metadata(&der)?;
+        Ok((der, this_update, next_update))
+    })
+    .await
+    .map_err(|error| RmcpServerKitError::Tls(format!("CRL parse task failed: {error}")))?
 }
 
 /// Compute and box the next refresh sleep deadline.
@@ -2148,6 +2326,28 @@ fn acquire_host_semaphore(
     )
 }
 
+/// Network and CPU concurrency caps shared by one `gated_fetch` call.
+///
+/// Groups `gated_fetch`'s parameters so the function itself stays within the
+/// house argument-count limit; every field is a borrow or a cheap `Copy`
+/// value already owned by the caller.
+struct CrlFetchContext<'ctx> {
+    /// CRL fetcher with the SSRF-screening resolver installed.
+    client: &'ctx Client,
+    /// Global cap on simultaneous CRL HTTP fetches (SSRF amplification guard).
+    global_sem: &'ctx Arc<Semaphore>,
+    /// Per-host serializer, at most one in-flight fetch per origin host.
+    host_semaphores: &'ctx Arc<TokioMutex<HashMap<String, Arc<Semaphore>>>>,
+    /// Whether plain `http://` CDP URLs are fetched.
+    allow_http: bool,
+    /// Cap on a single CRL response body.
+    max_bytes: u64,
+    /// Cap on distinct CDP hosts tracked by `host_semaphores`.
+    max_host_semaphores: usize,
+    /// Bounds concurrent CPU-bound CRL parse jobs. See [`CRL_CPU_PERMITS`].
+    crl_cpu: &'ctx Arc<Semaphore>,
+}
+
 /// Fetch a single CRL URL through the global + per-host concurrency caps.
 ///
 /// `global_sem` caps total simultaneous CRL fetches process-wide.
@@ -2163,13 +2363,8 @@ fn acquire_host_semaphore(
 // position, acquired global/host permits RAII-drop, and host-map insertion can
 // leave only an idle bounded semaphore entry that later self-heals.
 async fn gated_fetch(
-    client: &Client,
-    global_sem: &Arc<Semaphore>,
-    host_semaphores: &Arc<TokioMutex<HashMap<String, Arc<Semaphore>>>>,
+    ctx: &CrlFetchContext<'_>,
     url: &str,
-    allow_http: bool,
-    max_bytes: u64,
-    max_host_semaphores: usize,
 ) -> Result<CachedCrl, RmcpServerKitError> {
     let host_key = Url::parse(url)
         .ok()
@@ -2177,11 +2372,11 @@ async fn gated_fetch(
         .unwrap_or_else(|| url.to_owned());
 
     let host_sem = {
-        let mut map = host_semaphores.lock().await;
-        acquire_host_semaphore(&mut map, &host_key, max_host_semaphores)?
+        let mut map = ctx.host_semaphores.lock().await;
+        acquire_host_semaphore(&mut map, &host_key, ctx.max_host_semaphores)?
     };
 
-    let _global_permit = Arc::clone(global_sem)
+    let _global_permit = Arc::clone(ctx.global_sem)
         .acquire_owned()
         .await
         .map_err(|error| {
@@ -2192,23 +2387,28 @@ async fn gated_fetch(
         .await
         .map_err(|error| RmcpServerKitError::Tls(format!("CRL host semaphore closed: {error}")))?;
 
-    fetch_crl(client, url, allow_http, max_bytes).await
+    fetch_crl(ctx.client, url, ctx.allow_http, ctx.max_bytes, ctx.crl_cpu).await
 }
 
 /// Fetch and parse a single CRL into a cache entry.
+///
+/// The DER parse runs on the blocking pool (see
+/// [`parse_crl_metadata_blocking`]), bounded by [`CRL_CPU_PERMITS`].
 ///
 /// # Errors
 ///
 /// Returns an error if the scheme is rejected, DNS screening fails, the HTTP
 /// fetch fails, the body exceeds the cap, or the DER cannot be parsed.
-// cancel-safe: DNS lookup, request send, chunk reads, DER parse, and metadata
-// extraction build only a local `CachedCrl`; CRL cache/verifier state changes
-// happen later, when callers commit the returned value.
+// cancel-safe: DNS lookup, request send, and chunk reads build only a local buffer; CRL
+// cache/verifier state changes happen later, when callers commit the returned value. Dropping
+// this future while the blocking parse is in flight does not cancel it (spawn_blocking cannot be
+// aborted); the bounded parse finishes and its result is simply discarded.
 async fn fetch_crl(
     client: &Client,
     url: &str,
     allow_http: bool,
     max_bytes: u64,
+    crl_cpu: &Arc<Semaphore>,
 ) -> Result<CachedCrl, RmcpServerKitError> {
     let parsed = Url::parse(url)
         .map_err(|error| RmcpServerKitError::Tls(format!("CRL URL parse {url}: {error}")))?;
@@ -2272,8 +2472,13 @@ async fn fetch_crl(
         body.extend_from_slice(&chunk);
     }
 
-    let der = CertificateRevocationListDer::from(body);
-    let (this_update, next_update) = parse_crl_metadata(der.as_ref())?;
+    let (parsed_der, this_update, next_update) = {
+        let permit = Arc::clone(crl_cpu).acquire_owned().await.map_err(|error| {
+            RmcpServerKitError::Tls(format!("CRL CPU semaphore closed: {error}"))
+        })?;
+        parse_crl_metadata_blocking(body, permit).await?
+    };
+    let der = CertificateRevocationListDer::from(parsed_der);
 
     Ok(CachedCrl {
         der,
@@ -2383,18 +2588,19 @@ mod tests {
         slice,
         sync::atomic::{AtomicUsize, Ordering},
     };
-    use std::{io, sync::Mutex as StdMutex};
+    use std::{io, sync::Mutex as StdMutex, time::Instant as StdInstant};
 
     use anyhow::Context as _;
     use rcgen::{
-        BasicConstraints, CertificateParams, CertifiedIssuer, DnType, IsCa, KeyPair,
-        KeyUsagePurpose,
+        BasicConstraints, CertificateParams, CertificateRevocationListParams, CertifiedIssuer,
+        DnType, IsCa, KeyIdMethod, KeyPair, KeyUsagePurpose, RevocationReason, RevokedCertParams,
+        SerialNumber, date_time_ymd,
     };
     use rustls::crypto::ring;
     use serde_json::{from_value, json};
     use tokio::{
-        task::{spawn_blocking, yield_now},
-        time::timeout,
+        task::yield_now,
+        time::{MissedTickBehavior, interval, timeout},
     };
     use tracing::{Level, subscriber};
     use tracing_subscriber::fmt as subscriber_fmt;
@@ -2846,7 +3052,15 @@ mod tests {
         // transport/oauth test suites).
         drop(ring::default_provider().install_default());
         let client = Client::new();
-        let Err(err) = fetch_crl(&client, "https://u:p@crl.example/ca.crl", false, 1024).await
+        let crl_cpu = Arc::new(Semaphore::new(CRL_CPU_PERMITS));
+        let Err(err) = fetch_crl(
+            &client,
+            "https://u:p@crl.example/ca.crl",
+            false,
+            1024,
+            &crl_cpu,
+        )
+        .await
         else {
             anyhow::bail!("userinfo-bearing CRL URL must be rejected");
         };
@@ -3845,6 +4059,470 @@ mod tests {
         assert!(
             pending <= cap,
             "pending_urls ({pending}) must never exceed crl_max_seen_urls ({cap}) regardless of peer count"
+        );
+        Ok(())
+    }
+
+    // ---- ASY-02: CRL parsing and verifier rebuilds run on the blocking pool
+
+    /// Revoked-certificate count for the large CRL fixture shared by the
+    /// ASY-02 CPU-offload tests below. Chosen so a single synchronous parse
+    /// of the fixture takes comfortably more than 20 ms even in a debug
+    /// build; each test asserts this directly and fails loudly (naming this
+    /// constant) if the host is fast enough to invalidate the margin.
+    const LARGE_FIXTURE_ENTRIES: u64 = 16000;
+
+    /// How many copies of the large fixture CRL the commit-path progress and
+    /// cancellation tests pre-populate the cache with, to approximate the
+    /// DEEP-SEC02-SEC03-ASY02 review's multi-CRL rebuild measurements at a
+    /// scale a debug test build can afford.
+    const COMMIT_FIXTURE_COUNT: usize = 3;
+
+    /// Build a self-signed CA and a CRL DER revoking `entry_count`
+    /// certificates, for the large-fixture CPU-offload tests.
+    fn generate_large_crl_der(
+        entry_count: u64,
+    ) -> anyhow::Result<CertificateRevocationListDer<'static>> {
+        let mut params = CertificateParams::new(Vec::<String>::new()).context("CRL CA params")?;
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "asy02-large-crl-ca");
+        let key = KeyPair::generate().context("CRL CA key")?;
+        let ca = CertifiedIssuer::self_signed(params, key).context("CRL CA self-signed")?;
+
+        let revoked_certs = (0..entry_count)
+            .map(|serial| RevokedCertParams {
+                serial_number: SerialNumber::from(serial),
+                revocation_time: date_time_ymd(2026, 1, 1),
+                reason_code: Some(RevocationReason::KeyCompromise),
+                invalidity_date: None,
+            })
+            .collect();
+
+        let der: CertificateRevocationListDer<'static> = CertificateRevocationListParams {
+            this_update: date_time_ymd(2026, 1, 1),
+            next_update: date_time_ymd(2027, 1, 1),
+            crl_number: SerialNumber::from(1_u64),
+            issuing_distribution_point: None,
+            revoked_certs,
+            key_identifier_method: KeyIdMethod::Sha256,
+        }
+        .signed_by(&ca)
+        .context("sign large CRL")?
+        .into();
+        Ok(der)
+    }
+
+    /// Build a `CachedCrl` from a DER buffer, parsing its real metadata
+    /// (unlike `synthetic_entry`'s minimal placeholder DER).
+    fn cached_crl_from_der(
+        der: CertificateRevocationListDer<'static>,
+        source_url: &str,
+    ) -> anyhow::Result<CachedCrl> {
+        let (this_update, next_update) =
+            parse_crl_metadata(der.as_ref()).context("parse fixture CRL metadata")?;
+        Ok(CachedCrl {
+            der,
+            this_update,
+            next_update,
+            fetched_at: SystemTime::now(),
+            source_url: source_url.to_owned(),
+        })
+    }
+
+    /// Run `fut` to completion while a real-clock 5 ms ticker runs
+    /// concurrently on this (possibly single-threaded) runtime, returning the
+    /// largest gap observed between consecutive ticks alongside `fut`'s
+    /// result.
+    ///
+    /// A stalled executor thread (synchronous CPU work with no yield point)
+    /// shows up as one gap close to the stall's whole duration; an executor
+    /// that keeps yielding to work offloaded elsewhere (`spawn_blocking`)
+    /// shows only small, timer-jitter gaps.
+    async fn max_ticker_gap_until<F>(fut: F) -> (Duration, anyhow::Result<()>)
+    where
+        F: Future<Output = anyhow::Result<()>>,
+    {
+        let max_gap_cell = Arc::new(StdMutex::new(Duration::ZERO));
+        // Seeded to the race's start, not left at a zero/placeholder value:
+        // a ticker that never gets polled even once (the executor is fully
+        // starved end to end) must still read back as one large gap, not a
+        // vacuous `Duration::ZERO` the inter-tick loop below never observed.
+        let last_tick = Arc::new(StdMutex::new(StdInstant::now()));
+        let ticker_max_gap = Arc::clone(&max_gap_cell);
+        let ticker_last_tick = Arc::clone(&last_tick);
+        let ticker = tokio::spawn(async move {
+            let mut ticks = interval(Duration::from_millis(5));
+            ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                let _tick = ticks.tick().await;
+                let now = StdInstant::now();
+                let gap = {
+                    let mut last_guard = ticker_last_tick
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    let gap = now.duration_since(*last_guard);
+                    *last_guard = now;
+                    gap
+                };
+                let mut max_guard = ticker_max_gap
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if gap > *max_guard {
+                    *max_guard = gap;
+                }
+            }
+        });
+
+        let result = fut.await;
+        // Close out any trailing gap since the last successful tick: the
+        // inter-tick loop above can only record a gap once a NEXT tick
+        // arrives to measure against, so a ticker that fell behind (or never
+        // ran at all) right up to `fut`'s completion would otherwise go
+        // unmeasured.
+        let now = StdInstant::now();
+        {
+            let last = *last_tick.lock().unwrap_or_else(PoisonError::into_inner);
+            let trailing_gap = now.duration_since(last);
+            let mut max_guard = max_gap_cell.lock().unwrap_or_else(PoisonError::into_inner);
+            if trailing_gap > *max_guard {
+                *max_guard = trailing_gap;
+            }
+        }
+        ticker.abort();
+        let _joined = ticker.await;
+
+        let max_gap = *max_gap_cell.lock().unwrap_or_else(PoisonError::into_inner);
+        (max_gap, result)
+    }
+
+    /// Pins that `fetch_crl`'s DER parse runs on the blocking pool: on a
+    /// current-thread runtime, a 5 ms ticker keeps ticking with only small
+    /// gaps while a large CRL is parsed through [`parse_crl_metadata_blocking`]
+    /// (the same offload helper `fetch_crl` calls), instead of stalling for
+    /// the whole parse duration.
+    ///
+    /// Calls `parse_crl_metadata_blocking` directly rather than the full
+    /// `fetch_crl`: `fetch_crl` also screens the resolved address before
+    /// connecting, and a `wiremock` server only ever resolves to loopback,
+    /// which that unrelated, pre-existing screening always rejects. This is
+    /// the "nearest in-crate seam" that still exercises the real offloaded
+    /// parse path end to end.
+    ///
+    /// RED when `parse_crl_metadata_blocking` is mutated back to an inline,
+    /// synchronous call (no `spawn_blocking`): observed baseline 133.1 ms,
+    /// `max_gap` 179.1 ms (the mutated helper has no `.await` point left at
+    /// all, so it also starves the ticker task before it can run even once;
+    /// see the hand-over for the mutation-test log path).
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_crl_offload_keeps_the_runtime_responsive() -> anyhow::Result<()> {
+        install_ring_provider();
+        let der = generate_large_crl_der(LARGE_FIXTURE_ENTRIES)?;
+        let der_bytes = der.as_ref().to_vec();
+
+        let baseline_start = StdInstant::now();
+        let _metadata =
+            parse_crl_metadata(&der_bytes).context("baseline parse must succeed on the fixture")?;
+        let baseline = baseline_start.elapsed();
+        assert!(
+            baseline >= Duration::from_millis(20),
+            "fixture must take at least 20 ms to parse synchronously (was {baseline:?}); \
+             enlarge LARGE_FIXTURE_ENTRIES"
+        );
+
+        let crl_cpu = Arc::new(Semaphore::new(CRL_CPU_PERMITS));
+        let (max_gap, parse_result) = max_ticker_gap_until(async {
+            let _parsed = {
+                let permit = Arc::clone(&crl_cpu)
+                    .acquire_owned()
+                    .await
+                    .context("acquire CRL CPU permit")?;
+                parse_crl_metadata_blocking(der_bytes.clone(), permit)
+                    .await
+                    .map_err(anyhow::Error::from)?
+            };
+            Ok(())
+        })
+        .await;
+        parse_result
+            .context("offloaded parse_crl_metadata_blocking must succeed on the fixture")?;
+
+        assert!(
+            max_gap.saturating_mul(4) <= baseline,
+            "offloaded parse must not stall the runtime: max_gap={max_gap:?}, baseline={baseline:?}"
+        );
+        Ok(())
+    }
+
+    /// Pins that `commit_cache_update_atomically`'s verifier rebuild and
+    /// identity recomputation run on the blocking pool: on a current-thread
+    /// runtime, a 5 ms ticker keeps ticking with only small gaps while a
+    /// commit rebuilds a verifier over several large cached CRLs.
+    ///
+    /// RED when `build_verifier_state_blocking` is mutated back to an
+    /// inline, synchronous call (no `spawn_blocking`): observed baseline
+    /// 147.5 ms, `max_gap` 168.7 ms.
+    #[tokio::test(flavor = "current_thread")]
+    async fn commit_rebuild_offload_keeps_the_runtime_responsive() -> anyhow::Result<()> {
+        install_ring_provider();
+        let der = generate_large_crl_der(LARGE_FIXTURE_ENTRIES)?;
+
+        let mut config = test_mtls_config()?;
+        config.crl_max_cache_entries = 64;
+        let mut roots = RootCertStore::empty();
+        roots.add(test_ca_root()?).context("add ca root")?;
+        let arc_roots = Arc::new(roots);
+
+        let mut initial_cache = HashMap::new();
+        for index in 0..COMMIT_FIXTURE_COUNT {
+            let url = format!("memory://large-crl-{index}");
+            let entry = cached_crl_from_der(der.clone(), &url)?;
+            let _previous = initial_cache.insert(url, entry);
+        }
+
+        let extra_url = "memory://large-crl-extra".to_owned();
+        let extra_entry = cached_crl_from_der(der.clone(), &extra_url)?;
+
+        let mut baseline_candidate = initial_cache.clone();
+        let _displaced = baseline_candidate.insert(extra_url.clone(), extra_entry.clone());
+        let baseline_start = StdInstant::now();
+        let _verifier = rebuild_verifier(&arc_roots, &config, &baseline_candidate)
+            .context("baseline rebuild_verifier must succeed")?;
+        let _identities = crl_cache_identities(&baseline_candidate);
+        let baseline = baseline_start.elapsed();
+        assert!(
+            baseline >= Duration::from_millis(20),
+            "fixture must take at least 20 ms to rebuild synchronously (was {baseline:?}); \
+             enlarge LARGE_FIXTURE_ENTRIES or COMMIT_FIXTURE_COUNT"
+        );
+
+        let (discover_tx, discover_rx) = mpsc::unbounded_channel();
+        drop(discover_rx);
+        let set = CrlSet::new(Arc::clone(&arc_roots), config, discover_tx, initial_cache)?;
+
+        let (max_gap, commit_result) = max_ticker_gap_until(async {
+            set.__test_try_insert_cache(&extra_url, extra_entry)
+                .await
+                .map(|_changed| ())
+                .map_err(anyhow::Error::from)
+        })
+        .await;
+        commit_result.context("offloaded commit must succeed")?;
+
+        assert!(
+            max_gap.saturating_mul(4) <= baseline,
+            "offloaded commit rebuild must not stall the runtime: max_gap={max_gap:?}, baseline={baseline:?}"
+        );
+        Ok(())
+    }
+
+    /// Pins that the CRL CPU permit is held by the BLOCKING CLOSURE, not by
+    /// the awaiting future: cancelling the caller (here, a timeout) must not
+    /// release the permit before the bounded parse actually finishes.
+    ///
+    /// New behavior, not a reproduction of an old regression: at `221978a`
+    /// there is no `crl_cpu` field and no blocking offload to cancel.
+    #[tokio::test]
+    #[rustfmt::skip]
+    #[expect(clippy::significant_drop_tightening, reason = "deliberate: src/mtls_revocation.rs::crl_cpu_permit_stays_held_until_blocking_parse_completes_after_cancellation moves the permit into parse_crl_metadata_blocking's spawn_blocking closure, which this test's whole point is to prove; clippy's suggested fix (drop it after the call) would be a use-after-move")]
+    async fn crl_cpu_permit_stays_held_until_blocking_parse_completes_after_cancellation()
+    -> anyhow::Result<()> {
+        install_ring_provider();
+        let der = generate_large_crl_der(LARGE_FIXTURE_ENTRIES)?;
+        let der_bytes = der.as_ref().to_vec();
+
+        let baseline_start = StdInstant::now();
+        let _metadata =
+            parse_crl_metadata(&der_bytes).context("baseline parse must succeed on the fixture")?;
+        let baseline = baseline_start.elapsed();
+        assert!(
+            baseline >= Duration::from_millis(20),
+            "fixture must take at least 20 ms to parse synchronously (was {baseline:?})"
+        );
+
+        let crl_cpu = Arc::new(Semaphore::new(CRL_CPU_PERMITS));
+        let permit = Arc::clone(&crl_cpu)
+            .acquire_owned()
+            .await
+            .context("acquire CRL CPU permit")?;
+
+        // Fires at 75% of the measured baseline: comfortably past dispatch
+        // overhead, but before the parse itself can have completed.
+        let cutoff = baseline.saturating_sub(baseline / 4);
+        let outcome = timeout(cutoff, parse_crl_metadata_blocking(der_bytes, permit)).await;
+        assert!(
+            outcome.is_err(),
+            "the timeout must fire mid-parse for this assertion to test anything; \
+             got {outcome:?} within {cutoff:?} (baseline {baseline:?})"
+        );
+
+        assert_eq!(
+            crl_cpu.available_permits(),
+            CRL_CPU_PERMITS - 1,
+            "the permit must still be held while the detached blocking parse keeps running"
+        );
+
+        sleep(baseline.saturating_mul(3)).await;
+        assert_eq!(
+            crl_cpu.available_permits(),
+            CRL_CPU_PERMITS,
+            "the permit must be released once the blocking parse actually finishes"
+        );
+        Ok(())
+    }
+
+    /// Pins that a cancelled commit lets the bounded verifier rebuild finish
+    /// in the background and discards its result: the committed cache and the
+    /// published verifier stay at the previous generation, even once the
+    /// detached blocking work later completes.
+    #[tokio::test]
+    async fn cancelled_commit_leaves_the_previous_generation_published() -> anyhow::Result<()> {
+        install_ring_provider();
+        let der = generate_large_crl_der(LARGE_FIXTURE_ENTRIES)?;
+
+        let mut config = test_mtls_config()?;
+        config.crl_max_cache_entries = 64;
+        let mut roots = RootCertStore::empty();
+        roots.add(test_ca_root()?).context("add ca root")?;
+        let arc_roots = Arc::new(roots);
+
+        let small_url = "memory://small-baseline".to_owned();
+        let small_entry = synthetic_entry(SystemTime::now());
+        let mut initial_cache = HashMap::new();
+        let _previous = initial_cache.insert(small_url, small_entry);
+
+        let (discover_tx, discover_rx) = mpsc::unbounded_channel();
+        drop(discover_rx);
+        let set = CrlSet::new(
+            Arc::clone(&arc_roots),
+            config.clone(),
+            discover_tx,
+            initial_cache,
+        )?;
+
+        let large_url = "memory://large-new-entry".to_owned();
+        let large_entry = cached_crl_from_der(der, &large_url)?;
+
+        // Baseline timing uses its OWN clone of the candidate; this clone's
+        // pointer addresses are irrelevant below, only the duration is used.
+        let baseline_candidate = {
+            let mut candidate = set.cache_lock().read().await.clone();
+            let _displaced = candidate.insert(large_url.clone(), large_entry.clone());
+            candidate
+        };
+        let baseline_start = StdInstant::now();
+        let _verifier = rebuild_verifier(&arc_roots, &config, &baseline_candidate)
+            .context("baseline rebuild_verifier must succeed")?;
+        let _identities = crl_cache_identities(&baseline_candidate);
+        let baseline = baseline_start.elapsed();
+        assert!(
+            baseline >= Duration::from_millis(20),
+            "fixture must take at least 20 ms to rebuild synchronously (was {baseline:?})"
+        );
+
+        // Computed directly against the LIVE cache, with no intervening
+        // clone: a `CachedCrl`'s DER reallocates on every `.clone()`, so
+        // comparing two independently-cloned snapshots would always differ
+        // in `der_ptr` even when nothing changed. Reading the live map twice
+        // with nothing in between is what makes `der_ptr` a meaningful,
+        // stable identity here.
+        let pre_cache_identities = {
+            let cache = set.cache_lock().read().await;
+            crl_cache_identities(&cache)
+        };
+        let pre_committed_identities = set.verifier_state.load().committed_identities.clone();
+        let pre_cached_urls = set.verifier_state.load().cached_urls.clone();
+
+        let task_set = Arc::clone(&set);
+        let handle = tokio::spawn(async move {
+            task_set
+                .__test_try_insert_cache(&large_url, large_entry)
+                .await
+        });
+        // A quarter of the way into the expected rebuild: well past commit
+        // setup (lock, clone, permit acquire) but well before completion.
+        sleep(baseline / 4).await;
+        handle.abort();
+        let _joined = handle.await;
+
+        {
+            let cache_now = set.cache_lock().read().await;
+            assert_eq!(
+                crl_cache_identities(&cache_now),
+                pre_cache_identities,
+                "a cancelled commit must not publish a partial cache write"
+            );
+        }
+        let state_now = set.verifier_state.load();
+        assert_eq!(
+            state_now.committed_identities, pre_committed_identities,
+            "a cancelled commit must not publish new identities"
+        );
+        assert_eq!(
+            state_now.cached_urls, pre_cached_urls,
+            "a cancelled commit must not publish new coverage"
+        );
+        drop(state_now);
+
+        // Let the detached blocking rebuild actually finish, then prove again
+        // that its discarded result was never published late.
+        sleep(baseline.saturating_mul(3)).await;
+        {
+            let cache_now = set.cache_lock().read().await;
+            assert_eq!(
+                crl_cache_identities(&cache_now),
+                pre_cache_identities,
+                "the discarded blocking result must never be published late"
+            );
+        }
+        let state_after = set.verifier_state.load();
+        assert_eq!(
+            state_after.committed_identities, pre_committed_identities,
+            "the discarded blocking result must never publish identities late"
+        );
+        Ok(())
+    }
+
+    /// Pins that a closed `crl_cpu` semaphore surfaces as an error instead of
+    /// a hang.
+    ///
+    /// Covers only the closed-semaphore sub-case of `JoinError` handling: a
+    /// genuine panic inside `rebuild_verifier` or `parse_crl_metadata` is not
+    /// cheaply testable without a new test-only fault-injection hook, which
+    /// the brief forbids adding (no new public or `test-helpers` item).
+    #[tokio::test]
+    async fn closed_crl_cpu_semaphore_surfaces_as_an_error_not_a_hang() -> anyhow::Result<()> {
+        install_ring_provider();
+        let mut config = test_mtls_config()?;
+        config.crl_max_cache_entries = 64;
+        let mut roots = RootCertStore::empty();
+        roots.add(test_ca_root()?).context("add ca root")?;
+        let (discover_tx, discover_rx) = mpsc::unbounded_channel();
+        drop(discover_rx);
+        let set = CrlSet::new(Arc::new(roots), config, discover_tx, HashMap::new())?;
+        set.crl_cpu.close();
+
+        let url = "memory://closed-semaphore".to_owned();
+        let entry = synthetic_entry(SystemTime::now());
+        let result = timeout(
+            Duration::from_secs(5),
+            set.__test_try_insert_cache(&url, entry),
+        )
+        .await
+        .context("commit must not hang when the CRL CPU semaphore is closed")?;
+
+        let Err(error) = result else {
+            anyhow::bail!("commit over a closed CRL CPU semaphore must fail, not succeed");
+        };
+        assert!(
+            error.to_string().contains("CRL CPU semaphore closed"),
+            "error must name the closed semaphore: {error}"
         );
         Ok(())
     }
