@@ -278,6 +278,8 @@ Residuals an operator should know:
 - Because the server certificate chain is a source, a publicly issued server
   certificate makes its CA's public CRL and OCSP hosts trusted too (the
   startup `INFO` log lists them).
+- A trusted origin must use a DNS hostname or an IPv4 literal; IPv6-literal
+  hosts are not fetched and fail closed.
 
 Coverage limit: when neither the CA bundle nor the server chain names the
 PKI host - for example a bundle holding only a self-signed root with no CDP

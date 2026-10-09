@@ -1489,11 +1489,10 @@ impl CrlSet {
     /// # ⚠️ Security
     ///
     /// Writes into `cache` directly, bypassing `commit_cache_update_atomically`
-    /// and publication ordering at lines 283-291. This can desynchronise
-    /// `cached_urls` from `inner_verifier`; with default
-    /// `crl_deny_on_unavailable = true`, the lines 547-579 precheck trusts
-    /// `cached_urls` and can admit a certificate whose revocation status is
-    /// unenforceable.
+    /// and the publication step in `commit_cache_update_atomically`. This can
+    /// desynchronise `cached_urls` from `verifier_state`; with default
+    /// `crl_deny_on_unavailable = true`, the precheck trusts `cached_urls` and
+    /// can admit a certificate whose revocation status is unenforceable.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     #[inline]
@@ -2685,6 +2684,8 @@ async fn fetch_crl(
     // operator's configured certificates; see `CrlSet::trusted_origins`.
     let trusted_origin = trusted_origins.contains(&parsed.origin());
 
+    // An IPv6-literal host fails closed here because `host_str()` retains
+    // brackets, and `lookup_host` expects an unbracketed IPv6 address.
     let addrs = lookup_host((host, port))
         .await
         .map_err(|error| RmcpServerKitError::Tls(format!("CRL DNS resolution {url}: {error}")))?;
@@ -3316,7 +3317,7 @@ mod tests {
     ///
     /// This test asserts the property that actually matters: the cap is
     /// applied *before* `CrlSet::new`, so `cache`, `cached_urls`, and
-    /// `inner_verifier` are all derived from one already-bounded map. Post-hoc
+    /// `verifier_state` are all derived from one already-bounded map. Post-hoc
     /// mutation would violate the publication ordering documented above.
     ///
     /// If you are here to "improve" this by making it drive `bootstrap_fetch`:

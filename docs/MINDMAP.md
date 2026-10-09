@@ -79,11 +79,11 @@ mindmap
         scheme/userinfo/IP-literal blocks
         Used by JWKS, CRL, OAuth proxy fetches
       mtls_revocation.rs
-        CrlSet L95
-        note_discovered_urls L348
-        DynamicClientCertVerifier L736
+        CrlSet
+        note_discovered_urls
+        DynamicClientCertVerifier
         bootstrap_fetch L889
-        run_crl_refresher L981
+        run_crl_refresher
       tool_hooks.rs
         HookedHandler L219
         impl HookedHandler L240

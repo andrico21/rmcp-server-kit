@@ -501,7 +501,9 @@ checking at all - the trusted origins are logged once at startup (`INFO`
 level) for audit. Residuals, and what to do when neither chain names your
 PKI host (e.g. a bundle holding only a self-signed root with no CDP/AIA
 extension - add the issuing CA certificate to `mtls.ca_cert_path` instead),
-are in [SECURITY.md](../SECURITY.md#operator-trusted-crlaia-origins).
+are in [SECURITY.md](../SECURITY.md#operator-trusted-crlaia-origins). Trusted
+origins must use DNS hostnames or IPv4 literals; IPv6-literal hosts are not
+fetched and fail closed.
 
 **Since 3.14, TLS session resumption is disabled on mTLS listeners**, which
 is what makes "every new handshake" true rather than "every full handshake."

@@ -509,36 +509,55 @@ alone would be insufficient: non-CRL mTLS still relies on
 `[mtls]` is configured and `crl_enabled = true` (the default).
 
 Lifecycle:
-1. `bootstrap_fetch(roots, ca_certs, config)` (`src/mtls_revocation.rs:1965`) is
-   called from `run_server` *before* the listener is built. It walks the
-   configured CA chain, extracts every X.509 CRL Distribution Point (CDP)
-   URL via `extract_cdp_urls`, fetches each via `reqwest` under a 10 s
-   total deadline, and seeds the cache.
+1. `bootstrap_fetch(roots, ca_certs, config)` (`src/mtls_revocation.rs:1964`) is
+   the public helper. `run_server` calls the crate-internal
+   `bootstrap_fetch_with_server_chain(roots, ca_certs, server_chain, config)`
+   *before* the listener is built. That path walks the configured CA chain,
+   extracts every X.509 CRL Distribution Point (CDP) URL via
+   `extract_cdp_urls`, fetches each via `reqwest` under a 10 s total
+   deadline, and seeds the cache. It also derives the trusted origins from
+   the CDP and AIA caIssuers and OCSP URIs named in the CA bundle and the
+   server certificate chain, then logs the sorted set once at INFO.
 2. The returned `Arc<CrlSet>` (`src/mtls_revocation.rs:322`) owns:
-   - `inner_verifier: ArcSwap<VerifierHandle>` - current
-     `Arc<dyn ClientCertVerifier>` built from the latest CRL set; swapped
-     atomically when CRLs refresh.
-   - `cache: tokio::sync::RwLock<HashMap<String, CachedCrl>>` keyed by URL.
+   - `verifier_state: ArcSwap<VerifierState>` - one published generation
+     containing the current `Arc<dyn ClientCertVerifier>`, the URLs whose
+     CRLs it enforces, and the committed cache-entry identities.
+   - `commit_lock: tokio::sync::Mutex<()>` and
+     `cache: tokio::sync::RwLock<HashMap<String, CachedCrl>>` keyed by URL.
    - `discover_tx: mpsc::UnboundedSender<String>` - channel used by the
      handshake path to register newly observed CDP URLs for fetch.
-   - `seen_urls: Mutex<HashSet<String>>` - dedupe of URLs already processed.
-3. `DynamicClientCertVerifier` (`src/mtls_revocation.rs:1621`) is the
-   `Arc<dyn ClientCertVerifier>` handed to `rustls::ServerConfig`. Its
-   trait methods delegate to the inner verifier loaded from
-   `inner_verifier.load()`. Because `tokio_rustls::TlsAcceptor` clones
-   the verifier `Arc` from the `ServerConfig` at construction, the
-   dynamic verifier MUST be the Arc handed to rustls; its inner verifier
-   then swaps via the internal `ArcSwap`.
-4. `run_crl_refresher(set, rx, shutdown)` (`src/mtls_revocation.rs:2245`)
+   - `seen_urls` and `pending_urls` mutexes - permanent and in-flight
+     discovery dedupe sets.
+   - `global_fetch_sem`, `host_semaphores`, `discovery_limiter`,
+     `discovery_limiter_per_peer`, `crl_cpu`, and `trusted_origins` - the
+     network, admission, CPU, and trusted-origin bounds.
+   A commit publishes the rebuilt cache and `verifier_state` together under
+   the cache write lock with no `.await` between them; handshake readers take
+   a non-blocking cache `try_read()` and then load `verifier_state`.
+3. `DynamicClientCertVerifier` (`src/mtls_revocation.rs:1620`) is the
+   `Arc<dyn ClientCertVerifier>` handed to `rustls::ServerConfig`. It holds
+   `{ inner: Arc<CrlSet>, dn_subjects }` and delegates every revocation
+   precheck and rustls verifier decision to the `CrlSet` and its published
+   `verifier_state`. Because `tokio_rustls::TlsAcceptor` clones the verifier
+   `Arc` from the `ServerConfig` at construction, the dynamic verifier MUST
+   be the Arc handed to rustls.
+4. `run_crl_refresher(set, rx, shutdown)` (`src/mtls_revocation.rs:2243`)
    is spawned by `run_server`. It:
    - Drains the `discover_tx` receiver and fetches any newly observed CDP URLs.
    - Re-fetches each cached CRL before its `nextUpdate`, clamped to
-     `[10 min, 24 h]` (overridable via `crl_refresh_interval`).
-   - On any successful fetch, rebuilds the inner verifier and `inner_verifier.store()`s it.
+      `[10 min, 24 h]` (overridable via `crl_refresh_interval`).
+   - Commits successful refreshes through `commit_cache_update_atomically`,
+     which rebuilds the rustls verifier on the bounded Tokio blocking pool and
+     publishes the cache and `verifier_state` as one generation.
    - Honours `crl_fetch_timeout` per request and `crl_retry_retention`
      (`crl_stale_grace` deprecated alias) for retry-retention eviction after
      `nextUpdate`. Expired CRLs are never trusted when expiration enforcement
      is enabled.
+
+CRL parsing and verifier rebuilds are CPU-bound, so both steady-state commits
+and bootstrap rebuilds run on Tokio's blocking pool behind two permits. The
+steady-state path uses `CrlSet::crl_cpu`; bootstrap uses a bootstrap-local
+semaphore of the same size before the `CrlSet` exists.
 
 Failure modes:
 - Fetch failure / parse failure: if `crl_deny_on_unavailable = true`
@@ -548,23 +567,28 @@ Failure modes:
   keeps failing is retained only for retry until `nextUpdate +
   crl_retry_retention`; webpki still rejects CRL use past `nextUpdate`.
 - `crl_allow_http = false` rejects `http://` CDP URLs.
+- CRL and AIA URLs whose host is an IPv6 literal are not fetched: the lookup of
+  the bracketed host fails, so the fetch fails closed.
 - `crl_end_entity_only = true` checks only the leaf, skipping intermediates.
 
 ### SSRF hardening
 
-The shared SSRF helpers live in `src/ssrf.rs` and split into two layers:
+The shared SSRF helpers live in `src/ssrf.rs`. CRL traffic uses the scheme and
+userinfo gate, the shared IP classifier, and the connect-time screening
+resolver rather than redirect screening: the CRL clients are built with
+`Policy::none()`.
 
-- **Validate-time blanket guard** (`check_url_literal_ip`, used by
-  `OAuthConfig::validate` and CRL config validation): rejects any URL that
-  uses a literal IPv4/IPv6 host or that contains userinfo. Operators must
-  use DNS hostnames in configuration.
-- **Runtime per-hop guard** (`redirect_target_reason`, called from inside
-  the `OauthHttpClient`, `JwksCache`, and CRL redirect closures): rejects
-  targets resolving to private, loopback, link-local, multicast,
-  broadcast, unspecified, site-local, benchmarking, ORCHID, ORCHIDv2,
-  RFC 8215 local-use NAT64, or cloud-metadata IP ranges. Public IPs are
-  permitted because legitimate DNS resolution may yield them. The closures
-  are sync (no async DNS inside policy).
+For CRL fetches, the guard covers:
+- `check_scheme` rejects non-http(s) schemes, userinfo, and `http://` unless
+  `crl_allow_http = true`.
+- `fetch_crl` performs a DNS pre-flight and calls `reject_blocked_crl_ip`,
+  which delegates to `ip_block_reason`. A trusted origin named in the
+  operator's CA bundle or server chain can skip the private-address block;
+  cloud-metadata addresses stay blocked.
+- `SsrfScreeningResolver` re-screens DNS answers at connect time with the
+  same trusted hostnames, closing the resolution-to-connect gap for DNS names.
+- The body-size, global fetch, per-host, discovery-rate, seen-URL, pending-URL,
+  and cache caps bound the remaining blast radius.
 
 For OAuth, the guard covers:
 - All six configured URL fields at startup (`issuer`, `jwks_uri`,
@@ -574,33 +598,23 @@ For OAuth, the guard covers:
   `JwksCache::new`) - runtime per-hop range guard plus
   `https -> http` downgrade rejection and `http -> http` gating on
   `allow_http_oauth_urls`.
-
-Async DNS-based private-IP rejection on direct (non-redirect) OAuth
-requests is **not** performed; the validate-time blanket literal-IP
-rejection is the primary trust anchor for operator-supplied URLs.
-
-Additionally, several knobs cap the blast radius even when a host is
-reachable:
-
-- `crl_max_concurrent_fetches` (default 4) - global parallel-fetch cap.
-- `crl_max_response_bytes` (default 5 MiB) - body size cap.
-- `crl_discovery_rate_per_min` (default 60) - discovery rate limit, applied per source peer IP for attributed handshakes (process-global fallback when unattributed).
-- `crl_max_host_semaphores` (default 1024) - caps unique CDP hosts.
-- `crl_max_seen_urls` (default 4096) - caps discovery deduplication map.
-- `crl_max_cache_entries` (default 1024) - caps CRL memory cache.
+- Direct OAuth and JWKS requests as well as redirects, because the OAuth
+  clients install `SsrfScreeningResolver` on the `reqwest` clients.
 
 ### Discovery admission ordering
 
 `note_discovered_urls` (`src/mtls_revocation.rs:968`) implements a
-strict commit-after-admission protocol to keep the discovery rate
-limiter from "leaking" URLs:
+strict pending-before-send protocol to keep discovery retries correct:
 
-1. Snapshot the candidate URL set.
-2. Do not filter URLs here: each discovered candidate proceeds to admission.
-   `fetch_crl` later applies `check_scheme`, `reject_blocked_crl_ip`,
-   `ip_block_reason`, and connect-time `SsrfScreeningResolver` screening
-   before issuing any request.
-3. For each candidate, attempt admission. When the handshake peer is
+1. Sort and deduplicate the advertised URL set, select the relevant set
+   (`crl_end_entity_only` chooses leaf CDPs only), and reject a certificate
+   advertising more than `MAX_RELEVANT_CDP_URLS_PER_HANDSHAKE` distinct
+   relevant URLs.
+2. Snapshot `seen_urls` and `pending_urls`, then keep only relevant URLs that
+   are neither confirmed cached nor already in flight. `fetch_crl` later
+   applies `check_scheme`, `reject_blocked_crl_ip`, `ip_block_reason`, and
+   connect-time `SsrfScreeningResolver` screening before issuing any request.
+3. For each remaining candidate, attempt admission. When the handshake peer is
    attributed via the `CURRENT_HANDSHAKE_PEER` task-local (set by the
    TLS accept worker), admission consults that peer's own bucket
    (`discovery_limiter_per_peer.check_key(peer)`); with no attributed
@@ -609,25 +623,24 @@ limiter from "leaking" URLs:
    than peek, so an attributed peer must consult **only** its own bucket -
    also touching the global one would let a rejected attacker still drain
    the shared budget.
-4. **Only after** the limiter admits the URL **and** the
-   `discover_tx.send(url)` succeeds, insert the URL into the
-   `seen_urls` `HashSet`. If admission fails (limiter-throttled or
-   channel closed), the URL is intentionally **left unseen** so a
-   subsequent handshake observing the same URL can retry admission
-   once the limiter window opens.
+4. After admission, insert the URL into `pending_urls` before
+   `discover_tx.send(url)`. `promote_pending_to_seen` moves it to `seen_urls`
+   only after `fetch_and_store_url` confirms the CRL is actually in the cache;
+   failed fetches, cache refusals, dropped futures, and closed-channel sends
+   clear the pending marker without promotion, so the URL remains retriable.
 
-This ordering matters: a naive "mark seen, then attempt admission"
-implementation would silently drop CDP URLs forever the first time the
-rate limiter engaged, breaking revocation for the affected client
-identities. Per-peer keying additionally stops one peer's spray from
-fail-closing a concurrent legitimate peer. The current ordering is
-verified by `__test_check_discovery_rate` (`src/mtls_revocation.rs:1267`)
-and by the per-peer isolation test
+This ordering matters: a naive "mark seen, then attempt admission" or
+"mark seen, then fetch" implementation would silently drop CDP URLs forever
+the first time the rate limiter engaged or the fetch failed, breaking
+revocation for the affected client identities. Per-peer keying additionally
+stops one peer's spray from fail-closing a concurrent legitimate peer. The
+current ordering is verified by `__test_check_discovery_rate`
+(`src/mtls_revocation.rs:1267`) and by the per-peer isolation test
 (`per_peer_discovery_quota_does_not_starve_other_peers`).
 
-Hot-reload: `ReloadHandle::refresh_crls()` (in `src/transport.rs`) sends a
-sentinel through the discover channel that forces re-fetch of every cached
-URL on the next refresher tick.
+Hot-reload: `ReloadHandle::refresh_crls()` (in `src/transport.rs`) calls
+`CrlSet::force_refresh()` to re-fetch every cached URL and commit the results
+through the same atomic publication path.
 
 Test helper: `__test_with_prepopulated_crls(...)` (doc-hidden) lets `tests/integration/e2e.rs`
 seed a `CrlSet` with synthetic `rcgen`-generated CRLs and `wiremock`-served
