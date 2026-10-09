@@ -2874,6 +2874,7 @@ mod tests {
     use rustls::crypto::ring;
     use serde_json::{from_value, json};
     use tokio::{
+        runtime::Handle,
         task::yield_now,
         time::{MissedTickBehavior, interval, timeout},
     };
@@ -4689,10 +4690,14 @@ mod tests {
     /// on a fast machine instead of a fixed count needing per-host tuning.
     const LARGE_FIXTURE_ENTRIES: u64 = 16_000;
 
-    /// Upper bound on the adaptive growth in `adaptive_large_crl_der` and
-    /// `adaptive_large_crl_der_signed_by`, so a machine fast enough to defeat
-    /// several doublings still terminates in bounded time.
-    const LARGE_FIXTURE_ENTRIES_MAX: u64 = 128_000;
+    /// Upper bound on adaptive CRL fixture growth. The helpers stop as soon
+    /// as their target duration is met, so wall time and memory scale with
+    /// the runner's own speed: faster machines need more entries for the
+    /// same duration, but each entry costs them less. This cap is 8x the old
+    /// bound, so only a runner several times faster than the development box
+    /// should approach it; reaching it below target is a loud test-fixture
+    /// error, not a weak pass.
+    const LARGE_FIXTURE_ENTRIES_MAX: u64 = 1_024_000;
 
     /// How many copies of the shared large fixture CRL the commit-path
     /// progress and cancellation tests pre-populate the cache with, to
@@ -4791,20 +4796,28 @@ mod tests {
 
     /// Grow `entry_count` by doubling (bounded by `LARGE_FIXTURE_ENTRIES_MAX`)
     /// until a synchronous parse of the generated CRL takes at least
-    /// `target`, returning the DER that met it (or, once bounded, the
-    /// largest one tried). Keeps the "fixture is heavy enough" precondition
-    /// the CPU-offload tests rely on adaptive to host speed, instead of a
-    /// fixed entry count a fast machine could outrun.
+    /// `target`, returning the DER that met it. Keeps the "fixture is heavy
+    /// enough" precondition the CPU-offload tests rely on adaptive to host
+    /// speed, instead of a fixed entry count a fast machine could outrun.
     fn adaptive_large_crl_der(
         target: Duration,
-    ) -> anyhow::Result<CertificateRevocationListDer<'static>> {
+    ) -> anyhow::Result<(CertificateRevocationListDer<'static>, Duration)> {
         let mut entries = LARGE_FIXTURE_ENTRIES;
         loop {
             let der = generate_large_crl_der(entries)?;
             let start = StdInstant::now();
             let _parsed = parse_crl_metadata(der.as_ref()).context("adaptive fixture parse")?;
-            if start.elapsed() >= target || entries >= LARGE_FIXTURE_ENTRIES_MAX {
-                return Ok(der);
+            let parse_elapsed = start.elapsed();
+            if parse_elapsed >= target {
+                return Ok((der, parse_elapsed));
+            }
+            if entries >= LARGE_FIXTURE_ENTRIES_MAX {
+                anyhow::bail!(
+                    "large CRL fixture capped below target: parse_elapsed={parse_elapsed:?}, \
+                     target={target:?}, cap_entries={LARGE_FIXTURE_ENTRIES_MAX}; \
+                     this machine is faster than the fixture can compensate for, so enlarge \
+                     LARGE_FIXTURE_ENTRIES_MAX"
+                );
             }
             entries = entries.saturating_mul(2).min(LARGE_FIXTURE_ENTRIES_MAX);
         }
@@ -4814,14 +4827,25 @@ mod tests {
     /// CPU-offload test in this module: fixture generation (signing every
     /// revoked-certificate entry) is the slow part, and the DER is read-only
     /// once built, so every test reuses this one instance instead of
-    /// regenerating it.
+    /// regenerating it. Its parse baseline is at least 300 ms, which keeps the
+    /// cancellation permit race margin well above coarse CI scheduling stalls.
     fn shared_large_crl_der() -> anyhow::Result<&'static CertificateRevocationListDer<'static>> {
-        static FIXTURE: OnceLock<CertificateRevocationListDer<'static>> = OnceLock::new();
-        if let Some(der) = FIXTURE.get() {
-            return Ok(der);
+        Ok(&shared_large_crl_fixture()?.0)
+    }
+
+    fn shared_large_crl_parse_baseline() -> anyhow::Result<Duration> {
+        Ok(shared_large_crl_fixture()?.1)
+    }
+
+    fn shared_large_crl_fixture()
+    -> anyhow::Result<&'static (CertificateRevocationListDer<'static>, Duration)> {
+        static FIXTURE: OnceLock<(CertificateRevocationListDer<'static>, Duration)> =
+            OnceLock::new();
+        if let Some(fixture) = FIXTURE.get() {
+            return Ok(fixture);
         }
-        let der = adaptive_large_crl_der(Duration::from_millis(20))?;
-        Ok(FIXTURE.get_or_init(move || der))
+        let fixture = adaptive_large_crl_der(Duration::from_millis(300))?;
+        Ok(FIXTURE.get_or_init(move || fixture))
     }
 
     /// Run `fut` to completion while a task that does nothing but repeatedly
@@ -5007,15 +5031,7 @@ mod tests {
 
         let mut baseline_candidate = initial_cache.clone();
         let _displaced = baseline_candidate.insert(extra_url.clone(), extra_entry.clone());
-        let baseline_start = StdInstant::now();
-        let _verifier = rebuild_verifier(&arc_roots, &config, &baseline_candidate)
-            .context("baseline rebuild_verifier must succeed")?;
-        let _identities = crl_cache_identities(&baseline_candidate);
-        let baseline = baseline_start.elapsed();
-        assert!(
-            baseline >= Duration::from_millis(20),
-            "fixture must take at least 20 ms to rebuild synchronously (was {baseline:?})"
-        );
+        let _baseline = shared_large_crl_parse_baseline()?;
 
         let (discover_tx, discover_rx) = mpsc::unbounded_channel();
         drop(discover_rx);
@@ -5055,9 +5071,12 @@ mod tests {
     /// detached parse finishing before the assertion runs - by construction,
     /// not by probability: the permit is only observed taken by POLLING
     /// (`yield_now`, no sleep), so the very next statement runs within a
-    /// handful of scheduler ticks of that observation, several orders of
-    /// magnitude below the fixture's independently asserted >= 20 ms parse
-    /// floor. The eventual release is then proven by a notification barrier
+    /// handful of scheduler ticks of that observation, well below the
+    /// fixture's generation-time parse baseline, which is grown to at least
+    /// 300 ms. A warm re-parse can legitimately be lower, so this test relies
+    /// on the helper's own cold measurement instead of gating on a fresh
+    /// wall-clock measurement. The eventual release is then proven by a
+    /// notification barrier
     /// (`Semaphore::acquire_many_owned` under a generous `timeout`), not a
     /// fixed `sleep`.
     #[tokio::test]
@@ -5067,13 +5086,10 @@ mod tests {
         let der = shared_large_crl_der()?;
         let der_bytes = der.as_ref().to_vec();
 
-        let baseline_start = StdInstant::now();
-        let _metadata =
-            parse_crl_metadata(&der_bytes).context("baseline parse must succeed on the fixture")?;
-        let baseline = baseline_start.elapsed();
+        let baseline = shared_large_crl_parse_baseline()?;
         assert!(
-            baseline >= Duration::from_millis(20),
-            "fixture must take at least 20 ms to parse synchronously (was {baseline:?})"
+            baseline >= Duration::from_millis(300),
+            "fixture must take at least 300 ms to parse synchronously (was {baseline:?})"
         );
 
         let crl_cpu = Arc::new(Semaphore::new(CRL_CPU_PERMITS));
@@ -5133,8 +5149,9 @@ mod tests {
     ///
     /// No fixed `sleep` anywhere in this test: both waits are
     /// notification-driven (poll-until-permit-taken before aborting;
-    /// `acquire_many_owned` under a generous `timeout` before the final
-    /// re-check), for the same reason given on the permit test above.
+    /// `acquire_many_owned` under a generous `timeout`; then a state-driven
+    /// drain that waits for the commit mutex and spawned-task count before the
+    /// final re-check), for the same reason given on the permit test above.
     #[tokio::test]
     async fn cancelled_commit_leaves_the_previous_generation_published() -> anyhow::Result<()> {
         install_ring_provider();
@@ -5175,6 +5192,7 @@ mod tests {
         let pre_committed_identities = set.verifier_state.load().committed_identities.clone();
         let pre_cached_urls = set.verifier_state.load().cached_urls.clone();
 
+        let alive_tasks_before_commit = Handle::current().metrics().num_alive_tasks();
         let task_set = Arc::clone(&set);
         let handle = tokio::spawn(async move {
             task_set
@@ -5234,32 +5252,63 @@ mod tests {
         .context("the detached rebuild must release the permit within 30s")?
         .context("acquire_many_owned must succeed")?;
 
-        // The permit is released as soon as the bounded build finishes,
-        // which can be a handful of scheduler ticks before a still-running
-        // commit reaches its own publication step (acquiring the cache
-        // write lock, then the swap and store) - yielding repeatedly here
-        // gives that trailing tail every chance to run before the re-check
-        // below, without any wall-clock wait: a commit that was genuinely
-        // cancelled before reaching publication never runs that tail at
-        // all, so this loop changes nothing for it either way.
-        for _ in 0_u32..1000_u32 {
-            yield_now().await;
-        }
+        // State-driven drain: a detached whole-commit mutant keeps
+        // `commit_lock` until its publication tail finishes. Tokio's runtime
+        // metric counts spawned async tasks; sampling before the commit task is
+        // spawned means a detached tail task of any shape must finish before
+        // the count returns to this baseline. Blocking-pool jobs are covered by
+        // the permit barrier above, so no fixed yield count or sleep is needed.
+        drain_cancelled_commit_tail(&set, alive_tasks_before_commit).await?;
 
+        assert_cancelled_commit_still_unpublished(
+            &set,
+            &pre_cache_identities,
+            &pre_committed_identities,
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn drain_cancelled_commit_tail(
+        set: &CrlSet,
+        alive_tasks_before_commit: usize,
+    ) -> anyhow::Result<()> {
+        let drain_start = StdInstant::now();
+        timeout(Duration::from_secs(30), async {
+            loop {
+                {
+                    let _commit = set.commit_lock.lock().await;
+                }
+                if Handle::current().metrics().num_alive_tasks() <= alive_tasks_before_commit {
+                    return;
+                }
+                yield_now().await;
+            }
+        })
+        .await
+        .context("the cancelled commit tail must drain within 30s")?;
+        let _drain_elapsed = drain_start.elapsed();
+        Ok(())
+    }
+
+    async fn assert_cancelled_commit_still_unpublished(
+        set: &CrlSet,
+        pre_cache_identities: &HashMap<String, EntryIdentity>,
+        pre_committed_identities: &HashMap<String, EntryIdentity>,
+    ) {
         {
             let cache_now = set.cache_lock().read().await;
             assert_eq!(
-                crl_cache_identities(&cache_now),
+                &crl_cache_identities(&cache_now),
                 pre_cache_identities,
                 "the discarded blocking result must never be published late"
             );
         }
         let state_after = set.verifier_state.load();
         assert_eq!(
-            state_after.committed_identities, pre_committed_identities,
+            &state_after.committed_identities, pre_committed_identities,
             "the discarded blocking result must never publish identities late"
         );
-        Ok(())
     }
 
     /// Pins that a closed `crl_cpu` semaphore surfaces as an error instead of
@@ -5306,11 +5355,6 @@ mod tests {
         Ok(())
     }
 
-    /// Build a self-signed CA carrying a CDP extension naming `cdp_url`, so
-    /// the same CA can sign a CRL served at that URL (unlike
-    /// `build_ca_with_cdp_and_aia`, this returns the signer, not just the
-    /// DER, because the end-to-end responsiveness test below needs to sign
-    /// a large CRL with it).
     /// Build a self-signed CA carrying a CDP extension with one entry per
     /// `cdp_urls` element, so the same CA can sign a large CRL served at
     /// each of them (unlike `build_ca_with_cdp_and_aia`, this returns the
@@ -5382,10 +5426,16 @@ mod tests {
                 .context("adaptive e2e fixture rebuild")?;
             let rebuild_elapsed = rebuild_start.elapsed();
 
-            if (parse_elapsed >= target && rebuild_elapsed >= target)
-                || entries >= LARGE_FIXTURE_ENTRIES_MAX
-            {
+            if parse_elapsed >= target && rebuild_elapsed >= target {
                 return Ok((der, parse_elapsed, rebuild_elapsed));
+            }
+            if entries >= LARGE_FIXTURE_ENTRIES_MAX {
+                anyhow::bail!(
+                    "e2e CRL fixture capped below target: parse_elapsed={parse_elapsed:?}, \
+                     rebuild_elapsed={rebuild_elapsed:?}, target={target:?}, \
+                     cap_entries={LARGE_FIXTURE_ENTRIES_MAX}; this machine is faster than the \
+                     fixture can compensate for, so enlarge LARGE_FIXTURE_ENTRIES_MAX"
+                );
             }
             entries = entries.saturating_mul(2).min(LARGE_FIXTURE_ENTRIES_MAX);
         }
@@ -5406,9 +5456,9 @@ mod tests {
     /// 5 ms ticker's ticks instead (`max_ticker_gap_until`): a stall shows up
     /// as one outsized gap even with real I/O happening around it. Both
     /// fixture baselines (a single fetch's parse, and the final rebuild over
-    /// every fetched entry) are independently asserted at or above 300 ms,
-    /// and the assertion allows up to half of the larger one as the largest
-    /// observed gap - a margin of well over 100 ms above ordinary scheduler
+    /// every fetched entry) are grown inside the adaptive helper until both
+    /// clear 300 ms, and the assertion allows up to half of the smaller one as
+    /// observed gap - a margin of at least 150 ms above ordinary scheduler
     /// jitter (observed in the tens of ms on this machine), so routine
     /// jitter cannot trip it, while a real stall at either offload point
     /// (which shows up as a gap close to that point's own baseline) still
@@ -5427,7 +5477,7 @@ mod tests {
         let mut roots = RootCertStore::empty();
         roots.add(ca.der().clone()).context("add ca root")?;
         let arc_roots = Arc::new(roots);
-        let config = test_mtls_config()?;
+        let mut config = test_mtls_config()?;
 
         let (der, fetch_baseline, rebuild_baseline) = adaptive_e2e_crl_der(
             &ca,
@@ -5437,6 +5487,9 @@ mod tests {
             Duration::from_millis(300),
         )?;
         let der_bytes = der.as_ref().to_vec();
+        config.crl_max_response_bytes = u64::try_from(der_bytes.len())
+            .context("large fixture DER length must fit the CRL byte cap type")?
+            .saturating_add(1024);
         for url in &cdp_urls {
             let request_path = Url::parse(url).context("parse cdp url")?.path().to_owned();
             Mock::given(method("GET"))
@@ -5446,22 +5499,7 @@ mod tests {
                 .await;
         }
 
-        // Sanity check only (always true by construction: these are the
-        // exact measurements `adaptive_e2e_crl_der` grew the fixture to
-        // satisfy): a loud, specific failure if that invariant is ever
-        // broken by a future refactor, instead of a silent weak margin.
-        assert!(
-            fetch_baseline >= Duration::from_millis(300),
-            "fixture must take at least 300 ms to parse synchronously (was {fetch_baseline:?}); \
-             enlarge LARGE_FIXTURE_ENTRIES_MAX"
-        );
-        assert!(
-            rebuild_baseline >= Duration::from_millis(300),
-            "fixture must take at least 300 ms to rebuild synchronously over {} copies \
-             (was {rebuild_baseline:?}); enlarge LARGE_FIXTURE_ENTRIES_MAX",
-            cdp_urls.len()
-        );
-        let baseline = fetch_baseline.max(rebuild_baseline);
+        let baseline = fetch_baseline.min(rebuild_baseline);
 
         let ca_certs = vec![ca.der().clone()];
         let (max_gap, bootstrap_result) = max_ticker_gap_until(async {
