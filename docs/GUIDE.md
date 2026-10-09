@@ -612,11 +612,13 @@ crl_max_cache_entries      = 1024      # caps parsed CRLs held in memory
 >
 > **CRL parsing and verifier rebuilds run on the blocking pool, not the
 > async runtime, at most two at a time.** Parsing a large CRL and rebuilding
-> the `rustls` verifier over a deep cache are both CPU-bound work that would
-> otherwise occupy a Tokio worker thread for as long as it takes - a large or
-> crafted CRL can no longer stall request handling elsewhere on the server.
-> This bound is independent of `crl_max_concurrent_fetches` (which limits
-> outbound network fetches, not CPU work) and is not operator-tunable.
+> the `rustls` verifier over a deep cache are both CPU-bound work; offloading
+> it means a large or crafted CRL no longer occupies a Tokio worker thread
+> for as long as it takes to parse or rebuild. CPU saturation of the host
+> can still slow other work - this bound only stops that work from
+> monopolizing one async worker thread specifically. This bound is
+> independent of `crl_max_concurrent_fetches` (which limits outbound network
+> fetches, not CPU work) and is not operator-tunable.
 > Rebuilds still serialize one commit at a time, so throughput under a deep
 > cache is unchanged; only where the CPU work runs has changed. If a commit's
 > caller is cancelled (for example, a timeout) while its bounded rebuild is

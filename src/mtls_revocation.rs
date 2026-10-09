@@ -2857,9 +2857,13 @@ mod tests {
         iter::once,
         net::{Ipv4Addr, Ipv6Addr},
         slice,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::atomic::{AtomicU64, AtomicUsize, Ordering},
     };
-    use std::{io, sync::Mutex as StdMutex, time::Instant as StdInstant};
+    use std::{
+        io,
+        sync::{Mutex as StdMutex, OnceLock},
+        time::Instant as StdInstant,
+    };
 
     use anyhow::Context as _;
     use rcgen::{
@@ -2875,6 +2879,10 @@ mod tests {
     };
     use tracing::{Level, subscriber};
     use tracing_subscriber::fmt as subscriber_fmt;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
 
     use super::*;
 
@@ -3172,10 +3180,24 @@ mod tests {
     /// origin is in the trusted set: the exception in
     /// `reject_blocked_crl_ip` is unconditional on the block reason, not
     /// just on `trusted_origin`.
+    ///
+    /// Both the client's own timeout and the outer `tokio::time::timeout`
+    /// bound this test's worst case: if the cloud-metadata exception were
+    /// ever dropped, the pre-flight would stop rejecting before any network
+    /// attempt, and the fetch would instead try to reach a real (unreachable
+    /// from a test sandbox) `169.254.169.254` for as long as the client's
+    /// timeout allows. Both bounds are generous for the passing case (the
+    /// pre-flight returns in microseconds, no network attempted) and make a
+    /// regression fail by assertion in bounded time instead of hanging until
+    /// an external test-runner kill.
     #[tokio::test]
     async fn fetch_crl_cloud_metadata_blocked_even_for_trusted_origin() -> anyhow::Result<()> {
         install_ring_provider();
-        let client = Client::new();
+        let client = Client::builder()
+            .connect_timeout(Duration::from_millis(200))
+            .timeout(Duration::from_millis(500))
+            .build()
+            .context("build bounded test client")?;
         let crl_cpu = Arc::new(Semaphore::new(CRL_CPU_PERMITS));
         let metadata_url = "http://169.254.169.254/latest/meta-data/";
         let trusted_origin = Url::parse(metadata_url)
@@ -3183,16 +3205,25 @@ mod tests {
             .origin();
         let trusted_origins: Arc<HashSet<Origin>> = Arc::new(once(trusted_origin).collect());
 
-        let Err(err) = fetch_crl(
-            &client,
-            metadata_url,
-            true,
-            1024,
-            &crl_cpu,
-            &trusted_origins,
+        let outcome = timeout(
+            Duration::from_secs(2),
+            fetch_crl(
+                &client,
+                metadata_url,
+                true,
+                1024,
+                &crl_cpu,
+                &trusted_origins,
+            ),
         )
         .await
-        else {
+        .context(
+            "cloud metadata must be rejected at the pre-flight stage, well within 2s; a \
+             mutant that drops the cloud-metadata exception would instead attempt a real \
+             network connection and hang here",
+        )?;
+
+        let Err(err) = outcome else {
             anyhow::bail!("cloud metadata must stay blocked even for a trusted origin");
         };
         let rendered = err.to_string();
@@ -3200,6 +3231,70 @@ mod tests {
             rendered.contains("cloud_metadata"),
             "error must carry the cloud_metadata block reason, proving the pre-flight check \
              ran before any network attempt: {rendered}"
+        );
+        Ok(())
+    }
+
+    /// Pins the server-chain source of trusted CRL origins end to end
+    /// through the crate-internal `bootstrap_fetch_with_server_chain`: a CDP
+    /// named ONLY in the server certificate chain (never in the CA bundle)
+    /// is trusted and fetched.
+    ///
+    /// The production call site (`run_server` in `transport.rs`) that passes
+    /// the real server chain is not unit-testable here: it also loads TLS
+    /// listener state this module's tests do not construct. This test is the
+    /// nearest in-crate seam: it calls the exact crate-internal function
+    /// `run_server` calls, with the one parameter it is the only caller to
+    /// populate.
+    #[tokio::test]
+    async fn bootstrap_fetch_with_server_chain_trusts_server_chain_only_origin()
+    -> anyhow::Result<()> {
+        install_ring_provider();
+        let mock = MockServer::start().await;
+        let port = mock.address().port();
+        let cdp_url = format!("http://127.0.0.1:{port}/server-chain-only-crl");
+        Mock::given(method("GET"))
+            .and(path("/server-chain-only-crl"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(Vec::<u8>::new()))
+            .mount(&mock)
+            .await;
+
+        // The CA bundle names NO CDP at all: if the trusted set were ever
+        // derived from `ca_certs` alone, this origin would be absent from it
+        // and the fetch below would stay blocked.
+        let ca_cert = build_ca_with_cdp_and_aia("server-chain-only-ca", vec![], &[])?;
+        let server_chain_cert =
+            build_ca_with_cdp_and_aia("server-chain-only-leaf", vec![cdp_url.clone()], &[])?;
+
+        let mut roots = RootCertStore::empty();
+        roots.add(ca_cert.clone()).context("add ca root")?;
+
+        let (set, discover_rx) = bootstrap_fetch_with_server_chain(
+            Arc::new(roots),
+            slice::from_ref(&ca_cert),
+            slice::from_ref(&server_chain_cert),
+            test_mtls_config()?,
+        )
+        .await
+        .context("bootstrap with server chain")?;
+        drop(discover_rx);
+
+        // `__test_trigger_fetch` swallows fetch errors and never commits a
+        // non-CRL body to the cache, so the trust decision is asserted by
+        // the mock's received-request count, not by `__test_cache_contains`.
+        set.__test_trigger_fetch(&cdp_url)
+            .await
+            .context("trigger fetch of the server-chain-only trusted origin")?;
+        let received = mock
+            .received_requests()
+            .await
+            .context("request recording must be enabled")?;
+        assert!(
+            received
+                .iter()
+                .any(|request| request.url.path() == "/server-chain-only-crl"),
+            "a CDP named only in the server certificate chain must be trusted and reach \
+             the mock"
         );
         Ok(())
     }
@@ -4585,26 +4680,75 @@ mod tests {
         Ok(())
     }
 
-    // ---- ASY-02: CRL parsing and verifier rebuilds run on the blocking pool
+    // ---- CRL parsing and verifier rebuilds run on the blocking pool
 
-    /// Revoked-certificate count for the large CRL fixture shared by the
-    /// ASY-02 CPU-offload tests below. Chosen so a single synchronous parse
-    /// of the fixture takes comfortably more than 20 ms even in a debug
-    /// build; each test asserts this directly and fails loudly (naming this
-    /// constant) if the host is fast enough to invalidate the margin.
-    const LARGE_FIXTURE_ENTRIES: u64 = 16000;
+    /// Revoked-certificate count the shared large CRL fixture below starts
+    /// from; `adaptive_large_crl_der` grows it (doubling, bounded by
+    /// `LARGE_FIXTURE_ENTRIES_MAX`) until a single synchronous parse takes at
+    /// least the caller's target duration, so the fixture stays heavy enough
+    /// on a fast machine instead of a fixed count needing per-host tuning.
+    const LARGE_FIXTURE_ENTRIES: u64 = 16_000;
 
-    /// How many copies of the large fixture CRL the commit-path progress and
-    /// cancellation tests pre-populate the cache with, to approximate the
-    /// DEEP-SEC02-SEC03-ASY02 review's multi-CRL rebuild measurements at a
-    /// scale a debug test build can afford.
+    /// Upper bound on the adaptive growth in `adaptive_large_crl_der` and
+    /// `adaptive_large_crl_der_signed_by`, so a machine fast enough to defeat
+    /// several doublings still terminates in bounded time.
+    const LARGE_FIXTURE_ENTRIES_MAX: u64 = 128_000;
+
+    /// How many copies of the shared large fixture CRL the commit-path
+    /// progress and cancellation tests pre-populate the cache with, to
+    /// approximate a multi-CRL verifier rebuild at a scale a debug test
+    /// build can afford.
     const COMMIT_FIXTURE_COUNT: usize = 3;
 
-    /// Build a self-signed CA and a CRL DER revoking `entry_count`
-    /// certificates, for the large-fixture CPU-offload tests.
-    fn generate_large_crl_der(
+    /// Floor for `yield_progress_count_until`'s counter. A mutant that runs
+    /// the measured CPU-bound work inline (no `.await` point at all) leaves
+    /// the counter at 0 or 1, since the executor never gets a chance to poll
+    /// it before the race ends; genuine offload lets the scheduler dispatch
+    /// the progress task repeatedly for the whole duration of the blocking
+    /// work, reaching into the hundreds even on a loaded CI box. 50 is a
+    /// large margin above the mutant's ceiling and a large margin below a
+    /// realistic genuine-offload count - with no wall-clock dependence at
+    /// all, since it counts scheduler dispatches, not elapsed time.
+    const PROGRESS_COUNT_FLOOR: u64 = 50;
+
+    /// Revoked-certificate entries for a large CRL fixture: `entry_count`
+    /// synthetic serials, all revoked for key compromise.
+    fn large_crl_revoked_certs(entry_count: u64) -> Vec<RevokedCertParams> {
+        (0..entry_count)
+            .map(|serial| RevokedCertParams {
+                serial_number: SerialNumber::from(serial),
+                revocation_time: date_time_ymd(2026, 1, 1),
+                reason_code: Some(RevocationReason::KeyCompromise),
+                invalidity_date: None,
+            })
+            .collect()
+    }
+
+    /// Sign a CRL with `entry_count` revoked entries, issued by `ca`.
+    fn sign_large_crl(
+        ca: &CertifiedIssuer<'static, KeyPair>,
         entry_count: u64,
     ) -> anyhow::Result<CertificateRevocationListDer<'static>> {
+        let der: CertificateRevocationListDer<'static> = CertificateRevocationListParams {
+            this_update: date_time_ymd(2026, 1, 1),
+            next_update: date_time_ymd(2027, 1, 1),
+            crl_number: SerialNumber::from(1_u64),
+            issuing_distribution_point: None,
+            revoked_certs: large_crl_revoked_certs(entry_count),
+            key_identifier_method: KeyIdMethod::Sha256,
+        }
+        .signed_by(ca)
+        .context("sign large CRL")?
+        .into();
+        Ok(der)
+    }
+
+    /// Build a self-signed CA with no CDP: the helper-level CPU-offload
+    /// tests below parse and rebuild the fixture directly and never fetch it
+    /// over the network.
+    fn build_large_crl_fixture_ca(
+        common_name: &str,
+    ) -> anyhow::Result<CertifiedIssuer<'static, KeyPair>> {
         let mut params = CertificateParams::new(Vec::<String>::new()).context("CRL CA params")?;
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params.key_usages = vec![
@@ -4614,31 +4758,18 @@ mod tests {
         ];
         params
             .distinguished_name
-            .push(DnType::CommonName, "asy02-large-crl-ca");
+            .push(DnType::CommonName, common_name);
         let key = KeyPair::generate().context("CRL CA key")?;
-        let ca = CertifiedIssuer::self_signed(params, key).context("CRL CA self-signed")?;
+        CertifiedIssuer::self_signed(params, key).context("CRL CA self-signed")
+    }
 
-        let revoked_certs = (0..entry_count)
-            .map(|serial| RevokedCertParams {
-                serial_number: SerialNumber::from(serial),
-                revocation_time: date_time_ymd(2026, 1, 1),
-                reason_code: Some(RevocationReason::KeyCompromise),
-                invalidity_date: None,
-            })
-            .collect();
-
-        let der: CertificateRevocationListDer<'static> = CertificateRevocationListParams {
-            this_update: date_time_ymd(2026, 1, 1),
-            next_update: date_time_ymd(2027, 1, 1),
-            crl_number: SerialNumber::from(1_u64),
-            issuing_distribution_point: None,
-            revoked_certs,
-            key_identifier_method: KeyIdMethod::Sha256,
-        }
-        .signed_by(&ca)
-        .context("sign large CRL")?
-        .into();
-        Ok(der)
+    /// Build a self-signed CA and a CRL DER revoking `entry_count`
+    /// certificates, for the large-fixture CPU-offload tests.
+    fn generate_large_crl_der(
+        entry_count: u64,
+    ) -> anyhow::Result<CertificateRevocationListDer<'static>> {
+        let ca = build_large_crl_fixture_ca("large-crl-fixture-ca")?;
+        sign_large_crl(&ca, entry_count)
     }
 
     /// Build a `CachedCrl` from a DER buffer, parsing its real metadata
@@ -4658,6 +4789,69 @@ mod tests {
         })
     }
 
+    /// Grow `entry_count` by doubling (bounded by `LARGE_FIXTURE_ENTRIES_MAX`)
+    /// until a synchronous parse of the generated CRL takes at least
+    /// `target`, returning the DER that met it (or, once bounded, the
+    /// largest one tried). Keeps the "fixture is heavy enough" precondition
+    /// the CPU-offload tests rely on adaptive to host speed, instead of a
+    /// fixed entry count a fast machine could outrun.
+    fn adaptive_large_crl_der(
+        target: Duration,
+    ) -> anyhow::Result<CertificateRevocationListDer<'static>> {
+        let mut entries = LARGE_FIXTURE_ENTRIES;
+        loop {
+            let der = generate_large_crl_der(entries)?;
+            let start = StdInstant::now();
+            let _parsed = parse_crl_metadata(der.as_ref()).context("adaptive fixture parse")?;
+            if start.elapsed() >= target || entries >= LARGE_FIXTURE_ENTRIES_MAX {
+                return Ok(der);
+            }
+            entries = entries.saturating_mul(2).min(LARGE_FIXTURE_ENTRIES_MAX);
+        }
+    }
+
+    /// One large CRL DER, generated once and shared by every helper-level
+    /// CPU-offload test in this module: fixture generation (signing every
+    /// revoked-certificate entry) is the slow part, and the DER is read-only
+    /// once built, so every test reuses this one instance instead of
+    /// regenerating it.
+    fn shared_large_crl_der() -> anyhow::Result<&'static CertificateRevocationListDer<'static>> {
+        static FIXTURE: OnceLock<CertificateRevocationListDer<'static>> = OnceLock::new();
+        if let Some(der) = FIXTURE.get() {
+            return Ok(der);
+        }
+        let der = adaptive_large_crl_der(Duration::from_millis(20))?;
+        Ok(FIXTURE.get_or_init(move || der))
+    }
+
+    /// Run `fut` to completion while a task that does nothing but repeatedly
+    /// `tokio::task::yield_now().await` runs concurrently on this (possibly
+    /// single-threaded) runtime, returning how many times that loop body ran
+    /// alongside `fut`'s result.
+    ///
+    /// A pure scheduling-progress count, with no wall-clock dependence at
+    /// all: see `PROGRESS_COUNT_FLOOR` for why a mutant and genuine offload
+    /// are separated by orders of magnitude, not a ratio.
+    async fn yield_progress_count_until<F>(fut: F) -> (u64, anyhow::Result<()>)
+    where
+        F: Future<Output = anyhow::Result<()>>,
+    {
+        let counter = Arc::new(AtomicU64::new(0));
+        let task_counter = Arc::clone(&counter);
+        let progress = tokio::spawn(async move {
+            loop {
+                let _previous = task_counter.fetch_add(1, Ordering::Relaxed);
+                yield_now().await;
+            }
+        });
+
+        let result = fut.await;
+        progress.abort();
+        let _joined = progress.await;
+
+        (counter.load(Ordering::Relaxed), result)
+    }
+
     /// Run `fut` to completion while a real-clock 5 ms ticker runs
     /// concurrently on this (possibly single-threaded) runtime, returning the
     /// largest gap observed between consecutive ticks alongside `fut`'s
@@ -4666,7 +4860,12 @@ mod tests {
     /// A stalled executor thread (synchronous CPU work with no yield point)
     /// shows up as one gap close to the stall's whole duration; an executor
     /// that keeps yielding to work offloaded elsewhere (`spawn_blocking`)
-    /// shows only small, timer-jitter gaps.
+    /// shows only small, timer-jitter gaps. Used only by the end-to-end
+    /// bootstrap test below: that test's measured work interleaves with real
+    /// socket I/O, during which a plain scheduling-progress count keeps
+    /// advancing regardless of whether the CPU-bound parts are offloaded, so
+    /// a gap measurement is the only one of the two methods that can still
+    /// detect a stall there.
     async fn max_ticker_gap_until<F>(fut: F) -> (Duration, anyhow::Result<()>)
     where
         F: Future<Output = anyhow::Result<()>>,
@@ -4725,27 +4924,25 @@ mod tests {
     }
 
     /// Pins that `fetch_crl`'s DER parse runs on the blocking pool: on a
-    /// current-thread runtime, a 5 ms ticker keeps ticking with only small
-    /// gaps while a large CRL is parsed through [`parse_crl_metadata_blocking`]
-    /// (the same offload helper `fetch_crl` calls), instead of stalling for
-    /// the whole parse duration.
+    /// current-thread runtime, a `yield_now`-looping progress counter keeps
+    /// advancing while a large CRL is parsed through
+    /// [`parse_crl_metadata_blocking`] (the same offload helper `fetch_crl`
+    /// calls), instead of being starved for the whole parse duration. A pure
+    /// scheduling-progress count: no wall-clock ratio, no `sleep`.
     ///
     /// Calls `parse_crl_metadata_blocking` directly rather than the full
     /// `fetch_crl`: `fetch_crl` also screens the resolved address before
     /// connecting, and a `wiremock` server only ever resolves to loopback,
     /// which that unrelated, pre-existing screening always rejects. This is
     /// the "nearest in-crate seam" that still exercises the real offloaded
-    /// parse path end to end.
-    ///
-    /// RED when `parse_crl_metadata_blocking` is mutated back to an inline,
-    /// synchronous call (no `spawn_blocking`): observed baseline 133.1 ms,
-    /// `max_gap` 179.1 ms (the mutated helper has no `.await` point left at
-    /// all, so it also starves the ticker task before it can run even once;
-    /// see the hand-over for the mutation-test log path).
+    /// parse path;
+    /// `bootstrap_fetch_offload_keeps_the_runtime_responsive_end_to_end`
+    /// below exercises the real network path, now that a trusted loopback
+    /// origin can be fetched.
     #[tokio::test(flavor = "current_thread")]
     async fn fetch_crl_offload_keeps_the_runtime_responsive() -> anyhow::Result<()> {
         install_ring_provider();
-        let der = generate_large_crl_der(LARGE_FIXTURE_ENTRIES)?;
+        let der = shared_large_crl_der()?;
         let der_bytes = der.as_ref().to_vec();
 
         let baseline_start = StdInstant::now();
@@ -4755,11 +4952,11 @@ mod tests {
         assert!(
             baseline >= Duration::from_millis(20),
             "fixture must take at least 20 ms to parse synchronously (was {baseline:?}); \
-             enlarge LARGE_FIXTURE_ENTRIES"
+             adaptive_large_crl_der should have grown it further"
         );
 
         let crl_cpu = Arc::new(Semaphore::new(CRL_CPU_PERMITS));
-        let (max_gap, parse_result) = max_ticker_gap_until(async {
+        let (progress, parse_result) = yield_progress_count_until(async {
             let _parsed = {
                 let permit = Arc::clone(&crl_cpu)
                     .acquire_owned()
@@ -4776,24 +4973,21 @@ mod tests {
             .context("offloaded parse_crl_metadata_blocking must succeed on the fixture")?;
 
         assert!(
-            max_gap.saturating_mul(4) <= baseline,
-            "offloaded parse must not stall the runtime: max_gap={max_gap:?}, baseline={baseline:?}"
+            progress >= PROGRESS_COUNT_FLOOR,
+            "offloaded parse must not stall the runtime: the scheduler only dispatched the \
+             progress counter {progress} times while the parse ran (floor {PROGRESS_COUNT_FLOOR})"
         );
         Ok(())
     }
 
     /// Pins that `commit_cache_update_atomically`'s verifier rebuild and
-    /// identity recomputation run on the blocking pool: on a current-thread
-    /// runtime, a 5 ms ticker keeps ticking with only small gaps while a
-    /// commit rebuilds a verifier over several large cached CRLs.
-    ///
-    /// RED when `build_verifier_state_blocking` is mutated back to an
-    /// inline, synchronous call (no `spawn_blocking`): observed baseline
-    /// 147.5 ms, `max_gap` 168.7 ms.
+    /// identity recomputation run on the blocking pool: the same
+    /// scheduling-progress-count property as the parse test above, applied
+    /// to a commit that rebuilds a verifier over several large cached CRLs.
     #[tokio::test(flavor = "current_thread")]
     async fn commit_rebuild_offload_keeps_the_runtime_responsive() -> anyhow::Result<()> {
         install_ring_provider();
-        let der = generate_large_crl_der(LARGE_FIXTURE_ENTRIES)?;
+        let der = shared_large_crl_der()?;
 
         let mut config = test_mtls_config()?;
         config.crl_max_cache_entries = 64;
@@ -4820,8 +5014,7 @@ mod tests {
         let baseline = baseline_start.elapsed();
         assert!(
             baseline >= Duration::from_millis(20),
-            "fixture must take at least 20 ms to rebuild synchronously (was {baseline:?}); \
-             enlarge LARGE_FIXTURE_ENTRIES or COMMIT_FIXTURE_COUNT"
+            "fixture must take at least 20 ms to rebuild synchronously (was {baseline:?})"
         );
 
         let (discover_tx, discover_rx) = mpsc::unbounded_channel();
@@ -4834,7 +5027,7 @@ mod tests {
             Arc::new(HashSet::new()),
         )?;
 
-        let (max_gap, commit_result) = max_ticker_gap_until(async {
+        let (progress, commit_result) = yield_progress_count_until(async {
             set.__test_try_insert_cache(&extra_url, extra_entry)
                 .await
                 .map(|_changed| ())
@@ -4844,25 +5037,34 @@ mod tests {
         commit_result.context("offloaded commit must succeed")?;
 
         assert!(
-            max_gap.saturating_mul(4) <= baseline,
-            "offloaded commit rebuild must not stall the runtime: max_gap={max_gap:?}, baseline={baseline:?}"
+            progress >= PROGRESS_COUNT_FLOOR,
+            "offloaded commit rebuild must not stall the runtime: the scheduler only \
+             dispatched the progress counter {progress} times while the rebuild ran \
+             (floor {PROGRESS_COUNT_FLOOR})"
         );
         Ok(())
     }
 
     /// Pins that the CRL CPU permit is held by the BLOCKING CLOSURE, not by
-    /// the awaiting future: cancelling the caller (here, a timeout) must not
-    /// release the permit before the bounded parse actually finishes.
+    /// the awaiting future: aborting the task that awaits the offloaded
+    /// parse must not release the permit before the bounded parse actually
+    /// finishes.
     ///
-    /// New behavior, not a reproduction of an old regression: at `221978a`
-    /// there is no `crl_cpu` field and no blocking offload to cancel.
+    /// No fixed `sleep` anywhere in this test. The "permit still held right
+    /// after abort" assertion is safe from its one possible race - the
+    /// detached parse finishing before the assertion runs - by construction,
+    /// not by probability: the permit is only observed taken by POLLING
+    /// (`yield_now`, no sleep), so the very next statement runs within a
+    /// handful of scheduler ticks of that observation, several orders of
+    /// magnitude below the fixture's independently asserted >= 20 ms parse
+    /// floor. The eventual release is then proven by a notification barrier
+    /// (`Semaphore::acquire_many_owned` under a generous `timeout`), not a
+    /// fixed `sleep`.
     #[tokio::test]
-    #[rustfmt::skip]
-    #[expect(clippy::significant_drop_tightening, reason = "deliberate: src/mtls_revocation.rs::crl_cpu_permit_stays_held_until_blocking_parse_completes_after_cancellation moves the permit into parse_crl_metadata_blocking's spawn_blocking closure, which this test's whole point is to prove; clippy's suggested fix (drop it after the call) would be a use-after-move")]
     async fn crl_cpu_permit_stays_held_until_blocking_parse_completes_after_cancellation()
     -> anyhow::Result<()> {
         install_ring_provider();
-        let der = generate_large_crl_der(LARGE_FIXTURE_ENTRIES)?;
+        let der = shared_large_crl_der()?;
         let der_bytes = der.as_ref().to_vec();
 
         let baseline_start = StdInstant::now();
@@ -4875,44 +5077,68 @@ mod tests {
         );
 
         let crl_cpu = Arc::new(Semaphore::new(CRL_CPU_PERMITS));
-        let permit = Arc::clone(&crl_cpu)
-            .acquire_owned()
-            .await
-            .context("acquire CRL CPU permit")?;
+        let task_cpu = Arc::clone(&crl_cpu);
+        let handle = tokio::spawn(async move {
+            let permit = Arc::clone(&task_cpu)
+                .acquire_owned()
+                .await
+                .context("acquire CRL CPU permit")?;
+            parse_crl_metadata_blocking(der_bytes, permit)
+                .await
+                .map_err(anyhow::Error::from)
+        });
 
-        // Fires at 75% of the measured baseline: comfortably past dispatch
-        // overhead, but before the parse itself can have completed.
-        let cutoff = baseline.saturating_sub(baseline / 4);
-        let outcome = timeout(cutoff, parse_crl_metadata_blocking(der_bytes, permit)).await;
-        assert!(
-            outcome.is_err(),
-            "the timeout must fire mid-parse for this assertion to test anything; \
-             got {outcome:?} within {cutoff:?} (baseline {baseline:?})"
-        );
+        // Poll (no sleep) until the spawned task's `acquire_owned` has
+        // actually completed: the permit count only drops once that
+        // happens, so this cannot observe a false "taken" before it is true.
+        let observed = timeout(Duration::from_secs(5), async {
+            loop {
+                if crl_cpu.available_permits() < CRL_CPU_PERMITS {
+                    return;
+                }
+                yield_now().await;
+            }
+        })
+        .await;
+        observed.context("the permit must be observed taken within 5s")?;
+
+        handle.abort();
+        let _joined = handle.await;
 
         assert_eq!(
             crl_cpu.available_permits(),
             CRL_CPU_PERMITS - 1,
-            "the permit must still be held while the detached blocking parse keeps running"
+            "the permit must still be held immediately after the awaiting task is aborted: \
+             it is owned by the detached blocking closure, not by the aborted future"
         );
 
-        sleep(baseline.saturating_mul(3)).await;
-        assert_eq!(
-            crl_cpu.available_permits(),
-            CRL_CPU_PERMITS,
-            "the permit must be released once the blocking parse actually finishes"
-        );
+        // Notification barrier: both permits become acquirable again only
+        // once the detached parse actually finishes and drops its permit.
+        let permit_count =
+            u32::try_from(CRL_CPU_PERMITS).context("CRL_CPU_PERMITS must fit in a u32")?;
+        let _barrier = timeout(
+            Duration::from_secs(30),
+            Arc::clone(&crl_cpu).acquire_many_owned(permit_count),
+        )
+        .await
+        .context("the detached parse must release the permit within 30s")?
+        .context("acquire_many_owned must succeed")?;
         Ok(())
     }
 
     /// Pins that a cancelled commit lets the bounded verifier rebuild finish
-    /// in the background and discards its result: the committed cache and the
-    /// published verifier stay at the previous generation, even once the
+    /// in the background and discards its result: the committed cache and
+    /// the published verifier stay at the previous generation, even once the
     /// detached blocking work later completes.
+    ///
+    /// No fixed `sleep` anywhere in this test: both waits are
+    /// notification-driven (poll-until-permit-taken before aborting;
+    /// `acquire_many_owned` under a generous `timeout` before the final
+    /// re-check), for the same reason given on the permit test above.
     #[tokio::test]
     async fn cancelled_commit_leaves_the_previous_generation_published() -> anyhow::Result<()> {
         install_ring_provider();
-        let der = generate_large_crl_der(LARGE_FIXTURE_ENTRIES)?;
+        let der = shared_large_crl_der()?;
 
         let mut config = test_mtls_config()?;
         config.crl_max_cache_entries = 64;
@@ -4936,31 +5162,12 @@ mod tests {
         )?;
 
         let large_url = "memory://large-new-entry".to_owned();
-        let large_entry = cached_crl_from_der(der, &large_url)?;
+        let large_entry = cached_crl_from_der(der.clone(), &large_url)?;
 
-        // Baseline timing uses its OWN clone of the candidate; this clone's
-        // pointer addresses are irrelevant below, only the duration is used.
-        let baseline_candidate = {
-            let mut candidate = set.cache_lock().read().await.clone();
-            let _displaced = candidate.insert(large_url.clone(), large_entry.clone());
-            candidate
-        };
-        let baseline_start = StdInstant::now();
-        let _verifier = rebuild_verifier(&arc_roots, &config, &baseline_candidate)
-            .context("baseline rebuild_verifier must succeed")?;
-        let _identities = crl_cache_identities(&baseline_candidate);
-        let baseline = baseline_start.elapsed();
-        assert!(
-            baseline >= Duration::from_millis(20),
-            "fixture must take at least 20 ms to rebuild synchronously (was {baseline:?})"
-        );
-
-        // Computed directly against the LIVE cache, with no intervening
-        // clone: a `CachedCrl`'s DER reallocates on every `.clone()`, so
+        // Read directly from the LIVE cache both times, with nothing in
+        // between: a `CachedCrl`'s DER reallocates on every `.clone()`, so
         // comparing two independently-cloned snapshots would always differ
-        // in `der_ptr` even when nothing changed. Reading the live map twice
-        // with nothing in between is what makes `der_ptr` a meaningful,
-        // stable identity here.
+        // in `der_ptr` even when nothing changed.
         let pre_cache_identities = {
             let cache = set.cache_lock().read().await;
             crl_cache_identities(&cache)
@@ -4974,9 +5181,23 @@ mod tests {
                 .__test_try_insert_cache(&large_url, large_entry)
                 .await
         });
-        // A quarter of the way into the expected rebuild: well past commit
-        // setup (lock, clone, permit acquire) but well before completion.
-        sleep(baseline / 4).await;
+
+        // Poll (no sleep) until the commit holds the CRL CPU permit:
+        // `commit_cache_update_atomically` acquires the permit and spawns
+        // the blocking rebuild in the same expression, with no `.await`
+        // point between them, so observing the permit taken also proves the
+        // detached rebuild has already been dispatched.
+        let permit_taken = timeout(Duration::from_secs(5), async {
+            loop {
+                if set.crl_cpu.available_permits() < CRL_CPU_PERMITS {
+                    return;
+                }
+                yield_now().await;
+            }
+        })
+        .await;
+        permit_taken.context("the commit must take the CRL CPU permit within 5s")?;
+
         handle.abort();
         let _joined = handle.await;
 
@@ -4999,9 +5220,32 @@ mod tests {
         );
         drop(state_now);
 
-        // Let the detached blocking rebuild actually finish, then prove again
-        // that its discarded result was never published late.
-        sleep(baseline.saturating_mul(3)).await;
+        // Notification barrier: let the detached blocking rebuild actually
+        // finish (both permits become acquirable again only once it does),
+        // then prove again that its discarded result was never published
+        // late.
+        let permit_count =
+            u32::try_from(CRL_CPU_PERMITS).context("CRL_CPU_PERMITS must fit in a u32")?;
+        let _barrier = timeout(
+            Duration::from_secs(30),
+            Arc::clone(&set.crl_cpu).acquire_many_owned(permit_count),
+        )
+        .await
+        .context("the detached rebuild must release the permit within 30s")?
+        .context("acquire_many_owned must succeed")?;
+
+        // The permit is released as soon as the bounded build finishes,
+        // which can be a handful of scheduler ticks before a still-running
+        // commit reaches its own publication step (acquiring the cache
+        // write lock, then the swap and store) - yielding repeatedly here
+        // gives that trailing tail every chance to run before the re-check
+        // below, without any wall-clock wait: a commit that was genuinely
+        // cancelled before reaching publication never runs that tail at
+        // all, so this loop changes nothing for it either way.
+        for _ in 0_u32..1000_u32 {
+            yield_now().await;
+        }
+
         {
             let cache_now = set.cache_lock().read().await;
             assert_eq!(
@@ -5024,7 +5268,7 @@ mod tests {
     /// Covers only the closed-semaphore sub-case of `JoinError` handling: a
     /// genuine panic inside `rebuild_verifier` or `parse_crl_metadata` is not
     /// cheaply testable without a new test-only fault-injection hook, which
-    /// the brief forbids adding (no new public or `test-helpers` item).
+    /// this unit does not add (no new public or `test-helpers` item).
     #[tokio::test]
     async fn closed_crl_cpu_semaphore_surfaces_as_an_error_not_a_hang() -> anyhow::Result<()> {
         install_ring_provider();
@@ -5058,6 +5302,189 @@ mod tests {
         assert!(
             error.to_string().contains("CRL CPU semaphore closed"),
             "error must name the closed semaphore: {error}"
+        );
+        Ok(())
+    }
+
+    /// Build a self-signed CA carrying a CDP extension naming `cdp_url`, so
+    /// the same CA can sign a CRL served at that URL (unlike
+    /// `build_ca_with_cdp_and_aia`, this returns the signer, not just the
+    /// DER, because the end-to-end responsiveness test below needs to sign
+    /// a large CRL with it).
+    /// Build a self-signed CA carrying a CDP extension with one entry per
+    /// `cdp_urls` element, so the same CA can sign a large CRL served at
+    /// each of them (unlike `build_ca_with_cdp_and_aia`, this returns the
+    /// signer, not just the DER, because the end-to-end responsiveness test
+    /// below needs to sign a large CRL with it). Each URL gets its OWN
+    /// `CrlDistributionPoint` rather than sharing one with multiple URIs, so
+    /// every URL is fetched and cached as its own entry instead of being
+    /// treated as an RFC 5280 4.2.1.13 mirror of the others.
+    fn build_large_crl_ca_with_cdp(
+        common_name: &str,
+        cdp_urls: &[String],
+    ) -> anyhow::Result<CertifiedIssuer<'static, KeyPair>> {
+        let mut params = CertificateParams::new(Vec::<String>::new()).context("CRL CA params")?;
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        params
+            .distinguished_name
+            .push(DnType::CommonName, common_name);
+        params.crl_distribution_points = cdp_urls
+            .iter()
+            .map(|url| CrlDistributionPoint {
+                uris: vec![url.clone()],
+            })
+            .collect();
+        let key = KeyPair::generate().context("CRL CA key")?;
+        CertifiedIssuer::self_signed(params, key).context("CRL CA self-signed")
+    }
+
+    /// Grow `entry_count` by doubling (bounded by `LARGE_FIXTURE_ENTRIES_MAX`)
+    /// until BOTH a single synchronous parse AND a `rebuild_verifier` over
+    /// `copies` copies of the signed CRL take at least `target`, returning
+    /// the DER together with the two measurements that decided it. The
+    /// end-to-end responsiveness test below has two independently mutable
+    /// offload points (the per-fetch parse, and the final verifier build
+    /// over every fetched entry); each needs its own baseline heavy enough
+    /// to make that point's stall observable. Returning these measurements,
+    /// instead of having the caller re-measure the same operations
+    /// afterward, avoids a second source of timing noise: a cold-cache
+    /// first parse and a warm-cache re-parse of the same bytes can
+    /// legitimately differ, so a separate re-check could read below
+    /// `target` even though this loop's own measurement cleared it.
+    fn adaptive_e2e_crl_der(
+        ca: &CertifiedIssuer<'static, KeyPair>,
+        roots: &Arc<RootCertStore>,
+        config: &MtlsConfig,
+        copies: usize,
+        target: Duration,
+    ) -> anyhow::Result<(CertificateRevocationListDer<'static>, Duration, Duration)> {
+        let mut entries = LARGE_FIXTURE_ENTRIES;
+        loop {
+            let der = sign_large_crl(ca, entries)?;
+
+            let parse_start = StdInstant::now();
+            let _parsed = parse_crl_metadata(der.as_ref()).context("adaptive e2e fixture parse")?;
+            let parse_elapsed = parse_start.elapsed();
+
+            let mut candidate = HashMap::new();
+            for index in 0..copies {
+                let url = format!("memory://e2e-rebuild-probe-{index}");
+                let entry = cached_crl_from_der(der.clone(), &url)?;
+                let _previous = candidate.insert(url, entry);
+            }
+            let rebuild_start = StdInstant::now();
+            let _verifier = rebuild_verifier(roots, config, &candidate)
+                .context("adaptive e2e fixture rebuild")?;
+            let rebuild_elapsed = rebuild_start.elapsed();
+
+            if (parse_elapsed >= target && rebuild_elapsed >= target)
+                || entries >= LARGE_FIXTURE_ENTRIES_MAX
+            {
+                return Ok((der, parse_elapsed, rebuild_elapsed));
+            }
+            entries = entries.saturating_mul(2).min(LARGE_FIXTURE_ENTRIES_MAX);
+        }
+    }
+
+    /// Pins that `bootstrap_fetch`'s offloaded CRL parses and initial
+    /// verifier build keep a `current_thread` runtime responsive end to end,
+    /// through the real network path: trusted loopback origins (the CDPs
+    /// named in the configured CA certificate) can now be fetched through
+    /// `wiremock`, where before they would have been blocked at the
+    /// pre-flight stage.
+    ///
+    /// Unlike the helper-level progress-count tests above, a plain
+    /// scheduling-progress count cannot tell offload from a stall here: the
+    /// fetch itself also awaits real socket I/O, during which the counter
+    /// keeps advancing regardless of whether the CPU-bound parse and
+    /// verifier build are offloaded. This measures the LARGEST GAP between a
+    /// 5 ms ticker's ticks instead (`max_ticker_gap_until`): a stall shows up
+    /// as one outsized gap even with real I/O happening around it. Both
+    /// fixture baselines (a single fetch's parse, and the final rebuild over
+    /// every fetched entry) are independently asserted at or above 300 ms,
+    /// and the assertion allows up to half of the larger one as the largest
+    /// observed gap - a margin of well over 100 ms above ordinary scheduler
+    /// jitter (observed in the tens of ms on this machine), so routine
+    /// jitter cannot trip it, while a real stall at either offload point
+    /// (which shows up as a gap close to that point's own baseline) still
+    /// fails it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn bootstrap_fetch_offload_keeps_the_runtime_responsive_end_to_end() -> anyhow::Result<()>
+    {
+        install_ring_provider();
+        let mock = MockServer::start().await;
+        let port = mock.address().port();
+        let cdp_urls: Vec<String> = (0..=COMMIT_FIXTURE_COUNT)
+            .map(|index| format!("http://127.0.0.1:{port}/e2e-large-crl-{index}"))
+            .collect();
+
+        let ca = build_large_crl_ca_with_cdp("e2e-large-crl-ca", &cdp_urls)?;
+        let mut roots = RootCertStore::empty();
+        roots.add(ca.der().clone()).context("add ca root")?;
+        let arc_roots = Arc::new(roots);
+        let config = test_mtls_config()?;
+
+        let (der, fetch_baseline, rebuild_baseline) = adaptive_e2e_crl_der(
+            &ca,
+            &arc_roots,
+            &config,
+            cdp_urls.len(),
+            Duration::from_millis(300),
+        )?;
+        let der_bytes = der.as_ref().to_vec();
+        for url in &cdp_urls {
+            let request_path = Url::parse(url).context("parse cdp url")?.path().to_owned();
+            Mock::given(method("GET"))
+                .and(path(request_path))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(der_bytes.clone()))
+                .mount(&mock)
+                .await;
+        }
+
+        // Sanity check only (always true by construction: these are the
+        // exact measurements `adaptive_e2e_crl_der` grew the fixture to
+        // satisfy): a loud, specific failure if that invariant is ever
+        // broken by a future refactor, instead of a silent weak margin.
+        assert!(
+            fetch_baseline >= Duration::from_millis(300),
+            "fixture must take at least 300 ms to parse synchronously (was {fetch_baseline:?}); \
+             enlarge LARGE_FIXTURE_ENTRIES_MAX"
+        );
+        assert!(
+            rebuild_baseline >= Duration::from_millis(300),
+            "fixture must take at least 300 ms to rebuild synchronously over {} copies \
+             (was {rebuild_baseline:?}); enlarge LARGE_FIXTURE_ENTRIES_MAX",
+            cdp_urls.len()
+        );
+        let baseline = fetch_baseline.max(rebuild_baseline);
+
+        let ca_certs = vec![ca.der().clone()];
+        let (max_gap, bootstrap_result) = max_ticker_gap_until(async {
+            let (set, discover_rx) = bootstrap_fetch(arc_roots, &ca_certs, config)
+                .await
+                .map_err(anyhow::Error::from)?;
+            drop(discover_rx);
+            for url in &cdp_urls {
+                if !set.__test_cache_contains(url) {
+                    anyhow::bail!(
+                        "every large CRL must be fetched and cached at bootstrap: missing {url}"
+                    );
+                }
+            }
+            Ok(())
+        })
+        .await;
+        bootstrap_result.context("bootstrap_fetch over the large CRLs must succeed")?;
+
+        assert!(
+            max_gap.saturating_mul(2) <= baseline,
+            "bootstrap's offloaded parse and verifier rebuild must not stall the runtime: \
+             max_gap={max_gap:?}, baseline={baseline:?}"
         );
         Ok(())
     }

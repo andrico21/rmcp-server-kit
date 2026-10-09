@@ -164,6 +164,13 @@ mod tests {
     /// same origin is also fetched (`__test_trigger_fetch`); and the same
     /// host on a different port - not named in the trusted set - stays
     /// blocked.
+    ///
+    /// Assumes the HTTP connector falls back from `::1` to `127.0.0.1` for
+    /// the `localhost` hostname: the `wiremock` listener below binds
+    /// `127.0.0.1` only, not `::1`, so a resolver that tried `::1` first and
+    /// stopped there would make this test fail closed instead of pinning
+    /// what it names. This is the system resolver's ordinary dual-stack
+    /// fallback behavior, not something this test controls.
     #[tokio::test]
     async fn trusted_hostname_origin_passes_both_checks_and_other_port_stays_blocked()
     -> anyhow::Result<()> {
@@ -240,6 +247,11 @@ mod tests {
     /// A loopback origin named in no configured certificate stays blocked
     /// even when the same port is trusted under the OTHER form
     /// (IP-literal vs hostname).
+    ///
+    /// Assumes the HTTP connector falls back from `::1` to `127.0.0.1` for
+    /// `localhost`, the same assumption documented on
+    /// `trusted_hostname_origin_passes_both_checks_and_other_port_stays_blocked`
+    /// above.
     #[tokio::test]
     async fn loopback_origin_in_untrusted_form_stays_blocked() -> anyhow::Result<()> {
         install_ring_provider();
