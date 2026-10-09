@@ -12,11 +12,11 @@
 //!   - Body cap rejects oversized responses.
 //!   - Redirect policy rejects 30x.
 //!
-//! The SSRF *blocked-IP* defense (loopback / metadata / RFC1918 / etc.) is
-//! covered by the `ssrf_guard` unit tests inside `mtls_revocation.rs`
-//! because exercising it in an integration test would require resolving
-//! attacker-controlled hostnames to private IPs (which `wiremock` cannot
-//! provide). The unit tests there cover all 12 IP classes exhaustively.
+//! The SSRF blocked-IP classifier is covered by the `ip_block_reason` unit
+//! tests in `src/ssrf.rs`; CRL fetch rejection is covered by
+//! `reject_blocked_crl_ip` and `fetch_crl` unit tests in
+//! `src/mtls_revocation.rs`. `tests/integration/crl_trusted_origin.rs` covers
+//! the operator-trusted exception end to end.
 #[cfg_attr(
     target_os = "linux",
     expect(

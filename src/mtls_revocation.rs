@@ -11,10 +11,39 @@
 //! client certificates is fire-and-forget and never blocks the synchronous
 //! handshake path.
 //!
-//! Security note: CDP URLs are extracted from attacker-controllable client
-//! certs *before* chain validation. This is safe by design; see the
-//! `// SECURITY:` comment on `DynamicClientCertVerifier::verify_client_cert`
-//! for the full rationale before changing the discovery ordering.
+//! Security note: CDP URLs are read from the certificates a client presents
+//! before the chain is verified, so that `crl_deny_on_unavailable` can reject a
+//! client whose CRL was never fetched. A client with a self-made, unsigned
+//! certificate therefore chooses the URL.
+//!
+//! The CA signature guarantees a CRL's contents and origin, so where a genuine
+//! CRL is downloaded from does not matter for trust. It does not stop the
+//! server from sending the request: without screening, any client that can
+//! start a TLS handshake could make the server send `GET` requests to internal
+//! addresses, such as cloud metadata, loopback admin ports, or internal APIs.
+//! That is blind SSRF: the bogus CRL is rejected afterwards, but the request
+//! has already reached the internal service, which is enough to trigger a
+//! state-changing `GET` endpoint or to map the internal network.
+//!
+//! The defences are the scheme and userinfo check in `check_scheme`,
+//! resolved-address screening before connecting through `ip_block_reason`
+//! applied by `reject_blocked_crl_ip` in `fetch_crl`, re-screening at connect
+//! time through `SsrfScreeningResolver` to catch DNS rebinding, no redirects,
+//! and the discovery-rate, concurrency, and body-size caps.
+//!
+//! Plain HTTP is allowed by default (`crl_allow_http = true`): the signature
+//! makes HTTP safe for the CRL itself, but it also puts plain-HTTP internal
+//! services, such as cloud metadata and loopback admin ports, in reach.
+//! Requiring HTTPS would narrow this exposure, not remove it, so it is no
+//! substitute for the address screening.
+//!
+//! There is no configurable CRL allowlist. Instead, the origins (scheme, host,
+//! port) of the CDP and AIA URLs named in the operator's configured
+//! certificates (the mTLS CA bundle and the server certificate chain) pass the
+//! address screening automatically, because the operator chose them;
+//! cloud-metadata addresses stay blocked. Any other CDP that resolves to a
+//! blocked address is never fetched, and with `crl_deny_on_unavailable = true`
+//! (the default) a client whose certificate names only such CDPs is rejected.
 //!
 //! Semantics:
 //! - `crl_deny_on_unavailable = true` (default) => fail closed when a
@@ -1648,9 +1677,10 @@ impl ClientCertVerifier for DynamicClientCertVerifier {
         // rate-limited channel. The actual fetch runs off-path in
         // `run_crl_refresher` and is gated by SSRF screening
         // (`src/ssrf.rs`), body-size cap, deadline, and the
-        // `crl_allow_http` policy. CRLs are CA-signed (RFC 5280 §5), so
-        // http(s) CDP URLs are protocol design, not an SSRF sink. The
-        // discovery must happen BEFORE delegating to the inner verifier
+        // `crl_allow_http` policy. The signature protects the CRL, not the
+        // request; fetching a URL from an unverified certificate off-path is
+        // acceptable only because the fetch is screened. See the module docs.
+        // The discovery must happen BEFORE delegating to the inner verifier
         // so `crl_deny_on_unavailable = true` can fail-closed on a
         // never-fetched CDP. Do NOT reorder.
         let mut end_entity_urls =
@@ -1937,6 +1967,9 @@ pub async fn bootstrap_fetch(
     ca_certs: &[CertificateDer<'static>],
     config: MtlsConfig,
 ) -> Result<(Arc<CrlSet>, mpsc::UnboundedReceiver<String>), RmcpServerKitError> {
+    // Bootstrap URLs come from the configured CA certificates, not clients.
+    // Their origins are operator-trusted for CRL address screening;
+    // cloud-metadata addresses stay blocked.
     bootstrap_fetch_with_server_chain(roots, ca_certs, &[], config).await
 }
 
@@ -1961,6 +1994,9 @@ pub(crate) async fn bootstrap_fetch_with_server_chain(
 ) -> Result<(Arc<CrlSet>, mpsc::UnboundedReceiver<String>), RmcpServerKitError> {
     let (discover_tx, discover_rx) = mpsc::unbounded_channel();
 
+    // Bootstrap URLs come from configured certificates: the public helper uses
+    // the CA bundle, while this crate-internal path also trusts origins named
+    // in the server certificate chain. Cloud-metadata addresses stay blocked.
     let mut urls = ca_certs
         .iter()
         .flat_map(|cert| extract_cdp_urls(cert.as_ref(), config.crl_allow_http))
@@ -2625,6 +2661,8 @@ async fn fetch_crl(
     let parsed = Url::parse(url)
         .map_err(|error| RmcpServerKitError::Tls(format!("CRL URL parse {url}: {error}")))?;
 
+    // SECURITY: this URL can come from an unverified client certificate; see
+    // the module docs for why the fetch must be screened before any request.
     if let Err(reason) = check_scheme(&parsed, allow_http) {
         // Sanitized: the gate must not echo what it rejects (the URL may
         // carry userinfo credentials - the very thing being refused).
@@ -2654,6 +2692,8 @@ async fn fetch_crl(
     let mut any_addr = false;
     for addr in addrs {
         any_addr = true;
+        // SECURITY: a client-chosen CDP host is resolved before connecting and
+        // each address is screened; see the module docs for the threat model.
         reject_blocked_crl_ip(url, addr.ip(), trusted_origin)?;
     }
     if !any_addr {

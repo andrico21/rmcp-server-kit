@@ -216,8 +216,13 @@ crl_retry_retention      = "24h"    # keep failed-refresh entries for retry only
 
 CRL Distribution Point URLs are extracted from X.509 extensions on
 attacker-influenceable client certificates, so the CRL fetcher is treated
-as a hostile-input network call. Before any HTTP request is issued,
-`src/mtls_revocation.rs::ssrf_guard` rejects URLs that:
+as a hostile-input network call. The CA signature protects a CRL's contents,
+not the outbound request, which is why the fetch is screened. Before any HTTP
+request is issued, `check_scheme` in `src/ssrf.rs` enforces the scheme and
+userinfo checks, and `fetch_crl` screens resolved addresses through
+`reject_blocked_crl_ip` and `ip_block_reason`. `SsrfScreeningResolver` in
+`src/ssrf_resolver.rs` re-screens at connect time. Together these checks reject
+URLs that:
 
 - Use a scheme other than `http://` or `https://` (`ftp://`, `file://`,
   `gopher://`, `data:`, `dict://`, etc. are all denied).

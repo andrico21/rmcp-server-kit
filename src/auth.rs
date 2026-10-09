@@ -645,7 +645,7 @@ pub struct MtlsConfig {
     ///
     /// Defaults to `true` because RFC 5280 §4.2.1.13 designates HTTP (and
     /// LDAP) as the canonical transport for CRL distribution points.
-    /// SSRF defense for HTTP CDPs is provided by the IP-allowlist guard
+    /// SSRF defense for HTTP CDPs is provided by address screening
     /// (private/loopback/link-local/multicast addresses are rejected unless
     /// the URL's origin is named in the operator's configured certificates;
     /// cloud-metadata addresses are always rejected), redirect=none,
