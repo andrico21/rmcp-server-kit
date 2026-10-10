@@ -1173,13 +1173,16 @@ use rmcp_server_kit::config::{
 };
 
 let server: ServerConfig = toml::from_str(&config_str)?;
-validate_server_config(&server)?;  // Checks port, TLS pairing, durations
+validate_server_config(&server)?;  // Checks listen socket, nested auth, TLS pairing, durations
 
 let obs: ObservabilityConfig = toml::from_str(&config_str)?;
 validate_observability_config(&obs)?;  // Checks log levels, formats
 ```
 
 Returns `RmcpServerKitError::Config` with a descriptive message on failure.
+The TOML preflight also rejects nested auth mistakes (API-key identity
+conflicts, OAuth config, auth rate-limit capacity, mTLS capacity) before the
+bridged `McpServerConfig` reaches `serve()`.
 
 ---
 

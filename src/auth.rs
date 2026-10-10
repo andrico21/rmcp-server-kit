@@ -1020,9 +1020,8 @@ pub struct AuthConfig {
     pub max_concurrent_verifications: Option<NonZeroUsize>,
     /// Maximum time a request waits for a verification permit before
     /// receiving `503 Service Unavailable` with `Retry-After: 1` instead of
-    /// queuing unboundedly. Must be greater than zero
-    /// ([`AuthConfig::check_verification_wait`] enforces this at startup).
-    /// Default: 1 second.
+    /// queuing unboundedly. Must be greater than zero; config validation
+    /// enforces this at startup. Default: 1 second.
     #[serde(default = "default_verification_wait", with = "humantime_serde")]
     pub verification_wait: Duration,
     /// OAuth 2.1 JWT bearer token authentication.
@@ -1208,8 +1207,8 @@ impl AuthConfig {
 
     /// Override how long a request waits for a verification permit before
     /// receiving `503 Service Unavailable` with `Retry-After: 1` (default 1
-    /// second). Must be greater than zero
-    /// ([`Self::check_verification_wait`] enforces this at startup).
+    /// second). Must be greater than zero; config validation enforces this at
+    /// startup.
     #[expect(
         clippy::missing_const_for_fn,
         reason = "public API frozen until the next major release"
@@ -1290,25 +1289,6 @@ impl AuthConfig {
     #[inline]
     pub fn validate_api_key_names(&self) -> Result<(), RmcpServerKitError> {
         check_api_key_names(&self.api_keys)
-    }
-
-    /// Validate that [`Self::verification_wait`] is greater than zero.
-    ///
-    /// Shared by [`McpServerConfig::check`](crate::transport::McpServerConfig)
-    /// (builder validation) and the TOML preflight
-    /// (`validate_rate_limit_knobs`) so both surfaces enforce the same rule.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RmcpServerKitError::Config`] when `verification_wait` is zero.
-    #[inline]
-    pub fn check_verification_wait(&self) -> Result<(), RmcpServerKitError> {
-        if self.verification_wait.is_zero() {
-            return Err(RmcpServerKitError::Config(
-                "auth.verification_wait must be greater than zero".into(),
-            ));
-        }
-        Ok(())
     }
 
     /// Produce a hash-free summary of the auth config for admin endpoints.
@@ -5666,30 +5646,6 @@ mod tests {
             .with_verification_wait(Duration::from_secs(7));
         assert_eq!(cfg.max_concurrent_verifications, Some(permits));
         assert_eq!(cfg.verification_wait, Duration::from_secs(7));
-        Ok(())
-    }
-
-    /// Pins that `check_verification_wait` rejects zero and accepts the
-    /// default and an explicit positive override.
-    #[test]
-    fn check_verification_wait_rejects_zero() -> anyhow::Result<()> {
-        let mut cfg = AuthConfig::with_keys(vec![]);
-        assert!(cfg.check_verification_wait().is_ok(), "default must pass");
-
-        cfg = cfg.with_verification_wait(Duration::from_millis(1));
-        assert!(
-            cfg.check_verification_wait().is_ok(),
-            "any positive duration must pass"
-        );
-
-        cfg = cfg.with_verification_wait(Duration::ZERO);
-        let Err(err) = cfg.check_verification_wait() else {
-            anyhow::bail!("zero verification_wait must be rejected");
-        };
-        assert!(
-            err.to_string().contains("verification_wait"),
-            "error must name verification_wait: {err}"
-        );
         Ok(())
     }
 

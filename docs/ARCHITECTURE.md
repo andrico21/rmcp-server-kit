@@ -46,8 +46,8 @@ The crate has two transports:
 
 | Transport          | Function                                            | Auth/RBAC/TLS  | Use case                                         |
 |--------------------|-----------------------------------------------------|----------------|--------------------------------------------------|
-| **Streamable HTTP**| `serve()` - `src/transport.rs:2981`                 | **Yes**        | Production network deployment                    |
-| stdio              | `serve_stdio()` - `src/transport.rs:5424`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
+| **Streamable HTTP**| `serve()` - `src/transport.rs:2957`                 | **Yes**        | Production network deployment                    |
+| stdio              | `serve_stdio()` - `src/transport.rs:5407`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
 
 ---
 
@@ -101,25 +101,25 @@ There are **no circular dependencies**.
 
 A complete HTTP request to `/mcp` flows through these layers, top-to-bottom
 (outermost → innermost). The corresponding code lives in
-`src/transport.rs:1635-2052` (middleware wiring inside `build_app_router`) and in each module.
+`build_app_router` (`src/transport.rs:2282`) and in each module.
 
 ```
-TCP / TLS handshake                         src/transport.rs:3619  (TlsListener)
+TCP / TLS handshake                         src/transport.rs:3600  (TlsListener)
    │  - Handshakes run CONCURRENTLY on a background acceptor task
-│    (run_tls_acceptor, src/transport.rs:3223): 256-permit in-flight
+│    (run_tls_acceptor, src/transport.rs:3691): 256-permit in-flight
    │    cap, 10 s per-handshake timeout; axum receives only completed
    │    connections via a bounded channel.
    │  - mTLS: client cert verified during the handshake; the resulting
    │    AuthIdentity is attached to the **per-connection** TlsConnInfo
    │    extension (no shared SocketAddr-keyed map).
    ▼
-axum Router                                  src/transport.rs:2076  (build_app_router)
+axum Router                                  src/transport.rs:2282  (build_app_router)
    │
-├── 0. Security headers                   src/transport.rs:3359
+├── 0. Security headers                   src/transport.rs:4316
    │      Outermost response-only decoration: HSTS, CSP,
    │      X-Frame-Options=DENY, X-Content-Type-Options, ...
    │
-├── 1. Origin check                       src/transport.rs:3880
+├── 1. Origin check                       src/transport.rs:5108
    │      Rejects 403 if Origin/Host not allowed (MCP spec requirement)
    │
    ├── 2. Peer-address normalization         src/transport.rs (normalize_peer_addr_middleware)
@@ -205,7 +205,7 @@ Authenticated endpoints:
 | `POST /mcp`         | Yes  | The MCP JSON-RPC endpoint (Streamable HTTP)    |
 | `GET  /mcp`         | Yes  | SSE stream for server → client messages        |
 | `*    /admin/*`     | Yes (role: `admin`) | `src/admin.rs:160-172`                        |
-| `POST /authorize`, `/token`, `/register`, `/introspect`, `/revoke` | feature `oauth` proxy | `src/transport.rs:3095-3190` |
+| `POST /authorize`, `/token`, `/register`, `/introspect`, `/revoke` | feature `oauth` proxy via `build_oauth_admin_router` | `src/transport.rs:3403` |
 
 ---
 
@@ -309,10 +309,10 @@ Startup-only.
 **File**: `src/auth.rs` (~600 LOC).
 
 ### Construction
-`AuthState` is built inside `build_app_router()` at `src/transport.rs:1822`. It contains:
-- `api_keys: ArcSwap<Vec<ApiKeyEntry>>` (`src/auth.rs:1682`)
+`AuthState` is built inside `build_app_router()` at `src/transport.rs:2282`. It contains:
+- `api_keys` hot-swap vector (`src/auth.rs:1660`)
 - mTLS identities: stored **per-connection** on the
-  `TlsConnInfo` extension (`src/auth.rs:1376`), read by `auth_middleware` (`src/auth.rs:2614`).
+  `TlsConnInfo` extension (`src/auth.rs:1373`), read by `auth_middleware` (`src/auth.rs:2594`).
   No shared `SocketAddr`-keyed map exists - the previous design was replaced
   to avoid identity-binding races behind load balancers and to remove a
   `RwLock` from the request hot path.
@@ -329,11 +329,11 @@ Startup-only.
   entirely** (the TLS handshake already performed expensive crypto with a
   verified peer, so mTLS callers cannot be used to mount a CPU-spray
   attack).
-- `jwks_cache: Option<Arc<JwksCache>>` (`src/auth.rs:1703`) when `feature=oauth` is on and `oauth.issuer` is configured
+- `jwks_cache` (`src/auth.rs:1681`) when `feature=oauth` is on and `oauth.issuer` is configured
 
 ### API key flow
 1. Client sends `Authorization: Bearer <api-key>`.
-2. `auth_middleware` (`src/auth.rs:2614`) first runs the **pre-auth abuse
+2. `auth_middleware` (`src/auth.rs:2594`) first runs the **pre-auth abuse
    gate** keyed by the request's source IP. If the gate is exhausted the
    middleware returns `429` immediately, *without* touching Argon2id.
 3. Otherwise the middleware looks up the key by an indexed prefix
@@ -352,10 +352,10 @@ threaded as `SecretString` from `AuthIdentity.raw_token` through
 1. The `TlsListener` validates the client cert chain (configured roots).
 2. It extracts CN/SAN as `name`, derives `role` from the configured
    subject→role mapping, and attaches `AuthIdentity { method: Mtls, … }`
-   to the **per-connection** `TlsConnInfo` extension
-   (`src/transport.rs:2178-2244`).
-3. `auth_middleware` reads the identity directly from the connection
-   extension (`src/auth.rs:1376-1382`); no shared SocketAddr-keyed map is
+   to the **per-connection** extension in `extract_handshake_identity`
+   (`src/transport.rs:3668`).
+3. `auth_middleware` reads the identity directly from that connection
+   state (`src/auth.rs:2594`); no shared SocketAddr-keyed map is
    consulted, so there is no port-reuse aliasing risk.
 
 ### OAuth JWT flow (feature = `oauth`)
@@ -449,7 +449,7 @@ an outbound `Authorization` header for downstream token passthrough.
 
 ## 7. TLS / mTLS
 
-**Custom listener**: `TlsListener` in `src/transport.rs:3619`, implementing
+**Custom listener**: `TlsListener` in `src/transport.rs:3600`, implementing
 `axum::serve::Listener` so axum's hyper machinery accepts it as a drop-in
 replacement for `TcpListener`.
 
@@ -457,7 +457,7 @@ Lifecycle (concurrent-acceptor design, since the 1.8.1 review fixes):
 1. `TlsListener::new(...)` reads PEM cert + key, builds a `rustls::ServerConfig`,
    optionally wraps with mTLS verification using configured root CAs, then
    spawns a dedicated background acceptor task (`run_tls_acceptor`,
-   `src/transport.rs:3639`) that owns the `TcpListener`.
+   `src/transport.rs:3691`) that owns the `TcpListener`.
 2. The acceptor task loops: acquires a permit from a semaphore sized by
    `max_concurrent_tls_handshakes` (default 256 via
    `DEFAULT_MAX_CONCURRENT_TLS_HANDSHAKES`; configurable since 1.9.0 via
@@ -659,10 +659,10 @@ recommended.
 
 ### Validation flow
 1. Client sends `Authorization: Bearer <jwt>`.
-2. `JwksCache::validate_token(token)` (`src/oauth.rs:1994`):
+2. `JwksCache::validate_token(token)` (`src/oauth.rs:3280`):
    - Decodes the JWT header to get `kid` and `alg`.
    - `lookup_key()` looks up by `kid` in the cached JWKS
-     (`src/oauth.rs:2456`).
+     (`src/oauth.rs:4140`).
    - If not found, calls `refresh_with_cooldown()` (`src/oauth.rs:3712`):
        - Enforces `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:2865`) so multiple
        invalid tokens cannot DoS the JWKS endpoint.
@@ -673,7 +673,7 @@ recommended.
 
 ### Optional OAuth 2.1 proxy
 When `oauth.proxy` is configured, rmcp-server-kit mounts thin proxy endpoints under
-the server's own URL (`src/transport.rs:1851`):
+the server's own URL via `install_oauth_proxy_routes` (`src/transport.rs:3279`):
 - `/.well-known/oauth-authorization-server`
 - `/authorize`, `/token`, `/register`, `/introspect`, `/revoke`
 
@@ -807,8 +807,8 @@ Two ArcSwaps power runtime reconfiguration:
 
 | State            | Type                           | Defined at                  |
 |------------------|---------------------------------|-----------------------------|
-| API keys         | `ArcSwap<Vec<ApiKeyEntry>>`     | `src/auth.rs:1682`          |
-| RBAC policy      | `ArcSwap<RbacPolicy>`           | `src/transport.rs:1986`      |
+| API keys         | `AuthState` `api_keys` slot     | `src/auth.rs:1660`          |
+| RBAC policy      | `ReloadHandle` `rbac` slot      | `src/transport.rs:1954`      |
 
 Procedure:
 1. Consumer calls `reload_handle.try_reload_auth_keys(new_keys)` (fallible,
@@ -860,7 +860,7 @@ clippy lint enforces this.
 Three layers, applied in a fixed order.
 
 **Programmatic** - `McpServerConfig::new(addr, name, version)` builder
-(`src/transport.rs:955`). Holds everything `serve()` needs, including the
+(`src/transport.rs:951`). Holds everything `serve()` needs, including the
 runtime-only fields TOML cannot express: `rbac`, `readiness_check`,
 `extra_router`, `on_reload_ready`, and the metrics listener. Deliberately does
 **not** derive `Deserialize` - it carries callbacks and an `axum::Router`, and
@@ -1006,18 +1006,18 @@ These are **non-negotiable**. Breaking any of them is a security regression.
 
 1. **Origin check runs before auth.** Reordering would allow unauthenticated
    browser-origin requests to hit the auth path and amplify timing oracles.
-Wired in `build_app_router` (`src/transport.rs:2076`); the middleware
-itself is at `src/transport.rs:4773`.
+Wired in `build_app_router` (`src/transport.rs:2282`);
+`origin_check_middleware` is at `src/transport.rs:5108`.
 
 2. **Auth runs before RBAC.** Without an `AuthIdentity`, RBAC has no role
-   to evaluate. The middleware order in `src/transport.rs` (auth at
-   `src/auth.rs:2614`, RBAC at `src/rbac.rs:749`) enforces this.
+   to evaluate. `build_app_router` installs the auth layer before the RBAC
+   layer (`src/transport.rs:2282`).
 
 3. **Per-IP rate limiter sits inside auth.** Anonymous IPs cannot
    exhaust the rate-limit budget for authenticated callers.
 
 4. **JWKS refresh is rate-limited.** Removing `JWKS_REFRESH_COOLDOWN`
-   (`src/oauth.rs:1878`) creates a DoS vector against the issuer's JWKS endpoint.
+   (`src/oauth.rs:2865`) creates a DoS vector against the issuer's JWKS endpoint.
 
 5. **No symmetric JWT algorithms by default.** `HS*` algorithms with a
    public JWKS would enable algorithm-confusion attacks. Don't add them

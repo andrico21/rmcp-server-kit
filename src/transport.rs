@@ -1726,21 +1726,6 @@ impl McpServerConfig {
                 )));
             }
         }
-        if let Some(rl) = self.auth.as_ref().and_then(|auth| auth.rate_limit.as_ref()) {
-            if rl.burst == Some(0) {
-                return Err(RmcpServerKitError::Config(
-                    "auth rate_limit.burst must be greater than zero".into(),
-                ));
-            }
-            if rl.pre_auth_burst == Some(0) {
-                return Err(RmcpServerKitError::Config(
-                    "auth rate_limit.pre_auth_burst must be greater than zero".into(),
-                ));
-            }
-        }
-        if let Some(auth) = &self.auth {
-            auth.check_verification_wait()?;
-        }
         Ok(())
     }
 
@@ -1816,7 +1801,9 @@ impl McpServerConfig {
     /// configuration violates: admin/auth wiring, TLS cert-key pairing, mTLS
     /// without TLS, bind address, URL, origin, or size-limit checks.
     fn check(&self) -> Result<(), RmcpServerKitError> {
-        use crate::config::{SharedConfigViolation, check_shared_config_invariants};
+        use crate::config::{
+            SharedConfigViolation, check_auth_nested_config, check_shared_config_invariants,
+        };
 
         // Delegated to `check_shared_config_invariants` so this validator and
         // `validate_server_config` cannot drift in ordering. Wording stays
@@ -1857,10 +1844,6 @@ impl McpServerConfig {
                 }
                 .into(),
             ));
-        }
-
-        if let Some(auth) = &self.auth {
-            auth.validate_api_key_names()?;
         }
 
         // 3. bind_addr parses
@@ -1916,14 +1899,6 @@ impl McpServerConfig {
         // 6d. Trusted-forwarder knobs (extracted helper).
         self.check_trusted_forwarder()?;
 
-        // 7. OAuth URL fields enforce HTTPS (unless `allow_http_oauth_urls`)
-        #[cfg(feature = "oauth")]
-        if let Some(auth_cfg) = &self.auth
-            && let Some(oauth_cfg) = &auth_cfg.oauth
-        {
-            oauth_cfg.validate()?;
-        }
-
         self.check_session_binding_config()?;
 
         // 8. Security-header overrides parse as valid HTTP header values,
@@ -1939,19 +1914,9 @@ impl McpServerConfig {
             ));
         }
 
-        // 10. Auth rate-limit `max_tracked_keys` must be > 0. A zero cap
-        //     would force `BoundedKeyedLimiter` to evict on every insert
-        //     and effectively disable rate limiting.
-        if let Some(auth_cfg) = &self.auth
-            && let Some(rl) = &auth_cfg.rate_limit
-            && rl.max_tracked_keys == 0
-        {
-            return Err(RmcpServerKitError::Config(
-                "auth.rate_limit.max_tracked_keys must be greater than zero".into(),
-            ));
-        }
-
-        check_auth_capacity_knobs(self.auth.as_ref())?;
+        // 10. Nested auth config: API-key identities, OAuth URL/capacity
+        //     checks, auth limiter capacity, and mTLS capacity.
+        check_auth_nested_config(self.auth.as_ref())?;
 
         // 11. tls_handshake_timeout must be > 0. A zero deadline would
         //     reap every handshake before it could complete, rejecting
@@ -5697,78 +5662,6 @@ fn security_header_overrides(
     ]
     .into_iter()
     .filter_map(|(field, value)| value.map(|text| (field, text)))
-}
-
-/// Reject auth rate-limit settings that would silently weaken their gates.
-///
-/// A zero `max_attempts_per_minute` would fall back to the framework default,
-/// and a zero `pre_auth_max_per_minute` would *raise* the pre-auth quota; both
-/// are rejected so an operator typo cannot relax the shield around Argon2.
-///
-/// # Errors
-///
-/// Returns [`RmcpServerKitError::Config`] naming the offending field when any
-/// auth rate-limit knob is zero, or when mTLS capacity knobs are invalid.
-fn check_auth_capacity_knobs(auth: Option<&AuthConfig>) -> Result<(), RmcpServerKitError> {
-    if let Some(auth_cfg) = auth {
-        if let Some(rl) = &auth_cfg.rate_limit {
-            (rl.max_attempts_per_minute != 0).ok_or_else(|| {
-                RmcpServerKitError::Config(
-                    "auth.rate_limit.max_attempts_per_minute must be nonzero".into(),
-                )
-            })?;
-            // `0` here does not mean "unlimited" -- `build_pre_auth_limiter`
-            // falls back to DEFAULT_PRE_AUTH_RATE, so a typo silently *raises*
-            // the pre-auth quota (e.g. 1/min + 0 yields 300/min, not 10/min)
-            // and weakens the gate that shields Argon2 from CPU-spray.
-            (rl.pre_auth_max_per_minute != Some(0)).ok_or_else(|| {
-                RmcpServerKitError::Config(
-                    "auth.rate_limit.pre_auth_max_per_minute must be nonzero when set".into(),
-                )
-            })?;
-        }
-        if let Some(mtls) = &auth_cfg.mtls {
-            check_mtls_capacity_knobs(mtls)?;
-        }
-        auth_cfg.check_oauth_feature()?;
-    }
-    Ok(())
-}
-
-/// Reject zeroed mTLS/CRL capacity knobs.
-///
-/// A zero streaming cap or concurrency bound can make CRL fetching silently
-/// never succeed, which under `crl_deny_on_unavailable = true` fails every
-/// CDP-bearing handshake instead of loudly reporting the misconfiguration.
-///
-/// # Errors
-///
-/// Returns [`RmcpServerKitError::Config`] naming the offending field when any
-/// `auth.mtls` capacity knob is zero.
-fn check_mtls_capacity_knobs(mtls: &MtlsConfig) -> Result<(), RmcpServerKitError> {
-    (mtls.crl_max_concurrent_fetches != 0).ok_or_else(|| {
-        RmcpServerKitError::Config("auth.mtls.crl_max_concurrent_fetches must be nonzero".into())
-    })?;
-    (mtls.crl_discovery_rate_per_min != 0).ok_or_else(|| {
-        RmcpServerKitError::Config("auth.mtls.crl_discovery_rate_per_min must be nonzero".into())
-    })?;
-    (mtls.crl_max_host_semaphores != 0).ok_or_else(|| {
-        RmcpServerKitError::Config("auth.mtls.crl_max_host_semaphores must be nonzero".into())
-    })?;
-    (mtls.crl_max_seen_urls != 0).ok_or_else(|| {
-        RmcpServerKitError::Config("auth.mtls.crl_max_seen_urls must be nonzero".into())
-    })?;
-    (mtls.crl_max_cache_entries != 0).ok_or_else(|| {
-        RmcpServerKitError::Config("auth.mtls.crl_max_cache_entries must be nonzero".into())
-    })?;
-    // `0` rejects every non-empty CRL body at the streaming cap, so CRL
-    // fetching never succeeds. Under the default `crl_deny_on_unavailable
-    // = true` that fails every CDP-bearing handshake rather than loudly
-    // reporting the misconfiguration.
-    (mtls.crl_max_response_bytes != 0).ok_or_else(|| {
-        RmcpServerKitError::Config("auth.mtls.crl_max_response_bytes must be nonzero".into())
-    })?;
-    Ok(())
 }
 
 #[cfg_attr(
