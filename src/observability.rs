@@ -77,7 +77,8 @@ impl FormatTime for LocalTime {
 /// overall call, never to the audit sink itself: when the configured path
 /// cannot be hardened to an owner-only regular file, no audit writer is
 /// installed at all, on any platform, rather than writing audit events to
-/// an unprotected or attacker-controlled target.
+/// an unprotected or attacker-controlled target. On Unix this includes a
+/// regular file with more than one hard link.
 ///
 /// # Errors
 ///
@@ -198,9 +199,9 @@ impl Drop for TracingGuard {
 /// subscriber installation fails. On Unix, opening the audit log also fails
 /// this way when the configured path is a symlink at its final component,
 /// is not a regular file (a device, FIFO, or socket), is a pre-existing
-/// file not owned by this process's effective user, or its permissions
-/// cannot be hardened to `0o600`; see the "Audit-log file permissions"
-/// section of the guide for the full contract.
+/// file not owned by this process's effective user, has more than one hard
+/// link, or its permissions cannot be hardened to `0o600`; see the
+/// "Audit-log file permissions" section of the guide for the full contract.
 #[inline]
 pub fn init_tracing_from_config_strict(
     config: &ObservabilityConfig,
@@ -764,6 +765,15 @@ fn create_private_audit_file(path: &Path) -> Result<fs::File, String> {
     harden_audit_handle(fd, path, geteuid().as_raw(), set_audit_file_mode)
 }
 
+/// Widen a platform `st_nlink` value without triggering target-specific Clippy.
+#[cfg(unix)]
+fn widen_link_count<T>(count: T) -> u64
+where
+    T: Into<u64>,
+{
+    count.into()
+}
+
 /// Translate an `open` failure on the audit-log path into an operator
 /// message that names the specific rule it tripped, for the two errnos
 /// this hardening deliberately provokes.
@@ -798,15 +808,14 @@ fn describe_audit_open_error(path: &Path, error: Errno) -> String {
 /// the rejection path without a foreign-owned fixture (which needs
 /// privileges this test suite does not assume) or a syscall this suite
 /// cannot make fail for real. Keeping the seam handle-based rather than
-/// path-based also keeps it extensible: a future hard-link check
-/// (`st_nlink`) or a Windows reparse-point check can be added without
+/// path-based also lets the link-count check use the inspected handle without
 /// reopening the path or touching the caller.
 ///
 /// # Errors
 ///
 /// Returns `Err` naming the path and the reason when the handle cannot be
-/// inspected, is not a regular file, is not owned by `effective_uid`, or
-/// `set_mode` fails.
+/// inspected, is not a regular file, is not owned by `effective_uid`, has
+/// more than one hard link, or `set_mode` fails.
 #[cfg(unix)]
 fn harden_audit_handle(
     fd: OwnedFd,
@@ -833,6 +842,14 @@ fn harden_audit_handle(
     if !is_owned_by_effective_user(stat.st_uid, effective_uid) {
         return Err(format!(
             "audit log file {} is not owned by this process's effective user",
+            path.display()
+        ));
+    }
+
+    let link_count = widen_link_count(stat.st_nlink);
+    if link_count > 1 {
+        return Err(format!(
+            "audit log file {} has {link_count} links; refusing hard-linked audit files",
             path.display()
         ));
     }
@@ -1633,6 +1650,143 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    /// Pins that strict init refuses a hard-linked audit file before any
+    /// writer is installed or file metadata is changed.
+    fn hardlinked_audit_path_is_rejected_by_strict_init_without_changes() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = unique_temp_path("audit-hardlink-strict-dir")?;
+        fs::create_dir_all(&dir).context("create fixture dir")?;
+        let audit_path = dir.join("audit.log");
+        let other_path = dir.join("audit.alias");
+        let marker = "hard-linked audit fixture, strict rejection leaves it alone";
+        fs::write(&audit_path, marker).context("create hardlink target")?;
+        fs::set_permissions(&audit_path, fs::Permissions::from_mode(0o644))
+            .context("set hardlink target mode")?;
+        fs::hard_link(&audit_path, &other_path).context("create second hardlink")?;
+
+        let config = observability_config(Some(audit_path.clone()));
+        let error = match prepare_tracing_audit_strict(&config) {
+            Err(RmcpServerKitError::Startup(message)) => message,
+            Err(other) => anyhow::bail!(
+                "a hard-linked audit path must fail closed with Startup; got a different error variant: {other}"
+            ),
+            Ok(setup) => {
+                drop(setup.guard);
+                anyhow::bail!(
+                    "a hard-linked audit path must fail closed with Startup; it succeeded"
+                )
+            }
+        };
+        assert!(
+            error.contains("has 2 links"),
+            "error must name the hardlink count; got {error:?}"
+        );
+        let mode = fs::metadata(&audit_path)
+            .context("read hardlink target metadata")?
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o644,
+            "a refused hard-linked audit file must leave mode untouched; got {mode:o}"
+        );
+        let contents = fs::read_to_string(&other_path).context("read hardlink alias contents")?;
+        assert_eq!(
+            contents, marker,
+            "a refused hard-linked audit file must leave contents untouched"
+        );
+
+        fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    /// Pins that removing the second directory entry makes the same inode safe
+    /// for strict init again, and the accepted file is tightened to `0o600`.
+    fn single_link_audit_path_is_accepted_after_alias_removed() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = unique_temp_path("audit-hardlink-removed-dir")?;
+        fs::create_dir_all(&dir).context("create fixture dir")?;
+        let audit_path = dir.join("audit.log");
+        let other_path = dir.join("audit.alias");
+        fs::write(&audit_path, b"single-link fixture").context("create audit file")?;
+        fs::set_permissions(&audit_path, fs::Permissions::from_mode(0o644))
+            .context("set audit file mode")?;
+        fs::hard_link(&audit_path, &other_path).context("create second hardlink")?;
+        fs::remove_file(&other_path).context("remove second hardlink")?;
+
+        let config = observability_config(Some(audit_path.clone()));
+        let setup = prepare_tracing_audit_strict(&config)
+            .context("a single-link self-owned audit file must be accepted")?;
+        drop(setup.guard);
+
+        let mode = fs::metadata(&audit_path)
+            .context("read accepted audit file metadata")?
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "an accepted single-link audit file must be tightened to 0o600; got {mode:o}"
+        );
+
+        fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    /// Pins that lenient init treats a hard-linked audit path like any other
+    /// hardening failure: warn, install no audit sink, and leave the file alone.
+    fn lenient_init_installs_no_sink_for_hardlinked_audit_path() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = unique_temp_path("audit-hardlink-lenient-dir")?;
+        fs::create_dir_all(&dir).context("create fixture dir")?;
+        let audit_path = dir.join("audit.log");
+        let other_path = dir.join("audit.alias");
+        fs::write(&audit_path, b"lenient hardlink fixture").context("create audit file")?;
+        fs::set_permissions(&audit_path, fs::Permissions::from_mode(0o644))
+            .context("set audit file mode")?;
+        fs::hard_link(&audit_path, &other_path).context("create second hardlink")?;
+
+        let config = observability_config(Some(audit_path.clone()));
+        let setup = prepare_tracing_audit_lenient(&config);
+
+        assert!(
+            setup.writer.is_none(),
+            "no audit sink may be installed when a hard-linked path is refused"
+        );
+        assert!(
+            setup
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("has 2 links")),
+            "lenient init must warn with the hardlink count; got {:?}",
+            setup.warnings
+        );
+        let mode = fs::metadata(&audit_path)
+            .context("read hardlink target metadata")?
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o644,
+            "a refused hard-linked audit file must leave mode untouched; got {mode:o}"
+        );
+
+        fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
     /// Pins that the hardened open handle ends with plain blocking
     /// semantics: `O_NONBLOCK` is needed only to keep the checks inside
     /// `create_private_audit_file` from hanging on a FIFO, and must not
@@ -1698,6 +1852,54 @@ mod tests {
             contents.is_empty(),
             "a rejected handle must never be written to; got {} bytes",
             contents.len()
+        );
+
+        fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    /// Pins that the hardening seam rejects a regular file with more than one
+    /// link before correcting its mode, because every name reaches one inode.
+    fn harden_audit_handle_rejects_hardlinked_file_before_chmod() -> anyhow::Result<()> {
+        use std::os::{fd::OwnedFd, unix::fs::PermissionsExt as _};
+
+        use rustix::process::geteuid;
+
+        let dir = unique_temp_path("audit-seam-hardlink")?;
+        fs::create_dir_all(&dir).context("create fixture dir")?;
+        let path = dir.join("audit.log");
+        let other_path = dir.join("audit.alias");
+        fs::write(&path, b"hardlink seam fixture").context("create fixture file")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+            .context("set fixture mode")?;
+        fs::hard_link(&path, &other_path).context("create second hardlink")?;
+        let file = fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .context("open hard-linked fixture file")?;
+        let fd = OwnedFd::from(file);
+        let real_uid = geteuid().as_raw();
+
+        let result = super::harden_audit_handle(fd, &path, real_uid, super::set_audit_file_mode);
+
+        let error = result
+            .err()
+            .context("a hard-linked audit handle must be rejected")?;
+        assert!(
+            error.contains("has 2 links"),
+            "error must name the hardlink count; got {error:?}"
+        );
+        let mode = fs::metadata(&path)
+            .context("read fixture metadata")?
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o644,
+            "a rejected hard-linked handle must not be chmodded; got {mode:o}"
         );
 
         fs::remove_dir_all(&dir).context("remove audit temp dir")?;

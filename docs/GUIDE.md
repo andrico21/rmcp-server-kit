@@ -1246,7 +1246,8 @@ credential material, so it is created with owner-only permissions.
   path component (a symlinked *parent* directory is still traversed),
   refuses anything that is not a regular file (devices, FIFOs, sockets),
   and refuses a pre-existing file not owned by the process's effective
-  user, even when that process runs as root. A file this call *creates*
+  user, even when that process runs as root. A regular file with more than
+  one hard link is also refused. A file this call *creates*
   gets mode `0o600` as part of the creating `open`, so it is never exposed
   at a wider mode, not even briefly (the process umask can only tighten
   that further, never widen it). A *pre-existing* file keeps its current
@@ -1285,6 +1286,12 @@ Dedicate the path to the service user, pre-create it with the service
 user as owner, or rotate with copy-and-truncate (for example logrotate's
 `copytruncate`) rather than recreate, so a restart always finds a file
 still owned by the service user.
+
+Do not use hardlink-based retention or rotation for the audit log. A second
+directory entry for the inode lets another local principal keep an open path to
+the same log file even though the inode itself is owned by the service user.
+Use copy-based retention instead: copy and truncate the current file, or rename
+the active file and let the process reopen a fresh single-link path on restart.
 
 On a platform that is neither Unix nor Windows, a configured `audit_log_path`
 fails closed: startup errors and no file is created.

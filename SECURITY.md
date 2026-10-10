@@ -706,18 +706,22 @@ where the audit log actually lands, by planting a symlink at the configured
 path pointing somewhere they control or want to see written to; by planting
 a special file (device, FIFO, socket) that behaves unexpectedly when opened
 for append; or by pre-creating a regular file they own at that path so the
-server's audit trail is written into a file another local user can read.
+server's audit trail is written into a file another local user can read. A
+hardlink planted by a local user creates the same problem in reverse: the inode
+can be owned by the server process and still have another directory entry that
+another principal controls, giving that principal an open path to the same log.
 
 On Unix, opening the audit log refuses all three: it never follows a
 symlink at the final path component (a symlinked *parent* directory is
 still traversed - only the final component is protected), it refuses
 anything that is not a regular file, and it refuses a pre-existing file not
 owned by the server process's effective user, even when the process runs
-as root. These checks run on the already-open handle before any write and
-before the audit writer thread is spawned, so a rejected target is never
-written to. Strict initialization fails startup on any of these failures;
-the deprecated lenient initializer installs no audit sink at all rather
-than writing to an unprotected one.
+as root. It also refuses a regular file with more than one hard link. These
+checks run on the already-open handle before any write and before the audit
+writer thread is spawned, so a rejected target is never written to. Strict
+initialization fails startup on any of these failures; the deprecated lenient
+initializer installs no audit sink at all rather than writing to an
+unprotected one.
 
 A pre-existing audit-log path owned by another local user - an init
 container or provisioning step that ran as root, a sidecar, a shared
@@ -728,6 +732,10 @@ pre-create it with the service user as owner, or configure log rotation
 with copy-and-truncate semantics (for example logrotate's `copytruncate`)
 instead of recreate, so a restart always finds a file the service user
 already owns.
+
+Do not use hardlink-based audit-log retention or rotation. Use copy-based
+retention instead, such as copy-and-truncate or a rename followed by reopening
+a fresh single-link path on restart.
 
 ## Coordinated disclosure
 
