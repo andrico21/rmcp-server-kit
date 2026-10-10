@@ -1242,9 +1242,18 @@ worker threads do not perform synchronous file I/O.
 The audit log carries identities, and under the diagnostic switches it can carry
 credential material, so it is created with owner-only permissions.
 
-- **Unix:** owner-only (`0o600`) is applied **at file creation** via
-  `OpenOptions::mode`. There is no window in which the file is readable by other
-  local principals. A pre-existing file has its mode corrected after opening.
+- **Unix:** opening the audit log refuses to follow a symlink at the final
+  path component (a symlinked *parent* directory is still traversed),
+  refuses anything that is not a regular file (devices, FIFOs, sockets),
+  and refuses a pre-existing file not owned by the process's effective
+  user, even when that process runs as root. A file this call *creates*
+  gets mode `0o600` as part of the creating `open`, so it is never exposed
+  at a wider mode, not even briefly (the process umask can only tighten
+  that further, never widen it). A *pre-existing* file keeps its current
+  mode until the open handle has passed the regular-file and owner
+  checks, at which point it is corrected to `0o600` with `fchmod` on that
+  handle. Nothing is written to the handle before every check has passed,
+  and a symlink's target is never opened, chmodded, or written to.
 - **Windows:** the file is created and a protected owner-only DACL is applied
   immediately afterwards, discarding inherited ACEs.
 
@@ -1257,6 +1266,25 @@ removes the *persistent* exposure, not the momentary one.
 If Windows ACL hardening fails, startup fails and the crate attempts to delete
 the unprotected file. The error reports whether that deletion succeeded, so you
 can tell whether an unprotected audit log may remain at that path.
+
+On Unix, a hardening failure never deletes anything: the mode is applied
+atomically at creation, so a file this process creates is never exposed at a
+wider mode even transiently, and a pre-existing file that fails a check was
+not created by this process, so it is left untouched rather than destroyed.
+
+Strict initialization (`init_tracing_from_config_strict`) fails startup on
+any of these failures. The deprecated lenient initializer
+(`init_tracing_from_config`) warns instead and installs no audit sink at
+all, on any platform, rather than writing to an unprotected one.
+
+A pre-existing audit-log path owned by another user now fails strict
+startup: an init container or provisioning step that ran as root, a
+sidecar, a shared volume, or a log rotator that recreates the file as
+root all leave the path owned by someone other than the service process.
+Dedicate the path to the service user, pre-create it with the service
+user as owner, or rotate with copy-and-truncate (for example logrotate's
+`copytruncate`) rather than recreate, so a restart always finds a file
+still owned by the service user.
 
 On a platform that is neither Unix nor Windows, a configured `audit_log_path`
 fails closed: startup errors and no file is created.

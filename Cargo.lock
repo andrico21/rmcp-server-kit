@@ -2402,6 +2402,7 @@ dependencies = [
  "reqwest",
  "rmcp",
  "rsa",
+ "rustix",
  "rustls",
  "secrecy",
  "serde",

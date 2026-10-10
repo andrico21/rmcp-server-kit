@@ -71,8 +71,13 @@ impl FormatTime for LocalTime {
 /// When `log_format` is `"json"`, emits machine-readable JSON lines.
 /// When `audit_log_path` is set, appends an additional JSON log file
 /// at INFO level for audit trail purposes. This legacy function keeps its
-/// fail-open audit-log behaviour for source compatibility: audit setup errors
-/// are logged as warnings after subscriber initialization succeeds.
+/// fail-open behaviour for source compatibility: a failure to prepare the
+/// audit sink is logged as a warning after subscriber initialization
+/// succeeds, rather than failing this call. "Fail open" applies only to the
+/// overall call, never to the audit sink itself: when the configured path
+/// cannot be hardened to an owner-only regular file, no audit writer is
+/// installed at all, on any platform, rather than writing audit events to
+/// an unprotected or attacker-controlled target.
 ///
 /// # Errors
 ///
@@ -190,7 +195,12 @@ impl Drop for TracingGuard {
 ///
 /// Returns [`RmcpServerKitError::Startup`] if audit-log directory creation,
 /// audit-log opening, audit writer thread spawning, or global tracing
-/// subscriber installation fails.
+/// subscriber installation fails. On Unix, opening the audit log also fails
+/// this way when the configured path is a symlink at its final component,
+/// is not a regular file (a device, FIFO, or socket), is a pre-existing
+/// file not owned by this process's effective user, or its permissions
+/// cannot be hardened to `0o600`; see the "Audit-log file permissions"
+/// section of the guide for the full contract.
 #[inline]
 pub fn init_tracing_from_config_strict(
     config: &ObservabilityConfig,
@@ -591,8 +601,7 @@ fn open_audit_file(path: &Path) -> Result<AuditSetup, String> {
     }
 
     let file = create_private_audit_file(path)?;
-
-    let warnings = audit_file_permission_warnings(&file);
+    let warnings = Vec::new();
 
     let (sender, receiver) = mpsc::sync_channel(AUDIT_LOG_CHANNEL_CAPACITY);
     let dropped = Arc::new(AtomicU64::new(0));
@@ -686,28 +695,196 @@ fn legacy_tracing_guards() -> &'static Mutex<Vec<TracingGuard>> {
     GUARDS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+// Named to avoid colliding with `std::io` (already imported above as `io`):
+// `harden_audit_handle` and `set_audit_file_mode` hand this across a
+// function boundary in their signatures, where a function-body-local `use`
+// cannot reach.
+#[cfg(unix)]
+use rustix::io::Result as RustixIoResult;
+#[cfg(unix)]
+use rustix::{fd::OwnedFd, io::Errno};
+
 /// Create (or append to) the audit log with owner-only permissions.
 ///
-/// SECURITY: the mode is applied by `open` itself rather than by a following
-/// `set_permissions`. The two-step form leaves a window in which the file
-/// exists with umask-derived permissions, so any local principal can open it
-/// before the mode is tightened. Audit logs carry identities and, under the
-/// diagnostic switches, credential material.
+/// SECURITY: opens with `O_NOFOLLOW` so a symlink planted at the final path
+/// component is refused rather than followed (a symlinked *parent*
+/// directory is still traversed; only the final component is protected).
+/// `O_NONBLOCK` keeps a FIFO planted at the path from blocking this call
+/// forever when no reader exists, turning that into a prompt error instead
+/// of a startup hang; it is a no-op on a regular file and is cleared again
+/// once the handle passes every check, so the writer thread gets plain
+/// blocking-file semantics. `O_NOCTTY` stops a tty path from becoming this
+/// process's controlling terminal.
+///
+/// The mode is applied atomically by `open` itself, never by a following
+/// `set_permissions`: the two-step form leaves a window in which a freshly
+/// created file carries umask-derived permissions, so any local principal
+/// could open it before the mode is tightened. The post-open checks
+/// (regular file, effective-UID ownership, mode correction, clearing
+/// `O_NONBLOCK`) live in [`harden_audit_handle`], which takes the open
+/// handle rather than a path so they stay independently testable without
+/// privileges: a test can hand it a real handle with a deliberately wrong
+/// `effective_uid`, or a `set_mode` that always fails, without needing a
+/// foreign-owned fixture or a syscall this suite can make fail for real.
+/// Audit logs carry identities and, under the diagnostic switches,
+/// credential material.
+///
+/// This function never deletes a file on failure. The mode is fixed at
+/// creation time, so a file this call creates is never exposed at a wider
+/// mode, even transiently, and a pre-existing file that fails a check
+/// (wrong type, wrong owner) was not created by this process: deleting it
+/// would destroy something this process does not own, for no benefit, since
+/// nothing was ever written to it.
 ///
 /// # Errors
 ///
-/// Returns `Err` with a message when the audit log cannot be opened with
-/// owner-only permissions.
+/// Returns `Err` naming the path and the reason when the audit log cannot
+/// be opened, is not a regular file, is not owned by this process's
+/// effective UID, or its permissions cannot be hardened to `0o600`. A
+/// symlinked final component surfaces as `ELOOP` and a FIFO with no reader
+/// as `ENXIO`; both get a message naming the specific rule that was
+/// refused instead of the bare OS error text.
 #[cfg(unix)]
 fn create_private_audit_file(path: &Path) -> Result<fs::File, String> {
-    use std::os::unix::fs::OpenOptionsExt as _;
+    use rustix::{
+        fs::{Mode, OFlags, open},
+        process::geteuid,
+    };
 
-    fs::OpenOptions::new()
-        .mode(0o600)
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|error| format!("failed to open audit log file {}: {error}", path.display()))
+    let flags = OFlags::CREATE
+        | OFlags::APPEND
+        | OFlags::WRONLY
+        | OFlags::NOFOLLOW
+        | OFlags::CLOEXEC
+        | OFlags::NONBLOCK
+        | OFlags::NOCTTY;
+    let fd = open(path, flags, Mode::RUSR | Mode::WUSR)
+        .map_err(|error| describe_audit_open_error(path, error))?;
+
+    harden_audit_handle(fd, path, geteuid().as_raw(), set_audit_file_mode)
+}
+
+/// Translate an `open` failure on the audit-log path into an operator
+/// message that names the specific rule it tripped, for the two errnos
+/// this hardening deliberately provokes.
+///
+/// `O_NOFOLLOW` turns a symlinked final path component into `ELOOP`;
+/// `O_NONBLOCK` turns a FIFO with no reader into `ENXIO` instead of
+/// blocking startup forever. Every other errno keeps the generic "failed to
+/// open" form. Only the path and the OS-level reason are ever named, never
+/// a symlink's target.
+#[cfg(unix)]
+fn describe_audit_open_error(path: &Path, error: Errno) -> String {
+    match error {
+        Errno::LOOP => format!(
+            "audit log path {} is a symbolic link; refusing to follow it",
+            path.display()
+        ),
+        Errno::NXIO => format!(
+            "audit log path {} is not a regular file (a FIFO without a \
+             reader, or a device with nothing attached)",
+            path.display()
+        ),
+        other => format!("failed to open audit log file {}: {other}", path.display()),
+    }
+}
+
+/// Harden an already-open audit-log handle: verify it is a regular file
+/// owned by `effective_uid`, correct its mode, and clear `O_NONBLOCK`.
+///
+/// Split out of `create_private_audit_file` so the regular-file, ownership
+/// and mode-correction checks can be driven directly against a real open
+/// handle in tests: a wrong `effective_uid` or a failing `set_mode` proves
+/// the rejection path without a foreign-owned fixture (which needs
+/// privileges this test suite does not assume) or a syscall this suite
+/// cannot make fail for real. Keeping the seam handle-based rather than
+/// path-based also keeps it extensible: a future hard-link check
+/// (`st_nlink`) or a Windows reparse-point check can be added without
+/// reopening the path or touching the caller.
+///
+/// # Errors
+///
+/// Returns `Err` naming the path and the reason when the handle cannot be
+/// inspected, is not a regular file, is not owned by `effective_uid`, or
+/// `set_mode` fails.
+#[cfg(unix)]
+fn harden_audit_handle(
+    fd: OwnedFd,
+    path: &Path,
+    effective_uid: u32,
+    set_mode: fn(&OwnedFd) -> RustixIoResult<()>,
+) -> Result<fs::File, String> {
+    use rustix::fs::{FileType, OFlags, fcntl_setfl, fstat};
+
+    let stat = fstat(&fd).map_err(|error| {
+        format!(
+            "failed to inspect audit log file {}: {error}",
+            path.display()
+        )
+    })?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(format!(
+            "audit log path {} is not a regular file",
+            path.display()
+        ));
+    }
+    // `uid_t` (rustix's `RawUid`) is `u32` on every Unix target this crate
+    // supports, so this comparison needs no widening.
+    if !is_owned_by_effective_user(stat.st_uid, effective_uid) {
+        return Err(format!(
+            "audit log file {} is not owned by this process's effective user",
+            path.display()
+        ));
+    }
+
+    set_mode(&fd).map_err(|error| {
+        format!(
+            "failed to set audit log permissions to 0o600 for {}: {error}",
+            path.display()
+        )
+    })?;
+
+    // Re-arm blocking semantics now that the handle is confirmed safe: the
+    // writer thread (spawned only after this function returns `Ok`) expects
+    // a plain blocking file, and `O_NONBLOCK` was only ever needed to keep
+    // the checks above from hanging on a FIFO.
+    fcntl_setfl(&fd, OFlags::APPEND).map_err(|error| {
+        format!(
+            "failed to clear non-blocking mode on audit log file {}: {error}",
+            path.display()
+        )
+    })?;
+
+    Ok(fs::File::from(fd))
+}
+
+/// Decide whether a file's owner matches this process's effective user.
+///
+/// A pure comparison over raw UIDs so the ownership rule is unit-testable
+/// with fabricated values: proving the rejection path for a file owned by a
+/// different user does not require actually creating one, which needs
+/// privileges this test suite does not assume.
+#[cfg(unix)]
+const fn is_owned_by_effective_user(file_uid: u32, effective_uid: u32) -> bool {
+    file_uid == effective_uid
+}
+
+/// Correct an audit-log handle's mode to owner-only (`0o600`).
+///
+/// A plain function, not a closure, so production code and a test can both
+/// hand `harden_audit_handle` a `set_mode` of the same concrete function
+/// pointer type: a test substitutes a different plain function that always
+/// fails, proving the "turn a chmod failure into a warning" mutant red
+/// without needing the real `fchmod` syscall to fail.
+///
+/// # Errors
+///
+/// Returns `Err` when the underlying `fchmod` call fails.
+#[cfg(unix)]
+fn set_audit_file_mode(fd: &OwnedFd) -> RustixIoResult<()> {
+    use rustix::fs::{Mode, fchmod};
+
+    fchmod(fd, Mode::RUSR | Mode::WUSR)
 }
 
 /// Create (or append to) the audit log with an owner-only DACL.
@@ -799,27 +976,6 @@ fn create_private_audit_file(path: &Path) -> Result<fs::File, String> {
     ))
 }
 
-/// Rewrite an existing audit file to owner-only permissions and collect failures.
-#[cfg(unix)]
-fn audit_file_permission_warnings(file: &fs::File) -> Vec<String> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let mut warnings = Vec::new();
-    // A pre-existing file keeps its old mode: `OpenOptions::mode` applies only
-    // when `open` creates the file, so tighten it explicitly here.
-    if let Err(error) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
-        warnings.push(format!(
-            "failed to set audit log permissions to 0o600: {error}"
-        ));
-    }
-    warnings
-}
-
-#[cfg(not(unix))]
-fn audit_file_permission_warnings(_file: &fs::File) -> Vec<String> {
-    Vec::new()
-}
-
 #[cfg_attr(
     all(test, target_os = "linux"),
     expect(
@@ -853,6 +1009,8 @@ mod tests {
     };
     #[cfg(unix)]
     use std::io::Write as _;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    use std::thread;
     use std::{
         env, fs, io,
         path::{Path, PathBuf},
@@ -867,7 +1025,7 @@ mod tests {
     use tracing_subscriber::fmt::MakeWriter as _;
     use tracing_subscriber::{Layer as _, filter, fmt, layer::SubscriberExt as _};
 
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(not(windows))]
     use super::prepare_tracing_audit_lenient;
     use super::{AuditMessage, AuditWorker, init_tracing, prepare_tracing_audit_strict};
     use crate::{
@@ -1280,6 +1438,442 @@ mod tests {
              got mode {mode:o}"
         );
         fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    /// Pins that a symlinked audit path is refused before any write, leaving
+    /// the symlink target's content and mode untouched. The old code opened
+    /// through the symlink, chmodded the target to 0o600, and wrote through
+    /// it.
+    fn symlinked_audit_path_is_rejected_before_any_write() -> anyhow::Result<()> {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let dir = unique_temp_path("audit-symlink-dir")?;
+        fs::create_dir_all(&dir).context("create fixture dir")?;
+        let target_path = dir.join("target.log");
+        let marker = "pre-existing target contents, never touched";
+        fs::write(&target_path, marker).context("create symlink target")?;
+        fs::set_permissions(&target_path, fs::Permissions::from_mode(0o644))
+            .context("set target mode")?;
+        let audit_path = dir.join("audit.log");
+        symlink(&target_path, &audit_path).context("create audit path symlink")?;
+
+        let config = observability_config(Some(audit_path));
+        let error = match prepare_tracing_audit_strict(&config) {
+            Err(RmcpServerKitError::Startup(message)) => message,
+            Err(other) => anyhow::bail!(
+                "a symlinked audit path must fail closed with Startup; got a different error variant: {other}"
+            ),
+            Ok(_) => {
+                anyhow::bail!("a symlinked audit path must fail closed with Startup; it succeeded")
+            }
+        };
+        assert!(
+            error.contains("is a symbolic link"),
+            "error must name the symlink rejection, not a bare OS error; got {error:?}"
+        );
+        let target_mode = fs::metadata(&target_path)
+            .context("read target metadata")?
+            .permissions()
+            .mode();
+        assert_eq!(
+            target_mode & 0o777,
+            0o644,
+            "a refused symlink must leave the target's mode untouched; got {target_mode:o}"
+        );
+        let target_contents = fs::read_to_string(&target_path).context("read target contents")?;
+        assert_eq!(
+            target_contents, marker,
+            "a refused symlink must leave the target's contents untouched"
+        );
+
+        fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    /// Pins that `/dev/null` (a non-regular file) is refused by strict init
+    /// and that the refusal never changes its mode. The old code chmodded
+    /// through it and only warned when that chmod failed with `EPERM`.
+    fn dev_null_is_rejected_by_strict_init_and_its_mode_is_untouched() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let before = fs::metadata("/dev/null")
+            .context("stat /dev/null before the attempt")?
+            .permissions()
+            .mode();
+
+        let config = observability_config(Some(PathBuf::from("/dev/null")));
+        let result = prepare_tracing_audit_strict(&config);
+
+        assert!(
+            matches!(result, Err(RmcpServerKitError::Startup(_))),
+            "a non-regular audit path must fail closed with Startup"
+        );
+        let after = fs::metadata("/dev/null")
+            .context("stat /dev/null after the attempt")?
+            .permissions()
+            .mode();
+        assert_eq!(
+            before, after,
+            "a refused non-regular audit path must never have its mode touched"
+        );
+
+        Ok(())
+    }
+
+    /// Send the FIFO test's outcome over its bounded notification channel.
+    ///
+    /// `None` means the open unexpectedly succeeded; `Some(message)` carries
+    /// the rejection reason so the test can assert on it. The send result is
+    /// intentionally discarded: a full or disconnected channel means the
+    /// receiver already gave up on its bounded `recv_timeout`, at which
+    /// point the test has already failed on the timeout and there is no
+    /// corrective action this thread could take.
+    #[expect(
+        clippy::let_underscore_must_use,
+        reason = "deliberate: src/observability.rs::notify_fifo_test_outcome: a full or disconnected channel has no corrective action; the test's bounded recv_timeout is the actual correctness check"
+    )]
+    #[expect(
+        let_underscore_drop,
+        reason = "deliberate: src/observability.rs::notify_fifo_test_outcome drops the full-or-disconnected send result without logging, same as AuditFileWriter::flush above"
+    )]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn notify_fifo_test_outcome(
+        sender: &mpsc::SyncSender<Option<String>>,
+        outcome: Option<String>,
+    ) {
+        let _: Result<(), mpsc::TrySendError<Option<String>>> = sender.try_send(outcome);
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    /// Pins that a FIFO at the audit path is refused promptly rather than
+    /// blocking startup forever, with a message naming the specific rule
+    /// rather than a bare `ENXIO`. `O_WRONLY` on a FIFO with no reader
+    /// blocks until one attaches; `O_NONBLOCK` turns that into an immediate
+    /// error instead. Linux-only: rustix excludes `mkfifoat` on Apple
+    /// targets, so this is skipped on macOS, where the `/dev/null` test
+    /// above already covers the non-regular-file rule on every Unix.
+    fn fifo_audit_path_is_rejected_promptly_not_hung() -> anyhow::Result<()> {
+        use rustix::fs::{CWD, Mode, mkfifoat};
+
+        let dir = unique_temp_path("audit-fifo-dir")?;
+        fs::create_dir_all(&dir).context("create fixture dir")?;
+        let audit_path = dir.join("audit.fifo");
+        mkfifoat(CWD, &audit_path, Mode::RUSR | Mode::WUSR)
+            .map_err(|error| anyhow::anyhow!("create test fifo: {error}"))?;
+
+        let config = observability_config(Some(audit_path));
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let _join = thread::spawn(move || {
+            let outcome = match prepare_tracing_audit_strict(&config) {
+                Ok(setup) => {
+                    drop(setup.guard);
+                    None
+                }
+                Err(RmcpServerKitError::Startup(message)) => Some(message),
+                Err(other) => Some(format!("unexpected error variant: {other}")),
+            };
+            notify_fifo_test_outcome(&sender, outcome);
+        });
+
+        let outcome = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .context("opening a FIFO audit path must not hang startup")?;
+        let message = outcome.context("a FIFO at the audit path must fail closed, not succeed")?;
+        assert!(
+            message.contains("is not a regular file"),
+            "error must name the non-regular-file rejection, not a bare OS error; got {message:?}"
+        );
+
+        fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    /// Pins that a pre-existing, self-owned `0o644` audit file is tightened
+    /// to `0o600` and accepted.
+    fn preexisting_self_owned_file_is_tightened_to_0600() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = unique_temp_path("audit-tighten-dir")?;
+        fs::create_dir_all(&dir).context("create fixture dir")?;
+        let audit_path = dir.join("audit.log");
+        fs::write(&audit_path, b"pre-existing").context("create pre-existing audit file")?;
+        fs::set_permissions(&audit_path, fs::Permissions::from_mode(0o644))
+            .context("loosen the pre-existing file's mode")?;
+
+        let config = observability_config(Some(audit_path.clone()));
+        let setup = prepare_tracing_audit_strict(&config)
+            .context("a self-owned pre-existing file must be accepted")?;
+        drop(setup.guard);
+
+        let mode = fs::metadata(&audit_path)
+            .context("read tightened file metadata")?
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "a pre-existing self-owned file must be tightened to 0o600; got {mode:o}"
+        );
+
+        fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    /// Pins that the hardened open handle ends with plain blocking
+    /// semantics: `O_NONBLOCK` is needed only to keep the checks inside
+    /// `create_private_audit_file` from hanging on a FIFO, and must not
+    /// reach the writer thread.
+    fn create_private_audit_file_clears_nonblock_after_hardening() -> anyhow::Result<()> {
+        use rustix::fs::{OFlags, fcntl_getfl};
+
+        let dir = unique_temp_path("audit-nonblock-dir")?;
+        fs::create_dir_all(&dir).context("create fixture dir")?;
+        let audit_path = dir.join("audit.log");
+
+        let file = super::create_private_audit_file(&audit_path)
+            .map_err(|error| anyhow::anyhow!("create_private_audit_file: {error}"))?;
+        let flags = fcntl_getfl(&file).context("read back the handle's status flags")?;
+        assert!(
+            !flags.contains(OFlags::NONBLOCK),
+            "the hardened handle must not keep O_NONBLOCK set"
+        );
+
+        drop(file);
+        fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    /// Pins that `harden_audit_handle` rejects a real, self-owned regular
+    /// file when handed an `effective_uid` that does not match its owner,
+    /// and that no byte is ever written to it. This drives the seam
+    /// directly (the real owner matches the real `geteuid()`, so this
+    /// could not be proven by opening through `create_private_audit_file`)
+    /// and is the faithful red test for both dropping the ownership check
+    /// and writing to the handle before the checks run.
+    fn harden_audit_handle_rejects_mismatched_owner_without_writing() -> anyhow::Result<()> {
+        use std::os::fd::OwnedFd;
+
+        use rustix::process::geteuid;
+
+        let dir = unique_temp_path("audit-seam-wrong-uid")?;
+        fs::create_dir_all(&dir).context("create fixture dir")?;
+        let path = dir.join("audit.log");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .context("open a real self-owned file")?;
+        let fd = OwnedFd::from(file);
+        let real_uid = geteuid().as_raw();
+        let wrong_uid = real_uid.wrapping_add(1);
+
+        let result = super::harden_audit_handle(fd, &path, wrong_uid, super::set_audit_file_mode);
+
+        let error = result
+            .err()
+            .context("a mismatched effective_uid must be rejected")?;
+        assert!(
+            error.contains("not owned by this process's effective user"),
+            "error must name the ownership problem; got {error:?}"
+        );
+        let contents = fs::read(&path).context("read fixture file")?;
+        assert!(
+            contents.is_empty(),
+            "a rejected handle must never be written to; got {} bytes",
+            contents.len()
+        );
+
+        fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    /// Pins that `harden_audit_handle` turns a `set_mode` failure into
+    /// `Err` rather than a warning, and never writes to the handle first.
+    /// `set_mode` is injected specifically so this can be proven without
+    /// making the real `fchmod` syscall fail.
+    fn harden_audit_handle_rejects_failing_set_mode() -> anyhow::Result<()> {
+        use std::os::fd::OwnedFd;
+
+        use rustix::{io::Errno, process::geteuid};
+
+        fn always_fails(_fd: &OwnedFd) -> super::RustixIoResult<()> {
+            Err(Errno::PERM)
+        }
+
+        let dir = unique_temp_path("audit-seam-chmod-fail")?;
+        fs::create_dir_all(&dir).context("create fixture dir")?;
+        let path = dir.join("audit.log");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .context("open a real self-owned file")?;
+        let fd = OwnedFd::from(file);
+        let real_uid = geteuid().as_raw();
+
+        let result = super::harden_audit_handle(fd, &path, real_uid, always_fails);
+
+        let error = result
+            .err()
+            .context("a failing set_mode must be reported, not downgraded to a warning")?;
+        assert!(
+            error.contains("permissions"),
+            "error must mention the permissions failure; got {error:?}"
+        );
+        let contents = fs::read(&path).context("read fixture file")?;
+        assert!(
+            contents.is_empty(),
+            "a rejected handle must never be written to; got {} bytes",
+            contents.len()
+        );
+
+        fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    /// Pins that `harden_audit_handle` rejects a handle that is not a
+    /// regular file, independent of the open path: cheap and
+    /// platform-independent, unlike the FIFO test above, this needs no
+    /// privileges and no special fixture.
+    fn harden_audit_handle_rejects_non_regular_file() -> anyhow::Result<()> {
+        use std::os::fd::OwnedFd;
+
+        use rustix::process::geteuid;
+
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .open("/dev/null")
+            .context("open /dev/null read-only")?;
+        let fd = OwnedFd::from(file);
+        let real_uid = geteuid().as_raw();
+
+        let result = super::harden_audit_handle(
+            fd,
+            Path::new("/dev/null"),
+            real_uid,
+            super::set_audit_file_mode,
+        );
+
+        let error = result
+            .err()
+            .context("a non-regular handle must be rejected")?;
+        assert!(
+            error.contains("not a regular file"),
+            "error must name the regular-file rule; got {error:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    /// Pins the seam's success path directly: a self-owned regular file,
+    /// the real effective UID, and the real `fchmod` end with mode
+    /// `0o600` and no `O_NONBLOCK` on the returned handle.
+    fn harden_audit_handle_accepts_self_owned_file_and_clears_nonblock() -> anyhow::Result<()> {
+        use std::os::{fd::OwnedFd, unix::fs::PermissionsExt as _};
+
+        use rustix::{
+            fs::{OFlags, fcntl_getfl},
+            process::geteuid,
+        };
+
+        let dir = unique_temp_path("audit-seam-success")?;
+        fs::create_dir_all(&dir).context("create fixture dir")?;
+        let path = dir.join("audit.log");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .context("open a real self-owned file")?;
+        let fd = OwnedFd::from(file);
+        let real_uid = geteuid().as_raw();
+
+        let hardened = super::harden_audit_handle(fd, &path, real_uid, super::set_audit_file_mode)
+            .map_err(|error| anyhow::anyhow!("harden_audit_handle: {error}"))?;
+
+        let mode = fs::metadata(&path)
+            .context("read fixture metadata")?
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "handle must end 0o600; got {mode:o}");
+        let flags = fcntl_getfl(&hardened).context("read back status flags")?;
+        assert!(
+            !flags.contains(OFlags::NONBLOCK),
+            "handle must not keep O_NONBLOCK set"
+        );
+
+        drop(hardened);
+        fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/observability.rs::lenient_init_installs_no_sink_when_hardening_fails keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
+    #[cfg(unix)]
+    /// Pins that lenient (deprecated) init installs no audit sink when
+    /// hardening fails: the cross-platform behaviour the guard at the bottom
+    /// of this module pins for a platform with no private-permission
+    /// support, exercised here through a real Unix failure mode.
+    fn lenient_init_installs_no_sink_when_hardening_fails() -> anyhow::Result<()> {
+        let config = observability_config(Some(PathBuf::from("/dev/null")));
+
+        let setup = prepare_tracing_audit_lenient(&config);
+
+        assert!(
+            setup.writer.is_none(),
+            "no audit sink may be installed when hardening fails"
+        );
+        assert!(
+            !setup.warnings.is_empty(),
+            "lenient init must warn rather than fail silently; got {:?}",
+            setup.warnings
+        );
+
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/observability.rs::ownership_check_rejects_foreign_uid_without_requiring_root keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
+    #[cfg(unix)]
+    /// Pins the ownership-match decision directly against fabricated UIDs:
+    /// proving the rejection path with a REAL foreign-owned file needs
+    /// privileges (root, or a user-namespace / idmapped-mount setup) that
+    /// this test suite does not assume and CI does not grant.
+    fn ownership_check_rejects_foreign_uid_without_requiring_root() -> anyhow::Result<()> {
+        assert!(super::is_owned_by_effective_user(1000, 1000));
+        assert!(!super::is_owned_by_effective_user(1000, 0));
+        assert!(!super::is_owned_by_effective_user(0, 1000));
 
         Ok(())
     }

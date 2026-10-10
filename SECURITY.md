@@ -694,6 +694,41 @@ sessions" guidance above only fully closes that gap as of 3.14.
   revocation as unsupported and apply the defence-in-depth mitigations
   above.
 
+## Audit log file handling
+
+The audit log carries identities and, under the diagnostic switches, can
+carry credential material, so opening it is a security decision, not just a
+file-system operation.
+
+**Threat model:** a local principal with write access to the audit log's
+parent directory (or a path component above it) could otherwise redirect
+where the audit log actually lands, by planting a symlink at the configured
+path pointing somewhere they control or want to see written to; by planting
+a special file (device, FIFO, socket) that behaves unexpectedly when opened
+for append; or by pre-creating a regular file they own at that path so the
+server's audit trail is written into a file another local user can read.
+
+On Unix, opening the audit log refuses all three: it never follows a
+symlink at the final path component (a symlinked *parent* directory is
+still traversed - only the final component is protected), it refuses
+anything that is not a regular file, and it refuses a pre-existing file not
+owned by the server process's effective user, even when the process runs
+as root. These checks run on the already-open handle before any write and
+before the audit writer thread is spawned, so a rejected target is never
+written to. Strict initialization fails startup on any of these failures;
+the deprecated lenient initializer installs no audit sink at all rather
+than writing to an unprotected one.
+
+A pre-existing audit-log path owned by another local user - an init
+container or provisioning step that ran as root, a sidecar, a shared
+volume, or a log rotator that recreates the file as root - now fails
+strict startup rather than silently writing an audit trail into a file
+another principal controls. Dedicate the path to the service user,
+pre-create it with the service user as owner, or configure log rotation
+with copy-and-truncate semantics (for example logrotate's `copytruncate`)
+instead of recreate, so a restart always finds a file the service user
+already owns.
+
 ## Coordinated disclosure
 
 Once a fix is released, we will:
