@@ -220,10 +220,10 @@ consumer applications and `examples/`.
 | Entry                                    | File                                                                  | Notes                                                                                                  |
 |------------------------------------------|----------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------|
 | Crate root / public API                  | [`src/lib.rs`](src/lib.rs)                                            | Re-exports all public modules                                                                          |
-| **Server entry (HTTP)**                  | [`src/transport.rs`](src/transport.rs) - `serve()` (~line 2981)        | The function consumers call. Wires rmcp + axum + middleware + TLS + admin + metrics                    |
-| Server entry (stdio)                     | [`src/transport.rs`](src/transport.rs) - `serve_stdio()` (~line 5424) | For desktop/IDE clients. **Bypasses auth/RBAC/TLS** - use only for local subprocess MCP                |
-| Config builder                           | [`src/transport.rs`](src/transport.rs) - `McpServerConfig::new` (~line 536) | Builder-style config struct                                                                       |
-| Hot-reload handle                        | [`src/transport.rs`](src/transport.rs) - `ReloadHandle` (~line 1984)   | `try_reload_auth_keys` / `reload_auth_keys` / `reload_rbac` for runtime reconfig without restart      |
+| **Server entry (HTTP)**                  | [`src/transport.rs`](src/transport.rs) - `serve()` (~line 3025)        | The function consumers call. Wires rmcp + axum + middleware + TLS + admin + metrics                    |
+| Server entry (stdio)                     | [`src/transport.rs`](src/transport.rs) - `serve_stdio()` (~line 5515) | For desktop/IDE clients. **Bypasses auth/RBAC/TLS** - use only for local subprocess MCP                |
+| Config builder                           | [`src/transport.rs`](src/transport.rs) - `McpServerConfig::new` (~line 1001) | Builder-style config struct                                                                       |
+| Hot-reload handle                        | [`src/transport.rs`](src/transport.rs) - `ReloadHandle` (~line 2014)   | `try_reload_auth_keys` / `reload_auth_keys` / `reload_rbac` for runtime reconfig without restart      |
 | Runnable example                         | [`examples/minimal_server.rs`](examples/minimal_server.rs)            | Smallest possible consumer of `serve()`                                                                |
 | Integration reference                    | [`tests/integration/e2e.rs`](tests/integration/e2e.rs)                | Real-world usage patterns; use as an integration cookbook                                              |
 
@@ -233,7 +233,7 @@ consumer applications and `examples/`.
 
 ```
                    ┌──────────────────────────────────┐
-   HTTP request ─► │  TlsListener  (TLS / mTLS)       │  src/transport.rs:3140
+   HTTP request ─► │  TlsListener  (TLS / mTLS)       │  src/transport.rs:3668
                    └────────────────┬─────────────────┘
                                     ▼
                    ┌──────────────────────────────────┐
@@ -251,7 +251,7 @@ consumer applications and `examples/`.
         (executed top-to-bottom on request)            │
                                                        │
         0. Security headers - outermost, response-only decoration; pass-through on requests
-        1. Origin check       src/transport.rs:4493    │  spec: MCP origin validation
+        1. Origin check       src/transport.rs:5171    │  spec: MCP origin validation
            Logs only the requests it rejects.
         2. Peer-addr normalize (normalize_peer_addr_middleware) │  mirrors TLS peer into ConnectInfo<SocketAddr> + public PeerAddr (both branches)
         2b. Request log (request_log_middleware): DEBUG `incoming request` / `request completed`, skips request_log_exclude_paths, client fields per [server.log_context] knobs
@@ -357,7 +357,7 @@ The core's current-Rust idioms (for example `Vec::push_mut` /
 |------------------------------------------------|--------------------------------------------------------|
 | Server entry / router / middleware order       | `src/transport.rs` - `serve()` and surrounding helpers |
 | API key authentication                         | `src/auth.rs` - `AuthState`, `ApiKeyEntry`, `auth_middleware` |
-| mTLS identity extraction                       | `src/transport.rs` - `extract_mtls_identity` call site (~line 3694)   |
+| mTLS identity extraction                       | `src/transport.rs` - `extract_mtls_identity` call site (~line 3746)   |
 | mTLS CRL revocation (CDP-driven)               | `src/mtls_revocation.rs` - `CrlSet`, `DynamicClientCertVerifier`, `bootstrap_fetch`, `run_crl_refresher` |
 | OAuth JWT validation / JWKS cache              | `src/oauth.rs` - `JwksCache`, feature-gated           |
 | RBAC policy evaluation                         | `src/rbac.rs` - `RbacPolicy::check`, `enforce_tool_policy` |
@@ -377,8 +377,8 @@ The core's current-Rust idioms (for example `Vec::push_mut` /
 | Security-header TOML controls                  | `src/transport.rs` - `SecurityHeadersConfig`; `src/config.rs` - `ServerConfig::security_headers` |
 | Error type → HTTP status mapping               | `src/error.rs` - `RmcpServerKitError::into_response`           |
 | Origin / security headers / CORS               | `src/transport.rs` - `origin_check_middleware`, `security_headers_middleware` |
-| Graceful shutdown (Ctrl-C / SIGTERM)           | `src/transport.rs` - `shutdown_signal()` (~line 4153) |
-| Hot-reload of keys / RBAC                      | `src/transport.rs` - `ReloadHandle` (~line 1984)       |
+| Graceful shutdown (Ctrl-C / SIGTERM)           | `src/transport.rs` - `shutdown_signal()` (~line 4205) |
+| Hot-reload of keys / RBAC                      | `src/transport.rs` - `ReloadHandle` (~line 2014)       |
 | Environment variable override mapping          | `src/config.rs` - `ServerConfig::apply_env_overrides`, `ObservabilityConfig::apply_env_overrides`; `src/rbac.rs` - `RbacConfig::apply_env_overrides` |
 | `rmcp` / `rmcp-macros` version bump in `Cargo.toml` / `Cargo.lock` | `docs/RMCP_UPGRADE_CHECKLIST.md` - the checks to run; `tests/integration/delegation_guard.rs` - the trait-surface guard |
 | Lint gates (catalog / allow / profile-equality / prose) | `scripts/lint-ratchet/{catalog_gate,allow_gate,profile_eq,prose_gates}.py`; shared helpers in `scripts/lint-ratchet/common.py` |

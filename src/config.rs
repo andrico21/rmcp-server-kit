@@ -177,6 +177,13 @@ pub(crate) const ENV_OVERRIDE_SPECS: &[EnvOverrideSpec] = &[
         redacted: false,
     },
     EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__SERVER__LOG_CONTEXT__SESSION_ID_HEADER",
+        target_field: "server.log_context.session_id_header",
+        value_type: "SessionIdLogPolicy",
+        required_feature: None,
+        redacted: false,
+    },
+    EnvOverrideSpec {
         env_var: "RMCP_SERVER_KIT__SERVER__SESSION_BINDING_SECRET",
         target_field: "server.session_binding_secret",
         value_type: "SecretString",
@@ -305,6 +312,9 @@ pub(crate) const SERVER_ADMIN_ENABLED_ENV: &str = "RMCP_SERVER_KIT__SERVER__ADMI
 /// Environment variable name for the `server.key_eviction_policy` override.
 pub(crate) const SERVER_KEY_EVICTION_POLICY_ENV: &str =
     "RMCP_SERVER_KIT__SERVER__KEY_EVICTION_POLICY";
+/// Environment variable name for the `server.log_context.session_id_header` override.
+pub(crate) const SERVER_LOG_CONTEXT_SESSION_ID_HEADER_ENV: &str =
+    "RMCP_SERVER_KIT__SERVER__LOG_CONTEXT__SESSION_ID_HEADER";
 /// Environment variable name for the direct `server.session_binding_secret` override.
 pub(crate) const SERVER_SESSION_BINDING_SECRET_ENV: &str =
     "RMCP_SERVER_KIT__SERVER__SESSION_BINDING_SECRET";
@@ -721,6 +731,18 @@ impl ServerConfig {
             applied.push(env_report(
                 SERVER_KEY_EVICTION_POLICY_ENV,
                 "server.key_eviction_policy",
+                raw,
+            ));
+        }
+        if let Some(raw) = read_env(SERVER_LOG_CONTEXT_SESSION_ID_HEADER_ENV)? {
+            self.log_context.session_id_header = parse_env_value(
+                SERVER_LOG_CONTEXT_SESSION_ID_HEADER_ENV,
+                &raw,
+                "SessionIdLogPolicy",
+            )?;
+            applied.push(env_report(
+                SERVER_LOG_CONTEXT_SESSION_ID_HEADER_ENV,
+                "server.log_context.session_id_header",
                 raw,
             ));
         }
@@ -2018,9 +2040,12 @@ mod tests {
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
-    use crate::auth::{ApiKeyEntry, generate_api_key};
     #[cfg(feature = "oauth")]
     use crate::oauth::{OAuthConfig, OAuthProxyConfig};
+    use crate::{
+        auth::{ApiKeyEntry, generate_api_key},
+        transport::SessionIdLogPolicy,
+    };
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -2890,6 +2915,42 @@ client_ip = false
                 "Error for header '{bad}' contains doubled 'log_context.log_context' prefix: {err_msg}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    /// Pins that TOML accepts every session-id header log policy and rejects
+    /// unknown values.
+    fn log_context_session_id_header_toml_values() -> anyhow::Result<()> {
+        for (raw, policy) in [
+            ("plain", SessionIdLogPolicy::Plain),
+            ("mask", SessionIdLogPolicy::Mask),
+            ("hide", SessionIdLogPolicy::Hide),
+        ] {
+            let cfg: ServerConfig = toml::from_str(&format!(
+                r#"
+                    [log_context]
+                    session_id_header = "{raw}"
+                "#
+            ))
+            .with_context(|| format!("session_id_header {raw:?} must parse"))?;
+            assert_eq!(cfg.log_context.session_id_header, policy);
+
+            let bridged = cfg
+                .apply_to_mcp_config(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0"))
+                .context("session id policy must bridge")?;
+            assert_eq!(bridged.log_context.session_id_header, policy);
+        }
+
+        let Err(err) = toml::from_str::<ServerConfig>(
+            r#"
+                [log_context]
+                session_id_header = "plaintext"
+            "#,
+        ) else {
+            anyhow::bail!("unknown session_id_header must fail closed");
+        };
+        assert!(err.to_string().contains("session_id_header"), "{err}");
         Ok(())
     }
 
@@ -5023,6 +5084,45 @@ client_ip = false
     }
 
     #[test]
+    /// Pins that the session-id header policy env override applies and rejects
+    /// unknown values.
+    fn session_id_header_env_override_applies_and_fails_closed() -> anyhow::Result<()> {
+        with_env_vars(
+            &[(SERVER_LOG_CONTEXT_SESSION_ID_HEADER_ENV, Some("mask"))],
+            || -> anyhow::Result<()> {
+                let mut cfg = ServerConfig::default();
+                let report = cfg
+                    .apply_env_overrides()
+                    .context("session-id policy override must apply")?;
+                assert_eq!(cfg.log_context.session_id_header, SessionIdLogPolicy::Mask);
+                let entry = report.first().context("one override must be reported")?;
+                assert_eq!(entry.env_var, SERVER_LOG_CONTEXT_SESSION_ID_HEADER_ENV);
+                assert_eq!(entry.target_field, "server.log_context.session_id_header");
+                assert_eq!(entry.value.as_deref(), Some("mask"));
+                Ok(())
+            },
+        )?;
+
+        with_env_vars(
+            &[(SERVER_LOG_CONTEXT_SESSION_ID_HEADER_ENV, Some("plaintext"))],
+            || -> anyhow::Result<()> {
+                let mut cfg = ServerConfig::default();
+                let Err(err) = cfg.apply_env_overrides() else {
+                    anyhow::bail!("bad session-id policy must fail closed");
+                };
+                let msg = err.to_string();
+                assert!(
+                    msg.contains(SERVER_LOG_CONTEXT_SESSION_ID_HEADER_ENV),
+                    "{msg}"
+                );
+                assert!(msg.contains("SessionIdLogPolicy"), "{msg}");
+                Ok(())
+            },
+        )?;
+        Ok(())
+    }
+
+    #[test]
     /// Pins that a secret env/file conflict is rejected.
     fn session_binding_secret_env_and_file_conflict_rejected() -> anyhow::Result<()> {
         with_env_vars(
@@ -5667,6 +5767,12 @@ client_ip = false
         (
             SERVER_KEY_EVICTION_POLICY_ENV,
             "server.key_eviction_policy",
+            None,
+            false,
+        ),
+        (
+            SERVER_LOG_CONTEXT_SESSION_ID_HEADER_ENV,
+            "server.log_context.session_id_header",
             None,
             false,
         ),

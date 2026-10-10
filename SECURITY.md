@@ -70,6 +70,12 @@ escape hatch for a trusted gateway that deliberately re-authenticates each
 request under different labels. It also reinstates the CWE-384 risk: any leaked
 raw rmcp session ID can again be replayed by another authenticated identity.
 
+A bound `Mcp-Session-Id` is still correlation metadata. An unbound raw rmcp
+session ID is replayable if it leaks. `server.log_context.session_id_header =
+"mask"` limits exposure in full request-header logs by revealing only the first
+and last 4 characters for long values, but it is no substitute for leaving
+`session_binding = true`.
+
 Multi-replica deployments that configure `McpServerConfig::with_session_store`
 must also configure a shared `server.session_binding_secret` (or the
 `RMCP_SERVER_KIT__SERVER__SESSION_BINDING_SECRET_FILE` environment variable).

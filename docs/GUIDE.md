@@ -1070,6 +1070,7 @@ extra_route_rate_limit = 60
 # credential_fingerprint = false
 # auth_scheme = true
 # mcp_hints = true
+# session_id_header = "plain"
 # request_completion = true
 ```
 
@@ -2118,6 +2119,7 @@ attribute probe noise without logging spoofable header material.
 | `credential_owner` | Adds `credential_owner` and `credential_rejection` to `auth failed` lines when a credential verifies but is rejected: an expired API key, or an OAuth JWT rejected for expiry, wrong audience, no mapped role, or missing subject. The label is the same identity the `authenticated` line logs. Off by default and not enabled by `recommended()`. |
 | `auth_scheme` | Adds `auth_scheme` and `token_kind` to `auth failed` lines. |
 | `mcp_hints` | Adds `mcp_session` and `mcp_protocol_version` to `auth failed` and `incoming request` lines. |
+| `session_id_header` | Controls only the `Mcp-Session-Id` entry inside full request-header logs when `log_request_headers` is enabled. `plain` logs the raw header value, preserving compatibility. `mask` logs a partial reveal, first 4 and last 4 characters joined as `abcd...wxyz` for values of 16 or more characters, and `[MASKED]` for shorter values. The partial reveal is intentionally correlatable. `hide` omits the header name and value. |
 | `request_completion` | Emits a DEBUG `request completed` line with `method`, `path`, `status`, `latency_ms`, and any enabled `client_ip`, `peer_ip`, or `request_id` fields. |
 
 Defaults follow `LogContextConfig::default()`: all fields default to `false`.
@@ -2126,6 +2128,8 @@ Defaults follow `LogContextConfig::default()`: all fields default to `false`.
 posture: enough context to identify noisy clients and understand authentication
 failures. It leaves `request_id`, `credential_fingerprint`,
 `credential_owner`, and `request_completion` off unless you ask for those fields.
+The `session_id_header` policy defaults to `plain`, so enabling full request
+header logging keeps historical behaviour unless you set it to `mask` or `hide`.
 
 Validation rejects `request_log_exclude_paths` entries that are empty or don't
 start with `/`. It also rejects `request_id = true` unless `trusted_proxies` is
@@ -2139,7 +2143,10 @@ Privacy note: this section is a deliberate, documented deviation from the
 pre-3.14.4 RUST_GUIDELINES rule that authentication attempts should include the
 source IP. Client context is now opt-in and off by default. Operators choose
 which fields to add to security-relevant framework lines; the kit still never
-logs raw forwarding headers or credential bytes.
+logs raw forwarding headers or credential bytes. If `log_request_headers` is
+enabled, `session_id_header = "mask"` limits accidental log-leak exposure for
+`Mcp-Session-Id` values, but it is a partial reveal and is no substitute for
+leaving `session_binding = true`.
 
 Rendering rules are stable. Client-supplied strings such as `user_agent` are
 quoted in structured fields, control characters are removed, and long strings
@@ -2181,6 +2188,7 @@ credential_fingerprint = false
 credential_owner = false
 auth_scheme = false
 mcp_hints = false
+session_id_header = "plain"
 request_completion = false
 ```
 
@@ -3123,6 +3131,7 @@ user_agent = true
 credential_fingerprint = false
 auth_scheme = true
 mcp_hints = true
+session_id_header = "plain"  # env: RMCP_SERVER_KIT__SERVER__LOG_CONTEXT__SESSION_ID_HEADER
 
 [server.security_headers]
 # Customise any of the twelve OWASP headers; omit a key to keep the built-in default.
@@ -3337,6 +3346,7 @@ call order is:
 | `RMCP_SERVER_KIT__SERVER__TLS_KEY_PATH` | `server.tls_key_path` | Path | |
 | `RMCP_SERVER_KIT__SERVER__ADMIN_ENABLED` | `server.admin_enabled` | bool | |
 | `RMCP_SERVER_KIT__SERVER__KEY_EVICTION_POLICY` | `server.key_eviction_policy` | KeyEvictionPolicy | |
+| `RMCP_SERVER_KIT__SERVER__LOG_CONTEXT__SESSION_ID_HEADER` | `server.log_context.session_id_header` | SessionIdLogPolicy | |
 | `RMCP_SERVER_KIT__SERVER__SESSION_BINDING_SECRET` | `server.session_binding_secret` | SecretString | secret; redacted in report |
 | `RMCP_SERVER_KIT__SERVER__SESSION_BINDING_SECRET_FILE` | `server.session_binding_secret` | Path | secret; redacted in report |
 | `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ISSUER` | `server.auth.oauth.issuer` | String | requires `oauth` feature |

@@ -6,6 +6,7 @@ use core::{
     net::{IpAddr, SocketAddr},
     num::NonZeroUsize,
     pin::Pin,
+    str::{self, FromStr},
     sync::atomic::{AtomicBool, Ordering},
     task,
     time::Duration,
@@ -22,7 +23,7 @@ use arc_swap::ArcSwap;
 use axum::{
     body::Body,
     extract::{ConnectInfo, FromRequestParts, Request, connect_info::Connected},
-    http::{Extensions, HeaderMap, HeaderName, Method, StatusCode, request::Parts},
+    http::{Extensions, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, request::Parts},
     middleware::Next,
     response::{IntoResponse, Response},
     serve::{IncomingStream, Listener},
@@ -320,12 +321,56 @@ pub struct SecurityHeadersConfig {
     pub strict_transport_security: Option<String>,
 }
 
+/// Logging policy for the `Mcp-Session-Id` request header when full request
+/// header logging is enabled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SessionIdLogPolicy {
+    /// Log the raw `Mcp-Session-Id` header value. This preserves the historical
+    /// request-header logging behaviour.
+    #[default]
+    Plain,
+    /// Log only a partial session-id reveal: values with 16 or more characters
+    /// become `first4...last4`, and shorter values become `[MASKED]`.
+    Mask,
+    /// Omit the `Mcp-Session-Id` header name and value from request-header logs.
+    Hide,
+}
+
+/// Error returned when parsing a session-id header log policy fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SessionIdLogPolicyParseError;
+
+impl Display for SessionIdLogPolicyParseError {
+    #[inline]
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        f.write_str("expected one of: plain, mask, hide")
+    }
+}
+
+impl FromStr for SessionIdLogPolicy {
+    type Err = SessionIdLogPolicyParseError;
+
+    #[inline]
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "plain" => Ok(Self::Plain),
+            "mask" => Ok(Self::Mask),
+            "hide" => Ok(Self::Hide),
+            _ => Err(SessionIdLogPolicyParseError),
+        }
+    }
+}
+
 /// Per-item switches for client-context fields in log lines.
 ///
-/// Every field is off by default: client IPs, user agents and
+/// Every boolean field is off by default: client IPs, user agents and
 /// identifiers are personal data, so each item is an explicit opt-in.
-/// With every knob off, log lines keep their pre-3.14.4 shape. See
-/// [`LogContextConfig::recommended`] for a curated low-risk preset.
+/// With every knob off and [`SessionIdLogPolicy::Plain`], log lines keep their
+/// pre-3.14.4 shape. See [`LogContextConfig::recommended`] for a curated
+/// low-risk preset.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(default)]
 #[serde(deny_unknown_fields)]
@@ -361,6 +406,9 @@ pub struct LogContextConfig {
     /// value) and `mcp_protocol_version` on `auth failed` and
     /// `incoming request` lines.
     pub mcp_hints: bool,
+    /// Controls how the `Mcp-Session-Id` request header is rendered when
+    /// full request-header logging is enabled. Default: [`SessionIdLogPolicy::Plain`].
+    pub session_id_header: SessionIdLogPolicy,
     /// Include `credential_fp` on `auth failed` lines, for Bearer
     /// tokens only: the first 8 hex characters of HMAC-SHA256 keyed
     /// with the RBAC redaction salt. Set `rbac.redaction_salt` for
@@ -391,6 +439,7 @@ impl Default for LogContextConfig {
             user_agent: false,
             auth_scheme: false,
             mcp_hints: false,
+            session_id_header: SessionIdLogPolicy::Plain,
             credential_fingerprint: false,
             credential_owner: false,
             request_completion: false,
@@ -400,7 +449,8 @@ impl Default for LogContextConfig {
 
 impl LogContextConfig {
     /// A curated low-risk preset: enables `client_ip`, `peer_ip`,
-    /// `request_line`, `user_agent`, `auth_scheme` and `mcp_hints`.
+    /// `request_line`, `user_agent`, `auth_scheme` and `mcp_hints`, while
+    /// leaving [`Self::session_id_header`] at [`SessionIdLogPolicy::Plain`].
     /// Leaves `request_id` (needs `trusted_proxies`),
     /// `credential_fingerprint`, `credential_owner` and `request_completion`
     /// off, so the result validates without any other configuration.
@@ -1516,6 +1566,16 @@ impl McpServerConfig {
         self
     }
 
+    /// Set how the `Mcp-Session-Id` request header is rendered when
+    /// [`Self::enable_request_header_logging`] is active. The default is
+    /// [`SessionIdLogPolicy::Plain`] for compatibility.
+    #[must_use]
+    #[inline]
+    pub fn with_session_id_log_policy(mut self, policy: SessionIdLogPolicy) -> Self {
+        self.log_context.session_id_header = policy;
+        self
+    }
+
     /// Replace the list of paths excluded from the `incoming request` /
     /// `request completed` log lines (default: `["/healthz",
     /// "/readyz"]`). Matching is an exact-string comparison against
@@ -2291,10 +2351,7 @@ where
     use anyhow::Context as _;
     use axum::{
         error_handling::HandleErrorLayer,
-        http::{
-            HeaderValue,
-            header::{AUTHORIZATION, CONTENT_TYPE},
-        },
+        http::header::{AUTHORIZATION, CONTENT_TYPE},
         middleware::from_fn,
         routing::get,
     };
@@ -2320,6 +2377,15 @@ where
 
     let allowed_hosts = derive_allowed_hosts(&config.bind_addr, config.public_url.as_deref());
     tracing::info!(allowed_hosts = %allowed_hosts.join(", "), "configured Streamable HTTP allowed hosts");
+
+    if config.log_request_headers
+        && !config.session_binding
+        && config.log_context.session_id_header == SessionIdLogPolicy::Plain
+    {
+        tracing::warn!(
+            "raw MCP session IDs are logged in request headers because session_binding is disabled and session_id_header=plain"
+        );
+    }
 
     if config.max_concurrent_requests.is_none() {
         tracing::warn!(
@@ -4425,8 +4491,6 @@ fn apply_security_header(
     override_value: Option<&str>,
     default: &'static str,
 ) {
-    use axum::http::HeaderValue;
-
     match override_value {
         None => {
             let _previous = headers.insert(name, HeaderValue::from_static(default));
@@ -4469,8 +4533,6 @@ fn apply_security_header(
 pub(crate) fn validate_security_headers(
     cfg: &SecurityHeadersConfig,
 ) -> Result<(), RmcpServerKitError> {
-    use axum::http::HeaderValue;
-
     let fields: &[(&str, Option<&str>)] = &[
         (
             "x_content_type_options",
@@ -4554,7 +4616,7 @@ pub(crate) fn validate_security_headers(
 /// is synchronous, so cancellation simply drops the response before it is sent.
 #[cfg(feature = "oauth")]
 async fn oauth_token_cache_headers_middleware(req: Request<Body>, next: Next) -> Response {
-    use axum::http::{HeaderValue, header};
+    use axum::http::header;
 
     let mut resp = next.run(req).await;
     let headers = resp.headers_mut();
@@ -4686,8 +4748,7 @@ pub(crate) fn validate_trusted_proxy_entry(entry: &str) -> Result<(), String> {
 ///
 /// Requires a
 /// syntactically valid HTTP header name that is neither one of
-/// [`REDACTED_LOG_HEADERS`] nor `mcp-session-id` (the session ID must
-/// never reach a log line). Shared by the builder
+/// [`REDACTED_LOG_HEADERS`] nor `mcp-session-id`. Shared by the builder
 /// ([`McpServerConfig::check_trusted_forwarder`]) and the TOML
 /// validator so the two cannot drift.
 ///
@@ -5233,6 +5294,8 @@ struct RequestLogFields {
     mcp_session: Option<bool>,
     /// MCP protocol version header value, when hints are enabled.
     mcp_protocol_version: Option<String>,
+    /// Session-id request-header rendering policy.
+    session_id_header: SessionIdLogPolicy,
 }
 
 /// Build the [`RequestLogFields`] for `req` from the configured selectors.
@@ -5257,6 +5320,7 @@ fn request_log_fields(cfg: &LogContextConfig, req: &Request<Body>) -> RequestLog
             .flatten(),
         mcp_session: cfg.mcp_hints.then_some(mcp_session),
         mcp_protocol_version,
+        session_id_header: cfg.session_id_header,
     }
 }
 
@@ -5326,7 +5390,7 @@ fn log_incoming_request(
             request_id = fields.request_id.as_deref(),
             mcp_session = fields.mcp_session,
             mcp_protocol_version = fields.mcp_protocol_version.as_deref(),
-            headers = %format_request_headers_for_log(headers),
+            headers = %format_request_headers_for_log(headers, fields.session_id_header),
             "incoming request"
         );
     } else {
@@ -5361,19 +5425,61 @@ const REDACTED_LOG_HEADERS: [&str; 6] = [
 
 /// Render the request header set for logging, redacting credential and
 /// forwarding headers.
-fn format_request_headers_for_log(headers: &HeaderMap) -> String {
+fn format_request_headers_for_log(
+    headers: &HeaderMap,
+    session_id_policy: SessionIdLogPolicy,
+) -> String {
     headers
         .iter()
-        .map(|(key, value)| {
+        .filter_map(|(key, value)| {
             let name = key.as_str();
             if REDACTED_LOG_HEADERS.contains(&name) {
-                format!("{name}: [REDACTED]")
+                Some(format!("{name}: [REDACTED]"))
+            } else if name == "mcp-session-id" {
+                render_session_id_header_for_log(
+                    name,
+                    header_value_for_log(value),
+                    session_id_policy,
+                )
             } else {
-                format!("{name}: {}", value.to_str().unwrap_or("<non-utf8>"))
+                Some(format!("{name}: {}", header_value_for_log(value)))
             }
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Return a header value as UTF-8 text for log rendering.
+fn header_value_for_log(value: &HeaderValue) -> &str {
+    str::from_utf8(value.as_bytes()).unwrap_or("<non-utf8>")
+}
+
+/// Render a session-id header according to the configured policy.
+fn render_session_id_header_for_log(
+    name: &str,
+    value: &str,
+    policy: SessionIdLogPolicy,
+) -> Option<String> {
+    match policy {
+        SessionIdLogPolicy::Plain => Some(format!("{name}: {value}")),
+        SessionIdLogPolicy::Mask => Some(format!("{name}: {}", mask_session_id_for_log(value))),
+        SessionIdLogPolicy::Hide => None,
+    }
+}
+
+/// Mask a session ID without splitting UTF-8 code points.
+fn mask_session_id_for_log(value: &str) -> String {
+    if value.chars().count() < 16 {
+        return "[MASKED]".to_owned();
+    }
+
+    let first = value.chars().take(4).collect::<String>();
+    let mut tail = ['\0'; 4];
+    for (slot, ch) in tail.iter_mut().zip(value.chars().rev().take(4)) {
+        *slot = ch;
+    }
+    let last = tail.into_iter().rev().collect::<String>();
+    format!("{first}...{last}")
 }
 
 // -- stdio transport --
@@ -7048,9 +7154,11 @@ mod tests {
     fn log_context_credential_owner_defaults_off_and_not_recommended() -> anyhow::Result<()> {
         let default = LogContextConfig::default();
         assert!(!default.credential_owner, "default must be off");
+        assert_eq!(default.session_id_header, SessionIdLogPolicy::Plain);
 
         let recommended = LogContextConfig::recommended();
         assert!(!recommended.credential_owner, "recommended must be off");
+        assert_eq!(recommended.session_id_header, SessionIdLogPolicy::Plain);
 
         Ok(())
     }
@@ -7565,8 +7673,6 @@ mod tests {
     /// characters, and dropped entirely when they are not valid UTF-8.
     #[tokio::test]
     async fn request_id_sanitized_and_bounded() -> anyhow::Result<()> {
-        use axum::http::HeaderValue;
-
         let app = request_id_probe_router(Some(request_id_resolver(Some("x-request-id"))?));
         let sanitized = app
             .clone()
@@ -8582,7 +8688,7 @@ mod tests {
         let _previous_cookie = headers.insert("cookie", "sid=abc".parse()?);
         let _previous_request_id = headers.insert("x-request-id", "req-123".parse()?);
 
-        let out = format_request_headers_for_log(&headers);
+        let out = format_request_headers_for_log(&headers, SessionIdLogPolicy::Plain);
         assert!(out.contains("authorization: [REDACTED]"));
         assert!(out.contains("cookie: [REDACTED]"));
         assert!(out.contains("x-request-id: req-123"));
@@ -8602,7 +8708,7 @@ mod tests {
         let _previous_xri = headers.insert("x-real-ip", "203.0.113.9".parse()?);
         let _previous_request_id = headers.insert("x-request-id", "req-123".parse()?);
 
-        let out = format_request_headers_for_log(&headers);
+        let out = format_request_headers_for_log(&headers, SessionIdLogPolicy::Plain);
         for name in ["forwarded", "x-forwarded-for", "x-real-ip"] {
             assert!(
                 out.contains(&format!("{name}: [REDACTED]")),
@@ -8614,6 +8720,84 @@ mod tests {
             "no forwarded address may survive redaction; got {out}"
         );
         assert!(out.contains("x-request-id: req-123"));
+
+        Ok(())
+    }
+
+    /// Pins that request-header logging applies the configured session-id policy.
+    #[test]
+    fn format_request_headers_applies_session_id_policy() -> anyhow::Result<()> {
+        let mut plain_headers = HeaderMap::new();
+        let _previous_plain = plain_headers.insert("mcp-session-id", "plain-session-123".parse()?);
+        let plain = format_request_headers_for_log(&plain_headers, SessionIdLogPolicy::Plain);
+        assert!(
+            plain.contains("mcp-session-id: plain-session-123"),
+            "{plain}"
+        );
+
+        let mut boundary_headers = HeaderMap::new();
+        let _previous_boundary =
+            boundary_headers.insert("mcp-session-id", "abcdefghijklmnop".parse()?);
+        let boundary = format_request_headers_for_log(&boundary_headers, SessionIdLogPolicy::Mask);
+        assert!(
+            boundary.contains("mcp-session-id: abcd...mnop"),
+            "{boundary}"
+        );
+        assert!(!boundary.contains("efghijkl"), "{boundary}");
+
+        let mut short_headers = HeaderMap::new();
+        let _previous_short = short_headers.insert("mcp-session-id", "short-id-15xxxx".parse()?);
+        let short = format_request_headers_for_log(&short_headers, SessionIdLogPolicy::Mask);
+        assert!(short.contains("mcp-session-id: [MASKED]"), "{short}");
+        assert!(!short.contains("short-id-15xxxx"), "{short}");
+
+        let mut long_headers = HeaderMap::new();
+        let _previous_long = long_headers.insert("mcp-session-id", "abcdefghijklmnopq".parse()?);
+        let long = format_request_headers_for_log(&long_headers, SessionIdLogPolicy::Mask);
+        assert!(long.contains("mcp-session-id: abcd...nopq"), "{long}");
+        assert!(!long.contains("efghijklm"), "{long}");
+
+        let mut unicode_headers = HeaderMap::new();
+        let unicode_value =
+            HeaderValue::from_bytes("\u{e5}\u{df}\u{e7}\u{111}\u{e9}fghijklmnop".as_bytes())?;
+        let _previous_unicode = unicode_headers.insert("mcp-session-id", unicode_value);
+        let unicode = format_request_headers_for_log(&unicode_headers, SessionIdLogPolicy::Mask);
+        assert!(
+            unicode.contains("mcp-session-id: \u{e5}\u{df}\u{e7}\u{111}...mnop"),
+            "{unicode}"
+        );
+
+        let mut hidden_headers = HeaderMap::new();
+        let _previous_hidden =
+            hidden_headers.insert("mcp-session-id", "hidden-session-123".parse()?);
+        let hidden = format_request_headers_for_log(&hidden_headers, SessionIdLogPolicy::Hide);
+        assert!(!hidden.contains("mcp-session-id"), "{hidden}");
+        assert!(!hidden.contains("hidden-session-123"), "{hidden}");
+
+        Ok(())
+    }
+
+    /// Pins that startup warns only when raw session IDs are header-logged
+    /// without session binding.
+    #[test]
+    fn startup_warns_for_plain_session_id_header_logging_without_binding() -> anyhow::Result<()> {
+        for (policy, session_binding, should_warn) in [
+            (SessionIdLogPolicy::Plain, false, true),
+            (SessionIdLogPolicy::Plain, true, false),
+            (SessionIdLogPolicy::Mask, false, false),
+            (SessionIdLogPolicy::Hide, false, false),
+        ] {
+            let logs = CapturedLogs::default();
+            let _guard = capture_debug_logs(logs.clone());
+            let _app = reqlog_router(|cfg| {
+                cfg.enable_request_header_logging()
+                    .with_session_binding(session_binding)
+                    .with_session_id_log_policy(policy)
+            })?;
+            let warnings =
+                logs.lines_containing("raw MCP session IDs are logged in request headers");
+            assert_eq!(warnings.is_empty(), !should_warn, "policy={policy:?}");
+        }
 
         Ok(())
     }
@@ -8982,8 +9166,6 @@ mod tests {
     /// `Vary: Accept-Encoding` header.
     #[cfg(feature = "oauth")]
     async fn vary_accept_encoding_handler() -> Response {
-        use axum::http::HeaderValue;
-
         let mut response = Response::new(Body::from("{}"));
         let _previous = response
             .headers_mut()
