@@ -702,7 +702,8 @@ file-system operation.
 
 **Threat model:** a local principal with write access to the audit log's
 parent directory (or a path component above it) could otherwise redirect
-where the audit log actually lands, by planting a symlink at the configured
+where the audit log actually lands, by planting a symlink (or, on Windows,
+any reparse point - a junction or mount point included) at the configured
 path pointing somewhere they control or want to see written to; by planting
 a special file (device, FIFO, socket) that behaves unexpectedly when opened
 for append; or by pre-creating a regular file they own at that path so the
@@ -722,6 +723,20 @@ writer thread is spawned, so a rejected target is never written to. Strict
 initialization fails startup on any of these failures; the deprecated lenient
 initializer installs no audit sink at all rather than writing to an
 unprotected one.
+
+On Windows, opening the audit log refuses a reparse point at the final path
+component - a symbolic link, a junction, a mount point, or any other
+reparse tag - in two steps: a pre-check before the open, and an attribute
+check on the already-opened handle, so a swap between the two does not
+slip a reparse point past the first check alone. Neither check ever
+deletes anything: a rejected reparse point is never removed. The open
+creates the file when it does not exist; the protected owner-only DACL is
+applied only once both checks have passed, and if that DACL step fails the
+file is deleted best-effort, but only when this call created it - a
+pre-existing file that fails DACL hardening is left in place rather than
+destroyed, matching the Unix policy of never deleting something this
+process did not create. A symlinked *parent* directory is still traversed;
+only the final component is protected, as on Unix.
 
 A pre-existing audit-log path owned by another local user - an init
 container or provisioning step that ran as root, a sidecar, a shared

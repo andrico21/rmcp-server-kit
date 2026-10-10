@@ -1255,8 +1255,13 @@ credential material, so it is created with owner-only permissions.
   checks, at which point it is corrected to `0o600` with `fchmod` on that
   handle. Nothing is written to the handle before every check has passed,
   and a symlink's target is never opened, chmodded, or written to.
-- **Windows:** the file is created and a protected owner-only DACL is applied
-  immediately afterwards, discarding inherited ACEs.
+- **Windows:** opening the audit log refuses a reparse point at the final
+  path component (a symbolic link, junction, mount point, or any other
+  reparse tag; a symlinked *parent* directory is still traversed) - checked
+  both before the open and again on the opened handle, so a swap between
+  the two does not slip through. The open creates the file when it does
+  not exist, and once both checks have passed a protected owner-only DACL
+  is applied immediately afterwards, discarding inherited ACEs.
 
 **These are not equivalent.** Rust's standard library cannot pass
 `SECURITY_ATTRIBUTES` to file creation ([rust-lang/libs-team#324]), so Windows
@@ -1264,9 +1269,13 @@ has no safe creation-time equivalent of `mode(0o600)`. The Windows path
 therefore leaves a small create-then-harden race that Unix does not have: it
 removes the *persistent* exposure, not the momentary one.
 
-If Windows ACL hardening fails, startup fails and the crate attempts to delete
-the unprotected file. The error reports whether that deletion succeeded, so you
-can tell whether an unprotected audit log may remain at that path.
+If Windows ACL hardening fails, startup fails and, only when this call
+created the file, the crate attempts to delete it; a pre-existing file that
+fails hardening is left in place rather than deleted. The error reports
+which of those applies and, when deletion was attempted, whether it
+succeeded, so you can tell whether an unprotected file, or an untouched
+pre-existing one, may remain at that path. A rejected reparse point is
+never deleted.
 
 On Unix, a hardening failure never deletes anything: the mode is applied
 atomically at creation, so a file this process creates is never exposed at a

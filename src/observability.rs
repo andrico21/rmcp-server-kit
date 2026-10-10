@@ -78,7 +78,9 @@ impl FormatTime for LocalTime {
 /// cannot be hardened to an owner-only regular file, no audit writer is
 /// installed at all, on any platform, rather than writing audit events to
 /// an unprotected or attacker-controlled target. On Unix this includes a
-/// regular file with more than one hard link.
+/// regular file with more than one hard link. On Windows this includes a
+/// reparse point at the final path component (a symbolic link, junction,
+/// mount point, or any other reparse tag).
 ///
 /// # Errors
 ///
@@ -200,8 +202,13 @@ impl Drop for TracingGuard {
 /// this way when the configured path is a symlink at its final component,
 /// is not a regular file (a device, FIFO, or socket), is a pre-existing
 /// file not owned by this process's effective user, has more than one hard
-/// link, or its permissions cannot be hardened to `0o600`; see the
-/// "Audit-log file permissions" section of the guide for the full contract.
+/// link, or its permissions cannot be hardened to `0o600`. On Windows,
+/// opening the audit log also fails this way when the configured path is a
+/// reparse point at its final component (a symbolic link, junction, mount
+/// point, or any other reparse tag) - checked both before the open and
+/// again on the opened handle - or when applying the owner-only DACL
+/// fails. See the "Audit-log file permissions" section of the guide for
+/// the full contract.
 #[inline]
 pub fn init_tracing_from_config_strict(
     config: &ObservabilityConfig,
@@ -904,6 +911,94 @@ fn set_audit_file_mode(fd: &OwnedFd) -> RustixIoResult<()> {
     fchmod(fd, Mode::RUSR | Mode::WUSR)
 }
 
+/// Win32 `FILE_ATTRIBUTE_REPARSE_POINT` (`0x400`).
+///
+/// Set in a file or directory's attributes whenever it is a reparse point
+/// of ANY tag - a symbolic link, a junction, a mount point, or a
+/// filesystem-specific tag such as a cloud-file placeholder or a
+/// deduplicated file. Deliberately the raw attribute bit, not
+/// `std::fs::FileType::is_symlink`, which is true only for reparse tags
+/// carrying the `NAME_SURROGATE` bit (symlinks and junctions): testing the
+/// raw bit instead refuses every reparse point, including the ones
+/// `is_symlink` would silently let through.
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+/// Win32 `FILE_FLAG_OPEN_REPARSE_POINT` (`0x0020_0000`): opens a reparse
+/// point itself instead of transparently following it to its target.
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+/// True when `metadata` names a reparse point of any tag. See
+/// [`FILE_ATTRIBUTE_REPARSE_POINT`] for why the raw bit is tested instead
+/// of `FileType::is_symlink`.
+#[cfg(windows)]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+/// Shared rejection message for both the pre-check and the handle check, so
+/// a caller sees the identical wording regardless of which one fired.
+#[cfg(windows)]
+fn reparse_point_rejection(path: &Path) -> String {
+    format!(
+        "audit log path {} is a reparse point (a symbolic link, junction, \
+         mount point, or another reparse tag); refusing to use it",
+        path.display()
+    )
+}
+
+/// Open `path` for append, creating it if absent, refusing to follow a
+/// reparse point either way.
+///
+/// Returns the open handle together with whether THIS call created the
+/// file (`true`) or opened a pre-existing one (`false`); see
+/// [`create_private_audit_file`] for why that distinction decides whether
+/// a later hardening failure may delete the file.
+///
+/// # Errors
+///
+/// Returns `Err` when neither a fresh creation nor an open of an existing
+/// file succeeds.
+#[cfg(windows)]
+fn open_or_create_audit_handle(path: &Path) -> Result<(fs::File, bool), String> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    // `create_new(true)` is the only way this call can PROVE it created the
+    // file: `CREATE_NEW` fails with `AlreadyExists` on any existing name,
+    // reparse point included, so success here is proof of creation; a
+    // `symlink_metadata` pre-check that merely observed `NotFound` would be
+    // racy (a TOCTOU swap between that check and this open). `custom_flags`
+    // requests `FILE_FLAG_OPEN_REPARSE_POINT` explicitly; std also ORs it
+    // into the flags whenever `create_new` is set, so it is redundant on
+    // this branch and required on the fallback branch below.
+    match fs::OpenOptions::new()
+        .create_new(true)
+        .append(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+    {
+        Ok(file) => Ok((file, true)),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => fs::OpenOptions::new()
+            .append(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map(|file| (file, false))
+            .map_err(|open_error| {
+                format!(
+                    "failed to open audit log file {}: {open_error}",
+                    path.display()
+                )
+            }),
+        Err(error) => Err(format!(
+            "failed to open audit log file {}: {error}",
+            path.display()
+        )),
+    }
+}
+
 /// Create (or append to) the audit log with an owner-only DACL.
 ///
 /// SECURITY: Windows has no safe creation-time equivalent of `mode(0o600)`.
@@ -913,10 +1008,30 @@ fn set_audit_file_mode(fd: &OwnedFd) -> RustixIoResult<()> {
 /// create-then-harden window the Unix path does not have: this removes the
 /// *persistent* exposure, not the momentary one. It is not parity.
 ///
-/// If hardening fails once the file exists, the file is deleted best-effort and
-/// the error states whether that succeeded, so an operator knows whether an
-/// unprotected audit log may remain on disk. Continuing instead would recreate
-/// the silent security-control failure this replaced.
+/// Before that window opens, this refuses a reparse point at the final path
+/// component - a symbolic link, a junction, a mount point, or any other
+/// reparse tag - in two steps: a `symlink_metadata` pre-check (never
+/// follows the final component) and, after an open that also never follows
+/// it (`FILE_FLAG_OPEN_REPARSE_POINT`), an attribute check on the opened
+/// handle itself, closing the gap a pre-check alone would leave open to a
+/// swap between the two. Neither check ever deletes anything: a rejected
+/// reparse point is never removed. A symlinked *parent* directory is still
+/// traversed; only the final component is protected, matching the Unix
+/// path.
+///
+/// If hardening fails once the file exists, the file is deleted best-effort
+/// only when THIS call created it; a pre-existing file that fails hardening
+/// is left in place, since deleting it would destroy something this
+/// process did not create, for no security benefit. The error states
+/// whether deletion was attempted and whether it succeeded, so an operator
+/// knows whether an unprotected file, or an untouched pre-existing one, may
+/// remain at that path.
+///
+/// # Errors
+///
+/// Returns `Err` when the path is a reparse point (checked both before and
+/// after the open), when opening or inspecting the file fails, or when
+/// applying the owner-only DACL fails.
 #[cfg(windows)]
 fn create_private_audit_file(path: &Path) -> Result<fs::File, String> {
     use std::ffi::OsString;
@@ -924,23 +1039,52 @@ fn create_private_audit_file(path: &Path) -> Result<fs::File, String> {
     use windows_permissions::{
         LocalBox, SecurityDescriptor,
         constants::{SeObjectType, SecurityInformation},
+        utilities::current_process_sid,
         wrappers,
     };
 
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|e| format!("failed to open audit log file {}: {e}", path.display()))?;
+    match fs::symlink_metadata(path) {
+        Ok(existing) if is_reparse_point(&existing) => {
+            return Err(reparse_point_rejection(path));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect audit log path {}: {error}",
+                path.display()
+            ));
+        }
+    }
+
+    let (file, created_by_this_call) = open_or_create_audit_handle(path)?;
+
+    // A TOCTOU swap between the pre-check above and this open would slip
+    // past it; the open used `FILE_FLAG_OPEN_REPARSE_POINT`, so this reads
+    // the reparse point's own attributes, never the target's.
+    let opened_metadata = file.metadata().map_err(|metadata_error| {
+        format!(
+            "failed to inspect the opened audit log handle for {}: {metadata_error}",
+            path.display()
+        )
+    })?;
+    if is_reparse_point(&opened_metadata) {
+        drop(file);
+        return Err(reparse_point_rejection(path));
+    }
 
     let harden = || -> Result<(), String> {
-        let sid = windows_permissions::utilities::current_process_sid()
-            .map_err(|e| format!("cannot determine the current process SID: {e}"))?;
+        let sid = current_process_sid().map_err(|sid_error| {
+            format!("cannot determine the current process SID: {sid_error}")
+        })?;
         // `D:P` protects the DACL, discarding inherited ACEs; a single
         // FA (full access) ACE for this process's SID is the owner-only grant.
-        let sd: LocalBox<SecurityDescriptor> = format!("D:P(A;;FA;;;{sid})")
-            .parse()
-            .map_err(|e| format!("cannot build an owner-only security descriptor: {e}"))?;
+        let sd: LocalBox<SecurityDescriptor> =
+            format!("D:P(A;;FA;;;{sid})")
+                .parse()
+                .map_err(|parse_error| {
+                    format!("cannot build an owner-only security descriptor: {parse_error}")
+                })?;
         let dacl = sd
             .dacl()
             .ok_or_else(|| "owner-only security descriptor carried no DACL".to_owned())?;
@@ -954,19 +1098,24 @@ fn create_private_audit_file(path: &Path) -> Result<fs::File, String> {
             Some(dacl),
             None,
         )
-        .map_err(|e| format!("cannot apply the owner-only DACL: {e}"))
+        .map_err(|set_error| format!("cannot apply the owner-only DACL: {set_error}"))
     };
 
     match harden() {
         Ok(()) => Ok(file),
         Err(reason) => {
             drop(file);
-            let cleanup = match fs::remove_file(path) {
-                Ok(()) => "the unprotected file was deleted".to_owned(),
-                Err(e) => format!(
-                    "the unprotected file could NOT be deleted and may remain at {}: {e}",
-                    path.display()
-                ),
+            let cleanup = if created_by_this_call {
+                match fs::remove_file(path) {
+                    Ok(()) => "the unprotected file this call created was deleted".to_owned(),
+                    Err(remove_error) => format!(
+                        "the unprotected file this call created could NOT be deleted \
+                         and may remain at {}: {remove_error}",
+                        path.display()
+                    ),
+                }
+            } else {
+                "a pre-existing file at this path was left in place, not deleted".to_owned()
             };
             Err(format!(
                 "audit log ACL hardening failed for {}: {reason}; {cleanup}",
@@ -2133,6 +2282,156 @@ mod tests {
         );
 
         fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
+    }
+
+    /// Pins that a pre-existing regular audit-log file is still accepted
+    /// through the open-existing fallback of `open_or_create_audit_handle`
+    /// (strict init returns only when the DACL step succeeded) and that
+    /// its contents are not altered.
+    #[test]
+    #[cfg(windows)]
+    fn windows_preexisting_audit_file_is_accepted_without_alteration() -> anyhow::Result<()> {
+        let dir = unique_temp_path("audit-preexisting")?;
+        fs::create_dir_all(&dir).context("create preexisting-file temp dir")?;
+        let audit_path = dir.join("audit.log");
+        fs::write(&audit_path, b"pre-existing audit content\n")
+            .context("write pre-existing audit file")?;
+        let config = observability_config(Some(audit_path.clone()));
+
+        let setup = prepare_tracing_audit_strict(&config)
+            .context("a pre-existing regular audit file must still be accepted")?;
+        drop(setup.guard);
+
+        assert!(
+            audit_path.exists(),
+            "the pre-existing audit file must not be deleted"
+        );
+        let contents = fs::read(&audit_path).context("read audit file contents")?;
+        assert_eq!(
+            contents, b"pre-existing audit content\n",
+            "opening for append must not truncate or alter pre-existing contents"
+        );
+
+        fs::remove_dir_all(&dir).context("remove preexisting-file temp dir")?;
+
+        Ok(())
+    }
+
+    /// Pins that a junction at the final path component is refused before
+    /// any write, naming the specific reparse-point rejection (a directory
+    /// cannot be opened for append anyway, so only that specific message
+    /// proves the reparse-point check ran before any open attempt), and
+    /// that the junction and its target directory both survive untouched.
+    /// Creating a junction needs no special privilege on Windows.
+    #[test]
+    #[cfg(windows)]
+    fn windows_junctioned_audit_path_is_rejected_before_any_write() -> anyhow::Result<()> {
+        let dir = unique_temp_path("audit-junction")?;
+        fs::create_dir_all(&dir).context("create junction base dir")?;
+        let target_dir = dir.join("junction-target");
+        fs::create_dir_all(&target_dir).context("create junction target dir")?;
+        let link_path = dir.join("audit.log");
+
+        let status = process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&link_path)
+            .arg(&target_dir)
+            .status()
+            .context("spawn mklink /J to build this test's junction fixture")?;
+        assert!(
+            status.success(),
+            "mklink /J must succeed to set up this test's fixture; got {status:?}"
+        );
+
+        let config = observability_config(Some(link_path.clone()));
+        let err = prepare_tracing_audit_strict(&config)
+            .err()
+            .context("a junctioned audit path must fail closed with Startup")?;
+        let msg = err.to_string();
+        assert!(
+            msg.contains("reparse point"),
+            "error must name the reparse-point rejection; got {msg:?}"
+        );
+
+        assert!(
+            link_path.exists(),
+            "the junction itself must still exist after the rejection"
+        );
+        assert!(
+            target_dir.exists(),
+            "the junction's target directory must still exist after the rejection"
+        );
+
+        fs::remove_dir(&link_path)
+            .context("remove the junction without recursing into its target")?;
+        fs::remove_dir_all(&dir).context("remove junction temp dir")?;
+
+        Ok(())
+    }
+
+    /// Pins that a file symlink at the final path component is refused
+    /// before any write, naming the specific reparse-point rejection, and
+    /// that the symlink's target file and contents survive untouched.
+    /// Creating a file symlink needs `SeCreateSymbolicLinkPrivilege` or
+    /// Developer Mode; when the runner grants neither, `symlink_file` fails
+    /// with raw OS error 1314 (`ERROR_PRIVILEGE_NOT_HELD`), which this test
+    /// detects and returns early from rather than failing for a privilege
+    /// it does not control. That raw code, not `io::ErrorKind`, is the
+    /// correct check: std's own `decode_error_kind` has no match arm for
+    /// 1314, so it falls through to `ErrorKind::Uncategorized`, and std's
+    /// own test suite (`library/std/src/fs/tests.rs`) checks
+    /// `raw_os_error() == Some(1314)` for exactly this reason. The skip is
+    /// silent (no output) because libtest captures the output of a
+    /// passing test.
+    #[test]
+    #[cfg(windows)]
+    fn windows_symlinked_audit_path_is_rejected_before_any_write() -> anyhow::Result<()> {
+        const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+
+        let dir = unique_temp_path("audit-symlink")?;
+        fs::create_dir_all(&dir).context("create symlink base dir")?;
+        let target_path = dir.join("target.log");
+        let link_path = dir.join("audit.log");
+        fs::write(&target_path, b"pre-existing target contents\n")
+            .context("write symlink target")?;
+
+        if let Err(error) = std::os::windows::fs::symlink_file(&target_path, &link_path) {
+            if error.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) {
+                fs::remove_dir_all(&dir).context("remove symlink temp dir")?;
+                return Ok(());
+            }
+            return Err(error).context("create file symlink fixture");
+        }
+
+        let config = observability_config(Some(link_path.clone()));
+        let err = prepare_tracing_audit_strict(&config)
+            .err()
+            .context("a symlinked audit path must fail closed with Startup")?;
+        let msg = err.to_string();
+        assert!(
+            msg.contains("reparse point"),
+            "error must name the reparse-point rejection; got {msg:?}"
+        );
+
+        let contents = fs::read(&target_path).context("read symlink target contents")?;
+        assert_eq!(
+            contents, b"pre-existing target contents\n",
+            "the symlink target file's contents must be unchanged"
+        );
+        assert!(
+            link_path.exists(),
+            "the symlink itself must still exist after the rejection"
+        );
+        assert!(
+            target_path.exists(),
+            "the symlink target file must still exist after the rejection"
+        );
+
+        fs::remove_dir_all(&dir).context("remove symlink temp dir")?;
 
         Ok(())
     }
