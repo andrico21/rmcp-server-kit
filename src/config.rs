@@ -1708,6 +1708,7 @@ fn validate_rate_limit_knobs(server: &ServerConfig) -> RmcpResult<()> {
     }
     if let Some(auth) = server.auth.as_ref() {
         auth.check_oauth_feature()?;
+        auth.check_verification_wait()?;
     }
     if let Some(rl) = server
         .auth
@@ -3016,6 +3017,8 @@ client_ip = false
                 api_keys: Vec::new(),
                 mtls: Some(mtls),
                 rate_limit: None,
+                max_concurrent_verifications: None,
+                verification_wait: Duration::from_secs(1),
                 #[cfg(feature = "oauth")]
                 oauth: None,
                 #[cfg(not(feature = "oauth"))]
@@ -3126,6 +3129,76 @@ client_ip = false
             anyhow::bail!("zero pre_auth_max_per_minute must be rejected");
         };
         assert_config_nonzero_error(err, "auth.rate_limit.pre_auth_max_per_minute")
+    }
+
+    #[test]
+    /// Pins that a zero `verification_wait` is rejected by the TOML preflight.
+    fn rejects_zero_verification_wait() -> anyhow::Result<()> {
+        let mut auth = AuthConfig::with_keys(vec![]);
+        auth.verification_wait = Duration::ZERO;
+        let cfg = ServerConfig {
+            auth: Some(auth),
+            ..ServerConfig::default()
+        };
+        let Err(err) = validate_server_config(&cfg) else {
+            anyhow::bail!("zero verification_wait must be rejected");
+        };
+        assert!(
+            err.to_string().contains("verification_wait"),
+            "error must name verification_wait: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    /// Pins that `max_concurrent_verifications` and `verification_wait`
+    /// deserialize from TOML, and that a typo'd key is still rejected by
+    /// `deny_unknown_fields`.
+    fn auth_toml_parses_admission_control_knobs() -> anyhow::Result<()> {
+        use core::num::NonZeroUsize;
+
+        let server = toml::from_str::<ServerConfig>(
+            r#"
+                listen_port = 8080
+
+                [auth]
+                enabled = true
+                max_concurrent_verifications = 8
+                verification_wait = "2s"
+            "#,
+        )
+        .context("auth table with the new admission-control knobs must parse")?;
+        let auth = server.auth.context("auth must be Some")?;
+        assert_eq!(
+            auth.max_concurrent_verifications.map(NonZeroUsize::get),
+            Some(8),
+            "max_concurrent_verifications must parse to 8"
+        );
+        assert_eq!(
+            auth.verification_wait,
+            Duration::from_secs(2),
+            "verification_wait must parse humantime \"2s\" to 2 seconds"
+        );
+
+        let Err(err) = toml::from_str::<ServerConfig>(
+            "
+                listen_port = 8080
+
+                [auth]
+                enabled = true
+                max_concurrent_verification = 8
+            ",
+        ) else {
+            anyhow::bail!(
+                "a typo'd key (missing trailing 's') must still be rejected by \
+                 deny_unknown_fields"
+            );
+        };
+        assert!(
+            err.to_string().contains("unknown field"),
+            "error must name the unknown field: {err}"
+        );
+        Ok(())
     }
 
     #[test]

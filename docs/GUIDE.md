@@ -313,11 +313,15 @@ let auth = AuthConfig::with_keys(vec![
     ApiKeyEntry::new("readonly", ro_hash, "viewer"),
 ]);
 
-// With rate limiting
+// With rate limiting. API-key auth without rate limiting is unsafe on a
+// reachable listener: every bearer attempt runs an Argon2id verification
+// per configured key (see "Argon2id verification admission control"
+// below). `with_pre_auth_burst(10)` caps the initial unauthenticated wave
+// admitted to that work at 10, well below the default of 300.
 let auth = AuthConfig::with_keys(vec![
     ApiKeyEntry::new("admin", hash, "admin"),
 ])
-.with_rate_limit(RateLimitConfig::new(30));
+.with_rate_limit(RateLimitConfig::new(30).with_pre_auth_burst(10));
 ```
 
 ##### Fields
@@ -328,6 +332,8 @@ let auth = AuthConfig::with_keys(vec![
 | `api_keys` | `Vec<ApiKeyEntry>` | `[]` | Bearer token API keys |
 | `mtls` | `Option<MtlsConfig>` | `None` | mTLS client cert config |
 | `rate_limit` | `Option<RateLimitConfig>` | `None` | Auth attempt rate limit |
+| `max_concurrent_verifications` | `Option<NonZeroUsize>` | `None` (resolves to `available_parallelism()` clamped `1..=16`) | Bounds concurrent Argon2id API-key verifications |
+| `verification_wait` | humantime duration | `"1s"` | Max time a request waits for a verification permit before `503` |
 | `oauth` | `Option<OAuthConfig>` | `None` | OAuth 2.1 (feature: `oauth`) |
 
 ##### Constructors
@@ -337,6 +343,38 @@ let auth = AuthConfig::with_keys(vec![
 | `AuthConfig::default()` | Disabled (no auth enforced) |
 | `AuthConfig::with_keys(keys)` | Enabled with API keys |
 | `.with_rate_limit(config)` | Builder: attach rate limiting |
+| `.with_max_concurrent_verifications(n)` | Builder: override the Argon2id verification permit count |
+| `.with_verification_wait(duration)` | Builder: override the permit-wait timeout (must be > 0) |
+
+#### Argon2id verification admission control
+
+Every bearer-token attempt runs one Argon2id verification per configured
+API key on the blocking thread pool (~72 ms and ~21 MiB per verification
+with this crate's default cost parameters). `AuthState` bounds concurrent
+admission into that work with a permit pool so a flood of invalid bearer
+tokens cannot grow memory use without limit:
+
+- `max_concurrent_verifications` (default: `available_parallelism()`
+  clamped to `1..=16`) is the maximum number of Argon2id verifications
+  running at once. Peak memory from this path is therefore bounded by
+  roughly `max_concurrent_verifications * 21 MiB`, plus overhead.
+- A request that cannot get a permit within `verification_wait` (default 1
+  second) receives `503 Service Unavailable` with `Retry-After: 1` and a
+  generic body - never a `401`, never a hang, and this outcome is counted
+  separately in `/admin/auth/counters` (`failure_overloaded`) rather than
+  as a credential failure, so it does not consume the post-failure
+  rate-limit budget.
+- This bound is independent of, and composes with, [`RateLimitConfig`'s
+  pre-auth gate](#ratelimitconfig) (which throttles by source IP before
+  any Argon2id work runs) and [`max_concurrent_requests`](#mcpserverconfig)
+  (which bounds total in-flight requests of every kind). The permit pool
+  is the only one of the three that bounds Argon2id memory directly,
+  independent of source IP or client count.
+- There is no default-on limiter and no opt-out for the permit pool
+  itself: sizing is always explicit via `max_concurrent_verifications` and
+  `verification_wait`. It mitigates a sustained flood's resource cost; it
+  does not eliminate the flood itself - see
+  [`SECURITY.md`](../SECURITY.md#argon2id-verification-admission-control).
 
 #### `ApiKeyEntry`
 
@@ -2922,7 +2960,7 @@ constraints.
 
 ```rust,ignore
 use std::sync::Arc;
-use rmcp_server_kit::auth::{ApiKeyEntry, AuthConfig, generate_api_key};
+use rmcp_server_kit::auth::{ApiKeyEntry, AuthConfig, RateLimitConfig, generate_api_key};
 use rmcp_server_kit::rbac::{ArgumentAllowlist, RbacConfig, RbacPolicy, RoleConfig};
 
 // In production, load pre-generated PHC hashes from config instead.
@@ -2932,7 +2970,10 @@ let (viewer_token, viewer_hash) = generate_api_key()?;
 let auth = AuthConfig::with_keys(vec![
     ApiKeyEntry::new("admin-key", admin_hash, "admin"),
     ApiKeyEntry::new("viewer-key", viewer_hash, "viewer"),
-]);
+])
+// API-key auth without rate limiting is unsafe on a reachable listener
+// (see "Argon2id verification admission control" above).
+.with_rate_limit(RateLimitConfig::new(30).with_pre_auth_burst(10));
 
 let viewer = RoleConfig::new(
     "viewer",

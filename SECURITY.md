@@ -133,6 +133,30 @@ enabling it changes the wire format of `taskId` values.
   `task_status_notifications_remain_unroutable_until_binding_is_added` fails
   when that upstream change lands.
 
+## Argon2id verification admission control
+
+Every bearer-token attempt runs one Argon2id verification per configured
+API key, on the blocking thread pool, with this crate's default cost
+parameters costing roughly 72 ms of CPU and 21 MiB of memory each. Without
+a bound, concurrent invalid-bearer traffic can drive memory and latency up
+without limit. `AuthState` bounds admission into that work with a permit
+pool (`AuthConfig::max_concurrent_verifications`, default
+`available_parallelism()` clamped to `1..=16`): a request that cannot get a
+permit within `AuthConfig::verification_wait` (default 1 second) receives
+`503 Service Unavailable` with `Retry-After: 1` instead of queuing
+unboundedly, and this outcome is counted separately
+(`failure_overloaded` in `/admin/auth/counters`) rather than as a failed
+credential, so it does not consume the post-failure rate-limit budget.
+
+**Residual risk, stated plainly:** a sustained flood can keep legitimate
+callers receiving bounded-latency `503`s for as long as it lasts; the
+bound limits memory and per-request latency, it does not make the service
+unaffected by the attack. Pair it with
+[`RateLimitConfig`'s pre-auth gate](docs/GUIDE.md#ratelimitconfig), which
+throttles by source IP before any Argon2id work runs, for defense in
+depth. There is no default-on limiter and no opt-out for the permit pool
+itself: sizing is always explicit.
+
 ## Certificate revocation
 
 > ✅ **rmcp-server-kit performs CDP-driven CRL revocation

@@ -136,6 +136,7 @@ defined cleanup order, and no panic path. `scripts/lint-ratchet/prose_gates.py
 | `Drop for AuditWorkerGuard` | `src/observability.rs:441` | Signals shutdown then parks/joins the writer thread for at most `AUDIT_WRITER_JOIN_TIMEOUT` (5s); no async work or panic path. Bounded blocking is deliberate and documented. No defect. |
 | `Drop for CancelOnDrop` | `src/transport.rs:2866` | Sync, non-blocking `CancellationToken::cancel`; no I/O, await or panic path. Never disarmed on purpose. No defect. |
 | `Drop for TlsListener` | `src/transport.rs:3777` | Sync, non-blocking `JoinHandle::abort`; in-flight workers exit on the closed channel. No I/O, await or panic path. No defect. |
+| `Drop for ReleaseHookOnDrop` | `src/auth.rs:1648` | Test-only. Flips the `AtomicBool` gate of a `VerificationHook`; sync, no I/O or await, no panic path. Runs on unwind too, which unparks any `spawn_blocking` closure still busy-waiting before the test's `Runtime` drops. No defect. |
 
 ## Local deviations register
 
@@ -345,9 +346,10 @@ entry in the same PR that introduces a deviation.
    `ApiKeyEntry::try_with_expiry`), and public builders stay non-`const` under
    the frozen `clippy::missing_const_for_fn` expectation (`RfcTimestamp::
    as_datetime`, `RfcTimestamp::into_inner`, `ApiKeyEntry::with_expiry`,
-   `RateLimitConfig::{with_pre_auth_max_per_minute, with_max_tracked_keys,
+    `RateLimitConfig::{with_pre_auth_max_per_minute, with_max_tracked_keys,
    with_idle_eviction, with_burst, with_pre_auth_burst}`,
-   `AuthConfig::{with_keys, with_rate_limit, check_oauth_feature}`); the
+   `AuthConfig::{with_keys, with_rate_limit, check_oauth_feature,
+   with_verification_wait}`); the
    `oauth`-only shape of `AuthConfig::check_oauth_feature` additionally freezes
    `clippy::unnecessary_wraps` and `clippy::unused_self`, and `AuthConfig`'s
    `oauth` placeholder (present only without the `oauth` feature) freezes
@@ -358,7 +360,10 @@ entry in the same PR that introduces a deviation.
    of `AuthLogContext` (constructed by `src/transport.rs`'s test helper), and
    the crate-private `oauth` placeholder field. Constant-time arithmetic in
    `verify_slots` uses `wrapping_sub` (never `checked_*` + `?`, G-8), and the
-   redaction tests' output is unchanged. Evidence: the task-18 migration
+   redaction tests' output is unchanged. A permit pool now gates admission
+   into `authenticate_bearer_identity` before the `verify_slots` scan runs;
+   it bounds concurrent Argon2id work and does not alter `verify_slots`
+   itself, which stays byte-identical. Evidence: the task-18 migration
    record (`new-permanent-expects.txt`, `gates.txt`).
 19. **2026-10-04 - `src/tool_hooks.rs` + `src/rbac_context.rs` per-item
    expectations (task 21).** Under entry 13's decision this lane freezes two

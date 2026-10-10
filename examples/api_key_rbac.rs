@@ -28,7 +28,7 @@ use rmcp::{
     model::{ServerCapabilities, ServerConfig},
 };
 use rmcp_server_kit::{
-    auth::{ApiKeyEntry, AuthConfig, generate_api_key},
+    auth::{ApiKeyEntry, AuthConfig, RateLimitConfig, generate_api_key},
     config::ObservabilityConfig,
     observability::init_tracing_from_config_strict,
     rbac::{ArgumentAllowlist, RbacConfig, RbacPolicy, RoleConfig},
@@ -64,7 +64,13 @@ async fn main() -> rmcp_server_kit::Result<()> {
     let auth = AuthConfig::with_keys(vec![
         ApiKeyEntry::new("admin-key", admin_hash, "admin"),
         ApiKeyEntry::new("viewer-key", viewer_hash, "viewer"),
-    ]);
+    ])
+    // API-key auth without rate limiting is unsafe on a reachable listener:
+    // every bearer attempt runs an Argon2id verification per configured
+    // key. `with_pre_auth_burst(10)` caps the initial unauthenticated wave
+    // admitted to that work at 10 (well below the default pre-auth burst
+    // of 300, which is sized for less exposed deployments).
+    .with_rate_limit(RateLimitConfig::new(30).with_pre_auth_burst(10));
 
     // 2. RBAC: admin can call anything; viewer is restricted to `echo` and
     //    `resource_list`, and `echo`'s `message` argument is allowlisted.

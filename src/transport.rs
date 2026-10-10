@@ -62,7 +62,7 @@ use crate::{
     auth::{
         ApiKeyEntry, AuthConfig, AuthCounters, AuthIdentity, AuthLogContext, AuthState, MtlsConfig,
         SeenIdentitySet, TlsConnInfo, auth_middleware, build_pre_auth_limiter, build_rate_limiter,
-        extract_mtls_identity,
+        extract_mtls_identity, resolve_max_concurrent_verifications,
     },
     bounded_limiter::{BoundedKeyedLimiter, BoundedLimiterDeny, KeyEvictionPolicy},
     error::RmcpServerKitError,
@@ -1738,6 +1738,9 @@ impl McpServerConfig {
                 ));
             }
         }
+        if let Some(auth) = &self.auth {
+            auth.check_verification_wait()?;
+        }
         Ok(())
     }
 
@@ -2432,6 +2435,12 @@ where
                 api_keys: ArcSwap::new(Arc::new(auth_config.api_keys.clone())),
                 rate_limiter,
                 pre_auth_limiter,
+                hash_permits: Arc::new(Semaphore::new(
+                    resolve_max_concurrent_verifications(auth_config).get(),
+                )),
+                verification_wait: auth_config.verification_wait,
+                #[cfg(test)]
+                verification_hook: None,
                 #[cfg(feature = "oauth")]
                 jwks_cache,
                 seen_identities: SeenIdentitySet::new(),
@@ -6001,13 +6010,17 @@ mod tests {
     ///
     /// Returns an error when the generated API-key hash cannot be produced.
     fn reload_test_state(name: &str) -> anyhow::Result<(Arc<AuthState>, String)> {
-        use crate::auth::generate_api_key;
+        use crate::auth::{default_max_concurrent_verifications, generate_api_key};
 
         let (token, hash) = generate_api_key()?;
         let state = Arc::new(AuthState {
             api_keys: ArcSwap::from_pointee(vec![ApiKeyEntry::new(name, hash, "ops")]),
             rate_limiter: None,
             pre_auth_limiter: None,
+            hash_permits: Arc::new(Semaphore::new(default_max_concurrent_verifications().get())),
+            verification_wait: Duration::from_secs(1),
+            #[cfg(test)]
+            verification_hook: None,
             #[cfg(feature = "oauth")]
             jwks_cache: None,
             seen_identities: SeenIdentitySet::new(),
@@ -6334,6 +6347,8 @@ mod tests {
             api_keys: Vec::new(),
             mtls: None,
             rate_limit: Some(rl),
+            max_concurrent_verifications: None,
+            verification_wait: Duration::from_secs(1),
             #[cfg(feature = "oauth")]
             oauth: None,
             #[cfg(not(feature = "oauth"))]
@@ -7355,6 +7370,36 @@ mod tests {
             .context("zero pre-auth rate")?;
         assert!(err.to_string().contains("pre_auth_max_per_minute"));
 
+        Ok(())
+    }
+
+    /// Pins that a zero `verification_wait` is rejected by builder
+    /// validation.
+    #[test]
+    fn validate_rejects_zero_verification_wait() -> anyhow::Result<()> {
+        let auth = AuthConfig::with_keys(vec![]).with_verification_wait(Duration::ZERO);
+        let err = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0")
+            .with_auth(auth)
+            .validate()
+            .err()
+            .context("zero verification_wait")?;
+        assert!(err.to_string().contains("verification_wait"));
+
+        Ok(())
+    }
+
+    /// Pins that [`AuthConfig::with_max_concurrent_verifications`] and
+    /// [`AuthConfig::with_verification_wait`] set the fields they name.
+    #[test]
+    fn with_max_concurrent_verifications_and_with_verification_wait_build() -> anyhow::Result<()> {
+        use core::num::NonZeroUsize;
+
+        let permits = NonZeroUsize::new(6).context("6 is nonzero")?;
+        let auth = AuthConfig::with_keys(vec![])
+            .with_max_concurrent_verifications(permits)
+            .with_verification_wait(Duration::from_secs(3));
+        assert_eq!(auth.max_concurrent_verifications, Some(permits));
+        assert_eq!(auth.verification_wait, Duration::from_secs(3));
         Ok(())
     }
 
@@ -10045,7 +10090,7 @@ mod tests {
     /// Returns an error when either API key cannot be generated.
     #[cfg(feature = "oauth")]
     fn m6_auth_state(fields: LogContextConfig) -> anyhow::Result<(Arc<AuthState>, String, String)> {
-        use crate::auth::generate_api_key;
+        use crate::auth::{default_max_concurrent_verifications, generate_api_key};
 
         let (admin_token, admin_hash) = generate_api_key().context("admin api key")?;
         let (viewer_token, viewer_hash) = generate_api_key().context("viewer api key")?;
@@ -10056,6 +10101,10 @@ mod tests {
             ]),
             rate_limiter: None,
             pre_auth_limiter: None,
+            hash_permits: Arc::new(Semaphore::new(default_max_concurrent_verifications().get())),
+            verification_wait: Duration::from_secs(1),
+            #[cfg(test)]
+            verification_hook: None,
             jwks_cache: None,
             seen_identities: SeenIdentitySet::new(),
             counters: AuthCounters::default(),

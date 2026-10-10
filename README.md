@@ -77,14 +77,18 @@ cargo run --example oauth_server --features oauth
 **API key + RBAC + per-tool argument allowlist:**
 
 ```rust,ignore
-use rmcp_server_kit::auth::{ApiKeyEntry, AuthConfig, generate_api_key};
+use rmcp_server_kit::auth::{ApiKeyEntry, AuthConfig, RateLimitConfig, generate_api_key};
 use rmcp_server_kit::rbac::{ArgumentAllowlist, RbacConfig, RbacPolicy, RoleConfig};
 use std::sync::Arc;
 
 let (token, hash) = generate_api_key()?;
 let auth = AuthConfig::with_keys(vec![
     ApiKeyEntry::new("viewer-key", hash, "viewer"),
-]);
+])
+// API-key auth without rate limiting is unsafe on a reachable listener.
+// `with_pre_auth_burst(10)` caps the initial unauthenticated wave admitted
+// to Argon2id verification at 10, well below the default of 300.
+.with_rate_limit(RateLimitConfig::new(30).with_pre_auth_burst(10));
 let viewer = RoleConfig::new("viewer", vec!["echo".into()], vec!["*".into()])
     .with_argument_allowlists(vec![ArgumentAllowlist::new_required(
         "echo", "message", vec!["hello".into(), "ping".into()],
