@@ -346,7 +346,7 @@ entry in the same PR that introduces a deviation.
    `ApiKeyEntry::try_with_expiry`), and public builders stay non-`const` under
    the frozen `clippy::missing_const_for_fn` expectation (`RfcTimestamp::
    as_datetime`, `RfcTimestamp::into_inner`, `ApiKeyEntry::with_expiry`,
-    `RateLimitConfig::{with_pre_auth_max_per_minute, with_max_tracked_keys,
+   `RateLimitConfig::{with_pre_auth_max_per_minute, with_max_tracked_keys,
    with_idle_eviction, with_burst, with_pre_auth_burst}`,
    `AuthConfig::{with_keys, with_rate_limit, check_oauth_feature,
    with_verification_wait}`); the

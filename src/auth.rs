@@ -1013,7 +1013,9 @@ pub struct AuthConfig {
     /// to the blocking thread pool. `None` (default) resolves to
     /// `available_parallelism()` clamped to `1..=16` at auth-state
     /// construction time. Bounds Argon2id's memory footprint (roughly this
-    /// value times ~21 MiB) independent of source IP or client count.
+    /// value times ~21 MiB) independent of source IP or client count. A
+    /// value above `tokio::sync::Semaphore::MAX_PERMITS` is clamped to it
+    /// (effectively unbounded) rather than panicking at startup.
     #[serde(default)]
     pub max_concurrent_verifications: Option<NonZeroUsize>,
     /// Maximum time a request waits for a verification permit before
@@ -1087,12 +1089,27 @@ pub(crate) fn default_max_concurrent_verifications() -> NonZeroUsize {
     clamp_parallelism_to_permit_bound(n)
 }
 
+/// Clamp a requested permit count to [`Semaphore::MAX_PERMITS`].
+///
+/// `Semaphore::new` panics above that bound, and an operator-supplied
+/// `max_concurrent_verifications` (for example a TOML integer up to
+/// `u64::MAX`, or `NonZeroUsize::MAX` through the builder) must never crash
+/// the server at startup. Values above the largest permit count the pool
+/// supports are clamped to it, which is effectively unbounded.
+fn clamp_to_semaphore_max(requested: NonZeroUsize) -> NonZeroUsize {
+    if requested.get() > Semaphore::MAX_PERMITS {
+        NonZeroUsize::new(Semaphore::MAX_PERMITS).unwrap_or(NonZeroUsize::MIN)
+    } else {
+        requested
+    }
+}
+
 /// Resolve the effective Argon2id verification permit count for an
 /// [`AuthConfig`].
 pub(crate) fn resolve_max_concurrent_verifications(config: &AuthConfig) -> NonZeroUsize {
     config
         .max_concurrent_verifications
-        .unwrap_or_else(default_max_concurrent_verifications)
+        .map_or_else(default_max_concurrent_verifications, clamp_to_semaphore_max)
 }
 
 /// Validate API-key `name`s as session/task-binding principal identities,
@@ -2488,7 +2505,7 @@ fn overloaded_response(state: &AuthState) -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
         [(header::RETRY_AFTER, "1")],
-        "server is busy verifying other requests; retry shortly",
+        "service temporarily unavailable; retry shortly",
     )
         .into_response()
 }
@@ -5562,7 +5579,8 @@ mod tests {
         clippy::unnecessary_wraps,
         reason = "deliberate: src/auth.rs::clamp_parallelism_to_permit_bound_stays_within_1_to_16 keeps the uniform test signature while it only asserts"
     )]
-    /// Clamp parallelism to permit bound stays within 1 to 16.
+    /// Pins that the parallelism-to-permit-count clamp never resolves
+    /// below 1 or above 16, at both boundaries and beyond them.
     #[test]
     fn clamp_parallelism_to_permit_bound_stays_within_1_to_16() -> anyhow::Result<()> {
         assert_eq!(
@@ -5597,7 +5615,8 @@ mod tests {
         clippy::unnecessary_wraps,
         reason = "deliberate: src/auth.rs::default_max_concurrent_verifications_is_within_1_to_16 keeps the uniform test signature while it only asserts"
     )]
-    /// Default max concurrent verifications is within 1 to 16.
+    /// Pins that the resolved default permit count always stays within
+    /// `1..=16`, regardless of this host's actual parallelism.
     #[test]
     fn default_max_concurrent_verifications_is_within_1_to_16() -> anyhow::Result<()> {
         let resolved = default_max_concurrent_verifications().get();
@@ -5612,7 +5631,8 @@ mod tests {
         clippy::unnecessary_wraps,
         reason = "deliberate: src/auth.rs::auth_config_default_has_1s_verification_wait_and_no_permit_override keeps the uniform test signature while it only asserts"
     )]
-    /// Auth config default has 1s verification wait and no permit override.
+    /// Pins that `AuthConfig::default()` and `with_keys` both carry the 1
+    /// second `verification_wait` default and no permit-count override.
     #[test]
     fn auth_config_default_has_1s_verification_wait_and_no_permit_override() -> anyhow::Result<()> {
         let cfg = AuthConfig::default();
@@ -5635,7 +5655,8 @@ mod tests {
         Ok(())
     }
 
-    /// With max concurrent verifications and with verification wait set fields.
+    /// Pins that `with_max_concurrent_verifications` and
+    /// `with_verification_wait` each set exactly the field they name.
     #[test]
     fn with_max_concurrent_verifications_and_with_verification_wait_set_fields()
     -> anyhow::Result<()> {
@@ -5672,7 +5693,8 @@ mod tests {
         Ok(())
     }
 
-    /// Auth config summary unaffected by admission knobs.
+    /// Pins that the new admission-control knobs leave `AuthConfig::summary`
+    /// unchanged: it still reports only the pre-existing boolean flags.
     #[test]
     fn auth_config_summary_unaffected_by_admission_knobs() -> anyhow::Result<()> {
         let permits = NonZeroUsize::new(4).context("4 is nonzero")?;
@@ -5685,6 +5707,28 @@ mod tests {
             "summary.bearer must still reflect api_keys presence regardless of the new knobs"
         );
         assert_eq!(summary.api_keys.len(), 1);
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/auth.rs::resolve_max_concurrent_verifications_clamps_to_semaphore_max keeps the uniform test signature while it only asserts"
+    )]
+    /// Pins that an operator-supplied `max_concurrent_verifications` above
+    /// `Semaphore::MAX_PERMITS` is clamped to it rather than reaching
+    /// `Semaphore::new` and panicking the server at startup.
+    #[test]
+    fn resolve_max_concurrent_verifications_clamps_to_semaphore_max() -> anyhow::Result<()> {
+        let cfg =
+            AuthConfig::with_keys(vec![]).with_max_concurrent_verifications(NonZeroUsize::MAX);
+        let resolved = resolve_max_concurrent_verifications(&cfg);
+        assert_eq!(
+            resolved.get(),
+            Semaphore::MAX_PERMITS,
+            "a permit count above Semaphore::MAX_PERMITS must clamp to it"
+        );
+        // The clamp's entire purpose is that this does not panic.
+        let _semaphore = Semaphore::new(resolved.get());
         Ok(())
     }
 }

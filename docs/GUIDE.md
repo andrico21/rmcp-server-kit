@@ -370,9 +370,10 @@ tokens cannot grow memory use without limit:
   (which bounds total in-flight requests of every kind). The permit pool
   is the only one of the three that bounds Argon2id memory directly,
   independent of source IP or client count.
-- There is no default-on limiter and no opt-out for the permit pool
-  itself: sizing is always explicit via `max_concurrent_verifications` and
-  `verification_wait`. It mitigates a sustained flood's resource cost; it
+- The permit pool itself cannot be disabled, but it is on by default
+  with a resolved size (not an explicit operator choice unless
+  `max_concurrent_verifications` and `verification_wait` are set). It
+  mitigates a sustained flood's resource cost; it
   does not eliminate the flood itself - see
   [`SECURITY.md`](../SECURITY.md#argon2id-verification-admission-control).
 

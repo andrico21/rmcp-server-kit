@@ -154,8 +154,11 @@ bound limits memory and per-request latency, it does not make the service
 unaffected by the attack. Pair it with
 [`RateLimitConfig`'s pre-auth gate](docs/GUIDE.md#ratelimitconfig), which
 throttles by source IP before any Argon2id work runs, for defense in
-depth. There is no default-on limiter and no opt-out for the permit pool
-itself: sizing is always explicit.
+depth. The permit pool itself cannot be disabled, but it is on by
+default with a resolved size (`available_parallelism()` clamped to
+`1..=16`) and a 1 second wait, not an explicit operator choice; the
+per-IP pre-auth rate limiter is opt-in (`AuthConfig::rate_limit`
+defaults to `None`, which is why the examples now configure it).
 
 ## Certificate revocation
 
