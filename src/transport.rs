@@ -2287,6 +2287,8 @@ where
     H: ServerHandler + 'static,
     F: Fn() -> H + Send + Sync + Clone + 'static,
 {
+    #[cfg(feature = "oauth")]
+    use anyhow::Context as _;
     use axum::{
         error_handling::HandleErrorLayer,
         http::{
@@ -2394,7 +2396,7 @@ where
                     JwksCache::with_shutdown(oauth_cfg, ct.child_token()).map(Arc::new)
                 })
                 .transpose()
-                .map_err(|error| io::Error::other(format!("JWKS HTTP client: {error}")))?;
+                .context("JWKS HTTP client")?;
 
             Some(Arc::new(AuthState {
                 api_keys: ArcSwap::new(Arc::new(auth_config.api_keys.clone())),

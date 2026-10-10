@@ -659,12 +659,12 @@ recommended.
 
 ### Validation flow
 1. Client sends `Authorization: Bearer <jwt>`.
-2. `JwksCache::validate_token(token)` (`src/oauth.rs:3280`):
+2. `JwksCache::validate_token(token)` (`src/oauth.rs:3350`):
    - Decodes the JWT header to get `kid` and `alg`.
    - `lookup_key()` looks up by `kid` in the cached JWKS
-     (`src/oauth.rs:4140`).
-   - If not found, calls `refresh_with_cooldown()` (`src/oauth.rs:3712`):
-       - Enforces `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:2865`) so multiple
+     (`src/oauth.rs:4210`).
+   - If not found, calls `refresh_with_cooldown()` (`src/oauth.rs:3782`):
+       - Enforces `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:2920`) so multiple
        invalid tokens cannot DoS the JWKS endpoint.
      - Deduplicates concurrent refreshes.
    - Validates signature, `iss`, `aud`, `exp`, `nbf` using `jsonwebtoken`.
@@ -1017,7 +1017,7 @@ Wired in `build_app_router` (`src/transport.rs:2282`);
    exhaust the rate-limit budget for authenticated callers.
 
 4. **JWKS refresh is rate-limited.** Removing `JWKS_REFRESH_COOLDOWN`
-   (`src/oauth.rs:2865`) creates a DoS vector against the issuer's JWKS endpoint.
+   (`src/oauth.rs:2920`) creates a DoS vector against the issuer's JWKS endpoint.
 
 5. **No symmetric JWT algorithms by default.** `HS*` algorithms with a
    public JWKS would enable algorithm-confusion attacks. Don't add them

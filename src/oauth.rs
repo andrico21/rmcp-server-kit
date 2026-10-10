@@ -19,7 +19,6 @@ use alloc::sync::Arc;
 #[cfg(test)]
 use core::sync::atomic::AtomicU64;
 use core::{
-    error::Error,
     fmt,
     hint::cold_path,
     sync::atomic::{AtomicBool, Ordering},
@@ -28,7 +27,7 @@ use core::{
 use std::{
     collections::HashMap,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Mutex, PoisonError},
     time::Instant,
 };
@@ -385,6 +384,55 @@ struct MtlsClientKey {
     key_path: PathBuf,
 }
 
+/// Read `ca_path` once and parse it as a bundle of PEM certificates.
+///
+/// Shared by the three OAuth-bound outbound HTTP clients
+/// ([`JwksCache::new`], [`OauthHttpClient::build`], and the mTLS client
+/// builder) so every `ca_cert_path` gets identical validation: the file
+/// must exist, must parse as PEM, and must contain at least one
+/// certificate. `reqwest::Certificate::from_pem` (the previous, per-client
+/// parser) only ever stored the bytes without parsing them, so an empty
+/// file, plain text, raw DER, or a key-only PEM silently produced "no
+/// custom root" and the client fell back to the system trust store with
+/// no startup signal. `from_pem_bundle` only reads PEM `CERTIFICATE`
+/// sections, so those inputs now parse to zero certificates and are
+/// rejected here.
+///
+/// A certificate section with valid PEM framing but undecodable DER body
+/// is **not** rejected here: `reqwest`'s rustls backend defers DER
+/// validation to `ClientBuilder::build()`, so that failure surfaces only
+/// when the caller later builds the client from the returned
+/// certificates. Callers must label that `build()` error with the same
+/// `client` and `ca_path` so the operator sees one consistent diagnosis
+/// regardless of which malformed-bundle shape triggered it.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Startup`] naming `client` and `ca_path`
+/// when the file cannot be read, the bundle cannot be parsed as PEM, or
+/// it parses to zero certificates.
+fn load_ca_bundle(client: &str, ca_path: &Path) -> Result<Vec<Certificate>, RmcpServerKitError> {
+    let pem = fs::read(ca_path).map_err(|error| {
+        RmcpServerKitError::Startup(format!(
+            "{client}: ca_cert_path {}: {error}",
+            ca_path.display()
+        ))
+    })?;
+    let certs = Certificate::from_pem_bundle(&pem).map_err(|error| {
+        RmcpServerKitError::Startup(format!(
+            "{client}: ca_cert_path {}: {error}",
+            ca_path.display()
+        ))
+    })?;
+    if certs.is_empty() {
+        return Err(RmcpServerKitError::Startup(format!(
+            "{client}: ca_cert_path {}: no certificates found",
+            ca_path.display()
+        )));
+    }
+    Ok(certs)
+}
+
 impl OauthHttpClient {
     /// Build a client from the OAuth configuration (preferred since 1.2.1).
     ///
@@ -521,17 +569,24 @@ impl OauthHttpClient {
         // Read the optional CA bundle once; reused by both clients below.
         // Pre-startup blocking I/O is intentional -- the constructor is sync
         // by contract and runs from `serve()`'s pre-startup phase.
-        let ca_pem: Option<Vec<u8>> = if let Some(cfg) = config
-            && let Some(ca_path) = &cfg.ca_cert_path
-        {
-            Some(fs::read(ca_path).map_err(|error| {
-                RmcpServerKitError::Startup(format!(
-                    "oauth http client: read ca_cert_path {}: {error}",
-                    ca_path.display()
-                ))
-            })?)
-        } else {
-            None
+        let ca_path: Option<&Path> = config.and_then(|cfg| cfg.ca_cert_path.as_deref());
+        let ca_certs: Option<Vec<Certificate>> = ca_path
+            .map(|path| load_ca_bundle("oauth http client", path))
+            .transpose()?;
+
+        // Build-time failure of a certificate that `load_ca_bundle` accepted
+        // (PEM-framed but undecodable DER - see its doc comment) must still
+        // name `ca_cert_path` so the operator sees one consistent diagnosis.
+        let describe_build_error = |error: reqwest::Error| -> RmcpServerKitError {
+            ca_path.map_or_else(
+                || RmcpServerKitError::Startup(format!("oauth http client init: {error}")),
+                |path| {
+                    RmcpServerKitError::Startup(format!(
+                        "oauth http client init: ca_cert_path {}: {error}",
+                        path.display()
+                    ))
+                },
+            )
         };
 
         // Base builder shared by both clients: `no_proxy` (so HTTP(S)_PROXY
@@ -543,13 +598,10 @@ impl OauthHttpClient {
                 .dns_resolver(Arc::clone(&resolver))
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(30));
-            if let Some(pem) = &ca_pem {
-                let cert = Certificate::from_pem(pem).map_err(|error| {
-                    RmcpServerKitError::Startup(format!(
-                        "oauth http client: parse ca_cert_path: {error}"
-                    ))
-                })?;
-                builder = builder.add_root_certificate(cert);
+            if let Some(certs) = &ca_certs {
+                for cert in certs {
+                    builder = builder.add_root_certificate(cert.clone());
+                }
             }
             Ok(builder)
         };
@@ -580,28 +632,24 @@ impl OauthHttpClient {
                 },
             ))
             .build()
-            .map_err(|error| {
-                RmcpServerKitError::Startup(format!("oauth http client init: {error}"))
-            })?;
+            .map_err(describe_build_error)?;
 
         // M7: credential-POST client -- NEVER follows redirects. A 307/308 from
         // a compromised or open-redirecting token/introspection/revocation
         // endpoint must not re-send the `client_secret`-bearing body to another
         // host (RFC 8705 §2). Mirrors the `Policy::none()` mTLS cert clients.
         //
-        // Shares the "oauth http client init" error label with the gated
-        // `inner` build above: both consume the same `make_base()` config, so
-        // a `ClientBuilder::build()` failure is a shared TLS-backend fault
+        // Shares `describe_build_error` with the gated `inner` build above:
+        // both consume the same `make_base()` config, so a
+        // `ClientBuilder::build()` failure is a shared TLS-backend fault
         // rather than a property of either client. Using one label keeps the
         // operator-visible startup error identical whether or not `inner` is
         // compiled in. Genuine misconfiguration (allowlist, ca_cert_path read
-        // and parse) is already reported by `make_base()` itself.
+        // and parse) is already reported before `make_base()` runs.
         let credential_client = make_base()?
             .redirect(Policy::none())
             .build()
-            .map_err(|error| {
-                RmcpServerKitError::Startup(format!("oauth http client init: {error}"))
-            })?;
+            .map_err(describe_build_error)?;
 
         #[cfg(feature = "oauth-mtls-client")]
         let mtls_clients = build_mtls_clients(config, &allowlist, &test_bypass)?;
@@ -962,6 +1010,12 @@ pub struct OAuthConfig {
     /// separately. The deprecated [`OauthHttpClient::new`] no-arg
     /// constructor cannot honour this field -- migrate to
     /// [`OauthHttpClient::with_config`] for full coverage.
+    ///
+    /// **Validation.** A configured path is read once per client and
+    /// parsed as a PEM certificate bundle. The server fails at startup,
+    /// rather than silently falling back to the system trust store, when
+    /// the file cannot be read, cannot be parsed as PEM, or parses to zero
+    /// certificates.
     #[serde(default)]
     pub ca_cert_path: Option<PathBuf>,
     /// Allow plain-HTTP (non-TLS) URLs for OAuth endpoints (`jwks_uri`,
@@ -1733,23 +1787,24 @@ fn build_mtls_clients(
         .identity(identity);
 
     if let Some(ca_path) = &cfg.ca_cert_path {
-        let pem = fs::read(ca_path).map_err(|error| {
-            RmcpServerKitError::Startup(format!(
-                "oauth http client mTLS: read ca_cert_path {}: {error}",
-                ca_path.display()
-            ))
-        })?;
-        let cert = Certificate::from_pem(&pem).map_err(|error| {
-            RmcpServerKitError::Startup(format!(
-                "oauth http client mTLS: parse ca_cert_path {}: {error}",
-                ca_path.display()
-            ))
-        })?;
-        builder = builder.add_root_certificate(cert);
+        for cert in load_ca_bundle("oauth http client mTLS", ca_path)? {
+            builder = builder.add_root_certificate(cert);
+        }
     }
 
+    // A certificate `load_ca_bundle` accepted (PEM-framed but undecodable
+    // DER - see its doc comment) can still fail here; name `ca_cert_path`
+    // again so the operator sees one consistent diagnosis.
     let client = builder.build().map_err(|error| {
-        RmcpServerKitError::Startup(format!("oauth http client mTLS init: {error}"))
+        cfg.ca_cert_path.as_deref().map_or_else(
+            || RmcpServerKitError::Startup(format!("oauth http client mTLS init: {error}")),
+            |path| {
+                RmcpServerKitError::Startup(format!(
+                    "oauth http client mTLS init: ca_cert_path {}: {error}",
+                    path.display()
+                ))
+            },
+        )
     })?;
     let _replaced = map.insert(
         MtlsClientKey {
@@ -3051,12 +3106,12 @@ impl JwksCacheShared {
     ///
     /// # Errors
     ///
-    /// Returns an error if the CA bundle cannot be read, the HTTP client
-    /// cannot be built, or `config.jwks_cache_ttl` is not a valid duration.
-    fn new(
-        config: &OAuthConfig,
-        shutdown: &CancellationToken,
-    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
+    /// Returns [`RmcpServerKitError::Config`] when `config.jwks_cache_ttl`,
+    /// `config.ssrf_allowlist`, or `config.allowed_algorithms` is invalid.
+    /// Returns [`RmcpServerKitError::Startup`] when the CA bundle named by
+    /// `config.ca_cert_path` cannot be read or parsed, contains no
+    /// certificates, or the HTTP client cannot be built.
+    fn new(config: &OAuthConfig, shutdown: &CancellationToken) -> Result<Self, RmcpServerKitError> {
         // Ensure crypto providers are installed (idempotent -- ok() ignores
         // the error if already installed by another call in the same process).
         drop(default_provider().install_default());
@@ -3065,10 +3120,10 @@ impl JwksCacheShared {
         }
 
         let ttl = humantime::parse_duration(&config.jwks_cache_ttl).map_err(|error| {
-            format!(
+            RmcpServerKitError::Config(format!(
                 "invalid jwks_cache_ttl {:?}: {error}",
                 config.jwks_cache_ttl
-            )
+            ))
         })?;
 
         let mut validation = Validation::new(Algorithm::RS256);
@@ -3095,7 +3150,7 @@ impl JwksCacheShared {
         // surfaced at startup rather than on first JWKS fetch.
         let allowlist = match config.ssrf_allowlist.as_ref() {
             Some(raw) => Arc::new(compile_oauth_ssrf_allowlist(raw).map_err(|error| {
-                Box::<dyn Error + Send + Sync>::from(format!("oauth.ssrf_allowlist: {error}"))
+                RmcpServerKitError::Config(format!("oauth.ssrf_allowlist: {error}"))
             })?),
             None => Arc::new(CompiledSsrfAllowlist::default()),
         };
@@ -3172,12 +3227,26 @@ impl JwksCacheShared {
             // intentional. Do not wrap in `spawn_blocking`: the constructor
             // is synchronous by contract and is called from `serve()`'s
             // pre-startup phase.
-            let pem = fs::read(ca_path)?;
-            let cert = Certificate::from_pem(&pem)?;
-            http_builder = http_builder.add_root_certificate(cert);
+            for cert in load_ca_bundle("jwks client", ca_path)? {
+                http_builder = http_builder.add_root_certificate(cert);
+            }
         }
 
-        let http = http_builder.build()?;
+        // A certificate `load_ca_bundle` accepted (PEM-framed but
+        // undecodable DER - see its doc comment) can still fail here;
+        // name `ca_cert_path` again so the operator sees one consistent
+        // diagnosis.
+        let http = http_builder.build().map_err(|error| {
+            config.ca_cert_path.as_deref().map_or_else(
+                || RmcpServerKitError::Startup(format!("jwks client init: {error}")),
+                |path| {
+                    RmcpServerKitError::Startup(format!(
+                        "jwks client init: ca_cert_path {}: {error}",
+                        path.display()
+                    ))
+                },
+            )
+        })?;
 
         let (refresh_tx, _refresh_rx) = watch::channel(RefreshSnapshot::initial());
 
@@ -3222,15 +3291,17 @@ impl JwksCache {
     ///
     /// # Errors
     ///
-    /// Returns an error if the CA bundle cannot be read, the HTTP client
-    /// cannot be built, or `config.jwks_cache_ttl` is not a valid
-    /// humantime duration. [`OAuthConfig::validate`] (run automatically by
-    /// the typed
+    /// Returns [`RmcpServerKitError::Config`] when `config.jwks_cache_ttl`,
+    /// `config.ssrf_allowlist`, or `config.allowed_algorithms` is invalid.
+    /// [`OAuthConfig::validate`] (run automatically by the typed
     /// [`McpServerConfig::validate`](crate::transport::McpServerConfig::validate)
-    /// pipeline) rejects invalid TTLs up front, so the TTL branch is
-    /// unreachable for validated configs.
+    /// pipeline) rejects invalid TTLs up front, so that branch is
+    /// unreachable for validated configs. Returns
+    /// [`RmcpServerKitError::Startup`] when the CA bundle named by
+    /// `config.ca_cert_path` cannot be read or parsed, contains no
+    /// certificates, or the HTTP client cannot be built.
     #[inline]
-    pub fn new(config: &OAuthConfig) -> Result<Self, Box<dyn Error + Send + Sync>> {
+    pub fn new(config: &OAuthConfig) -> Result<Self, RmcpServerKitError> {
         Self::with_shutdown(config, CancellationToken::new())
     }
 
@@ -3239,12 +3310,11 @@ impl JwksCache {
     ///
     /// # Errors
     ///
-    /// Returns an error if the CA bundle cannot be read, the HTTP client
-    /// cannot be built, or `config.jwks_cache_ttl` is not a valid duration.
+    /// Same error conditions as [`new`](Self::new).
     pub(crate) fn with_shutdown(
         config: &OAuthConfig,
         shutdown: CancellationToken,
-    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
+    ) -> Result<Self, RmcpServerKitError> {
         Ok(Self {
             shared: Arc::new(JwksCacheShared::new(config, &shutdown)?),
             shutdown,
@@ -5438,9 +5508,7 @@ mod tests {
 
     #[cfg(feature = "oauth-mtls-client")]
     use core::ptr;
-    use std::io;
-    #[cfg(feature = "oauth-mtls-client")]
-    use std::{env, process};
+    use std::{env, io, process};
 
     use anyhow::Context as _;
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -10008,7 +10076,8 @@ role = "admin"
         Ok(())
     }
 
-    /// Fails `JwksCache::new` for an invalid `ssrf_allowlist` CIDR.
+    /// Fails `JwksCache::new` for an invalid `ssrf_allowlist` CIDR, with
+    /// the `Config` variant (misconfiguration, not a startup I/O fault).
     #[tokio::test]
     async fn jwks_cache_rejects_misconfigured_allowlist_at_startup() -> anyhow::Result<()> {
         let mut cfg = OAuthConfig::builder(
@@ -10024,13 +10093,18 @@ role = "admin"
         let Err(err) = JwksCache::new(&cfg) else {
             anyhow::bail!("invalid CIDR must fail JwksCache::new")
         };
+        assert!(
+            matches!(err, RmcpServerKitError::Config(_)),
+            "a misconfigured allowlist is a Config error, not Startup; got {err:?}"
+        );
         let msg = err.to_string();
         assert!(msg.contains("oauth.ssrf_allowlist"), "got {msg:?}");
 
         Ok(())
     }
 
-    /// Returns Err rather than panicking for an invalid `jwks_cache_ttl`.
+    /// Returns Err rather than panicking for an invalid `jwks_cache_ttl`,
+    /// with the `Config` variant (misconfiguration, not a startup I/O fault).
     #[tokio::test]
     async fn jwks_cache_new_invalid_ttl_is_err() -> anyhow::Result<()> {
         // An unvalidated config with a bogus TTL must surface as Err, not
@@ -10045,8 +10119,246 @@ role = "admin"
         let Err(err) = JwksCache::new(&cfg) else {
             anyhow::bail!("invalid jwks_cache_ttl must fail JwksCache::new")
         };
+        assert!(
+            matches!(err, RmcpServerKitError::Config(_)),
+            "a bad jwks_cache_ttl is a Config error, not Startup; got {err:?}"
+        );
         let msg = err.to_string();
         assert!(msg.contains("jwks_cache_ttl"), "got {msg:?}");
+
+        Ok(())
+    }
+
+    /// Fails `JwksCache::new` for an invalid `allowed_algorithms` entry,
+    /// with the `Config` variant, not `Startup`.
+    #[tokio::test]
+    async fn jwks_cache_rejects_invalid_allowed_algorithms_at_startup() -> anyhow::Result<()> {
+        let mut cfg = OAuthConfig::builder(
+            "https://auth.example.com/",
+            "mcp",
+            "https://auth.example.com/jwks.json",
+        )
+        .build();
+        cfg.allowed_algorithms = Some(vec!["not-a-real-algorithm".into()]);
+        let Err(err) = JwksCache::new(&cfg) else {
+            anyhow::bail!("an unsupported algorithm name must fail JwksCache::new")
+        };
+        assert!(
+            matches!(err, RmcpServerKitError::Config(_)),
+            "an unsupported algorithm name is a Config error, not Startup; got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("allowed_algorithms"), "got {msg:?}");
+
+        Ok(())
+    }
+
+    /// Fails `JwksCache::new` for a missing `ca_cert_path`, with the
+    /// `Startup` variant naming the configured path.
+    #[tokio::test]
+    async fn jwks_cache_missing_ca_cert_path_returns_startup_with_path() -> anyhow::Result<()> {
+        let mut cfg = OAuthConfig::builder(
+            "https://auth.example.com/",
+            "mcp",
+            "https://auth.example.com/jwks.json",
+        )
+        .build();
+        let missing = PathBuf::from("/nonexistent/rmcp-api02/missing-ca.pem");
+        cfg.ca_cert_path = Some(missing.clone());
+        let Err(err) = JwksCache::new(&cfg) else {
+            anyhow::bail!("a missing ca_cert_path must fail JwksCache::new")
+        };
+        assert!(
+            matches!(err, RmcpServerKitError::Startup(_)),
+            "a missing CA file is a Startup error, not Config; got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ca_cert_path") && msg.contains(&missing.display().to_string()),
+            "error must name ca_cert_path and the path; got {msg:?}"
+        );
+
+        Ok(())
+    }
+
+    // Shared CA-bundle validation table.
+    //
+    // `load_ca_bundle` is the ONE private helper used by all three
+    // OAuth-bound outbound clients (`JwksCache::new`, `OauthHttpClient::build`,
+    // `build_mtls_clients`). Every row below must behave identically across
+    // all three.
+
+    /// Wraps `body` in a PEM `label` section. Built from repeated single
+    /// dashes rather than a five-dash literal so the fixture's framing is
+    /// as explicit in source as the bytes it produces.
+    fn pem_section(label: &str, body: &str) -> String {
+        let bar = "-".repeat(5);
+        format!("{bar}BEGIN {label}{bar}\n{body}\n{bar}END {label}{bar}\n")
+    }
+
+    /// One real, parseable self-signed certificate plus its PEM-encoded key.
+    ///
+    /// Generated fresh per call so the "accepted" table rows exercise a
+    /// certificate `reqwest` itself considers valid rather than a
+    /// hand-rolled fixture.
+    fn generate_test_ca(san: &str) -> anyhow::Result<(String, String, Vec<u8>)> {
+        let cert = rcgen::generate_simple_self_signed(vec![san.to_owned()]).context("rcgen")?;
+        let cert_pem = cert.cert.pem();
+        let key_pem = cert.signing_key.serialize_pem();
+        let cert_der = cert.cert.der().to_vec();
+        Ok((cert_pem, key_pem, cert_der))
+    }
+
+    /// Writes `bytes` to a uniquely named temp file (so each table case
+    /// gets its own fixture) and returns the path to pass as `ca_cert_path`.
+    fn write_ca_bundle(label: &str, bytes: &[u8]) -> anyhow::Result<PathBuf> {
+        let dir = env::temp_dir();
+        let pid = process::id();
+        let nonce: u64 = rand::random();
+        let path = dir.join(format!("rmcp-api02-ca-{label}-{pid}-{nonce}.pem"));
+        fs::write(&path, bytes).context("write CA bundle fixture")?;
+        Ok(path)
+    }
+
+    /// The CA-bundle validation table: `(label, bundle bytes, accepted)`.
+    ///
+    /// Before the three clients shared `load_ca_bundle`, each used
+    /// `reqwest::Certificate::from_pem`, which never parses: four of the six
+    /// rejected rows here (`empty-file`, `garbage-text`, `der-encoded-ca`,
+    /// `private-key-only`) were accepted silently and produced a client with
+    /// no custom root; only `unterminated-pem` and `pem-framed-bad-der`
+    /// already failed, at `ClientBuilder::build()`.
+    fn ca_bundle_validation_cases() -> anyhow::Result<Vec<(&'static str, Vec<u8>, bool)>> {
+        let (cert_one_pem, key_one_pem, cert_one_der) = generate_test_ca("ca-bundle-one.test")?;
+        let (cert_two_pem, _key_two_pem, _cert_two_der) = generate_test_ca("ca-bundle-two.test")?;
+        let two_cert = format!("{cert_one_pem}{cert_two_pem}");
+        let cert_plus_key = format!("{cert_one_pem}{key_one_pem}");
+        let unterminated_pem = {
+            let bar = "-".repeat(5);
+            format!("{bar}BEGIN CERTIFICATE{bar}\nMIIB\n")
+        };
+        let pem_framed_bad_der = pem_section("CERTIFICATE", "AAAA");
+        Ok(vec![
+            ("one-cert", cert_one_pem.into_bytes(), true),
+            ("two-cert", two_cert.into_bytes(), true),
+            ("cert-plus-key", cert_plus_key.into_bytes(), true),
+            ("empty-file", Vec::new(), false),
+            (
+                "garbage-text",
+                b"this is not a certificate\n".to_vec(),
+                false,
+            ),
+            ("der-encoded-ca", cert_one_der, false),
+            ("private-key-only", key_one_pem.into_bytes(), false),
+            ("unterminated-pem", unterminated_pem.into_bytes(), false),
+            ("pem-framed-bad-der", pem_framed_bad_der.into_bytes(), false),
+        ])
+    }
+
+    /// Asserts one CA-bundle table row's outcome against `result`, then
+    /// removes `path`. Shared by all three per-client tests below so the
+    /// pass/fail criteria cannot drift between them.
+    fn assert_ca_bundle_case<T>(
+        label: &str,
+        path: &Path,
+        result: Result<T, RmcpServerKitError>,
+        accepted: bool,
+    ) -> anyhow::Result<()> {
+        let _removed = fs::remove_file(path);
+        if accepted {
+            let _built = result
+                .map_err(|error| anyhow::anyhow!("{label}: expected Ok, got Err({error})"))?;
+            return Ok(());
+        }
+        let Err(err) = result else {
+            anyhow::bail!("{label}: expected Err, got Ok");
+        };
+        assert!(
+            matches!(err, RmcpServerKitError::Startup(_)),
+            "{label}: a malformed CA bundle is a Startup error; got {err:?}"
+        );
+        let msg = err.to_string();
+        let path_str = path.display().to_string();
+        assert!(
+            msg.contains("ca_cert_path") && msg.contains(&path_str),
+            "{label}: error must name ca_cert_path and the path; got {msg:?}"
+        );
+        let is_zero_cert_case = matches!(
+            label,
+            "empty-file" | "garbage-text" | "der-encoded-ca" | "private-key-only"
+        );
+        assert_eq!(
+            msg.contains("no certificates found"),
+            is_zero_cert_case,
+            "{label}: \"no certificates found\" must appear only for a bundle that \
+             parses to zero certificates, not for a parse or build failure; got {msg:?}"
+        );
+        Ok(())
+    }
+
+    /// `JwksCache::new` accepts a CA bundle iff it contains at least one
+    /// certificate, and otherwise fails with `Startup` naming `ca_cert_path`.
+    ///
+    /// A mutation that removes `JwksCacheShared::new`'s call to the shared
+    /// helper must turn this red.
+    #[tokio::test]
+    async fn jwks_cache_enforces_ca_bundle_table() -> anyhow::Result<()> {
+        for (label, bytes, accepted) in ca_bundle_validation_cases()? {
+            let path = write_ca_bundle(&format!("jwks-{label}"), &bytes)?;
+            let mut cfg = test_config("https://auth.example.com/jwks.json");
+            cfg.ca_cert_path = Some(path.clone());
+            let result = JwksCache::new(&cfg);
+            assert_ca_bundle_case(label, &path, result, accepted)?;
+        }
+
+        Ok(())
+    }
+
+    /// `OauthHttpClient::with_config` accepts a CA bundle iff it contains at
+    /// least one certificate. A mutation that removes `OauthHttpClient::build`'s
+    /// call to the shared helper must turn this red.
+    #[test]
+    fn oauth_http_client_enforces_ca_bundle_table() -> anyhow::Result<()> {
+        for (label, bytes, accepted) in ca_bundle_validation_cases()? {
+            let path = write_ca_bundle(&format!("http-{label}"), &bytes)?;
+            let mut cfg = validation_https_config();
+            cfg.ca_cert_path = Some(path.clone());
+            let result = OauthHttpClient::with_config(&cfg);
+            assert_ca_bundle_case(label, &path, result, accepted)?;
+        }
+
+        Ok(())
+    }
+
+    /// White-box: `build_mtls_clients` enforces the same CA-bundle table as
+    /// the other two clients. A mutation that removes its call to the
+    /// shared helper must turn this red.
+    ///
+    /// Called directly rather than through `OauthHttpClient::with_config`:
+    /// that constructor's shared `ca_certs` step (feeding
+    /// `inner`/`credential_client`) reads the same `ca_cert_path` and would
+    /// always fail first, shadowing a defect in `build_mtls_clients`'s own
+    /// independent call to the helper.
+    #[cfg(feature = "oauth-mtls-client")]
+    #[test]
+    fn build_mtls_clients_enforces_ca_bundle_table() -> anyhow::Result<()> {
+        install_test_crypto_provider();
+        let (cert_path, key_path) = write_self_signed_pem()?;
+        let allowlist = Arc::new(CompiledSsrfAllowlist::default());
+        let test_bypass: TestLoopbackBypass = Arc::new(AtomicBool::new(false));
+        for (label, bytes, accepted) in ca_bundle_validation_cases()? {
+            let ca_path = write_ca_bundle(&format!("mtls-{label}"), &bytes)?;
+            let cc = ClientCertConfig {
+                cert_path: cert_path.clone(),
+                key_path: key_path.clone(),
+            };
+            let mut cfg = https_cfg_with_tx(tx_with(None, Some(cc)));
+            cfg.ca_cert_path = Some(ca_path.clone());
+            let result = build_mtls_clients(Some(&cfg), &allowlist, &test_bypass);
+            assert_ca_bundle_case(label, &ca_path, result, accepted)?;
+        }
+        let _removed_cert = fs::remove_file(&cert_path);
+        let _removed_key = fs::remove_file(&key_path);
 
         Ok(())
     }

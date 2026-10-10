@@ -439,7 +439,7 @@ graph TD
 | RBAC engine                       | `src/rbac.rs`                            | `RbacPolicy` L352, task-locals L90-150, `rbac_middleware` L678-825           |
 | Memory-bounded keyed limiter      | `src/bounded_limiter.rs`                 | `BoundedKeyedLimiter` L134                                                    |
 | Trusted-forwarder resolution      | `src/forwarded.rs`                       | `resolve_client_ip`, `FallbackReason` (rightmost-untrusted, fail-safe-to-direct) |
-| OAuth JWT / JWKS                  | `src/oauth.rs` (feature `oauth`)         | `JwksCache` L2549, `JWKS_REFRESH_COOLDOWN` ~L2628, `select_jwks_key` L2755 |
+| OAuth JWT / JWKS                  | `src/oauth.rs` (feature `oauth`)         | `JwksCache` L2736, `JWKS_REFRESH_COOLDOWN` ~L2920, `select_jwks_key` L3576 |
 | SSRF guard (outbound HTTP)        | `src/ssrf.rs`                            | per-hop scheme/userinfo/IP-literal blocks                                     |
 | mTLS revocation (CRL)             | `src/mtls_revocation.rs`                 | `CrlSet` L100, `DynamicClientCertVerifier` L771, `bootstrap_fetch` L935       |
 | Tool hooks / size cap             | `src/tool_hooks.rs`                      | `HookedHandler` L219                                                          |
