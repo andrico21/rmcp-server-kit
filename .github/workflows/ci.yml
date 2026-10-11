@@ -314,6 +314,8 @@ jobs:
         run: python3 scripts/lint-ratchet/profile_eq.py --clippy-toml
       - name: Prose gates
         run: python3 scripts/lint-ratchet/prose_gates.py --enforce
+      - name: Dash gate
+        run: python3 scripts/lint-ratchet/dash_gate.py --enforce
 
   # ---------------------------------------------------------------------------
   # Supply-chain advisory jobs (Phase 2 / 1.1.0).

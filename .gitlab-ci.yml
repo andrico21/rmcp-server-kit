@@ -147,6 +147,12 @@ audit:
   script:
     - rtk cargo audit
 
+dash-gate:
+  stage: lint
+  needs: []
+  script:
+    - python3 scripts/lint-ratchet/dash_gate.py --enforce
+
 # ---------------------------------------------------------------------------
 # Check stage: build & feature matrix
 # ---------------------------------------------------------------------------

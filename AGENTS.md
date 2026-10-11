@@ -160,7 +160,7 @@ Z:\TempPersistent\rmcp-server-kit\
 | License/ban policy               | `cargo deny check`                                                   |
 | MSRV check (lint-capped)         | `RUSTFLAGS="--cap-lints=warn" CARGO_BUILD_WARNINGS=allow cargo +1.99.0 build --all-features` |
 | Semver check (library)           | `cargo semver-checks check-release`                                  |
-| Lint gates (CI)                  | `python3 scripts/lint-ratchet/catalog_gate.py`; `allow_gate.py --enforce`; `profile_eq.py --clippy-toml`; `prose_gates.py --enforce` |
+| Lint gates (CI)                  | `python3 scripts/lint-ratchet/catalog_gate.py`; `allow_gate.py --enforce`; `profile_eq.py --clippy-toml`; `prose_gates.py --enforce`; `dash_gate.py --enforce` |
 | Docs citations + links (CI)      | `cargo test --all-features --test docs_citations` and `lychee --offline --no-progress README.md RUST_GUIDELINES.md docs/*.md` |
 
 **CI definition lives in**:
@@ -381,7 +381,7 @@ The core's current-Rust idioms (for example `Vec::push_mut` /
 | Hot-reload of keys / RBAC                      | `src/transport.rs` - `ReloadHandle` (~line 2014)       |
 | Environment variable override mapping          | `src/config.rs` - `ServerConfig::apply_env_overrides`, `ObservabilityConfig::apply_env_overrides`; `src/rbac.rs` - `RbacConfig::apply_env_overrides` |
 | `rmcp` / `rmcp-macros` version bump in `Cargo.toml` / `Cargo.lock` | `docs/RMCP_UPGRADE_CHECKLIST.md` - the checks to run; `tests/integration/delegation_guard.rs` - the trait-surface guard |
-| Lint gates (catalog / allow / profile-equality / prose) | `scripts/lint-ratchet/{catalog_gate,allow_gate,profile_eq,prose_gates}.py`; shared helpers in `scripts/lint-ratchet/common.py` |
+| Lint gates (catalog / allow / profile-equality / prose) | `scripts/lint-ratchet/{catalog_gate,allow_gate,profile_eq,prose_gates,dash_gate}.py`; shared helpers in `scripts/lint-ratchet/common.py` |
 | Vendored-guideline index / deviations register         | `RUST_GUIDELINES.md` (index); `docs/rust-guidelines/` (vendored bytes - never edit) |
 | Test tiers / `required-features` wiring                | `Cargo.toml` `[[test]]` tables; `tests/unit/` and `tests/integration/` |
 

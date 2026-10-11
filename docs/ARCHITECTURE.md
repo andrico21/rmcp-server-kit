@@ -955,15 +955,16 @@ jobs: `fmt` (pinned `nightly-2026-10-03`), `clippy`, `test` (Linux/macOS/Windows
 `cargo-audit`, `cargo-vet`, `taplo`, `cargo-machete`, `Rustdoc` (pinned nightly
 with `--cfg docsrs`), `Rustdoc (stable)`, `MSRV (1.99.0)` (lint-capped),
 `Memory bounds`, `Validate docs (citations + links)`, the `lint-ratchet`
-self-tests, and the four permanent lint gates. `cargo-geiger` and the nightly
+self-tests, and the five permanent lint gates. `cargo-geiger` and the nightly
 `Rustdoc (latest nightly canary)` run informational; `cargo-mutants` is
 schedule-only.
 
 The lint gates are stdlib-only Python under `scripts/lint-ratchet/`:
 `catalog_gate.py` (every `#[expect]` reason is in the sanctioned catalog),
 `allow_gate.py` (no `#[allow]`), `profile_eq.py` (the committed `[lints]` table
-equals the vendored profile), and `prose_gates.py` (cancel-safety notes, test
-signatures, docs, emptiness-assertion messages). Shared helpers live in
+equals the vendored profile), `prose_gates.py` (cancel-safety notes, test
+signatures, docs, emptiness-assertion messages), and `dash_gate.py` (house
+dash convention outside vendored guidelines). Shared helpers live in
 `common.py`; the counting ratchet and
 its `baseline/` tree were retired once the last `lint-migration:` expectation
 reached zero.

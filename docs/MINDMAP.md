@@ -249,7 +249,7 @@ mindmap
       deny.toml license + ban
       .cargo/audit.toml
       rustfmt.toml
-      scripts/lint-ratchet/ catalog allow profile_eq prose
+      scripts/lint-ratchet/ catalog allow profile_eq prose dash
       .cargo/config.toml build.warnings deny
     Coding standards
       RUST_GUIDELINES.md index + docs/rust-guidelines/ vendored

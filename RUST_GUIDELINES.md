@@ -476,9 +476,10 @@ numbered entry only if one of these situations arises later.
    bytes; never write upstream.
 4. Run the gates: `cargo test --all-features --test docs_citations`,
    `lychee --offline --no-progress README.md RUST_GUIDELINES.md docs/*.md`,
-   the four lint gates (`python3 scripts/lint-ratchet/catalog_gate.py`,
+   the five lint gates (`python3 scripts/lint-ratchet/catalog_gate.py`,
    `allow_gate.py --enforce`, `profile_eq.py --clippy-toml`,
-   `prose_gates.py --enforce`), plus the usual fmt/lint/test set. The retired
+   `prose_gates.py --enforce`, `dash_gate.py --enforce`), plus the usual
+   fmt/lint/test set. The retired
    counting ratchet is not part of the set.
 
 ## Toolchain-bump procedure
