@@ -10026,21 +10026,44 @@ mod tests {
 
     fn assert_owasp_headers(resp: &Response, ctx: &str) {
         let headers = resp.headers();
+        for (name, value) in [
+            ("x-content-type-options", "nosniff"),
+            ("x-frame-options", "deny"),
+            ("cache-control", "no-store, max-age=0"),
+            ("referrer-policy", "no-referrer"),
+            ("cross-origin-opener-policy", "same-origin"),
+            ("cross-origin-resource-policy", "same-origin"),
+            ("cross-origin-embedder-policy", "require-corp"),
+            (
+                "permissions-policy",
+                "accelerometer=(), camera=(), geolocation=(), microphone=()",
+            ),
+            ("x-permitted-cross-domain-policies", "none"),
+            (
+                "content-security-policy",
+                "default-src 'none'; form-action 'self'; object-src 'none'; frame-ancestors 'none'; upgrade-insecure-requests",
+            ),
+            ("x-dns-prefetch-control", "off"),
+            (
+                "strict-transport-security",
+                "max-age=63072000; includeSubDomains",
+            ),
+        ] {
+            assert_eq!(
+                headers
+                    .get(name)
+                    .and_then(|header_value| header_value.to_str().ok()),
+                Some(value),
+                "{ctx}: {name} default mismatch"
+            );
+        }
         assert!(
-            headers.contains_key("x-content-type-options"),
-            "{ctx}: missing X-Content-Type-Options"
+            headers.get("server").is_none(),
+            "{ctx}: server fingerprint header must be absent"
         );
         assert!(
-            headers.contains_key("x-frame-options"),
-            "{ctx}: missing X-Frame-Options"
-        );
-        assert!(
-            headers.contains_key("strict-transport-security"),
-            "{ctx}: missing Strict-Transport-Security"
-        );
-        assert!(
-            headers.contains_key(header::CONTENT_SECURITY_POLICY),
-            "{ctx}: missing Content-Security-Policy"
+            headers.get("x-powered-by").is_none(),
+            "{ctx}: x-powered-by fingerprint header must be absent"
         );
     }
 
@@ -10172,6 +10195,25 @@ mod tests {
         let resp = app.oneshot(req).await?;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_owasp_headers(&resp, "overload-503");
+
+        Ok(())
+    }
+
+    /// Pins that the request body-limit 413 response carries the OWASP security
+    /// headers.
+    #[tokio::test]
+    async fn headers_on_body_limit_413() -> anyhow::Result<()> {
+        let app = m5_router(None)?;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header(header::ORIGIN, "http://good.example")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CONTENT_LENGTH, (1024 * 1024 + 1).to_string())
+            .body(Body::from("x".repeat(1024 * 1024 + 1)))?;
+        let resp = app.oneshot(req).await?;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_owasp_headers(&resp, "body-limit-413");
 
         Ok(())
     }

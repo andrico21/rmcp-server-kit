@@ -686,6 +686,14 @@ mod tests {
             headers.get("strict-transport-security").is_none(),
             "{context}: HSTS must remain absent on plaintext"
         );
+        assert!(
+            headers.get("server").is_none(),
+            "{context}: server fingerprint header must be absent"
+        );
+        assert!(
+            headers.get("x-powered-by").is_none(),
+            "{context}: x-powered-by fingerprint header must be absent"
+        );
     }
 
     fn assert_security_header_defaults(headers: &HeaderMap, context: &str) {
@@ -715,6 +723,14 @@ mod tests {
         assert!(
             headers.get("strict-transport-security").is_none(),
             "{context}: HSTS must remain absent on plaintext"
+        );
+        assert!(
+            headers.get("server").is_none(),
+            "{context}: server fingerprint header must be absent"
+        );
+        assert!(
+            headers.get("x-powered-by").is_none(),
+            "{context}: x-powered-by fingerprint header must be absent"
         );
     }
 
@@ -1045,6 +1061,7 @@ mod tests {
         let client = reqwest::Client::new();
         let mcp_resp = client.post(format!("{base}/mcp")).body("{}").send().await?;
         assert_eq!(mcp_resp.status(), 401);
+        assert_security_header_defaults(mcp_resp.headers(), "unauthenticated /mcp 401");
         Ok(())
     }
 
@@ -1133,6 +1150,7 @@ mod tests {
             .send()
             .await?;
         assert_eq!(resp.status(), 403);
+        assert_security_header_defaults(resp.headers(), "rbac deny 403");
         Ok(())
     }
 
@@ -1592,6 +1610,7 @@ mod tests {
         // Third request: should be 429 (rate limited).
         let resp = client.post(&url).body("{}").send().await?;
         assert_eq!(resp.status(), 429, "request 3 should be rate limited");
+        assert_security_header_defaults(resp.headers(), "auth rate limit 429");
         Ok(())
     }
 
@@ -1623,6 +1642,7 @@ mod tests {
         }
         let resp = client.get(format!("{base}/ping")).send().await?;
         assert_eq!(resp.status(), 429, "request 3 should be rate limited");
+        assert_security_header_defaults(resp.headers(), "extra route rate limit 429");
         assert!(
             resp.text()
                 .await?
@@ -1719,6 +1739,7 @@ mod tests {
         }
         let resp = client.post(&url).body("{}").send().await?;
         assert_eq!(resp.status(), 429);
+        assert_security_header_defaults(resp.headers(), "auth retry-after 429");
         let retry_after = resp
             .headers()
             .get("retry-after")
@@ -2660,6 +2681,7 @@ mod tests {
             413,
             "oversized body must be rejected with 413 before RBAC buffers it"
         );
+        assert_security_header_defaults(resp.headers(), "mcp body limit 413");
         Ok(())
     }
 
@@ -3087,6 +3109,7 @@ mod tests {
             "/token must reject oversized body with 413 (got {})",
             token_resp.status()
         );
+        assert_security_header_defaults(token_resp.headers(), "oauth token body limit 413");
 
         // /register - Json extractor. Send an oversized JSON string value.
         let big_json = serde_json::json!({ "redirect_uris": [oversized.clone()] }).to_string();

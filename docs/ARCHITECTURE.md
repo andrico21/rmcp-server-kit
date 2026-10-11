@@ -938,10 +938,10 @@ error, not a silently empty binary. There is no separate `e2e` tier; every test
 is autonomous (loopback ports or `wiremock`, no live external service).
 
 Examples worth reading:
-- `auth_accepts_valid_bearer` - `tests/integration/e2e.rs:1053`
-- `rbac_denies_unpermitted_tool` - `tests/integration/e2e.rs:1172`
-- `rbac_allows_permitted_tool` - `tests/integration/e2e.rs:1202`
-- `rbac_argument_allowlist_enforced` - `tests/integration/e2e.rs:1235`
+- `auth_accepts_valid_bearer` - `tests/integration/e2e.rs:1070`
+- `rbac_denies_unpermitted_tool` - `tests/integration/e2e.rs:1190`
+- `rbac_allows_permitted_tool` - `tests/integration/e2e.rs:1220`
+- `rbac_argument_allowlist_enforced` - `tests/integration/e2e.rs:1253`
 
 > When changing behaviour, **add an E2E test first**. The unit tests in
 > `auth.rs`/`rbac.rs` are useful but the E2E suite is what catches
