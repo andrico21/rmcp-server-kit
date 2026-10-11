@@ -128,15 +128,15 @@ defined cleanup order, and no panic path. `scripts/lint-ratchet/prose_gates.py
 
 | Impl | File:line | Finding |
 | ---- | --------- | ------- |
-| `Drop for ExposureTestGuard` | `src/diagnostics.rs:197` | Test-only. Restores the process-global switch snapshot in memory; sync, no I/O or await, no panic path. No defect. |
-| `Drop for PendingUrlGuard` | `src/mtls_revocation.rs:1953` | Clears the in-flight URL marker (poison-recovering mutex); sync, no I/O or await, no panic path. Ordering is explicit via `disarm()` before promotion. No defect. |
-| `Drop for RefreshCompletionGuard` | `src/oauth.rs:2817` | Publishes one JWKS refresh completion and releases watch waiters through sync mutex/watch operations; no I/O, await, blocking or panic path. No defect. |
-| `Drop for JwksCache` | `src/oauth.rs:2829` | Sync, non-blocking `CancellationToken::cancel` for cache-owned JWKS refresh tasks; no I/O, await or panic path. No defect. |
-| `Drop for TracingGuard` | `src/observability.rs:247` | Delegates to `AuditWorkerGuard` by taking the `Option`; sync, no await, no panic path. Bounded by design (5s). No defect. |
-| `Drop for AuditWorkerGuard` | `src/observability.rs:441` | Signals shutdown then parks/joins the writer thread for at most `AUDIT_WRITER_JOIN_TIMEOUT` (5s); no async work or panic path. Bounded blocking is deliberate and documented. No defect. |
-| `Drop for CancelOnDrop` | `src/transport.rs:2866` | Sync, non-blocking `CancellationToken::cancel`; no I/O, await or panic path. Never disarmed on purpose. No defect. |
-| `Drop for TlsListener` | `src/transport.rs:3777` | Sync, non-blocking `JoinHandle::abort`; in-flight workers exit on the closed channel. No I/O, await or panic path. No defect. |
-| `Drop for ReleaseHookOnDrop` | `src/auth.rs:1648` | Test-only. Flips the `AtomicBool` gate of a `VerificationHook`; sync, no I/O or await, no panic path. Runs on unwind too, which unparks any `spawn_blocking` closure still busy-waiting before the test's `Runtime` drops. No defect. |
+| `ExposureTestGuard` | `src/diagnostics.rs:152` | Test-only. Restores the process-global switch snapshot in memory; sync, no I/O or await, no panic path. No defect. |
+| `Drop for PendingUrlGuard` | `src/mtls_revocation.rs:2285` | Clears the in-flight URL marker (poison-recovering mutex); sync, no I/O or await, no panic path. Ordering is explicit via `disarm()` before promotion. No defect. |
+| `RefreshCompletionGuard` | `src/oauth.rs:2879` | Publishes one JWKS refresh completion and releases watch waiters through sync mutex/watch operations; no I/O, await, blocking or panic path. No defect. |
+| `Drop for JwksCache` | `src/oauth.rs:2744` | Sync, non-blocking `CancellationToken::cancel` for cache-owned JWKS refresh tasks; no I/O, await or panic path. No defect. |
+| `TracingGuard` | `src/observability.rs:137` | Delegates to `AuditWorkerGuard` by taking the `Option`; sync, no await, no panic path. Bounded by design (5s). No defect. |
+| `Drop for AuditWorkerGuard` | `src/observability.rs:378` | Signals shutdown then parks/joins the writer thread for at most `AUDIT_WRITER_JOIN_TIMEOUT` (5s); no async work or panic path. Bounded blocking is deliberate and documented. No defect. |
+| `Drop for CancelOnDrop` | `src/transport.rs:2959` | Sync, non-blocking `CancellationToken::cancel`; no I/O, await or panic path. Never disarmed on purpose. No defect. |
+| `Drop for TlsListener` | `src/transport.rs:3656` | Sync, non-blocking `JoinHandle::abort`; in-flight workers exit on the closed channel. No I/O, await or panic path. No defect. |
+| `Drop for ReleaseHookOnDrop` | `src/auth.rs:1642` | Test-only. Flips the `AtomicBool` gate of a `VerificationHook`; sync, no I/O or await, no panic path. Runs on unwind too, which unparks any `spawn_blocking` closure still busy-waiting before the test's `Runtime` drops. No defect. |
 
 ## Local deviations register
 

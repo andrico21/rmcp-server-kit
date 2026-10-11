@@ -68,7 +68,7 @@ mod tests {
     /// How far (in lines, each direction) an anchor symbol may sit from the
     /// cited line/range. The doc headers promise "approximate" citations;
     /// this is the enforced meaning of approximate.
-    const TOLERANCE: usize = 30;
+    const TOLERANCE: usize = 10;
 
     /// Anchor candidates shorter than this are ignored (too noisy).
     const MIN_ANCHOR_LEN: usize = 3;
@@ -76,7 +76,7 @@ mod tests {
     /// Identifier-like tokens that are too generic to anchor anything.
     const ANCHOR_STOPLIST: &[&str] = &[
         "src", "the", "and", "for", "rs", "line", "str", "Vec", "Arc", "Some", "None", "Option",
-        "String", "true", "false", "usize", "bool",
+        "String", "true", "false", "usize", "bool", "new", "call", "run",
     ];
 
     #[derive(Debug, Clone)]
@@ -90,7 +90,7 @@ mod tests {
         /// Line in the doc where the citation appears.
         doc_line: usize,
         /// Symbol candidates extracted from the same doc line. Empty means
-        /// "length-check only".
+        /// invalid: every citation must carry a specific anchor.
         anchors: Vec<String>,
     }
 
@@ -330,12 +330,32 @@ mod tests {
         out
     }
 
+    fn unparsed_src_line_ranges(doc_name: &str, doc: &str) -> Vec<String> {
+        let mut failures = Vec::new();
+        for (idx, line) in doc.lines().enumerate() {
+            if !line.contains("src/") || !line.contains("line") {
+                continue;
+            }
+            let prose_range = line.contains("lines ")
+                || line.contains("line range")
+                || line.contains("around lines")
+                || line.contains("near lines");
+            if prose_range && parse_citations(line).is_empty() {
+                failures.push(format!(
+                    "{doc_name}:{} mentions a src/*.rs prose line range that is not a parseable citation",
+                    idx.saturating_add(1)
+                ));
+            }
+        }
+        failures
+    }
+
     fn check_doc(doc_name: &str, doc: &str) -> (usize, Vec<String>) {
         let root = workspace_root();
         let citations = parse_citations(doc);
 
         let mut file_lines: BTreeMap<String, Option<Vec<String>>> = BTreeMap::new();
-        let mut failures: Vec<String> = Vec::new();
+        let mut failures: Vec<String> = unparsed_src_line_ranges(doc_name, doc);
 
         for citation in &citations {
             let cached_lines = file_lines.entry(citation.file.clone()).or_insert_with(|| {
@@ -366,6 +386,12 @@ mod tests {
             }
 
             if citation.anchors.is_empty() {
+                failures.push(format!(
+                    "{doc_name}:{} cites {}:{} without a non-generic anchor symbol on the same line",
+                    citation.doc_line,
+                    citation.file,
+                    fmt_range(citation)
+                ));
                 continue;
             }
 
@@ -650,6 +676,13 @@ mod tests {
         Ok(())
     }
 
+    /// Pins that every `src/*.rs` citation in `RUST_GUIDELINES.md` resolves.
+    #[test]
+    fn rust_guidelines_citations_resolve() -> anyhow::Result<()> {
+        run_doc_test("RUST_GUIDELINES.md")?;
+        Ok(())
+    }
+
     #[test]
     #[expect(
         clippy::unnecessary_wraps,
@@ -691,6 +724,57 @@ mod tests {
             "expected >=10 symbol-anchored citations in docs/ARCHITECTURE.md, found {anchored} \
              (out of {} citations) - anchor extraction is likely broken",
             citations.len()
+        );
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: tests/integration/docs_citations.rs::unanchored_citation_is_rejected keeps the uniform test signature while it only asserts"
+    )]
+    #[test]
+    /// Pins that a citation without a symbol anchor is rejected.
+    fn unanchored_citation_is_rejected() -> anyhow::Result<()> {
+        let (_total, failures) = check_doc("fixture.md", "See src/lib.rs:1 for details.");
+        assert!(
+            failures
+                .iter()
+                .any(|failure| failure.contains("without a non-generic anchor")),
+            "unanchored citation must fail: {failures:?}"
+        );
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: tests/integration/docs_citations.rs::generic_anchor_is_rejected keeps the uniform test signature while it only asserts"
+    )]
+    #[test]
+    /// Pins that generic anchors such as `new` do not satisfy citations.
+    fn generic_anchor_is_rejected() -> anyhow::Result<()> {
+        let (_total, failures) = check_doc("fixture.md", "`new` is near src/lib.rs:1.");
+        assert!(
+            failures
+                .iter()
+                .any(|failure| failure.contains("without a non-generic anchor")),
+            "generic anchor must fail: {failures:?}"
+        );
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: tests/integration/docs_citations.rs::prose_line_range_is_rejected keeps the uniform test signature while it only asserts"
+    )]
+    #[test]
+    /// Pins that prose `src/*.rs` line ranges must use a parseable citation.
+    fn prose_line_range_is_rejected() -> anyhow::Result<()> {
+        let (_total, failures) = check_doc("fixture.md", "See src/lib.rs lines 1-3 for details.");
+        assert!(
+            failures
+                .iter()
+                .any(|failure| failure.contains("prose line range")),
+            "prose range must fail: {failures:?}"
         );
         Ok(())
     }

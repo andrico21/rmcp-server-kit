@@ -222,7 +222,7 @@ consumer applications and `examples/`.
 | Crate root / public API                  | [`src/lib.rs`](src/lib.rs)                                            | Re-exports all public modules                                                                          |
 | **Server entry (HTTP)**                  | [`src/transport.rs`](src/transport.rs) - `serve()` (~line 3025)        | The function consumers call. Wires rmcp + axum + middleware + TLS + admin + metrics                    |
 | Server entry (stdio)                     | [`src/transport.rs`](src/transport.rs) - `serve_stdio()` (~line 5515) | For desktop/IDE clients. **Bypasses auth/RBAC/TLS** - use only for local subprocess MCP                |
-| Config builder                           | [`src/transport.rs`](src/transport.rs) - `McpServerConfig::new` (~line 1001) | Builder-style config struct                                                                       |
+| Config builder                           | [`src/transport.rs`](src/transport.rs) - `McpServerConfig::new` (`src/transport.rs:989`) | Builder-style config struct                                                                       |
 | Hot-reload handle                        | [`src/transport.rs`](src/transport.rs) - `ReloadHandle` (~line 2014)   | `try_reload_auth_keys` / `reload_auth_keys` / `reload_rbac` for runtime reconfig without restart      |
 | Runnable example                         | [`examples/minimal_server.rs`](examples/minimal_server.rs)            | Smallest possible consumer of `serve()`                                                                |
 | Integration reference                    | [`tests/integration/e2e.rs`](tests/integration/e2e.rs)                | Real-world usage patterns; use as an integration cookbook                                              |
@@ -233,7 +233,7 @@ consumer applications and `examples/`.
 
 ```
                    ┌──────────────────────────────────┐
-   HTTP request ─► │  TlsListener  (TLS / mTLS)       │  src/transport.rs:3668
+   HTTP request ─► │  TlsListener  (TLS / mTLS)       │  `TlsListener` src/transport.rs:3656
                    └────────────────┬─────────────────┘
                                     ▼
                    ┌──────────────────────────────────┐
@@ -251,7 +251,7 @@ consumer applications and `examples/`.
         (executed top-to-bottom on request)            │
                                                        │
         0. Security headers - outermost, response-only decoration; pass-through on requests
-        1. Origin check       src/transport.rs:5171    │  spec: MCP origin validation
+        1. Origin check       `origin_check_middleware` src/transport.rs:5159    │  spec: MCP origin validation
            Logs only the requests it rejects.
         2. Peer-addr normalize (normalize_peer_addr_middleware) │  mirrors TLS peer into ConnectInfo<SocketAddr> + public PeerAddr (both branches)
         2b. Request log (request_log_middleware): DEBUG `incoming request` / `request completed`, skips request_log_exclude_paths, client fields per [server.log_context] knobs
@@ -272,7 +272,7 @@ consumer applications and `examples/`.
 - `AuthState.api_keys: ArcSwap<Vec<ApiKeyEntry>>` - swap API keys at runtime
 - `rbac_swap: ArcSwap<RbacPolicy>` - swap RBAC policy at runtime
 - mTLS identity: bound to the connection itself via `AuthenticatedTlsStream` / per-connection `TlsConnInfo` extension - set by the TLS handshake worker, read by auth middleware (no shared `SocketAddr`-keyed map)
-- Task-local: `current_role()`, `current_identity()`, `current_token()`, `current_sub()` - set by middleware, callable from inside tool handlers (`src/rbac.rs:243`)
+- Task-local: `current_role()` (`src/rbac.rs:158`), `current_identity()` (`src/rbac.rs:180`), `current_token()` (`src/rbac.rs:202`), and `current_sub()` (`src/rbac.rs:220`) - set by middleware, callable from inside tool handlers
 
 For a much deeper version see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
@@ -357,7 +357,7 @@ The core's current-Rust idioms (for example `Vec::push_mut` /
 |------------------------------------------------|--------------------------------------------------------|
 | Server entry / router / middleware order       | `src/transport.rs` - `serve()` and surrounding helpers |
 | API key authentication                         | `src/auth.rs` - `AuthState`, `ApiKeyEntry`, `auth_middleware` |
-| mTLS identity extraction                       | `src/transport.rs` - `extract_mtls_identity` call site (~line 3746)   |
+| mTLS identity extraction                       | `src/transport.rs` - `extract_mtls_identity` call site (near `run_tls_acceptor`, `src/transport.rs:3747`)   |
 | mTLS CRL revocation (CDP-driven)               | `src/mtls_revocation.rs` - `CrlSet`, `DynamicClientCertVerifier`, `bootstrap_fetch`, `run_crl_refresher` |
 | OAuth JWT validation / JWKS cache              | `src/oauth.rs` - `JwksCache`, feature-gated           |
 | RBAC policy evaluation                         | `src/rbac.rs` - `RbacPolicy::check`, `enforce_tool_policy` |
@@ -377,7 +377,7 @@ The core's current-Rust idioms (for example `Vec::push_mut` /
 | Security-header TOML controls                  | `src/transport.rs` - `SecurityHeadersConfig`; `src/config.rs` - `ServerConfig::security_headers` |
 | Error type → HTTP status mapping               | `src/error.rs` - `RmcpServerKitError::into_response`           |
 | Origin / security headers / CORS               | `src/transport.rs` - `origin_check_middleware`, `security_headers_middleware` |
-| Graceful shutdown (Ctrl-C / SIGTERM)           | `src/transport.rs` - `shutdown_signal()` (~line 4205) |
+| Graceful shutdown (Ctrl-C / SIGTERM)           | `src/transport.rs` - `shutdown_signal()` (`src/transport.rs:4190`) |
 | Hot-reload of keys / RBAC                      | `src/transport.rs` - `ReloadHandle` (~line 2014)       |
 | Environment variable override mapping          | `src/config.rs` - `ServerConfig::apply_env_overrides`, `ObservabilityConfig::apply_env_overrides`; `src/rbac.rs` - `RbacConfig::apply_env_overrides` |
 | `rmcp` / `rmcp-macros` version bump in `Cargo.toml` / `Cargo.lock` | `docs/RMCP_UPGRADE_CHECKLIST.md` - the checks to run; `tests/integration/delegation_guard.rs` - the trait-surface guard |
@@ -389,8 +389,8 @@ The core's current-Rust idioms (for example `Vec::push_mut` /
 
 ## 10. Common pitfalls (history of bites)
 
-1. **Middleware order matters for security.** Origin check MUST run before auth so unauthenticated callers are rejected by origin first. Rate limit MUST be inside auth so anonymous storms don't amplify. See `src/transport.rs` middleware wiring around lines 1640-1830.
-2. **JWKS refresh is rate-limited.** Don't remove the `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:2920`) - invalid JWTs would otherwise DoS the JWKS endpoint.
+1. **Middleware order matters for security.** Origin check MUST run before auth so unauthenticated callers are rejected by origin first. Rate limit MUST be inside auth so anonymous storms don't amplify. See `build_app_router` middleware wiring in `src/transport.rs:2330`.
+2. **JWKS refresh is rate-limited.** Don't remove the `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:2928`) - invalid JWTs would otherwise DoS the JWKS endpoint.
 3. **Task-local RBAC context only exists inside the request scope.** Calling `current_role()` from a `tokio::spawn`ed background task returns `None`. Capture the value before spawning.
 4. **`stdio` transport bypasses everything.** `serve_stdio` does NOT enforce auth, RBAC, TLS, or origin checks. It's intended for trusted local subprocess scenarios only.
 5. **mTLS identity is bound to the connection stream (`TlsConnInfo`), not to a shared `SocketAddr` map.** If a load balancer terminates TCP and rewrites peer addresses you must terminate TLS at the LB and use a different identity-binding strategy; the in-process binding itself is immune to port-reuse aliasing.

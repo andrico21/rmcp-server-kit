@@ -296,12 +296,12 @@ mindmap
 sequenceDiagram
     autonumber
     participant C as Client
-    participant TLS as TlsListener<br/>src/transport.rs:3668
+    participant TLS as `TlsListener`<br/>src/transport.rs:3656
     participant R as axum Router
-    participant O as origin_check<br/>src/transport.rs:5171
-    participant H as security_headers<br/>src/transport.rs:3797
-    participant A as auth_middleware<br/>src/auth.rs:1006
-    participant B as rbac_middleware<br/>src/rbac.rs:584
+    participant O as `origin_check_middleware`<br/>src/transport.rs:5159
+    participant H as `security_headers_middleware`<br/>src/transport.rs:4372
+    participant A as `auth_middleware`<br/>src/auth.rs:2594
+    participant B as `rbac_middleware`<br/>src/rbac.rs:1354
     participant L as per-IP rate limit<br/>governor + bounded_limiter
     participant M as rmcp Streamable<br/>HTTP service
     participant T as ServerHandler<br/>(consumer impl)
@@ -332,20 +332,20 @@ sequenceDiagram
 ```mermaid
 flowchart LR
     subgraph Admin["Admin / operator"]
-        RH[ReloadHandle<br/>src/transport.rs:712]
+        RH[`ReloadHandle`<br/>src/transport.rs:2002]
     end
 
     subgraph SharedState["Shared state (lock-free / fine-grained)"]
-        AKS[(ArcSwap&lt;ApiKeys&gt;<br/>AuthState.api_keys<br/>src/auth.rs:631)]
+        AKS[(ArcSwap&lt;ApiKeys&gt;<br/>`AuthState` api_keys<br/>src/auth.rs:1660)]
         RBS[(ArcSwap&lt;RbacPolicy&gt;<br/>rbac_swap)]
-        MTL[mTLS AuthIdentity<br/>per-connection<br/>TlsConnInfo extension<br/>src/auth.rs:602-610]
+        MTL[mTLS `AuthIdentity`<br/>per-connection<br/>TlsConnInfo extension<br/>src/auth.rs:76]
     end
 
     subgraph Hot["Request-time consumers"]
-        AM[auth_middleware<br/>src/auth.rs:1006]
-        BM[rbac_middleware<br/>src/rbac.rs:584]
-        TL["Task-locals<br/>current_role / current_identity<br/>current_token / current_sub<br/>src/rbac.rs:83-145"]
-        TH[HookedHandler<br/>src/tool_hooks.rs:219]
+        AM[`auth_middleware`<br/>src/auth.rs:2594]
+        BM[`rbac_middleware`<br/>src/rbac.rs:1354]
+        TL["Task-locals<br/>`current_role` / `current_identity`<br/>`current_token` / `current_sub`<br/>src/rbac.rs:158-220"]
+        TH[`HookedHandler`<br/>src/tool_hooks.rs:335]
     end
 
     RH -- reload_auth_keys --> AKS
@@ -432,14 +432,14 @@ graph TD
 | Server entry (HTTP)               | `src/transport.rs`                       | `serve` L3025, `McpServerConfig` L493-, `ReloadHandle` ~L2014              |
 | Server entry (stdio, no auth)     | `src/transport.rs`                       | `serve_stdio` L5515                                                          |
 | Router builder + middleware wire  | `src/transport.rs`                       | `build_app_router` L2342; security headers, peer-addr normalization, request logging, and origin checks are wired there |
-| TLS / mTLS acceptor               | `src/transport.rs`                       | `TlsListener` L3668                                                          |
-| Origin / security headers (defs)  | `src/transport.rs`                       | `origin_check_middleware` L5171, `security_headers_middleware` ~L4387       |
+| TLS / mTLS acceptor               | `src/transport.rs`                       | `TlsListener` L3656                                                          |
+| Origin / security headers (defs)  | `src/transport.rs`                       | `origin_check_middleware` L5159, `security_headers_middleware` ~L4372       |
 | Graceful shutdown                 | `src/transport.rs`                       | `shutdown_signal` L4205                                                      |
-| API key + mTLS auth               | `src/auth.rs`                            | `AuthIdentity` L76, `AuthState` ~L1404, `auth_middleware` L2272              |
-| RBAC engine                       | `src/rbac.rs`                            | `RbacPolicy` L352, task-locals L90-150, `rbac_middleware` L678-825           |
+| API key + mTLS auth               | `src/auth.rs`                            | `AuthIdentity` L76, `AuthState` ~L1660, `auth_middleware` L2594              |
+| RBAC engine                       | `src/rbac.rs`                            | `RbacPolicy` L709, task-locals L158-220, `rbac_middleware` L1354           |
 | Memory-bounded keyed limiter      | `src/bounded_limiter.rs`                 | `BoundedKeyedLimiter` L134                                                    |
 | Trusted-forwarder resolution      | `src/forwarded.rs`                       | `resolve_client_ip`, `FallbackReason` (rightmost-untrusted, fail-safe-to-direct) |
-| OAuth JWT / JWKS                  | `src/oauth.rs` (feature `oauth`)         | `JwksCache` L2736, `JWKS_REFRESH_COOLDOWN` ~L2920, `select_jwks_key` L3576 |
+| OAuth JWT / JWKS                  | `src/oauth.rs` (feature `oauth`)         | `JwksCache` L2744, `JWKS_REFRESH_COOLDOWN` ~L2928, `select_jwks_key` L3576 |
 | SSRF guard (outbound HTTP)        | `src/ssrf.rs`                            | per-hop scheme/userinfo/IP-literal blocks                                     |
 | mTLS revocation (CRL)             | `src/mtls_revocation.rs`                 | `CrlSet` L100, `DynamicClientCertVerifier` L771, `bootstrap_fetch` L935       |
 | Tool hooks / size cap             | `src/tool_hooks.rs`                      | `HookedHandler` L219                                                          |
@@ -456,7 +456,7 @@ graph TD
 ## How to read this mindmap
 
 1. **Start at the root** - confirms crate identity (library, edition, MSRV).
-2. **Modules branch** - every `src/*.rs` file with its key symbols and file:line refs.
+2. **Modules branch** - every parseable citation to a `src/*.rs` file includes its key symbol and file:line ref.
 3. **Endpoints / Auth modes / Middleware order** - runtime surface of the server.
 4. **State plane / Hot reload** - how `ArcSwap` and task-locals coordinate.
 5. **Critical pitfalls** - checklist before proposing any change.
