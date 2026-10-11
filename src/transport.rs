@@ -773,7 +773,7 @@ pub struct McpServerConfig {
     pub request_log_exclude_paths: Vec<String>,
     /// Expose build metadata (`build_git_sha`, `build_timestamp`,
     /// `rust_version`) on the unauthenticated `/version` endpoint.
-    /// **Default: `false`** -- only `name`, `version`, and `rmcp_server_kit_version`
+    /// **Default: `false`** - only `name`, `version`, and `rmcp_server_kit_version`
     /// are served otherwise, so build fingerprints are not leaked to
     /// anonymous callers. Enable via
     /// [`McpServerConfig::expose_build_metadata`].
@@ -1176,8 +1176,8 @@ impl McpServerConfig {
     /// with `panic = "abort"`, so catching it is not possible.
     ///
     /// A path that merely sits *under* a framework prefix without exactly
-    /// overlapping an existing route -- `/admin/custom` alongside
-    /// `/admin/status`, say -- does **not** panic and is **not** validated.
+    /// overlapping an existing route - `/admin/custom` alongside
+    /// `/admin/status`, say - does **not** panic and is **not** validated.
     /// `axum::Router` exposes no route-enumeration API, so the framework
     /// cannot inspect these paths. Avoiding such collisions is the caller's
     /// responsibility.
@@ -1993,7 +1993,7 @@ impl McpServerConfig {
 /// Handle for hot-reloading server configuration without restart.
 ///
 /// Obtained via [`McpServerConfig::on_reload_ready`].
-/// All swap operations are lock-free and wait-free -- in-flight requests
+/// All swap operations are lock-free and wait-free - in-flight requests
 /// finish with the old values while new requests see the update immediately.
 #[expect(
     missing_debug_implementations,
@@ -2127,9 +2127,9 @@ struct AppRunParams {
     /// wins. The force-exit path must still cancel it, or a stuck stream turns
     /// a truncation bug into a shutdown hang.
     session_ct: CancellationToken,
-    /// `"http"` or `"https"` -- used only for boot-time logging.
+    /// `"http"` or `"https"` - used only for boot-time logging.
     scheme: &'static str,
-    /// Server name -- used only for boot-time logging.
+    /// Server name - used only for boot-time logging.
     name: String,
 }
 
@@ -2321,7 +2321,7 @@ fn install_extra_router(router: axum::Router, config: &mut McpServerConfig) -> a
 )]
 #[expect(
     clippy::too_many_lines,
-    reason = "deliberate: src/transport.rs::build_app_router — router assembly is intrinsically sequential; the length is layer wiring, not branching logic"
+    reason = "deliberate: src/transport.rs::build_app_router - router assembly is intrinsically sequential; the length is layer wiring, not branching logic"
 )]
 #[expect(
     deprecated,
@@ -2469,7 +2469,7 @@ where
                 // Absolute only when `public_url` supplies a trustworthy
                 // external origin. Without it `derive_server_url` falls back
                 // to the bind address, which behind a TLS-terminating proxy
-                // is an internal `http://` address -- advertising that would
+                // is an internal `http://` address - advertising that would
                 // send clients somewhere they cannot reach. `None` keeps the
                 // relative path, which resolves against whatever origin the
                 // client was actually challenged from.
@@ -2665,7 +2665,7 @@ where
     // RFC 9728: Protected Resource Metadata endpoint.
     // When OAuth is configured, serve full metadata with authorization_servers.
     // Otherwise, serve a minimal document with just the resource URL and no
-    // authorization_servers -- this tells MCP clients (e.g. Claude Code SDK)
+    // authorization_servers - this tells MCP clients (e.g. Claude Code SDK)
     // that the server exists but does NOT require OAuth authentication,
     // preventing them from gating the connection behind a broken auth flow.
     let server_url = derive_server_url(&config);
@@ -2892,10 +2892,10 @@ where
     }));
 
     // OWASP security response headers. Installed LAST, making this the
-    // OUTERMOST response layer: every response -- normal handler output,
+    // OUTERMOST response layer: every response - normal handler output,
     // origin-403, CORS preflight, the overload-503 (already converted to a
     // Response by the HandleErrorLayer nested inside the load-shed stack),
-    // and the 404 fallback -- flows back out through it and gains the headers.
+    // and the 404 fallback - flows back out through it and gains the headers.
     // This is response-only decoration: on the request path it is a
     // pass-through, so origin still runs before auth and the rate limiter
     // still sits inside auth.
@@ -2948,8 +2948,8 @@ where
 ///
 /// Startup spawns background tasks (the Prometheus metrics listener, the CRL
 /// refresher, the external-shutdown bridge) before every fallible step has
-/// completed. Without this guard a later failure -- a main-bind `AddrInUse`,
-/// an unreadable TLS key -- returns `Err` while those tasks keep running and
+/// completed. Without this guard a later failure - a main-bind `AddrInUse`,
+/// an unreadable TLS key - returns `Err` while those tasks keep running and
 /// keep their ports bound for the lifetime of the process.
 ///
 /// The guard is deliberately never disarmed: once the serve function returns,
@@ -4041,7 +4041,7 @@ fn build_tls_server_config_from_verifier(
 /// Session resumption is disabled whenever mTLS is configured at all: non-CRL
 /// mTLS still relies on `verify_client_cert` for expiry and chain validation,
 /// so scoping to `crl_enabled` alone would leave that path unprotected. The
-/// non-mTLS branch is untouched -- it requests no client cert, so resumption
+/// non-mTLS branch is untouched - it requests no client cert, so resumption
 /// there is not security-relevant.
 ///
 /// # Errors
@@ -4162,7 +4162,7 @@ fn serialize_version_payload(name: &str, version: &str, expose_build_metadata: b
 // NOT cancel-safe: the kit itself mutates no state here, but this awaits a
 // consumer-supplied readiness future. Cancellation drops that future at
 // whatever await it is parked on, so cancel safety is the callback author's
-// contract -- a readiness probe must not leave partial state behind.
+// contract - a readiness probe must not leave partial state behind.
 /// Readiness probe handler that awaits the configured check.
 async fn readyz(check: ReadinessCheck) -> impl IntoResponse {
     let status = check().await;
@@ -4220,7 +4220,7 @@ async fn shutdown_signal() {
     }
 }
 
-// -- Origin validation (MCP 2025-11-25 spec, section 2.0.1) --
+// - Origin validation (MCP 2025-11-25 spec, section 2.0.1) -
 
 /// Middleware that validates the `Origin` header on incoming HTTP requests.
 ///
@@ -4235,7 +4235,7 @@ async fn shutdown_signal() {
 /// but it is not available everywhere: `/mcp` is mounted with `nest_service`,
 /// whose tail match may carry `MatchedNestedPath` instead, and unmatched
 /// requests that hit the 404 fallback carry neither. The raw URI path is
-/// never used as a fallback -- that is precisely the unbounded input.
+/// never used as a fallback - that is precisely the unbounded input.
 #[cfg(feature = "metrics")]
 fn metrics_labels(req: &Request<Body>) -> (&'static str, String) {
     use axum::extract::MatchedPath;
@@ -4591,8 +4591,8 @@ pub(crate) fn validate_security_headers(
 /// `Cache-Control: no-store, max-age=0` is already applied globally by
 /// [`security_headers_middleware`]; this middleware adds:
 ///
-/// - `Pragma: no-cache` -- mandated by RFC 6749 §5.1 for HTTP/1.0 caches.
-/// - `Vary: Authorization` -- mandated by RFC 6750 §5.4 for endpoints
+/// - `Pragma: no-cache` - mandated by RFC 6749 §5.1 for HTTP/1.0 caches.
+/// - `Vary: Authorization` - mandated by RFC 6750 §5.4 for endpoints
 ///   whose response depends on the `Authorization` header.
 ///
 /// Applied only to the OAuth proxy token-class endpoints (`/token`,
@@ -4916,7 +4916,7 @@ fn build_extra_route_rate_limiter_with_policy(
 /// exempt requests consume no limiter budget and produce no deny
 /// telemetry. Fail-closed - any non-listed path stays limited.
 // cancel-safe: the limiter is charged synchronously before the `next.run(req)`
-// await. Charging an attempt that a later timeout cancels is deliberate -- the
+// await. Charging an attempt that a later timeout cancels is deliberate - the
 // request was admitted, so it must cost budget (same posture as auth/rbac).
 async fn extra_route_rate_limit_middleware(
     limiter: Arc<ExtraRouteRateLimiter>,
@@ -5471,7 +5471,7 @@ fn mask_session_id_for_log(value: &str) -> String {
     format!("{first}...{last}")
 }
 
-// -- stdio transport --
+// - stdio transport -
 
 /// Serve an MCP server over stdin/stdout (stdio transport).
 ///
@@ -5526,7 +5526,7 @@ where
 
 #[expect(
     clippy::multiple_inherent_impl,
-    reason = "deliberate: src/transport.rs::McpServerConfig — the second block groups the TLS-path and role accessors; merging relocates ~140 lines for no behavior gain"
+    reason = "deliberate: src/transport.rs::McpServerConfig - the second block groups the TLS-path and role accessors; merging relocates ~140 lines for no behavior gain"
 )]
 #[expect(
     clippy::missing_const_for_fn,
@@ -5847,7 +5847,7 @@ mod tests {
         set_default(subscriber)
     }
 
-    // -- startup task lifecycle --
+    // - startup task lifecycle -
 
     /// Pins that the shutdown bridge exits when the server-internal token is
     /// cancelled even though the external token is not.
@@ -5897,7 +5897,7 @@ mod tests {
 
     #[expect(
         clippy::unnecessary_wraps,
-        reason = "deliberate: src/transport.rs::cancel_on_drop_cancels_its_token — keeps the uniform IS-7 test signature while it only constructs values"
+        reason = "deliberate: src/transport.rs::cancel_on_drop_cancels_its_token - keeps the uniform IS-7 test signature while it only constructs values"
     )]
     #[test]
     /// Pins that dropping the startup guard cancels its token.
@@ -6062,15 +6062,15 @@ mod tests {
         Ok(())
     }
 
-    // -- McpServerConfig --
+    // - McpServerConfig -
 
     #[expect(
         deprecated,
-        reason = "deliberate: src/transport.rs::server_config_new_defaults — exercises deprecated config fields directly"
+        reason = "deliberate: src/transport.rs::server_config_new_defaults - exercises deprecated config fields directly"
     )]
     #[expect(
         clippy::unnecessary_wraps,
-        reason = "deliberate: src/transport.rs::server_config_new_defaults — keeps the uniform IS-7 test signature while it only constructs values"
+        reason = "deliberate: src/transport.rs::server_config_new_defaults - keeps the uniform IS-7 test signature while it only constructs values"
     )]
     #[test]
     /// Pins every default `McpServerConfig::new` leaves in place across
@@ -6131,7 +6131,7 @@ mod tests {
 
     #[expect(
         clippy::unnecessary_wraps,
-        reason = "deliberate: src/transport.rs::session_store_defaults_to_none — keeps the uniform IS-7 test signature while it only constructs values"
+        reason = "deliberate: src/transport.rs::session_store_defaults_to_none - keeps the uniform IS-7 test signature while it only constructs values"
     )]
     #[test]
     /// Pins that a fresh config has no session store attached.
@@ -6145,7 +6145,7 @@ mod tests {
 
     #[expect(
         clippy::unnecessary_wraps,
-        reason = "deliberate: src/transport.rs::event_store_defaults_to_none — keeps the uniform IS-7 test signature while it only constructs values"
+        reason = "deliberate: src/transport.rs::event_store_defaults_to_none - keeps the uniform IS-7 test signature while it only constructs values"
     )]
     #[test]
     /// Pins that a fresh config has no event store attached.
@@ -6228,11 +6228,11 @@ mod tests {
 
     #[expect(
         deprecated,
-        reason = "deliberate: src/transport.rs::tls_handshake_builders_set_fields — exercises deprecated config fields directly"
+        reason = "deliberate: src/transport.rs::tls_handshake_builders_set_fields - exercises deprecated config fields directly"
     )]
     #[expect(
         clippy::unnecessary_wraps,
-        reason = "deliberate: src/transport.rs::tls_handshake_builders_set_fields — keeps the uniform IS-7 test signature while it only constructs values"
+        reason = "deliberate: src/transport.rs::tls_handshake_builders_set_fields - keeps the uniform IS-7 test signature while it only constructs values"
     )]
     #[test]
     /// Pins that the TLS handshake timeout and concurrency builders store
@@ -6271,7 +6271,7 @@ mod tests {
 
     #[expect(
         deprecated,
-        reason = "deliberate: src/transport.rs::validate_consumes_and_proves — exercises deprecated config fields directly"
+        reason = "deliberate: src/transport.rs::validate_consumes_and_proves - exercises deprecated config fields directly"
     )]
     #[test]
     /// Pins that `validate` consumes the config into a `Validated` wrapper
@@ -6359,7 +6359,7 @@ mod tests {
 
     #[expect(
         clippy::unnecessary_wraps,
-        reason = "deliberate: src/transport.rs::derive_allowed_hosts_includes_public_host — keeps the uniform IS-7 test signature while it only constructs values"
+        reason = "deliberate: src/transport.rs::derive_allowed_hosts_includes_public_host - keeps the uniform IS-7 test signature while it only constructs values"
     )]
     #[test]
     /// Pins that the derived host allowlist includes the `public_url` host.
@@ -6375,7 +6375,7 @@ mod tests {
 
     #[expect(
         clippy::unnecessary_wraps,
-        reason = "deliberate: src/transport.rs::derive_allowed_hosts_includes_bind_authority — keeps the uniform IS-7 test signature while it only constructs values"
+        reason = "deliberate: src/transport.rs::derive_allowed_hosts_includes_bind_authority - keeps the uniform IS-7 test signature while it only constructs values"
     )]
     #[test]
     /// Pins that the derived host allowlist includes both the bind host and
@@ -6394,7 +6394,7 @@ mod tests {
         Ok(())
     }
 
-    // -- healthz --
+    // - healthz -
 
     /// Pins that `/healthz` answers 200 with `status: ok` and leaks neither
     /// the server name nor its version.
@@ -6420,7 +6420,7 @@ mod tests {
         Ok(())
     }
 
-    // -- readyz --
+    // - readyz -
 
     /// Pins that a ready readiness check yields 200 with the check's fields
     /// and no name or version leak.
@@ -6477,7 +6477,7 @@ mod tests {
         Ok(())
     }
 
-    // -- normalize_peer_addr_middleware / PeerAddr --
+    // - normalize_peer_addr_middleware / PeerAddr -
 
     /// Build a test router that reports the request's peer-address
     /// extensions as `"<ConnectInfo>|<PeerAddr>"` (empty when absent).
@@ -6625,7 +6625,7 @@ mod tests {
         Ok(())
     }
 
-    // -- extra_route_rate_limit_middleware --
+    // - extra_route_rate_limit_middleware -
 
     /// Handler used by the limiter probe routers: always answers `"ok"`.
     async fn ok_handler() -> &'static str {
@@ -6800,7 +6800,7 @@ mod tests {
 
     #[expect(
         clippy::unnecessary_wraps,
-        reason = "deliberate: src/transport.rs::limiter_client_key_falls_back_to_unattributed — keeps the uniform IS-7 test signature while it only constructs values"
+        reason = "deliberate: src/transport.rs::limiter_client_key_falls_back_to_unattributed - keeps the uniform IS-7 test signature while it only constructs values"
     )]
     #[test]
     /// Pins that requests with no peer address fall back to the shared
@@ -7009,7 +7009,7 @@ mod tests {
 
     #[expect(
         clippy::unnecessary_wraps,
-        reason = "deliberate: src/transport.rs::new_config_defaults_log_settings — keeps the uniform IS-7 test signature while it only constructs values"
+        reason = "deliberate: src/transport.rs::new_config_defaults_log_settings - keeps the uniform IS-7 test signature while it only constructs values"
     )]
     #[test]
     /// Pins the log-related defaults of a fresh `McpServerConfig`: an empty
@@ -7135,7 +7135,7 @@ mod tests {
 
     #[expect(
         clippy::unnecessary_wraps,
-        reason = "deliberate: src/transport.rs::log_context_credential_owner_defaults_off_and_not_recommended — keeps the uniform IS-7 test signature while it only asserts on values"
+        reason = "deliberate: src/transport.rs::log_context_credential_owner_defaults_off_and_not_recommended - keeps the uniform IS-7 test signature while it only asserts on values"
     )]
     #[test]
     /// Pins that `credential_owner` is off by default and in the recommended
@@ -7455,7 +7455,7 @@ mod tests {
         Ok(())
     }
 
-    // -- trusted-forwarder mode (ClientIp / ForwardedHeaderMode) --
+    // - trusted-forwarder mode (ClientIp / ForwardedHeaderMode) -
 
     /// Pins that `trusted_forwarder_max_entries` accepts only
     /// `1..=MAX_SCANNED_ENTRIES` and rejects the configurable ceiling plus one.
@@ -8576,7 +8576,7 @@ mod tests {
         Ok(())
     }
 
-    // -- origin_check_middleware --
+    // - origin_check_middleware -
 
     /// Build a test router with origin check middleware and a simple handler.
     fn origin_router(origins: Vec<String>, log_request_headers: bool) -> axum::Router {
@@ -8820,7 +8820,7 @@ mod tests {
         Ok(())
     }
 
-    // -- security_headers_middleware --
+    // - security_headers_middleware -
 
     fn security_router(is_tls: bool) -> axum::Router {
         security_router_with(is_tls, SecurityHeadersConfig::default())
@@ -8982,7 +8982,7 @@ mod tests {
         Ok(())
     }
 
-    // -- SecurityHeadersConfig validation + override semantics --
+    // - SecurityHeadersConfig validation + override semantics -
 
     /// Build a minimal config with a custom `SecurityHeadersConfig` and drive
     /// it through `check()`.
@@ -9172,7 +9172,7 @@ mod tests {
         Ok(())
     }
 
-    // -- oauth_token_cache_headers_middleware --
+    // - oauth_token_cache_headers_middleware -
 
     /// Axum handler shared by the OAuth middleware tests: replies `{}`.
     #[cfg(feature = "oauth")]
@@ -9265,7 +9265,7 @@ mod tests {
         Ok(())
     }
 
-    // -- version endpoint --
+    // - version endpoint -
 
     /// Pins that the version payload hides build fingerprint fields by
     /// default.
@@ -9328,7 +9328,7 @@ mod tests {
         Ok(())
     }
 
-    // -- concurrency limit layer --
+    // - concurrency limit layer -
 
     /// Error handler for the concurrency-limit test: maps load shedding to 503.
     async fn handle_service_unavailable(_err: tower::BoxError) -> StatusCode {
@@ -9359,7 +9359,7 @@ mod tests {
         Ok(())
     }
 
-    // -- compression layer --
+    // - compression layer -
 
     /// Pins that the compression layer gzip-encodes a large response.
     #[tokio::test]
@@ -9446,7 +9446,7 @@ mod tests {
         Ok(())
     }
 
-    // -- TlsListener handshake timeout --
+    // - TlsListener handshake timeout -
 
     /// Pins that the TLS listener reaps connections that never complete their
     /// handshake.
@@ -9518,7 +9518,7 @@ mod tests {
         Ok(())
     }
 
-    // -- TLS session resumption disabled for mTLS (WO-T1) --
+    // - TLS session resumption disabled for mTLS (WO-T1) -
 
     use core::sync::atomic::AtomicUsize;
 
@@ -9919,7 +9919,7 @@ mod tests {
         // `rustls::client::handy::ClientSessionMemoryCache` divides its
         // requested `size` by `MAX_TLS13_TICKETS_PER_SERVER` (8) to get a
         // server-name-slot count. A `size` of 8 or less rounds down to
-        // exactly one slot, whose backing `VecDeque` has capacity 1 --
+        // exactly one slot, whose backing `VecDeque` has capacity 1 -
         // its own eviction guard (`capacity() == len()`) then fires on the
         // very first insert and evicts the entry that insert just made,
         // so no ticket ever survives to the next connection. 256 mirrors
@@ -9998,7 +9998,7 @@ mod tests {
         );
         assert_eq!(
             fixed.calls_after_second, 2,
-            "connection 2 must re-invoke the verifier -- this is the fix"
+            "connection 2 must re-invoke the verifier - this is the fix"
         );
 
         let control = run_resumption_scenario(false).await?;
@@ -10016,13 +10016,13 @@ mod tests {
         );
         assert_eq!(
             control.calls_after_second, 1,
-            "control verifier must NOT be re-invoked -- this is the exact bypass the fix eliminates"
+            "control verifier must NOT be re-invoked - this is the exact bypass the fix eliminates"
         );
 
         Ok(())
     }
 
-    // -- M5: OWASP security headers reach early / fallback responses --
+    // - M5: OWASP security headers reach early / fallback responses -
 
     fn assert_owasp_headers(resp: &Response, ctx: &str) {
         let headers = resp.headers();
@@ -10113,7 +10113,7 @@ mod tests {
 
     #[expect(
         clippy::unnecessary_wraps,
-        reason = "deliberate: src/transport.rs::extra_router_non_overlapping_path_under_framework_prefix_is_accepted — keeps the uniform IS-7 test signature while it only asserts that the router merge succeeds"
+        reason = "deliberate: src/transport.rs::extra_router_non_overlapping_path_under_framework_prefix_is_accepted - keeps the uniform IS-7 test signature while it only asserts that the router merge succeeds"
     )]
     /// Pins that a path under a framework prefix which does not exactly overlap
     /// an existing route is accepted.
@@ -10218,7 +10218,7 @@ mod tests {
         Ok(())
     }
 
-    // -- M6: OAuth proxy admin endpoints enforce the admin role --
+    // - M6: OAuth proxy admin endpoints enforce the admin role -
 
     /// Builds the M6 auth state holding one admin and one viewer API key.
     ///
@@ -10375,7 +10375,7 @@ mod tests {
         Ok(())
     }
 
-    // -- F3 regression: unbounded Prometheus label cardinality --
+    // - F3 regression: unbounded Prometheus label cardinality -
     //
     // `metrics_middleware` runs outside the auth layer, so it observes
     // unauthenticated traffic. Labelling with the raw URI path and raw HTTP
@@ -10496,7 +10496,7 @@ mod tests {
 
         #[expect(
             clippy::unnecessary_wraps,
-            reason = "deliberate: src/transport.rs::request_parse_normalizes_scheme_host_and_ports — keeps the uniform IS-7 test signature while it only asserts on parsed origin tuples"
+            reason = "deliberate: src/transport.rs::request_parse_normalizes_scheme_host_and_ports - keeps the uniform IS-7 test signature while it only asserts on parsed origin tuples"
         )]
         #[test]
         /// Pins that request-origin parsing normalizes scheme, host, and ports.
@@ -10528,7 +10528,7 @@ mod tests {
 
         #[expect(
             clippy::unnecessary_wraps,
-            reason = "deliberate: src/transport.rs::request_parse_rejects_paths_queries_fragments_and_odd_schemes — keeps the uniform IS-7 test signature while it only asserts on rejected origin inputs"
+            reason = "deliberate: src/transport.rs::request_parse_rejects_paths_queries_fragments_and_odd_schemes - keeps the uniform IS-7 test signature while it only asserts on rejected origin inputs"
         )]
         #[test]
         /// Pins that request-origin parsing rejects paths, queries, fragments,
@@ -10556,7 +10556,7 @@ mod tests {
 
         #[expect(
             clippy::unnecessary_wraps,
-            reason = "deliberate: src/transport.rs::config_parse_tolerates_one_root_trailing_slash_only — keeps the uniform IS-7 test signature while it only asserts on parsed config tuples"
+            reason = "deliberate: src/transport.rs::config_parse_tolerates_one_root_trailing_slash_only - keeps the uniform IS-7 test signature while it only asserts on parsed config tuples"
         )]
         #[test]
         /// Pins that config-origin parsing tolerates exactly one trailing slash
@@ -10639,7 +10639,7 @@ mod tests {
 
         #[expect(
             clippy::unnecessary_wraps,
-            reason = "deliberate: src/transport.rs::non_canonical_port_spellings_are_rejected — keeps the uniform IS-7 test signature while it only asserts on rejected port spellings"
+            reason = "deliberate: src/transport.rs::non_canonical_port_spellings_are_rejected - keeps the uniform IS-7 test signature while it only asserts on rejected port spellings"
         )]
         #[test]
         /// Pins that non-canonical port spellings are rejected on the request

@@ -8,15 +8,15 @@
 //!
 //! Targets:
 //!
-//! 1. **API key generate→verify round-trip** -- every freshly generated
+//! 1. **API key generate→verify round-trip** - every freshly generated
 //!    key must verify against itself, regardless of the surrounding
 //!    timing or noise from co-generated keys.
-//! 2. **`argument_allowed` monotonicity** -- when an allowlist contains
+//! 2. **`argument_allowed` monotonicity** - when an allowlist contains
 //!    a value, that value's *first POSIX-shell argv element* must be
 //!    accepted; when an allowlist is non-empty and does NOT contain the
 //!    value, the value must be rejected. This guards against silent
 //!    regressions in the `glob_match` / basename matching path.
-//! 3. **Tool-name glob safety** -- patterns built from random
+//! 3. **Tool-name glob safety** - patterns built from random
 //!    alphanumeric strings + `*` wildcards must never panic when matched
 //!    against arbitrary tool names. (Catches regex/glob-engine
 //!    regressions.)
@@ -123,7 +123,7 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(PROPTEST_CASES))]
 
         /// Pattern matching against arbitrary tool names must never panic.
-        /// The result itself is opaque -- this target exists to fuzz the
+        /// The result itself is opaque - this target exists to fuzz the
         /// `glob_match` path used by per-tool argument allowlists.
         #[test]
         fn glob_pattern_never_panics(
@@ -191,7 +191,7 @@ mod tests {
         }
 
         /// Adding a deny entry may only remove capability. A role that denies an
-        /// operation must never allow it, regardless of what `allow` grants --
+        /// operation must never allow it, regardless of what `allow` grants -
         /// this is the monotonicity guarantee the fail-open bug violated.
         #[test]
         fn adding_a_deny_entry_never_grants_access(

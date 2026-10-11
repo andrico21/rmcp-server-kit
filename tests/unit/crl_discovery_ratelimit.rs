@@ -19,9 +19,9 @@
 //!
 //! Tests 3 and 4 use [`CrlSet::__test_with_kept_receiver`] (instead of
 //! `__test_with_prepopulated_crls` which drops the discover-channel
-//! receiver) so the production commit-to-`seen_urls` path -- which only
+//! receiver) so the production commit-to-`seen_urls` path - which only
 //! marks a URL seen after BOTH the limiter admits it AND the channel
-//! send succeeds -- actually executes. With the receiver dropped, the
+//! send succeeds - actually executes. With the receiver dropped, the
 //! send side would always fail and `seen_urls` would never be
 //! populated, masking both real bugs and real fixes.
 //!
@@ -115,7 +115,7 @@ mod tests {
         roots.add(build_ca_root()?).context("add ca root")?;
         #[expect(
             deprecated,
-            reason = "deliberate: mtls_revocation::CrlSet::__test_with_prepopulated_crls — the deprecated test-only constructor is the only prepopulated-CrlSet entry point until 4.0"
+            reason = "deliberate: mtls_revocation::CrlSet::__test_with_prepopulated_crls - the deprecated test-only constructor is the only prepopulated-CrlSet entry point until 4.0"
         )]
         let set = CrlSet::__test_with_prepopulated_crls(
             Arc::new(roots),
@@ -138,7 +138,7 @@ mod tests {
         roots.add(build_ca_root()?).context("add ca root")?;
         #[expect(
             deprecated,
-            reason = "deliberate: mtls_revocation::CrlSet::__test_with_kept_receiver — the deprecated test-only constructor is the only kept-receiver entry point until 4.0"
+            reason = "deliberate: mtls_revocation::CrlSet::__test_with_kept_receiver - the deprecated test-only constructor is the only kept-receiver entry point until 4.0"
         )]
         let set = CrlSet::__test_with_kept_receiver(
             Arc::new(roots),
@@ -156,7 +156,7 @@ mod tests {
             .collect()
     }
 
-    // -- Q1: rate limiter accepts N then drops remainder -------------------------
+    // - Q1: rate limiter accepts N then drops remainder -------------------------
 
     /// Pins that a burst is admitted up to the quota and the remainder is dropped.
     #[test]
@@ -172,7 +172,7 @@ mod tests {
         Ok(())
     }
 
-    // -- Q2: first burst within quota all pass -----------------------------------
+    // - Q2: first burst within quota all pass -----------------------------------
 
     /// Pins that a burst no larger than the quota is admitted in full.
     #[test]
@@ -186,7 +186,7 @@ mod tests {
         Ok(())
     }
 
-    // -- Q3: note_discovered_urls dedup runs before the limiter ----------------
+    // - Q3: note_discovered_urls dedup runs before the limiter ----------------
     //
     // In the B2-fixed implementation, `note_discovered_urls` snapshots
     // `seen_urls` read-only first to filter out already-known URLs (cheap
@@ -194,7 +194,7 @@ mod tests {
     // remaining URLs through the limiter. A URL is committed to `seen_urls`
     // ONLY after the limiter accepts it AND the discovery channel send
     // succeeds. To observe the commit (so the second batch can actually be
-    // dedup'd) we must keep the receiver alive -- otherwise channel sends
+    // dedup'd) we must keep the receiver alive - otherwise channel sends
     // fail, no URL is ever marked seen, and re-submitting the same batch
     // would consume limiter capacity a second time, masking the bug.
 
@@ -241,7 +241,7 @@ mod tests {
         assert_eq!(
             accepted, 7,
             "dedup must leave 7 quota free; got accepted={accepted} dropped={dropped} \
-             -- non-7 acceptance means second-batch dedup wrongly consumed limiter quota"
+             - non-7 acceptance means second-batch dedup wrongly consumed limiter quota"
         );
         assert_eq!(
             dropped, 0,
@@ -250,7 +250,7 @@ mod tests {
         Ok(())
     }
 
-    // -- Q4: B2 regression -- rate-limited URLs are NOT marked seen --------------
+    // - Q4: B2 regression - rate-limited URLs are NOT marked seen --------------
 
     /// Pins that a limiter-dropped URL stays retriable on the next handshake.
     #[test]
@@ -286,7 +286,7 @@ mod tests {
             "first-batch URL must be marked seen after successful limiter+send (test infra check)"
         );
 
-        // Target URL: limiter exhausted -- governor must drop it. Under
+        // Target URL: limiter exhausted - governor must drop it. Under
         // B2 the URL must NOT be marked seen so the next handshake gets
         // a fresh chance once the limiter refills.
         let _: bool = crl_set.__test_note_discovered_urls(&target);

@@ -155,7 +155,7 @@ compile unchanged.
 
 Two `auth.api_keys` entries that share a `name` but declare *different*
 `role`s are now rejected. This is a no-opt-out hard error on
-previously-accepted configuration, shipped in a **minor** release -- the same
+previously-accepted configuration, shipped in a **minor** release - the same
 shape as two hard errors already shipped in a 3.8 minor (`auth.mtls` without
 TLS is a validation error; a certificate advertising more than 64 CDP URLs is
 rejected): a security-motivated rejection of malformed config, not an API
@@ -163,7 +163,7 @@ break. `check_api_key_names` stays `pub(crate)` and no public signature
 changes, so `cargo-semver-checks` reports nothing.
 
 **Impact:** the API-key `name` is the session/task-binding *principal
-identity* -- the MCP session-binding and task-binding fingerprints derive
+identity* - the MCP session-binding and task-binding fingerprints derive
 their per-principal namespace from it alone. Two same-named entries are
 therefore one principal, so mapping one name to two roles is a contradiction
 that silently collapses two authorization profiles into a single identity
@@ -172,13 +172,13 @@ A config that boots today with such a pair will refuse to start after
 upgrading.
 
 **This has no opt-out and applies on both the startup and hot-reload paths.**
-The hot-reload path was already safe -- `try_reload_auth_keys` validates
-before swapping and retains the prior keys on error -- so a *running* server
+The hot-reload path was already safe - `try_reload_auth_keys` validates
+before swapping and retains the prior keys on error - so a *running* server
 cannot be pushed into this state; the newly-strict surface is startup
 validation, which previously accepted the contradictory pair.
 
 **Action required:** none for conforming configuration. Same name with the
-*same* role remains valid -- that is credential rotation (one principal, two
+*same* role remains valid - that is credential rotation (one principal, two
 secrets), and is explicitly preserved. Give two entries the same `name` only
 when they are the same principal; use distinct names for distinct principals,
 and each name keeps its own session/task namespace even under a shared RBAC
@@ -195,7 +195,7 @@ CDP URLs into the CRL fetch pipeline is now applied **per source peer IP**
 for attributed TLS handshakes, instead of as a single process-global bucket.
 This is a **minor**, additive change: no config field is added or removed,
 `crl_discovery_rate_per_min` keeps its name, type, `#[serde(default)]`, and
-validation, and no public signature changes -- so `cargo semver-checks`
+validation, and no public signature changes - so `cargo semver-checks`
 reports nothing. Only the *documented semantics* of an existing knob change,
 which is what this note exists to record.
 
@@ -218,7 +218,7 @@ TOML under `deny_unknown_fields` and make rollback breaking). The per-peer
 key is the **direct** peer IP: behind a TCP load balancer that terminates the
 connection it is the balancer's address, and per-IP keying does not by itself
 defeat a distributed attacker. Submissions with no attributed handshake peer
--- a `DynamicClientCertVerifier` built outside this crate's transport -- fall
+- a `DynamicClientCertVerifier` built outside this crate's transport - fall
 back to the pre-change process-global bucket.
 
 **Action required:** none for the common case. If you deliberately relied on
@@ -240,9 +240,9 @@ active), which on the standard transport should never happen.
 mTLS listeners no longer issue or accept TLS session resumption (TLS 1.2
 session IDs/tickets, TLS 1.3 tickets). rustls previously restored a resumed
 handshake's peer certificate chain from cached session state without ever
-calling `ClientCertVerifier::verify_client_cert` -- the only site that checks
+calling `ClientCertVerifier::verify_client_cert` - the only site that checks
 CRL revocation and certificate validity-period (`notAfter`) / chain
-validation -- so a certificate that had been revoked or had expired could
+validation - so a certificate that had been revoked or had expired could
 continue authenticating for as long as a session could be resumed. This is a
 **minor**, no-opt-out behavioural change: no public API or `MtlsConfig` field
 changes, so `cargo semver-checks` reports nothing.
@@ -250,11 +250,11 @@ changes, so `cargo semver-checks` reports nothing.
 **Impact:** every *new* mTLS connection now performs a full handshake, so CRL
 revocation and `notAfter` expiry apply starting with the next connection
 after upgrade. Connections already established when the server restarts are
-unaffected -- they remain trusted until closed, exactly as before; this
+unaffected - they remain trusted until closed, exactly as before; this
 change only removes a *new* connection's ability to skip verification via a
 resumed session. High-churn mTLS clients (short-lived connections that
-previously resumed) now pay a full handshake -- a CPU cost, not a
-correctness change -- on every connection; plain TLS (no client certificate)
+previously resumed) now pay a full handshake - a CPU cost, not a
+correctness change - on every connection; plain TLS (no client certificate)
 is untouched.
 
 **Action required:** none for correctness. If you serve a high volume of
@@ -530,8 +530,8 @@ should match it.
 
 ## Migrating to 3.8: CRL fail-closed by default
 
-This mTLS/CRL hardening is additive at the API level -- `cargo semver-checks`
-reports no breaking change -- but it **alters two runtime defaults**. `cargo semver-checks` cannot
+This mTLS/CRL hardening is additive at the API level - `cargo semver-checks`
+reports no breaking change - but it **alters two runtime defaults**. `cargo semver-checks` cannot
 detect a behavioural default change, so read this section before upgrading.
 
 ### 1. `crl_deny_on_unavailable` now defaults to `true`
@@ -542,7 +542,7 @@ the exact condition an attacker holding a revoked certificate can induce, by
 blocking reachability to the CA's CDP host.
 
 From `3.8`, such a handshake is **rejected**, per RFC 5280 §6.3. Denial requires
-*every* relevant CDP to be unavailable, not merely one -- otherwise blocking a
+*every* relevant CDP to be unavailable, not merely one - otherwise blocking a
 single mirror would become a denial-of-service vector.
 
 **Who is affected:** deployments using mTLS with `crl_enabled = true` (the
@@ -594,7 +594,7 @@ friends.
 ### 3. `auth.mtls` without TLS is now a validation error
 
 Configuring `auth.mtls` without both `tls_cert_path` and `tls_key_path` used to
-start successfully with client-certificate authentication **silently disabled** --
+start successfully with client-certificate authentication **silently disabled** -
 a plaintext listener never performs a TLS handshake, so no client identity is
 ever extracted. This combination is now rejected by
 `McpServerConfig::validate()`. Supply both TLS paths, or remove `auth.mtls`.
@@ -618,7 +618,7 @@ withdrawn. Presence enforcement is opt-in by design, because an allowlist that
 constrains a supplied value is a legitimate configuration and flipping the
 default would silently turn previously-allowed traffic into `403`s with no
 compile error. Set `required = true` (or use `new_required`) wherever omitting
-the argument must be rejected -- there is no future release in which that
+the argument must be rejected - there is no future release in which that
 happens automatically.
 
 ### 5. Certificates advertising more than 64 CDP URLs are rejected
@@ -668,7 +668,7 @@ now is the only non-breaking way to give downstream users notice.
 
 ## Migrating from 3.4 to 3.5
 
-`3.5` is additive at the API level -- `cargo semver-checks` reports no breaking
+`3.5` is additive at the API level - `cargo semver-checks` reports no breaking
 change, no default values were altered, and no code change is required to
 upgrade. Existing configurations parse and behave identically to 3.4.x unless
 you opt in to the new features.

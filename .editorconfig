@@ -14,7 +14,7 @@
 #
 # The drift is real and has bitten this repo: `git ls-files --eol` has shown
 # tracked files sitting at w/crlf and w/mixed while the index was uniformly
-# i/lf. Windows tooling defaults are the usual cause -- Python's text mode and
+# i/lf. Windows tooling defaults are the usual cause - Python's text mode and
 # PowerShell's Out-File both emit CRLF unless told otherwise.
 
 root = true

@@ -397,7 +397,7 @@ impl Drop for AuditWorkerGuard {
     )]
     #[expect(
         clippy::arithmetic_side_effects,
-        reason = "invariant: src/observability.rs::AuditWorkerGuard::drop -- the deadline arithmetic is bounded by AUDIT_WRITER_JOIN_TIMEOUT and cannot overflow within the process lifetime"
+        reason = "invariant: src/observability.rs::AuditWorkerGuard::drop - the deadline arithmetic is bounded by AUDIT_WRITER_JOIN_TIMEOUT and cannot overflow within the process lifetime"
     )]
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
@@ -2504,7 +2504,7 @@ mod tests {
     // With JSON logging (`.json()`, wired above in this module), a field
     // recorded with the Debug sigil (`?`) is rendered via `format!("{:?}")`
     // and then embedded in a JSON string; if the Debug output itself
-    // contains quotes, the JSON serializer escapes them --
+    // contains quotes, the JSON serializer escapes them -
     // `"request_id":"String(\"abc-123\")"` instead of
     // `"request_id":"abc-123"`. This is a heuristic TRIPWIRE modelled on
     // `crate::error`'s guard, not a proof: it enforces two syntactic rules
@@ -2612,7 +2612,7 @@ mod tests {
     }
 
     /// Rule A: a `format!(...)` format string that is *only* a single Debug
-    /// placeholder (`"{:?}"` or `"{value:?}"`) -- unconditional
+    /// placeholder (`"{:?}"` or `"{value:?}"`) - unconditional
     /// Debug-stringification with no surrounding human-readable text.
     #[expect(
         clippy::literal_string_with_formatting_args,
@@ -2627,7 +2627,7 @@ mod tests {
     }
 
     /// Every production `format!(...)` call whose format string matches
-    /// [`is_bare_debug_format_string`]. Scans `format!` invocations only --
+    /// [`is_bare_debug_format_string`]. Scans `format!` invocations only -
     /// a `tracing::warn!("... {:?}", x)` message string is not this shape
     /// (see `rule_a_ignores...` below).
     fn find_bare_debug_format_calls(src: &str) -> Vec<String> {
@@ -2730,7 +2730,7 @@ mod tests {
         (
             "src/mtls_revocation.rs",
             "url = ?raw",
-            "deliberate control-character escaping of attacker-supplied input -- see the log-injection note at the call site",
+            "deliberate control-character escaping of attacker-supplied input - see the log-injection note at the call site",
         ),
         (
             "src/oauth.rs",
@@ -2799,7 +2799,7 @@ mod tests {
         assert!(
             offenders.is_empty(),
             "production `format!(...)` must not unconditionally Debug-stringify a value with \
-             no surrounding text -- JSON logging escapes embedded quotes (e.g. \
+             no surrounding text - JSON logging escapes embedded quotes (e.g. \
              `\"request_id\":\"String(\\\"abc-123\\\")\"`). Use `.to_string()` on a `Display` \
              value instead:\n{}",
             offenders.join("\n")
@@ -2830,7 +2830,7 @@ mod tests {
         assert!(
             offenders.is_empty(),
             "production tracing::{{trace,debug,info,warn,error}}! calls must not use the Debug \
-             sigil (`?`) on a structured field unless explicitly allowlisted -- JSON logging \
+             sigil (`?`) on a structured field unless explicitly allowlisted - JSON logging \
              escapes embedded quotes in the Debug rendering. Use `%` (Display) instead, or add \
              an entry to RULE_B_ALLOWLIST with a reason if Debug really is intended:\n{}",
             offenders.join("\n")
@@ -2877,7 +2877,7 @@ mod tests {
     fn rule_a_ignores_debug_embedded_in_larger_text_and_tracing_message_strings()
     -> anyhow::Result<()> {
         // Diagnostic messages that embed Debug inside human-readable text
-        // are outside this bug class -- the quoting is often desirable
+        // are outside this bug class - the quoting is often desirable
         // there (it delimits an untrusted value).
         assert_eq!(
             find_bare_debug_format_calls(

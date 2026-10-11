@@ -126,7 +126,7 @@ jobs:
       # older cargo-semver-checks from ~/.cargo/bin, and `cargo install`
       # would then skip the upgrade. Versions before 0.50 cannot parse the
       # rustdoc JSON v61 emitted by Rust 1.99 and fail with
-      # "unsupported rustdoc format v61" -- a tooling error indistinguishable
+      # "unsupported rustdoc format v61" - a tooling error indistinguishable
       # from a real semver break in the CI log.
       - name: Install cargo-semver-checks
         run: cargo install cargo-semver-checks --locked --force --version '^0.50'
@@ -516,7 +516,7 @@ jobs:
           # was truncated and the untested tail is silently absent from
           # outcomes.json, which is the failure this job must never hide.
           # cargo-mutants' own statuses: 0 = clean, 2 = surviving mutants,
-          # 3 = mutants that timed out individually -- those keep the job green.
+          # 3 = mutants that timed out individually - those keep the job green.
           # 4 = ExitCode::BaselineFailed (e.g. the baseline test run hitting
           # `--timeout`) is NOT advisory: it leaves outcomes.json truncated or
           # absent, which the summariser below treats as a hard error rather
@@ -584,8 +584,8 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           # Advisory statuses (0 clean, 2 missed mutants, 3 timed-out mutants,
           # 124/137 wall-clock kill) all still write both files. Missing or
-          # unparseable output under any OTHER status -- notably 4 =
-          # ExitCode::BaselineFailed, which is not advisory -- means the run
+          # unparseable output under any OTHER status - notably 4 =
+          # ExitCode::BaselineFailed, which is not advisory - means the run
           # never produced results and must not pass silently.
           status="${MUTANTS_STATUS:-unknown}"
           if [ -z "$generated_raw" ] || [ -z "$completed_raw" ]; then

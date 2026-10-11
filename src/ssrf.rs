@@ -19,7 +19,7 @@ use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use url::Url;
 
 /// AWS / GCP / Azure metadata endpoint. Always blocked even if private
-/// IPs are otherwise allowed -- this address is unique to cloud-VM
+/// IPs are otherwise allowed - this address is unique to cloud-VM
 /// privilege-escalation pivots.
 pub(crate) const CLOUD_METADATA_V4: Ipv4Addr = Ipv4Addr::new(169, 254, 169, 254);
 
@@ -406,16 +406,16 @@ impl CidrEntry {
     /// - Missing `/` separator.
     /// - Non-numeric prefix.
     /// - Prefix > 32 (IPv4) or > 128 (IPv6).
-    /// - **Prefix `0`** (`0.0.0.0/0` / `::/0`) -- would defeat the entire
+    /// - **Prefix `0`** (`0.0.0.0/0` / `::/0`) - would defeat the entire
     ///   guard by allowing every address.
-    /// - **IPv4-mapped IPv6 CIDRs** (`::ffff:127.0.0.0/104`) -- write the
+    /// - **IPv4-mapped IPv6 CIDRs** (`::ffff:127.0.0.0/104`) - write the
     ///   IPv4 form instead. This matches `ip_block_reason`'s normalization
     ///   so the runtime check and the allowlist agree on family.
-    /// - IPv6 zone identifiers (`fe80::1%eth0/64`) -- rejected by
+    /// - IPv6 zone identifiers (`fe80::1%eth0/64`) - rejected by
     ///   `IpAddr::from_str` directly.
     /// - Non-zero host bits (`10.0.0.1/8`).
     ///
-    /// Uses `std::net` only -- no new dependencies.
+    /// Uses `std::net` only - no new dependencies.
     ///
     /// # Errors
     ///
@@ -572,7 +572,7 @@ impl CompiledSsrfAllowlist {
         self.cidrs.iter().any(|cidr| cidr.contains(ip))
     }
 
-    /// Returns true iff both `hosts` and `cidrs` are empty -- i.e. the
+    /// Returns true iff both `hosts` and `cidrs` are empty - i.e. the
     /// allowlist is a no-op and the default SSRF guard should apply
     /// unchanged.
     pub(crate) const fn is_empty(&self) -> bool {
@@ -609,7 +609,7 @@ impl CompiledSsrfAllowlist {
 /// Like the non-allowlist variant, this does NOT perform DNS resolution.
 /// Redirect targets with DNS hostnames are passed through (the closure
 /// will let `reqwest` follow them, and the post-DNS guard on the next
-/// fetch -- if any -- would catch a hostname resolving into blocked
+/// fetch - if any - would catch a hostname resolving into blocked
 /// space).
 #[cfg(feature = "oauth")]
 pub(crate) fn redirect_target_reason_with_allowlist(
@@ -810,7 +810,7 @@ mod tests {
     /// Numeric IPv4 literals must never reach the fetch path as an allowed
     /// DNS name. The WHATWG URL parser normalizes decimal, hex, and octal
     /// forms to `Host::Ipv4` before `check_url_literal_ip` sees them, so the
-    /// literal-IP guard covers them -- but nothing in this crate pins that,
+    /// literal-IP guard covers them - but nothing in this crate pins that,
     /// and it is exactly the shape an SSRF filter bypass takes.
     ///
     /// The invariant asserted is "not reachable as a `Domain`": either the
@@ -1504,7 +1504,7 @@ mod tests {
     #[test]
     /// Pins that GCP IPv6 metadata is labelled `cloud_metadata`.
     fn block_reason_classifies_gcp_ipv6_metadata_as_cloud_metadata() -> anyhow::Result<()> {
-        // fd20:ce::254 -- GCP IPv6 metadata. Same reasoning as AWS.
+        // fd20:ce::254 - GCP IPv6 metadata. Same reasoning as AWS.
         assert_eq!(
             ip_block_reason(IpAddr::V6(super::CLOUD_METADATA_V6_GCP)),
             Some("cloud_metadata")
@@ -1597,7 +1597,7 @@ mod tests {
         #[test]
         /// Pins that a zero IPv4 prefix is rejected.
         fn cidr_parse_rejects_zero_prefix_v4() -> anyhow::Result<()> {
-            // 0.0.0.0/0 would allow every IPv4 address -- defeats the
+            // 0.0.0.0/0 would allow every IPv4 address - defeats the
             // entire SSRF guard. Operators must enumerate.
             let Err(err) = CidrEntry::parse("0.0.0.0/0") else {
                 anyhow::bail!("must reject");

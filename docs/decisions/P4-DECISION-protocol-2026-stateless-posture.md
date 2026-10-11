@@ -1,4 +1,4 @@
-# P4 — SPIKE: the crate's posture for MCP 2026-07-28 stateless Streamable HTTP
+# P4 - SPIKE: the crate's posture for MCP 2026-07-28 stateless Streamable HTTP
 
 **Status**: decision record (spike exit deliverable). No production code ships from this spike.
 **Date**: 2026-09-17. **rmcp**: 3.4.0 (pinned). **Crate**: 3.12.0+unreleased.
@@ -34,7 +34,7 @@ source-grounded, not reproduced.
 
 ---
 
-## Q1 — Cohesive "advanced protocol mode" vs isolated flags
+## Q1 - Cohesive "advanced protocol mode" vs isolated flags
 
 **Options**: A) expose `legacy_session_mode`, `json_response` and `stateless_protocol_metadata_required`
 as isolated flags; B) a `ProtocolMode` enum; C) a `McpServerConfig::stateless_2026()` preset that sets
@@ -58,9 +58,9 @@ behaviour are unaffected.
 policy) together, plus individual `with_*` overrides for the three underlying fields. Document that
 the preset rejects non-2026 clients, so it is opt-in.
 
-**Verdict: GO** — as a follow-up implementation issue (this spike ships no code).
+**Verdict: GO** - as a follow-up implementation issue (this spike ships no code).
 
-## Q2 — First-class "2026-only stateless" preset vs handler-side version restriction
+## Q2 - First-class "2026-only stateless" preset vs handler-side version restriction
 
 **Options**: A) document `ServerHandler::supported_protocol_versions` narrowing only; B) ship the
 preset from Q1.
@@ -78,7 +78,7 @@ handler list bounds negotiation.
 
 **Verdict: GO** (same follow-up issue as Q1).
 
-## Q3 — `session_binding` when a 2026 request carries `Mcp-Session-Id`
+## Q3 - `session_binding` when a 2026 request carries `Mcp-Session-Id`
 
 **Options**: A) ignore the header under 2026; B) reject it under 2026; C) keep the current
 fail-closed behaviour (validate identity binding when present, no-op when absent).
@@ -97,7 +97,7 @@ session header is still identity-checked).
 
 **Verdict: NO CHANGE** (documentation note attached to the Q1 follow-up).
 
-## Q4 — Identity binding for stateless SSE replay (`Last-Event-ID`)
+## Q4 - Identity binding for stateless SSE replay (`Last-Event-ID`)
 
 **Options**: A) strengthen the `EventStore` contract (identity-scoped streams / validated ids) with a
 trait-level requirement; B) bind `Last-Event-ID` the way `Mcp-Session-Id` is bound; C) declare it
@@ -119,7 +119,7 @@ revisited only if a concrete leaked-id replay is shown against a documented impl
 
 **Verdict: GO on C; DEFER A/B.**
 
-## Q5 — `task_binding` default under 2026 stateless
+## Q5 - `task_binding` default under 2026 stateless
 
 **Options**: A) keep default `false` + strong documentation recommending it under 2026; B) flip the
 default with a transitional path.
@@ -137,7 +137,7 @@ contained by session state, which raises the stakes but does not change the comp
 
 **Verdict: NO-GO on flipping now; GO on documentation.**
 
-## Q6 — Empirical client behaviour: protocol headers and metadata
+## Q6 - Empirical client behaviour: protocol headers and metadata
 
 **What was observed.** Against this crate's own server (real HTTP, `serve()`):
 

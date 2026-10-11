@@ -105,13 +105,13 @@ MCP tasks (SEP-2663) hand the client a long-lived `taskId` that is later
 presented to `tasks/get`, `tasks/update`, and `tasks/cancel`. Upstream `rmcp`
 resolves those calls **by task ID alone**, and this crate's RBAC layer inspects
 only `tools/call`. Without binding, any *authenticated* identity holding another
-identity's task ID can read, update, or cancel that task -- the same
+identity's task ID can read, update, or cancel that task - the same
 leaked-identifier-as-bearer-capability problem session binding solves.
 
 When enabled, the task ID returned to the client is a signed wrapper bound to
 the authenticated identity, verified and rewritten back to the raw ID before the
-consumer's handler sees it. A wrapper that fails verification -- malformed, not
-wrapped, signed for a different identity, or signed under a rotated secret --
+consumer's handler sees it. A wrapper that fails verification - malformed, not
+wrapped, signed for a different identity, or signed under a rotated secret -
 is rejected with exactly the error `rmcp` returns for a genuinely unknown task,
 so the check cannot be used to probe whether another identity's task exists.
 
@@ -591,7 +591,7 @@ The allowlist is checked **after** the IP-block classifier runs, and
    policy.
 4. Misconfiguration (literal IPs in `hosts`, ports/paths/userinfo in
    `hosts`, malformed CIDRs, `/0`, IPv4-mapped IPv6 CIDRs, zone IDs,
-   non-zero host bits) is rejected at startup -- the server refuses to
+   non-zero host bits) is rejected at startup - the server refuses to
    come up, rather than fail-open.
 5. When the allowlist is non-empty, `OAuthConfig::validate` emits a
    `tracing::warn!` naming the host and CIDR counts so the elevated

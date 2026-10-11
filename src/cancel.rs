@@ -8,13 +8,13 @@
 //! the losing future when another branch wins. For work that owns a
 //! remote-side resource (an SSH channel, an in-flight HTTP body, a DB
 //! transaction), dropping mid-flight leaves that resource half-open
-//! until some outer lifetime ends -- the inner future's own
+//! until some outer lifetime ends - the inner future's own
 //! `close().await` calls only run on its own early-return paths, never
 //! on outer Drop.
 //!
 //! The fix: hand the future to [`tokio::spawn`] so it owns its own task
-//! frame. Race the resulting [`tokio::task::JoinHandle`] -- not the
-//! future itself -- against the cancel/timeout sources. When the
+//! frame. Race the resulting [`tokio::task::JoinHandle`] - not the
+//! future itself - against the cancel/timeout sources. When the
 //! cancel/timeout branch wins, the `JoinHandle` is dropped (NOT
 //! `.abort()`); the detached task keeps running to completion and
 //! drives the inner close path. The client gets its cancel/timeout
@@ -42,8 +42,8 @@
 //! # Lifetime
 //!
 //! Spawned tasks live on the tokio runtime. They are bounded by:
-//! 1. The future's own completion (normal exit -- desired path).
-//! 2. Tokio runtime shutdown (unavoidable -- TCP teardown forces the
+//! 1. The future's own completion (normal exit - desired path).
+//! 2. Tokio runtime shutdown (unavoidable - TCP teardown forces the
 //!    remote side to release resources regardless).
 //!
 //! They are NOT bounded by the request handler that started them, by
@@ -157,7 +157,7 @@ pub enum DetachOutcome<T> {
 ///
 /// If `ct.is_cancelled()` already holds at entry, this returns
 /// [`DetachOutcome::Cancelled`] without spawning `fut`. The future will
-/// NEVER start in that case -- do not begin expensive or mutating work
+/// NEVER start in that case - do not begin expensive or mutating work
 /// for already-abandoned requests.
 ///
 /// # Behavior
@@ -168,7 +168,7 @@ pub enum DetachOutcome<T> {
 /// [`tokio::task::JoinHandle`] against `ct` and (optionally)
 /// `tokio::time::sleep(timeout)`. On tie, completion wins (the handle
 /// arm comes first under `biased;`). On cancel/timeout the spawned
-/// task keeps running to completion -- dropping the [`tokio::task::JoinHandle`]
+/// task keeps running to completion - dropping the [`tokio::task::JoinHandle`]
 /// is a no-op for the task.
 ///
 /// # Requirements on `fut`
@@ -184,7 +184,7 @@ pub enum DetachOutcome<T> {
 )]
 // cancel-safe: under composition, the inner future is moved into a
 // `tokio::spawn` before we await anything, so the cancel/timeout arms can
-// only ever drop the `JoinHandle` (a no-op for the task) -- never the inner
+// only ever drop the `JoinHandle` (a no-op for the task) - never the inner
 // future itself.
 pub async fn run_with_cancel_and_timeout<F, T>(
     fut: F,
@@ -205,7 +205,7 @@ where
     // `biased;` evaluates arms top-down. The `&mut handle` arm comes
     // FIRST so a ready completion wins over a simultaneously-ready
     // cancel/timeout. Dropping the `JoinHandle` does NOT abort the
-    // task -- the spawned future runs to its own completion and cleans
+    // task - the spawned future runs to its own completion and cleans
     // up via its own Drop / early-return paths.
     if let Some(deadline) = timeout {
         tokio::select! {
@@ -227,7 +227,7 @@ where
 ///
 /// Panics are surfaced distinctly via
 /// [`DetachOutcome::Panicked`] so the caller can distinguish them from
-/// cancel/timeout -- do not fold panics into the cancel path, that
+/// cancel/timeout - do not fold panics into the cancel path, that
 /// loses real failure info.
 fn map_join<T>(joined: Result<T, JoinError>) -> DetachOutcome<T> {
     match joined {
@@ -263,7 +263,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_outcome_and_detached_future_runs_to_completion() -> anyhow::Result<()> {
         // The cancel branch wins, but the future must still complete in
-        // the background -- this is the central contract.
+        // the background - this is the central contract.
         //
         // The pre-cancel check short-circuits if the token is cancelled
         // at entry, so we delay-cancel after the helper has spawned the

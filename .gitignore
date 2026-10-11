@@ -20,7 +20,7 @@ __pycache__/
 # exact dependency versions. This repo does: `cargo vet` is a *blocking* job
 # and its exemptions in supply-chain/ pin exact versions. With no committed
 # lockfile CI resolved dependencies fresh on every run, so any transitive
-# release turned vet red at a moment nobody chose -- twice in one hour during
+# release turned vet red at a moment nobody chose - twice in one hour during
 # the 3.6.0 release alone.
 #
 # Committing the lockfile makes dependency updates deliberate: `cargo update`

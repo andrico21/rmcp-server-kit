@@ -99,7 +99,7 @@ mod tests {
     };
     use tokio_util::sync::CancellationToken;
 
-    // -- Minimal test handler --
+    // - Minimal test handler -
 
     #[derive(Clone)]
     struct TestHandler;
@@ -436,7 +436,7 @@ mod tests {
         })
     }
 
-    // -- Test helpers --
+    // - Test helpers -
 
     /// Find a free ephemeral port. Retained for legacy call-sites that
     /// build a config from a port number; new tests should prefer
@@ -451,7 +451,7 @@ mod tests {
     /// deterministically.
     struct ServerHarness {
         /// Base URL (`http://127.0.0.1:<port>`). Always contains the
-        /// actually-bound port -- safe to use immediately.
+        /// actually-bound port - safe to use immediately.
         base: String,
         /// Cancellation token wired into `serve_with_listener`'s shutdown
         /// path. Cancelling triggers the same graceful drain as a real
@@ -1161,7 +1161,7 @@ mod tests {
         let cfg = config_on_port(port).with_allowed_origins(["http://localhost:3000"]);
         let base = spawn_server(cfg).await?;
 
-        // No Origin header -- non-browser client, should pass.
+        // No Origin header - non-browser client, should pass.
         let client = reqwest::Client::new();
         let resp = client.post(format!("{base}/mcp")).body("{}").send().await?;
         assert_ne!(resp.status(), 403);
@@ -3196,7 +3196,7 @@ mod tests {
     ///    code path a real SIGTERM would trigger after BUG-NEW's fix)
     ///    causes the server to exit before a 10s hang detector fires.
     /// 2. The server actually waits at least most of the graceful window
-    ///    (~450ms) instead of insta-killing the in-flight request -- this
+    ///    (~450ms) instead of insta-killing the in-flight request - this
     ///    catches an over-correction that would skip graceful drain
     ///    entirely.
     ///
@@ -3259,7 +3259,7 @@ mod tests {
         // would complete instantly regardless of the bug.
         let slow_url = format!("{base}/slow");
         let in_flight = tokio::spawn(async move {
-            // We don't care about the response -- only that the request
+            // We don't care about the response - only that the request
             // was accepted and is occupying server resources during
             // shutdown.
             drop(reqwest::get(&slow_url).await);
@@ -3293,7 +3293,7 @@ mod tests {
 
         // Best-effort: drain the background HTTP task. It may complete
         // with an error (connection reset by force-exit) or succeed if
-        // the runtime aborted it -- either is acceptable.
+        // the runtime aborted it - either is acceptable.
         in_flight.abort();
         drop(in_flight.await);
 
@@ -3386,7 +3386,7 @@ mod tests {
     /// `enable_admin` without a corresponding `with_auth(...).enabled = true`
     /// must be rejected by `validate()` as `RmcpServerKitError::Config`. With the
     /// typestate `Validated<McpServerConfig>` proof token, `serve()` cannot
-    /// even be called with an invalid config -- the rejection happens at
+    /// even be called with an invalid config - the rejection happens at
     /// `validate()` time, statically preventing exposing `/admin/*` without
     /// authentication.
     #[tokio::test]
@@ -3432,7 +3432,7 @@ mod tests {
         );
 
         // Both set together: only the *file existence* matters at startup,
-        // not validate() -- so this should pass validation.
+        // not validate() - so this should pass validation.
         let paired_cfg = McpServerConfig::new("127.0.0.1:0", "test", "0.0.1")
             .with_tls("/tmp/cert.pem", "/tmp/key.pem");
         drop(
@@ -3657,7 +3657,7 @@ mod tests {
             Ok(())
         }
 
-        // -- server-side-TLS-only PKI (no mTLS, no CRL) --
+        // - server-side-TLS-only PKI (no mTLS, no CRL) -
 
         /// PEM-encoded server-side-TLS-only materials (no mTLS, no CRL).
         struct ServerTlsPki {
@@ -3812,7 +3812,7 @@ mod tests {
     /// complete successfully when shutdown is triggered.
     ///
     /// Before the fix, the MCP service was handed `ct.child_token()`, and the
-    /// graceful path cancels `ct` the moment the shutdown trigger fires -- i.e. at
+    /// graceful path cancels `ct` the moment the shutdown trigger fires - i.e. at
     /// the *start* of the grace window. rmcp ends the SSE response stream on that
     /// cancellation, so a tool call still running was cut off even though the
     /// drain window had barely opened. The service now holds a dedicated session
@@ -3823,7 +3823,7 @@ mod tests {
     /// and only then releases the handler. Nothing depends on elapsed time
     /// thresholds, so it does not become flaky under CI scheduling.
     ///
-    /// It must exercise `/mcp` specifically -- `with_extra_router` routes never
+    /// It must exercise `/mcp` specifically - `with_extra_router` routes never
     /// reach `StreamableHttpService`, which is the sole consumer of the session
     /// token, so a test built that way would pass against the bug.
     #[tokio::test]
@@ -3890,7 +3890,7 @@ mod tests {
             .await
             .context("tool call did not return within 10s")?
             .context("tool call task panicked")?
-            .context("tool call transport error -- the session was cancelled mid-flight")?;
+            .context("tool call transport error - the session was cancelled mid-flight")?;
 
         assert_eq!(
             resp.status(),
@@ -4004,7 +4004,7 @@ mod tests {
     /// The assertion is deliberately on the **client-side response body**, not on
     /// the server task completing. When force-exit wins the `select!` the
     /// `axum::serve` future is simply dropped, so `serve_with_listener` returns
-    /// whether or not the session token was cancelled -- asserting on the join
+    /// whether or not the session token was cancelled - asserting on the join
     /// handle would produce a test that cannot fail. What the cancellation
     /// actually changes is that rmcp ends the SSE stream, so the body reaches EOF
     /// instead of hanging until some unrelated timeout.
@@ -4074,7 +4074,7 @@ mod tests {
         let body = timeout(Duration::from_secs(10), resp.text())
             .await
             .context(
-                "response body never terminated -- force-exit did not cancel the session token",
+                "response body never terminated - force-exit did not cancel the session token",
             )?
             .context("read response body")?;
 

@@ -3,7 +3,7 @@
 # The repository already stores every tracked file with LF (verified via
 # `git ls-files --eol`: i/lf across the board). Without this file, a clone with
 # `core.autocrlf=true` materialises CRLF in the working tree, which silently
-# breaks the shell scripts the CI bench gates invoke -- `set -o pipefail\r`
+# breaks the shell scripts the CI bench gates invoke - `set -o pipefail\r`
 # fails with "invalid option name". Working trees had already drifted apart
 # (some scripts CRLF, others LF), so this pins the intent rather than relying
 # on each contributor's git configuration.

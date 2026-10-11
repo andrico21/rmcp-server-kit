@@ -14,7 +14,7 @@
 //! Or pass a real TOML file path:
 //!
 //! ```bash
-//! cargo run --example config_file_server -- ./config.toml
+//! cargo run --example config_file_server - ./config.toml
 //! ```
 //!
 //! Then, in another shell:
@@ -83,7 +83,7 @@ hosts = ["*"]
 /// Note the `deny_unknown_fields`: every kit-provided section struct sets it,
 /// so a misspelled key *inside* `[server]` is rejected. Only the application's
 /// own root type can reject a misspelled *table name* such as `[serverr]`, so
-/// applications should set it here too -- otherwise a mistyped section is
+/// applications should set it here too - otherwise a mistyped section is
 /// silently dropped and the server starts with defaults for it.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

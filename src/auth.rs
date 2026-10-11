@@ -476,9 +476,9 @@ impl Debug for RfcTimestamp {
     #[inline]
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         // Render as the canonical RFC 3339 string (not chrono's internal
-        // debug form) so existing `ApiKeyEntry` Debug-redaction tests --
+        // debug form) so existing `ApiKeyEntry` Debug-redaction tests -
         // which look for the literal `"2030-01-01T00:00:00Z"` form in the
-        // formatted output -- continue to hold without bespoke handling.
+        // formatted output - continue to hold without bespoke handling.
         write!(f, "{}", self.0.to_rfc3339())
     }
 }
@@ -668,7 +668,7 @@ pub struct MtlsConfig {
     /// revocation status cannot be determined as unverified, so a client
     /// certificate advertising CRL distribution points is rejected when
     /// *every* relevant CDP is uncached and unfetchable. Denial requires all
-    /// relevant CDPs to be unavailable, not merely one -- otherwise an
+    /// relevant CDPs to be unavailable, not merely one - otherwise an
     /// attacker who blocks a single mirror could deny service.
     ///
     /// Set to `false` to restore the pre-3.8 fail-open behaviour, in which an
@@ -1122,7 +1122,7 @@ pub(crate) fn resolve_max_concurrent_verifications(config: &AuthConfig) -> NonZe
 /// 2. A name reused with a *different* `role` is rejected: same-named keys
 ///    are one principal sharing one identity namespace, so two roles under
 ///    one name is a contradiction. Same name with the *same* role is
-///    permitted -- that is credential rotation (one principal, two secrets).
+///    permitted - that is credential rotation (one principal, two secrets).
 ///
 /// Shared by [`AuthConfig::validate_api_key_names`] (startup validation) and
 /// [`AuthState::try_reload_keys`] (hot-reload validation) so both surfaces
@@ -1225,7 +1225,7 @@ impl AuthConfig {
     ///
     /// Fails closed on purpose. Ignoring the table would start the server with
     /// OAuth silently disabled while the operator's configuration says it is
-    /// on -- for a bearer-token deployment that is an unauthenticated server.
+    /// on - for a bearer-token deployment that is an unauthenticated server.
     ///
     /// # Errors
     ///
@@ -1704,7 +1704,7 @@ impl AuthState {
     /// Validate and atomically replace the API key list.
     ///
     /// Rejects an invalid key list before installing anything (a blank name,
-    /// or a name reused with a different role -- see
+    /// or a name reused with a different role - see
     /// [`AuthConfig::validate_api_key_names`]); on error the previous key list
     /// stays in place, so a failed hot reload never leaves the server serving
     /// session-binding-colliding keys.
@@ -1712,8 +1712,8 @@ impl AuthState {
     /// # Errors
     ///
     /// Returns [`RmcpServerKitError::Config`] naming the first offending
-    /// index -- either a blank `name`, or a `name` reused with a different
-    /// `role` -- and leaves the current key list untouched.
+    /// index - either a blank `name`, or a `name` reused with a different
+    /// `role` - and leaves the current key list untouched.
     pub(crate) fn try_reload_keys(&self, keys: Vec<ApiKeyEntry>) -> Result<(), RmcpServerKitError> {
         check_api_key_names(&keys)?;
         self.reload_keys_unchecked(keys);
@@ -1725,7 +1725,7 @@ impl AuthState {
     ///
     /// New requests immediately see the updated keys.
     /// In-flight requests that already loaded the old list finish
-    /// using it -- no torn reads.
+    /// using it - no torn reads.
     ///
     /// Private and unchecked on purpose: it does not reject a blank-named key
     /// (session-binding-colliding, CWE-384). The only caller is
@@ -1927,7 +1927,7 @@ pub fn extract_mtls_identity(cert_der: &[u8], default_role: &str) -> Option<Auth
 /// change: [`ApiKeyEntry::new`] accepts an arbitrary caller-supplied hash
 /// and [`verify_bearer_token`] verifies the raw presented string, so
 /// consumers may have hashed opaque tokens containing punctuation outside
-/// `token68`. Those must keep authenticating -- do not "complete" this
+/// `token68`. Those must keep authenticating - do not "complete" this
 /// check without a major-version note.
 ///
 /// ASCII semantics suffice because [`http::HeaderValue::to_str`] rejects
@@ -1974,7 +1974,7 @@ fn extract_bearer(value: &str) -> Option<&str> {
 /// branchlessness: selecting `verify_against` and recording `matched_index`
 /// are both ordinary data-dependent branches. They are cheap, predictable,
 /// and operate on locals, so they are dwarfed by the Argon2id verification
-/// that dominates every iteration -- but the timing claim stops at
+/// that dominates every iteration - but the timing claim stops at
 /// "one verification per configured key". Do not read this as a
 /// constant-time selection routine.
 ///
@@ -3493,7 +3493,7 @@ mod tests {
     fn check_api_key_names_rejects_same_name_different_role() -> anyhow::Result<()> {
         // Two entries share a name but declare different roles. The name alone
         // is the session/task-binding principal identity, so this is one label
-        // for two authorization profiles -- rejected.
+        // for two authorization profiles - rejected.
         let keys = vec![
             ApiKeyEntry::new("ops", "hash-a", "admin"),
             ApiKeyEntry::new("ops", "hash-b", "viewer"),
@@ -3628,7 +3628,7 @@ mod tests {
         Ok(())
     }
 
-    // -- auth_middleware integration tests --
+    // - auth_middleware integration tests -
 
     use http_body_util::BodyExt as _;
     use tower::ServiceExt as _;
@@ -4250,7 +4250,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
         // Second request from same "IP" (no ConnectInfo in test, so peer_addr is None
-        // and rate limiter won't fire). That's expected -- rate limiting requires
+        // and rate limiter won't fire). That's expected - rate limiting requires
         // ConnectInfo which isn't available in unit tests without a real server.
         // This test verifies the middleware wiring doesn't panic.
         Ok(())
@@ -4304,7 +4304,7 @@ mod tests {
         Ok(())
     }
 
-    // -- pre-auth abuse gate (H-S1) --
+    // - pre-auth abuse gate (H-S1) -
 
     /// The pre-auth gate must default to ~10x the post-failure quota so honest
     /// retry storms never trip it but a Argon2-spray attacker is throttled.
@@ -4948,7 +4948,7 @@ mod tests {
         Ok(())
     }
 
-    // -- AuthFailureClass exact-string contract tests --
+    // - AuthFailureClass exact-string contract tests -
     //
     // These tests pin the exact wire strings emitted for each failure
     // class. They exist to kill mutation-test mutants that replace the
@@ -5048,7 +5048,7 @@ mod tests {
         Ok(())
     }
 
-    // -- AuthConfig::summary boolean-flag contract tests --
+    // - AuthConfig::summary boolean-flag contract tests -
     //
     // These tests pin the boolean flags emitted by `AuthConfig::summary`
     // so that mutations like deleting `!` (which would invert the

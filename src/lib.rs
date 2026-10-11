@@ -163,7 +163,7 @@ pub mod mtls_revocation;
 
 // Explicit re-exports rather than a glob. A `pub use crate::error::*;` would
 // silently promote every future `pub` item added to `error.rs` into the crate
-// root's stable API surface -- `cargo-semver-checks` flags removals, not
+// root's stable API surface - `cargo-semver-checks` flags removals, not
 // accidental additions, so the mistake would ship unnoticed. Listing the three
 // items keeps the root surface a deliberate choice.
 #[expect(

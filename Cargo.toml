@@ -26,7 +26,7 @@ exclude = [
   ".cargo/config.toml",
   # Agent planning scratchpads. Untracked, so a clean CI checkout never sees
   # them, but `cargo publish --allow-dirty` from a working tree would package
-  # them -- they contain internal review notes and session identifiers.
+  # them - they contain internal review notes and session identifiers.
   ".omo/",
   ".sisyphus/",
   # Development-only guideline docs. The root file is the vendoring index; the
@@ -173,8 +173,8 @@ rustix = { version = "1", default-features = false, features = [
 # Windows-only: owner-only ACLs for the audit log.
 #
 # Unix applies 0o600 at creation via rustix's `open`. Windows has no safe
-# creation-time equivalent -- std cannot pass SECURITY_ATTRIBUTES to file
-# creation (rust-lang/libs-team#324) -- so the DACL is applied immediately
+# creation-time equivalent - std cannot pass SECURITY_ATTRIBUTES to file
+# creation (rust-lang/libs-team#324) - so the DACL is applied immediately
 # after creation. This crate is used ONLY for current_process_sid() and
 # applying a protected owner-only DACL; its unsafe Win32 calls are
 # encapsulated, which is required because this crate is #![forbid(unsafe_code)].

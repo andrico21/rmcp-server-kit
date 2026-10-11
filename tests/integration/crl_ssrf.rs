@@ -57,7 +57,7 @@ mod tests {
         matchers::{method, path},
     };
 
-    // -- helpers -----------------------------------------------------------------
+    // - helpers -----------------------------------------------------------------
 
     fn build_ca() -> anyhow::Result<CertifiedIssuer<'static, KeyPair>> {
         let mut params = CertificateParams::new(Vec::<String>::new()).context("ca params")?;
@@ -124,7 +124,7 @@ mod tests {
             .context("hardened client builds")
     }
 
-    // -- Q1: extract_cdp_urls schema validation ---------------------------------
+    // - Q1: extract_cdp_urls schema validation ---------------------------------
 
     /// Pins that only HTTPS CDP URLs survive when `crl_allow_http` is false.
     #[test]
@@ -198,7 +198,7 @@ mod tests {
         Ok(())
     }
 
-    // -- Q2: hardened client refuses redirects ----------------------------------
+    // - Q2: hardened client refuses redirects ----------------------------------
 
     /// Pins that the hardened client surfaces a 302 without following it.
     #[tokio::test]
@@ -232,7 +232,7 @@ mod tests {
         Ok(())
     }
 
-    // -- Q3: hardened client returns 5xx upstream errors as errors --------------
+    // - Q3: hardened client returns 5xx upstream errors as errors --------------
 
     /// Pins that a 5xx upstream response surfaces as an error.
     #[tokio::test]
@@ -258,7 +258,7 @@ mod tests {
         Ok(())
     }
 
-    // -- Q4: streaming body-cap behavior (chunk-loop semantics) -----------------
+    // - Q4: streaming body-cap behavior (chunk-loop semantics) -----------------
 
     /// Pins that the chunked cap loop trips on an oversized response body.
     #[tokio::test]
@@ -343,7 +343,7 @@ mod tests {
         Ok(())
     }
 
-    // -- Q5: test-cert with no CDP URLs -----------------------------------------
+    // - Q5: test-cert with no CDP URLs -----------------------------------------
 
     /// Pins that a cert without a CDP extension yields no URLs.
     #[test]

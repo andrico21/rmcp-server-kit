@@ -21,7 +21,7 @@
 //!    setting `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` would route
 //!    requests through the proxy and bypass our resolver entirely
 //!    (Oracle review N1). The matrix points each variant at TEST-NET-1
-//!    (`192.0.2.1:1`) -- a documented, unroutable decoy. Even if the
+//!    (`192.0.2.1:1`) - a documented, unroutable decoy. Even if the
 //!    environment leaks one through, the connection cannot succeed,
 //!    so the only way to observe the resolver firing is for `reqwest`
 //!    to ignore the proxy entirely. Each variant asserts the resolver

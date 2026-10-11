@@ -131,7 +131,7 @@ fn evaluate_oauth_redirect(
 ///
 /// The suffixes are `.localhost`, `.local` and `.internal`. A trailing FQDN-root
 /// dot is canonicalized first so `idp.internal.` cannot bypass the check. OAuth
-/// targets only -- CRL fetches build an empty allowlist and are out of scope.
+/// targets only - CRL fetches build an empty allowlist and are out of scope.
 ///
 /// Exact `localhost` is deliberately NOT matched here: it resolves to
 /// loopback and is already blocked by the post-DNS IP screen, and an
@@ -162,7 +162,7 @@ fn oauth_internal_suffix_blocked(host: &str, allowlist: &CompiledSsrfAllowlist) 
 ///
 /// **Cloud-metadata addresses (IPv4 `169.254.169.254`, Alibaba/Tencent
 /// `100.100.100.200`, AWS IPv6 `fd00:ec2::254`, GCP IPv6
-/// `fd20:ce::254`) are blocked unconditionally** -- the operator
+/// `fd20:ce::254`) are blocked unconditionally** - the operator
 /// allowlist cannot re-allow them.
 ///
 /// This single core is compiled identically under ALL cfgs, so the test
@@ -238,7 +238,7 @@ async fn screen_oauth_target_core(
             return Err(RmcpServerKitError::Config(format!(
                 "OAuth target blocked: hostname {host} resolved to {ip} ({reason}). \
                  To allow, add the hostname to oauth.ssrf_allowlist.hosts or the CIDR \
-                 to oauth.ssrf_allowlist.cidrs (operators only -- see SECURITY.md). \
+                 to oauth.ssrf_allowlist.cidrs (operators only - see SECURITY.md). \
                  URL: {target}"
             )));
         }
@@ -313,7 +313,7 @@ async fn screen_oauth_target_with_test_override(
 ///
 /// [`with_config`] also honours [`OAuthConfig::ca_cert_path`] (if set) and
 /// adds the supplied PEM CA bundle to the system roots so that
-/// every OAuth-bound HTTP request -- not just the JWKS fetch -- can
+/// every OAuth-bound HTTP request - not just the JWKS fetch - can
 /// trust enterprise/internal certificate authorities. This restores
 /// the behaviour that existed pre-`0.10.0` before the `OauthHttpClient`
 /// wrapper landed.
@@ -373,7 +373,7 @@ pub struct OauthHttpClient {
 }
 
 /// M-H4: cache key for cert-bearing `reqwest::Client`s. Path-based
-/// (not contents-based) -- in-place cert rotation is not picked up
+/// (not contents-based) - in-place cert rotation is not picked up
 /// without restart (documented limitation in `CHANGELOG.md` 1.6.0).
 #[cfg(feature = "oauth-mtls-client")]
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -505,7 +505,7 @@ impl OauthHttpClient {
     /// construction and the error still names `ca_cert_path`.
     fn build(config: Option<&OAuthConfig>) -> Result<Self, RmcpServerKitError> {
         // Install the rustls crypto provider before constructing any reqwest
-        // client (idempotent -- `ok()` ignores the error when a provider was
+        // client (idempotent - `ok()` ignores the error when a provider was
         // already installed elsewhere in the process). Without this a
         // standalone `OauthHttpClient::new`/`with_config` built before
         // `JwksCache::new` or TLS setup would panic inside reqwest with
@@ -572,7 +572,7 @@ impl OauthHttpClient {
         ));
 
         // Read the optional CA bundle once; reused by both clients below.
-        // Pre-startup blocking I/O is intentional -- the constructor is sync
+        // Pre-startup blocking I/O is intentional - the constructor is sync
         // by contract and runs from `serve()`'s pre-startup phase.
         let ca_path: Option<&Path> = config.and_then(|cfg| cfg.ca_cert_path.as_deref());
         let ca_certs: Option<Vec<Certificate>> = ca_path
@@ -639,7 +639,7 @@ impl OauthHttpClient {
             .build()
             .map_err(describe_build_error)?;
 
-        // M7: credential-POST client -- NEVER follows redirects. A 307/308 from
+        // M7: credential-POST client - NEVER follows redirects. A 307/308 from
         // a compromised or open-redirecting token/introspection/revocation
         // endpoint must not re-send the `client_secret`-bearing body to another
         // host (RFC 8705 §2). Mirrors the `Policy::none()` mTLS cert clients.
@@ -824,7 +824,7 @@ fn oauth_request_target_for_log(raw: &str) -> String {
 /// documentation, benchmarking, or reserved ranges is rejected before
 /// connect.
 ///
-/// **Cloud-metadata addresses remain unbypassable** -- operators
+/// **Cloud-metadata addresses remain unbypassable** - operators
 /// cannot opt in to metadata-service exposure. This carve-out covers:
 ///
 /// - IPv4 `169.254.169.254` (AWS / GCP / Azure).
@@ -922,7 +922,7 @@ fn compile_oauth_ssrf_allowlist(raw: &OAuthSsrfAllowlist) -> Result<CompiledSsrf
             Ok(url::Host::Ipv4(_) | url::Host::Ipv6(_)) => {
                 return Err(format!(
                     "oauth.ssrf_allowlist.hosts[{idx}] = {trimmed:?}: literal IPs are forbidden \
-                     here -- list them via oauth.ssrf_allowlist.cidrs instead"
+                     here - list them via oauth.ssrf_allowlist.cidrs instead"
                 ));
             }
             Err(error) => {
@@ -1013,7 +1013,7 @@ pub struct OAuthConfig {
     /// upstream-API CA path); any application-owned HTTP clients
     /// outside the kit must still configure their own CA trust
     /// separately. The deprecated [`OauthHttpClient::new`] no-arg
-    /// constructor cannot honour this field -- migrate to
+    /// constructor cannot honour this field - migrate to
     /// [`OauthHttpClient::with_config`] for full coverage.
     ///
     /// **Validation.** A configured path is read once per client and
@@ -1046,7 +1046,7 @@ pub struct OAuthConfig {
     /// When set, the listed hostnames and CIDR blocks may resolve into
     /// otherwise-blocked address ranges (RFC 1918, loopback, link-local,
     /// CGNAT, IPv6 unique-local, ...). **Cloud-metadata addresses
-    /// remain unbypassable regardless of this setting** -- see
+    /// remain unbypassable regardless of this setting** - see
     /// [`OAuthSsrfAllowlist`] and `SECURITY.md` § "Operator allowlist".
     #[serde(default)]
     pub ssrf_allowlist: Option<OAuthSsrfAllowlist>,
@@ -1064,7 +1064,7 @@ pub struct OAuthConfig {
     /// When set, it must be a non-empty **subset** of that built-in set;
     /// anything else fails [`OAuthConfig::validate`]. Names are matched
     /// case-insensitively. This knob can only ever NARROW the accepted
-    /// algorithms -- it cannot re-enable `HS*` or `none`, so an operator
+    /// algorithms - it cannot re-enable `HS*` or `none`, so an operator
     /// cannot use it to open an algorithm-confusion hole.
     ///
     /// Use it to pin a deployment to exactly what its identity provider
@@ -2111,7 +2111,7 @@ impl OAuthConfigBuilder {
     /// **Operator-only.** Use only when an in-cluster IdP (e.g. Keycloak)
     /// resolves to private/loopback address space and must be reached.
     /// Cloud-metadata addresses (AWS/GCP/Alibaba IPv4 + IPv6) remain
-    /// blocked regardless of allowlist contents -- see
+    /// blocked regardless of allowlist contents - see
     /// [`OAuthSsrfAllowlist`] and `SECURITY.md`  "Operator allowlist".
     #[inline]
     pub fn ssrf_allowlist(mut self, allowlist: OAuthSsrfAllowlist) -> Self {
@@ -2220,7 +2220,7 @@ pub struct TokenExchangeConfig {
     pub client_id: String,
     /// OAuth `client_secret` for confidential-client authentication
     /// (RFC 6749 §2.3.1 HTTP Basic). Mutually exclusive with
-    /// `client_cert` -- [`OAuthConfig::validate`] rejects configs
+    /// `client_cert` - [`OAuthConfig::validate`] rejects configs
     /// that set both, or neither.
     pub client_secret: Option<secrecy::SecretString>,
     /// Client certificate for RFC 8705 §2 mTLS client authentication.
@@ -2488,8 +2488,8 @@ pub struct OAuthProxyConfig {
     /// authorization-code flow.
     ///
     /// Only `resource` is ever dropped. Parameters that carry security
-    /// meaning -- `state`, `code_challenge`, `code_challenge_method`,
-    /// `code_verifier`, `redirect_uri`, `nonce`, `scope` -- are always
+    /// meaning - `state`, `code_challenge`, `code_challenge_method`,
+    /// `code_verifier`, `redirect_uri`, `nonce`, `scope` - are always
     /// forwarded, so enabling this cannot silently disable PKCE or CSRF
     /// protection. The upstream `/introspect` and `/revoke` proxy path is
     /// unaffected: `resource` is not a parameter of RFC 7662 or RFC 7009
@@ -2634,8 +2634,8 @@ impl OAuthProxyConfigBuilder {
 /// stays usable without ever consulting the untrusted token header.
 ///
 /// **`P-521`/`ES512` is deliberately absent.** `jsonwebtoken` 11's
-/// `Algorithm` enum has no `ES512` variant at all -- it defines only `ES256`
-/// and `ES384` for ECDSA -- so a `P-521` family could not name an algorithm to
+/// `Algorithm` enum has no `ES512` variant at all - it defines only `ES256`
+/// and `ES384` for ECDSA - so a `P-521` family could not name an algorithm to
 /// map to. It is likewise absent from [`ACCEPTED_ALGS`]. Supporting P-521 would
 /// require upstream `jsonwebtoken` support first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2985,7 +2985,7 @@ const fn accepted_algorithm_name(alg: Algorithm) -> Option<&'static str> {
 /// Parse an operator-supplied algorithm name.
 ///
 /// Case-insensitive so `rs256` and `RS256` both work. Returns `None` for any
-/// name outside [`ACCEPTED_ALGS`] -- including `HS256` and `none` -- which is
+/// name outside [`ACCEPTED_ALGS`] - including `HS256` and `none` - which is
 /// what enforces the narrow-only rule at config-validation time.
 fn accepted_algorithm_from_name(name: &str) -> Option<Algorithm> {
     ACCEPTED_ALGS
@@ -3009,7 +3009,7 @@ fn accepted_algorithm_names() -> String {
 /// `accepted_algorithm_from_name` returns `None` for `HS*` and `none`, so an
 /// operator can never re-enable a symmetric or unsigned algorithm through
 /// config. An empty list is rejected because it would silently reject every
-/// token -- almost certainly an operator mistake rather than an intent to
+/// token - almost certainly an operator mistake rather than an intent to
 /// disable OAuth.
 ///
 /// # Errors
@@ -3120,7 +3120,7 @@ impl JwksCacheShared {
     /// `config.ca_cert_path` cannot be read or parsed, contains no
     /// certificates, or the HTTP client cannot be built.
     fn new(config: &OAuthConfig, shutdown: &CancellationToken) -> Result<Self, RmcpServerKitError> {
-        // Ensure crypto providers are installed (idempotent -- ok() ignores
+        // Ensure crypto providers are installed (idempotent - ok() ignores
         // the error if already installed by another call in the same process).
         drop(default_provider().install_default());
         if let Err(_already_installed) = DEFAULT_PROVIDER.install_default() {
@@ -3755,13 +3755,13 @@ impl JwksCache {
             }
         }
 
-        // Cache miss or expired -- refresh (with cooldown/deduplication).
+        // Cache miss or expired - refresh (with cooldown/deduplication).
         self.refresh_with_cooldown().await;
 
         // Fail closed (H2): a failed or cooled-down refresh leaves the previous
         // (now-expired) cache in place. Re-apply the freshness gate the first
         // lookup enforces so a rotated-out key is never served from a stale
-        // cache -- otherwise an attacker who can stall the JWKS endpoint could
+        // cache - otherwise an attacker who can stall the JWKS endpoint could
         // keep a revoked signing key valid past its TTL.
         let guard = self.shared.inner.read().await;
         guard
@@ -4269,8 +4269,8 @@ fn jwk_permits_signature_verification(jwk: &Jwk) -> bool {
 /// Determine how a JWK constrains the algorithms it may verify.
 ///
 /// An explicit `alg` pins exactly one algorithm (unchanged behaviour). When
-/// `alg` is absent -- which RFC 7517 4.4 explicitly permits, and which Entra
-/// v2.0 always does -- the key type implies the family instead. Returning
+/// `alg` is absent - which RFC 7517 4.4 explicitly permits, and which Entra
+/// v2.0 always does - the key type implies the family instead. Returning
 /// `None` drops the key, so unknown or symmetric key types stay fail-closed.
 fn jwk_algorithm(jwk: &Jwk) -> Option<JwkAlg> {
     jwk.common.key_algorithm.map_or_else(
@@ -4303,8 +4303,8 @@ const fn explicit_jwk_algorithm(declared: KeyAlgorithm) -> Option<Algorithm> {
 ///
 /// SECURITY: inference reads only the JWK's own key material, never the token
 /// header, so it cannot be steered by an attacker. `OctetKey` (symmetric) is
-/// deliberately never inferred -- an `HS*` secret must not become a
-/// verification key -- and `P-521` yields `None` because `jsonwebtoken` 11
+/// deliberately never inferred - an `HS*` secret must not become a
+/// verification key - and `P-521` yields `None` because `jsonwebtoken` 11
 /// defines no `ES512` variant (its own `EllipticCurve::P521` doc notes the
 /// curve is unsupported by `ring`).
 #[expect(
@@ -4568,7 +4568,7 @@ fn resolve_authorization_servers<'server>(
     // Advertise this server only when it actually mounts the OAuth endpoints.
     // `install_oauth_proxy_routes` mounts `/authorize`, `/token`, and
     // `/.well-known/oauth-authorization-server` ONLY when `proxy` is set, while
-    // Protected Resource Metadata is served unconditionally -- so without a
+    // Protected Resource Metadata is served unconditionally - so without a
     // proxy the local URL resolves to a 404 and the upstream issuer is the only
     // truthful answer. An application that mounts its own facade through
     // `with_extra_router` must say so via `authorization_servers`.
@@ -4880,8 +4880,8 @@ async fn proxy_oauth_admin_request(
     use axum::{http::header, response::IntoResponse as _};
 
     // `false`: `resource` is not a parameter of RFC 7662 introspection or
-    // RFC 7009 revocation requests, so the strip flag -- which exists purely
-    // to satisfy Entra's authorization-code flow -- must not reach this path.
+    // RFC 7009 revocation requests, so the strip flag - which exists purely
+    // to satisfy Entra's authorization-code flow - must not reach this path.
     let mut upstream_body = rewrite_client_auth_params(body, &proxy.client_id, false);
     if let Some(secret) = &proxy.client_secret {
         use core::fmt::Write as _;
@@ -5072,7 +5072,7 @@ fn sanitize_oauth_error_code(raw: &str) -> &'static str {
 // Callers that can be cancelled should use `exchange_token_with_cancel`, which
 // pre-checks the token, detaches the in-flight exchange rather than dropping it,
 // and audits a token minted after the caller went away. That is a mitigation,
-// not a guarantee -- see its docs for what remains unattainable.
+// not a guarantee - see its docs for what remains unattainable.
 #[inline]
 // NOT cancel-safe: and not fixable at this layer - once `send_screened` puts the
 // RFC 8693 POST on the wire, dropping this future cannot un-send it. The
@@ -5489,7 +5489,7 @@ fn rewrite_client_auth_params(
         }
         // SECURITY: `resource` is the ONLY caller parameter this flag drops.
         // Comparison happens post-decode, so `%72esource` cannot smuggle past
-        // it -- the same property that protects CLIENT_AUTH_PARAMS above.
+        // it - the same property that protects CLIENT_AUTH_PARAMS above.
         if strip_resource && key.as_ref() == "resource" {
             continue;
         }
@@ -5596,7 +5596,7 @@ mod tests {
         Ok(())
     }
 
-    // -- F2 regression: client-auth parameter smuggling in the OAuth proxy --
+    // - F2 regression: client-auth parameter smuggling in the OAuth proxy -
     //
     // The previous `replace_client_id` split on `&` and dropped segments
     // literally starting with `client_id=`. Percent-encoded keys survived that
@@ -5789,7 +5789,7 @@ mod tests {
     /// Strips a percent-encoded resource key, matched after decoding.
     fn rewrite_strips_percent_encoded_resource_key() -> anyhow::Result<()> {
         // The strip filter compares post-decode, so an encoded key cannot
-        // smuggle `resource` upstream -- same property that protects
+        // smuggle `resource` upstream - same property that protects
         // CLIENT_AUTH_PARAMS.
         let out = rewrite_client_auth_params("%72esource=sneaky&scope=read", "proxy-id", true);
         let pairs = decoded_pairs(&out);
@@ -6350,7 +6350,7 @@ role = "admin"
         let mut cfg = validation_https_config();
         cfg.proxy = Some(
             OAuthProxyConfig::builder(
-                "http://idp.example.com/authorize", // <-- HTTP, must be rejected
+                "http://idp.example.com/authorize", // <- HTTP, must be rejected
                 "https://idp.example.com/token",
                 "client",
             )
@@ -6374,7 +6374,7 @@ role = "admin"
         cfg.proxy = Some(
             OAuthProxyConfig::builder(
                 "https://idp.example.com/authorize",
-                "http://idp.example.com/token", // <-- HTTP, must be rejected
+                "http://idp.example.com/token", // <- HTTP, must be rejected
                 "client",
             )
             .build(),
@@ -6430,7 +6430,7 @@ role = "admin"
         Ok(())
     }
 
-    // -- M3 regression: unauthenticated /introspect and /revoke must fail validate --
+    // - M3 regression: unauthenticated /introspect and /revoke must fail validate -
 
     /// Rejects exposed admin endpoints lacking both auth guards.
     #[test]
@@ -6529,7 +6529,7 @@ role = "admin"
         let mut cfg = validation_https_config();
         cfg.token_exchange = Some(
             TokenExchangeConfig::new(
-                "http://idp.example.com/token", // <-- HTTP
+                "http://idp.example.com/token", // <- HTTP
                 "client",
                 None,
                 None,
@@ -6868,7 +6868,7 @@ role = "admin"
         .context("JWKS refresh completion must be published")
     }
 
-    // -- H2: expired JWKS cache must fail closed when refresh cannot succeed --
+    // - H2: expired JWKS cache must fail closed when refresh cannot succeed -
 
     /// Prime a cache from a valid JWKS, then repoint the endpoint at a 503.
     ///
@@ -7309,7 +7309,7 @@ role = "admin"
         Ok(())
     }
 
-    // -- Issue #17: JWKS keys that omit the OPTIONAL `alg` member (RFC 7517 4.4) --
+    // - Issue #17: JWKS keys that omit the OPTIONAL `alg` member (RFC 7517 4.4) -
     //
     // Microsoft Entra v2.0 publishes every signing key without `alg`
     // (verified against login.microsoftonline.com/common/discovery/v2.0/keys:
@@ -7516,7 +7516,7 @@ role = "admin"
         Ok(())
     }
 
-    // -- allowed_algorithms: operator narrowing of the accepted algorithm set --
+    // - allowed_algorithms: operator narrowing of the accepted algorithm set -
 
     /// Round-trips every accepted algorithm to a configurable name and back.
     #[test]
@@ -7770,7 +7770,7 @@ role = "admin"
         };
         assert_eq!(first_failure, JwtValidationFailure::Invalid);
         // Second attempt: the refresh cooldown is now active, so no refresh is
-        // attempted -- the still-expired cache must not serve the stale key.
+        // attempted - the still-expired cache must not serve the stale key.
         let Err(failure) = cache.validate_token_with_reason(&token).await else {
             anyhow::bail!("cooldown-active + expired cache must still fail closed");
         };
@@ -7822,7 +7822,7 @@ role = "admin"
         Ok(())
     }
 
-    // -- L4: kid-strict key lookup + require_subject --
+    // - L4: kid-strict key lookup + require_subject -
 
     #[expect(
         clippy::unnecessary_wraps,
@@ -8448,7 +8448,7 @@ role = "admin"
         // Must comfortably exceed the mock response delay: the detached task
         // cannot emit its audit line until the upstream exchange completes, so
         // this bound is `mock delay + slack`, not a latency expectation. It is
-        // a bounded wait -- on success it returns as soon as the line appears.
+        // a bounded wait - on success it returns as soon as the line appears.
         timeout(Duration::from_secs(15), async {
             loop {
                 if logs.contents().contains(needle) {
@@ -8625,7 +8625,7 @@ role = "admin"
                     // the `biased;` race before the caller cancels. A tight
                     // delay would make the outcome assertion depend on machine
                     // load rather than on the detach behaviour it proves. The
-                    // test never waits this out -- returning without waiting is
+                    // test never waits this out - returning without waiting is
                     // precisely the point.
                     .set_delay(Duration::from_secs(2))
                     .set_body_json(exchange_response(
@@ -9993,7 +9993,7 @@ role = "admin"
         Ok(())
     }
 
-    // -- L3: internal-hostname-suffix pre-DNS denylist --
+    // - L3: internal-hostname-suffix pre-DNS denylist -
 
     #[expect(
         clippy::unnecessary_wraps,
@@ -11489,7 +11489,7 @@ role = "admin"
         Ok(())
     }
 
-    // -- introspection / revocation proxy --
+    // - introspection / revocation proxy -
 
     fn proxy_cfg(token_url: &str) -> OAuthProxyConfig {
         OAuthProxyConfig {

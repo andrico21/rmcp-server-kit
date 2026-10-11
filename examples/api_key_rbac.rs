@@ -79,7 +79,7 @@ async fn main() -> rmcp_server_kit::Result<()> {
     //    OMITS `message`. With the compatibility default (`required = false`)
     //    an allowlist only constrains the argument when it is supplied, so a
     //    caller omitting it passes unchecked and any handler-side default
-    //    value is used instead -- a fail-open surprise.
+    //    value is used instead - a fail-open surprise.
     let viewer = RoleConfig::new(
         "viewer",
         vec!["echo".into(), "resource_list".into()],

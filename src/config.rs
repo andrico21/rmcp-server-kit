@@ -2092,7 +2092,7 @@ mod tests {
             .server)
     }
 
-    // -- ServerConfig defaults --
+    // - ServerConfig defaults -
 
     #[expect(
         clippy::unnecessary_wraps,
@@ -2189,7 +2189,7 @@ mod tests {
         Ok(())
     }
 
-    // -- validate_server_config --
+    // - validate_server_config -
 
     #[expect(
         clippy::unnecessary_wraps,
@@ -3595,7 +3595,7 @@ client_ip = false
         Ok(())
     }
 
-    // -- validate_observability_config --
+    // - validate_observability_config -
 
     #[expect(
         clippy::unnecessary_wraps,
@@ -3688,7 +3688,7 @@ client_ip = false
         Ok(())
     }
 
-    // -- serde deserialization --
+    // - serde deserialization -
 
     #[test]
     /// Pins the deserialized defaults for a bare `ServerConfig` TOML.

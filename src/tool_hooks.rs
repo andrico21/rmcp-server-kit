@@ -447,7 +447,7 @@ struct AfterHookHolder {
 ///
 /// `actual` is `None` when the result could not be serialized, so its true
 /// size is unknown. It is rendered as `"unknown"` rather than a fabricated
-/// number -- operators read `actual_bytes` as a measurement.
+/// number - operators read `actual_bytes` as a measurement.
 fn too_large_result(limit: usize, actual: Option<usize>, tool: &str) -> CallToolResult {
     let actual_desc = actual.map_or_else(
         || "an unmeasurable number of".to_owned(),
@@ -470,8 +470,8 @@ fn too_large_result(limit: usize, actual: Option<usize>, tool: &str) -> CallTool
     result
 }
 
-/// Outcome of the `max_result_bytes` policy for a measured -- or
-/// unmeasurable -- result.
+/// Outcome of the `max_result_bytes` policy for a measured - or
+/// unmeasurable - result.
 #[derive(Debug, PartialEq, Eq)]
 enum SizeVerdict {
     /// Within the cap, or no cap configured. Carries the measured size.
@@ -569,7 +569,7 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
     }
 
     // Synchronous negotiation helper: no context and no hooks apply, so plain
-    // delegation is the only transparent option -- the trait default would
+    // delegation is the only transparent option - the trait default would
     // shadow an inner override.
     #[inline]
     fn negotiate_initialize(
@@ -675,7 +675,7 @@ impl<H: ServerHandler> ServerHandler for HookedHandler<H> {
     // NOT cancel-safe: this awaits consumer-supplied before-hooks and the
     // consumer's inner handler. After-hooks are dispatched only on the normal
     // Deny/Replace/Ok/Err paths, so a cancellation between them drops the
-    // paired after-hook -- an audit hook can record a started call that never
+    // paired after-hook - an audit hook can record a started call that never
     // closes out. Make the after-hook idempotent or detach the tool body.
     #[inline]
     async fn call_tool(
@@ -1806,8 +1806,8 @@ mod tests {
     // Each driver proves, by exact equality on the inner probe's record log
     // (and on sentinel values no rmcp default body can produce), that the
     // wrapper forwarded the call. Every driver runs twice: once against the
-    // real wrapper, and once against `PassthroughDefaults` -- the wrapper with
-    // all delegations deleted -- where the probe must stay untouched. That
+    // real wrapper, and once against `PassthroughDefaults` - the wrapper with
+    // all delegations deleted - where the probe must stay untouched. That
     // second half is the per-method mutation check.
     //
     // No assertion here uses `contains`, `is_empty()` or a length threshold:
@@ -1820,7 +1820,7 @@ mod tests {
     /// test that proves the inner handler was reached.
     ///
     /// Parsed by `tests/integration/delegation_guard.rs`, which asserts this table covers
-    /// exactly its `DIRECTLY_DELEGATED ∪ BEHAVIORAL_WRAPPED` classification --
+    /// exactly its `DIRECTLY_DELEGATED ∪ BEHAVIORAL_WRAPPED` classification -
     /// so a method cannot be added or reclassified without a driver.
     const SEMANTIC_DRIVERS: &[(&str, &str)] = &[
         ("ping", "hooked_handler_delegates_ping"),
@@ -2055,9 +2055,9 @@ mod tests {
         );
 
         // Exact full sequence (mechanism 3): the two driven methods and nothing
-        // else. Neither can be produced by a re-entrant default -- the probe
+        // else. Neither can be produced by a re-entrant default - the probe
         // overrides `initialize` outright, and `discover` is only reachable
-        // through the wrapper's delegation -- so the expected log contains both
+        // through the wrapper's delegation - so the expected log contains both
         // driven methods, per the ambient-calls invariant.
         assert_eq!(probe.seen(), vec!["initialize", "discover"]);
 
@@ -2183,7 +2183,7 @@ mod tests {
             ]
         );
 
-        // Negative control: the same four requests, answered by defaults --
+        // Negative control: the same four requests, answered by defaults -
         // empty result sets, probe untouched.
         let control = ForwardingProbe::default();
         let (mut control_reader, mut control_writer, _control_service) =
@@ -2424,7 +2424,7 @@ mod tests {
 
         // Exact full sequence (mechanism 3): this arm calls
         // `accepted_subscription_filter` before `listen`, and both are the
-        // wrapper's own delegations -- so the expected log is the two-element
+        // wrapper's own delegations - so the expected log is the two-element
         // ordered sequence, not the singleton `["listen"]`.
         assert_eq!(probe.seen(), vec!["accepted_subscription_filter", "listen"]);
 

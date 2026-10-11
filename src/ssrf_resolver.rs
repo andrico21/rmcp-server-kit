@@ -175,7 +175,7 @@ pub(crate) fn screen_addrs(
             continue;
         };
 
-        // Cloud-metadata is unbypassable -- short-circuit BEFORE
+        // Cloud-metadata is unbypassable - short-circuit BEFORE
         // consulting the allowlist or the loopback-bypass flag. This
         // ordering is the security invariant Oracle review S2 requires.
         if reason == "cloud_metadata" {

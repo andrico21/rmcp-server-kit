@@ -126,7 +126,7 @@ The `release.yml` workflow then:
 1. Verifies the tag matches the crate version.
 2. Runs `cargo publish --dry-run`.
 3. Runs `cargo publish` (requires `CARGO_REGISTRY_TOKEN` secret).
-4. Creates a GitHub release with auto-generated notes -- but only when this
+4. Creates a GitHub release with auto-generated notes - but only when this
    run actually performed the `cargo publish` upload. If the version was
    already on crates.io before this run (the publish step reports
    `published=false`), this step is skipped, because the run that truly
@@ -143,7 +143,7 @@ Because "Create GitHub release" is now gated on `steps.publish.outputs.published
 == 'true'`, only the run that actually uploaded the crate creates the release.
 That closes a recovery path the pipeline used to have for free: previously, if
 run A published successfully but its release-creation step failed transiently, a
-later run B -- which sees the version already on crates.io -- would create the
+later run B - which sees the version already on crates.io - would create the
 release instead. Now run B reports `published=false` and skips the step, so
 **no** run will auto-create that release. You must create it by hand, and only
 after proving the published bytes are the ones this tag describes.

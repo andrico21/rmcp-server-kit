@@ -380,9 +380,9 @@ pub struct CrlSet {
     /// **fallback** admission path, consulted only when a submission arrives
     /// with no attributed handshake peer (see `discovery_limiter_per_peer`).
     ///
-    /// Attributed handshakes -- the sole production path, via the
+    /// Attributed handshakes - the sole production path, via the
     /// `CURRENT_HANDSHAKE_PEER` scope installed by the TLS accept worker in
-    /// `crate::transport` -- consult the per-peer limiter instead, so one peer
+    /// `crate::transport` - consult the per-peer limiter instead, so one peer
     /// can no longer drain another peer's discovery budget. This global bucket
     /// still guards the unattributed path: a downstream verifier built outside
     /// this crate's transport, or any future caller of `note_discovered_urls`
@@ -439,7 +439,7 @@ impl CrlSet {
     ) -> Result<Arc<Self>, RmcpServerKitError> {
         // M-H2: install the SSRF screening resolver on the CRL fetcher.
         // CRL CDP URLs come from attacker-controllable client certs and
-        // their hosts are re-resolved per fetch -- exactly the TOCTOU
+        // their hosts are re-resolved per fetch - exactly the TOCTOU
         // class M-H2 closes. The allowlist holds the lowercased hostnames
         // of the operator-trusted origins (the CDP and AIA URIs named in
         // the configured certificates); there is no configurable CRL
@@ -636,7 +636,7 @@ impl CrlSet {
         }
     }
 
-    /// Report a CDP discovery submission dropped by the per-minute limiter --
+    /// Report a CDP discovery submission dropped by the per-minute limiter -
     /// per-peer when the handshake peer is attributed, process-global
     /// otherwise. Throttled through `should_warn_throttled` exactly like the
     /// cap warnings: the drain happens on the unauthenticated handshake path,
@@ -655,8 +655,8 @@ impl CrlSet {
 
     /// Report that discovery ran with no attributed handshake peer, so per-peer
     /// admission was unavailable and the process-global limiter was consulted
-    /// as a fallback. The happy path -- attributed TLS handshakes driven by the
-    /// scoped accept worker in `crate::transport` -- never triggers this; it is
+    /// as a fallback. The happy path - attributed TLS handshakes driven by the
+    /// scoped accept worker in `crate::transport` - never triggers this; it is
     /// a regression canary. If a future edit drops the `CURRENT_HANDSHAKE_PEER`
     /// scope, per-peer isolation silently reverts to global-only admission and
     /// this WARN is what makes that observable. Downstream users constructing
@@ -1025,7 +1025,7 @@ impl CrlSet {
         // SECURITY: discover only from `relevant_urls`, the same set the cap
         // above governs. Reading `all_urls` here instead would let a peer with
         // `crl_end_entity_only = true` drive discovery, pending-set growth, and
-        // limiter consumption from uncapped intermediate CDPs -- the exact
+        // limiter consumption from uncapped intermediate CDPs - the exact
         // amplification the cap exists to remove.
         let candidates: Vec<String> = {
             let seen = self
@@ -1052,7 +1052,7 @@ impl CrlSet {
         // and falls back to the process-global limiter only when no handshake
         // scope is present. SECURITY (order is load-bearing): the
         // `governor`-backed `check()`/`check_key()` APIs CONSUME a token rather
-        // than peek, so an attributed peer must consult ONLY its own bucket --
+        // than peek, so an attributed peer must consult ONLY its own bucket -
         // also consulting the global bucket would let a rejected attacker still
         // drain the shared budget, the exact cross-peer starvation this fixes.
         for url in candidates {
@@ -1142,7 +1142,7 @@ impl CrlSet {
             return (true, state);
         }
 
-        // `all(..not cached..)` -- deny only when EVERY relevant CDP URL is
+        // `all(..not cached..)` - deny only when EVERY relevant CDP URL is
         // uncached, not when any single one is. RFC 5280 4.2.1.13: "If the
         // DistributionPointName contains multiple values, each name
         // describes a different mechanism to obtain the same CRL." The
@@ -1671,7 +1671,7 @@ impl ClientCertVerifier for DynamicClientCertVerifier {
         now: UnixTime,
     ) -> Result<ClientCertVerified, TlsError> {
         // SECURITY: extracting CDP URLs from an unverified client cert
-        // here is intentional. No HTTP happens on this path -- the call
+        // here is intentional. No HTTP happens on this path - the call
         // to `note_discovered_urls` only enqueues onto a bounded,
         // rate-limited channel. The actual fetch runs off-path in
         // `run_crl_refresher` and is gated by SSRF screening
@@ -3398,8 +3398,8 @@ mod tests {
     /// driving `bootstrap_fetch`, because `bootstrap_fetch` cannot be reached
     /// from a test without weakening production SSRF screening.
     ///
-    /// `fetch_crl` performs its own DNS precheck -- `tokio::net::lookup_host`
-    /// followed by `ip_block_reason` -- *before* handing the request to
+    /// `fetch_crl` performs its own DNS precheck - `tokio::net::lookup_host`
+    /// followed by `ip_block_reason` - *before* handing the request to
     /// `reqwest`. That precheck is independent of the `dns_resolver` injected
     /// into the client, so a custom resolver cannot redirect a fetch to a
     /// local mock: a `wiremock` server on loopback is rejected as a blocked IP
@@ -3407,9 +3407,9 @@ mod tests {
     ///
     /// Reaching `bootstrap_fetch` end to end would therefore require either a
     /// test-only bypass of that precheck, or a CRL served from a public
-    /// non-private address. The first is deliberately not done -- a bypass
+    /// non-private address. The first is deliberately not done - a bypass
     /// seam next to CRL fetching is a worse security liability than the
-    /// coverage it would buy -- and the second is not available offline.
+    /// coverage it would buy - and the second is not available offline.
     ///
     /// This test asserts the property that actually matters: the cap is
     /// applied *before* `CrlSet::new`, so `cache`, `cached_urls`, and
@@ -4556,7 +4556,7 @@ mod tests {
     // ---- WO-R6: per-peer CRL discovery admission ---------------------------
 
     /// A single peer draining its own per-peer discovery quota must not deny a
-    /// concurrent legitimate peer presenting a not-yet-cached CDP URL -- the
+    /// concurrent legitimate peer presenting a not-yet-cached CDP URL - the
     /// cross-peer starvation the process-global limiter allowed and per-peer
     /// keying removes. Also asserts the attributed path never fires the
     /// unattributed-fallback canary, proving the task-local scope was honoured.

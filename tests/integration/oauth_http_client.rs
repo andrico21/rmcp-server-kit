@@ -292,7 +292,7 @@ mod tests {
         Ok((client, ca_path))
     }
 
-    /// Used by Test 2 (positive CA) -- references the unused PEM helpers
+    /// Used by Test 2 (positive CA) - references the unused PEM helpers
     /// to keep `clippy::dead_code` quiet without `#[allow]` attributes.
     fn consume_pem(pki: &TestPki) {
         let _: (&String, &String) = (&pki.leaf_cert_pem, &pki.leaf_key_pem);

@@ -29,7 +29,7 @@
 //!    rejections) so an actively-firing attacker cannot dodge eviction by
 //!    appearing idle.
 //! 5. Optionally spawning a best-effort background prune task. Cap
-//!    enforcement does **not** depend on this task running -- it is
+//!    enforcement does **not** depend on this task running - it is
 //!    purely an optimization that reclaims memory between admission
 //!    events.
 //!
@@ -172,11 +172,11 @@ impl<K: Eq + Hash + Clone> Clone for BoundedKeyedLimiter<K> {
 impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
     /// Create a new bounded keyed limiter.
     ///
-    /// * `quota` -- the per-key rate-limit quota applied to every entry.
-    /// * `max_tracked_keys` -- hard cap on the number of simultaneously
+    /// * `quota` - the per-key rate-limit quota applied to every entry.
+    /// * `max_tracked_keys` - hard cap on the number of simultaneously
     ///   tracked keys. When reached, an insert first prunes idle entries
     ///   then falls back to LRU eviction.
-    /// * `idle_eviction` -- entries whose `last_seen` is older than this
+    /// * `idle_eviction` - entries whose `last_seen` is older than this
     ///   are eligible for opportunistic pruning.
     ///
     /// # Background prune task
@@ -233,13 +233,13 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
     /// `requests_per_minute`. The rate is clamped to a minimum of `1`
     /// request/min so a misconfigured `0` does not panic at startup.
     ///
-    /// * `requests_per_minute` -- per-key rate, clamped to `>= 1`.
-    /// * `max_tracked_keys` -- hard cap on simultaneously tracked keys,
+    /// * `requests_per_minute` - per-key rate, clamped to `>= 1`.
+    /// * `max_tracked_keys` - hard cap on simultaneously tracked keys,
     ///   clamped to `>= 1`. `McpServerConfig` validation rejects `0`
     ///   upstream, so the clamp is defense-in-depth for direct callers.
     ///   When reached, an insert first prunes idle entries then falls
     ///   back to LRU eviction.
-    /// * `idle_eviction` -- entries whose `last_seen` is older than this
+    /// * `idle_eviction` - entries whose `last_seen` is older than this
     ///   are eligible for opportunistic pruning.
     #[must_use]
     #[inline]
@@ -278,13 +278,13 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
     /// `requests_per_second`. The rate is clamped to a minimum of `1`
     /// request/sec so a misconfigured `0` does not panic at startup.
     ///
-    /// * `requests_per_second` -- per-key rate, clamped to `>= 1`.
-    /// * `max_tracked_keys` -- hard cap on simultaneously tracked keys,
+    /// * `requests_per_second` - per-key rate, clamped to `>= 1`.
+    /// * `max_tracked_keys` - hard cap on simultaneously tracked keys,
     ///   clamped to `>= 1`. `McpServerConfig` validation rejects `0`
     ///   upstream, so the clamp is defense-in-depth for direct callers.
     ///   When reached, an insert first prunes idle entries then falls
     ///   back to LRU eviction.
-    /// * `idle_eviction` -- entries whose `last_seen` is older than this
+    /// * `idle_eviction` - entries whose `last_seen` is older than this
     ///   are eligible for opportunistic pruning.
     #[must_use]
     #[inline]
@@ -370,13 +370,13 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> BoundedKeyedLimiter<K> {
     /// Test the per-key quota for `key`.
     ///
     /// Returns `Ok(())` if the request is allowed. The `last_seen`
-    /// timestamp is updated on **every** call -- including rate-limit
-    /// rejections -- so an actively firing attacker cannot age out into
+    /// timestamp is updated on **every** call - including rate-limit
+    /// rejections - so an actively firing attacker cannot age out into
     /// a fresh quota by appearing idle.
     ///
     /// When inserting a new key into a full table, idle entries are pruned
     /// first; if the table is still full, the entry with the oldest
-    /// `last_seen` is evicted (LRU). The new key is always inserted --
+    /// `last_seen` is evicted (LRU). The new key is always inserted -
     /// honest new clients are never rejected because the table is full.
     ///
     /// # Errors
@@ -736,7 +736,7 @@ mod tests {
         };
 
         // Force eviction by inserting two unrelated keys (cap = 2). The
-        // attacker (`target`) is rate-limited -- it has a *recent*
+        // attacker (`target`) is rate-limited - it has a *recent*
         // `last_seen` because of the failed check above. So inserting
         // two new keys must NOT evict the attacker; instead one of the
         // *other* unrelated keys gets evicted via LRU. We therefore
@@ -772,7 +772,7 @@ mod tests {
         )]
         let _: Result<(), BoundedLimiterError> = limiter.check_key(&ip(5));
 
-        // `target` should have been evicted by now -- a fresh check_key
+        // `target` should have been evicted by now - a fresh check_key
         // re-inserts with a fresh quota.
         let Ok(()) = limiter.check_key(&target) else {
             anyhow::bail!("evicted key gets a fresh quota on reappearance");
@@ -801,7 +801,7 @@ mod tests {
         assert_eq!(limiter.len(), 3);
 
         // The attacker now starts firing. First two are allowed
-        // (fills quota), then we expect refusals -- but each refusal
+        // (fills quota), then we expect refusals - but each refusal
         // updates last_seen so the attacker stays "current".
         sleep(Duration::from_millis(5));
         let attacker = ip(200);

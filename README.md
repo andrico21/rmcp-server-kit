@@ -9,7 +9,7 @@
 It provides a Streamable HTTP transport with TLS/mTLS, structured
 observability, authentication (Bearer / mTLS / OAuth 2.1 JWT), role-based
 access control (RBAC), per-IP rate limiting, and optional Prometheus
-metrics -- all wired up and ready to go.
+metrics - all wired up and ready to go.
 
 You supply a `rmcp::handler::server::ServerHandler` implementation; rmcp-server-kit
 handles everything else.
@@ -25,7 +25,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 
 > The minimal example below uses default features only. Enable the
 > `oauth` feature (`features = ["oauth"]`) to validate JWTs against a
-> JWKS, or `metrics` for the Prometheus `/metrics` endpoint -- see the
+> JWKS, or `metrics` for the Prometheus `/metrics` endpoint - see the
 > [Cargo features](#cargo-features) table below.
 
 ```rust
@@ -97,8 +97,8 @@ let rbac = Arc::new(RbacPolicy::new(&RbacConfig::with_roles(vec![viewer])));
 ```
 
 > Use `ArgumentAllowlist::new_required` (as above), not `new`, unless omitting
-> the argument is genuinely safe. `required` defaults to `false` -- permanently
-> -- so an allowlist built with `new` constrains the value only when the caller
+> the argument is genuinely safe. `required` defaults to `false` - permanently
+> - so an allowlist built with `new` constrains the value only when the caller
 > supplies it, and a tool that substitutes its own default for a missing
 > argument bypasses the allowlist entirely. See the
 > [argument allowlist guide](docs/GUIDE.md#argumentallowlist).
@@ -196,7 +196,7 @@ let config = McpServerConfig::new("127.0.0.1:8443", "my-server", "0.1.0")
 | `oauth`              | No      | OAuth 2.1 JWT validation via JWKS.             |
 | `oauth-mtls-client`  | No      | RFC 8705 mTLS client authentication for the OAuth token-exchange endpoint. Implies `oauth`. |
 | `metrics`            | No      | Prometheus metrics registry and `/metrics`.    |
-| `test-helpers`       | No      | Test-only helpers for downstream integration tests. **Never enable in a production build** -- see the warning below. |
+| `test-helpers`       | No      | Test-only helpers for downstream integration tests. **Never enable in a production build** - see the warning below. |
 
 > **`test-helpers` is not safe in production.** It is not part of the stable
 > API surface and carries no semver guarantees across minor releases. Some of

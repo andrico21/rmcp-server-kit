@@ -7,8 +7,8 @@
 //!
 //! Redaction is nevertheless a debugging obstacle, so each category can be
 //! switched to plaintext. [`Debug::fmt`](std::fmt::Debug::fmt) receives only
-//! `&self` and a formatter -- it cannot see an
-//! [`ObservabilityConfig`](crate::config::ObservabilityConfig) -- so the
+//! `&self` and a formatter - it cannot see an
+//! [`ObservabilityConfig`](crate::config::ObservabilityConfig) - so the
 //! switches live here as process-global atomics rather than as per-server
 //! state.
 //!

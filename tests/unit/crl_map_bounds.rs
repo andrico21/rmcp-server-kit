@@ -120,7 +120,7 @@ mod tests {
         roots.add(build_ca_root()?).context("add ca root")?;
         #[expect(
             deprecated,
-            reason = "deliberate: mtls_revocation::CrlSet::__test_with_prepopulated_crls — the deprecated test-only constructor is the only prepopulated-CrlSet entry point until 4.0"
+            reason = "deliberate: mtls_revocation::CrlSet::__test_with_prepopulated_crls - the deprecated test-only constructor is the only prepopulated-CrlSet entry point until 4.0"
         )]
         let set = CrlSet::__test_with_prepopulated_crls(
             Arc::new(roots),
@@ -309,7 +309,7 @@ mod tests {
         Ok(())
     }
 
-    // -- F1 regression: first-fetch failure permanently suppressed retry --
+    // - F1 regression: first-fetch failure permanently suppressed retry -
     //
     // A discovered CDP URL was committed to the permanent dedup set as soon as
     // it was queued. When that first fetch failed, no code path could ever undo
@@ -317,7 +317,7 @@ mod tests {
     // cached and later went stale. The URL was therefore never re-enqueued for
     // the process lifetime, so revocation for that CDP was silently disabled
     // under the pre-3.9 default `crl_deny_on_unavailable = false`, or the
-    // handshake failed forever with it set to `true` -- which is now the default.
+    // handshake failed forever with it set to `true` - which is now the default.
     //
     // CDP URLs come from the client-presented certificate, so a holder of a
     // revoked cert could trigger this deliberately by making the first fetch
@@ -336,7 +336,7 @@ mod tests {
         roots.add(build_ca_root()?).context("add ca root")?;
         #[expect(
             deprecated,
-            reason = "deliberate: mtls_revocation::CrlSet::__test_with_kept_receiver — the deprecated test-only constructor is the only kept-receiver entry point until 4.0"
+            reason = "deliberate: mtls_revocation::CrlSet::__test_with_kept_receiver - the deprecated test-only constructor is the only kept-receiver entry point until 4.0"
         )]
         let set = CrlSet::__test_with_kept_receiver(
             Arc::new(roots),
