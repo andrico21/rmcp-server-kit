@@ -191,6 +191,13 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   client is built). Previously, several of these shapes silently produced a
   client with no custom root, so a private-CA identity provider failed only
   later, with an unrelated TLS error, on the first JWKS or token request.
+- **mTLS with CRL checking no longer panics at startup when no rustls crypto
+  provider was installed** - the CRL bootstrap built its HTTP client before
+  the TLS listener installed the `ring` provider, so a server with
+  `[server.auth.mtls]` and the default `crl_enabled = true` but no OAuth
+  configuration panicked at startup, as did a direct
+  `mtls_revocation::bootstrap_fetch` call; the CRL client constructors now
+  install the provider themselves, as the OAuth clients already did.
 
 ## [3.14.4] - 2026-10-06
 

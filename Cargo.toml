@@ -229,6 +229,10 @@ required-features = ["test-helpers"]
 # to carry: running a gated target without its features now errors with
 # "requires the features" instead of silently running an empty binary.
 [[test]]
+name = "crl_crypto_provider"
+path = "tests/unit/crl_crypto_provider.rs"
+
+[[test]]
 name = "crl_discovery_ratelimit"
 path = "tests/unit/crl_discovery_ratelimit.rs"
 

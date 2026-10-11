@@ -61,6 +61,7 @@ rmcp-server-kit/
 ├── tests/
 │   ├── unit/                 In-process tests (no I/O)
 │   │   ├── api_auto_traits.rs
+│   │   ├── crl_crypto_provider.rs
 │   │   ├── crl_discovery_ratelimit.rs
 │   │   ├── crl_h3_regression.rs      (feature = "test-helpers")
 │   │   ├── crl_map_bounds.rs         (feature = "test-helpers")
@@ -182,8 +183,8 @@ ephemeral loopback ports.
 | **Integration** | `tests/integration/*.rs` | loopback ports, `wiremock`, or file reads | `cargo test --all-features` |
 | **Benches** | `benches/rbac_redaction.rs`, `hook_latency.rs` | - | `cargo bench` |
 
-`tests/unit/` (in-process): `api_auto_traits`, `crl_discovery_ratelimit`,
-`crl_h3_regression`, `crl_map_bounds`, `oauth_url_validation`,
+`tests/unit/` (in-process): `api_auto_traits`, `crl_crypto_provider`,
+`crl_discovery_ratelimit`, `crl_h3_regression`, `crl_map_bounds`, `oauth_url_validation`,
 `parser_properties`, `properties`.
 
 `tests/integration/` (loopback ports, `wiremock` or file reads): `crl_ssrf`,

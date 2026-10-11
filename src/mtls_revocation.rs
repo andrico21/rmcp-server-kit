@@ -437,6 +437,7 @@ impl CrlSet {
         initial_cache: HashMap<String, CachedCrl>,
         trusted_origins: Arc<HashSet<Origin>>,
     ) -> Result<Arc<Self>, RmcpServerKitError> {
+        install_crl_crypto_provider();
         // M-H2: install the SSRF screening resolver on the CRL fetcher.
         // CRL CDP URLs come from attacker-controllable client certs and
         // their hosts are re-resolved per fetch - exactly the TOCTOU
@@ -1971,7 +1972,6 @@ pub async fn bootstrap_fetch(
     // cloud-metadata addresses stay blocked.
     bootstrap_fetch_with_server_chain(roots, ca_certs, &[], config).await
 }
-
 /// Same as [`bootstrap_fetch`], but also derives the trusted origin set
 /// from `server_chain`.
 ///
@@ -1991,6 +1991,7 @@ pub(crate) async fn bootstrap_fetch_with_server_chain(
     server_chain: &[CertificateDer<'static>],
     config: MtlsConfig,
 ) -> Result<(Arc<CrlSet>, mpsc::UnboundedReceiver<String>), RmcpServerKitError> {
+    install_crl_crypto_provider();
     let (discover_tx, discover_rx) = mpsc::unbounded_channel();
 
     // Bootstrap URLs come from configured certificates: the public helper uses
@@ -2273,7 +2274,6 @@ pub async fn run_crl_refresher(
         }
     }
 }
-
 /// Owned abort-safety guard for the discovery arm in `run_crl_refresher`.
 // Abort-safety guard for the discovery arm in `run_crl_refresher`. Cooperative
 // shutdown already leaves `pending_urls` consistent because the arm body runs to
@@ -2317,6 +2317,16 @@ impl Drop for PendingUrlGuard {
             self.set.clear_pending(&self.url);
         }
     }
+}
+
+/// Install the process-default rustls provider before building CRL clients.
+fn install_crl_crypto_provider() {
+    // Prevent reqwest from panicking with "No rustls crypto provider is configured".
+    // If the application already installed a provider, rustls keeps that provider
+    // and this ignored install result matches the TLS and OAuth constructors.
+    use rustls::crypto::ring;
+
+    drop(ring::default_provider().install_default());
 }
 
 /// Apply a discovery fetch's settlement to the pending/seen dedup state.
