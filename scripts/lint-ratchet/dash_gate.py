@@ -26,6 +26,10 @@ COMMAND_RE = re.compile(
     r"(bash|cargo|cargo-\w+|clippy-driver|curl|gh|git|lychee|python3?|pwsh|"
     r"rtk|rustc|rustup|sh|sha256sum|taplo|run:)\b"
 )
+COMMAND_WORD_RE = re.compile(
+    r"^(bash|cargo|cargo-\w+|clippy-driver|curl|gh|git|lychee|python3?|pwsh|"
+    r"rtk|rustc|rustup|sh|sha256sum|taplo)\b"
+)
 
 
 @dataclass(frozen=True)
@@ -196,6 +200,50 @@ def regions_for(path: Path, text: str) -> tuple[list[str], list[str]]:
     return hash_comment_regions(text)
 
 
+def command_usage_prefix(line: str) -> tuple[str, int]:
+    offset = len(line) - len(line.lstrip())
+    stripped = line[offset:]
+    for marker in ("//!", "///", "//", "#"):
+        if stripped.startswith(marker):
+            offset += len(marker)
+            stripped = stripped[len(marker):]
+            spaces = len(stripped) - len(stripped.lstrip())
+            offset += spaces
+            stripped = stripped[spaces:]
+            break
+    if stripped[:1] in {"-", "*"}:
+        offset += 1
+        stripped = stripped[1:]
+        spaces = len(stripped) - len(stripped.lstrip())
+        offset += spaces
+        stripped = stripped[spaces:]
+    if stripped[:1] in {"$", ">"}:
+        offset += 1
+        stripped = stripped[1:]
+        spaces = len(stripped) - len(stripped.lstrip())
+        offset += spaces
+        stripped = stripped[spaces:]
+    if stripped.startswith("run:"):
+        offset += len("run:")
+        stripped = stripped[len("run:"):]
+        spaces = len(stripped) - len(stripped.lstrip())
+        offset += spaces
+        stripped = stripped[spaces:]
+    return stripped, offset
+
+
+def is_command_usage_separator(line: str, column: int) -> bool:
+    prefix, offset = command_usage_prefix(line)
+    command = COMMAND_WORD_RE.match(prefix)
+    if command is None or column < offset:
+        return False
+    relative = column - offset
+    if prefix[relative : relative + len(DOUBLE_DASH)] != DOUBLE_DASH:
+        return False
+    before = prefix[:relative]
+    return bool(COMMAND_RE.search(before))
+
+
 def line_bounds(text: str, index: int) -> tuple[int, int]:
     start = text.rfind("\n", 0, index) + 1
     end = text.find("\n", index)
@@ -223,6 +271,8 @@ def classify_token(path: Path, text: str, regions: list[str], fences: list[str],
     if before.isalnum() and after.isalnum() and re.search(r"#[\w-]*$", line[:column]):
         return "exempt"
     if re.match(r"[A-Za-z]", after) and before in " \t`(\"'[=|\n":
+        return "exempt"
+    if before in " \t" and is_command_usage_separator(line, column):
         return "exempt"
     if before in " \t" and COMMAND_RE.search(line[:column]):
         rest = text[index + 2 : index + 40]
@@ -312,6 +362,12 @@ def self_test() -> int:
         "shield.md": (f"https://img.shields.io/badge/license-Apache{dd}2.0-blue.svg\n", 0, set()),
         "anchor.md": (f"[old](#a{dd}b)\n", 0, set()),
         "separator.md": (f"Run `cargo run {dd} {dd}literal` to pass a separator.\n", 0, set()),
+        "rs_command_separator.rs": (f"//! cargo run {dd}example demo {dd} ./config.toml\n", 0, set()),
+        "sh_command_separator.sh": (f"# cargo run {dd}example demo {dd} ./config.toml\n", 0, set()),
+        "yaml_command_separator.yml": (f"      - run: cargo run {dd}example x {dd} ./cfg.toml\n", 0, set()),
+        "md_fenced_command.md": (f"```bash\ncargo run -p demo {dd} serve\n```\n", 0, set()),
+        "md_prose_command.md": (f"Run `cargo test` {dd} it is slow.\n", 1, {"prose"}),
+        "rs_prose_command.rs": (f"//! See the cargo docs {dd} they explain it.\n", 1, {"prose"}),
     }
     failures: list[str] = []
     with tempfile.TemporaryDirectory() as temp_dir:

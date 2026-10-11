@@ -14,7 +14,7 @@
 //! Or pass a real TOML file path:
 //!
 //! ```bash
-//! cargo run --example config_file_server - ./config.toml
+//! cargo run --example config_file_server -- ./config.toml
 //! ```
 //!
 //! Then, in another shell:
