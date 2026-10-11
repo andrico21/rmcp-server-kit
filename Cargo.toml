@@ -160,9 +160,9 @@ urlencoding = { version = "2", optional = true }
 # log. Rust std has no portable `O_NOFOLLOW` constant and no `geteuid`, and
 # this crate is `#![forbid(unsafe_code)]`, so the open, the owner and
 # regular-file checks on the handle, and the mode correction all go through
-# rustix's safe wrappers instead of a raw libc call. Version pinned to the
-# one already locked transitively through `tempfile` (dev-dependency), so
-# this does not change the resolved version.
+# rustix's safe wrappers instead of a raw libc call. Manifest requirement
+# stays at `version = "1"`; Cargo.lock pins the resolved rustix 1.x
+# version, so this does not change the resolved version.
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", default-features = false, features = [
   "fs",

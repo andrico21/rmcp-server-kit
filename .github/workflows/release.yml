@@ -38,7 +38,7 @@ on:
     workflows: ["CI"]
     types: [completed]
 
-# Least-privilege default (SUP-01 PR-1); the publish job below keeps its own
+# Least-privilege default; the publish job below keeps its own
 # `contents: write` grant because "Create GitHub release" needs it.
 permissions:
   contents: read

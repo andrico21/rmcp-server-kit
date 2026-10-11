@@ -16,7 +16,7 @@ on:
     - cron: "17 3 * * *"
   workflow_dispatch:
 
-# Least-privilege default (SUP-01 PR-1): every job here only reads the repo
+# Least-privilege default: every job here only reads the repo
 # and runs cargo/tooling commands, none of them create releases, post PR
 # comments, or exchange an OIDC token, so the read-only default covers the
 # whole workflow and no job below needs its own `permissions:` grant.

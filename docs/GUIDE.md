@@ -332,7 +332,7 @@ let auth = AuthConfig::with_keys(vec![
 | `api_keys` | `Vec<ApiKeyEntry>` | `[]` | Bearer token API keys |
 | `mtls` | `Option<MtlsConfig>` | `None` | mTLS client cert config |
 | `rate_limit` | `Option<RateLimitConfig>` | `None` | Auth attempt rate limit |
-| `max_concurrent_verifications` | `Option<NonZeroUsize>` | `None` (resolves to `available_parallelism()` clamped `1..=16`) | Bounds concurrent Argon2id API-key verifications |
+| `max_concurrent_verifications` | `Option<NonZeroUsize>` | `None` (resolves to `available_parallelism()` clamped `1..=16`) | Bounds concurrent Argon2id API-key verifications; values above `tokio::sync::Semaphore::MAX_PERMITS` are clamped to that ceiling |
 | `verification_wait` | humantime duration | `"1s"` | Max time a request waits for a verification permit before `503` |
 | `oauth` | `Option<OAuthConfig>` | `None` | OAuth 2.1 (feature: `oauth`) |
 
@@ -369,7 +369,9 @@ tokens cannot grow memory use without limit:
   any Argon2id work runs) and [`max_concurrent_requests`](#mcpserverconfig)
   (which bounds total in-flight requests of every kind). The permit pool
   is the only one of the three that bounds Argon2id memory directly,
-  independent of source IP or client count.
+  independent of source IP or client count. A configured value above
+  `tokio::sync::Semaphore::MAX_PERMITS` is clamped to that ceiling,
+  making it effectively unbounded rather than a startup panic.
 - The permit pool itself cannot be disabled, but it is on by default
   with a resolved size (not an explicit operator choice unless
   `max_concurrent_verifications` and `verification_wait` are set). It
@@ -1076,7 +1078,7 @@ extra_route_rate_limit = 60
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `listen_addr` | `String` | `"127.0.0.1"` | Bind address |
+| `listen_addr` | `String` | `"127.0.0.1"` | Bind address. IPv6 literals must include brackets, for example `[::1]`, because TOML validation composes this with `listen_port` as a `SocketAddr` |
 | `listen_port` | `u16` | `8443` | Bind port |
 | `tls_cert_path` | `Option<PathBuf>` | `None` | TLS certificate path |
 | `tls_key_path` | `Option<PathBuf>` | `None` | TLS private key path |
@@ -1157,7 +1159,7 @@ log_upstream_error_bodies = false
 | `log_level` | `String` | `"info,rmcp=warn,rmcp_server_kit=info"` | EnvFilter directives. Targets match by prefix, so `rmcp=warn` also matches `rmcp_server_kit::*` unless the more specific `rmcp_server_kit=info` directive is present. Use trace, debug, info, warn, or error levels. |
 | `log_format` | `String` | `"pretty"` | json, pretty, or text |
 | `audit_log_path` | `Option<PathBuf>` | `None` | JSON audit log file |
-| `log_request_headers` | `bool` | `false` | Emit inbound HTTP request headers at DEBUG level (sensitive headers remain redacted); the incoming request line is skipped for request_log_exclude_paths |
+| `log_request_headers` | `bool` | `false` | Emit inbound HTTP request headers at DEBUG level; `authorization`, `cookie`, `proxy-authorization`, `forwarded`, `x-forwarded-for` and `x-real-ip` values become `[REDACTED]`, `Mcp-Session-Id` follows `[server.log_context].session_id_header`, and all other headers log as sent (`<non-utf8>` for non-visible-ASCII values). The incoming request line is skipped for request_log_exclude_paths |
 | `metrics_enabled` | `bool` | `false` | Enable Prometheus |
 | `metrics_bind` | `String` | `"127.0.0.1:9090"` | Metrics listener |
 | `log_plaintext_oauth_tokens` | `bool` | `false` | Defaults to redacted; enabling writes secrets to logs, is for local debugging only, and is process-wide, not per-server |
@@ -1290,7 +1292,7 @@ credential material, so it is created with owner-only permissions.
   refuses anything that is not a regular file (devices, FIFOs, sockets),
   and refuses a pre-existing file not owned by the process's effective
   user, even when that process runs as root. A regular file with more than
-  one hard link is also refused. A file this call *creates*
+  one hard link is also refused at start-up. A file this call *creates*
   gets mode `0o600` as part of the creating `open`, so it is never exposed
   at a wider mode, not even briefly (the process umask can only tighten
   that further, never widen it). A *pre-existing* file keeps its current
@@ -1298,6 +1300,8 @@ credential material, so it is created with owner-only permissions.
   checks, at which point it is corrected to `0o600` with `fchmod` on that
   handle. Nothing is written to the handle before every check has passed,
   and a symlink's target is never opened, chmodded, or written to.
+  These checks are a start-up snapshot of the opened handle; a hard link
+  added later is not detected until the next start-up hardening pass.
 - **Windows:** opening the audit log refuses a reparse point at the final
   path component (a symbolic link, junction, mount point, or any other
   reparse tag; a symlinked *parent* directory is still traversed) - checked
@@ -1313,12 +1317,15 @@ therefore leaves a small create-then-harden race that Unix does not have: it
 removes the *persistent* exposure, not the momentary one.
 
 If Windows ACL hardening fails, startup fails and, only when this call
-created the file, the crate attempts to delete it; a pre-existing file that
-fails hardening is left in place rather than deleted. The error reports
+created the file, the crate drops the handle and attempts to delete that
+path; a pre-existing file that fails hardening is left in place rather than
+deleted. Because the cleanup is by path, a principal with write access to
+the parent directory can race it, the same residual as the by-path DACL
+application. The error reports
 which of those applies and, when deletion was attempted, whether it
 succeeded, so you can tell whether an unprotected file, or an untouched
 pre-existing one, may remain at that path. A rejected reparse point is
-never deleted.
+never deleted, and this code never deletes a pre-existing file.
 
 On Unix, a hardening failure never deletes anything: the mode is applied
 atomically at creation, so a file this process creates is never exposed at a
@@ -1340,10 +1347,12 @@ user as owner, or rotate with copy-and-truncate (for example logrotate's
 still owned by the service user.
 
 Do not use hardlink-based retention or rotation for the audit log. A second
-directory entry for the inode lets another local principal keep an open path to
-the same log file even though the inode itself is owned by the service user.
-Use copy-based retention instead: copy and truncate the current file, or rename
-the active file and let the process reopen a fresh single-link path on restart.
+directory entry survives unlinking or rotation of the configured path, and
+Linux `fs.protected_hardlinks` is not guaranteed on every host. Permissions
+still live on the inode, so a non-owner needs permission to open that extra
+name. Use copy-based retention instead: copy and truncate the current
+file, or rename the active file and let the process reopen a fresh
+single-link path on restart.
 
 On a platform that is neither Unix nor Windows, a configured `audit_log_path`
 fails closed: startup errors and no file is created.

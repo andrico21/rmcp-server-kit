@@ -419,6 +419,10 @@ mod tests {
             captured.headers
         );
 
+        // `exchange_token` returns only after a followed redirect would already
+        // have connected to this listener. The 200 ms wait is only extra
+        // margin: this one-sided check passes on timeout and fails on a
+        // connection, while the request capture above has a 30 s hang detector.
         let accepted_redirect = timeout(Duration::from_millis(200), redirect_target.accept()).await;
         assert!(
             accepted_redirect.is_err(),

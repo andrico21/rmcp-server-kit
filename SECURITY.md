@@ -164,7 +164,10 @@ depth. The permit pool itself cannot be disabled, but it is on by
 default with a resolved size (`available_parallelism()` clamped to
 `1..=16`) and a 1 second wait, not an explicit operator choice; the
 per-IP pre-auth rate limiter is opt-in (`AuthConfig::rate_limit`
-defaults to `None`, which is why the examples now configure it).
+defaults to `None`, which is why the examples now configure it). A configured
+value above `tokio::sync::Semaphore::MAX_PERMITS` is clamped to that
+ceiling, making the permit pool effectively unbounded rather than a startup
+panic.
 
 ## Certificate revocation
 
@@ -743,7 +746,9 @@ for append; or by pre-creating a regular file they own at that path so the
 server's audit trail is written into a file another local user can read. A
 hardlink planted by a local user creates the same problem in reverse: the inode
 can be owned by the server process and still have another directory entry that
-another principal controls, giving that principal an open path to the same log.
+survives unlinking or rotation of the configured path. Permissions still live
+on the inode, so a non-owner needs permission to open that extra name, and
+Linux `fs.protected_hardlinks` is not guaranteed on every host.
 
 On Unix, opening the audit log refuses all three: it never follows a
 symlink at the final path component (a symlinked *parent* directory is
@@ -751,10 +756,12 @@ still traversed - only the final component is protected), it refuses
 anything that is not a regular file, and it refuses a pre-existing file not
 owned by the server process's effective user, even when the process runs
 as root. It also refuses a regular file with more than one hard link. These
-checks run on the already-open handle before any write and before the audit
-writer thread is spawned, so a rejected target is never written to. Strict
-initialization fails startup on any of these failures; the deprecated lenient
-initializer installs no audit sink at all rather than writing to an
+checks run once at start-up on the already-open handle before any write and
+before the audit writer thread is spawned, so a rejected target is never
+written to; a hard link added later is not detected until the next start-up
+hardening pass. Strict initialization fails startup on any of these
+failures; the deprecated lenient initializer installs no audit sink at all
+rather than writing to an
 unprotected one.
 
 On Windows, opening the audit log refuses a reparse point at the final path
@@ -765,11 +772,14 @@ slip a reparse point past the first check alone. Neither check ever
 deletes anything: a rejected reparse point is never removed. The open
 creates the file when it does not exist; the protected owner-only DACL is
 applied only once both checks have passed, and if that DACL step fails the
-file is deleted best-effort, but only when this call created it - a
-pre-existing file that fails DACL hardening is left in place rather than
-destroyed, matching the Unix policy of never deleting something this
-process did not create. A symlinked *parent* directory is still traversed;
-only the final component is protected, as on Unix.
+handle is dropped and the path is deleted best-effort, but only when this
+call created it - a pre-existing file that fails DACL hardening is left in
+place rather than destroyed, matching the Unix policy of never deleting
+something this process did not create. Because cleanup is by path, a local
+principal with write access to the parent directory can race it, the same
+residual as the by-path DACL application. A symlinked *parent*
+directory is still traversed; only the final component is protected, as on
+Unix.
 
 A pre-existing audit-log path owned by another local user - an init
 container or provisioning step that ran as root, a sidecar, a shared

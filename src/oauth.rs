@@ -449,8 +449,11 @@ impl OauthHttpClient {
     /// # Errors
     ///
     /// Returns [`crate::error::RmcpServerKitError::Startup`] if the configured
-    /// `ca_cert_path` cannot be read or parsed, or if the underlying
-    /// HTTP client cannot be constructed (e.g. TLS backend init failure).
+    /// `ca_cert_path` cannot be read, cannot be parsed as PEM, parses to zero
+    /// certificates, or if the underlying HTTP client cannot be constructed
+    /// (e.g. TLS backend init failure). An undecodable PEM-framed certificate
+    /// fails during client construction and the error still names
+    /// `ca_cert_path`.
     #[inline]
     pub fn with_config(config: &OAuthConfig) -> Result<Self, RmcpServerKitError> {
         Self::build(Some(config))
@@ -496,8 +499,10 @@ impl OauthHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns [`RmcpServerKitError::Startup`] when the CA bundle cannot be read or parsed or a
-    /// client cannot be constructed.
+    /// Returns [`RmcpServerKitError::Startup`] when the CA bundle cannot be read,
+    /// cannot be parsed as PEM, parses to zero certificates, or a client cannot
+    /// be constructed. An undecodable PEM-framed certificate fails during client
+    /// construction and the error still names `ca_cert_path`.
     fn build(config: Option<&OAuthConfig>) -> Result<Self, RmcpServerKitError> {
         // Install the rustls crypto provider before constructing any reqwest
         // client (idempotent -- `ok()` ignores the error when a provider was
@@ -1717,8 +1722,11 @@ fn validate_client_cert_config(cc: &ClientCertConfig) -> Result<(), RmcpServerKi
 ///
 /// # Errors
 ///
-/// Returns [`RmcpServerKitError::Startup`] when a configured client certificate cannot be
-/// loaded or built.
+/// Returns [`RmcpServerKitError::Startup`] when a configured client certificate
+/// cannot be loaded or built; when `ca_cert_path` cannot be read, cannot be
+/// parsed as PEM, or parses to zero certificates; or when a PEM-framed CA
+/// certificate reaches client construction but contains undecodable DER. CA
+/// bundle errors name the mTLS client and the path.
 #[cfg(feature = "oauth-mtls-client")]
 fn build_mtls_clients(
     config: Option<&OAuthConfig>,

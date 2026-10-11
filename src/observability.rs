@@ -1019,13 +1019,16 @@ fn open_or_create_audit_handle(path: &Path) -> Result<(fs::File, bool), String> 
 /// traversed; only the final component is protected, matching the Unix
 /// path.
 ///
-/// If hardening fails once the file exists, the file is deleted best-effort
-/// only when THIS call created it; a pre-existing file that fails hardening
-/// is left in place, since deleting it would destroy something this
-/// process did not create, for no security benefit. The error states
-/// whether deletion was attempted and whether it succeeded, so an operator
-/// knows whether an unprotected file, or an untouched pre-existing one, may
-/// remain at that path.
+/// If hardening fails once the file exists, the handle is dropped and this
+/// path is deleted best-effort only when THIS call created it; a
+/// pre-existing file that fails hardening is left in place, since deleting
+/// it would destroy something this process did not create, for no security
+/// benefit. The cleanup is by path, so a principal with write access to the
+/// parent directory can race it, the same residual as the by-path DACL
+/// application above. The error states whether deletion was attempted and
+/// whether it succeeded, so an operator knows whether an unprotected file,
+/// or an untouched pre-existing one, may remain at that path. A rejected
+/// reparse point and a pre-existing file are never deleted by this code.
 ///
 /// # Errors
 ///

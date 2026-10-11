@@ -318,7 +318,7 @@ def _self_test() -> int:
         ok, diffs = check(Path(td))
         check_cond("crlf fence parses", ok and not diffs)
 
-    # duplicate-crate mirror (SUP-02): clippy.toml allowed-duplicate-crates
+    # duplicate-crate mirror: clippy.toml allowed-duplicate-crates
     # vs deny.toml [bans] skip must name the same crates.
     with tempfile.TemporaryDirectory() as td:
         clippy_two = clippy_ok.replace(
