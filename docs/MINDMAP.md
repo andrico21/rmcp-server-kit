@@ -448,7 +448,7 @@ graph TD
 | Prometheus metrics                | `src/metrics.rs` (feature `metrics`)     | `McpMetrics` L49, `serve_metrics` L189                                         |
 | Configuration (TOML)              | `src/config.rs` + `src/transport.rs`     | TOML schema + `McpServerConfig`                                               |
 | Error → HTTP mapping              | `src/error.rs`                           | `RmcpServerKitError` L46, `IntoResponse` L170                                           |
-| Integration reference             | `tests/integration/e2e.rs`               | `spawn_server` L499                                                           |
+| Integration reference             | `tests/integration/e2e.rs`               | `spawn_server` L507                                                           |
 | Runnable examples                 | `examples/`                              | `minimal_server.rs`, `api_key_rbac.rs`, `oauth_server.rs`                    |
 
 ---

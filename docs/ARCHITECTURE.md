@@ -3,10 +3,11 @@
 > **Audience**: AI agents and engineers who need to **modify** rmcp-server-kit safely.
 > **Companion**: [`MINDMAP.md`](MINDMAP.md) for the visual view, [`../AGENTS.md`](../AGENTS.md) for the navigation hub, [`GUIDE.md`](GUIDE.md) for end-user usage.
 >
-> All file references use `file:line` against the working tree as of 1.9.0.
-> Line numbers are approximate (±20) - they help localize, not replace `Read`.
-> Citations are pinned by `tests/integration/docs_citations.rs` so they fail loudly when
-> a cited file disappears or shrinks below a referenced line.
+> All file references use `file:line` against the current working tree.
+> Each citation names its symbol in backticks on the same line and points at
+> that symbol's definition line. `tests/integration/docs_citations.rs` fails
+> when the definition is more than 10 lines from the citation, when a cited file
+> disappears or shrinks below the cited line, or when a citation has no symbol.
 
 ---
 
@@ -391,7 +392,7 @@ ArgumentAllowlist {                       // `ArgumentAllowlist` src/rbac.rs:435
 ```
 
 ### Decision function
-- `RbacPolicy` (`src/rbac.rs:709`); its `check` method spans src/rbac.rs:723-869 for pure allow/deny
+- `RbacPolicy::check` (`src/rbac.rs:869`) - pure allow/deny
 - `RbacPolicy::argument_allowed(role, tool, argument, value)` - JSON value match (`argument_allowed`, `src/rbac.rs:954`)
 - `RbacPolicy::redact_arg(value)` - HMAC-SHA256 of an argument value with
 the policy's salt, returning an 8-char hex prefix (`redact_with_salt`, `src/rbac.rs:1244`).
@@ -428,7 +429,7 @@ making preimage recovery infeasible. See
 `redact_with_salt` (`src/rbac.rs:1244`).
 
 ### Task-locals
-`tokio::task_local!` block near `current_role` (`src/rbac.rs:158`) defines four task-locals:
+The `tokio::task_local!` block (`CURRENT_ROLE`, `src/rbac.rs:118`) defines four task-locals; the accessors start at `current_role` (`src/rbac.rs:158`):
 - `CURRENT_ROLE: String`
 - `CURRENT_IDENTITY: String`
 - `CURRENT_TOKEN: SecretString`
@@ -859,8 +860,7 @@ clippy lint enforces this.
 
 Three layers, applied in a fixed order.
 
-**Programmatic** - `McpServerConfig` (`src/transport.rs:481`) config,
-constructed by `McpServerConfig::new(addr, name, version)` near line 989. It holds everything the server needs, including the
+**Programmatic** - `McpServerConfig::new(addr, name, version)` builder (`src/transport.rs:989`). Holds everything the server needs, including the
 runtime-only fields TOML cannot express: `rbac`, `readiness_check`,
 `extra_router`, `on_reload_ready`, and the metrics listener. Deliberately does
 **not** derive `Deserialize` - it carries callbacks and an `axum::Router`, and
@@ -925,7 +925,7 @@ algorithm selection, etc.) with no I/O or network.
 **Integration / E2E** tests live one crate per file under
 `tests/integration/*.rs` (the largest is `e2e.rs`). They:
 - Spawn `rmcp_server_kit::transport::serve(...)` on an **ephemeral port** via
-  `spawn_server()` (`tests/integration/e2e.rs:499`).
+  `spawn_server()` (`tests/integration/e2e.rs:507`).
 - Use `reqwest` to make real HTTP calls - origin checks, auth, RBAC,
   rate-limiting, readiness, body limits, TLS handshakes.
 - Use `wiremock` for OAuth/JWKS upstreams.

@@ -1,29 +1,24 @@
-//! Pins `file:line` citations referenced from the agent-facing docs
-//! (`docs/ARCHITECTURE.md`, `AGENTS.md`, `docs/MINDMAP.md`).
+//! Pins `file:line` citations referenced from the agent-facing docs:
+//! `docs/ARCHITECTURE.md`, `AGENTS.md`, `docs/MINDMAP.md`, and
+//! `RUST_GUIDELINES.md`.
 //!
-//! When code moves, this test fails first so docs stay accurate.
+//! Every parsed citation first gets an existence and length check: the cited
+//! file must exist, and the file must have at least the cited line count. The
+//! same doc line must also carry a specific anchor. Generic words such as
+//! `new`, `check`, `call`, and `run` never anchor alone; a qualified token such
+//! as `Type::method` contributes both useful identifier names.
 //!
-//! Two layers of validation:
+//! The anchor must be the declared name on a definition-like source line within
+//! `TOLERANCE` lines of the cited location. Definition-like lines are `fn`,
+//! `struct`, `enum`, `union`, `trait`, `type`, `mod`, `static`, `const`,
+//! `macro_rules!`, an `impl` header naming the anchor, or a `name:` field or
+//! variant. Comments, strings, and call sites never count.
 //!
-//! 1. **Existence / length** (all citations): the cited file exists and
-//!    has at least the cited line count.
-//! 2. **Symbol anchoring** (citations with a recognizable symbol on the
-//!    same doc line): at least one anchor symbol - a backticked token
-//!    like `` `TlsListener` `` or a parenthesized identifier like
-//!    `(build_app_router)` - must appear within `TOLERANCE` lines of the
-//!    cited location in the cited file. This catches silent drift that
-//!    the length check cannot (a file that only ever grows keeps every
-//!    stale citation "valid" forever).
-//!
-//! Recognized citation forms (all require the `src/<file>.rs` path on
-//! the same doc line):
-//!   `src/<file>.rs:<line>`            (single line)
-//!   `src/<file>.rs:<line>-<line>`     (range)
-//!   `src/<file>.rs` ... `(~line <line>)`   (AGENTS.md table style)
-//!   `src/<file>.rs` ... `~L<line>`         (MINDMAP.md table style).
-//!
-//! Out of scope: mindmap nodes whose file is implied by a parent node
-//! (no path on the line), and prose without a `src/*.rs` mention.
+//! Recognized citation forms all keep the `src/<file>.rs` path on the same doc
+//! line: `src/<file>.rs:<line>`, `src/<file>.rs:<line>-<line>`, `(~line <n>)`,
+//! `~L<n>`, and MINDMAP navigation pairs such as `symbol L<n>` or `` `symbol`
+//! L<n> ``. A prose line range next to a `src/` path is rejected when it is not
+//! a parseable citation.
 //!
 //! Drift fixes are easy: re-read the cited code and update the number.
 #[cfg_attr(
@@ -127,6 +122,7 @@ mod tests {
         }
     }
 
+    // Drop audit: removes a synchronous temporary fixture directory; errors are ignored on purpose, and this path cannot await or panic.
     impl Drop for FixtureRoot {
         fn drop(&mut self) {
             drop(fs::remove_dir_all(&self.path));
