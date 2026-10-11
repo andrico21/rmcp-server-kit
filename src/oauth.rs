@@ -9059,6 +9059,79 @@ role = "admin"
         Ok(())
     }
 
+    /// Pins that a token whose `nbf` is beyond the validation leeway rejects.
+    #[tokio::test]
+    async fn rejects_token_not_yet_valid() -> anyhow::Result<()> {
+        let kid = "test-key-future-nbf";
+        let (pem, jwks) = generate_test_keypair(kid)?;
+        let (cache, _mock_server) = cache_for_jwks(&jwks).await?;
+        let now = jsonwebtoken::get_current_timestamp();
+        let token = mint_token_with_claims(
+            &pem,
+            kid,
+            &serde_json::json!({
+                "iss": "https://auth.test.local",
+                "aud": "https://mcp.test.local/mcp",
+                "sub": "future-nbf-bot",
+                "scope": "mcp:read",
+                "exp": now.saturating_add(3600),
+                "iat": now,
+                "nbf": now.saturating_add(3600),
+            }),
+        )?;
+
+        assert!(
+            matches!(
+                cache.validate_token_with_reason(&token).await,
+                Err(JwtValidationFailure::Invalid)
+            ),
+            "a token not valid for another hour must reject as an invalid JWT"
+        );
+        assert!(
+            cache.validate_token_detailed(&token, true).await.is_err(),
+            "detailed validation must reject the future nbf token"
+        );
+        assert!(
+            cache.validate_token(&token).await.is_none(),
+            "plain validation must reject the future nbf token"
+        );
+
+        Ok(())
+    }
+
+    /// Pins that the default 60 second JWT leeway admits a near-future `nbf`.
+    #[tokio::test]
+    async fn accepts_nbf_within_leeway() -> anyhow::Result<()> {
+        let kid = "test-key-leeway-nbf";
+        let (pem, jwks) = generate_test_keypair(kid)?;
+        let (cache, _mock_server) = cache_for_jwks(&jwks).await?;
+        let now = jsonwebtoken::get_current_timestamp();
+        // The jsonwebtoken validation leeway is 60 s. A 30 s nbf offset and
+        // 1 h expiry leave wide margins for scheduler jitter without sleeps.
+        let token = mint_token_with_claims(
+            &pem,
+            kid,
+            &serde_json::json!({
+                "iss": "https://auth.test.local",
+                "aud": "https://mcp.test.local/mcp",
+                "sub": "leeway-nbf-bot",
+                "scope": "mcp:read",
+                "exp": now.saturating_add(3600),
+                "iat": now,
+                "nbf": now.saturating_add(30),
+            }),
+        )?;
+
+        let identity = cache
+            .validate_token(&token)
+            .await
+            .context("nbf inside the 60 s leeway must authenticate")?;
+        assert_eq!(identity.name, "leeway-nbf-bot");
+        assert_eq!(identity.role, "viewer");
+
+        Ok(())
+    }
+
     /// Rejects a token whose scopes map to no configured role.
     #[tokio::test]
     async fn no_matching_scope_rejected() -> anyhow::Result<()> {
