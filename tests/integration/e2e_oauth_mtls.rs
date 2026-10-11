@@ -352,11 +352,22 @@ mod tests {
     async fn mtls_client_does_not_follow_redirects() -> anyhow::Result<()> {
         let pki = build_mtls_pki()?;
 
-        let redirect = b"HTTP/1.1 302 Found\r\n\
-            Location: https://attacker.invalid/exfil\r\n\
-            Content-Length: 0\r\n\
-            \r\n";
-        let (token_url, _captured_rx) = spawn_one_shot_mtls_server(&pki, redirect.to_vec()).await?;
+        let redirect_target = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .context("bind redirect target")?;
+        let redirect_target_addr = redirect_target
+            .local_addr()
+            .context("redirect target local_addr")?;
+
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\n\
+             Location: https://localhost:{}/exfil\r\n\
+             Content-Length: 0\r\n\
+             \r\n",
+            redirect_target_addr.port()
+        );
+        let (token_url, captured_rx) =
+            spawn_one_shot_mtls_server(&pki, redirect.into_bytes()).await?;
 
         let ca_path = write_pem("ca-redir", &pki.ca_pem)?;
         let cert_path = write_pem("client-cert-redir", &pki.client_cert_pem)?;
@@ -396,6 +407,22 @@ mod tests {
                 || err_msg.contains("invalid_request")
                 || err_msg.contains("invalid_grant"),
             "302 must map to a sanitized OAuth error short code, NOT a follow-through; got {err_msg}"
+        );
+
+        let captured = timeout(Duration::from_secs(30), captured_rx)
+            .await
+            .context("captured channel timeout")?
+            .context("captured channel closed")?;
+        assert!(
+            captured.headers.starts_with("POST /token "),
+            "token endpoint must receive exactly the original /token request; got:\n{}",
+            captured.headers
+        );
+
+        let accepted_redirect = timeout(Duration::from_millis(200), redirect_target.accept()).await;
+        assert!(
+            accepted_redirect.is_err(),
+            "redirect target must receive zero connections after exchange_token returns"
         );
         Ok(())
     }
