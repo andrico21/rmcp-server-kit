@@ -121,14 +121,16 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 - **mTLS CRL fetches now trust the origins named in the operator's
   configured certificates** - the CRL and AIA screening that blocks private,
-  loopback and other restricted addresses now passes automatically for any
-  `https` origin (and any `http` origin when `crl_allow_http` is enabled)
-  named in the CRL Distribution Point or Authority Information Access
-  extensions of a certificate in `mtls.ca_cert_path` or in the server's own
-  TLS certificate chain - because the operator, not a client, chose those
-  URLs. Cloud-metadata addresses remain unbypassable regardless. There is no
-  configuration knob; the trusted origins are logged once at startup (INFO)
-  for audit. **Known limitation (pre-existing, unchanged by this release):**
+  loopback and other restricted addresses now passes automatically for an
+  `https` origin, or an `http` origin while `crl_allow_http` is enabled (the
+  default), that is named in the CRL Distribution Point or Authority
+  Information Access extensions of a certificate in `mtls.ca_cert_path` or in
+  the server's own TLS certificate chain (origins are compared on scheme,
+  lowercased host and effective port) - because the operator, not a client,
+  chose those URLs. Cloud-metadata addresses remain unbypassable regardless.
+  There is no configuration knob; the trusted origins are logged once at
+  startup (INFO) for audit. **Known limitation (pre-existing, unchanged by
+  this release):**
   a CRL or AIA URL whose host is an IPv6 literal is never fetched - the
   bracketed-host lookup fails closed - so publish such endpoints under a DNS
   hostname or an IPv4 literal.
@@ -139,10 +141,11 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   owner, type and link-count checks, and opened-handle `fchmod` now use
   `rustix` safe wrappers because the standard library has no portable
   `O_NOFOLLOW` and this crate forbids `unsafe`. In this repository's lockfile,
-  `rustix` 1.1.5 was already present as a dev-only dependency of `tempfile`,
-  but downstream Unix normal builds now gain `rustix` and, on Linux,
-  `linux-raw-sys` through it. The project's `cargo vet` exemptions for both
-  crates were raised from `safe-to-run` to `safe-to-deploy`.
+  `rustix` 1.1.5 was already present, but only through `tempfile`, which only
+  dev-dependencies pull in; downstream Unix normal builds now gain `rustix`
+  and, on Linux, its `linux-raw-sys` dependency. The project's `cargo vet`
+  exemptions for both crates were raised from `safe-to-run` to
+  `safe-to-deploy`.
 - **TOML config preflight now applies the same nested auth validation as the
   builder path** - API-key principal names, OAuth feature presence and
   config, auth rate-limit capacity (including `max_tracked_keys`), mTLS

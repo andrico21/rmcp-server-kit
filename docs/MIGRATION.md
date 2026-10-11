@@ -84,13 +84,13 @@ Bearer API-key authentication now bounds how many Argon2id verifications
 run concurrently on the blocking thread pool:
 
 - `AuthConfig::max_concurrent_verifications` (TOML
-  `server.auth.max_concurrent_verifications`) - default `None`, which resolves to
-  `available_parallelism()` clamped to `1..=16` at auth-state construction;
-  an explicit value above `Semaphore::MAX_PERMITS` is clamped rather than
-  panicking.
-- `AuthConfig::verification_wait` (TOML `server.auth.verification_wait`) - default
-  `1s`; a TOML or builder value of `"0s"` / `Duration::ZERO` is rejected at
-  validation (`auth.verification_wait must be greater than zero`).
+  `server.auth.max_concurrent_verifications`) - default `None`, which
+  resolves to `available_parallelism()` clamped to `1..=16` at auth-state
+  construction; an explicit value above `Semaphore::MAX_PERMITS` is clamped
+  rather than panicking.
+- `AuthConfig::verification_wait` (TOML `server.auth.verification_wait`) -
+  default `1s`; a TOML or builder value of `"0s"` / `Duration::ZERO` is
+  rejected at validation (`auth.verification_wait must be greater than zero`).
 
 A bearer request that cannot get a permit within `verification_wait` now
 receives `503 Service Unavailable` with `Retry-After: 1` and a generic body,
@@ -151,10 +151,10 @@ into any of these ranges is blocked outright - **unless** its origin
 (scheme, lowercased host, effective port) is named in the CRL Distribution
 Point or Authority Information Access extensions of a certificate in
 `mtls.ca_cert_path` or in the server's own TLS certificate chain. Since
-3.15.0, such operator-configured `https` origins, and `http` origins when
-`crl_allow_http` is enabled, skip the private-address SSRF screen
-automatically (no configuration knob; the trusted set is logged once at
-startup at INFO), so a corporate PKI that publishes its CRLs on an internal
+3.15.0, such operator-configured `https` origins, and `http` origins while
+`crl_allow_http` is enabled (the default), skip the private-address SSRF
+screen automatically (no configuration knob; the trusted set is logged once
+at startup at INFO), so a corporate PKI that publishes its CRLs on an internal
 host now works as long as the issuing CA certificate (the one carrying the
 CDP/AIA extensions) is present in `mtls.ca_cert_path` or the server's own
 chain. Cloud-metadata addresses remain unbypassable regardless of trust.
