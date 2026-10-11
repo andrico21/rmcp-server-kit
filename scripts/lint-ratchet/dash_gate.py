@@ -298,19 +298,20 @@ def print_report(violations: list[Violation], file_count: int) -> None:
 
 
 def self_test() -> int:
+    dd = DOUBLE_DASH
     fixtures: dict[str, tuple[str, int, set[str]]] = {
-        "prose.md": ("alpha -- beta\n", 1, {"prose"}),
-        "banner.rs": ("// -- part --\nfn main() {}\n", 2, {"banner"}),
-        "string.rs": ('const MSG: &str = "alpha -- beta";\n', 1, {"string"}),
-        "arrow.txt": ("left <-- right\n", 1, {"arrow"}),
-        "unicode.md": ("alpha \u2014 beta\n", 1, {"unicode"}),
-        "cli.md": ("Run `cargo clippy -- -D warnings` before merging.\n", 0, set()),
-        "mermaid.md": ("```mermaid\nA-->>B\nB --> C\n```\n", 0, set()),
-        "html.md": ("<!-- generated -->\n", 0, set()),
-        "rule.md": ("---\n| a | b |\n|---|---|\n", 0, set()),
-        "shield.md": ("https://img.shields.io/badge/license-Apache--2.0-blue.svg\n", 0, set()),
-        "anchor.md": ("[old](#a--b)\n", 0, set()),
-        "separator.md": ("Run `cargo run -- --literal` to pass a separator.\n", 0, set()),
+        "prose.md": (f"alpha {dd} beta\n", 1, {"prose"}),
+        "banner.rs": (f"// {dd} part {dd}\nfn main() {{}}\n", 2, {"banner"}),
+        "string.rs": (f'const MSG: &str = "alpha {dd} beta";\n', 1, {"string"}),
+        "arrow.txt": (f"left <{dd} right\n", 1, {"arrow"}),
+        "unicode.md": (f"alpha {chr(0x2014)} beta\n", 1, {"unicode"}),
+        "cli.md": (f"Run `cargo clippy {dd} -D warnings` before merging.\n", 0, set()),
+        "mermaid.md": (f"```mermaid\nA{dd}>>B\nB {dd}> C\n```\n", 0, set()),
+        "html.md": (f"<!{dd} generated {dd}>\n", 0, set()),
+        "rule.md": ("-" * 3 + "\n| a | b |\n|" + "-" * 3 + "|" + "-" * 3 + "|\n", 0, set()),
+        "shield.md": (f"https://img.shields.io/badge/license-Apache{dd}2.0-blue.svg\n", 0, set()),
+        "anchor.md": (f"[old](#a{dd}b)\n", 0, set()),
+        "separator.md": (f"Run `cargo run {dd} {dd}literal` to pass a separator.\n", 0, set()),
     }
     failures: list[str] = []
     with tempfile.TemporaryDirectory() as temp_dir:
