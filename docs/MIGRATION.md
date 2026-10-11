@@ -3,7 +3,7 @@
 This guide shows how to wire the standalone `rmcp-server-kit` crate into a
 downstream project, and how to migrate across breaking major releases.
 
-## Migrating to 3.15.0: audit-log hardening, Argon2id admission control, CRL trust, and one recorded API break
+## Migrating to 3.15.0: audit-log hardening, Argon2id admission control, CRL trust, and one breaking API change
 
 ### `JwksCache::new` returns the crate error type (breaking)
 
@@ -26,10 +26,6 @@ switch to `RmcpServerKitError`: a bad `jwks_cache_ttl`, `ssrf_allowlist`, or
 `allowed_algorithms` maps to `RmcpServerKitError::Config`; a CA bundle file
 read failure, bad CA bundle content, or `reqwest` client build failure maps
 to `RmcpServerKitError::Startup` naming the path.
-
-This is this release's one deliberate, owner-approved breaking change; see
-the "Recorded exception" entry in [`docs/RELEASING.md`](RELEASING.md) for
-why it ships in a minor release.
 
 ### Audit-log hardening (Unix)
 

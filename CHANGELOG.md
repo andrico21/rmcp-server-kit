@@ -33,12 +33,6 @@ migration note and a config opt-out - see the 3.1.0 notes below.
       JwksCache::new(&oauth_config);
   ```
 
-  This is this release's one deliberate, owner-approved breaking change.
-  `cargo semver-checks` does not detect a return-type retype on an existing
-  `Result`, so it stays green; see the "Recorded exception" in
-  [`docs/RELEASING.md`](docs/RELEASING.md) for why a minor release carries it
-  instead of a major one.
-
 ### Security
 
 - **Argon2id API-key verification is now admission-controlled** -
