@@ -122,16 +122,27 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 - **mTLS CRL fetches now trust the origins named in the operator's
   configured certificates** - the CRL and AIA screening that blocks private,
   loopback and other restricted addresses now passes automatically for any
-  `http`/`https` origin (scheme, lowercased host, effective port) named in
-  the CRL Distribution Point or Authority Information Access extensions of a
-  certificate in `mtls.ca_cert_path` or in the server's own TLS certificate
-  chain - because the operator, not a client, chose those URLs. Cloud-metadata
-  addresses remain unbypassable regardless. There is no configuration knob;
-  the trusted origins are logged once at startup (INFO) for audit. **Known
-  limitation (pre-existing, unchanged by this release):** a CRL or AIA URL
-  whose host is an IPv6 literal is never fetched - the bracketed-host lookup
-  fails closed - so publish such endpoints under a DNS hostname or an IPv4
-  literal.
+  `https` origin (and any `http` origin when `crl_allow_http` is enabled)
+  named in the CRL Distribution Point or Authority Information Access
+  extensions of a certificate in `mtls.ca_cert_path` or in the server's own
+  TLS certificate chain - because the operator, not a client, chose those
+  URLs. Cloud-metadata addresses remain unbypassable regardless. There is no
+  configuration knob; the trusted origins are logged once at startup (INFO)
+  for audit. **Known limitation (pre-existing, unchanged by this release):**
+  a CRL or AIA URL whose host is an IPv6 literal is never fetched - the
+  bracketed-host lookup fails closed - so publish such endpoints under a DNS
+  hostname or an IPv4 literal.
+- **`rustix` is now a direct Unix dependency for audit-log hardening** - the
+  crate depends on `rustix` with `default-features = false` and the `fs`,
+  `process` and `std` features on Unix targets. The audit-log open (without
+  following a symlink at the final path component), opened-handle `fstat`
+  owner, type and link-count checks, and opened-handle `fchmod` now use
+  `rustix` safe wrappers because the standard library has no portable
+  `O_NOFOLLOW` and this crate forbids `unsafe`. In this repository's lockfile,
+  `rustix` 1.1.5 was already present as a dev-only dependency of `tempfile`,
+  but downstream Unix normal builds now gain `rustix` and, on Linux,
+  `linux-raw-sys` through it. The project's `cargo vet` exemptions for both
+  crates were raised from `safe-to-run` to `safe-to-deploy`.
 - **TOML config preflight now applies the same nested auth validation as the
   builder path** - API-key principal names, OAuth feature presence and
   config, auth rate-limit capacity (including `max_tracked_keys`), mTLS
@@ -152,18 +163,24 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   `docs/decisions/P4-DECISION-protocol-2026-stateless-posture.md` also
   changed; external bookmarks to their old URL fragments will no longer
   resolve.
-- **Consolidated internal and test-only work (internal)** - every
-  emptiness assertion in unit tests now carries a message, enforced by a
-  new `emptiness-message` prose-gate check; the mTLS CRL end-to-end,
-  cancellation and admission-control test suites were hardened against
-  wall-clock flakiness (progress counters and notification barriers
-  replacing fixed sleeps and timing ratios); RBAC allow-path, mTLS
-  token-exchange redirect, OAuth `nbf` leeway, shutdown-timing and
-  OWASP-header test coverage was tightened; the docs citation guard now
-  requires a nearby definition-like anchor and checks the MINDMAP
-  navigation table; and stale CRL architecture, threat-model and audit-log
-  documentation was brought in line with the current code. No production
-  behavior changed in any of this work.
+- **Consolidated internal and test-only work (internal)** - GitHub Actions
+  workflows now pin every action to a commit SHA and default to read-only
+  permissions, while the publish job keeps its own `contents: write` grant;
+  Dependabot now checks the `github-actions` ecosystem weekly; and
+  `docs/RELEASING.md` records the residual risk of the retained crates.io
+  publish token. Every emptiness assertion in unit tests now carries a
+  message, enforced by a new `emptiness-message` prose-gate check; the
+  lint-ratchet gates now also require `clippy.toml` `allowed-duplicate-crates`
+  and `deny.toml` `[bans] skip` to name the same crates and require
+  cancel-safety notes on async functions behind the `test-helpers` feature;
+  the mTLS CRL end-to-end, cancellation and admission-control test suites were
+  hardened against wall-clock flakiness (progress counters and notification
+  barriers replacing fixed sleeps and timing ratios); RBAC allow-path, mTLS
+  token-exchange redirect, OAuth `nbf` leeway, shutdown-timing and OWASP-header
+  test coverage was tightened; the docs citation guard now requires a nearby
+  definition-like anchor and checks the MINDMAP navigation table; and stale CRL
+  architecture, threat-model and audit-log documentation was brought in line
+  with the current code. No production behavior changed in any of this work.
 
 ### Fixed
 

@@ -84,11 +84,11 @@ Bearer API-key authentication now bounds how many Argon2id verifications
 run concurrently on the blocking thread pool:
 
 - `AuthConfig::max_concurrent_verifications` (TOML
-  `auth.max_concurrent_verifications`) - default `None`, which resolves to
+  `server.auth.max_concurrent_verifications`) - default `None`, which resolves to
   `available_parallelism()` clamped to `1..=16` at auth-state construction;
   an explicit value above `Semaphore::MAX_PERMITS` is clamped rather than
   panicking.
-- `AuthConfig::verification_wait` (TOML `auth.verification_wait`) - default
+- `AuthConfig::verification_wait` (TOML `server.auth.verification_wait`) - default
   `1s`; a TOML or builder value of `"0s"` / `Duration::ZERO` is rejected at
   validation (`auth.verification_wait must be greater than zero`).
 
@@ -151,20 +151,16 @@ into any of these ranges is blocked outright - **unless** its origin
 (scheme, lowercased host, effective port) is named in the CRL Distribution
 Point or Authority Information Access extensions of a certificate in
 `mtls.ca_cert_path` or in the server's own TLS certificate chain. Since
-3.15.0, such operator-configured origins skip the private-address SSRF
-screen automatically (no configuration knob; the trusted set is logged
-once at startup at INFO), so a corporate PKI that publishes its CRLs on an
-internal host now works as long as the issuing CA certificate (the one
-carrying the CDP/AIA extensions) is present in `mtls.ca_cert_path` or the
-server's own chain. Cloud-metadata addresses remain unbypassable
-regardless of trust. This narrows the 3.14-era statement that a CDP
-resolving into a blocked range is always rejected: it is rejected only for
-origins not named in a configured certificate.
-
-**Known limitation (pre-existing, unchanged by this release):** a CRL or
-AIA URL whose host is an IPv6 literal is never fetched, trusted origin or
-not - the bracketed-host address lookup fails, so the fetch fails closed.
-Publish CRL and AIA endpoints under a DNS hostname or an IPv4 literal.
+3.15.0, such operator-configured `https` origins, and `http` origins when
+`crl_allow_http` is enabled, skip the private-address SSRF screen
+automatically (no configuration knob; the trusted set is logged once at
+startup at INFO), so a corporate PKI that publishes its CRLs on an internal
+host now works as long as the issuing CA certificate (the one carrying the
+CDP/AIA extensions) is present in `mtls.ca_cert_path` or the server's own
+chain. Cloud-metadata addresses remain unbypassable regardless of trust.
+This narrows the 3.14-era statement that a CDP resolving into a blocked
+range is always rejected: it is rejected only for origins not named in a
+configured certificate. See also the CRL/AIA IPv6-literal limitation below.
 
 ### Session-id log policy (opt-in, default unchanged)
 
@@ -178,7 +174,16 @@ the existing behavior. If full request-header logging is enabled with
 `session_id_header` left at `"plain"` and `session_binding` disabled,
 startup now logs a WARN, because an unbound raw session id is replayable
 log-leak material; set `session_binding = true`, or choose `"mask"` or
-`"hide"`, to clear it.
+`"hide"`, to clear it. The matching environment override is
+`RMCP_SERVER_KIT__SERVER__LOG_CONTEXT__SESSION_ID_HEADER`.
+
+### Known limitations
+
+**CRL and AIA IPv6-literal endpoints:** a CRL or AIA URL whose host is an
+IPv6 literal is never fetched, trusted origin or not - the bracketed-host
+address lookup fails, so the fetch fails closed. This limitation is
+pre-existing, unchanged by this release. Publish CRL and AIA endpoints under
+a DNS hostname or an IPv4 literal.
 
 ### Dash convention and four runtime-visible strings
 

@@ -32,7 +32,7 @@ ships one deliberate, owner-approved breaking change to public API: the
 a return-type retype on an existing `Result`, so it reports no change; the
 break is real regardless. Under the rules above, a breaking change is a
 major-release change, and a strict major bump (4.0.0) would be the
-alternative. It is a one-off: the release stays as published, and later
+alternative. It is a one-off: the release ships as is, and later
 releases follow the rules above.
 
 ## Pre-flight checklist
