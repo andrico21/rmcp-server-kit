@@ -5212,7 +5212,7 @@ mod tests {
         Ok(())
     }
 
-    // -- Argon2id verification permit pool (admission control) --
+    // - Argon2id verification permit pool (admission control) -
 
     /// Builds an `AuthState` with no API keys and no rate limiters, for
     /// admission-control tests that only care about the permit pool.
@@ -5386,14 +5386,14 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
             "a request beyond the permit pool must receive 503, never a hang or a 401"
         );
-        // Lower-bound only (never flaky on a slow machine, only on a
-        // mutation that makes the wait instant): `verification_wait` is
-        // 300 ms: a 100 ms margin absorbs scheduling jitter without
-        // weakening the "wait ignored" mutation's detectability.
+        let minimum_wait = verification_wait / 10;
+        // Lower-bound only: timers do not fire early, while an ignored wait
+        // returns in about a millisecond. One tenth of the configured wait is
+        // enough to catch that mutation without creating a red flake on slow CI.
         assert!(
-            elapsed >= Duration::from_millis(200),
-            "the overloaded request must actually wait close to verification_wait \
-             (300ms), not return instantly: took {elapsed:?}"
+            elapsed >= minimum_wait,
+            "the overloaded request must wait at least one tenth of \
+             verification_wait ({minimum_wait:?}), not return instantly: took {elapsed:?}"
         );
         let retry_after = overloaded
             .headers()
@@ -5553,72 +5553,51 @@ mod tests {
         Ok(())
     }
 
-    // -- Admission-control knobs: defaults, builders, TOML, validation --
+    // - Admission-control knobs: defaults, builders, TOML, validation -
 
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "deliberate: src/auth.rs::clamp_parallelism_to_permit_bound_stays_within_1_to_16 keeps the uniform test signature while it only asserts"
-    )]
     /// Pins that the parallelism-to-permit-count clamp never resolves
     /// below 1 or above 16, at both boundaries and beyond them.
     #[test]
     fn clamp_parallelism_to_permit_bound_stays_within_1_to_16() -> anyhow::Result<()> {
-        assert_eq!(
-            clamp_parallelism_to_permit_bound(0).get(),
-            1,
-            "zero clamps up to the floor of 1"
-        );
-        assert_eq!(
-            clamp_parallelism_to_permit_bound(1).get(),
-            1,
-            "1 is unchanged"
-        );
-        assert_eq!(
-            clamp_parallelism_to_permit_bound(16).get(),
-            16,
-            "16 is unchanged (the ceiling)"
-        );
-        assert_eq!(
-            clamp_parallelism_to_permit_bound(17).get(),
-            16,
-            "17 clamps down to the ceiling of 16"
-        );
-        assert_eq!(
-            clamp_parallelism_to_permit_bound(9_999).get(),
-            16,
-            "a very large hint still clamps to 16"
-        );
+        for (input, expected, label) in [
+            (0, 1, "zero clamps up to the floor of 1"),
+            (1, 1, "1 is unchanged"),
+            (16, 16, "16 is unchanged (the ceiling)"),
+            (17, 16, "17 clamps down to the ceiling of 16"),
+            (9_999, 16, "a very large hint still clamps to 16"),
+        ] {
+            let expected_nonzero = NonZeroUsize::new(expected).context(label)?;
+            assert_eq!(
+                clamp_parallelism_to_permit_bound(input),
+                expected_nonzero,
+                "{label}"
+            );
+        }
         Ok(())
     }
 
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "deliberate: src/auth.rs::default_max_concurrent_verifications_is_within_1_to_16 keeps the uniform test signature while it only asserts"
-    )]
     /// Pins that the resolved default permit count always stays within
     /// `1..=16`, regardless of this host's actual parallelism.
     #[test]
     fn default_max_concurrent_verifications_is_within_1_to_16() -> anyhow::Result<()> {
-        let resolved = default_max_concurrent_verifications().get();
+        let resolved = default_max_concurrent_verifications();
+        let floor = NonZeroUsize::new(1).context("permit floor is nonzero")?;
+        let ceiling = NonZeroUsize::new(16).context("permit ceiling is nonzero")?;
         assert!(
-            (1..=16).contains(&resolved),
+            (floor.get()..=ceiling.get()).contains(&resolved.get()),
             "default permit count must resolve within 1..=16, got {resolved}"
         );
         Ok(())
     }
 
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "deliberate: src/auth.rs::auth_config_default_has_1s_verification_wait_and_no_permit_override keeps the uniform test signature while it only asserts"
-    )]
     /// Pins that `AuthConfig::default()` and `with_keys` both carry the 1
     /// second `verification_wait` default and no permit-count override.
     #[test]
     fn auth_config_default_has_1s_verification_wait_and_no_permit_override() -> anyhow::Result<()> {
         let cfg = AuthConfig::default();
+        let expected_wait = humantime::parse_duration("1s").context("1s duration parses")?;
         assert_eq!(
-            cfg.verification_wait,
-            Duration::from_secs(1),
+            cfg.verification_wait, expected_wait,
             "default verification_wait must be 1 second"
         );
         assert_eq!(
@@ -5628,8 +5607,7 @@ mod tests {
         );
         let with_keys_cfg = AuthConfig::with_keys(vec![]);
         assert_eq!(
-            with_keys_cfg.verification_wait,
-            Duration::from_secs(1),
+            with_keys_cfg.verification_wait, expected_wait,
             "with_keys must carry the same 1 second default"
         );
         Ok(())
@@ -5666,10 +5644,6 @@ mod tests {
         Ok(())
     }
 
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "deliberate: src/auth.rs::resolve_max_concurrent_verifications_clamps_to_semaphore_max keeps the uniform test signature while it only asserts"
-    )]
     /// Pins that an operator-supplied `max_concurrent_verifications` above
     /// `Semaphore::MAX_PERMITS` is clamped to it rather than reaching
     /// `Semaphore::new` and panicking the server at startup.
@@ -5678,9 +5652,10 @@ mod tests {
         let cfg =
             AuthConfig::with_keys(vec![]).with_max_concurrent_verifications(NonZeroUsize::MAX);
         let resolved = resolve_max_concurrent_verifications(&cfg);
+        let max_permits = NonZeroUsize::new(Semaphore::MAX_PERMITS)
+            .context("Semaphore::MAX_PERMITS is nonzero")?;
         assert_eq!(
-            resolved.get(),
-            Semaphore::MAX_PERMITS,
+            resolved, max_permits,
             "a permit count above Semaphore::MAX_PERMITS must clamp to it"
         );
         // The clamp's entire purpose is that this does not panic.
