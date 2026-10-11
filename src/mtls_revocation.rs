@@ -1972,6 +1972,7 @@ pub async fn bootstrap_fetch(
     // cloud-metadata addresses stay blocked.
     bootstrap_fetch_with_server_chain(roots, ca_certs, &[], config).await
 }
+
 /// Same as [`bootstrap_fetch`], but also derives the trusted origin set
 /// from `server_chain`.
 ///
@@ -2274,6 +2275,7 @@ pub async fn run_crl_refresher(
         }
     }
 }
+
 /// Owned abort-safety guard for the discovery arm in `run_crl_refresher`.
 // Abort-safety guard for the discovery arm in `run_crl_refresher`. Cooperative
 // shutdown already leaves `pending_urls` consistent because the arm body runs to
