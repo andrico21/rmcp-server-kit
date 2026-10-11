@@ -338,20 +338,8 @@ pub enum SessionIdLogPolicy {
     Hide,
 }
 
-/// Error returned when parsing a session-id header log policy fails.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct SessionIdLogPolicyParseError;
-
-impl Display for SessionIdLogPolicyParseError {
-    #[inline]
-    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        f.write_str("expected one of: plain, mask, hide")
-    }
-}
-
 impl FromStr for SessionIdLogPolicy {
-    type Err = SessionIdLogPolicyParseError;
+    type Err = ();
 
     #[inline]
     fn from_str(raw: &str) -> Result<Self, Self::Err> {
@@ -359,7 +347,7 @@ impl FromStr for SessionIdLogPolicy {
             "plain" => Ok(Self::Plain),
             "mask" => Ok(Self::Mask),
             "hide" => Ok(Self::Hide),
-            _ => Err(SessionIdLogPolicyParseError),
+            _ => Err(()),
         }
     }
 }
@@ -5436,33 +5424,34 @@ fn format_request_headers_for_log(
             if REDACTED_LOG_HEADERS.contains(&name) {
                 Some(format!("{name}: [REDACTED]"))
             } else if name == "mcp-session-id" {
-                render_session_id_header_for_log(
-                    name,
-                    header_value_for_log(value),
-                    session_id_policy,
-                )
+                render_session_id_header_for_log(name, value, session_id_policy)
             } else {
-                Some(format!("{name}: {}", header_value_for_log(value)))
+                Some(format!(
+                    "{name}: {}",
+                    value.to_str().unwrap_or("<non-utf8>")
+                ))
             }
         })
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-/// Return a header value as UTF-8 text for log rendering.
-fn header_value_for_log(value: &HeaderValue) -> &str {
-    str::from_utf8(value.as_bytes()).unwrap_or("<non-utf8>")
-}
-
 /// Render a session-id header according to the configured policy.
 fn render_session_id_header_for_log(
     name: &str,
-    value: &str,
+    value: &HeaderValue,
     policy: SessionIdLogPolicy,
 ) -> Option<String> {
     match policy {
-        SessionIdLogPolicy::Plain => Some(format!("{name}: {value}")),
-        SessionIdLogPolicy::Mask => Some(format!("{name}: {}", mask_session_id_for_log(value))),
+        SessionIdLogPolicy::Plain => Some(format!(
+            "{name}: {}",
+            value.to_str().unwrap_or("<non-utf8>")
+        )),
+        SessionIdLogPolicy::Mask => Some(format!(
+            "{name}: {}",
+            str::from_utf8(value.as_bytes())
+                .map_or_else(|_| "[MASKED]".to_owned(), mask_session_id_for_log)
+        )),
         SessionIdLogPolicy::Hide => None,
     }
 }
@@ -8735,6 +8724,25 @@ mod tests {
             "{plain}"
         );
 
+        let mut plain_opaque_headers = HeaderMap::new();
+        let plain_session_value = HeaderValue::from_bytes("plain-\u{e9}opaque-session".as_bytes())?;
+        let _previous_plain_session =
+            plain_opaque_headers.insert("mcp-session-id", plain_session_value);
+        let plain_probe_value = HeaderValue::from_bytes("probe-\u{f6}opaque".as_bytes())?;
+        let _previous_plain_probe = plain_opaque_headers.insert("x-probe", plain_probe_value);
+        let plain_opaque =
+            format_request_headers_for_log(&plain_opaque_headers, SessionIdLogPolicy::Plain);
+        assert!(
+            plain_opaque.contains("mcp-session-id: <non-utf8>"),
+            "{plain_opaque}"
+        );
+        assert!(
+            plain_opaque.contains("x-probe: <non-utf8>"),
+            "{plain_opaque}"
+        );
+        assert!(!plain_opaque.contains('\u{e9}'), "{plain_opaque}");
+        assert!(!plain_opaque.contains('\u{f6}'), "{plain_opaque}");
+
         let mut boundary_headers = HeaderMap::new();
         let _previous_boundary =
             boundary_headers.insert("mcp-session-id", "abcdefghijklmnop".parse()?);
@@ -8765,6 +8773,16 @@ mod tests {
         assert!(
             unicode.contains("mcp-session-id: \u{e5}\u{df}\u{e7}\u{111}...mnop"),
             "{unicode}"
+        );
+
+        let mut invalid_utf8_headers = HeaderMap::new();
+        let invalid_value = HeaderValue::from_bytes(&[0xff; 20])?;
+        let _previous_invalid = invalid_utf8_headers.insert("mcp-session-id", invalid_value);
+        let invalid_utf8 =
+            format_request_headers_for_log(&invalid_utf8_headers, SessionIdLogPolicy::Mask);
+        assert!(
+            invalid_utf8.contains("mcp-session-id: [MASKED]"),
+            "{invalid_utf8}"
         );
 
         let mut hidden_headers = HeaderMap::new();
