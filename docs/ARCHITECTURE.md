@@ -391,7 +391,7 @@ ArgumentAllowlist {                       // `ArgumentAllowlist` src/rbac.rs:435
 ```
 
 ### Decision function
-- `RbacPolicy::check` method - pure allow/deny on `RbacPolicy` (`src/rbac.rs:723-869`)
+- `RbacPolicy` (`src/rbac.rs:709`); its `check` method spans src/rbac.rs:723-869 for pure allow/deny
 - `RbacPolicy::argument_allowed(role, tool, argument, value)` - JSON value match (`argument_allowed`, `src/rbac.rs:954`)
 - `RbacPolicy::redact_arg(value)` - HMAC-SHA256 of an argument value with
 the policy's salt, returning an 8-char hex prefix (`redact_with_salt`, `src/rbac.rs:1244`).
