@@ -1185,6 +1185,24 @@ mod tests {
         .to_string()
     }
 
+    async fn assert_allowed_tool_call_response(
+        resp: reqwest::Response,
+        context: &str,
+    ) -> anyhow::Result<()> {
+        assert_eq!(resp.status(), 200, "{context}: HTTP status must be 200");
+        let body = mcp_response_json(resp).await?;
+        assert_eq!(
+            body.get("id").and_then(serde_json::Value::as_u64),
+            Some(1),
+            "{context}: JSON-RPC id must match the request"
+        );
+        assert!(
+            body.get("result").is_some() || body.get("error").is_some(),
+            "{context}: JSON-RPC response must carry result or error: {body}"
+        );
+        Ok(())
+    }
+
     /// Pins that RBAC denies a tool outside the role's allow list with 403.
     #[tokio::test]
     async fn rbac_denies_unpermitted_tool() -> anyhow::Result<()> {
@@ -1232,19 +1250,18 @@ mod tests {
         let base = spawn_server(cfg).await?;
 
         let client = reqwest::Client::new();
+        let session_id = mcp_initialize_with_bearer(&client, &base.base, Some(&token)).await?;
 
-        // Ops role with wildcard allow -- should pass RBAC.
-        // The tool doesn't exist on the handler, so MCP returns an error *response*
-        // (not an HTTP error), meaning HTTP 200 with a JSON-RPC error body.
         let resp = client
             .post(format!("{base}/mcp"))
             .header("authorization", format!("Bearer {token}"))
             .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-session-id", session_id)
             .body(tool_call_body("resource_list", &serde_json::json!({})))
             .send()
             .await?;
-        // Should NOT be 403 (RBAC passed).
-        assert_ne!(resp.status(), 403);
+        assert_allowed_tool_call_response(resp, "wildcard-permitted tool").await?;
         Ok(())
     }
 
@@ -1274,19 +1291,21 @@ mod tests {
         let base = spawn_server(cfg).await?;
 
         let client = reqwest::Client::new();
+        let session_id = mcp_initialize_with_bearer(&client, &base.base, Some(&token)).await?;
 
-        // Allowed command: ls
         let resp = client
             .post(format!("{base}/mcp"))
             .header("authorization", format!("Bearer {token}"))
             .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-session-id", &session_id)
             .body(tool_call_body(
                 "container_exec",
                 &serde_json::json!({"cmd": "ls -la"}),
             ))
             .send()
             .await?;
-        assert_ne!(resp.status(), 403, "allowed cmd 'ls' should not be denied");
+        assert_allowed_tool_call_response(resp, "allowlisted command").await?;
 
         // Denied command: rm
         let denied_resp = client

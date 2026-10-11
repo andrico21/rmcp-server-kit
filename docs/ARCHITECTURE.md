@@ -939,9 +939,9 @@ is autonomous (loopback ports or `wiremock`, no live external service).
 
 Examples worth reading:
 - `auth_accepts_valid_bearer` - `tests/integration/e2e.rs:1070`
-- `rbac_denies_unpermitted_tool` - `tests/integration/e2e.rs:1190`
-- `rbac_allows_permitted_tool` - `tests/integration/e2e.rs:1220`
-- `rbac_argument_allowlist_enforced` - `tests/integration/e2e.rs:1253`
+- `rbac_denies_unpermitted_tool` - `tests/integration/e2e.rs:1208`
+- `rbac_allows_permitted_tool` - `tests/integration/e2e.rs:1238`
+- `rbac_argument_allowlist_enforced` - `tests/integration/e2e.rs:1270`
 
 > When changing behaviour, **add an E2E test first**. The unit tests in
 > `auth.rs`/`rbac.rs` are useful but the E2E suite is what catches
