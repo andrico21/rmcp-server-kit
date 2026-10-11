@@ -24,6 +24,17 @@ added public API: the per-item client-context logging controls listed under
 Under the rules above that is a minor-release change. It is a one-off: the
 release stays as published, and later releases follow the rules above.
 
+**Recorded exception (2026-10-11):** 3.15.0 is a minor release that also
+ships one deliberate, owner-approved breaking change to public API: the
+`JwksCache::new` return type, documented under "Breaking" in
+`CHANGELOG.md` and in the 3.15.0 section of
+[`docs/MIGRATION.md`](MIGRATION.md). `cargo semver-checks` does not detect
+a return-type retype on an existing `Result`, so it reports no change; the
+break is real regardless. Under the rules above, a breaking change is a
+major-release change, and a strict major bump (4.0.0) would be the
+alternative. It is a one-off: the release stays as published, and later
+releases follow the rules above.
+
 ## Pre-flight checklist
 
 1. **All CI jobs green on `main` - verify this before tagging, not after.**

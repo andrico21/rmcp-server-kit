@@ -3,6 +3,212 @@
 This guide shows how to wire the standalone `rmcp-server-kit` crate into a
 downstream project, and how to migrate across breaking major releases.
 
+## Migrating to 3.15.0: audit-log hardening, Argon2id admission control, CRL trust, and one recorded API break
+
+### `JwksCache::new` returns the crate error type (breaking)
+
+`JwksCache::new` now returns `Result<Self, RmcpServerKitError>` instead of
+`Result<Self, Box<dyn Error + Send + Sync>>`:
+
+```rust,ignore
+// before
+let cache: Result<JwksCache, Box<dyn std::error::Error + Send + Sync>> =
+    JwksCache::new(&oauth_config);
+
+// after
+let cache: Result<JwksCache, rmcp_server_kit::RmcpServerKitError> =
+    JwksCache::new(&oauth_config);
+```
+
+Code that uses `?` into `anyhow::Error` or `Box<dyn Error>` compiles
+unchanged. Code that names the boxed error type, or downcasts it, must
+switch to `RmcpServerKitError`: a bad `jwks_cache_ttl`, `ssrf_allowlist`, or
+`allowed_algorithms` maps to `RmcpServerKitError::Config`; a CA bundle file
+read failure, bad CA bundle content, or `reqwest` client build failure maps
+to `RmcpServerKitError::Startup` naming the path.
+
+This is this release's one deliberate, owner-approved breaking change; see
+the "Recorded exception" entry in [`docs/RELEASING.md`](RELEASING.md) for
+why it ships in a minor release.
+
+### Audit-log hardening (Unix)
+
+Opening `audit_log_path` is now stricter, checked once at startup before any
+write:
+
+- **A pre-existing path owned by a different user** now fails strict
+  startup instead of silently writing the audit trail through it. This
+  affects an init container, a sidecar, a shared volume, or a provisioning
+  step that created the path as root. Dedicate the path to the service
+  user, pre-create it owned by the service user, or switch any rotator to
+  copy-and-truncate semantics (for example logrotate's `copytruncate`) so a
+  restart always finds a file the service user already owns.
+- **A symlinked path** (including a dangling symlink or one pointing at a
+  directory) now fails strict startup; only the final path component is
+  checked, so a symlinked parent directory is still traversed.
+- **A special file** at that path (a device, FIFO, or socket) now fails
+  strict startup.
+- **A regular file with more than one hard link** now fails strict startup.
+  Hard-link-based retention or rotation schemes are affected; use
+  copy-based retention instead, such as copying and truncating the active
+  file, or rotating by rename and reopening a fresh single-link path on
+  restart. Single-link, self-owned regular files are still accepted and
+  tightened to `0o600`.
+
+The deprecated lenient initializer now installs no audit sink at all when
+any of these checks fails, instead of falling back to an unprotected
+writer. All of these checks run once, at startup, against the file as it
+exists then; a hard link or a second directory entry added afterward is not
+detected (permissions still live on the inode, so a new directory entry
+does not by itself grant another principal read access to the content).
+
+### Audit-log hardening (Windows)
+
+Opening `audit_log_path` now refuses a reparse point (a symbolic link, a
+junction, a mount point, or a filesystem-specific tag such as a cloud-file
+placeholder or a deduplicated file) at the final path component, checked
+both before the open and again on the opened handle. Point `audit_log_path`
+directly at a plain file or a path that does not yet exist.
+
+If DACL hardening fails after the file is opened, the crate now deletes the
+file only when it created it in this call; a pre-existing file that fails
+hardening is left in place, matching the Unix policy of never deleting
+something the process did not create. Cleanup still removes the file by
+path after the handle is dropped, so a principal with write access to the
+parent directory can race that delete; this is a pre-existing residual of
+the by-path ACL call, not new in this release.
+
+### Argon2id verification admission control
+
+Bearer API-key authentication now bounds how many Argon2id verifications
+run concurrently on the blocking thread pool:
+
+- `AuthConfig::max_concurrent_verifications` (TOML
+  `auth.max_concurrent_verifications`) - default `None`, which resolves to
+  `available_parallelism()` clamped to `1..=16` at auth-state construction;
+  an explicit value above `Semaphore::MAX_PERMITS` is clamped rather than
+  panicking.
+- `AuthConfig::verification_wait` (TOML `auth.verification_wait`) - default
+  `1s`; a TOML or builder value of `"0s"` / `Duration::ZERO` is rejected at
+  validation (`auth.verification_wait must be greater than zero`).
+
+A bearer request that cannot get a permit within `verification_wait` now
+receives `503 Service Unavailable` with `Retry-After: 1` and a generic body,
+instead of queuing unboundedly; these responses are counted separately as
+`AuthCountersSnapshot::failure_overloaded` at `/admin/auth/counters`. The
+constant-time credential scan itself is unchanged. This bounds Argon2id's
+memory growth (roughly `max_concurrent_verifications` times ~21 MiB)
+independent of source IP or client count, but a sustained flood can still
+keep legitimate callers receiving bounded-latency `503`s for as long as it
+lasts - the bound limits memory and per-request latency, it does not make
+the service unaffected by the attack. Pair it with a per-IP rate limit (see
+`RateLimitConfig::with_pre_auth_burst` in `docs/GUIDE.md`); API-key auth with
+no rate limiting at all is unsafe on a reachable listener.
+
+### CA bundle validation
+
+`oauth.ca_cert_path` (consumed by the JWKS cache, the general-purpose OAuth
+HTTP client, and the token-exchange mTLS client) now fails startup, naming
+the client and the path, when the file is missing, empty, contains no PEM
+certificate, contains only a private key, is DER-encoded, is an
+unterminated PEM, or is PEM-framed but contains malformed DER. Previously,
+several of these shapes produced a client with no custom root and no error,
+so a private-CA identity provider failed later with an unrelated TLS error
+on the first JWKS or token request, even though `ca_cert_path` appeared to
+be configured correctly.
+
+### Stricter TOML preflight validation
+
+TOML config preflight (`validate_server_config`) now shares the same nested
+auth validation as the programmatic builder path, so a mistake that
+previously passed preflight and failed only once bridged into
+`McpServerConfig` now fails preflight directly. Check nested auth settings
+for: duplicate or blank API-key names; an unsupported OAuth algorithm list;
+a zero OAuth JWKS cache cap; a malformed OAuth JWKS cache TTL; a zero auth
+rate-limit capacity (including `max_tracked_keys`); a zero mTLS CRL capacity
+cap; a zero `verification_wait`; and a malformed `listen_addr` /
+`listen_port` pair. The last check parses the composed
+`listen_addr:listen_port` as a `SocketAddr`, so a bare IPv6 `listen_addr`
+(for example `::1`) is rejected with a message naming the expected form -
+bracket IPv6 hosts (`[::1]`) in `listen_addr`.
+
+### SSRF range additions and CRL origin trust
+
+The SSRF guard used by OAuth, JWKS, token, revocation and introspection
+fetches now blocks four more special-purpose IPv6 range classes by
+default: RFC 8215 local-use NAT64 (`64:ff9b:1::/48`), deprecated site-local
+(`fec0::/10`), benchmarking (`2001:2::/48`), and ORCHID/ORCHIDv2
+(`2001:10::/28`, `2001:20::/28`). A previously reachable target in any of
+these ranges now needs a narrow `ssrf_allowlist` CIDR entry; prefer the
+narrowest CIDR that covers the actual endpoint over allowlisting a whole
+range. A cloud-metadata IPv4 address embedded in any RFC 6052 layout inside
+the NAT64 `/48` (not only the `/96` layout) remains unbypassable even under
+a broad allowlist. `100::/64` (discard-only) and ISATAP interface
+identifiers under global prefixes are intentionally not decoded.
+
+The CRL fetch path has no allowlist, so a CRL distribution point resolving
+into any of these ranges is blocked outright - **unless** its origin
+(scheme, lowercased host, effective port) is named in the CRL Distribution
+Point or Authority Information Access extensions of a certificate in
+`mtls.ca_cert_path` or in the server's own TLS certificate chain. Since
+3.15.0, such operator-configured origins skip the private-address SSRF
+screen automatically (no configuration knob; the trusted set is logged
+once at startup at INFO), so a corporate PKI that publishes its CRLs on an
+internal host now works as long as the issuing CA certificate (the one
+carrying the CDP/AIA extensions) is present in `mtls.ca_cert_path` or the
+server's own chain. Cloud-metadata addresses remain unbypassable
+regardless of trust. This narrows the 3.14-era statement that a CDP
+resolving into a blocked range is always rejected: it is rejected only for
+origins not named in a configured certificate.
+
+**Known limitation (pre-existing, unchanged by this release):** a CRL or
+AIA URL whose host is an IPv6 literal is never fetched, trusted origin or
+not - the bracketed-host address lookup fails, so the fetch fails closed.
+Publish CRL and AIA endpoints under a DNS hostname or an IPv4 literal.
+
+### Session-id log policy (opt-in, default unchanged)
+
+`[server.log_context] session_id_header` (and
+`McpServerConfig::with_session_id_log_policy`) controls how full
+request-header logging renders `Mcp-Session-Id`: `"plain"` (default,
+identical to prior releases), `"mask"` (values of 16 or more Unicode
+characters become `first4...last4`; shorter values become `[MASKED]`), or
+`"hide"` (the header is omitted entirely). No action is required to keep
+the existing behavior. If full request-header logging is enabled with
+`session_id_header` left at `"plain"` and `session_binding` disabled,
+startup now logs a WARN, because an unbound raw session id is replayable
+log-leak material; set `session_binding = true`, or choose `"mask"` or
+`"hide"`, to clear it.
+
+### Dash convention and four runtime-visible strings
+
+The repository-wide prose style is now a single hyphen; two consecutive
+hyphens are reserved for command-line flags and separators. Four
+operator-visible warning strings had that separator normalized from a
+double hyphen to a single hyphen - exact log matchers must be updated:
+
+| file | message (new wording) |
+|---|---|
+| `src/oauth.rs` | `operators only - see SECURITY.md` |
+| `src/oauth.rs` | `here - list them via oauth.ssrf_allowlist.cidrs instead` |
+| `src/rbac.rs` | `not as a pattern - set rbac.allow_operation_matching` |
+| `src/rbac.rs` | `substitutes its own default bypasses it entirely - set` |
+
+The `docs/GUIDE.md` top-level heading and the `Q1`-`Q6` headings of
+`docs/decisions/P4-DECISION-protocol-2026-stateless-posture.md` also
+changed to the single-hyphen form; external bookmarks or links to their old
+URL fragments will no longer resolve. No inbound link inside this
+repository pointed at the old fragments.
+
+### Public API
+
+The only breaking public API change in 3.15.0 is the `JwksCache::new`
+retype above. The public additions are `AuthConfig::max_concurrent_verifications`,
+`AuthConfig::verification_wait` and their builders,
+`AuthCountersSnapshot::failure_overloaded`, and `SessionIdLogPolicy` with
+`LogContextConfig::session_id_header` and
+`McpServerConfig::with_session_id_log_policy`, all described above.
+
 ## Migrating to 3.14.4: logging defaults, MSRV 1.99, and `/metrics` security headers
 
 ### Framework INFO lines are visible under the default filter

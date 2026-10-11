@@ -11,14 +11,172 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+## [3.15.0] - 2026-10-11
+
+### Breaking
+
+- **`JwksCache::new` now returns the crate error type instead of a boxed
+  error** - `pub fn new(config: &OAuthConfig) -> Result<Self,
+  RmcpServerKitError>`, replacing `Result<Self, Box<dyn Error + Send +
+  Sync>>`. Code that propagates the error with `?` into `anyhow::Error` or
+  `Box<dyn Error>` compiles unchanged:
+
+  ```rust,ignore
+  let cache = JwksCache::new(&oauth_config)?;
+  ```
+
+  Code that names the boxed error type or downcasts it must switch to the
+  crate error type:
+
+  ```rust,ignore
+  let result: Result<JwksCache, rmcp_server_kit::RmcpServerKitError> =
+      JwksCache::new(&oauth_config);
+  ```
+
+  This is this release's one deliberate, owner-approved breaking change.
+  `cargo semver-checks` does not detect a return-type retype on an existing
+  `Result`, so it stays green; see the "Recorded exception" in
+  [`docs/RELEASING.md`](docs/RELEASING.md) for why a minor release carries it
+  instead of a major one.
+
+### Security
+
+- **Argon2id API-key verification is now admission-controlled** -
+  `AuthConfig::max_concurrent_verifications` (default
+  `available_parallelism()` clamped to `1..=16`, and clamped again to
+  `Semaphore::MAX_PERMITS` if set higher) bounds how many Argon2id
+  verifications (roughly 21 MiB each) run at once on the blocking thread
+  pool. A bearer request that cannot get a permit within
+  `AuthConfig::verification_wait` (default `1s`) now fails fast with `503
+  Service Unavailable` and `Retry-After: 1` instead of queuing unboundedly;
+  these hits are counted separately as `AuthCountersSnapshot::failure_overloaded`
+  and visible at `/admin/auth/counters`. The constant-time credential scan is
+  unchanged. Documented API-key configurations (README, `docs/GUIDE.md`,
+  `examples/api_key_rbac.rs`) now also show a per-IP rate limit, since
+  API-key auth without one is unsafe on a reachable listener.
+- **SSRF guard blocks more special-purpose IPv6 ranges by default** - RFC
+  8215 local-use NAT64 (`64:ff9b:1::/48`), deprecated site-local
+  (`fec0::/10`), benchmarking (`2001:2::/48`), and ORCHID/ORCHIDv2
+  (`2001:10::/28`, `2001:20::/28`) are now blocked for OAuth, JWKS, token,
+  revocation and introspection endpoints unless re-allowed with a narrow
+  `ssrf_allowlist` CIDR. A cloud-metadata IPv4 address embedded in any RFC
+  6052 layout inside the NAT64 `/48` (not only the `/96` layout) stays
+  blocked even under a broad allowlist. The CRL fetch path has no allowlist,
+  so a distribution point resolving into any of these ranges is now blocked
+  outright, unless its origin is one trusted under the CRL change below.
+- **Unix audit-log opening refuses symlinks, special files, foreign owners
+  and hard links** - opening `audit_log_path` now refuses to follow a
+  symlink at the final path component, refuses anything that is not a
+  regular file (devices, FIFOs, sockets), refuses a pre-existing file not
+  owned by the server process's effective user (even running as root), and
+  refuses a regular file with more than one hard link - all before
+  permissions are tightened or the audit writer starts. Strict
+  initialization fails startup on any of these; the deprecated lenient
+  initializer now installs no audit sink at all when hardening fails, rather
+  than writing to an unprotected one. These checks run once at startup, not
+  continuously; use copy-based retention or rotation (for example
+  logrotate's `copytruncate`), not hardlinks.
+- **Windows audit-log opening refuses reparse points; DACL-hardening cleanup
+  is more conservative** - opening `audit_log_path` now refuses a reparse
+  point (a symbolic link, junction, mount point, or any other reparse tag,
+  including cloud-file placeholders and deduplicated files) at the final
+  path component, checked both before the open and again on the opened
+  handle; a rejected reparse point is never deleted. If owner-only DACL
+  hardening fails after the file is opened, the file is now deleted only
+  when this call created it - a pre-existing file that fails hardening is
+  left in place, matching the existing Unix policy of never deleting
+  something the process did not create. Cleanup still removes by path after
+  the handle is dropped, so a principal with write access to the parent
+  directory can still race it.
+- **A cancelled request can no longer stall OAuth authentication for the
+  JWKS refresh cooldown** - the JWKS refresh now runs as one shared
+  background task that callers wait on; it completes, or ends at server
+  shutdown or cache drop, and releases its waiters even if it panics. A
+  client that previously disconnected mid-refresh could burn the refresh
+  cooldown and fail every subsequent OAuth request closed until it expired;
+  the cooldown and fail-closed behavior are otherwise unchanged, and there
+  is no public API change.
+- **CRL parsing and verifier rebuilds no longer run on a Tokio worker
+  thread** - DER parsing and `rustls` verifier rebuilds, triggered by CRL
+  refresh, handshake-discovered CDP fetches, and bootstrap, now run on the
+  blocking thread pool, bounded to at most two concurrent jobs. A large or
+  adversarially large CRL, or a deep CRL cache, could previously stall a
+  Tokio worker thread - and every other task scheduled on it - for the
+  parse or rebuild duration. No configuration change; internal only.
+
+### Added
+
+- **`[server.log_context] session_id_header`** chooses how full
+  request-header logging renders the `Mcp-Session-Id` header:
+  `"plain"` (default, unchanged historical rendering), `"mask"` (16 or more
+  characters render as `first4...last4`, counted by Unicode character, never
+  bytes; shorter values render `[MASKED]`), or `"hide"` (the header name and
+  value are both omitted). Set it with
+  `McpServerConfig::with_session_id_log_policy` or the matching env
+  override. Startup now logs a WARN when full request-header logging is
+  enabled with `session_id_header = "plain"` and `session_binding` is
+  disabled.
+
 ### Changed
 
-- **Every emptiness assertion carries a message (internal)** - six
-  message-less `assert!(x.is_empty())` checks in unit tests now say what they
-  pin, as the vendored core requires for every emptiness assertion. Clippy's
-  `assert_is_empty` cannot see these shapes (a custom `is_empty()` method, or a
-  collection whose elements lack `PartialEq`), so a new `emptiness-message`
-  check in `scripts/lint-ratchet/prose_gates.py` enforces the rule in CI.
+- **mTLS CRL fetches now trust the origins named in the operator's
+  configured certificates** - the CRL and AIA screening that blocks private,
+  loopback and other restricted addresses now passes automatically for any
+  `http`/`https` origin (scheme, lowercased host, effective port) named in
+  the CRL Distribution Point or Authority Information Access extensions of a
+  certificate in `mtls.ca_cert_path` or in the server's own TLS certificate
+  chain - because the operator, not a client, chose those URLs. Cloud-metadata
+  addresses remain unbypassable regardless. There is no configuration knob;
+  the trusted origins are logged once at startup (INFO) for audit. **Known
+  limitation (pre-existing, unchanged by this release):** a CRL or AIA URL
+  whose host is an IPv6 literal is never fetched - the bracketed-host lookup
+  fails closed - so publish such endpoints under a DNS hostname or an IPv4
+  literal.
+- **TOML config preflight now applies the same nested auth validation as the
+  builder path** - API-key principal names, OAuth feature presence and
+  config, auth rate-limit capacity (including `max_tracked_keys`), mTLS
+  capacity knobs, and `verification_wait` are validated by one shared helper
+  called from both validators. The preflight also now parses the composed
+  `listen_addr:listen_port` as a `SocketAddr` before startup, so a bare IPv6
+  `listen_addr` (for example `::1`) is rejected earlier with a message
+  naming the expected form - bracket IPv6 hosts (`[::1]`).
+- **House dash convention applied across the repository** - prose now uses a
+  single hyphen (two consecutive hyphens are reserved for command-line
+  flags and separators), enforced in CI by a new lint-ratchet gate. Four
+  operator-visible warning strings had that separator normalized from a
+  double hyphen to a single hyphen: the OAuth SSRF-allowlist "operators
+  only" and "list them via oauth.ssrf_allowlist.cidrs" messages
+  (`src/oauth.rs`), and the RBAC "not as a pattern" and "bypasses it
+  entirely" messages (`src/rbac.rs`); exact log matchers must be updated.
+  The `docs/GUIDE.md` top-level heading and the `Q1`-`Q6` headings of
+  `docs/decisions/P4-DECISION-protocol-2026-stateless-posture.md` also
+  changed; external bookmarks to their old URL fragments will no longer
+  resolve.
+- **Consolidated internal and test-only work (internal)** - every
+  emptiness assertion in unit tests now carries a message, enforced by a
+  new `emptiness-message` prose-gate check; the mTLS CRL end-to-end,
+  cancellation and admission-control test suites were hardened against
+  wall-clock flakiness (progress counters and notification barriers
+  replacing fixed sleeps and timing ratios); RBAC allow-path, mTLS
+  token-exchange redirect, OAuth `nbf` leeway, shutdown-timing and
+  OWASP-header test coverage was tightened; the docs citation guard now
+  requires a nearby definition-like anchor and checks the MINDMAP
+  navigation table; and stale CRL architecture, threat-model and audit-log
+  documentation was brought in line with the current code. No production
+  behavior changed in any of this work.
+
+### Fixed
+
+- **Invalid `ca_cert_path` bundles now fail at startup instead of being
+  silently ignored** - the OAuth JWKS cache, the general-purpose OAuth HTTP
+  client, and the token-exchange mTLS client all now read the configured CA
+  bundle once and reject it, naming the client and the path, when the file
+  is missing, is empty, contains no PEM certificate, contains only a
+  private key, is DER-encoded, is an unterminated PEM, or is PEM-framed but
+  contains malformed DER (the last case is rejected only when the HTTP
+  client is built). Previously, several of these shapes silently produced a
+  client with no custom root, so a private-CA identity provider failed only
+  later, with an unrelated TLS error, on the first JWKS or token request.
 
 ## [3.14.4] - 2026-10-06
 
