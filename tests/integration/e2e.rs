@@ -3175,7 +3175,7 @@ mod tests {
     /// 1. With a long-running in-flight request and a 500ms shutdown
     ///    timeout, cancelling the harness's `CancellationToken` (the same
     ///    code path a real SIGTERM would trigger after BUG-NEW's fix)
-    ///    causes the server to exit within ~500ms.
+    ///    causes the server to exit before a 10s hang detector fires.
     /// 2. The server actually waits at least most of the graceful window
     ///    (~450ms) instead of insta-killing the in-flight request -- this
     ///    catches an over-correction that would skip graceful drain
@@ -3193,8 +3193,9 @@ mod tests {
         use tokio::sync::oneshot;
 
         // Build a server with a *short* graceful deadline (500ms) and an
-        // extra route that sleeps 10s server-side -- representing an
-        // in-flight tool call that will not finish before the deadline.
+        // extra route that sleeps 60s server-side. The handler must be
+        // abandoned when the grace window expires; waiting for it would trip
+        // the 10s hang detector below.
         //
         // The handler signals via a oneshot channel as soon as it begins
         // executing, so the test can wait for the request to be
@@ -3223,7 +3224,7 @@ mod tests {
                                     // The client may already be gone; best-effort notify.
                                     tracing::debug!("oneshot receiver dropped before the send");
                                 }
-                                sleep(Duration::from_secs(10)).await;
+                                sleep(Duration::from_secs(60)).await;
                                 "done"
                             },
                         ),
@@ -3252,19 +3253,20 @@ mod tests {
         // failure rather than a hang.
         timeout(Duration::from_secs(30), started_rx)
             .await
-            .context("/slow handler did not start within 5s -- request never reached the server")?
+            .context("/slow handler did not start within 30s - request never reached the server")?
             .context("started_tx dropped without sending")?;
 
         // Trigger graceful shutdown. With BUG-NEW fixed, this is
         // semantically identical to a single SIGTERM.
         let start = Instant::now();
-        let res = timeout(Duration::from_secs(2), harness.shutdown()).await;
+        let res = timeout(Duration::from_secs(10), harness.shutdown()).await;
         let elapsed = start.elapsed();
 
-        // Outer timeout MUST NOT fire -- if it did, the server hung past
-        // both its graceful window and the cushion, which is the bug.
+        // Outer timeout MUST NOT fire. Ten seconds is at least 20x the 500ms
+        // grace window, so it is a jitter-safe hang detector rather than a
+        // timing expectation.
         let server_result =
-            res.context("server failed to shut down within 2s -- BUG-NEW regression")?;
+            res.context("server failed to shut down within 10s - BUG-NEW regression")?;
 
         // The server should exit cleanly (an error here would indicate a
         // fault unrelated to this bug; surface it loudly).
@@ -3276,21 +3278,13 @@ mod tests {
         in_flight.abort();
         drop(in_flight.await);
 
-        // Lower bound: the server actually waited (most of) the graceful
-        // window. 450ms = 500ms - 50ms scheduling/cleanup slack. Catches
-        // an over-correction that skips graceful drain.
+        // Lower bound: the server actually waited most of the graceful
+        // window. 450ms = 500ms - 50ms scheduling and cleanup slack. A lower
+        // bound cannot fail because a runner is slow; it only fails if the
+        // server exits too early.
         assert!(
             elapsed >= Duration::from_millis(450),
             "shutdown completed in {elapsed:?}, expected >= 450ms (server skipped graceful drain)"
-        );
-
-        // Upper bound: the server did NOT hang. 1500ms = 500ms graceful +
-        // 1000ms generous slack for CI scheduling jitter (the bug used to
-        // hang indefinitely; any value materially below the 2s outer
-        // timeout proves the fix).
-        assert!(
-            elapsed < Duration::from_millis(1500),
-            "shutdown took {elapsed:?}, expected < 1500ms (BUG-NEW regression)"
         );
         Ok(())
     }

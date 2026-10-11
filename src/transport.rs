@@ -10209,8 +10209,8 @@ mod tests {
             .uri("/mcp")
             .header(header::ORIGIN, "http://good.example")
             .header(header::CONTENT_TYPE, "application/json")
-            .header(header::CONTENT_LENGTH, (1024 * 1024 + 1).to_string())
-            .body(Body::from("x".repeat(1024 * 1024 + 1)))?;
+            .header(header::CONTENT_LENGTH, (1024_usize * 1024 + 1).to_string())
+            .body(Body::from("x".repeat(1024_usize * 1024 + 1)))?;
         let resp = app.oneshot(req).await?;
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
         assert_owasp_headers(&resp, "body-limit-413");
