@@ -429,25 +429,25 @@ graph TD
 
 | Area                              | Module / file                           | Notable symbols (file:line)                                                  |
 |-----------------------------------|------------------------------------------|-------------------------------------------------------------------------------|
-| Server entry (HTTP)               | `src/transport.rs`                       | `serve` L3025, `McpServerConfig` L493-, `ReloadHandle` ~L2014              |
-| Server entry (stdio, no auth)     | `src/transport.rs`                       | `serve_stdio` L5515                                                          |
-| Router builder + middleware wire  | `src/transport.rs`                       | `build_app_router` L2342; security headers, peer-addr normalization, request logging, and origin checks are wired there |
+| Server entry (HTTP)               | `src/transport.rs`                       | `serve` L3013, `McpServerConfig` L481, `ReloadHandle` ~L2011              |
+| Server entry (stdio, no auth)     | `src/transport.rs`                       | `serve_stdio` L5504                                                          |
+| Router builder + middleware wire  | `src/transport.rs`                       | `build_app_router` L2330; security headers, peer-addr normalization, request logging, and origin checks are wired there |
 | TLS / mTLS acceptor               | `src/transport.rs`                       | `TlsListener` L3656                                                          |
 | Origin / security headers (defs)  | `src/transport.rs`                       | `origin_check_middleware` L5159, `security_headers_middleware` ~L4372       |
-| Graceful shutdown                 | `src/transport.rs`                       | `shutdown_signal` L4205                                                      |
+| Graceful shutdown                 | `src/transport.rs`                       | `shutdown_signal` L4190                                                      |
 | API key + mTLS auth               | `src/auth.rs`                            | `AuthIdentity` L76, `AuthState` ~L1660, `auth_middleware` L2594              |
-| RBAC engine                       | `src/rbac.rs`                            | `RbacPolicy` L709, task-locals L158-220, `rbac_middleware` L1354           |
-| Memory-bounded keyed limiter      | `src/bounded_limiter.rs`                 | `BoundedKeyedLimiter` L134                                                    |
+| RBAC engine                       | `src/rbac.rs`                            | `RbacPolicy` L709, `current_role` L158, `current_identity` L180, `current_token` L202, `current_sub` L220, `rbac_middleware` L1354           |
+| Memory-bounded keyed limiter      | `src/bounded_limiter.rs`                 | `BoundedKeyedLimiter` L158                                                    |
 | Trusted-forwarder resolution      | `src/forwarded.rs`                       | `resolve_client_ip`, `FallbackReason` (rightmost-untrusted, fail-safe-to-direct) |
-| OAuth JWT / JWKS                  | `src/oauth.rs` (feature `oauth`)         | `JwksCache` L2744, `JWKS_REFRESH_COOLDOWN` ~L2928, `select_jwks_key` L3576 |
+| OAuth JWT / JWKS                  | `src/oauth.rs` (feature `oauth`)         | `JwksCache` L2744, `JWKS_REFRESH_COOLDOWN` ~L2928, `select_jwks_key` L3584 |
 | SSRF guard (outbound HTTP)        | `src/ssrf.rs`                            | per-hop scheme/userinfo/IP-literal blocks                                     |
-| mTLS revocation (CRL)             | `src/mtls_revocation.rs`                 | `CrlSet` L100, `DynamicClientCertVerifier` L771, `bootstrap_fetch` L935       |
-| Tool hooks / size cap             | `src/tool_hooks.rs`                      | `HookedHandler` L219                                                          |
-| Admin diagnostics                 | `src/admin.rs`                           | `require_admin_role` L133, `admin_router` L160                                |
-| Tracing / audit log               | `src/observability.rs`                   | `init_tracing_from_config` L39, audit sink L170                              |
-| Prometheus metrics                | `src/metrics.rs` (feature `metrics`)     | `McpMetrics` L26, `serve_metrics` L95                                         |
+| mTLS revocation (CRL)             | `src/mtls_revocation.rs`                 | `CrlSet` L322, `DynamicClientCertVerifier` L1620, `bootstrap_fetch` L1964       |
+| Tool hooks / size cap             | `src/tool_hooks.rs`                      | `HookedHandler` L335                                                          |
+| Admin diagnostics                 | `src/admin.rs`                           | `require_admin_role` L182, `admin_router` L209                                |
+| Tracing / audit log               | `src/observability.rs`                   | `init_tracing_from_config` L96, `AuditWorkerGuard` L378                              |
+| Prometheus metrics                | `src/metrics.rs` (feature `metrics`)     | `McpMetrics` L49, `serve_metrics` L189                                         |
 | Configuration (TOML)              | `src/config.rs` + `src/transport.rs`     | TOML schema + `McpServerConfig`                                               |
-| Error → HTTP mapping              | `src/error.rs`                           | `RmcpServerKitError` L13, `IntoResponse` L56                                           |
+| Error → HTTP mapping              | `src/error.rs`                           | `RmcpServerKitError` L46, `IntoResponse` L170                                           |
 | Integration reference             | `tests/integration/e2e.rs`               | `spawn_server` L499                                                           |
 | Runnable examples                 | `examples/`                              | `minimal_server.rs`, `api_key_rbac.rs`, `oauth_server.rs`                    |
 

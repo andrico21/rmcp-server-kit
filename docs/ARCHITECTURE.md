@@ -310,7 +310,7 @@ Startup-only.
 
 ### Construction
 `AuthState` is built inside `build_app_router()` at `src/transport.rs:2330`. It contains:
-- `api_keys` hot-swap vector (`src/auth.rs:1660`)
+- `AuthState::api_keys` hot-swap vector (`src/auth.rs:1662`)
 - mTLS identities: stored **per-connection** on the
   `TlsConnInfo` extension (`src/auth.rs:1373`), read by `auth_middleware` (`src/auth.rs:2594`).
   No shared `SocketAddr`-keyed map exists - the previous design was replaced
@@ -329,7 +329,7 @@ Startup-only.
   entirely** (the TLS handshake already performed expensive crypto with a
   verified peer, so mTLS callers cannot be used to mount a CPU-spray
   attack).
-- `jwks_cache` (`src/auth.rs:1681`) when `feature=oauth` is on and `oauth.issuer` is configured
+- `AuthState::jwks_cache` (`src/auth.rs:1683`) when `feature=oauth` is on and `oauth.issuer` is configured
 
 ### API key flow
 1. Client sends `Authorization: Bearer <api-key>`.
@@ -391,7 +391,7 @@ ArgumentAllowlist {                       // `ArgumentAllowlist` src/rbac.rs:435
 ```
 
 ### Decision function
-- `check` - pure allow/deny (`src/rbac.rs:869`)
+- `RbacPolicy::check` method - pure allow/deny on `RbacPolicy` (`src/rbac.rs:723-869`)
 - `RbacPolicy::argument_allowed(role, tool, argument, value)` - JSON value match (`argument_allowed`, `src/rbac.rs:954`)
 - `RbacPolicy::redact_arg(value)` - HMAC-SHA256 of an argument value with
 the policy's salt, returning an 8-char hex prefix (`redact_with_salt`, `src/rbac.rs:1244`).
@@ -428,7 +428,7 @@ making preimage recovery infeasible. See
 `redact_with_salt` (`src/rbac.rs:1244`).
 
 ### Task-locals
-`tokio::task_local!` block at `src/rbac.rs:117` defines four task-locals:
+`tokio::task_local!` block near `current_role` (`src/rbac.rs:158`) defines four task-locals:
 - `CURRENT_ROLE: String`
 - `CURRENT_IDENTITY: String`
 - `CURRENT_TOKEN: SecretString`
@@ -457,8 +457,7 @@ replacement for `TcpListener`.
 Lifecycle (concurrent-acceptor design, since the 1.8.1 review fixes):
 1. `TlsListener::new(...)` reads PEM cert + key, builds a `rustls::ServerConfig`,
    optionally wraps with mTLS verification using configured root CAs, then
-   spawns a dedicated background acceptor task (`run_tls_acceptor`,
-   `src/transport.rs:3747`) that owns the `TcpListener`.
+   spawns `run_tls_acceptor` (`src/transport.rs:3747`) as the dedicated background acceptor task that owns the listener.
 2. The acceptor task loops: acquires a permit from a semaphore sized by
    `max_concurrent_tls_handshakes` (default 256 via
    `DEFAULT_MAX_CONCURRENT_TLS_HANDSHAKES`; configurable since 1.9.0 via
@@ -860,8 +859,8 @@ clippy lint enforces this.
 
 Three layers, applied in a fixed order.
 
-**Programmatic** - `McpServerConfig::new(addr, name, version)` builder
-(`src/transport.rs:989`). Holds everything `serve()` needs, including the
+**Programmatic** - `McpServerConfig` (`src/transport.rs:481`) config,
+constructed by `McpServerConfig::new(addr, name, version)` near line 989. It holds everything the server needs, including the
 runtime-only fields TOML cannot express: `rbac`, `readiness_check`,
 `extra_router`, `on_reload_ready`, and the metrics listener. Deliberately does
 **not** derive `Deserialize` - it carries callbacks and an `axum::Router`, and
@@ -872,7 +871,7 @@ retiring.
 
 - `ServerConfig` - `src/config.rs:373`
 - `ObservabilityConfig` - `src/config.rs:1364`
-- `SecurityHeadersConfig` - `src/transport.rs:291`
+- `SecurityHeadersConfig` - `src/transport.rs:292`
 - `AuthConfig`, `MtlsConfig`, `RateLimitConfig` - `src/auth.rs`
 - `RbacConfig` - `src/rbac.rs`
 - `OAuthConfig` - `src/oauth.rs`

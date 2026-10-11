@@ -40,7 +40,7 @@ shutdown.
 ## 2. Repository map (top 2-3 levels)
 
 ```
-Z:\TempPersistent\rmcp-server-kit\
+rmcp-server-kit/
 ├── src/                      Library source (THE crate)
 │   ├── lib.rs                  Crate root - re-exports public modules
 │   ├── transport.rs            ★ Server entry: serve(), serve_stdio(), TLS, router, middleware wiring
@@ -140,9 +140,9 @@ Z:\TempPersistent\rmcp-server-kit\
 
 ## 4. Build / test / run cheat sheet
 
-> All commands assume cwd = `Z:\TempPersistent\rmcp-server-kit`.
-> Prefer the `rtk` wrapper (`Z:\TempPersistent\rtk.exe`) for token-efficient
-> output in agent contexts - e.g. `Z:\TempPersistent\rtk.exe cargo build`.
+> All commands assume the repository root as the working directory.
+> Prefer the `rtk` wrapper when it is installed for token-efficient
+> output in agent contexts - for example `rtk cargo build`.
 
 | Goal                             | Command                                                              |
 |----------------------------------|----------------------------------------------------------------------|
@@ -220,10 +220,10 @@ consumer applications and `examples/`.
 | Entry                                    | File                                                                  | Notes                                                                                                  |
 |------------------------------------------|----------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------|
 | Crate root / public API                  | [`src/lib.rs`](src/lib.rs)                                            | Re-exports all public modules                                                                          |
-| **Server entry (HTTP)**                  | [`src/transport.rs`](src/transport.rs) - `serve()` (~line 3025)        | The function consumers call. Wires rmcp + axum + middleware + TLS + admin + metrics                    |
-| Server entry (stdio)                     | [`src/transport.rs`](src/transport.rs) - `serve_stdio()` (~line 5515) | For desktop/IDE clients. **Bypasses auth/RBAC/TLS** - use only for local subprocess MCP                |
-| Config builder                           | [`src/transport.rs`](src/transport.rs) - `McpServerConfig::new` (`src/transport.rs:989`) | Builder-style config struct                                                                       |
-| Hot-reload handle                        | [`src/transport.rs`](src/transport.rs) - `ReloadHandle` (~line 2014)   | `try_reload_auth_keys` / `reload_auth_keys` / `reload_rbac` for runtime reconfig without restart      |
+| **Server entry (HTTP)**                  | [`src/transport.rs`](src/transport.rs) - `serve()` (~line 3013)        | The function consumers call. Wires rmcp + axum + middleware + TLS + admin + metrics                    |
+| Server entry (stdio)                     | [`src/transport.rs`](src/transport.rs) - `serve_stdio()` (~line 5504) | For desktop/IDE clients. **Bypasses auth/RBAC/TLS** - use only for local subprocess MCP                |
+| Config builder                           | [`src/transport.rs`](src/transport.rs) - `McpServerConfig::new` (`src/transport.rs:481`) | Builder-style config struct; constructor `new` is near line 989                                                                       |
+| Hot-reload handle                        | [`src/transport.rs`](src/transport.rs) - `ReloadHandle` (~line 2011)   | `try_reload_auth_keys` / `reload_auth_keys` / `reload_rbac` for runtime reconfig without restart      |
 | Runnable example                         | [`examples/minimal_server.rs`](examples/minimal_server.rs)            | Smallest possible consumer of `serve()`                                                                |
 | Integration reference                    | [`tests/integration/e2e.rs`](tests/integration/e2e.rs)                | Real-world usage patterns; use as an integration cookbook                                              |
 
@@ -378,7 +378,7 @@ The core's current-Rust idioms (for example `Vec::push_mut` /
 | Error type → HTTP status mapping               | `src/error.rs` - `RmcpServerKitError::into_response`           |
 | Origin / security headers / CORS               | `src/transport.rs` - `origin_check_middleware`, `security_headers_middleware` |
 | Graceful shutdown (Ctrl-C / SIGTERM)           | `src/transport.rs` - `shutdown_signal()` (`src/transport.rs:4190`) |
-| Hot-reload of keys / RBAC                      | `src/transport.rs` - `ReloadHandle` (~line 2014)       |
+| Hot-reload of keys / RBAC                      | `src/transport.rs` - `ReloadHandle` (~line 2011)       |
 | Environment variable override mapping          | `src/config.rs` - `ServerConfig::apply_env_overrides`, `ObservabilityConfig::apply_env_overrides`; `src/rbac.rs` - `RbacConfig::apply_env_overrides` |
 | `rmcp` / `rmcp-macros` version bump in `Cargo.toml` / `Cargo.lock` | `docs/RMCP_UPGRADE_CHECKLIST.md` - the checks to run; `tests/integration/delegation_guard.rs` - the trait-surface guard |
 | Lint gates (catalog / allow / profile-equality / prose) | `scripts/lint-ratchet/{catalog_gate,allow_gate,profile_eq,prose_gates,dash_gate}.py`; shared helpers in `scripts/lint-ratchet/common.py` |

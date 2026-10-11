@@ -56,7 +56,12 @@ mod tests {
     extern crate alloc;
 
     use alloc::collections::BTreeMap;
-    use std::{fs, path::PathBuf};
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use std::{
+        env, fs,
+        path::{Path, PathBuf},
+        process,
+    };
 
     use anyhow::Context as _;
     use rmcp_server_kit::{
@@ -76,7 +81,7 @@ mod tests {
     /// Identifier-like tokens that are too generic to anchor anything.
     const ANCHOR_STOPLIST: &[&str] = &[
         "src", "the", "and", "for", "rs", "line", "str", "Vec", "Arc", "Some", "None", "Option",
-        "String", "true", "false", "usize", "bool", "new", "call", "run",
+        "String", "true", "false", "usize", "bool", "new", "check", "call", "run",
     ];
 
     #[derive(Debug, Clone)]
@@ -112,6 +117,39 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
     }
 
+    struct FixtureRoot {
+        path: PathBuf,
+    }
+
+    impl FixtureRoot {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for FixtureRoot {
+        fn drop(&mut self) {
+            drop(fs::remove_dir_all(&self.path));
+        }
+    }
+
+    fn fixture_root_with_source(source: &str) -> anyhow::Result<FixtureRoot> {
+        let path = env::temp_dir().join(format!(
+            "rmcp-server-kit-docs-citation-{}-{}",
+            process::id(),
+            unique_fixture_id()
+        ));
+        let src = path.join("src");
+        fs::create_dir_all(&src).context("create src fixture directory")?;
+        fs::write(src.join("lib.rs"), source).context("write src/lib.rs fixture")?;
+        Ok(FixtureRoot { path })
+    }
+
+    fn unique_fixture_id() -> u64 {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    }
+
     /// Leading `[A-Za-z_][A-Za-z0-9_]*` run after skipping any non-identifier
     /// prefix characters (`&`, `[`, `*`, spaces, ...).
     fn leading_identifier(input: &str) -> Option<&str> {
@@ -140,35 +178,38 @@ mod tests {
         candidate != stem
     }
 
-    /// Extract anchor candidates from a doc line: the leading identifier of
-    /// every backticked segment (plus, for `path::to::item` forms, the final
-    /// segment), and every `(identifier)` group.
+    /// Extract anchor candidates from a doc line: every useful identifier in
+    /// backticked segments, qualified final segments such as `Type::method`,
+    /// and every `(identifier)` group.
     fn extract_anchors(line: &str, file: &str) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
-        let mut push = |candidate: &str| {
-            if keep_anchor(candidate, file) && !out.iter().any(|anchor| anchor == candidate) {
+        let mut push = |candidate: &str, precise: bool| {
+            let kept = if precise {
+                candidate.len() >= MIN_ANCHOR_LEN
+            } else {
+                keep_anchor(candidate, file)
+            };
+            if kept && !out.iter().any(|anchor| anchor == candidate) {
                 out.push(candidate.to_owned());
             }
         };
 
-        // Backticked segments: odd-indexed pieces of a split on '`'.
         for segment in line.split('`').skip(1).step_by(2) {
             if let Some(ident) = leading_identifier(segment) {
-                push(ident);
+                push(ident, false);
             }
-            // `transport::healthz` / `RbacPolicy::check(...)`: the segment
-            // after the last `::` (up to any argument list) is usually the
-            // most specific anchor.
             let head = segment.split('(').next().unwrap_or(segment);
             if let Some(last) = head.rsplit("::").next()
                 && last != head
                 && let Some(ident) = leading_identifier(last)
             {
-                push(ident);
+                push(ident, true);
+            }
+            for ident in identifiers(segment) {
+                push(ident, false);
             }
         }
 
-        // Parenthesized single identifiers: "(build_app_router)".
         let mut tail = line;
         while let Some(open) = tail.find('(') {
             let inner = tail
@@ -183,11 +224,28 @@ mod tests {
                 && inner.get(len..).is_some_and(|rest| rest.starts_with(')'))
                 && let Some(ident) = inner.get(..len)
             {
-                push(ident);
+                push(ident, false);
             }
             tail = inner;
         }
 
+        out
+    }
+
+    fn identifiers(input: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut tail = input;
+        while let Some(start) = tail.find(|ch: char| ch.is_ascii_alphabetic() || ch == '_') {
+            let ident_tail = tail.get(start..).unwrap_or("");
+            let len = ident_tail
+                .bytes()
+                .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                .count();
+            if let Some(ident) = ident_tail.get(..len) {
+                out.push(ident);
+            }
+            tail = ident_tail.get(len..).unwrap_or("");
+        }
         out
     }
 
@@ -285,6 +343,46 @@ mod tests {
         None
     }
 
+    fn parse_line_pairs(line: &str) -> Vec<(String, usize)> {
+        let mut out = Vec::new();
+        let bytes = line.as_bytes();
+        for (idx, _) in line.match_indices('L') {
+            if idx
+                .checked_sub(1)
+                .and_then(|prev| bytes.get(prev))
+                .is_some_and(u8::is_ascii_alphabetic)
+            {
+                continue;
+            }
+            let digits = idx
+                .checked_add(1)
+                .and_then(|next| line.get(next..))
+                .unwrap_or("");
+            let digit_len = digits.bytes().take_while(u8::is_ascii_digit).count();
+            if digit_len == 0 {
+                continue;
+            }
+            let Some(line_no) = digits.get(..digit_len).and_then(|value| value.parse().ok()) else {
+                continue;
+            };
+            let before = line.get(..idx).unwrap_or("").trim_end();
+            let raw_symbol = before.strip_suffix('`').map_or_else(
+                || {
+                    before
+                        .rsplit(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == ':'))
+                        .next()
+                        .unwrap_or("")
+                },
+                |stripped| stripped.rsplit('`').next().unwrap_or(""),
+            );
+            let anchor_symbol = raw_symbol.rsplit("::").next().unwrap_or(raw_symbol);
+            if anchor_symbol.len() >= MIN_ANCHOR_LEN {
+                out.push((anchor_symbol.to_owned(), line_no));
+            }
+        }
+        out
+    }
+
     fn parse_citations(doc: &str) -> Vec<Citation> {
         let mut out = Vec::new();
         for (doc_idx, line) in doc.lines().enumerate() {
@@ -315,7 +413,7 @@ mod tests {
             }
 
             // Pair a bare path with a `~line N` / `~LN` locator on the same line.
-            if let Some(file) = bare_file
+            if let Some(file) = bare_file.clone()
                 && let Some(found) = parse_tilde_line(line)
             {
                 out.push(Citation {
@@ -325,6 +423,18 @@ mod tests {
                     end: found,
                     doc_line: doc_line_no,
                 });
+            }
+
+            if let Some(file) = bare_file {
+                for (anchor, found) in parse_line_pairs(line) {
+                    out.push(Citation {
+                        anchors: vec![anchor],
+                        file: file.clone(),
+                        start: found,
+                        end: found,
+                        doc_line: doc_line_no,
+                    });
+                }
             }
         }
         out
@@ -350,8 +460,7 @@ mod tests {
         failures
     }
 
-    fn check_doc(doc_name: &str, doc: &str) -> (usize, Vec<String>) {
-        let root = workspace_root();
+    fn check_doc_at(root: &Path, doc_name: &str, doc: &str) -> (usize, Vec<String>) {
         let citations = parse_citations(doc);
 
         let mut file_lines: BTreeMap<String, Option<Vec<String>>> = BTreeMap::new();
@@ -423,27 +532,100 @@ mod tests {
         (citations.len(), failures)
     }
 
-    /// True when `anchor` occurs in `window` as a standalone identifier: the
-    /// characters immediately surrounding the match (when present) must not
-    /// be identifier characters. Plain substring matching let generic
-    /// anchors like `serve` match inside `server` / `observed`, silently
-    /// masking stale citations.
+    fn check_doc(doc_name: &str, doc: &str) -> (usize, Vec<String>) {
+        let root = workspace_root();
+        check_doc_at(&root, doc_name, doc)
+    }
+
+    /// True when `anchor` is declared by a definition-like line in `window`.
     fn window_has_anchor(window: &str, anchor: &str) -> bool {
-        const fn is_ident(byte: u8) -> bool {
-            byte.is_ascii_alphanumeric() || byte == b'_'
+        window
+            .lines()
+            .any(|line| is_definition_like_line(line, anchor))
+    }
+
+    fn is_definition_like_line(line: &str, anchor: &str) -> bool {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") {
+            return false;
         }
-        let bytes = window.as_bytes();
-        window.match_indices(anchor).any(|(pos, _)| {
-            let before_ok = pos
-                .checked_sub(1)
-                .is_none_or(|index| !bytes.get(index).copied().is_some_and(is_ident));
-            let after_ok = !bytes
-                .get(pos..)
-                .and_then(|rest| rest.get(anchor.len()))
-                .copied()
-                .is_some_and(is_ident);
-            before_ok && after_ok
-        })
+        let head = trimmed
+            .split_once("//")
+            .map_or(trimmed, |(before, _)| before)
+            .trim();
+        let code = strip_definition_prefix(head);
+        if starts_named_definition(code, anchor) || starts_named_field(code, anchor) {
+            return true;
+        }
+        if let Some(impl_head) = code
+            .strip_prefix("impl")
+            .or_else(|| code.strip_prefix("unsafe impl"))
+            .and_then(|rest| rest.split(['{', ';']).next())
+        {
+            return contains_ident(impl_head, anchor);
+        }
+        false
+    }
+
+    fn strip_definition_prefix(mut code: &str) -> &str {
+        loop {
+            let trimmed = code.trim_start();
+            if let Some(rest) = strip_visibility(trimmed) {
+                code = rest;
+            } else if let Some(rest) = trimmed.strip_prefix("async ") {
+                code = rest;
+            } else if let Some(rest) = trimmed.strip_prefix("unsafe ") {
+                code = rest;
+            } else if let Some(rest) = trimmed.strip_prefix("const ") {
+                code = rest;
+            } else if let Some(rest) = trimmed.strip_prefix("extern ") {
+                code = rest.trim_start_matches('"');
+                if let Some((_, tail)) = code.split_once('"') {
+                    code = tail;
+                }
+            } else {
+                return trimmed;
+            }
+        }
+    }
+
+    fn strip_visibility(code: &str) -> Option<&str> {
+        let rest = code.strip_prefix("pub")?;
+        if let Some(scoped) = rest.strip_prefix('(') {
+            let (_, tail) = scoped.split_once(')')?;
+            Some(tail.trim_start())
+        } else if rest.starts_with(char::is_whitespace) {
+            Some(rest.trim_start())
+        } else {
+            None
+        }
+    }
+
+    fn starts_named_definition(code: &str, anchor: &str) -> bool {
+        for keyword in [
+            "fn", "struct", "enum", "union", "trait", "type", "mod", "static", "const",
+        ] {
+            if let Some(rest) = code.strip_prefix(keyword)
+                && rest.starts_with(char::is_whitespace)
+            {
+                return leading_identifier(rest).is_some_and(|ident| ident == anchor);
+            }
+        }
+        if let Some(rest) = code.strip_prefix("macro_rules!") {
+            return leading_identifier(rest).is_some_and(|ident| ident == anchor);
+        }
+        false
+    }
+
+    fn starts_named_field(code: &str, anchor: &str) -> bool {
+        let field_code = strip_visibility(code).unwrap_or(code).trim_start();
+        field_code
+            .strip_prefix(anchor)
+            .is_some_and(|rest| rest.trim_start().starts_with(':'))
+    }
+
+    fn contains_ident(input: &str, anchor: &str) -> bool {
+        identifiers(input).into_iter().any(|ident| ident == anchor)
     }
 
     fn fmt_range(citation: &Citation) -> String {
@@ -691,13 +873,13 @@ mod tests {
     /// Pins that anchor matching only accepts whole identifier tokens.
     fn anchor_matching_requires_identifier_boundaries() -> anyhow::Result<()> {
         assert!(window_has_anchor("pub async fn serve<H, F>(", "serve"));
-        assert!(window_has_anchor("calls serve() here", "serve"));
+        assert!(!window_has_anchor("calls serve() here", "serve"));
         assert!(
             !window_has_anchor("the server observed traffic", "serve"),
             "substring inside larger identifiers must not match"
         );
         assert!(!window_has_anchor("preserved", "serve"));
-        assert!(window_has_anchor("get(healthz)", "healthz"));
+        assert!(window_has_anchor("pub(crate) struct healthz;", "healthz"));
         assert!(!window_has_anchor("healthz_returns_ok", "healthz"));
         Ok(())
     }
@@ -728,14 +910,13 @@ mod tests {
         Ok(())
     }
 
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "deliberate: tests/integration/docs_citations.rs::unanchored_citation_is_rejected keeps the uniform test signature while it only asserts"
-    )]
     #[test]
     /// Pins that a citation without a symbol anchor is rejected.
     fn unanchored_citation_is_rejected() -> anyhow::Result<()> {
         let (_total, failures) = check_doc("fixture.md", "See src/lib.rs:1 for details.");
+        let _first_failure = failures
+            .first()
+            .context("unanchored citation should fail")?;
         assert!(
             failures
                 .iter()
@@ -745,14 +926,11 @@ mod tests {
         Ok(())
     }
 
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "deliberate: tests/integration/docs_citations.rs::generic_anchor_is_rejected keeps the uniform test signature while it only asserts"
-    )]
     #[test]
     /// Pins that generic anchors such as `new` do not satisfy citations.
     fn generic_anchor_is_rejected() -> anyhow::Result<()> {
         let (_total, failures) = check_doc("fixture.md", "`new` is near src/lib.rs:1.");
+        let _first_failure = failures.first().context("generic anchor should fail")?;
         assert!(
             failures
                 .iter()
@@ -762,14 +940,88 @@ mod tests {
         Ok(())
     }
 
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "deliberate: tests/integration/docs_citations.rs::prose_line_range_is_rejected keeps the uniform test signature while it only asserts"
-    )]
+    /// Pins that a qualified `Type::new` citation can use a nearby `fn new`.
+    #[test]
+    fn qualified_new_anchor_passes_when_method_definition_is_nearby() -> anyhow::Result<()> {
+        let root = fixture_root_with_source(
+            "pub struct Demo;\nimpl Demo {\n    pub fn new() -> Self { Self }\n}\n",
+        )?;
+        let (_total, failures) = check_doc_at(
+            root.path(),
+            "fixture.md",
+            "`Demo::new` is defined at src/lib.rs:3.",
+        );
+        assert!(
+            failures.is_empty(),
+            "qualified new citation should pass: {failures:?}"
+        );
+        Ok(())
+    }
+
+    /// Pins that a call site or comment cannot anchor a stale citation.
+    #[test]
+    fn call_site_or_comment_anchor_inside_window_is_rejected() -> anyhow::Result<()> {
+        let mut source = String::from("pub fn serve() {}\n");
+        for _ in 0_u8..20 {
+            source.push_str("// filler\n");
+        }
+        source
+            .push_str("// serve appears here but is not a definition\nfn caller() { serve(); }\n");
+        let root = fixture_root_with_source(&source)?;
+        let (_total, failures) = check_doc_at(
+            root.path(),
+            "fixture.md",
+            "`serve` entry is at src/lib.rs:23.",
+        );
+        assert!(
+            failures
+                .iter()
+                .any(|failure| failure.contains("none of the anchor symbols")),
+            "call-site-only anchor must fail: {failures:?}"
+        );
+        Ok(())
+    }
+
+    /// Pins that a nearby definition-like line anchors the citation.
+    #[test]
+    fn definition_inside_window_is_accepted() -> anyhow::Result<()> {
+        let root = fixture_root_with_source("// leading\npub async fn serve() {}\n")?;
+        let (_total, failures) =
+            check_doc_at(root.path(), "fixture.md", "`serve` is at src/lib.rs:2.");
+        assert!(
+            failures.is_empty(),
+            "nearby definition should pass: {failures:?}"
+        );
+        Ok(())
+    }
+
+    /// Pins that MINDMAP-style symbol `L<n>` pairs are parsed and checked.
+    #[test]
+    fn l_pair_citation_is_checked() -> anyhow::Result<()> {
+        let root = fixture_root_with_source("pub fn serve() {}\n// filler\n")?;
+        let (_ok_total, ok_failures) =
+            check_doc_at(root.path(), "fixture.md", "| src/lib.rs | serve L1 |\n");
+        assert!(
+            ok_failures.is_empty(),
+            "exact L-pair should pass: {ok_failures:?}"
+        );
+
+        let (_bad_total, bad_failures) =
+            check_doc_at(root.path(), "fixture.md", "| src/lib.rs | serve L20 |\n");
+        assert!(
+            bad_failures
+                .iter()
+                .any(|failure| failure.contains("file only has")),
+            "stale L-pair must fail: {bad_failures:?}"
+        );
+        Ok(())
+    }
+
     #[test]
     /// Pins that prose `src/*.rs` line ranges must use a parseable citation.
     fn prose_line_range_is_rejected() -> anyhow::Result<()> {
         let (_total, failures) = check_doc("fixture.md", "See src/lib.rs lines 1-3 for details.");
+        let _first_failure = failures.first().context("prose range should fail")?;
         assert!(
             failures
                 .iter()
