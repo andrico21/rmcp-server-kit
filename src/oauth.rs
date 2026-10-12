@@ -7219,6 +7219,81 @@ role = "admin"
         Ok(())
     }
 
+    /// Pins that a panicked JWKS refresh leaves the cache able to refresh again.
+    ///
+    /// The completion guard clears the in-flight generation, so once the
+    /// cooldown has expired the next unknown-kid validation starts a new
+    /// refresh and succeeds.
+    #[tokio::test]
+    async fn panicked_refresh_recovers_once_the_cooldown_expires() -> anyhow::Result<()> {
+        let kid = "asy01-recover";
+        let (pem, jwks) = generate_test_keypair(kid)?;
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(matchers::method("GET"))
+            .and(matchers::path("/jwks.json"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&jwks))
+            .mount(&mock_server)
+            .await;
+        let cache = test_cache(&test_config(&format!("{}/jwks.json", mock_server.uri())))?;
+        cache.__test_force_next_refresh_panic();
+        let token = mint_token(
+            &pem,
+            kid,
+            "https://auth.test.local",
+            "https://mcp.test.local/mcp",
+            "asy01-recover",
+            "mcp:read",
+        )?;
+
+        assert!(
+            timeout(Duration::from_secs(2), cache.validate_token(&token))
+                .await
+                .context("the panicked refresh must release its waiter")?
+                .is_none(),
+            "a panicked refresh must fail the first validation closed"
+        );
+        assert_eq!(cache.__test_refresh_completion_count(), 1);
+        assert_eq!(recorded_request_count(&mock_server).await?, 0);
+
+        assert!(
+            timeout(Duration::from_secs(2), cache.validate_token(&token))
+                .await
+                .context("a cooldown-skipped validation must still return promptly")?
+                .is_none(),
+            "a second validation inside the cooldown must still fail closed"
+        );
+        assert_eq!(cache.__test_refresh_completion_count(), 1);
+        assert_eq!(recorded_request_count(&mock_server).await?, 0);
+
+        let expired = Instant::now()
+            .checked_sub(JWKS_REFRESH_COOLDOWN.saturating_add(Duration::from_secs(1)))
+            .context("the monotonic clock must allow backdating past the cooldown")?;
+        {
+            let mut state = cache
+                .shared
+                .refresh_state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            assert_eq!(
+                state.in_flight, None,
+                "the panicked generation must be cleared from in_flight"
+            );
+            state.last_refresh_attempt = Some(expired);
+        }
+
+        assert!(
+            timeout(Duration::from_secs(5), cache.validate_token(&token))
+                .await
+                .context("the post-cooldown refresh must release its waiter")?
+                .is_some(),
+            "once the cooldown expires the next validation must succeed"
+        );
+        assert_eq!(cache.__test_refresh_completion_count(), 2);
+        assert_eq!(recorded_request_count(&mock_server).await?, 1);
+
+        Ok(())
+    }
+
     /// Collapses duplicate `kid` entries in the JWKS to a single cached key.
     #[test]
     fn build_key_cache_last_duplicate_kid_wins() -> anyhow::Result<()> {
