@@ -233,6 +233,10 @@ name = "crl_crypto_provider"
 path = "tests/unit/crl_crypto_provider.rs"
 
 [[test]]
+name = "crl_crypto_provider_crl_set"
+path = "tests/unit/crl_crypto_provider_crl_set.rs"
+
+[[test]]
 name = "crl_discovery_ratelimit"
 path = "tests/unit/crl_discovery_ratelimit.rs"
 
