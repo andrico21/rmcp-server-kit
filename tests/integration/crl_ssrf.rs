@@ -5,8 +5,8 @@
 //!
 //! - `extract_cdp_urls` validates schemes, drops malformed URLs, and
 //!   filters HTTP per `crl_allow_http`.
-//! - The reqwest client configuration matches what `CrlSet::new` builds
-//!   (redirect=none, `connect_timeout=3s`) so any deviation is loud.
+//! - The reqwest client redirect policy matches what `build_crl_http_client`
+//!   builds (redirect=none) so any deviation is loud.
 //! - End-to-end behaviors against `wiremock`:
 //!   - Successful CRL fetch through the full pipeline.
 //!   - Body cap rejects oversized responses.
@@ -108,9 +108,11 @@ mod tests {
         Ok(der.as_ref().to_vec())
     }
 
-    /// Construct the same `reqwest::Client` shape that `CrlSet::new` builds.
-    /// Kept here (not imported) so any production-side regression that loosens
-    /// the policy is caught by these tests failing.
+    /// Construct a `reqwest::Client` with `build_crl_http_client`'s redirect
+    /// policy.
+    ///
+    /// Kept here (not imported) so any production-side regression that
+    /// loosens the policy is caught by these tests failing.
     fn build_hardened_client() -> anyhow::Result<reqwest::Client> {
         // reqwest is built with rustls-no-provider; install ring for tests.
         drop(ring::default_provider().install_default());

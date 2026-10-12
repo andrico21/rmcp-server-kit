@@ -31,8 +31,10 @@
 //! The defences are the scheme and userinfo check in `check_scheme`,
 //! resolved-address screening before connecting through `ip_block_reason`
 //! applied by `reject_blocked_crl_ip` in `fetch_crl`, re-screening at connect
-//! time through `SsrfScreeningResolver` to catch DNS rebinding, no redirects,
-//! discovery only for certificates on the verified path, and the
+//! time through `SsrfScreeningResolver` to catch DNS rebinding (a URL whose
+//! exact origin is not trusted always uses a client that admits no blocked
+//! address, so a trusted hostname is trusted only on its trusted origin), no
+//! redirects, discovery only for certificates on the verified path, and the
 //! discovery-rate, concurrency, and body-size caps.
 //!
 //! Plain HTTP is allowed by default (`crl_allow_http = true`): the signature
@@ -359,8 +361,8 @@ pub struct CrlSet {
     pub config: MtlsConfig,
     /// Fire-and-forget discovery channel for newly-seen CDP URLs.
     pub discover_tx: mpsc::UnboundedSender<String>,
-    /// CRL fetcher with the SSRF-screening resolver installed.
-    client: Client,
+    /// CRL fetch clients; see [`CrlHttpClients`].
+    clients: CrlHttpClients,
     /// URLs whose CRL is confirmed present in `cache`. Permanent dedup: a URL
     /// here is never re-enqueued for discovery.
     seen_urls: Mutex<HashSet<String>>,
@@ -447,40 +449,8 @@ impl CrlSet {
         trusted_origins: Arc<HashSet<Origin>>,
     ) -> Result<Arc<Self>, RmcpServerKitError> {
         install_crl_crypto_provider();
-        // M-H2: install the SSRF screening resolver on the CRL fetcher.
-        // CRL CDP URLs come from presented client certificates (only those on a
-        // verified path, but chosen by the issuing CA) and
-        // their hosts are re-resolved per fetch - exactly the TOCTOU
-        // class M-H2 closes. The allowlist holds the lowercased hostnames
-        // of the operator-trusted origins (the CDP and AIA URIs named in
-        // the configured certificates); there is no configurable CRL
-        // allowlist.
-        let allowlist = Arc::new(build_trusted_origin_allowlist(&trusted_origins));
-        let resolver: Arc<dyn Resolve> = Arc::new(SsrfScreeningResolver::new(
-            Arc::clone(&allowlist),
-            #[cfg(any(test, feature = "test-helpers"))]
-            Arc::new(AtomicBool::new(false)),
-            #[expect(
-                clippy::cfg_not_test,
-                reason = "deliberate: src/mtls_revocation.rs::SsrfScreeningResolver::new takes a no-op bypass argument when the test-helpers feature is absent; the inverted cfg is intentional"
-            )]
-            #[cfg(not(any(test, feature = "test-helpers")))]
-            (),
-        ));
-
-        let client = Client::builder()
-            // M-H2/N1: see oauth.rs::OauthHttpClient::build for rationale.
-            .no_proxy()
-            .dns_resolver(Arc::clone(&resolver))
-            .timeout(config.crl_fetch_timeout)
-            .connect_timeout(CRL_CONNECT_TIMEOUT)
-            .tcp_keepalive(None)
-            .redirect(Policy::none())
-            .user_agent(format!("rmcp-server-kit/{}", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|error| {
-                RmcpServerKitError::Startup(format!("CRL HTTP client init: {error}"))
-            })?;
+        // M-H2: install exact-origin SSRF screening on the CRL fetch clients.
+        let clients = CrlHttpClients::new(&trusted_origins, config.crl_fetch_timeout)?;
 
         let signature_algorithms = CryptoProvider::get_default()
             .map(|provider| provider.signature_verification_algorithms)
@@ -533,7 +503,7 @@ impl CrlSet {
             roots,
             config,
             discover_tx,
-            client,
+            clients,
             seen_urls: Mutex::new(seen_urls),
             pending_urls: Mutex::new(HashSet::new()),
             global_fetch_sem,
@@ -927,7 +897,7 @@ impl CrlSet {
     // during the fetch cannot promote a URL into the seen_urls dedup set.
     async fn fetch_and_store_url(&self, url: String) -> Result<bool, RmcpServerKitError> {
         let ctx = CrlFetchContext {
-            client: &self.client,
+            clients: &self.clients,
             global_sem: &self.global_fetch_sem,
             host_semaphores: &self.host_semaphores,
             allow_http: self.config.crl_allow_http,
@@ -1550,7 +1520,7 @@ impl CrlSet {
     // `gated_fetch` and leaves only bounded semaphore/map state behind.
     pub async fn __test_trigger_fetch(&self, url: &str) -> Result<(), RmcpServerKitError> {
         let ctx = CrlFetchContext {
-            client: &self.client,
+            clients: &self.clients,
             global_sem: &self.global_fetch_sem,
             host_semaphores: &self.host_semaphores,
             allow_http: self.config.crl_allow_http,
@@ -1644,7 +1614,7 @@ impl CrlSet {
     ) -> Vec<(String, Result<CachedCrl, RmcpServerKitError>)> {
         let mut tasks = JoinSet::new();
         for url in urls {
-            let client = self.client.clone();
+            let clients = self.clients.clone();
             let global_sem = Arc::clone(&self.global_fetch_sem);
             let host_map = Arc::clone(&self.host_semaphores);
             let allow_http = self.config.crl_allow_http;
@@ -1654,7 +1624,7 @@ impl CrlSet {
             let trusted_origins = Arc::clone(&self.trusted_origins);
             let _task = tasks.spawn(async move {
                 let ctx = CrlFetchContext {
-                    client: &client,
+                    clients: &clients,
                     global_sem: &global_sem,
                     host_semaphores: &host_map,
                     allow_http,
@@ -2018,11 +1988,95 @@ fn trusted_hostnames(origins: &HashSet<Origin>) -> Vec<String> {
 /// origins.
 ///
 /// Hostnames only, never CIDR entries: see [`trusted_hostnames`] for why
-/// IP-literal origins are excluded rather than turned into a CIDR. Shared by
-/// [`CrlSet::new`] and [`bootstrap_fetch_with_server_chain`] so both
-/// entry points build the identical allowlist from the same trusted set.
+/// IP-literal origins are excluded rather than turned into a CIDR. Used by
+/// [`CrlHttpClients::new`] for the trusted client.
 fn build_trusted_origin_allowlist(trusted_origins: &HashSet<Origin>) -> CompiledSsrfAllowlist {
     CompiledSsrfAllowlist::new(trusted_hostnames(trusted_origins), Vec::new())
+}
+
+/// CRL fetch clients with SSRF-screening resolvers installed.
+///
+/// Both clients resolve through [`SsrfScreeningResolver`]. `screened` admits no
+/// blocked address. `trusted` also admits the hostnames of the
+/// operator-trusted origins and is used only for a URL whose exact origin is
+/// trusted, so the connect-time screen applies the same origin match as the
+/// pre-flight check instead of trusting a hostname on every port.
+#[derive(Clone, Debug)]
+struct CrlHttpClients {
+    /// Client for URLs whose exact origin is not trusted.
+    screened: Client,
+    /// Client for URLs whose exact origin is trusted.
+    trusted: Client,
+}
+
+impl CrlHttpClients {
+    /// Build the screened and trusted CRL fetch clients.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either HTTP client cannot be built.
+    fn new(
+        trusted_origins: &HashSet<Origin>,
+        fetch_timeout: Duration,
+    ) -> Result<Self, RmcpServerKitError> {
+        Ok(Self {
+            screened: build_crl_http_client(CompiledSsrfAllowlist::default(), fetch_timeout)?,
+            trusted: build_crl_http_client(
+                build_trusted_origin_allowlist(trusted_origins),
+                fetch_timeout,
+            )?,
+        })
+    }
+
+    /// Select the trusted client only when `url`'s exact origin is trusted.
+    fn for_url<'client>(
+        &'client self,
+        url: &Url,
+        trusted_origins: &HashSet<Origin>,
+    ) -> (bool, &'client Client) {
+        let trusted_origin = trusted_origins.contains(&url.origin());
+        let client = if trusted_origin {
+            &self.trusted
+        } else {
+            &self.screened
+        };
+        (trusted_origin, client)
+    }
+}
+
+/// Build one CRL HTTP client using the supplied SSRF allowlist.
+///
+/// # Errors
+///
+/// Returns an error if the `reqwest` client cannot be built.
+fn build_crl_http_client(
+    compiled_allowlist: CompiledSsrfAllowlist,
+    fetch_timeout: Duration,
+) -> Result<Client, RmcpServerKitError> {
+    let allowlist = Arc::new(compiled_allowlist);
+    let resolver: Arc<dyn Resolve> = Arc::new(SsrfScreeningResolver::new(
+        Arc::clone(&allowlist),
+        #[cfg(any(test, feature = "test-helpers"))]
+        Arc::new(AtomicBool::new(false)),
+        #[expect(
+            clippy::cfg_not_test,
+            reason = "deliberate: src/mtls_revocation.rs::SsrfScreeningResolver::new takes a no-op bypass argument when the test-helpers feature is absent; the inverted cfg is intentional"
+        )]
+        #[cfg(not(any(test, feature = "test-helpers")))]
+        (),
+    ));
+
+    Client::builder()
+        // M-H2/N1: see oauth.rs::OauthHttpClient::build for rationale.
+        .no_proxy()
+        .dns_resolver(Arc::clone(&resolver))
+        .timeout(fetch_timeout)
+        .connect_timeout(CRL_CONNECT_TIMEOUT)
+        .tcp_keepalive(None)
+        .redirect(Policy::none())
+        .user_agent(format!("rmcp-server-kit/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|error| RmcpServerKitError::Startup(format!("CRL HTTP client init: {error}")))
 }
 
 /// Log the trusted CRL/AIA origins once at startup, so an operator can audit
@@ -2128,33 +2182,8 @@ pub(crate) async fn bootstrap_fetch_with_server_chain(
     ));
     log_trusted_crl_origins(&trusted_origins);
 
-    // M-H2: same SSRF resolver hardening as CrlSet::new. The resolver
-    // allowlist is seeded with the hostnames of the operator-trusted
-    // origins computed above, instead of staying empty.
-    let bootstrap_allowlist = Arc::new(build_trusted_origin_allowlist(&trusted_origins));
-    let bootstrap_resolver: Arc<dyn Resolve> = Arc::new(SsrfScreeningResolver::new(
-        Arc::clone(&bootstrap_allowlist),
-        #[cfg(any(test, feature = "test-helpers"))]
-        Arc::new(AtomicBool::new(false)),
-        #[expect(
-            clippy::cfg_not_test,
-            reason = "deliberate: src/mtls_revocation.rs::SsrfScreeningResolver::new takes a no-op bypass argument when the test-helpers feature is absent; the inverted cfg is intentional"
-        )]
-        #[cfg(not(any(test, feature = "test-helpers")))]
-        (),
-    ));
-
-    let client = Client::builder()
-        // M-H2/N1: see oauth.rs::OauthHttpClient::build for rationale.
-        .no_proxy()
-        .dns_resolver(Arc::clone(&bootstrap_resolver))
-        .timeout(config.crl_fetch_timeout)
-        .connect_timeout(CRL_CONNECT_TIMEOUT)
-        .tcp_keepalive(None)
-        .redirect(Policy::none())
-        .user_agent(format!("rmcp-server-kit/{}", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|error| RmcpServerKitError::Startup(format!("CRL HTTP client init: {error}")))?;
+    // M-H2: bootstrap URLs are all trusted origins by construction.
+    let clients = CrlHttpClients::new(&trusted_origins, config.crl_fetch_timeout)?;
 
     // Bootstrap shares the same global concurrency + per-host cap as the
     // hot-path verifier so a maliciously broad CA chain cannot overwhelm
@@ -2174,7 +2203,7 @@ pub(crate) async fn bootstrap_fetch_with_server_chain(
     let bootstrap_crl_cpu = Arc::new(Semaphore::new(CRL_CPU_PERMITS));
 
     let fetch_ctx = CrlFetchContext {
-        client: &client,
+        clients: &clients,
         global_sem: &global_sem,
         host_semaphores: &host_semaphores,
         allow_http,
@@ -2226,7 +2255,7 @@ async fn bootstrap_fetch_urls(
     let mut tasks = JoinSet::new();
     for url in urls {
         let task_url = url.clone();
-        let task_client = ctx.client.clone();
+        let task_clients = ctx.clients.clone();
         let task_global_sem = Arc::clone(ctx.global_sem);
         let task_host_semaphores = Arc::clone(ctx.host_semaphores);
         let task_crl_cpu = Arc::clone(ctx.crl_cpu);
@@ -2236,7 +2265,7 @@ async fn bootstrap_fetch_urls(
         let max_host_semaphores = ctx.max_host_semaphores;
         let _task = tasks.spawn(async move {
             let task_ctx = CrlFetchContext {
-                client: &task_client,
+                clients: &task_clients,
                 global_sem: &task_global_sem,
                 host_semaphores: &task_host_semaphores,
                 allow_http,
@@ -2693,8 +2722,8 @@ fn acquire_host_semaphore(
 /// house argument-count limit; every field is a borrow or a cheap `Copy`
 /// value already owned by the caller.
 struct CrlFetchContext<'ctx> {
-    /// CRL fetcher with the SSRF-screening resolver installed.
-    client: &'ctx Client,
+    /// CRL fetch client pair with SSRF-screening resolvers installed.
+    clients: &'ctx CrlHttpClients,
     /// Global cap on simultaneous CRL HTTP fetches (SSRF amplification guard).
     global_sem: &'ctx Arc<Semaphore>,
     /// Per-host serializer, at most one in-flight fetch per origin host.
@@ -2751,7 +2780,7 @@ async fn gated_fetch(
         .map_err(|error| RmcpServerKitError::Tls(format!("CRL host semaphore closed: {error}")))?;
 
     fetch_crl(
-        ctx.client,
+        ctx.clients,
         url,
         ctx.allow_http,
         ctx.max_bytes,
@@ -2764,7 +2793,8 @@ async fn gated_fetch(
 /// Fetch and parse a single CRL into a cache entry.
 ///
 /// The DER parse runs on the blocking pool (see
-/// [`parse_crl_metadata_blocking`]), bounded by [`CRL_CPU_PERMITS`].
+/// [`parse_crl_metadata_blocking`]), bounded by [`CRL_CPU_PERMITS`]. The
+/// selected client's resolver re-screens at connect time.
 ///
 /// # Errors
 ///
@@ -2777,7 +2807,7 @@ async fn gated_fetch(
 // this future while the blocking parse is in flight does not cancel it (spawn_blocking cannot be
 // aborted); the bounded parse finishes and its result is simply discarded.
 async fn fetch_crl(
-    client: &Client,
+    clients: &CrlHttpClients,
     url: &str,
     allow_http: bool,
     max_bytes: u64,
@@ -2810,7 +2840,7 @@ async fn fetch_crl(
     // The origin (scheme, host, port) is trusted when it is named in a CRL
     // Distribution Point or Authority Information Access extension of the
     // operator's configured certificates; see `CrlSet::trusted_origins`.
-    let trusted_origin = trusted_origins.contains(&parsed.origin());
+    let (trusted_origin, client) = clients.for_url(&parsed, trusted_origins);
 
     // An IPv6-literal host fails closed here because `host_str()` retains
     // brackets, and `lookup_host` expects an unbracketed IPv6 address.
@@ -2983,13 +3013,15 @@ mod tests {
 
     use core::{
         cell::Cell,
+        error::Error as _,
         iter::once,
         net::{Ipv4Addr, Ipv6Addr},
-        slice,
+        ptr, slice,
         sync::atomic::{AtomicU64, AtomicUsize, Ordering},
     };
     use std::{
         io,
+        net::{TcpListener, ToSocketAddrs as _},
         sync::{LazyLock, Mutex as StdMutex},
         time::Instant as StdInstant,
     };
@@ -3360,6 +3392,110 @@ mod tests {
         Ok(())
     }
 
+    /// Pins that only a URL whose exact origin is trusted gets the trusted client: the same host on another port, or another scheme, gets the screened one.
+    #[tokio::test]
+    async fn crl_client_selection_uses_the_exact_origin() -> anyhow::Result<()> {
+        install_ring_provider();
+        let trusted_origin = Url::parse("http://localhost:4000/a.crl")
+            .context("parse trusted CRL origin")?
+            .origin();
+        let trusted: HashSet<Origin> = once(trusted_origin).collect();
+        let clients = CrlHttpClients::new(&trusted, Duration::from_secs(5))?;
+
+        let exact_url = Url::parse("http://localhost:4000/a.crl").context("parse exact URL")?;
+        let (exact_trusted, exact_client) = clients.for_url(&exact_url, &trusted);
+        assert!(
+            exact_trusted,
+            "exact trusted origin must be reported trusted"
+        );
+        assert!(
+            ptr::eq(exact_client, &raw const clients.trusted),
+            "exact trusted origin must use the trusted client"
+        );
+
+        let port_url = Url::parse("http://localhost:4001/a.crl").context("parse port URL")?;
+        let (port_trusted, port_client) = clients.for_url(&port_url, &trusted);
+        assert!(
+            !port_trusted,
+            "same hostname on another port must not be trusted"
+        );
+        assert!(
+            ptr::eq(port_client, &raw const clients.screened),
+            "same hostname on another port must use the screened client"
+        );
+
+        let scheme_url = Url::parse("https://localhost:4000/a.crl").context("parse scheme URL")?;
+        let (scheme_trusted, scheme_client) = clients.for_url(&scheme_url, &trusted);
+        assert!(
+            !scheme_trusted,
+            "same hostname and port under another scheme must not be trusted"
+        );
+        assert!(
+            ptr::eq(scheme_client, &raw const clients.screened),
+            "same hostname and port under another scheme must use the screened client"
+        );
+        Ok(())
+    }
+
+    /// Pins that connect-time screening matches the exact trusted origin: the screened client refuses a trusted hostname, the trusted client reaches it.
+    #[tokio::test]
+    async fn screened_crl_client_refuses_a_trusted_hostname_at_connect_time() -> anyhow::Result<()>
+    {
+        install_ring_provider();
+        let mut bound_listener = None;
+        for addr in ("localhost", 0)
+            .to_socket_addrs()
+            .context("resolve localhost bind candidates")?
+        {
+            if let Ok(bound) = TcpListener::bind(addr) {
+                bound_listener = Some(bound);
+                break;
+            }
+        }
+        let listener = bound_listener.context("no localhost address could be bound")?;
+        let port = listener
+            .local_addr()
+            .context("read mock listener address")?
+            .port();
+        let server = MockServer::builder().listener(listener).start().await;
+        Mock::given(method("GET"))
+            .and(path("/crl"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server)
+            .await;
+
+        let url = Url::parse(&format!("http://localhost:{port}/crl")).context("parse CRL URL")?;
+        let trusted: HashSet<Origin> = once(url.origin()).collect();
+        let clients = CrlHttpClients::new(&trusted, Duration::from_secs(5))?;
+
+        let status = clients.trusted.get(url.clone()).send().await?.status();
+        assert_eq!(
+            status,
+            reqwest::StatusCode::OK,
+            "trusted client must reach the trusted localhost origin"
+        );
+
+        let err = clients
+            .screened
+            .get(url)
+            .send()
+            .await
+            .err()
+            .context("screened client must reject localhost")?;
+        let mut rendered = err.to_string();
+        let mut current = err.source();
+        while let Some(inner) = current {
+            rendered.push_str(" :: ");
+            rendered.push_str(&inner.to_string());
+            current = inner.source();
+        }
+        assert!(
+            rendered.contains("blocked IP"),
+            "screened client error chain must expose blocked IP: {rendered}"
+        );
+        Ok(())
+    }
+
     /// Pins that the trusted-origin match considers the full origin (scheme,
     /// host, port), not just host and port.
     ///
@@ -3368,15 +3504,15 @@ mod tests {
     #[tokio::test]
     async fn fetch_crl_trusted_origin_match_is_scheme_sensitive() -> anyhow::Result<()> {
         install_ring_provider();
-        let client = Client::new();
         let crl_cpu = Arc::new(Semaphore::new(CRL_CPU_PERMITS));
         let trusted_origin = Url::parse("https://127.0.0.1:65535/crl")
             .context("parse https trusted origin")?
             .origin();
         let trusted_origins: Arc<HashSet<Origin>> = Arc::new(once(trusted_origin).collect());
+        let clients = CrlHttpClients::new(&trusted_origins, Duration::from_secs(5))?;
 
         let Err(err) = fetch_crl(
-            &client,
+            &clients,
             "http://127.0.0.1:65535/crl",
             true,
             1024,
@@ -3414,22 +3550,18 @@ mod tests {
     #[tokio::test]
     async fn fetch_crl_cloud_metadata_blocked_even_for_trusted_origin() -> anyhow::Result<()> {
         install_ring_provider();
-        let client = Client::builder()
-            .connect_timeout(Duration::from_millis(200))
-            .timeout(Duration::from_millis(500))
-            .build()
-            .context("build bounded test client")?;
         let crl_cpu = Arc::new(Semaphore::new(CRL_CPU_PERMITS));
         let metadata_url = "http://169.254.169.254/latest/meta-data/";
         let trusted_origin = Url::parse(metadata_url)
             .context("parse cloud-metadata origin")?
             .origin();
         let trusted_origins: Arc<HashSet<Origin>> = Arc::new(once(trusted_origin).collect());
+        let clients = CrlHttpClients::new(&trusted_origins, Duration::from_millis(500))?;
 
         let outcome = timeout(
             Duration::from_secs(2),
             fetch_crl(
-                &client,
+                &clients,
                 metadata_url,
                 true,
                 1024,
@@ -4185,11 +4317,11 @@ mod tests {
         // provider before any Client is built (same pattern as the
         // transport/oauth test suites).
         drop(ring::default_provider().install_default());
-        let client = Client::new();
         let crl_cpu = Arc::new(Semaphore::new(CRL_CPU_PERMITS));
         let trusted_origins = Arc::new(HashSet::new());
+        let clients = CrlHttpClients::new(&trusted_origins, Duration::from_secs(5))?;
         let Err(err) = fetch_crl(
-            &client,
+            &clients,
             "https://u:p@crl.example/ca.crl",
             false,
             1024,

@@ -441,7 +441,7 @@ graph TD
 | Trusted-forwarder resolution      | `src/forwarded.rs`                       | `resolve_client_ip`, `FallbackReason` (rightmost-untrusted, fail-safe-to-direct) |
 | OAuth JWT / JWKS                  | `src/oauth.rs` (feature `oauth`)         | `JwksCache` L2744, `JWKS_REFRESH_COOLDOWN` ~L2928, `select_jwks_key` L3584 |
 | SSRF guard (outbound HTTP)        | `src/ssrf.rs`                            | per-hop scheme/userinfo/IP-literal blocks                                     |
-| mTLS revocation (CRL)             | `src/mtls_revocation.rs`                 | `CrlSet` L327, `DynamicClientCertVerifier` L1737, `bootstrap_fetch` L2080       |
+| mTLS revocation (CRL)             | `src/mtls_revocation.rs`                 | `CrlSet` L329, `DynamicClientCertVerifier` L1707, `bootstrap_fetch` L2134       |
 | Tool hooks / size cap             | `src/tool_hooks.rs`                      | `HookedHandler` L335                                                          |
 | Admin diagnostics                 | `src/admin.rs`                           | `require_admin_role` L182, `admin_router` L209                                |
 | Tracing / audit log               | `src/observability.rs`                   | `init_tracing_from_config` L96, `AuditWorkerGuard` L378                              |
