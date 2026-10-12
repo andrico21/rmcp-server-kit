@@ -429,12 +429,12 @@ graph TD
 
 | Area                              | Module / file                           | Notable symbols (file:line)                                                  |
 |-----------------------------------|------------------------------------------|-------------------------------------------------------------------------------|
-| Server entry (HTTP)               | `src/transport.rs`                       | `serve` L3013, `McpServerConfig` L481, `ReloadHandle` ~L2011              |
-| Server entry (stdio, no auth)     | `src/transport.rs`                       | `serve_stdio` L5504                                                          |
-| Router builder + middleware wire  | `src/transport.rs`                       | `build_app_router` L2330; security headers, peer-addr normalization, request logging, and origin checks are wired there |
-| TLS / mTLS acceptor               | `src/transport.rs`                       | `TlsListener` L3656                                                          |
-| Origin / security headers (defs)  | `src/transport.rs`                       | `origin_check_middleware` L5159, `security_headers_middleware` ~L4372       |
-| Graceful shutdown                 | `src/transport.rs`                       | `shutdown_signal` L4190                                                      |
+| Server entry (HTTP)               | `src/transport.rs`                       | `serve` L3014, `McpServerConfig` L481, `ReloadHandle` ~L2003              |
+| Server entry (stdio, no auth)     | `src/transport.rs`                       | `serve_stdio` L5505                                                          |
+| Router builder + middleware wire  | `src/transport.rs`                       | `build_app_router` L2331; security headers, peer-addr normalization, request logging, and origin checks are wired there |
+| TLS / mTLS acceptor               | `src/transport.rs`                       | `TlsListener` L3657                                                          |
+| Origin / security headers (defs)  | `src/transport.rs`                       | `origin_check_middleware` L5160, `security_headers_middleware` ~L4373       |
+| Graceful shutdown                 | `src/transport.rs`                       | `shutdown_signal` L4191                                                      |
 | API key + mTLS auth               | `src/auth.rs`                            | `AuthIdentity` L76, `AuthState` ~L1660, `auth_middleware` L2594              |
 | RBAC engine                       | `src/rbac.rs`                            | `RbacPolicy` L709, `current_role` L158, `current_identity` L180, `current_token` L202, `current_sub` L220, `rbac_middleware` L1354           |
 | Memory-bounded keyed limiter      | `src/bounded_limiter.rs`                 | `BoundedKeyedLimiter` L158                                                    |
