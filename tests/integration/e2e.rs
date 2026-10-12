@@ -3326,6 +3326,9 @@ mod tests {
     ///    (~450ms) instead of insta-killing the in-flight request - this
     ///    catches an over-correction that would skip graceful drain
     ///    entirely.
+    /// 3. The server exits within the grace window plus 4s: the 1.5s
+    ///    bound removed in a2eaa08 flaked on CI jitter, while 4s of slack
+    ///    still catches a multi-second wait added to the shutdown path.
     ///
     /// **Cross-platform note**: real `SIGTERM` / Ctrl+C is intentionally
     /// NOT used here (Windows portability). Production `shutdown_signal()`
@@ -3351,8 +3354,9 @@ mod tests {
         let port = free_port().await?;
         let (started_tx, started_rx) = oneshot::channel::<()>();
         let started_state = Arc::new(Mutex::new(Some(started_tx)));
+        let shutdown_timeout = Duration::from_millis(500);
         let cfg = config_on_port(port)
-            .with_shutdown_timeout(Duration::from_millis(500))
+            .with_shutdown_timeout(shutdown_timeout)
             .with_extra_router(
                 Router::new()
                     .route(
@@ -3428,9 +3432,20 @@ mod tests {
         // window. 450ms = 500ms - 50ms scheduling and cleanup slack. A lower
         // bound cannot fail because a runner is slow; it only fails if the
         // server exits too early.
+        let drain_floor = shutdown_timeout.saturating_sub(Duration::from_millis(50));
         assert!(
-            elapsed >= Duration::from_millis(450),
+            elapsed >= drain_floor,
             "shutdown completed in {elapsed:?}, expected >= 450ms (server skipped graceful drain)"
+        );
+
+        // Upper bound: the server must not overrun the grace window by more
+        // than 4s. 4s is >=8x the 500ms grace window, which is jitter-safe:
+        // the 1.5s bound removed in a2eaa08 flaked on CI jitter, while 4s of
+        // slack still catches a multi-second wait added to the shutdown path.
+        let overrun_limit = shutdown_timeout.saturating_add(Duration::from_secs(4));
+        assert!(
+            elapsed < overrun_limit,
+            "shutdown took {elapsed:?}, more than 4s past the {shutdown_timeout:?} grace window: the force-exit timer fired late or the shutdown path gained a blocking wait"
         );
         Ok(())
     }
