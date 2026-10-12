@@ -202,13 +202,13 @@ impl Drop for TracingGuard {
 /// this way when the configured path is a symlink at its final component,
 /// is not a regular file (a device, FIFO, or socket), is a pre-existing
 /// file not owned by this process's effective user, has more than one hard
-/// link, or its permissions cannot be hardened to `0o600`. On Windows,
-/// opening the audit log also fails this way when the configured path is a
-/// reparse point at its final component (a symbolic link, junction, mount
-/// point, or any other reparse tag) - checked both before the open and
-/// again on the opened handle - or when applying the owner-only DACL
-/// fails. See the "Audit-log file permissions" section of the guide for
-/// the full contract.
+/// link, or its permissions cannot be corrected to `0o600` and are not
+/// already exactly `0o600`. On Windows, opening the audit log also fails
+/// this way when the configured path is a reparse point at its final
+/// component (a symbolic link, junction, mount point, or any other reparse
+/// tag) - checked both before the open and again on the opened handle - or
+/// when applying the owner-only DACL fails. See the "Audit-log file
+/// permissions" section of the guide for the full contract.
 #[inline]
 pub fn init_tracing_from_config_strict(
     config: &ObservabilityConfig,
@@ -748,10 +748,10 @@ use rustix::{fd::OwnedFd, io::Errno};
 ///
 /// Returns `Err` naming the path and the reason when the audit log cannot
 /// be opened, is not a regular file, is not owned by this process's
-/// effective UID, or its permissions cannot be hardened to `0o600`. A
-/// symlinked final component surfaces as `ELOOP` and a FIFO with no reader
-/// as `ENXIO`; both get a message naming the specific rule that was
-/// refused instead of the bare OS error text.
+/// effective UID, or its permissions cannot be corrected to `0o600` and are
+/// not already exactly `0o600`. A symlinked final component surfaces as
+/// `ELOOP` and a FIFO with no reader as `ENXIO`; both get a message naming
+/// the specific rule that was refused instead of the bare OS error text.
 #[cfg(unix)]
 fn create_private_audit_file(path: &Path) -> Result<fs::File, String> {
     use rustix::{
@@ -807,7 +807,10 @@ fn describe_audit_open_error(path: &Path, error: Errno) -> String {
 }
 
 /// Harden an already-open audit-log handle: verify it is a regular file
-/// owned by `effective_uid`, correct its mode, and clear `O_NONBLOCK`.
+/// owned by `effective_uid`, correct its mode to 0o600, and clear
+/// `O_NONBLOCK`.
+///
+/// The correction accepts a handle already at exactly 0o600 when it fails.
 ///
 /// Split out of `create_private_audit_file` so the regular-file, ownership
 /// and mode-correction checks can be driven directly against a real open
@@ -822,7 +825,8 @@ fn describe_audit_open_error(path: &Path, error: Errno) -> String {
 ///
 /// Returns `Err` naming the path and the reason when the handle cannot be
 /// inspected, is not a regular file, is not owned by `effective_uid`, has
-/// more than one hard link, or `set_mode` fails.
+/// more than one hard link, or `set_mode` fails on a handle not already at
+/// 0o600.
 #[cfg(unix)]
 fn harden_audit_handle(
     fd: OwnedFd,
@@ -830,7 +834,7 @@ fn harden_audit_handle(
     effective_uid: u32,
     set_mode: fn(&OwnedFd) -> RustixIoResult<()>,
 ) -> Result<fs::File, String> {
-    use rustix::fs::{FileType, OFlags, fcntl_setfl, fstat};
+    use rustix::fs::{FileType, Mode, OFlags, fcntl_setfl, fstat};
 
     let stat = fstat(&fd).map_err(|error| {
         format!(
@@ -861,12 +865,22 @@ fn harden_audit_handle(
         ));
     }
 
-    set_mode(&fd).map_err(|error| {
-        format!(
+    // fchmod is always attempted so its side effects on ACL filesystems are
+    // kept wherever chmod works. A filesystem that rejects chmod (CIFS/SMB
+    // without Unix extensions, vfat, some FUSE or NFS mounts) can still
+    // present a pre-created file whose permission bits are already exactly
+    // owner-only (no setuid, setgid or sticky bit); that file is accepted
+    // because the required state already holds. Any other failure fails
+    // closed. Only `Mode` values are compared, so no cast is needed even
+    // where `st_mode` is narrower (macOS).
+    if let Err(error) = set_mode(&fd)
+        && Mode::from_raw_mode(stat.st_mode) != Mode::RUSR | Mode::WUSR
+    {
+        return Err(format!(
             "failed to set audit log permissions to 0o600 for {}: {error}",
             path.display()
-        )
-    })?;
+        ));
+    }
 
     // Re-arm blocking semantics now that the handle is confirmed safe: the
     // writer thread (spawned only after this function returns `Ok`) expects
@@ -2064,9 +2078,10 @@ mod tests {
     /// Pins that `harden_audit_handle` turns a `set_mode` failure into
     /// `Err` rather than a warning, and never writes to the handle first.
     /// `set_mode` is injected specifically so this can be proven without
-    /// making the real `fchmod` syscall fail.
+    /// making the real `fchmod` syscall fail. The fixture starts at 0o644,
+    /// independent of the process umask.
     fn harden_audit_handle_rejects_failing_set_mode() -> anyhow::Result<()> {
-        use std::os::fd::OwnedFd;
+        use std::os::{fd::OwnedFd, unix::fs::PermissionsExt as _};
 
         use rustix::{io::Errno, process::geteuid};
 
@@ -2082,6 +2097,8 @@ mod tests {
             .append(true)
             .open(&path)
             .context("open a real self-owned file")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+            .context("widen fixture mode")?;
         let fd = OwnedFd::from(file);
         let real_uid = geteuid().as_raw();
 
@@ -2146,7 +2163,8 @@ mod tests {
     #[cfg(unix)]
     /// Pins the seam's success path directly: a self-owned regular file,
     /// the real effective UID, and the real `fchmod` end with mode
-    /// `0o600` and no `O_NONBLOCK` on the returned handle.
+    /// `0o600` and no `O_NONBLOCK` on the returned handle. The fixture
+    /// starts at 0o644, independent of the process umask.
     fn harden_audit_handle_accepts_self_owned_file_and_clears_nonblock() -> anyhow::Result<()> {
         use std::os::{fd::OwnedFd, unix::fs::PermissionsExt as _};
 
@@ -2163,6 +2181,8 @@ mod tests {
             .append(true)
             .open(&path)
             .context("open a real self-owned file")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+            .context("widen fixture mode")?;
         let fd = OwnedFd::from(file);
         let real_uid = geteuid().as_raw();
 
@@ -2181,6 +2201,162 @@ mod tests {
         );
 
         drop(hardened);
+        fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    /// Pins that a self-owned regular file already at exactly 0o600 is
+    /// accepted when fchmod fails, as on a filesystem that rejects chmod,
+    /// and that the handle still loses `O_NONBLOCK`.
+    fn harden_audit_handle_accepts_0600_when_set_mode_fails() -> anyhow::Result<()> {
+        use std::os::{fd::OwnedFd, unix::fs::PermissionsExt as _};
+
+        use rustix::{
+            fs::{OFlags, fcntl_getfl, fcntl_setfl},
+            io::Errno,
+            process::geteuid,
+        };
+
+        fn always_fails(_fd: &OwnedFd) -> super::RustixIoResult<()> {
+            Err(Errno::PERM)
+        }
+
+        let dir = unique_temp_path("audit-seam-chmod-fail-0600")?;
+        fs::create_dir_all(&dir).context("create fixture dir")?;
+        let path = dir.join("audit.log");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .context("open a real self-owned file")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .context("set fixture mode")?;
+        let fd = OwnedFd::from(file);
+        fcntl_setfl(&fd, OFlags::APPEND | OFlags::NONBLOCK).context("arm O_NONBLOCK")?;
+        anyhow::ensure!(
+            fcntl_getfl(&fd)
+                .context("read fixture status flags")?
+                .contains(OFlags::NONBLOCK),
+            "fixture handle must start with O_NONBLOCK set"
+        );
+        let real_uid = geteuid().as_raw();
+
+        let hardened = super::harden_audit_handle(fd, &path, real_uid, always_fails)
+            .map_err(|error| anyhow::anyhow!("harden_audit_handle: {error}"))?;
+
+        let mode = fs::metadata(&path)
+            .context("read fixture metadata")?
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7777, 0o600, "handle must stay 0o600; got {mode:o}");
+        let flags = fcntl_getfl(&hardened).context("read back status flags")?;
+        assert!(
+            !flags.contains(OFlags::NONBLOCK),
+            "handle must not keep O_NONBLOCK set"
+        );
+
+        drop(hardened);
+        fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    /// Pins that fchmod is still attempted on a file already at 0o600, so
+    /// its side effects on ACL filesystems are kept wherever chmod works.
+    fn harden_audit_handle_still_attempts_set_mode_at_0600() -> anyhow::Result<()> {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        use std::os::{fd::OwnedFd, unix::fs::PermissionsExt as _};
+
+        use rustix::process::geteuid;
+
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        #[expect(
+            clippy::unnecessary_wraps,
+            reason = "deliberate: src/observability.rs::harden_audit_handle takes a fallible set_mode fn pointer, so this counting seam must return a Result"
+        )]
+        fn counting(_fd: &OwnedFd) -> super::RustixIoResult<()> {
+            let _previous = CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        let dir = unique_temp_path("audit-seam-chmod-attempt-0600")?;
+        fs::create_dir_all(&dir).context("create fixture dir")?;
+        let path = dir.join("audit.log");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .context("open a real self-owned file")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .context("set fixture mode")?;
+        let fd = OwnedFd::from(file);
+        let real_uid = geteuid().as_raw();
+
+        let hardened = super::harden_audit_handle(fd, &path, real_uid, counting)
+            .map_err(|error| anyhow::anyhow!("harden_audit_handle: {error}"))?;
+
+        assert_eq!(
+            CALLS.load(Ordering::SeqCst),
+            1,
+            "set_mode must be attempted exactly once even at 0o600"
+        );
+
+        drop(hardened);
+        fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    /// Pins that setuid, setgid and sticky bits count: a file at 0o4600 is
+    /// not accepted when fchmod fails.
+    fn harden_audit_handle_rejects_special_bits_when_set_mode_fails() -> anyhow::Result<()> {
+        use std::os::{fd::OwnedFd, unix::fs::PermissionsExt as _};
+
+        use rustix::{io::Errno, process::geteuid};
+
+        fn always_fails(_fd: &OwnedFd) -> super::RustixIoResult<()> {
+            Err(Errno::PERM)
+        }
+
+        let dir = unique_temp_path("audit-seam-chmod-fail-special")?;
+        fs::create_dir_all(&dir).context("create fixture dir")?;
+        let path = dir.join("audit.log");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .context("open a real self-owned file")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o4600))
+            .context("set fixture mode")?;
+        let fixture_mode = fs::metadata(&path)
+            .context("read fixture metadata")?
+            .permissions()
+            .mode();
+        anyhow::ensure!(
+            fixture_mode & 0o7777 == 0o4600,
+            "fixture must carry the setuid bit; got {fixture_mode:o}"
+        );
+        let fd = OwnedFd::from(file);
+        let real_uid = geteuid().as_raw();
+
+        let result = super::harden_audit_handle(fd, &path, real_uid, always_fails);
+
+        let error = result
+            .err()
+            .context("a 0o4600 handle must be rejected when set_mode fails")?;
+        assert!(
+            error.contains("permissions"),
+            "error must mention the permissions failure; got {error:?}"
+        );
+
         fs::remove_dir_all(&dir).context("remove audit temp dir")?;
 
         Ok(())
