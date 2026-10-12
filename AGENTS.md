@@ -211,6 +211,8 @@ the default-feature build is covered too.
 `rmcp-<version>/src/handler/server.rs` under the local Cargo registry and hard-fails if
 it is missing, so run `cargo fetch` first on a cold checkout. Set `RMCP_SRC_DIR` to the
 rmcp crate root for atypical layouts - notably `cargo vendor`, which CI does not use.
+CI sets `RMCP_REQUIRE_SYMLINK_TESTS=1`, which turns the Windows symlink audit
+test's missing-privilege skip into a failure.
 
 ---
 

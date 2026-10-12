@@ -2565,7 +2565,9 @@ mod tests {
     /// own test suite (`library/std/src/fs/tests.rs`) checks
     /// `raw_os_error() == Some(1314)` for exactly this reason. The skip is
     /// silent (no output) because libtest captures the output of a
-    /// passing test.
+    /// passing test - but only when the privilege is missing AND
+    /// `RMCP_REQUIRE_SYMLINK_TESTS` is not exactly `1`; CI sets that
+    /// variable so the missing-privilege path fails instead of skipping.
     #[test]
     #[cfg(windows)]
     fn windows_symlinked_audit_path_is_rejected_before_any_write() -> anyhow::Result<()> {
@@ -2581,6 +2583,11 @@ mod tests {
         if let Err(error) = std::os::windows::fs::symlink_file(&target_path, &link_path) {
             if error.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) {
                 fs::remove_dir_all(&dir).context("remove symlink temp dir")?;
+                anyhow::ensure!(
+                    env::var_os("RMCP_REQUIRE_SYMLINK_TESTS").as_deref()
+                        != Some(std::ffi::OsStr::new("1")),
+                    "creating a file symlink needs SeCreateSymbolicLinkPrivilege or Windows Developer Mode, and RMCP_REQUIRE_SYMLINK_TESTS=1 forbids skipping this test"
+                );
                 return Ok(());
             }
             return Err(error).context("create file symlink fixture");

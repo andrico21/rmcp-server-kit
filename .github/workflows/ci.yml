@@ -70,7 +70,12 @@ jobs:
           rm -f /opt/homebrew/bin/cargo /opt/homebrew/bin/rustc /opt/homebrew/bin/rustup /opt/homebrew/bin/rustup-init
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
       - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      - name: Enable Developer Mode for unprivileged symlinks (Windows)
+        if: runner.os == 'Windows'
+        run: reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock" /t REG_DWORD /f /v "AllowDevelopmentWithoutDevLicense" /d "1"
       - run: cargo test --all-features
+        env:
+          RMCP_REQUIRE_SYMLINK_TESTS: "1"
       - name: Doctests [H-T4]
         run: cargo test --doc --all-features
 
