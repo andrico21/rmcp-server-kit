@@ -709,8 +709,8 @@ pub struct MtlsConfig {
     pub crl_max_response_bytes: u64,
     /// CDP discovery rate limit, in URLs per minute. Throttles how many
     /// *new* CDP URLs the verifier may admit into the fetch pipeline,
-    /// bounding asymmetric `DoS` amplification when attacker-controlled
-    /// certificates carry large CDP lists.
+    /// bounding asymmetric `DoS` amplification when presented certificate
+    /// chains carry large CDP lists (only chains that verify are admitted).
     ///
     /// Applied **per source peer IP** for attributed TLS handshakes: the
     /// value is each peer's own per-minute quota, so one peer draining its
