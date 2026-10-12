@@ -349,15 +349,16 @@ let auth = AuthConfig::with_keys(vec![
 #### Argon2id verification admission control
 
 Every bearer-token attempt runs one Argon2id verification per configured
-API key on the blocking thread pool (~72 ms and ~21 MiB per verification
-with this crate's default cost parameters). `AuthState` bounds concurrent
+API key on the blocking thread pool (roughly 27-52 ms of CPU, depending on
+how many run at once, and about 19 MiB - Argon2id m = 19456 KiB - per
+verification with this crate's default cost parameters). `AuthState` bounds concurrent
 admission into that work with a permit pool so a flood of invalid bearer
 tokens cannot grow memory use without limit:
 
 - `max_concurrent_verifications` (default: `available_parallelism()`
   clamped to `1..=16`) is the maximum number of Argon2id verifications
   running at once. Peak memory from this path is therefore bounded by
-  roughly `max_concurrent_verifications * 21 MiB`, plus overhead.
+  roughly `max_concurrent_verifications * 19 MiB`, plus overhead.
 - A request that cannot get a permit within `verification_wait` (default 1
   second) receives `503 Service Unavailable` with `Retry-After: 1` and a
   generic body - never a `401`, never a hang, and this outcome is counted
@@ -378,6 +379,38 @@ tokens cannot grow memory use without limit:
   mitigates a sustained flood's resource cost; it
   does not eliminate the flood itself - see
   [`SECURITY.md`](../SECURITY.md#argon2id-verification-admission-control).
+
+##### Capacity planning
+
+The permit pool bounds legitimate traffic as well as floods, so size it for
+your peak burst of valid bearer requests.
+
+Each bearer request holds one permit for a full key scan: one Argon2id
+verification per configured API key, expired or malformed keys included.
+Sustained capacity is therefore about
+`max_concurrent_verifications / (configured keys x t_verify)` requests per
+second, where `t_verify` is the time of one verification. A burst admitted
+within the wait is about
+`max_concurrent_verifications x floor(verification_wait / (configured keys x t_verify))`
+requests; anything beyond that receives `503` with `Retry-After: 1` even when
+every credential is valid.
+
+Measured `t_verify` on an 8-core laptop CPU (AMD Ryzen 7 PRO 8840U, release
+build) is about 27 ms with 1-2 concurrent verifications, 36 ms with 4 and
+52 ms with 8. Measure on your own hardware with a release build; debug builds
+are far slower. For example, 2 permits, 10 keys and 30 ms per verification
+give about 6-7 bearer requests per second.
+
+Do not rely on clients retrying or honouring `Retry-After`. The per-IP
+pre-auth gate answers `429` before the pool is reached, so a client throttled
+there never competes for a permit. To absorb a legitimate peak:
+
+- raise `max_concurrent_verifications` (about 19 MiB of memory each) or
+  `verification_wait`;
+- keep the number of configured keys small, since every key adds one
+  verification to each request (hot-reloaded keys count too);
+- watch `failure_overloaded` in `/admin/auth/counters`, which counts the
+  requests the permit pool turned away with `503`.
 
 #### `ApiKeyEntry`
 

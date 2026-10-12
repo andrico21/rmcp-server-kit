@@ -37,12 +37,14 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   `AuthConfig::max_concurrent_verifications` (default
   `available_parallelism()` clamped to `1..=16`, and clamped again to
   `Semaphore::MAX_PERMITS` if set higher) bounds how many Argon2id
-  verifications (roughly 21 MiB each) run at once on the blocking thread
+  verifications (about 19 MiB each) run at once on the blocking thread
   pool. A bearer request that cannot get a permit within
   `AuthConfig::verification_wait` (default `1s`) now fails fast with `503
   Service Unavailable` and `Retry-After: 1` instead of queuing unboundedly;
   these hits are counted separately as `AuthCountersSnapshot::failure_overloaded`
-  and visible at `/admin/auth/counters`. The constant-time credential scan is
+  and visible at `/admin/auth/counters`. A legitimate burst beyond the
+  pool's capacity also receives `503`; see the capacity guidance in
+  `docs/GUIDE.md`. The constant-time credential scan is
   unchanged. Documented API-key configurations (README, `docs/GUIDE.md`,
   `examples/api_key_rbac.rs`) now also show a per-IP rate limit, since
   API-key auth without one is unsafe on a reachable listener.

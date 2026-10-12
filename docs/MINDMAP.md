@@ -300,7 +300,7 @@ sequenceDiagram
     participant R as axum Router
     participant O as `origin_check_middleware`<br/>src/transport.rs:5160
     participant H as `security_headers_middleware`<br/>src/transport.rs:4373
-    participant A as `auth_middleware`<br/>src/auth.rs:2590
+    participant A as `auth_middleware`<br/>src/auth.rs:2594
     participant B as `rbac_middleware`<br/>src/rbac.rs:1354
     participant L as per-IP rate limit<br/>governor + bounded_limiter
     participant M as rmcp Streamable<br/>HTTP service
@@ -336,13 +336,13 @@ flowchart LR
     end
 
     subgraph SharedState["Shared state (lock-free / fine-grained)"]
-        AKS[(ArcSwap&lt;ApiKeys&gt;<br/>`AuthState` api_keys<br/>src/auth.rs:1658)]
+        AKS[(ArcSwap&lt;ApiKeys&gt;<br/>`AuthState` api_keys<br/>src/auth.rs:1662)]
         RBS[(ArcSwap&lt;RbacPolicy&gt;<br/>rbac_swap)]
         MTL[mTLS `AuthIdentity`<br/>per-connection<br/>TlsConnInfo extension<br/>src/auth.rs:76]
     end
 
     subgraph Hot["Request-time consumers"]
-        AM[`auth_middleware`<br/>src/auth.rs:2590]
+        AM[`auth_middleware`<br/>src/auth.rs:2594]
         BM[`rbac_middleware`<br/>src/rbac.rs:1354]
         TL["Task-locals<br/>`current_role` / `current_identity`<br/>`current_token` / `current_sub`<br/>src/rbac.rs:158-220"]
         TH[`HookedHandler`<br/>src/tool_hooks.rs:335]

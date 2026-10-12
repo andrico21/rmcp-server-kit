@@ -93,13 +93,24 @@ receives `503 Service Unavailable` with `Retry-After: 1` and a generic body,
 instead of queuing unboundedly; these responses are counted separately as
 `AuthCountersSnapshot::failure_overloaded` at `/admin/auth/counters`. The
 constant-time credential scan itself is unchanged. This bounds Argon2id's
-memory growth (roughly `max_concurrent_verifications` times ~21 MiB)
+memory growth (roughly `max_concurrent_verifications` times about 19 MiB)
 independent of source IP or client count, but a sustained flood can still
 keep legitimate callers receiving bounded-latency `503`s for as long as it
 lasts - the bound limits memory and per-request latency, it does not make
 the service unaffected by the attack. Pair it with a per-IP rate limit (see
 `RateLimitConfig::with_pre_auth_burst` in `docs/GUIDE.md`); API-key auth with
 no rate limiting at all is unsafe on a reachable listener.
+
+Valid credentials are subject to the same bound. Each bearer request holds
+one permit for a full key scan (one verification per configured key), so
+sustained capacity is about
+`max_concurrent_verifications / (configured keys x t_verify)` requests per
+second, and a burst admitted within the wait is about
+`max_concurrent_verifications x floor(verification_wait / (configured keys x t_verify))`.
+A burst beyond that receives `503` even when every credential is valid.
+Bursty API-key deployments should raise `max_concurrent_verifications` or
+`verification_wait` before upgrading and watch `failure_overloaded`; see
+the capacity planning section of `docs/GUIDE.md`.
 
 ### CA bundle validation
 

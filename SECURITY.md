@@ -143,7 +143,8 @@ enabling it changes the wire format of `taskId` values.
 
 Every bearer-token attempt runs one Argon2id verification per configured
 API key, on the blocking thread pool, with this crate's default cost
-parameters costing roughly 72 ms of CPU and 21 MiB of memory each. Without
+parameters costing roughly 27-52 ms of CPU (depending on concurrency) and
+about 19 MiB of memory each. Without
 a bound, concurrent invalid-bearer traffic can drive memory and latency up
 without limit. `AuthState` bounds admission into that work with a permit
 pool (`AuthConfig::max_concurrent_verifications`, default
@@ -157,7 +158,9 @@ credential, so it does not consume the post-failure rate-limit budget.
 **Residual risk, stated plainly:** a sustained flood can keep legitimate
 callers receiving bounded-latency `503`s for as long as it lasts; the
 bound limits memory and per-request latency, it does not make the service
-unaffected by the attack. Pair it with
+unaffected by the attack. A legitimate burst larger than the pool can drain
+within `verification_wait` also receives `503`; see
+[capacity planning](docs/GUIDE.md#capacity-planning) in the guide. Pair it with
 [`RateLimitConfig`'s pre-auth gate](docs/GUIDE.md#ratelimitconfig), which
 throttles by source IP before any Argon2id work runs, for defense in
 depth. The permit pool itself cannot be disabled, but it is on by

@@ -1013,8 +1013,12 @@ pub struct AuthConfig {
     /// to the blocking thread pool. `None` (default) resolves to
     /// `available_parallelism()` clamped to `1..=16` at auth-state
     /// construction time. Bounds Argon2id's memory footprint (roughly this
-    /// value times ~21 MiB) independent of source IP or client count. A
-    /// value above `tokio::sync::Semaphore::MAX_PERMITS` is clamped to it
+    /// value times ~19 MiB) independent of source IP or client count. Each
+    /// permit is held for a full key scan (one verification per configured
+    /// key), so sustained bearer capacity is roughly this value divided by
+    /// (configured keys x per-verification time); see the guide's
+    /// capacity-planning section. A value above
+    /// `tokio::sync::Semaphore::MAX_PERMITS` is clamped to it
     /// (effectively unbounded) rather than panicking at startup.
     #[serde(default)]
     pub max_concurrent_verifications: Option<NonZeroUsize>,
@@ -2401,7 +2405,7 @@ async fn authenticate_bearer_identity(
         }
     }
 
-    // Argon2id is CPU-bound and memory-heavy (~21 MiB per verification) -
+    // Argon2id is CPU-bound and memory-heavy (~19 MiB per verification) -
     // bound concurrent admission with a permit pool before offloading to
     // the blocking thread pool, so a flood of invalid bearer tokens cannot
     // grow memory use without limit. A request that cannot get a permit

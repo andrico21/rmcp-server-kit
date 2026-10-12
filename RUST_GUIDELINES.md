@@ -136,7 +136,7 @@ defined cleanup order, and no panic path. `scripts/lint-ratchet/prose_gates.py
 | `Drop for AuditWorkerGuard` | `src/observability.rs:392` | Signals shutdown then parks/joins the writer thread for at most `AUDIT_WRITER_JOIN_TIMEOUT` (5s); no async work or panic path. Bounded blocking is deliberate and documented. No defect. |
 | `Drop for CancelOnDrop` | `src/transport.rs:2966` | Sync, non-blocking `CancellationToken::cancel`; no I/O, await or panic path. Never disarmed on purpose. No defect. |
 | `Drop for TlsListener` | `src/transport.rs:3930` | Sync, non-blocking `JoinHandle::abort`; in-flight workers exit on the closed channel. No I/O, await or panic path. No defect. |
-| `Drop for ReleaseHookOnDrop` | `src/auth.rs:1645` | Test-only. Flips the `AtomicBool` gate of a `VerificationHook`; sync, no I/O or await, no panic path. Runs on unwind too, which unparks any `spawn_blocking` closure still busy-waiting before the test's `Runtime` drops. No defect. |
+| `Drop for ReleaseHookOnDrop` | `src/auth.rs:1649` | Test-only. Flips the `AtomicBool` gate of a `VerificationHook`; sync, no I/O or await, no panic path. Runs on unwind too, which unparks any `spawn_blocking` closure still busy-waiting before the test's `Runtime` drops. No defect. |
 
 ## Local deviations register
 
