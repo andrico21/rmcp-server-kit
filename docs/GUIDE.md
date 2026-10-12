@@ -576,8 +576,11 @@ that otherwise rejects loopback, link-local, and other internal addresses.
 Cloud-metadata addresses stay blocked regardless. This is what lets a
 corporate PKI that publishes CRLs on an internal host work with CRL
 checking at all - the trusted origins are logged once at startup (`INFO`
-level) for audit. Residuals, and what to do when neither chain names your
-PKI host (e.g. a bundle holding only a self-signed root with no CDP/AIA
+level) for audit. At runtime, a client can cause a fetch from a trusted origin
+only through a CDP URL named by a certificate on the verified path of its
+presented chain, which must verify against `mtls.ca_cert_path`. Residuals,
+and what to do when neither chain names your PKI host (e.g. a bundle holding
+only a self-signed root with no CDP/AIA
 extension - add the issuing CA certificate to `mtls.ca_cert_path` instead),
 are in [SECURITY.md](../SECURITY.md#operator-trusted-crlaia-origins). Trusted
 origins must use DNS hostnames or IPv4 literals; IPv6-literal hosts are not
