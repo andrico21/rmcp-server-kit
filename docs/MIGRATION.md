@@ -3,7 +3,7 @@
 This guide shows how to wire the standalone `rmcp-server-kit` crate into a
 downstream project, and how to migrate across breaking major releases.
 
-## Migrating to 3.15.0: audit-log hardening, Argon2id admission control, CRL trust, and one breaking API change
+## Migrating to 3.20.0: audit-log hardening, Argon2id admission control, CRL trust, and one breaking API change
 
 ### `JwksCache::new` returns the crate error type (breaking)
 
@@ -147,7 +147,7 @@ into any of these ranges is blocked outright - **unless** its origin
 (scheme, lowercased host, effective port) is named in the CRL Distribution
 Point or Authority Information Access extensions of a certificate in
 `mtls.ca_cert_path` or in the server's own TLS certificate chain. Since
-3.15.0, such operator-configured `https` origins, and `http` origins while
+3.20.0, such operator-configured `https` origins, and `http` origins while
 `crl_allow_http` is enabled (the default), skip the private-address SSRF
 screen automatically (no configuration knob; the trusted set is logged once
 at startup at INFO), so a corporate PKI that publishes its CRLs on an internal
@@ -203,7 +203,7 @@ repository pointed at the old fragments.
 
 ### Public API
 
-The only breaking public API change in 3.15.0 is the `JwksCache::new`
+The only breaking public API change in 3.20.0 is the `JwksCache::new`
 retype above. The public additions are `AuthConfig::max_concurrent_verifications`,
 `AuthConfig::verification_wait` and their builders,
 `AuthCountersSnapshot::failure_overloaded`, and `SessionIdLogPolicy` with
