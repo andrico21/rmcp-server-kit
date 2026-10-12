@@ -201,7 +201,8 @@ let config = McpServerConfig::new("127.0.0.1:8443", "my-server", "0.1.0")
 > **`test-helpers` is not safe in production.** It is not part of the stable
 > API surface and carries no semver guarantees across minor releases. Some of
 > the helpers it exposes deliberately bypass SSRF screening, the JWKS refresh
-> cooldown, the CDP discovery rate limiter, and CRL verifier publication. Enable
+> cooldown, the CDP discovery rate limiter, the verified path CRL discovery
+> gate, and CRL verifier publication. Enable
 > it only in test and integration builds. See the
 > [Cargo features section of the guide](docs/GUIDE.md#cargo-features) for the
 > per-helper detail.
@@ -297,9 +298,12 @@ does not break existing TOML parsing. `Clone` survives with
 
 **Status: shipped (minor, additive).** Recorded here so the residual
 trade-offs are not rediscovered. `crl_discovery_rate_per_min` gates admission
-of *new* CDP URLs into the CRL fetch pipeline on the unauthenticated mTLS
-handshake path. It is now keyed **per source peer IP** for attributed
-handshakes (process-global fallback when unattributed), which removes the
+of *new* CDP URLs into the CRL fetch pipeline on the mTLS handshake path;
+since 3.20.0 only CDP URLs named by the verified path of a presented chain
+that verifies against the configured roots (checked before the client proves
+key possession; revocation not considered) are admitted. It is now keyed
+**per source peer IP** for attributed handshakes (process-global fallback
+when unattributed), which removes the
 cross-peer starvation a single global bucket allowed: one peer could drain
 the shared budget and fail-closed a concurrent legitimate peer whose
 certificate pointed at a not-yet-cached CDP. It is a mitigation, not a
@@ -307,8 +311,9 @@ complete DoS defense; the accepted residuals are:
 
 - **Per-IP keying does not defeat a *distributed* attacker.** A sprayer using
   many source IPs cycles through independent per-peer budgets. Each sprayed IP
-  still pays a full TLS handshake, matching the default posture of the bearer
-  pre-auth limiter elsewhere in this crate.
+  still pays a full TLS handshake and also needs a copy of a valid client
+  chain, matching the default posture of the bearer pre-auth limiter
+  elsewhere in this crate.
 - **The key is the *direct* peer IP.** Behind a TCP load balancer that
   terminates the connection, that is the balancer's address, not the client's.
   Terminate TLS at the edge if you need true client attribution.

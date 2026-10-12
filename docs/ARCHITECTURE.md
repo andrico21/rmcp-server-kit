@@ -532,6 +532,11 @@ Lifecycle:
    - `global_fetch_sem`, `host_semaphores`, `discovery_limiter`,
      `discovery_limiter_per_peer`, `crl_cpu`, and `trusted_origins` - the
      network, admission, CPU, and trusted-origin bounds.
+   - `roots` and `signature_algorithms` - the client-auth root store and the
+     process-default provider's signature algorithms (captured once in
+     `CrlSet::new`). The live verifier uses the same pair, and
+     `verified_path_cdp_urls` reuses them for the verified path check
+     described under "Discovery admission ordering".
    A commit publishes the rebuilt cache and `verifier_state` together under
    the cache write lock with no `.await` between them; handshake readers take
    a non-blocking cache `try_read()` and then load `verifier_state`.
@@ -610,12 +615,24 @@ strict pending-before-send protocol to keep discovery retries correct:
 1. Sort and deduplicate the advertised URL set, select the relevant set
    (`crl_end_entity_only` chooses leaf CDPs only), and reject a certificate
    advertising more than `MAX_RELEVANT_CDP_URLS_PER_HANDSHAKE` distinct
-   relevant URLs.
+   relevant URLs. The cap and the fail-closed precheck count every relevant
+   presented CDP URL, including those of certificates that later turn out to
+   be off the verified path (with `crl_end_entity_only = true` only the end
+   entity's URLs are relevant).
 2. Snapshot `seen_urls` and `pending_urls`, then keep only relevant URLs that
    are neither confirmed cached nor already in flight. `fetch_crl` later
    applies `check_scheme`, `reject_blocked_crl_ip`, `ip_block_reason`, and
    connect-time `SsrfScreeningResolver` screening before issuing any request.
-3. For each remaining candidate, attempt admission. When the handshake peer is
+3. When candidates remain, run the `discoverable` closure once. It is
+   `CrlSet::verified_path_cdp_urls`: webpki path building from the presented
+   chain to the configured roots with the same signature algorithms as the
+   live verifier, client-auth usage, and no revocation. A chain that does not
+   verify yields `None`, which empties the candidates, so nothing is admitted
+   and no limiter token is consumed. For a chain that verifies, candidates
+   not named by the end entity or the intermediates on the verified path are
+   dropped (logged at `debug`). Off-path certificates are therefore excluded
+   from discovery but, by default, not from step 1's cap or the precheck.
+4. For each remaining candidate, attempt admission. When the handshake peer is
    attributed via the `CURRENT_HANDSHAKE_PEER` task-local (set by the
    TLS accept worker), admission consults that peer's own bucket
    (`discovery_limiter_per_peer.check_key(peer)`); with no attributed
@@ -624,7 +641,7 @@ strict pending-before-send protocol to keep discovery retries correct:
    than peek, so an attributed peer must consult **only** its own bucket -
    also touching the global one would let a rejected attacker still drain
    the shared budget.
-4. After admission, insert the URL into `pending_urls` before
+5. After admission, insert the URL into `pending_urls` before
    `discover_tx.send(url)`. `promote_pending_to_seen` moves it to `seen_urls`
    only after `fetch_and_store_url` confirms the CRL is actually in the cache;
    failed fetches, cache refusals, dropped futures, and closed-channel sends

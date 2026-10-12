@@ -90,7 +90,7 @@ This gives you `/healthz`, `/readyz`, and `/mcp` endpoints out of the box.
 | `oauth`   | No      | OAuth 2.1 JWT validation via JWKS. Adds `jsonwebtoken` and `reqwest`. |
 | `oauth-mtls-client` | No | RFC 8705 §2 mTLS client authentication for the OAuth token-exchange endpoint. Implies `oauth`. Without this feature, configurations that set `TokenExchangeConfig::client_cert` are rejected at startup by `OAuthConfig::validate`. See Recipe 2 for usage. |
 | `metrics` | No      | Prometheus metrics endpoint on a separate listener. Adds `prometheus`. |
-| `test-helpers` | No | Exposes test-only helpers from `mtls_revocation` and, when `oauth` is also enabled, `oauth`, for downstream integration tests. **Not part of the stable API surface** - no semver guarantees across minor releases. **never enable in a production build:** some helpers deliberately bypass SSRF screening, the JWKS refresh cooldown, the CDP discovery rate limiter, and CRL verifier publication. |
+| `test-helpers` | No | Exposes test-only helpers from `mtls_revocation` and, when `oauth` is also enabled, `oauth`, for downstream integration tests. **Not part of the stable API surface** - no semver guarantees across minor releases. **never enable in a production build:** some helpers deliberately bypass SSRF screening, the JWKS refresh cooldown, the CDP discovery rate limiter, the verified path CRL discovery gate, and CRL verifier publication. |
 
 Enable in `Cargo.toml`:
 
@@ -555,8 +555,12 @@ internally by the TLS acceptor.
 
 CRL URLs are auto-discovered from the X.509 **CRL Distribution Points**
 (CDP) extension on the configured CA chain (eagerly at startup, with a
-10-second total bootstrap deadline) and from each new client certificate
-observed during a TLS handshake (lazily). CRLs are cached in memory keyed
+10-second total bootstrap deadline) and from the verified path of each new
+client chain that verifies against `mtls.ca_cert_path` (lazily, during a TLS
+handshake). The chain is checked before the client proves key possession and
+revocation is not considered, so a chain that does not verify, or a
+certificate appended outside the verified path, contributes no URL to
+discovery. CRLs are cached in memory keyed
 by URL and refreshed on a background task before `nextUpdate`, clamped to
 `[10 min, 24 h]`. The underlying `rustls::ClientCertVerifier` is hot-swapped
 via `ArcSwap` whenever fresh CRLs land, so every new handshake sees the

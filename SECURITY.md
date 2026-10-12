@@ -185,9 +185,13 @@ When mTLS is enabled, rmcp-server-kit:
 1. At startup, scans the configured CA chain for the X.509 **CRL Distribution
    Points** (CDP) extension and fetches each referenced CRL via HTTP(S),
    bounded by a 10-second total bootstrap deadline.
-2. On each new client certificate observed during a TLS handshake, lazily
-   discovers any additional CDP URLs the leaf or intermediates point at and
-   schedules them for fetch.
+2. On each new client chain observed during a TLS handshake, lazily
+   discovers any additional CDP URLs named by the certificates on the
+   verified path of a presented chain that verifies against the configured
+   roots (checked before the client proves key possession; revocation not
+   considered) and schedules them for fetch. A chain that does not verify
+   contributes no URL, and certificates appended outside the verified path
+   contribute none either.
 3. Caches every CRL in memory keyed by URL and refreshes it before
    `nextUpdate` (clamped to `[10 min, 24 h]`) on a background task.
 4. Hot-swaps the underlying `rustls::ClientCertVerifier` via `ArcSwap` once
@@ -253,9 +257,11 @@ crl_retry_retention      = "24h"    # keep failed-refresh entries for retry only
 
 ### CRL fetch SSRF hardening
 
-CRL Distribution Point URLs are extracted from X.509 extensions on
-attacker-influenceable client certificates, so the CRL fetcher is treated
-as a hostile-input network call. The CA signature protects a CRL's contents,
+CRL Distribution Point URLs are discovered only from the certificates on the
+verified path of a presented chain that verifies against the configured
+roots, so they are chosen by that chain's issuing CA. They are still treated
+as hostile input, so the CRL fetcher is a hostile-input network call. The CA
+signature protects a CRL's contents,
 not the outbound request, which is why the fetch is screened. Before any HTTP
 request is issued, `check_scheme` in `src/ssrf.rs` enforces the scheme and
 userinfo checks, and `fetch_crl` screens resolved addresses through
@@ -308,9 +314,17 @@ count and sorted list) so an operator can audit what bypasses the screening.
 
 Residuals an operator should know:
 
-- An anonymous client can make the server send a GET to any path on a
-  trusted origin (same scheme, host and port), which normally serves only
-  CRLs and CA certificates.
+- A chain that does not verify against the configured roots triggers no
+  fetch, and certificates appended outside the verified path contribute
+  nothing to discovery, so a client without a valid chain cannot make the
+  server request a path on a trusted origin. Their CDP URLs still count
+  toward the per-handshake 64-URL malformed-certificate cap and the
+  fail-closed availability precheck (every presented certificate's URLs by
+  default, only the end entity's with `crl_end_entity_only = true`), which
+  can only reject that presenting client's own handshake. Anyone holding a
+  copy of a valid chain (public bytes only, revoked or not) can trigger
+  fetches of exactly the CDP URLs that chain's issuing CA chose, and on a
+  trusted origin those are fetched with the private-address block skipped.
 - Trust is bound to the hostname, not a pinned address: if a trusted host's
   DNS is compromised, the fetch reaches whatever address it resolves to,
   with the private-address block skipped for that request.
@@ -358,26 +372,42 @@ in ordinary global addresses, so generic decoding would misclassify them.
 
 ### CRL discovery under adversarial load
 
-CDP URLs are extracted from client certificates **before** chain
-validation. This ordering is a deliberate, load-bearing invariant: with
-`crl_deny_on_unavailable = true` the verifier must be able to fail
-closed on a never-fetched CDP, which requires discovering the CDP before
-delegating to the inner verifier. No HTTP happens on the handshake path -
-discovery only enqueues onto a bounded, rate-limited channel, and the
-actual fetch runs on a background task behind the full SSRF guard.
+CDP URLs are extracted from client certificates **before** the
+revocation-checking inner verifier runs. This ordering is a deliberate,
+load-bearing invariant: with `crl_deny_on_unavailable = true` the verifier
+must be able to fail closed on a never-fetched CDP, which requires
+discovering the CDP before delegating to the inner verifier. Since 3.20.0
+admission to discovery additionally requires the verified path: the server
+builds the path from the presented chain to the configured roots (same
+roots, same signature algorithms and client-auth usage as the live verifier,
+revocation not considered), once per handshake and only when a presented CDP
+URL is new, and admits only the URLs named by certificates on that path. This
+check runs before the client proves key possession, so it describes the
+presented chain, not the client. A chain that does not verify admits nothing
+and consumes no discovery budget, so throwaway certificates submit no URL.
+The per-handshake 64-URL cap and the fail-closed precheck still run on every
+relevant presented CDP URL (every presented certificate's by default, only the
+end entity's with `crl_end_entity_only = true`), including those of
+certificates outside the verified path, so off-path certificates are excluded
+from discovery but not, by default, from the cap or the precheck. No HTTP
+happens on the handshake path - discovery only enqueues onto a bounded,
+rate-limited channel, and the actual fetch runs on a background task behind
+the full SSRF guard.
 
 The residual cost of that ordering is a bounded griefing window, now
 **scoped per source peer IP** for attributed TLS handshakes. Discovery
 admission is keyed on the peer address: the TLS accept worker installs the
 handshake peer's IP in a task-local that the synchronous
 `ClientCertVerifier` callback reads, so each peer draws on its own
-per-minute `crl_discovery_rate_per_min` budget. An **unauthenticated**
-peer presenting throwaway certificates carrying unique CDP URLs can still
-exhaust *its own* budget and fill `crl_max_seen_urls` slots, but it can no
+per-minute `crl_discovery_rate_per_min` budget. Only a holder of a copy of a
+valid chain (public bytes, revoked or not) can submit URLs: it can exhaust
+*its own* budget and fill `crl_max_seen_urls` slots, but only with the CDP
+URLs that chain's issuing CA chose, and it can no
 longer drain a shared bucket and thereby starve a concurrent legitimate
 peer's discovery of a *new* CDP URL - the fail-closed denial under
 `crl_deny_on_unavailable = true` that such starvation used to cause is
-removed. Earlier releases stated per-source-IP budgeting was "not possible
+removed. Throwaway certificates that do not verify no longer reach the
+budget at all. Earlier releases stated per-source-IP budgeting was "not possible
 at this layer" because `rustls`'s `ClientCertVerifier` callback has no
 access to the peer address; that is no longer true - the address is carried
 to the callback out of band via the task-local, without changing the
@@ -385,9 +415,10 @@ callback signature.
 
 This is not a complete DoS defense, and the trade-offs are deliberate:
 
-- Per-IP keying does **not** defeat a *distributed* attacker; a sprayer
-  controlling many source IPs cycles through fresh per-peer budgets. Each
-  sprayed IP still pays a full TLS handshake, matching the default posture
+- Per-IP keying does **not** defeat a *distributed* holder of a valid chain;
+  a sprayer controlling many source IPs cycles through fresh per-peer
+  budgets. Each sprayed IP still pays a full TLS handshake and needs a copy
+  of a valid client chain, matching the default posture
   of the bearer pre-auth limiter elsewhere in this crate.
 - The key is the **direct** peer IP. Behind a TCP load balancer that
   terminates the connection, that is the balancer's address, not the
@@ -412,7 +443,11 @@ Operator guidance:
   otherwise the global fallback bucket). This is the observable signature
   of a discovery spray or of an undersized `crl_discovery_rate_per_min`.
   The line is throttled to at most one per minute, so it is a
-  flood-resistant signal rather than a per-URL audit trail.
+  flood-resistant signal rather than a per-URL audit trail. A spray of
+  certificates that do not verify no longer produces these lines (it
+  consumes no discovery budget); apart from the throttled per-handshake
+  URL-cap warning for a certificate over the cap, it shows only as handshake
+  failures at debug level (`TLS handshake failed from <addr>`).
 - Alert **separately** on `discovery_unattributed_fallback` WARN log lines
   - discovery ran with no handshake peer scope, so per-peer protection was
   **not** active and admission fell back to the global bucket. On the

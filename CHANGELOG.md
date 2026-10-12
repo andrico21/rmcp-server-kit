@@ -102,6 +102,26 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   adversarially large CRL, or a deep CRL cache, could previously stall a
   Tokio worker thread - and every other task scheduled on it - for the
   parse or rebuild duration. No configuration change; internal only.
+- **CRL discovery follows the verified certificate path** - runtime CRL
+  discovery now fetches only the CDP URLs named by certificates on the
+  verified path of a presented client chain that verifies against the
+  configured roots (checked before the client proves key possession;
+  revocation not considered). Previously the CDP URLs of every presented
+  certificate were discovered before any chain check, so a client holding no
+  valid chain could make the server send GET requests to attacker-chosen
+  URLs and, with the operator-trusted origins added in this release, to any
+  path on such an origin, which skips the private-address screen (cloud
+  metadata addresses excepted). A chain that does not verify now triggers no
+  fetch and spends no discovery budget, and a certificate appended outside
+  the verified path contributes no URL. Those certificates' CDP URLs still
+  count toward the unchanged per-handshake 64-URL malformed-certificate cap
+  and the fail-closed availability precheck by default (with
+  `crl_end_entity_only = true` only the end entity's URLs are considered),
+  and `crl_deny_on_unavailable` semantics are unchanged. The gate lives in
+  `DynamicClientCertVerifier`, so it applies under any transport. Remaining
+  residual: anyone holding a copy of a valid chain (public bytes, revoked or
+  not) can trigger fetches of only the CDP URLs that chain's issuing CA
+  chose. No configuration change.
 
 ### Added
 
@@ -145,6 +165,12 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   and, on Linux, its `linux-raw-sys` dependency. The project's `cargo vet`
   exemptions for both crates were raised from `safe-to-run` to
   `safe-to-deploy`.
+- **`rustls-webpki` is now a direct dependency** - the verified path of a
+  presented client chain, which the `rustls` client verifier discards, is
+  built with `rustls-webpki` directly (`default-features = false`, feature
+  `std`). It is the same 0.103.15 already in `Cargo.lock` through `rustls`,
+  so no new crate enters the lock file, and its `cargo vet` exemption is
+  already `safe-to-deploy`.
 - **TOML config preflight now applies the same nested auth validation as the
   builder path** - API-key principal names, OAuth feature presence and
   config, auth rate-limit capacity (including `max_tracked_keys`), mTLS

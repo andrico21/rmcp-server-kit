@@ -182,9 +182,36 @@ at startup at INFO), so a corporate PKI that publishes its CRLs on an internal
 host now works as long as the issuing CA certificate (the one carrying the
 CDP/AIA extensions) is present in `mtls.ca_cert_path` or the server's own
 chain. Cloud-metadata addresses remain unbypassable regardless of trust.
+A runtime-discovered CDP URL reaches that trusted-origin path only when a
+certificate on the verified path of a presented chain names it (see
+[CRL discovery follows the verified certificate path](#crl-discovery-follows-the-verified-certificate-path)).
 This narrows the 3.14-era statement that a CDP resolving into a blocked
 range is always rejected: it is rejected only for origins not named in a
 configured certificate. See also the CRL/AIA IPv6-literal limitation below.
+
+### CRL discovery follows the verified certificate path
+
+Runtime CRL discovery now fetches only the CDP URLs named by certificates on
+the verified path of a presented client chain that verifies against the
+configured roots (`mtls.ca_cert_path`). The chain is checked before the
+client proves key possession and revocation is not considered. A chain that
+does not verify triggers no CRL request and consumes no discovery budget,
+and a certificate appended outside the verified path contributes no URL to
+discovery. Their CDP URLs still count toward the unchanged per-handshake
+64-URL malformed-certificate cap and the fail-closed availability precheck
+(every presented certificate's URLs by default, only the end entity's with
+`crl_end_entity_only = true`), which can only affect the presenting client's
+own handshake.
+
+No operator action is required. A valid client's first-contact discovery is
+unchanged, and `crl_deny_on_unavailable` semantics are unchanged. Anyone
+holding a copy of a valid chain (public bytes, revoked or not) can still
+trigger fetches of exactly the CDP URLs that chain's issuing CA chose.
+Downstream code that calls `DynamicClientCertVerifier` directly gets the same
+gate under any transport. A spray of certificates that do not verify no
+longer produces `discovery_rate_limited` log lines; it shows as handshake
+failures at debug level. The crate now depends directly on `rustls-webpki`
+for this check; see the CHANGELOG.
 
 ### Session-id log policy (opt-in, default unchanged)
 
