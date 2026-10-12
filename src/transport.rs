@@ -7322,7 +7322,7 @@ mod tests {
     }
 
     /// Pins that zero burst limits on the auth limiter or its pre-auth limiter
-    /// are rejected, naming `rate_limit.burst` / `pre_auth_burst`.
+    /// are rejected, naming `auth.rate_limit.burst` / `auth.rate_limit.pre_auth_burst`.
     #[test]
     fn validate_rejects_zero_auth_bursts() -> anyhow::Result<()> {
         use crate::auth::RateLimitConfig;
@@ -7334,7 +7334,7 @@ mod tests {
             .validate()
             .err()
             .context("zero auth burst")?;
-        assert!(burst_err.to_string().contains("rate_limit.burst"));
+        assert!(burst_err.to_string().contains("auth.rate_limit.burst"));
 
         let pre_auth = AuthConfig::with_keys(vec![])
             .with_rate_limit(RateLimitConfig::new(10).with_pre_auth_burst(0));
@@ -7343,7 +7343,11 @@ mod tests {
             .validate()
             .err()
             .context("zero pre-auth burst")?;
-        assert!(pre_auth_err.to_string().contains("pre_auth_burst"));
+        assert!(
+            pre_auth_err
+                .to_string()
+                .contains("auth.rate_limit.pre_auth_burst")
+        );
 
         Ok(())
     }

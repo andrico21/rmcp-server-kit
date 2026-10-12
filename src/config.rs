@@ -1567,26 +1567,28 @@ fn check_nested_rate_limit(rate_limit: Option<&RateLimitConfig>) -> RmcpResult<(
     (rl.max_attempts_per_minute != 0).ok_or_else(|| {
         RmcpServerKitError::Config("auth.rate_limit.max_attempts_per_minute must be nonzero".into())
     })?;
-    if rl.burst == Some(0) {
-        return Err(RmcpServerKitError::Config(
-            "auth rate_limit.burst must be greater than zero".into(),
-        ));
-    }
-    if rl.pre_auth_burst == Some(0) {
-        return Err(RmcpServerKitError::Config(
-            "auth rate_limit.pre_auth_burst must be greater than zero".into(),
-        ));
-    }
+    (rl.burst != Some(0)).ok_or_else(|| {
+        RmcpServerKitError::Config("auth.rate_limit.burst must be greater than zero".into())
+    })?;
+    (rl.pre_auth_burst != Some(0)).ok_or_else(|| {
+        RmcpServerKitError::Config(
+            "auth.rate_limit.pre_auth_burst must be greater than zero".into(),
+        )
+    })?;
+    // 0 here does not mean "unlimited" - build_pre_auth_limiter falls back to
+    // DEFAULT_PRE_AUTH_RATE, so a typo silently raises the pre-auth quota, for
+    // example 1/min plus 0 yields 300/min, not 10/min, and weakens the gate
+    // that shields Argon2 from CPU spray.
     (rl.pre_auth_max_per_minute != Some(0)).ok_or_else(|| {
         RmcpServerKitError::Config(
             "auth.rate_limit.pre_auth_max_per_minute must be nonzero when set".into(),
         )
     })?;
-    if rl.max_tracked_keys == 0 {
-        return Err(RmcpServerKitError::Config(
+    (rl.max_tracked_keys != 0).ok_or_else(|| {
+        RmcpServerKitError::Config(
             "auth.rate_limit.max_tracked_keys must be greater than zero".into(),
-        ));
-    }
+        )
+    })?;
     Ok(())
 }
 
@@ -3090,7 +3092,7 @@ client_ip = false
         let Err(err) = validate_server_config(&cfg) else {
             anyhow::bail!("zero auth burst must be rejected");
         };
-        assert!(err.to_string().contains("rate_limit.burst"));
+        assert!(err.to_string().contains("auth.rate_limit.burst"));
 
         let auth_pre = AuthConfig::with_keys(vec![])
             .with_rate_limit(RateLimitConfig::new(10).with_pre_auth_burst(0));
@@ -3101,7 +3103,11 @@ client_ip = false
         let Err(err_pre) = validate_server_config(&cfg_pre) else {
             anyhow::bail!("zero pre-auth burst must be rejected");
         };
-        assert!(err_pre.to_string().contains("pre_auth_burst"));
+        assert!(
+            err_pre
+                .to_string()
+                .contains("auth.rate_limit.pre_auth_burst")
+        );
         Ok(())
     }
 
@@ -3405,6 +3411,16 @@ client_ip = false
                 "zero max_tracked_keys",
                 server_config_with_rate_limit(max_tracked),
                 "auth.rate_limit.max_tracked_keys",
+            ),
+            (
+                "zero rate-limit burst",
+                server_config_with_rate_limit(RateLimitConfig::new(41).with_burst(0)),
+                "auth.rate_limit.burst must be greater than zero",
+            ),
+            (
+                "zero pre-auth burst",
+                server_config_with_rate_limit(RateLimitConfig::new(41).with_pre_auth_burst(0)),
+                "auth.rate_limit.pre_auth_burst must be greater than zero",
             ),
             (
                 "zero mtls capacity",
