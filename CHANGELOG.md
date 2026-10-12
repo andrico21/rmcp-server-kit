@@ -117,11 +117,19 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   count toward the unchanged per-handshake 64-URL malformed-certificate cap
   and the fail-closed availability precheck by default (with
   `crl_end_entity_only = true` only the end entity's URLs are considered),
-  and `crl_deny_on_unavailable` semantics are unchanged. The gate lives in
-  `DynamicClientCertVerifier`, so it applies under any transport. Remaining
+  and `crl_deny_on_unavailable` semantics are unchanged. As a consequence, with
+  `crl_end_entity_only = false` (the default), a CRL URL that a presented chain
+  names only on a certificate outside its verified path is no longer fetched
+  because of that chain. A client that depended on such a CRL, whether to cover
+  a certificate of its chain or only to satisfy the fail-closed precheck, can
+  find it unavailable until it is cached some other way: under the default
+  `crl_deny_on_unavailable = true` its handshake can then be refused, and under
+  `crl_deny_on_unavailable = false` a certificate that CRL covered can be
+  accepted without a revocation check (see the migration notes). The gate lives
+  in `DynamicClientCertVerifier`, so it applies under any transport. Remaining
   residual: anyone holding a copy of a valid chain (public bytes, revoked or
-  not) can trigger fetches of only the CDP URLs that chain's issuing CA
-  chose. No configuration change.
+  not) can trigger fetches of only the CDP URLs that chain's issuing CA chose.
+  No configuration change.
 - **CRL connect-time DNS screening now trusts only the exact trusted origin**
   and uses two HTTP clients. A URL whose exact origin (scheme, host, and
   port) is trusted is fetched by a client whose connect-time resolver admits

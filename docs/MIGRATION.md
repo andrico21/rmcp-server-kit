@@ -207,10 +207,21 @@ discovery. Their CDP URLs still count toward the unchanged per-handshake
 `crl_end_entity_only = true`), which can only affect the presenting client's
 own handshake.
 
-No operator action is required. A valid client's first-contact discovery is
-unchanged, and `crl_deny_on_unavailable` semantics are unchanged. Anyone
-holding a copy of a valid chain (public bytes, revoked or not) can still
-trigger fetches of exactly the CDP URLs that chain's issuing CA chose.
+No operator action is required unless a client presents a certificate outside
+its verified path, for example an extra or cross-signed intermediate. With
+`crl_end_entity_only = false` (the default), a CRL URL that a presented chain
+names only on a certificate outside its verified path is no longer fetched
+because of that chain. A client that depended on such a CRL, whether to cover a
+certificate of its chain or only to satisfy the fail-closed precheck, can find
+it unavailable until it is cached some other way. Then, with
+`crl_deny_on_unavailable = true` (the default), its handshake can be refused,
+and with `crl_deny_on_unavailable = false` a certificate that CRL covered can be
+accepted without a revocation check. Before 3.20.0 such a URL was fetched. The
+CRL is available again once a certificate on the verified path of a presented
+chain names its URL and the fetched CRL is cached, for example after the client
+certificate is reissued with that URL in its CDP extension. Anyone holding a
+copy of a valid chain (public bytes, revoked or not) can still trigger fetches
+of exactly the CDP URLs that chain's issuing CA chose.
 Downstream code that calls `DynamicClientCertVerifier` directly gets the same
 gate under any transport. A spray of certificates that do not verify no
 longer produces `discovery_rate_limited` log lines; it shows as handshake
@@ -266,10 +277,10 @@ Validation messages changed too - exact message matchers must be updated:
   path said `auth rate_limit.burst` in 3.14.4);
 - zero pre-auth burst: `auth.rate_limit.pre_auth_burst must be greater than
   zero` (the builder path said `auth rate_limit.pre_auth_burst` in 3.14.4);
-- TOML listen address: `listen_addr/listen_port <addr> is not a valid socket
+- TOML listen address: `listen_addr/listen_port "<addr>" is not a valid socket
   address (expected e.g. 127.0.0.1:8080; write an IPv6 listen_addr in
   brackets, e.g. [::1])`;
-- builder listen address: `bind_addr <addr> is not a valid socket address
+- builder listen address: `bind_addr "<addr>" is not a valid socket address
   (expected e.g. 127.0.0.1:8080 or [::1]:8080)`.
 
 ### Public API
