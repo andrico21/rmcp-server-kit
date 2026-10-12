@@ -153,8 +153,9 @@ rate-limit capacity (including `max_tracked_keys`); a zero mTLS CRL capacity
 cap; a zero `verification_wait`; and a malformed `listen_addr` /
 `listen_port` pair. The last check parses the composed
 `listen_addr:listen_port` as a `SocketAddr`, so a bare IPv6 `listen_addr`
-(for example `::1`) is rejected with a message naming the expected form -
-bracket IPv6 hosts (`[::1]`) in `listen_addr`.
+(for example `::1`) is rejected with a message that shows the bracketed form
+(`[::1]`); write IPv6 hosts in brackets in `listen_addr`. The builder's
+`bind_addr` error gained the same hint.
 
 ### SSRF range additions and CRL origin trust
 
@@ -259,6 +260,18 @@ changed to the single-hyphen form; external bookmarks or links to their old
 URL fragments will no longer resolve. No inbound link inside this
 repository pointed at the old fragments.
 
+Validation messages changed too - exact message matchers must be updated:
+
+- zero burst: `auth.rate_limit.burst must be greater than zero` (the builder
+  path said `auth rate_limit.burst` in 3.14.4);
+- zero pre-auth burst: `auth.rate_limit.pre_auth_burst must be greater than
+  zero` (the builder path said `auth rate_limit.pre_auth_burst` in 3.14.4);
+- TOML listen address: `listen_addr/listen_port <addr> is not a valid socket
+  address (expected e.g. 127.0.0.1:8080; write an IPv6 listen_addr in
+  brackets, e.g. [::1])`;
+- builder listen address: `bind_addr <addr> is not a valid socket address
+  (expected e.g. 127.0.0.1:8080 or [::1]:8080)`.
+
 ### Public API
 
 The only breaking public API change in 3.20.0 is the `JwksCache::new`
@@ -267,6 +280,9 @@ retype above. The public additions are `AuthConfig::max_concurrent_verifications
 `AuthCountersSnapshot::failure_overloaded`, and `SessionIdLogPolicy` with
 `LogContextConfig::session_id_header` and
 `McpServerConfig::with_session_id_log_policy`, all described above.
+`AuthConfig::with_verification_wait` and
+`McpServerConfig::with_session_id_log_policy` are `const fn`, like
+`AuthConfig::with_max_concurrent_verifications`.
 
 ## Migrating to 3.14.4: logging defaults, MSRV 1.99, and `/metrics` security headers
 

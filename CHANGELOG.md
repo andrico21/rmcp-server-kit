@@ -186,8 +186,18 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   capacity knobs, and `verification_wait` are validated by one shared helper
   called from both validators. The preflight also now parses the composed
   `listen_addr:listen_port` as a `SocketAddr` before startup, so a bare IPv6
-  `listen_addr` (for example `::1`) is rejected earlier with a message
-  naming the expected form - bracket IPv6 hosts (`[::1]`).
+  `listen_addr` (for example `::1`) is rejected earlier with a message that
+  shows the bracketed form (`[::1]`); the builder's `bind_addr` error gained
+  the same hint.
+- **Validation messages** - the zero-`burst` and zero-`pre_auth_burst`
+  errors now name `auth.rate_limit.burst` and `auth.rate_limit.pre_auth_burst`
+  on both validators (the builder path said `auth rate_limit.burst` and
+  `auth rate_limit.pre_auth_burst` in 3.14.4), and both listen-address
+  errors show the bracketed IPv6 form. Exact message matchers must be
+  updated.
+- **`const fn` builders** - `AuthConfig::with_verification_wait` and
+  `McpServerConfig::with_session_id_log_policy` are `const fn`, like
+  `AuthConfig::with_max_concurrent_verifications`.
 - **House dash convention applied across the repository** - prose now uses a
   single hyphen (two consecutive hyphens are reserved for command-line
   flags and separators), enforced in CI by a new lint-ratchet gate. Four
@@ -217,7 +227,15 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   test coverage was tightened; the docs citation guard now requires a nearby
   definition-like anchor and checks the MINDMAP navigation table; and stale CRL
   architecture, threat-model and audit-log documentation was brought in line
-  with the current code. No production behavior changed in any of this work.
+  with the current code. The cancelled-JWKS-refresh test now cancels only
+  after the upstream fetch started and serves both loopback families; the
+  forced-shutdown test regained an upper bound (grace plus 4 s); a new test
+  covers JWKS recovery after a panicked refresh; the direct `CrlSet`
+  constructor's crypto provider is proved in a separate test binary; the
+  trusted-origin hostname tests listen on both loopback families; and the
+  Windows symlink audit test fails instead of skipping when CI sets
+  `RMCP_REQUIRE_SYMLINK_TESTS=1`. No production behavior changed in any of
+  this work.
 
 ### Fixed
 
