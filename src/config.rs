@@ -1374,7 +1374,9 @@ pub struct ObservabilityConfig {
     /// Log output format: `json`, `pretty`, or `text` (default: `pretty`).
     #[serde(default = "default_log_format")]
     pub log_format: String,
-    /// Optional path to an append-only audit log file.
+    /// Optional path to an append-only audit log file. It must name a regular
+    /// file (not a symlink, `/dev/stdout`, a FIFO or a device) owned by the
+    /// server's effective user; see the guide's audit-log section.
     pub audit_log_path: Option<PathBuf>,
     /// Emit inbound HTTP request headers at DEBUG level in transport logs.
     /// Sensitive headers remain redacted when enabled.

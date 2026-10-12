@@ -69,7 +69,12 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   initializer now installs no audit sink at all when hardening fails, rather
   than writing to an unprotected one. These checks run once at startup, not
   continuously; use copy-based retention or rotation (for example
-  logrotate's `copytruncate`), not hardlinks.
+  logrotate's `copytruncate`), not hardlinks. A failed correction of the
+  mode to `0o600` now fails closed too (it was a warning) unless the file
+  already is exactly `0o600`, so pre-create it on filesystems that reject
+  chmod. `/dev/stdout`, `/dev/stderr` and FIFOs are no longer accepted as
+  audit-log paths; NFS with `root_squash` and a root server fails the owner
+  check.
 - **Windows audit-log opening refuses reparse points; DACL-hardening cleanup
   is more conservative** - opening `audit_log_path` now refuses a reparse
   point (a symbolic link, junction, mount point, or any other reparse tag,

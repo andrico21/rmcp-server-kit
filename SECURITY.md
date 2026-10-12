@@ -758,7 +758,12 @@ symlink at the final path component (a symlinked *parent* directory is
 still traversed - only the final component is protected), it refuses
 anything that is not a regular file, and it refuses a pre-existing file not
 owned by the server process's effective user, even when the process runs
-as root. It also refuses a regular file with more than one hard link. These
+as root. It also refuses a regular file with more than one hard link. Its
+permissions are corrected to `0o600` on the open handle; if that fails (a
+filesystem that rejects chmod) startup fails closed unless the file
+already has exactly mode `0o600`. The "Setups that no longer start" list
+in the guide's audit-log section names the common container and NAS
+deployments this affects and the remedy for each. These
 checks run once at start-up on the already-open handle before any write and
 before the audit writer thread is spawned, so a rejected target is never
 written to; a hard link added later is not detected until the next start-up

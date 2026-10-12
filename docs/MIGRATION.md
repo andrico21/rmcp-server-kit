@@ -50,6 +50,23 @@ write:
   file, or rotating by rename and reopening a fresh single-link path on
   restart. Single-link, self-owned regular files are still accepted and
   tightened to `0o600`.
+- **A filesystem that rejects chmod** (CIFS/SMB without Unix extensions,
+  vfat or exFAT, some FUSE or NFS mounts): a failed correction of the mode
+  to `0o600` now fails strict startup (before 3.20.0 it was a warning)
+  unless the file already has exactly mode `0o600`. Where the filesystem
+  keeps per-file modes, pre-create the file as the service user with mode
+  `0600`; on vfat, exFAT or CIFS without Unix extensions set mount options
+  that report that owner and mode (see the guide), or use a filesystem
+  with POSIX permissions.
+- **`/dev/stdout`, `/dev/stderr`, `/proc/self/fd/N`, a FIFO, a socket or a
+  device** are no longer accepted as `audit_log_path`. The audit file only
+  duplicates the INFO-and-above events already written to stderr, so a
+  container that ships its output streams should leave `audit_log_path`
+  unset.
+- **NFS with `root_squash` and a server running as root:** the created
+  file is owned by the squashed user, so the owner check fails. Run the
+  server as a non-root user that owns the path, or keep the audit log on
+  local storage.
 
 The deprecated lenient initializer now installs no audit sink at all when
 any of these checks fails, instead of falling back to an unprotected

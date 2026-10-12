@@ -1331,7 +1331,9 @@ credential material, so it is created with owner-only permissions.
   that further, never widen it). A *pre-existing* file keeps its current
   mode until the open handle has passed the regular-file and owner
   checks, at which point it is corrected to `0o600` with `fchmod` on that
-  handle. Nothing is written to the handle before every check has passed,
+  handle; if `fchmod` fails (a filesystem that rejects chmod), a file whose
+  permission bits are already exactly `0o600` is accepted, and anything else
+  fails startup. Nothing is written to the handle before every check has passed,
   and a symlink's target is never opened, chmodded, or written to.
   These checks are a start-up snapshot of the opened handle; a hard link
   added later is not detected until the next start-up hardening pass.
@@ -1387,13 +1389,41 @@ name. Use copy-based retention instead: copy and truncate the current
 file, or rename the active file and let the process reopen a fresh
 single-link path on restart.
 
+**Setups that no longer start.** On Unix, strict initialization fails
+startup in these common deployments. The Windows behavior described above
+is unchanged.
+
+- **A filesystem that rejects chmod** (CIFS/SMB without Unix extensions,
+  vfat or exFAT, some FUSE or NFS mounts): a failed `fchmod` now fails
+  strict startup (before 3.20.0 it was only a warning) unless the file
+  already has exactly mode `0o600`, with no setuid, setgid or sticky bit.
+  Where the filesystem keeps per-file modes, pre-create the file as the
+  service user with mode `0600` (it must still be a regular, single-link
+  file owned by the effective user); otherwise use a filesystem with POSIX
+  permissions. On vfat, exFAT or CIFS without Unix extensions the owner
+  and mode are reported from mount options (for example
+  `uid=<service user>,fmask=0177` on vfat or exFAT,
+  `uid=<service user>,file_mode=0600` on CIFS); these examples are
+  illustrative, not a recommendation.
+- **`/dev/stdout`, `/dev/stderr`, `/proc/self/fd/N`, a FIFO, a socket or a
+  device:** refused as a symlink or as not a regular file. The audit file
+  is an additional JSON copy of the INFO-and-above events the server
+  already writes to stderr (the same log filter gates both), so a
+  container that ships its output streams should leave `audit_log_path`
+  unset.
+- **NFS with `root_squash` and a server running as root:** the created
+  file is owned by the squashed user, so the owner check fails. Run the
+  server as a non-root user that owns the path, or keep the audit log on
+  local storage.
+
 On a platform that is neither Unix nor Windows, a configured `audit_log_path`
 fails closed: startup errors and no file is created.
 
 [rust-lang/libs-team#324]: https://github.com/rust-lang/libs-team/issues/324
 
 The deprecated `init_tracing_from_config(config)` compatibility entry point
-keeps the old fail-open audit-log behaviour and returns `Result<(), TryInitError>`.
+still starts the process when audit-log setup fails (it warns and returns
+`Result<(), TryInitError>`) but installs no audit sink in that case.
 
 ---
 
