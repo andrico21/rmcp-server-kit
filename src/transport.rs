@@ -1897,7 +1897,8 @@ impl McpServerConfig {
         // 3. bind_addr parses
         if self.bind_addr.parse::<SocketAddr>().is_err() {
             return Err(RmcpServerKitError::Config(format!(
-                "bind_addr {:?} is not a valid socket address (expected e.g. 127.0.0.1:8080)",
+                "bind_addr {:?} is not a valid socket address \
+                 (expected e.g. 127.0.0.1:8080 or [::1]:8080)",
                 self.bind_addr
             )));
         }

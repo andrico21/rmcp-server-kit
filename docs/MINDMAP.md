@@ -296,10 +296,10 @@ mindmap
 sequenceDiagram
     autonumber
     participant C as Client
-    participant TLS as `TlsListener`<br/>src/transport.rs:3656
+    participant TLS as `TlsListener`<br/>src/transport.rs:3657
     participant R as axum Router
-    participant O as `origin_check_middleware`<br/>src/transport.rs:5159
-    participant H as `security_headers_middleware`<br/>src/transport.rs:4372
+    participant O as `origin_check_middleware`<br/>src/transport.rs:5160
+    participant H as `security_headers_middleware`<br/>src/transport.rs:4373
     participant A as `auth_middleware`<br/>src/auth.rs:2594
     participant B as `rbac_middleware`<br/>src/rbac.rs:1354
     participant L as per-IP rate limit<br/>governor + bounded_limiter
@@ -332,7 +332,7 @@ sequenceDiagram
 ```mermaid
 flowchart LR
     subgraph Admin["Admin / operator"]
-        RH[`ReloadHandle`<br/>src/transport.rs:2002]
+        RH[`ReloadHandle`<br/>src/transport.rs:2003]
     end
 
     subgraph SharedState["Shared state (lock-free / fine-grained)"]

@@ -237,7 +237,7 @@ consumer applications and `examples/`.
 
 ```
                    ┌──────────────────────────────────┐
-   HTTP request ─► │  TlsListener  (TLS / mTLS)       │  `TlsListener` src/transport.rs:3656
+   HTTP request ─► │  TlsListener  (TLS / mTLS)       │  `TlsListener` src/transport.rs:3657
                    └────────────────┬─────────────────┘
                                     ▼
                    ┌──────────────────────────────────┐
@@ -255,7 +255,7 @@ consumer applications and `examples/`.
         (executed top-to-bottom on request)            │
                                                        │
         0. Security headers - outermost, response-only decoration; pass-through on requests
-        1. Origin check       `origin_check_middleware` src/transport.rs:5159    │  spec: MCP origin validation
+        1. Origin check       `origin_check_middleware` src/transport.rs:5160    │  spec: MCP origin validation
            Logs only the requests it rejects.
         2. Peer-addr normalize (normalize_peer_addr_middleware) │  mirrors TLS peer into ConnectInfo<SocketAddr> + public PeerAddr (both branches)
         2b. Request log (request_log_middleware): DEBUG `incoming request` / `request completed`, skips request_log_exclude_paths, client fields per [server.log_context] knobs
@@ -361,7 +361,7 @@ The core's current-Rust idioms (for example `Vec::push_mut` /
 |------------------------------------------------|--------------------------------------------------------|
 | Server entry / router / middleware order       | `src/transport.rs` - `serve()` and surrounding helpers |
 | API key authentication                         | `src/auth.rs` - `AuthState`, `ApiKeyEntry`, `auth_middleware` |
-| mTLS identity extraction                       | `src/transport.rs` - `extract_mtls_identity` call site (near `run_tls_acceptor`, `src/transport.rs:3747`)   |
+| mTLS identity extraction                       | `src/transport.rs` - `extract_mtls_identity` call site (near `run_tls_acceptor`, `src/transport.rs:3748`)   |
 | mTLS CRL revocation (CDP-driven)               | `src/mtls_revocation.rs` - `CrlSet`, `DynamicClientCertVerifier`, `bootstrap_fetch`, `run_crl_refresher` |
 | OAuth JWT validation / JWKS cache              | `src/oauth.rs` - `JwksCache`, feature-gated           |
 | RBAC policy evaluation                         | `src/rbac.rs` - `RbacPolicy::check`, `enforce_tool_policy` |
@@ -381,7 +381,7 @@ The core's current-Rust idioms (for example `Vec::push_mut` /
 | Security-header TOML controls                  | `src/transport.rs` - `SecurityHeadersConfig`; `src/config.rs` - `ServerConfig::security_headers` |
 | Error type → HTTP status mapping               | `src/error.rs` - `RmcpServerKitError::into_response`           |
 | Origin / security headers / CORS               | `src/transport.rs` - `origin_check_middleware`, `security_headers_middleware` |
-| Graceful shutdown (Ctrl-C / SIGTERM)           | `src/transport.rs` - `shutdown_signal()` (`src/transport.rs:4190`) |
+| Graceful shutdown (Ctrl-C / SIGTERM)           | `src/transport.rs` - `shutdown_signal()` (`src/transport.rs:4191`) |
 | Hot-reload of keys / RBAC                      | `src/transport.rs` - `ReloadHandle` (~line 2011)       |
 | Environment variable override mapping          | `src/config.rs` - `ServerConfig::apply_env_overrides`, `ObservabilityConfig::apply_env_overrides`; `src/rbac.rs` - `RbacConfig::apply_env_overrides` |
 | `rmcp` / `rmcp-macros` version bump in `Cargo.toml` / `Cargo.lock` | `docs/RMCP_UPGRADE_CHECKLIST.md` - the checks to run; `tests/integration/delegation_guard.rs` - the trait-surface guard |
@@ -393,7 +393,7 @@ The core's current-Rust idioms (for example `Vec::push_mut` /
 
 ## 10. Common pitfalls (history of bites)
 
-1. **Middleware order matters for security.** Origin check MUST run before auth so unauthenticated callers are rejected by origin first. Rate limit MUST be inside auth so anonymous storms don't amplify. See `build_app_router` middleware wiring in `src/transport.rs:2330`.
+1. **Middleware order matters for security.** Origin check MUST run before auth so unauthenticated callers are rejected by origin first. Rate limit MUST be inside auth so anonymous storms don't amplify. See `build_app_router` middleware wiring in `src/transport.rs:2331`.
 2. **JWKS refresh is rate-limited.** Don't remove the `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:2928`) - invalid JWTs would otherwise DoS the JWKS endpoint.
 3. **Task-local RBAC context only exists inside the request scope.** Calling `current_role()` from a `tokio::spawn`ed background task returns `None`. Capture the value before spawning.
 4. **`stdio` transport bypasses everything.** `serve_stdio` does NOT enforce auth, RBAC, TLS, or origin checks. It's intended for trusted local subprocess scenarios only.

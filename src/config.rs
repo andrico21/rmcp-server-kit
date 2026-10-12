@@ -371,7 +371,8 @@ pub(crate) const RBAC_REDACTION_SALT_FILE_ENV: &str = "RMCP_SERVER_KIT__RBAC__RE
 )]
 #[non_exhaustive]
 pub struct ServerConfig {
-    /// Listen address (IP or hostname). Default: `127.0.0.1`.
+    /// Listen address: an IP literal (a hostname is rejected). Write an IPv6
+    /// literal in brackets, for example `[::1]`. Default: `127.0.0.1`.
     #[serde(default = "default_listen_addr")]
     pub listen_addr: String,
     /// Listen TCP port. Default: `8443`.
@@ -1655,7 +1656,8 @@ fn validate_listen_socket(server: &ServerConfig) -> RmcpResult<()> {
     if bind_addr.parse::<SocketAddr>().is_err() {
         return Err(RmcpServerKitError::Config(format!(
             "listen_addr/listen_port {bind_addr:?} is not a valid socket address \
-             (expected e.g. 127.0.0.1:8080)"
+             (expected e.g. 127.0.0.1:8080; write an IPv6 listen_addr in brackets, \
+             e.g. [::1])"
         )));
     }
     Ok(())
@@ -3459,6 +3461,13 @@ client_ip = false
             &server,
             "valid socket address",
         )?;
+
+        let bare_ipv6 = ServerConfig {
+            listen_addr: "::1".into(),
+            listen_port: 8444,
+            ..ServerConfig::default()
+        };
+        assert_server_config_rejected_by_both("bare IPv6 listen address", &bare_ipv6, "[::1]")?;
         Ok(())
     }
 
