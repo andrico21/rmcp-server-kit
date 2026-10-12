@@ -1559,7 +1559,7 @@ impl McpServerConfig {
     /// [`SessionIdLogPolicy::Plain`] for compatibility.
     #[must_use]
     #[inline]
-    pub fn with_session_id_log_policy(mut self, policy: SessionIdLogPolicy) -> Self {
+    pub const fn with_session_id_log_policy(mut self, policy: SessionIdLogPolicy) -> Self {
         self.log_context.session_id_header = policy;
         self
     }

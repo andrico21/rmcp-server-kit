@@ -1209,13 +1209,9 @@ impl AuthConfig {
     /// receiving `503 Service Unavailable` with `Retry-After: 1` (default 1
     /// second). Must be greater than zero; config validation enforces this at
     /// startup.
-    #[expect(
-        clippy::missing_const_for_fn,
-        reason = "public API frozen until the next major release"
-    )]
     #[must_use]
     #[inline]
-    pub fn with_verification_wait(mut self, wait: Duration) -> Self {
+    pub const fn with_verification_wait(mut self, wait: Duration) -> Self {
         self.verification_wait = wait;
         self
     }

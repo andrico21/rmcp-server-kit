@@ -136,7 +136,7 @@ defined cleanup order, and no panic path. `scripts/lint-ratchet/prose_gates.py
 | `Drop for AuditWorkerGuard` | `src/observability.rs:392` | Signals shutdown then parks/joins the writer thread for at most `AUDIT_WRITER_JOIN_TIMEOUT` (5s); no async work or panic path. Bounded blocking is deliberate and documented. No defect. |
 | `Drop for CancelOnDrop` | `src/transport.rs:2966` | Sync, non-blocking `CancellationToken::cancel`; no I/O, await or panic path. Never disarmed on purpose. No defect. |
 | `Drop for TlsListener` | `src/transport.rs:3930` | Sync, non-blocking `JoinHandle::abort`; in-flight workers exit on the closed channel. No I/O, await or panic path. No defect. |
-| `Drop for ReleaseHookOnDrop` | `src/auth.rs:1642` | Test-only. Flips the `AtomicBool` gate of a `VerificationHook`; sync, no I/O or await, no panic path. Runs on unwind too, which unparks any `spawn_blocking` closure still busy-waiting before the test's `Runtime` drops. No defect. |
+| `Drop for ReleaseHookOnDrop` | `src/auth.rs:1645` | Test-only. Flips the `AtomicBool` gate of a `VerificationHook`; sync, no I/O or await, no panic path. Runs on unwind too, which unparks any `spawn_blocking` closure still busy-waiting before the test's `Runtime` drops. No defect. |
 
 ## Local deviations register
 
@@ -348,8 +348,7 @@ entry in the same PR that introduces a deviation.
    as_datetime`, `RfcTimestamp::into_inner`, `ApiKeyEntry::with_expiry`,
    `RateLimitConfig::{with_pre_auth_max_per_minute, with_max_tracked_keys,
    with_idle_eviction, with_burst, with_pre_auth_burst}`,
-   `AuthConfig::{with_keys, with_rate_limit, check_oauth_feature,
-   with_verification_wait}`); the
+   `AuthConfig::{with_keys, with_rate_limit, check_oauth_feature}`); the
    `oauth`-only shape of `AuthConfig::check_oauth_feature` additionally freezes
    `clippy::unnecessary_wraps` and `clippy::unused_self`, and `AuthConfig`'s
    `oauth` placeholder (present only without the `oauth` feature) freezes
