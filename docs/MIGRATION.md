@@ -182,6 +182,9 @@ at startup at INFO), so a corporate PKI that publishes its CRLs on an internal
 host now works as long as the issuing CA certificate (the one carrying the
 CDP/AIA extensions) is present in `mtls.ca_cert_path` or the server's own
 chain. Cloud-metadata addresses remain unbypassable regardless of trust.
+The connect-time DNS screen applies the same exact-origin match: a URL whose
+origin is not trusted is fetched by a client that admits no blocked address,
+even when its hostname is the hostname of a trusted origin on another port.
 A runtime-discovered CDP URL reaches that trusted-origin path only when a
 certificate on the verified path of a presented chain names it (see
 [CRL discovery follows the verified certificate path](#crl-discovery-follows-the-verified-certificate-path)).

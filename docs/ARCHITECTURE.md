@@ -529,6 +529,8 @@ Lifecycle:
      handshake path to register newly observed CDP URLs for fetch.
    - `seen_urls` and `pending_urls` mutexes - permanent and in-flight
      discovery dedupe sets.
+   - `clients` - the screened and trusted CRL fetch clients
+     (`CrlHttpClients`, see "SSRF hardening").
    - `global_fetch_sem`, `host_semaphores`, `discovery_limiter`,
      `discovery_limiter_per_peer`, `crl_cpu`, and `trusted_origins` - the
      network, admission, CPU, and trusted-origin bounds.
@@ -591,8 +593,15 @@ For CRL fetches, the guard covers:
   which delegates to `ip_block_reason`. A trusted origin named in the
   operator's CA bundle or server chain can skip the private-address block;
   cloud-metadata addresses stay blocked.
-- `SsrfScreeningResolver` re-screens DNS answers at connect time with the
-  same trusted hostnames, closing the resolution-to-connect gap for DNS names.
+- `SsrfScreeningResolver` re-screens DNS answers at connect time, closing the
+  resolution-to-connect gap for DNS names. CRL fetches use two clients
+  (`CrlHttpClients`): the screened client has no trusted hostnames and
+  serves every URL whose exact origin (scheme, host, and port) is not
+  trusted; the trusted client, whose resolver admits the trusted hostnames,
+  serves only URLs whose exact origin is trusted. One
+  `CrlHttpClients::for_url` decision drives both the pre-flight and the
+  client choice, so a DNS change cannot carry a trusted hostname onto
+  another port.
 - The body-size, global fetch, per-host, discovery-rate, seen-URL, pending-URL,
   and cache caps bound the remaining blast radius.
 

@@ -327,7 +327,12 @@ Residuals an operator should know:
   trusted origin those are fetched with the private-address block skipped.
 - Trust is bound to the hostname, not a pinned address: if a trusted host's
   DNS is compromised, the fetch reaches whatever address it resolves to,
-  with the private-address block skipped for that request.
+  with the private-address block skipped for that request. The connect-time
+  re-screen is origin-exact: only a URL whose exact origin (scheme, host,
+  and port) is trusted is fetched by the client whose resolver admits the
+  trusted hostnames; every other URL uses a client that admits no blocked
+  address, so a DNS change cannot carry a trusted hostname onto another
+  port.
 - Because the server certificate chain is a source, a publicly issued server
   certificate makes its CA's public CRL and OCSP hosts trusted too (the
   startup `INFO` log lists them).

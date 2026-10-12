@@ -122,6 +122,15 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   residual: anyone holding a copy of a valid chain (public bytes, revoked or
   not) can trigger fetches of only the CDP URLs that chain's issuing CA
   chose. No configuration change.
+- **CRL connect-time DNS screening now trusts only the exact trusted origin**
+  and uses two HTTP clients. A URL whose exact origin (scheme, host, and
+  port) is trusted is fetched by a client whose connect-time resolver admits
+  the trusted hostnames; every other URL is fetched by a client that admits
+  no blocked address. One decision drives both the pre-flight check and the
+  client choice, so a DNS change cannot carry a trusted hostname onto
+  another port. Trust for the trusted origin itself stays bound to the
+  hostname, not a pinned address, and cloud-metadata addresses stay blocked.
+  No configuration change.
 
 ### Added
 
