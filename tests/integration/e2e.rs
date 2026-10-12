@@ -2865,8 +2865,102 @@ mod tests {
         Ok(resp.status())
     }
 
+    /// `localhost` resolves to `::1`, `127.0.0.1` or both, in a host-specific
+    /// order, and IP-literal OAuth URLs are rejected, so the JWKS mock must
+    /// answer on both loopback addresses on one shared port.
     #[cfg(feature = "oauth")]
-    async fn cancel_initialize_mid_request(base: &str, token: &str) -> anyhow::Result<()> {
+    struct DualStackMock {
+        /// The server bound to `127.0.0.1`.
+        v4: wiremock::MockServer,
+        /// The server bound to `::1` on the same port, when this host has `::1`.
+        v6: Option<wiremock::MockServer>,
+    }
+
+    #[cfg(feature = "oauth")]
+    impl DualStackMock {
+        /// Binds `127.0.0.1` on an ephemeral port and `::1` on the same port,
+        /// retrying when that port is taken on `::1`; a host without `::1`
+        /// gets an IPv4-only mock.
+        async fn start() -> anyhow::Result<Self> {
+            use core::net::{Ipv4Addr, Ipv6Addr};
+            use std::{io::ErrorKind as IoErrorKind, net::TcpListener as StdTcpListener};
+
+            for _ in 0..16_u8 {
+                let v4_listener = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                    .context("bind the IPv4 loopback mock listener")?;
+                let port = v4_listener
+                    .local_addr()
+                    .context("read the IPv4 mock listener address")?
+                    .port();
+                match StdTcpListener::bind((Ipv6Addr::LOCALHOST, port)) {
+                    Ok(v6_listener) => {
+                        let v4 = wiremock::MockServer::builder()
+                            .listener(v4_listener)
+                            .start()
+                            .await;
+                        let v6 = wiremock::MockServer::builder()
+                            .listener(v6_listener)
+                            .start()
+                            .await;
+                        return Ok(Self { v4, v6: Some(v6) });
+                    }
+                    Err(err) if err.kind() == IoErrorKind::AddrInUse => {}
+                    Err(_) => {
+                        let v4 = wiremock::MockServer::builder()
+                            .listener(v4_listener)
+                            .start()
+                            .await;
+                        return Ok(Self { v4, v6: None });
+                    }
+                }
+            }
+            anyhow::bail!("no port was free on both 127.0.0.1 and ::1 after 16 attempts")
+        }
+
+        /// The port both loopback servers share.
+        fn port(&self) -> u16 {
+            self.v4.address().port()
+        }
+
+        /// Mounts a fresh mock from `build` on every running server.
+        async fn mount<B>(&self, build: B)
+        where
+            B: Fn() -> wiremock::Mock,
+        {
+            build().mount(&self.v4).await;
+            if let Some(v6) = &self.v6 {
+                build().mount(v6).await;
+            }
+        }
+
+        /// Counts the requests for `wanted` received across both servers.
+        async fn path_count(&self, wanted: &str) -> anyhow::Result<usize> {
+            let mut count = 0_usize;
+            for server in [Some(&self.v4), self.v6.as_ref()].into_iter().flatten() {
+                let requests = server
+                    .received_requests()
+                    .await
+                    .context("request recording must be enabled")?;
+                count = count.saturating_add(
+                    requests
+                        .iter()
+                        .filter(|request| request.url.path() == wanted)
+                        .count(),
+                );
+            }
+            Ok(count)
+        }
+    }
+
+    /// Writes a complete initialize request, waits until the server has
+    /// started the JWKS fetch, then drops the connection.
+    #[cfg(feature = "oauth")]
+    async fn cancel_initialize_after_jwks_fetch_started(
+        base: &str,
+        token: &str,
+        jwks: &DualStackMock,
+    ) -> anyhow::Result<()> {
+        let before = jwks.path_count("/jwks.json").await?;
         let addr = base
             .strip_prefix("http://")
             .context("test base must be plain HTTP")?;
@@ -2892,7 +2986,20 @@ mod tests {
             .write_all(request.as_bytes())
             .await
             .context("write raw initialize")?;
-        sleep(Duration::from_millis(50)).await;
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if jwks
+                    .path_count("/jwks.json")
+                    .await
+                    .is_ok_and(|count| count > before)
+                {
+                    return;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("the server must start the JWKS fetch within 10s")?;
         drop(stream);
         Ok(())
     }
@@ -3054,27 +3161,34 @@ mod tests {
         Ok(())
     }
 
-    /// Cancelled OAuth HTTP auth waits do not abort the shared JWKS refresh.
+    /// Pins that a cancelled OAuth HTTP request does not abort the shared JWKS
+    /// refresh: the first request is cancelled only after the upstream JWKS
+    /// fetch has started. Before the shared-refresh fix the fetch ran inside
+    /// the request future with the cooldown already stamped, so dropping the
+    /// connection cancelled it and the immediate second request was rejected
+    /// with 401. The 2 s upstream delay gives the server ample time to notice
+    /// the dropped connection before the fetch could complete.
     #[cfg(feature = "oauth")]
     #[tokio::test]
     async fn asy01_cancelled_http_request_does_not_burn_jwks_cooldown() -> anyhow::Result<()> {
         use wiremock::{Mock, ResponseTemplate, matchers};
 
         let kid = "asy01-http";
-        let (pem, jwks) = generate_oauth_test_keypair(kid)?;
+        let (pem, jwks_body) = generate_oauth_test_keypair(kid)?;
         let token = mint_oauth_test_token(&pem, kid)?;
-        let mock = wiremock::MockServer::start().await;
-        Mock::given(matchers::method("GET"))
-            .and(matchers::path("/jwks.json"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(&jwks)
-                    .set_delay(Duration::from_millis(500)),
-            )
-            .mount(&mock)
-            .await;
+        let jwks = DualStackMock::start().await?;
+        jwks.mount(|| {
+            Mock::given(matchers::method("GET"))
+                .and(matchers::path("/jwks.json"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(&jwks_body)
+                        .set_delay(Duration::from_secs(2)),
+                )
+        })
+        .await;
 
-        let jwks_uri = format!("http://localhost:{}/jwks.json", mock.address().port());
+        let jwks_uri = format!("http://localhost:{}/jwks.json", jwks.port());
         let port = free_port().await?;
         let cfg = config_on_port(port)
             .with_auth(oauth_auth_config(&jwks_uri, "10m")?)
@@ -3082,9 +3196,22 @@ mod tests {
         let base = spawn_server(cfg).await?;
         let client = reqwest::Client::new();
 
-        cancel_initialize_mid_request(&base.base, &token).await?;
-        sleep(Duration::from_millis(700)).await;
-        assert_eq!(initialize_status(&client, &base.base, &token).await?, 200);
+        cancel_initialize_after_jwks_fetch_started(&base.base, &token, &jwks).await?;
+        let status = timeout(
+            Duration::from_secs(15),
+            initialize_status(&client, &base.base, &token),
+        )
+        .await
+        .context("the second initialize must finish")??;
+        assert_eq!(
+            status, 200,
+            "the second request must join the cancelled request's refresh and authenticate"
+        );
+        assert_eq!(
+            jwks.path_count("/jwks.json").await?,
+            1,
+            "the second request must join the in-flight refresh, not start another"
+        );
 
         Ok(())
     }
