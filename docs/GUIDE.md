@@ -555,11 +555,12 @@ internally by the TLS acceptor.
 
 CRL URLs are auto-discovered from the X.509 **CRL Distribution Points**
 (CDP) extension on the configured CA chain (eagerly at startup, with a
-10-second total bootstrap deadline) and from the verified path of each new
-client chain that verifies against `mtls.ca_cert_path` (lazily, during a TLS
+10-second total bootstrap deadline) and from every verified path of each new
+client chain that verifies against `mtls.ca_cert_path` (the end entity and
+every intermediate on a path to a configured root, lazily, during a TLS
 handshake). The chain is checked before the client proves key possession and
 revocation is not considered, so a chain that does not verify, or a
-certificate appended outside the verified path, contributes no URL to
+certificate on no verified path, contributes no URL to
 discovery. CRLs are cached in memory keyed
 by URL and refreshed on a background task before `nextUpdate`, clamped to
 `[10 min, 24 h]`. The underlying `rustls::ClientCertVerifier` is hot-swapped
@@ -577,7 +578,7 @@ Cloud-metadata addresses stay blocked regardless. This is what lets a
 corporate PKI that publishes CRLs on an internal host work with CRL
 checking at all - the trusted origins are logged once at startup (`INFO`
 level) for audit. At runtime, a client can cause a fetch from a trusted origin
-only through a CDP URL named by a certificate on the verified path of its
+only through a CDP URL named by a certificate on a verified path of its
 presented chain, which must verify against `mtls.ca_cert_path`. Residuals,
 and what to do when neither chain names your PKI host (e.g. a bundle holding
 only a self-signed root with no CDP/AIA

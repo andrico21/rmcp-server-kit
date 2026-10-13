@@ -187,46 +187,58 @@ The connect-time DNS screen applies the same exact-origin match: a URL whose
 origin is not trusted is fetched by a client that admits no blocked address,
 even when its hostname is the hostname of a trusted origin on another port.
 A runtime-discovered CDP URL reaches that trusted-origin path only when a
-certificate on the verified path of a presented chain names it (see
-[CRL discovery follows the verified certificate path](#crl-discovery-follows-the-verified-certificate-path)).
+certificate on a verified path of a presented chain names it (see
+[CRL discovery follows verified certificate paths](#crl-discovery-follows-verified-certificate-paths)).
 This narrows the 3.14-era statement that a CDP resolving into a blocked
 range is always rejected: it is rejected only for origins not named in a
 configured certificate. See also the CRL/AIA IPv6-literal limitation below.
 
-### CRL discovery follows the verified certificate path
+### CRL discovery follows verified certificate paths
 
-Runtime CRL discovery now fetches only the CDP URLs named by certificates on
-the verified path of a presented client chain that verifies against the
-configured roots (`mtls.ca_cert_path`). The chain is checked before the
-client proves key possession and revocation is not considered. A chain that
-does not verify triggers no CRL request and consumes no discovery budget,
-and a certificate appended outside the verified path contributes no URL to
-discovery. Their CDP URLs still count toward the unchanged per-handshake
-64-URL malformed-certificate cap and the fail-closed availability precheck
-(every presented certificate's URLs by default, only the end entity's with
+Runtime CRL discovery now fetches only the CDP URLs named by the end entity or
+by an intermediate on a verified path of a presented client chain: a path to a
+configured root (`mtls.ca_cert_path`) that verifies as the live verifier
+would, except that revocation is not considered. The chain is checked before
+the client proves key possession. Every verified path counts, up to webpki's
+path-building budget, and byte-identical duplicate intermediates are ignored,
+so a client that presents a cross-signed intermediate in two copies has the
+URLs of whichever copy the live verifier accepts discovered. A chain that does
+not verify triggers no CRL request and consumes no discovery budget, and a
+certificate on no verified path contributes no URL to discovery. Their CDP
+URLs still count toward the unchanged per-handshake 64-URL
+malformed-certificate cap and the fail-closed availability precheck (every
+presented certificate's URLs by default, only the end entity's with
 `crl_end_entity_only = true`), which can only affect the presenting client's
 own handshake.
 
-No operator action is required unless a client presents a certificate outside
-its verified path, for example an extra or cross-signed intermediate. With
-`crl_end_entity_only = false` (the default), a CRL URL that a presented chain
-names only on a certificate outside its verified path is no longer fetched
-because of that chain. A client that depended on such a CRL, whether to cover a
-certificate of its chain or only to satisfy the fail-closed precheck, can find
-it unavailable until it is cached some other way. Then, with
-`crl_deny_on_unavailable = true` (the default), its handshake can be refused,
-and with `crl_deny_on_unavailable = false` a certificate that CRL covered can be
-accepted without a revocation check. Before 3.20.0 such a URL was fetched. The
-CRL is available again once a certificate on the verified path of a presented
-chain names its URL and the fetched CRL is cached, for example after the client
-certificate is reissued with that URL in its CDP extension. Anyone holding a
-copy of a valid chain (public bytes, revoked or not) can still trigger fetches
-of exactly the CDP URLs that chain's issuing CA chose.
+In two narrow cases a CDP URL that 3.14 fetched is no longer fetched because
+of the presenting chain, until it is cached some other way. First, a URL named
+only by a certificate on no verified path. The live verifier never builds a
+path through such a certificate, so no revocation decision depends on its CRL,
+but the fail-closed precheck refuses a handshake when every relevant CDP URL
+is uncached: with `crl_end_entity_only = false` and
+`crl_deny_on_unavailable = true` (both defaults), a client whose relevant URLs
+are all named only by such certificates - for example an end-entity
+certificate without a CDP extension presented together with an unrelated
+certificate that has one - can be
+refused. Second, a chain that offers dozens of distinct alternative paths. The
+live verifier gives up on a candidate path at its first revocation failure,
+while discovery verifies every candidate in full against webpki's fixed
+per-verification budget (which includes a limit of 100 signature checks), so
+discovery can exhaust that budget before it reaches the path the live verifier
+accepts. Any of that path's CRLs not named by a recorded path are then not
+discovered from the chain: under `crl_deny_on_unavailable = true` the
+handshake can be refused, and under `false` the certificates they cover can be
+accepted without a revocation check. Otherwise no operator action is required.
+Anyone holding a copy of a valid chain (public bytes, revoked or not) can
+still trigger fetches of the CDP URLs chosen by the CAs that issued the
+certificates on its verified paths.
+
 Downstream code that calls `DynamicClientCertVerifier` directly gets the same
-gate under any transport. A spray of certificates that do not verify no
-longer produces `discovery_rate_limited` log lines; it shows as handshake
-failures at debug level. The crate now depends directly on `rustls-webpki`
-for this check; see the CHANGELOG.
+gate under any transport. A spray of certificates that do not verify no longer
+produces `discovery_rate_limited` log lines; it shows as handshake failures at
+debug level. The crate now depends directly on `rustls-webpki` for this check;
+see the CHANGELOG.
 
 ### Session-id log policy (opt-in, default unchanged)
 

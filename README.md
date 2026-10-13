@@ -299,9 +299,10 @@ does not break existing TOML parsing. `Clone` survives with
 **Status: shipped (minor, additive).** Recorded here so the residual
 trade-offs are not rediscovered. `crl_discovery_rate_per_min` gates admission
 of *new* CDP URLs into the CRL fetch pipeline on the mTLS handshake path;
-since 3.20.0 only CDP URLs named by the verified path of a presented chain
-that verifies against the configured roots (checked before the client proves
-key possession; revocation not considered) are admitted. It is now keyed
+since 3.20.0 only CDP URLs named by the end entity or by intermediates on a
+verified path of a presented chain (a path to the configured roots that
+verifies, checked before the client proves key possession; revocation not
+considered) are admitted. It is now keyed
 **per source peer IP** for attributed handshakes (process-global fallback
 when unattributed), which removes the
 cross-peer starvation a single global bucket allowed: one peer could drain

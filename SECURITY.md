@@ -186,12 +186,13 @@ When mTLS is enabled, rmcp-server-kit:
    Points** (CDP) extension and fetches each referenced CRL via HTTP(S),
    bounded by a 10-second total bootstrap deadline.
 2. On each new client chain observed during a TLS handshake, lazily
-   discovers any additional CDP URLs named by the certificates on the
-   verified path of a presented chain that verifies against the configured
-   roots (checked before the client proves key possession; revocation not
-   considered) and schedules them for fetch. A chain that does not verify
-   contributes no URL, and certificates appended outside the verified path
-   contribute none either.
+   discovers any additional CDP URLs named by the end entity or by
+   intermediates on a verified path of a presented chain (a path to the
+   configured roots that verifies as the live verifier would, except that
+   revocation is not considered; checked before the client proves key
+   possession) and schedules them for fetch. A chain that does not verify
+   contributes no URL, and certificates on no verified path contribute none
+   either.
 3. Caches every CRL in memory keyed by URL and refreshes it before
    `nextUpdate` (clamped to `[10 min, 24 h]`) on a background task.
 4. Hot-swaps the underlying `rustls::ClientCertVerifier` via `ArcSwap` once
@@ -257,9 +258,9 @@ crl_retry_retention      = "24h"    # keep failed-refresh entries for retry only
 
 ### CRL fetch SSRF hardening
 
-CRL Distribution Point URLs are discovered only from the certificates on the
-verified path of a presented chain that verifies against the configured
-roots, so they are chosen by that chain's issuing CA. They are still treated
+CRL Distribution Point URLs are discovered only from the end entity and the
+intermediates on a verified path of a presented chain, so they are chosen by
+the CAs that issued those certificates. They are still treated
 as hostile input, so the CRL fetcher is a hostile-input network call. The CA
 signature protects a CRL's contents,
 not the outbound request, which is why the fetch is screened. Before any HTTP
@@ -315,16 +316,17 @@ count and sorted list) so an operator can audit what bypasses the screening.
 Residuals an operator should know:
 
 - A chain that does not verify against the configured roots triggers no
-  fetch, and certificates appended outside the verified path contribute
-  nothing to discovery, so a client without a valid chain cannot make the
+  fetch, and certificates on no verified path contribute nothing to
+  discovery, so a client without a valid chain cannot make the
   server request a path on a trusted origin. Their CDP URLs still count
   toward the per-handshake 64-URL malformed-certificate cap and the
   fail-closed availability precheck (every presented certificate's URLs by
   default, only the end entity's with `crl_end_entity_only = true`), which
   can only reject that presenting client's own handshake. Anyone holding a
   copy of a valid chain (public bytes only, revoked or not) can trigger
-  fetches of exactly the CDP URLs that chain's issuing CA chose, and on a
-  trusted origin those are fetched with the private-address block skipped.
+  fetches of exactly the CDP URLs chosen by the CAs that issued the
+  certificates on its verified paths, and on a trusted origin those are
+  fetched with the private-address block skipped.
 - Trust is bound to the hostname, not a pinned address: if a trusted host's
   DNS is compromised, the fetch reaches whatever address it resolves to,
   with the private-address block skipped for that request. The connect-time
@@ -382,19 +384,23 @@ revocation-checking inner verifier runs. This ordering is a deliberate,
 load-bearing invariant: with `crl_deny_on_unavailable = true` the verifier
 must be able to fail closed on a never-fetched CDP, which requires
 discovering the CDP before delegating to the inner verifier. Since 3.20.0
-admission to discovery additionally requires the verified path: the server
-builds the path from the presented chain to the configured roots (same
+admission to discovery additionally requires a verified path: the server
+enumerates every path from the presented chain to the configured roots (same
 roots, same signature algorithms and client-auth usage as the live verifier,
-revocation not considered), once per handshake and only when a presented CDP
-URL is new, and admits only the URLs named by certificates on that path. This
+revocation not considered, byte-identical duplicate intermediates ignored,
+within webpki's per-call path-building budget), once per handshake and only
+when a presented CDP URL is new, and admits only the URLs named by the end
+entity or by intermediates on those paths. This
 check runs before the client proves key possession, so it describes the
 presented chain, not the client. A chain that does not verify admits nothing
 and consumes no discovery budget, so throwaway certificates submit no URL.
 The per-handshake 64-URL cap and the fail-closed precheck still run on every
 relevant presented CDP URL (every presented certificate's by default, only the
 end entity's with `crl_end_entity_only = true`), including those of
-certificates outside the verified path, so off-path certificates are excluded
-from discovery but not, by default, from the cap or the precheck. No HTTP
+certificates on no verified path, so such certificates are excluded from
+discovery but not, by default, from the cap or the precheck. A chain that
+offers dozens of distinct alternative paths can exhaust that budget before
+the path the live verifier accepts; see docs/MIGRATION.md. No HTTP
 happens on the handshake path - discovery only enqueues onto a bounded,
 rate-limited channel, and the actual fetch runs on a background task behind
 the full SSRF guard.
@@ -406,8 +412,9 @@ handshake peer's IP in a task-local that the synchronous
 `ClientCertVerifier` callback reads, so each peer draws on its own
 per-minute `crl_discovery_rate_per_min` budget. Only a holder of a copy of a
 valid chain (public bytes, revoked or not) can submit URLs: it can exhaust
-*its own* budget and fill `crl_max_seen_urls` slots, but only with the CDP
-URLs that chain's issuing CA chose, and it can no
+*its own* budget and fill `crl_max_seen_urls` slots, but only with CDP URLs
+chosen by the CAs that issued the certificates on its verified paths, and it
+can no
 longer drain a shared bucket and thereby starve a concurrent legitimate
 peer's discovery of a *new* CDP URL - the fail-closed denial under
 `crl_deny_on_unavailable = true` that such starvation used to cause is
@@ -464,8 +471,10 @@ Operator guidance:
 - Size `crl_max_seen_urls` and `crl_max_cache_entries` to comfortably
   exceed your CA estate's real CDP count, especially with
   `crl_deny_on_unavailable = true`: at the cache cap the **newest** entry
-  is rejected (never an existing one - LRU eviction would let an attacker
-  evict the legitimate warm set by spamming throwaway CDP URLs), so a
+  is rejected (never an existing one - LRU eviction would let any source of
+  many distinct CDP URLs, which since 3.20.0 takes certificates on a
+  verified path such as those of a misbehaving issuing CA, evict the
+  legitimate warm set), so a
   full cache means newly discovered legitimate CDPs cannot enter until
   capacity frees up.
 - Pre-seed the cache via the startup bootstrap: CDPs present in the

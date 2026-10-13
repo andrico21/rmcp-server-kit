@@ -102,34 +102,33 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   adversarially large CRL, or a deep CRL cache, could previously stall a
   Tokio worker thread - and every other task scheduled on it - for the
   parse or rebuild duration. No configuration change; internal only.
-- **CRL discovery follows the verified certificate path** - runtime CRL
-  discovery now fetches only the CDP URLs named by certificates on the
-  verified path of a presented client chain that verifies against the
-  configured roots (checked before the client proves key possession;
-  revocation not considered). Previously the CDP URLs of every presented
+- **CRL discovery follows verified certificate paths** - runtime CRL discovery
+  now fetches only the CDP URLs named by the end entity or by an intermediate
+  on a verified path of a presented client chain: a path to a configured root
+  that verifies as the live verifier would, except that revocation is not
+  considered (checked before the client proves key possession). Every verified
+  path counts, up to webpki's path-building budget, and byte-identical
+  duplicate intermediates are ignored, so a client that presents a
+  cross-signed intermediate in two copies has the URLs of whichever copy the
+  live verifier accepts discovered. Previously the CDP URLs of every presented
   certificate were discovered before any chain check, so a client holding no
-  valid chain could make the server send GET requests to attacker-chosen
-  URLs and, with the operator-trusted origins added in this release, to any
-  path on such an origin, which skips the private-address screen (cloud
-  metadata addresses excepted). A chain that does not verify now triggers no
-  fetch and spends no discovery budget, and a certificate appended outside
-  the verified path contributes no URL. Those certificates' CDP URLs still
-  count toward the unchanged per-handshake 64-URL malformed-certificate cap
-  and the fail-closed availability precheck by default (with
-  `crl_end_entity_only = true` only the end entity's URLs are considered),
-  and `crl_deny_on_unavailable` semantics are unchanged. As a consequence, with
-  `crl_end_entity_only = false` (the default), a CRL URL that a presented chain
-  names only on a certificate outside its verified path is no longer fetched
-  because of that chain. A client that depended on such a CRL, whether to cover
-  a certificate of its chain or only to satisfy the fail-closed precheck, can
-  find it unavailable until it is cached some other way: under the default
-  `crl_deny_on_unavailable = true` its handshake can then be refused, and under
-  `crl_deny_on_unavailable = false` a certificate that CRL covered can be
-  accepted without a revocation check (see the migration notes). The gate lives
-  in `DynamicClientCertVerifier`, so it applies under any transport. Remaining
-  residual: anyone holding a copy of a valid chain (public bytes, revoked or
-  not) can trigger fetches of only the CDP URLs that chain's issuing CA chose.
-  No configuration change.
+  valid chain could make the server send GET requests to attacker-chosen URLs
+  and, with the operator-trusted origins added in this release, to any path on
+  such an origin, which skips the private-address screen (cloud metadata
+  addresses excepted). A chain that does not verify now triggers no fetch and
+  spends no discovery budget, and a certificate on no verified path
+  contributes no URL. Those certificates' CDP URLs still count toward the
+  unchanged per-handshake 64-URL malformed-certificate cap and the fail-closed
+  availability precheck by default (with `crl_end_entity_only = true` only the
+  end entity's URLs are considered), and `crl_deny_on_unavailable` semantics
+  are unchanged. Two narrow cases are described in the migration notes: a
+  chain whose relevant CDP URLs are all named only by certificates on no
+  verified path, and a chain that offers dozens of distinct alternative paths.
+  The gate lives in `DynamicClientCertVerifier`, so it applies under any
+  transport. Remaining residual: anyone holding a copy of a valid chain
+  (public bytes, revoked or not) can trigger fetches of only the CDP URLs
+  chosen by the CAs that issued the certificates on its verified paths. No
+  configuration change.
 - **CRL connect-time DNS screening now trusts only the exact trusted origin**
   and uses two HTTP clients. A URL whose exact origin (scheme, host, and
   port) is trusted is fetched by a client whose connect-time resolver admits
@@ -182,7 +181,7 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   and, on Linux, its `linux-raw-sys` dependency. The project's `cargo vet`
   exemptions for both crates were raised from `safe-to-run` to
   `safe-to-deploy`.
-- **`rustls-webpki` is now a direct dependency** - the verified path of a
+- **`rustls-webpki` is now a direct dependency** - every verified path of a
   presented client chain, which the `rustls` client verifier discards, is
   built with `rustls-webpki` directly (`default-features = false`, feature
   `std`). It is the same 0.103.15 already in `Cargo.lock` through `rustls`,

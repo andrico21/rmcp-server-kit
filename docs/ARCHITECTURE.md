@@ -537,7 +537,7 @@ Lifecycle:
    - `roots` and `signature_algorithms` - the client-auth root store and the
      process-default provider's signature algorithms (captured once in
      `CrlSet::new`). The live verifier uses the same pair, and
-     `cdp_urls_on_verified_paths` reuses them for the verified path check
+     `cdp_urls_on_verified_paths` reuses them for the verified-path check
      described under "Discovery admission ordering".
    A commit publishes the rebuilt cache and `verifier_state` together under
    the cache write lock with no `.await` between them; handshake readers take
@@ -626,21 +626,30 @@ strict pending-before-send protocol to keep discovery retries correct:
    advertising more than `MAX_RELEVANT_CDP_URLS_PER_HANDSHAKE` distinct
    relevant URLs. The cap and the fail-closed precheck count every relevant
    presented CDP URL, including those of certificates that later turn out to
-   be off the verified path (with `crl_end_entity_only = true` only the end
+   be on no verified path (with `crl_end_entity_only = true` only the end
    entity's URLs are relevant).
 2. Snapshot `seen_urls` and `pending_urls`, then keep only relevant URLs that
    are neither confirmed cached nor already in flight. `fetch_crl` later
    applies `check_scheme`, `reject_blocked_crl_ip`, `ip_block_reason`, and
    connect-time `SsrfScreeningResolver` screening before issuing any request.
 3. When candidates remain, run the `discoverable` closure once. It is
-   `CrlSet::cdp_urls_on_verified_paths`: webpki path building from the presented
-   chain to the configured roots with the same signature algorithms as the
-   live verifier, client-auth usage, and no revocation. A chain that does not
+   `CrlSet::cdp_urls_on_verified_paths`: after byte-identical duplicate
+   intermediates are dropped, webpki path building from the presented chain
+   to the configured roots with the same signature algorithms as the live
+   verifier, client-auth usage, and no revocation, continued past the first
+   success - a `verify_path` callback records each complete path and rejects
+   it so webpki keeps searching within its per-call budget - so every
+   verified path the budget reaches contributes. The live verifier gives up
+   on a candidate at its first revocation failure while this search verifies
+   each candidate in full, so a chain with dozens of distinct alternative
+   paths can exhaust the budget before the path the live verifier accepts.
+   A chain that does not
    verify yields `None`, which empties the candidates, so nothing is admitted
    and no limiter token is consumed. For a chain that verifies, candidates
-   not named by the end entity or the intermediates on the verified path are
-   dropped (logged at `debug`). Off-path certificates are therefore excluded
-   from discovery but, by default, not from step 1's cap or the precheck.
+   not named by the end entity or by an intermediate on any verified path are
+   dropped (logged at `debug`). Certificates on no verified path are therefore
+   excluded from discovery but, by default, not from step 1's cap or the
+   precheck.
 4. For each remaining candidate, attempt admission. When the handshake peer is
    attributed via the `CURRENT_HANDSHAKE_PEER` task-local (set by the
    TLS accept worker), admission consults that peer's own bucket
