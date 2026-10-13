@@ -11,6 +11,8 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+## [3.20.0] - 2026-10-13
+
 ### Breaking
 
 - **`JwksCache::new` now returns the crate error type instead of a boxed
