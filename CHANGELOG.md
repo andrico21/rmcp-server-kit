@@ -11,14 +11,260 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+## [3.20.0] - 2026-10-13
+
+### Breaking
+
+- **`JwksCache::new` now returns the crate error type instead of a boxed
+  error** - `pub fn new(config: &OAuthConfig) -> Result<Self,
+  RmcpServerKitError>`, replacing `Result<Self, Box<dyn Error + Send +
+  Sync>>`. Code that propagates the error with `?` into `anyhow::Error` or
+  `Box<dyn Error>` compiles unchanged:
+
+  ```rust,ignore
+  let cache = JwksCache::new(&oauth_config)?;
+  ```
+
+  Code that names the boxed error type or downcasts it must switch to the
+  crate error type:
+
+  ```rust,ignore
+  let result: Result<JwksCache, rmcp_server_kit::RmcpServerKitError> =
+      JwksCache::new(&oauth_config);
+  ```
+
+### Security
+
+- **Argon2id API-key verification is now admission-controlled** -
+  `AuthConfig::max_concurrent_verifications` (default
+  `available_parallelism()` clamped to `1..=16`, and clamped again to
+  `Semaphore::MAX_PERMITS` if set higher) bounds how many Argon2id
+  verifications (about 19 MiB each) run at once on the blocking thread
+  pool. A bearer request that cannot get a permit within
+  `AuthConfig::verification_wait` (default `1s`) now fails fast with `503
+  Service Unavailable` and `Retry-After: 1` instead of queuing unboundedly;
+  these hits are counted separately as `AuthCountersSnapshot::failure_overloaded`
+  and visible at `/admin/auth/counters`. A legitimate burst beyond the
+  pool's capacity also receives `503`; see the capacity guidance in
+  `docs/GUIDE.md`. The constant-time credential scan is
+  unchanged. Documented API-key configurations (README, `docs/GUIDE.md`,
+  `examples/api_key_rbac.rs`) now also show a per-IP rate limit, since
+  API-key auth without one is unsafe on a reachable listener.
+- **SSRF guard blocks more special-purpose IPv6 ranges by default** - RFC
+  8215 local-use NAT64 (`64:ff9b:1::/48`), deprecated site-local
+  (`fec0::/10`), benchmarking (`2001:2::/48`), and ORCHID/ORCHIDv2
+  (`2001:10::/28`, `2001:20::/28`) are now blocked for OAuth, JWKS, token,
+  revocation and introspection endpoints unless re-allowed with a narrow
+  `ssrf_allowlist` CIDR. A cloud-metadata IPv4 address embedded in any RFC
+  6052 layout inside the NAT64 `/48` (not only the `/96` layout) stays
+  blocked even under a broad allowlist. The CRL fetch path has no allowlist,
+  so a distribution point resolving into any of these ranges is now blocked
+  outright, unless its origin is one trusted under the CRL change below.
+- **Unix audit-log opening refuses symlinks, special files, foreign owners
+  and hard links** - opening `audit_log_path` now refuses to follow a
+  symlink at the final path component, refuses anything that is not a
+  regular file (devices, FIFOs, sockets), refuses a pre-existing file not
+  owned by the server process's effective user (even running as root), and
+  refuses a regular file with more than one hard link - all before
+  permissions are tightened or the audit writer starts. Strict
+  initialization fails startup on any of these; the deprecated lenient
+  initializer now installs no audit sink at all when hardening fails, rather
+  than writing to an unprotected one. These checks run once at startup, not
+  continuously; use copy-based retention or rotation (for example
+  logrotate's `copytruncate`), not hardlinks. A failed correction of the
+  mode to `0o600` now fails closed too (it was a warning) unless the file
+  already is exactly `0o600`, so pre-create it on filesystems that reject
+  chmod. `/dev/stdout`, `/dev/stderr` and FIFOs are no longer accepted as
+  audit-log paths; NFS with `root_squash` and a root server fails the owner
+  check.
+- **Windows audit-log opening refuses reparse points; DACL-hardening cleanup
+  is more conservative** - opening `audit_log_path` now refuses a reparse
+  point (a symbolic link, junction, mount point, or any other reparse tag,
+  including cloud-file placeholders and deduplicated files) at the final
+  path component, checked both before the open and again on the opened
+  handle; a rejected reparse point is never deleted. If owner-only DACL
+  hardening fails after the file is opened, the file is now deleted only
+  when this call created it - a pre-existing file that fails hardening is
+  left in place, matching the existing Unix policy of never deleting
+  something the process did not create. Cleanup still removes by path after
+  the handle is dropped, so a principal with write access to the parent
+  directory can still race it.
+- **A cancelled request can no longer stall OAuth authentication for the
+  JWKS refresh cooldown** - the JWKS refresh now runs as one shared
+  background task that callers wait on; it completes, or ends at server
+  shutdown or cache drop, and releases its waiters even if it panics. A
+  client that previously disconnected mid-refresh could burn the refresh
+  cooldown and fail every subsequent OAuth request closed until it expired;
+  the cooldown and fail-closed behavior are otherwise unchanged, and there
+  is no public API change.
+- **CRL parsing and verifier rebuilds no longer run on a Tokio worker
+  thread** - DER parsing and `rustls` verifier rebuilds, triggered by CRL
+  refresh, handshake-discovered CDP fetches, and bootstrap, now run on the
+  blocking thread pool, bounded to at most two concurrent jobs. A large or
+  adversarially large CRL, or a deep CRL cache, could previously stall a
+  Tokio worker thread - and every other task scheduled on it - for the
+  parse or rebuild duration. No configuration change; internal only.
+- **CRL discovery follows verified certificate paths** - runtime CRL discovery
+  now fetches only the CDP URLs named by the end entity or by an intermediate
+  on a verified path of a presented client chain: a path to a configured root
+  that verifies as the live verifier would, except that revocation is not
+  considered (checked before the client proves key possession). Every verified
+  path counts, up to webpki's path-building budget, and byte-identical
+  duplicate intermediates are ignored, so a client that presents a
+  cross-signed intermediate in two copies has the URLs of whichever copy the
+  live verifier accepts discovered. Previously the CDP URLs of every presented
+  certificate were discovered before any chain check, so a client holding no
+  valid chain could make the server send GET requests to attacker-chosen URLs
+  and, with the operator-trusted origins added in this release, to any path on
+  such an origin, which skips the private-address screen (cloud metadata
+  addresses excepted). A chain that does not verify now triggers no fetch and
+  spends no discovery budget, and a certificate on no verified path
+  contributes no URL. Those certificates' CDP URLs still count toward the
+  unchanged per-handshake 64-URL malformed-certificate cap and the fail-closed
+  availability precheck by default (with `crl_end_entity_only = true` only the
+  end entity's URLs are considered), and `crl_deny_on_unavailable` semantics
+  are unchanged. Two narrow cases are described in the migration notes: a
+  chain whose relevant CDP URLs are all named only by certificates on no
+  verified path, and a chain that offers dozens of distinct alternative paths.
+  The gate lives in `DynamicClientCertVerifier`, so it applies under any
+  transport. Remaining residual: anyone holding a copy of a valid chain
+  (public bytes, revoked or not) can trigger fetches of only the CDP URLs
+  chosen by the CAs that issued the certificates on its verified paths. No
+  configuration change.
+- **CRL connect-time DNS screening now trusts only the exact trusted origin**
+  and uses two HTTP clients. A URL whose exact origin (scheme, host, and
+  port) is trusted is fetched by a client whose connect-time resolver admits
+  the trusted hostnames; every other URL is fetched by a client that admits
+  no blocked address. One decision drives both the pre-flight check and the
+  client choice, so a DNS change cannot carry a trusted hostname onto
+  another port. Trust for the trusted origin itself stays bound to the
+  hostname, not a pinned address, and cloud-metadata addresses stay blocked.
+  No configuration change.
+
+### Added
+
+- **`[server.log_context] session_id_header`** chooses how full
+  request-header logging renders the `Mcp-Session-Id` header:
+  `"plain"` (default, unchanged historical rendering), `"mask"` (16 or more
+  characters render as `first4...last4`, counted by Unicode character, never
+  bytes; shorter values render `[MASKED]`), or `"hide"` (the header name and
+  value are both omitted). Set it with
+  `McpServerConfig::with_session_id_log_policy` or the matching env
+  override. Startup now logs a WARN when full request-header logging is
+  enabled with `session_id_header = "plain"` and `session_binding` is
+  disabled.
+
 ### Changed
 
-- **Every emptiness assertion carries a message (internal)** - six
-  message-less `assert!(x.is_empty())` checks in unit tests now say what they
-  pin, as the vendored core requires for every emptiness assertion. Clippy's
-  `assert_is_empty` cannot see these shapes (a custom `is_empty()` method, or a
-  collection whose elements lack `PartialEq`), so a new `emptiness-message`
-  check in `scripts/lint-ratchet/prose_gates.py` enforces the rule in CI.
+- **mTLS CRL fetches now trust the origins named in the operator's
+  configured certificates** - the CRL and AIA screening that blocks private,
+  loopback and other restricted addresses now passes automatically for an
+  `https` origin, or an `http` origin while `crl_allow_http` is enabled (the
+  default), that is named in the CRL Distribution Point or Authority
+  Information Access extensions of a certificate in `mtls.ca_cert_path` or in
+  the server's own TLS certificate chain (origins are compared on scheme,
+  lowercased host and effective port) - because the operator, not a client,
+  chose those URLs. Cloud-metadata addresses remain unbypassable regardless.
+  There is no configuration knob; the trusted origins are logged once at
+  startup (INFO) for audit. **Known limitation (pre-existing, unchanged by
+  this release):**
+  a CRL or AIA URL whose host is an IPv6 literal is never fetched - the
+  bracketed-host lookup fails closed - so publish such endpoints under a DNS
+  hostname or an IPv4 literal.
+- **`rustix` is now a direct Unix dependency for audit-log hardening** - the
+  crate depends on `rustix` with `default-features = false` and the `fs`,
+  `process` and `std` features on Unix targets. The audit-log open (without
+  following a symlink at the final path component), opened-handle `fstat`
+  owner, type and link-count checks, and opened-handle `fchmod` now use
+  `rustix` safe wrappers because the standard library has no portable
+  `O_NOFOLLOW` and this crate forbids `unsafe`. In this repository's lockfile,
+  `rustix` 1.1.5 was already present, but only through `tempfile`, which only
+  dev-dependencies pull in; downstream Unix normal builds now gain `rustix`
+  and, on Linux, its `linux-raw-sys` dependency. The project's `cargo vet`
+  exemptions for both crates were raised from `safe-to-run` to
+  `safe-to-deploy`.
+- **`rustls-webpki` is now a direct dependency** - every verified path of a
+  presented client chain, which the `rustls` client verifier discards, is
+  built with `rustls-webpki` directly (`default-features = false`, feature
+  `std`). It is the same 0.103.15 already in `Cargo.lock` through `rustls`,
+  so no new crate enters the lock file, and its `cargo vet` exemption is
+  already `safe-to-deploy`.
+- **TOML config preflight now applies the same nested auth validation as the
+  builder path** - API-key principal names, OAuth feature presence and
+  config, auth rate-limit capacity (including `max_tracked_keys`), mTLS
+  capacity knobs, and `verification_wait` are validated by one shared helper
+  called from both validators. The preflight also now parses the composed
+  `listen_addr:listen_port` as a `SocketAddr` before startup, so a bare IPv6
+  `listen_addr` (for example `::1`) is rejected earlier with a message that
+  shows the bracketed form (`[::1]`); the builder's `bind_addr` error gained
+  the same hint.
+- **Validation messages** - the zero-`burst` and zero-`pre_auth_burst`
+  errors now name `auth.rate_limit.burst` and `auth.rate_limit.pre_auth_burst`
+  on both validators (the builder path said `auth rate_limit.burst` and
+  `auth rate_limit.pre_auth_burst` in 3.14.4), and both listen-address
+  errors show the bracketed IPv6 form. Exact message matchers must be
+  updated.
+- **`const fn` builders** - `AuthConfig::with_verification_wait` and
+  `McpServerConfig::with_session_id_log_policy` are `const fn`, like
+  `AuthConfig::with_max_concurrent_verifications`.
+- **House dash convention applied across the repository** - prose now uses a
+  single hyphen (two consecutive hyphens are reserved for command-line
+  flags and separators), enforced in CI by a new lint-ratchet gate. Four
+  operator-visible warning strings had that separator normalized from a
+  double hyphen to a single hyphen: the OAuth SSRF-allowlist "operators
+  only" and "list them via oauth.ssrf_allowlist.cidrs" messages
+  (`src/oauth.rs`), and the RBAC "not as a pattern" and "bypasses it
+  entirely" messages (`src/rbac.rs`); exact log matchers must be updated.
+  The `docs/GUIDE.md` top-level heading and the `Q1`-`Q6` headings of
+  `docs/decisions/P4-DECISION-protocol-2026-stateless-posture.md` also
+  changed; external bookmarks to their old URL fragments will no longer
+  resolve.
+- **Consolidated internal and test-only work (internal)** - GitHub Actions
+  workflows now pin every action to a commit SHA and default to read-only
+  permissions, while the publish job keeps its own `contents: write` grant;
+  Dependabot now checks the `github-actions` ecosystem weekly; and
+  `docs/RELEASING.md` records the residual risk of the retained crates.io
+  publish token. Every emptiness assertion in unit tests now carries a
+  message, enforced by a new `emptiness-message` prose-gate check; the
+  lint-ratchet gates now also require `clippy.toml` `allowed-duplicate-crates`
+  and `deny.toml` `[bans] skip` to name the same crates and require
+  cancel-safety notes on async functions behind the `test-helpers` feature;
+  the mTLS CRL end-to-end, cancellation and admission-control test suites were
+  hardened against wall-clock flakiness (progress counters and notification
+  barriers replacing fixed sleeps and timing ratios); RBAC allow-path, mTLS
+  token-exchange redirect, OAuth `nbf` leeway, shutdown-timing and OWASP-header
+  test coverage was tightened; the docs citation guard now requires a nearby
+  definition-like anchor and checks the MINDMAP navigation table; and stale CRL
+  architecture, threat-model and audit-log documentation was brought in line
+  with the current code. The cancelled-JWKS-refresh test now cancels only
+  after the upstream fetch started and serves both loopback families; the
+  forced-shutdown test regained an upper bound (grace plus 4 s); a new test
+  covers JWKS recovery after a panicked refresh; the direct `CrlSet`
+  constructor's crypto provider is proved in a separate test binary; the
+  trusted-origin hostname tests listen on both loopback families; and the
+  Windows symlink audit test fails instead of skipping when CI sets
+  `RMCP_REQUIRE_SYMLINK_TESTS=1`. No production behavior changed in any of
+  this work.
+
+### Fixed
+
+- **Invalid `ca_cert_path` bundles now fail at startup instead of being
+  silently ignored** - the OAuth JWKS cache, the general-purpose OAuth HTTP
+  client, and the token-exchange mTLS client all now read the configured CA
+  bundle once and reject it, naming the client and the path, when the file
+  is missing, is empty, contains no PEM certificate, contains only a
+  private key, is DER-encoded, is an unterminated PEM, or is PEM-framed but
+  contains malformed DER (the last case is rejected only when the HTTP
+  client is built). Previously, several of these shapes silently produced a
+  client with no custom root, so a private-CA identity provider failed only
+  later, with an unrelated TLS error, on the first JWKS or token request.
+- **mTLS with CRL checking no longer panics at startup when no rustls crypto
+  provider was installed** - the CRL bootstrap built its HTTP client before
+  the TLS listener installed the `ring` provider, so a server with
+  `[server.auth.mtls]` and the default `crl_enabled = true` but no OAuth
+  configuration panicked at startup, as did a direct
+  `mtls_revocation::bootstrap_fetch` call; the CRL client constructors now
+  install the provider themselves, as the OAuth clients already did.
 
 ## [3.14.4] - 2026-10-06
 
@@ -353,7 +599,7 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   hardening (below) closed the *blank*-name case; this closes the
   *duplicate*-name case. The session/task-binding fingerprint derives its
   per-principal namespace from the API-key `name` alone (`fingerprint()`,
-  `src/session_binding.rs`) — no key id, hash, or role is mixed in — so two
+  `src/session_binding.rs`) - no key id, hash, or role is mixed in - so two
   entries sharing a name produce byte-identical fingerprints and a
   session/task token minted under one verifies under the other, even though
   the two keys grant different roles.
@@ -367,9 +613,9 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   names; each name then keeps its own session/task namespace even under a
   shared RBAC role.
 
-  **Compatibility:** no API change — `check_api_key_names` is `pub(crate)` and
+  **Compatibility:** no API change - `check_api_key_names` is `pub(crate)` and
   every public caller keeps its signature, so `cargo semver-checks` reports
-  nothing — with a **runtime behavioural change**: a startup configuration
+  nothing - with a **runtime behavioural change**: a startup configuration
   that pairs one name with two roles, previously accepted, is now rejected.
   The hot-reload path was already fail-safe (`try_reload_auth_keys` validates
   before swapping and retains the prior keys on error), so only the startup
@@ -647,10 +893,10 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   `discovery_unattributed_fallback` (per-peer admission was unavailable, so
   the global fallback was used).
 
-  **Compatibility:** no API change — a private `CrlSet` field and two private
+  **Compatibility:** no API change - a private `CrlSet` field and two private
   constants are added, `DynamicClientCertVerifier::new` keeps its signature,
   and no `MtlsConfig` field is added or retyped, so `cargo semver-checks`
-  reports nothing — with a **runtime behavioural change**: the public
+  reports nothing - with a **runtime behavioural change**: the public
   `crl_discovery_rate_per_min` field keeps its name/type/serde-default/
   validation, but its documented semantics change from process-global to
   per-peer-when-attributed. This is why the change ships as a **minor**, not
@@ -680,7 +926,7 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 - **`rust-toolchain.toml`** pinning the development/build toolchain to
   Rust **1.98.1** (`clippy` and `rustfmt` components). This does not change
-  the crate's `rust-version = "1.98.0"` MSRV promise to consumers -- patch
+  the crate's `rust-version = "1.98.0"` MSRV promise to consumers - patch
   releases are forward-compatible, so code built against the 1.98.0 floor
   still compiles under 1.98.1 unchanged, confirmed by a clean
   `cargo +1.98.0 build --all-features`. The pin exists purely to stop this
@@ -702,8 +948,8 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
   **Fixes RUSTSEC-2026-0285** (`rustls` 0.23.44 -> 0.23.45): rustls accepted
   TLS 1.3 handshake messages sent at the wrong encryption level when packed
-  into the same record as a key-changing message -- e.g. a plaintext
-  `EncryptedExtensions` immediately following `ServerHello` -- violating RFC
+  into the same record as a key-changing message - e.g. a plaintext
+  `EncryptedExtensions` immediately following `ServerHello` - violating RFC
   8446 §5.1, which requires terminating such connections with an
   `unexpected_message` alert. The handshake transcript is still authenticated,
   so a network-position attacker could not use this to alter or complete a
@@ -711,7 +957,7 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   have rejected. Same bug class as Go's GO-2026-4340 (CVE-2025-61730). This is
   the advisory that turned the nightly scheduled `cargo-audit`/`cargo-deny` CI
   jobs red on `main` from 2026-09-15 onward against the unchanged 3.10.1
-  commit (upstream discovered the issue; no code regression) -- this release's
+  commit (upstream discovered the issue; no code regression) - this release's
   lockfile bump resolves it.
 
   Other refreshed packages: `reqwest`, `toml`, `async-compression`,
@@ -743,16 +989,16 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   **No security urgency.** No rustls advisory affects 0.23.43. rustls 0.23.44
   does raise its `rustls-webpki` floor to 0.103.14, which carries the fix for a
   high-severity CRL-parsing denial of service (RUSTSEC-2026-0104) whose
-  advisory names mTLS servers using CRLs -- directly this crate's territory --
+  advisory names mTLS servers using CRLs - directly this crate's territory -
   but the committed lockfile already resolved `rustls-webpki` 0.103.15, so that
   fix was already in place and `cargo audit` was clean before and after.
 
   Everything else in rustls 0.23.44 is inapplicable or benign here: ML-DSA
   support lands in the `aws-lc-rs` provider (this crate uses `ring`), the ECH
   certificate-name fix is client-side, and `SSLKEYLOGFILE` files are now created
-  owner-only on Unix. One change did warrant testing rather than assumption --
+  owner-only on Unix. One change did warrant testing rather than assumption -
   TLS 1.2 client-certificate requests now filter the verifier's advertised
-  signature schemes -- and the mTLS end-to-end suites pass unchanged.
+  signature schemes - and the mTLS end-to-end suites pass unchanged.
 
 ## [3.10.0] - 2026-09-05
 
@@ -765,7 +1011,7 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   none, because sealing it correctly depends on business context only the
   consumer has. A consumer could reasonably have assumed otherwise, so
   `docs/GUIDE.md` now states the non-coverage plainly and gives concrete
-  identity-binding guidance for `RequestStateCodec` -- which principal accessor
+  identity-binding guidance for `RequestStateCodec` - which principal accessor
   to bind, that the type needs rmcp's non-default `request-state` feature, how
   to scope it to the originating request, TTL and single-use handling, and the
   reminder that the sealed payload is authenticated rather than encrypted.
@@ -777,8 +1023,8 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 - **Identity-bound MCP task IDs (`task_binding`, opt-in, default `false`).**
   MCP tasks (SEP-2663) hand the client a long-lived `taskId` that is later
   presented to `tasks/get`, `tasks/update`, and `tasks/cancel`. Upstream `rmcp`
-  resolves those calls **by task ID alone** -- `TaskManager` takes no principal
-  argument -- and this crate's RBAC layer inspects only `tools/call`. Any
+  resolves those calls **by task ID alone** - `TaskManager` takes no principal
+  argument - and this crate's RBAC layer inspects only `tools/call`. Any
   *authenticated* identity holding another identity's task ID could therefore
   read, update, or cancel that task: the same
   leaked-identifier-as-bearer-capability problem session binding already solves
@@ -787,7 +1033,7 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   Enable via `McpServerConfig::with_task_binding(true)` or TOML
   `server.task_binding = true`. The `taskId` returned to the client becomes a
   signed wrapper bound to the authenticated identity, verified and rewritten
-  back to the raw ID before the consumer's handler runs -- **handlers continue
+  back to the raw ID before the consumer's handler runs - **handlers continue
   to see raw task IDs and need no changes.** A wrapper that fails verification
   (malformed, unwrapped, signed for another identity, or signed under a rotated
   secret) is rejected with exactly the error `rmcp` returns for a genuinely
@@ -810,7 +1056,7 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   and migration note; consumers that need cross-identity task isolation should
   enable `task_binding` explicitly.
 
-  Affects only consumers that implement tasks -- the `ServerHandler` task
+  Affects only consumers that implement tasks - the `ServerHandler` task
   methods otherwise default to method-not-found.
 
 ### Fixed
@@ -820,14 +1066,14 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   regardless of how the call resolved". That holds only on the normal
   Deny / Replace / Ok / Err resolution paths. If the `call_tool` future is
   dropped after a before-hook has run but before the call resolves, the
-  paired after-hook is never spawned -- a caveat the implementation already
+  paired after-hook is never spawned - a caveat the implementation already
   recorded internally but the public docs contradicted. Consumers who built
   audit trails or resource-release guards on before/after *pairing* could
   therefore see silently unpaired records under cancellation. The field docs
   now state the cancellation limitation and direct such consumers to make the
   after-hook idempotent or tolerant of missing closes.
 
-  **Documentation only -- no behaviour change.** The runtime has always
+  **Documentation only - no behaviour change.** The runtime has always
   behaved this way; only the description was wrong.
 
 ### Changed
@@ -836,7 +1082,7 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   semver-compatible lockfile bumps** (`tower-http` 0.7.1, `tokio-rustls`
   0.26.5, `toml` 1.1.5, `sse-stream` 0.2.6, `mio`, `indexmap`, `syn`, `cc`,
   `smallvec`, the `wasm-bindgen` family, and others). No `Cargo.toml` version
-  requirement changed -- this is a lockfile-only move.
+  requirement changed - this is a lockfile-only move.
 
   **Behaviour note for consumers.** rmcp 3.2.0 routes *every* `initialize`
   request through the legacy/session lifecycle regardless of the protocol
@@ -852,7 +1098,7 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   `initialize` now mints a session, and that session is wrapped and bound to
   the initiating identity exactly as a legacy one is. This is locked by the new
   `initialize_2026_protocol_is_session_bound_to_identity` end-to-end test,
-  which was verified to fail against rmcp 3.1.4 and pass against 3.2.0 -- the
+  which was verified to fail against rmcp 3.1.4 and pass against 3.2.0 - the
   pre-existing suite could not have caught the change, because every other
   end-to-end `initialize` uses a pre-`2026-07-28` (legacy) version.
 
@@ -887,9 +1133,9 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   provides the control and leaves the policy to the operator.
 
   This reverses forward-looking statements in earlier releases (3.8.0 and 3.9.1
-  notes, and `docs/MIGRATION.md`). Those release entries are left as written —
+  notes, and `docs/MIGRATION.md`). Those release entries are left as written -
   they were accurate at the time and rewriting shipped notes would falsify the
-  record — but `docs/MIGRATION.md`, the `ArgumentAllowlist` rustdoc, the README
+  record - but `docs/MIGRATION.md`, the `ArgumentAllowlist` rustdoc, the README
   and the guide have all been corrected, since they are live guidance rather
   than history.
 
@@ -898,7 +1144,7 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   permanent control rather than an interim one, and is not going away.
 
 - **`ArgumentAllowlist` documentation now states where argument validation
-  actually belongs.** It is in the tool -- its input schema and handler -- not
+  actually belongs.** It is in the tool - its input schema and handler - not
   in this crate, which sees an untyped JSON object at an authorization boundary
   and cannot know a tool's parameter types, value ranges, or which option
   combinations are meaningful. An allowlist is a coarse role-scoped gate layered
@@ -916,9 +1162,9 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 - **The optional-argument-allowlist startup warning now names the remedy.** It
   previously said only "optional argument allowlist may fail open", which
   identified the role, tool and argument but gave an operator nothing to act on.
-  It now explains the failure mode — the allowed-value list is enforced only
+  It now explains the failure mode - the allowed-value list is enforced only
   when the caller supplies the argument, so a tool substituting its own default
-  bypasses it — and names the fix: `required = true` in TOML, or
+  bypasses it - and names the fix: `required = true` in TOML, or
   `ArgumentAllowlist::new_required` in code. Warning text only; no behaviour
   change. This remains the only mitigation available in 3.x, because flipping
   the `required` default is a breaking change reserved for 4.0.
@@ -927,7 +1173,7 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 - **The README Cargo-features table listed only two of the four declared
   features.** `oauth-mtls-client` and `test-helpers` were both absent, so a
-  reader arriving from crates.io had no signal that `test-helpers` exists — let
+  reader arriving from crates.io had no signal that `test-helpers` exists - let
   alone that it must never be enabled in a production build, since some of its
   helpers deliberately bypass SSRF screening, the JWKS refresh cooldown, the CDP
   discovery rate limiter, and CRL verifier publication. That hazard was already
@@ -938,9 +1184,9 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   default) favours admitting new clients at the cost of letting an evicted quiet
   tenant return with a fresh quota, while `reject_new` favours isolating
   established tenants at the cost of turning away genuinely new ones. It records
-  why `evict_lru` is the default — under a high-cardinality spray attack
+  why `evict_lru` is the default - under a high-cardinality spray attack
   `reject_new` would let an attacker fill the table and deny every new
-  legitimate client — and states that a `reject_new` rejection returns **503,
+  legitimate client - and states that a `reject_new` rejection returns **503,
   not 429**, because it signals server-side admission capacity rather than a
   per-client quota breach.
 
@@ -954,10 +1200,10 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   `src/session_binding.rs`). When that stable id was blank (empty or
   whitespace-only), two distinct principals produced byte-identical
   fingerprints, so one caller's identity-bound session became usable by another
-  — reopening the CWE-384 hole previously closed for session binding.
+  - reopening the CWE-384 hole previously closed for session binding.
 
   The five first-party producers that could emit a blank stable id are now
-  closed — mTLS extraction, configured API keys, hot-reloaded API keys,
+  closed - mTLS extraction, configured API keys, hot-reloaded API keys,
   `verify_bearer_token`, and OAuth claims:
 
   - **mTLS** (`extract_mtls_identity`): a present-but-blank Subject CN no longer
@@ -971,8 +1217,8 @@ migration note and a config opt-out - see the 3.1.0 notes below.
     under the SAN name; empty-CN-without-SAN completes the TLS handshake but is
     rejected as unauthenticated before MCP handling.
   - **API-key configuration**: a blank API-key `name` is now rejected during
-    config validation — via both `validate_server_config` and
-    `McpServerConfig::validate()` — naming the offending key index. The check is
+    config validation - via both `validate_server_config` and
+    `McpServerConfig::validate()` - naming the offending key index. The check is
     exposed as `AuthConfig::validate_api_key_names`, so it can also be called
     directly when a configuration is assembled programmatically.
   - **API-key hot reload**: added `ReloadHandle::try_reload_auth_keys` (fallible)
@@ -988,15 +1234,15 @@ migration note and a config opt-out - see the 3.1.0 notes below.
     short-circuits into a blank name; a blank `sub` is stored as `None` (so the
     OAuth fingerprint never keys on a blank stable id) and is rejected when
     `require_subject` is set. **Correction:** an earlier draft of this change
-    stated OAuth was unaffected. That was wrong — OAuth carried the same
+    stated OAuth was unaffected. That was wrong - OAuth carried the same
     collision and is fixed here.
 
   `fingerprint()` additionally carries a `debug_assert!` that the selected
-  stable id is non-blank — an in-crate breadcrumb that the first-party
+  stable id is non-blank - an in-crate breadcrumb that the first-party
   producers above are validated upstream, not a runtime guard.
 
-  **Compatibility:** API-additive — the new `ReloadHandle::try_reload_auth_keys`
-  and `AuthConfig::validate_api_key_names` — with a **runtime behavioural
+  **Compatibility:** API-additive - the new `ReloadHandle::try_reload_auth_keys`
+  and `AuthConfig::validate_api_key_names` - with a **runtime behavioural
   change**: `reload_auth_keys` now refuses a blank-named batch and retains the
   previously installed keys rather than swapping them in. `cargo semver-checks`
   reports the API surface as additive, but this behaviour change is why the fix
@@ -1107,14 +1353,14 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 - **Documented the single-role authorization contract.** rmcp-server-kit evaluates exactly one
   role string per identity and never unions several matched roles; for OAuth that role is the
   **first matching `role_mappings` / `scopes` entry in configuration order**, so mapping order is
-  significant and most-specific entries belong first. This was already the behaviour -- it was
+  significant and most-specific entries belong first. This was already the behaviour - it was
   simply never written down, which is how a downstream consumer came to discover it by reading
   source. Now covered in the `current_role()` rustdoc and in `docs/GUIDE.md` (new
   "One role per identity" section, plus the OAuth `role_claim` notes), together with the two
   supported ways to grant a caller the combined capability of several claims: define one RBAC role
   that grants the union, or normalise the claim at the IdP.
 
-  The docs also record that `current_role()` is **not** an authorization decision -- tool
+  The docs also record that `current_role()` is **not** an authorization decision - tool
   authorization is enforced in middleware before the task-local is installed, and admin gating
   reads the request's `AuthIdentity` directly.
 
@@ -1151,7 +1397,7 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   role's `allow = ["*"]`. This list can only ever remove capability, so it is
   safe to enable in any deployment. Defaults to empty (no behaviour change).
   Two scope limits: it is gated on `rbac.enabled`, and like the rest of the
-  engine it governs *invocation* (`tools/call`) only -- a denied tool may still
+  engine it governs *invocation* (`tools/call`) only - a denied tool may still
   appear in a `tools/list` response unless the handler filters it.
 - **`RbacConfig.allow_operation_matching`** (`AllowOperationMatching::Legacy` |
   `Glob`, TOML `"legacy"` | `"glob"`, default `Legacy`) - opt into glob matching
@@ -1162,7 +1408,7 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 - **Config-load warning** for `allow` entries that contain a `*` (other than the
   literal allow-all `"*"`) while `allow_operation_matching` is `legacy`. Under
   legacy matching the `*` is an ordinary character, so such an entry grants only
-  an operation whose name contains that literal `*` -- almost never what the
+  an operation whose name contains that literal `*` - almost never what the
   operator meant. A warning is also emitted when `global_deny` is non-empty
   while `rbac.enabled = false`, since every check short-circuits to allow.
 - **`RoleConfig::with_deny`**, **`RbacConfig::with_global_deny`**,
@@ -1679,7 +1925,7 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
   marks a URL in-flight in `pending_urls`, then awaits `fetch_and_store_url`.
   Every normal exit promoted or cleared that marker, but `JoinHandle::abort`
   drops the future mid-await so neither ran, and a stale `pending_urls` entry
-  suppresses re-enqueue permanently -- that CDP was then never retried until
+  suppresses re-enqueue permanently - that CDP was then never retried until
   process restart. The arm now holds an owned RAII guard across the await whose
   `Drop` clears the marker on every path, including abort. Cooperative shutdown
   via the cancellation token was already safe and is unchanged.
@@ -1711,7 +1957,7 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
 - **Bearer credentials containing embedded whitespace are rejected.** RFC 7235
   §2.1 defines the credential as `token68`, which excludes whitespace; accepting
   it created a parser differential against a fronting proxy that splits on any
-  whitespace. Only whitespace is rejected -- the full `token68` character class
+  whitespace. Only whitespace is rejected - the full `token68` character class
   is deliberately **not** enforced, because `ApiKeyEntry::new` accepts an
   arbitrary caller-supplied hash and consumers may have hashed externally-issued
   opaque tokens containing other punctuation. Those continue to authenticate.
@@ -1760,12 +2006,12 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
 
 ### Added
 
-- `oauth::exchange_token_with_cancel` -- a cancel-aware wrapper around
+- `oauth::exchange_token_with_cancel` - a cancel-aware wrapper around
   `exchange_token` (feature `oauth`). It pre-checks the cancellation token so an
   already-abandoned request never reaches the wire, detaches the in-flight
   exchange instead of dropping it, and returns `cancel::DetachOutcome`. If the
   caller goes away and the exchange later succeeds, the detached task emits one
-  `warn` recording that a downstream token was minted and discarded -- metadata
+  `warn` recording that a downstream token was minted and discarded - metadata
   only (`expires_in`, truncated `issued_token_type`); no token material, subject
   token, form body, client secret, or endpoint details are logged on that
   abandoned-success path. Additive; `exchange_token` is unchanged.
@@ -1787,7 +2033,7 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
   many can be in flight during a cancel storm. Use it behind the crate's
   existing authentication, rate-limit, and concurrency controls.
 
-- `RmcpServerKitError::Internal` -- an internal-failure variant whose detail is
+- `RmcpServerKitError::Internal` - an internal-failure variant whose detail is
   logged server-side and collapsed to `"internal server error"` on the wire.
   Additive: the enum is `#[non_exhaustive]`.
 
@@ -1812,15 +2058,15 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
   `Example.COM` did not match a `hosts = ["example.com"]` pattern. Since DNS
   names and IP literals are case-insensitive by specification, this corrects
   false denials. Operation names and tool-name patterns remain **case-sensitive**
-  -- normalization is scoped to host matching only.
+  - normalization is scoped to host matching only.
 
 - **`generate_api_key` now returns `RmcpServerKitError::Internal` instead of
   `Auth` when salt encoding or Argon2 hashing fails.** The `Auth` variant is
   declared client-facing and is rendered verbatim to HTTP clients, so embedding
   an upstream `password_hash::Error` chain in it violated that contract; it
   also mapped a server-side fault to `401` rather than `500`. Not a compile
-  break -- the enum is `#[non_exhaustive]`, so downstream matches already carry
-  a wildcard arm -- but the observable variant and HTTP status change.
+  break - the enum is `#[non_exhaustive]`, so downstream matches already carry
+  a wildcard arm - but the observable variant and HTTP status change.
 
 - Servers started with `max_concurrent_requests` unset now log one startup
   warning. No default is imposed; behaviour is unchanged.
@@ -1856,9 +2102,9 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
 - **`docs/GUIDE.md`'s `RmcpServerKitError` reference was stale and is now
   accurate.** It listed an `Other(anyhow::Error)` variant that does not exist,
   and omitted `RateLimitedFor`, `Tls`, `Startup`, `Metrics`, and the new
-  `Internal`. The variants are now grouped by exposure -- client-facing
+  `Internal`. The variants are now grouped by exposure - client-facing
   (rendered verbatim) versus internal-only (collapsed to
-  `"internal server error"`) -- and the `#[non_exhaustive]` contract is stated.
+  `"internal server error"`) - and the `#[non_exhaustive]` contract is stated.
 
 - `RbacPolicy::argument_allowed` now documents that token comparison is
   byte-exact with no Unicode normalization, and the consequence on
@@ -1869,23 +2115,23 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
   startup inside `axum::Router::merge`; a path merely *under* a framework
   prefix (`/admin/custom` alongside `/admin/status`) does **not** panic and is
   **not** validated. `axum::Router` exposes no route-enumeration API, so the
-  framework cannot inspect these paths -- avoiding such collisions is the
+  framework cannot inspect these paths - avoiding such collisions is the
   caller's responsibility. Both behaviours are now pinned by tests.
 
 ### Internal
 
 - Every production async fn that can run inside `select!`, `timeout`, or an
   abortable task now carries a `// cancel-safe:` or `// NOT cancel-safe:`
-  annotation, per `RUST_GUIDELINES.md` 5. Documentation only -- no behaviour
+  annotation, per `RUST_GUIDELINES.md` 5. Documentation only - no behaviour
   change. Auditing the bodies surfaced two paths that were genuinely **not**
-  cancel-safe; both are now addressed -- `mtls_revocation::run_crl_refresher`
+  cancel-safe; both are now addressed - `mtls_revocation::run_crl_refresher`
   under *Security*, and `oauth::exchange_token` under *Added*.
 
 - The client-facing-message invariant on `RmcpServerKitError` now has a
   regression guard. A test walks `src/` and fails when `Auth`, `Rbac`,
   `RateLimited`, or `RateLimitedFor.message` is constructed with an
   interpolated error-shaped binding (`{e}`, `{err}`, `{error}`, `{source}`, or
-  the positional form) -- the exact shape of the defect fixed above.
+  the positional form) - the exact shape of the defect fixed above.
 
   It is a **tripwire, not a proof**: it does not catch an error bound to a
   differently-named variable, an error stringified before interpolation, or a
@@ -1895,7 +2141,7 @@ Entra compatibility) and RFC 8693 token-exchange conformance.
   degrade into a no-op that always passes.
 
 - `host_matches` lowercases the host once per call rather than once per
-  pattern, and only when a wildcard pattern is present -- an all-exact host
+  pattern, and only when a wildcard pattern is present - an all-exact host
   pattern list stays allocation-free.
 
 - Numeric IPv4 literal forms (decimal, hex, octal) and IPv4-mapped IPv6 are now
@@ -2045,7 +2291,7 @@ Retires the `mcpx` naming that outlived the crate rename.
   code path calls these methods automatically: `serve()`, `validate()`, and every config
   constructor are unaffected. This release is purely additive.
 
-- **`EnvOverride` and `EnvOverrideSource`** -- public, `#[non_exhaustive]` types that
+- **`EnvOverride` and `EnvOverrideSource`** - public, `#[non_exhaustive]` types that
   describe each applied override. `EnvOverride::value` is `None` for secret-typed targets
   so secrets are never exposed in report output or `Debug` formatting.
 
@@ -3155,7 +3401,7 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
   is `#[non_exhaustive]` and `#[must_use]`. The originating
   tracing span is preserved via `.instrument(Span::current())`.
   Task-local RBAC scope is intentionally NOT propagated into the
-  detached task -- detached work should finish or close
+  detached task - detached work should finish or close
   already-authorized resources rather than initiate fresh
   RBAC-gated operations; the module-level `# Caveats` rustdoc
   shows how to capture and rebind RBAC context for callers that
@@ -3389,7 +3635,7 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
 
 ### Added
 
-- **Configurable security headers** (`src/transport.rs`) -- new
+- **Configurable security headers** (`src/transport.rs`) - new
   `SecurityHeadersConfig` struct and `McpServerConfig::with_security_headers`
   builder method allow operators to override or omit any of the twelve
   OWASP security headers emitted by `security_headers_middleware`. Each
@@ -3398,20 +3644,20 @@ that do not opt in to `[server.security_headers]`, `max_request_body`, or
   Non-empty values are validated via `HeaderValue::from_str` inside
   `McpServerConfig::validate()`; invalid values fail server startup. The
   `Strict-Transport-Security` field additionally rejects any value containing
-  `preload` (case-insensitive) -- HSTS preload-list opt-in must be made via
+  `preload` (case-insensitive) - HSTS preload-list opt-in must be made via
   a dedicated future builder, not smuggled through this knob. Existing
   defaults are unchanged; this is a purely additive API surface change.
 
 ### Fixed
 
-- **OAuth proxy** (`src/transport.rs`) -- `/token`, `/register`, `/introspect`,
+- **OAuth proxy** (`src/transport.rs`) - `/token`, `/register`, `/introspect`,
   and `/revoke` responses now include `Pragma: no-cache` and
   `Vary: Authorization`, completing RFC 6749 §5.1 / RFC 6750 §5.4 compliance
   for OAuth proxy deployments. `Cache-Control: no-store` was already set
   globally by `security_headers_middleware`; this patch fills the remaining
   legacy-cache and `Vary` gaps. The new `oauth_token_cache_headers_middleware`
   is feature-gated (`oauth`) and only active when `OAuthConfig.proxy` is
-  configured -- resource-server-only deployments are unaffected. `Vary` is
+  configured - resource-server-only deployments are unaffected. `Vary` is
   appended (not replaced), preserving any pre-existing `Vary` value (e.g.
   `Accept-Encoding` from the compression layer).
 
@@ -3423,7 +3669,7 @@ and tightening fail-closed handling of malformed shell input.
 
 ### Security
 
-- **`Cargo.lock`** -- bump transitive `rustls-webpki` `0.103.12 -> 0.103.13`
+- **`Cargo.lock`** - bump transitive `rustls-webpki` `0.103.12 -> 0.103.13`
   to pick up the fix for [RUSTSEC-2026-0104](https://rustsec.org/advisories/RUSTSEC-2026-0104).
   The advisory describes a reachable panic in
   `BorrowedCertRevocationList::from_der` /
@@ -3432,12 +3678,12 @@ and tightening fail-closed handling of malformed shell input.
   `IssuingDistributionPoint` CRL extension. The panic is reachable
   before the CRL signature is verified, so any consumer that fetches
   CRLs via `mtls_revocation` would be exposed; consumers that do not
-  use CRLs are unaffected. No code or API changes in this crate -- the
+  use CRLs are unaffected. No code or API changes in this crate - the
   fix is entirely a transitive dependency bump.
 
 ### Fixed
 
-- **`src/rbac.rs`** -- `RbacPolicy::argument_allowed` now tokenizes
+- **`src/rbac.rs`** - `RbacPolicy::argument_allowed` now tokenizes
   argument values with POSIX-shell-like lexical rules (`shlex::split`)
   instead of `str::split_whitespace`. Allowlist entries containing
   spaces (e.g. `/usr/bin/my tool`) now match correctly when the value
@@ -3465,9 +3711,9 @@ tokenization downstream.
 | Empty input string `""` | accepts `""` if listed | **deny** | stricter |
 | Quoted empty token `r#""""#` | accepts `""` if listed | **deny** | stricter |
 | Tab/newline separator | works incidentally | works per POSIX | identical in practice |
-| Quoted-literal allowlist entry (e.g. `["'bash'"]` matching `'bash' -c true`) | allow | **deny** (shlex strips the surrounding quotes -> first token `bash`, not `'bash'`) | observable regression -- see operator notes |
-| Backslash-literal allowlist entry (e.g. `[r"foo\bar"]`) | allow | **deny** (POSIX shlex treats `\` as escape -> first token becomes `foobar`) | observable regression -- see operator notes |
-| Windows-style path allowlist entry (e.g. `[r"C:\Windows\System32\cmd.exe"]`) | allow | **deny** (POSIX shlex eats backslashes) | observable regression -- see operator notes |
+| Quoted-literal allowlist entry (e.g. `["'bash'"]` matching `'bash' -c true`) | allow | **deny** (shlex strips the surrounding quotes -> first token `bash`, not `'bash'`) | observable regression - see operator notes |
+| Backslash-literal allowlist entry (e.g. `[r"foo\bar"]`) | allow | **deny** (POSIX shlex treats `\` as escape -> first token becomes `foobar`) | observable regression - see operator notes |
+| Windows-style path allowlist entry (e.g. `[r"C:\Windows\System32\cmd.exe"]`) | allow | **deny** (POSIX shlex eats backslashes) | observable regression - see operator notes |
 
 ### Notes for operators
 
@@ -3483,7 +3729,7 @@ tokenization downstream.
   the policy boundary, expressed with forward slashes, or migrated to
   a typed pre-tokenized argument matcher in a future release.
 - **Quoted literals in the allowlist** (e.g. `"'bash'"`) no longer
-  match. These configurations were never sound -- they only worked
+  match. These configurations were never sound - they only worked
   because the old `split_whitespace` first token also retained the
   quote characters as literals, which any execve-aware consumer would
   immediately strip. Update such entries to the bare command name

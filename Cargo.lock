@@ -2376,7 +2376,7 @@ dependencies = [
 
 [[package]]
 name = "rmcp-server-kit"
-version = "3.14.4"
+version = "3.20.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2402,7 +2402,9 @@ dependencies = [
  "reqwest",
  "rmcp",
  "rsa",
+ "rustix",
  "rustls",
+ "rustls-webpki",
  "secrecy",
  "serde",
  "serde_json",

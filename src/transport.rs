@@ -6,6 +6,7 @@ use core::{
     net::{IpAddr, SocketAddr},
     num::NonZeroUsize,
     pin::Pin,
+    str::{self, FromStr},
     sync::atomic::{AtomicBool, Ordering},
     task,
     time::Duration,
@@ -22,7 +23,7 @@ use arc_swap::ArcSwap;
 use axum::{
     body::Body,
     extract::{ConnectInfo, FromRequestParts, Request, connect_info::Connected},
-    http::{Extensions, HeaderMap, HeaderName, Method, StatusCode, request::Parts},
+    http::{Extensions, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, request::Parts},
     middleware::Next,
     response::{IntoResponse, Response},
     serve::{IncomingStream, Listener},
@@ -62,7 +63,7 @@ use crate::{
     auth::{
         ApiKeyEntry, AuthConfig, AuthCounters, AuthIdentity, AuthLogContext, AuthState, MtlsConfig,
         SeenIdentitySet, TlsConnInfo, auth_middleware, build_pre_auth_limiter, build_rate_limiter,
-        extract_mtls_identity,
+        extract_mtls_identity, resolve_max_concurrent_verifications,
     },
     bounded_limiter::{BoundedKeyedLimiter, BoundedLimiterDeny, KeyEvictionPolicy},
     error::RmcpServerKitError,
@@ -320,12 +321,44 @@ pub struct SecurityHeadersConfig {
     pub strict_transport_security: Option<String>,
 }
 
+/// Logging policy for the `Mcp-Session-Id` request header when full request
+/// header logging is enabled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SessionIdLogPolicy {
+    /// Log the raw `Mcp-Session-Id` header value. This preserves the historical
+    /// request-header logging behaviour.
+    #[default]
+    Plain,
+    /// Log only a partial session-id reveal: values with 16 or more characters
+    /// become `first4...last4`, and shorter values become `[MASKED]`.
+    Mask,
+    /// Omit the `Mcp-Session-Id` header name and value from request-header logs.
+    Hide,
+}
+
+impl FromStr for SessionIdLogPolicy {
+    type Err = ();
+
+    #[inline]
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "plain" => Ok(Self::Plain),
+            "mask" => Ok(Self::Mask),
+            "hide" => Ok(Self::Hide),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Per-item switches for client-context fields in log lines.
 ///
-/// Every field is off by default: client IPs, user agents and
+/// Every boolean field is off by default: client IPs, user agents and
 /// identifiers are personal data, so each item is an explicit opt-in.
-/// With every knob off, log lines keep their pre-3.14.4 shape. See
-/// [`LogContextConfig::recommended`] for a curated low-risk preset.
+/// With every knob off and [`SessionIdLogPolicy::Plain`], log lines keep their
+/// pre-3.14.4 shape. See [`LogContextConfig::recommended`] for a curated
+/// low-risk preset.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(default)]
 #[serde(deny_unknown_fields)]
@@ -361,6 +394,9 @@ pub struct LogContextConfig {
     /// value) and `mcp_protocol_version` on `auth failed` and
     /// `incoming request` lines.
     pub mcp_hints: bool,
+    /// Controls how the `Mcp-Session-Id` request header is rendered when
+    /// full request-header logging is enabled. Default: [`SessionIdLogPolicy::Plain`].
+    pub session_id_header: SessionIdLogPolicy,
     /// Include `credential_fp` on `auth failed` lines, for Bearer
     /// tokens only: the first 8 hex characters of HMAC-SHA256 keyed
     /// with the RBAC redaction salt. Set `rbac.redaction_salt` for
@@ -391,6 +427,7 @@ impl Default for LogContextConfig {
             user_agent: false,
             auth_scheme: false,
             mcp_hints: false,
+            session_id_header: SessionIdLogPolicy::Plain,
             credential_fingerprint: false,
             credential_owner: false,
             request_completion: false,
@@ -400,7 +437,8 @@ impl Default for LogContextConfig {
 
 impl LogContextConfig {
     /// A curated low-risk preset: enables `client_ip`, `peer_ip`,
-    /// `request_line`, `user_agent`, `auth_scheme` and `mcp_hints`.
+    /// `request_line`, `user_agent`, `auth_scheme` and `mcp_hints`, while
+    /// leaving [`Self::session_id_header`] at [`SessionIdLogPolicy::Plain`].
     /// Leaves `request_id` (needs `trusted_proxies`),
     /// `credential_fingerprint`, `credential_owner` and `request_completion`
     /// off, so the result validates without any other configuration.
@@ -735,7 +773,7 @@ pub struct McpServerConfig {
     pub request_log_exclude_paths: Vec<String>,
     /// Expose build metadata (`build_git_sha`, `build_timestamp`,
     /// `rust_version`) on the unauthenticated `/version` endpoint.
-    /// **Default: `false`** -- only `name`, `version`, and `rmcp_server_kit_version`
+    /// **Default: `false`** - only `name`, `version`, and `rmcp_server_kit_version`
     /// are served otherwise, so build fingerprints are not leaked to
     /// anonymous callers. Enable via
     /// [`McpServerConfig::expose_build_metadata`].
@@ -1138,8 +1176,8 @@ impl McpServerConfig {
     /// with `panic = "abort"`, so catching it is not possible.
     ///
     /// A path that merely sits *under* a framework prefix without exactly
-    /// overlapping an existing route -- `/admin/custom` alongside
-    /// `/admin/status`, say -- does **not** panic and is **not** validated.
+    /// overlapping an existing route - `/admin/custom` alongside
+    /// `/admin/status`, say - does **not** panic and is **not** validated.
     /// `axum::Router` exposes no route-enumeration API, so the framework
     /// cannot inspect these paths. Avoiding such collisions is the caller's
     /// responsibility.
@@ -1516,6 +1554,16 @@ impl McpServerConfig {
         self
     }
 
+    /// Set how the `Mcp-Session-Id` request header is rendered when
+    /// [`Self::enable_request_header_logging`] is active. The default is
+    /// [`SessionIdLogPolicy::Plain`] for compatibility.
+    #[must_use]
+    #[inline]
+    pub const fn with_session_id_log_policy(mut self, policy: SessionIdLogPolicy) -> Self {
+        self.log_context.session_id_header = policy;
+        self
+    }
+
     /// Replace the list of paths excluded from the `incoming request` /
     /// `request completed` log lines (default: `["/healthz",
     /// "/readyz"]`). Matching is an exact-string comparison against
@@ -1726,18 +1774,6 @@ impl McpServerConfig {
                 )));
             }
         }
-        if let Some(rl) = self.auth.as_ref().and_then(|auth| auth.rate_limit.as_ref()) {
-            if rl.burst == Some(0) {
-                return Err(RmcpServerKitError::Config(
-                    "auth rate_limit.burst must be greater than zero".into(),
-                ));
-            }
-            if rl.pre_auth_burst == Some(0) {
-                return Err(RmcpServerKitError::Config(
-                    "auth rate_limit.pre_auth_burst must be greater than zero".into(),
-                ));
-            }
-        }
         Ok(())
     }
 
@@ -1813,7 +1849,9 @@ impl McpServerConfig {
     /// configuration violates: admin/auth wiring, TLS cert-key pairing, mTLS
     /// without TLS, bind address, URL, origin, or size-limit checks.
     fn check(&self) -> Result<(), RmcpServerKitError> {
-        use crate::config::{SharedConfigViolation, check_shared_config_invariants};
+        use crate::config::{
+            SharedConfigViolation, check_auth_nested_config, check_shared_config_invariants,
+        };
 
         // Delegated to `check_shared_config_invariants` so this validator and
         // `validate_server_config` cannot drift in ordering. Wording stays
@@ -1856,14 +1894,11 @@ impl McpServerConfig {
             ));
         }
 
-        if let Some(auth) = &self.auth {
-            auth.validate_api_key_names()?;
-        }
-
         // 3. bind_addr parses
         if self.bind_addr.parse::<SocketAddr>().is_err() {
             return Err(RmcpServerKitError::Config(format!(
-                "bind_addr {:?} is not a valid socket address (expected e.g. 127.0.0.1:8080)",
+                "bind_addr {:?} is not a valid socket address \
+                 (expected e.g. 127.0.0.1:8080 or [::1]:8080)",
                 self.bind_addr
             )));
         }
@@ -1913,14 +1948,6 @@ impl McpServerConfig {
         // 6d. Trusted-forwarder knobs (extracted helper).
         self.check_trusted_forwarder()?;
 
-        // 7. OAuth URL fields enforce HTTPS (unless `allow_http_oauth_urls`)
-        #[cfg(feature = "oauth")]
-        if let Some(auth_cfg) = &self.auth
-            && let Some(oauth_cfg) = &auth_cfg.oauth
-        {
-            oauth_cfg.validate()?;
-        }
-
         self.check_session_binding_config()?;
 
         // 8. Security-header overrides parse as valid HTTP header values,
@@ -1936,19 +1963,9 @@ impl McpServerConfig {
             ));
         }
 
-        // 10. Auth rate-limit `max_tracked_keys` must be > 0. A zero cap
-        //     would force `BoundedKeyedLimiter` to evict on every insert
-        //     and effectively disable rate limiting.
-        if let Some(auth_cfg) = &self.auth
-            && let Some(rl) = &auth_cfg.rate_limit
-            && rl.max_tracked_keys == 0
-        {
-            return Err(RmcpServerKitError::Config(
-                "auth.rate_limit.max_tracked_keys must be greater than zero".into(),
-            ));
-        }
-
-        check_auth_capacity_knobs(self.auth.as_ref())?;
+        // 10. Nested auth config: API-key identities, OAuth URL/capacity
+        //     checks, auth limiter capacity, and mTLS capacity.
+        check_auth_nested_config(self.auth.as_ref())?;
 
         // 11. tls_handshake_timeout must be > 0. A zero deadline would
         //     reap every handshake before it could complete, rejecting
@@ -1977,7 +1994,7 @@ impl McpServerConfig {
 /// Handle for hot-reloading server configuration without restart.
 ///
 /// Obtained via [`McpServerConfig::on_reload_ready`].
-/// All swap operations are lock-free and wait-free -- in-flight requests
+/// All swap operations are lock-free and wait-free - in-flight requests
 /// finish with the old values while new requests see the update immediately.
 #[expect(
     missing_debug_implementations,
@@ -2111,9 +2128,9 @@ struct AppRunParams {
     /// wins. The force-exit path must still cancel it, or a stuck stream turns
     /// a truncation bug into a shutdown hang.
     session_ct: CancellationToken,
-    /// `"http"` or `"https"` -- used only for boot-time logging.
+    /// `"http"` or `"https"` - used only for boot-time logging.
     scheme: &'static str,
-    /// Server name -- used only for boot-time logging.
+    /// Server name - used only for boot-time logging.
     name: String,
 }
 
@@ -2305,7 +2322,7 @@ fn install_extra_router(router: axum::Router, config: &mut McpServerConfig) -> a
 )]
 #[expect(
     clippy::too_many_lines,
-    reason = "deliberate: src/transport.rs::build_app_router — router assembly is intrinsically sequential; the length is layer wiring, not branching logic"
+    reason = "deliberate: src/transport.rs::build_app_router - router assembly is intrinsically sequential; the length is layer wiring, not branching logic"
 )]
 #[expect(
     deprecated,
@@ -2319,12 +2336,11 @@ where
     H: ServerHandler + 'static,
     F: Fn() -> H + Send + Sync + Clone + 'static,
 {
+    #[cfg(feature = "oauth")]
+    use anyhow::Context as _;
     use axum::{
         error_handling::HandleErrorLayer,
-        http::{
-            HeaderValue,
-            header::{AUTHORIZATION, CONTENT_TYPE},
-        },
+        http::header::{AUTHORIZATION, CONTENT_TYPE},
         middleware::from_fn,
         routing::get,
     };
@@ -2350,6 +2366,15 @@ where
 
     let allowed_hosts = derive_allowed_hosts(&config.bind_addr, config.public_url.as_deref());
     tracing::info!(allowed_hosts = %allowed_hosts.join(", "), "configured Streamable HTTP allowed hosts");
+
+    if config.log_request_headers
+        && !config.session_binding
+        && config.log_context.session_id_header == SessionIdLogPolicy::Plain
+    {
+        tracing::warn!(
+            "raw MCP session IDs are logged in request headers because session_binding is disabled and session_id_header=plain"
+        );
+    }
 
     if config.max_concurrent_requests.is_none() {
         tracing::warn!(
@@ -2422,14 +2447,22 @@ where
             let jwks_cache = auth_config
                 .oauth
                 .as_ref()
-                .map(|oauth_cfg| JwksCache::new(oauth_cfg).map(Arc::new))
+                .map(|oauth_cfg| {
+                    JwksCache::with_shutdown(oauth_cfg, ct.child_token()).map(Arc::new)
+                })
                 .transpose()
-                .map_err(|error| io::Error::other(format!("JWKS HTTP client: {error}")))?;
+                .context("JWKS HTTP client")?;
 
             Some(Arc::new(AuthState {
                 api_keys: ArcSwap::new(Arc::new(auth_config.api_keys.clone())),
                 rate_limiter,
                 pre_auth_limiter,
+                hash_permits: Arc::new(Semaphore::new(
+                    resolve_max_concurrent_verifications(auth_config).get(),
+                )),
+                verification_wait: auth_config.verification_wait,
+                #[cfg(test)]
+                verification_hook: None,
                 #[cfg(feature = "oauth")]
                 jwks_cache,
                 seen_identities: SeenIdentitySet::new(),
@@ -2437,7 +2470,7 @@ where
                 // Absolute only when `public_url` supplies a trustworthy
                 // external origin. Without it `derive_server_url` falls back
                 // to the bind address, which behind a TLS-terminating proxy
-                // is an internal `http://` address -- advertising that would
+                // is an internal `http://` address - advertising that would
                 // send clients somewhere they cannot reach. `None` keeps the
                 // relative path, which resolves against whatever origin the
                 // client was actually challenged from.
@@ -2633,7 +2666,7 @@ where
     // RFC 9728: Protected Resource Metadata endpoint.
     // When OAuth is configured, serve full metadata with authorization_servers.
     // Otherwise, serve a minimal document with just the resource URL and no
-    // authorization_servers -- this tells MCP clients (e.g. Claude Code SDK)
+    // authorization_servers - this tells MCP clients (e.g. Claude Code SDK)
     // that the server exists but does NOT require OAuth authentication,
     // preventing them from gating the connection behind a broken auth flow.
     let server_url = derive_server_url(&config);
@@ -2860,10 +2893,10 @@ where
     }));
 
     // OWASP security response headers. Installed LAST, making this the
-    // OUTERMOST response layer: every response -- normal handler output,
+    // OUTERMOST response layer: every response - normal handler output,
     // origin-403, CORS preflight, the overload-503 (already converted to a
     // Response by the HandleErrorLayer nested inside the load-shed stack),
-    // and the 404 fallback -- flows back out through it and gains the headers.
+    // and the 404 fallback - flows back out through it and gains the headers.
     // This is response-only decoration: on the request path it is a
     // pass-through, so origin still runs before auth and the rate limiter
     // still sits inside auth.
@@ -2916,8 +2949,8 @@ where
 ///
 /// Startup spawns background tasks (the Prometheus metrics listener, the CRL
 /// refresher, the external-shutdown bridge) before every fallible step has
-/// completed. Without this guard a later failure -- a main-bind `AddrInUse`,
-/// an unreadable TLS key -- returns `Err` while those tasks keep running and
+/// completed. Without this guard a later failure - a main-bind `AddrInUse`,
+/// an unreadable TLS key - returns `Err` while those tasks keep running and
 /// keep their ports bound for the lifetime of the process.
 ///
 /// The guard is deliberately never disarmed: once the serve function returns,
@@ -3219,10 +3252,15 @@ async fn run_server(
             && mtls.crl_enabled
         {
             let (ca_certs, roots) = load_client_auth_roots(&mtls.ca_cert_path)?;
-            let (crl_set, discover_rx) =
-                mtls_revocation::bootstrap_fetch(roots, &ca_certs, mtls.clone())
-                    .await
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            let server_chain = load_certs(&cert_path)?;
+            let (crl_set, discover_rx) = mtls_revocation::bootstrap_fetch_with_server_chain(
+                roots,
+                &ca_certs,
+                &server_chain,
+                mtls.clone(),
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             let _crl_refresher_task = tokio::spawn(mtls_revocation::run_crl_refresher(
                 Arc::clone(&crl_set),
                 discover_rx,
@@ -4004,7 +4042,7 @@ fn build_tls_server_config_from_verifier(
 /// Session resumption is disabled whenever mTLS is configured at all: non-CRL
 /// mTLS still relies on `verify_client_cert` for expiry and chain validation,
 /// so scoping to `crl_enabled` alone would leave that path unprotected. The
-/// non-mTLS branch is untouched -- it requests no client cert, so resumption
+/// non-mTLS branch is untouched - it requests no client cert, so resumption
 /// there is not security-relevant.
 ///
 /// # Errors
@@ -4125,7 +4163,7 @@ fn serialize_version_payload(name: &str, version: &str, expose_build_metadata: b
 // NOT cancel-safe: the kit itself mutates no state here, but this awaits a
 // consumer-supplied readiness future. Cancellation drops that future at
 // whatever await it is parked on, so cancel safety is the callback author's
-// contract -- a readiness probe must not leave partial state behind.
+// contract - a readiness probe must not leave partial state behind.
 /// Readiness probe handler that awaits the configured check.
 async fn readyz(check: ReadinessCheck) -> impl IntoResponse {
     let status = check().await;
@@ -4183,7 +4221,7 @@ async fn shutdown_signal() {
     }
 }
 
-// -- Origin validation (MCP 2025-11-25 spec, section 2.0.1) --
+// - Origin validation (MCP 2025-11-25 spec, section 2.0.1) -
 
 /// Middleware that validates the `Origin` header on incoming HTTP requests.
 ///
@@ -4198,7 +4236,7 @@ async fn shutdown_signal() {
 /// but it is not available everywhere: `/mcp` is mounted with `nest_service`,
 /// whose tail match may carry `MatchedNestedPath` instead, and unmatched
 /// requests that hit the 404 fallback carry neither. The raw URI path is
-/// never used as a fallback -- that is precisely the unbounded input.
+/// never used as a fallback - that is precisely the unbounded input.
 #[cfg(feature = "metrics")]
 fn metrics_labels(req: &Request<Body>) -> (&'static str, String) {
     use axum::extract::MatchedPath;
@@ -4442,8 +4480,6 @@ fn apply_security_header(
     override_value: Option<&str>,
     default: &'static str,
 ) {
-    use axum::http::HeaderValue;
-
     match override_value {
         None => {
             let _previous = headers.insert(name, HeaderValue::from_static(default));
@@ -4486,8 +4522,6 @@ fn apply_security_header(
 pub(crate) fn validate_security_headers(
     cfg: &SecurityHeadersConfig,
 ) -> Result<(), RmcpServerKitError> {
-    use axum::http::HeaderValue;
-
     let fields: &[(&str, Option<&str>)] = &[
         (
             "x_content_type_options",
@@ -4558,8 +4592,8 @@ pub(crate) fn validate_security_headers(
 /// `Cache-Control: no-store, max-age=0` is already applied globally by
 /// [`security_headers_middleware`]; this middleware adds:
 ///
-/// - `Pragma: no-cache` -- mandated by RFC 6749 §5.1 for HTTP/1.0 caches.
-/// - `Vary: Authorization` -- mandated by RFC 6750 §5.4 for endpoints
+/// - `Pragma: no-cache` - mandated by RFC 6749 §5.1 for HTTP/1.0 caches.
+/// - `Vary: Authorization` - mandated by RFC 6750 §5.4 for endpoints
 ///   whose response depends on the `Authorization` header.
 ///
 /// Applied only to the OAuth proxy token-class endpoints (`/token`,
@@ -4571,7 +4605,7 @@ pub(crate) fn validate_security_headers(
 /// is synchronous, so cancellation simply drops the response before it is sent.
 #[cfg(feature = "oauth")]
 async fn oauth_token_cache_headers_middleware(req: Request<Body>, next: Next) -> Response {
-    use axum::http::{HeaderValue, header};
+    use axum::http::header;
 
     let mut resp = next.run(req).await;
     let headers = resp.headers_mut();
@@ -4703,8 +4737,7 @@ pub(crate) fn validate_trusted_proxy_entry(entry: &str) -> Result<(), String> {
 ///
 /// Requires a
 /// syntactically valid HTTP header name that is neither one of
-/// [`REDACTED_LOG_HEADERS`] nor `mcp-session-id` (the session ID must
-/// never reach a log line). Shared by the builder
+/// [`REDACTED_LOG_HEADERS`] nor `mcp-session-id`. Shared by the builder
 /// ([`McpServerConfig::check_trusted_forwarder`]) and the TOML
 /// validator so the two cannot drift.
 ///
@@ -4884,7 +4917,7 @@ fn build_extra_route_rate_limiter_with_policy(
 /// exempt requests consume no limiter budget and produce no deny
 /// telemetry. Fail-closed - any non-listed path stays limited.
 // cancel-safe: the limiter is charged synchronously before the `next.run(req)`
-// await. Charging an attempt that a later timeout cancels is deliberate -- the
+// await. Charging an attempt that a later timeout cancels is deliberate - the
 // request was admitted, so it must cost budget (same posture as auth/rbac).
 async fn extra_route_rate_limit_middleware(
     limiter: Arc<ExtraRouteRateLimiter>,
@@ -5250,6 +5283,8 @@ struct RequestLogFields {
     mcp_session: Option<bool>,
     /// MCP protocol version header value, when hints are enabled.
     mcp_protocol_version: Option<String>,
+    /// Session-id request-header rendering policy.
+    session_id_header: SessionIdLogPolicy,
 }
 
 /// Build the [`RequestLogFields`] for `req` from the configured selectors.
@@ -5274,6 +5309,7 @@ fn request_log_fields(cfg: &LogContextConfig, req: &Request<Body>) -> RequestLog
             .flatten(),
         mcp_session: cfg.mcp_hints.then_some(mcp_session),
         mcp_protocol_version,
+        session_id_header: cfg.session_id_header,
     }
 }
 
@@ -5343,7 +5379,7 @@ fn log_incoming_request(
             request_id = fields.request_id.as_deref(),
             mcp_session = fields.mcp_session,
             mcp_protocol_version = fields.mcp_protocol_version.as_deref(),
-            headers = %format_request_headers_for_log(headers),
+            headers = %format_request_headers_for_log(headers, fields.session_id_header),
             "incoming request"
         );
     } else {
@@ -5378,22 +5414,65 @@ const REDACTED_LOG_HEADERS: [&str; 6] = [
 
 /// Render the request header set for logging, redacting credential and
 /// forwarding headers.
-fn format_request_headers_for_log(headers: &HeaderMap) -> String {
+fn format_request_headers_for_log(
+    headers: &HeaderMap,
+    session_id_policy: SessionIdLogPolicy,
+) -> String {
     headers
         .iter()
-        .map(|(key, value)| {
+        .filter_map(|(key, value)| {
             let name = key.as_str();
             if REDACTED_LOG_HEADERS.contains(&name) {
-                format!("{name}: [REDACTED]")
+                Some(format!("{name}: [REDACTED]"))
+            } else if name == "mcp-session-id" {
+                render_session_id_header_for_log(name, value, session_id_policy)
             } else {
-                format!("{name}: {}", value.to_str().unwrap_or("<non-utf8>"))
+                Some(format!(
+                    "{name}: {}",
+                    value.to_str().unwrap_or("<non-utf8>")
+                ))
             }
         })
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-// -- stdio transport --
+/// Render a session-id header according to the configured policy.
+fn render_session_id_header_for_log(
+    name: &str,
+    value: &HeaderValue,
+    policy: SessionIdLogPolicy,
+) -> Option<String> {
+    match policy {
+        SessionIdLogPolicy::Plain => Some(format!(
+            "{name}: {}",
+            value.to_str().unwrap_or("<non-utf8>")
+        )),
+        SessionIdLogPolicy::Mask => Some(format!(
+            "{name}: {}",
+            str::from_utf8(value.as_bytes())
+                .map_or_else(|_| "[MASKED]".to_owned(), mask_session_id_for_log)
+        )),
+        SessionIdLogPolicy::Hide => None,
+    }
+}
+
+/// Mask a session ID without splitting UTF-8 code points.
+fn mask_session_id_for_log(value: &str) -> String {
+    if value.chars().count() < 16 {
+        return "[MASKED]".to_owned();
+    }
+
+    let first = value.chars().take(4).collect::<String>();
+    let mut tail = ['\0'; 4];
+    for (slot, ch) in tail.iter_mut().zip(value.chars().rev().take(4)) {
+        *slot = ch;
+    }
+    let last = tail.into_iter().rev().collect::<String>();
+    format!("{first}...{last}")
+}
+
+// - stdio transport -
 
 /// Serve an MCP server over stdin/stdout (stdio transport).
 ///
@@ -5448,7 +5527,7 @@ where
 
 #[expect(
     clippy::multiple_inherent_impl,
-    reason = "deliberate: src/transport.rs::McpServerConfig — the second block groups the TLS-path and role accessors; merging relocates ~140 lines for no behavior gain"
+    reason = "deliberate: src/transport.rs::McpServerConfig - the second block groups the TLS-path and role accessors; merging relocates ~140 lines for no behavior gain"
 )]
 #[expect(
     clippy::missing_const_for_fn,
@@ -5683,78 +5762,6 @@ fn security_header_overrides(
     .filter_map(|(field, value)| value.map(|text| (field, text)))
 }
 
-/// Reject auth rate-limit settings that would silently weaken their gates.
-///
-/// A zero `max_attempts_per_minute` would fall back to the framework default,
-/// and a zero `pre_auth_max_per_minute` would *raise* the pre-auth quota; both
-/// are rejected so an operator typo cannot relax the shield around Argon2.
-///
-/// # Errors
-///
-/// Returns [`RmcpServerKitError::Config`] naming the offending field when any
-/// auth rate-limit knob is zero, or when mTLS capacity knobs are invalid.
-fn check_auth_capacity_knobs(auth: Option<&AuthConfig>) -> Result<(), RmcpServerKitError> {
-    if let Some(auth_cfg) = auth {
-        if let Some(rl) = &auth_cfg.rate_limit {
-            (rl.max_attempts_per_minute != 0).ok_or_else(|| {
-                RmcpServerKitError::Config(
-                    "auth.rate_limit.max_attempts_per_minute must be nonzero".into(),
-                )
-            })?;
-            // `0` here does not mean "unlimited" -- `build_pre_auth_limiter`
-            // falls back to DEFAULT_PRE_AUTH_RATE, so a typo silently *raises*
-            // the pre-auth quota (e.g. 1/min + 0 yields 300/min, not 10/min)
-            // and weakens the gate that shields Argon2 from CPU-spray.
-            (rl.pre_auth_max_per_minute != Some(0)).ok_or_else(|| {
-                RmcpServerKitError::Config(
-                    "auth.rate_limit.pre_auth_max_per_minute must be nonzero when set".into(),
-                )
-            })?;
-        }
-        if let Some(mtls) = &auth_cfg.mtls {
-            check_mtls_capacity_knobs(mtls)?;
-        }
-        auth_cfg.check_oauth_feature()?;
-    }
-    Ok(())
-}
-
-/// Reject zeroed mTLS/CRL capacity knobs.
-///
-/// A zero streaming cap or concurrency bound can make CRL fetching silently
-/// never succeed, which under `crl_deny_on_unavailable = true` fails every
-/// CDP-bearing handshake instead of loudly reporting the misconfiguration.
-///
-/// # Errors
-///
-/// Returns [`RmcpServerKitError::Config`] naming the offending field when any
-/// `auth.mtls` capacity knob is zero.
-fn check_mtls_capacity_knobs(mtls: &MtlsConfig) -> Result<(), RmcpServerKitError> {
-    (mtls.crl_max_concurrent_fetches != 0).ok_or_else(|| {
-        RmcpServerKitError::Config("auth.mtls.crl_max_concurrent_fetches must be nonzero".into())
-    })?;
-    (mtls.crl_discovery_rate_per_min != 0).ok_or_else(|| {
-        RmcpServerKitError::Config("auth.mtls.crl_discovery_rate_per_min must be nonzero".into())
-    })?;
-    (mtls.crl_max_host_semaphores != 0).ok_or_else(|| {
-        RmcpServerKitError::Config("auth.mtls.crl_max_host_semaphores must be nonzero".into())
-    })?;
-    (mtls.crl_max_seen_urls != 0).ok_or_else(|| {
-        RmcpServerKitError::Config("auth.mtls.crl_max_seen_urls must be nonzero".into())
-    })?;
-    (mtls.crl_max_cache_entries != 0).ok_or_else(|| {
-        RmcpServerKitError::Config("auth.mtls.crl_max_cache_entries must be nonzero".into())
-    })?;
-    // `0` rejects every non-empty CRL body at the streaming cap, so CRL
-    // fetching never succeeds. Under the default `crl_deny_on_unavailable
-    // = true` that fails every CDP-bearing handshake rather than loudly
-    // reporting the misconfiguration.
-    (mtls.crl_max_response_bytes != 0).ok_or_else(|| {
-        RmcpServerKitError::Config("auth.mtls.crl_max_response_bytes must be nonzero".into())
-    })?;
-    Ok(())
-}
-
 #[cfg_attr(
     all(test, target_os = "linux"),
     expect(
@@ -5841,7 +5848,7 @@ mod tests {
         set_default(subscriber)
     }
 
-    // -- startup task lifecycle --
+    // - startup task lifecycle -
 
     /// Pins that the shutdown bridge exits when the server-internal token is
     /// cancelled even though the external token is not.
@@ -5891,7 +5898,7 @@ mod tests {
 
     #[expect(
         clippy::unnecessary_wraps,
-        reason = "deliberate: src/transport.rs::cancel_on_drop_cancels_its_token — keeps the uniform IS-7 test signature while it only constructs values"
+        reason = "deliberate: src/transport.rs::cancel_on_drop_cancels_its_token - keeps the uniform IS-7 test signature while it only constructs values"
     )]
     #[test]
     /// Pins that dropping the startup guard cancels its token.
@@ -5994,13 +6001,17 @@ mod tests {
     ///
     /// Returns an error when the generated API-key hash cannot be produced.
     fn reload_test_state(name: &str) -> anyhow::Result<(Arc<AuthState>, String)> {
-        use crate::auth::generate_api_key;
+        use crate::auth::{default_max_concurrent_verifications, generate_api_key};
 
         let (token, hash) = generate_api_key()?;
         let state = Arc::new(AuthState {
             api_keys: ArcSwap::from_pointee(vec![ApiKeyEntry::new(name, hash, "ops")]),
             rate_limiter: None,
             pre_auth_limiter: None,
+            hash_permits: Arc::new(Semaphore::new(default_max_concurrent_verifications().get())),
+            verification_wait: Duration::from_secs(1),
+            #[cfg(test)]
+            verification_hook: None,
             #[cfg(feature = "oauth")]
             jwks_cache: None,
             seen_identities: SeenIdentitySet::new(),
@@ -6052,15 +6063,15 @@ mod tests {
         Ok(())
     }
 
-    // -- McpServerConfig --
+    // - McpServerConfig -
 
     #[expect(
         deprecated,
-        reason = "deliberate: src/transport.rs::server_config_new_defaults — exercises deprecated config fields directly"
+        reason = "deliberate: src/transport.rs::server_config_new_defaults - exercises deprecated config fields directly"
     )]
     #[expect(
         clippy::unnecessary_wraps,
-        reason = "deliberate: src/transport.rs::server_config_new_defaults — keeps the uniform IS-7 test signature while it only constructs values"
+        reason = "deliberate: src/transport.rs::server_config_new_defaults - keeps the uniform IS-7 test signature while it only constructs values"
     )]
     #[test]
     /// Pins every default `McpServerConfig::new` leaves in place across
@@ -6121,7 +6132,7 @@ mod tests {
 
     #[expect(
         clippy::unnecessary_wraps,
-        reason = "deliberate: src/transport.rs::session_store_defaults_to_none — keeps the uniform IS-7 test signature while it only constructs values"
+        reason = "deliberate: src/transport.rs::session_store_defaults_to_none - keeps the uniform IS-7 test signature while it only constructs values"
     )]
     #[test]
     /// Pins that a fresh config has no session store attached.
@@ -6135,7 +6146,7 @@ mod tests {
 
     #[expect(
         clippy::unnecessary_wraps,
-        reason = "deliberate: src/transport.rs::event_store_defaults_to_none — keeps the uniform IS-7 test signature while it only constructs values"
+        reason = "deliberate: src/transport.rs::event_store_defaults_to_none - keeps the uniform IS-7 test signature while it only constructs values"
     )]
     #[test]
     /// Pins that a fresh config has no event store attached.
@@ -6218,11 +6229,11 @@ mod tests {
 
     #[expect(
         deprecated,
-        reason = "deliberate: src/transport.rs::tls_handshake_builders_set_fields — exercises deprecated config fields directly"
+        reason = "deliberate: src/transport.rs::tls_handshake_builders_set_fields - exercises deprecated config fields directly"
     )]
     #[expect(
         clippy::unnecessary_wraps,
-        reason = "deliberate: src/transport.rs::tls_handshake_builders_set_fields — keeps the uniform IS-7 test signature while it only constructs values"
+        reason = "deliberate: src/transport.rs::tls_handshake_builders_set_fields - keeps the uniform IS-7 test signature while it only constructs values"
     )]
     #[test]
     /// Pins that the TLS handshake timeout and concurrency builders store
@@ -6261,7 +6272,7 @@ mod tests {
 
     #[expect(
         deprecated,
-        reason = "deliberate: src/transport.rs::validate_consumes_and_proves — exercises deprecated config fields directly"
+        reason = "deliberate: src/transport.rs::validate_consumes_and_proves - exercises deprecated config fields directly"
     )]
     #[test]
     /// Pins that `validate` consumes the config into a `Validated` wrapper
@@ -6327,6 +6338,8 @@ mod tests {
             api_keys: Vec::new(),
             mtls: None,
             rate_limit: Some(rl),
+            max_concurrent_verifications: None,
+            verification_wait: Duration::from_secs(1),
             #[cfg(feature = "oauth")]
             oauth: None,
             #[cfg(not(feature = "oauth"))]
@@ -6347,7 +6360,7 @@ mod tests {
 
     #[expect(
         clippy::unnecessary_wraps,
-        reason = "deliberate: src/transport.rs::derive_allowed_hosts_includes_public_host — keeps the uniform IS-7 test signature while it only constructs values"
+        reason = "deliberate: src/transport.rs::derive_allowed_hosts_includes_public_host - keeps the uniform IS-7 test signature while it only constructs values"
     )]
     #[test]
     /// Pins that the derived host allowlist includes the `public_url` host.
@@ -6363,7 +6376,7 @@ mod tests {
 
     #[expect(
         clippy::unnecessary_wraps,
-        reason = "deliberate: src/transport.rs::derive_allowed_hosts_includes_bind_authority — keeps the uniform IS-7 test signature while it only constructs values"
+        reason = "deliberate: src/transport.rs::derive_allowed_hosts_includes_bind_authority - keeps the uniform IS-7 test signature while it only constructs values"
     )]
     #[test]
     /// Pins that the derived host allowlist includes both the bind host and
@@ -6382,7 +6395,7 @@ mod tests {
         Ok(())
     }
 
-    // -- healthz --
+    // - healthz -
 
     /// Pins that `/healthz` answers 200 with `status: ok` and leaks neither
     /// the server name nor its version.
@@ -6408,7 +6421,7 @@ mod tests {
         Ok(())
     }
 
-    // -- readyz --
+    // - readyz -
 
     /// Pins that a ready readiness check yields 200 with the check's fields
     /// and no name or version leak.
@@ -6465,7 +6478,7 @@ mod tests {
         Ok(())
     }
 
-    // -- normalize_peer_addr_middleware / PeerAddr --
+    // - normalize_peer_addr_middleware / PeerAddr -
 
     /// Build a test router that reports the request's peer-address
     /// extensions as `"<ConnectInfo>|<PeerAddr>"` (empty when absent).
@@ -6613,7 +6626,7 @@ mod tests {
         Ok(())
     }
 
-    // -- extra_route_rate_limit_middleware --
+    // - extra_route_rate_limit_middleware -
 
     /// Handler used by the limiter probe routers: always answers `"ok"`.
     async fn ok_handler() -> &'static str {
@@ -6788,7 +6801,7 @@ mod tests {
 
     #[expect(
         clippy::unnecessary_wraps,
-        reason = "deliberate: src/transport.rs::limiter_client_key_falls_back_to_unattributed — keeps the uniform IS-7 test signature while it only constructs values"
+        reason = "deliberate: src/transport.rs::limiter_client_key_falls_back_to_unattributed - keeps the uniform IS-7 test signature while it only constructs values"
     )]
     #[test]
     /// Pins that requests with no peer address fall back to the shared
@@ -6997,7 +7010,7 @@ mod tests {
 
     #[expect(
         clippy::unnecessary_wraps,
-        reason = "deliberate: src/transport.rs::new_config_defaults_log_settings — keeps the uniform IS-7 test signature while it only constructs values"
+        reason = "deliberate: src/transport.rs::new_config_defaults_log_settings - keeps the uniform IS-7 test signature while it only constructs values"
     )]
     #[test]
     /// Pins the log-related defaults of a fresh `McpServerConfig`: an empty
@@ -7123,7 +7136,7 @@ mod tests {
 
     #[expect(
         clippy::unnecessary_wraps,
-        reason = "deliberate: src/transport.rs::log_context_credential_owner_defaults_off_and_not_recommended — keeps the uniform IS-7 test signature while it only asserts on values"
+        reason = "deliberate: src/transport.rs::log_context_credential_owner_defaults_off_and_not_recommended - keeps the uniform IS-7 test signature while it only asserts on values"
     )]
     #[test]
     /// Pins that `credential_owner` is off by default and in the recommended
@@ -7131,9 +7144,11 @@ mod tests {
     fn log_context_credential_owner_defaults_off_and_not_recommended() -> anyhow::Result<()> {
         let default = LogContextConfig::default();
         assert!(!default.credential_owner, "default must be off");
+        assert_eq!(default.session_id_header, SessionIdLogPolicy::Plain);
 
         let recommended = LogContextConfig::recommended();
         assert!(!recommended.credential_owner, "recommended must be off");
+        assert_eq!(recommended.session_id_header, SessionIdLogPolicy::Plain);
 
         Ok(())
     }
@@ -7308,7 +7323,7 @@ mod tests {
     }
 
     /// Pins that zero burst limits on the auth limiter or its pre-auth limiter
-    /// are rejected, naming `rate_limit.burst` / `pre_auth_burst`.
+    /// are rejected, naming `auth.rate_limit.burst` / `auth.rate_limit.pre_auth_burst`.
     #[test]
     fn validate_rejects_zero_auth_bursts() -> anyhow::Result<()> {
         use crate::auth::RateLimitConfig;
@@ -7320,7 +7335,7 @@ mod tests {
             .validate()
             .err()
             .context("zero auth burst")?;
-        assert!(burst_err.to_string().contains("rate_limit.burst"));
+        assert!(burst_err.to_string().contains("auth.rate_limit.burst"));
 
         let pre_auth = AuthConfig::with_keys(vec![])
             .with_rate_limit(RateLimitConfig::new(10).with_pre_auth_burst(0));
@@ -7329,7 +7344,11 @@ mod tests {
             .validate()
             .err()
             .context("zero pre-auth burst")?;
-        assert!(pre_auth_err.to_string().contains("pre_auth_burst"));
+        assert!(
+            pre_auth_err
+                .to_string()
+                .contains("auth.rate_limit.pre_auth_burst")
+        );
 
         Ok(())
     }
@@ -7348,6 +7367,36 @@ mod tests {
             .context("zero pre-auth rate")?;
         assert!(err.to_string().contains("pre_auth_max_per_minute"));
 
+        Ok(())
+    }
+
+    /// Pins that a zero `verification_wait` is rejected by builder
+    /// validation.
+    #[test]
+    fn validate_rejects_zero_verification_wait() -> anyhow::Result<()> {
+        let auth = AuthConfig::with_keys(vec![]).with_verification_wait(Duration::ZERO);
+        let err = McpServerConfig::new("127.0.0.1:8080", "t", "1.0.0")
+            .with_auth(auth)
+            .validate()
+            .err()
+            .context("zero verification_wait")?;
+        assert!(err.to_string().contains("verification_wait"));
+
+        Ok(())
+    }
+
+    /// Pins that [`AuthConfig::with_max_concurrent_verifications`] and
+    /// [`AuthConfig::with_verification_wait`] set the fields they name.
+    #[test]
+    fn with_max_concurrent_verifications_and_with_verification_wait_build() -> anyhow::Result<()> {
+        use core::num::NonZeroUsize;
+
+        let permits = NonZeroUsize::new(6).context("6 is nonzero")?;
+        let auth = AuthConfig::with_keys(vec![])
+            .with_max_concurrent_verifications(permits)
+            .with_verification_wait(Duration::from_secs(3));
+        assert_eq!(auth.max_concurrent_verifications, Some(permits));
+        assert_eq!(auth.verification_wait, Duration::from_secs(3));
         Ok(())
     }
 
@@ -7411,7 +7460,7 @@ mod tests {
         Ok(())
     }
 
-    // -- trusted-forwarder mode (ClientIp / ForwardedHeaderMode) --
+    // - trusted-forwarder mode (ClientIp / ForwardedHeaderMode) -
 
     /// Pins that `trusted_forwarder_max_entries` accepts only
     /// `1..=MAX_SCANNED_ENTRIES` and rejects the configurable ceiling plus one.
@@ -7618,8 +7667,6 @@ mod tests {
     /// characters, and dropped entirely when they are not valid UTF-8.
     #[tokio::test]
     async fn request_id_sanitized_and_bounded() -> anyhow::Result<()> {
-        use axum::http::HeaderValue;
-
         let app = request_id_probe_router(Some(request_id_resolver(Some("x-request-id"))?));
         let sanitized = app
             .clone()
@@ -8534,7 +8581,7 @@ mod tests {
         Ok(())
     }
 
-    // -- origin_check_middleware --
+    // - origin_check_middleware -
 
     /// Build a test router with origin check middleware and a simple handler.
     fn origin_router(origins: Vec<String>, log_request_headers: bool) -> axum::Router {
@@ -8635,7 +8682,7 @@ mod tests {
         let _previous_cookie = headers.insert("cookie", "sid=abc".parse()?);
         let _previous_request_id = headers.insert("x-request-id", "req-123".parse()?);
 
-        let out = format_request_headers_for_log(&headers);
+        let out = format_request_headers_for_log(&headers, SessionIdLogPolicy::Plain);
         assert!(out.contains("authorization: [REDACTED]"));
         assert!(out.contains("cookie: [REDACTED]"));
         assert!(out.contains("x-request-id: req-123"));
@@ -8655,7 +8702,7 @@ mod tests {
         let _previous_xri = headers.insert("x-real-ip", "203.0.113.9".parse()?);
         let _previous_request_id = headers.insert("x-request-id", "req-123".parse()?);
 
-        let out = format_request_headers_for_log(&headers);
+        let out = format_request_headers_for_log(&headers, SessionIdLogPolicy::Plain);
         for name in ["forwarded", "x-forwarded-for", "x-real-ip"] {
             assert!(
                 out.contains(&format!("{name}: [REDACTED]")),
@@ -8671,7 +8718,114 @@ mod tests {
         Ok(())
     }
 
-    // -- security_headers_middleware --
+    /// Pins that request-header logging applies the configured session-id policy.
+    #[test]
+    fn format_request_headers_applies_session_id_policy() -> anyhow::Result<()> {
+        let mut plain_headers = HeaderMap::new();
+        let _previous_plain = plain_headers.insert("mcp-session-id", "plain-session-123".parse()?);
+        let plain = format_request_headers_for_log(&plain_headers, SessionIdLogPolicy::Plain);
+        assert!(
+            plain.contains("mcp-session-id: plain-session-123"),
+            "{plain}"
+        );
+
+        let mut plain_opaque_headers = HeaderMap::new();
+        let plain_session_value = HeaderValue::from_bytes("plain-\u{e9}opaque-session".as_bytes())?;
+        let _previous_plain_session =
+            plain_opaque_headers.insert("mcp-session-id", plain_session_value);
+        let plain_probe_value = HeaderValue::from_bytes("probe-\u{f6}opaque".as_bytes())?;
+        let _previous_plain_probe = plain_opaque_headers.insert("x-probe", plain_probe_value);
+        let plain_opaque =
+            format_request_headers_for_log(&plain_opaque_headers, SessionIdLogPolicy::Plain);
+        assert!(
+            plain_opaque.contains("mcp-session-id: <non-utf8>"),
+            "{plain_opaque}"
+        );
+        assert!(
+            plain_opaque.contains("x-probe: <non-utf8>"),
+            "{plain_opaque}"
+        );
+        assert!(!plain_opaque.contains('\u{e9}'), "{plain_opaque}");
+        assert!(!plain_opaque.contains('\u{f6}'), "{plain_opaque}");
+
+        let mut boundary_headers = HeaderMap::new();
+        let _previous_boundary =
+            boundary_headers.insert("mcp-session-id", "abcdefghijklmnop".parse()?);
+        let boundary = format_request_headers_for_log(&boundary_headers, SessionIdLogPolicy::Mask);
+        assert!(
+            boundary.contains("mcp-session-id: abcd...mnop"),
+            "{boundary}"
+        );
+        assert!(!boundary.contains("efghijkl"), "{boundary}");
+
+        let mut short_headers = HeaderMap::new();
+        let _previous_short = short_headers.insert("mcp-session-id", "short-id-15xxxx".parse()?);
+        let short = format_request_headers_for_log(&short_headers, SessionIdLogPolicy::Mask);
+        assert!(short.contains("mcp-session-id: [MASKED]"), "{short}");
+        assert!(!short.contains("short-id-15xxxx"), "{short}");
+
+        let mut long_headers = HeaderMap::new();
+        let _previous_long = long_headers.insert("mcp-session-id", "abcdefghijklmnopq".parse()?);
+        let long = format_request_headers_for_log(&long_headers, SessionIdLogPolicy::Mask);
+        assert!(long.contains("mcp-session-id: abcd...nopq"), "{long}");
+        assert!(!long.contains("efghijklm"), "{long}");
+
+        let mut unicode_headers = HeaderMap::new();
+        let unicode_value =
+            HeaderValue::from_bytes("\u{e5}\u{df}\u{e7}\u{111}\u{e9}fghijklmnop".as_bytes())?;
+        let _previous_unicode = unicode_headers.insert("mcp-session-id", unicode_value);
+        let unicode = format_request_headers_for_log(&unicode_headers, SessionIdLogPolicy::Mask);
+        assert!(
+            unicode.contains("mcp-session-id: \u{e5}\u{df}\u{e7}\u{111}...mnop"),
+            "{unicode}"
+        );
+
+        let mut invalid_utf8_headers = HeaderMap::new();
+        let invalid_value = HeaderValue::from_bytes(&[0xff; 20])?;
+        let _previous_invalid = invalid_utf8_headers.insert("mcp-session-id", invalid_value);
+        let invalid_utf8 =
+            format_request_headers_for_log(&invalid_utf8_headers, SessionIdLogPolicy::Mask);
+        assert!(
+            invalid_utf8.contains("mcp-session-id: [MASKED]"),
+            "{invalid_utf8}"
+        );
+
+        let mut hidden_headers = HeaderMap::new();
+        let _previous_hidden =
+            hidden_headers.insert("mcp-session-id", "hidden-session-123".parse()?);
+        let hidden = format_request_headers_for_log(&hidden_headers, SessionIdLogPolicy::Hide);
+        assert!(!hidden.contains("mcp-session-id"), "{hidden}");
+        assert!(!hidden.contains("hidden-session-123"), "{hidden}");
+
+        Ok(())
+    }
+
+    /// Pins that startup warns only when raw session IDs are header-logged
+    /// without session binding.
+    #[test]
+    fn startup_warns_for_plain_session_id_header_logging_without_binding() -> anyhow::Result<()> {
+        for (policy, session_binding, should_warn) in [
+            (SessionIdLogPolicy::Plain, false, true),
+            (SessionIdLogPolicy::Plain, true, false),
+            (SessionIdLogPolicy::Mask, false, false),
+            (SessionIdLogPolicy::Hide, false, false),
+        ] {
+            let logs = CapturedLogs::default();
+            let _guard = capture_debug_logs(logs.clone());
+            let _app = reqlog_router(|cfg| {
+                cfg.enable_request_header_logging()
+                    .with_session_binding(session_binding)
+                    .with_session_id_log_policy(policy)
+            })?;
+            let warnings =
+                logs.lines_containing("raw MCP session IDs are logged in request headers");
+            assert_eq!(warnings.is_empty(), !should_warn, "policy={policy:?}");
+        }
+
+        Ok(())
+    }
+
+    // - security_headers_middleware -
 
     fn security_router(is_tls: bool) -> axum::Router {
         security_router_with(is_tls, SecurityHeadersConfig::default())
@@ -8833,7 +8987,7 @@ mod tests {
         Ok(())
     }
 
-    // -- SecurityHeadersConfig validation + override semantics --
+    // - SecurityHeadersConfig validation + override semantics -
 
     /// Build a minimal config with a custom `SecurityHeadersConfig` and drive
     /// it through `check()`.
@@ -9023,7 +9177,7 @@ mod tests {
         Ok(())
     }
 
-    // -- oauth_token_cache_headers_middleware --
+    // - oauth_token_cache_headers_middleware -
 
     /// Axum handler shared by the OAuth middleware tests: replies `{}`.
     #[cfg(feature = "oauth")]
@@ -9035,8 +9189,6 @@ mod tests {
     /// `Vary: Accept-Encoding` header.
     #[cfg(feature = "oauth")]
     async fn vary_accept_encoding_handler() -> Response {
-        use axum::http::HeaderValue;
-
         let mut response = Response::new(Body::from("{}"));
         let _previous = response
             .headers_mut()
@@ -9118,7 +9270,7 @@ mod tests {
         Ok(())
     }
 
-    // -- version endpoint --
+    // - version endpoint -
 
     /// Pins that the version payload hides build fingerprint fields by
     /// default.
@@ -9181,7 +9333,7 @@ mod tests {
         Ok(())
     }
 
-    // -- concurrency limit layer --
+    // - concurrency limit layer -
 
     /// Error handler for the concurrency-limit test: maps load shedding to 503.
     async fn handle_service_unavailable(_err: tower::BoxError) -> StatusCode {
@@ -9212,7 +9364,7 @@ mod tests {
         Ok(())
     }
 
-    // -- compression layer --
+    // - compression layer -
 
     /// Pins that the compression layer gzip-encodes a large response.
     #[tokio::test]
@@ -9299,7 +9451,7 @@ mod tests {
         Ok(())
     }
 
-    // -- TlsListener handshake timeout --
+    // - TlsListener handshake timeout -
 
     /// Pins that the TLS listener reaps connections that never complete their
     /// handshake.
@@ -9371,7 +9523,7 @@ mod tests {
         Ok(())
     }
 
-    // -- TLS session resumption disabled for mTLS (WO-T1) --
+    // - TLS session resumption disabled for mTLS (WO-T1) -
 
     use core::sync::atomic::AtomicUsize;
 
@@ -9772,7 +9924,7 @@ mod tests {
         // `rustls::client::handy::ClientSessionMemoryCache` divides its
         // requested `size` by `MAX_TLS13_TICKETS_PER_SERVER` (8) to get a
         // server-name-slot count. A `size` of 8 or less rounds down to
-        // exactly one slot, whose backing `VecDeque` has capacity 1 --
+        // exactly one slot, whose backing `VecDeque` has capacity 1 -
         // its own eviction guard (`capacity() == len()`) then fires on the
         // very first insert and evicts the entry that insert just made,
         // so no ticket ever survives to the next connection. 256 mirrors
@@ -9851,7 +10003,7 @@ mod tests {
         );
         assert_eq!(
             fixed.calls_after_second, 2,
-            "connection 2 must re-invoke the verifier -- this is the fix"
+            "connection 2 must re-invoke the verifier - this is the fix"
         );
 
         let control = run_resumption_scenario(false).await?;
@@ -9869,31 +10021,54 @@ mod tests {
         );
         assert_eq!(
             control.calls_after_second, 1,
-            "control verifier must NOT be re-invoked -- this is the exact bypass the fix eliminates"
+            "control verifier must NOT be re-invoked - this is the exact bypass the fix eliminates"
         );
 
         Ok(())
     }
 
-    // -- M5: OWASP security headers reach early / fallback responses --
+    // - M5: OWASP security headers reach early / fallback responses -
 
     fn assert_owasp_headers(resp: &Response, ctx: &str) {
         let headers = resp.headers();
+        for (name, value) in [
+            ("x-content-type-options", "nosniff"),
+            ("x-frame-options", "deny"),
+            ("cache-control", "no-store, max-age=0"),
+            ("referrer-policy", "no-referrer"),
+            ("cross-origin-opener-policy", "same-origin"),
+            ("cross-origin-resource-policy", "same-origin"),
+            ("cross-origin-embedder-policy", "require-corp"),
+            (
+                "permissions-policy",
+                "accelerometer=(), camera=(), geolocation=(), microphone=()",
+            ),
+            ("x-permitted-cross-domain-policies", "none"),
+            (
+                "content-security-policy",
+                "default-src 'none'; form-action 'self'; object-src 'none'; frame-ancestors 'none'; upgrade-insecure-requests",
+            ),
+            ("x-dns-prefetch-control", "off"),
+            (
+                "strict-transport-security",
+                "max-age=63072000; includeSubDomains",
+            ),
+        ] {
+            assert_eq!(
+                headers
+                    .get(name)
+                    .and_then(|header_value| header_value.to_str().ok()),
+                Some(value),
+                "{ctx}: {name} default mismatch"
+            );
+        }
         assert!(
-            headers.contains_key("x-content-type-options"),
-            "{ctx}: missing X-Content-Type-Options"
+            headers.get("server").is_none(),
+            "{ctx}: server fingerprint header must be absent"
         );
         assert!(
-            headers.contains_key("x-frame-options"),
-            "{ctx}: missing X-Frame-Options"
-        );
-        assert!(
-            headers.contains_key("strict-transport-security"),
-            "{ctx}: missing Strict-Transport-Security"
-        );
-        assert!(
-            headers.contains_key(header::CONTENT_SECURITY_POLICY),
-            "{ctx}: missing Content-Security-Policy"
+            headers.get("x-powered-by").is_none(),
+            "{ctx}: x-powered-by fingerprint header must be absent"
         );
     }
 
@@ -9943,7 +10118,7 @@ mod tests {
 
     #[expect(
         clippy::unnecessary_wraps,
-        reason = "deliberate: src/transport.rs::extra_router_non_overlapping_path_under_framework_prefix_is_accepted — keeps the uniform IS-7 test signature while it only asserts that the router merge succeeds"
+        reason = "deliberate: src/transport.rs::extra_router_non_overlapping_path_under_framework_prefix_is_accepted - keeps the uniform IS-7 test signature while it only asserts that the router merge succeeds"
     )]
     /// Pins that a path under a framework prefix which does not exactly overlap
     /// an existing route is accepted.
@@ -10029,7 +10204,26 @@ mod tests {
         Ok(())
     }
 
-    // -- M6: OAuth proxy admin endpoints enforce the admin role --
+    /// Pins that the request body-limit 413 response carries the OWASP security
+    /// headers.
+    #[tokio::test]
+    async fn headers_on_body_limit_413() -> anyhow::Result<()> {
+        let app = m5_router(None)?;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header(header::ORIGIN, "http://good.example")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CONTENT_LENGTH, (1024_usize * 1024 + 1).to_string())
+            .body(Body::from("x".repeat(1024_usize * 1024 + 1)))?;
+        let resp = app.oneshot(req).await?;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_owasp_headers(&resp, "body-limit-413");
+
+        Ok(())
+    }
+
+    // - M6: OAuth proxy admin endpoints enforce the admin role -
 
     /// Builds the M6 auth state holding one admin and one viewer API key.
     ///
@@ -10038,7 +10232,7 @@ mod tests {
     /// Returns an error when either API key cannot be generated.
     #[cfg(feature = "oauth")]
     fn m6_auth_state(fields: LogContextConfig) -> anyhow::Result<(Arc<AuthState>, String, String)> {
-        use crate::auth::generate_api_key;
+        use crate::auth::{default_max_concurrent_verifications, generate_api_key};
 
         let (admin_token, admin_hash) = generate_api_key().context("admin api key")?;
         let (viewer_token, viewer_hash) = generate_api_key().context("viewer api key")?;
@@ -10049,6 +10243,10 @@ mod tests {
             ]),
             rate_limiter: None,
             pre_auth_limiter: None,
+            hash_permits: Arc::new(Semaphore::new(default_max_concurrent_verifications().get())),
+            verification_wait: Duration::from_secs(1),
+            #[cfg(test)]
+            verification_hook: None,
             jwks_cache: None,
             seen_identities: SeenIdentitySet::new(),
             counters: AuthCounters::default(),
@@ -10182,7 +10380,7 @@ mod tests {
         Ok(())
     }
 
-    // -- F3 regression: unbounded Prometheus label cardinality --
+    // - F3 regression: unbounded Prometheus label cardinality -
     //
     // `metrics_middleware` runs outside the auth layer, so it observes
     // unauthenticated traffic. Labelling with the raw URI path and raw HTTP
@@ -10303,7 +10501,7 @@ mod tests {
 
         #[expect(
             clippy::unnecessary_wraps,
-            reason = "deliberate: src/transport.rs::request_parse_normalizes_scheme_host_and_ports — keeps the uniform IS-7 test signature while it only asserts on parsed origin tuples"
+            reason = "deliberate: src/transport.rs::request_parse_normalizes_scheme_host_and_ports - keeps the uniform IS-7 test signature while it only asserts on parsed origin tuples"
         )]
         #[test]
         /// Pins that request-origin parsing normalizes scheme, host, and ports.
@@ -10335,7 +10533,7 @@ mod tests {
 
         #[expect(
             clippy::unnecessary_wraps,
-            reason = "deliberate: src/transport.rs::request_parse_rejects_paths_queries_fragments_and_odd_schemes — keeps the uniform IS-7 test signature while it only asserts on rejected origin inputs"
+            reason = "deliberate: src/transport.rs::request_parse_rejects_paths_queries_fragments_and_odd_schemes - keeps the uniform IS-7 test signature while it only asserts on rejected origin inputs"
         )]
         #[test]
         /// Pins that request-origin parsing rejects paths, queries, fragments,
@@ -10363,7 +10561,7 @@ mod tests {
 
         #[expect(
             clippy::unnecessary_wraps,
-            reason = "deliberate: src/transport.rs::config_parse_tolerates_one_root_trailing_slash_only — keeps the uniform IS-7 test signature while it only asserts on parsed config tuples"
+            reason = "deliberate: src/transport.rs::config_parse_tolerates_one_root_trailing_slash_only - keeps the uniform IS-7 test signature while it only asserts on parsed config tuples"
         )]
         #[test]
         /// Pins that config-origin parsing tolerates exactly one trailing slash
@@ -10446,7 +10644,7 @@ mod tests {
 
         #[expect(
             clippy::unnecessary_wraps,
-            reason = "deliberate: src/transport.rs::non_canonical_port_spellings_are_rejected — keeps the uniform IS-7 test signature while it only asserts on rejected port spellings"
+            reason = "deliberate: src/transport.rs::non_canonical_port_spellings_are_rejected - keeps the uniform IS-7 test signature while it only asserts on rejected port spellings"
         )]
         #[test]
         /// Pins that non-canonical port spellings are rejected on the request

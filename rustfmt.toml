@@ -3,7 +3,7 @@ imports_granularity = "Crate"
 group_imports = "StdExternalCrate"
 
 # Enforce LF, do not merely preserve it. The default is "Auto", which keeps
-# whatever a file already has -- so a tool that writes CRLF on Windows (Python's
+# whatever a file already has - so a tool that writes CRLF on Windows (Python's
 # default text mode, PowerShell's Out-File) silently drifts a file and
 # `cargo fmt` happily formats around it. With "Unix", `cargo fmt --check` fails
 # on CRLF, which turns invisible drift into a caught CI error. Complements

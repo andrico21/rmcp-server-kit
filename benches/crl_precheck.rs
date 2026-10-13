@@ -91,7 +91,7 @@ const INVARIANCE_URL_COUNT: usize = 16;
 #[expect(
     clippy::expect_used,
     clippy::missing_panics_doc,
-    reason = "deliberate: benches/crl_precheck.rs::build_ca — fixture construction panics by design; a broken fixture must abort the benchmark run"
+    reason = "deliberate: benches/crl_precheck.rs::build_ca - fixture construction panics by design; a broken fixture must abort the benchmark run"
 )]
 fn build_ca() -> CertifiedIssuer<'static, KeyPair> {
     let mut params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
@@ -135,7 +135,7 @@ fn build_crl(ca: &CertifiedIssuer<'static, KeyPair>, target_bytes: usize) -> Vec
 #[expect(
     clippy::expect_used,
     clippy::missing_panics_doc,
-    reason = "deliberate: benches/crl_precheck.rs::sign_crl — fixture construction panics by design; a broken fixture must abort the benchmark run"
+    reason = "deliberate: benches/crl_precheck.rs::sign_crl - fixture construction panics by design; a broken fixture must abort the benchmark run"
 )]
 fn sign_crl(ca: &CertifiedIssuer<'static, KeyPair>, revoked: usize) -> Vec<u8> {
     let revoked_certs = (0..revoked)
@@ -165,7 +165,7 @@ fn sign_crl(ca: &CertifiedIssuer<'static, KeyPair>, revoked: usize) -> Vec<u8> {
 #[expect(
     clippy::expect_used,
     clippy::missing_panics_doc,
-    reason = "deliberate: benches/crl_precheck.rs::bench_config — fixture construction panics by design; a broken fixture must abort the benchmark run"
+    reason = "deliberate: benches/crl_precheck.rs::bench_config - fixture construction panics by design; a broken fixture must abort the benchmark run"
 )]
 fn bench_config(deny_on_unavailable: bool) -> MtlsConfig {
     let mut config: MtlsConfig = serde_json::from_value(serde_json::json!({
@@ -202,7 +202,7 @@ struct Scenario {
 #[expect(
     clippy::expect_used,
     clippy::missing_panics_doc,
-    reason = "deliberate: benches/crl_precheck.rs::scenario — fixture construction panics by design; a broken fixture must abort the benchmark run"
+    reason = "deliberate: benches/crl_precheck.rs::scenario - fixture construction panics by design; a broken fixture must abort the benchmark run"
 )]
 fn scenario(
     ca: &CertifiedIssuer<'static, KeyPair>,
@@ -219,7 +219,7 @@ fn scenario(
         .collect::<Vec<_>>();
     #[expect(
         deprecated,
-        reason = "deliberate: mtls_revocation::CrlSet::__test_with_prepopulated_crls — the deprecated test-only constructor is the only prepopulated-CrlSet entry point until 4.0"
+        reason = "deliberate: mtls_revocation::CrlSet::__test_with_prepopulated_crls - the deprecated test-only constructor is the only prepopulated-CrlSet entry point until 4.0"
     )]
     let set = CrlSet::__test_with_prepopulated_crls(
         Arc::new(roots),
@@ -265,7 +265,7 @@ where
 /// scale-invariance gate explicitly.
 #[expect(
     clippy::use_debug,
-    reason = "deliberate: benches/crl_precheck.rs::report_p95 — Duration has no Display impl, and the Debug-rendered p95 table is the recorded benchmark output (D-19 byte-identical)"
+    reason = "deliberate: benches/crl_precheck.rs::report_p95 - Duration has no Display impl, and the Debug-rendered p95 table is the recorded benchmark output (D-19 byte-identical)"
 )]
 fn report_p95(ca: &CertifiedIssuer<'static, KeyPair>) {
     let stdout = io::stdout();
@@ -401,7 +401,7 @@ fn bench_tampered(criterion: &mut Criterion) {
     runtime.block_on(async {
         #[expect(
             deprecated,
-            reason = "deliberate: mtls_revocation::CrlSet::cache — this benchmark intentionally mutates the deprecated public cache field to simulate tampering"
+            reason = "deliberate: mtls_revocation::CrlSet::cache - this benchmark intentionally mutates the deprecated public cache field to simulate tampering"
         )]
         let mut cache = replaced.set.cache.write().await;
         if let Some(entry) = cache.get_mut("memory://crl/0") {
@@ -414,7 +414,7 @@ fn bench_tampered(criterion: &mut Criterion) {
     runtime.block_on(async {
         #[expect(
             deprecated,
-            reason = "deliberate: mtls_revocation::CrlSet::cache — this benchmark intentionally mutates the deprecated public cache field to simulate tampering"
+            reason = "deliberate: mtls_revocation::CrlSet::cache - this benchmark intentionally mutates the deprecated public cache field to simulate tampering"
         )]
         let mut cache = removed.set.cache.write().await;
         drop(cache.remove("memory://crl/0"));

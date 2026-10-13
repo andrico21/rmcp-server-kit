@@ -13,7 +13,7 @@ index (provenance, hashes, open deviations, re-vendor procedure). Before
 opening a PR, review the Quick Reference Checklist at the end of the core;
 reviewers will enforce it. The strictest stable lint profile (core Section 9)
 is committed in `Cargo.toml`, and permanent CI gates keep it honest: the
-catalog, allow, profile-equality and prose gates under `scripts/lint-ratchet/`.
+catalog, allow, profile-equality, prose and dash gates under `scripts/lint-ratchet/`.
 The `docs/RUST_1_95_NOTES.md` file is a historical record frozen at Rust 1.95;
 the current toolchain policy is the MSRV work in `docs/MIGRATION.md` (3.14.4).
 
@@ -48,6 +48,7 @@ python3 scripts/lint-ratchet/catalog_gate.py
 python3 scripts/lint-ratchet/allow_gate.py --enforce
 python3 scripts/lint-ratchet/profile_eq.py --clippy-toml
 python3 scripts/lint-ratchet/prose_gates.py --enforce
+python3 scripts/lint-ratchet/dash_gate.py --enforce
 ```
 
 All of these must pass.

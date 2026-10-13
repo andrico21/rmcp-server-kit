@@ -1,13 +1,25 @@
 //! SSRF guards for outbound HTTP: scheme/userinfo validation, literal-IP
-//! rejection, cloud-metadata blocking, and the operator host/CIDR allowlist
-//! shared by the OAuth/JWKS and CRL fetch paths.
+//! rejection, cloud-metadata blocking, reserved-address classification, and
+//! OAuth/JWKS allowlisting.
+//!
+//! OAuth and JWKS fetches may re-allow non-metadata private, unique-local,
+//! site-local, benchmarking, ORCHID, and other reserved targets through an
+//! operator CIDR allowlist. Cloud-metadata classifications are never
+//! re-allowable. CRL fetches use the same blocked-IP classifier without an
+//! operator allowlist.
+//!
+//! The classifier intentionally does not decode IPv6 discard-only
+//! `100::/64`, because traffic to that prefix is dropped rather than reaching
+//! a confidentiality target. It also does not decode ISATAP interface
+//! identifiers under global prefixes, because the same bit patterns occur in
+//! ordinary global addresses and generic decoding would misclassify them.
 
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use url::Url;
 
 /// AWS / GCP / Azure metadata endpoint. Always blocked even if private
-/// IPs are otherwise allowed -- this address is unique to cloud-VM
+/// IPs are otherwise allowed - this address is unique to cloud-VM
 /// privilege-escalation pivots.
 pub(crate) const CLOUD_METADATA_V4: Ipv4Addr = Ipv4Addr::new(169, 254, 169, 254);
 
@@ -99,17 +111,29 @@ pub(crate) fn sanitized_url_for_log(url: &Url) -> String {
 /// - IPv4 multicast (224/4) and reserved future use (240/4).
 /// - IPv6 loopback (`::1`), unspecified (`::`).
 /// - IPv6 link-local (`fe80::/10`).
+/// - IPv6 site-local (`fec0::/10`, deprecated by RFC 3879).
 /// - IPv6 unique local (`fc00::/7`).
 /// - IPv6 multicast (`ff00::/8`).
 /// - IPv6 documentation (`2001:db8::/32`).
+/// - IPv6 benchmarking (`2001:2::/48`, RFC 5180).
+/// - IPv6 ORCHID (`2001:10::/28`, RFC 4843) and `ORCHIDv2`
+///   (`2001:20::/28`, RFC 7343).
 /// - IPv6 Teredo tunneling (`2001::/32`), blocked outright.
 /// - IPv6 NAT64 (`64:ff9b::/96`) and 6to4 (`2002::/16`) when the
 ///   embedded IPv4 address is itself blocked by any rule above; embedded
 ///   cloud-metadata is re-labelled `cloud_metadata` so an operator
 ///   allowlist covering the transition prefix cannot re-allow it.
+/// - IPv6 NAT64 local-use (`64:ff9b:1::/48`) as `nat64_local_use`,
+///   re-allowable via the operator allowlist except when any RFC 6052
+///   layout that fits inside the `/48` embeds cloud metadata.
 /// - IPv6 IPv4-compatible (`::a.b.c.d`, deprecated `::/96`): the whole
 ///   prefix is blocked, inheriting any IPv4 rule for the embedded address.
 /// - IPv4-mapped IPv6 inheriting any of the above.
+///
+/// Intentionally not decoded: IPv6 discard-only `100::/64`, because traffic
+/// to that prefix is dropped, and ISATAP interface identifiers under global
+/// prefixes, because their bit patterns are not unique to tunneled private or
+/// metadata targets.
 ///
 /// **Cloud-metadata addresses are checked BEFORE the generic buckets** so
 /// that an operator allowlist (see [`CompiledSsrfAllowlist`]) covering
@@ -231,6 +255,12 @@ fn block_reason_v6(v6: Ipv6Addr) -> Option<&'static str> {
     if segments[0] == 0x2001 && segments[1] == 0x0000 {
         return Some("teredo");
     }
+    if let Some(reason) = nat64_local_use_reason(v6) {
+        return Some(reason);
+    }
+    if let Some(reason) = reserved_ipv6_reason(segments) {
+        return Some(reason);
+    }
     // NAT64 well-known prefix 64:ff9b::/96 (RFC 6052): the trailing 32
     // bits embed an IPv4 address. On DNS64/NAT64 egress networks EVERY
     // public host maps into this prefix, so blocking it wholesale would
@@ -267,6 +297,61 @@ fn block_reason_v6(v6: Ipv6Addr) -> Option<&'static str> {
             return Some("6to4_embedded");
         }
         return None;
+    }
+    None
+}
+
+/// Classify RFC 8215 local-use NAT64, preserving embedded metadata.
+fn nat64_local_use_reason(v6: Ipv6Addr) -> Option<&'static str> {
+    let [
+        o0,
+        o1,
+        o2,
+        o3,
+        o4,
+        o5,
+        o6,
+        o7,
+        _u,
+        o9,
+        o10,
+        o11,
+        o12,
+        o13,
+        o14,
+        o15,
+    ] = v6.octets();
+    if [o0, o1, o2, o3, o4, o5] != [0x00, 0x64, 0xff, 0x9b, 0x00, 0x01] {
+        return None;
+    }
+    // /32 and /40 cannot encode metadata inside this /48: their first IPv4
+    // octet would be fixed at 0 or 1 by `64:ff9b:1::/48`.
+    for embedded in [
+        Ipv4Addr::new(o6, o7, o9, o10),
+        Ipv4Addr::new(o7, o9, o10, o11),
+        Ipv4Addr::new(o9, o10, o11, o12),
+        Ipv4Addr::new(o12, o13, o14, o15),
+    ] {
+        if block_reason_v4(embedded) == Some("cloud_metadata") {
+            return Some("cloud_metadata");
+        }
+    }
+    Some("nat64_local_use")
+}
+
+/// Classify re-allowable IPv6 special-purpose ranges not covered by `std`.
+const fn reserved_ipv6_reason(segments: [u16; 8]) -> Option<&'static str> {
+    if (segments[0] & 0xffc0) == 0xfec0 {
+        return Some("site_local");
+    }
+    if segments[0] == 0x2001 && segments[1] == 0x0002 && segments[2] == 0 {
+        return Some("benchmarking");
+    }
+    if segments[0] == 0x2001 {
+        let orchid_prefix = segments[1] & 0xfff0;
+        if orchid_prefix == 0x0010 || orchid_prefix == 0x0020 {
+            return Some("orchid");
+        }
     }
     None
 }
@@ -321,16 +406,16 @@ impl CidrEntry {
     /// - Missing `/` separator.
     /// - Non-numeric prefix.
     /// - Prefix > 32 (IPv4) or > 128 (IPv6).
-    /// - **Prefix `0`** (`0.0.0.0/0` / `::/0`) -- would defeat the entire
+    /// - **Prefix `0`** (`0.0.0.0/0` / `::/0`) - would defeat the entire
     ///   guard by allowing every address.
-    /// - **IPv4-mapped IPv6 CIDRs** (`::ffff:127.0.0.0/104`) -- write the
+    /// - **IPv4-mapped IPv6 CIDRs** (`::ffff:127.0.0.0/104`) - write the
     ///   IPv4 form instead. This matches `ip_block_reason`'s normalization
     ///   so the runtime check and the allowlist agree on family.
-    /// - IPv6 zone identifiers (`fe80::1%eth0/64`) -- rejected by
+    /// - IPv6 zone identifiers (`fe80::1%eth0/64`) - rejected by
     ///   `IpAddr::from_str` directly.
     /// - Non-zero host bits (`10.0.0.1/8`).
     ///
-    /// Uses `std::net` only -- no new dependencies.
+    /// Uses `std::net` only - no new dependencies.
     ///
     /// # Errors
     ///
@@ -466,10 +551,6 @@ pub(crate) struct CompiledSsrfAllowlist {
 impl CompiledSsrfAllowlist {
     /// Construct a compiled allowlist from already-validated host
     /// entries (lowercased) and CIDR entries.
-    #[cfg_attr(
-        all(not(test), not(feature = "oauth")),
-        expect(dead_code, reason = "consumer is feature-gated")
-    )]
     pub(crate) const fn new(hosts: Vec<String>, cidrs: Vec<CidrEntry>) -> Self {
         Self { hosts, cidrs }
     }
@@ -491,7 +572,7 @@ impl CompiledSsrfAllowlist {
         self.cidrs.iter().any(|cidr| cidr.contains(ip))
     }
 
-    /// Returns true iff both `hosts` and `cidrs` are empty -- i.e. the
+    /// Returns true iff both `hosts` and `cidrs` are empty - i.e. the
     /// allowlist is a no-op and the default SSRF guard should apply
     /// unchanged.
     pub(crate) const fn is_empty(&self) -> bool {
@@ -528,7 +609,7 @@ impl CompiledSsrfAllowlist {
 /// Like the non-allowlist variant, this does NOT perform DNS resolution.
 /// Redirect targets with DNS hostnames are passed through (the closure
 /// will let `reqwest` follow them, and the post-DNS guard on the next
-/// fetch -- if any -- would catch a hostname resolving into blocked
+/// fetch - if any - would catch a hostname resolving into blocked
 /// space).
 #[cfg(feature = "oauth")]
 pub(crate) fn redirect_target_reason_with_allowlist(
@@ -566,7 +647,121 @@ mod tests {
 
     use url::Url;
 
-    use super::{check_scheme, ip_block_reason, sanitized_url_for_log};
+    use super::{
+        CLOUD_METADATA_V4, CLOUD_METADATA_V4_ALIBABA, check_scheme, ip_block_reason,
+        sanitized_url_for_log,
+    };
+
+    #[derive(Clone, Copy)]
+    enum Rfc6052Layout {
+        Prefix48,
+        Prefix56,
+        Prefix64,
+        Prefix96,
+    }
+
+    impl Rfc6052Layout {
+        const ALL: [Self; 4] = [
+            Self::Prefix48,
+            Self::Prefix56,
+            Self::Prefix64,
+            Self::Prefix96,
+        ];
+
+        const fn name(self) -> &'static str {
+            match self {
+                Self::Prefix48 => "/48",
+                Self::Prefix56 => "/56",
+                Self::Prefix64 => "/64",
+                Self::Prefix96 => "/96",
+            }
+        }
+    }
+
+    fn embed_rfc6052_local_use(
+        layout: Rfc6052Layout,
+        ipv4: Ipv4Addr,
+        u_octet: u8,
+        suffix: [u8; 3],
+    ) -> Ipv6Addr {
+        let [v4_first, v4_second, v4_third, v4_fourth] = ipv4.octets();
+        let [suffix_first, suffix_second, suffix_third] = suffix;
+        let octets = match layout {
+            Rfc6052Layout::Prefix48 => [
+                0x00,
+                0x64,
+                0xff,
+                0x9b,
+                0x00,
+                0x01,
+                v4_first,
+                v4_second,
+                u_octet,
+                v4_third,
+                v4_fourth,
+                suffix_first,
+                suffix_second,
+                suffix_third,
+                0,
+                0,
+            ],
+            Rfc6052Layout::Prefix56 => [
+                0x00,
+                0x64,
+                0xff,
+                0x9b,
+                0x00,
+                0x01,
+                0,
+                v4_first,
+                u_octet,
+                v4_second,
+                v4_third,
+                v4_fourth,
+                suffix_first,
+                suffix_second,
+                suffix_third,
+                0,
+            ],
+            Rfc6052Layout::Prefix64 => [
+                0x00,
+                0x64,
+                0xff,
+                0x9b,
+                0x00,
+                0x01,
+                0,
+                0,
+                u_octet,
+                v4_first,
+                v4_second,
+                v4_third,
+                v4_fourth,
+                suffix_first,
+                suffix_second,
+                suffix_third,
+            ],
+            Rfc6052Layout::Prefix96 => [
+                0x00,
+                0x64,
+                0xff,
+                0x9b,
+                0x00,
+                0x01,
+                suffix_first,
+                suffix_second,
+                u_octet,
+                suffix_third,
+                0,
+                0,
+                v4_first,
+                v4_second,
+                v4_third,
+                v4_fourth,
+            ],
+        };
+        Ipv6Addr::from(octets)
+    }
 
     #[test]
     /// Pins that `https` URLs are accepted regardless of the `allow_http` flag.
@@ -615,7 +810,7 @@ mod tests {
     /// Numeric IPv4 literals must never reach the fetch path as an allowed
     /// DNS name. The WHATWG URL parser normalizes decimal, hex, and octal
     /// forms to `Host::Ipv4` before `check_url_literal_ip` sees them, so the
-    /// literal-IP guard covers them -- but nothing in this crate pins that,
+    /// literal-IP guard covers them - but nothing in this crate pins that,
     /// and it is exactly the shape an SSRF filter bypass takes.
     ///
     /// The invariant asserted is "not reachable as a `Domain`": either the
@@ -851,6 +1046,246 @@ mod tests {
 
     #[expect(
         clippy::unnecessary_wraps,
+        reason = "deliberate: src/ssrf.rs::nat64_local_use_classification keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
+    /// Pins RFC 8215 local-use NAT64 classification and adjacent boundaries.
+    fn nat64_local_use_classification() -> anyhow::Result<()> {
+        for (ip, expected) in [
+            (
+                Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 0, 0, 0xa9fe, 0xa9fe),
+                Some("cloud_metadata"),
+            ),
+            (
+                Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 0, 0, 0x6464, 0x64c8),
+                Some("cloud_metadata"),
+            ),
+            (
+                Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 0, 0, 0x0a00, 0x0001),
+                Some("nat64_local_use"),
+            ),
+            (
+                Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 0, 0, 0x0808, 0x0808),
+                Some("nat64_local_use"),
+            ),
+            (
+                Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 1, 0, 0, 1),
+                Some("nat64_local_use"),
+            ),
+            (
+                Ipv6Addr::new(0x0064, 0xff9b, 1, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff),
+                Some("nat64_local_use"),
+            ),
+            (Ipv6Addr::new(0x0064, 0xff9b, 2, 0, 0, 0, 0, 1), None),
+            (Ipv6Addr::new(0x0064, 0xff9b, 0, 1, 0, 0, 0x0a00, 1), None),
+            (
+                Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0x0a00, 1),
+                Some("nat64_embedded"),
+            ),
+            (
+                Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0xa9fe, 0xa9fe),
+                Some("cloud_metadata"),
+            ),
+        ] {
+            assert_eq!(ip_block_reason(IpAddr::V6(ip)), expected, "{ip}");
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/ssrf.rs::nat64_local_use_metadata_in_all_rfc6052_layouts keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
+    /// Pins metadata blocking for every RFC 6052 layout that fits in local-use NAT64.
+    fn nat64_local_use_metadata_in_all_rfc6052_layouts() -> anyhow::Result<()> {
+        for layout in Rfc6052Layout::ALL {
+            for ipv4 in [CLOUD_METADATA_V4, CLOUD_METADATA_V4_ALIBABA] {
+                for u_octet in [0, 0x87] {
+                    for suffix in [[0, 0, 0], [0x12, 0x34, 0x56]] {
+                        let ip = embed_rfc6052_local_use(layout, ipv4, u_octet, suffix);
+                        assert_eq!(
+                            ip_block_reason(IpAddr::V6(ip)),
+                            Some("cloud_metadata"),
+                            "layout={} ipv4={ipv4} u={u_octet:#04x} suffix={suffix:02x?} ip={ip}",
+                            layout.name()
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/ssrf.rs::nat64_local_use_non_metadata_in_all_rfc6052_layouts keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
+    /// Pins non-metadata embedded IPv4 values keep the local-use NAT64 label.
+    fn nat64_local_use_non_metadata_in_all_rfc6052_layouts() -> anyhow::Result<()> {
+        for layout in Rfc6052Layout::ALL {
+            for ipv4 in [
+                Ipv4Addr::new(10, 0, 0, 1),
+                Ipv4Addr::new(8, 8, 8, 8),
+                Ipv4Addr::new(169, 254, 169, 253),
+                Ipv4Addr::new(100, 100, 100, 201),
+            ] {
+                let ip = embed_rfc6052_local_use(layout, ipv4, 0x87, [0x12, 0x34, 0x56]);
+                assert_eq!(
+                    ip_block_reason(IpAddr::V6(ip)),
+                    Some("nat64_local_use"),
+                    "layout={} ipv4={ipv4} ip={ip}",
+                    layout.name()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/ssrf.rs::nat64_local_use_unaligned_metadata_bytes_keep_local_use_label keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
+    /// Pins that metadata-like bytes at no RFC 6052 layout position keep the local-use label.
+    fn nat64_local_use_unaligned_metadata_bytes_keep_local_use_label() -> anyhow::Result<()> {
+        for ip in [
+            Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 0, 0xa9fe, 0xa9fe, 0),
+            Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 0xa9fe, 0xa9fe, 0, 0),
+            Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 0, 0, 0xfea9, 0xfea9),
+        ] {
+            assert_eq!(
+                ip_block_reason(IpAddr::V6(ip)),
+                Some("nat64_local_use"),
+                "{ip}"
+            );
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/ssrf.rs::reserved_ipv6_special_purpose_classification keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
+    /// Pins site-local, benchmarking and ORCHID IPv6 special-purpose classifications.
+    fn reserved_ipv6_special_purpose_classification() -> anyhow::Result<()> {
+        for (ip, expected) in [
+            (
+                Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 0),
+                Some("site_local"),
+            ),
+            (
+                Ipv6Addr::new(0xfed0, 0, 0, 0, 0, 0, 0, 1),
+                Some("site_local"),
+            ),
+            (
+                Ipv6Addr::new(
+                    0xfeff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+                ),
+                Some("site_local"),
+            ),
+            (
+                Ipv6Addr::new(0x2001, 0x0002, 0, 0, 0, 0, 0, 0),
+                Some("benchmarking"),
+            ),
+            (
+                Ipv6Addr::new(0x2001, 0x0002, 0, 0, 0, 0, 0, 1),
+                Some("benchmarking"),
+            ),
+            (
+                Ipv6Addr::new(0x2001, 0x0002, 0, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff),
+                Some("benchmarking"),
+            ),
+            (
+                Ipv6Addr::new(0x2001, 0x0010, 0, 0, 0, 0, 0, 0),
+                Some("orchid"),
+            ),
+            (
+                Ipv6Addr::new(0x2001, 0x0018, 0, 0, 0, 0, 0, 1),
+                Some("orchid"),
+            ),
+            (
+                Ipv6Addr::new(
+                    0x2001, 0x001f, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+                ),
+                Some("orchid"),
+            ),
+            (
+                Ipv6Addr::new(0x2001, 0x0020, 0, 0, 0, 0, 0, 0),
+                Some("orchid"),
+            ),
+            (
+                Ipv6Addr::new(0x2001, 0x0028, 0, 0, 0, 0, 0, 1),
+                Some("orchid"),
+            ),
+            (
+                Ipv6Addr::new(
+                    0x2001, 0x002f, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+                ),
+                Some("orchid"),
+            ),
+            (
+                Ipv6Addr::new(
+                    0xfebf, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+                ),
+                Some("link_local"),
+            ),
+            (
+                Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0),
+                Some("multicast"),
+            ),
+            (
+                Ipv6Addr::new(
+                    0x2001, 0x0001, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+                ),
+                None,
+            ),
+            (Ipv6Addr::new(0x2001, 0x0002, 1, 0, 0, 0, 0, 0), None),
+            (Ipv6Addr::new(0x2001, 0x0003, 0, 0, 0, 0, 0, 0), None),
+            (
+                Ipv6Addr::new(
+                    0x2001, 0x000f, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+                ),
+                None,
+            ),
+            (Ipv6Addr::new(0x2001, 0x0030, 0, 0, 0, 0, 0, 0), None),
+        ] {
+            assert_eq!(ip_block_reason(IpAddr::V6(ip)), expected, "{ip}");
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/ssrf.rs::reserved_ipv6_not_decoded_guards keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
+    /// Pins intentionally undecoded IPv6 patterns and metadata-first ordering.
+    fn reserved_ipv6_not_decoded_guards() -> anyhow::Result<()> {
+        for ip in [
+            Ipv6Addr::new(0x0100, 0, 0, 0, 0, 0, 0, 1),
+            Ipv6Addr::new(0x2001, 0x4860, 0, 0, 0, 0x5efe, 0x0a00, 0x0001),
+            Ipv6Addr::new(0x2001, 0x4860, 0, 0, 0, 0x5efe, 0xa9fe, 0xa9fe),
+        ] {
+            assert_eq!(ip_block_reason(IpAddr::V6(ip)), None, "{ip}");
+        }
+        for ip in [
+            Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254),
+            Ipv6Addr::new(0xfd20, 0x00ce, 0, 0, 0, 0, 0, 0x0254),
+        ] {
+            assert_eq!(
+                ip_block_reason(IpAddr::V6(ip)),
+                Some("cloud_metadata"),
+                "{ip}"
+            );
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
         reason = "deliberate: src/ssrf.rs::ipv4_compatible_ipv6_blocked keeps the uniform test signature while it cannot fail"
     )]
     #[test]
@@ -1069,7 +1504,7 @@ mod tests {
     #[test]
     /// Pins that GCP IPv6 metadata is labelled `cloud_metadata`.
     fn block_reason_classifies_gcp_ipv6_metadata_as_cloud_metadata() -> anyhow::Result<()> {
-        // fd20:ce::254 -- GCP IPv6 metadata. Same reasoning as AWS.
+        // fd20:ce::254 - GCP IPv6 metadata. Same reasoning as AWS.
         assert_eq!(
             ip_block_reason(IpAddr::V6(super::CLOUD_METADATA_V6_GCP)),
             Some("cloud_metadata")
@@ -1162,7 +1597,7 @@ mod tests {
         #[test]
         /// Pins that a zero IPv4 prefix is rejected.
         fn cidr_parse_rejects_zero_prefix_v4() -> anyhow::Result<()> {
-            // 0.0.0.0/0 would allow every IPv4 address -- defeats the
+            // 0.0.0.0/0 would allow every IPv4 address - defeats the
             // entire SSRF guard. Operators must enumerate.
             let Err(err) = CidrEntry::parse("0.0.0.0/0") else {
                 anyhow::bail!("must reject");

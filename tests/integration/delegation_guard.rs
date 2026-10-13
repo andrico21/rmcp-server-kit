@@ -294,7 +294,7 @@ mod tests {
 
         let Some(macro_at) = source.find("macro_rules! server_handler_methods") else {
             anyhow::bail!(
-                "{}: `server_handler_methods!` macro not found -- rmcp restructured \
+                "{}: `server_handler_methods!` macro not found - rmcp restructured \
                  `ServerHandler`; update this guard",
                 source_path.display()
             );
@@ -379,7 +379,7 @@ mod tests {
 
         assert!(
             !names.is_empty(),
-            "{}: macro parse matched zero methods -- inspect the rmcp source layout \
+            "{}: macro parse matched zero methods - inspect the rmcp source layout \
              and this parser (silently skipping would recreate the drift it guards against)",
             source_path.display()
         );
@@ -549,7 +549,7 @@ mod tests {
             "{wrapper}: impl scan found {} methods in {source_rel}, expected \
              {expected_impl_method_count}. \
              Either the wrapper genuinely changed (update the count) or the scanner \
-             mis-scoped (fix the scanner -- do not weaken these assertions).",
+             mis-scoped (fix the scanner - do not weaken these assertions).",
             found.len()
         );
         Ok(())
@@ -708,7 +708,7 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     /// Methods with no possible semantic driver, per wrapper. Must stay empty: no
-    /// `ServerHandler` method is structurally unreachable -- each is drivable
+    /// `ServerHandler` method is structurally unreachable - each is drivable
     /// through dispatch or a direct call. Legitimising an entry is a deliberate
     /// code change: relax this assertion and record why, rather than adding names.
     const HOOKED_HANDLER_SEMANTICALLY_UNPROVABLE: &[&str] = &[];
@@ -795,8 +795,8 @@ mod tests {
         assert!(
             semantically_unprovable.is_empty(),
             "{wrapper}: SEMANTICALLY_UNPROVABLE must stay empty; found \
-             {semantically_unprovable:?}. No method is structurally unreachable -- every one \
-             is drivable through dispatch or a direct call -- so legitimising an entry means \
+             {semantically_unprovable:?}. No method is structurally unreachable - every one \
+             is drivable through dispatch or a direct call - so legitimising an entry means \
              relaxing this assertion and recording why, not adding a name."
         );
 
@@ -828,7 +828,7 @@ mod tests {
             missing.is_empty() && unclassified.is_empty(),
             "{wrapper}: the SEMANTIC_DRIVERS table in {source_rel} does not cover the \
              classification. Classified but not driven: {missing:?}; driven but not \
-             classified: {unclassified:?}. Add a driver (or a macro-origin pin) -- do not \
+             classified: {unclassified:?}. Add a driver (or a macro-origin pin) - do not \
              relax this equality."
         );
         Ok(())
@@ -862,7 +862,7 @@ mod tests {
         assert!(
             mismatched.is_empty(),
             "{wrapper}: macro-origin pins no longer hold: {mismatched:?}. A method that became \
-             a literal `fn` is no longer discharged by its shared macro-body driver -- give it \
+             a literal `fn` is no longer discharged by its shared macro-body driver - give it \
              its own semantic driver, and change the pin only when the impl genuinely changed."
         );
         Ok(())
@@ -909,7 +909,7 @@ mod tests {
 
         assert!(
             !names.is_empty(),
-            "{source_rel}: `SEMANTIC_DRIVERS` parsed to zero names -- the table shape changed; \
+            "{source_rel}: `SEMANTIC_DRIVERS` parsed to zero names - the table shape changed; \
              update this parser rather than relaxing the gate"
         );
         Ok(names)

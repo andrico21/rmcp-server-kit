@@ -40,7 +40,7 @@ shutdown.
 ## 2. Repository map (top 2-3 levels)
 
 ```
-Z:\TempPersistent\rmcp-server-kit\
+rmcp-server-kit/
 ├── src/                      Library source (THE crate)
 │   ├── lib.rs                  Crate root - re-exports public modules
 │   ├── transport.rs            ★ Server entry: serve(), serve_stdio(), TLS, router, middleware wiring
@@ -61,6 +61,8 @@ Z:\TempPersistent\rmcp-server-kit\
 ├── tests/
 │   ├── unit/                 In-process tests (no I/O)
 │   │   ├── api_auto_traits.rs
+│   │   ├── crl_crypto_provider.rs
+│   │   ├── crl_crypto_provider_crl_set.rs
 │   │   ├── crl_discovery_ratelimit.rs
 │   │   ├── crl_h3_regression.rs      (feature = "test-helpers")
 │   │   ├── crl_map_bounds.rs         (feature = "test-helpers")
@@ -69,6 +71,7 @@ Z:\TempPersistent\rmcp-server-kit\
 │   │   └── properties.rs
 │   └── integration/          Loopback ports, `wiremock`, or file reads
 │       ├── crl_ssrf.rs
+│       ├── crl_trusted_origin.rs    (feature = "test-helpers")
 │       ├── delegation_guard.rs
 │       ├── docs_citations.rs
 │       ├── e2e.rs            Spawns serve() on ephemeral ports
@@ -139,9 +142,9 @@ Z:\TempPersistent\rmcp-server-kit\
 
 ## 4. Build / test / run cheat sheet
 
-> All commands assume cwd = `Z:\TempPersistent\rmcp-server-kit`.
-> Prefer the `rtk` wrapper (`Z:\TempPersistent\rtk.exe`) for token-efficient
-> output in agent contexts - e.g. `Z:\TempPersistent\rtk.exe cargo build`.
+> All commands assume the repository root as the working directory.
+> Prefer the `rtk` wrapper when it is installed for token-efficient
+> output in agent contexts - for example `rtk cargo build`.
 
 | Goal                             | Command                                                              |
 |----------------------------------|----------------------------------------------------------------------|
@@ -159,7 +162,7 @@ Z:\TempPersistent\rmcp-server-kit\
 | License/ban policy               | `cargo deny check`                                                   |
 | MSRV check (lint-capped)         | `RUSTFLAGS="--cap-lints=warn" CARGO_BUILD_WARNINGS=allow cargo +1.99.0 build --all-features` |
 | Semver check (library)           | `cargo semver-checks check-release`                                  |
-| Lint gates (CI)                  | `python3 scripts/lint-ratchet/catalog_gate.py`; `allow_gate.py --enforce`; `profile_eq.py --clippy-toml`; `prose_gates.py --enforce` |
+| Lint gates (CI)                  | `python3 scripts/lint-ratchet/catalog_gate.py`; `allow_gate.py --enforce`; `profile_eq.py --clippy-toml`; `prose_gates.py --enforce`; `dash_gate.py --enforce` |
 | Docs citations + links (CI)      | `cargo test --all-features --test docs_citations` and `lychee --offline --no-progress README.md RUST_GUIDELINES.md docs/*.md` |
 
 **CI definition lives in**:
@@ -181,13 +184,13 @@ ephemeral loopback ports.
 | **Integration** | `tests/integration/*.rs` | loopback ports, `wiremock`, or file reads | `cargo test --all-features` |
 | **Benches** | `benches/rbac_redaction.rs`, `hook_latency.rs` | - | `cargo bench` |
 
-`tests/unit/` (in-process): `api_auto_traits`, `crl_discovery_ratelimit`,
-`crl_h3_regression`, `crl_map_bounds`, `oauth_url_validation`,
+`tests/unit/` (in-process): `api_auto_traits`, `crl_crypto_provider`,
+`crl_crypto_provider_crl_set`, `crl_discovery_ratelimit`, `crl_h3_regression`, `crl_map_bounds`, `oauth_url_validation`,
 `parser_properties`, `properties`.
 
 `tests/integration/` (loopback ports, `wiremock` or file reads): `crl_ssrf`,
-`delegation_guard`, `docs_citations`, `e2e`, `e2e_oauth_mtls`, `jwks_key_cap`,
-`jwks_redirect_ssrf`, `limiter_memory` (`#[ignore]`d), `metrics_handle`,
+`crl_trusted_origin`, `delegation_guard`, `docs_citations`, `e2e`, `e2e_oauth_mtls`,
+`jwks_key_cap`, `jwks_redirect_ssrf`, `limiter_memory` (`#[ignore]`d), `metrics_handle`,
 `metrics_headers`, `oauth_http_client`, `origin_validation`, `ssrf_resolver`.
 
 **Feature-gated targets.** Each test file is declared with an explicit `[[test]]`
@@ -195,7 +198,7 @@ target in `Cargo.toml`; ten of them carry `required-features`, so running a
 gated target without its features now **errors** with "requires the features"
 instead of silently running an empty binary:
 
-- `test-helpers`: `crl_h3_regression`, `crl_map_bounds`
+- `test-helpers`: `crl_h3_regression`, `crl_map_bounds`, `crl_trusted_origin`
 - `oauth`: `oauth_url_validation`
 - `oauth` **and** `test-helpers`: `jwks_key_cap`, `jwks_redirect_ssrf`,
   `oauth_http_client`, `ssrf_resolver`, `e2e_oauth_mtls`
@@ -208,6 +211,8 @@ the default-feature build is covered too.
 `rmcp-<version>/src/handler/server.rs` under the local Cargo registry and hard-fails if
 it is missing, so run `cargo fetch` first on a cold checkout. Set `RMCP_SRC_DIR` to the
 rmcp crate root for atypical layouts - notably `cargo vendor`, which CI does not use.
+CI sets `RMCP_REQUIRE_SYMLINK_TESTS=1`, which turns the Windows symlink audit
+test's missing-privilege skip into a failure.
 
 ---
 
@@ -219,10 +224,10 @@ consumer applications and `examples/`.
 | Entry                                    | File                                                                  | Notes                                                                                                  |
 |------------------------------------------|----------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------|
 | Crate root / public API                  | [`src/lib.rs`](src/lib.rs)                                            | Re-exports all public modules                                                                          |
-| **Server entry (HTTP)**                  | [`src/transport.rs`](src/transport.rs) - `serve()` (~line 2981)        | The function consumers call. Wires rmcp + axum + middleware + TLS + admin + metrics                    |
-| Server entry (stdio)                     | [`src/transport.rs`](src/transport.rs) - `serve_stdio()` (~line 5424) | For desktop/IDE clients. **Bypasses auth/RBAC/TLS** - use only for local subprocess MCP                |
-| Config builder                           | [`src/transport.rs`](src/transport.rs) - `McpServerConfig::new` (~line 536) | Builder-style config struct                                                                       |
-| Hot-reload handle                        | [`src/transport.rs`](src/transport.rs) - `ReloadHandle` (~line 1984)   | `try_reload_auth_keys` / `reload_auth_keys` / `reload_rbac` for runtime reconfig without restart      |
+| **Server entry (HTTP)**                  | [`src/transport.rs`](src/transport.rs) - `serve()` (~line 3014)        | The function consumers call. Wires rmcp + axum + middleware + TLS + admin + metrics                    |
+| Server entry (stdio)                     | [`src/transport.rs`](src/transport.rs) - `serve_stdio()` (~line 5505) | For desktop/IDE clients. **Bypasses auth/RBAC/TLS** - use only for local subprocess MCP                |
+| Config builder                           | [`src/transport.rs`](src/transport.rs) - `McpServerConfig::new` (`src/transport.rs:989`) | Builder-style config struct                                                                       |
+| Hot-reload handle                        | [`src/transport.rs`](src/transport.rs) - `ReloadHandle` (~line 2003)   | `try_reload_auth_keys` / `reload_auth_keys` / `reload_rbac` for runtime reconfig without restart      |
 | Runnable example                         | [`examples/minimal_server.rs`](examples/minimal_server.rs)            | Smallest possible consumer of `serve()`                                                                |
 | Integration reference                    | [`tests/integration/e2e.rs`](tests/integration/e2e.rs)                | Real-world usage patterns; use as an integration cookbook                                              |
 
@@ -232,7 +237,7 @@ consumer applications and `examples/`.
 
 ```
                    ┌──────────────────────────────────┐
-   HTTP request ─► │  TlsListener  (TLS / mTLS)       │  src/transport.rs:3140
+   HTTP request ─► │  TlsListener  (TLS / mTLS)       │  `TlsListener` src/transport.rs:3657
                    └────────────────┬─────────────────┘
                                     ▼
                    ┌──────────────────────────────────┐
@@ -250,7 +255,7 @@ consumer applications and `examples/`.
         (executed top-to-bottom on request)            │
                                                        │
         0. Security headers - outermost, response-only decoration; pass-through on requests
-        1. Origin check       src/transport.rs:4493    │  spec: MCP origin validation
+        1. Origin check       `origin_check_middleware` src/transport.rs:5160    │  spec: MCP origin validation
            Logs only the requests it rejects.
         2. Peer-addr normalize (normalize_peer_addr_middleware) │  mirrors TLS peer into ConnectInfo<SocketAddr> + public PeerAddr (both branches)
         2b. Request log (request_log_middleware): DEBUG `incoming request` / `request completed`, skips request_log_exclude_paths, client fields per [server.log_context] knobs
@@ -271,7 +276,7 @@ consumer applications and `examples/`.
 - `AuthState.api_keys: ArcSwap<Vec<ApiKeyEntry>>` - swap API keys at runtime
 - `rbac_swap: ArcSwap<RbacPolicy>` - swap RBAC policy at runtime
 - mTLS identity: bound to the connection itself via `AuthenticatedTlsStream` / per-connection `TlsConnInfo` extension - set by the TLS handshake worker, read by auth middleware (no shared `SocketAddr`-keyed map)
-- Task-local: `current_role()`, `current_identity()`, `current_token()`, `current_sub()` - set by middleware, callable from inside tool handlers (`src/rbac.rs:243`)
+- Task-local: `current_role()` (`src/rbac.rs:158`), `current_identity()` (`src/rbac.rs:180`), `current_token()` (`src/rbac.rs:202`), and `current_sub()` (`src/rbac.rs:220`) - set by middleware, callable from inside tool handlers
 
 For a much deeper version see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
@@ -356,7 +361,7 @@ The core's current-Rust idioms (for example `Vec::push_mut` /
 |------------------------------------------------|--------------------------------------------------------|
 | Server entry / router / middleware order       | `src/transport.rs` - `serve()` and surrounding helpers |
 | API key authentication                         | `src/auth.rs` - `AuthState`, `ApiKeyEntry`, `auth_middleware` |
-| mTLS identity extraction                       | `src/transport.rs` - `extract_mtls_identity` call site (~line 3694)   |
+| mTLS identity extraction                       | `src/transport.rs` - `extract_mtls_identity` call site (near `run_tls_acceptor`, `src/transport.rs:3748`)   |
 | mTLS CRL revocation (CDP-driven)               | `src/mtls_revocation.rs` - `CrlSet`, `DynamicClientCertVerifier`, `bootstrap_fetch`, `run_crl_refresher` |
 | OAuth JWT validation / JWKS cache              | `src/oauth.rs` - `JwksCache`, feature-gated           |
 | RBAC policy evaluation                         | `src/rbac.rs` - `RbacPolicy::check`, `enforce_tool_policy` |
@@ -376,11 +381,11 @@ The core's current-Rust idioms (for example `Vec::push_mut` /
 | Security-header TOML controls                  | `src/transport.rs` - `SecurityHeadersConfig`; `src/config.rs` - `ServerConfig::security_headers` |
 | Error type → HTTP status mapping               | `src/error.rs` - `RmcpServerKitError::into_response`           |
 | Origin / security headers / CORS               | `src/transport.rs` - `origin_check_middleware`, `security_headers_middleware` |
-| Graceful shutdown (Ctrl-C / SIGTERM)           | `src/transport.rs` - `shutdown_signal()` (~line 4153) |
-| Hot-reload of keys / RBAC                      | `src/transport.rs` - `ReloadHandle` (~line 1984)       |
+| Graceful shutdown (Ctrl-C / SIGTERM)           | `src/transport.rs` - `shutdown_signal()` (`src/transport.rs:4191`) |
+| Hot-reload of keys / RBAC                      | `src/transport.rs` - `ReloadHandle` (~line 2003)       |
 | Environment variable override mapping          | `src/config.rs` - `ServerConfig::apply_env_overrides`, `ObservabilityConfig::apply_env_overrides`; `src/rbac.rs` - `RbacConfig::apply_env_overrides` |
 | `rmcp` / `rmcp-macros` version bump in `Cargo.toml` / `Cargo.lock` | `docs/RMCP_UPGRADE_CHECKLIST.md` - the checks to run; `tests/integration/delegation_guard.rs` - the trait-surface guard |
-| Lint gates (catalog / allow / profile-equality / prose) | `scripts/lint-ratchet/{catalog_gate,allow_gate,profile_eq,prose_gates}.py`; shared helpers in `scripts/lint-ratchet/common.py` |
+| Lint gates (catalog / allow / profile-equality / prose) | `scripts/lint-ratchet/{catalog_gate,allow_gate,profile_eq,prose_gates,dash_gate}.py`; shared helpers in `scripts/lint-ratchet/common.py` |
 | Vendored-guideline index / deviations register         | `RUST_GUIDELINES.md` (index); `docs/rust-guidelines/` (vendored bytes - never edit) |
 | Test tiers / `required-features` wiring                | `Cargo.toml` `[[test]]` tables; `tests/unit/` and `tests/integration/` |
 
@@ -388,8 +393,8 @@ The core's current-Rust idioms (for example `Vec::push_mut` /
 
 ## 10. Common pitfalls (history of bites)
 
-1. **Middleware order matters for security.** Origin check MUST run before auth so unauthenticated callers are rejected by origin first. Rate limit MUST be inside auth so anonymous storms don't amplify. See `src/transport.rs` middleware wiring around lines 1640-1830.
-2. **JWKS refresh is rate-limited.** Don't remove the `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:2725`) - invalid JWTs would otherwise DoS the JWKS endpoint.
+1. **Middleware order matters for security.** Origin check MUST run before auth so unauthenticated callers are rejected by origin first. Rate limit MUST be inside auth so anonymous storms don't amplify. See `build_app_router` middleware wiring in `src/transport.rs:2331`.
+2. **JWKS refresh is rate-limited.** Don't remove the `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:2928`) - invalid JWTs would otherwise DoS the JWKS endpoint.
 3. **Task-local RBAC context only exists inside the request scope.** Calling `current_role()` from a `tokio::spawn`ed background task returns `None`. Capture the value before spawning.
 4. **`stdio` transport bypasses everything.** `serve_stdio` does NOT enforce auth, RBAC, TLS, or origin checks. It's intended for trusted local subprocess scenarios only.
 5. **mTLS identity is bound to the connection stream (`TlsConnInfo`), not to a shared `SocketAddr` map.** If a load balancer terminates TCP and rewrites peer addresses you must terminate TLS at the LB and use a different identity-binding strategy; the in-process binding itself is immune to port-reuse aliasing.

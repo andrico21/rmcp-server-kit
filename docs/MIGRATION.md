@@ -3,6 +3,310 @@
 This guide shows how to wire the standalone `rmcp-server-kit` crate into a
 downstream project, and how to migrate across breaking major releases.
 
+## Migrating to 3.20.0: audit-log hardening, Argon2id admission control, CRL trust, and one breaking API change
+
+### `JwksCache::new` returns the crate error type (breaking)
+
+`JwksCache::new` now returns `Result<Self, RmcpServerKitError>` instead of
+`Result<Self, Box<dyn Error + Send + Sync>>`:
+
+```rust,ignore
+// before
+let cache: Result<JwksCache, Box<dyn std::error::Error + Send + Sync>> =
+    JwksCache::new(&oauth_config);
+
+// after
+let cache: Result<JwksCache, rmcp_server_kit::RmcpServerKitError> =
+    JwksCache::new(&oauth_config);
+```
+
+Code that uses `?` into `anyhow::Error` or `Box<dyn Error>` compiles
+unchanged. Code that names the boxed error type, or downcasts it, must
+switch to `RmcpServerKitError`: a bad `jwks_cache_ttl`, `ssrf_allowlist`, or
+`allowed_algorithms` maps to `RmcpServerKitError::Config`; a CA bundle file
+read failure, bad CA bundle content, or `reqwest` client build failure maps
+to `RmcpServerKitError::Startup` naming the path.
+
+### Audit-log hardening (Unix)
+
+Opening `audit_log_path` is now stricter, checked once at startup before any
+write:
+
+- **A pre-existing path owned by a different user** now fails strict
+  startup instead of silently writing the audit trail through it. This
+  affects an init container, a sidecar, a shared volume, or a provisioning
+  step that created the path as root. Dedicate the path to the service
+  user, pre-create it owned by the service user, or switch any rotator to
+  copy-and-truncate semantics (for example logrotate's `copytruncate`) so a
+  restart always finds a file the service user already owns.
+- **A symlinked path** (including a dangling symlink or one pointing at a
+  directory) now fails strict startup; only the final path component is
+  checked, so a symlinked parent directory is still traversed.
+- **A special file** at that path (a device, FIFO, or socket) now fails
+  strict startup.
+- **A regular file with more than one hard link** now fails strict startup.
+  Hard-link-based retention or rotation schemes are affected; use
+  copy-based retention instead, such as copying and truncating the active
+  file, or rotating by rename and reopening a fresh single-link path on
+  restart. Single-link, self-owned regular files are still accepted and
+  tightened to `0o600`.
+- **A filesystem that rejects chmod** (CIFS/SMB without Unix extensions,
+  vfat or exFAT, some FUSE or NFS mounts): a failed correction of the mode
+  to `0o600` now fails strict startup (before 3.20.0 it was a warning)
+  unless the file already has exactly mode `0o600`. Where the filesystem
+  keeps per-file modes, pre-create the file as the service user with mode
+  `0600`; on vfat, exFAT or CIFS without Unix extensions set mount options
+  that report that owner and mode (see the guide), or use a filesystem
+  with POSIX permissions.
+- **`/dev/stdout`, `/dev/stderr`, `/proc/self/fd/N`, a FIFO, a socket or a
+  device** are no longer accepted as `audit_log_path`. The audit file only
+  duplicates the INFO-and-above events already written to stderr, so a
+  container that ships its output streams should leave `audit_log_path`
+  unset.
+- **NFS with `root_squash` and a server running as root:** the created
+  file is owned by the squashed user, so the owner check fails. Run the
+  server as a non-root user that owns the path, or keep the audit log on
+  local storage.
+
+The deprecated lenient initializer now installs no audit sink at all when
+any of these checks fails, instead of falling back to an unprotected
+writer. All of these checks run once, at startup, against the file as it
+exists then; a hard link or a second directory entry added afterward is not
+detected (permissions still live on the inode, so a new directory entry
+does not by itself grant another principal read access to the content).
+
+### Audit-log hardening (Windows)
+
+Opening `audit_log_path` now refuses a reparse point (a symbolic link, a
+junction, a mount point, or a filesystem-specific tag such as a cloud-file
+placeholder or a deduplicated file) at the final path component, checked
+both before the open and again on the opened handle. Point `audit_log_path`
+directly at a plain file or a path that does not yet exist.
+
+If DACL hardening fails after the file is opened, the crate now deletes the
+file only when it created it in this call; a pre-existing file that fails
+hardening is left in place, matching the Unix policy of never deleting
+something the process did not create. Cleanup still removes the file by
+path after the handle is dropped, so a principal with write access to the
+parent directory can race that delete; this is a pre-existing residual of
+the by-path ACL call, not new in this release.
+
+### Argon2id verification admission control
+
+Bearer API-key authentication now bounds how many Argon2id verifications
+run concurrently on the blocking thread pool:
+
+- `AuthConfig::max_concurrent_verifications` (TOML
+  `server.auth.max_concurrent_verifications`) - default `None`, which
+  resolves to `available_parallelism()` clamped to `1..=16` at auth-state
+  construction; an explicit value above `Semaphore::MAX_PERMITS` is clamped
+  rather than panicking.
+- `AuthConfig::verification_wait` (TOML `server.auth.verification_wait`) -
+  default `1s`; a TOML or builder value of `"0s"` / `Duration::ZERO` is
+  rejected at validation (`auth.verification_wait must be greater than zero`).
+
+A bearer request that cannot get a permit within `verification_wait` now
+receives `503 Service Unavailable` with `Retry-After: 1` and a generic body,
+instead of queuing unboundedly; these responses are counted separately as
+`AuthCountersSnapshot::failure_overloaded` at `/admin/auth/counters`. The
+constant-time credential scan itself is unchanged. This bounds Argon2id's
+memory growth (roughly `max_concurrent_verifications` times about 19 MiB)
+independent of source IP or client count, but a sustained flood can still
+keep legitimate callers receiving bounded-latency `503`s for as long as it
+lasts - the bound limits memory and per-request latency, it does not make
+the service unaffected by the attack. Pair it with a per-IP rate limit (see
+`RateLimitConfig::with_pre_auth_burst` in `docs/GUIDE.md`); API-key auth with
+no rate limiting at all is unsafe on a reachable listener.
+
+Valid credentials are subject to the same bound. Each bearer request holds
+one permit for a full key scan (one verification per configured key), so
+sustained capacity is about
+`max_concurrent_verifications / (configured keys x t_verify)` requests per
+second, and a burst admitted within the wait is about
+`max_concurrent_verifications x floor(verification_wait / (configured keys x t_verify))`.
+A burst beyond that receives `503` even when every credential is valid.
+Bursty API-key deployments should raise `max_concurrent_verifications` or
+`verification_wait` before upgrading and watch `failure_overloaded`; see
+the capacity planning section of `docs/GUIDE.md`.
+
+### CA bundle validation
+
+`oauth.ca_cert_path` (consumed by the JWKS cache, the general-purpose OAuth
+HTTP client, and the token-exchange mTLS client) now fails startup, naming
+the client and the path, when the file is missing, empty, contains no PEM
+certificate, contains only a private key, is DER-encoded, is an
+unterminated PEM, or is PEM-framed but contains malformed DER. Previously,
+several of these shapes produced a client with no custom root and no error,
+so a private-CA identity provider failed later with an unrelated TLS error
+on the first JWKS or token request, even though `ca_cert_path` appeared to
+be configured correctly.
+
+### Stricter TOML preflight validation
+
+TOML config preflight (`validate_server_config`) now shares the same nested
+auth validation as the programmatic builder path, so a mistake that
+previously passed preflight and failed only once bridged into
+`McpServerConfig` now fails preflight directly. Check nested auth settings
+for: duplicate or blank API-key names; an unsupported OAuth algorithm list;
+a zero OAuth JWKS cache cap; a malformed OAuth JWKS cache TTL; a zero auth
+rate-limit capacity (including `max_tracked_keys`); a zero mTLS CRL capacity
+cap; a zero `verification_wait`; and a malformed `listen_addr` /
+`listen_port` pair. The last check parses the composed
+`listen_addr:listen_port` as a `SocketAddr`, so a bare IPv6 `listen_addr`
+(for example `::1`) is rejected with a message that shows the bracketed form
+(`[::1]`); write IPv6 hosts in brackets in `listen_addr`. The builder's
+`bind_addr` error gained the same hint.
+
+### SSRF range additions and CRL origin trust
+
+The SSRF guard used by OAuth, JWKS, token, revocation and introspection
+fetches now blocks four more special-purpose IPv6 range classes by
+default: RFC 8215 local-use NAT64 (`64:ff9b:1::/48`), deprecated site-local
+(`fec0::/10`), benchmarking (`2001:2::/48`), and ORCHID/ORCHIDv2
+(`2001:10::/28`, `2001:20::/28`). A previously reachable target in any of
+these ranges now needs a narrow `ssrf_allowlist` CIDR entry; prefer the
+narrowest CIDR that covers the actual endpoint over allowlisting a whole
+range. A cloud-metadata IPv4 address embedded in any RFC 6052 layout inside
+the NAT64 `/48` (not only the `/96` layout) remains unbypassable even under
+a broad allowlist. `100::/64` (discard-only) and ISATAP interface
+identifiers under global prefixes are intentionally not decoded.
+
+The CRL fetch path has no allowlist, so a CRL distribution point resolving
+into any of these ranges is blocked outright - **unless** its origin
+(scheme, lowercased host, effective port) is named in the CRL Distribution
+Point or Authority Information Access extensions of a certificate in
+`mtls.ca_cert_path` or in the server's own TLS certificate chain. Since
+3.20.0, such operator-configured `https` origins, and `http` origins while
+`crl_allow_http` is enabled (the default), skip the private-address SSRF
+screen automatically (no configuration knob; the trusted set is logged once
+at startup at INFO), so a corporate PKI that publishes its CRLs on an internal
+host now works as long as the issuing CA certificate (the one carrying the
+CDP/AIA extensions) is present in `mtls.ca_cert_path` or the server's own
+chain. Cloud-metadata addresses remain unbypassable regardless of trust.
+The connect-time DNS screen applies the same exact-origin match: a URL whose
+origin is not trusted is fetched by a client that admits no blocked address,
+even when its hostname is the hostname of a trusted origin on another port.
+A runtime-discovered CDP URL reaches that trusted-origin path only when a
+certificate on a verified path of a presented chain names it (see
+[CRL discovery follows verified certificate paths](#crl-discovery-follows-verified-certificate-paths)).
+This narrows the 3.14-era statement that a CDP resolving into a blocked
+range is always rejected: it is rejected only for origins not named in a
+configured certificate. See also the CRL/AIA IPv6-literal limitation below.
+
+### CRL discovery follows verified certificate paths
+
+Runtime CRL discovery now fetches only the CDP URLs named by the end entity or
+by an intermediate on a verified path of a presented client chain: a path to a
+configured root (`mtls.ca_cert_path`) that verifies as the live verifier
+would, except that revocation is not considered. The chain is checked before
+the client proves key possession. Every verified path counts, up to webpki's
+path-building budget, and byte-identical duplicate intermediates are ignored,
+so a client that presents a cross-signed intermediate in two copies has the
+URLs of whichever copy the live verifier accepts discovered. A chain that does
+not verify triggers no CRL request and consumes no discovery budget, and a
+certificate on no verified path contributes no URL to discovery. Their CDP
+URLs still count toward the unchanged per-handshake 64-URL
+malformed-certificate cap and the fail-closed availability precheck (every
+presented certificate's URLs by default, only the end entity's with
+`crl_end_entity_only = true`), which can only affect the presenting client's
+own handshake.
+
+In two narrow cases a CDP URL that 3.14 fetched is no longer fetched because
+of the presenting chain, until it is cached some other way. First, a URL named
+only by a certificate on no verified path. The live verifier never builds a
+path through such a certificate, so no revocation decision depends on its CRL,
+but the fail-closed precheck refuses a handshake when every relevant CDP URL
+is uncached: with `crl_end_entity_only = false` and
+`crl_deny_on_unavailable = true` (both defaults), a client whose relevant URLs
+are all named only by such certificates - for example an end-entity
+certificate without a CDP extension presented together with an unrelated
+certificate that has one - can be
+refused. Second, a chain that offers dozens of distinct alternative paths. The
+live verifier gives up on a candidate path at its first revocation failure,
+while discovery verifies every candidate in full against webpki's fixed
+per-verification budget (which includes a limit of 100 signature checks), so
+discovery can exhaust that budget before it reaches the path the live verifier
+accepts. Any of that path's CRLs not named by a recorded path are then not
+discovered from the chain: under `crl_deny_on_unavailable = true` the
+handshake can be refused, and under `false` the certificates they cover can be
+accepted without a revocation check. Otherwise no operator action is required.
+Anyone holding a copy of a valid chain (public bytes, revoked or not) can
+still trigger fetches of the CDP URLs chosen by the CAs that issued the
+certificates on its verified paths.
+
+Downstream code that calls `DynamicClientCertVerifier` directly gets the same
+gate under any transport. A spray of certificates that do not verify no longer
+produces `discovery_rate_limited` log lines; it shows as handshake failures at
+debug level. The crate now depends directly on `rustls-webpki` for this check;
+see the CHANGELOG.
+
+### Session-id log policy (opt-in, default unchanged)
+
+`[server.log_context] session_id_header` (and
+`McpServerConfig::with_session_id_log_policy`) controls how full
+request-header logging renders `Mcp-Session-Id`: `"plain"` (default,
+identical to prior releases), `"mask"` (values of 16 or more Unicode
+characters become `first4...last4`; shorter values become `[MASKED]`), or
+`"hide"` (the header is omitted entirely). No action is required to keep
+the existing behavior. If full request-header logging is enabled with
+`session_id_header` left at `"plain"` and `session_binding` disabled,
+startup now logs a WARN, because an unbound raw session id is replayable
+log-leak material; set `session_binding = true`, or choose `"mask"` or
+`"hide"`, to clear it. The matching environment override is
+`RMCP_SERVER_KIT__SERVER__LOG_CONTEXT__SESSION_ID_HEADER`.
+
+### Known limitations
+
+**CRL and AIA IPv6-literal endpoints:** a CRL or AIA URL whose host is an
+IPv6 literal is never fetched, trusted origin or not - the bracketed-host
+address lookup fails, so the fetch fails closed. This limitation is
+pre-existing, unchanged by this release. Publish CRL and AIA endpoints under
+a DNS hostname or an IPv4 literal.
+
+### Dash convention and four runtime-visible strings
+
+The repository-wide prose style is now a single hyphen; two consecutive
+hyphens are reserved for command-line flags and separators. Four
+operator-visible warning strings had that separator normalized from a
+double hyphen to a single hyphen - exact log matchers must be updated:
+
+| file | message (new wording) |
+|---|---|
+| `src/oauth.rs` | `operators only - see SECURITY.md` |
+| `src/oauth.rs` | `here - list them via oauth.ssrf_allowlist.cidrs instead` |
+| `src/rbac.rs` | `not as a pattern - set rbac.allow_operation_matching` |
+| `src/rbac.rs` | `substitutes its own default bypasses it entirely - set` |
+
+The `docs/GUIDE.md` top-level heading and the `Q1`-`Q6` headings of
+`docs/decisions/P4-DECISION-protocol-2026-stateless-posture.md` also
+changed to the single-hyphen form; external bookmarks or links to their old
+URL fragments will no longer resolve. No inbound link inside this
+repository pointed at the old fragments.
+
+Validation messages changed too - exact message matchers must be updated:
+
+- zero burst: `auth.rate_limit.burst must be greater than zero` (the builder
+  path said `auth rate_limit.burst` in 3.14.4);
+- zero pre-auth burst: `auth.rate_limit.pre_auth_burst must be greater than
+  zero` (the builder path said `auth rate_limit.pre_auth_burst` in 3.14.4);
+- TOML listen address: `listen_addr/listen_port "<addr>" is not a valid socket
+  address (expected e.g. 127.0.0.1:8080; write an IPv6 listen_addr in
+  brackets, e.g. [::1])`;
+- builder listen address: `bind_addr "<addr>" is not a valid socket address
+  (expected e.g. 127.0.0.1:8080 or [::1]:8080)`.
+
+### Public API
+
+The only breaking public API change in 3.20.0 is the `JwksCache::new`
+retype above. The public additions are `AuthConfig::max_concurrent_verifications`,
+`AuthConfig::verification_wait` and their builders,
+`AuthCountersSnapshot::failure_overloaded`, and `SessionIdLogPolicy` with
+`LogContextConfig::session_id_header` and
+`McpServerConfig::with_session_id_log_policy`, all described above.
+`AuthConfig::with_verification_wait` and
+`McpServerConfig::with_session_id_log_policy` are `const fn`, like
+`AuthConfig::with_max_concurrent_verifications`.
+
 ## Migrating to 3.14.4: logging defaults, MSRV 1.99, and `/metrics` security headers
 
 ### Framework INFO lines are visible under the default filter
@@ -155,7 +459,7 @@ compile unchanged.
 
 Two `auth.api_keys` entries that share a `name` but declare *different*
 `role`s are now rejected. This is a no-opt-out hard error on
-previously-accepted configuration, shipped in a **minor** release -- the same
+previously-accepted configuration, shipped in a **minor** release - the same
 shape as two hard errors already shipped in a 3.8 minor (`auth.mtls` without
 TLS is a validation error; a certificate advertising more than 64 CDP URLs is
 rejected): a security-motivated rejection of malformed config, not an API
@@ -163,7 +467,7 @@ break. `check_api_key_names` stays `pub(crate)` and no public signature
 changes, so `cargo-semver-checks` reports nothing.
 
 **Impact:** the API-key `name` is the session/task-binding *principal
-identity* -- the MCP session-binding and task-binding fingerprints derive
+identity* - the MCP session-binding and task-binding fingerprints derive
 their per-principal namespace from it alone. Two same-named entries are
 therefore one principal, so mapping one name to two roles is a contradiction
 that silently collapses two authorization profiles into a single identity
@@ -172,13 +476,13 @@ A config that boots today with such a pair will refuse to start after
 upgrading.
 
 **This has no opt-out and applies on both the startup and hot-reload paths.**
-The hot-reload path was already safe -- `try_reload_auth_keys` validates
-before swapping and retains the prior keys on error -- so a *running* server
+The hot-reload path was already safe - `try_reload_auth_keys` validates
+before swapping and retains the prior keys on error - so a *running* server
 cannot be pushed into this state; the newly-strict surface is startup
 validation, which previously accepted the contradictory pair.
 
 **Action required:** none for conforming configuration. Same name with the
-*same* role remains valid -- that is credential rotation (one principal, two
+*same* role remains valid - that is credential rotation (one principal, two
 secrets), and is explicitly preserved. Give two entries the same `name` only
 when they are the same principal; use distinct names for distinct principals,
 and each name keeps its own session/task namespace even under a shared RBAC
@@ -195,7 +499,7 @@ CDP URLs into the CRL fetch pipeline is now applied **per source peer IP**
 for attributed TLS handshakes, instead of as a single process-global bucket.
 This is a **minor**, additive change: no config field is added or removed,
 `crl_discovery_rate_per_min` keeps its name, type, `#[serde(default)]`, and
-validation, and no public signature changes -- so `cargo semver-checks`
+validation, and no public signature changes - so `cargo semver-checks`
 reports nothing. Only the *documented semantics* of an existing knob change,
 which is what this note exists to record.
 
@@ -218,7 +522,7 @@ TOML under `deny_unknown_fields` and make rollback breaking). The per-peer
 key is the **direct** peer IP: behind a TCP load balancer that terminates the
 connection it is the balancer's address, and per-IP keying does not by itself
 defeat a distributed attacker. Submissions with no attributed handshake peer
--- a `DynamicClientCertVerifier` built outside this crate's transport -- fall
+- a `DynamicClientCertVerifier` built outside this crate's transport - fall
 back to the pre-change process-global bucket.
 
 **Action required:** none for the common case. If you deliberately relied on
@@ -240,9 +544,9 @@ active), which on the standard transport should never happen.
 mTLS listeners no longer issue or accept TLS session resumption (TLS 1.2
 session IDs/tickets, TLS 1.3 tickets). rustls previously restored a resumed
 handshake's peer certificate chain from cached session state without ever
-calling `ClientCertVerifier::verify_client_cert` -- the only site that checks
+calling `ClientCertVerifier::verify_client_cert` - the only site that checks
 CRL revocation and certificate validity-period (`notAfter`) / chain
-validation -- so a certificate that had been revoked or had expired could
+validation - so a certificate that had been revoked or had expired could
 continue authenticating for as long as a session could be resumed. This is a
 **minor**, no-opt-out behavioural change: no public API or `MtlsConfig` field
 changes, so `cargo semver-checks` reports nothing.
@@ -250,11 +554,11 @@ changes, so `cargo semver-checks` reports nothing.
 **Impact:** every *new* mTLS connection now performs a full handshake, so CRL
 revocation and `notAfter` expiry apply starting with the next connection
 after upgrade. Connections already established when the server restarts are
-unaffected -- they remain trusted until closed, exactly as before; this
+unaffected - they remain trusted until closed, exactly as before; this
 change only removes a *new* connection's ability to skip verification via a
 resumed session. High-churn mTLS clients (short-lived connections that
-previously resumed) now pay a full handshake -- a CPU cost, not a
-correctness change -- on every connection; plain TLS (no client certificate)
+previously resumed) now pay a full handshake - a CPU cost, not a
+correctness change - on every connection; plain TLS (no client certificate)
 is untouched.
 
 **Action required:** none for correctness. If you serve a high volume of
@@ -530,8 +834,8 @@ should match it.
 
 ## Migrating to 3.8: CRL fail-closed by default
 
-This mTLS/CRL hardening is additive at the API level -- `cargo semver-checks`
-reports no breaking change -- but it **alters two runtime defaults**. `cargo semver-checks` cannot
+This mTLS/CRL hardening is additive at the API level - `cargo semver-checks`
+reports no breaking change - but it **alters two runtime defaults**. `cargo semver-checks` cannot
 detect a behavioural default change, so read this section before upgrading.
 
 ### 1. `crl_deny_on_unavailable` now defaults to `true`
@@ -542,7 +846,7 @@ the exact condition an attacker holding a revoked certificate can induce, by
 blocking reachability to the CA's CDP host.
 
 From `3.8`, such a handshake is **rejected**, per RFC 5280 §6.3. Denial requires
-*every* relevant CDP to be unavailable, not merely one -- otherwise blocking a
+*every* relevant CDP to be unavailable, not merely one - otherwise blocking a
 single mirror would become a denial-of-service vector.
 
 **Who is affected:** deployments using mTLS with `crl_enabled = true` (the
@@ -594,7 +898,7 @@ friends.
 ### 3. `auth.mtls` without TLS is now a validation error
 
 Configuring `auth.mtls` without both `tls_cert_path` and `tls_key_path` used to
-start successfully with client-certificate authentication **silently disabled** --
+start successfully with client-certificate authentication **silently disabled** -
 a plaintext listener never performs a TLS handshake, so no client identity is
 ever extracted. This combination is now rejected by
 `McpServerConfig::validate()`. Supply both TLS paths, or remove `auth.mtls`.
@@ -618,7 +922,7 @@ withdrawn. Presence enforcement is opt-in by design, because an allowlist that
 constrains a supplied value is a legitimate configuration and flipping the
 default would silently turn previously-allowed traffic into `403`s with no
 compile error. Set `required = true` (or use `new_required`) wherever omitting
-the argument must be rejected -- there is no future release in which that
+the argument must be rejected - there is no future release in which that
 happens automatically.
 
 ### 5. Certificates advertising more than 64 CDP URLs are rejected
@@ -668,7 +972,7 @@ now is the only non-breaking way to give downstream users notice.
 
 ## Migrating from 3.4 to 3.5
 
-`3.5` is additive at the API level -- `cargo semver-checks` reports no breaking
+`3.5` is additive at the API level - `cargo semver-checks` reports no breaking
 change, no default values were altered, and no code change is required to
 upgrade. Existing configurations parse and behave identically to 3.4.x unless
 you opt in to the new features.

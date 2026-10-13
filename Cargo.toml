@@ -1,6 +1,6 @@
 [package]
 name = "rmcp-server-kit"
-version = "3.14.4"
+version = "3.20.0"
 edition = "2024"
 rust-version = "1.99.0"
 license = "MIT OR Apache-2.0"
@@ -26,7 +26,7 @@ exclude = [
   ".cargo/config.toml",
   # Agent planning scratchpads. Untracked, so a clean CI checkout never sees
   # them, but `cargo publish --allow-dirty` from a working tree would package
-  # them -- they contain internal review notes and session identifiers.
+  # them - they contain internal review notes and session identifiers.
   ".omo/",
   ".sisyphus/",
   # Development-only guideline docs. The root file is the vendoring index; the
@@ -92,6 +92,12 @@ rustls = { version = "0.23", default-features = false, features = [
   "logging",
   "tls12",
 ] }
+# CRL discovery needs the verified certificate paths, which rustls's client
+# verifier discards; this is the version rustls already uses, so no new crate
+# enters Cargo.lock.
+webpki = { package = "rustls-webpki", version = "0.103.15", default-features = false, features = [
+  "std",
+] }
 tokio-rustls = { version = "0.26", default-features = false, features = [
   "ring",
 ] }
@@ -156,11 +162,25 @@ reqwest = { version = "0.13.4", default-features = false, features = [
 ] }
 urlencoding = { version = "2", optional = true }
 
+# Unix-only: safe `open`/`fstat`/`fchmod`/`geteuid` for hardening the audit
+# log. Rust std has no portable `O_NOFOLLOW` constant and no `geteuid`, and
+# this crate is `#![forbid(unsafe_code)]`, so the open, the owner and
+# regular-file checks on the handle, and the mode correction all go through
+# rustix's safe wrappers instead of a raw libc call. Manifest requirement
+# stays at `version = "1"`; Cargo.lock pins the resolved rustix 1.x
+# version, so this does not change the resolved version.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", default-features = false, features = [
+  "fs",
+  "process",
+  "std",
+] }
+
 # Windows-only: owner-only ACLs for the audit log.
 #
-# Unix applies 0o600 at creation via OpenOptionsExt::mode. Windows has no safe
-# creation-time equivalent -- std cannot pass SECURITY_ATTRIBUTES to file
-# creation (rust-lang/libs-team#324) -- so the DACL is applied immediately
+# Unix applies 0o600 at creation via rustix's `open`. Windows has no safe
+# creation-time equivalent - std cannot pass SECURITY_ATTRIBUTES to file
+# creation (rust-lang/libs-team#324) - so the DACL is applied immediately
 # after creation. This crate is used ONLY for current_process_sid() and
 # applying a protected owner-only DACL; its unsafe Win32 calls are
 # encapsulated, which is required because this crate is #![forbid(unsafe_code)].
@@ -175,7 +195,7 @@ metrics = ["dep:prometheus"]
 # Test-only helpers from mtls_revocation and oauth for downstream integration
 # tests. never enable in a production build: some helpers deliberately bypass
 # SSRF screening, the JWKS refresh cooldown, the CDP discovery rate limiter,
-# and CRL verifier publication.
+# the verified path CRL discovery gate, and CRL verifier publication.
 test-helpers = []
 
 [dev-dependencies]
@@ -215,6 +235,14 @@ required-features = ["test-helpers"]
 # to carry: running a gated target without its features now errors with
 # "requires the features" instead of silently running an empty binary.
 [[test]]
+name = "crl_crypto_provider"
+path = "tests/unit/crl_crypto_provider.rs"
+
+[[test]]
+name = "crl_crypto_provider_crl_set"
+path = "tests/unit/crl_crypto_provider_crl_set.rs"
+
+[[test]]
 name = "crl_discovery_ratelimit"
 path = "tests/unit/crl_discovery_ratelimit.rs"
 
@@ -248,6 +276,11 @@ path = "tests/unit/parser_properties.rs"
 [[test]]
 name = "crl_ssrf"
 path = "tests/integration/crl_ssrf.rs"
+
+[[test]]
+name = "crl_trusted_origin"
+path = "tests/integration/crl_trusted_origin.rs"
+required-features = ["test-helpers"]
 
 [[test]]
 name = "delegation_guard"

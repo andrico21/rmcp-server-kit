@@ -16,14 +16,21 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
+#[cfg(test)]
+use core::sync::atomic::AtomicU64;
 use core::{
-    error::Error,
     fmt,
     hint::cold_path,
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
-use std::{collections::HashMap, fs, path::PathBuf, time::Instant};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    sync::{Mutex, PoisonError},
+    time::Instant,
+};
 
 use axum::{http::StatusCode, response::Response};
 use base64::engine::general_purpose;
@@ -43,7 +50,7 @@ use rustls::crypto::ring::default_provider;
 use serde::Deserialize;
 use tokio::{
     net::lookup_host,
-    sync::{Mutex, RwLock, oneshot, oneshot::error::RecvError},
+    sync::{RwLock, oneshot, oneshot::error::RecvError, watch},
     task::spawn_blocking,
     time::sleep,
 };
@@ -124,7 +131,7 @@ fn evaluate_oauth_redirect(
 ///
 /// The suffixes are `.localhost`, `.local` and `.internal`. A trailing FQDN-root
 /// dot is canonicalized first so `idp.internal.` cannot bypass the check. OAuth
-/// targets only -- CRL fetches build an empty allowlist and are out of scope.
+/// targets only - CRL fetches build an empty allowlist and are out of scope.
 ///
 /// Exact `localhost` is deliberately NOT matched here: it resolves to
 /// loopback and is already blocked by the post-DNS IP screen, and an
@@ -155,7 +162,7 @@ fn oauth_internal_suffix_blocked(host: &str, allowlist: &CompiledSsrfAllowlist) 
 ///
 /// **Cloud-metadata addresses (IPv4 `169.254.169.254`, Alibaba/Tencent
 /// `100.100.100.200`, AWS IPv6 `fd00:ec2::254`, GCP IPv6
-/// `fd20:ce::254`) are blocked unconditionally** -- the operator
+/// `fd20:ce::254`) are blocked unconditionally** - the operator
 /// allowlist cannot re-allow them.
 ///
 /// This single core is compiled identically under ALL cfgs, so the test
@@ -231,7 +238,7 @@ async fn screen_oauth_target_core(
             return Err(RmcpServerKitError::Config(format!(
                 "OAuth target blocked: hostname {host} resolved to {ip} ({reason}). \
                  To allow, add the hostname to oauth.ssrf_allowlist.hosts or the CIDR \
-                 to oauth.ssrf_allowlist.cidrs (operators only -- see SECURITY.md). \
+                 to oauth.ssrf_allowlist.cidrs (operators only - see SECURITY.md). \
                  URL: {target}"
             )));
         }
@@ -270,6 +277,8 @@ async fn screen_oauth_target(
 /// Returns [`RmcpServerKitError::Config`] when the target URL is malformed or resolves to a
 /// blocked address.
 #[cfg(any(test, feature = "test-helpers"))]
+// cancel-safe: performs DNS resolution and pure screening with no shared state;
+// cancellation drops only local resolver/client work.
 async fn screen_oauth_target_with_test_override(
     url: &str,
     allow_http: bool,
@@ -304,7 +313,7 @@ async fn screen_oauth_target_with_test_override(
 ///
 /// [`with_config`] also honours [`OAuthConfig::ca_cert_path`] (if set) and
 /// adds the supplied PEM CA bundle to the system roots so that
-/// every OAuth-bound HTTP request -- not just the JWKS fetch -- can
+/// every OAuth-bound HTTP request - not just the JWKS fetch - can
 /// trust enterprise/internal certificate authorities. This restores
 /// the behaviour that existed pre-`0.10.0` before the `OauthHttpClient`
 /// wrapper landed.
@@ -364,7 +373,7 @@ pub struct OauthHttpClient {
 }
 
 /// M-H4: cache key for cert-bearing `reqwest::Client`s. Path-based
-/// (not contents-based) -- in-place cert rotation is not picked up
+/// (not contents-based) - in-place cert rotation is not picked up
 /// without restart (documented limitation in `CHANGELOG.md` 1.6.0).
 #[cfg(feature = "oauth-mtls-client")]
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -373,6 +382,55 @@ struct MtlsClientKey {
     cert_path: PathBuf,
     /// Path to the PEM private key for `cert_path`.
     key_path: PathBuf,
+}
+
+/// Read `ca_path` once and parse it as a bundle of PEM certificates.
+///
+/// Shared by the three OAuth-bound outbound HTTP clients
+/// ([`JwksCache::new`], [`OauthHttpClient::build`], and the mTLS client
+/// builder) so every `ca_cert_path` gets identical validation: the file
+/// must exist, must parse as PEM, and must contain at least one
+/// certificate. `reqwest::Certificate::from_pem` (the previous, per-client
+/// parser) only ever stored the bytes without parsing them, so an empty
+/// file, plain text, raw DER, or a key-only PEM silently produced "no
+/// custom root" and the client fell back to the system trust store with
+/// no startup signal. `from_pem_bundle` only reads PEM `CERTIFICATE`
+/// sections, so those inputs now parse to zero certificates and are
+/// rejected here.
+///
+/// A certificate section with valid PEM framing but undecodable DER body
+/// is **not** rejected here: `reqwest`'s rustls backend defers DER
+/// validation to `ClientBuilder::build()`, so that failure surfaces only
+/// when the caller later builds the client from the returned
+/// certificates. Callers must label that `build()` error with the same
+/// `client` and `ca_path` so the operator sees one consistent diagnosis
+/// regardless of which malformed-bundle shape triggered it.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Startup`] naming `client` and `ca_path`
+/// when the file cannot be read, the bundle cannot be parsed as PEM, or
+/// it parses to zero certificates.
+fn load_ca_bundle(client: &str, ca_path: &Path) -> Result<Vec<Certificate>, RmcpServerKitError> {
+    let pem = fs::read(ca_path).map_err(|error| {
+        RmcpServerKitError::Startup(format!(
+            "{client}: ca_cert_path {}: {error}",
+            ca_path.display()
+        ))
+    })?;
+    let certs = Certificate::from_pem_bundle(&pem).map_err(|error| {
+        RmcpServerKitError::Startup(format!(
+            "{client}: ca_cert_path {}: {error}",
+            ca_path.display()
+        ))
+    })?;
+    if certs.is_empty() {
+        return Err(RmcpServerKitError::Startup(format!(
+            "{client}: ca_cert_path {}: no certificates found",
+            ca_path.display()
+        )));
+    }
+    Ok(certs)
 }
 
 impl OauthHttpClient {
@@ -391,8 +449,11 @@ impl OauthHttpClient {
     /// # Errors
     ///
     /// Returns [`crate::error::RmcpServerKitError::Startup`] if the configured
-    /// `ca_cert_path` cannot be read or parsed, or if the underlying
-    /// HTTP client cannot be constructed (e.g. TLS backend init failure).
+    /// `ca_cert_path` cannot be read, cannot be parsed as PEM, parses to zero
+    /// certificates, or if the underlying HTTP client cannot be constructed
+    /// (e.g. TLS backend init failure). An undecodable PEM-framed certificate
+    /// fails during client construction and the error still names
+    /// `ca_cert_path`.
     #[inline]
     pub fn with_config(config: &OAuthConfig) -> Result<Self, RmcpServerKitError> {
         Self::build(Some(config))
@@ -438,11 +499,13 @@ impl OauthHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns [`RmcpServerKitError::Startup`] when the CA bundle cannot be read or parsed or a
-    /// client cannot be constructed.
+    /// Returns [`RmcpServerKitError::Startup`] when the CA bundle cannot be read,
+    /// cannot be parsed as PEM, parses to zero certificates, or a client cannot
+    /// be constructed. An undecodable PEM-framed certificate fails during client
+    /// construction and the error still names `ca_cert_path`.
     fn build(config: Option<&OAuthConfig>) -> Result<Self, RmcpServerKitError> {
         // Install the rustls crypto provider before constructing any reqwest
-        // client (idempotent -- `ok()` ignores the error when a provider was
+        // client (idempotent - `ok()` ignores the error when a provider was
         // already installed elsewhere in the process). Without this a
         // standalone `OauthHttpClient::new`/`with_config` built before
         // `JwksCache::new` or TLS setup would panic inside reqwest with
@@ -509,19 +572,26 @@ impl OauthHttpClient {
         ));
 
         // Read the optional CA bundle once; reused by both clients below.
-        // Pre-startup blocking I/O is intentional -- the constructor is sync
+        // Pre-startup blocking I/O is intentional - the constructor is sync
         // by contract and runs from `serve()`'s pre-startup phase.
-        let ca_pem: Option<Vec<u8>> = if let Some(cfg) = config
-            && let Some(ca_path) = &cfg.ca_cert_path
-        {
-            Some(fs::read(ca_path).map_err(|error| {
-                RmcpServerKitError::Startup(format!(
-                    "oauth http client: read ca_cert_path {}: {error}",
-                    ca_path.display()
-                ))
-            })?)
-        } else {
-            None
+        let ca_path: Option<&Path> = config.and_then(|cfg| cfg.ca_cert_path.as_deref());
+        let ca_certs: Option<Vec<Certificate>> = ca_path
+            .map(|path| load_ca_bundle("oauth http client", path))
+            .transpose()?;
+
+        // Build-time failure of a certificate that `load_ca_bundle` accepted
+        // (PEM-framed but undecodable DER - see its doc comment) must still
+        // name `ca_cert_path` so the operator sees one consistent diagnosis.
+        let describe_build_error = |error: reqwest::Error| -> RmcpServerKitError {
+            ca_path.map_or_else(
+                || RmcpServerKitError::Startup(format!("oauth http client init: {error}")),
+                |path| {
+                    RmcpServerKitError::Startup(format!(
+                        "oauth http client init: ca_cert_path {}: {error}",
+                        path.display()
+                    ))
+                },
+            )
         };
 
         // Base builder shared by both clients: `no_proxy` (so HTTP(S)_PROXY
@@ -533,13 +603,10 @@ impl OauthHttpClient {
                 .dns_resolver(Arc::clone(&resolver))
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(30));
-            if let Some(pem) = &ca_pem {
-                let cert = Certificate::from_pem(pem).map_err(|error| {
-                    RmcpServerKitError::Startup(format!(
-                        "oauth http client: parse ca_cert_path: {error}"
-                    ))
-                })?;
-                builder = builder.add_root_certificate(cert);
+            if let Some(certs) = &ca_certs {
+                for cert in certs {
+                    builder = builder.add_root_certificate(cert.clone());
+                }
             }
             Ok(builder)
         };
@@ -570,28 +637,24 @@ impl OauthHttpClient {
                 },
             ))
             .build()
-            .map_err(|error| {
-                RmcpServerKitError::Startup(format!("oauth http client init: {error}"))
-            })?;
+            .map_err(describe_build_error)?;
 
-        // M7: credential-POST client -- NEVER follows redirects. A 307/308 from
+        // M7: credential-POST client - NEVER follows redirects. A 307/308 from
         // a compromised or open-redirecting token/introspection/revocation
         // endpoint must not re-send the `client_secret`-bearing body to another
         // host (RFC 8705 §2). Mirrors the `Policy::none()` mTLS cert clients.
         //
-        // Shares the "oauth http client init" error label with the gated
-        // `inner` build above: both consume the same `make_base()` config, so
-        // a `ClientBuilder::build()` failure is a shared TLS-backend fault
+        // Shares `describe_build_error` with the gated `inner` build above:
+        // both consume the same `make_base()` config, so a
+        // `ClientBuilder::build()` failure is a shared TLS-backend fault
         // rather than a property of either client. Using one label keeps the
         // operator-visible startup error identical whether or not `inner` is
         // compiled in. Genuine misconfiguration (allowlist, ca_cert_path read
-        // and parse) is already reported by `make_base()` itself.
+        // and parse) is already reported before `make_base()` runs.
         let credential_client = make_base()?
             .redirect(Policy::none())
             .build()
-            .map_err(|error| {
-                RmcpServerKitError::Startup(format!("oauth http client init: {error}"))
-            })?;
+            .map_err(describe_build_error)?;
 
         #[cfg(feature = "oauth-mtls-client")]
         let mtls_clients = build_mtls_clients(config, &allowlist, &test_bypass)?;
@@ -675,6 +738,8 @@ impl OauthHttpClient {
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     #[inline]
+    // cancel-safe: bypasses preflight screening but publishes no local state;
+    // cancellation only drops the in-flight GET/response.
     pub async fn __test_get(&self, url: &str) -> reqwest::Result<reqwest::Response> {
         self.inner.get(url).send().await
     }
@@ -759,7 +824,7 @@ fn oauth_request_target_for_log(raw: &str) -> String {
 /// documentation, benchmarking, or reserved ranges is rejected before
 /// connect.
 ///
-/// **Cloud-metadata addresses remain unbypassable** -- operators
+/// **Cloud-metadata addresses remain unbypassable** - operators
 /// cannot opt in to metadata-service exposure. This carve-out covers:
 ///
 /// - IPv4 `169.254.169.254` (AWS / GCP / Azure).
@@ -857,7 +922,7 @@ fn compile_oauth_ssrf_allowlist(raw: &OAuthSsrfAllowlist) -> Result<CompiledSsrf
             Ok(url::Host::Ipv4(_) | url::Host::Ipv6(_)) => {
                 return Err(format!(
                     "oauth.ssrf_allowlist.hosts[{idx}] = {trimmed:?}: literal IPs are forbidden \
-                     here -- list them via oauth.ssrf_allowlist.cidrs instead"
+                     here - list them via oauth.ssrf_allowlist.cidrs instead"
                 ));
             }
             Err(error) => {
@@ -948,8 +1013,14 @@ pub struct OAuthConfig {
     /// upstream-API CA path); any application-owned HTTP clients
     /// outside the kit must still configure their own CA trust
     /// separately. The deprecated [`OauthHttpClient::new`] no-arg
-    /// constructor cannot honour this field -- migrate to
+    /// constructor cannot honour this field - migrate to
     /// [`OauthHttpClient::with_config`] for full coverage.
+    ///
+    /// **Validation.** A configured path is read once per client and
+    /// parsed as a PEM certificate bundle. The server fails at startup,
+    /// rather than silently falling back to the system trust store, when
+    /// the file cannot be read, cannot be parsed as PEM, or parses to zero
+    /// certificates.
     #[serde(default)]
     pub ca_cert_path: Option<PathBuf>,
     /// Allow plain-HTTP (non-TLS) URLs for OAuth endpoints (`jwks_uri`,
@@ -975,7 +1046,7 @@ pub struct OAuthConfig {
     /// When set, the listed hostnames and CIDR blocks may resolve into
     /// otherwise-blocked address ranges (RFC 1918, loopback, link-local,
     /// CGNAT, IPv6 unique-local, ...). **Cloud-metadata addresses
-    /// remain unbypassable regardless of this setting** -- see
+    /// remain unbypassable regardless of this setting** - see
     /// [`OAuthSsrfAllowlist`] and `SECURITY.md` § "Operator allowlist".
     #[serde(default)]
     pub ssrf_allowlist: Option<OAuthSsrfAllowlist>,
@@ -993,7 +1064,7 @@ pub struct OAuthConfig {
     /// When set, it must be a non-empty **subset** of that built-in set;
     /// anything else fails [`OAuthConfig::validate`]. Names are matched
     /// case-insensitively. This knob can only ever NARROW the accepted
-    /// algorithms -- it cannot re-enable `HS*` or `none`, so an operator
+    /// algorithms - it cannot re-enable `HS*` or `none`, so an operator
     /// cannot use it to open an algorithm-confusion hole.
     ///
     /// Use it to pin a deployment to exactly what its identity provider
@@ -1651,8 +1722,11 @@ fn validate_client_cert_config(cc: &ClientCertConfig) -> Result<(), RmcpServerKi
 ///
 /// # Errors
 ///
-/// Returns [`RmcpServerKitError::Startup`] when a configured client certificate cannot be
-/// loaded or built.
+/// Returns [`RmcpServerKitError::Startup`] when a configured client certificate
+/// cannot be loaded or built; when `ca_cert_path` cannot be read, cannot be
+/// parsed as PEM, or parses to zero certificates; or when a PEM-framed CA
+/// certificate reaches client construction but contains undecodable DER. CA
+/// bundle errors name the mTLS client and the path.
 #[cfg(feature = "oauth-mtls-client")]
 fn build_mtls_clients(
     config: Option<&OAuthConfig>,
@@ -1721,23 +1795,24 @@ fn build_mtls_clients(
         .identity(identity);
 
     if let Some(ca_path) = &cfg.ca_cert_path {
-        let pem = fs::read(ca_path).map_err(|error| {
-            RmcpServerKitError::Startup(format!(
-                "oauth http client mTLS: read ca_cert_path {}: {error}",
-                ca_path.display()
-            ))
-        })?;
-        let cert = Certificate::from_pem(&pem).map_err(|error| {
-            RmcpServerKitError::Startup(format!(
-                "oauth http client mTLS: parse ca_cert_path {}: {error}",
-                ca_path.display()
-            ))
-        })?;
-        builder = builder.add_root_certificate(cert);
+        for cert in load_ca_bundle("oauth http client mTLS", ca_path)? {
+            builder = builder.add_root_certificate(cert);
+        }
     }
 
+    // A certificate `load_ca_bundle` accepted (PEM-framed but undecodable
+    // DER - see its doc comment) can still fail here; name `ca_cert_path`
+    // again so the operator sees one consistent diagnosis.
     let client = builder.build().map_err(|error| {
-        RmcpServerKitError::Startup(format!("oauth http client mTLS init: {error}"))
+        cfg.ca_cert_path.as_deref().map_or_else(
+            || RmcpServerKitError::Startup(format!("oauth http client mTLS init: {error}")),
+            |path| {
+                RmcpServerKitError::Startup(format!(
+                    "oauth http client mTLS init: ca_cert_path {}: {error}",
+                    path.display()
+                ))
+            },
+        )
     })?;
     let _replaced = map.insert(
         MtlsClientKey {
@@ -2036,7 +2111,7 @@ impl OAuthConfigBuilder {
     /// **Operator-only.** Use only when an in-cluster IdP (e.g. Keycloak)
     /// resolves to private/loopback address space and must be reached.
     /// Cloud-metadata addresses (AWS/GCP/Alibaba IPv4 + IPv6) remain
-    /// blocked regardless of allowlist contents -- see
+    /// blocked regardless of allowlist contents - see
     /// [`OAuthSsrfAllowlist`] and `SECURITY.md`  "Operator allowlist".
     #[inline]
     pub fn ssrf_allowlist(mut self, allowlist: OAuthSsrfAllowlist) -> Self {
@@ -2145,7 +2220,7 @@ pub struct TokenExchangeConfig {
     pub client_id: String,
     /// OAuth `client_secret` for confidential-client authentication
     /// (RFC 6749 §2.3.1 HTTP Basic). Mutually exclusive with
-    /// `client_cert` -- [`OAuthConfig::validate`] rejects configs
+    /// `client_cert` - [`OAuthConfig::validate`] rejects configs
     /// that set both, or neither.
     pub client_secret: Option<secrecy::SecretString>,
     /// Client certificate for RFC 8705 §2 mTLS client authentication.
@@ -2413,8 +2488,8 @@ pub struct OAuthProxyConfig {
     /// authorization-code flow.
     ///
     /// Only `resource` is ever dropped. Parameters that carry security
-    /// meaning -- `state`, `code_challenge`, `code_challenge_method`,
-    /// `code_verifier`, `redirect_uri`, `nonce`, `scope` -- are always
+    /// meaning - `state`, `code_challenge`, `code_challenge_method`,
+    /// `code_verifier`, `redirect_uri`, `nonce`, `scope` - are always
     /// forwarded, so enabling this cannot silently disable PKCE or CSRF
     /// protection. The upstream `/introspect` and `/revoke` proxy path is
     /// unaffected: `resource` is not a parameter of RFC 7662 or RFC 7009
@@ -2559,8 +2634,8 @@ impl OAuthProxyConfigBuilder {
 /// stays usable without ever consulting the untrusted token header.
 ///
 /// **`P-521`/`ES512` is deliberately absent.** `jsonwebtoken` 11's
-/// `Algorithm` enum has no `ES512` variant at all -- it defines only `ES256`
-/// and `ES384` for ECDSA -- so a `P-521` family could not name an algorithm to
+/// `Algorithm` enum has no `ES512` variant at all - it defines only `ES256`
+/// and `ES384` for ECDSA - so a `P-521` family could not name an algorithm to
 /// map to. It is likewise absent from [`ACCEPTED_ALGS`]. Supporting P-521 would
 /// require upstream `jsonwebtoken` support first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2667,6 +2742,14 @@ impl CachedKeys {
 )]
 #[non_exhaustive]
 pub struct JwksCache {
+    /// Shared cache state held by background refresh tasks.
+    shared: Arc<JwksCacheShared>,
+    /// Cache-owned task cancellation token. Dropping the public cache cancels it.
+    shutdown: CancellationToken,
+}
+
+/// Shared JWKS cache state used by request futures and detached refresh tasks.
+struct JwksCacheShared {
     /// The upstream JWKS endpoint.
     jwks_uri: String,
     /// Configured cache TTL for fetched keys.
@@ -2706,11 +2789,12 @@ pub struct JwksCache {
     role_claim: Option<String>,
     /// Claim-value-to-role mappings.
     role_mappings: Vec<RoleMapping>,
-    /// Tracks the last refresh attempt timestamp. Enforces a 10-second cooldown
-    /// between refresh attempts to prevent abuse via fabricated JWTs with invalid kids.
-    last_refresh_attempt: RwLock<Option<Instant>>,
-    /// Serializes concurrent refresh attempts so only one fetch is in flight.
-    refresh_lock: Mutex<()>,
+    /// Single-flight refresh state; never held across `.await`.
+    refresh_state: Mutex<RefreshState>,
+    /// Publishes refresh completions to current and future waiters.
+    refresh_tx: watch::Sender<RefreshSnapshot>,
+    /// Cancels detached refresh tasks during server shutdown or cache drop.
+    shutdown: CancellationToken,
     /// Compiled operator SSRF allowlist (empty by default = original
     /// fail-closed behaviour). Wrapped in `Arc` so the redirect-policy
     /// closure can capture a cheap clone without inflating the cache size.
@@ -2720,6 +2804,124 @@ pub struct JwksCache {
     /// matching field on `OauthHttpClient`.
     #[cfg(any(test, feature = "test-helpers"))]
     test_allow_loopback_ssrf: TestLoopbackBypass,
+    #[cfg(test)]
+    test_force_refresh_panic: AtomicBool,
+    #[cfg(test)]
+    test_refresh_completions: Arc<AtomicU64>,
+}
+
+/// Mutable single-flight state protected by [`JwksCacheShared::refresh_state`].
+struct RefreshState {
+    /// Last refresh attempt timestamp for cooldown enforcement.
+    last_refresh_attempt: Option<Instant>,
+    /// Generation currently being fetched, if any.
+    in_flight: Option<u64>,
+    /// Next generation id assigned to a new fetch.
+    next_generation: u64,
+}
+
+impl RefreshState {
+    /// Build the initial idle refresh state.
+    const fn new() -> Self {
+        Self {
+            last_refresh_attempt: None,
+            in_flight: None,
+            next_generation: 1,
+        }
+    }
+}
+
+/// Last completed refresh generation and outcome.
+#[derive(Clone, Copy)]
+struct RefreshSnapshot {
+    /// Completed generation. Zero means no task has completed yet.
+    generation: u64,
+    /// Outcome for `generation`.
+    result: RefreshResult,
+}
+
+impl RefreshSnapshot {
+    /// Initial snapshot observed before any refresh has completed.
+    const fn initial() -> Self {
+        Self {
+            generation: 0,
+            result: RefreshResult::Succeeded,
+        }
+    }
+}
+
+/// Completion outcome for a detached refresh task.
+#[derive(Clone, Copy)]
+enum RefreshResult {
+    /// Refresh fetched and published a usable JWKS.
+    Succeeded,
+    /// Refresh attempted the upstream but could not publish fresh keys.
+    Failed,
+    /// Cache shutdown cancelled the refresh.
+    Shutdown,
+    /// The task exited before explicitly recording an outcome.
+    Aborted,
+}
+
+impl RefreshResult {
+    /// Log a completed refresh generation at the appropriate level.
+    fn log(self) {
+        match self {
+            Self::Succeeded => {}
+            Self::Failed => tracing::debug!("JWKS refresh failed; 10s cooldown preserved"),
+            Self::Shutdown => tracing::debug!("JWKS refresh cancelled by shutdown"),
+            Self::Aborted => tracing::warn!("JWKS refresh task aborted before completion"),
+        }
+    }
+}
+
+/// RAII publisher that releases every waiter exactly once.
+struct RefreshCompletionGuard {
+    /// Shared cache state whose synchronous refresh state is updated on drop.
+    shared: Arc<JwksCacheShared>,
+    /// Generation this guard owns.
+    generation: u64,
+    /// Outcome published on drop unless disarmed by normal completion.
+    result: RefreshResult,
+    /// Whether drop should publish `result`.
+    armed: bool,
+}
+
+impl RefreshCompletionGuard {
+    /// Create an armed guard for a spawned refresh generation.
+    const fn new(shared: Arc<JwksCacheShared>, generation: u64) -> Self {
+        Self {
+            shared,
+            generation,
+            result: RefreshResult::Aborted,
+            armed: true,
+        }
+    }
+
+    /// Record the final outcome that [`Drop`] should publish.
+    const fn complete(&mut self, result: RefreshResult) {
+        self.result = result;
+    }
+}
+
+// Drop audit: sync-only waiter publication for a detached JWKS refresh generation; no I/O, await, blocking, or panic path.
+impl Drop for RefreshCompletionGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        self.shared
+            .publish_refresh_completion(self.generation, self.result);
+    }
+}
+
+// Drop audit: sync-only cancellation of cache-owned JWKS refresh tasks; no I/O, await, blocking, or panic path.
+impl Drop for JwksCache {
+    #[inline]
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
 }
 
 /// Minimum interval between refresh attempts triggered by an unknown `kid`.
@@ -2783,7 +2985,7 @@ const fn accepted_algorithm_name(alg: Algorithm) -> Option<&'static str> {
 /// Parse an operator-supplied algorithm name.
 ///
 /// Case-insensitive so `rs256` and `RS256` both work. Returns `None` for any
-/// name outside [`ACCEPTED_ALGS`] -- including `HS256` and `none` -- which is
+/// name outside [`ACCEPTED_ALGS`] - including `HS256` and `none` - which is
 /// what enforces the narrow-only rule at config-validation time.
 fn accepted_algorithm_from_name(name: &str) -> Option<Algorithm> {
     ACCEPTED_ALGS
@@ -2807,7 +3009,7 @@ fn accepted_algorithm_names() -> String {
 /// `accepted_algorithm_from_name` returns `None` for `HS*` and `none`, so an
 /// operator can never re-enable a symmetric or unsigned algorithm through
 /// config. An empty list is rejected because it would silently reject every
-/// token -- almost certainly an operator mistake rather than an intent to
+/// token - almost certainly an operator mistake rather than an intent to
 /// disable OAuth.
 ///
 /// # Errors
@@ -2872,25 +3074,53 @@ struct DecodeFailure {
     expired_claims: Option<Box<Claims>>,
 }
 
-impl JwksCache {
-    /// Build a new cache from OAuth configuration.
+impl JwksCacheShared {
+    /// Publish a detached refresh task outcome and release every waiter.
+    fn publish_refresh_completion(&self, generation: u64, result: RefreshResult) {
+        let mut state = self
+            .refresh_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if state.in_flight == Some(generation) {
+            state.in_flight = None;
+        }
+        let snapshot = RefreshSnapshot { generation, result };
+        drop(state);
+
+        if let Err(error) = self.refresh_tx.send(snapshot) {
+            tracing::debug!(%error, generation, "JWKS refresh completion had no waiters");
+        }
+        #[cfg(test)]
+        {
+            let previous_completion_count = self
+                .test_refresh_completions
+                .fetch_add(1, Ordering::Relaxed);
+            if previous_completion_count == u64::MAX {
+                tracing::trace!(
+                    previous_completion_count,
+                    "JWKS refresh completion counter wrapped"
+                );
+            }
+        }
+        result.log();
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "deliberate: src/oauth.rs::JwksCacheShared::new keeps the screening, TLS and redirect setup in one reviewable block"
+    )]
+    #[inline]
+    /// Build shared cache state from OAuth configuration and a shutdown token.
     ///
     /// # Errors
     ///
-    /// Returns an error if the CA bundle cannot be read, the HTTP client
-    /// cannot be built, or `config.jwks_cache_ttl` is not a valid
-    /// humantime duration. [`OAuthConfig::validate`] (run automatically by
-    /// the typed
-    /// [`McpServerConfig::validate`](crate::transport::McpServerConfig::validate)
-    /// pipeline) rejects invalid TTLs up front, so the TTL branch is
-    /// unreachable for validated configs.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "deliberate: src/oauth.rs::JwksCache::new keeps the screening, TLS and redirect setup in one reviewable block"
-    )]
-    #[inline]
-    pub fn new(config: &OAuthConfig) -> Result<Self, Box<dyn Error + Send + Sync>> {
-        // Ensure crypto providers are installed (idempotent -- ok() ignores
+    /// Returns [`RmcpServerKitError::Config`] when `config.jwks_cache_ttl`,
+    /// `config.ssrf_allowlist`, or `config.allowed_algorithms` is invalid.
+    /// Returns [`RmcpServerKitError::Startup`] when the CA bundle named by
+    /// `config.ca_cert_path` cannot be read or parsed, contains no
+    /// certificates, or the HTTP client cannot be built.
+    fn new(config: &OAuthConfig, shutdown: &CancellationToken) -> Result<Self, RmcpServerKitError> {
+        // Ensure crypto providers are installed (idempotent - ok() ignores
         // the error if already installed by another call in the same process).
         drop(default_provider().install_default());
         if let Err(_already_installed) = DEFAULT_PROVIDER.install_default() {
@@ -2898,10 +3128,10 @@ impl JwksCache {
         }
 
         let ttl = humantime::parse_duration(&config.jwks_cache_ttl).map_err(|error| {
-            format!(
+            RmcpServerKitError::Config(format!(
                 "invalid jwks_cache_ttl {:?}: {error}",
                 config.jwks_cache_ttl
-            )
+            ))
         })?;
 
         let mut validation = Validation::new(Algorithm::RS256);
@@ -2928,7 +3158,7 @@ impl JwksCache {
         // surfaced at startup rather than on first JWKS fetch.
         let allowlist = match config.ssrf_allowlist.as_ref() {
             Some(raw) => Arc::new(compile_oauth_ssrf_allowlist(raw).map_err(|error| {
-                Box::<dyn Error + Send + Sync>::from(format!("oauth.ssrf_allowlist: {error}"))
+                RmcpServerKitError::Config(format!("oauth.ssrf_allowlist: {error}"))
             })?),
             None => Arc::new(CompiledSsrfAllowlist::default()),
         };
@@ -3005,12 +3235,28 @@ impl JwksCache {
             // intentional. Do not wrap in `spawn_blocking`: the constructor
             // is synchronous by contract and is called from `serve()`'s
             // pre-startup phase.
-            let pem = fs::read(ca_path)?;
-            let cert = Certificate::from_pem(&pem)?;
-            http_builder = http_builder.add_root_certificate(cert);
+            for cert in load_ca_bundle("jwks client", ca_path)? {
+                http_builder = http_builder.add_root_certificate(cert);
+            }
         }
 
-        let http = http_builder.build()?;
+        // A certificate `load_ca_bundle` accepted (PEM-framed but
+        // undecodable DER - see its doc comment) can still fail here;
+        // name `ca_cert_path` again so the operator sees one consistent
+        // diagnosis.
+        let http = http_builder.build().map_err(|error| {
+            config.ca_cert_path.as_deref().map_or_else(
+                || RmcpServerKitError::Startup(format!("jwks client init: {error}")),
+                |path| {
+                    RmcpServerKitError::Startup(format!(
+                        "jwks client init: ca_cert_path {}: {error}",
+                        path.display()
+                    ))
+                },
+            )
+        })?;
+
+        let (refresh_tx, _refresh_rx) = watch::channel(RefreshSnapshot::initial());
 
         Ok(Self {
             jwks_uri: config.jwks_uri.clone(),
@@ -3030,11 +3276,56 @@ impl JwksCache {
             scopes: config.scopes.clone(),
             role_claim: config.role_claim.clone(),
             role_mappings: config.role_mappings.clone(),
-            last_refresh_attempt: RwLock::new(None),
-            refresh_lock: Mutex::new(()),
+            refresh_state: Mutex::new(RefreshState::new()),
+            refresh_tx,
+            shutdown: shutdown.clone(),
             allowlist,
             #[cfg(any(test, feature = "test-helpers"))]
             test_allow_loopback_ssrf: test_bypass,
+            #[cfg(test)]
+            test_force_refresh_panic: AtomicBool::new(false),
+            #[cfg(test)]
+            test_refresh_completions: Arc::new(AtomicU64::new(0)),
+        })
+    }
+}
+
+#[expect(
+    clippy::multiple_inherent_impl,
+    reason = "deliberate: src/oauth.rs::JwksCache splits its inherent impl so the cfg-gated test helpers follow the shared refresh code they exercise"
+)]
+impl JwksCache {
+    /// Build a new cache from OAuth configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RmcpServerKitError::Config`] when `config.jwks_cache_ttl`,
+    /// `config.ssrf_allowlist`, or `config.allowed_algorithms` is invalid.
+    /// [`OAuthConfig::validate`] (run automatically by the typed
+    /// [`McpServerConfig::validate`](crate::transport::McpServerConfig::validate)
+    /// pipeline) rejects invalid TTLs up front, so that branch is
+    /// unreachable for validated configs. Returns
+    /// [`RmcpServerKitError::Startup`] when the CA bundle named by
+    /// `config.ca_cert_path` cannot be read or parsed, contains no
+    /// certificates, or the HTTP client cannot be built.
+    #[inline]
+    pub fn new(config: &OAuthConfig) -> Result<Self, RmcpServerKitError> {
+        Self::with_shutdown(config, CancellationToken::new())
+    }
+
+    #[inline]
+    /// Build a cache with a caller-provided shutdown token.
+    ///
+    /// # Errors
+    ///
+    /// Same error conditions as [`new`](Self::new).
+    pub(crate) fn with_shutdown(
+        config: &OAuthConfig,
+        shutdown: CancellationToken,
+    ) -> Result<Self, RmcpServerKitError> {
+        Ok(Self {
+            shared: Arc::new(JwksCacheShared::new(config, &shutdown)?),
+            shutdown,
         })
     }
 
@@ -3053,13 +3344,17 @@ impl JwksCache {
     pub fn __test_allow_loopback_ssrf(self) -> Self {
         // M-H2/B1: flip the SHARED atomic so the resolver inside the
         // cached client and the pre-flight check both observe the bypass.
-        self.test_allow_loopback_ssrf.store(true, Ordering::Relaxed);
+        self.shared
+            .test_allow_loopback_ssrf
+            .store(true, Ordering::Relaxed);
         self
     }
 
     /// Validate a JWT Bearer token. Returns `Some(AuthIdentity)` on success.
     #[inline]
-    // cancel-safe: read-only validation; a cancelled call may leave an idempotent JWKS refresh in flight, which the cache deduplicates.
+    // cancel-safe: read-only validation; a cancelled call may leave a detached
+    // single-flight JWKS refresh in flight, which the cache completes or fails
+    // independently of the caller.
     pub async fn validate_token(&self, token: &str) -> Option<AuthIdentity> {
         self.validate_token_with_reason(token).await.ok()
     }
@@ -3070,9 +3365,9 @@ impl JwksCache {
     ///
     /// Returns [`JwtValidationFailure::Expired`] when the JWT is expired,
     /// or [`JwtValidationFailure::Invalid`] for all other validation failures.
-    // cancel-safe: composed of cancel-safe `decode_claims` (spawn_blocking
-    // decode, no shared state) plus pure, side-effect-free claim checks
-    // (`check_audience`, `resolve_role`). No partial state on cancellation.
+    // cancel-safe: composed of cancel-safe `decode_claims` (detached JWKS
+    // refresh waiter plus spawn_blocking decode) and pure claim checks. No
+    // request-owned partial state is committed on cancellation.
     #[inline]
     pub async fn validate_token_with_reason(
         &self,
@@ -3088,10 +3383,10 @@ impl JwksCache {
     /// # Errors
     ///
     /// Returns [`JwtRejection`] carrying the failure classification and optional owner.
-    // cancel-safe: composed of cancel-safe `decode_claims` (spawn_blocking
-    // decode, no shared state) plus pure claim checks. Owner attribution uses
-    // already-verified claims or expired claims from the same blocking decode.
-    // No partial state is committed on cancellation.
+    // cancel-safe: composed of cancel-safe `decode_claims` (detached JWKS
+    // refresh waiter plus spawn_blocking decode) and pure claim checks. Owner
+    // attribution uses claims recovered from that decode; no request-owned
+    // partial state is committed on cancellation.
     pub(crate) async fn validate_token_detailed(
         &self,
         token: &str,
@@ -3117,7 +3412,7 @@ impl JwksCache {
         // `require_subject` must also reject a *blank* sub: it is the OAuth
         // session-binding stable id, so a blank one collapses distinct
         // principals to one fingerprint (CWE-384).
-        if self.require_subject
+        if self.shared.require_subject
             && claims
                 .sub
                 .as_deref()
@@ -3191,10 +3486,9 @@ impl JwksCache {
     /// # Errors
     ///
     /// Returns [`DecodeFailure`] carrying the failure classification and any expired claims.
-    // cancel-safe: `select_jwks_key` (cancel-safe: read-only lookup + idempotent
-    // refresh) then a `spawn_blocking` decode whose `JoinHandle`, if dropped on
-    // cancellation, detaches the verification (it completes off-task). No shared
-    // state is mutated on this path.
+    // cancel-safe: `select_jwks_key` only waits on cache state or a detached
+    // refresh task, then the `spawn_blocking` decode detaches if the JoinHandle
+    // is dropped. No request-owned partial state is committed on cancellation.
     async fn decode_claims(
         &self,
         token: &str,
@@ -3211,7 +3505,7 @@ impl JwksCache {
         // Build a per-decode validation scoped to the header's algorithm.
         // jsonwebtoken requires ALL algorithms in the list to share the
         // same family as the key, so we restrict to [alg] only.
-        let mut validation = self.validation_template.clone();
+        let mut validation = self.shared.validation_template.clone();
         validation.algorithms = vec![alg];
 
         // Move the (cheap) clones into the blocking task so the verifier
@@ -3284,10 +3578,9 @@ impl JwksCache {
     /// # Errors
     ///
     /// Returns a message when no key in the refreshed JWKS can verify the token.
-    // NOT cancel-safe: on a cache miss this delegates to `find_key`, which can
-    // enter `refresh_with_cooldown`. That commits `last_refresh_attempt` before
-    // fetching, so a cancellation mid-refresh still consumes the cooldown slot
-    // and the next caller may be refused a refresh for the cooldown window.
+    // cancel-safe: on a cache miss this delegates to `find_key`, which waits on
+    // a detached single-flight refresh. Dropping this future does not abort the
+    // refresh after it stamps the cooldown.
     async fn select_jwks_key(
         &self,
         token: &str,
@@ -3300,7 +3593,7 @@ impl JwksCache {
         let kid = header.kid.as_deref();
         tracing::debug!(alg = ?header.alg, kid = kid.unwrap_or("-"), "JWT header decoded");
 
-        if !self.allowed_algorithms.contains(&header.alg) {
+        if !self.shared.allowed_algorithms.contains(&header.alg) {
             cold_path();
             tracing::debug!(alg = ?header.alg, "JWT algorithm not accepted");
             return Err(JwtValidationFailure::Invalid);
@@ -3328,19 +3621,23 @@ impl JwksCache {
     ///
     /// Returns the [`JwtValidationFailure`] classification for the mismatch.
     fn check_audience(&self, claims: &Claims) -> Result<(), JwtValidationFailure> {
-        if claims.aud.contains(&self.expected_audience) {
+        if claims.aud.contains(&self.shared.expected_audience) {
             return Ok(());
         }
         let azp_match = claims
             .azp
             .as_deref()
-            .is_some_and(|azp| azp == self.expected_audience);
+            .is_some_and(|azp| azp == self.shared.expected_audience);
         if azp_match {
-            match self.audience_mode {
+            match self.shared.audience_mode {
                 AudienceValidationMode::Permissive => {
-                    if !self.azp_permissive_logged.swap(true, Ordering::Relaxed) {
+                    if !self
+                        .shared
+                        .azp_permissive_logged
+                        .swap(true, Ordering::Relaxed)
+                    {
                         tracing::info!(
-                            expected = %self.expected_audience,
+                            expected = %self.shared.expected_audience,
                             "JWT accepted via azp-only audience fallback because \
                              audience_validation_mode = \"permissive\". Acceptance is \
                              intentionally wider than the spec; set \"warn\" or \"strict\" \
@@ -3350,9 +3647,13 @@ impl JwksCache {
                     return Ok(());
                 }
                 AudienceValidationMode::Warn => {
-                    if !self.azp_fallback_warned.swap(true, Ordering::Relaxed) {
+                    if !self
+                        .shared
+                        .azp_fallback_warned
+                        .swap(true, Ordering::Relaxed)
+                    {
                         tracing::warn!(
-                            expected = %self.expected_audience,
+                            expected = %self.shared.expected_audience,
                             azp = claims.azp.as_deref().unwrap_or("-"),
                             "JWT accepted via deprecated azp-only audience fallback. \
                              Configure your IdP to populate aud, or set \
@@ -3393,8 +3694,8 @@ impl JwksCache {
         tracing::debug!(
             aud = %aud,
             azp = azp,
-            expected = %self.expected_audience,
-            mode = self.audience_mode.as_str(),
+            expected = %self.shared.expected_audience,
+            mode = self.shared.audience_mode.as_str(),
             "JWT rejected: audience mismatch"
         );
     }
@@ -3409,11 +3710,12 @@ impl JwksCache {
     ///
     /// Returns [`JwtValidationFailure::Invalid`] when no mapping matches.
     fn resolve_role(&self, claims: &Claims) -> Result<String, JwtValidationFailure> {
-        if let Some(claim_path) = &self.role_claim {
+        if let Some(claim_path) = &self.shared.role_claim {
             let owned_first_class: Vec<String> = first_class_claim_values(claims, claim_path);
             let mut values: Vec<&str> = owned_first_class.iter().map(String::as_str).collect();
             values.extend(resolve_claim_path(&claims.extra, claim_path));
             return self
+                .shared
                 .role_mappings
                 .iter()
                 .find(|mapping| values.contains(&mapping.claim_value.as_str()))
@@ -3428,7 +3730,8 @@ impl JwksCache {
             .split_whitespace()
             .collect();
 
-        self.scopes
+        self.shared
+            .scopes
             .iter()
             .find(|mapping| token_scopes.contains(&mapping.scope.as_str()))
             .map(|mapping| mapping.role.clone())
@@ -3438,12 +3741,12 @@ impl JwksCache {
     /// Look up a decoding key by kid + algorithm. Refreshes JWKS on miss,
     /// subject to cooldown and deduplication constraints.
     // cancel-safe: reads the key cache under a `tokio::sync::RwLock` and, on a
-    // miss, delegates to the idempotent `refresh_with_cooldown`. Cancellation at
-    // any await leaves the cache in its prior consistent state.
+    // miss, waits for `refresh_with_cooldown`, which owns fetch work in a
+    // detached task. Cancellation drops only this waiter.
     async fn find_key(&self, kid: Option<&str>, alg: Algorithm) -> Option<DecodingKey> {
         // Try cached keys first.
         {
-            let guard = self.inner.read().await;
+            let guard = self.shared.inner.read().await;
             if let Some(cached) = guard.as_ref()
                 && !cached.is_expired()
                 && let Some(key) = lookup_key(cached, kid, alg)
@@ -3452,15 +3755,15 @@ impl JwksCache {
             }
         }
 
-        // Cache miss or expired -- refresh (with cooldown/deduplication).
+        // Cache miss or expired - refresh (with cooldown/deduplication).
         self.refresh_with_cooldown().await;
 
         // Fail closed (H2): a failed or cooled-down refresh leaves the previous
         // (now-expired) cache in place. Re-apply the freshness gate the first
         // lookup enforces so a rotated-out key is never served from a stale
-        // cache -- otherwise an attacker who can stall the JWKS endpoint could
+        // cache - otherwise an attacker who can stall the JWKS endpoint could
         // keep a revoked signing key valid past its TTL.
-        let guard = self.inner.read().await;
+        let guard = self.shared.inner.read().await;
         guard
             .as_ref()
             .filter(|cached| !cached.is_expired())
@@ -3474,26 +3777,27 @@ impl JwksCache {
     ///
     /// # Cancellation
     ///
-    /// **NOT cancel-safe by design.** `last_refresh_attempt` is committed
-    /// *before* the fetch so that a burst of failing or cancelled refreshes
-    /// cannot hammer the JWKS endpoint (the invalid-JWT → JWKS-refresh DoS
-    /// class; see `AGENTS.md` pitfall #2). The consequence is a deliberate
-    /// trade-off: if this future is cancelled between the timestamp write and
-    /// cache publication, a genuinely-new `kid` may be rejected for up to
-    /// [`JWKS_REFRESH_COOLDOWN`] (10s). Endpoint DoS protection is preferred
-    /// over immediate post-cancellation retriability. Do **not** "fix" this by
-    /// bypassing the cooldown on unknown-`kid` requests - that reopens the
+    /// `last_refresh_attempt` is still committed *before* the fetch so failing
+    /// refreshes cannot hammer the JWKS endpoint (the invalid-JWT to
+    /// JWKS-refresh DoS class; see `AGENTS.md` pitfall #2). The fetch itself is
+    /// detached into a cache-owned single-flight task, so cancelling one request
+    /// waiter does not abort the refresh after the cooldown has been consumed.
+    /// Do not bypass the cooldown on unknown-`kid` requests - that reopens the
     /// DoS-amplification vector the cooldown exists to close.
-    // NOT cancel-safe: see the `# Cancellation` section above - cooldown is
-    // committed before the fetch to throttle JWKS-endpoint abuse.
+    // cancel-safe: this future may stamp cooldown and spawn a detached refresh,
+    // but cancellation drops only the caller's watch waiter. The spawned task
+    // publishes completion or shutdown independently.
     async fn refresh_with_cooldown(&self) {
-        // Acquire the mutex to serialize refresh attempts.
-        let _guard = self.refresh_lock.lock().await;
-
-        // Check cooldown: skip if we refreshed recently.
-        {
-            let last = self.last_refresh_attempt.read().await;
-            if let Some(ts) = *last
+        let mut rx = self.shared.refresh_tx.subscribe();
+        let target_generation = {
+            let mut state = self
+                .shared
+                .refresh_state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(generation) = state.in_flight {
+                generation
+            } else if let Some(ts) = state.last_refresh_attempt
                 && ts.elapsed() < JWKS_REFRESH_COOLDOWN
             {
                 tracing::info!(
@@ -3502,25 +3806,104 @@ impl JwksCache {
                     "JWKS refresh skipped (cooldown active)"
                 );
                 return;
+            } else {
+                state.last_refresh_attempt = Some(Instant::now());
+                let generation = state.next_generation;
+                state.next_generation = state.next_generation.saturating_add(1);
+                state.in_flight = Some(generation);
+                drop(state);
+                let shared = Arc::clone(&self.shared);
+                let refresh_task = tokio::spawn(async move {
+                    let mut guard = RefreshCompletionGuard::new(Arc::clone(&shared), generation);
+                    #[cfg(test)]
+                    if shared
+                        .test_force_refresh_panic
+                        .swap(false, Ordering::Relaxed)
+                    {
+                        __test_forced_refresh_panic();
+                    }
+                    let outcome = run_detached_refresh(Arc::clone(&shared)).await;
+                    guard.complete(outcome);
+                });
+                drop(refresh_task);
+                generation
+            }
+        };
+
+        let initial_snapshot = *rx.borrow();
+        if initial_snapshot.generation >= target_generation {
+            match initial_snapshot.result {
+                RefreshResult::Succeeded
+                | RefreshResult::Failed
+                | RefreshResult::Shutdown
+                | RefreshResult::Aborted => return,
             }
         }
 
-        // Update last refresh timestamp BEFORE the fetch attempt.
-        // This ensures the cooldown applies even if the fetch fails.
-        {
-            let mut last = self.last_refresh_attempt.write().await;
-            *last = Some(Instant::now());
-        }
+        wait_for_refresh_generation(&mut rx, &self.shutdown, target_generation).await;
+    }
+}
 
-        // Perform the actual fetch.
-        // The error is already logged inside `refresh_inner`; the cooldown
-        // stamp above must stand regardless so a failing upstream cannot be
-        // hammered by fabricated-kid floods.
-        if let Err(error) = self.refresh_inner().await {
-            tracing::debug!(%error, "JWKS refresh failed; 10s cooldown preserved");
+#[expect(
+    clippy::integer_division_remainder_used,
+    reason = "external macro: tokio::select"
+)]
+/// Run one detached refresh until upstream completion or cache shutdown.
+// cancel-safe: the refresh task owns this future; cancellation is driven only by the cache shutdown token branch.
+async fn run_detached_refresh(shared: Arc<JwksCacheShared>) -> RefreshResult {
+    tokio::select! {
+        result = shared.refresh_inner() => match result {
+            Ok(()) => RefreshResult::Succeeded,
+            Err(_error) => RefreshResult::Failed,
+        },
+        () = shared.shutdown.cancelled() => RefreshResult::Shutdown,
+    }
+}
+
+#[expect(
+    clippy::integer_division_remainder_used,
+    reason = "external macro: tokio::select"
+)]
+/// Wait for a refresh generation to publish or for cache shutdown.
+// cancel-safe: waits only on watch notification or shutdown cancellation; dropping this waiter does not affect the detached refresh task.
+async fn wait_for_refresh_generation(
+    rx: &mut watch::Receiver<RefreshSnapshot>,
+    shutdown: &CancellationToken,
+    target_generation: u64,
+) {
+    loop {
+        tokio::select! {
+            changed = rx.changed() => {
+                let changed_snapshot = *rx.borrow();
+                if changed.is_err() || changed_snapshot.generation >= target_generation {
+                    match changed_snapshot.result {
+                        RefreshResult::Succeeded
+                        | RefreshResult::Failed
+                        | RefreshResult::Shutdown
+                        | RefreshResult::Aborted => return,
+                    }
+                }
+            }
+            () = shutdown.cancelled() => return,
         }
     }
+}
 
+#[cfg(test)]
+#[expect(
+    clippy::missing_panics_doc,
+    clippy::panic,
+    reason = "deliberate: src/oauth.rs::__test_forced_refresh_panic panics on purpose inside the refresh task so tests prove the completion guard releases waiters"
+)]
+fn __test_forced_refresh_panic() {
+    panic!("test-only forced JWKS refresh panic");
+}
+
+#[expect(
+    clippy::multiple_inherent_impl,
+    reason = "deliberate: src/oauth.rs::JwksCacheShared keeps construction and refresh I/O in separate impl blocks so the public JwksCache methods stay grouped"
+)]
+impl JwksCacheShared {
     /// Fetch JWKS from the configured URI and update the cache.
     ///
     /// Internal implementation - callers should use [`Self::refresh_with_cooldown`]
@@ -3650,7 +4033,9 @@ impl JwksCache {
             }
         }
     }
+}
 
+impl JwksCache {
     /// Test-only: drive `refresh_inner` now, surfacing the
     /// `build_key_cache` error string. Used by `tests/integration/jwks_key_cap.rs`.
     ///
@@ -3662,18 +4047,22 @@ impl JwksCache {
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     #[inline]
+    // cancel-safe: fetches and parses into locals before taking the write lock;
+    // cancellation before the lock leaves the cache unchanged, and after the
+    // synchronous assignment leaves a complete cache entry.
     pub async fn __test_refresh_now(&self) -> Result<(), String> {
         let jwks = self
+            .shared
             .fetch_jwks()
             .await
             .ok_or_else(|| "failed to fetch or parse JWKS".to_owned())?;
-        let (keys, unnamed_keys) = build_key_cache(&jwks, self.max_jwks_keys)?;
-        let mut guard = self.inner.write().await;
+        let (keys, unnamed_keys) = build_key_cache(&jwks, self.shared.max_jwks_keys)?;
+        let mut guard = self.shared.inner.write().await;
         *guard = Some(CachedKeys {
             keys,
             unnamed_keys,
             fetched_at: Instant::now(),
-            ttl: self.ttl,
+            ttl: self.shared.ttl,
         });
         drop(guard);
         Ok(())
@@ -3684,11 +4073,35 @@ impl JwksCache {
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     #[inline]
+    // cancel-safe: read-only cache lookup under a `tokio::sync::RwLock`; a
+    // cancelled waiter or reader leaves no state change.
     pub async fn __test_has_kid(&self, kid: &str) -> bool {
-        let guard = self.inner.read().await;
+        let guard = self.shared.inner.read().await;
         guard
             .as_ref()
             .is_some_and(|cache| cache.keys.contains_key(kid))
+    }
+
+    #[cfg(test)]
+    fn __test_force_next_refresh_panic(&self) {
+        self.shared
+            .test_force_refresh_panic
+            .store(true, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn __test_refresh_completion_count(&self) -> u64 {
+        self.shared.test_refresh_completions.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn __test_refresh_completion_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.shared.test_refresh_completions)
+    }
+
+    #[cfg(test)]
+    async fn fetch_jwks(&self) -> Option<JwkSet> {
+        self.shared.fetch_jwks().await
     }
 }
 
@@ -3856,8 +4269,8 @@ fn jwk_permits_signature_verification(jwk: &Jwk) -> bool {
 /// Determine how a JWK constrains the algorithms it may verify.
 ///
 /// An explicit `alg` pins exactly one algorithm (unchanged behaviour). When
-/// `alg` is absent -- which RFC 7517 4.4 explicitly permits, and which Entra
-/// v2.0 always does -- the key type implies the family instead. Returning
+/// `alg` is absent - which RFC 7517 4.4 explicitly permits, and which Entra
+/// v2.0 always does - the key type implies the family instead. Returning
 /// `None` drops the key, so unknown or symmetric key types stay fail-closed.
 fn jwk_algorithm(jwk: &Jwk) -> Option<JwkAlg> {
     jwk.common.key_algorithm.map_or_else(
@@ -3890,8 +4303,8 @@ const fn explicit_jwk_algorithm(declared: KeyAlgorithm) -> Option<Algorithm> {
 ///
 /// SECURITY: inference reads only the JWK's own key material, never the token
 /// header, so it cannot be steered by an attacker. `OctetKey` (symmetric) is
-/// deliberately never inferred -- an `HS*` secret must not become a
-/// verification key -- and `P-521` yields `None` because `jsonwebtoken` 11
+/// deliberately never inferred - an `HS*` secret must not become a
+/// verification key - and `P-521` yields `None` because `jsonwebtoken` 11
 /// defines no `ES512` variant (its own `EllipticCurve::P521` doc notes the
 /// curve is unsupported by `ring`).
 #[expect(
@@ -4155,7 +4568,7 @@ fn resolve_authorization_servers<'server>(
     // Advertise this server only when it actually mounts the OAuth endpoints.
     // `install_oauth_proxy_routes` mounts `/authorize`, `/token`, and
     // `/.well-known/oauth-authorization-server` ONLY when `proxy` is set, while
-    // Protected Resource Metadata is served unconditionally -- so without a
+    // Protected Resource Metadata is served unconditionally - so without a
     // proxy the local URL resolves to a 404 and the upstream issuer is the only
     // truthful answer. An application that mounts its own facade through
     // `with_extra_router` must say so via `authorization_servers`.
@@ -4467,8 +4880,8 @@ async fn proxy_oauth_admin_request(
     use axum::{http::header, response::IntoResponse as _};
 
     // `false`: `resource` is not a parameter of RFC 7662 introspection or
-    // RFC 7009 revocation requests, so the strip flag -- which exists purely
-    // to satisfy Entra's authorization-code flow -- must not reach this path.
+    // RFC 7009 revocation requests, so the strip flag - which exists purely
+    // to satisfy Entra's authorization-code flow - must not reach this path.
     let mut upstream_body = rewrite_client_auth_params(body, &proxy.client_id, false);
     if let Some(secret) = &proxy.client_secret {
         use core::fmt::Write as _;
@@ -4659,7 +5072,7 @@ fn sanitize_oauth_error_code(raw: &str) -> &'static str {
 // Callers that can be cancelled should use `exchange_token_with_cancel`, which
 // pre-checks the token, detaches the in-flight exchange rather than dropping it,
 // and audits a token minted after the caller went away. That is a mitigation,
-// not a guarantee -- see its docs for what remains unattainable.
+// not a guarantee - see its docs for what remains unattainable.
 #[inline]
 // NOT cancel-safe: and not fixable at this layer - once `send_screened` puts the
 // RFC 8693 POST on the wire, dropping this future cannot un-send it. The
@@ -5076,7 +5489,7 @@ fn rewrite_client_auth_params(
         }
         // SECURITY: `resource` is the ONLY caller parameter this flag drops.
         // Comparison happens post-decode, so `%72esource` cannot smuggle past
-        // it -- the same property that protects CLIENT_AUTH_PARAMS above.
+        // it - the same property that protects CLIENT_AUTH_PARAMS above.
         if strip_resource && key.as_ref() == "resource" {
             continue;
         }
@@ -5103,9 +5516,7 @@ mod tests {
 
     #[cfg(feature = "oauth-mtls-client")]
     use core::ptr;
-    #[cfg(feature = "oauth-mtls-client")]
-    use std::{env, process};
-    use std::{io, sync::Mutex};
+    use std::{env, io, process};
 
     use anyhow::Context as _;
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -5185,7 +5596,7 @@ mod tests {
         Ok(())
     }
 
-    // -- F2 regression: client-auth parameter smuggling in the OAuth proxy --
+    // - F2 regression: client-auth parameter smuggling in the OAuth proxy -
     //
     // The previous `replace_client_id` split on `&` and dropped segments
     // literally starting with `client_id=`. Percent-encoded keys survived that
@@ -5378,7 +5789,7 @@ mod tests {
     /// Strips a percent-encoded resource key, matched after decoding.
     fn rewrite_strips_percent_encoded_resource_key() -> anyhow::Result<()> {
         // The strip filter compares post-decode, so an encoded key cannot
-        // smuggle `resource` upstream -- same property that protects
+        // smuggle `resource` upstream - same property that protects
         // CLIENT_AUTH_PARAMS.
         let out = rewrite_client_auth_params("%72esource=sneaky&scope=read", "proxy-id", true);
         let pairs = decoded_pairs(&out);
@@ -5939,7 +6350,7 @@ role = "admin"
         let mut cfg = validation_https_config();
         cfg.proxy = Some(
             OAuthProxyConfig::builder(
-                "http://idp.example.com/authorize", // <-- HTTP, must be rejected
+                "http://idp.example.com/authorize", // <- HTTP, must be rejected
                 "https://idp.example.com/token",
                 "client",
             )
@@ -5963,7 +6374,7 @@ role = "admin"
         cfg.proxy = Some(
             OAuthProxyConfig::builder(
                 "https://idp.example.com/authorize",
-                "http://idp.example.com/token", // <-- HTTP, must be rejected
+                "http://idp.example.com/token", // <- HTTP, must be rejected
                 "client",
             )
             .build(),
@@ -6019,7 +6430,7 @@ role = "admin"
         Ok(())
     }
 
-    // -- M3 regression: unauthenticated /introspect and /revoke must fail validate --
+    // - M3 regression: unauthenticated /introspect and /revoke must fail validate -
 
     /// Rejects exposed admin endpoints lacking both auth guards.
     #[test]
@@ -6118,7 +6529,7 @@ role = "admin"
         let mut cfg = validation_https_config();
         cfg.token_exchange = Some(
             TokenExchangeConfig::new(
-                "http://idp.example.com/token", // <-- HTTP
+                "http://idp.example.com/token", // <- HTTP
                 "client",
                 None,
                 None,
@@ -6428,7 +6839,36 @@ role = "admin"
             .__test_allow_loopback_ssrf())
     }
 
-    // -- H2: expired JWKS cache must fail closed when refresh cannot succeed --
+    async fn wait_until_has_kid(cache: &JwksCache, kid: &str) -> anyhow::Result<()> {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if cache.__test_has_kid(kid).await {
+                    return;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("JWKS refresh must publish the expected kid")
+    }
+
+    async fn wait_for_refresh_completion_count(
+        cache: &JwksCache,
+        expected: u64,
+    ) -> anyhow::Result<()> {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if cache.__test_refresh_completion_count() >= expected {
+                    return;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("JWKS refresh completion must be published")
+    }
+
+    // - H2: expired JWKS cache must fail closed when refresh cannot succeed -
 
     /// Prime a cache from a valid JWKS, then repoint the endpoint at a 503.
     ///
@@ -6473,6 +6913,385 @@ role = "admin"
             "mcp:read",
         )?;
         Ok((cache, token, mock_server))
+    }
+
+    /// Cancelled JWKS refresh waiters do not abort the detached refresh task.
+    #[tokio::test]
+    async fn cancelled_refresh_waiter_does_not_block_next_valid_caller() -> anyhow::Result<()> {
+        let kid = "asy01-cancelled-unit";
+        let (pem, jwks) = generate_test_keypair(kid)?;
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(matchers::method("GET"))
+            .and(matchers::path("/jwks.json"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(&jwks)
+                    .set_delay(Duration::from_millis(500)),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let jwks_uri = format!("{}/jwks.json", mock_server.uri());
+        let config = test_config(&jwks_uri);
+        let cache = test_cache(&config)?;
+        let token = mint_token(
+            &pem,
+            kid,
+            "https://auth.test.local",
+            "https://mcp.test.local/mcp",
+            "asy01-unit",
+            "mcp:read",
+        )?;
+
+        let cancelled = timeout(Duration::from_millis(50), cache.validate_token(&token)).await;
+        assert!(
+            cancelled.is_err(),
+            "first waiter must be cancelled by timeout"
+        );
+        wait_until_has_kid(&cache, kid).await?;
+
+        let result = cache.validate_token(&token).await;
+        assert!(
+            result.is_some(),
+            "next valid caller must use the completed refresh"
+        );
+
+        Ok(())
+    }
+
+    /// Cancelled invalid-kid callers still share one cooldown-priced upstream fetch.
+    #[tokio::test]
+    async fn invalid_kid_cancellations_share_one_refresh_per_cooldown() -> anyhow::Result<()> {
+        let served_kid = "asy01-served";
+        let invalid_kid = "asy01-invalid";
+        let (served_pem, jwks) = generate_test_keypair(served_kid)?;
+        let (invalid_pem, _) = generate_test_keypair(invalid_kid)?;
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(matchers::method("GET"))
+            .and(matchers::path("/jwks.json"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(&jwks)
+                    .set_delay(Duration::from_millis(500)),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let jwks_uri = format!("{}/jwks.json", mock_server.uri());
+        let cache = test_cache(&test_config(&jwks_uri))?;
+        let invalid_token = mint_token(
+            &invalid_pem,
+            invalid_kid,
+            "https://auth.test.local",
+            "https://mcp.test.local/mcp",
+            "asy01-invalid",
+            "mcp:read",
+        )?;
+
+        for _ in 0_usize..4_usize {
+            drop(
+                timeout(
+                    Duration::from_millis(50),
+                    cache.validate_token(&invalid_token),
+                )
+                .await,
+            );
+        }
+        wait_for_refresh_completion_count(&cache, 1).await?;
+
+        let served_token = mint_token(
+            &served_pem,
+            served_kid,
+            "https://auth.test.local",
+            "https://mcp.test.local/mcp",
+            "asy01-served",
+            "mcp:read",
+        )?;
+        assert!(cache.validate_token(&served_token).await.is_some());
+        assert_eq!(
+            recorded_request_count(&mock_server).await?,
+            1,
+            "invalid-kid cancellations must not bypass the JWKS cooldown"
+        );
+
+        Ok(())
+    }
+
+    /// Dropping a public cache cancels its detached refresh task.
+    #[tokio::test]
+    async fn dropped_public_cache_stops_in_flight_refresh() -> anyhow::Result<()> {
+        let kid = "asy01-drop";
+        let (pem, jwks) = generate_test_keypair(kid)?;
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(matchers::method("GET"))
+            .and(matchers::path("/jwks.json"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(&jwks)
+                    .set_delay(Duration::from_secs(10)),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let cache = test_cache(&test_config(&format!("{}/jwks.json", mock_server.uri())))?;
+        let completions = cache.__test_refresh_completion_counter();
+        let token = mint_token(
+            &pem,
+            kid,
+            "https://auth.test.local",
+            "https://mcp.test.local/mcp",
+            "asy01-drop",
+            "mcp:read",
+        )?;
+        let cancelled = timeout(Duration::from_millis(50), cache.validate_token(&token)).await;
+        assert!(
+            cancelled.is_err(),
+            "first waiter must be cancelled by timeout"
+        );
+        wait_for_recorded_request(&mock_server).await?;
+        drop(cache);
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if completions.load(Ordering::Relaxed) >= 1 {
+                    return;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("drop cancellation must complete the refresh guard")?;
+
+        Ok(())
+    }
+
+    /// Cancelling the server token stops an in-flight detached refresh task.
+    #[tokio::test]
+    async fn server_shutdown_token_stops_in_flight_refresh() -> anyhow::Result<()> {
+        let kid = "asy01-shutdown";
+        let (pem, jwks) = generate_test_keypair(kid)?;
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(matchers::method("GET"))
+            .and(matchers::path("/jwks.json"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(&jwks)
+                    .set_delay(Duration::from_secs(10)),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let shutdown = CancellationToken::new();
+        let cache = JwksCache::with_shutdown(
+            &test_config(&format!("{}/jwks.json", mock_server.uri())),
+            shutdown.child_token(),
+        )
+        .map_err(anyhow::Error::msg)?
+        .__test_allow_loopback_ssrf();
+        let completions = cache.__test_refresh_completion_counter();
+        let token = mint_token(
+            &pem,
+            kid,
+            "https://auth.test.local",
+            "https://mcp.test.local/mcp",
+            "asy01-shutdown",
+            "mcp:read",
+        )?;
+        let cancelled = timeout(Duration::from_millis(50), cache.validate_token(&token)).await;
+        assert!(
+            cancelled.is_err(),
+            "first waiter must be cancelled by timeout"
+        );
+        wait_for_recorded_request(&mock_server).await?;
+
+        shutdown.cancel();
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if completions.load(Ordering::Relaxed) >= 1 {
+                    return;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("server shutdown must complete the refresh guard")?;
+
+        Ok(())
+    }
+
+    /// Concurrent expired-cache callers share one refresh and one completion.
+    #[tokio::test]
+    async fn concurrent_expired_cache_callers_share_one_refresh_completion() -> anyhow::Result<()> {
+        let kid = "asy01-concurrent";
+        let (pem, jwks) = generate_test_keypair(kid)?;
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(matchers::method("GET"))
+            .and(matchers::path("/jwks.json"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&jwks))
+            .mount(&mock_server)
+            .await;
+        let mut config = test_config(&format!("{}/jwks.json", mock_server.uri()));
+        config.jwks_cache_ttl = "50ms".into();
+        let cache = Arc::new(test_cache(&config)?);
+        let token = mint_token(
+            &pem,
+            kid,
+            "https://auth.test.local",
+            "https://mcp.test.local/mcp",
+            "asy01-concurrent",
+            "mcp:read",
+        )?;
+        cache
+            .__test_refresh_now()
+            .await
+            .map_err(anyhow::Error::msg)?;
+        sleep(Duration::from_millis(75)).await;
+        mock_server.reset().await;
+        wiremock::Mock::given(matchers::method("GET"))
+            .and(matchers::path("/jwks.json"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(&jwks)
+                    .set_delay(Duration::from_millis(200)),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let mut handles = Vec::new();
+        for _ in 0_usize..8_usize {
+            let cache_for_task = Arc::clone(&cache);
+            let token_for_task = token.clone();
+            handles.push(tokio::spawn(async move {
+                cache_for_task.validate_token(&token_for_task).await
+            }));
+        }
+        for handle in handles {
+            assert!(handle.await?.is_some(), "concurrent caller must validate");
+        }
+        assert_eq!(recorded_request_count(&mock_server).await?, 1);
+        assert_eq!(cache.__test_refresh_completion_count(), 1);
+
+        Ok(())
+    }
+
+    /// A panicking refresh task releases all waiters instead of hanging them.
+    #[tokio::test]
+    async fn panicking_refresh_task_releases_waiters_with_failure() -> anyhow::Result<()> {
+        let kid = "asy01-panic";
+        let (pem, jwks) = generate_test_keypair(kid)?;
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(matchers::method("GET"))
+            .and(matchers::path("/jwks.json"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&jwks))
+            .mount(&mock_server)
+            .await;
+        let cache = Arc::new(test_cache(&test_config(&format!(
+            "{}/jwks.json",
+            mock_server.uri()
+        )))?);
+        cache.__test_force_next_refresh_panic();
+        let token = mint_token(
+            &pem,
+            kid,
+            "https://auth.test.local",
+            "https://mcp.test.local/mcp",
+            "asy01-panic",
+            "mcp:read",
+        )?;
+
+        let mut handles = Vec::new();
+        for _ in 0_usize..4_usize {
+            let cache_for_task = Arc::clone(&cache);
+            let token_for_task = token.clone();
+            handles.push(tokio::spawn(async move {
+                cache_for_task.validate_token(&token_for_task).await
+            }));
+        }
+        for handle in handles {
+            let result = timeout(Duration::from_secs(2), handle)
+                .await
+                .context("panic completion must release waiter")??;
+            assert!(result.is_none(), "aborted refresh must fail closed");
+        }
+        assert_eq!(cache.__test_refresh_completion_count(), 1);
+
+        Ok(())
+    }
+
+    /// Pins that a panicked JWKS refresh leaves the cache able to refresh again.
+    ///
+    /// The completion guard clears the in-flight generation, so once the
+    /// cooldown has expired the next unknown-kid validation starts a new
+    /// refresh and succeeds.
+    #[tokio::test]
+    async fn panicked_refresh_recovers_once_the_cooldown_expires() -> anyhow::Result<()> {
+        let kid = "asy01-recover";
+        let (pem, jwks) = generate_test_keypair(kid)?;
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(matchers::method("GET"))
+            .and(matchers::path("/jwks.json"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&jwks))
+            .mount(&mock_server)
+            .await;
+        let cache = test_cache(&test_config(&format!("{}/jwks.json", mock_server.uri())))?;
+        cache.__test_force_next_refresh_panic();
+        let token = mint_token(
+            &pem,
+            kid,
+            "https://auth.test.local",
+            "https://mcp.test.local/mcp",
+            "asy01-recover",
+            "mcp:read",
+        )?;
+
+        assert!(
+            timeout(Duration::from_secs(2), cache.validate_token(&token))
+                .await
+                .context("the panicked refresh must release its waiter")?
+                .is_none(),
+            "a panicked refresh must fail the first validation closed"
+        );
+        assert_eq!(cache.__test_refresh_completion_count(), 1);
+        assert_eq!(recorded_request_count(&mock_server).await?, 0);
+
+        assert!(
+            timeout(Duration::from_secs(2), cache.validate_token(&token))
+                .await
+                .context("a cooldown-skipped validation must still return promptly")?
+                .is_none(),
+            "a second validation inside the cooldown must still fail closed"
+        );
+        assert_eq!(cache.__test_refresh_completion_count(), 1);
+        assert_eq!(recorded_request_count(&mock_server).await?, 0);
+
+        let expired = Instant::now()
+            .checked_sub(JWKS_REFRESH_COOLDOWN.saturating_add(Duration::from_secs(1)))
+            .context("the monotonic clock must allow backdating past the cooldown")?;
+        {
+            let mut state = cache
+                .shared
+                .refresh_state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            assert_eq!(
+                state.in_flight, None,
+                "the panicked generation must be cleared from in_flight"
+            );
+            state.last_refresh_attempt = Some(expired);
+        }
+
+        assert!(
+            timeout(Duration::from_secs(5), cache.validate_token(&token))
+                .await
+                .context("the post-cooldown refresh must release its waiter")?
+                .is_some(),
+            "once the cooldown expires the next validation must succeed"
+        );
+        assert_eq!(cache.__test_refresh_completion_count(), 2);
+        assert_eq!(recorded_request_count(&mock_server).await?, 1);
+
+        Ok(())
     }
 
     /// Collapses duplicate `kid` entries in the JWKS to a single cached key.
@@ -6565,7 +7384,7 @@ role = "admin"
         Ok(())
     }
 
-    // -- Issue #17: JWKS keys that omit the OPTIONAL `alg` member (RFC 7517 4.4) --
+    // - Issue #17: JWKS keys that omit the OPTIONAL `alg` member (RFC 7517 4.4) -
     //
     // Microsoft Entra v2.0 publishes every signing key without `alg`
     // (verified against login.microsoftonline.com/common/discovery/v2.0/keys:
@@ -6772,7 +7591,7 @@ role = "admin"
         Ok(())
     }
 
-    // -- allowed_algorithms: operator narrowing of the accepted algorithm set --
+    // - allowed_algorithms: operator narrowing of the accepted algorithm set -
 
     /// Round-trips every accepted algorithm to a configurable name and back.
     #[test]
@@ -7026,7 +7845,7 @@ role = "admin"
         };
         assert_eq!(first_failure, JwtValidationFailure::Invalid);
         // Second attempt: the refresh cooldown is now active, so no refresh is
-        // attempted -- the still-expired cache must not serve the stale key.
+        // attempted - the still-expired cache must not serve the stale key.
         let Err(failure) = cache.validate_token_with_reason(&token).await else {
             anyhow::bail!("cooldown-active + expired cache must still fail closed");
         };
@@ -7078,7 +7897,7 @@ role = "admin"
         Ok(())
     }
 
-    // -- L4: kid-strict key lookup + require_subject --
+    // - L4: kid-strict key lookup + require_subject -
 
     #[expect(
         clippy::unnecessary_wraps,
@@ -7704,7 +8523,7 @@ role = "admin"
         // Must comfortably exceed the mock response delay: the detached task
         // cannot emit its audit line until the upstream exchange completes, so
         // this bound is `mock delay + slack`, not a latency expectation. It is
-        // a bounded wait -- on success it returns as soon as the line appears.
+        // a bounded wait - on success it returns as soon as the line appears.
         timeout(Duration::from_secs(15), async {
             loop {
                 if logs.contents().contains(needle) {
@@ -7881,7 +8700,7 @@ role = "admin"
                     // the `biased;` race before the caller cancels. A tight
                     // delay would make the outcome assertion depend on machine
                     // load rather than on the detach behaviour it proves. The
-                    // test never waits this out -- returning without waiting is
+                    // test never waits this out - returning without waiting is
                     // precisely the point.
                     .set_delay(Duration::from_secs(2))
                     .set_body_json(exchange_response(
@@ -8319,6 +9138,79 @@ role = "admin"
             require_sub_cache.validate_token_with_reason(&no_sub).await,
             Err(JwtValidationFailure::Invalid)
         ));
+
+        Ok(())
+    }
+
+    /// Pins that a token whose `nbf` is beyond the validation leeway rejects.
+    #[tokio::test]
+    async fn rejects_token_not_yet_valid() -> anyhow::Result<()> {
+        let kid = "test-key-future-nbf";
+        let (pem, jwks) = generate_test_keypair(kid)?;
+        let (cache, _mock_server) = cache_for_jwks(&jwks).await?;
+        let now = jsonwebtoken::get_current_timestamp();
+        let token = mint_token_with_claims(
+            &pem,
+            kid,
+            &serde_json::json!({
+                "iss": "https://auth.test.local",
+                "aud": "https://mcp.test.local/mcp",
+                "sub": "future-nbf-bot",
+                "scope": "mcp:read",
+                "exp": now.saturating_add(3600),
+                "iat": now,
+                "nbf": now.saturating_add(3600),
+            }),
+        )?;
+
+        assert!(
+            matches!(
+                cache.validate_token_with_reason(&token).await,
+                Err(JwtValidationFailure::Invalid)
+            ),
+            "a token not valid for another hour must reject as an invalid JWT"
+        );
+        assert!(
+            cache.validate_token_detailed(&token, true).await.is_err(),
+            "detailed validation must reject the future nbf token"
+        );
+        assert!(
+            cache.validate_token(&token).await.is_none(),
+            "plain validation must reject the future nbf token"
+        );
+
+        Ok(())
+    }
+
+    /// Pins that the default 60 second JWT leeway admits a near-future `nbf`.
+    #[tokio::test]
+    async fn accepts_nbf_within_leeway() -> anyhow::Result<()> {
+        let kid = "test-key-leeway-nbf";
+        let (pem, jwks) = generate_test_keypair(kid)?;
+        let (cache, _mock_server) = cache_for_jwks(&jwks).await?;
+        let now = jsonwebtoken::get_current_timestamp();
+        // The jsonwebtoken validation leeway is 60 s. A 30 s nbf offset and
+        // 1 h expiry leave wide margins for scheduler jitter without sleeps.
+        let token = mint_token_with_claims(
+            &pem,
+            kid,
+            &serde_json::json!({
+                "iss": "https://auth.test.local",
+                "aud": "https://mcp.test.local/mcp",
+                "sub": "leeway-nbf-bot",
+                "scope": "mcp:read",
+                "exp": now.saturating_add(3600),
+                "iat": now,
+                "nbf": now.saturating_add(30),
+            }),
+        )?;
+
+        let identity = cache
+            .validate_token(&token)
+            .await
+            .context("nbf inside the 60 s leeway must authenticate")?;
+        assert_eq!(identity.name, "leeway-nbf-bot");
+        assert_eq!(identity.role, "viewer");
 
         Ok(())
     }
@@ -9176,7 +10068,7 @@ role = "admin"
         Ok(())
     }
 
-    // -- L3: internal-hostname-suffix pre-DNS denylist --
+    // - L3: internal-hostname-suffix pre-DNS denylist -
 
     #[expect(
         clippy::unnecessary_wraps,
@@ -9340,7 +10232,8 @@ role = "admin"
         Ok(())
     }
 
-    /// Fails `JwksCache::new` for an invalid `ssrf_allowlist` CIDR.
+    /// Fails `JwksCache::new` for an invalid `ssrf_allowlist` CIDR, with
+    /// the `Config` variant (misconfiguration, not a startup I/O fault).
     #[tokio::test]
     async fn jwks_cache_rejects_misconfigured_allowlist_at_startup() -> anyhow::Result<()> {
         let mut cfg = OAuthConfig::builder(
@@ -9356,13 +10249,18 @@ role = "admin"
         let Err(err) = JwksCache::new(&cfg) else {
             anyhow::bail!("invalid CIDR must fail JwksCache::new")
         };
+        assert!(
+            matches!(err, RmcpServerKitError::Config(_)),
+            "a misconfigured allowlist is a Config error, not Startup; got {err:?}"
+        );
         let msg = err.to_string();
         assert!(msg.contains("oauth.ssrf_allowlist"), "got {msg:?}");
 
         Ok(())
     }
 
-    /// Returns Err rather than panicking for an invalid `jwks_cache_ttl`.
+    /// Returns Err rather than panicking for an invalid `jwks_cache_ttl`,
+    /// with the `Config` variant (misconfiguration, not a startup I/O fault).
     #[tokio::test]
     async fn jwks_cache_new_invalid_ttl_is_err() -> anyhow::Result<()> {
         // An unvalidated config with a bogus TTL must surface as Err, not
@@ -9377,8 +10275,246 @@ role = "admin"
         let Err(err) = JwksCache::new(&cfg) else {
             anyhow::bail!("invalid jwks_cache_ttl must fail JwksCache::new")
         };
+        assert!(
+            matches!(err, RmcpServerKitError::Config(_)),
+            "a bad jwks_cache_ttl is a Config error, not Startup; got {err:?}"
+        );
         let msg = err.to_string();
         assert!(msg.contains("jwks_cache_ttl"), "got {msg:?}");
+
+        Ok(())
+    }
+
+    /// Fails `JwksCache::new` for an invalid `allowed_algorithms` entry,
+    /// with the `Config` variant, not `Startup`.
+    #[tokio::test]
+    async fn jwks_cache_rejects_invalid_allowed_algorithms_at_startup() -> anyhow::Result<()> {
+        let mut cfg = OAuthConfig::builder(
+            "https://auth.example.com/",
+            "mcp",
+            "https://auth.example.com/jwks.json",
+        )
+        .build();
+        cfg.allowed_algorithms = Some(vec!["not-a-real-algorithm".into()]);
+        let Err(err) = JwksCache::new(&cfg) else {
+            anyhow::bail!("an unsupported algorithm name must fail JwksCache::new")
+        };
+        assert!(
+            matches!(err, RmcpServerKitError::Config(_)),
+            "an unsupported algorithm name is a Config error, not Startup; got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("allowed_algorithms"), "got {msg:?}");
+
+        Ok(())
+    }
+
+    /// Fails `JwksCache::new` for a missing `ca_cert_path`, with the
+    /// `Startup` variant naming the configured path.
+    #[tokio::test]
+    async fn jwks_cache_missing_ca_cert_path_returns_startup_with_path() -> anyhow::Result<()> {
+        let mut cfg = OAuthConfig::builder(
+            "https://auth.example.com/",
+            "mcp",
+            "https://auth.example.com/jwks.json",
+        )
+        .build();
+        let missing = PathBuf::from("/nonexistent/rmcp-api02/missing-ca.pem");
+        cfg.ca_cert_path = Some(missing.clone());
+        let Err(err) = JwksCache::new(&cfg) else {
+            anyhow::bail!("a missing ca_cert_path must fail JwksCache::new")
+        };
+        assert!(
+            matches!(err, RmcpServerKitError::Startup(_)),
+            "a missing CA file is a Startup error, not Config; got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ca_cert_path") && msg.contains(&missing.display().to_string()),
+            "error must name ca_cert_path and the path; got {msg:?}"
+        );
+
+        Ok(())
+    }
+
+    // Shared CA-bundle validation table.
+    //
+    // `load_ca_bundle` is the ONE private helper used by all three
+    // OAuth-bound outbound clients (`JwksCache::new`, `OauthHttpClient::build`,
+    // `build_mtls_clients`). Every row below must behave identically across
+    // all three.
+
+    /// Wraps `body` in a PEM `label` section. Built from repeated single
+    /// dashes rather than a five-dash literal so the fixture's framing is
+    /// as explicit in source as the bytes it produces.
+    fn pem_section(label: &str, body: &str) -> String {
+        let bar = "-".repeat(5);
+        format!("{bar}BEGIN {label}{bar}\n{body}\n{bar}END {label}{bar}\n")
+    }
+
+    /// One real, parseable self-signed certificate plus its PEM-encoded key.
+    ///
+    /// Generated fresh per call so the "accepted" table rows exercise a
+    /// certificate `reqwest` itself considers valid rather than a
+    /// hand-rolled fixture.
+    fn generate_test_ca(san: &str) -> anyhow::Result<(String, String, Vec<u8>)> {
+        let cert = rcgen::generate_simple_self_signed(vec![san.to_owned()]).context("rcgen")?;
+        let cert_pem = cert.cert.pem();
+        let key_pem = cert.signing_key.serialize_pem();
+        let cert_der = cert.cert.der().to_vec();
+        Ok((cert_pem, key_pem, cert_der))
+    }
+
+    /// Writes `bytes` to a uniquely named temp file (so each table case
+    /// gets its own fixture) and returns the path to pass as `ca_cert_path`.
+    fn write_ca_bundle(label: &str, bytes: &[u8]) -> anyhow::Result<PathBuf> {
+        let dir = env::temp_dir();
+        let pid = process::id();
+        let nonce: u64 = rand::random();
+        let path = dir.join(format!("rmcp-api02-ca-{label}-{pid}-{nonce}.pem"));
+        fs::write(&path, bytes).context("write CA bundle fixture")?;
+        Ok(path)
+    }
+
+    /// The CA-bundle validation table: `(label, bundle bytes, accepted)`.
+    ///
+    /// Before the three clients shared `load_ca_bundle`, each used
+    /// `reqwest::Certificate::from_pem`, which never parses: four of the six
+    /// rejected rows here (`empty-file`, `garbage-text`, `der-encoded-ca`,
+    /// `private-key-only`) were accepted silently and produced a client with
+    /// no custom root; only `unterminated-pem` and `pem-framed-bad-der`
+    /// already failed, at `ClientBuilder::build()`.
+    fn ca_bundle_validation_cases() -> anyhow::Result<Vec<(&'static str, Vec<u8>, bool)>> {
+        let (cert_one_pem, key_one_pem, cert_one_der) = generate_test_ca("ca-bundle-one.test")?;
+        let (cert_two_pem, _key_two_pem, _cert_two_der) = generate_test_ca("ca-bundle-two.test")?;
+        let two_cert = format!("{cert_one_pem}{cert_two_pem}");
+        let cert_plus_key = format!("{cert_one_pem}{key_one_pem}");
+        let unterminated_pem = {
+            let bar = "-".repeat(5);
+            format!("{bar}BEGIN CERTIFICATE{bar}\nMIIB\n")
+        };
+        let pem_framed_bad_der = pem_section("CERTIFICATE", "AAAA");
+        Ok(vec![
+            ("one-cert", cert_one_pem.into_bytes(), true),
+            ("two-cert", two_cert.into_bytes(), true),
+            ("cert-plus-key", cert_plus_key.into_bytes(), true),
+            ("empty-file", Vec::new(), false),
+            (
+                "garbage-text",
+                b"this is not a certificate\n".to_vec(),
+                false,
+            ),
+            ("der-encoded-ca", cert_one_der, false),
+            ("private-key-only", key_one_pem.into_bytes(), false),
+            ("unterminated-pem", unterminated_pem.into_bytes(), false),
+            ("pem-framed-bad-der", pem_framed_bad_der.into_bytes(), false),
+        ])
+    }
+
+    /// Asserts one CA-bundle table row's outcome against `result`, then
+    /// removes `path`. Shared by all three per-client tests below so the
+    /// pass/fail criteria cannot drift between them.
+    fn assert_ca_bundle_case<T>(
+        label: &str,
+        path: &Path,
+        result: Result<T, RmcpServerKitError>,
+        accepted: bool,
+    ) -> anyhow::Result<()> {
+        let _removed = fs::remove_file(path);
+        if accepted {
+            let _built = result
+                .map_err(|error| anyhow::anyhow!("{label}: expected Ok, got Err({error})"))?;
+            return Ok(());
+        }
+        let Err(err) = result else {
+            anyhow::bail!("{label}: expected Err, got Ok");
+        };
+        assert!(
+            matches!(err, RmcpServerKitError::Startup(_)),
+            "{label}: a malformed CA bundle is a Startup error; got {err:?}"
+        );
+        let msg = err.to_string();
+        let path_str = path.display().to_string();
+        assert!(
+            msg.contains("ca_cert_path") && msg.contains(&path_str),
+            "{label}: error must name ca_cert_path and the path; got {msg:?}"
+        );
+        let is_zero_cert_case = matches!(
+            label,
+            "empty-file" | "garbage-text" | "der-encoded-ca" | "private-key-only"
+        );
+        assert_eq!(
+            msg.contains("no certificates found"),
+            is_zero_cert_case,
+            "{label}: \"no certificates found\" must appear only for a bundle that \
+             parses to zero certificates, not for a parse or build failure; got {msg:?}"
+        );
+        Ok(())
+    }
+
+    /// `JwksCache::new` accepts a CA bundle iff it contains at least one
+    /// certificate, and otherwise fails with `Startup` naming `ca_cert_path`.
+    ///
+    /// A mutation that removes `JwksCacheShared::new`'s call to the shared
+    /// helper must turn this red.
+    #[tokio::test]
+    async fn jwks_cache_enforces_ca_bundle_table() -> anyhow::Result<()> {
+        for (label, bytes, accepted) in ca_bundle_validation_cases()? {
+            let path = write_ca_bundle(&format!("jwks-{label}"), &bytes)?;
+            let mut cfg = test_config("https://auth.example.com/jwks.json");
+            cfg.ca_cert_path = Some(path.clone());
+            let result = JwksCache::new(&cfg);
+            assert_ca_bundle_case(label, &path, result, accepted)?;
+        }
+
+        Ok(())
+    }
+
+    /// `OauthHttpClient::with_config` accepts a CA bundle iff it contains at
+    /// least one certificate. A mutation that removes `OauthHttpClient::build`'s
+    /// call to the shared helper must turn this red.
+    #[test]
+    fn oauth_http_client_enforces_ca_bundle_table() -> anyhow::Result<()> {
+        for (label, bytes, accepted) in ca_bundle_validation_cases()? {
+            let path = write_ca_bundle(&format!("http-{label}"), &bytes)?;
+            let mut cfg = validation_https_config();
+            cfg.ca_cert_path = Some(path.clone());
+            let result = OauthHttpClient::with_config(&cfg);
+            assert_ca_bundle_case(label, &path, result, accepted)?;
+        }
+
+        Ok(())
+    }
+
+    /// White-box: `build_mtls_clients` enforces the same CA-bundle table as
+    /// the other two clients. A mutation that removes its call to the
+    /// shared helper must turn this red.
+    ///
+    /// Called directly rather than through `OauthHttpClient::with_config`:
+    /// that constructor's shared `ca_certs` step (feeding
+    /// `inner`/`credential_client`) reads the same `ca_cert_path` and would
+    /// always fail first, shadowing a defect in `build_mtls_clients`'s own
+    /// independent call to the helper.
+    #[cfg(feature = "oauth-mtls-client")]
+    #[test]
+    fn build_mtls_clients_enforces_ca_bundle_table() -> anyhow::Result<()> {
+        install_test_crypto_provider();
+        let (cert_path, key_path) = write_self_signed_pem()?;
+        let allowlist = Arc::new(CompiledSsrfAllowlist::default());
+        let test_bypass: TestLoopbackBypass = Arc::new(AtomicBool::new(false));
+        for (label, bytes, accepted) in ca_bundle_validation_cases()? {
+            let ca_path = write_ca_bundle(&format!("mtls-{label}"), &bytes)?;
+            let cc = ClientCertConfig {
+                cert_path: cert_path.clone(),
+                key_path: key_path.clone(),
+            };
+            let mut cfg = https_cfg_with_tx(tx_with(None, Some(cc)));
+            cfg.ca_cert_path = Some(ca_path.clone());
+            let result = build_mtls_clients(Some(&cfg), &allowlist, &test_bypass);
+            assert_ca_bundle_case(label, &ca_path, result, accepted)?;
+        }
+        let _removed_cert = fs::remove_file(&cert_path);
+        let _removed_key = fs::remove_file(&key_path);
 
         Ok(())
     }
@@ -9643,7 +10779,7 @@ role = "admin"
             .context("warn mode must accept azp-only match")?;
         assert_eq!(identity.role, "viewer");
         assert!(
-            cache.azp_fallback_warned.load(Ordering::Relaxed),
+            cache.shared.azp_fallback_warned.load(Ordering::Relaxed),
             "warn-once flag should be set after first azp-only match"
         );
 
@@ -9656,7 +10792,7 @@ role = "admin"
                 .context("warn mode must continue accepting subsequent matches")?,
         );
         assert!(
-            cache.azp_fallback_warned.load(Ordering::Relaxed),
+            cache.shared.azp_fallback_warned.load(Ordering::Relaxed),
             "warn-once flag must remain set; the assertion guards against accidental clearing"
         );
 
@@ -9704,11 +10840,11 @@ role = "admin"
                 .context("permissive mode must accept azp-only match")?,
         );
         assert!(
-            !cache.azp_fallback_warned.load(Ordering::Relaxed),
+            !cache.shared.azp_fallback_warned.load(Ordering::Relaxed),
             "permissive mode must not flip the warn-once flag"
         );
         assert!(
-            cache.azp_permissive_logged.load(Ordering::Relaxed),
+            cache.shared.azp_permissive_logged.load(Ordering::Relaxed),
             "permissive mode must record its own once-per-process log flag"
         );
 
@@ -10428,7 +11564,7 @@ role = "admin"
         Ok(())
     }
 
-    // -- introspection / revocation proxy --
+    // - introspection / revocation proxy -
 
     fn proxy_cfg(token_url: &str) -> OAuthProxyConfig {
         OAuthProxyConfig {

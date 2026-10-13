@@ -129,7 +129,7 @@ tokio::task_local! {
 /// Authorization evaluates exactly one role string per identity; it never
 /// unions several matched roles. The string comes from
 /// [`ApiKeyEntry::role`](crate::auth::ApiKeyEntry), `MtlsConfig::default_role`,
-/// or -- for OAuth -- the **first matching entry in configuration order**
+/// or - for OAuth - the **first matching entry in configuration order**
 /// (`role_mappings` when `role_claim` is set, otherwise `scopes`). A token
 /// bearing several role-granting claims therefore yields only the first
 /// mapped role. See the RBAC section of `docs/GUIDE.md` for the operator
@@ -143,7 +143,7 @@ tokio::task_local! {
 /// Tool authorization is enforced by the RBAC middleware *before* this
 /// task-local is installed, and admin gating reads the request's
 /// `AuthIdentity` directly rather than this accessor. Use `current_role`
-/// for handler context, audit, and filtering -- never as the sole basis
+/// for handler context, audit, and filtering - never as the sole basis
 /// for granting access.
 ///
 /// # Empty roles
@@ -374,7 +374,7 @@ impl RoleConfig {
 ///
 /// # Scope: this is not the argument-validation layer
 ///
-/// Argument validation belongs **downstream, in the tool itself** -- its input
+/// Argument validation belongs **downstream, in the tool itself** - its input
 /// schema and its handler. Only the tool knows its parameter types, value
 /// ranges, mutually exclusive options, and which combinations are meaningful.
 /// This crate deliberately does not attempt that, and cannot: it sees an
@@ -400,14 +400,14 @@ impl RoleConfig {
 /// tool's schema and defaults, which are the consumer's to declare.
 ///
 /// By default this constrains the value only **when the argument is
-/// present** -- omitting it entirely skips the check. Set
+/// present** - omitting it entirely skips the check. Set
 /// [`required`](Self::required) to also demand the argument be supplied.
 /// This default is **permanent and deliberate**: presence enforcement is
 /// opt-in, because an allowlist that constrains a supplied value is a
 /// legitimate configuration and the crate does not impose the stricter
 /// policy on existing deployments. Use
 /// [`ArgumentAllowlist::new_required`] whenever omitting the argument must
-/// fail closed -- in particular when the tool substitutes its own default
+/// fail closed - in particular when the tool substitutes its own default
 /// for a missing value, since that default is never checked.
 //
 // NOTE(future-pr): typed pre-tokenized argument matcher (CHANGELOG.md
@@ -448,8 +448,8 @@ pub struct ArgumentAllowlist {
     /// input schema already marks the argument required, but fails open
     /// when the handler substitutes a default for a missing value.
     ///
-    /// When `true`, a call that omits the argument -- or supplies a
-    /// non-string -- is denied with 403, independently of `allowed`. Setting
+    /// When `true`, a call that omits the argument - or supplies a
+    /// non-string - is denied with 403, independently of `allowed`. Setting
     /// `required` with an empty `allowed` therefore means "must be supplied
     /// as a string, any value accepted".
     #[serde(default)]
@@ -571,7 +571,7 @@ pub enum AllowOperationMatching {
     reason = "public API frozen until the next major release"
 )]
 pub struct RbacConfig {
-    /// Master switch -- when false, the RBAC middleware is not installed.
+    /// Master switch - when false, the RBAC middleware is not installed.
     #[serde(default)]
     pub enabled: bool,
     /// Role definitions available to identities.
@@ -583,7 +583,7 @@ pub struct RbacConfig {
     #[serde(default)]
     pub allow_operation_matching: AllowOperationMatching,
     /// Server-wide operation kill switch, evaluated **before** any role is
-    /// consulted and applied regardless of what a role's `allow` grants --
+    /// consulted and applied regardless of what a role's `allow` grants -
     /// including `allow = ["*"]`.
     ///
     /// Entries are **always** glob-matched, independent of
@@ -593,7 +593,7 @@ pub struct RbacConfig {
     /// Two scope limits apply. It is gated on [`RbacConfig::enabled`]: when
     /// RBAC is disabled every check short-circuits to
     /// [`RbacDecision::Allow`] before the kill switch is consulted. And it
-    /// governs *invocation* only -- like the rest of this engine it is
+    /// governs *invocation* only - like the rest of this engine it is
     /// enforced on `tools/call`, so a denied tool may still appear in a
     /// `tools/list` response unless the handler filters it.
     #[serde(default)]
@@ -932,7 +932,7 @@ impl RbacPolicy {
     /// **No Unicode normalization.** Token comparison is byte-exact. A
     /// value that is canonically equivalent to an allowlist entry but
     /// encoded differently (NFC vs NFD, or a homoglyph) does **not**
-    /// match, and is therefore denied -- this direction is fail-closed.
+    /// match, and is therefore denied - this direction is fail-closed.
     /// The residual hazard runs the other way: on a normalizing filesystem
     /// (e.g. macOS APFS, which folds NFD) an allowlisted NFC entry can
     /// resolve to a different file than the policy author intended.
@@ -1117,7 +1117,7 @@ impl RbacPolicy {
     /// workload (e.g. `list_hosts` filtering over many wildcard patterns).
     fn host_matches(patterns: &[String], host: &str) -> bool {
         // Lowercased once per call rather than once per pattern, and only
-        // when a wildcard pattern will actually consume it -- an all-exact
+        // when a wildcard pattern will actually consume it - an all-exact
         // pattern list stays allocation-free via `eq_ignore_ascii_case`.
         let host_lower = patterns
             .iter()
@@ -1153,7 +1153,7 @@ impl RbacPolicy {
 /// [`AllowOperationMatching::Legacy`] is in effect.
 ///
 /// Under legacy matching the `*` is an ordinary character, so the entry grants
-/// only an operation whose name contains that literal `*` -- almost never what
+/// only an operation whose name contains that literal `*` - almost never what
 /// the operator meant. The literal `"*"` is exempt: that is the documented
 /// allow-all form.
 fn warn_on_literal_allow_globs(roles: &[RoleConfig], mode: AllowOperationMatching) {
@@ -1171,7 +1171,7 @@ fn warn_on_literal_allow_globs(roles: &[RoleConfig], mode: AllowOperationMatchin
                 role = %role.name,
                 operation = %entry,
                 "allow entry contains '*' but operation matching is 'legacy'; \
-                 the '*' is matched literally, not as a pattern -- set \
+                 the '*' is matched literally, not as a pattern - set \
                  rbac.allow_operation_matching = \"glob\" to enable globbing, \
                  or list the operation names exactly"
             );
@@ -1203,7 +1203,7 @@ fn warn_on_optional_value_allowlists(roles: &[RoleConfig]) {
                     "argument allowlist is optional and fails open when the \
                      argument is omitted: the allowed-value list is enforced \
                      only if the caller supplies the argument, so a tool that \
-                     substitutes its own default bypasses it entirely -- set \
+                     substitutes its own default bypasses it entirely - set \
                      `required = true` in TOML, or construct via \
                      `ArgumentAllowlist::new_required`, to reject calls that \
                      omit it"
@@ -1277,7 +1277,7 @@ pub(crate) fn redact_with_salt(salt: &[u8], value: &str) -> String {
     out
 }
 
-// -- RBAC middleware --
+// - RBAC middleware -
 
 /// Which client-context fields the RBAC deny log may include.
 ///
@@ -1543,7 +1543,7 @@ fn enforce_tool_policy(
     // wrong JSON type must not silently downgrade the host-glob check to an
     // operation-only check. `as_str()` on an array/object/number/bool/null
     // yields `None`, which would route to `check_operation` and skip
-    // `RoleConfig.hosts` entirely -- letting a caller opt out of host
+    // `RoleConfig.hosts` entirely - letting a caller opt out of host
     // restrictions by changing the argument's shape. Fail closed, and log
     // the type rather than the value so no caller input is leaked.
     if let Some(value) = host_value
@@ -1683,8 +1683,8 @@ fn check_strict_argument(
 ///
 /// Absence can only be judged here: [`check_argument`] is keyed by a present
 /// argument and structurally cannot observe a missing one. This runs even when
-/// `args` is `None` -- i.e. the call carried no `arguments` object, or a
-/// non-object -- because returning early on that would let a caller skip every
+/// `args` is `None` - i.e. the call carried no `arguments` object, or a
+/// non-object - because returning early on that would let a caller skip every
 /// `required` constraint by omitting the object entirely.
 fn check_required_arguments(
     policy: &RbacPolicy,
@@ -1866,7 +1866,7 @@ fn match_middle(mut text: &str, parts: &[&str]) -> bool {
 
 #[expect(
     clippy::multiple_inherent_impl,
-    reason = "deliberate: src/rbac.rs::RbacConfig — the second block groups the environment-override application; merging relocates ~90 lines for no behavior gain"
+    reason = "deliberate: src/rbac.rs::RbacConfig - the second block groups the environment-override application; merging relocates ~90 lines for no behavior gain"
 )]
 impl RbacConfig {
     /// Applies `RMCP_SERVER_KIT__RBAC__*` environment overrides.
@@ -2408,7 +2408,7 @@ mod tests {
         result
     }
 
-    // -- tool rate limiter: burst + Retry-After --
+    // - tool rate limiter: burst + Retry-After -
 
     /// Burst capacity admits an initial spike larger than the sustained
     /// rate; the next request within the window is denied.
@@ -2542,7 +2542,7 @@ mod tests {
         })
     }
 
-    // -- glob_match tests --
+    // - glob_match tests -
 
     #[expect(
         clippy::unnecessary_wraps,
@@ -2639,7 +2639,7 @@ mod tests {
         Ok(())
     }
 
-    // -- glob_match boundary / mutation-coverage tests --
+    // - glob_match boundary / mutation-coverage tests -
     //
     // The cases below exist to kill specific mutants surfaced by
     // `cargo mutants` against `glob_match` / `match_middle` (see
@@ -2716,7 +2716,7 @@ mod tests {
         Ok(())
     }
 
-    // -- RbacPolicy::argument_allowed mutation-coverage tests --
+    // - RbacPolicy::argument_allowed mutation-coverage tests -
 
     #[expect(
         clippy::unnecessary_wraps,
@@ -2750,7 +2750,7 @@ mod tests {
         Ok(())
     }
 
-    // -- RbacPolicy::check tests --
+    // - RbacPolicy::check tests -
 
     #[expect(
         clippy::unnecessary_wraps,
@@ -2897,7 +2897,7 @@ mod tests {
         Ok(())
     }
 
-    // -- host_visible tests --
+    // - host_visible tests -
 
     #[expect(
         clippy::unnecessary_wraps,
@@ -3003,7 +3003,7 @@ mod tests {
         Ok(())
     }
 
-    // -- argument_allowed tests --
+    // - argument_allowed tests -
 
     #[expect(
         clippy::unnecessary_wraps,
@@ -3013,7 +3013,7 @@ mod tests {
     /// Argument allowed no allowlist.
     fn argument_allowed_no_allowlist() -> anyhow::Result<()> {
         let policy = test_policy();
-        // ops has no argument_allowlists -- all values allowed
+        // ops has no argument_allowlists - all values allowed
         assert!(policy.argument_allowed("ops", "resource_exec", "cmd", "rm -rf /"));
         assert!(policy.argument_allowed("ops", "resource_exec", "cmd", "bash"));
         Ok(())
@@ -3085,7 +3085,7 @@ mod tests {
         Ok(())
     }
 
-    // -- M7: strict argument confinement (`deny_unknown_arguments`) --
+    // - M7: strict argument confinement (`deny_unknown_arguments`) -
 
     fn strict_test_policy(allowlists: Vec<ArgumentAllowlist>) -> RbacPolicy {
         let role = RoleConfig::new("viewer", vec!["run".into()], vec!["*".into()])
@@ -3206,7 +3206,7 @@ mod tests {
         Ok(())
     }
 
-    // -- shlex-tokenization regression tests (1.4.1) --
+    // - shlex-tokenization regression tests (1.4.1) -
     //
     // These tests pin the POSIX-shell-like tokenization contract added
     // in 1.4.1. See `RbacPolicy::argument_allowed` doc comment for the
@@ -3333,10 +3333,10 @@ mod tests {
     #[test]
     /// Argument allowed quoted literal token no longer matches.
     fn argument_allowed_quoted_literal_token_no_longer_matches() -> anyhow::Result<()> {
-        // 1.4.0 behavior: split_whitespace first token = "'bash'" --
+        // 1.4.0 behavior: split_whitespace first token = "'bash'" -
         //                 matched literal allowlist entry "'bash'".
         // 1.4.1 behavior: shlex strips the surrounding quotes -> first
-        //                 token = "bash" -- no match against allowlist
+        //                 token = "bash" - no match against allowlist
         //                 entry "'bash'". Deny.
         let policy = shlex_policy(vec!["'bash'".into()]);
         assert!(!policy.argument_allowed("viewer", "run", "cmd", "'bash' -c true"));
@@ -3380,7 +3380,7 @@ mod tests {
         Ok(())
     }
 
-    // -- host_patterns tests --
+    // - host_patterns tests -
 
     #[expect(
         clippy::unnecessary_wraps,
@@ -3402,7 +3402,7 @@ mod tests {
         Ok(())
     }
 
-    // -- check_operation tests (no host check) --
+    // - check_operation tests (no host check) -
 
     #[expect(
         clippy::unnecessary_wraps,
@@ -3474,7 +3474,7 @@ mod tests {
         Ok(())
     }
 
-    // -- operation glob matching / global_deny tests --
+    // - operation glob matching / global_deny tests -
 
     fn op_policy(role: RoleConfig) -> RbacPolicy {
         RbacPolicy::new(&RbacConfig::with_roles(vec![role]))
@@ -3929,7 +3929,7 @@ mod tests {
         Ok(())
     }
 
-    // -- current_role / current_identity tests --
+    // - current_role / current_identity tests -
 
     #[expect(
         clippy::unnecessary_wraps,
@@ -4017,7 +4017,7 @@ mod tests {
         Ok(())
     }
 
-    // -- rbac_middleware integration tests --
+    // - rbac_middleware integration tests -
 
     fn tool_call_body(tool: &str, args: &serde_json::Value) -> String {
         serde_json::json!({
@@ -4231,7 +4231,7 @@ mod tests {
             .body(Body::empty())
             .context("unexpected value")?;
         // GET on a POST-only route returns 405, but the middleware itself
-        // doesn't block it -- it returns next.run(req).
+        // doesn't block it - it returns next.run(req).
         let resp = app.oneshot(req).await.context("unexpected value")?;
         assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
         Ok(())
@@ -4441,7 +4441,7 @@ mod tests {
     async fn middleware_disabled_policy_passes_everything() -> anyhow::Result<()> {
         let policy = Arc::new(RbacPolicy::disabled());
         let app = rbac_router(policy);
-        // No identity, disabled policy -- should pass.
+        // No identity, disabled policy - should pass.
         let body = tool_call_body("anything", &serde_json::json!({}));
         let req = Request::builder()
             .method(Method::POST)
@@ -4573,7 +4573,7 @@ mod tests {
         Ok(())
     }
 
-    // -- redact_arg / redaction_salt tests --
+    // - redact_arg / redaction_salt tests -
 
     #[expect(
         clippy::unnecessary_wraps,
@@ -4673,7 +4673,7 @@ mod tests {
         Ok(())
     }
 
-    // -- enforce_tool_policy identity propagation regression test (BUG H-S3) --
+    // - enforce_tool_policy identity propagation regression test (BUG H-S3) -
 
     /// Regression: when `enforce_tool_policy` denied a request, the deny
     /// log used to read `current_identity()`, which was always `None` at
@@ -4708,7 +4708,7 @@ mod tests {
         Ok(())
     }
 
-    // -- M2 regression: non-string argument values bypass allowlist --
+    // - M2 regression: non-string argument values bypass allowlist -
 
     fn restricted_exec_identity() -> AuthIdentity {
         AuthIdentity {
@@ -4885,12 +4885,12 @@ mod tests {
         Ok(())
     }
 
-    // -- F4 regression: non-string `host` downgraded the host-glob check --
+    // - F4 regression: non-string `host` downgraded the host-glob check -
     //
     // `restricted-exec` is scoped to `hosts: ["dev-*"]`. Before the fix,
     // `arguments.host` was read with `as_str()`, so any non-string shape
     // yielded `None` and routed to `check_operation`, skipping the host
-    // globs entirely -- letting a caller reach `prod-1` by sending the
+    // globs entirely - letting a caller reach `prod-1` by sending the
     // host as an array. Each case below returned 200 before the fix.
 
     async fn exec_status(args: &serde_json::Value) -> anyhow::Result<StatusCode> {
@@ -4952,7 +4952,7 @@ mod tests {
         Ok(())
     }
 
-    // -- F5: opt-in `required` on ArgumentAllowlist --
+    // - F5: opt-in `required` on ArgumentAllowlist -
     //
     // An allowlist constrains a value only when the argument is present, so a
     // caller could skip it entirely by omitting the key. That is safe when the

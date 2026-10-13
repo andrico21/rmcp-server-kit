@@ -103,7 +103,7 @@ mod tests {
         roots.add(build_ca_root()?).context("add ca root")?;
         #[expect(
             deprecated,
-            reason = "deliberate: mtls_revocation::CrlSet::__test_with_prepopulated_crls — the deprecated test-only constructor is the only prepopulated-CrlSet entry point until 4.0"
+            reason = "deliberate: mtls_revocation::CrlSet::__test_with_prepopulated_crls - the deprecated test-only constructor is the only prepopulated-CrlSet entry point until 4.0"
         )]
         let set = CrlSet::__test_with_prepopulated_crls(Arc::new(roots), config, Vec::new())
             .context("empty CRL set")?;

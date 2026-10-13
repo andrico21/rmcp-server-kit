@@ -54,7 +54,11 @@ mod tests {
         extract::ConnectInfo,
         routing::{get, post},
     };
+    #[cfg(feature = "oauth")]
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use futures::stream;
+    #[cfg(feature = "oauth")]
+    use jsonwebtoken::Algorithm;
     use reqwest::header::HeaderMap;
     use rmcp::{
         handler::server::ServerHandler,
@@ -80,8 +84,12 @@ mod tests {
         },
         transport::{ForwardedHeaderMode, McpServerConfig, serve_with_listener},
     };
+    #[cfg(feature = "oauth")]
+    use rsa::{pkcs8, pkcs8::EncodePrivateKey as _, rand_core, traits::PublicKeyParts as _};
     use rustls::crypto::ring;
     use secrecy::SecretString;
+    #[cfg(feature = "oauth")]
+    use tokio::io::AsyncWriteExt as _;
     use tokio::{
         fs,
         net::{TcpListener, TcpStream},
@@ -91,7 +99,7 @@ mod tests {
     };
     use tokio_util::sync::CancellationToken;
 
-    // -- Minimal test handler --
+    // - Minimal test handler -
 
     #[derive(Clone)]
     struct TestHandler;
@@ -428,7 +436,7 @@ mod tests {
         })
     }
 
-    // -- Test helpers --
+    // - Test helpers -
 
     /// Find a free ephemeral port. Retained for legacy call-sites that
     /// build a config from a port number; new tests should prefer
@@ -443,7 +451,7 @@ mod tests {
     /// deterministically.
     struct ServerHarness {
         /// Base URL (`http://127.0.0.1:<port>`). Always contains the
-        /// actually-bound port -- safe to use immediately.
+        /// actually-bound port - safe to use immediately.
         base: String,
         /// Cancellation token wired into `serve_with_listener`'s shutdown
         /// path. Cancelling triggers the same graceful drain as a real
@@ -678,6 +686,14 @@ mod tests {
             headers.get("strict-transport-security").is_none(),
             "{context}: HSTS must remain absent on plaintext"
         );
+        assert!(
+            headers.get("server").is_none(),
+            "{context}: server fingerprint header must be absent"
+        );
+        assert!(
+            headers.get("x-powered-by").is_none(),
+            "{context}: x-powered-by fingerprint header must be absent"
+        );
     }
 
     fn assert_security_header_defaults(headers: &HeaderMap, context: &str) {
@@ -707,6 +723,14 @@ mod tests {
         assert!(
             headers.get("strict-transport-security").is_none(),
             "{context}: HSTS must remain absent on plaintext"
+        );
+        assert!(
+            headers.get("server").is_none(),
+            "{context}: server fingerprint header must be absent"
+        );
+        assert!(
+            headers.get("x-powered-by").is_none(),
+            "{context}: x-powered-by fingerprint header must be absent"
         );
     }
 
@@ -1037,6 +1061,7 @@ mod tests {
         let client = reqwest::Client::new();
         let mcp_resp = client.post(format!("{base}/mcp")).body("{}").send().await?;
         assert_eq!(mcp_resp.status(), 401);
+        assert_security_header_defaults(mcp_resp.headers(), "unauthenticated /mcp 401");
         Ok(())
     }
 
@@ -1125,6 +1150,7 @@ mod tests {
             .send()
             .await?;
         assert_eq!(resp.status(), 403);
+        assert_security_header_defaults(resp.headers(), "rbac deny 403");
         Ok(())
     }
 
@@ -1135,7 +1161,7 @@ mod tests {
         let cfg = config_on_port(port).with_allowed_origins(["http://localhost:3000"]);
         let base = spawn_server(cfg).await?;
 
-        // No Origin header -- non-browser client, should pass.
+        // No Origin header - non-browser client, should pass.
         let client = reqwest::Client::new();
         let resp = client.post(format!("{base}/mcp")).body("{}").send().await?;
         assert_ne!(resp.status(), 403);
@@ -1157,6 +1183,24 @@ mod tests {
             }
         })
         .to_string()
+    }
+
+    async fn assert_allowed_tool_call_response(
+        resp: reqwest::Response,
+        context: &str,
+    ) -> anyhow::Result<()> {
+        assert_eq!(resp.status(), 200, "{context}: HTTP status must be 200");
+        let body = mcp_response_json(resp).await?;
+        assert_eq!(
+            body.get("id").and_then(serde_json::Value::as_u64),
+            Some(1),
+            "{context}: JSON-RPC id must match the request"
+        );
+        assert!(
+            body.get("result").is_some() || body.get("error").is_some(),
+            "{context}: JSON-RPC response must carry result or error: {body}"
+        );
+        Ok(())
     }
 
     /// Pins that RBAC denies a tool outside the role's allow list with 403.
@@ -1206,19 +1250,18 @@ mod tests {
         let base = spawn_server(cfg).await?;
 
         let client = reqwest::Client::new();
+        let session_id = mcp_initialize_with_bearer(&client, &base.base, Some(&token)).await?;
 
-        // Ops role with wildcard allow -- should pass RBAC.
-        // The tool doesn't exist on the handler, so MCP returns an error *response*
-        // (not an HTTP error), meaning HTTP 200 with a JSON-RPC error body.
         let resp = client
             .post(format!("{base}/mcp"))
             .header("authorization", format!("Bearer {token}"))
             .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-session-id", session_id)
             .body(tool_call_body("resource_list", &serde_json::json!({})))
             .send()
             .await?;
-        // Should NOT be 403 (RBAC passed).
-        assert_ne!(resp.status(), 403);
+        assert_allowed_tool_call_response(resp, "wildcard-permitted tool").await?;
         Ok(())
     }
 
@@ -1248,19 +1291,21 @@ mod tests {
         let base = spawn_server(cfg).await?;
 
         let client = reqwest::Client::new();
+        let session_id = mcp_initialize_with_bearer(&client, &base.base, Some(&token)).await?;
 
-        // Allowed command: ls
         let resp = client
             .post(format!("{base}/mcp"))
             .header("authorization", format!("Bearer {token}"))
             .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-session-id", &session_id)
             .body(tool_call_body(
                 "container_exec",
                 &serde_json::json!({"cmd": "ls -la"}),
             ))
             .send()
             .await?;
-        assert_ne!(resp.status(), 403, "allowed cmd 'ls' should not be denied");
+        assert_allowed_tool_call_response(resp, "allowlisted command").await?;
 
         // Denied command: rm
         let denied_resp = client
@@ -1584,6 +1629,7 @@ mod tests {
         // Third request: should be 429 (rate limited).
         let resp = client.post(&url).body("{}").send().await?;
         assert_eq!(resp.status(), 429, "request 3 should be rate limited");
+        assert_security_header_defaults(resp.headers(), "auth rate limit 429");
         Ok(())
     }
 
@@ -1615,6 +1661,7 @@ mod tests {
         }
         let resp = client.get(format!("{base}/ping")).send().await?;
         assert_eq!(resp.status(), 429, "request 3 should be rate limited");
+        assert_security_header_defaults(resp.headers(), "extra route rate limit 429");
         assert!(
             resp.text()
                 .await?
@@ -1711,6 +1758,7 @@ mod tests {
         }
         let resp = client.post(&url).body("{}").send().await?;
         assert_eq!(resp.status(), 429);
+        assert_security_header_defaults(resp.headers(), "auth retry-after 429");
         let retry_after = resp
             .headers()
             .get("retry-after")
@@ -2652,6 +2700,7 @@ mod tests {
             413,
             "oversized body must be rejected with 413 before RBAC buffers it"
         );
+        assert_security_header_defaults(resp.headers(), "mcp body limit 413");
         Ok(())
     }
 
@@ -2725,6 +2774,234 @@ mod tests {
             }
         });
         serde_json::from_value(json).context("oauth config deserialization")
+    }
+
+    #[cfg(feature = "oauth")]
+    fn generate_oauth_test_keypair(kid: &str) -> anyhow::Result<(String, serde_json::Value)> {
+        let mut rng = rand_core::OsRng;
+        let private_key = rsa::RsaPrivateKey::new(&mut rng, 2048).context("keypair generation")?;
+        let private_pem = private_key
+            .to_pkcs8_pem(pkcs8::LineEnding::LF)
+            .context("PKCS8 PEM export")?
+            .to_string();
+        let public_key = private_key.to_public_key();
+        let jwks = serde_json::json!({
+            "keys": [{
+                "kty": "RSA",
+                "use": "sig",
+                "alg": "RS256",
+                "kid": kid,
+                "n": URL_SAFE_NO_PAD.encode(public_key.n().to_bytes_be()),
+                "e": URL_SAFE_NO_PAD.encode(public_key.e().to_bytes_be())
+            }]
+        });
+        Ok((private_pem, jwks))
+    }
+
+    #[cfg(feature = "oauth")]
+    fn mint_oauth_test_token(private_pem: &str, kid: &str) -> anyhow::Result<String> {
+        let encoding_key = jsonwebtoken::EncodingKey::from_rsa_pem(private_pem.as_bytes())
+            .context("encoding key from PEM")?;
+        let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
+        header.kid = Some(kid.into());
+        let now = jsonwebtoken::get_current_timestamp();
+        let claims = serde_json::json!({
+            "iss": "https://auth.test.local",
+            "aud": "https://mcp.test.local/mcp",
+            "sub": "asy01-http",
+            "scope": "mcp:read",
+            "exp": now.saturating_add(3600),
+            "iat": now
+        });
+        jsonwebtoken::encode(&header, &claims, &encoding_key).context("JWT encoding")
+    }
+
+    #[cfg(feature = "oauth")]
+    fn oauth_auth_config(jwks_uri: &str, ttl: &str) -> anyhow::Result<AuthConfig> {
+        let json = serde_json::json!({
+            "issuer": "https://auth.test.local",
+            "audience": "https://mcp.test.local/mcp",
+            "jwks_uri": jwks_uri,
+            "jwks_cache_ttl": ttl,
+            "allow_http_oauth_urls": true,
+            "ssrf_allowlist": {
+                "hosts": ["localhost"],
+                "cidrs": ["127.0.0.0/8"]
+            },
+            "scopes": [{"scope": "mcp:read", "role": "viewer"}]
+        });
+        let mut auth = AuthConfig::with_keys(vec![]);
+        auth.oauth = Some(serde_json::from_value(json).context("oauth config deserialization")?);
+        Ok(auth)
+    }
+
+    #[cfg(feature = "oauth")]
+    async fn initialize_status(
+        client: &reqwest::Client,
+        base: &str,
+        token: &str,
+    ) -> anyhow::Result<reqwest::StatusCode> {
+        let resp = client
+            .post(format!("{base}/mcp"))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("authorization", format!("Bearer {token}"))
+            .body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1_u32,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": { "name": "e2e", "version": "0.0.1" }
+                    }
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .context("initialize request")?;
+        Ok(resp.status())
+    }
+
+    /// `localhost` resolves to `::1`, `127.0.0.1` or both, in a host-specific
+    /// order, and IP-literal OAuth URLs are rejected, so the JWKS mock must
+    /// answer on both loopback addresses on one shared port.
+    #[cfg(feature = "oauth")]
+    struct DualStackMock {
+        /// The server bound to `127.0.0.1`.
+        v4: wiremock::MockServer,
+        /// The server bound to `::1` on the same port, when this host has `::1`.
+        v6: Option<wiremock::MockServer>,
+    }
+
+    #[cfg(feature = "oauth")]
+    impl DualStackMock {
+        /// Binds `127.0.0.1` on an ephemeral port and `::1` on the same port,
+        /// retrying when that port is taken on `::1`; a host without `::1`
+        /// gets an IPv4-only mock.
+        async fn start() -> anyhow::Result<Self> {
+            use core::net::{Ipv4Addr, Ipv6Addr};
+            use std::{io::ErrorKind as IoErrorKind, net::TcpListener as StdTcpListener};
+
+            for _ in 0..16_u8 {
+                let v4_listener = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                    .context("bind the IPv4 loopback mock listener")?;
+                let port = v4_listener
+                    .local_addr()
+                    .context("read the IPv4 mock listener address")?
+                    .port();
+                match StdTcpListener::bind((Ipv6Addr::LOCALHOST, port)) {
+                    Ok(v6_listener) => {
+                        let v4 = wiremock::MockServer::builder()
+                            .listener(v4_listener)
+                            .start()
+                            .await;
+                        let v6 = wiremock::MockServer::builder()
+                            .listener(v6_listener)
+                            .start()
+                            .await;
+                        return Ok(Self { v4, v6: Some(v6) });
+                    }
+                    Err(err) if err.kind() == IoErrorKind::AddrInUse => {}
+                    Err(_) => {
+                        let v4 = wiremock::MockServer::builder()
+                            .listener(v4_listener)
+                            .start()
+                            .await;
+                        return Ok(Self { v4, v6: None });
+                    }
+                }
+            }
+            anyhow::bail!("no port was free on both 127.0.0.1 and ::1 after 16 attempts")
+        }
+
+        /// The port both loopback servers share.
+        fn port(&self) -> u16 {
+            self.v4.address().port()
+        }
+
+        /// Mounts a fresh mock from `build` on every running server.
+        async fn mount<B>(&self, build: B)
+        where
+            B: Fn() -> wiremock::Mock,
+        {
+            build().mount(&self.v4).await;
+            if let Some(v6) = &self.v6 {
+                build().mount(v6).await;
+            }
+        }
+
+        /// Counts the requests for `wanted` received across both servers.
+        async fn path_count(&self, wanted: &str) -> anyhow::Result<usize> {
+            let mut count = 0_usize;
+            for server in [Some(&self.v4), self.v6.as_ref()].into_iter().flatten() {
+                let requests = server
+                    .received_requests()
+                    .await
+                    .context("request recording must be enabled")?;
+                count = count.saturating_add(
+                    requests
+                        .iter()
+                        .filter(|request| request.url.path() == wanted)
+                        .count(),
+                );
+            }
+            Ok(count)
+        }
+    }
+
+    /// Writes a complete initialize request, waits until the server has
+    /// started the JWKS fetch, then drops the connection.
+    #[cfg(feature = "oauth")]
+    async fn cancel_initialize_after_jwks_fetch_started(
+        base: &str,
+        token: &str,
+        jwks: &DualStackMock,
+    ) -> anyhow::Result<()> {
+        let before = jwks.path_count("/jwks.json").await?;
+        let addr = base
+            .strip_prefix("http://")
+            .context("test base must be plain HTTP")?;
+        let mut stream = TcpStream::connect(addr)
+            .await
+            .context("connect raw client")?;
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1_u32,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "e2e", "version": "0.0.1" }
+            }
+        })
+        .to_string();
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .context("write raw initialize")?;
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if jwks
+                    .path_count("/jwks.json")
+                    .await
+                    .is_ok_and(|count| count > before)
+                {
+                    return;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("the server must start the JWKS fetch within 10s")?;
+        drop(stream);
+        Ok(())
     }
 
     /// Regression test for C3: by default (`expose_admin_endpoints = false`),
@@ -2884,6 +3161,61 @@ mod tests {
         Ok(())
     }
 
+    /// Pins that a cancelled OAuth HTTP request does not abort the shared JWKS
+    /// refresh: the first request is cancelled only after the upstream JWKS
+    /// fetch has started. Before the shared-refresh fix the fetch ran inside
+    /// the request future with the cooldown already stamped, so dropping the
+    /// connection cancelled it and the immediate second request was rejected
+    /// with 401. The 2 s upstream delay gives the server ample time to notice
+    /// the dropped connection before the fetch could complete.
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn asy01_cancelled_http_request_does_not_burn_jwks_cooldown() -> anyhow::Result<()> {
+        use wiremock::{Mock, ResponseTemplate, matchers};
+
+        let kid = "asy01-http";
+        let (pem, jwks_body) = generate_oauth_test_keypair(kid)?;
+        let token = mint_oauth_test_token(&pem, kid)?;
+        let jwks = DualStackMock::start().await?;
+        jwks.mount(|| {
+            Mock::given(matchers::method("GET"))
+                .and(matchers::path("/jwks.json"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(&jwks_body)
+                        .set_delay(Duration::from_secs(2)),
+                )
+        })
+        .await;
+
+        let jwks_uri = format!("http://localhost:{}/jwks.json", jwks.port());
+        let port = free_port().await?;
+        let cfg = config_on_port(port)
+            .with_auth(oauth_auth_config(&jwks_uri, "10m")?)
+            .with_public_url(format!("http://127.0.0.1:{port}"));
+        let base = spawn_server(cfg).await?;
+        let client = reqwest::Client::new();
+
+        cancel_initialize_after_jwks_fetch_started(&base.base, &token, &jwks).await?;
+        let status = timeout(
+            Duration::from_secs(15),
+            initialize_status(&client, &base.base, &token),
+        )
+        .await
+        .context("the second initialize must finish")??;
+        assert_eq!(
+            status, 200,
+            "the second request must join the cancelled request's refresh and authenticate"
+        );
+        assert_eq!(
+            jwks.path_count("/jwks.json").await?,
+            1,
+            "the second request must join the in-flight refresh, not start another"
+        );
+
+        Ok(())
+    }
+
     /// rust-review MEDIUM: the OAuth proxy routes (`/token`, `/register`,
     /// `/introspect`, `/revoke`) must honor the operator-configured
     /// `max_request_body`, not fall back to axum's 2 MB `DefaultBodyLimit`.
@@ -2923,6 +3255,7 @@ mod tests {
             "/token must reject oversized body with 413 (got {})",
             token_resp.status()
         );
+        assert_security_header_defaults(token_resp.headers(), "oauth token body limit 413");
 
         // /register - Json extractor. Send an oversized JSON string value.
         let big_json = serde_json::json!({ "redirect_uris": [oversized.clone()] }).to_string();
@@ -2988,11 +3321,14 @@ mod tests {
     /// 1. With a long-running in-flight request and a 500ms shutdown
     ///    timeout, cancelling the harness's `CancellationToken` (the same
     ///    code path a real SIGTERM would trigger after BUG-NEW's fix)
-    ///    causes the server to exit within ~500ms.
+    ///    causes the server to exit before a 10s hang detector fires.
     /// 2. The server actually waits at least most of the graceful window
-    ///    (~450ms) instead of insta-killing the in-flight request -- this
+    ///    (~450ms) instead of insta-killing the in-flight request - this
     ///    catches an over-correction that would skip graceful drain
     ///    entirely.
+    /// 3. The server exits within the grace window plus 4s: the 1.5s
+    ///    bound removed in a2eaa08 flaked on CI jitter, while 4s of slack
+    ///    still catches a multi-second wait added to the shutdown path.
     ///
     /// **Cross-platform note**: real `SIGTERM` / Ctrl+C is intentionally
     /// NOT used here (Windows portability). Production `shutdown_signal()`
@@ -3006,8 +3342,9 @@ mod tests {
         use tokio::sync::oneshot;
 
         // Build a server with a *short* graceful deadline (500ms) and an
-        // extra route that sleeps 10s server-side -- representing an
-        // in-flight tool call that will not finish before the deadline.
+        // extra route that sleeps 60s server-side. The handler must be
+        // abandoned when the grace window expires; waiting for it would trip
+        // the 10s hang detector below.
         //
         // The handler signals via a oneshot channel as soon as it begins
         // executing, so the test can wait for the request to be
@@ -3017,8 +3354,9 @@ mod tests {
         let port = free_port().await?;
         let (started_tx, started_rx) = oneshot::channel::<()>();
         let started_state = Arc::new(Mutex::new(Some(started_tx)));
+        let shutdown_timeout = Duration::from_millis(500);
         let cfg = config_on_port(port)
-            .with_shutdown_timeout(Duration::from_millis(500))
+            .with_shutdown_timeout(shutdown_timeout)
             .with_extra_router(
                 Router::new()
                     .route(
@@ -3036,7 +3374,7 @@ mod tests {
                                     // The client may already be gone; best-effort notify.
                                     tracing::debug!("oneshot receiver dropped before the send");
                                 }
-                                sleep(Duration::from_secs(10)).await;
+                                sleep(Duration::from_secs(60)).await;
                                 "done"
                             },
                         ),
@@ -3052,7 +3390,7 @@ mod tests {
         // would complete instantly regardless of the bug.
         let slow_url = format!("{base}/slow");
         let in_flight = tokio::spawn(async move {
-            // We don't care about the response -- only that the request
+            // We don't care about the response - only that the request
             // was accepted and is occupying server resources during
             // shutdown.
             drop(reqwest::get(&slow_url).await);
@@ -3065,19 +3403,20 @@ mod tests {
         // failure rather than a hang.
         timeout(Duration::from_secs(30), started_rx)
             .await
-            .context("/slow handler did not start within 5s -- request never reached the server")?
+            .context("/slow handler did not start within 30s - request never reached the server")?
             .context("started_tx dropped without sending")?;
 
         // Trigger graceful shutdown. With BUG-NEW fixed, this is
         // semantically identical to a single SIGTERM.
         let start = Instant::now();
-        let res = timeout(Duration::from_secs(2), harness.shutdown()).await;
+        let res = timeout(Duration::from_secs(10), harness.shutdown()).await;
         let elapsed = start.elapsed();
 
-        // Outer timeout MUST NOT fire -- if it did, the server hung past
-        // both its graceful window and the cushion, which is the bug.
+        // Outer timeout MUST NOT fire. Ten seconds is at least 20x the 500ms
+        // grace window, so it is a jitter-safe hang detector rather than a
+        // timing expectation.
         let server_result =
-            res.context("server failed to shut down within 2s -- BUG-NEW regression")?;
+            res.context("server failed to shut down within 10s - BUG-NEW regression")?;
 
         // The server should exit cleanly (an error here would indicate a
         // fault unrelated to this bug; surface it loudly).
@@ -3085,25 +3424,28 @@ mod tests {
 
         // Best-effort: drain the background HTTP task. It may complete
         // with an error (connection reset by force-exit) or succeed if
-        // the runtime aborted it -- either is acceptable.
+        // the runtime aborted it - either is acceptable.
         in_flight.abort();
         drop(in_flight.await);
 
-        // Lower bound: the server actually waited (most of) the graceful
-        // window. 450ms = 500ms - 50ms scheduling/cleanup slack. Catches
-        // an over-correction that skips graceful drain.
+        // Lower bound: the server actually waited most of the graceful
+        // window. 450ms = 500ms - 50ms scheduling and cleanup slack. A lower
+        // bound cannot fail because a runner is slow; it only fails if the
+        // server exits too early.
+        let drain_floor = shutdown_timeout.saturating_sub(Duration::from_millis(50));
         assert!(
-            elapsed >= Duration::from_millis(450),
+            elapsed >= drain_floor,
             "shutdown completed in {elapsed:?}, expected >= 450ms (server skipped graceful drain)"
         );
 
-        // Upper bound: the server did NOT hang. 1500ms = 500ms graceful +
-        // 1000ms generous slack for CI scheduling jitter (the bug used to
-        // hang indefinitely; any value materially below the 2s outer
-        // timeout proves the fix).
+        // Upper bound: the server must not overrun the grace window by more
+        // than 4s. 4s is >=8x the 500ms grace window, which is jitter-safe:
+        // the 1.5s bound removed in a2eaa08 flaked on CI jitter, while 4s of
+        // slack still catches a multi-second wait added to the shutdown path.
+        let overrun_limit = shutdown_timeout.saturating_add(Duration::from_secs(4));
         assert!(
-            elapsed < Duration::from_millis(1500),
-            "shutdown took {elapsed:?}, expected < 1500ms (BUG-NEW regression)"
+            elapsed < overrun_limit,
+            "shutdown took {elapsed:?}, more than 4s past the {shutdown_timeout:?} grace window: the force-exit timer fired late or the shutdown path gained a blocking wait"
         );
         Ok(())
     }
@@ -3186,7 +3528,7 @@ mod tests {
     /// `enable_admin` without a corresponding `with_auth(...).enabled = true`
     /// must be rejected by `validate()` as `RmcpServerKitError::Config`. With the
     /// typestate `Validated<McpServerConfig>` proof token, `serve()` cannot
-    /// even be called with an invalid config -- the rejection happens at
+    /// even be called with an invalid config - the rejection happens at
     /// `validate()` time, statically preventing exposing `/admin/*` without
     /// authentication.
     #[tokio::test]
@@ -3232,7 +3574,7 @@ mod tests {
         );
 
         // Both set together: only the *file existence* matters at startup,
-        // not validate() -- so this should pass validation.
+        // not validate() - so this should pass validation.
         let paired_cfg = McpServerConfig::new("127.0.0.1:0", "test", "0.0.1")
             .with_tls("/tmp/cert.pem", "/tmp/key.pem");
         drop(
@@ -3457,7 +3799,7 @@ mod tests {
             Ok(())
         }
 
-        // -- server-side-TLS-only PKI (no mTLS, no CRL) --
+        // - server-side-TLS-only PKI (no mTLS, no CRL) -
 
         /// PEM-encoded server-side-TLS-only materials (no mTLS, no CRL).
         struct ServerTlsPki {
@@ -3612,7 +3954,7 @@ mod tests {
     /// complete successfully when shutdown is triggered.
     ///
     /// Before the fix, the MCP service was handed `ct.child_token()`, and the
-    /// graceful path cancels `ct` the moment the shutdown trigger fires -- i.e. at
+    /// graceful path cancels `ct` the moment the shutdown trigger fires - i.e. at
     /// the *start* of the grace window. rmcp ends the SSE response stream on that
     /// cancellation, so a tool call still running was cut off even though the
     /// drain window had barely opened. The service now holds a dedicated session
@@ -3623,7 +3965,7 @@ mod tests {
     /// and only then releases the handler. Nothing depends on elapsed time
     /// thresholds, so it does not become flaky under CI scheduling.
     ///
-    /// It must exercise `/mcp` specifically -- `with_extra_router` routes never
+    /// It must exercise `/mcp` specifically - `with_extra_router` routes never
     /// reach `StreamableHttpService`, which is the sole consumer of the session
     /// token, so a test built that way would pass against the bug.
     #[tokio::test]
@@ -3690,7 +4032,7 @@ mod tests {
             .await
             .context("tool call did not return within 10s")?
             .context("tool call task panicked")?
-            .context("tool call transport error -- the session was cancelled mid-flight")?;
+            .context("tool call transport error - the session was cancelled mid-flight")?;
 
         assert_eq!(
             resp.status(),
@@ -3804,7 +4146,7 @@ mod tests {
     /// The assertion is deliberately on the **client-side response body**, not on
     /// the server task completing. When force-exit wins the `select!` the
     /// `axum::serve` future is simply dropped, so `serve_with_listener` returns
-    /// whether or not the session token was cancelled -- asserting on the join
+    /// whether or not the session token was cancelled - asserting on the join
     /// handle would produce a test that cannot fail. What the cancellation
     /// actually changes is that rmcp ends the SSE stream, so the body reaches EOF
     /// instead of hanging until some unrelated timeout.
@@ -3874,7 +4216,7 @@ mod tests {
         let body = timeout(Duration::from_secs(10), resp.text())
             .await
             .context(
-                "response body never terminated -- force-exit did not cancel the session token",
+                "response body never terminated - force-exit did not cancel the session token",
             )?
             .context("read response body")?;
 

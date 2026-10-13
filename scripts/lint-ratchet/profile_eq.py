@@ -137,6 +137,34 @@ def diff_clippy(sample: dict, actual: dict) -> list[str]:
     return diffs
 
 
+def _duplicate_crate_name(entry) -> str | None:
+    """Crate name out of one ``allowed-duplicate-crates`` or ``[bans] skip``
+    entry.  Accepts a plain ``"name"``/``"name@version"`` string, or a table
+    with a ``crate`` or ``name`` key (the two spellings cargo-deny's schema
+    allows for ``[[bans.skip]]``)."""
+    if isinstance(entry, str):
+        return entry.split("@", 1)[0]
+    if isinstance(entry, dict):
+        return entry.get("crate") or entry.get("name")
+    return None
+
+
+def diff_duplicate_mirror(clippy_actual: dict, deny: dict) -> list[str]:
+    """``allowed-duplicate-crates`` in clippy.toml vs ``[bans] skip`` in
+    deny.toml must name the same crates (several skip entries for different
+    versions of one crate count as one name)."""
+    clippy_names = {n for e in clippy_actual.get("allowed-duplicate-crates", [])
+                    if (n := _duplicate_crate_name(e)) is not None}
+    deny_names = {n for e in deny.get("bans", {}).get("skip", [])
+                  if (n := _duplicate_crate_name(e)) is not None}
+    diffs: list[str] = []
+    for name in sorted(clippy_names - deny_names):
+        diffs.append(f"{name}: in clippy.toml allowed-duplicate-crates, missing from deny.toml [bans] skip")
+    for name in sorted(deny_names - clippy_names):
+        diffs.append(f"{name}: in deny.toml [bans] skip, missing from clippy.toml allowed-duplicate-crates")
+    return diffs
+
+
 def check(root: Path, clippy_toml: bool = False):
     core_path = root / CORE_REL
     core_text = core_path.read_text(encoding="utf-8")
@@ -163,6 +191,12 @@ def check(root: Path, clippy_toml: bool = False):
             sample = tomllib.loads(sample_fence)
             actual = tomllib.loads((root / "clippy.toml").read_text(encoding="utf-8"))
             diffs.extend(diff_clippy(sample, actual))
+            deny_path = root / "deny.toml"
+            if deny_path.exists():
+                deny = tomllib.loads(deny_path.read_text(encoding="utf-8"))
+                diffs.extend(diff_duplicate_mirror(actual, deny))
+            else:
+                diffs.append("deny.toml: not found, cannot check the duplicate-crate mirror")
 
     return (not diffs), diffs
 
@@ -238,12 +272,14 @@ def _self_test() -> int:
         "allowed-duplicate-crates = [\"sha2@0.10\"]\n"
         "doc-valid-idents = [\"..\", \"McpServer\"]\n"
     )
+    deny_ok = "[[bans.skip]]\nname = \"sha2\"\nversion = \"0.10\"\n"
 
-    def build(td, cargo_text, clippy_text, deltas_text):
+    def build(td, cargo_text, clippy_text, deltas_text, deny_text=deny_ok):
         (Path(td) / "docs/rust-guidelines").mkdir(parents=True)
         (Path(td) / CORE_REL).write_bytes(md.encode("utf-8"))
         (Path(td) / "Cargo.toml").write_bytes(cargo_text.encode("utf-8"))
         (Path(td) / "clippy.toml").write_bytes(clippy_text.encode("utf-8"))
+        (Path(td) / "deny.toml").write_bytes(deny_text.encode("utf-8"))
         (Path(td) / "scripts/lint-ratchet").mkdir(parents=True)
         (Path(td) / "scripts/lint-ratchet/profile-deltas.toml").write_bytes(deltas_text.encode("utf-8"))
 
@@ -281,6 +317,51 @@ def _self_test() -> int:
         (Path(td) / CORE_REL).write_bytes(md.replace("\n", "\r\n").encode("utf-8"))
         ok, diffs = check(Path(td))
         check_cond("crlf fence parses", ok and not diffs)
+
+    # duplicate-crate mirror: clippy.toml allowed-duplicate-crates
+    # vs deny.toml [bans] skip must name the same crates.
+    with tempfile.TemporaryDirectory() as td:
+        clippy_two = clippy_ok.replace(
+            "allowed-duplicate-crates = [\"sha2@0.10\"]",
+            "allowed-duplicate-crates = [\"sha2@0.10\", \"rand@0.8\"]",
+        )
+        deny_two = deny_ok + "\n[[bans.skip]]\nname = \"rand\"\nversion = \"0.8\"\n"
+        build(td, cargo_ok, clippy_two, "# empty\n", deny_two)
+        ok, diffs = check(Path(td), clippy_toml=True)
+        check_cond("duplicate mirror: equal sets pass", ok and not diffs)
+
+    with tempfile.TemporaryDirectory() as td:
+        clippy_extra = clippy_ok.replace(
+            "allowed-duplicate-crates = [\"sha2@0.10\"]",
+            "allowed-duplicate-crates = [\"sha2@0.10\", \"orphan-crate\"]",
+        )
+        build(td, cargo_ok, clippy_extra, "# empty\n")  # deny_ok mirrors sha2 only
+        ok, diffs = check(Path(td), clippy_toml=True)
+        check_cond("duplicate mirror: missing-in-deny fails", not ok)
+        check_cond("duplicate mirror: missing-in-deny names the crate and side",
+                   any("orphan-crate" in d and "deny.toml" in d for d in diffs))
+
+    with tempfile.TemporaryDirectory() as td:
+        deny_extra = deny_ok + "\n[[bans.skip]]\nname = \"orphan-crate\"\nversion = \"1.0\"\n"
+        build(td, cargo_ok, clippy_ok, "# empty\n", deny_extra)
+        ok, diffs = check(Path(td), clippy_toml=True)
+        check_cond("duplicate mirror: missing-in-clippy fails", not ok)
+        check_cond("duplicate mirror: missing-in-clippy names the crate and side",
+                   any("orphan-crate" in d and "clippy.toml" in d for d in diffs))
+
+    with tempfile.TemporaryDirectory() as td:
+        clippy_multi = clippy_ok.replace(
+            "allowed-duplicate-crates = [\"sha2@0.10\"]",
+            "allowed-duplicate-crates = [\"sha2@0.10\", \"rand\"]",
+        )
+        deny_multi = (
+            deny_ok
+            + "\n[[bans.skip]]\nname = \"rand\"\nversion = \"0.8\"\n"
+            + "\n[[bans.skip]]\ncrate = \"rand\"\nversion = \"0.9\"\n"
+        )
+        build(td, cargo_ok, clippy_multi, "# empty\n", deny_multi)
+        ok, diffs = check(Path(td), clippy_toml=True)
+        check_cond("duplicate mirror: multi-version skip counts as one name", ok and not diffs)
 
     if failures:
         for f in failures:

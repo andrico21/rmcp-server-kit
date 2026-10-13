@@ -5,18 +5,18 @@
 //!
 //! - `extract_cdp_urls` validates schemes, drops malformed URLs, and
 //!   filters HTTP per `crl_allow_http`.
-//! - The reqwest client configuration matches what `CrlSet::new` builds
-//!   (redirect=none, `connect_timeout=3s`) so any deviation is loud.
+//! - The reqwest client redirect policy matches what `build_crl_http_client`
+//!   builds (redirect=none) so any deviation is loud.
 //! - End-to-end behaviors against `wiremock`:
 //!   - Successful CRL fetch through the full pipeline.
 //!   - Body cap rejects oversized responses.
 //!   - Redirect policy rejects 30x.
 //!
-//! The SSRF *blocked-IP* defense (loopback / metadata / RFC1918 / etc.) is
-//! covered by the `ssrf_guard` unit tests inside `mtls_revocation.rs`
-//! because exercising it in an integration test would require resolving
-//! attacker-controlled hostnames to private IPs (which `wiremock` cannot
-//! provide). The unit tests there cover all 12 IP classes exhaustively.
+//! The SSRF blocked-IP classifier is covered by the `ip_block_reason` unit
+//! tests in `src/ssrf.rs`; CRL fetch rejection is covered by
+//! `reject_blocked_crl_ip` and `fetch_crl` unit tests in
+//! `src/mtls_revocation.rs`. `tests/integration/crl_trusted_origin.rs` covers
+//! the operator-trusted exception end to end.
 #[cfg_attr(
     target_os = "linux",
     expect(
@@ -57,7 +57,7 @@ mod tests {
         matchers::{method, path},
     };
 
-    // -- helpers -----------------------------------------------------------------
+    // - helpers -----------------------------------------------------------------
 
     fn build_ca() -> anyhow::Result<CertifiedIssuer<'static, KeyPair>> {
         let mut params = CertificateParams::new(Vec::<String>::new()).context("ca params")?;
@@ -108,9 +108,11 @@ mod tests {
         Ok(der.as_ref().to_vec())
     }
 
-    /// Construct the same `reqwest::Client` shape that `CrlSet::new` builds.
-    /// Kept here (not imported) so any production-side regression that loosens
-    /// the policy is caught by these tests failing.
+    /// Construct a `reqwest::Client` with `build_crl_http_client`'s redirect
+    /// policy.
+    ///
+    /// Kept here (not imported) so any production-side regression that
+    /// loosens the policy is caught by these tests failing.
     fn build_hardened_client() -> anyhow::Result<reqwest::Client> {
         // reqwest is built with rustls-no-provider; install ring for tests.
         drop(ring::default_provider().install_default());
@@ -124,7 +126,7 @@ mod tests {
             .context("hardened client builds")
     }
 
-    // -- Q1: extract_cdp_urls schema validation ---------------------------------
+    // - Q1: extract_cdp_urls schema validation ---------------------------------
 
     /// Pins that only HTTPS CDP URLs survive when `crl_allow_http` is false.
     #[test]
@@ -198,7 +200,7 @@ mod tests {
         Ok(())
     }
 
-    // -- Q2: hardened client refuses redirects ----------------------------------
+    // - Q2: hardened client refuses redirects ----------------------------------
 
     /// Pins that the hardened client surfaces a 302 without following it.
     #[tokio::test]
@@ -232,7 +234,7 @@ mod tests {
         Ok(())
     }
 
-    // -- Q3: hardened client returns 5xx upstream errors as errors --------------
+    // - Q3: hardened client returns 5xx upstream errors as errors --------------
 
     /// Pins that a 5xx upstream response surfaces as an error.
     #[tokio::test]
@@ -258,7 +260,7 @@ mod tests {
         Ok(())
     }
 
-    // -- Q4: streaming body-cap behavior (chunk-loop semantics) -----------------
+    // - Q4: streaming body-cap behavior (chunk-loop semantics) -----------------
 
     /// Pins that the chunked cap loop trips on an oversized response body.
     #[tokio::test]
@@ -343,7 +345,7 @@ mod tests {
         Ok(())
     }
 
-    // -- Q5: test-cert with no CDP URLs -----------------------------------------
+    // - Q5: test-cert with no CDP URLs -----------------------------------------
 
     /// Pins that a cert without a CDP extension yields no URLs.
     #[test]

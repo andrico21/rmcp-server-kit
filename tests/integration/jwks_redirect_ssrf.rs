@@ -224,7 +224,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // 1.4.0 -- Operator SSRF allowlist (no `__test_allow_loopback_ssrf`)
+    // 1.4.0 - Operator SSRF allowlist (no `__test_allow_loopback_ssrf`)
     // ---------------------------------------------------------------------------
     //
     // These tests exercise the *real* post-DNS screening path against a
@@ -243,8 +243,8 @@ mod tests {
         install_crypto_provider();
 
         let mock = MockServer::start().await;
-        // Resolve via DNS so the post-DNS screening path -- not the
-        // literal-IP rejector -- is what gates the request.
+        // Resolve via DNS so the post-DNS screening path - not the
+        // literal-IP rejector - is what gates the request.
         let base = mock.uri().replace("127.0.0.1", "localhost");
         let jwks_doc = synthetic_jwks(1);
 
@@ -351,7 +351,7 @@ mod tests {
         config.allow_http_oauth_urls = true;
 
         // Deliberately permissive allowlist. The metadata IP MUST still be
-        // rejected on the redirect hop -- this pins the cloud-metadata
+        // rejected on the redirect hop - this pins the cloud-metadata
         // carve-out invariant.
         let mut allowlist = OAuthSsrfAllowlist::default();
         allowlist.cidrs.push("169.254.0.0/16".into());

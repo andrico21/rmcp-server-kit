@@ -70,6 +70,12 @@ escape hatch for a trusted gateway that deliberately re-authenticates each
 request under different labels. It also reinstates the CWE-384 risk: any leaked
 raw rmcp session ID can again be replayed by another authenticated identity.
 
+A bound `Mcp-Session-Id` is still correlation metadata. An unbound raw rmcp
+session ID is replayable if it leaks. `server.log_context.session_id_header =
+"mask"` limits exposure in full request-header logs by revealing only the first
+and last 4 characters for long values, but it is no substitute for leaving
+`session_binding = true`.
+
 Multi-replica deployments that configure `McpServerConfig::with_session_store`
 must also configure a shared `server.session_binding_secret` (or the
 `RMCP_SERVER_KIT__SERVER__SESSION_BINDING_SECRET_FILE` environment variable).
@@ -99,13 +105,13 @@ MCP tasks (SEP-2663) hand the client a long-lived `taskId` that is later
 presented to `tasks/get`, `tasks/update`, and `tasks/cancel`. Upstream `rmcp`
 resolves those calls **by task ID alone**, and this crate's RBAC layer inspects
 only `tools/call`. Without binding, any *authenticated* identity holding another
-identity's task ID can read, update, or cancel that task -- the same
+identity's task ID can read, update, or cancel that task - the same
 leaked-identifier-as-bearer-capability problem session binding solves.
 
 When enabled, the task ID returned to the client is a signed wrapper bound to
 the authenticated identity, verified and rewritten back to the raw ID before the
-consumer's handler sees it. A wrapper that fails verification -- malformed, not
-wrapped, signed for a different identity, or signed under a rotated secret --
+consumer's handler sees it. A wrapper that fails verification - malformed, not
+wrapped, signed for a different identity, or signed under a rotated secret -
 is rejected with exactly the error `rmcp` returns for a genuinely unknown task,
 so the check cannot be used to probe whether another identity's task exists.
 
@@ -133,6 +139,39 @@ enabling it changes the wire format of `taskId` values.
   `task_status_notifications_remain_unroutable_until_binding_is_added` fails
   when that upstream change lands.
 
+## Argon2id verification admission control
+
+Every bearer-token attempt runs one Argon2id verification per configured
+API key, on the blocking thread pool, with this crate's default cost
+parameters costing roughly 27-52 ms of CPU (depending on concurrency) and
+about 19 MiB of memory each. Without
+a bound, concurrent invalid-bearer traffic can drive memory and latency up
+without limit. `AuthState` bounds admission into that work with a permit
+pool (`AuthConfig::max_concurrent_verifications`, default
+`available_parallelism()` clamped to `1..=16`): a request that cannot get a
+permit within `AuthConfig::verification_wait` (default 1 second) receives
+`503 Service Unavailable` with `Retry-After: 1` instead of queuing
+unboundedly, and this outcome is counted separately
+(`failure_overloaded` in `/admin/auth/counters`) rather than as a failed
+credential, so it does not consume the post-failure rate-limit budget.
+
+**Residual risk, stated plainly:** a sustained flood can keep legitimate
+callers receiving bounded-latency `503`s for as long as it lasts; the
+bound limits memory and per-request latency, it does not make the service
+unaffected by the attack. A legitimate burst larger than the pool can drain
+within `verification_wait` also receives `503`; see
+[capacity planning](docs/GUIDE.md#capacity-planning) in the guide. Pair it with
+[`RateLimitConfig`'s pre-auth gate](docs/GUIDE.md#ratelimitconfig), which
+throttles by source IP before any Argon2id work runs, for defense in
+depth. The permit pool itself cannot be disabled, but it is on by
+default with a resolved size (`available_parallelism()` clamped to
+`1..=16`) and a 1 second wait, not an explicit operator choice; the
+per-IP pre-auth rate limiter is opt-in (`AuthConfig::rate_limit`
+defaults to `None`, which is why the examples now configure it). A configured
+value above `tokio::sync::Semaphore::MAX_PERMITS` is clamped to that
+ceiling, making the permit pool effectively unbounded rather than a startup
+panic.
+
 ## Certificate revocation
 
 > ✅ **rmcp-server-kit performs CDP-driven CRL revocation
@@ -146,9 +185,14 @@ When mTLS is enabled, rmcp-server-kit:
 1. At startup, scans the configured CA chain for the X.509 **CRL Distribution
    Points** (CDP) extension and fetches each referenced CRL via HTTP(S),
    bounded by a 10-second total bootstrap deadline.
-2. On each new client certificate observed during a TLS handshake, lazily
-   discovers any additional CDP URLs the leaf or intermediates point at and
-   schedules them for fetch.
+2. On each new client chain observed during a TLS handshake, lazily
+   discovers any additional CDP URLs named by the end entity or by
+   intermediates on a verified path of a presented chain (a path to the
+   configured roots that verifies as the live verifier would, except that
+   revocation is not considered; checked before the client proves key
+   possession) and schedules them for fetch. A chain that does not verify
+   contributes no URL, and certificates on no verified path contribute none
+   either.
 3. Caches every CRL in memory keyed by URL and refreshes it before
    `nextUpdate` (clamped to `[10 min, 24 h]`) on a background task.
 4. Hot-swaps the underlying `rustls::ClientCertVerifier` via `ArcSwap` once
@@ -197,8 +241,10 @@ crl_retry_retention      = "24h"    # keep failed-refresh entries for retry only
   the cache; bootstrap re-fetches everything within the 10 s deadline.
 - **CDP URLs are honoured after SSRF normalisation, not rewritten.**
   rmcp-server-kit does not proxy or pin CDP URLs, but it does enforce a
-  scheme allowlist, reject userinfo, and refuse private/loopback/link-local/
-  cloud-metadata IP literals before issuing the fetch (see
+  scheme allowlist, reject userinfo, and refuse private/loopback/link-local
+  IP literals before issuing the fetch, unless the URL's origin is named in
+  the operator's configured certificates (cloud-metadata literals are
+  refused regardless; see
   [CRL fetch SSRF hardening](#crl-fetch-ssrf-hardening) below).
   Operators must still ensure their issuing CA's CDP host is reachable
   from the server's network.
@@ -212,10 +258,17 @@ crl_retry_retention      = "24h"    # keep failed-refresh entries for retry only
 
 ### CRL fetch SSRF hardening
 
-CRL Distribution Point URLs are extracted from X.509 extensions on
-attacker-influenceable client certificates, so the CRL fetcher is treated
-as a hostile-input network call. Before any HTTP request is issued,
-`src/mtls_revocation.rs::ssrf_guard` rejects URLs that:
+CRL Distribution Point URLs are discovered only from the end entity and the
+intermediates on a verified path of a presented chain, so they are chosen by
+the CAs that issued those certificates. They are still treated
+as hostile input, so the CRL fetcher is a hostile-input network call. The CA
+signature protects a CRL's contents,
+not the outbound request, which is why the fetch is screened. Before any HTTP
+request is issued, `check_scheme` in `src/ssrf.rs` enforces the scheme and
+userinfo checks, and `fetch_crl` screens resolved addresses through
+`reject_blocked_crl_ip` and `ip_block_reason`. `SsrfScreeningResolver` in
+`src/ssrf_resolver.rs` re-screens at connect time. Together these checks reject
+URLs that:
 
 - Use a scheme other than `http://` or `https://` (`ftp://`, `file://`,
   `gopher://`, `data:`, `dict://`, etc. are all denied).
@@ -224,7 +277,9 @@ as a hostile-input network call. Before any HTTP request is issued,
   unspecified/broadcast IPv4 or IPv6 address, including the cloud
   metadata endpoints `169.254.169.254` and `fd00:ec2::254`, IPv4-mapped
   IPv6 `::ffff:0:0/96`, IPv4-compatible IPv6, IPv6 unique-local
-  `fc00::/7`, IPv6 link-local `fe80::/10`, and the IPv6 loopback `::1`.
+  `fc00::/7`, IPv6 site-local `fec0::/10`, IPv6 benchmarking
+  `2001:2::/48`, ORCHID `2001:10::/28`, ORCHIDv2 `2001:20::/28`, IPv6
+  link-local `fe80::/10`, and the IPv6 loopback `::1`.
 
 In addition the fetcher applies four bounded-resource caps to limit
 SSRF/DoS amplification even if a CRL host is reachable:
@@ -246,6 +301,51 @@ operator-unintended host has no security benefit.
 Discovery URLs containing IP literals are normalized
 (rejecting octal/hex/percent-encoded obfuscation) before the SSRF check.
 
+#### Operator-trusted CRL/AIA origins
+
+There is no configurable CRL allowlist. Instead, at startup the server
+collects the URIs in the CRL Distribution Points and Authority Information
+Access (caIssuers, OCSP) extensions of every certificate in `mtls.ca_cert_path`
+and in the server's own TLS certificate chain (`tls_cert_path`), reduces each
+to its origin (scheme, lowercased host, effective port), and trusts that set
+automatically: a CRL fetch whose URL origin is in it skips the
+private-address block above. Cloud-metadata addresses stay blocked even for a
+trusted origin. The trusted origins are logged once at startup (`INFO`,
+count and sorted list) so an operator can audit what bypasses the screening.
+
+Residuals an operator should know:
+
+- A chain that does not verify against the configured roots triggers no
+  fetch, and certificates on no verified path contribute nothing to
+  discovery, so a client without a valid chain cannot make the
+  server request a path on a trusted origin. Their CDP URLs still count
+  toward the per-handshake 64-URL malformed-certificate cap and the
+  fail-closed availability precheck (every presented certificate's URLs by
+  default, only the end entity's with `crl_end_entity_only = true`), which
+  can only reject that presenting client's own handshake. Anyone holding a
+  copy of a valid chain (public bytes only, revoked or not) can trigger
+  fetches of exactly the CDP URLs chosen by the CAs that issued the
+  certificates on its verified paths, and on a trusted origin those are
+  fetched with the private-address block skipped.
+- Trust is bound to the hostname, not a pinned address: if a trusted host's
+  DNS is compromised, the fetch reaches whatever address it resolves to,
+  with the private-address block skipped for that request. The connect-time
+  re-screen is origin-exact: only a URL whose exact origin (scheme, host,
+  and port) is trusted is fetched by the client whose resolver admits the
+  trusted hostnames; every other URL uses a client that admits no blocked
+  address, so a DNS change cannot carry a trusted hostname onto another
+  port.
+- Because the server certificate chain is a source, a publicly issued server
+  certificate makes its CA's public CRL and OCSP hosts trusted too (the
+  startup `INFO` log lists them).
+- A trusted origin must use a DNS hostname or an IPv4 literal; IPv6-literal
+  hosts are not fetched and fail closed.
+
+Coverage limit: when neither the CA bundle nor the server chain names the
+PKI host - for example a bundle holding only a self-signed root with no CDP
+or AIA extension - nothing is trusted for that PKI. Add the issuing CA
+certificate (the one carrying the CDP/AIA extensions) to `mtls.ca_cert_path`.
+
 #### IPv6 transition prefixes
 
 The IP range guard shared by the CRL and OAuth fetchers also classifies
@@ -263,29 +363,63 @@ IPv6 transition-mechanism prefixes:
   protocol is obsolete, its embedded client address is XOR-obfuscated and
   attacker-chosen, and no legitimate JWKS/CRL endpoint is reachable only
   via Teredo.
+- **Site-local `fec0::/10` (RFC 3879), benchmarking `2001:2::/48`
+  (RFC 5180), ORCHID `2001:10::/28` (RFC 4843), and ORCHIDv2
+  `2001:20::/28` (RFC 7343)**: blocked by default as special-purpose
+  IPv6 space. OAuth and JWKS fetches can re-allow them with a narrow
+  operator CIDR allowlist; CRL fetches re-allow them only when the
+  resolved origin is named in the operator's configured certificates (see
+  "Operator-trusted CRL/AIA origins" above), never via a CIDR allowlist.
+
+The classifier intentionally does not decode discard-only `100::/64`
+(RFC 6666), because traffic to that prefix is dropped rather than
+reaching a confidentiality target. It also does not decode ISATAP
+interface identifiers under global prefixes: the same bit patterns occur
+in ordinary global addresses, so generic decoding would misclassify them.
 
 ### CRL discovery under adversarial load
 
-CDP URLs are extracted from client certificates **before** chain
-validation. This ordering is a deliberate, load-bearing invariant: with
-`crl_deny_on_unavailable = true` the verifier must be able to fail
-closed on a never-fetched CDP, which requires discovering the CDP before
-delegating to the inner verifier. No HTTP happens on the handshake path -
-discovery only enqueues onto a bounded, rate-limited channel, and the
-actual fetch runs on a background task behind the full SSRF guard.
+CDP URLs are extracted from client certificates **before** the
+revocation-checking inner verifier runs. This ordering is a deliberate,
+load-bearing invariant: with `crl_deny_on_unavailable = true` the verifier
+must be able to fail closed on a never-fetched CDP, which requires
+discovering the CDP before delegating to the inner verifier. Since 3.20.0
+admission to discovery additionally requires a verified path: the server
+enumerates every path from the presented chain to the configured roots (same
+roots, same signature algorithms and client-auth usage as the live verifier,
+revocation not considered, byte-identical duplicate intermediates ignored,
+within webpki's per-call path-building budget), once per handshake and only
+when a presented CDP URL is new, and admits only the URLs named by the end
+entity or by intermediates on those paths. This
+check runs before the client proves key possession, so it describes the
+presented chain, not the client. A chain that does not verify admits nothing
+and consumes no discovery budget, so throwaway certificates submit no URL.
+The per-handshake 64-URL cap and the fail-closed precheck still run on every
+relevant presented CDP URL (every presented certificate's by default, only the
+end entity's with `crl_end_entity_only = true`), including those of
+certificates on no verified path, so such certificates are excluded from
+discovery but not, by default, from the cap or the precheck. A chain that
+offers dozens of distinct alternative paths can exhaust that budget before
+the path the live verifier accepts; see docs/MIGRATION.md. No HTTP
+happens on the handshake path - discovery only enqueues onto a bounded,
+rate-limited channel, and the actual fetch runs on a background task behind
+the full SSRF guard.
 
 The residual cost of that ordering is a bounded griefing window, now
 **scoped per source peer IP** for attributed TLS handshakes. Discovery
 admission is keyed on the peer address: the TLS accept worker installs the
 handshake peer's IP in a task-local that the synchronous
 `ClientCertVerifier` callback reads, so each peer draws on its own
-per-minute `crl_discovery_rate_per_min` budget. An **unauthenticated**
-peer presenting throwaway certificates carrying unique CDP URLs can still
-exhaust *its own* budget and fill `crl_max_seen_urls` slots, but it can no
+per-minute `crl_discovery_rate_per_min` budget. Only a holder of a copy of a
+valid chain (public bytes, revoked or not) can submit URLs: it can exhaust
+*its own* budget and fill `crl_max_seen_urls` slots, but only with CDP URLs
+chosen by the CAs that issued the certificates on its verified paths, and it
+can no
 longer drain a shared bucket and thereby starve a concurrent legitimate
 peer's discovery of a *new* CDP URL - the fail-closed denial under
 `crl_deny_on_unavailable = true` that such starvation used to cause is
-removed. Earlier releases stated per-source-IP budgeting was "not possible
+removed. Throwaway certificates that do not verify no longer reach the
+budget at all. Earlier releases stated per-source-IP budgeting was "not possible
 at this layer" because `rustls`'s `ClientCertVerifier` callback has no
 access to the peer address; that is no longer true - the address is carried
 to the callback out of band via the task-local, without changing the
@@ -293,9 +427,10 @@ callback signature.
 
 This is not a complete DoS defense, and the trade-offs are deliberate:
 
-- Per-IP keying does **not** defeat a *distributed* attacker; a sprayer
-  controlling many source IPs cycles through fresh per-peer budgets. Each
-  sprayed IP still pays a full TLS handshake, matching the default posture
+- Per-IP keying does **not** defeat a *distributed* holder of a valid chain;
+  a sprayer controlling many source IPs cycles through fresh per-peer
+  budgets. Each sprayed IP still pays a full TLS handshake and needs a copy
+  of a valid client chain, matching the default posture
   of the bearer pre-auth limiter elsewhere in this crate.
 - The key is the **direct** peer IP. Behind a TCP load balancer that
   terminates the connection, that is the balancer's address, not the
@@ -320,7 +455,11 @@ Operator guidance:
   otherwise the global fallback bucket). This is the observable signature
   of a discovery spray or of an undersized `crl_discovery_rate_per_min`.
   The line is throttled to at most one per minute, so it is a
-  flood-resistant signal rather than a per-URL audit trail.
+  flood-resistant signal rather than a per-URL audit trail. A spray of
+  certificates that do not verify no longer produces these lines (it
+  consumes no discovery budget); apart from the throttled per-handshake
+  URL-cap warning for a certificate over the cap, it shows only as handshake
+  failures at debug level (`TLS handshake failed from <addr>`).
 - Alert **separately** on `discovery_unattributed_fallback` WARN log lines
   - discovery ran with no handshake peer scope, so per-peer protection was
   **not** active and admission fell back to the global bucket. On the
@@ -332,8 +471,10 @@ Operator guidance:
 - Size `crl_max_seen_urls` and `crl_max_cache_entries` to comfortably
   exceed your CA estate's real CDP count, especially with
   `crl_deny_on_unavailable = true`: at the cache cap the **newest** entry
-  is rejected (never an existing one - LRU eviction would let an attacker
-  evict the legitimate warm set by spamming throwaway CDP URLs), so a
+  is rejected (never an existing one - LRU eviction would let any source of
+  many distinct CDP URLs, which since 3.20.0 takes certificates on a
+  verified path such as those of a misbehaving issuing CA, evict the
+  legitimate warm set), so a
   full cache means newly discovered legitimate CDPs cannot enter until
   capacity frees up.
 - Pre-seed the cache via the startup bootstrap: CDPs present in the
@@ -444,6 +585,13 @@ applies three resource-exhaustion caps:
 | `reqwest` default              | `10`          | Hard limit on the number of HTTP redirects followed during a fetch (not user-tunable).       |
 | `OauthHttpClient` timeout      | `30 s`        | Total timeout for an OAuth-bound HTTP request (default).                                     |
 
+JWKS refresh is single-flight per cache: concurrent misses share one upstream
+fetch, and request cancellation only drops that caller's waiter. The shared
+refresh continues until it publishes fresh keys, records failure, or observes
+server/cache shutdown. The 10 s cooldown is still stamped before the fetch and
+failed or cooled-down refreshes still fail closed rather than serving expired
+keys.
+
 Furthermore, `check_oauth_url` (applied at config-construction time
 and redirect time) rejects URLs that:
 - Carry RFC 3986 userinfo (`https://user:pass@host/`).
@@ -456,8 +604,10 @@ model remains robust against hostile or compromised Identity Providers.
 
 Some deployments terminate OAuth/JWKS at an in-cluster IdP whose
 hostname legitimately resolves into private (RFC 1918), loopback, CGNAT,
-or unique-local space (for example a Keycloak `Service` ClusterIP). The
-default fail-closed policy described above blocks those targets.
+unique-local, site-local, benchmarking, ORCHID, ORCHIDv2, or RFC 8215
+local-use NAT64 (`64:ff9b:1::/48`) space (for example a Keycloak
+`Service` ClusterIP or a local NAT64 gateway). The default fail-closed
+policy described above blocks those targets.
 
 `OAuthConfig::ssrf_allowlist` is the **opt-in operator escape hatch**.
 It accepts:
@@ -476,6 +626,13 @@ The allowlist is checked **after** the IP-block classifier runs, and
    generic `unique_local` / `cgnat` / `link_local` buckets, so listing
    `fd00::/8`, `100.64.0.0/10`, or `169.254.0.0/16` in `cidrs` never
    re-allows the metadata addresses themselves.
+   Even when `64:ff9b:1::/48` is allowlisted, addresses whose RFC 6052
+   embedded IPv4 decodes to a cloud-metadata address remain blocked,
+   exactly as for the well-known NAT64 prefix. This holds in every RFC
+   6052 prefix length that fits inside the `/48` (`/48`, `/56`, `/64`,
+   and `/96`). An allowlist entry still re-allows every non-metadata
+   address in its range, so allowlist the narrowest prefix your NAT64
+   gateway actually uses.
 2. The empty (default) allowlist preserves the pre-1.4.0 behaviour
    verbatim, including the exact wording of the "OAuth target resolved
    to blocked IP" error message, so existing operator runbooks and
@@ -486,7 +643,7 @@ The allowlist is checked **after** the IP-block classifier runs, and
    policy.
 4. Misconfiguration (literal IPs in `hosts`, ports/paths/userinfo in
    `hosts`, malformed CIDRs, `/0`, IPv4-mapped IPv6 CIDRs, zone IDs,
-   non-zero host bits) is rejected at startup -- the server refuses to
+   non-zero host bits) is rejected at startup - the server refuses to
    come up, rather than fail-open.
 5. When the allowlist is non-empty, `OAuthConfig::validate` emits a
    `tracing::warn!` naming the host and CIDR counts so the elevated
@@ -498,9 +655,19 @@ Operational guidance:
   range. Hostname allowlists trust DNS to remain truthful; CIDR
   allowlists do not.
 - Keep the allowlist as narrow as possible. `10.0.0.0/8` is much
-  weaker than the actual `/24` of the IdP's `Service` subnet.
+  weaker than the actual `/24` of the IdP's `Service` subnet, and
+  `64:ff9b:1::/48` is weaker than the specific local-use NAT64 prefix your
+  OAuth/JWKS endpoint needs.
 - Audit the `oauth.ssrf_allowlist is configured` warn-level log line on
   every restart and on every config reload.
+
+CRL fetches use the same blocked-IP classifier, with no configurable
+allowlist: instead, the CRL/AIA origins named in the operator's configured
+certificates (the mTLS CA bundle and the server certificate chain) are
+trusted automatically, cloud metadata excepted (see
+"Operator-trusted CRL/AIA origins" above). A CRL distribution point
+resolving into `64:ff9b:1::/48`, `fec0::/10`, `2001:2::/48`, `2001:10::/28`,
+or `2001:20::/28` is blocked unless its origin is in that trusted set.
 
 ### OAuth HTTPS enforcement
 
@@ -533,10 +700,11 @@ attacker-supplied input. OAuth URL hardening operates in three layers:
    `OauthHttpClient` and `JwksCache` resolve the target hostname and
    classify every returned IP against the SSRF range guard *before*
    issuing the request, rejecting targets in private, loopback,
-   link-local, multicast, broadcast, unspecified, CGNAT, or
-   cloud-metadata ranges. The opt-in `OAuthConfig::ssrf_allowlist`
-   relaxes this for in-cluster IdPs but cannot bypass cloud-metadata
-   addresses (see the "Operator allowlist" subsection above).
+   link-local, multicast, broadcast, unspecified, CGNAT, site-local,
+   benchmarking, ORCHID, ORCHIDv2, local-use NAT64, or cloud-metadata
+   ranges. The opt-in `OAuthConfig::ssrf_allowlist` relaxes this for
+   in-cluster IdPs but cannot bypass cloud-metadata addresses (see the
+   "Operator allowlist" subsection above).
 3. **Sync per-hop guard on redirects.** A per-hop SSRF range guard runs
    inside both client redirect closures using literal-IP classification
    (no extra DNS), rejecting cross-hop pivots into blocked ranges.
@@ -613,6 +781,76 @@ sessions" guidance above only fully closes that gap as of 3.14.
 - OCSP is not implemented; if your PKI publishes only OCSP, treat
   revocation as unsupported and apply the defence-in-depth mitigations
   above.
+
+## Audit log file handling
+
+The audit log carries identities and, under the diagnostic switches, can
+carry credential material, so opening it is a security decision, not just a
+file-system operation.
+
+**Threat model:** a local principal with write access to the audit log's
+parent directory (or a path component above it) could otherwise redirect
+where the audit log actually lands, by planting a symlink (or, on Windows,
+any reparse point - a junction or mount point included) at the configured
+path pointing somewhere they control or want to see written to; by planting
+a special file (device, FIFO, socket) that behaves unexpectedly when opened
+for append; or by pre-creating a regular file they own at that path so the
+server's audit trail is written into a file another local user can read. A
+hardlink planted by a local user creates the same problem in reverse: the inode
+can be owned by the server process and still have another directory entry that
+survives unlinking or rotation of the configured path. Permissions still live
+on the inode, so a non-owner needs permission to open that extra name, and
+Linux `fs.protected_hardlinks` is not guaranteed on every host.
+
+On Unix, opening the audit log refuses all three: it never follows a
+symlink at the final path component (a symlinked *parent* directory is
+still traversed - only the final component is protected), it refuses
+anything that is not a regular file, and it refuses a pre-existing file not
+owned by the server process's effective user, even when the process runs
+as root. It also refuses a regular file with more than one hard link. Its
+permissions are corrected to `0o600` on the open handle; if that fails (a
+filesystem that rejects chmod) startup fails closed unless the file
+already has exactly mode `0o600`. The "Setups that no longer start" list
+in the guide's audit-log section names the common container and NAS
+deployments this affects and the remedy for each. These
+checks run once at start-up on the already-open handle before any write and
+before the audit writer thread is spawned, so a rejected target is never
+written to; a hard link added later is not detected until the next start-up
+hardening pass. Strict initialization fails startup on any of these
+failures; the deprecated lenient initializer installs no audit sink at all
+rather than writing to an
+unprotected one.
+
+On Windows, opening the audit log refuses a reparse point at the final path
+component - a symbolic link, a junction, a mount point, or any other
+reparse tag - in two steps: a pre-check before the open, and an attribute
+check on the already-opened handle, so a swap between the two does not
+slip a reparse point past the first check alone. Neither check ever
+deletes anything: a rejected reparse point is never removed. The open
+creates the file when it does not exist; the protected owner-only DACL is
+applied only once both checks have passed, and if that DACL step fails the
+handle is dropped and the path is deleted best-effort, but only when this
+call created it - a pre-existing file that fails DACL hardening is left in
+place rather than destroyed, matching the Unix policy of never deleting
+something this process did not create. Because cleanup is by path, a local
+principal with write access to the parent directory can race it, the same
+residual as the by-path DACL application. A symlinked *parent*
+directory is still traversed; only the final component is protected, as on
+Unix.
+
+A pre-existing audit-log path owned by another local user - an init
+container or provisioning step that ran as root, a sidecar, a shared
+volume, or a log rotator that recreates the file as root - now fails
+strict startup rather than silently writing an audit trail into a file
+another principal controls. Dedicate the path to the service user,
+pre-create it with the service user as owner, or configure log rotation
+with copy-and-truncate semantics (for example logrotate's `copytruncate`)
+instead of recreate, so a restart always finds a file the service user
+already owns.
+
+Do not use hardlink-based audit-log retention or rotation. Use copy-based
+retention instead, such as copy-and-truncate or a rename followed by reopening
+a fresh single-link path on restart.
 
 ## Coordinated disclosure
 

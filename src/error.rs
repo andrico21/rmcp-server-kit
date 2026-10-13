@@ -98,7 +98,7 @@ pub enum RmcpServerKitError {
     ///
     /// Detail is logged server-side and collapsed to `"internal server error"`
     /// on the wire. Use this for runtime faults that are neither configuration
-    /// nor startup problems -- e.g. a cryptographic primitive failing -- rather
+    /// nor startup problems - e.g. a cryptographic primitive failing - rather
     /// than reaching for a client-facing variant.
     #[error("internal error: {0}")]
     Internal(String),
@@ -521,12 +521,12 @@ mod tests {
     // an error stringified first (`let s = e.to_string()`); a non-error
     // internal detail such as a file path or upstream URL; or anything
     // constructed by a downstream crate. Do not read a pass here as the
-    // invariant being enforced -- it is still upheld by review.
+    // invariant being enforced - it is still upheld by review.
     // -----------------------------------------------------------------
 
     /// Variant constructors whose payload reaches the HTTP client verbatim.
     /// `RateLimited` also substring-matches `RateLimitedFor`, which is
-    /// intended -- its `message` field has the same exposure.
+    /// intended - its `message` field has the same exposure.
     const CLIENT_FACING_CTORS: &[&str] = &[
         "RmcpServerKitError::Auth",
         "RmcpServerKitError::Rbac",

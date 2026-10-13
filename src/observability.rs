@@ -71,8 +71,16 @@ impl FormatTime for LocalTime {
 /// When `log_format` is `"json"`, emits machine-readable JSON lines.
 /// When `audit_log_path` is set, appends an additional JSON log file
 /// at INFO level for audit trail purposes. This legacy function keeps its
-/// fail-open audit-log behaviour for source compatibility: audit setup errors
-/// are logged as warnings after subscriber initialization succeeds.
+/// fail-open behaviour for source compatibility: a failure to prepare the
+/// audit sink is logged as a warning after subscriber initialization
+/// succeeds, rather than failing this call. "Fail open" applies only to the
+/// overall call, never to the audit sink itself: when the configured path
+/// cannot be hardened to an owner-only regular file, no audit writer is
+/// installed at all, on any platform, rather than writing audit events to
+/// an unprotected or attacker-controlled target. On Unix this includes a
+/// regular file with more than one hard link. On Windows this includes a
+/// reparse point at the final path component (a symbolic link, junction,
+/// mount point, or any other reparse tag).
 ///
 /// # Errors
 ///
@@ -190,7 +198,17 @@ impl Drop for TracingGuard {
 ///
 /// Returns [`RmcpServerKitError::Startup`] if audit-log directory creation,
 /// audit-log opening, audit writer thread spawning, or global tracing
-/// subscriber installation fails.
+/// subscriber installation fails. On Unix, opening the audit log also fails
+/// this way when the configured path is a symlink at its final component,
+/// is not a regular file (a device, FIFO, or socket), is a pre-existing
+/// file not owned by this process's effective user, has more than one hard
+/// link, or its permissions cannot be corrected to `0o600` and are not
+/// already exactly `0o600`. On Windows, opening the audit log also fails
+/// this way when the configured path is a reparse point at its final
+/// component (a symbolic link, junction, mount point, or any other reparse
+/// tag) - checked both before the open and again on the opened handle - or
+/// when applying the owner-only DACL fails. See the "Audit-log file
+/// permissions" section of the guide for the full contract.
 #[inline]
 pub fn init_tracing_from_config_strict(
     config: &ObservabilityConfig,
@@ -379,7 +397,7 @@ impl Drop for AuditWorkerGuard {
     )]
     #[expect(
         clippy::arithmetic_side_effects,
-        reason = "invariant: src/observability.rs::AuditWorkerGuard::drop -- the deadline arithmetic is bounded by AUDIT_WRITER_JOIN_TIMEOUT and cannot overflow within the process lifetime"
+        reason = "invariant: src/observability.rs::AuditWorkerGuard::drop - the deadline arithmetic is bounded by AUDIT_WRITER_JOIN_TIMEOUT and cannot overflow within the process lifetime"
     )]
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
@@ -591,8 +609,7 @@ fn open_audit_file(path: &Path) -> Result<AuditSetup, String> {
     }
 
     let file = create_private_audit_file(path)?;
-
-    let warnings = audit_file_permission_warnings(&file);
+    let warnings = Vec::new();
 
     let (sender, receiver) = mpsc::sync_channel(AUDIT_LOG_CHANNEL_CAPACITY);
     let dropped = Arc::new(AtomicU64::new(0));
@@ -686,28 +703,314 @@ fn legacy_tracing_guards() -> &'static Mutex<Vec<TracingGuard>> {
     GUARDS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+// Named to avoid colliding with `std::io` (already imported above as `io`):
+// `harden_audit_handle` and `set_audit_file_mode` hand this across a
+// function boundary in their signatures, where a function-body-local `use`
+// cannot reach.
+#[cfg(unix)]
+use rustix::io::Result as RustixIoResult;
+#[cfg(unix)]
+use rustix::{fd::OwnedFd, io::Errno};
+
 /// Create (or append to) the audit log with owner-only permissions.
 ///
-/// SECURITY: the mode is applied by `open` itself rather than by a following
-/// `set_permissions`. The two-step form leaves a window in which the file
-/// exists with umask-derived permissions, so any local principal can open it
-/// before the mode is tightened. Audit logs carry identities and, under the
-/// diagnostic switches, credential material.
+/// SECURITY: opens with `O_NOFOLLOW` so a symlink planted at the final path
+/// component is refused rather than followed (a symlinked *parent*
+/// directory is still traversed; only the final component is protected).
+/// `O_NONBLOCK` keeps a FIFO planted at the path from blocking this call
+/// forever when no reader exists, turning that into a prompt error instead
+/// of a startup hang; it is a no-op on a regular file and is cleared again
+/// once the handle passes every check, so the writer thread gets plain
+/// blocking-file semantics. `O_NOCTTY` stops a tty path from becoming this
+/// process's controlling terminal.
+///
+/// The mode is applied atomically by `open` itself, never by a following
+/// `set_permissions`: the two-step form leaves a window in which a freshly
+/// created file carries umask-derived permissions, so any local principal
+/// could open it before the mode is tightened. The post-open checks
+/// (regular file, effective-UID ownership, mode correction, clearing
+/// `O_NONBLOCK`) live in [`harden_audit_handle`], which takes the open
+/// handle rather than a path so they stay independently testable without
+/// privileges: a test can hand it a real handle with a deliberately wrong
+/// `effective_uid`, or a `set_mode` that always fails, without needing a
+/// foreign-owned fixture or a syscall this suite can make fail for real.
+/// Audit logs carry identities and, under the diagnostic switches,
+/// credential material.
+///
+/// This function never deletes a file on failure. The mode is fixed at
+/// creation time, so a file this call creates is never exposed at a wider
+/// mode, even transiently, and a pre-existing file that fails a check
+/// (wrong type, wrong owner) was not created by this process: deleting it
+/// would destroy something this process does not own, for no benefit, since
+/// nothing was ever written to it.
 ///
 /// # Errors
 ///
-/// Returns `Err` with a message when the audit log cannot be opened with
-/// owner-only permissions.
+/// Returns `Err` naming the path and the reason when the audit log cannot
+/// be opened, is not a regular file, is not owned by this process's
+/// effective UID, or its permissions cannot be corrected to `0o600` and are
+/// not already exactly `0o600`. A symlinked final component surfaces as
+/// `ELOOP` and a FIFO with no reader as `ENXIO`; both get a message naming
+/// the specific rule that was refused instead of the bare OS error text.
 #[cfg(unix)]
 fn create_private_audit_file(path: &Path) -> Result<fs::File, String> {
-    use std::os::unix::fs::OpenOptionsExt as _;
+    use rustix::{
+        fs::{Mode, OFlags, open},
+        process::geteuid,
+    };
 
-    fs::OpenOptions::new()
-        .mode(0o600)
-        .create(true)
+    let flags = OFlags::CREATE
+        | OFlags::APPEND
+        | OFlags::WRONLY
+        | OFlags::NOFOLLOW
+        | OFlags::CLOEXEC
+        | OFlags::NONBLOCK
+        | OFlags::NOCTTY;
+    let fd = open(path, flags, Mode::RUSR | Mode::WUSR)
+        .map_err(|error| describe_audit_open_error(path, error))?;
+
+    harden_audit_handle(fd, path, geteuid().as_raw(), set_audit_file_mode)
+}
+
+/// Widen a platform `st_nlink` value without triggering target-specific Clippy.
+#[cfg(unix)]
+fn widen_link_count<T>(count: T) -> u64
+where
+    T: Into<u64>,
+{
+    count.into()
+}
+
+/// Translate an `open` failure on the audit-log path into an operator
+/// message that names the specific rule it tripped, for the two errnos
+/// this hardening deliberately provokes.
+///
+/// `O_NOFOLLOW` turns a symlinked final path component into `ELOOP`;
+/// `O_NONBLOCK` turns a FIFO with no reader into `ENXIO` instead of
+/// blocking startup forever. Every other errno keeps the generic "failed to
+/// open" form. Only the path and the OS-level reason are ever named, never
+/// a symlink's target.
+#[cfg(unix)]
+fn describe_audit_open_error(path: &Path, error: Errno) -> String {
+    match error {
+        Errno::LOOP => format!(
+            "audit log path {} is a symbolic link; refusing to follow it",
+            path.display()
+        ),
+        Errno::NXIO => format!(
+            "audit log path {} is not a regular file (a FIFO without a \
+             reader, or a device with nothing attached)",
+            path.display()
+        ),
+        other => format!("failed to open audit log file {}: {other}", path.display()),
+    }
+}
+
+/// Harden an already-open audit-log handle: verify it is a regular file
+/// owned by `effective_uid`, correct its mode to 0o600, and clear
+/// `O_NONBLOCK`.
+///
+/// The correction accepts a handle already at exactly 0o600 when it fails.
+///
+/// Split out of `create_private_audit_file` so the regular-file, ownership
+/// and mode-correction checks can be driven directly against a real open
+/// handle in tests: a wrong `effective_uid` or a failing `set_mode` proves
+/// the rejection path without a foreign-owned fixture (which needs
+/// privileges this test suite does not assume) or a syscall this suite
+/// cannot make fail for real. Keeping the seam handle-based rather than
+/// path-based also lets the link-count check use the inspected handle without
+/// reopening the path or touching the caller.
+///
+/// # Errors
+///
+/// Returns `Err` naming the path and the reason when the handle cannot be
+/// inspected, is not a regular file, is not owned by `effective_uid`, has
+/// more than one hard link, or `set_mode` fails on a handle not already at
+/// 0o600.
+#[cfg(unix)]
+fn harden_audit_handle(
+    fd: OwnedFd,
+    path: &Path,
+    effective_uid: u32,
+    set_mode: fn(&OwnedFd) -> RustixIoResult<()>,
+) -> Result<fs::File, String> {
+    use rustix::fs::{FileType, Mode, OFlags, fcntl_setfl, fstat};
+
+    let stat = fstat(&fd).map_err(|error| {
+        format!(
+            "failed to inspect audit log file {}: {error}",
+            path.display()
+        )
+    })?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(format!(
+            "audit log path {} is not a regular file",
+            path.display()
+        ));
+    }
+    // `uid_t` (rustix's `RawUid`) is `u32` on every Unix target this crate
+    // supports, so this comparison needs no widening.
+    if !is_owned_by_effective_user(stat.st_uid, effective_uid) {
+        return Err(format!(
+            "audit log file {} is not owned by this process's effective user",
+            path.display()
+        ));
+    }
+
+    let link_count = widen_link_count(stat.st_nlink);
+    if link_count > 1 {
+        return Err(format!(
+            "audit log file {} has {link_count} links; refusing hard-linked audit files",
+            path.display()
+        ));
+    }
+
+    // fchmod is always attempted so its side effects on ACL filesystems are
+    // kept wherever chmod works. A filesystem that rejects chmod (CIFS/SMB
+    // without Unix extensions, vfat, some FUSE or NFS mounts) can still
+    // present a pre-created file whose permission bits are already exactly
+    // owner-only (no setuid, setgid or sticky bit); that file is accepted
+    // because the required state already holds. Any other failure fails
+    // closed. Only `Mode` values are compared, so no cast is needed even
+    // where `st_mode` is narrower (macOS).
+    if let Err(error) = set_mode(&fd)
+        && Mode::from_raw_mode(stat.st_mode) != Mode::RUSR | Mode::WUSR
+    {
+        return Err(format!(
+            "failed to set audit log permissions to 0o600 for {}: {error}",
+            path.display()
+        ));
+    }
+
+    // Re-arm blocking semantics now that the handle is confirmed safe: the
+    // writer thread (spawned only after this function returns `Ok`) expects
+    // a plain blocking file, and `O_NONBLOCK` was only ever needed to keep
+    // the checks above from hanging on a FIFO.
+    fcntl_setfl(&fd, OFlags::APPEND).map_err(|error| {
+        format!(
+            "failed to clear non-blocking mode on audit log file {}: {error}",
+            path.display()
+        )
+    })?;
+
+    Ok(fs::File::from(fd))
+}
+
+/// Decide whether a file's owner matches this process's effective user.
+///
+/// A pure comparison over raw UIDs so the ownership rule is unit-testable
+/// with fabricated values: proving the rejection path for a file owned by a
+/// different user does not require actually creating one, which needs
+/// privileges this test suite does not assume.
+#[cfg(unix)]
+const fn is_owned_by_effective_user(file_uid: u32, effective_uid: u32) -> bool {
+    file_uid == effective_uid
+}
+
+/// Correct an audit-log handle's mode to owner-only (`0o600`).
+///
+/// A plain function, not a closure, so production code and a test can both
+/// hand `harden_audit_handle` a `set_mode` of the same concrete function
+/// pointer type: a test substitutes a different plain function that always
+/// fails, proving the "turn a chmod failure into a warning" mutant red
+/// without needing the real `fchmod` syscall to fail.
+///
+/// # Errors
+///
+/// Returns `Err` when the underlying `fchmod` call fails.
+#[cfg(unix)]
+fn set_audit_file_mode(fd: &OwnedFd) -> RustixIoResult<()> {
+    use rustix::fs::{Mode, fchmod};
+
+    fchmod(fd, Mode::RUSR | Mode::WUSR)
+}
+
+/// Win32 `FILE_ATTRIBUTE_REPARSE_POINT` (`0x400`).
+///
+/// Set in a file or directory's attributes whenever it is a reparse point
+/// of ANY tag - a symbolic link, a junction, a mount point, or a
+/// filesystem-specific tag such as a cloud-file placeholder or a
+/// deduplicated file. Deliberately the raw attribute bit, not
+/// `std::fs::FileType::is_symlink`, which is true only for reparse tags
+/// carrying the `NAME_SURROGATE` bit (symlinks and junctions): testing the
+/// raw bit instead refuses every reparse point, including the ones
+/// `is_symlink` would silently let through.
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+/// Win32 `FILE_FLAG_OPEN_REPARSE_POINT` (`0x0020_0000`): opens a reparse
+/// point itself instead of transparently following it to its target.
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+/// True when `metadata` names a reparse point of any tag. See
+/// [`FILE_ATTRIBUTE_REPARSE_POINT`] for why the raw bit is tested instead
+/// of `FileType::is_symlink`.
+#[cfg(windows)]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+/// Shared rejection message for both the pre-check and the handle check, so
+/// a caller sees the identical wording regardless of which one fired.
+#[cfg(windows)]
+fn reparse_point_rejection(path: &Path) -> String {
+    format!(
+        "audit log path {} is a reparse point (a symbolic link, junction, \
+         mount point, or another reparse tag); refusing to use it",
+        path.display()
+    )
+}
+
+/// Open `path` for append, creating it if absent, refusing to follow a
+/// reparse point either way.
+///
+/// Returns the open handle together with whether THIS call created the
+/// file (`true`) or opened a pre-existing one (`false`); see
+/// [`create_private_audit_file`] for why that distinction decides whether
+/// a later hardening failure may delete the file.
+///
+/// # Errors
+///
+/// Returns `Err` when neither a fresh creation nor an open of an existing
+/// file succeeds.
+#[cfg(windows)]
+fn open_or_create_audit_handle(path: &Path) -> Result<(fs::File, bool), String> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    // `create_new(true)` is the only way this call can PROVE it created the
+    // file: `CREATE_NEW` fails with `AlreadyExists` on any existing name,
+    // reparse point included, so success here is proof of creation; a
+    // `symlink_metadata` pre-check that merely observed `NotFound` would be
+    // racy (a TOCTOU swap between that check and this open). `custom_flags`
+    // requests `FILE_FLAG_OPEN_REPARSE_POINT` explicitly; std also ORs it
+    // into the flags whenever `create_new` is set, so it is redundant on
+    // this branch and required on the fallback branch below.
+    match fs::OpenOptions::new()
+        .create_new(true)
         .append(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
-        .map_err(|error| format!("failed to open audit log file {}: {error}", path.display()))
+    {
+        Ok(file) => Ok((file, true)),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => fs::OpenOptions::new()
+            .append(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map(|file| (file, false))
+            .map_err(|open_error| {
+                format!(
+                    "failed to open audit log file {}: {open_error}",
+                    path.display()
+                )
+            }),
+        Err(error) => Err(format!(
+            "failed to open audit log file {}: {error}",
+            path.display()
+        )),
+    }
 }
 
 /// Create (or append to) the audit log with an owner-only DACL.
@@ -719,10 +1022,33 @@ fn create_private_audit_file(path: &Path) -> Result<fs::File, String> {
 /// create-then-harden window the Unix path does not have: this removes the
 /// *persistent* exposure, not the momentary one. It is not parity.
 ///
-/// If hardening fails once the file exists, the file is deleted best-effort and
-/// the error states whether that succeeded, so an operator knows whether an
-/// unprotected audit log may remain on disk. Continuing instead would recreate
-/// the silent security-control failure this replaced.
+/// Before that window opens, this refuses a reparse point at the final path
+/// component - a symbolic link, a junction, a mount point, or any other
+/// reparse tag - in two steps: a `symlink_metadata` pre-check (never
+/// follows the final component) and, after an open that also never follows
+/// it (`FILE_FLAG_OPEN_REPARSE_POINT`), an attribute check on the opened
+/// handle itself, closing the gap a pre-check alone would leave open to a
+/// swap between the two. Neither check ever deletes anything: a rejected
+/// reparse point is never removed. A symlinked *parent* directory is still
+/// traversed; only the final component is protected, matching the Unix
+/// path.
+///
+/// If hardening fails once the file exists, the handle is dropped and this
+/// path is deleted best-effort only when THIS call created it; a
+/// pre-existing file that fails hardening is left in place, since deleting
+/// it would destroy something this process did not create, for no security
+/// benefit. The cleanup is by path, so a principal with write access to the
+/// parent directory can race it, the same residual as the by-path DACL
+/// application above. The error states whether deletion was attempted and
+/// whether it succeeded, so an operator knows whether an unprotected file,
+/// or an untouched pre-existing one, may remain at that path. A rejected
+/// reparse point and a pre-existing file are never deleted by this code.
+///
+/// # Errors
+///
+/// Returns `Err` when the path is a reparse point (checked both before and
+/// after the open), when opening or inspecting the file fails, or when
+/// applying the owner-only DACL fails.
 #[cfg(windows)]
 fn create_private_audit_file(path: &Path) -> Result<fs::File, String> {
     use std::ffi::OsString;
@@ -730,23 +1056,52 @@ fn create_private_audit_file(path: &Path) -> Result<fs::File, String> {
     use windows_permissions::{
         LocalBox, SecurityDescriptor,
         constants::{SeObjectType, SecurityInformation},
+        utilities::current_process_sid,
         wrappers,
     };
 
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|e| format!("failed to open audit log file {}: {e}", path.display()))?;
+    match fs::symlink_metadata(path) {
+        Ok(existing) if is_reparse_point(&existing) => {
+            return Err(reparse_point_rejection(path));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect audit log path {}: {error}",
+                path.display()
+            ));
+        }
+    }
+
+    let (file, created_by_this_call) = open_or_create_audit_handle(path)?;
+
+    // A TOCTOU swap between the pre-check above and this open would slip
+    // past it; the open used `FILE_FLAG_OPEN_REPARSE_POINT`, so this reads
+    // the reparse point's own attributes, never the target's.
+    let opened_metadata = file.metadata().map_err(|metadata_error| {
+        format!(
+            "failed to inspect the opened audit log handle for {}: {metadata_error}",
+            path.display()
+        )
+    })?;
+    if is_reparse_point(&opened_metadata) {
+        drop(file);
+        return Err(reparse_point_rejection(path));
+    }
 
     let harden = || -> Result<(), String> {
-        let sid = windows_permissions::utilities::current_process_sid()
-            .map_err(|e| format!("cannot determine the current process SID: {e}"))?;
+        let sid = current_process_sid().map_err(|sid_error| {
+            format!("cannot determine the current process SID: {sid_error}")
+        })?;
         // `D:P` protects the DACL, discarding inherited ACEs; a single
         // FA (full access) ACE for this process's SID is the owner-only grant.
-        let sd: LocalBox<SecurityDescriptor> = format!("D:P(A;;FA;;;{sid})")
-            .parse()
-            .map_err(|e| format!("cannot build an owner-only security descriptor: {e}"))?;
+        let sd: LocalBox<SecurityDescriptor> =
+            format!("D:P(A;;FA;;;{sid})")
+                .parse()
+                .map_err(|parse_error| {
+                    format!("cannot build an owner-only security descriptor: {parse_error}")
+                })?;
         let dacl = sd
             .dacl()
             .ok_or_else(|| "owner-only security descriptor carried no DACL".to_owned())?;
@@ -760,19 +1115,24 @@ fn create_private_audit_file(path: &Path) -> Result<fs::File, String> {
             Some(dacl),
             None,
         )
-        .map_err(|e| format!("cannot apply the owner-only DACL: {e}"))
+        .map_err(|set_error| format!("cannot apply the owner-only DACL: {set_error}"))
     };
 
     match harden() {
         Ok(()) => Ok(file),
         Err(reason) => {
             drop(file);
-            let cleanup = match fs::remove_file(path) {
-                Ok(()) => "the unprotected file was deleted".to_owned(),
-                Err(e) => format!(
-                    "the unprotected file could NOT be deleted and may remain at {}: {e}",
-                    path.display()
-                ),
+            let cleanup = if created_by_this_call {
+                match fs::remove_file(path) {
+                    Ok(()) => "the unprotected file this call created was deleted".to_owned(),
+                    Err(remove_error) => format!(
+                        "the unprotected file this call created could NOT be deleted \
+                         and may remain at {}: {remove_error}",
+                        path.display()
+                    ),
+                }
+            } else {
+                "a pre-existing file at this path was left in place, not deleted".to_owned()
             };
             Err(format!(
                 "audit log ACL hardening failed for {}: {reason}; {cleanup}",
@@ -797,27 +1157,6 @@ fn create_private_audit_file(path: &Path) -> Result<fs::File, String> {
          guarantee owner-only access for {}; audit logging disabled",
         path.display()
     ))
-}
-
-/// Rewrite an existing audit file to owner-only permissions and collect failures.
-#[cfg(unix)]
-fn audit_file_permission_warnings(file: &fs::File) -> Vec<String> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let mut warnings = Vec::new();
-    // A pre-existing file keeps its old mode: `OpenOptions::mode` applies only
-    // when `open` creates the file, so tighten it explicitly here.
-    if let Err(error) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
-        warnings.push(format!(
-            "failed to set audit log permissions to 0o600: {error}"
-        ));
-    }
-    warnings
-}
-
-#[cfg(not(unix))]
-fn audit_file_permission_warnings(_file: &fs::File) -> Vec<String> {
-    Vec::new()
 }
 
 #[cfg_attr(
@@ -853,6 +1192,8 @@ mod tests {
     };
     #[cfg(unix)]
     use std::io::Write as _;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    use std::thread;
     use std::{
         env, fs, io,
         path::{Path, PathBuf},
@@ -867,7 +1208,7 @@ mod tests {
     use tracing_subscriber::fmt::MakeWriter as _;
     use tracing_subscriber::{Layer as _, filter, fmt, layer::SubscriberExt as _};
 
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(not(windows))]
     use super::prepare_tracing_audit_lenient;
     use super::{AuditMessage, AuditWorker, init_tracing, prepare_tracing_audit_strict};
     use crate::{
@@ -1284,6 +1625,789 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    #[cfg(unix)]
+    /// Pins that a symlinked audit path is refused before any write, leaving
+    /// the symlink target's content and mode untouched. The old code opened
+    /// through the symlink, chmodded the target to 0o600, and wrote through
+    /// it.
+    fn symlinked_audit_path_is_rejected_before_any_write() -> anyhow::Result<()> {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let dir = unique_temp_path("audit-symlink-dir")?;
+        fs::create_dir_all(&dir).context("create fixture dir")?;
+        let target_path = dir.join("target.log");
+        let marker = "pre-existing target contents, never touched";
+        fs::write(&target_path, marker).context("create symlink target")?;
+        fs::set_permissions(&target_path, fs::Permissions::from_mode(0o644))
+            .context("set target mode")?;
+        let audit_path = dir.join("audit.log");
+        symlink(&target_path, &audit_path).context("create audit path symlink")?;
+
+        let config = observability_config(Some(audit_path));
+        let error = match prepare_tracing_audit_strict(&config) {
+            Err(RmcpServerKitError::Startup(message)) => message,
+            Err(other) => anyhow::bail!(
+                "a symlinked audit path must fail closed with Startup; got a different error variant: {other}"
+            ),
+            Ok(_) => {
+                anyhow::bail!("a symlinked audit path must fail closed with Startup; it succeeded")
+            }
+        };
+        assert!(
+            error.contains("is a symbolic link"),
+            "error must name the symlink rejection, not a bare OS error; got {error:?}"
+        );
+        let target_mode = fs::metadata(&target_path)
+            .context("read target metadata")?
+            .permissions()
+            .mode();
+        assert_eq!(
+            target_mode & 0o777,
+            0o644,
+            "a refused symlink must leave the target's mode untouched; got {target_mode:o}"
+        );
+        let target_contents = fs::read_to_string(&target_path).context("read target contents")?;
+        assert_eq!(
+            target_contents, marker,
+            "a refused symlink must leave the target's contents untouched"
+        );
+
+        fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    /// Pins that `/dev/null` (a non-regular file) is refused by strict init
+    /// and that the refusal never changes its mode. The old code chmodded
+    /// through it and only warned when that chmod failed with `EPERM`.
+    fn dev_null_is_rejected_by_strict_init_and_its_mode_is_untouched() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let before = fs::metadata("/dev/null")
+            .context("stat /dev/null before the attempt")?
+            .permissions()
+            .mode();
+
+        let config = observability_config(Some(PathBuf::from("/dev/null")));
+        let result = prepare_tracing_audit_strict(&config);
+
+        assert!(
+            matches!(result, Err(RmcpServerKitError::Startup(_))),
+            "a non-regular audit path must fail closed with Startup"
+        );
+        let after = fs::metadata("/dev/null")
+            .context("stat /dev/null after the attempt")?
+            .permissions()
+            .mode();
+        assert_eq!(
+            before, after,
+            "a refused non-regular audit path must never have its mode touched"
+        );
+
+        Ok(())
+    }
+
+    /// Send the FIFO test's outcome over its bounded notification channel.
+    ///
+    /// `None` means the open unexpectedly succeeded; `Some(message)` carries
+    /// the rejection reason so the test can assert on it. The send result is
+    /// intentionally discarded: a full or disconnected channel means the
+    /// receiver already gave up on its bounded `recv_timeout`, at which
+    /// point the test has already failed on the timeout and there is no
+    /// corrective action this thread could take.
+    #[expect(
+        clippy::let_underscore_must_use,
+        reason = "deliberate: src/observability.rs::notify_fifo_test_outcome: a full or disconnected channel has no corrective action; the test's bounded recv_timeout is the actual correctness check"
+    )]
+    #[expect(
+        let_underscore_drop,
+        reason = "deliberate: src/observability.rs::notify_fifo_test_outcome drops the full-or-disconnected send result without logging, same as AuditFileWriter::flush above"
+    )]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn notify_fifo_test_outcome(
+        sender: &mpsc::SyncSender<Option<String>>,
+        outcome: Option<String>,
+    ) {
+        let _: Result<(), mpsc::TrySendError<Option<String>>> = sender.try_send(outcome);
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    /// Pins that a FIFO at the audit path is refused promptly rather than
+    /// blocking startup forever, with a message naming the specific rule
+    /// rather than a bare `ENXIO`. `O_WRONLY` on a FIFO with no reader
+    /// blocks until one attaches; `O_NONBLOCK` turns that into an immediate
+    /// error instead. Linux-only: rustix excludes `mkfifoat` on Apple
+    /// targets, so this is skipped on macOS, where the `/dev/null` test
+    /// above already covers the non-regular-file rule on every Unix.
+    fn fifo_audit_path_is_rejected_promptly_not_hung() -> anyhow::Result<()> {
+        use rustix::fs::{CWD, Mode, mkfifoat};
+
+        let dir = unique_temp_path("audit-fifo-dir")?;
+        fs::create_dir_all(&dir).context("create fixture dir")?;
+        let audit_path = dir.join("audit.fifo");
+        mkfifoat(CWD, &audit_path, Mode::RUSR | Mode::WUSR)
+            .map_err(|error| anyhow::anyhow!("create test fifo: {error}"))?;
+
+        let config = observability_config(Some(audit_path));
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let _join = thread::spawn(move || {
+            let outcome = match prepare_tracing_audit_strict(&config) {
+                Ok(setup) => {
+                    drop(setup.guard);
+                    None
+                }
+                Err(RmcpServerKitError::Startup(message)) => Some(message),
+                Err(other) => Some(format!("unexpected error variant: {other}")),
+            };
+            notify_fifo_test_outcome(&sender, outcome);
+        });
+
+        let outcome = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .context("opening a FIFO audit path must not hang startup")?;
+        let message = outcome.context("a FIFO at the audit path must fail closed, not succeed")?;
+        assert!(
+            message.contains("is not a regular file"),
+            "error must name the non-regular-file rejection, not a bare OS error; got {message:?}"
+        );
+
+        fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    /// Pins that a pre-existing, self-owned `0o644` audit file is tightened
+    /// to `0o600` and accepted.
+    fn preexisting_self_owned_file_is_tightened_to_0600() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = unique_temp_path("audit-tighten-dir")?;
+        fs::create_dir_all(&dir).context("create fixture dir")?;
+        let audit_path = dir.join("audit.log");
+        fs::write(&audit_path, b"pre-existing").context("create pre-existing audit file")?;
+        fs::set_permissions(&audit_path, fs::Permissions::from_mode(0o644))
+            .context("loosen the pre-existing file's mode")?;
+
+        let config = observability_config(Some(audit_path.clone()));
+        let setup = prepare_tracing_audit_strict(&config)
+            .context("a self-owned pre-existing file must be accepted")?;
+        drop(setup.guard);
+
+        let mode = fs::metadata(&audit_path)
+            .context("read tightened file metadata")?
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "a pre-existing self-owned file must be tightened to 0o600; got {mode:o}"
+        );
+
+        fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    /// Pins that strict init refuses a hard-linked audit file before any
+    /// writer is installed or file metadata is changed.
+    fn hardlinked_audit_path_is_rejected_by_strict_init_without_changes() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = unique_temp_path("audit-hardlink-strict-dir")?;
+        fs::create_dir_all(&dir).context("create fixture dir")?;
+        let audit_path = dir.join("audit.log");
+        let other_path = dir.join("audit.alias");
+        let marker = "hard-linked audit fixture, strict rejection leaves it alone";
+        fs::write(&audit_path, marker).context("create hardlink target")?;
+        fs::set_permissions(&audit_path, fs::Permissions::from_mode(0o644))
+            .context("set hardlink target mode")?;
+        fs::hard_link(&audit_path, &other_path).context("create second hardlink")?;
+
+        let config = observability_config(Some(audit_path.clone()));
+        let error = match prepare_tracing_audit_strict(&config) {
+            Err(RmcpServerKitError::Startup(message)) => message,
+            Err(other) => anyhow::bail!(
+                "a hard-linked audit path must fail closed with Startup; got a different error variant: {other}"
+            ),
+            Ok(setup) => {
+                drop(setup.guard);
+                anyhow::bail!(
+                    "a hard-linked audit path must fail closed with Startup; it succeeded"
+                )
+            }
+        };
+        assert!(
+            error.contains("has 2 links"),
+            "error must name the hardlink count; got {error:?}"
+        );
+        let mode = fs::metadata(&audit_path)
+            .context("read hardlink target metadata")?
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o644,
+            "a refused hard-linked audit file must leave mode untouched; got {mode:o}"
+        );
+        let contents = fs::read_to_string(&other_path).context("read hardlink alias contents")?;
+        assert_eq!(
+            contents, marker,
+            "a refused hard-linked audit file must leave contents untouched"
+        );
+
+        fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    /// Pins that removing the second directory entry makes the same inode safe
+    /// for strict init again, and the accepted file is tightened to `0o600`.
+    fn single_link_audit_path_is_accepted_after_alias_removed() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = unique_temp_path("audit-hardlink-removed-dir")?;
+        fs::create_dir_all(&dir).context("create fixture dir")?;
+        let audit_path = dir.join("audit.log");
+        let other_path = dir.join("audit.alias");
+        fs::write(&audit_path, b"single-link fixture").context("create audit file")?;
+        fs::set_permissions(&audit_path, fs::Permissions::from_mode(0o644))
+            .context("set audit file mode")?;
+        fs::hard_link(&audit_path, &other_path).context("create second hardlink")?;
+        fs::remove_file(&other_path).context("remove second hardlink")?;
+
+        let config = observability_config(Some(audit_path.clone()));
+        let setup = prepare_tracing_audit_strict(&config)
+            .context("a single-link self-owned audit file must be accepted")?;
+        drop(setup.guard);
+
+        let mode = fs::metadata(&audit_path)
+            .context("read accepted audit file metadata")?
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "an accepted single-link audit file must be tightened to 0o600; got {mode:o}"
+        );
+
+        fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    /// Pins that lenient init treats a hard-linked audit path like any other
+    /// hardening failure: warn, install no audit sink, and leave the file alone.
+    fn lenient_init_installs_no_sink_for_hardlinked_audit_path() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = unique_temp_path("audit-hardlink-lenient-dir")?;
+        fs::create_dir_all(&dir).context("create fixture dir")?;
+        let audit_path = dir.join("audit.log");
+        let other_path = dir.join("audit.alias");
+        fs::write(&audit_path, b"lenient hardlink fixture").context("create audit file")?;
+        fs::set_permissions(&audit_path, fs::Permissions::from_mode(0o644))
+            .context("set audit file mode")?;
+        fs::hard_link(&audit_path, &other_path).context("create second hardlink")?;
+
+        let config = observability_config(Some(audit_path.clone()));
+        let setup = prepare_tracing_audit_lenient(&config);
+
+        assert!(
+            setup.writer.is_none(),
+            "no audit sink may be installed when a hard-linked path is refused"
+        );
+        assert!(
+            setup
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("has 2 links")),
+            "lenient init must warn with the hardlink count; got {:?}",
+            setup.warnings
+        );
+        let mode = fs::metadata(&audit_path)
+            .context("read hardlink target metadata")?
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o644,
+            "a refused hard-linked audit file must leave mode untouched; got {mode:o}"
+        );
+
+        fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    /// Pins that the hardened open handle ends with plain blocking
+    /// semantics: `O_NONBLOCK` is needed only to keep the checks inside
+    /// `create_private_audit_file` from hanging on a FIFO, and must not
+    /// reach the writer thread.
+    fn create_private_audit_file_clears_nonblock_after_hardening() -> anyhow::Result<()> {
+        use rustix::fs::{OFlags, fcntl_getfl};
+
+        let dir = unique_temp_path("audit-nonblock-dir")?;
+        fs::create_dir_all(&dir).context("create fixture dir")?;
+        let audit_path = dir.join("audit.log");
+
+        let file = super::create_private_audit_file(&audit_path)
+            .map_err(|error| anyhow::anyhow!("create_private_audit_file: {error}"))?;
+        let flags = fcntl_getfl(&file).context("read back the handle's status flags")?;
+        assert!(
+            !flags.contains(OFlags::NONBLOCK),
+            "the hardened handle must not keep O_NONBLOCK set"
+        );
+
+        drop(file);
+        fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    /// Pins that `harden_audit_handle` rejects a real, self-owned regular
+    /// file when handed an `effective_uid` that does not match its owner,
+    /// and that no byte is ever written to it. This drives the seam
+    /// directly (the real owner matches the real `geteuid()`, so this
+    /// could not be proven by opening through `create_private_audit_file`)
+    /// and is the faithful red test for both dropping the ownership check
+    /// and writing to the handle before the checks run.
+    fn harden_audit_handle_rejects_mismatched_owner_without_writing() -> anyhow::Result<()> {
+        use std::os::fd::OwnedFd;
+
+        use rustix::process::geteuid;
+
+        let dir = unique_temp_path("audit-seam-wrong-uid")?;
+        fs::create_dir_all(&dir).context("create fixture dir")?;
+        let path = dir.join("audit.log");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .context("open a real self-owned file")?;
+        let fd = OwnedFd::from(file);
+        let real_uid = geteuid().as_raw();
+        let wrong_uid = real_uid.wrapping_add(1);
+
+        let result = super::harden_audit_handle(fd, &path, wrong_uid, super::set_audit_file_mode);
+
+        let error = result
+            .err()
+            .context("a mismatched effective_uid must be rejected")?;
+        assert!(
+            error.contains("not owned by this process's effective user"),
+            "error must name the ownership problem; got {error:?}"
+        );
+        let contents = fs::read(&path).context("read fixture file")?;
+        assert!(
+            contents.is_empty(),
+            "a rejected handle must never be written to; got {} bytes",
+            contents.len()
+        );
+
+        fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    /// Pins that the hardening seam rejects a regular file with more than one
+    /// link before correcting its mode, because every name reaches one inode.
+    fn harden_audit_handle_rejects_hardlinked_file_before_chmod() -> anyhow::Result<()> {
+        use std::os::{fd::OwnedFd, unix::fs::PermissionsExt as _};
+
+        use rustix::process::geteuid;
+
+        let dir = unique_temp_path("audit-seam-hardlink")?;
+        fs::create_dir_all(&dir).context("create fixture dir")?;
+        let path = dir.join("audit.log");
+        let other_path = dir.join("audit.alias");
+        fs::write(&path, b"hardlink seam fixture").context("create fixture file")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+            .context("set fixture mode")?;
+        fs::hard_link(&path, &other_path).context("create second hardlink")?;
+        let file = fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .context("open hard-linked fixture file")?;
+        let fd = OwnedFd::from(file);
+        let real_uid = geteuid().as_raw();
+
+        let result = super::harden_audit_handle(fd, &path, real_uid, super::set_audit_file_mode);
+
+        let error = result
+            .err()
+            .context("a hard-linked audit handle must be rejected")?;
+        assert!(
+            error.contains("has 2 links"),
+            "error must name the hardlink count; got {error:?}"
+        );
+        let mode = fs::metadata(&path)
+            .context("read fixture metadata")?
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o644,
+            "a rejected hard-linked handle must not be chmodded; got {mode:o}"
+        );
+
+        fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    /// Pins that `harden_audit_handle` turns a `set_mode` failure into
+    /// `Err` rather than a warning, and never writes to the handle first.
+    /// `set_mode` is injected specifically so this can be proven without
+    /// making the real `fchmod` syscall fail. The fixture starts at 0o644,
+    /// independent of the process umask.
+    fn harden_audit_handle_rejects_failing_set_mode() -> anyhow::Result<()> {
+        use std::os::{fd::OwnedFd, unix::fs::PermissionsExt as _};
+
+        use rustix::{io::Errno, process::geteuid};
+
+        fn always_fails(_fd: &OwnedFd) -> super::RustixIoResult<()> {
+            Err(Errno::PERM)
+        }
+
+        let dir = unique_temp_path("audit-seam-chmod-fail")?;
+        fs::create_dir_all(&dir).context("create fixture dir")?;
+        let path = dir.join("audit.log");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .context("open a real self-owned file")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+            .context("widen fixture mode")?;
+        let fd = OwnedFd::from(file);
+        let real_uid = geteuid().as_raw();
+
+        let result = super::harden_audit_handle(fd, &path, real_uid, always_fails);
+
+        let error = result
+            .err()
+            .context("a failing set_mode must be reported, not downgraded to a warning")?;
+        assert!(
+            error.contains("permissions"),
+            "error must mention the permissions failure; got {error:?}"
+        );
+        let contents = fs::read(&path).context("read fixture file")?;
+        assert!(
+            contents.is_empty(),
+            "a rejected handle must never be written to; got {} bytes",
+            contents.len()
+        );
+
+        fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    /// Pins that `harden_audit_handle` rejects a handle that is not a
+    /// regular file, independent of the open path: cheap and
+    /// platform-independent, unlike the FIFO test above, this needs no
+    /// privileges and no special fixture.
+    fn harden_audit_handle_rejects_non_regular_file() -> anyhow::Result<()> {
+        use std::os::fd::OwnedFd;
+
+        use rustix::process::geteuid;
+
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .open("/dev/null")
+            .context("open /dev/null read-only")?;
+        let fd = OwnedFd::from(file);
+        let real_uid = geteuid().as_raw();
+
+        let result = super::harden_audit_handle(
+            fd,
+            Path::new("/dev/null"),
+            real_uid,
+            super::set_audit_file_mode,
+        );
+
+        let error = result
+            .err()
+            .context("a non-regular handle must be rejected")?;
+        assert!(
+            error.contains("not a regular file"),
+            "error must name the regular-file rule; got {error:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    /// Pins the seam's success path directly: a self-owned regular file,
+    /// the real effective UID, and the real `fchmod` end with mode
+    /// `0o600` and no `O_NONBLOCK` on the returned handle. The fixture
+    /// starts at 0o644, independent of the process umask.
+    fn harden_audit_handle_accepts_self_owned_file_and_clears_nonblock() -> anyhow::Result<()> {
+        use std::os::{fd::OwnedFd, unix::fs::PermissionsExt as _};
+
+        use rustix::{
+            fs::{OFlags, fcntl_getfl},
+            process::geteuid,
+        };
+
+        let dir = unique_temp_path("audit-seam-success")?;
+        fs::create_dir_all(&dir).context("create fixture dir")?;
+        let path = dir.join("audit.log");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .context("open a real self-owned file")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+            .context("widen fixture mode")?;
+        let fd = OwnedFd::from(file);
+        let real_uid = geteuid().as_raw();
+
+        let hardened = super::harden_audit_handle(fd, &path, real_uid, super::set_audit_file_mode)
+            .map_err(|error| anyhow::anyhow!("harden_audit_handle: {error}"))?;
+
+        let mode = fs::metadata(&path)
+            .context("read fixture metadata")?
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "handle must end 0o600; got {mode:o}");
+        let flags = fcntl_getfl(&hardened).context("read back status flags")?;
+        assert!(
+            !flags.contains(OFlags::NONBLOCK),
+            "handle must not keep O_NONBLOCK set"
+        );
+
+        drop(hardened);
+        fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    /// Pins that a self-owned regular file already at exactly 0o600 is
+    /// accepted when fchmod fails, as on a filesystem that rejects chmod,
+    /// and that the handle still loses `O_NONBLOCK`.
+    fn harden_audit_handle_accepts_0600_when_set_mode_fails() -> anyhow::Result<()> {
+        use std::os::{fd::OwnedFd, unix::fs::PermissionsExt as _};
+
+        use rustix::{
+            fs::{OFlags, fcntl_getfl, fcntl_setfl},
+            io::Errno,
+            process::geteuid,
+        };
+
+        fn always_fails(_fd: &OwnedFd) -> super::RustixIoResult<()> {
+            Err(Errno::PERM)
+        }
+
+        let dir = unique_temp_path("audit-seam-chmod-fail-0600")?;
+        fs::create_dir_all(&dir).context("create fixture dir")?;
+        let path = dir.join("audit.log");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .context("open a real self-owned file")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .context("set fixture mode")?;
+        let fd = OwnedFd::from(file);
+        fcntl_setfl(&fd, OFlags::APPEND | OFlags::NONBLOCK).context("arm O_NONBLOCK")?;
+        anyhow::ensure!(
+            fcntl_getfl(&fd)
+                .context("read fixture status flags")?
+                .contains(OFlags::NONBLOCK),
+            "fixture handle must start with O_NONBLOCK set"
+        );
+        let real_uid = geteuid().as_raw();
+
+        let hardened = super::harden_audit_handle(fd, &path, real_uid, always_fails)
+            .map_err(|error| anyhow::anyhow!("harden_audit_handle: {error}"))?;
+
+        let mode = fs::metadata(&path)
+            .context("read fixture metadata")?
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7777, 0o600, "handle must stay 0o600; got {mode:o}");
+        let flags = fcntl_getfl(&hardened).context("read back status flags")?;
+        assert!(
+            !flags.contains(OFlags::NONBLOCK),
+            "handle must not keep O_NONBLOCK set"
+        );
+
+        drop(hardened);
+        fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    /// Pins that fchmod is still attempted on a file already at 0o600, so
+    /// its side effects on ACL filesystems are kept wherever chmod works.
+    fn harden_audit_handle_still_attempts_set_mode_at_0600() -> anyhow::Result<()> {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        use std::os::{fd::OwnedFd, unix::fs::PermissionsExt as _};
+
+        use rustix::process::geteuid;
+
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        #[expect(
+            clippy::unnecessary_wraps,
+            reason = "deliberate: src/observability.rs::harden_audit_handle takes a fallible set_mode fn pointer, so this counting seam must return a Result"
+        )]
+        fn counting(_fd: &OwnedFd) -> super::RustixIoResult<()> {
+            let _previous = CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        let dir = unique_temp_path("audit-seam-chmod-attempt-0600")?;
+        fs::create_dir_all(&dir).context("create fixture dir")?;
+        let path = dir.join("audit.log");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .context("open a real self-owned file")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .context("set fixture mode")?;
+        let fd = OwnedFd::from(file);
+        let real_uid = geteuid().as_raw();
+
+        let hardened = super::harden_audit_handle(fd, &path, real_uid, counting)
+            .map_err(|error| anyhow::anyhow!("harden_audit_handle: {error}"))?;
+
+        assert_eq!(
+            CALLS.load(Ordering::SeqCst),
+            1,
+            "set_mode must be attempted exactly once even at 0o600"
+        );
+
+        drop(hardened);
+        fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    /// Pins that setuid, setgid and sticky bits count: a file at 0o4600 is
+    /// not accepted when fchmod fails.
+    fn harden_audit_handle_rejects_special_bits_when_set_mode_fails() -> anyhow::Result<()> {
+        use std::os::{fd::OwnedFd, unix::fs::PermissionsExt as _};
+
+        use rustix::{io::Errno, process::geteuid};
+
+        fn always_fails(_fd: &OwnedFd) -> super::RustixIoResult<()> {
+            Err(Errno::PERM)
+        }
+
+        let dir = unique_temp_path("audit-seam-chmod-fail-special")?;
+        fs::create_dir_all(&dir).context("create fixture dir")?;
+        let path = dir.join("audit.log");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .context("open a real self-owned file")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o4600))
+            .context("set fixture mode")?;
+        let fixture_mode = fs::metadata(&path)
+            .context("read fixture metadata")?
+            .permissions()
+            .mode();
+        anyhow::ensure!(
+            fixture_mode & 0o7777 == 0o4600,
+            "fixture must carry the setuid bit; got {fixture_mode:o}"
+        );
+        let fd = OwnedFd::from(file);
+        let real_uid = geteuid().as_raw();
+
+        let result = super::harden_audit_handle(fd, &path, real_uid, always_fails);
+
+        let error = result
+            .err()
+            .context("a 0o4600 handle must be rejected when set_mode fails")?;
+        assert!(
+            error.contains("permissions"),
+            "error must mention the permissions failure; got {error:?}"
+        );
+
+        fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/observability.rs::lenient_init_installs_no_sink_when_hardening_fails keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
+    #[cfg(unix)]
+    /// Pins that lenient (deprecated) init installs no audit sink when
+    /// hardening fails: the cross-platform behaviour the guard at the bottom
+    /// of this module pins for a platform with no private-permission
+    /// support, exercised here through a real Unix failure mode.
+    fn lenient_init_installs_no_sink_when_hardening_fails() -> anyhow::Result<()> {
+        let config = observability_config(Some(PathBuf::from("/dev/null")));
+
+        let setup = prepare_tracing_audit_lenient(&config);
+
+        assert!(
+            setup.writer.is_none(),
+            "no audit sink may be installed when hardening fails"
+        );
+        assert!(
+            !setup.warnings.is_empty(),
+            "lenient init must warn rather than fail silently; got {:?}",
+            setup.warnings
+        );
+
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/observability.rs::ownership_check_rejects_foreign_uid_without_requiring_root keeps the uniform test signature while it cannot fail"
+    )]
+    #[test]
+    #[cfg(unix)]
+    /// Pins the ownership-match decision directly against fabricated UIDs:
+    /// proving the rejection path with a REAL foreign-owned file needs
+    /// privileges (root, or a user-namespace / idmapped-mount setup) that
+    /// this test suite does not assume and CI does not grant.
+    fn ownership_check_rejects_foreign_uid_without_requiring_root() -> anyhow::Result<()> {
+        assert!(super::is_owned_by_effective_user(1000, 1000));
+        assert!(!super::is_owned_by_effective_user(1000, 0));
+        assert!(!super::is_owned_by_effective_user(0, 1000));
+
+        Ok(())
+    }
+
     /// The audit log must end up with a protected, owner-only DACL: exactly one
     /// ACE, granting this process's SID, with inherited entries discarded.
     ///
@@ -1337,6 +2461,163 @@ mod tests {
         );
 
         fs::remove_dir_all(&dir).context("remove audit temp dir")?;
+
+        Ok(())
+    }
+
+    /// Pins that a pre-existing regular audit-log file is still accepted
+    /// through the open-existing fallback of `open_or_create_audit_handle`
+    /// (strict init returns only when the DACL step succeeded) and that
+    /// its contents are not altered.
+    #[test]
+    #[cfg(windows)]
+    fn windows_preexisting_audit_file_is_accepted_without_alteration() -> anyhow::Result<()> {
+        let dir = unique_temp_path("audit-preexisting")?;
+        fs::create_dir_all(&dir).context("create preexisting-file temp dir")?;
+        let audit_path = dir.join("audit.log");
+        fs::write(&audit_path, b"pre-existing audit content\n")
+            .context("write pre-existing audit file")?;
+        let config = observability_config(Some(audit_path.clone()));
+
+        let setup = prepare_tracing_audit_strict(&config)
+            .context("a pre-existing regular audit file must still be accepted")?;
+        drop(setup.guard);
+
+        assert!(
+            audit_path.exists(),
+            "the pre-existing audit file must not be deleted"
+        );
+        let contents = fs::read(&audit_path).context("read audit file contents")?;
+        assert_eq!(
+            contents, b"pre-existing audit content\n",
+            "opening for append must not truncate or alter pre-existing contents"
+        );
+
+        fs::remove_dir_all(&dir).context("remove preexisting-file temp dir")?;
+
+        Ok(())
+    }
+
+    /// Pins that a junction at the final path component is refused before
+    /// any write, naming the specific reparse-point rejection (a directory
+    /// cannot be opened for append anyway, so only that specific message
+    /// proves the reparse-point check ran before any open attempt), and
+    /// that the junction and its target directory both survive untouched.
+    /// Creating a junction needs no special privilege on Windows.
+    #[test]
+    #[cfg(windows)]
+    fn windows_junctioned_audit_path_is_rejected_before_any_write() -> anyhow::Result<()> {
+        let dir = unique_temp_path("audit-junction")?;
+        fs::create_dir_all(&dir).context("create junction base dir")?;
+        let target_dir = dir.join("junction-target");
+        fs::create_dir_all(&target_dir).context("create junction target dir")?;
+        let link_path = dir.join("audit.log");
+
+        let status = process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&link_path)
+            .arg(&target_dir)
+            .status()
+            .context("spawn mklink /J to build this test's junction fixture")?;
+        assert!(
+            status.success(),
+            "mklink /J must succeed to set up this test's fixture; got {status:?}"
+        );
+
+        let config = observability_config(Some(link_path.clone()));
+        let err = prepare_tracing_audit_strict(&config)
+            .err()
+            .context("a junctioned audit path must fail closed with Startup")?;
+        let msg = err.to_string();
+        assert!(
+            msg.contains("reparse point"),
+            "error must name the reparse-point rejection; got {msg:?}"
+        );
+
+        assert!(
+            link_path.exists(),
+            "the junction itself must still exist after the rejection"
+        );
+        assert!(
+            target_dir.exists(),
+            "the junction's target directory must still exist after the rejection"
+        );
+
+        fs::remove_dir(&link_path)
+            .context("remove the junction without recursing into its target")?;
+        fs::remove_dir_all(&dir).context("remove junction temp dir")?;
+
+        Ok(())
+    }
+
+    /// Pins that a file symlink at the final path component is refused
+    /// before any write, naming the specific reparse-point rejection, and
+    /// that the symlink's target file and contents survive untouched.
+    /// Creating a file symlink needs `SeCreateSymbolicLinkPrivilege` or
+    /// Developer Mode; when the runner grants neither, `symlink_file` fails
+    /// with raw OS error 1314 (`ERROR_PRIVILEGE_NOT_HELD`), which this test
+    /// detects and returns early from rather than failing for a privilege
+    /// it does not control. That raw code, not `io::ErrorKind`, is the
+    /// correct check: std's own `decode_error_kind` has no match arm for
+    /// 1314, so it falls through to `ErrorKind::Uncategorized`, and std's
+    /// own test suite (`library/std/src/fs/tests.rs`) checks
+    /// `raw_os_error() == Some(1314)` for exactly this reason. The skip is
+    /// silent (no output) because libtest captures the output of a
+    /// passing test - but only when the privilege is missing AND
+    /// `RMCP_REQUIRE_SYMLINK_TESTS` is not exactly `1`; CI sets that
+    /// variable so the missing-privilege path fails instead of skipping.
+    #[test]
+    #[cfg(windows)]
+    fn windows_symlinked_audit_path_is_rejected_before_any_write() -> anyhow::Result<()> {
+        const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+
+        let dir = unique_temp_path("audit-symlink")?;
+        fs::create_dir_all(&dir).context("create symlink base dir")?;
+        let target_path = dir.join("target.log");
+        let link_path = dir.join("audit.log");
+        fs::write(&target_path, b"pre-existing target contents\n")
+            .context("write symlink target")?;
+
+        if let Err(error) = std::os::windows::fs::symlink_file(&target_path, &link_path) {
+            if error.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) {
+                fs::remove_dir_all(&dir).context("remove symlink temp dir")?;
+                anyhow::ensure!(
+                    env::var_os("RMCP_REQUIRE_SYMLINK_TESTS").as_deref()
+                        != Some(std::ffi::OsStr::new("1")),
+                    "creating a file symlink needs SeCreateSymbolicLinkPrivilege or Windows Developer Mode, and RMCP_REQUIRE_SYMLINK_TESTS=1 forbids skipping this test"
+                );
+                return Ok(());
+            }
+            return Err(error).context("create file symlink fixture");
+        }
+
+        let config = observability_config(Some(link_path.clone()));
+        let err = prepare_tracing_audit_strict(&config)
+            .err()
+            .context("a symlinked audit path must fail closed with Startup")?;
+        let msg = err.to_string();
+        assert!(
+            msg.contains("reparse point"),
+            "error must name the reparse-point rejection; got {msg:?}"
+        );
+
+        let contents = fs::read(&target_path).context("read symlink target contents")?;
+        assert_eq!(
+            contents, b"pre-existing target contents\n",
+            "the symlink target file's contents must be unchanged"
+        );
+        assert!(
+            link_path.exists(),
+            "the symlink itself must still exist after the rejection"
+        );
+        assert!(
+            target_path.exists(),
+            "the symlink target file must still exist after the rejection"
+        );
+
+        fs::remove_dir_all(&dir).context("remove symlink temp dir")?;
 
         Ok(())
     }
@@ -1406,7 +2687,7 @@ mod tests {
     // With JSON logging (`.json()`, wired above in this module), a field
     // recorded with the Debug sigil (`?`) is rendered via `format!("{:?}")`
     // and then embedded in a JSON string; if the Debug output itself
-    // contains quotes, the JSON serializer escapes them --
+    // contains quotes, the JSON serializer escapes them -
     // `"request_id":"String(\"abc-123\")"` instead of
     // `"request_id":"abc-123"`. This is a heuristic TRIPWIRE modelled on
     // `crate::error`'s guard, not a proof: it enforces two syntactic rules
@@ -1514,7 +2795,7 @@ mod tests {
     }
 
     /// Rule A: a `format!(...)` format string that is *only* a single Debug
-    /// placeholder (`"{:?}"` or `"{value:?}"`) -- unconditional
+    /// placeholder (`"{:?}"` or `"{value:?}"`) - unconditional
     /// Debug-stringification with no surrounding human-readable text.
     #[expect(
         clippy::literal_string_with_formatting_args,
@@ -1529,7 +2810,7 @@ mod tests {
     }
 
     /// Every production `format!(...)` call whose format string matches
-    /// [`is_bare_debug_format_string`]. Scans `format!` invocations only --
+    /// [`is_bare_debug_format_string`]. Scans `format!` invocations only -
     /// a `tracing::warn!("... {:?}", x)` message string is not this shape
     /// (see `rule_a_ignores...` below).
     fn find_bare_debug_format_calls(src: &str) -> Vec<String> {
@@ -1632,7 +2913,7 @@ mod tests {
         (
             "src/mtls_revocation.rs",
             "url = ?raw",
-            "deliberate control-character escaping of attacker-supplied input -- see the log-injection note at the call site",
+            "deliberate control-character escaping of attacker-supplied input - see the log-injection note at the call site",
         ),
         (
             "src/oauth.rs",
@@ -1701,7 +2982,7 @@ mod tests {
         assert!(
             offenders.is_empty(),
             "production `format!(...)` must not unconditionally Debug-stringify a value with \
-             no surrounding text -- JSON logging escapes embedded quotes (e.g. \
+             no surrounding text - JSON logging escapes embedded quotes (e.g. \
              `\"request_id\":\"String(\\\"abc-123\\\")\"`). Use `.to_string()` on a `Display` \
              value instead:\n{}",
             offenders.join("\n")
@@ -1732,7 +3013,7 @@ mod tests {
         assert!(
             offenders.is_empty(),
             "production tracing::{{trace,debug,info,warn,error}}! calls must not use the Debug \
-             sigil (`?`) on a structured field unless explicitly allowlisted -- JSON logging \
+             sigil (`?`) on a structured field unless explicitly allowlisted - JSON logging \
              escapes embedded quotes in the Debug rendering. Use `%` (Display) instead, or add \
              an entry to RULE_B_ALLOWLIST with a reason if Debug really is intended:\n{}",
             offenders.join("\n")
@@ -1779,7 +3060,7 @@ mod tests {
     fn rule_a_ignores_debug_embedded_in_larger_text_and_tracing_message_strings()
     -> anyhow::Result<()> {
         // Diagnostic messages that embed Debug inside human-readable text
-        // are outside this bug class -- the quoting is often desirable
+        // are outside this bug class - the quoting is often desirable
         // there (it delimits an untrusted value).
         assert_eq!(
             find_bare_debug_format_calls(

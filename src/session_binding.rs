@@ -165,7 +165,7 @@ pub(crate) fn fingerprint(identity: &AuthIdentity) -> IdentityFingerprint {
     // All producers are validated upstream to yield a non-blank stable id
     // (mTLS `extract_mtls_identity`, API-key `check_api_key_names`, OAuth
     // `validate_token_with_reason`); a blank one collapses distinct principals
-    // to one fingerprint (CWE-384). Assert in debug only -- a runtime refusal
+    // to one fingerprint (CWE-384). Assert in debug only - a runtime refusal
     // here is too late in the request lifecycle and has no good failure mode.
     debug_assert!(
         !stable_id.trim().is_empty(),
@@ -341,7 +341,7 @@ pub(crate) fn keyed_mac(secret: &SessionBindingSecret) -> HmacSha256 {
         let digest = Sha256::digest(key);
         #[expect(
             clippy::expect_used,
-            reason = "invariant: src/session_binding.rs::keyed_mac -- a 32-byte SHA-256 digest is unconditionally a valid HMAC-SHA256 key (RFC 2104 allows any key length)"
+            reason = "invariant: src/session_binding.rs::keyed_mac - a 32-byte SHA-256 digest is unconditionally a valid HMAC-SHA256 key (RFC 2104 allows any key length)"
         )]
         HmacSha256::new_from_slice(&digest).expect("32-byte SHA256 digest is valid HMAC key")
     }

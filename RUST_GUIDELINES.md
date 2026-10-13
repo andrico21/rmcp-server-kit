@@ -128,12 +128,15 @@ defined cleanup order, and no panic path. `scripts/lint-ratchet/prose_gates.py
 
 | Impl | File:line | Finding |
 | ---- | --------- | ------- |
-| `Drop for ExposureTestGuard` | `src/diagnostics.rs:197` | Test-only. Restores the process-global switch snapshot in memory; sync, no I/O or await, no panic path. No defect. |
-| `Drop for PendingUrlGuard` | `src/mtls_revocation.rs:1953` | Clears the in-flight URL marker (poison-recovering mutex); sync, no I/O or await, no panic path. Ordering is explicit via `disarm()` before promotion. No defect. |
-| `Drop for TracingGuard` | `src/observability.rs:247` | Delegates to `AuditWorkerGuard` by taking the `Option`; sync, no await, no panic path. Bounded by design (5s). No defect. |
-| `Drop for AuditWorkerGuard` | `src/observability.rs:441` | Signals shutdown then parks/joins the writer thread for at most `AUDIT_WRITER_JOIN_TIMEOUT` (5s); no async work or panic path. Bounded blocking is deliberate and documented. No defect. |
-| `Drop for CancelOnDrop` | `src/transport.rs:2866` | Sync, non-blocking `CancellationToken::cancel`; no I/O, await or panic path. Never disarmed on purpose. No defect. |
-| `Drop for TlsListener` | `src/transport.rs:3777` | Sync, non-blocking `JoinHandle::abort`; in-flight workers exit on the closed channel. No I/O, await or panic path. No defect. |
+| `ExposureTestGuard` | `src/diagnostics.rs:152` | Test-only. Restores the process-global switch snapshot in memory; sync, no I/O or await, no panic path. No defect. |
+| `Drop for PendingUrlGuard` | `src/mtls_revocation.rs:2498` | Clears the in-flight URL marker (poison-recovering mutex); sync, no I/O or await, no panic path. Ordering is explicit via `disarm()` before promotion. No defect. |
+| `RefreshCompletionGuard` | `src/oauth.rs:2879` | Publishes one JWKS refresh completion and releases watch waiters through sync mutex/watch operations; no I/O, await, blocking or panic path. No defect. |
+| `Drop for JwksCache` | `src/oauth.rs:2920` | Sync, non-blocking `CancellationToken::cancel` for cache-owned JWKS refresh tasks; no I/O, await or panic path. No defect. |
+| `TracingGuard` | `src/observability.rs:137` | Delegates to `AuditWorkerGuard` by taking the `Option`; sync, no await, no panic path. Bounded by design (5s). No defect. |
+| `Drop for AuditWorkerGuard` | `src/observability.rs:392` | Signals shutdown then parks/joins the writer thread for at most `AUDIT_WRITER_JOIN_TIMEOUT` (5s); no async work or panic path. Bounded blocking is deliberate and documented. No defect. |
+| `Drop for CancelOnDrop` | `src/transport.rs:2966` | Sync, non-blocking `CancellationToken::cancel`; no I/O, await or panic path. Never disarmed on purpose. No defect. |
+| `Drop for TlsListener` | `src/transport.rs:3930` | Sync, non-blocking `JoinHandle::abort`; in-flight workers exit on the closed channel. No I/O, await or panic path. No defect. |
+| `Drop for ReleaseHookOnDrop` | `src/auth.rs:1649` | Test-only. Flips the `AtomicBool` gate of a `VerificationHook`; sync, no I/O or await, no panic path. Runs on unwind too, which unparks any `spawn_blocking` closure still busy-waiting before the test's `Runtime` drops. No defect. |
 
 ## Local deviations register
 
@@ -154,7 +157,12 @@ entry in the same PR that introduces a deviation.
    connect-time screening in `src/ssrf_resolver.rs`), with pre-flight screening
    on the bootstrap path. The OAuth path does implement the suffix rule.
    Owner-accepted: CRL integrity rests on the CA signature, and a name that
-   resolves only to public IPs is not an internal-service SSRF.
+   resolves only to public IPs is not an internal-service SSRF. Since 3.20,
+   origins named in the operator's configured certificates (the mTLS CA
+   bundle and the server certificate chain) bypass this resolved-address
+   screening automatically, cloud metadata excepted; the finding above is
+   unchanged, since a trusted certificate's hostname suffix is still never
+   inspected.
 3. **2026-10-03 - Client context off by default.** Core Section 10 expects auth
    attempts and RBAC denials to be logged with the source IP; `LogContextConfig`
    here keeps `client_ip` and the other client-context fields off unless an
@@ -351,7 +359,10 @@ entry in the same PR that introduces a deviation.
    of `AuthLogContext` (constructed by `src/transport.rs`'s test helper), and
    the crate-private `oauth` placeholder field. Constant-time arithmetic in
    `verify_slots` uses `wrapping_sub` (never `checked_*` + `?`, G-8), and the
-   redaction tests' output is unchanged. Evidence: the task-18 migration
+   redaction tests' output is unchanged. A permit pool now gates admission
+   into `authenticate_bearer_identity` before the `verify_slots` scan runs;
+   it bounds concurrent Argon2id work and does not alter `verify_slots`
+   itself, which stays byte-identical. Evidence: the task-18 migration
    record (`new-permanent-expects.txt`, `gates.txt`).
 19. **2026-10-04 - `src/tool_hooks.rs` + `src/rbac_context.rs` per-item
    expectations (task 21).** Under entry 13's decision this lane freezes two
@@ -464,9 +475,10 @@ numbered entry only if one of these situations arises later.
    bytes; never write upstream.
 4. Run the gates: `cargo test --all-features --test docs_citations`,
    `lychee --offline --no-progress README.md RUST_GUIDELINES.md docs/*.md`,
-   the four lint gates (`python3 scripts/lint-ratchet/catalog_gate.py`,
+   the five lint gates (`python3 scripts/lint-ratchet/catalog_gate.py`,
    `allow_gate.py --enforce`, `profile_eq.py --clippy-toml`,
-   `prose_gates.py --enforce`), plus the usual fmt/lint/test set. The retired
+   `prose_gates.py --enforce`, `dash_gate.py --enforce`), plus the usual
+   fmt/lint/test set. The retired
    counting ratchet is not part of the set.
 
 ## Toolchain-bump procedure

@@ -175,7 +175,7 @@ pub(crate) fn screen_addrs(
             continue;
         };
 
-        // Cloud-metadata is unbypassable -- short-circuit BEFORE
+        // Cloud-metadata is unbypassable - short-circuit BEFORE
         // consulting the allowlist or the loopback-bypass flag. This
         // ordering is the security invariant Oracle review S2 requires.
         if reason == "cloud_metadata" {
@@ -307,6 +307,132 @@ mod tests {
             .err()
             .ok_or_else(|| anyhow::anyhow!("nat64-embedded metadata must be unbypassable"))?;
         assert!(err.contains("cloud_metadata"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    /// Pins that local-use NAT64 is blocked by default for private-shaped addresses.
+    fn rejects_nat64_local_use_private_under_empty_allowlist() -> anyhow::Result<()> {
+        let addrs = vec![socket_addr(IpAddr::V6(Ipv6Addr::new(
+            0x0064, 0xff9b, 1, 0, 0, 0, 0x0a00, 0x0001,
+        )))];
+        let err = screen_addrs(&addrs, &empty_allowlist(), "nat64-private.example", false)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("local-use NAT64 private-shaped IP must be blocked"))?;
+        assert!(err.contains("nat64_local_use"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    /// Pins that local-use NAT64 is blocked by default for public-shaped addresses.
+    fn rejects_nat64_local_use_public_under_empty_allowlist() -> anyhow::Result<()> {
+        let addrs = vec![socket_addr(IpAddr::V6(Ipv6Addr::new(
+            0x0064, 0xff9b, 1, 0, 0, 0, 0x0808, 0x0808,
+        )))];
+        let err = screen_addrs(&addrs, &empty_allowlist(), "nat64-public.example", false)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("local-use NAT64 public-shaped IP must be blocked"))?;
+        assert!(err.contains("nat64_local_use"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    /// Pins that a local-use NAT64 CIDR allowlist admits non-metadata addresses.
+    fn cidr_allowlist_permits_nat64_local_use_non_metadata() -> anyhow::Result<()> {
+        let addrs = vec![
+            socket_addr(IpAddr::V6(Ipv6Addr::new(
+                0x0064, 0xff9b, 1, 0, 0, 0, 0x0a00, 0x0001,
+            ))),
+            socket_addr(IpAddr::V6(Ipv6Addr::new(
+                0x0064, 0xff9b, 1, 0, 0, 0, 0x0808, 0x0808,
+            ))),
+        ];
+        let allowlist = allowlist_with(&[], &["64:ff9b:1::/48"])?;
+        let out = screen_addrs(&addrs, &allowlist, "nat64.example", false)
+            .map_err(|diag| anyhow::anyhow!("local-use NAT64 allowlist must admit: {diag}"))?;
+        assert_eq!(out, addrs);
+        Ok(())
+    }
+
+    #[test]
+    /// Pins that local-use NAT64 metadata stays blocked even with a `/48` allowlist.
+    fn rejects_nat64_local_use_metadata_even_with_allowlist() -> anyhow::Result<()> {
+        let allowlist = allowlist_with(&[], &["64:ff9b:1::/48"])?;
+        for ip in [
+            Ipv6Addr::new(0x0064, 0xff9b, 1, 0xa9fe, 0x00a9, 0xfe00, 0, 0),
+            Ipv6Addr::new(0x0064, 0xff9b, 1, 0x00a9, 0x00fe, 0xa9fe, 0, 0),
+            Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 0x00a9, 0xfea9, 0xfe00, 0),
+            Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 0, 0, 0xa9fe, 0xa9fe),
+        ] {
+            let addrs = vec![socket_addr(IpAddr::V6(ip))];
+            let err = screen_addrs(&addrs, &allowlist, "nat64-meta.example", false)
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("local-use NAT64 metadata must be unbypassable"))?;
+            assert!(err.contains("cloud_metadata"), "{err}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    /// Pins that an allowlist still admits non-metadata local-use NAT64 layouts.
+    fn cidr_allowlist_permits_nat64_local_use_non_metadata_layout() -> anyhow::Result<()> {
+        let addrs = vec![socket_addr(IpAddr::V6(Ipv6Addr::new(
+            0x0064, 0xff9b, 1, 0x0808, 0x0008, 0x0800, 0, 0,
+        )))];
+        let allowlist = allowlist_with(&[], &["64:ff9b:1::/48"])?;
+        let out = screen_addrs(&addrs, &allowlist, "nat64-public.example", false)
+            .map_err(|diag| anyhow::anyhow!("local-use NAT64 allowlist must admit: {diag}"))?;
+        assert_eq!(out, addrs);
+        Ok(())
+    }
+
+    #[test]
+    /// Pins that the new reserved IPv6 classes are blocked by default.
+    fn rejects_reserved_ipv6_classes_under_empty_allowlist() -> anyhow::Result<()> {
+        for (ip, label) in [
+            (Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 1), "site_local"),
+            (
+                Ipv6Addr::new(0x2001, 0x0002, 0, 0, 0, 0, 0, 1),
+                "benchmarking",
+            ),
+            (Ipv6Addr::new(0x2001, 0x0010, 0, 0, 0, 0, 0, 1), "orchid"),
+            (Ipv6Addr::new(0x2001, 0x0020, 0, 0, 0, 0, 0, 1), "orchid"),
+        ] {
+            let addrs = vec![socket_addr(IpAddr::V6(ip))];
+            let err = screen_addrs(&addrs, &empty_allowlist(), "reserved.example", false)
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("reserved IPv6 class must be blocked: {ip}"))?;
+            assert!(err.contains(label), "{err}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    /// Pins that CIDR allowlists admit the re-allowable reserved IPv6 classes.
+    fn cidr_allowlist_permits_reserved_ipv6_classes() -> anyhow::Result<()> {
+        for (ip, cidr) in [
+            (Ipv6Addr::new(0xfed0, 0, 0, 0, 0, 0, 0, 1), "fec0::/10"),
+            (
+                Ipv6Addr::new(0x2001, 0x0002, 0, 0, 0, 0, 0, 1),
+                "2001:2::/48",
+            ),
+            (
+                Ipv6Addr::new(0x2001, 0x0018, 0, 0, 0, 0, 0, 1),
+                "2001:10::/28",
+            ),
+            (
+                Ipv6Addr::new(0x2001, 0x0028, 0, 0, 0, 0, 0, 1),
+                "2001:20::/28",
+            ),
+        ] {
+            let addrs = vec![socket_addr(IpAddr::V6(ip))];
+            let allowlist = allowlist_with(&[], &[cidr])?;
+            let out =
+                screen_addrs(&addrs, &allowlist, "reserved.example", false).map_err(|diag| {
+                    anyhow::anyhow!("reserved IPv6 allowlist must admit {ip}: {diag}")
+                })?;
+            assert_eq!(out, addrs);
+        }
         Ok(())
     }
 

@@ -9,7 +9,7 @@
 It provides a Streamable HTTP transport with TLS/mTLS, structured
 observability, authentication (Bearer / mTLS / OAuth 2.1 JWT), role-based
 access control (RBAC), per-IP rate limiting, and optional Prometheus
-metrics -- all wired up and ready to go.
+metrics - all wired up and ready to go.
 
 You supply a `rmcp::handler::server::ServerHandler` implementation; rmcp-server-kit
 handles everything else.
@@ -25,7 +25,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 
 > The minimal example below uses default features only. Enable the
 > `oauth` feature (`features = ["oauth"]`) to validate JWTs against a
-> JWKS, or `metrics` for the Prometheus `/metrics` endpoint -- see the
+> JWKS, or `metrics` for the Prometheus `/metrics` endpoint - see the
 > [Cargo features](#cargo-features) table below.
 
 ```rust
@@ -77,14 +77,18 @@ cargo run --example oauth_server --features oauth
 **API key + RBAC + per-tool argument allowlist:**
 
 ```rust,ignore
-use rmcp_server_kit::auth::{ApiKeyEntry, AuthConfig, generate_api_key};
+use rmcp_server_kit::auth::{ApiKeyEntry, AuthConfig, RateLimitConfig, generate_api_key};
 use rmcp_server_kit::rbac::{ArgumentAllowlist, RbacConfig, RbacPolicy, RoleConfig};
 use std::sync::Arc;
 
 let (token, hash) = generate_api_key()?;
 let auth = AuthConfig::with_keys(vec![
     ApiKeyEntry::new("viewer-key", hash, "viewer"),
-]);
+])
+// API-key auth without rate limiting is unsafe on a reachable listener.
+// `with_pre_auth_burst(10)` caps the initial unauthenticated wave admitted
+// to Argon2id verification at 10, well below the default of 300.
+.with_rate_limit(RateLimitConfig::new(30).with_pre_auth_burst(10));
 let viewer = RoleConfig::new("viewer", vec!["echo".into()], vec!["*".into()])
     .with_argument_allowlists(vec![ArgumentAllowlist::new_required(
         "echo", "message", vec!["hello".into(), "ping".into()],
@@ -93,8 +97,8 @@ let rbac = Arc::new(RbacPolicy::new(&RbacConfig::with_roles(vec![viewer])));
 ```
 
 > Use `ArgumentAllowlist::new_required` (as above), not `new`, unless omitting
-> the argument is genuinely safe. `required` defaults to `false` -- permanently
-> -- so an allowlist built with `new` constrains the value only when the caller
+> the argument is genuinely safe. `required` defaults to `false` - permanently
+> - so an allowlist built with `new` constrains the value only when the caller
 > supplies it, and a tool that substitutes its own default for a missing
 > argument bypasses the allowlist entirely. See the
 > [argument allowlist guide](docs/GUIDE.md#argumentallowlist).
@@ -146,10 +150,13 @@ let oauth = OAuthConfig::builder(
 ```
 
 > The default fail-closed SSRF guard blocks targets that resolve into
-> private (RFC 1918), loopback, CGNAT, or unique-local space. Use
+> private (RFC 1918), loopback, CGNAT, unique-local, site-local,
+> benchmarking, ORCHID, ORCHIDv2, or RFC 8215 local-use NAT64 space. Use
 > `ssrf_allowlist` only when the IdP legitimately lives there (e.g. a
-> Keycloak `Service` ClusterIP). Cloud-metadata addresses (AWS / GCP /
-> Alibaba) remain unbypassable regardless of the allowlist contents.
+> Keycloak `Service` ClusterIP or local NAT64 gateway). Cloud-metadata
+> addresses (AWS / GCP / Alibaba) remain unbypassable regardless of the
+> allowlist contents, including when embedded in `64:ff9b:1::/48` using
+> any RFC 6052 layout that fits inside the `/48`.
 > See [`docs/GUIDE.md`](docs/GUIDE.md#allowing-in-cluster-idps) and the
 > "Operator allowlist" subsection of [`SECURITY.md`](SECURITY.md#operator-allowlist)
 > for the full trust model.
@@ -189,12 +196,13 @@ let config = McpServerConfig::new("127.0.0.1:8443", "my-server", "0.1.0")
 | `oauth`              | No      | OAuth 2.1 JWT validation via JWKS.             |
 | `oauth-mtls-client`  | No      | RFC 8705 mTLS client authentication for the OAuth token-exchange endpoint. Implies `oauth`. |
 | `metrics`            | No      | Prometheus metrics registry and `/metrics`.    |
-| `test-helpers`       | No      | Test-only helpers for downstream integration tests. **Never enable in a production build** -- see the warning below. |
+| `test-helpers`       | No      | Test-only helpers for downstream integration tests. **Never enable in a production build** - see the warning below. |
 
 > **`test-helpers` is not safe in production.** It is not part of the stable
 > API surface and carries no semver guarantees across minor releases. Some of
 > the helpers it exposes deliberately bypass SSRF screening, the JWKS refresh
-> cooldown, the CDP discovery rate limiter, and CRL verifier publication. Enable
+> cooldown, the CDP discovery rate limiter, the verified path CRL discovery
+> gate, and CRL verifier publication. Enable
 > it only in test and integration builds. See the
 > [Cargo features section of the guide](docs/GUIDE.md#cargo-features) for the
 > per-helper detail.
@@ -290,9 +298,13 @@ does not break existing TOML parsing. `Clone` survives with
 
 **Status: shipped (minor, additive).** Recorded here so the residual
 trade-offs are not rediscovered. `crl_discovery_rate_per_min` gates admission
-of *new* CDP URLs into the CRL fetch pipeline on the unauthenticated mTLS
-handshake path. It is now keyed **per source peer IP** for attributed
-handshakes (process-global fallback when unattributed), which removes the
+of *new* CDP URLs into the CRL fetch pipeline on the mTLS handshake path;
+since 3.20.0 only CDP URLs named by the end entity or by intermediates on a
+verified path of a presented chain (a path to the configured roots that
+verifies, checked before the client proves key possession; revocation not
+considered) are admitted. It is now keyed
+**per source peer IP** for attributed handshakes (process-global fallback
+when unattributed), which removes the
 cross-peer starvation a single global bucket allowed: one peer could drain
 the shared budget and fail-closed a concurrent legitimate peer whose
 certificate pointed at a not-yet-cached CDP. It is a mitigation, not a
@@ -300,8 +312,9 @@ complete DoS defense; the accepted residuals are:
 
 - **Per-IP keying does not defeat a *distributed* attacker.** A sprayer using
   many source IPs cycles through independent per-peer budgets. Each sprayed IP
-  still pays a full TLS handshake, matching the default posture of the bearer
-  pre-auth limiter elsewhere in this crate.
+  still pays a full TLS handshake and also needs a copy of a valid client
+  chain, matching the default posture of the bearer pre-auth limiter
+  elsewhere in this crate.
 - **The key is the *direct* peer IP.** Behind a TCP load balancer that
   terminates the connection, that is the balancer's address, not the client's.
   Terminate TLS at the edge if you need true client attribution.

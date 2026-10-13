@@ -228,13 +228,19 @@ pub(crate) fn admin_router(state: AdminState, config: &AdminConfig) -> Router {
 #[expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")]
 #[cfg(test)]
 mod tests {
+    use core::time::Duration;
+
     use anyhow::Context as _;
     use axum::{body::to_bytes, http::Request};
+    use tokio::sync::Semaphore;
     use tower::ServiceExt as _;
 
     use super::*;
     use crate::{
-        auth::{ApiKeyEntry, AuthCounters, AuthLogContext, AuthMethod, SeenIdentitySet},
+        auth::{
+            ApiKeyEntry, AuthCounters, AuthLogContext, AuthMethod, SeenIdentitySet,
+            default_max_concurrent_verifications,
+        },
         rbac::{RbacConfig, RoleConfig},
     };
 
@@ -247,6 +253,10 @@ mod tests {
             )]),
             rate_limiter: None,
             pre_auth_limiter: None,
+            hash_permits: Arc::new(Semaphore::new(default_max_concurrent_verifications().get())),
+            verification_wait: Duration::from_secs(1),
+            #[cfg(test)]
+            verification_hook: None,
             #[cfg(feature = "oauth")]
             jwks_cache: None,
             seen_identities: SeenIdentitySet::new(),

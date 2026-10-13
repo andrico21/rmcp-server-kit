@@ -30,7 +30,7 @@ pub(crate) const MAX_SCANNED_ENTRIES: usize = 16;
 ///
 /// [`MAX_SCANNED_ENTRIES`] exists to close header-bomb scanning, so exposing
 /// the knob without a ceiling would let an operator disable the protection.
-/// 64 is four times the default -- ample for any real proxy chain -- while
+/// 64 is four times the default - ample for any real proxy chain - while
 /// keeping per-request parsing work finite.
 pub(crate) const MAX_CONFIGURABLE_SCANNED_ENTRIES: usize = 64;
 

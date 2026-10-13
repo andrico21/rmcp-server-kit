@@ -1,10 +1,10 @@
-# rmcp-server-kit -- MCP Server Framework for Rust
+# rmcp-server-kit - MCP Server Framework for Rust
 
 A production-grade, reusable framework for building
 [Model Context Protocol](https://modelcontextprotocol.io/) servers in Rust.
 Provides Streamable HTTP transport with TLS/mTLS, structured observability,
 authentication (Bearer / mTLS / OAuth 2.1 JWT), role-based access control
-(RBAC), per-IP rate limiting, and Prometheus metrics -- all wired up and
+(RBAC), per-IP rate limiting, and Prometheus metrics - all wired up and
 ready to go.
 
 You supply a `ServerHandler` implementation; rmcp-server-kit handles everything else.
@@ -17,15 +17,15 @@ You supply a `ServerHandler` implementation; rmcp-server-kit handles everything 
 - [Cargo Features](#cargo-features)
 - [Architecture Overview](#architecture-overview)
 - [Module Reference](#module-reference)
-  - [transport](#transport) -- HTTP server, TLS, health endpoints
-  - [auth](#auth) -- Authentication middleware
-  - [rbac](#rbac) -- Role-based access control
-  - [config](#config) -- Server and observability configuration
-  - [error](#error) -- Error types
-  - [observability](#observability) -- Tracing and logging
-  - [cancel](#cancel) -- Cancel-safe detach helper for tool handlers
-  - [oauth](#oauth) -- OAuth 2.1 JWT validation (feature-gated)
-  - [metrics](#metrics) -- Prometheus metrics (feature-gated)
+  - [transport](#transport) - HTTP server, TLS, health endpoints
+  - [auth](#auth) - Authentication middleware
+  - [rbac](#rbac) - Role-based access control
+  - [config](#config) - Server and observability configuration
+  - [error](#error) - Error types
+  - [observability](#observability) - Tracing and logging
+  - [cancel](#cancel) - Cancel-safe detach helper for tool handlers
+  - [oauth](#oauth) - OAuth 2.1 JWT validation (feature-gated)
+  - [metrics](#metrics) - Prometheus metrics (feature-gated)
 - [Additional Built-in Endpoints and Features](#additional-built-in-endpoints-and-features)
 - [Full Example: Building a Custom MCP Server](#full-example-building-a-custom-mcp-server)
 - [Client Usage Guide](#client-usage-guide)
@@ -90,7 +90,7 @@ This gives you `/healthz`, `/readyz`, and `/mcp` endpoints out of the box.
 | `oauth`   | No      | OAuth 2.1 JWT validation via JWKS. Adds `jsonwebtoken` and `reqwest`. |
 | `oauth-mtls-client` | No | RFC 8705 §2 mTLS client authentication for the OAuth token-exchange endpoint. Implies `oauth`. Without this feature, configurations that set `TokenExchangeConfig::client_cert` are rejected at startup by `OAuthConfig::validate`. See Recipe 2 for usage. |
 | `metrics` | No      | Prometheus metrics endpoint on a separate listener. Adds `prometheus`. |
-| `test-helpers` | No | Exposes test-only helpers from `mtls_revocation` and, when `oauth` is also enabled, `oauth`, for downstream integration tests. **Not part of the stable API surface** -- no semver guarantees across minor releases. **never enable in a production build:** some helpers deliberately bypass SSRF screening, the JWKS refresh cooldown, the CDP discovery rate limiter, and CRL verifier publication. |
+| `test-helpers` | No | Exposes test-only helpers from `mtls_revocation` and, when `oauth` is also enabled, `oauth`, for downstream integration tests. **Not part of the stable API surface** - no semver guarantees across minor releases. **never enable in a production build:** some helpers deliberately bypass SSRF screening, the JWKS refresh cooldown, the CDP discovery rate limiter, the verified path CRL discovery gate, and CRL verifier publication. |
 
 Enable in `Cargo.toml`:
 
@@ -298,9 +298,9 @@ GET /readyz  -> 200 {"ready":true,...} or 503 {"ready":false,"reason":"..."}
 
 Authentication middleware supporting three methods (tried in priority order):
 
-1. **mTLS client certificates** -- extracted during TLS handshake
-2. **Bearer tokens** -- API keys verified against Argon2id hashes
-3. **OAuth 2.1 JWT** -- validated against JWKS endpoint (feature: `oauth`)
+1. **mTLS client certificates** - extracted during TLS handshake
+2. **Bearer tokens** - API keys verified against Argon2id hashes
+3. **OAuth 2.1 JWT** - validated against JWKS endpoint (feature: `oauth`)
 
 #### `AuthConfig`
 
@@ -313,11 +313,15 @@ let auth = AuthConfig::with_keys(vec![
     ApiKeyEntry::new("readonly", ro_hash, "viewer"),
 ]);
 
-// With rate limiting
+// With rate limiting. API-key auth without rate limiting is unsafe on a
+// reachable listener: every bearer attempt runs an Argon2id verification
+// per configured key (see "Argon2id verification admission control"
+// below). `with_pre_auth_burst(10)` caps the initial unauthenticated wave
+// admitted to that work at 10, well below the default of 300.
 let auth = AuthConfig::with_keys(vec![
     ApiKeyEntry::new("admin", hash, "admin"),
 ])
-.with_rate_limit(RateLimitConfig::new(30));
+.with_rate_limit(RateLimitConfig::new(30).with_pre_auth_burst(10));
 ```
 
 ##### Fields
@@ -328,6 +332,8 @@ let auth = AuthConfig::with_keys(vec![
 | `api_keys` | `Vec<ApiKeyEntry>` | `[]` | Bearer token API keys |
 | `mtls` | `Option<MtlsConfig>` | `None` | mTLS client cert config |
 | `rate_limit` | `Option<RateLimitConfig>` | `None` | Auth attempt rate limit |
+| `max_concurrent_verifications` | `Option<NonZeroUsize>` | `None` (resolves to `available_parallelism()` clamped `1..=16`) | Bounds concurrent Argon2id API-key verifications; values above `tokio::sync::Semaphore::MAX_PERMITS` are clamped to that ceiling |
+| `verification_wait` | humantime duration | `"1s"` | Max time a request waits for a verification permit before `503` |
 | `oauth` | `Option<OAuthConfig>` | `None` | OAuth 2.1 (feature: `oauth`) |
 
 ##### Constructors
@@ -337,6 +343,74 @@ let auth = AuthConfig::with_keys(vec![
 | `AuthConfig::default()` | Disabled (no auth enforced) |
 | `AuthConfig::with_keys(keys)` | Enabled with API keys |
 | `.with_rate_limit(config)` | Builder: attach rate limiting |
+| `.with_max_concurrent_verifications(n)` | Builder: override the Argon2id verification permit count |
+| `.with_verification_wait(duration)` | Builder: override the permit-wait timeout (must be > 0) |
+
+#### Argon2id verification admission control
+
+Every bearer-token attempt runs one Argon2id verification per configured
+API key on the blocking thread pool (roughly 27-52 ms of CPU, depending on
+how many run at once, and about 19 MiB - Argon2id m = 19456 KiB - per
+verification with this crate's default cost parameters). `AuthState` bounds concurrent
+admission into that work with a permit pool so a flood of invalid bearer
+tokens cannot grow memory use without limit:
+
+- `max_concurrent_verifications` (default: `available_parallelism()`
+  clamped to `1..=16`) is the maximum number of Argon2id verifications
+  running at once. Peak memory from this path is therefore bounded by
+  roughly `max_concurrent_verifications * 19 MiB`, plus overhead.
+- A request that cannot get a permit within `verification_wait` (default 1
+  second) receives `503 Service Unavailable` with `Retry-After: 1` and a
+  generic body - never a `401`, never a hang, and this outcome is counted
+  separately in `/admin/auth/counters` (`failure_overloaded`) rather than
+  as a credential failure, so it does not consume the post-failure
+  rate-limit budget.
+- This bound is independent of, and composes with, [`RateLimitConfig`'s
+  pre-auth gate](#ratelimitconfig) (which throttles by source IP before
+  any Argon2id work runs) and [`max_concurrent_requests`](#mcpserverconfig)
+  (which bounds total in-flight requests of every kind). The permit pool
+  is the only one of the three that bounds Argon2id memory directly,
+  independent of source IP or client count. A configured value above
+  `tokio::sync::Semaphore::MAX_PERMITS` is clamped to that ceiling,
+  making it effectively unbounded rather than a startup panic.
+- The permit pool itself cannot be disabled, but it is on by default
+  with a resolved size (not an explicit operator choice unless
+  `max_concurrent_verifications` and `verification_wait` are set). It
+  mitigates a sustained flood's resource cost; it
+  does not eliminate the flood itself - see
+  [`SECURITY.md`](../SECURITY.md#argon2id-verification-admission-control).
+
+##### Capacity planning
+
+The permit pool bounds legitimate traffic as well as floods, so size it for
+your peak burst of valid bearer requests.
+
+Each bearer request holds one permit for a full key scan: one Argon2id
+verification per configured API key, expired or malformed keys included.
+Sustained capacity is therefore about
+`max_concurrent_verifications / (configured keys x t_verify)` requests per
+second, where `t_verify` is the time of one verification. A burst admitted
+within the wait is about
+`max_concurrent_verifications x floor(verification_wait / (configured keys x t_verify))`
+requests; anything beyond that receives `503` with `Retry-After: 1` even when
+every credential is valid.
+
+Measured `t_verify` on an 8-core laptop CPU (AMD Ryzen 7 PRO 8840U, release
+build) is about 27 ms with 1-2 concurrent verifications, 36 ms with 4 and
+52 ms with 8. Measure on your own hardware with a release build; debug builds
+are far slower. For example, 2 permits, 10 keys and 30 ms per verification
+give about 6-7 bearer requests per second.
+
+Do not rely on clients retrying or honouring `Retry-After`. The per-IP
+pre-auth gate answers `429` before the pool is reached, so a client throttled
+there never competes for a permit. To absorb a legitimate peak:
+
+- raise `max_concurrent_verifications` (about 19 MiB of memory each) or
+  `verification_wait`;
+- keep the number of configured keys small, since every key adds one
+  verification to each request (hot-reloaded keys count too);
+- watch `failure_overloaded` in `/admin/auth/counters`, which counts the
+  requests the permit pool turned away with `503`.
 
 #### `ApiKeyEntry`
 
@@ -481,18 +555,43 @@ internally by the TLS acceptor.
 
 CRL URLs are auto-discovered from the X.509 **CRL Distribution Points**
 (CDP) extension on the configured CA chain (eagerly at startup, with a
-10-second total bootstrap deadline) and from each new client certificate
-observed during a TLS handshake (lazily). CRLs are cached in memory keyed
+10-second total bootstrap deadline) and from every verified path of each new
+client chain that verifies against `mtls.ca_cert_path` (the end entity and
+every intermediate on a path to a configured root, lazily, during a TLS
+handshake). The chain is checked before the client proves key possession and
+revocation is not considered, so a chain that does not verify, or a
+certificate on no verified path, contributes no URL to
+discovery. CRLs are cached in memory keyed
 by URL and refreshed on a background task before `nextUpdate`, clamped to
 `[10 min, 24 h]`. The underlying `rustls::ClientCertVerifier` is hot-swapped
 via `ArcSwap` whenever fresh CRLs land, so every new handshake sees the
 latest revocation data without dropping in-flight connections.
 
+**CRL/AIA origins named in your configured certificates are trusted
+automatically; there is no configurable CRL allowlist.** At startup the
+server collects the CRL Distribution Point and Authority Information Access
+(caIssuers, OCSP) URIs in every certificate in `mtls.ca_cert_path` and in the
+server's own TLS certificate chain, and trusts their origins (scheme, host,
+port): a CRL fetch to one of those origins skips the private-address block
+that otherwise rejects loopback, link-local, and other internal addresses.
+Cloud-metadata addresses stay blocked regardless. This is what lets a
+corporate PKI that publishes CRLs on an internal host work with CRL
+checking at all - the trusted origins are logged once at startup (`INFO`
+level) for audit. At runtime, a client can cause a fetch from a trusted origin
+only through a CDP URL named by a certificate on a verified path of its
+presented chain, which must verify against `mtls.ca_cert_path`. Residuals,
+and what to do when neither chain names your PKI host (e.g. a bundle holding
+only a self-signed root with no CDP/AIA
+extension - add the issuing CA certificate to `mtls.ca_cert_path` instead),
+are in [SECURITY.md](../SECURITY.md#operator-trusted-crlaia-origins). Trusted
+origins must use DNS hostnames or IPv4 literals; IPv6-literal hosts are not
+fetched and fail closed.
+
 **Since 3.14, TLS session resumption is disabled on mTLS listeners**, which
 is what makes "every new handshake" true rather than "every full handshake."
 Before 3.14, rustls could restore a resumed connection's peer certificate
 from cached session state without ever calling the verifier, so a
-certificate that had since been revoked -- or had expired -- could keep
+certificate that had since been revoked - or had expired - could keep
 authenticating for as long as a session stayed resumable. Every mTLS
 connection now performs a full handshake: clients that previously relied on
 resumption for a high volume of short-lived connections should use HTTP
@@ -537,7 +636,7 @@ the observed count and the cap.
 leave the server claiming revocation coverage its verifier cannot enforce.
 Such a write now fails closed with a throttled
 `crl_cache_out_of_band_mutation` WARN. Reading the field remains safe. This
-detects API misuse, not a same-process adversary -- see
+detects API misuse, not a same-process adversary - see
 [SECURITY.md](../SECURITY.md#out-of-band-crl-cache-mutation).
 
 `ReloadHandle::refresh_crls()` forces an immediate refresh of every
@@ -592,6 +691,22 @@ crl_max_cache_entries      = 1024      # caps parsed CRLs held in memory
 > CRLs stay small. It is **not** a lever for bounding per-handshake cost:
 > that cost is independent of CRL size by design. See
 > [SECURITY.md](../SECURITY.md#why-crl_max_response_bytes-stays-at-5-mib).
+>
+> **CRL parsing and verifier rebuilds run on the blocking pool, not the
+> async runtime, at most two at a time.** Parsing a large CRL and rebuilding
+> the `rustls` verifier over a deep cache are both CPU-bound work; offloading
+> it means a large or crafted CRL no longer occupies a Tokio worker thread
+> for as long as it takes to parse or rebuild. CPU saturation of the host
+> can still slow other work - this bound only stops that work from
+> monopolizing one async worker thread specifically. This bound is
+> independent of `crl_max_concurrent_fetches` (which limits outbound network
+> fetches, not CPU work) and is not operator-tunable.
+> Rebuilds still serialize one commit at a time, so throughput under a deep
+> cache is unchanged; only where the CPU work runs has changed. If a commit's
+> caller is cancelled (for example, a timeout) while its bounded rebuild is
+> still running, that rebuild runs to completion in the background and its
+> result is discarded: the previously published cache and verifier are
+> unaffected, never a late or out-of-order publication.
 
 
 ##### Defence-in-depth (still recommended even with CRL enabled)
@@ -776,15 +891,15 @@ enforcement with `with_required`:
 > change in a future release. Presence enforcement is opt-in by design: an
 > allowlist that constrains a supplied value is a legitimate configuration, and
 > flipping the default would silently convert previously-allowed traffic into
-> `403`s with no compile error to warn you. Set `required = true` -- or use
-> `ArgumentAllowlist::new_required` -- on every allowlist where omitting the
+> `403`s with no compile error to warn you. Set `required = true` - or use
+> `ArgumentAllowlist::new_required` - on every allowlist where omitting the
 > argument must be rejected. A startup warning names any allowlist left in the
 > fail-open form.
 
 > **Argument validation belongs in your tool, not here.** Only your tool knows
 > its parameter types, value ranges, and which option combinations are
 > meaningful; declare those in its input schema and enforce them in the handler.
-> An allowlist is a coarse role-scoped gate at the authorization boundary --
+> An allowlist is a coarse role-scoped gate at the authorization boundary -
 > defence in depth on top of that validation, never a substitute for it. It
 > checks only the **first `shlex::split` word**, so an allowlist of `["ls"]`
 > accepts `"ls -la; id"`: the first parsed word is `ls`, and everything after it
@@ -998,12 +1113,13 @@ extra_route_rate_limit = 60
 # credential_fingerprint = false
 # auth_scheme = true
 # mcp_hints = true
+# session_id_header = "plain"
 # request_completion = true
 ```
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `listen_addr` | `String` | `"127.0.0.1"` | Bind address |
+| `listen_addr` | `String` | `"127.0.0.1"` | Bind address. IPv6 literals must include brackets, for example `[::1]`, because TOML validation composes this with `listen_port` as a `SocketAddr` |
 | `listen_port` | `u16` | `8443` | Bind port |
 | `tls_cert_path` | `Option<PathBuf>` | `None` | TLS certificate path |
 | `tls_key_path` | `Option<PathBuf>` | `None` | TLS private key path |
@@ -1048,12 +1164,12 @@ safe; they trade different failure modes against each other.
 
 `"evict_lru"` is the default deliberately. Under a high-cardinality spray
 attack, `"reject_new"` would let the attacker fill the table and then deny
-*every* new legitimate client -- turning a rate-limit control into an outage.
+*every* new legitimate client - turning a rate-limit control into an outage.
 `"evict_lru"` keeps the service reachable and accepts a bounded quota-reset
 cost instead.
 
 Prefer `"reject_new"` only when your client population is small, known and
-stable -- for example a fixed set of internal services behind a gateway --
+stable - for example a fixed set of internal services behind a gateway -
 where admitting an unknown IP is itself suspicious and quota isolation for
 existing tenants matters more than reachability for new ones.
 
@@ -1084,7 +1200,7 @@ log_upstream_error_bodies = false
 | `log_level` | `String` | `"info,rmcp=warn,rmcp_server_kit=info"` | EnvFilter directives. Targets match by prefix, so `rmcp=warn` also matches `rmcp_server_kit::*` unless the more specific `rmcp_server_kit=info` directive is present. Use trace, debug, info, warn, or error levels. |
 | `log_format` | `String` | `"pretty"` | json, pretty, or text |
 | `audit_log_path` | `Option<PathBuf>` | `None` | JSON audit log file |
-| `log_request_headers` | `bool` | `false` | Emit inbound HTTP request headers at DEBUG level (sensitive headers remain redacted); the incoming request line is skipped for request_log_exclude_paths |
+| `log_request_headers` | `bool` | `false` | Emit inbound HTTP request headers at DEBUG level; `authorization`, `cookie`, `proxy-authorization`, `forwarded`, `x-forwarded-for` and `x-real-ip` values become `[REDACTED]`, `Mcp-Session-Id` follows `[server.log_context].session_id_header`, and all other headers log as sent (`<non-utf8>` for non-visible-ASCII values). The incoming request line is skipped for request_log_exclude_paths |
 | `metrics_enabled` | `bool` | `false` | Enable Prometheus |
 | `metrics_bind` | `String` | `"127.0.0.1:9090"` | Metrics listener |
 | `log_plaintext_oauth_tokens` | `bool` | `false` | Defaults to redacted; enabling writes secrets to logs, is for local debugging only, and is process-wide, not per-server |
@@ -1101,13 +1217,16 @@ use rmcp_server_kit::config::{
 };
 
 let server: ServerConfig = toml::from_str(&config_str)?;
-validate_server_config(&server)?;  // Checks port, TLS pairing, durations
+validate_server_config(&server)?;  // Checks listen socket, nested auth, TLS pairing, durations
 
 let obs: ObservabilityConfig = toml::from_str(&config_str)?;
 validate_observability_config(&obs)?;  // Checks log levels, formats
 ```
 
 Returns `RmcpServerKitError::Config` with a descriptive message on failure.
+The TOML preflight also rejects nested auth mistakes (API-key identity
+conflicts, OAuth config, auth rate-limit capacity, mTLS capacity) before the
+bridged `McpServerConfig` reaches `serve()`.
 
 ---
 
@@ -1209,11 +1328,30 @@ worker threads do not perform synchronous file I/O.
 The audit log carries identities, and under the diagnostic switches it can carry
 credential material, so it is created with owner-only permissions.
 
-- **Unix:** owner-only (`0o600`) is applied **at file creation** via
-  `OpenOptions::mode`. There is no window in which the file is readable by other
-  local principals. A pre-existing file has its mode corrected after opening.
-- **Windows:** the file is created and a protected owner-only DACL is applied
-  immediately afterwards, discarding inherited ACEs.
+- **Unix:** opening the audit log refuses to follow a symlink at the final
+  path component (a symlinked *parent* directory is still traversed),
+  refuses anything that is not a regular file (devices, FIFOs, sockets),
+  and refuses a pre-existing file not owned by the process's effective
+  user, even when that process runs as root. A regular file with more than
+  one hard link is also refused at start-up. A file this call *creates*
+  gets mode `0o600` as part of the creating `open`, so it is never exposed
+  at a wider mode, not even briefly (the process umask can only tighten
+  that further, never widen it). A *pre-existing* file keeps its current
+  mode until the open handle has passed the regular-file and owner
+  checks, at which point it is corrected to `0o600` with `fchmod` on that
+  handle; if `fchmod` fails (a filesystem that rejects chmod), a file whose
+  permission bits are already exactly `0o600` is accepted, and anything else
+  fails startup. Nothing is written to the handle before every check has passed,
+  and a symlink's target is never opened, chmodded, or written to.
+  These checks are a start-up snapshot of the opened handle; a hard link
+  added later is not detected until the next start-up hardening pass.
+- **Windows:** opening the audit log refuses a reparse point at the final
+  path component (a symbolic link, junction, mount point, or any other
+  reparse tag; a symlinked *parent* directory is still traversed) - checked
+  both before the open and again on the opened handle, so a swap between
+  the two does not slip through. The open creates the file when it does
+  not exist, and once both checks have passed a protected owner-only DACL
+  is applied immediately afterwards, discarding inherited ACEs.
 
 **These are not equivalent.** Rust's standard library cannot pass
 `SECURITY_ATTRIBUTES` to file creation ([rust-lang/libs-team#324]), so Windows
@@ -1221,9 +1359,70 @@ has no safe creation-time equivalent of `mode(0o600)`. The Windows path
 therefore leaves a small create-then-harden race that Unix does not have: it
 removes the *persistent* exposure, not the momentary one.
 
-If Windows ACL hardening fails, startup fails and the crate attempts to delete
-the unprotected file. The error reports whether that deletion succeeded, so you
-can tell whether an unprotected audit log may remain at that path.
+If Windows ACL hardening fails, startup fails and, only when this call
+created the file, the crate drops the handle and attempts to delete that
+path; a pre-existing file that fails hardening is left in place rather than
+deleted. Because the cleanup is by path, a principal with write access to
+the parent directory can race it, the same residual as the by-path DACL
+application. The error reports
+which of those applies and, when deletion was attempted, whether it
+succeeded, so you can tell whether an unprotected file, or an untouched
+pre-existing one, may remain at that path. A rejected reparse point is
+never deleted, and this code never deletes a pre-existing file.
+
+On Unix, a hardening failure never deletes anything: the mode is applied
+atomically at creation, so a file this process creates is never exposed at a
+wider mode even transiently, and a pre-existing file that fails a check was
+not created by this process, so it is left untouched rather than destroyed.
+
+Strict initialization (`init_tracing_from_config_strict`) fails startup on
+any of these failures. The deprecated lenient initializer
+(`init_tracing_from_config`) warns instead and installs no audit sink at
+all, on any platform, rather than writing to an unprotected one.
+
+A pre-existing audit-log path owned by another user now fails strict
+startup: an init container or provisioning step that ran as root, a
+sidecar, a shared volume, or a log rotator that recreates the file as
+root all leave the path owned by someone other than the service process.
+Dedicate the path to the service user, pre-create it with the service
+user as owner, or rotate with copy-and-truncate (for example logrotate's
+`copytruncate`) rather than recreate, so a restart always finds a file
+still owned by the service user.
+
+Do not use hardlink-based retention or rotation for the audit log. A second
+directory entry survives unlinking or rotation of the configured path, and
+Linux `fs.protected_hardlinks` is not guaranteed on every host. Permissions
+still live on the inode, so a non-owner needs permission to open that extra
+name. Use copy-based retention instead: copy and truncate the current
+file, or rename the active file and let the process reopen a fresh
+single-link path on restart.
+
+**Setups that no longer start.** On Unix, strict initialization fails
+startup in these common deployments. The Windows behavior described above
+is unchanged.
+
+- **A filesystem that rejects chmod** (CIFS/SMB without Unix extensions,
+  vfat or exFAT, some FUSE or NFS mounts): a failed `fchmod` now fails
+  strict startup (before 3.20.0 it was only a warning) unless the file
+  already has exactly mode `0o600`, with no setuid, setgid or sticky bit.
+  Where the filesystem keeps per-file modes, pre-create the file as the
+  service user with mode `0600` (it must still be a regular, single-link
+  file owned by the effective user); otherwise use a filesystem with POSIX
+  permissions. On vfat, exFAT or CIFS without Unix extensions the owner
+  and mode are reported from mount options (for example
+  `uid=<service user>,fmask=0177` on vfat or exFAT,
+  `uid=<service user>,file_mode=0600` on CIFS); these examples are
+  illustrative, not a recommendation.
+- **`/dev/stdout`, `/dev/stderr`, `/proc/self/fd/N`, a FIFO, a socket or a
+  device:** refused as a symlink or as not a regular file. The audit file
+  is an additional JSON copy of the INFO-and-above events the server
+  already writes to stderr (the same log filter gates both), so a
+  container that ships its output streams should leave `audit_log_path`
+  unset.
+- **NFS with `root_squash` and a server running as root:** the created
+  file is owned by the squashed user, so the owner check fails. Run the
+  server as a non-root user that owns the path, or keep the audit log on
+  local storage.
 
 On a platform that is neither Unix nor Windows, a configured `audit_log_path`
 fails closed: startup errors and no file is created.
@@ -1231,7 +1430,8 @@ fails closed: startup errors and no file is created.
 [rust-lang/libs-team#324]: https://github.com/rust-lang/libs-team/issues/324
 
 The deprecated `init_tracing_from_config(config)` compatibility entry point
-keeps the old fail-open audit-log behaviour and returns `Result<(), TryInitError>`.
+still starts the process when audit-log setup fails (it warns and returns
+`Result<(), TryInitError>`) but installs no audit sink in that case.
 
 ---
 
@@ -1274,7 +1474,7 @@ Highlights:
   via `.instrument(Span::current())`.
 
 RBAC task-locals (`rbac::current_role()` and friends) are NOT
-propagated into the detached future -- detached work should
+propagated into the detached future - detached work should
 finish/close already-authorized resources rather than initiate
 fresh RBAC-gated operations. See the module-level `# Caveats`
 rustdoc for a worked example of capturing and rebinding RBAC
@@ -1308,23 +1508,32 @@ role = "viewer"
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `issuer` | `String` | -- | Expected `iss` claim. |
-| `audience` | `String` | -- | Expected `aud` claim. |
-| `jwks_uri` | `String` | -- | JWKS endpoint URL. |
+| `issuer` | `String` | - | Expected `iss` claim. |
+| `audience` | `String` | - | Expected `aud` claim. |
+| `jwks_uri` | `String` | - | JWKS endpoint URL. |
 | `scopes` | `Vec<ScopeMapping>` | `[]` | OAuth scope -> RBAC role mapping. |
 | `jwks_cache_ttl` | `String` | `"10m"` | JWKS cache refresh interval. |
 | `max_jwks_keys` | `usize` | `256` | Fail-closed cap on public keys in a JWKS document. |
-| `allowed_algorithms` | `Option<Vec<String>>` | _unset_ | Pin the accepted JWT signing algorithms. When unset, the built-in set applies: `RS256`, `RS384`, `RS512`, `ES256`, `ES384`, `PS256`, `PS384`, `PS512`, `EdDSA`. When set, it must be a non-empty **subset** of that set; names are case-insensitive. This can only **narrow** the accepted algorithms -- `HS256`/`HS384`/`HS512` and `none` are never selectable, so it cannot be used to open an algorithm-confusion hole. An empty list is rejected (it would reject every token). Env: `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ALLOWED_ALGORITHMS` (comma-separated). |
+| `allowed_algorithms` | `Option<Vec<String>>` | _unset_ | Pin the accepted JWT signing algorithms. When unset, the built-in set applies: `RS256`, `RS384`, `RS512`, `ES256`, `ES384`, `PS256`, `PS384`, `PS512`, `EdDSA`. When set, it must be a non-empty **subset** of that set; names are case-insensitive. This can only **narrow** the accepted algorithms - `HS256`/`HS384`/`HS512` and `none` are never selectable, so it cannot be used to open an algorithm-confusion hole. An empty list is rejected (it would reject every token). Env: `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ALLOWED_ALGORITHMS` (comma-separated). |
 | `jwks_max_response_bytes` | `u64` | `1048576` | Fail-closed cap on the JWKS HTTP response body size (1 MiB default). |
+| `ca_cert_path` | `Option<PathBuf>` | _unset_ | Optional PEM CA bundle added (not substituted) to the system trust store for every OAuth-bound HTTP request (JWKS fetch, token exchange, introspection, revocation, OAuth proxy) made via `OauthHttpClient::with_config`. A configured path that cannot be read, cannot be parsed as PEM, or contains zero certificates fails the server at startup rather than being silently ignored. |
 | `allow_http_oauth_urls` | `bool` | `false` | Permit `http://` issuer/JWKS/etc. for local dev only. |
 | `audience_validation_mode` | `String` (`"permissive"` \| `"warn"` \| `"strict"`) | `"strict"` | How the resource server treats the legacy `azp` audience fallback. `"strict"` (default) accepts only `aud` matches and rejects `azp`-only matches; `"warn"` accepts `azp`-only matches but emits a one-shot WARN per process to surface IdPs not populating `aud`; `"permissive"` accepts `azp`-only matches silently (pre-1.7 behavior). |
 | `strict_audience_validation` | `Option<bool>` | _unset_ | **Deprecated since 1.7.0** - superseded by `audience_validation_mode`. Consulted only when `audience_validation_mode` is unset: `Some(true)` resolves to `"strict"`, `Some(false)` resolves to `"warn"`, and unset resolves to `"strict"` (the secure default). |
-| `ssrf_allowlist` | `table` | _unset_ | Operator opt-in allowlist of `hosts` and/or `cidrs` whose otherwise-blocked addresses (private/loopback/CGNAT/unique-local) the OAuth/JWKS fetcher is allowed to reach. Cloud-metadata addresses remain blocked. See "Allowing in-cluster IdPs" below and the "Operator allowlist" section in [`SECURITY.md`](../SECURITY.md). |
+| `ssrf_allowlist` | `table` | _unset_ | Operator opt-in allowlist of `hosts` and/or `cidrs` whose otherwise-blocked addresses (private/loopback/CGNAT/unique-local/site-local/benchmarking/ORCHID/ORCHIDv2/RFC 8215 local-use NAT64) the OAuth/JWKS fetcher is allowed to reach. Cloud-metadata addresses remain blocked. See "Allowing in-cluster IdPs" below and the "Operator allowlist" section in [`SECURITY.md`](../SECURITY.md). |
 | `role_claim` | `Option<String>` | `None` | JWT claim path (dot-notation for nested claims) to extract role values from; e.g. `"roles"` or `"realm_access.roles"`. When set, claim values are matched against `role_mappings` instead of `scopes`. Supports space-separated string claims and JSON array claims. Pairs with `role_mappings`. |
 | `role_mappings` | `Vec<RoleMapping>` | `[]` | Claim-value-to-role mappings used when `role_claim` is set. First matching entry wins. See the worked example below. |
 | `require_subject` | `bool` | `false` | Reject tokens that lack a `sub` (subject) claim. Leave `false` for client-credentials / machine-to-machine tokens, which legitimately carry no subject. |
 | `authorization_servers` | `Option<Vec<String>>` | _unset_ (topology) | RFC 9728 Protected Resource Metadata `authorization_servers`. **Unset resolves from topology**: the upstream `issuer` when `proxy` is absent, this server's own public URL (from `public_url`) when `proxy` is set. **Set it explicitly when your application mounts its own `/authorize` + `/token` via `with_extra_router` without `proxy`** - the crate cannot detect that case and would otherwise advertise the upstream issuer at a URL that 404s. An empty list omits the claim entirely (RFC 9728 §3.2). Validated at startup: no userinfo, no literal-IP host, scheme per `allow_http_oauth_urls`. See "OAuth discovery metadata" below. |
 | `authorization_server_metadata_issuer` | `Option<String>` | _unset_ (own URL) | RFC 8414 Authorization Server Metadata `issuer`, served by the proxy at `/.well-known/oauth-authorization-server`. **Unset publishes this server's own public URL (from `public_url`)**, as RFC 8414 §3.3 / §6.2 require. Legacy opt-out: set to your upstream `issuer` only when the IdP emits RFC 9207 `iss` and clients validate it. Validated at startup as above. |
+
+On-demand JWKS refresh is shared per cache. If several callers miss or observe
+an expired cache at once, they wait for the same upstream fetch. If one caller
+disconnects or times out, only that caller's wait is cancelled; the shared
+refresh continues until it publishes keys, records failure, or server/cache
+shutdown cancels it. The refresh cooldown and fail-closed stale-cache behavior
+are unchanged: the 10 s cooldown is consumed before the fetch, and failed or
+cooled-down refreshes do not make expired keys usable.
 
 ##### `ScopeMapping`
 
@@ -1480,7 +1689,8 @@ OAuth URL hardening operates in two layers:
 - **At runtime, on every HTTP redirect hop**, both the shared
   `OauthHttpClient` and the `JwksCache` redirect closures run a sync
   per-hop SSRF guard that rejects targets resolving to private, loopback,
-  link-local, multicast, broadcast, unspecified, or cloud-metadata
+  link-local, multicast, broadcast, unspecified, site-local, benchmarking,
+  ORCHID, ORCHIDv2, RFC 8215 local-use NAT64, or cloud-metadata
   IP ranges. `https -> http` downgrades are always rejected; `http -> http`
   is permitted only when `allow_http_oauth_urls = true`.
 - **Before every initial outbound connect**, OAuth/JWKS fetches resolve the
@@ -1510,15 +1720,35 @@ internally and are not configurable knobs.
 
 By default, the post-DNS SSRF guard rejects OAuth/JWKS targets whose
 hostnames resolve to private (RFC 1918), loopback, link-local, CGNAT,
-unique-local, or cloud-metadata address space. This is the right default
-for internet-facing IdPs but blocks legitimate in-cluster deployments
-where, for example, Keycloak resolves to a `10.x.x.x` ClusterIP.
+unique-local, site-local (`fec0::/10`), benchmarking (`2001:2::/48`),
+ORCHID (`2001:10::/28`), ORCHIDv2 (`2001:20::/28`), RFC 8215
+local-use NAT64 (`64:ff9b:1::/48`), or cloud-metadata address space.
+This is the right default for
+internet-facing IdPs but blocks legitimate in-cluster deployments where,
+for example, Keycloak resolves to a `10.x.x.x` ClusterIP or an IdP is
+reached through a local-use NAT64 gateway.
 
 Operators can opt in to **specific** trust by listing the hostnames or
 CIDR blocks the fetcher is permitted to reach. Cloud-metadata addresses
 (AWS/GCP/Alibaba IPv4 + IPv6) remain blocked **unconditionally**, even
-if a containing CIDR is listed -- see [`SECURITY.md`](../SECURITY.md)
+if a containing CIDR is listed - see [`SECURITY.md`](../SECURITY.md)
 under "Operator allowlist" for the full trust model.
+
+Even when `64:ff9b:1::/48` is allowlisted, addresses whose RFC 6052
+embedded IPv4 decodes to a cloud-metadata address remain blocked, exactly
+as for the well-known NAT64 prefix. This holds in every RFC 6052 prefix
+length that fits inside the `/48` (`/48`, `/56`, `/64` and `/96`). An
+allowlist entry still re-allows every non-metadata address in its range,
+so allowlist the narrowest prefix your NAT64 gateway actually uses.
+
+The CRL fetch path has no configurable SSRF allowlist. A CRL distribution
+point whose hostname resolves into `64:ff9b:1::/48`, `fec0::/10`,
+`2001:2::/48`, `2001:10::/28`, or `2001:20::/28` is blocked unless its origin
+(scheme, host, port) is named in the operator's configured certificates (the
+mTLS CA bundle or the server's own TLS certificate chain) - see
+[SECURITY.md](../SECURITY.md#operator-trusted-crlaia-origins). Otherwise,
+keep CRL hosts on ordinary reachable addresses or publish a different CDP
+hostname.
 
 ```toml
 [server.auth.oauth]
@@ -1529,6 +1759,8 @@ jwks_uri = "https://rhbk.ops.example.com/realms/ops/protocol/openid-connect/cert
 [server.auth.oauth.ssrf_allowlist]
 hosts = ["rhbk.ops.example.com"]
 cidrs = ["10.0.0.0/8"]
+# or the narrow local-use NAT64 prefix your IdP actually needs, e.g.
+# cidrs = ["64:ff9b:1:1234::/64"]
 ```
 
 Builder API:
@@ -1556,11 +1788,11 @@ Configuration is validated up-front:
 
 - `hosts` entries must be bare DNS hostnames (no scheme, port, path,
   userinfo, query, fragment) and must not be literal IPs (use `cidrs`
-  for those). Matching is case-insensitive exact match -- no wildcards.
+  for those). Matching is case-insensitive exact match - no wildcards.
 - `cidrs` entries are family-strict (no IPv4-mapped-IPv6, no `/0`, no
   zone IDs); host bits must be zero.
 - A misconfigured allowlist is rejected by `OAuthConfig::validate()` and
-  by `JwksCache::new()` -- the server fails to start, rather than
+  by `JwksCache::new()` - the server fails to start, rather than
   fail-open.
 - A non-empty allowlist emits a `tracing::warn!` at validate time
   naming the host and CIDR counts so the elevated trust is auditable.
@@ -1568,7 +1800,7 @@ Configuration is validated up-front:
 
 #### `OAuthProxyConfig` (optional)
 
-Optional sub-table that turns rmcp-server-kit into an OAuth proxy in front of an upstream IdP. When present, MCP clients see this server as the authorization server and perform a standard Authorization Code + PKCE flow; rmcp-server-kit forwards `/oauth/authorize`, `/oauth/token`, and -- when the relevant URLs and `expose_admin_endpoints` are set -- `/introspect` and `/revoke` to the upstream IdP, injecting `client_id` and `client_secret` as required.
+Optional sub-table that turns rmcp-server-kit into an OAuth proxy in front of an upstream IdP. When present, MCP clients see this server as the authorization server and perform a standard Authorization Code + PKCE flow; rmcp-server-kit forwards `/oauth/authorize`, `/oauth/token`, and - when the relevant URLs and `expose_admin_endpoints` are set - `/introspect` and `/revoke` to the upstream IdP, injecting `client_id` and `client_secret` as required.
 
 ```toml
 [server.auth.oauth.proxy]
@@ -1585,16 +1817,16 @@ strip_resource_param = false                             # set true for Microsof
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `authorize_url` | `String` | -- | Upstream authorization endpoint. |
-| `token_url` | `String` | -- | Upstream token endpoint. |
-| `client_id` | `String` | -- | OAuth `client_id` registered at the upstream IdP. |
+| `authorize_url` | `String` | - | Upstream authorization endpoint. |
+| `token_url` | `String` | - | Upstream token endpoint. |
+| `client_id` | `String` | - | OAuth `client_id` registered at the upstream IdP. |
 | `client_secret` | `Option<SecretString>` | `None` | OAuth `client_secret` for confidential clients. Omit (TOML: leave unset) for public clients. |
 | `introspection_url` | `Option<String>` | `None` | Upstream RFC 7662 introspection endpoint. Local `/introspect` is exposed only when this is set **and** `expose_admin_endpoints = true`. |
 | `revocation_url` | `Option<String>` | `None` | Upstream RFC 7009 revocation endpoint. Local `/revoke` is exposed only when this is set **and** `expose_admin_endpoints = true`. |
 | `expose_admin_endpoints` | `bool` | `false` | Mount `/introspect` and `/revoke`, and advertise them in the authorization-server metadata document. When `false` both endpoints return 404. |
 | `require_auth_on_admin_endpoints` | `bool` | `false` | Run the normal authentication middleware before `/introspect` and `/revoke`. **Recommended `true` for new deployments.** Pre-1.6 default of `false` is preserved for backward compatibility. |
 | `allow_unauthenticated_admin_endpoints` | `bool` | `false` | Operator opt-out for the M3 startup check that rejects `expose_admin_endpoints = true` combined with `require_auth_on_admin_endpoints = false`. Set `true` only when an authenticated reverse proxy / ingress screens `/introspect` and `/revoke` itself. Production should leave this `false` and set `require_auth_on_admin_endpoints = true` instead. |
-| `strip_resource_param` | `bool` | `false` | Drop the RFC 8707 `resource` parameter when forwarding `/authorize` and `/token` upstream. Set `true` for **Microsoft Entra ID (Azure AD) v2.0**, which rejects `resource` carried alongside a differing `api://` scope with `AADSTS9010010`; MCP clients send it because the MCP spec requires it. Only `resource` is ever dropped -- `state`, `code_challenge`, `code_challenge_method`, `code_verifier`, `redirect_uri`, `nonce`, and `scope` are always forwarded, so this cannot disable PKCE or CSRF protection. `/introspect` and `/revoke` are unaffected. Env: `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__STRIP_RESOURCE_PARAM`. |
+| `strip_resource_param` | `bool` | `false` | Drop the RFC 8707 `resource` parameter when forwarding `/authorize` and `/token` upstream. Set `true` for **Microsoft Entra ID (Azure AD) v2.0**, which rejects `resource` carried alongside a differing `api://` scope with `AADSTS9010010`; MCP clients send it because the MCP spec requires it. Only `resource` is ever dropped - `state`, `code_challenge`, `code_challenge_method`, `code_verifier`, `redirect_uri`, `nonce`, and `scope` are always forwarded, so this cannot disable PKCE or CSRF protection. `/introspect` and `/revoke` are unaffected. Env: `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__STRIP_RESOURCE_PARAM`. |
 
 #### `TokenExchangeConfig` (optional)
 
@@ -1606,14 +1838,14 @@ token_url = "https://downstream.example.com/oauth/token"
 client_id = "downstream-client-id"
 client_secret = "..."                                    # exactly one of client_secret / client_cert
 
-# All four below are RFC 8693 §2.1 OPTIONAL -- omit the key to leave the
+# All four below are RFC 8693 §2.1 OPTIONAL - omit the key to leave the
 # parameter out of the exchange request entirely.
 audience = "downstream-audience"
 resource = "https://api.example.com/v1"                  # RFC 8707 absolute URI, no fragment
 scope = "read write"
 requested_token_type = "access_token"                    # or "omit", or any token-type URI
 
-# OR -- RFC 8705 §2 mTLS client authentication (requires the `oauth-mtls-client` cargo feature):
+# OR - RFC 8705 §2 mTLS client authentication (requires the `oauth-mtls-client` cargo feature):
 [server.auth.oauth.token_exchange.client_cert]
 cert_path = "/etc/certs/oauth-client.pem"
 key_path  = "/etc/certs/oauth-client.key"
@@ -1621,9 +1853,9 @@ key_path  = "/etc/certs/oauth-client.key"
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `token_url` | `String` | -- | Authorization-server token endpoint used for the exchange. |
-| `client_id` | `String` | -- | OAuth `client_id` of the MCP server (the requester). |
-| `client_secret` | `Option<SecretString>` | `None` | RFC 6749 §2.3.1 HTTP-Basic client secret. **Mutually exclusive with `client_cert`** -- `OAuthConfig::validate` rejects configs that set both, or neither. |
+| `token_url` | `String` | - | Authorization-server token endpoint used for the exchange. |
+| `client_id` | `String` | - | OAuth `client_id` of the MCP server (the requester). |
+| `client_secret` | `Option<SecretString>` | `None` | RFC 6749 §2.3.1 HTTP-Basic client secret. **Mutually exclusive with `client_cert`** - `OAuthConfig::validate` rejects configs that set both, or neither. |
 | `client_cert` | `Option<ClientCertConfig>` | `None` | RFC 8705 §2 mTLS client authentication. **Requires the `oauth-mtls-client` cargo feature**; without it, `OAuthConfig::validate` fails closed at startup. See `ClientCertConfig` below. |
 | `audience` | `Option<String>` | `None` (omitted) | RFC 8693 §2.1 **OPTIONAL**. Logical name of the downstream API; the exchanged token carries it in `aud`. Omit the key to leave the parameter out. Distinct from `oauth.audience`, which is the `aud` this server *expects* on inbound tokens. |
 | `resource` | `Option<String>` | `None` (omitted) | RFC 8693 §2.1 **OPTIONAL**; an RFC 8707 resource indicator. Must be an absolute URI with no fragment. **Unrelated to `oauth.proxy.strip_resource_param`**, which governs the OAuth *proxy* endpoints, not token exchange. |
@@ -1637,15 +1869,15 @@ key_path  = "/etc/certs/oauth-client.key"
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `cert_path` | `PathBuf` | -- | Path to the PEM-encoded X.509 client certificate (single leaf or full chain). PEM-validated at startup. |
-| `key_path` | `PathBuf` | -- | Path to the PEM-encoded private key (PKCS#8 or RSA / EC). **Encrypted (passphrase-protected) keys are not supported** and are rejected at startup. |
+| `cert_path` | `PathBuf` | - | Path to the PEM-encoded X.509 client certificate (single leaf or full chain). PEM-validated at startup. |
+| `key_path` | `PathBuf` | - | Path to the PEM-encoded private key (PKCS#8 or RSA / EC). **Encrypted (passphrase-protected) keys are not supported** and are rejected at startup. |
 
 Operational notes for `client_cert`:
 
 - Cert + key files are read **once at server startup**; in-place rotation requires a process restart.
-- The token-exchange request authenticates by presenting the configured certificate at TLS handshake -- **no `Authorization` header is sent**.
+- The token-exchange request authenticates by presenting the configured certificate at TLS handshake - **no `Authorization` header is sent**.
 - The cert-bearing HTTP client uses `redirect::Policy::none()` so an attacker-controlled 3xx from the token endpoint cannot re-present the client certificate to a different host.
-- **Scope**: implements RFC 8705 §2 (PKI-bound client auth) only. RFC 8705 §3 self-signed client auth and the `cnf.x5t#S256` certificate-bound access-token confirmation claim are **not** enforced -- issued access tokens behave as bearer tokens once minted.
+- **Scope**: implements RFC 8705 §2 (PKI-bound client auth) only. RFC 8705 §3 self-signed client auth and the `cnf.x5t#S256` certificate-bound access-token confirmation claim are **not** enforced - issued access tokens behave as bearer tokens once minted.
 
 
 ---
@@ -1669,8 +1901,8 @@ tracing::info!(%prometheus_text, "exposition snapshot");
 ```
 
 Tracks:
-- `http_requests_total` -- counter by method, path, status
-- `http_request_duration_seconds` -- histogram by method, path
+- `http_requests_total` - counter by method, path, status
+- `http_request_duration_seconds` - histogram by method, path
 
 #### `serve_metrics()`
 
@@ -1679,7 +1911,7 @@ pub async fn serve_metrics(bind: String, metrics: Arc<McpMetrics>) -> rmcp_serve
 ```
 
 Spawns a dedicated HTTP listener serving `/metrics` in Prometheus text format.
-You don't call this directly -- rmcp-server-kit spawns it automatically when
+You don't call this directly - rmcp-server-kit spawns it automatically when
 `metrics_enabled = true` on `McpServerConfig`.
 
 The listener applies the same OWASP security response headers as the main
@@ -1967,6 +2199,7 @@ attribute probe noise without logging spoofable header material.
 | `credential_owner` | Adds `credential_owner` and `credential_rejection` to `auth failed` lines when a credential verifies but is rejected: an expired API key, or an OAuth JWT rejected for expiry, wrong audience, no mapped role, or missing subject. The label is the same identity the `authenticated` line logs. Off by default and not enabled by `recommended()`. |
 | `auth_scheme` | Adds `auth_scheme` and `token_kind` to `auth failed` lines. |
 | `mcp_hints` | Adds `mcp_session` and `mcp_protocol_version` to `auth failed` and `incoming request` lines. |
+| `session_id_header` | Controls only the `Mcp-Session-Id` entry inside full request-header logs when `log_request_headers` is enabled. `plain` logs the raw header value, preserving compatibility. `mask` logs a partial reveal, first 4 and last 4 characters joined as `abcd...wxyz` for values of 16 or more characters, and `[MASKED]` for shorter values. The partial reveal is intentionally correlatable. `hide` omits the header name and value. |
 | `request_completion` | Emits a DEBUG `request completed` line with `method`, `path`, `status`, `latency_ms`, and any enabled `client_ip`, `peer_ip`, or `request_id` fields. |
 
 Defaults follow `LogContextConfig::default()`: all fields default to `false`.
@@ -1975,6 +2208,8 @@ Defaults follow `LogContextConfig::default()`: all fields default to `false`.
 posture: enough context to identify noisy clients and understand authentication
 failures. It leaves `request_id`, `credential_fingerprint`,
 `credential_owner`, and `request_completion` off unless you ask for those fields.
+The `session_id_header` policy defaults to `plain`, so enabling full request
+header logging keeps historical behaviour unless you set it to `mask` or `hide`.
 
 Validation rejects `request_log_exclude_paths` entries that are empty or don't
 start with `/`. It also rejects `request_id = true` unless `trusted_proxies` is
@@ -1988,7 +2223,10 @@ Privacy note: this section is a deliberate, documented deviation from the
 pre-3.14.4 RUST_GUIDELINES rule that authentication attempts should include the
 source IP. Client context is now opt-in and off by default. Operators choose
 which fields to add to security-relevant framework lines; the kit still never
-logs raw forwarding headers or credential bytes.
+logs raw forwarding headers or credential bytes. If `log_request_headers` is
+enabled, `session_id_header = "mask"` limits accidental log-leak exposure for
+`Mcp-Session-Id` values, but it is a partial reveal and is no substitute for
+leaving `session_binding = true`.
 
 Rendering rules are stable. Client-supplied strings such as `user_agent` are
 quoted in structured fields, control characters are removed, and long strings
@@ -2030,6 +2268,7 @@ credential_fingerprint = false
 credential_owner = false
 auth_scheme = false
 mcp_hints = false
+session_id_header = "plain"
 request_completion = false
 ```
 
@@ -2063,7 +2302,7 @@ role. Distinct names get distinct session/task namespaces regardless of role.
 
 Because the name alone is the principal identity, two API-key entries that
 share a name are intentionally *one* principal sharing a single session/task
-namespace -- that is how credential rotation (an old secret and its
+namespace - that is how credential rotation (an old secret and its
 replacement under one service name) keeps working. To stop that from becoming
 a footgun, startup and hot-reload validation reject two same-named keys that
 declare *different* roles: one name is one principal and must map to one role
@@ -2173,7 +2412,7 @@ invalidates outstanding task IDs on restart. With authentication disabled it is
 a no-op, since there is no identity to bind to.
 
 In MCP 2026-07-28 stateless mode there is no session ID, so session binding is
-inert for those clients -- authentication and RBAC still apply per request, and
+inert for those clients - authentication and RBAC still apply per request, and
 task binding is unaffected because it works on task IDs rather than sessions.
 
 This is an explicit opt-in compatibility control, not a staged default flip.
@@ -2202,7 +2441,7 @@ or business logic, seal it with `rmcp::model::RequestStateCodec` and
 feature, which is neither an rmcp default nor enabled by this crate, so add it
 to your own `rmcp` dependency first. Build the associated data from:
 
-- the authenticated principal: `current_sub().or_else(current_identity)` --
+- the authenticated principal: `current_sub().or_else(current_identity)` -
   `current_sub()` is the OAuth `sub` claim and is preferred where present;
   `current_identity()` is the stable API-key name or mTLS certificate identity;
 - the request scope: method/tool name plus a canonical digest of the original
@@ -2294,7 +2533,7 @@ Non-empty values are validated via `axum::http::HeaderValue::from_str`
 inside `McpServerConfig::validate()`; invalid values fail the server
 startup with a `Config` error before any traffic is accepted.
 
-Example -- relax CSP for an admin panel that legitimately embeds
+Example - relax CSP for an admin panel that legitimately embeds
 rmcp-server-kit responses, and shorten HSTS during initial rollout:
 
 ```rust,ignore
@@ -2392,11 +2631,11 @@ than a string-smuggled override.
 When `admin_enabled = true` and an authenticated role equal to
 `admin_role` (default `"admin"`) is configured, rmcp-server-kit exposes:
 
-- `GET /admin/status` -- server name, version, uptime.
-- `GET /admin/auth/keys` -- names, roles, and expiry of configured API
+- `GET /admin/status` - server name, version, uptime.
+- `GET /admin/auth/keys` - names, roles, and expiry of configured API
   keys (never the hashes).
-- `GET /admin/auth/counters` -- authentication success/failure counters.
-- `GET /admin/rbac` -- the live RBAC policy summary.
+- `GET /admin/auth/counters` - authentication success/failure counters.
+- `GET /admin/rbac` - the live RBAC policy summary.
 
 All four require a caller with the admin role; every other role gets
 `403 forbidden`. The endpoints participate in the normal auth/RBAC
@@ -2418,10 +2657,10 @@ Set `OAuthProxyConfig::introspection_url` and/or
 `OAuthProxyConfig::revocation_url` to upstream endpoint URLs and rmcp-server-kit
 will expose matching local proxies:
 
-- `POST /introspect` -- forwards the form body to the upstream
+- `POST /introspect` - forwards the form body to the upstream
   introspection endpoint, injecting `client_id` (and
   `client_secret` for confidential clients) before forwarding.
-- `POST /revoke` -- same shape for token revocation.
+- `POST /revoke` - same shape for token revocation.
 
 For backward compatibility these endpoints are mounted unauthenticated unless
 you opt in with:
@@ -2763,7 +3002,7 @@ let token_exchange = TokenExchangeConfig::new(
     "https://downstream.example.com/oauth/token".to_string(),
     "downstream-client-id".to_string(),
     Some(SecretString::new("downstream-secret".into())),  // RFC 6749 §2.3.1 client_secret
-    None,                                                 // RFC 8705 §2 client_cert (mTLS) -- see below
+    None,                                                 // RFC 8705 §2 client_cert (mTLS) - see below
 )
 .with_audience("downstream-audience");                    // RFC 8693 §2.1 OPTIONAL
 
@@ -2797,7 +3036,7 @@ let token_exchange = TokenExchangeConfig::new(
 .with_audience("downstream-audience");
 ```
 
-Without the `oauth-mtls-client` feature enabled, a `client_cert`-bearing config fails closed at `OAuthConfig::validate` time. Cert + key paths are PEM-validated at startup (missing files, malformed PEM, and encrypted keys all surface before the first request). The token-exchange request authenticates by presenting the configured certificate at TLS handshake -- no `Authorization` header is sent -- and uses `redirect::Policy::none()` so an attacker-controlled 3xx from the token endpoint cannot re-present the client cert to a different host. Issued access tokens behave as bearer tokens once minted (`cnf.x5t#S256` certificate-binding per RFC 8705 §3 is out of scope). In-place certificate rotation requires server restart.
+Without the `oauth-mtls-client` feature enabled, a `client_cert`-bearing config fails closed at `OAuthConfig::validate` time. Cert + key paths are PEM-validated at startup (missing files, malformed PEM, and encrypted keys all surface before the first request). The token-exchange request authenticates by presenting the configured certificate at TLS handshake - no `Authorization` header is sent - and uses `redirect::Policy::none()` so an attacker-controlled 3xx from the token endpoint cannot re-present the client cert to a different host. Issued access tokens behave as bearer tokens once minted (`cnf.x5t#S256` certificate-binding per RFC 8705 §3 is out of scope). In-place certificate rotation requires server restart.
 
 Inside a tool handler, retrieve the (already-exchanged) downstream token via:
 
@@ -2814,7 +3053,7 @@ constraints.
 
 ```rust,ignore
 use std::sync::Arc;
-use rmcp_server_kit::auth::{ApiKeyEntry, AuthConfig, generate_api_key};
+use rmcp_server_kit::auth::{ApiKeyEntry, AuthConfig, RateLimitConfig, generate_api_key};
 use rmcp_server_kit::rbac::{ArgumentAllowlist, RbacConfig, RbacPolicy, RoleConfig};
 
 // In production, load pre-generated PHC hashes from config instead.
@@ -2824,7 +3063,10 @@ let (viewer_token, viewer_hash) = generate_api_key()?;
 let auth = AuthConfig::with_keys(vec![
     ApiKeyEntry::new("admin-key", admin_hash, "admin"),
     ApiKeyEntry::new("viewer-key", viewer_hash, "viewer"),
-]);
+])
+// API-key auth without rate limiting is unsafe on a reachable listener
+// (see "Argon2id verification admission control" above).
+.with_rate_limit(RateLimitConfig::new(30).with_pre_auth_burst(10));
 
 let viewer = RoleConfig::new(
     "viewer",
@@ -2969,6 +3211,7 @@ user_agent = true
 credential_fingerprint = false
 auth_scheme = true
 mcp_hints = true
+session_id_header = "plain"  # env: RMCP_SERVER_KIT__SERVER__LOG_CONTEXT__SESSION_ID_HEADER
 
 [server.security_headers]
 # Customise any of the twelve OWASP headers; omit a key to keep the built-in default.
@@ -3010,7 +3253,7 @@ audience = "my-mcp-server"  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__AUDIENC
 jwks_uri = "https://auth.example.com/.well-known/jwks.json"  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__JWKS_URI
 # Optional: pin the accepted JWT signing algorithms. Omit to accept the
 # built-in set (RS256/384/512, ES256/384, PS256/384/512, EdDSA). May only
-# narrow that set -- HS* and `none` are never selectable.
+# narrow that set - HS* and `none` are never selectable.
 allowed_algorithms = ["RS256"]  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ALLOWED_ALGORITHMS
 jwks_cache_ttl = "10m"
 
@@ -3183,6 +3426,7 @@ call order is:
 | `RMCP_SERVER_KIT__SERVER__TLS_KEY_PATH` | `server.tls_key_path` | Path | |
 | `RMCP_SERVER_KIT__SERVER__ADMIN_ENABLED` | `server.admin_enabled` | bool | |
 | `RMCP_SERVER_KIT__SERVER__KEY_EVICTION_POLICY` | `server.key_eviction_policy` | KeyEvictionPolicy | |
+| `RMCP_SERVER_KIT__SERVER__LOG_CONTEXT__SESSION_ID_HEADER` | `server.log_context.session_id_header` | SessionIdLogPolicy | |
 | `RMCP_SERVER_KIT__SERVER__SESSION_BINDING_SECRET` | `server.session_binding_secret` | SecretString | secret; redacted in report |
 | `RMCP_SERVER_KIT__SERVER__SESSION_BINDING_SECRET_FILE` | `server.session_binding_secret` | Path | secret; redacted in report |
 | `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ISSUER` | `server.auth.oauth.issuer` | String | requires `oauth` feature |
@@ -3223,10 +3467,10 @@ An empty or whitespace-only salt (either form) is rejected with `RmcpServerKitEr
 
 Each method returns `Vec<EnvOverride>`. Each entry carries:
 
-- `env_var` -- the name of the variable applied
-- `target_field` -- the dotted TOML path overridden (e.g. `server.listen_port`)
-- `source` -- `EnvOverrideSource::Env` (value read directly from the variable) or `EnvOverrideSource::File` (value read from the file named by a `_FILE` variable)
-- `value` -- the applied string for non-secret targets; `None` for secret-typed targets
+- `env_var` - the name of the variable applied
+- `target_field` - the dotted TOML path overridden (e.g. `server.listen_port`)
+- `source` - `EnvOverrideSource::Env` (value read directly from the variable) or `EnvOverrideSource::File` (value read from the file named by a `_FILE` variable)
+- `value` - the applied string for non-secret targets; `None` for secret-typed targets
 
 Secret-typed targets (`server.session_binding_secret`, `rbac.redaction_salt`) always carry `value: None`. The secret never appears in `EnvOverride::value` or in its `Debug` output. Log the report after initializing tracing so any env variable that shadowed a TOML value leaves a structured trail at startup, as shown in [`examples/config_file_server.rs`](../examples/config_file_server.rs).
 
@@ -3250,11 +3494,11 @@ The intended Kubernetes pattern: declare a minimal `[server.auth.oauth]` stub in
 
 These fields are intentionally absent from the env path:
 
-- **`auth.enabled`** -- disabling authentication via a single env var is too consequential and too easy to set accidentally.
-- **`security_headers`** -- semicolon-heavy CSP values are brittle in env and trivially weakened by accident; review them in a config-file diff.
-- **`max_request_body`** and **`expose_build_metadata`** -- best reviewed alongside related infrastructure settings in a config file.
-- **API key lists and RBAC roles** -- security policy belongs in a structured, version-controlled config file.
-- **OAuth proxy and token-exchange internals, SSRF allowlists, rate-limit tuning, `trusted_proxies`** -- consequential enough to warrant the full config-file review path.
+- **`auth.enabled`** - disabling authentication via a single env var is too consequential and too easy to set accidentally.
+- **`security_headers`** - semicolon-heavy CSP values are brittle in env and trivially weakened by accident; review them in a config-file diff.
+- **`max_request_body`** and **`expose_build_metadata`** - best reviewed alongside related infrastructure settings in a config file.
+- **API key lists and RBAC roles** - security policy belongs in a structured, version-controlled config file.
+- **OAuth proxy and token-exchange internals, SSRF allowlists, rate-limit tuning, `trusted_proxies`** - consequential enough to warrant the full config-file review path.
 
 ---
 

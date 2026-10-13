@@ -1,4 +1,4 @@
-use core::{fmt, str::FromStr, time::Duration};
+use core::{fmt, net::SocketAddr, str::FromStr, time::Duration};
 use std::{env, fs, path::PathBuf};
 
 use secrecy::{ExposeSecret as _, SecretString};
@@ -7,7 +7,7 @@ use serde::Deserialize;
 #[cfg(feature = "oauth")]
 use crate::oauth;
 use crate::{
-    auth::AuthConfig,
+    auth::{AuthConfig, MtlsConfig, RateLimitConfig},
     bounded_limiter::KeyEvictionPolicy,
     error::{Result as RmcpResult, RmcpServerKitError},
     forwarded::{MAX_CONFIGURABLE_SCANNED_ENTRIES, MAX_SCANNED_ENTRIES},
@@ -177,6 +177,13 @@ pub(crate) const ENV_OVERRIDE_SPECS: &[EnvOverrideSpec] = &[
         redacted: false,
     },
     EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__SERVER__LOG_CONTEXT__SESSION_ID_HEADER",
+        target_field: "server.log_context.session_id_header",
+        value_type: "SessionIdLogPolicy",
+        required_feature: None,
+        redacted: false,
+    },
+    EnvOverrideSpec {
         env_var: "RMCP_SERVER_KIT__SERVER__SESSION_BINDING_SECRET",
         target_field: "server.session_binding_secret",
         value_type: "SecretString",
@@ -305,6 +312,9 @@ pub(crate) const SERVER_ADMIN_ENABLED_ENV: &str = "RMCP_SERVER_KIT__SERVER__ADMI
 /// Environment variable name for the `server.key_eviction_policy` override.
 pub(crate) const SERVER_KEY_EVICTION_POLICY_ENV: &str =
     "RMCP_SERVER_KIT__SERVER__KEY_EVICTION_POLICY";
+/// Environment variable name for the `server.log_context.session_id_header` override.
+pub(crate) const SERVER_LOG_CONTEXT_SESSION_ID_HEADER_ENV: &str =
+    "RMCP_SERVER_KIT__SERVER__LOG_CONTEXT__SESSION_ID_HEADER";
 /// Environment variable name for the direct `server.session_binding_secret` override.
 pub(crate) const SERVER_SESSION_BINDING_SECRET_ENV: &str =
     "RMCP_SERVER_KIT__SERVER__SESSION_BINDING_SECRET";
@@ -361,7 +371,8 @@ pub(crate) const RBAC_REDACTION_SALT_FILE_ENV: &str = "RMCP_SERVER_KIT__RBAC__RE
 )]
 #[non_exhaustive]
 pub struct ServerConfig {
-    /// Listen address (IP or hostname). Default: `127.0.0.1`.
+    /// Listen address: an IP literal (a hostname is rejected). Write an IPv6
+    /// literal in brackets, for example `[::1]`. Default: `127.0.0.1`.
     #[serde(default = "default_listen_addr")]
     pub listen_addr: String,
     /// Listen TCP port. Default: `8443`.
@@ -721,6 +732,18 @@ impl ServerConfig {
             applied.push(env_report(
                 SERVER_KEY_EVICTION_POLICY_ENV,
                 "server.key_eviction_policy",
+                raw,
+            ));
+        }
+        if let Some(raw) = read_env(SERVER_LOG_CONTEXT_SESSION_ID_HEADER_ENV)? {
+            self.log_context.session_id_header = parse_env_value(
+                SERVER_LOG_CONTEXT_SESSION_ID_HEADER_ENV,
+                &raw,
+                "SessionIdLogPolicy",
+            )?;
+            applied.push(env_report(
+                SERVER_LOG_CONTEXT_SESSION_ID_HEADER_ENV,
+                "server.log_context.session_id_header",
                 raw,
             ));
         }
@@ -1351,7 +1374,9 @@ pub struct ObservabilityConfig {
     /// Log output format: `json`, `pretty`, or `text` (default: `pretty`).
     #[serde(default = "default_log_format")]
     pub log_format: String,
-    /// Optional path to an append-only audit log file.
+    /// Optional path to an append-only audit log file. It must name a regular
+    /// file (not a symlink, `/dev/stdout`, a FIFO or a device) owned by the
+    /// server's effective user; see the guide's audit-log section.
     pub audit_log_path: Option<PathBuf>,
     /// Emit inbound HTTP request headers at DEBUG level in transport logs.
     /// Sensitive headers remain redacted when enabled.
@@ -1492,6 +1517,154 @@ pub(crate) fn check_shared_config_invariants(
     Ok(())
 }
 
+/// Validate nested auth config shared by TOML and builder validation.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when nested auth, OAuth,
+/// rate-limit, or mTLS knobs are invalid.
+pub(crate) fn check_auth_nested_config(auth: Option<&AuthConfig>) -> RmcpResult<()> {
+    let Some(auth_cfg) = auth else {
+        return Ok(());
+    };
+
+    auth_cfg.validate_api_key_names()?;
+    auth_cfg.check_oauth_feature()?;
+    check_verification_wait(auth_cfg)?;
+    check_nested_rate_limit(auth_cfg.rate_limit.as_ref())?;
+    check_nested_mtls_config(auth_cfg.mtls.as_ref())?;
+
+    #[cfg(feature = "oauth")]
+    if let Some(oauth_cfg) = &auth_cfg.oauth {
+        oauth_cfg.validate()?;
+    }
+
+    Ok(())
+}
+
+/// Reject a zero auth verification-wait duration.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when `verification_wait` is zero.
+fn check_verification_wait(auth: &AuthConfig) -> RmcpResult<()> {
+    if auth.verification_wait.is_zero() {
+        return Err(RmcpServerKitError::Config(
+            "auth.verification_wait must be greater than zero".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate nested auth rate-limit knobs that have no safe zero value.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when a nested auth rate-limit knob
+/// is zero where zero would disable or weaken the limiter.
+fn check_nested_rate_limit(rate_limit: Option<&RateLimitConfig>) -> RmcpResult<()> {
+    let Some(rl) = rate_limit else {
+        return Ok(());
+    };
+
+    (rl.max_attempts_per_minute != 0).ok_or_else(|| {
+        RmcpServerKitError::Config("auth.rate_limit.max_attempts_per_minute must be nonzero".into())
+    })?;
+    (rl.burst != Some(0)).ok_or_else(|| {
+        RmcpServerKitError::Config("auth.rate_limit.burst must be greater than zero".into())
+    })?;
+    (rl.pre_auth_burst != Some(0)).ok_or_else(|| {
+        RmcpServerKitError::Config(
+            "auth.rate_limit.pre_auth_burst must be greater than zero".into(),
+        )
+    })?;
+    // 0 here does not mean "unlimited" - build_pre_auth_limiter falls back to
+    // DEFAULT_PRE_AUTH_RATE, so a typo silently raises the pre-auth quota, for
+    // example 1/min plus 0 yields 300/min, not 10/min, and weakens the gate
+    // that shields Argon2 from CPU spray.
+    (rl.pre_auth_max_per_minute != Some(0)).ok_or_else(|| {
+        RmcpServerKitError::Config(
+            "auth.rate_limit.pre_auth_max_per_minute must be nonzero when set".into(),
+        )
+    })?;
+    (rl.max_tracked_keys != 0).ok_or_else(|| {
+        RmcpServerKitError::Config(
+            "auth.rate_limit.max_tracked_keys must be greater than zero".into(),
+        )
+    })?;
+    Ok(())
+}
+
+/// Validate nested mTLS/CRL capacity knobs that have no safe zero value.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when an mTLS capacity knob is zero.
+fn check_nested_mtls_config(config: Option<&MtlsConfig>) -> RmcpResult<()> {
+    let Some(mtls) = config else {
+        return Ok(());
+    };
+
+    check_mtls_nonzero(
+        &mtls.crl_max_concurrent_fetches,
+        "auth.mtls.crl_max_concurrent_fetches",
+    )?;
+    check_mtls_nonzero(
+        &mtls.crl_discovery_rate_per_min,
+        "auth.mtls.crl_discovery_rate_per_min",
+    )?;
+    check_mtls_nonzero(
+        &mtls.crl_max_host_semaphores,
+        "auth.mtls.crl_max_host_semaphores",
+    )?;
+    check_mtls_nonzero(&mtls.crl_max_seen_urls, "auth.mtls.crl_max_seen_urls")?;
+    check_mtls_nonzero(
+        &mtls.crl_max_cache_entries,
+        "auth.mtls.crl_max_cache_entries",
+    )?;
+    check_mtls_nonzero(
+        &mtls.crl_max_response_bytes,
+        "auth.mtls.crl_max_response_bytes",
+    )?;
+    Ok(())
+}
+
+/// Validate a nonzero mTLS capacity knob.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when `value` is zero.
+fn check_mtls_nonzero<T>(value: &T, field: &str) -> RmcpResult<()>
+where
+    T: Copy + PartialEq + From<u8>,
+{
+    (*value != T::from(0))
+        .ok_or_else(|| RmcpServerKitError::Config(format!("{field} must be nonzero")))
+}
+
+/// Validate the TOML listener socket fields.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when `listen_port` is zero or the
+/// composed `listen_addr:listen_port` is not a socket address.
+fn validate_listen_socket(server: &ServerConfig) -> RmcpResult<()> {
+    if server.listen_port == 0 {
+        return Err(RmcpServerKitError::Config(
+            "listen_port must be nonzero".into(),
+        ));
+    }
+    let bind_addr = format!("{}:{}", server.listen_addr, server.listen_port);
+    if bind_addr.parse::<SocketAddr>().is_err() {
+        return Err(RmcpServerKitError::Config(format!(
+            "listen_addr/listen_port {bind_addr:?} is not a valid socket address \
+             (expected e.g. 127.0.0.1:8080; write an IPv6 listen_addr in brackets, \
+             e.g. [::1])"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate the generic server config fields.
 ///
 /// # Scope
@@ -1514,11 +1687,7 @@ pub(crate) fn check_shared_config_invariants(
 )]
 #[inline]
 pub fn validate_server_config(server: &ServerConfig) -> RmcpResult<()> {
-    if server.listen_port == 0 {
-        return Err(RmcpServerKitError::Config(
-            "listen_port must be nonzero".into(),
-        ));
-    }
+    validate_listen_socket(server)?;
 
     // These three checks are delegated to `check_shared_config_invariants` so
     // this validator and `McpServerConfig::check` cannot drift in ordering: a
@@ -1558,9 +1727,7 @@ pub fn validate_server_config(server: &ServerConfig) -> RmcpResult<()> {
         ));
     }
 
-    if let Some(auth) = &server.auth {
-        auth.validate_api_key_names()?;
-    }
+    check_auth_nested_config(server.auth.as_ref())?;
 
     // `allowed_origins` entries are checked with the same helper
     // `McpServerConfig::check` uses, so a TOML-only consumer cannot be told
@@ -1582,7 +1749,6 @@ pub fn validate_server_config(server: &ServerConfig) -> RmcpResult<()> {
     }
 
     validate_rate_limit_knobs(server)?;
-    validate_mtls_knobs(server)?;
     validate_trusted_forwarder_config(server)?;
 
     if server.admin_enabled && server.admin_role.trim().is_empty() {
@@ -1705,76 +1871,6 @@ fn validate_rate_limit_knobs(server: &ServerConfig) -> RmcpResult<()> {
                 "server.request_log_exclude_paths entries must be non-empty and start with '/': {path:?}"
             )));
         }
-    }
-    if let Some(auth) = server.auth.as_ref() {
-        auth.check_oauth_feature()?;
-    }
-    if let Some(rl) = server
-        .auth
-        .as_ref()
-        .and_then(|auth| auth.rate_limit.as_ref())
-    {
-        (rl.max_attempts_per_minute != 0).ok_or_else(|| {
-            RmcpServerKitError::Config(
-                "auth.rate_limit.max_attempts_per_minute must be nonzero".into(),
-            )
-        })?;
-        if rl.burst == Some(0) {
-            return Err(RmcpServerKitError::Config(
-                "auth.rate_limit.burst must be greater than zero".into(),
-            ));
-        }
-        if rl.pre_auth_burst == Some(0) {
-            return Err(RmcpServerKitError::Config(
-                "auth.rate_limit.pre_auth_burst must be greater than zero".into(),
-            ));
-        }
-        // `0` here does not mean "unlimited" -- `build_pre_auth_limiter`
-        // falls back to DEFAULT_PRE_AUTH_RATE, so a typo silently *raises*
-        // the pre-auth quota (e.g. 1/min + 0 yields 300/min, not 10/min)
-        // and weakens the gate that shields Argon2 from CPU-spray.
-        (rl.pre_auth_max_per_minute != Some(0)).ok_or_else(|| {
-            RmcpServerKitError::Config(
-                "auth.rate_limit.pre_auth_max_per_minute must be nonzero when set".into(),
-            )
-        })?;
-    }
-    Ok(())
-}
-
-/// Validate the mTLS/CRL knobs of a TOML [`ServerConfig`].
-///
-/// # Errors
-///
-/// Returns [`RmcpServerKitError::Config`] when a CRL knob is zero.
-fn validate_mtls_knobs(server: &ServerConfig) -> RmcpResult<()> {
-    if let Some(mtls) = server.auth.as_ref().and_then(|auth| auth.mtls.as_ref()) {
-        (mtls.crl_max_concurrent_fetches != 0).ok_or_else(|| {
-            RmcpServerKitError::Config(
-                "auth.mtls.crl_max_concurrent_fetches must be nonzero".into(),
-            )
-        })?;
-        (mtls.crl_discovery_rate_per_min != 0).ok_or_else(|| {
-            RmcpServerKitError::Config(
-                "auth.mtls.crl_discovery_rate_per_min must be nonzero".into(),
-            )
-        })?;
-        (mtls.crl_max_host_semaphores != 0).ok_or_else(|| {
-            RmcpServerKitError::Config("auth.mtls.crl_max_host_semaphores must be nonzero".into())
-        })?;
-        (mtls.crl_max_seen_urls != 0).ok_or_else(|| {
-            RmcpServerKitError::Config("auth.mtls.crl_max_seen_urls must be nonzero".into())
-        })?;
-        (mtls.crl_max_cache_entries != 0).ok_or_else(|| {
-            RmcpServerKitError::Config("auth.mtls.crl_max_cache_entries must be nonzero".into())
-        })?;
-        // `0` rejects every non-empty CRL body at the streaming cap, so CRL
-        // fetching never succeeds. Under the default `crl_deny_on_unavailable
-        // = true` that fails every CDP-bearing handshake rather than loudly
-        // reporting the misconfiguration.
-        (mtls.crl_max_response_bytes != 0).ok_or_else(|| {
-            RmcpServerKitError::Config("auth.mtls.crl_max_response_bytes must be nonzero".into())
-        })?;
     }
     Ok(())
 }
@@ -1950,9 +2046,12 @@ mod tests {
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
-    use crate::auth::{ApiKeyEntry, MtlsConfig, RateLimitConfig, generate_api_key};
     #[cfg(feature = "oauth")]
     use crate::oauth::{OAuthConfig, OAuthProxyConfig};
+    use crate::{
+        auth::{ApiKeyEntry, generate_api_key},
+        transport::SessionIdLogPolicy,
+    };
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -1999,7 +2098,7 @@ mod tests {
             .server)
     }
 
-    // -- ServerConfig defaults --
+    // - ServerConfig defaults -
 
     #[expect(
         clippy::unnecessary_wraps,
@@ -2096,7 +2195,7 @@ mod tests {
         Ok(())
     }
 
-    // -- validate_server_config --
+    // - validate_server_config -
 
     #[expect(
         clippy::unnecessary_wraps,
@@ -2826,6 +2925,42 @@ client_ip = false
     }
 
     #[test]
+    /// Pins that TOML accepts every session-id header log policy and rejects
+    /// unknown values.
+    fn log_context_session_id_header_toml_values() -> anyhow::Result<()> {
+        for (raw, policy) in [
+            ("plain", SessionIdLogPolicy::Plain),
+            ("mask", SessionIdLogPolicy::Mask),
+            ("hide", SessionIdLogPolicy::Hide),
+        ] {
+            let cfg: ServerConfig = toml::from_str(&format!(
+                r#"
+                    [log_context]
+                    session_id_header = "{raw}"
+                "#
+            ))
+            .with_context(|| format!("session_id_header {raw:?} must parse"))?;
+            assert_eq!(cfg.log_context.session_id_header, policy);
+
+            let bridged = cfg
+                .apply_to_mcp_config(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0"))
+                .context("session id policy must bridge")?;
+            assert_eq!(bridged.log_context.session_id_header, policy);
+        }
+
+        let Err(err) = toml::from_str::<ServerConfig>(
+            r#"
+                [log_context]
+                session_id_header = "plaintext"
+            "#,
+        ) else {
+            anyhow::bail!("unknown session_id_header must fail closed");
+        };
+        assert!(err.to_string().contains("session_id_header"), "{err}");
+        Ok(())
+    }
+
+    #[test]
     /// Pins that an empty TOML bridges log defaults into the MCP config.
     fn empty_toml_bridges_log_defaults() -> anyhow::Result<()> {
         let cfg: ServerConfig = toml::from_str("").context("empty TOML must parse")?;
@@ -2961,7 +3096,7 @@ client_ip = false
         let Err(err) = validate_server_config(&cfg) else {
             anyhow::bail!("zero auth burst must be rejected");
         };
-        assert!(err.to_string().contains("rate_limit.burst"));
+        assert!(err.to_string().contains("auth.rate_limit.burst"));
 
         let auth_pre = AuthConfig::with_keys(vec![])
             .with_rate_limit(RateLimitConfig::new(10).with_pre_auth_burst(0));
@@ -2972,7 +3107,11 @@ client_ip = false
         let Err(err_pre) = validate_server_config(&cfg_pre) else {
             anyhow::bail!("zero pre-auth burst must be rejected");
         };
-        assert!(err_pre.to_string().contains("pre_auth_burst"));
+        assert!(
+            err_pre
+                .to_string()
+                .contains("auth.rate_limit.pre_auth_burst")
+        );
         Ok(())
     }
 
@@ -3016,6 +3155,8 @@ client_ip = false
                 api_keys: Vec::new(),
                 mtls: Some(mtls),
                 rate_limit: None,
+                max_concurrent_verifications: None,
+                verification_wait: Duration::from_secs(1),
                 #[cfg(feature = "oauth")]
                 oauth: None,
                 #[cfg(not(feature = "oauth"))]
@@ -3126,6 +3267,245 @@ client_ip = false
             anyhow::bail!("zero pre_auth_max_per_minute must be rejected");
         };
         assert_config_nonzero_error(err, "auth.rate_limit.pre_auth_max_per_minute")
+    }
+
+    #[test]
+    /// Pins that a zero `verification_wait` is rejected by the TOML preflight.
+    fn rejects_zero_verification_wait() -> anyhow::Result<()> {
+        let mut auth = AuthConfig::with_keys(vec![]);
+        auth.verification_wait = Duration::ZERO;
+        let cfg = ServerConfig {
+            auth: Some(auth),
+            ..ServerConfig::default()
+        };
+        let Err(err) = validate_server_config(&cfg) else {
+            anyhow::bail!("zero verification_wait must be rejected");
+        };
+        assert!(
+            err.to_string().contains("verification_wait"),
+            "error must name verification_wait: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    /// Pins that `max_concurrent_verifications` and `verification_wait`
+    /// deserialize from TOML, and that a typo'd key is still rejected by
+    /// `deny_unknown_fields`.
+    fn auth_toml_parses_admission_control_knobs() -> anyhow::Result<()> {
+        use core::num::NonZeroUsize;
+
+        let server = toml::from_str::<ServerConfig>(
+            r#"
+                listen_port = 8080
+
+                [auth]
+                enabled = true
+                max_concurrent_verifications = 8
+                verification_wait = "2s"
+            "#,
+        )
+        .context("auth table with the new admission-control knobs must parse")?;
+        let auth = server.auth.context("auth must be Some")?;
+        assert_eq!(
+            auth.max_concurrent_verifications.map(NonZeroUsize::get),
+            Some(8),
+            "max_concurrent_verifications must parse to 8"
+        );
+        assert_eq!(
+            auth.verification_wait,
+            Duration::from_secs(2),
+            "verification_wait must parse humantime \"2s\" to 2 seconds"
+        );
+
+        let Err(err) = toml::from_str::<ServerConfig>(
+            "
+                listen_port = 8080
+
+                [auth]
+                enabled = true
+                max_concurrent_verification = 8
+            ",
+        ) else {
+            anyhow::bail!(
+                "a typo'd key (missing trailing 's') must still be rejected by \
+                 deny_unknown_fields"
+            );
+        };
+        assert!(
+            err.to_string().contains("unknown field"),
+            "error must name the unknown field: {err}"
+        );
+        Ok(())
+    }
+
+    fn assert_config_error_contains(
+        result: Result<(), RmcpServerKitError>,
+        label: &str,
+        expected: &str,
+    ) -> anyhow::Result<()> {
+        let Err(err) = result else {
+            anyhow::bail!("{label} must be rejected");
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains(expected),
+            "{label} error must contain {expected:?}; got {message:?}"
+        );
+        Ok(())
+    }
+
+    fn assert_server_config_rejected_by_both(
+        label: &str,
+        server: &ServerConfig,
+        expected: &str,
+    ) -> anyhow::Result<()> {
+        assert_config_error_contains(validate_server_config(server), label, expected)?;
+        let builder = server
+            .apply_to_mcp_config(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0"))
+            .with_context(|| format!("{label} must bridge to the builder config"))?;
+        assert_config_error_contains(builder.validate().map(|_| ()), label, expected)
+    }
+
+    fn server_config_with_rate_limit(rate_limit: RateLimitConfig) -> ServerConfig {
+        ServerConfig {
+            auth: Some(AuthConfig::with_keys(vec![]).with_rate_limit(rate_limit)),
+            ..ServerConfig::default()
+        }
+    }
+
+    fn server_config_with_auth(auth: AuthConfig) -> ServerConfig {
+        ServerConfig {
+            auth: Some(auth),
+            ..ServerConfig::default()
+        }
+    }
+
+    #[cfg(feature = "oauth")]
+    fn validation_https_oauth_config() -> OAuthConfig {
+        OAuthConfig::builder(
+            "https://auth.example.com",
+            "mcp",
+            "https://auth.example.com/.well-known/jwks.json",
+        )
+        .build()
+    }
+
+    #[cfg(feature = "oauth")]
+    fn server_config_with_oauth(oauth: OAuthConfig) -> ServerConfig {
+        let mut auth = AuthConfig::with_keys(vec![]);
+        auth.oauth = Some(oauth);
+        server_config_with_auth(auth)
+    }
+
+    #[test]
+    /// Pins that nested auth mistakes are rejected by both config validators.
+    fn nested_auth_validation_rejects_shared_non_oauth_rules() -> anyhow::Result<()> {
+        let mut max_tracked = RateLimitConfig::new(41);
+        max_tracked.max_tracked_keys = 0;
+
+        let mut mtls = valid_mtls_config();
+        mtls.crl_max_seen_urls = 0;
+
+        let mut zero_wait = AuthConfig::with_keys(vec![]);
+        zero_wait.verification_wait = Duration::ZERO;
+
+        for (label, server, expected) in [
+            (
+                "zero max_tracked_keys",
+                server_config_with_rate_limit(max_tracked),
+                "auth.rate_limit.max_tracked_keys",
+            ),
+            (
+                "zero rate-limit burst",
+                server_config_with_rate_limit(RateLimitConfig::new(41).with_burst(0)),
+                "auth.rate_limit.burst must be greater than zero",
+            ),
+            (
+                "zero pre-auth burst",
+                server_config_with_rate_limit(RateLimitConfig::new(41).with_pre_auth_burst(0)),
+                "auth.rate_limit.pre_auth_burst must be greater than zero",
+            ),
+            (
+                "zero mtls capacity",
+                server_config_with_mtls(mtls),
+                "auth.mtls.crl_max_seen_urls",
+            ),
+            (
+                "zero verification_wait",
+                server_config_with_auth(zero_wait),
+                "auth.verification_wait must be greater than zero",
+            ),
+            (
+                "duplicate api-key principal with different roles",
+                server_config_with_auth(AuthConfig::with_keys(vec![
+                    ApiKeyEntry::new("ops-key", "hash-a", "admin"),
+                    ApiKeyEntry::new("ops-key", "hash-b", "viewer"),
+                ])),
+                "reuses the name 'ops-key'",
+            ),
+        ] {
+            assert_server_config_rejected_by_both(label, &server, expected)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    /// Pins that malformed listen addresses are rejected by both config validators.
+    fn listen_address_validation_rejects_bad_socket_addresses() -> anyhow::Result<()> {
+        let server = ServerConfig {
+            listen_addr: "not an ip".into(),
+            listen_port: 8444,
+            ..ServerConfig::default()
+        };
+        assert_server_config_rejected_by_both(
+            "bad listen address",
+            &server,
+            "valid socket address",
+        )?;
+
+        let bare_ipv6 = ServerConfig {
+            listen_addr: "::1".into(),
+            listen_port: 8444,
+            ..ServerConfig::default()
+        };
+        assert_server_config_rejected_by_both("bare IPv6 listen address", &bare_ipv6, "[::1]")?;
+        Ok(())
+    }
+
+    #[cfg(feature = "oauth")]
+    #[test]
+    /// Pins that nested OAuth mistakes are rejected by both config validators.
+    fn nested_auth_validation_rejects_shared_oauth_rules() -> anyhow::Result<()> {
+        let mut hs256 = validation_https_oauth_config();
+        hs256.allowed_algorithms = Some(vec!["HS256".into()]);
+
+        let mut no_jwks_keys = validation_https_oauth_config();
+        no_jwks_keys.max_jwks_keys = 0;
+
+        let mut bad_cache_ttl = validation_https_oauth_config();
+        bad_cache_ttl.jwks_cache_ttl = "not-a-duration".into();
+
+        for (label, server, expected) in [
+            (
+                "forbidden oauth algorithm",
+                server_config_with_oauth(hs256),
+                "unsupported algorithm",
+            ),
+            (
+                "zero oauth jwks key cap",
+                server_config_with_oauth(no_jwks_keys),
+                "oauth.max_jwks_keys",
+            ),
+            (
+                "malformed oauth jwks cache ttl",
+                server_config_with_oauth(bad_cache_ttl),
+                "jwks_cache_ttl",
+            ),
+        ] {
+            assert_server_config_rejected_by_both(label, &server, expected)?;
+        }
+        Ok(())
     }
 
     #[test]
@@ -3242,7 +3622,7 @@ client_ip = false
         Ok(())
     }
 
-    // -- validate_observability_config --
+    // - validate_observability_config -
 
     #[expect(
         clippy::unnecessary_wraps,
@@ -3335,7 +3715,7 @@ client_ip = false
         Ok(())
     }
 
-    // -- serde deserialization --
+    // - serde deserialization -
 
     #[test]
     /// Pins the deserialized defaults for a bare `ServerConfig` TOML.
@@ -4041,6 +4421,264 @@ client_ip = false
         ("tool_list_filtering", "bool; no invalid state exists"),
     ];
 
+    const AUTH_NESTED_VALIDATION_OWNED: &[(&str, &str)] = &[
+        (
+            "AuthConfig.api_keys",
+            "validated by AuthConfig::validate_api_key_names",
+        ),
+        ("AuthConfig.mtls", "validated by check_nested_mtls_config"),
+        (
+            "AuthConfig.rate_limit",
+            "validated by check_nested_rate_limit",
+        ),
+        (
+            "AuthConfig.verification_wait",
+            "validated by check_verification_wait",
+        ),
+        (
+            "AuthConfig.oauth",
+            "validated by check_oauth_feature and OAuthConfig::validate",
+        ),
+        (
+            "RateLimitConfig.max_attempts_per_minute",
+            "checked nonzero by check_nested_rate_limit",
+        ),
+        (
+            "RateLimitConfig.pre_auth_max_per_minute",
+            "checked not Some(0) by check_nested_rate_limit",
+        ),
+        (
+            "RateLimitConfig.max_tracked_keys",
+            "checked greater than zero by check_nested_rate_limit",
+        ),
+        (
+            "RateLimitConfig.burst",
+            "checked not Some(0) by check_nested_rate_limit",
+        ),
+        (
+            "RateLimitConfig.pre_auth_burst",
+            "checked not Some(0) by check_nested_rate_limit",
+        ),
+        (
+            "MtlsConfig.crl_max_concurrent_fetches",
+            "checked nonzero by check_nested_mtls_config",
+        ),
+        (
+            "MtlsConfig.crl_max_response_bytes",
+            "checked nonzero by check_nested_mtls_config",
+        ),
+        (
+            "MtlsConfig.crl_discovery_rate_per_min",
+            "checked nonzero by check_nested_mtls_config",
+        ),
+        (
+            "MtlsConfig.crl_max_host_semaphores",
+            "checked nonzero by check_nested_mtls_config",
+        ),
+        (
+            "MtlsConfig.crl_max_seen_urls",
+            "checked nonzero by check_nested_mtls_config",
+        ),
+        (
+            "MtlsConfig.crl_max_cache_entries",
+            "checked nonzero by check_nested_mtls_config",
+        ),
+        ("OAuthConfig.issuer", "validated by OAuthConfig::validate"),
+        ("OAuthConfig.audience", "validated by OAuthConfig::validate"),
+        ("OAuthConfig.jwks_uri", "validated by OAuthConfig::validate"),
+        (
+            "OAuthConfig.jwks_cache_ttl",
+            "validated by OAuthConfig::validate",
+        ),
+        ("OAuthConfig.proxy", "validated by OAuthConfig::validate"),
+        (
+            "OAuthConfig.token_exchange",
+            "validated by OAuthConfig::validate",
+        ),
+        (
+            "OAuthConfig.allow_http_oauth_urls",
+            "governs URL validation in OAuthConfig::validate",
+        ),
+        (
+            "OAuthConfig.ssrf_allowlist",
+            "validated by OAuthConfig::validate",
+        ),
+        (
+            "OAuthConfig.max_jwks_keys",
+            "validated by OAuthConfig::validate",
+        ),
+        (
+            "OAuthConfig.allowed_algorithms",
+            "validated by OAuthConfig::validate",
+        ),
+        (
+            "OAuthConfig.authorization_servers",
+            "validated by OAuthConfig::validate",
+        ),
+        (
+            "OAuthConfig.authorization_server_metadata_issuer",
+            "validated by OAuthConfig::validate",
+        ),
+        (
+            "OAuthConfig.jwks_max_response_bytes",
+            "validated by OAuthConfig::validate",
+        ),
+    ];
+
+    const AUTH_NESTED_VALIDATION_EXEMPT: &[(&str, &str)] = &[
+        ("AuthConfig.enabled", "bool; no nested invalid state exists"),
+        (
+            "AuthConfig.max_concurrent_verifications",
+            "NonZeroUsize at the boundary; oversized values clamp at AuthState construction",
+        ),
+        (
+            "RateLimitConfig.idle_eviction",
+            "Duration; no invalid nested value exists",
+        ),
+        (
+            "RateLimitConfig.key_eviction_policy",
+            "enum; every variant is valid",
+        ),
+        (
+            "MtlsConfig.ca_cert_path",
+            "file existence is checked when the TLS verifier is built",
+        ),
+        ("MtlsConfig.required", "bool; no invalid state exists"),
+        (
+            "MtlsConfig.default_role",
+            "arbitrary role string consumed by auth/RBAC policy",
+        ),
+        ("MtlsConfig.crl_enabled", "bool; no invalid state exists"),
+        (
+            "MtlsConfig.crl_refresh_interval",
+            "Duration option; no invalid nested value exists",
+        ),
+        (
+            "MtlsConfig.crl_fetch_timeout",
+            "Duration; zero timeout is a fail-fast operator choice",
+        ),
+        (
+            "MtlsConfig.crl_stale_grace",
+            "Duration; zero grace is a valid strict posture",
+        ),
+        (
+            "MtlsConfig.crl_deny_on_unavailable",
+            "bool; no invalid state exists",
+        ),
+        (
+            "MtlsConfig.crl_end_entity_only",
+            "bool; no invalid state exists",
+        ),
+        ("MtlsConfig.crl_allow_http", "bool; no invalid state exists"),
+        (
+            "MtlsConfig.crl_enforce_expiration",
+            "bool; no invalid state exists",
+        ),
+        (
+            "OAuthConfig.scopes",
+            "empty list is valid and means no scope mapping",
+        ),
+        (
+            "OAuthConfig.role_claim",
+            "optional claim path; absence is valid",
+        ),
+        (
+            "OAuthConfig.role_mappings",
+            "empty list is valid and means no claim mapping",
+        ),
+        (
+            "OAuthConfig.ca_cert_path",
+            "certificate content validation is handled at HTTP-client build time",
+        ),
+        (
+            "OAuthConfig.require_subject",
+            "bool; no invalid state exists",
+        ),
+        (
+            "OAuthConfig.strict_audience_validation",
+            "deprecated compatibility option; every bool/None state resolves to a mode",
+        ),
+        (
+            "OAuthConfig.audience_validation_mode",
+            "enum option; every variant and None are valid",
+        ),
+    ];
+
+    fn prefixed_struct_fields(
+        source: &str,
+        marker: &str,
+        prefix: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        Ok(struct_fields_in(source, marker)?
+            .into_iter()
+            .map(|field| format!("{prefix}.{field}"))
+            .collect())
+    }
+
+    fn assert_nested_field_classified(field: &str) {
+        let owned = AUTH_NESTED_VALIDATION_OWNED
+            .iter()
+            .any(|(name, reason)| *name == field && !reason.trim().is_empty());
+        let exempt = AUTH_NESTED_VALIDATION_EXEMPT
+            .iter()
+            .any(|(name, reason)| *name == field && !reason.trim().is_empty());
+        assert!(
+            owned || exempt,
+            "`{field}` is neither owned by check_auth_nested_config nor exempted with a reason"
+        );
+        assert!(
+            !(owned && exempt),
+            "`{field}` is both owned and exempted; classify it exactly once"
+        );
+    }
+
+    #[test]
+    /// Pins that every nested auth config field is owned or exempted deliberately.
+    fn every_nested_auth_config_field_is_classified() -> anyhow::Result<()> {
+        let auth_source = include_str!("auth.rs");
+        let oauth_source = include_str!("oauth.rs");
+        let mut fields = Vec::new();
+        fields.extend(prefixed_struct_fields(
+            auth_source,
+            "pub struct AuthConfig {",
+            "AuthConfig",
+        )?);
+        fields.extend(prefixed_struct_fields(
+            auth_source,
+            "pub struct RateLimitConfig {",
+            "RateLimitConfig",
+        )?);
+        fields.extend(prefixed_struct_fields(
+            auth_source,
+            "pub struct MtlsConfig {",
+            "MtlsConfig",
+        )?);
+        fields.extend(prefixed_struct_fields(
+            oauth_source,
+            "pub struct OAuthConfig {",
+            "OAuthConfig",
+        )?);
+        assert!(
+            fields.len() >= 45,
+            "nested auth guard parsed only {} fields; update the parser",
+            fields.len()
+        );
+
+        for field in &fields {
+            assert_nested_field_classified(field);
+        }
+        for (field, _) in AUTH_NESTED_VALIDATION_OWNED
+            .iter()
+            .chain(AUTH_NESTED_VALIDATION_EXEMPT)
+        {
+            assert!(
+                fields.iter().any(|candidate| candidate == field),
+                "nested auth classification lists `{field}`, which is no longer a parsed field"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     /// Pins that every shared config field is validated by both validators.
     fn every_shared_config_field_is_validated_by_both() -> anyhow::Result<()> {
@@ -4081,7 +4719,6 @@ client_ip = false
         for expected in [
             "fn validate_server_config",
             "fn validate_rate_limit_knobs",
-            "fn validate_mtls_knobs",
             "fn validate_trusted_forwarder_config",
             "fn check_shared_config_invariants",
         ] {
@@ -4102,6 +4739,15 @@ client_ip = false
                 "builder validator surface lost `{expected}`; update the extraction rule"
             );
         }
+
+        assert!(
+            toml_surface.contains("check_auth_nested_config"),
+            "TOML validator surface must call check_auth_nested_config"
+        );
+        assert!(
+            builder_surface.contains("check_auth_nested_config"),
+            "builder validator surface must call check_auth_nested_config"
+        );
 
         for field in &shared {
             if let Some((_, reason)) = VALIDATION_PARITY_EXEMPT
@@ -4458,6 +5104,45 @@ client_ip = false
                 let msg = err.to_string();
                 assert!(msg.contains(SERVER_LISTEN_PORT_ENV));
                 assert!(msg.contains("u16"));
+                Ok(())
+            },
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    /// Pins that the session-id header policy env override applies and rejects
+    /// unknown values.
+    fn session_id_header_env_override_applies_and_fails_closed() -> anyhow::Result<()> {
+        with_env_vars(
+            &[(SERVER_LOG_CONTEXT_SESSION_ID_HEADER_ENV, Some("mask"))],
+            || -> anyhow::Result<()> {
+                let mut cfg = ServerConfig::default();
+                let report = cfg
+                    .apply_env_overrides()
+                    .context("session-id policy override must apply")?;
+                assert_eq!(cfg.log_context.session_id_header, SessionIdLogPolicy::Mask);
+                let entry = report.first().context("one override must be reported")?;
+                assert_eq!(entry.env_var, SERVER_LOG_CONTEXT_SESSION_ID_HEADER_ENV);
+                assert_eq!(entry.target_field, "server.log_context.session_id_header");
+                assert_eq!(entry.value.as_deref(), Some("mask"));
+                Ok(())
+            },
+        )?;
+
+        with_env_vars(
+            &[(SERVER_LOG_CONTEXT_SESSION_ID_HEADER_ENV, Some("plaintext"))],
+            || -> anyhow::Result<()> {
+                let mut cfg = ServerConfig::default();
+                let Err(err) = cfg.apply_env_overrides() else {
+                    anyhow::bail!("bad session-id policy must fail closed");
+                };
+                let msg = err.to_string();
+                assert!(
+                    msg.contains(SERVER_LOG_CONTEXT_SESSION_ID_HEADER_ENV),
+                    "{msg}"
+                );
+                assert!(msg.contains("SessionIdLogPolicy"), "{msg}");
                 Ok(())
             },
         )?;
@@ -5109,6 +5794,12 @@ client_ip = false
         (
             SERVER_KEY_EVICTION_POLICY_ENV,
             "server.key_eviction_policy",
+            None,
+            false,
+        ),
+        (
+            SERVER_LOG_CONTEXT_SESSION_ID_HEADER_ENV,
+            "server.log_context.session_id_header",
             None,
             false,
         ),

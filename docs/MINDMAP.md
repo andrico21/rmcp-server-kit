@@ -79,11 +79,11 @@ mindmap
         scheme/userinfo/IP-literal blocks
         Used by JWKS, CRL, OAuth proxy fetches
       mtls_revocation.rs
-        CrlSet L95
-        note_discovered_urls L348
-        DynamicClientCertVerifier L736
+        CrlSet
+        note_discovered_urls
+        DynamicClientCertVerifier
         bootstrap_fetch L889
-        run_crl_refresher L981
+        run_crl_refresher
       tool_hooks.rs
         HookedHandler L219
         impl HookedHandler L240
@@ -249,7 +249,7 @@ mindmap
       deny.toml license + ban
       .cargo/audit.toml
       rustfmt.toml
-      scripts/lint-ratchet/ catalog allow profile_eq prose
+      scripts/lint-ratchet/ catalog allow profile_eq prose dash
       .cargo/config.toml build.warnings deny
     Coding standards
       RUST_GUIDELINES.md index + docs/rust-guidelines/ vendored
@@ -296,12 +296,12 @@ mindmap
 sequenceDiagram
     autonumber
     participant C as Client
-    participant TLS as TlsListener<br/>src/transport.rs:3140
+    participant TLS as `TlsListener`<br/>src/transport.rs:3657
     participant R as axum Router
-    participant O as origin_check<br/>src/transport.rs:4493
-    participant H as security_headers<br/>src/transport.rs:3797
-    participant A as auth_middleware<br/>src/auth.rs:1006
-    participant B as rbac_middleware<br/>src/rbac.rs:584
+    participant O as `origin_check_middleware`<br/>src/transport.rs:5160
+    participant H as `security_headers_middleware`<br/>src/transport.rs:4373
+    participant A as `auth_middleware`<br/>src/auth.rs:2594
+    participant B as `rbac_middleware`<br/>src/rbac.rs:1354
     participant L as per-IP rate limit<br/>governor + bounded_limiter
     participant M as rmcp Streamable<br/>HTTP service
     participant T as ServerHandler<br/>(consumer impl)
@@ -332,20 +332,20 @@ sequenceDiagram
 ```mermaid
 flowchart LR
     subgraph Admin["Admin / operator"]
-        RH[ReloadHandle<br/>src/transport.rs:712]
+        RH[`ReloadHandle`<br/>src/transport.rs:2003]
     end
 
     subgraph SharedState["Shared state (lock-free / fine-grained)"]
-        AKS[(ArcSwap&lt;ApiKeys&gt;<br/>AuthState.api_keys<br/>src/auth.rs:631)]
+        AKS[(ArcSwap&lt;ApiKeys&gt;<br/>`AuthState` api_keys<br/>src/auth.rs:1662)]
         RBS[(ArcSwap&lt;RbacPolicy&gt;<br/>rbac_swap)]
-        MTL[mTLS AuthIdentity<br/>per-connection<br/>TlsConnInfo extension<br/>src/auth.rs:602-610]
+        MTL[mTLS `AuthIdentity`<br/>per-connection<br/>TlsConnInfo extension<br/>src/auth.rs:76]
     end
 
     subgraph Hot["Request-time consumers"]
-        AM[auth_middleware<br/>src/auth.rs:1006]
-        BM[rbac_middleware<br/>src/rbac.rs:584]
-        TL["Task-locals<br/>current_role / current_identity<br/>current_token / current_sub<br/>src/rbac.rs:83-145"]
-        TH[HookedHandler<br/>src/tool_hooks.rs:219]
+        AM[`auth_middleware`<br/>src/auth.rs:2594]
+        BM[`rbac_middleware`<br/>src/rbac.rs:1354]
+        TL["Task-locals<br/>`current_role` / `current_identity`<br/>`current_token` / `current_sub`<br/>src/rbac.rs:158-220"]
+        TH[`HookedHandler`<br/>src/tool_hooks.rs:335]
     end
 
     RH -- reload_auth_keys --> AKS
@@ -429,26 +429,26 @@ graph TD
 
 | Area                              | Module / file                           | Notable symbols (file:line)                                                  |
 |-----------------------------------|------------------------------------------|-------------------------------------------------------------------------------|
-| Server entry (HTTP)               | `src/transport.rs`                       | `serve` ~L2981, `McpServerConfig` L387-776, `ReloadHandle` ~L1816              |
-| Server entry (stdio, no auth)     | `src/transport.rs`                       | `serve_stdio` ~L5424                                                          |
-| Router builder + middleware wire  | `src/transport.rs`                       | `build_app_router` ~L2076, security headers wired ~L2657, peer-addr normalize wired ~L2624, request log wired just inside peer-addr normalize, origin wired ~L2641 |
-| TLS / mTLS acceptor               | `src/transport.rs`                       | `TlsListener` ~L3619                                                          |
-| Origin / security headers (defs)  | `src/transport.rs`                       | `origin_check_middleware` ~L5125, `security_headers_middleware` ~L4333       |
-| Graceful shutdown                 | `src/transport.rs`                       | `shutdown_signal` ~L4153                                                      |
-| API key + mTLS auth               | `src/auth.rs`                            | `AuthIdentity` L96, `AuthState` ~L1404, `auth_middleware` L2272              |
-| RBAC engine                       | `src/rbac.rs`                            | `RbacPolicy` L352, task-locals L90-150, `rbac_middleware` L678-825           |
-| Memory-bounded keyed limiter      | `src/bounded_limiter.rs`                 | `BoundedKeyedLimiter` L134                                                    |
+| Server entry (HTTP)               | `src/transport.rs`                       | `serve` L3014, `McpServerConfig` L481, `ReloadHandle` ~L2003              |
+| Server entry (stdio, no auth)     | `src/transport.rs`                       | `serve_stdio` L5505                                                          |
+| Router builder + middleware wire  | `src/transport.rs`                       | `build_app_router` L2331; security headers, peer-addr normalization, request logging, and origin checks are wired there |
+| TLS / mTLS acceptor               | `src/transport.rs`                       | `TlsListener` L3657                                                          |
+| Origin / security headers (defs)  | `src/transport.rs`                       | `origin_check_middleware` L5160, `security_headers_middleware` ~L4373       |
+| Graceful shutdown                 | `src/transport.rs`                       | `shutdown_signal` L4191                                                      |
+| API key + mTLS auth               | `src/auth.rs`                            | `AuthIdentity` L76, `AuthState` ~L1660, `auth_middleware` L2594              |
+| RBAC engine                       | `src/rbac.rs`                            | `RbacPolicy` L709, `current_role` L158, `current_identity` L180, `current_token` L202, `current_sub` L220, `rbac_middleware` L1354           |
+| Memory-bounded keyed limiter      | `src/bounded_limiter.rs`                 | `BoundedKeyedLimiter` L158                                                    |
 | Trusted-forwarder resolution      | `src/forwarded.rs`                       | `resolve_client_ip`, `FallbackReason` (rightmost-untrusted, fail-safe-to-direct) |
-| OAuth JWT / JWKS                  | `src/oauth.rs` (feature `oauth`)         | `JwksCache` L2549, `JWKS_REFRESH_COOLDOWN` ~L2628, `select_jwks_key` L2755 |
+| OAuth JWT / JWKS                  | `src/oauth.rs` (feature `oauth`)         | `JwksCache` L2744, `JWKS_REFRESH_COOLDOWN` ~L2928, `select_jwks_key` L3584 |
 | SSRF guard (outbound HTTP)        | `src/ssrf.rs`                            | per-hop scheme/userinfo/IP-literal blocks                                     |
-| mTLS revocation (CRL)             | `src/mtls_revocation.rs`                 | `CrlSet` L100, `DynamicClientCertVerifier` L771, `bootstrap_fetch` L935       |
-| Tool hooks / size cap             | `src/tool_hooks.rs`                      | `HookedHandler` L219                                                          |
-| Admin diagnostics                 | `src/admin.rs`                           | `require_admin_role` L133, `admin_router` L160                                |
-| Tracing / audit log               | `src/observability.rs`                   | `init_tracing_from_config` L39, audit sink L170                              |
-| Prometheus metrics                | `src/metrics.rs` (feature `metrics`)     | `McpMetrics` L26, `serve_metrics` L95                                         |
+| mTLS revocation (CRL)             | `src/mtls_revocation.rs`                 | `CrlSet` L330, `DynamicClientCertVerifier` L1745, `bootstrap_fetch` L2172       |
+| Tool hooks / size cap             | `src/tool_hooks.rs`                      | `HookedHandler` L335                                                          |
+| Admin diagnostics                 | `src/admin.rs`                           | `require_admin_role` L182, `admin_router` L209                                |
+| Tracing / audit log               | `src/observability.rs`                   | `init_tracing_from_config` L96, `AuditWorkerGuard` L378                              |
+| Prometheus metrics                | `src/metrics.rs` (feature `metrics`)     | `McpMetrics` L49, `serve_metrics` L189                                         |
 | Configuration (TOML)              | `src/config.rs` + `src/transport.rs`     | TOML schema + `McpServerConfig`                                               |
-| Error → HTTP mapping              | `src/error.rs`                           | `RmcpServerKitError` L13, `IntoResponse` L56                                           |
-| Integration reference             | `tests/integration/e2e.rs`               | `spawn_server` L499                                                           |
+| Error → HTTP mapping              | `src/error.rs`                           | `RmcpServerKitError` L46, `IntoResponse` L170                                           |
+| Integration reference             | `tests/integration/e2e.rs`               | `spawn_server` L507                                                           |
 | Runnable examples                 | `examples/`                              | `minimal_server.rs`, `api_key_rbac.rs`, `oauth_server.rs`                    |
 
 ---
@@ -456,7 +456,7 @@ graph TD
 ## How to read this mindmap
 
 1. **Start at the root** - confirms crate identity (library, edition, MSRV).
-2. **Modules branch** - every `src/*.rs` file with its key symbols and file:line refs.
+2. **Modules branch** - every parseable citation to a `src/*.rs` file includes its key symbol and file:line ref.
 3. **Endpoints / Auth modes / Middleware order** - runtime surface of the server.
 4. **State plane / Hot reload** - how `ArcSwap` and task-locals coordinate.
 5. **Critical pitfalls** - checklist before proposing any change.

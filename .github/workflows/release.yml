@@ -38,6 +38,11 @@ on:
     workflows: ["CI"]
     types: [completed]
 
+# Least-privilege default; the publish job below keeps its own
+# `contents: write` grant because "Create GitHub release" needs it.
+permissions:
+  contents: read
+
 jobs:
   publish:
     name: cargo publish
@@ -59,7 +64,7 @@ jobs:
       # Check out the exact commit that CI ran against, not the tip of
       # `main`. workflow_run-triggered jobs default to the workflow file
       # on the default branch but the working-tree checkout is up to us.
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           # We need tags for the `git tag --points-at` lookup below.
@@ -68,8 +73,8 @@ jobs:
           # push credential is persisted into the untrusted-head_sha checkout.
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
         with:
           # Single-build job: never write the shared cache from here, so an
           # untrusted head_sha cannot poison a cache other jobs restore.
@@ -165,7 +170,7 @@ jobs:
 
       - name: Create GitHub release
         if: steps.find-tag.outputs.skip != 'true' && steps.publish.outputs.published == 'true'
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@5113cdc90fd4d541c801c55356214017bf5ae34b # v3
         with:
           tag_name: ${{ steps.find-tag.outputs.tag }}
           body_path: ${{ env.NOTES_PATH }}

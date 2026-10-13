@@ -9,6 +9,8 @@
 extern crate alloc;
 
 use alloc::{collections::VecDeque, sync::Arc};
+#[cfg(test)]
+use core::sync::atomic::AtomicBool;
 use core::{
     fmt::{Debug, Display, Formatter, Result as FmtResult},
     net::{IpAddr, SocketAddr},
@@ -20,6 +22,8 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{LazyLock, Mutex, PoisonError},
+    thread::available_parallelism,
+    time::Instant,
 };
 
 use arc_swap::ArcSwap;
@@ -36,7 +40,7 @@ use secrecy::{ExposeSecret as _, SecretString};
 #[cfg(not(feature = "oauth"))]
 use serde::de::IgnoredAny;
 use serde::{Deserialize, de::Error as SerdeDeError};
-use tokio::task::spawn_blocking;
+use tokio::{sync::Semaphore, task::spawn_blocking, time::timeout};
 use tracing::field;
 use x509_parser::prelude::{FromDer as _, GeneralName, X509Certificate};
 
@@ -207,6 +211,25 @@ struct AuthRejection {
     owner: Option<CredentialOwner>,
 }
 
+/// Outcome of a failed bearer-token authentication attempt
+/// ([`authenticate_bearer_identity`]).
+///
+/// [`Self::Rejected`] carries a credential failure handled through the
+/// existing 401 path ([`unauthorized_response`]). [`Self::Overloaded`] means
+/// admission into the Argon2id verification permit pool timed out (or the
+/// pool was unexpectedly closed): `auth_middleware` returns `503 Service
+/// Unavailable` with `Retry-After: 1` directly, never through the 401 path,
+/// and this outcome is counted separately from any credential failure class
+/// so it never consumes the post-failure rate-limit budget.
+#[derive(Debug)]
+enum AuthFailure {
+    /// The credential was missing, invalid, or expired.
+    Rejected(AuthRejection),
+    /// The Argon2id verification permit pool could not admit this request
+    /// within [`AuthConfig::verification_wait`].
+    Overloaded,
+}
+
 /// API-key verification result from the fixed-work slot scan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ApiKeyVerdict {
@@ -292,6 +315,12 @@ pub struct AuthCountersSnapshot {
     /// Failures because the source IP exceeded the pre-auth abuse gate.
     /// These never reach the password-hash verification path.
     pub failure_pre_auth_gate: u64,
+    /// Requests rejected with `503 Service Unavailable` because the Argon2id
+    /// verification permit pool could not admit them within
+    /// `AuthConfig::verification_wait`. Counted separately from every other
+    /// failure class: these never reached password-hash verification, and
+    /// they do not consume the post-failure rate-limit budget.
+    pub failure_overloaded: u64,
 }
 
 /// Internal atomic counters backing [`AuthCountersSnapshot`].
@@ -313,6 +342,9 @@ pub(crate) struct AuthCounters {
     failure_rate_limited: AtomicU64,
     /// Count of failures rejected by the pre-auth abuse gate.
     failure_pre_auth_gate: AtomicU64,
+    /// Count of requests rejected because the Argon2id verification permit
+    /// pool could not admit them in time.
+    failure_overloaded: AtomicU64,
 }
 
 impl AuthCounters {
@@ -358,6 +390,13 @@ impl AuthCounters {
         }
     }
 
+    /// Record one request rejected because the Argon2id verification permit
+    /// pool could not admit it in time. Separate from
+    /// [`Self::record_failure`]: an overload is never a credential failure.
+    fn record_overload(&self) {
+        let _previous = self.failure_overloaded.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Snapshot the current counter values.
     fn snapshot(&self) -> AuthCountersSnapshot {
         AuthCountersSnapshot {
@@ -369,6 +408,7 @@ impl AuthCounters {
             failure_expired_credential: self.failure_expired_credential.load(Ordering::Relaxed),
             failure_rate_limited: self.failure_rate_limited.load(Ordering::Relaxed),
             failure_pre_auth_gate: self.failure_pre_auth_gate.load(Ordering::Relaxed),
+            failure_overloaded: self.failure_overloaded.load(Ordering::Relaxed),
         }
     }
 }
@@ -436,9 +476,9 @@ impl Debug for RfcTimestamp {
     #[inline]
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         // Render as the canonical RFC 3339 string (not chrono's internal
-        // debug form) so existing `ApiKeyEntry` Debug-redaction tests --
+        // debug form) so existing `ApiKeyEntry` Debug-redaction tests -
         // which look for the literal `"2030-01-01T00:00:00Z"` form in the
-        // formatted output -- continue to hold without bespoke handling.
+        // formatted output - continue to hold without bespoke handling.
         write!(f, "{}", self.0.to_rfc3339())
     }
 }
@@ -628,7 +668,7 @@ pub struct MtlsConfig {
     /// revocation status cannot be determined as unverified, so a client
     /// certificate advertising CRL distribution points is rejected when
     /// *every* relevant CDP is uncached and unfetchable. Denial requires all
-    /// relevant CDPs to be unavailable, not merely one -- otherwise an
+    /// relevant CDPs to be unavailable, not merely one - otherwise an
     /// attacker who blocks a single mirror could deny service.
     ///
     /// Set to `false` to restore the pre-3.8 fail-open behaviour, in which an
@@ -645,10 +685,11 @@ pub struct MtlsConfig {
     ///
     /// Defaults to `true` because RFC 5280 §4.2.1.13 designates HTTP (and
     /// LDAP) as the canonical transport for CRL distribution points.
-    /// SSRF defense for HTTP CDPs is provided by the IP-allowlist guard
-    /// (private/loopback/link-local/multicast/cloud-metadata addresses are
-    /// always rejected), redirect=none, body-size cap, and per-host
-    /// concurrency limit -- not by forcing HTTPS.
+    /// SSRF defense for HTTP CDPs is provided by address screening
+    /// (private/loopback/link-local/multicast addresses are rejected unless
+    /// the URL's origin is named in the operator's configured certificates;
+    /// cloud-metadata addresses are always rejected), redirect=none,
+    /// body-size cap, and per-host concurrency limit - not by forcing HTTPS.
     #[serde(default = "default_true")]
     pub crl_allow_http: bool,
     /// Enforce CRL expiration during certificate validation.
@@ -668,8 +709,8 @@ pub struct MtlsConfig {
     pub crl_max_response_bytes: u64,
     /// CDP discovery rate limit, in URLs per minute. Throttles how many
     /// *new* CDP URLs the verifier may admit into the fetch pipeline,
-    /// bounding asymmetric `DoS` amplification when attacker-controlled
-    /// certificates carry large CDP lists.
+    /// bounding asymmetric `DoS` amplification when presented certificate
+    /// chains carry large CDP lists (only chains that verify are admitted).
     ///
     /// Applied **per source peer IP** for attributed TLS handshakes: the
     /// value is each peer's own per-minute quota, so one peer draining its
@@ -694,8 +735,8 @@ pub struct MtlsConfig {
     /// fetch) are evicted on demand so new hosts keep working; only when
     /// every entry has a concurrent in-flight fetch does the request
     /// return [`RmcpServerKitError::Config`] containing the literal substring
-    /// `"crl_host_semaphore_cap_exceeded"`. Bounds memory growth from
-    /// attacker-controlled CDP URLs pointing at unique hostnames.
+    /// `"crl_host_semaphore_cap_exceeded"`. Bounds memory growth when
+    /// presented certificates name CDP URLs on many distinct hostnames.
     /// Default: 1024.
     #[serde(default = "default_crl_max_host_semaphores")]
     pub crl_max_host_semaphores: usize,
@@ -954,7 +995,7 @@ const fn default_idle_eviction() -> Duration {
         reason = "deliberate: src/auth.rs::AuthConfig oauth placeholder stays crate-private"
     )
 )]
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct AuthConfig {
@@ -968,6 +1009,25 @@ pub struct AuthConfig {
     pub mtls: Option<MtlsConfig>,
     /// Rate limiting for auth attempts.
     pub rate_limit: Option<RateLimitConfig>,
+    /// Maximum number of concurrent Argon2id API-key verifications admitted
+    /// to the blocking thread pool. `None` (default) resolves to
+    /// `available_parallelism()` clamped to `1..=16` at auth-state
+    /// construction time. Bounds Argon2id's memory footprint (roughly this
+    /// value times ~19 MiB) independent of source IP or client count. Each
+    /// permit is held for a full key scan (one verification per configured
+    /// key), so sustained bearer capacity is roughly this value divided by
+    /// (configured keys x per-verification time); see the guide's
+    /// capacity-planning section. A value above
+    /// `tokio::sync::Semaphore::MAX_PERMITS` is clamped to it
+    /// (effectively unbounded) rather than panicking at startup.
+    #[serde(default)]
+    pub max_concurrent_verifications: Option<NonZeroUsize>,
+    /// Maximum time a request waits for a verification permit before
+    /// receiving `503 Service Unavailable` with `Retry-After: 1` instead of
+    /// queuing unboundedly. Must be greater than zero; config validation
+    /// enforces this at startup. Default: 1 second.
+    #[serde(default = "default_verification_wait", with = "humantime_serde")]
+    pub verification_wait: Duration,
     /// OAuth 2.1 JWT bearer token authentication.
     #[cfg(feature = "oauth")]
     pub oauth: Option<OAuthConfig>,
@@ -986,6 +1046,75 @@ pub struct AuthConfig {
     pub(crate) oauth: Option<IgnoredAny>,
 }
 
+impl Default for AuthConfig {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_keys: Vec::new(),
+            mtls: None,
+            rate_limit: None,
+            max_concurrent_verifications: None,
+            verification_wait: default_verification_wait(),
+            #[cfg(feature = "oauth")]
+            oauth: None,
+            #[cfg(not(feature = "oauth"))]
+            oauth: None,
+        }
+    }
+}
+
+/// Serde default for [`AuthConfig::verification_wait`]: 1 second.
+const fn default_verification_wait() -> Duration {
+    Duration::from_secs(1)
+}
+
+/// Clamp a parallelism hint to the permit-pool bound `1..=16`.
+const fn clamp_parallelism_to_permit_bound(n: usize) -> NonZeroUsize {
+    let clamped = if n < 1 {
+        1
+    } else if n > 16 {
+        16
+    } else {
+        n
+    };
+    match NonZeroUsize::new(clamped) {
+        Some(value) => value,
+        None => NonZeroUsize::MIN,
+    }
+}
+
+/// Resolve the default Argon2id verification permit count when
+/// [`AuthConfig::max_concurrent_verifications`] is `None`:
+/// `available_parallelism()` clamped to `1..=16`.
+pub(crate) fn default_max_concurrent_verifications() -> NonZeroUsize {
+    let n = available_parallelism().map_or(1, NonZeroUsize::get);
+    clamp_parallelism_to_permit_bound(n)
+}
+
+/// Clamp a requested permit count to [`Semaphore::MAX_PERMITS`].
+///
+/// `Semaphore::new` panics above that bound, and an operator-supplied
+/// `max_concurrent_verifications` (for example a TOML integer up to
+/// `u64::MAX`, or `NonZeroUsize::MAX` through the builder) must never crash
+/// the server at startup. Values above the largest permit count the pool
+/// supports are clamped to it, which is effectively unbounded.
+fn clamp_to_semaphore_max(requested: NonZeroUsize) -> NonZeroUsize {
+    if requested.get() > Semaphore::MAX_PERMITS {
+        NonZeroUsize::new(Semaphore::MAX_PERMITS).unwrap_or(NonZeroUsize::MIN)
+    } else {
+        requested
+    }
+}
+
+/// Resolve the effective Argon2id verification permit count for an
+/// [`AuthConfig`].
+pub(crate) fn resolve_max_concurrent_verifications(config: &AuthConfig) -> NonZeroUsize {
+    config
+        .max_concurrent_verifications
+        .map_or_else(default_max_concurrent_verifications, clamp_to_semaphore_max)
+}
+
 /// Validate API-key `name`s as session/task-binding principal identities,
 /// naming the first offending index.
 ///
@@ -997,7 +1126,7 @@ pub struct AuthConfig {
 /// 2. A name reused with a *different* `role` is rejected: same-named keys
 ///    are one principal sharing one identity namespace, so two roles under
 ///    one name is a contradiction. Same name with the *same* role is
-///    permitted -- that is credential rotation (one principal, two secrets).
+///    permitted - that is credential rotation (one principal, two secrets).
 ///
 /// Shared by [`AuthConfig::validate_api_key_names`] (startup validation) and
 /// [`AuthState::try_reload_keys`] (hot-reload validation) so both surfaces
@@ -1049,6 +1178,8 @@ impl AuthConfig {
             api_keys: keys,
             mtls: None,
             rate_limit: None,
+            max_concurrent_verifications: None,
+            verification_wait: default_verification_wait(),
             #[cfg(feature = "oauth")]
             oauth: None,
             #[cfg(not(feature = "oauth"))]
@@ -1068,12 +1199,33 @@ impl AuthConfig {
         self
     }
 
+    /// Override the maximum number of concurrent Argon2id API-key
+    /// verifications (default: `available_parallelism()` clamped to
+    /// `1..=16`).
+    #[must_use]
+    #[inline]
+    pub const fn with_max_concurrent_verifications(mut self, permits: NonZeroUsize) -> Self {
+        self.max_concurrent_verifications = Some(permits);
+        self
+    }
+
+    /// Override how long a request waits for a verification permit before
+    /// receiving `503 Service Unavailable` with `Retry-After: 1` (default 1
+    /// second). Must be greater than zero; config validation enforces this at
+    /// startup.
+    #[must_use]
+    #[inline]
+    pub const fn with_verification_wait(mut self, wait: Duration) -> Self {
+        self.verification_wait = wait;
+        self
+    }
+
     /// Reject an `[auth.oauth]` table in a build compiled without the `oauth`
     /// cargo feature.
     ///
     /// Fails closed on purpose. Ignoring the table would start the server with
     /// OAuth silently disabled while the operator's configuration says it is
-    /// on -- for a bearer-token deployment that is an unauthenticated server.
+    /// on - for a bearer-token deployment that is an unauthenticated server.
     ///
     /// # Errors
     ///
@@ -1372,6 +1524,134 @@ impl AuthLogContext {
     }
 }
 
+/// Minimum gap between two Argon2id-overload WARN log lines.
+const OVERLOAD_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Throttles the Argon2id-overload WARN log.
+///
+/// At most one line per [`OVERLOAD_LOG_INTERVAL`], with the count of
+/// suppressed events folded into the next line. Process-wide (not per
+/// [`AuthState`]) because the log sink it protects is process-wide:
+/// multiple `AuthState`s sharing one process still emit at most one line
+/// per interval in total.
+#[derive(Debug, Default)]
+struct OverloadLogThrottle {
+    /// `Instant` of the last emitted log line, or `None` before the first.
+    last_logged: Mutex<Option<Instant>>,
+    /// Overload events observed since the last emitted log line.
+    suppressed: AtomicU64,
+}
+
+impl OverloadLogThrottle {
+    /// Record one overload event, emitting a throttled WARN log line.
+    fn record(&self) {
+        let now = Instant::now();
+        let mut last_logged = self
+            .last_logged
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let should_log = last_logged
+            .is_none_or(|last| now.saturating_duration_since(last) >= OVERLOAD_LOG_INTERVAL);
+        if !should_log {
+            drop(last_logged);
+            let _previous = self.suppressed.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        *last_logged = Some(now);
+        drop(last_logged);
+        let suppressed = self.suppressed.swap(0, Ordering::Relaxed);
+        tracing::warn!(
+            suppressed,
+            "rejecting bearer auth with 503: Argon2id verification permit pool saturated"
+        );
+    }
+}
+
+/// Process-wide instance of [`OverloadLogThrottle`].
+static OVERLOAD_LOG: LazyLock<OverloadLogThrottle> = LazyLock::new(OverloadLogThrottle::default);
+
+/// Test-only hook into the Argon2id verification closure.
+///
+/// Lets a unit test count how many verification closures are concurrently
+/// running (bounded by the permit pool) and hold them open deterministically
+/// until the test releases them. `cfg(test)` only: it is never part of any
+/// shipped build, the public API, or the `test-helpers` surface. One
+/// instance per [`AuthState`] (never a process-global), so parallel tests
+/// never share a gate.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct VerificationHook {
+    /// Verification closures currently parked between admission and
+    /// release.
+    active: AtomicU64,
+    /// Highest `active` value observed, for the never-exceeds-permit-count
+    /// assertion.
+    peak: AtomicU64,
+    /// Flips `true` to release every closure currently parked in
+    /// [`Self::enter_and_wait`].
+    open: AtomicBool,
+}
+
+#[cfg(test)]
+impl VerificationHook {
+    /// Called from inside the `spawn_blocking` closure, while the
+    /// verification permit is held: records entry, busy-polls (no sleep)
+    /// until [`Self::release`] flips the gate, then records exit.
+    ///
+    /// Busy-polling is safe here: this runs on a `spawn_blocking` thread,
+    /// never on an async worker, so it cannot starve the runtime.
+    fn enter_and_wait(&self) {
+        use std::thread::yield_now;
+
+        let previous = self.active.fetch_add(1, Ordering::SeqCst);
+        let now = previous.wrapping_add(1);
+        let _previous_peak = self.peak.fetch_max(now, Ordering::SeqCst);
+        while !self.open.load(Ordering::SeqCst) {
+            yield_now();
+        }
+        let _previous_active = self.active.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Release every closure currently parked in [`Self::enter_and_wait`].
+    fn release(&self) {
+        self.open.store(true, Ordering::SeqCst);
+    }
+
+    /// Current count of parked closures.
+    fn active_count(&self) -> u64 {
+        self.active.load(Ordering::SeqCst)
+    }
+
+    /// Highest count of parked closures observed since construction.
+    fn peak_count(&self) -> u64 {
+        self.peak.load(Ordering::SeqCst)
+    }
+}
+
+/// Drop guard that always calls [`VerificationHook::release`], even if a
+/// test assertion panics or an earlier step returns early.
+///
+/// A test that parks verification closures in the hook and only releases
+/// them on its final, happy-path line would hang the whole process if an
+/// assertion before that line panics: `Drop` for a Tokio `Runtime` created
+/// by `#[tokio::test]` waits for every outstanding `spawn_blocking` closure
+/// to finish, and a closure parked in [`VerificationHook::enter_and_wait`]
+/// never finishes until released. Constructing this guard immediately after
+/// the hook guarantees release on every exit path (`?`, `assert!`, panic).
+#[cfg(test)]
+struct ReleaseHookOnDrop<'hook>(&'hook VerificationHook);
+
+// Test-only: flips the `AtomicBool` gate of a `VerificationHook` so any
+// `spawn_blocking` closure still busy-waiting on it unparks before the
+// test's `Runtime` drops (ordinary Drop-on-unwind semantics).
+// Drop audit (2026-10-10): sync, no I/O or await, no panic path. No defect.
+#[cfg(test)]
+impl Drop for ReleaseHookOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
 /// Shared state for the auth middleware.
 ///
 /// `api_keys` uses [`ArcSwap`] so the SIGHUP handler can atomically
@@ -1385,6 +1665,19 @@ pub(crate) struct AuthState {
     /// Optional per-IP pre-auth abuse gate (consulted *before* password-hash work).
     /// mTLS-authenticated connections bypass this gate.
     pub pre_auth_limiter: Option<Arc<KeyedLimiter>>,
+    /// Permit pool bounding concurrent Argon2id API-key verifications. See
+    /// [`AuthConfig::max_concurrent_verifications`].
+    pub hash_permits: Arc<Semaphore>,
+    /// Maximum time a request waits for a verification permit before
+    /// receiving `503 Service Unavailable` with `Retry-After: 1`. See
+    /// [`AuthConfig::verification_wait`].
+    pub verification_wait: Duration,
+    #[cfg(test)]
+    /// Test-only hook into the Argon2id verification closure: counts active
+    /// closures and can hold them open deterministically. Never a public or
+    /// `test-helpers` surface - `cfg(test)` only, so it does not exist in
+    /// any shipped build.
+    pub verification_hook: Option<Arc<VerificationHook>>,
     #[cfg(feature = "oauth")]
     /// Optional JWKS cache for OAuth JWT validation.
     pub jwks_cache: Option<Arc<JwksCache>>,
@@ -1411,7 +1704,7 @@ impl AuthState {
     /// Validate and atomically replace the API key list.
     ///
     /// Rejects an invalid key list before installing anything (a blank name,
-    /// or a name reused with a different role -- see
+    /// or a name reused with a different role - see
     /// [`AuthConfig::validate_api_key_names`]); on error the previous key list
     /// stays in place, so a failed hot reload never leaves the server serving
     /// session-binding-colliding keys.
@@ -1419,8 +1712,8 @@ impl AuthState {
     /// # Errors
     ///
     /// Returns [`RmcpServerKitError::Config`] naming the first offending
-    /// index -- either a blank `name`, or a `name` reused with a different
-    /// `role` -- and leaves the current key list untouched.
+    /// index - either a blank `name`, or a `name` reused with a different
+    /// `role` - and leaves the current key list untouched.
     pub(crate) fn try_reload_keys(&self, keys: Vec<ApiKeyEntry>) -> Result<(), RmcpServerKitError> {
         check_api_key_names(&keys)?;
         self.reload_keys_unchecked(keys);
@@ -1432,7 +1725,7 @@ impl AuthState {
     ///
     /// New requests immediately see the updated keys.
     /// In-flight requests that already loaded the old list finish
-    /// using it -- no torn reads.
+    /// using it - no torn reads.
     ///
     /// Private and unchecked on purpose: it does not reject a blank-named key
     /// (session-binding-colliding, CWE-384). The only caller is
@@ -1634,7 +1927,7 @@ pub fn extract_mtls_identity(cert_der: &[u8], default_role: &str) -> Option<Auth
 /// change: [`ApiKeyEntry::new`] accepts an arbitrary caller-supplied hash
 /// and [`verify_bearer_token`] verifies the raw presented string, so
 /// consumers may have hashed opaque tokens containing punctuation outside
-/// `token68`. Those must keep authenticating -- do not "complete" this
+/// `token68`. Those must keep authenticating - do not "complete" this
 /// check without a major-version note.
 ///
 /// ASCII semantics suffice because [`http::HeaderValue::to_str`] rejects
@@ -1681,7 +1974,7 @@ fn extract_bearer(value: &str) -> Option<&str> {
 /// branchlessness: selecting `verify_against` and recording `matched_index`
 /// are both ordinary data-dependent branches. They are cheap, predictable,
 /// and operate on locals, so they are dwarfed by the Argon2id verification
-/// that dominates every iteration -- but the timing claim stops at
+/// that dominates every iteration - but the timing claim stops at
 /// "one verification per configured key". Do not read this as a
 /// constant-time selection routine.
 ///
@@ -2064,21 +2357,29 @@ fn unauthorized_response(state: &AuthState, failure_class: AuthFailureClass) -> 
 ///
 /// # Errors
 ///
-/// Returns [`AuthRejection`] describing the failure class and, when owner
-/// logging is enabled, the matched credential owner, when the token is not a
-/// valid active credential.
+/// Returns [`AuthFailure::Rejected`] describing the failure class and, when
+/// owner logging is enabled, the matched credential owner, when the token is
+/// not a valid active credential. Returns [`AuthFailure::Overloaded`] when
+/// the Argon2id verification permit pool could not admit this request
+/// within [`AuthConfig::verification_wait`].
 ///
 /// # Cancel safety
 ///
-/// No shared-state mutation. The Argon2 verification is offloaded to
-/// `spawn_blocking`; dropping its `JoinHandle` on cancellation detaches the
-/// task (the hash completes off-task, harmlessly) rather than tearing partial
-/// state. The OAuth branch delegates to `validate_token_detailed`, which is
-/// itself cancel-safe (read-only JWKS lookup + pure claim checks).
+/// No request-owned partial state is committed. Acquiring the verification
+/// permit (`Semaphore::acquire_owned` under `tokio::time::timeout`) is
+/// cancel-safe: dropping that future before it resolves never takes a
+/// permit without also returning it. Once acquired, the permit is MOVED
+/// into the `spawn_blocking` closure (not held across this `.await`), so a
+/// caller that cancels or times out while the hash runs never frees it
+/// early - it is released only when the blocking work ends. Dropping the
+/// `JoinHandle` on cancellation detaches the task (the hash completes
+/// off-task, harmlessly, still holding the permit until then). The OAuth
+/// branch delegates to `validate_token_detailed`, whose JWKS refresh waits
+/// on a detached single-flight task rather than owning the upstream fetch.
 async fn authenticate_bearer_identity(
     state: &AuthState,
     token: &str,
-) -> Result<AuthIdentity, AuthRejection> {
+) -> Result<AuthIdentity, AuthFailure> {
     let mut failure_class = AuthFailureClass::MissingCredential;
     let mut owner = None;
 
@@ -2104,15 +2405,42 @@ async fn authenticate_bearer_identity(
         }
     }
 
+    // Argon2id is CPU-bound and memory-heavy (~19 MiB per verification) -
+    // bound concurrent admission with a permit pool before offloading to
+    // the blocking thread pool, so a flood of invalid bearer tokens cannot
+    // grow memory use without limit. A request that cannot get a permit
+    // within `verification_wait` fails fast with 503 instead of queuing
+    // unboundedly on the blocking pool. The semaphore is never closed in
+    // this crate; a closed semaphore must still fail fast rather than
+    // silently skip the bound.
+    let Ok(Ok(permit)) = timeout(
+        state.verification_wait,
+        Arc::clone(&state.hash_permits).acquire_owned(),
+    )
+    .await
+    else {
+        return Err(AuthFailure::Overloaded);
+    };
+
     let owned_token = token.to_owned();
     let keys = state.api_keys.load_full(); // Arc clone, lock-free
     let keys_for_verify = Arc::clone(&keys);
+    #[cfg(test)]
+    let hook = state.verification_hook.clone();
 
-    // Argon2id is CPU-bound - offload to blocking thread pool.
-    let verdict =
-        spawn_blocking(move || verify_bearer_token_verdict(&owned_token, &keys_for_verify))
-            .await
-            .ok();
+    // The permit is moved into the blocking closure (not held across this
+    // `.await`), so it is released only when the Argon2id work ends: a
+    // caller that cancels or times out never frees it early.
+    let verdict = spawn_blocking(move || {
+        let _permit = permit;
+        #[cfg(test)]
+        if let Some(active_hook) = &hook {
+            active_hook.enter_and_wait();
+        }
+        verify_bearer_token_verdict(&owned_token, &keys_for_verify)
+    })
+    .await
+    .ok();
 
     match verdict {
         Some(ApiKeyVerdict::Active { name, role }) => {
@@ -2138,10 +2466,28 @@ async fn authenticate_bearer_identity(
         failure_class = AuthFailureClass::InvalidCredential;
     }
 
-    Err(AuthRejection {
+    Err(AuthFailure::Rejected(AuthRejection {
         failure_class,
         owner,
-    })
+    }))
+}
+
+/// Build the `503 Service Unavailable` response for Argon2id verification
+/// admission overload: records it in auth counters and emits a throttled
+/// WARN log line (never a flood, see [`OverloadLogThrottle`]).
+///
+/// Returned directly by [`auth_middleware`], never through the 401 path: no
+/// `WWW-Authenticate` challenge, a generic body, and it does not consume the
+/// post-failure rate-limit budget.
+fn overloaded_response(state: &AuthState) -> Response {
+    state.counters.record_overload();
+    OVERLOAD_LOG.record();
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, "1")],
+        "service temporarily unavailable; retry shortly",
+    )
+        .into_response()
 }
 
 /// Consult the pre-auth abuse gate for the given peer.
@@ -2290,7 +2636,11 @@ pub(crate) async fn auth_middleware(
                     let _previous = req.extensions_mut().insert(id);
                     return next.run(req).await;
                 }
-                Err(rejection) => (rejection.failure_class, rejection.owner),
+                // Admission overload is returned directly: never through the
+                // 401 path, never counted as a credential failure, and it
+                // never consumes the post-failure rate-limit budget below.
+                Err(AuthFailure::Overloaded) => return overloaded_response(&state),
+                Err(AuthFailure::Rejected(rejection)) => (rejection.failure_class, rejection.owner),
             },
             None => (AuthFailureClass::InvalidCredential, None),
         }
@@ -2340,6 +2690,7 @@ mod tests {
 
     use anyhow::Context as _;
     use axum::{http::HeaderValue, middleware::from_fn, routing::post};
+    use tokio::task::yield_now;
     use tracing::subscriber::set_default;
     use tracing_subscriber::fmt::MakeWriter;
 
@@ -3142,7 +3493,7 @@ mod tests {
     fn check_api_key_names_rejects_same_name_different_role() -> anyhow::Result<()> {
         // Two entries share a name but declare different roles. The name alone
         // is the session/task-binding principal identity, so this is one label
-        // for two authorization profiles -- rejected.
+        // for two authorization profiles - rejected.
         let keys = vec![
             ApiKeyEntry::new("ops", "hash-a", "admin"),
             ApiKeyEntry::new("ops", "hash-b", "viewer"),
@@ -3277,7 +3628,7 @@ mod tests {
         Ok(())
     }
 
-    // -- auth_middleware integration tests --
+    // - auth_middleware integration tests -
 
     use http_body_util::BodyExt as _;
     use tower::ServiceExt as _;
@@ -3300,6 +3651,12 @@ mod tests {
         test_auth_state_with_log_context(keys, LogContextConfig::default())
     }
 
+    /// Default-sized permit pool for tests that do not exercise admission
+    /// bounding directly.
+    fn test_default_hash_permits() -> Arc<Semaphore> {
+        Arc::new(Semaphore::new(default_max_concurrent_verifications().get()))
+    }
+
     fn test_auth_state_with_log_context(
         keys: Vec<ApiKeyEntry>,
         fields: LogContextConfig,
@@ -3309,6 +3666,10 @@ mod tests {
             api_keys: ArcSwap::new(Arc::new(keys)),
             rate_limiter: None,
             pre_auth_limiter: None,
+            hash_permits: test_default_hash_permits(),
+            verification_wait: Duration::from_secs(1),
+            #[cfg(test)]
+            verification_hook: None,
             #[cfg(feature = "oauth")]
             jwks_cache: None,
             seen_identities: SeenIdentitySet::new(),
@@ -3867,6 +4228,10 @@ mod tests {
                 key_eviction_policy: KeyEvictionPolicy::default(),
             })),
             pre_auth_limiter: None,
+            hash_permits: test_default_hash_permits(),
+            verification_wait: Duration::from_secs(1),
+            #[cfg(test)]
+            verification_hook: None,
             #[cfg(feature = "oauth")]
             jwks_cache: None,
             seen_identities: SeenIdentitySet::new(),
@@ -3885,7 +4250,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
         // Second request from same "IP" (no ConnectInfo in test, so peer_addr is None
-        // and rate limiter won't fire). That's expected -- rate limiting requires
+        // and rate limiter won't fire). That's expected - rate limiting requires
         // ConnectInfo which isn't available in unit tests without a real server.
         // This test verifies the middleware wiring doesn't panic.
         Ok(())
@@ -3939,7 +4304,7 @@ mod tests {
         Ok(())
     }
 
-    // -- pre-auth abuse gate (H-S1) --
+    // - pre-auth abuse gate (H-S1) -
 
     /// The pre-auth gate must default to ~10x the post-failure quota so honest
     /// retry storms never trip it but a Argon2-spray attacker is throttled.
@@ -4005,6 +4370,10 @@ mod tests {
             api_keys: ArcSwap::new(Arc::new(vec![])),
             rate_limiter: None,
             pre_auth_limiter: Some(build_pre_auth_limiter(&config)),
+            hash_permits: test_default_hash_permits(),
+            verification_wait: Duration::from_secs(1),
+            #[cfg(test)]
+            verification_hook: None,
             #[cfg(feature = "oauth")]
             jwks_cache: None,
             seen_identities: SeenIdentitySet::new(),
@@ -4042,6 +4411,10 @@ mod tests {
             api_keys: ArcSwap::new(Arc::new(vec![])),
             rate_limiter: None,
             pre_auth_limiter: Some(build_pre_auth_limiter(&config)),
+            hash_permits: test_default_hash_permits(),
+            verification_wait: Duration::from_secs(1),
+            #[cfg(test)]
+            verification_hook: None,
             #[cfg(feature = "oauth")]
             jwks_cache: None,
             seen_identities: SeenIdentitySet::new(),
@@ -4103,6 +4476,10 @@ mod tests {
             api_keys: ArcSwap::new(Arc::new(keys)),
             rate_limiter: None,
             pre_auth_limiter: Some(build_pre_auth_limiter(&config)),
+            hash_permits: test_default_hash_permits(),
+            verification_wait: Duration::from_secs(1),
+            #[cfg(test)]
+            verification_hook: None,
             #[cfg(feature = "oauth")]
             jwks_cache: None,
             seen_identities: SeenIdentitySet::new(),
@@ -4179,6 +4556,10 @@ mod tests {
             api_keys: ArcSwap::new(Arc::new(vec![])),
             rate_limiter: None,
             pre_auth_limiter: Some(build_pre_auth_limiter(&config)),
+            hash_permits: test_default_hash_permits(),
+            verification_wait: Duration::from_secs(1),
+            #[cfg(test)]
+            verification_hook: None,
             #[cfg(feature = "oauth")]
             jwks_cache: None,
             seen_identities: SeenIdentitySet::new(),
@@ -4241,6 +4622,10 @@ mod tests {
             api_keys: ArcSwap::new(Arc::new(vec![])),
             rate_limiter: None,
             pre_auth_limiter: Some(build_pre_auth_limiter(&config)),
+            hash_permits: test_default_hash_permits(),
+            verification_wait: Duration::from_secs(1),
+            #[cfg(test)]
+            verification_hook: None,
             #[cfg(feature = "oauth")]
             jwks_cache: None,
             seen_identities: SeenIdentitySet::new(),
@@ -4293,6 +4678,10 @@ mod tests {
             api_keys: ArcSwap::new(Arc::new(vec![])),
             rate_limiter: Some(build_rate_limiter(&config)),
             pre_auth_limiter: None,
+            hash_permits: test_default_hash_permits(),
+            verification_wait: Duration::from_secs(1),
+            #[cfg(test)]
+            verification_hook: None,
             #[cfg(feature = "oauth")]
             jwks_cache: None,
             seen_identities: SeenIdentitySet::new(),
@@ -4559,7 +4948,7 @@ mod tests {
         Ok(())
     }
 
-    // -- AuthFailureClass exact-string contract tests --
+    // - AuthFailureClass exact-string contract tests -
     //
     // These tests pin the exact wire strings emitted for each failure
     // class. They exist to kill mutation-test mutants that replace the
@@ -4659,7 +5048,7 @@ mod tests {
         Ok(())
     }
 
-    // -- AuthConfig::summary boolean-flag contract tests --
+    // - AuthConfig::summary boolean-flag contract tests -
     //
     // These tests pin the boolean flags emitted by `AuthConfig::summary`
     // so that mutations like deleting `!` (which would invert the
@@ -4820,6 +5209,457 @@ mod tests {
             rebuilt.insert_is_first("x"),
             "x must have been evicted by FIFO (would NOT have been evicted under LRU)"
         );
+        Ok(())
+    }
+
+    // - Argon2id verification permit pool (admission control) -
+
+    /// Builds an `AuthState` with no API keys and no rate limiters, for
+    /// admission-control tests that only care about the permit pool.
+    fn sec01_test_state(
+        permits: usize,
+        verification_wait: Duration,
+        hook: Option<Arc<VerificationHook>>,
+    ) -> Arc<AuthState> {
+        Arc::new(AuthState {
+            api_keys: ArcSwap::new(Arc::new(Vec::new())),
+            rate_limiter: None,
+            pre_auth_limiter: None,
+            hash_permits: Arc::new(Semaphore::new(permits)),
+            verification_wait,
+            #[cfg(test)]
+            verification_hook: hook,
+            #[cfg(feature = "oauth")]
+            jwks_cache: None,
+            seen_identities: SeenIdentitySet::new(),
+            counters: AuthCounters::default(),
+            resource_metadata_url: None,
+            log_context: AuthLogContext::default(),
+        })
+    }
+
+    /// Pins that a cancelled bearer-auth request does not free its
+    /// Argon2id verification permit early: the permit is owned by the
+    /// detached `spawn_blocking` closure, not by the aborted future, and
+    /// becomes available again only once the blocking work actually
+    /// finishes.
+    #[tokio::test]
+    async fn hash_permit_stays_held_until_blocking_verification_completes_after_cancellation()
+    -> anyhow::Result<()> {
+        let hook = Arc::new(VerificationHook::default());
+        // Guarantees `hook.release()` runs even if an assertion below
+        // panics: see `ReleaseHookOnDrop`'s doc comment for why that matters.
+        let _release_guard = ReleaseHookOnDrop(&hook);
+        let state = sec01_test_state(1, Duration::from_secs(5), Some(Arc::clone(&hook)));
+
+        let task_state = Arc::clone(&state);
+        let handle = tokio::spawn(async move {
+            authenticate_bearer_identity(&task_state, "Bearer not-a-real-token").await
+        });
+
+        // Poll (no sleep) until the spawned task's verification closure has
+        // actually started: the permit count only drops once admission
+        // succeeds, so this cannot observe a false "taken" before it is
+        // true.
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if hook.active_count() == 1 {
+                    return;
+                }
+                yield_now().await;
+            }
+        })
+        .await
+        .context("the verification closure must start within 5s")?;
+
+        let available_while_running = state.hash_permits.available_permits();
+
+        handle.abort();
+        let _joined = handle.await;
+
+        let available_after_abort = state.hash_permits.available_permits();
+
+        // Notification barrier: the permit becomes acquirable again only
+        // once the detached verification actually finishes and drops it.
+        // Releasing before asserting means a mutation that makes either
+        // assertion below fail still exits cleanly instead of hanging
+        // (see `ReleaseHookOnDrop`), though the guard above would also
+        // catch it.
+        hook.release();
+        let _permit = timeout(
+            Duration::from_secs(30),
+            Arc::clone(&state.hash_permits).acquire_owned(),
+        )
+        .await
+        .context("the detached verification must release the permit within 30s")?
+        .context("acquire_owned must succeed")?;
+
+        assert_eq!(
+            available_while_running, 0,
+            "the permit must be taken once the closure has started"
+        );
+        assert_eq!(
+            available_after_abort, 0,
+            "the permit must still be held immediately after the awaiting task is aborted: \
+             it is owned by the detached blocking closure, not by the aborted future"
+        );
+        Ok(())
+    }
+
+    /// Pins that a closed verification-permit semaphore fails fast as an
+    /// overload rather than hanging or silently bypassing the bound.
+    #[tokio::test]
+    async fn closed_hash_permits_semaphore_overloads_instead_of_hanging() -> anyhow::Result<()> {
+        let state = sec01_test_state(1, Duration::from_secs(5), None);
+        state.hash_permits.close();
+        let result = timeout(
+            Duration::from_secs(2),
+            authenticate_bearer_identity(&state, "Bearer whatever"),
+        )
+        .await
+        .context("a closed semaphore must fail fast, not hang")?;
+        assert!(
+            matches!(result, Err(AuthFailure::Overloaded)),
+            "a closed permit pool must be treated as overloaded, never silently admitted"
+        );
+        Ok(())
+    }
+
+    /// Pins the saturation contract end to end: active concurrent Argon2id
+    /// verifications never exceed `max_concurrent_verifications`, a
+    /// request beyond the pool waits roughly `verification_wait` and then
+    /// receives `503` with `Retry-After: 1` and no `WWW-Authenticate`
+    /// challenge (never a 401), and held requests succeed once released.
+    #[tokio::test]
+    async fn permit_pool_bounds_active_verifications_and_overloads_fail_fast() -> anyhow::Result<()>
+    {
+        let hook = Arc::new(VerificationHook::default());
+        // Guarantees `hook.release()` runs even if an assertion below
+        // panics: see `ReleaseHookOnDrop`'s doc comment for why that matters.
+        let _release_guard = ReleaseHookOnDrop(&hook);
+        let permits = 2_usize;
+        let verification_wait = Duration::from_millis(300);
+        let state = sec01_test_state(permits, verification_wait, Some(Arc::clone(&hook)));
+        let app = auth_router(Arc::clone(&state));
+        let permits_u64 = u64::try_from(permits).context("permits must fit in a u64")?;
+
+        let mut handles = Vec::new();
+        for _ in 0..permits {
+            let task_app = app.clone();
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri("/mcp")
+                .header("authorization", "Bearer held-request")
+                .body(Body::empty())?;
+            handles.push(tokio::spawn(async move { task_app.oneshot(req).await }));
+        }
+
+        // Poll (no sleep) until both held requests are parked in the hook,
+        // proving the pool admitted exactly `permits` concurrent
+        // verifications.
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if hook.active_count() == permits_u64 {
+                    return;
+                }
+                yield_now().await;
+            }
+        })
+        .await
+        .context("both held requests must be parked in the hook within 5s")?;
+
+        // A third concurrent request has no permit available: it must wait
+        // roughly `verification_wait` (never instantly - that would mean
+        // the wait is ignored) and then receive 503, never a hang or 401.
+        let overload_req = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header("authorization", "Bearer overloaded-request")
+            .body(Body::empty())?;
+        let started = Instant::now();
+        let overloaded = timeout(Duration::from_secs(5), app.clone().oneshot(overload_req))
+            .await
+            .context("the overloaded request must resolve within 5s")??;
+        let elapsed = started.elapsed();
+        assert_eq!(
+            overloaded.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a request beyond the permit pool must receive 503, never a hang or a 401"
+        );
+        let minimum_wait = verification_wait / 10;
+        // Lower-bound only: timers do not fire early, while an ignored wait
+        // returns in about a millisecond. One tenth of the configured wait is
+        // enough to catch that mutation without creating a red flake on slow CI.
+        assert!(
+            elapsed >= minimum_wait,
+            "the overloaded request must wait at least one tenth of \
+             verification_wait ({minimum_wait:?}), not return instantly: took {elapsed:?}"
+        );
+        let retry_after = overloaded
+            .headers()
+            .get(header::RETRY_AFTER)
+            .context("Retry-After must be present")?
+            .to_str()
+            .context("Retry-After must be valid UTF-8")?;
+        assert_eq!(retry_after, "1", "Retry-After must be exactly 1 second");
+        assert!(
+            overloaded.headers().get(header::WWW_AUTHENTICATE).is_none(),
+            "the overload response must never carry a 401-style challenge"
+        );
+
+        assert_eq!(
+            hook.peak_count(),
+            permits_u64,
+            "active verifications must never exceed the permit count"
+        );
+
+        // Release the held verifications; both must complete normally
+        // (401: no API keys are configured, so the token never matches).
+        hook.release();
+        for handle in handles {
+            let resp = handle.await.context("held request task must not panic")??;
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "a held request must succeed through to its normal outcome once released"
+            );
+        }
+
+        let counters = state.counters_snapshot();
+        assert_eq!(
+            counters.failure_overloaded, 1,
+            "exactly one request must have been counted as overloaded"
+        );
+        assert_eq!(
+            counters.failure_invalid_credential, 2,
+            "the two held-then-released requests must be counted as invalid credential, \
+             not overload"
+        );
+        Ok(())
+    }
+
+    /// Pins that an overloaded (503) request is never counted against the
+    /// post-failure rate limiter's budget: a tight one-failure budget
+    /// still admits the next REAL invalid-credential request as 401, not
+    /// 429, proving the overload consumed none of it.
+    #[tokio::test]
+    async fn overloaded_request_does_not_consume_post_failure_rate_limit_budget()
+    -> anyhow::Result<()> {
+        let hook = Arc::new(VerificationHook::default());
+        // Guarantees `hook.release()` runs even if an assertion below
+        // panics: see `ReleaseHookOnDrop`'s doc comment for why that matters.
+        let _release_guard = ReleaseHookOnDrop(&hook);
+        let rate_limit = RateLimitConfig {
+            max_attempts_per_minute: 1,
+            pre_auth_max_per_minute: None,
+            max_tracked_keys: default_max_tracked_keys(),
+            idle_eviction: default_idle_eviction(),
+            burst: None,
+            pre_auth_burst: None,
+            key_eviction_policy: KeyEvictionPolicy::default(),
+        };
+        let state = Arc::new(AuthState {
+            api_keys: ArcSwap::new(Arc::new(Vec::new())),
+            rate_limiter: Some(build_rate_limiter(&rate_limit)),
+            pre_auth_limiter: None,
+            hash_permits: Arc::new(Semaphore::new(1)),
+            verification_wait: Duration::from_millis(200),
+            #[cfg(test)]
+            verification_hook: Some(Arc::clone(&hook)),
+            #[cfg(feature = "oauth")]
+            jwks_cache: None,
+            seen_identities: SeenIdentitySet::new(),
+            counters: AuthCounters::default(),
+            resource_metadata_url: None,
+            log_context: AuthLogContext::default(),
+        });
+        let app = auth_router(Arc::clone(&state));
+        let peer: SocketAddr = "10.0.0.40:54321".parse()?;
+
+        // Occupy the single permit directly (bypassing the middleware, so
+        // this does not touch counters or the rate limiter itself).
+        let occupier_state = Arc::clone(&state);
+        let occupier = tokio::spawn(async move {
+            authenticate_bearer_identity(&occupier_state, "Bearer occupier").await
+        });
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if hook.active_count() == 1 {
+                    return;
+                }
+                yield_now().await;
+            }
+        })
+        .await
+        .context("the occupier must park in the hook within 5s")?;
+
+        // No permit available: overloads (503), must not touch the limiter.
+        let mut overload_req = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header("authorization", "Bearer overload-probe")
+            .body(Body::empty())?;
+        let _previous_overload = overload_req.extensions_mut().insert(ConnectInfo(peer));
+        let overloaded = timeout(Duration::from_secs(5), app.clone().oneshot(overload_req))
+            .await
+            .context("overloaded request must resolve within 5s")??;
+        assert_eq!(overloaded.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        hook.release();
+        let _joined = occupier.await.context("occupier task must not panic")?;
+
+        // Permit now free: this is the FIRST real failure the post-failure
+        // limiter ever sees. With a budget of exactly one, it must be
+        // admitted (401) - if the overload above had wrongly consumed the
+        // budget, this would already be the second charge and a
+        // budget-of-one limiter would reject it (429).
+        let mut first_real_req = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header("authorization", "Bearer still-not-a-real-token")
+            .body(Body::empty())?;
+        let _previous_first = first_real_req.extensions_mut().insert(ConnectInfo(peer));
+        let first_real = app.clone().oneshot(first_real_req).await?;
+        assert_eq!(
+            first_real.status(),
+            StatusCode::UNAUTHORIZED,
+            "the first real credential failure must be admitted: the overload must not \
+             have pre-consumed the one-failure budget"
+        );
+
+        // The budget is now genuinely exhausted by the request above.
+        let mut second_real_req = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header("authorization", "Bearer also-still-not-a-real-token")
+            .body(Body::empty())?;
+        let _previous_second = second_real_req.extensions_mut().insert(ConnectInfo(peer));
+        let second_real = app.oneshot(second_real_req).await?;
+        assert_eq!(
+            second_real.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the post-failure limiter must now be exhausted by the one real failure"
+        );
+
+        let counters = state.counters_snapshot();
+        assert_eq!(
+            counters.failure_overloaded, 1,
+            "exactly one overload must be counted"
+        );
+        assert_eq!(
+            counters.failure_invalid_credential, 1,
+            "the overload must not be double-counted as a credential failure"
+        );
+        Ok(())
+    }
+
+    // - Admission-control knobs: defaults, builders, TOML, validation -
+
+    /// Pins that the parallelism-to-permit-count clamp never resolves
+    /// below 1 or above 16, at both boundaries and beyond them.
+    #[test]
+    fn clamp_parallelism_to_permit_bound_stays_within_1_to_16() -> anyhow::Result<()> {
+        for (input, expected, label) in [
+            (0, 1, "zero clamps up to the floor of 1"),
+            (1, 1, "1 is unchanged"),
+            (16, 16, "16 is unchanged (the ceiling)"),
+            (17, 16, "17 clamps down to the ceiling of 16"),
+            (9_999, 16, "a very large hint still clamps to 16"),
+        ] {
+            let expected_nonzero = NonZeroUsize::new(expected).context(label)?;
+            assert_eq!(
+                clamp_parallelism_to_permit_bound(input),
+                expected_nonzero,
+                "{label}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Pins that the resolved default permit count always stays within
+    /// `1..=16`, regardless of this host's actual parallelism.
+    #[test]
+    fn default_max_concurrent_verifications_is_within_1_to_16() -> anyhow::Result<()> {
+        let resolved = default_max_concurrent_verifications();
+        let floor = NonZeroUsize::new(1).context("permit floor is nonzero")?;
+        let ceiling = NonZeroUsize::new(16).context("permit ceiling is nonzero")?;
+        assert!(
+            (floor.get()..=ceiling.get()).contains(&resolved.get()),
+            "default permit count must resolve within 1..=16, got {resolved}"
+        );
+        Ok(())
+    }
+
+    /// Pins that `AuthConfig::default()` and `with_keys` both carry the 1
+    /// second `verification_wait` default and no permit-count override.
+    #[test]
+    fn auth_config_default_has_1s_verification_wait_and_no_permit_override() -> anyhow::Result<()> {
+        let cfg = AuthConfig::default();
+        let expected_wait = humantime::parse_duration("1s").context("1s duration parses")?;
+        assert_eq!(
+            cfg.verification_wait, expected_wait,
+            "default verification_wait must be 1 second"
+        );
+        assert_eq!(
+            cfg.max_concurrent_verifications, None,
+            "default max_concurrent_verifications must be None (resolved at auth-state \
+             construction time)"
+        );
+        let with_keys_cfg = AuthConfig::with_keys(vec![]);
+        assert_eq!(
+            with_keys_cfg.verification_wait, expected_wait,
+            "with_keys must carry the same 1 second default"
+        );
+        Ok(())
+    }
+
+    /// Pins that `with_max_concurrent_verifications` and
+    /// `with_verification_wait` each set exactly the field they name.
+    #[test]
+    fn with_max_concurrent_verifications_and_with_verification_wait_set_fields()
+    -> anyhow::Result<()> {
+        let permits = NonZeroUsize::new(4).context("4 is nonzero")?;
+        let cfg = AuthConfig::with_keys(vec![])
+            .with_max_concurrent_verifications(permits)
+            .with_verification_wait(Duration::from_secs(7));
+        assert_eq!(cfg.max_concurrent_verifications, Some(permits));
+        assert_eq!(cfg.verification_wait, Duration::from_secs(7));
+        Ok(())
+    }
+
+    /// Pins that the new admission-control knobs leave `AuthConfig::summary`
+    /// unchanged: it still reports only the pre-existing boolean flags.
+    #[test]
+    fn auth_config_summary_unaffected_by_admission_knobs() -> anyhow::Result<()> {
+        let permits = NonZeroUsize::new(4).context("4 is nonzero")?;
+        let cfg = AuthConfig::with_keys(vec![ApiKeyEntry::new("k", "hash", "viewer")])
+            .with_max_concurrent_verifications(permits)
+            .with_verification_wait(Duration::from_secs(2));
+        let summary = cfg.summary();
+        assert!(
+            summary.bearer,
+            "summary.bearer must still reflect api_keys presence regardless of the new knobs"
+        );
+        assert_eq!(summary.api_keys.len(), 1);
+        Ok(())
+    }
+
+    /// Pins that an operator-supplied `max_concurrent_verifications` above
+    /// `Semaphore::MAX_PERMITS` is clamped to it rather than reaching
+    /// `Semaphore::new` and panicking the server at startup.
+    #[test]
+    fn resolve_max_concurrent_verifications_clamps_to_semaphore_max() -> anyhow::Result<()> {
+        let cfg =
+            AuthConfig::with_keys(vec![]).with_max_concurrent_verifications(NonZeroUsize::MAX);
+        let resolved = resolve_max_concurrent_verifications(&cfg);
+        let max_permits = NonZeroUsize::new(Semaphore::MAX_PERMITS)
+            .context("Semaphore::MAX_PERMITS is nonzero")?;
+        assert_eq!(
+            resolved, max_permits,
+            "a permit count above Semaphore::MAX_PERMITS must clamp to it"
+        );
+        // The clamp's entire purpose is that this does not panic.
+        let _semaphore = Semaphore::new(resolved.get());
         Ok(())
     }
 }

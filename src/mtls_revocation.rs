@@ -11,10 +11,46 @@
 //! client certificates is fire-and-forget and never blocks the synchronous
 //! handshake path.
 //!
-//! Security note: CDP URLs are extracted from attacker-controllable client
-//! certs *before* chain validation. This is safe by design; see the
-//! `// SECURITY:` comment on `DynamicClientCertVerifier::verify_client_cert`
-//! for the full rationale before changing the discovery ordering.
+//! Security note: CDP URLs are read before the revocation-checking verifier
+//! runs, so that `crl_deny_on_unavailable` can reject a client whose CRL was
+//! never fetched. Discovery admits only URLs named by certificates on a
+//! verified path of a chain that verifies against the configured roots, and
+//! every verified path counts. The check runs before key possession is proven
+//! and ignores revocation, so a copy of a valid chain can trigger only URLs
+//! chosen by the CAs that issued the certificates on its verified paths, while
+//! a self-made chain or a certificate on no verified path chooses nothing.
+//!
+//! The CA signature guarantees a CRL's contents and origin, so where a genuine
+//! CRL is downloaded from does not matter for trust. It does not stop the
+//! server from sending the request: without screening, a client presenting a
+//! self-made certificate could make the server send `GET` requests to internal
+//! addresses, such as cloud metadata, loopback admin ports, or internal APIs.
+//! That is blind SSRF: the bogus CRL is rejected afterwards, but the request
+//! has already reached the internal service, which is enough to trigger a
+//! state-changing `GET` endpoint or to map the internal network.
+//!
+//! The defences are the scheme and userinfo check in `check_scheme`,
+//! resolved-address screening before connecting through `ip_block_reason`
+//! applied by `reject_blocked_crl_ip` in `fetch_crl`, re-screening at connect
+//! time through `SsrfScreeningResolver` to catch DNS rebinding (a URL whose
+//! exact origin is not trusted always uses a client that admits no blocked
+//! address, so a trusted hostname is trusted only on its trusted origin), no
+//! redirects, discovery only for certificates on a verified path, and the
+//! discovery-rate, concurrency, and body-size caps.
+//!
+//! Plain HTTP is allowed by default (`crl_allow_http = true`): the signature
+//! makes HTTP safe for the CRL itself, but it also puts plain-HTTP internal
+//! services, such as cloud metadata and loopback admin ports, in reach.
+//! Requiring HTTPS would narrow this exposure, not remove it, so it is no
+//! substitute for the address screening.
+//!
+//! There is no configurable CRL allowlist. Instead, the origins (scheme, host,
+//! port) of the CDP and AIA URLs named in the operator's configured
+//! certificates (the mTLS CA bundle and the server certificate chain) pass the
+//! address screening automatically, because the operator chose them;
+//! cloud-metadata addresses stay blocked. Any other CDP that resolves to a
+//! blocked address is never fetched, and with `crl_deny_on_unavailable = true`
+//! (the default) a client whose certificate names only such CDPs is rejected.
 //!
 //! Semantics:
 //! - `crl_deny_on_unavailable = true` (default) => fail closed when a
@@ -44,6 +80,7 @@ use reqwest::{Client, dns::Resolve, redirect::Policy};
 use rustls::{
     DigitallySignedStruct, DistinguishedName, Error as TlsError, RootCertStore, SignatureScheme,
     client::danger::HandshakeSignatureValid,
+    crypto::{CryptoProvider, WebPkiSupportedAlgorithms},
     pki_types::{CertificateDer, CertificateRevocationListDer, UnixTime},
     server::{
         WebPkiClientVerifier,
@@ -52,13 +89,14 @@ use rustls::{
 };
 use tokio::{
     net::lookup_host,
-    sync::{Mutex as TokioMutex, RwLock, Semaphore, mpsc},
-    task::JoinSet,
+    sync::{Mutex as TokioMutex, OwnedSemaphorePermit, RwLock, Semaphore, mpsc},
+    task::{JoinSet, spawn_blocking},
     time::{Instant, Sleep, sleep},
 };
 use tokio_util::sync::CancellationToken;
-use url::Url;
+use url::{Host, Origin, Url};
 use x509_parser::{
+    der_parser::oid,
     extensions::{DistributionPointName, GeneralName, ParsedExtension},
     prelude::{FromDer as _, X509Certificate},
     revocation_list::CertificateRevocationList,
@@ -99,6 +137,16 @@ const MAX_RELEVANT_CDP_URLS_PER_HANDSHAKE: usize = 64;
 const CRL_DISCOVERY_MAX_TRACKED_PEERS: usize = 10_000;
 /// Idle-eviction window for CRL discovery peer keys. Matches the house pair.
 const CRL_DISCOVERY_PEER_IDLE_EVICTION: Duration = Duration::from_mins(15);
+
+/// Max concurrent CPU-bound CRL parse and verifier-rebuild jobs.
+///
+/// Shared across every handshake, refresh and discovery commit on one
+/// `CrlSet` (bootstrap uses its own, separate semaphore of the same size;
+/// see `bootstrap_fetch`). Deliberately independent of
+/// `crl_max_concurrent_fetches`, which bounds network fetch concurrency, not
+/// CPU parallelism. Deliberately a private constant rather than a config
+/// field: no operator should need to tune it.
+const CRL_CPU_PERMITS: usize = 2;
 
 tokio::task_local! {
     /// Peer IP of the TLS handshake being verified on this task. Set by the
@@ -174,7 +222,7 @@ impl fmt::Debug for VerifierState {
 /// same 32-byte head and tail, would not be detected. Such a caller already
 /// holds the cache write lock and is inside the trust boundary. The real fix is
 /// making `cache` private, which is a 4.0 change.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct EntryIdentity {
     /// Pointer address of the DER allocation at commit time.
     der_ptr: usize,
@@ -314,8 +362,8 @@ pub struct CrlSet {
     pub config: MtlsConfig,
     /// Fire-and-forget discovery channel for newly-seen CDP URLs.
     pub discover_tx: mpsc::UnboundedSender<String>,
-    /// CRL fetcher with the SSRF-screening resolver installed.
-    client: Client,
+    /// CRL fetch clients; see [`CrlHttpClients`].
+    clients: CrlHttpClients,
     /// URLs whose CRL is confirmed present in `cache`. Permanent dedup: a URL
     /// here is never re-enqueued for discovery.
     seen_urls: Mutex<HashSet<String>>,
@@ -340,9 +388,9 @@ pub struct CrlSet {
     /// **fallback** admission path, consulted only when a submission arrives
     /// with no attributed handshake peer (see `discovery_limiter_per_peer`).
     ///
-    /// Attributed handshakes -- the sole production path, via the
+    /// Attributed handshakes - the sole production path, via the
     /// `CURRENT_HANDSHAKE_PEER` scope installed by the TLS accept worker in
-    /// `crate::transport` -- consult the per-peer limiter instead, so one peer
+    /// `crate::transport` - consult the per-peer limiter instead, so one peer
     /// can no longer drain another peer's discovery budget. This global bucket
     /// still guards the unattributed path: a downstream verifier built outside
     /// this crate's transport, or any future caller of `note_discovered_urls`
@@ -359,6 +407,20 @@ pub struct CrlSet {
     max_response_bytes: u64,
     /// Last time each throttle key emitted a warning, for cooldown accounting.
     last_cap_warn: Mutex<HashMap<&'static str, Instant>>,
+    /// Bounds concurrent CPU-bound CRL parse and verifier-rebuild jobs on the
+    /// blocking pool. See [`CRL_CPU_PERMITS`].
+    crl_cpu: Arc<Semaphore>,
+    /// Deduplicated http(s) origins named in the CRL Distribution Points and
+    /// Authority Information Access extensions of the operator's configured
+    /// certificates (the mTLS CA bundle and the server certificate chain). A
+    /// CRL fetch whose URL origin is in this set skips the private-address
+    /// block (cloud metadata excepted). Computed once at startup; there is
+    /// no configurable CRL allowlist.
+    trusted_origins: Arc<HashSet<Origin>>,
+    /// The process-default provider's signature algorithms - the set
+    /// `WebPkiClientVerifier::builder` gives the live verifier - captured once
+    /// in `CrlSet::new`.
+    signature_algorithms: WebPkiSupportedAlgorithms,
     /// Test-only hook fired immediately before a discovered URL becomes
     /// observable on `discover_tx`.
     ///
@@ -385,39 +447,18 @@ impl CrlSet {
         config: MtlsConfig,
         discover_tx: mpsc::UnboundedSender<String>,
         initial_cache: HashMap<String, CachedCrl>,
+        trusted_origins: Arc<HashSet<Origin>>,
     ) -> Result<Arc<Self>, RmcpServerKitError> {
-        // M-H2: install the SSRF screening resolver on the CRL fetcher.
-        // CRL CDP URLs come from attacker-controllable client certs and
-        // their hosts are re-resolved per fetch -- exactly the TOCTOU
-        // class M-H2 closes. The allowlist is empty (default-strict),
-        // matching the existing CRL pre-flight posture; operators who
-        // need internal CDPs would extend this with the same
-        // CompiledSsrfAllowlist plumbing used by oauth.
-        let allowlist = Arc::new(CompiledSsrfAllowlist::default());
-        let resolver: Arc<dyn Resolve> = Arc::new(SsrfScreeningResolver::new(
-            Arc::clone(&allowlist),
-            #[cfg(any(test, feature = "test-helpers"))]
-            Arc::new(AtomicBool::new(false)),
-            #[expect(
-                clippy::cfg_not_test,
-                reason = "deliberate: src/mtls_revocation.rs::SsrfScreeningResolver::new takes a no-op bypass argument when the test-helpers feature is absent; the inverted cfg is intentional"
-            )]
-            #[cfg(not(any(test, feature = "test-helpers")))]
-            (),
-        ));
+        install_crl_crypto_provider();
+        // M-H2: install exact-origin SSRF screening on the CRL fetch clients.
+        let clients = CrlHttpClients::new(&trusted_origins, config.crl_fetch_timeout)?;
 
-        let client = Client::builder()
-            // M-H2/N1: see oauth.rs::OauthHttpClient::build for rationale.
-            .no_proxy()
-            .dns_resolver(Arc::clone(&resolver))
-            .timeout(config.crl_fetch_timeout)
-            .connect_timeout(CRL_CONNECT_TIMEOUT)
-            .tcp_keepalive(None)
-            .redirect(Policy::none())
-            .user_agent(format!("rmcp-server-kit/{}", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|error| {
-                RmcpServerKitError::Startup(format!("CRL HTTP client init: {error}"))
+        let signature_algorithms = CryptoProvider::get_default()
+            .map(|provider| provider.signature_verification_algorithms)
+            .ok_or_else(|| {
+                RmcpServerKitError::Tls(
+                    "mTLS verifier error: no rustls crypto provider is installed".into(),
+                )
             })?;
 
         let initial_verifier = rebuild_verifier(&roots, &config, &initial_cache)?;
@@ -463,7 +504,7 @@ impl CrlSet {
             roots,
             config,
             discover_tx,
-            client,
+            clients,
             seen_urls: Mutex::new(seen_urls),
             pending_urls: Mutex::new(HashSet::new()),
             global_fetch_sem,
@@ -472,6 +513,9 @@ impl CrlSet {
             discovery_limiter_per_peer,
             max_response_bytes,
             last_cap_warn: Mutex::new(HashMap::new()),
+            crl_cpu: Arc::new(Semaphore::new(CRL_CPU_PERMITS)),
+            trusted_origins,
+            signature_algorithms,
             #[cfg(any(test, feature = "test-helpers"))]
             discovery_send_probe: Mutex::new(None),
         }))
@@ -583,7 +627,7 @@ impl CrlSet {
         }
     }
 
-    /// Report a CDP discovery submission dropped by the per-minute limiter --
+    /// Report a CDP discovery submission dropped by the per-minute limiter -
     /// per-peer when the handshake peer is attributed, process-global
     /// otherwise. Throttled through `should_warn_throttled` exactly like the
     /// cap warnings: the drain happens on the unauthenticated handshake path,
@@ -602,8 +646,8 @@ impl CrlSet {
 
     /// Report that discovery ran with no attributed handshake peer, so per-peer
     /// admission was unavailable and the process-global limiter was consulted
-    /// as a fallback. The happy path -- attributed TLS handshakes driven by the
-    /// scoped accept worker in `crate::transport` -- never triggers this; it is
+    /// as a fallback. The happy path - attributed TLS handshakes driven by the
+    /// scoped accept worker in `crate::transport` - never triggers this; it is
     /// a regression canary. If a future edit drops the `CURRENT_HANDSHAKE_PEER`
     /// scope, per-peer isolation silently reverts to global-only admission and
     /// this WARN is what makes that observable. Downstream users constructing
@@ -620,14 +664,26 @@ impl CrlSet {
 
     /// Commit a batch of CRL inserts and removals as one atomic generation.
     ///
+    /// The verifier rebuild and identity recomputation for the candidate
+    /// cache run on the blocking pool (see
+    /// [`build_verifier_state_blocking`]), bounded by [`CRL_CPU_PERMITS`]. If
+    /// this future is dropped while that blocking work is running (caller
+    /// cancellation, a timeout), the bounded build still runs to completion
+    /// in the background and its result is simply discarded: the committed
+    /// cache and the published verifier stay at the previous generation,
+    /// never a late, out-of-order publication.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the verifier cannot be rebuilt for the new cache.
-    // cancel-safe: `commit_lock` is held across awaits, but every mutation
-    // before publication builds a local candidate. The cache swap and the
-    // `verifier_state.store` publication are adjacent with NO await between
-    // them, so a cancelled commit leaves either the old or the new generation
-    // -- never a half-applied mix.
+    /// Returns an error if the verifier cannot be rebuilt for the new cache,
+    /// or if the blocking rebuild task cannot be joined (including a panic
+    /// inside it).
+    // cancel-safe: `commit_lock` is held across awaits, but every mutation before publication
+    // builds a local candidate; the cache swap and `verifier_state.store` publication are
+    // adjacent with NO await between them, so a cancelled commit leaves the old or the new
+    // generation, never a half-applied mix. Dropping this future while the blocking rebuild runs
+    // does not cancel it (spawn_blocking cannot be aborted); the bounded build finishes and its
+    // result is discarded.
     async fn commit_cache_update_atomically(
         &self,
         inserts: Vec<(String, CachedCrl)>,
@@ -639,18 +695,23 @@ impl CrlSet {
         // `verifier_state.store(..)` publication, so readers synchronising on
         // that same `RwLock` can never observe a commit half-applied, while
         // `rebuild_verifier` and digesting stay off-lock and out of the
-        // verifier path's way.
+        // verifier path's way. Lock order is `commit_lock` then the
+        // `crl_cpu` permit acquired below; the fetch path (`fetch_crl`)
+        // acquires only the permit, never `commit_lock`, so there is no
+        // cycle.
         let _commit = self.commit_lock.lock().await;
 
         let mut candidate = self.cache_lock().read().await.clone();
         let mut admitted_urls = Vec::new();
 
         // POLICY: at cap the NEWEST entry is rejected, never an existing
-        // one (no LRU). Under adversarial unique-CDP churn an LRU would
-        // let an attacker evict the legitimate warm set by spamming
-        // throwaway CDP URLs; rejecting newcomers instead preserves
-        // revocation coverage for the established CA estate. Confirmed
-        // by Oracle review of the 1.13.0 rust-review fix plan.
+        // one (no LRU). Under unique-CDP churn an LRU would let any
+        // source of many distinct CDP URLs - since 3.20.0 that takes
+        // certificates on a verified path, such as those of a
+        // misbehaving issuing CA - evict the legitimate warm set;
+        // rejecting newcomers instead preserves revocation coverage for
+        // the established CA estate. Confirmed by Oracle review of the
+        // 1.13.0 rust-review fix plan.
         for (url, cached) in inserts {
             if candidate.len() >= self.config.crl_max_cache_entries && !candidate.contains_key(&url)
             {
@@ -665,8 +726,6 @@ impl CrlSet {
             let _removed = candidate.remove(url);
         }
 
-        let verifier = rebuild_verifier(&self.roots, &self.config, &candidate)?;
-
         // SECURITY: identities are recomputed for EVERY entry, not only for
         // what this commit wrote. `candidate` is a clone of the live cache and
         // cloning a `CachedCrl` reallocates its DER, so every carried-forward
@@ -674,16 +733,31 @@ impl CrlSet {
         // unrelated commit invalidate every other URL and deny every later
         // handshake. Recomputation is O(entries) pointer and scalar reads with
         // no hashing, so there is nothing to gain by being incremental.
+        let (rebuilt_cache, verifier, identities) = {
+            let permit = Arc::clone(&self.crl_cpu)
+                .acquire_owned()
+                .await
+                .map_err(|error| {
+                    RmcpServerKitError::Tls(format!("CRL CPU semaphore closed: {error}"))
+                })?;
+            build_verifier_state_blocking(
+                Arc::clone(&self.roots),
+                self.config.clone(),
+                candidate,
+                permit,
+            )
+            .await?
+        };
         let new_state = Arc::new(VerifierState {
             verifier,
-            cached_urls: candidate.keys().cloned().collect(),
-            committed_identities: crl_cache_identities(&candidate),
+            cached_urls: rebuilt_cache.keys().cloned().collect(),
+            committed_identities: identities,
         });
         let changed = !admitted_urls.is_empty() || !removals.is_empty();
 
         {
             let mut cache = self.cache_lock().write().await;
-            let superseded = mem::replace(&mut *cache, candidate);
+            let superseded = mem::replace(&mut *cache, rebuilt_cache);
             self.verifier_state.store(new_state);
             drop(cache);
             // Free the superseded map only AFTER releasing the write lock.
@@ -825,16 +899,17 @@ impl CrlSet {
     // cancel-safe: commits only after gated_fetch returns, so cancellation
     // during the fetch cannot promote a URL into the seen_urls dedup set.
     async fn fetch_and_store_url(&self, url: String) -> Result<bool, RmcpServerKitError> {
-        let cached = gated_fetch(
-            &self.client,
-            &self.global_fetch_sem,
-            &self.host_semaphores,
-            &url,
-            self.config.crl_allow_http,
-            self.max_response_bytes,
-            self.config.crl_max_host_semaphores,
-        )
-        .await?;
+        let ctx = CrlFetchContext {
+            clients: &self.clients,
+            global_sem: &self.global_fetch_sem,
+            host_semaphores: &self.host_semaphores,
+            allow_http: self.config.crl_allow_http,
+            max_bytes: self.max_response_bytes,
+            max_host_semaphores: self.config.crl_max_host_semaphores,
+            crl_cpu: &self.crl_cpu,
+            trusted_origins: &self.trusted_origins,
+        };
+        let cached = gated_fetch(&ctx, &url).await?;
         let _committed = self
             .commit_cache_update_atomically(vec![(url.clone(), cached)], &[])
             .await?;
@@ -873,29 +948,113 @@ impl CrlSet {
         let _removed = pending.remove(url);
     }
 
+    /// CDP URLs named by the end entity and by the intermediates on every
+    /// verified path of a presented chain.
+    ///
+    /// A verified path runs from the end entity to a configured root and is
+    /// verified exactly as the live verifier does except for revocation: same
+    /// roots, same signature algorithms and client-auth usage. webpki stops at
+    /// the first such path, so a `verify_path` callback records each candidate
+    /// path and rejects it to keep the search going; the search result is
+    /// therefore an error and is ignored. Byte-identical duplicate
+    /// intermediates are dropped first, so copies of one certificate cannot
+    /// spend webpki's per-call budget. The live verifier explores the same
+    /// distinct paths in the same order, but it gives up on a candidate at its
+    /// first revocation failure while this search verifies every candidate in
+    /// full, so only a chain offering dozens of distinct alternative paths can
+    /// exhaust this search's budget before the path the live verifier accepts.
+    /// Returns `None` when no path is recorded.
+    fn cdp_urls_on_verified_paths(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Option<HashSet<String>> {
+        use core::cell::Cell;
+
+        let cert = webpki::EndEntityCert::try_from(end_entity).ok()?;
+        let allow_http = self.config.crl_allow_http;
+        let mut seen_der = HashSet::new();
+        let distinct_intermediates = intermediates
+            .iter()
+            .filter(|&intermediate| seen_der.insert(intermediate.as_ref()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let recorded: Cell<Option<HashSet<String>>> = Cell::new(None);
+        let _search = cert.verify_for_usage(
+            self.signature_algorithms.all,
+            &self.roots.roots,
+            &distinct_intermediates,
+            now,
+            webpki::KeyUsage::client_auth(),
+            None,
+            Some(&|candidate: &webpki::VerifiedPath<'_>| {
+                let mut urls = recorded.take().unwrap_or_default();
+                urls.extend(
+                    candidate
+                        .intermediate_certificates()
+                        .flat_map(|intermediate| {
+                            extract_cdp_urls(intermediate.der().as_ref(), allow_http)
+                        }),
+                );
+                recorded.set(Some(urls));
+                // Rejecting every candidate keeps webpki building paths, because
+                // a `verify_path` error is non-fatal (rustls-webpki 0.103.15
+                // verify_cert.rs:91-94; only the budget errors are fatal,
+                // error.rs:357-364). So every verified path within the per-call
+                // budget is recorded, and the variant is otherwise irrelevant
+                // because the search result is ignored.
+                Err(webpki::Error::UnknownIssuer)
+            }),
+        );
+        recorded.into_inner().map(|mut urls| {
+            urls.extend(extract_cdp_urls(end_entity.as_ref(), allow_http));
+            urls
+        })
+    }
+
     /// Enqueue newly-seen CDP URLs and run the synchronous fail-closed
     /// precheck.
     ///
     /// Returns `(deny, state)`. The caller MUST enforce with the returned
     /// `state.verifier` rather than re-loading: pre-check and enforcement have
     /// to observe the same verifier generation.
-    #[expect(
-        clippy::significant_drop_tightening,
-        reason = "the cache read guard is deliberately acquired BEFORE loading VerifierState and is released by the match that consumes it; tightening as the lint suggests would invert the lock order this precheck's generation-coherence depends on"
-    )]
-    fn note_discovered_urls(
+    /// `discoverable` lazily returns the CDP URLs named by the verified paths of the presented chain.
+    fn note_discovered_urls<F>(
         &self,
         end_entity_urls: &[String],
         intermediate_urls: &[String],
-    ) -> (bool, Arc<VerifierState>) {
+        discoverable: F,
+    ) -> (bool, Arc<VerifierState>)
+    where
+        F: FnOnce() -> Option<HashSet<String>>,
+    {
         // INVARIANT: only called post-handshake from
         // `DynamicClientCertVerifier::verify_client_cert`. The peer has
         // already presented a chain that parses; this method must not panic
         // under attacker-controlled URL contents.
         //
-        // SECURITY: see `DynamicClientCertVerifier::verify_client_cert` for
-        // the rationale on why accepting URLs from an unverified cert is
-        // safe (no HTTP on this path; fetch is off-path and SSRF-gated).
+        // SECURITY: only URLs named by the end entity or by an intermediate on
+        // a verified path of a chain that verifies against the configured roots
+        // are discovered. Every verified path counts, within webpki's per-call
+        // budget and with byte-identical duplicate intermediates ignored, so
+        // the path the live verifier accepts is covered, including when a
+        // cross-signed intermediate is presented in two copies; only a chain
+        // offering dozens of distinct alternative paths can exhaust that budget
+        // first. The chain is checked before the client proves key possession
+        // and revocation is not considered, so a copy of a valid chain can only
+        // trigger URLs chosen by the CAs that issued the certificates on its
+        // verified paths. A self-made chain, or a certificate on no verified
+        // path, can no longer choose URLs the server fetches - including any
+        // path on an operator-trusted origin - nor spend discovery budget. The
+        // gate runs lazily, at most once, only when there is something new.
+        //
+        // The 64-URL cap, precheck and deny logic still operate on every
+        // presented CDP URL in `relevant_urls`. Certificates on no verified
+        // path are excluded from discovery only; they still count toward the
+        // cap. That deliberate choice avoids chain verification on every
+        // handshake and preserves the error returned for chains that do not
+        // verify.
         let mut all_urls = Vec::with_capacity(
             end_entity_urls
                 .len()
@@ -943,9 +1102,9 @@ impl CrlSet {
         // SECURITY: discover only from `relevant_urls`, the same set the cap
         // above governs. Reading `all_urls` here instead would let a peer with
         // `crl_end_entity_only = true` drive discovery, pending-set growth, and
-        // limiter consumption from uncapped intermediate CDPs -- the exact
+        // limiter consumption from uncapped intermediate CDPs - the exact
         // amplification the cap exists to remove.
-        let candidates: Vec<String> = {
+        let mut candidates: Vec<String> = {
             let seen = self
                 .seen_urls
                 .lock()
@@ -961,6 +1120,42 @@ impl CrlSet {
                 .collect()
         };
 
+        if !candidates.is_empty() {
+            if let Some(discoverable_urls) = discoverable() {
+                let before = candidates.len();
+                candidates.retain(|url| discoverable_urls.contains(url));
+                let dropped = before.saturating_sub(candidates.len());
+                if dropped > 0 {
+                    tracing::debug!(
+                        dropped,
+                        "CRL discovery dropped CDP URLs not named by a verified certificate path"
+                    );
+                }
+            } else {
+                let dropped = candidates.len();
+                candidates.clear();
+                tracing::debug!(
+                    dropped,
+                    "CRL discovery dropped CDP URLs not named by a verified certificate path"
+                );
+            }
+        }
+
+        self.admit_discovery_candidates(candidates);
+
+        if !self.config.crl_deny_on_unavailable {
+            return (false, self.verifier_state.load_full());
+        }
+
+        if relevant_urls.is_empty() {
+            return (false, self.verifier_state.load_full());
+        }
+
+        self.precheck_revocation_coverage(relevant_urls)
+    }
+
+    /// Admit already-filtered CDP discovery candidates into the fetch queue.
+    fn admit_discovery_candidates(&self, candidates: Vec<String>) {
         // Rate-limit gate: drop excess submissions on the floor with a WARN.
         // The mTLS verifier must remain non-blocking, so we use the
         // synchronous `check()`/`check_key()` APIs and never await here.
@@ -970,7 +1165,7 @@ impl CrlSet {
         // and falls back to the process-global limiter only when no handshake
         // scope is present. SECURITY (order is load-bearing): the
         // `governor`-backed `check()`/`check_key()` APIs CONSUME a token rather
-        // than peek, so an attributed peer must consult ONLY its own bucket --
+        // than peek, so an attributed peer must consult ONLY its own bucket -
         // also consulting the global bucket would let a rejected attacker still
         // drain the shared budget, the exact cross-peer starvation this fixes.
         for url in candidates {
@@ -1021,15 +1216,14 @@ impl CrlSet {
                 );
             }
         }
+    }
 
-        if !self.config.crl_deny_on_unavailable {
-            return (false, self.verifier_state.load_full());
-        }
-
-        if relevant_urls.is_empty() {
-            return (false, self.verifier_state.load_full());
-        }
-
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the cache read guard is deliberately acquired BEFORE loading VerifierState and is released by the match that consumes it; tightening as the lint suggests would invert the lock order this precheck's generation-coherence depends on"
+    )]
+    /// Run the fail-closed revocation coverage precheck against one verifier generation.
+    fn precheck_revocation_coverage(&self, relevant_urls: &[String]) -> (bool, Arc<VerifierState>) {
         // SECURITY (lock order - must match `commit_cache_update_atomically`):
         // take the cache read guard FIRST, then load the verifier state while
         // still holding it. Commits publish `cache` and `verifier_state` under
@@ -1060,7 +1254,7 @@ impl CrlSet {
             return (true, state);
         }
 
-        // `all(..not cached..)` -- deny only when EVERY relevant CDP URL is
+        // `all(..not cached..)` - deny only when EVERY relevant CDP URL is
         // uncached, not when any single one is. RFC 5280 4.2.1.13: "If the
         // DistributionPointName contains multiple values, each name
         // describes a different mechanism to obtain the same CRL." The
@@ -1120,7 +1314,13 @@ impl CrlSet {
             );
         }
 
-        Self::new(roots, config, discover_tx, initial_cache)
+        Self::new(
+            roots,
+            config,
+            discover_tx,
+            initial_cache,
+            Arc::new(HashSet::new()),
+        )
     }
 
     /// Test-only: same as [`Self::__test_with_prepopulated_crls`] but keeps and
@@ -1159,7 +1359,13 @@ impl CrlSet {
             );
         }
 
-        let crl_set = Self::new(roots, config, discover_tx, initial_cache)?;
+        let crl_set = Self::new(
+            roots,
+            config,
+            discover_tx,
+            initial_cache,
+            Arc::new(HashSet::new()),
+        )?;
         Ok((crl_set, discover_rx))
     }
 
@@ -1189,10 +1395,13 @@ impl CrlSet {
     /// State hazard: mutates discovery state; its closed-channel pending shim
     /// differs from production behaviour and can create state a real closed
     /// discovery channel would not record. Ungated public leak.
+    /// Bypasses the verified-path discovery gate: every URL is treated as
+    /// named by a verified certificate path.
     #[doc(hidden)]
     #[inline]
     pub fn __test_note_discovered_urls(&self, urls: &[String]) -> bool {
-        let (missing_cached, _state) = self.note_discovered_urls(urls, &[]);
+        let (missing_cached, _state) =
+            self.note_discovered_urls(urls, &[], || Some(urls.iter().cloned().collect()));
         if self.discover_tx.is_closed() {
             let already_seen: HashSet<String> = {
                 let seen = self
@@ -1224,6 +1433,8 @@ impl CrlSet {
 
     /// Test-only: invoke the real precheck with separate end-entity and
     /// intermediate CDP sets.
+    /// Bypasses the verified-path discovery gate: every URL is treated as
+    /// named by a verified certificate path.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     #[inline]
@@ -1232,8 +1443,16 @@ impl CrlSet {
         end_entity_urls: &[String],
         intermediate_urls: &[String],
     ) -> bool {
-        self.note_discovered_urls(end_entity_urls, intermediate_urls)
-            .0
+        self.note_discovered_urls(end_entity_urls, intermediate_urls, || {
+            Some(
+                end_entity_urls
+                    .iter()
+                    .chain(intermediate_urls)
+                    .cloned()
+                    .collect(),
+            )
+        })
+        .0
     }
 
     /// Test-only: report whether a URL is suppressed from re-discovery. Benign
@@ -1335,18 +1554,20 @@ impl CrlSet {
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     #[inline]
+    // cancel-safe: no local CRL state is published; dropping the future aborts
+    // `gated_fetch` and leaves only bounded semaphore/map state behind.
     pub async fn __test_trigger_fetch(&self, url: &str) -> Result<(), RmcpServerKitError> {
-        if let Err(error) = gated_fetch(
-            &self.client,
-            &self.global_fetch_sem,
-            &self.host_semaphores,
-            url,
-            self.config.crl_allow_http,
-            self.max_response_bytes,
-            self.config.crl_max_host_semaphores,
-        )
-        .await
-        {
+        let ctx = CrlFetchContext {
+            clients: &self.clients,
+            global_sem: &self.global_fetch_sem,
+            host_semaphores: &self.host_semaphores,
+            allow_http: self.config.crl_allow_http,
+            max_bytes: self.max_response_bytes,
+            max_host_semaphores: self.config.crl_max_host_semaphores,
+            crl_cpu: &self.crl_cpu,
+            trusted_origins: &self.trusted_origins,
+        };
+        if let Err(error) = gated_fetch(&ctx, url).await {
             if error
                 .to_string()
                 .contains("crl_host_semaphore_cap_exceeded")
@@ -1366,6 +1587,9 @@ impl CrlSet {
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     #[inline]
+    // cancel-safe: delegates to the atomic cache commit; cancellation before the
+    // commit leaves no update, and cancellation after it leaves a consistent
+    // cache/verifier publication.
     pub async fn __test_insert_cache(&self, url: &str, cached: CachedCrl) {
         let _result = self
             .commit_cache_update_atomically(vec![(url.to_owned(), cached)], &[])
@@ -1376,6 +1600,8 @@ impl CrlSet {
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     #[inline]
+    // cancel-safe: same atomic cache commit as `__test_insert_cache`, with the
+    // commit result returned instead of discarded.
     pub async fn __test_try_insert_cache(
         &self,
         url: &str,
@@ -1388,14 +1614,15 @@ impl CrlSet {
     /// # ⚠️ Security
     ///
     /// Writes into `cache` directly, bypassing `commit_cache_update_atomically`
-    /// and publication ordering at lines 283-291. This can desynchronise
-    /// `cached_urls` from `inner_verifier`; with default
-    /// `crl_deny_on_unavailable = true`, the lines 547-579 precheck trusts
-    /// `cached_urls` and can admit a certificate whose revocation status is
-    /// unenforceable.
+    /// and the publication step in `commit_cache_update_atomically`. This can
+    /// desynchronise `cached_urls` from `verifier_state`; with default
+    /// `crl_deny_on_unavailable = true`, the precheck trusts `cached_urls` and
+    /// can admit a certificate whose revocation status is unenforceable.
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     #[inline]
+    // cancel-safe: the only awaited operation is acquiring the cache write
+    // lock; once held, the direct insertion is synchronous.
     pub async fn __test_replace_cache_entry_unverified(&self, url: &str, cached: CachedCrl) {
         let mut cache = self.cache_lock().write().await;
         let _previous = cache.insert(url.to_owned(), cached);
@@ -1409,6 +1636,8 @@ impl CrlSet {
     #[cfg(any(test, feature = "test-helpers"))]
     #[doc(hidden)]
     #[inline]
+    // cancel-safe: delegates to `refresh_urls`, which fetches into locals and
+    // publishes only through the atomic cache commit.
     pub async fn __test_trigger_refresh_url(&self, url: &str) -> Result<(), RmcpServerKitError> {
         self.refresh_urls(vec![url.to_owned()]).await
     }
@@ -1423,23 +1652,26 @@ impl CrlSet {
     ) -> Vec<(String, Result<CachedCrl, RmcpServerKitError>)> {
         let mut tasks = JoinSet::new();
         for url in urls {
-            let client = self.client.clone();
+            let clients = self.clients.clone();
             let global_sem = Arc::clone(&self.global_fetch_sem);
             let host_map = Arc::clone(&self.host_semaphores);
             let allow_http = self.config.crl_allow_http;
             let max_bytes = self.max_response_bytes;
             let max_host_semaphores = self.config.crl_max_host_semaphores;
+            let crl_cpu = Arc::clone(&self.crl_cpu);
+            let trusted_origins = Arc::clone(&self.trusted_origins);
             let _task = tasks.spawn(async move {
-                let result = gated_fetch(
-                    &client,
-                    &global_sem,
-                    &host_map,
-                    &url,
+                let ctx = CrlFetchContext {
+                    clients: &clients,
+                    global_sem: &global_sem,
+                    host_semaphores: &host_map,
                     allow_http,
                     max_bytes,
                     max_host_semaphores,
-                )
-                .await;
+                    crl_cpu: &crl_cpu,
+                    trusted_origins: &trusted_origins,
+                };
+                let result = gated_fetch(&ctx, &url).await;
                 (url, result)
             });
         }
@@ -1563,17 +1795,14 @@ impl ClientCertVerifier for DynamicClientCertVerifier {
         intermediates: &[CertificateDer<'_>],
         now: UnixTime,
     ) -> Result<ClientCertVerified, TlsError> {
-        // SECURITY: extracting CDP URLs from an unverified client cert
-        // here is intentional. No HTTP happens on this path -- the call
-        // to `note_discovered_urls` only enqueues onto a bounded,
-        // rate-limited channel. The actual fetch runs off-path in
-        // `run_crl_refresher` and is gated by SSRF screening
-        // (`src/ssrf.rs`), body-size cap, deadline, and the
-        // `crl_allow_http` policy. CRLs are CA-signed (RFC 5280 §5), so
-        // http(s) CDP URLs are protocol design, not an SSRF sink. The
-        // discovery must happen BEFORE delegating to the inner verifier
-        // so `crl_deny_on_unavailable = true` can fail-closed on a
-        // never-fetched CDP. Do NOT reorder.
+        // SECURITY: URLs are extracted before the revocation-checking inner
+        // verifier so `crl_deny_on_unavailable = true` can fail closed on a
+        // never-fetched CDP. Only URLs named by certificates on a verified path
+        // of a chain that verifies against the configured roots are admitted to
+        // discovery. The chain is checked before key possession is proven and
+        // revocation is not considered. No HTTP happens on this path - the call
+        // to `note_discovered_urls` only enqueues onto a bounded, rate-limited
+        // channel. Do NOT reorder.
         let mut end_entity_urls =
             extract_cdp_urls(end_entity.as_ref(), self.inner.config.crl_allow_http);
         end_entity_urls.sort();
@@ -1589,9 +1818,12 @@ impl ClientCertVerifier for DynamicClientCertVerifier {
         intermediate_urls.sort();
         intermediate_urls.dedup();
 
-        let (revocation_unavailable, state) = self
-            .inner
-            .note_discovered_urls(&end_entity_urls, &intermediate_urls);
+        let (revocation_unavailable, state) =
+            self.inner
+                .note_discovered_urls(&end_entity_urls, &intermediate_urls, || {
+                    self.inner
+                        .cdp_urls_on_verified_paths(end_entity, intermediates, now)
+                });
         if revocation_unavailable {
             return Err(TlsError::General(
                 "client certificate revocation status unavailable".to_owned(),
@@ -1687,6 +1919,216 @@ pub fn extract_cdp_urls(cert_der: &[u8], allow_http: bool) -> Vec<String> {
     urls
 }
 
+/// Push `name`'s origin onto `origins` when it is an accepted http(s) URI.
+///
+/// Drops non-URI names, parse failures, and rejected schemes (userinfo,
+/// non-http(s)) silently (debug log), matching `extract_cdp_urls`.
+fn collect_uri_origin(name: &GeneralName<'_>, allow_http: bool, origins: &mut Vec<Origin>) {
+    let GeneralName::URI(uri) = name else {
+        return;
+    };
+    let raw = *uri;
+    let Ok(parsed) = Url::parse(raw) else {
+        tracing::debug!(url = ?raw, "trusted CRL origin URI parse failed; dropped");
+        return;
+    };
+    if let Err(reason) = check_scheme(&parsed, allow_http) {
+        tracing::debug!(
+            url = %sanitized_url_for_log(&parsed),
+            reason,
+            "trusted CRL origin URI rejected by scheme guard; dropped"
+        );
+        return;
+    }
+    origins.push(parsed.origin());
+}
+
+/// Collect the http(s) origins named in a certificate's CRL Distribution
+/// Points and Authority Information Access extensions.
+///
+/// Covers `id-ad-caIssuers` and `id-ad-ocsp` (RFC 5280 §4.2.2.1). Mirrors
+/// `extract_cdp_urls`'s scheme and userinfo filtering via `check_scheme`,
+/// but reduces each accepted URL to its origin (scheme, lowercased host,
+/// effective port) instead of keeping the full URL. A certificate that
+/// fails to parse yields no origins (debug log), never an error: this runs
+/// over operator-configured certificates at startup, and a malformed entry
+/// should narrow the trusted set, not abort the server.
+fn extract_trusted_origins(cert_der: &[u8], allow_http: bool) -> Vec<Origin> {
+    let Ok((_, cert)) = X509Certificate::from_der(cert_der) else {
+        tracing::debug!("trusted CRL origin: certificate parse failed; skipped");
+        return Vec::new();
+    };
+
+    let mut origins = Vec::new();
+    for ext in cert.extensions() {
+        let parsed = ext.parsed_extension();
+        if let ParsedExtension::CRLDistributionPoints(cdps) = parsed {
+            for point in cdps.iter() {
+                if let Some(DistributionPointName::FullName(names)) = &point.distribution_point {
+                    for name in names {
+                        collect_uri_origin(name, allow_http, &mut origins);
+                    }
+                }
+            }
+        }
+        if let ParsedExtension::AuthorityInfoAccess(aia) = parsed {
+            for desc in aia.iter() {
+                let is_relevant = desc.access_method == oid!(1.3.6.1.5.5.7.48.2)
+                    || desc.access_method == oid!(1.3.6.1.5.5.7.48.1);
+                if is_relevant {
+                    collect_uri_origin(&desc.access_location, allow_http, &mut origins);
+                }
+            }
+        }
+    }
+    origins
+}
+
+/// Collect the deduplicated trusted CRL/AIA origins named across `ca_certs`
+/// and `server_chain`.
+///
+/// `ca_certs` is the operator's configured mTLS CA bundle; `server_chain` is
+/// the server's own TLS certificate chain. A CRL fetch whose URL origin is
+/// in the returned set skips the private-address block (cloud metadata
+/// excepted); there is no configurable CRL allowlist.
+fn collect_trusted_crl_origins(
+    ca_certs: &[CertificateDer<'_>],
+    server_chain: &[CertificateDer<'_>],
+    allow_http: bool,
+) -> HashSet<Origin> {
+    ca_certs
+        .iter()
+        .chain(server_chain.iter())
+        .flat_map(|cert| extract_trusted_origins(cert.as_ref(), allow_http))
+        .collect()
+}
+
+/// Lowercased hostnames of the hostname-form (non-IP-literal) origins in
+/// `origins`, for the connect-time resolver allowlist.
+///
+/// IP-literal origins are intentionally excluded: `screen_addrs` applies
+/// CIDR entries to every hostname's resolved addresses, so adding an
+/// IP-literal origin as a CIDR would let a rebinding hostname reach that
+/// same address on any port. IP-literal trusted origins are enforced
+/// solely by the pre-flight origin match in `fetch_crl`, which is final:
+/// reqwest never re-resolves a literal.
+fn trusted_hostnames(origins: &HashSet<Origin>) -> Vec<String> {
+    origins
+        .iter()
+        .filter_map(|origin| match origin {
+            Origin::Tuple(_, Host::Domain(domain), _) => Some(domain.clone()),
+            Origin::Tuple(_, Host::Ipv4(_) | Host::Ipv6(_), _) | Origin::Opaque(_) => None,
+        })
+        .collect()
+}
+
+/// Build the CRL fetcher's connect-time resolver allowlist from the trusted
+/// origins.
+///
+/// Hostnames only, never CIDR entries: see [`trusted_hostnames`] for why
+/// IP-literal origins are excluded rather than turned into a CIDR. Used by
+/// [`CrlHttpClients::new`] for the trusted client.
+fn build_trusted_origin_allowlist(trusted_origins: &HashSet<Origin>) -> CompiledSsrfAllowlist {
+    CompiledSsrfAllowlist::new(trusted_hostnames(trusted_origins), Vec::new())
+}
+
+/// CRL fetch clients with SSRF-screening resolvers installed.
+///
+/// Both clients resolve through [`SsrfScreeningResolver`]. `screened` admits no
+/// blocked address. `trusted` also admits the hostnames of the
+/// operator-trusted origins and is used only for a URL whose exact origin is
+/// trusted, so the connect-time screen applies the same origin match as the
+/// pre-flight check instead of trusting a hostname on every port.
+#[derive(Clone, Debug)]
+struct CrlHttpClients {
+    /// Client for URLs whose exact origin is not trusted.
+    screened: Client,
+    /// Client for URLs whose exact origin is trusted.
+    trusted: Client,
+}
+
+impl CrlHttpClients {
+    /// Build the screened and trusted CRL fetch clients.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either HTTP client cannot be built.
+    fn new(
+        trusted_origins: &HashSet<Origin>,
+        fetch_timeout: Duration,
+    ) -> Result<Self, RmcpServerKitError> {
+        Ok(Self {
+            screened: build_crl_http_client(CompiledSsrfAllowlist::default(), fetch_timeout)?,
+            trusted: build_crl_http_client(
+                build_trusted_origin_allowlist(trusted_origins),
+                fetch_timeout,
+            )?,
+        })
+    }
+
+    /// Select the trusted client only when `url`'s exact origin is trusted.
+    fn for_url<'client>(
+        &'client self,
+        url: &Url,
+        trusted_origins: &HashSet<Origin>,
+    ) -> (bool, &'client Client) {
+        let trusted_origin = trusted_origins.contains(&url.origin());
+        let client = if trusted_origin {
+            &self.trusted
+        } else {
+            &self.screened
+        };
+        (trusted_origin, client)
+    }
+}
+
+/// Build one CRL HTTP client using the supplied SSRF allowlist.
+///
+/// # Errors
+///
+/// Returns an error if the `reqwest` client cannot be built.
+fn build_crl_http_client(
+    compiled_allowlist: CompiledSsrfAllowlist,
+    fetch_timeout: Duration,
+) -> Result<Client, RmcpServerKitError> {
+    let allowlist = Arc::new(compiled_allowlist);
+    let resolver: Arc<dyn Resolve> = Arc::new(SsrfScreeningResolver::new(
+        Arc::clone(&allowlist),
+        #[cfg(any(test, feature = "test-helpers"))]
+        Arc::new(AtomicBool::new(false)),
+        #[expect(
+            clippy::cfg_not_test,
+            reason = "deliberate: src/mtls_revocation.rs::SsrfScreeningResolver::new takes a no-op bypass argument when the test-helpers feature is absent; the inverted cfg is intentional"
+        )]
+        #[cfg(not(any(test, feature = "test-helpers")))]
+        (),
+    ));
+
+    Client::builder()
+        // M-H2/N1: see oauth.rs::OauthHttpClient::build for rationale.
+        .no_proxy()
+        .dns_resolver(Arc::clone(&resolver))
+        .timeout(fetch_timeout)
+        .connect_timeout(CRL_CONNECT_TIMEOUT)
+        .tcp_keepalive(None)
+        .redirect(Policy::none())
+        .user_agent(format!("rmcp-server-kit/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|error| RmcpServerKitError::Startup(format!("CRL HTTP client init: {error}")))
+}
+
+/// Log the trusted CRL/AIA origins once at startup, so an operator can audit
+/// what bypasses the private-address screening (cloud metadata excepted).
+fn log_trusted_crl_origins(origins: &HashSet<Origin>) {
+    let mut rendered: Vec<String> = origins.iter().map(Origin::ascii_serialization).collect();
+    rendered.sort();
+    tracing::info!(
+        count = rendered.len(),
+        origins = %rendered.join(", "),
+        "CRL fetch: trusted origins named in the configured certificates"
+    );
+}
+
 /// Bound the startup CDP fan-out to the same limit the steady-state cache obeys.
 ///
 /// SECURITY: `bootstrap_fetch` is a public helper taking a raw [`MtlsConfig`]
@@ -1714,28 +2156,55 @@ fn cap_bootstrap_urls(urls: &mut Vec<String>, cap: usize) {
 /// Bootstrap the CRL cache by extracting CDP URLs from the CA chain and
 /// fetching any reachable CRLs with a 10-second total deadline.
 ///
+/// The CRL/AIA origins named in `ca_certs` are trusted automatically (no
+/// configurable CRL allowlist): a CRL fetch whose URL origin is in that set
+/// skips the private-address block, cloud metadata excepted. Callers that
+/// also have the server's own TLS certificate chain available (the mTLS CRL
+/// wiring in `crate::transport::run_server`) extend that trusted set with it.
+///
 /// # Errors
 ///
 /// Returns an error if the initial verifier cannot be built.
-#[expect(
-    clippy::cognitive_complexity,
-    reason = "bootstrap coordinates timeout, parallel fetches, and partial-cache recovery"
-)]
-#[expect(
-    clippy::integer_division_remainder_used,
-    reason = "external macro: tokio::select"
-)]
-// cancel-safe: CRL cache state is local until final `CrlSet::new`; timeout or
-// cancellation drops the `JoinSet`, aborting in-flight `gated_fetch` before
-// publication. Bootstrap host semaphores are local and drop with this future.
 #[inline]
+// cancel-safe: CRL cache state is local until final `CrlSet::new`; timeout or cancellation drops
+// the `JoinSet`, aborting in-flight `gated_fetch` before publication. Bootstrap host semaphores
+// are local and drop with this future.
 pub async fn bootstrap_fetch(
     roots: Arc<RootCertStore>,
     ca_certs: &[CertificateDer<'static>],
     config: MtlsConfig,
 ) -> Result<(Arc<CrlSet>, mpsc::UnboundedReceiver<String>), RmcpServerKitError> {
+    // Bootstrap URLs come from the configured CA certificates, not clients.
+    // Their origins are operator-trusted for CRL address screening;
+    // cloud-metadata addresses stay blocked.
+    bootstrap_fetch_with_server_chain(roots, ca_certs, &[], config).await
+}
+
+/// Same as [`bootstrap_fetch`], but also derives the trusted origin set
+/// from `server_chain`.
+///
+/// `server_chain` is the server's own TLS certificate chain.
+/// `crate::transport::run_server` has both chains available and uses this
+/// variant directly; `bootstrap_fetch` delegates here with an empty
+/// `server_chain`.
+///
+/// # Errors
+///
+/// Returns an error if the initial verifier cannot be built.
+// cancel-safe: identical to `bootstrap_fetch` (see its comment); the extra
+// `server_chain` slice is read synchronously before any await.
+pub(crate) async fn bootstrap_fetch_with_server_chain(
+    roots: Arc<RootCertStore>,
+    ca_certs: &[CertificateDer<'static>],
+    server_chain: &[CertificateDer<'static>],
+    config: MtlsConfig,
+) -> Result<(Arc<CrlSet>, mpsc::UnboundedReceiver<String>), RmcpServerKitError> {
+    install_crl_crypto_provider();
     let (discover_tx, discover_rx) = mpsc::unbounded_channel();
 
+    // Bootstrap URLs come from configured certificates: the public helper uses
+    // the CA bundle, while this crate-internal path also trusts origins named
+    // in the server certificate chain. Cloud-metadata addresses stay blocked.
     let mut urls = ca_certs
         .iter()
         .flat_map(|cert| extract_cdp_urls(cert.as_ref(), config.crl_allow_http))
@@ -1744,33 +2213,15 @@ pub async fn bootstrap_fetch(
     urls.dedup();
     cap_bootstrap_urls(&mut urls, config.crl_max_cache_entries);
 
-    // M-H2: same SSRF resolver hardening as CrlSet::new -- bootstrap
-    // fetches the same attacker-controlled CDP URLs, just earlier in
-    // the lifecycle.
-    let bootstrap_allowlist = Arc::new(CompiledSsrfAllowlist::default());
-    let bootstrap_resolver: Arc<dyn Resolve> = Arc::new(SsrfScreeningResolver::new(
-        Arc::clone(&bootstrap_allowlist),
-        #[cfg(any(test, feature = "test-helpers"))]
-        Arc::new(AtomicBool::new(false)),
-        #[expect(
-            clippy::cfg_not_test,
-            reason = "deliberate: src/mtls_revocation.rs::SsrfScreeningResolver::new takes a no-op bypass argument when the test-helpers feature is absent; the inverted cfg is intentional"
-        )]
-        #[cfg(not(any(test, feature = "test-helpers")))]
-        (),
+    let trusted_origins = Arc::new(collect_trusted_crl_origins(
+        ca_certs,
+        server_chain,
+        config.crl_allow_http,
     ));
+    log_trusted_crl_origins(&trusted_origins);
 
-    let client = Client::builder()
-        // M-H2/N1: see oauth.rs::OauthHttpClient::build for rationale.
-        .no_proxy()
-        .dns_resolver(Arc::clone(&bootstrap_resolver))
-        .timeout(config.crl_fetch_timeout)
-        .connect_timeout(CRL_CONNECT_TIMEOUT)
-        .tcp_keepalive(None)
-        .redirect(Policy::none())
-        .user_agent(format!("rmcp-server-kit/{}", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|error| RmcpServerKitError::Startup(format!("CRL HTTP client init: {error}")))?;
+    // M-H2: bootstrap URLs are all trusted origins by construction.
+    let clients = CrlHttpClients::new(&trusted_origins, config.crl_fetch_timeout)?;
 
     // Bootstrap shares the same global concurrency + per-host cap as the
     // hot-path verifier so a maliciously broad CA chain cannot overwhelm
@@ -1783,25 +2234,85 @@ pub async fn bootstrap_fetch(
     let allow_http = config.crl_allow_http;
     let max_bytes = config.crl_max_response_bytes;
     let max_host_semaphores = config.crl_max_host_semaphores;
+    // Bounds CPU-bound CRL parse jobs during bootstrap. Separate from the
+    // `crl_cpu` field the resulting `CrlSet` gets in `CrlSet::new`: bootstrap
+    // runs before that `CrlSet` exists, so its fetch tasks and its one-shot
+    // initial verifier build below share this bootstrap-local semaphore.
+    let bootstrap_crl_cpu = Arc::new(Semaphore::new(CRL_CPU_PERMITS));
 
+    let fetch_ctx = CrlFetchContext {
+        clients: &clients,
+        global_sem: &global_sem,
+        host_semaphores: &host_semaphores,
+        allow_http,
+        max_bytes,
+        max_host_semaphores,
+        crl_cpu: &bootstrap_crl_cpu,
+        trusted_origins: &trusted_origins,
+    };
+    let initial_cache = bootstrap_fetch_urls(&fetch_ctx, &urls).await;
+
+    let set = {
+        let permit = Arc::clone(&bootstrap_crl_cpu)
+            .acquire_owned()
+            .await
+            .map_err(|error| {
+                RmcpServerKitError::Tls(format!("CRL CPU semaphore closed: {error}"))
+            })?;
+        new_crl_set_from_bootstrap_cache_blocking(
+            roots,
+            config,
+            discover_tx,
+            initial_cache,
+            trusted_origins,
+            permit,
+        )
+        .await?
+    };
+    Ok((set, discover_rx))
+}
+
+/// Fetch every bootstrap CDP URL concurrently under [`BOOTSTRAP_TIMEOUT`],
+/// returning whatever was fetched successfully before the deadline.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "bootstrap coordinates timeout, parallel fetches, and partial-cache recovery"
+)]
+#[expect(
+    clippy::integer_division_remainder_used,
+    reason = "external macro: tokio::select"
+)]
+// cancel-safe: results accumulate in a local map; the deadline elapsing, or
+// this future being dropped, only stops collecting further results - nothing
+// is published here, the caller commits the returned map itself.
+async fn bootstrap_fetch_urls(
+    ctx: &CrlFetchContext<'_>,
+    urls: &[String],
+) -> HashMap<String, CachedCrl> {
     let mut initial_cache = HashMap::new();
     let mut tasks = JoinSet::new();
-    for url in &urls {
-        let task_client = client.clone();
+    for url in urls {
         let task_url = url.clone();
-        let task_global_sem = Arc::clone(&global_sem);
-        let task_host_semaphores = Arc::clone(&host_semaphores);
+        let task_clients = ctx.clients.clone();
+        let task_global_sem = Arc::clone(ctx.global_sem);
+        let task_host_semaphores = Arc::clone(ctx.host_semaphores);
+        let task_crl_cpu = Arc::clone(ctx.crl_cpu);
+        let task_trusted_origins = Arc::clone(ctx.trusted_origins);
+        let allow_http = ctx.allow_http;
+        let max_bytes = ctx.max_bytes;
+        let max_host_semaphores = ctx.max_host_semaphores;
         let _task = tasks.spawn(async move {
-            let result = gated_fetch(
-                &task_client,
-                &task_global_sem,
-                &task_host_semaphores,
-                &task_url,
+            let task_ctx = CrlFetchContext {
+                clients: &task_clients,
+                global_sem: &task_global_sem,
+                host_semaphores: &task_host_semaphores,
                 allow_http,
                 max_bytes,
                 max_host_semaphores,
-            )
-            .await;
+                crl_cpu: &task_crl_cpu,
+                trusted_origins: &task_trusted_origins,
+            };
+            let result = gated_fetch(&task_ctx, &task_url).await;
             (task_url, result)
         });
     }
@@ -1837,8 +2348,7 @@ pub async fn bootstrap_fetch(
         }
     }
 
-    let set = new_crl_set_from_bootstrap_cache(roots, config, discover_tx, initial_cache)?;
-    Ok((set, discover_rx))
+    initial_cache
 }
 
 /// Apply the cache cap, then build the `CrlSet` from the bootstrap cache.
@@ -1851,9 +2361,38 @@ fn new_crl_set_from_bootstrap_cache(
     config: MtlsConfig,
     discover_tx: mpsc::UnboundedSender<String>,
     mut initial_cache: HashMap<String, CachedCrl>,
+    trusted_origins: Arc<HashSet<Origin>>,
 ) -> Result<Arc<CrlSet>, RmcpServerKitError> {
     apply_bootstrap_cache_cap(&mut initial_cache, config.crl_max_cache_entries);
-    CrlSet::new(roots, config, discover_tx, initial_cache)
+    CrlSet::new(roots, config, discover_tx, initial_cache, trusted_origins)
+}
+
+/// Build the bootstrap `CrlSet` on the blocking thread pool, bounded by the
+/// bootstrap-local CRL CPU semaphore (see `bootstrap_fetch`).
+///
+/// # Errors
+///
+/// Returns an error if [`new_crl_set_from_bootstrap_cache`] fails, or if the
+/// blocking task cannot be joined (including a panic inside it).
+// cancel-safe: every input, including the semaphore permit, is moved into the
+// blocking closure, so a dropped future lets the bounded build finish and
+// discards its result; bootstrap has published nothing yet in that case.
+async fn new_crl_set_from_bootstrap_cache_blocking(
+    roots: Arc<RootCertStore>,
+    config: MtlsConfig,
+    discover_tx: mpsc::UnboundedSender<String>,
+    initial_cache: HashMap<String, CachedCrl>,
+    trusted_origins: Arc<HashSet<Origin>>,
+    permit: OwnedSemaphorePermit,
+) -> Result<Arc<CrlSet>, RmcpServerKitError> {
+    spawn_blocking(move || {
+        let _permit = permit;
+        new_crl_set_from_bootstrap_cache(roots, config, discover_tx, initial_cache, trusted_origins)
+    })
+    .await
+    .map_err(|error| {
+        RmcpServerKitError::Tls(format!("CRL bootstrap verifier build task failed: {error}"))
+    })?
 }
 
 /// Drop the excess cache entries beyond `max_cache_entries`, in sorted order.
@@ -1964,6 +2503,16 @@ impl Drop for PendingUrlGuard {
     }
 }
 
+/// Install the process-default rustls provider before building CRL clients.
+fn install_crl_crypto_provider() {
+    // Prevent reqwest from panicking with "No rustls crypto provider is configured".
+    // If the application already installed a provider, rustls keeps that provider
+    // and this ignored install result matches the TLS and OAuth constructors.
+    use rustls::crypto::ring;
+
+    drop(ring::default_provider().install_default());
+}
+
 /// Apply a discovery fetch's settlement to the pending/seen dedup state.
 fn settle_discovered_url(
     mut pending_guard: PendingUrlGuard,
@@ -2038,6 +2587,47 @@ where
         .map_err(|error| RmcpServerKitError::Tls(format!("mTLS verifier error: {error}")))
 }
 
+/// Rebuild the verifier and recompute every entry's identity for a candidate
+/// cache on the blocking thread pool, bounded by the shared CRL CPU
+/// semaphore.
+///
+/// Takes the candidate cache by value and returns it unchanged alongside the
+/// rebuilt verifier and identity index, so the caller can publish all three
+/// together without re-reading the candidate after the blocking call.
+///
+/// # Errors
+///
+/// Returns an error if [`rebuild_verifier`] fails for the candidate cache, or
+/// if the blocking task cannot be joined (including a panic inside it).
+// cancel-safe: the semaphore permit and the candidate cache are both moved
+// into the blocking closure, so a dropped future lets the bounded rebuild
+// finish and discards its result; nothing is published in that case because
+// the caller never reaches its own publication step.
+async fn build_verifier_state_blocking(
+    roots: Arc<RootCertStore>,
+    config: MtlsConfig,
+    candidate: HashMap<String, CachedCrl>,
+    permit: OwnedSemaphorePermit,
+) -> Result<
+    (
+        HashMap<String, CachedCrl>,
+        Arc<dyn ClientCertVerifier>,
+        HashMap<String, EntryIdentity>,
+    ),
+    RmcpServerKitError,
+> {
+    spawn_blocking(move || {
+        let _permit = permit;
+        let verifier = rebuild_verifier(&roots, &config, &candidate)?;
+        let identities = crl_cache_identities(&candidate);
+        Ok((candidate, verifier, identities))
+    })
+    .await
+    .map_err(|error| {
+        RmcpServerKitError::Tls(format!("CRL verifier rebuild task failed: {error}"))
+    })?
+}
+
 /// Parse `thisUpdate` and `nextUpdate` metadata from a DER-encoded CRL.
 ///
 /// # Errors
@@ -2054,6 +2644,33 @@ pub fn parse_crl_metadata(
         asn1_time_to_system_time(crl.last_update()),
         crl.next_update().map(asn1_time_to_system_time),
     ))
+}
+
+/// Parse CRL metadata on the blocking thread pool, bounded by the shared CRL
+/// CPU semaphore.
+///
+/// Takes the DER bytes by value and returns them unchanged alongside the
+/// parsed metadata, so the caller can build a [`CachedCrl`] without
+/// re-reading the bytes after the blocking call.
+///
+/// # Errors
+///
+/// Returns an error if [`parse_crl_metadata`] fails for the DER bytes, or if
+/// the blocking task cannot be joined (including a panic inside it).
+// cancel-safe: the semaphore permit and the DER bytes are both moved into the
+// blocking closure, so a dropped future lets the bounded parse finish and
+// discards its result; no caller ever observes a partially-parsed `CachedCrl`.
+async fn parse_crl_metadata_blocking(
+    der: Vec<u8>,
+    permit: OwnedSemaphorePermit,
+) -> Result<(Vec<u8>, SystemTime, Option<SystemTime>), RmcpServerKitError> {
+    spawn_blocking(move || {
+        let _permit = permit;
+        let (this_update, next_update) = parse_crl_metadata(&der)?;
+        Ok((der, this_update, next_update))
+    })
+    .await
+    .map_err(|error| RmcpServerKitError::Tls(format!("CRL parse task failed: {error}")))?
 }
 
 /// Compute and box the next refresh sleep deadline.
@@ -2137,6 +2754,30 @@ fn acquire_host_semaphore(
     )
 }
 
+/// Network and CPU concurrency caps shared by one `gated_fetch` call.
+///
+/// Groups `gated_fetch`'s parameters so the function itself stays within the
+/// house argument-count limit; every field is a borrow or a cheap `Copy`
+/// value already owned by the caller.
+struct CrlFetchContext<'ctx> {
+    /// CRL fetch client pair with SSRF-screening resolvers installed.
+    clients: &'ctx CrlHttpClients,
+    /// Global cap on simultaneous CRL HTTP fetches (SSRF amplification guard).
+    global_sem: &'ctx Arc<Semaphore>,
+    /// Per-host serializer, at most one in-flight fetch per origin host.
+    host_semaphores: &'ctx Arc<TokioMutex<HashMap<String, Arc<Semaphore>>>>,
+    /// Whether plain `http://` CDP URLs are fetched.
+    allow_http: bool,
+    /// Cap on a single CRL response body.
+    max_bytes: u64,
+    /// Cap on distinct CDP hosts tracked by `host_semaphores`.
+    max_host_semaphores: usize,
+    /// Bounds concurrent CPU-bound CRL parse jobs. See [`CRL_CPU_PERMITS`].
+    crl_cpu: &'ctx Arc<Semaphore>,
+    /// Operator-trusted origins; see `CrlSet::trusted_origins`.
+    trusted_origins: &'ctx Arc<HashSet<Origin>>,
+}
+
 /// Fetch a single CRL URL through the global + per-host concurrency caps.
 ///
 /// `global_sem` caps total simultaneous CRL fetches process-wide.
@@ -2152,13 +2793,8 @@ fn acquire_host_semaphore(
 // position, acquired global/host permits RAII-drop, and host-map insertion can
 // leave only an idle bounded semaphore entry that later self-heals.
 async fn gated_fetch(
-    client: &Client,
-    global_sem: &Arc<Semaphore>,
-    host_semaphores: &Arc<TokioMutex<HashMap<String, Arc<Semaphore>>>>,
+    ctx: &CrlFetchContext<'_>,
     url: &str,
-    allow_http: bool,
-    max_bytes: u64,
-    max_host_semaphores: usize,
 ) -> Result<CachedCrl, RmcpServerKitError> {
     let host_key = Url::parse(url)
         .ok()
@@ -2166,11 +2802,11 @@ async fn gated_fetch(
         .unwrap_or_else(|| url.to_owned());
 
     let host_sem = {
-        let mut map = host_semaphores.lock().await;
-        acquire_host_semaphore(&mut map, &host_key, max_host_semaphores)?
+        let mut map = ctx.host_semaphores.lock().await;
+        acquire_host_semaphore(&mut map, &host_key, ctx.max_host_semaphores)?
     };
 
-    let _global_permit = Arc::clone(global_sem)
+    let _global_permit = Arc::clone(ctx.global_sem)
         .acquire_owned()
         .await
         .map_err(|error| {
@@ -2181,27 +2817,47 @@ async fn gated_fetch(
         .await
         .map_err(|error| RmcpServerKitError::Tls(format!("CRL host semaphore closed: {error}")))?;
 
-    fetch_crl(client, url, allow_http, max_bytes).await
+    fetch_crl(
+        ctx.clients,
+        url,
+        ctx.allow_http,
+        ctx.max_bytes,
+        ctx.crl_cpu,
+        ctx.trusted_origins,
+    )
+    .await
 }
 
 /// Fetch and parse a single CRL into a cache entry.
 ///
+/// The DER parse runs on the blocking pool (see
+/// [`parse_crl_metadata_blocking`]), bounded by [`CRL_CPU_PERMITS`]. The
+/// selected client's resolver re-screens at connect time.
+///
 /// # Errors
 ///
-/// Returns an error if the scheme is rejected, DNS screening fails, the HTTP
-/// fetch fails, the body exceeds the cap, or the DER cannot be parsed.
-// cancel-safe: DNS lookup, request send, chunk reads, DER parse, and metadata
-// extraction build only a local `CachedCrl`; CRL cache/verifier state changes
-// happen later, when callers commit the returned value.
+/// Returns an error if the scheme is rejected, DNS screening fails (unless
+/// the URL's origin is in the operator-trusted set, cloud metadata
+/// excepted), the HTTP fetch fails, the body exceeds the cap, or the DER
+/// cannot be parsed.
+// cancel-safe: DNS lookup, request send, and chunk reads build only a local buffer; CRL
+// cache/verifier state changes happen later, when callers commit the returned value. Dropping
+// this future while the blocking parse is in flight does not cancel it (spawn_blocking cannot be
+// aborted); the bounded parse finishes and its result is simply discarded.
 async fn fetch_crl(
-    client: &Client,
+    clients: &CrlHttpClients,
     url: &str,
     allow_http: bool,
     max_bytes: u64,
+    crl_cpu: &Arc<Semaphore>,
+    trusted_origins: &Arc<HashSet<Origin>>,
 ) -> Result<CachedCrl, RmcpServerKitError> {
     let parsed = Url::parse(url)
         .map_err(|error| RmcpServerKitError::Tls(format!("CRL URL parse {url}: {error}")))?;
 
+    // SECURITY: this URL can come from a certificate on a verified path of a
+    // presented chain; see the module docs for why the fetch must be screened
+    // before any request.
     if let Err(reason) = check_scheme(&parsed, allow_http) {
         // Sanitized: the gate must not echo what it rejects (the URL may
         // carry userinfo credentials - the very thing being refused).
@@ -2219,6 +2875,13 @@ async fn fetch_crl(
         .port_or_known_default()
         .ok_or_else(|| RmcpServerKitError::Tls(format!("CRL URL has no known port: {url}")))?;
 
+    // The origin (scheme, host, port) is trusted when it is named in a CRL
+    // Distribution Point or Authority Information Access extension of the
+    // operator's configured certificates; see `CrlSet::trusted_origins`.
+    let (trusted_origin, client) = clients.for_url(&parsed, trusted_origins);
+
+    // An IPv6-literal host fails closed here because `host_str()` retains
+    // brackets, and `lookup_host` expects an unbracketed IPv6 address.
     let addrs = lookup_host((host, port))
         .await
         .map_err(|error| RmcpServerKitError::Tls(format!("CRL DNS resolution {url}: {error}")))?;
@@ -2226,17 +2889,10 @@ async fn fetch_crl(
     let mut any_addr = false;
     for addr in addrs {
         any_addr = true;
-        if let Some(reason) = ip_block_reason(addr.ip()) {
-            tracing::warn!(
-                url = %url,
-                resolved_ip = %addr.ip(),
-                reason,
-                "CRL fetch denied: blocked IP"
-            );
-            return Err(RmcpServerKitError::Tls(format!(
-                "CRL host resolved to blocked IP ({reason}): {url}"
-            )));
-        }
+        // SECURITY: a CDP host named by a presented certificate is resolved
+        // before connecting and each address is screened; see the module
+        // docs for the threat model.
+        reject_blocked_crl_ip(url, addr.ip(), trusted_origin)?;
     }
     if !any_addr {
         return Err(RmcpServerKitError::Tls(format!(
@@ -2271,8 +2927,13 @@ async fn fetch_crl(
         body.extend_from_slice(&chunk);
     }
 
-    let der = CertificateRevocationListDer::from(body);
-    let (this_update, next_update) = parse_crl_metadata(der.as_ref())?;
+    let (parsed_der, this_update, next_update) = {
+        let permit = Arc::clone(crl_cpu).acquire_owned().await.map_err(|error| {
+            RmcpServerKitError::Tls(format!("CRL CPU semaphore closed: {error}"))
+        })?;
+        parse_crl_metadata_blocking(body, permit).await?
+    };
+    let der = CertificateRevocationListDer::from(parsed_der);
 
     Ok(CachedCrl {
         der,
@@ -2281,6 +2942,38 @@ async fn fetch_crl(
         fetched_at: SystemTime::now(),
         source_url: url.to_owned(),
     })
+}
+
+/// Reject a CRL resolved IP when the shared SSRF classifier blocks it.
+///
+/// Skipped when `trusted_origin` is true - the fetch's URL origin is named
+/// in the operator's configured certificates. Cloud metadata is rejected
+/// either way.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Tls`] when `ip` is in a blocked SSRF class
+/// and either `trusted_origin` is false or the class is cloud metadata.
+fn reject_blocked_crl_ip(
+    url: &str,
+    ip: IpAddr,
+    trusted_origin: bool,
+) -> Result<(), RmcpServerKitError> {
+    let Some(reason) = ip_block_reason(ip) else {
+        return Ok(());
+    };
+    if trusted_origin && reason != "cloud_metadata" {
+        return Ok(());
+    }
+    tracing::warn!(
+        url = %url,
+        resolved_ip = %ip,
+        reason,
+        "CRL fetch denied: blocked IP"
+    );
+    Err(RmcpServerKitError::Tls(format!(
+        "CRL host resolved to blocked IP ({reason}): {url}"
+    )))
 }
 
 /// Whether a cached CRL is due for refresh at `now`.
@@ -2358,24 +3051,40 @@ fn asn1_time_to_system_time(time: ASN1Time) -> SystemTime {
 mod tests {
 
     use core::{
-        slice,
-        sync::atomic::{AtomicUsize, Ordering},
+        cell::Cell,
+        error::Error as _,
+        iter::{from_fn, once, repeat_n},
+        net::{Ipv4Addr, Ipv6Addr},
+        ptr, slice,
+        sync::atomic::{AtomicU64, AtomicUsize, Ordering},
     };
-    use std::{io, sync::Mutex as StdMutex};
+    use std::{
+        io,
+        net::{TcpListener, ToSocketAddrs as _},
+        sync::{LazyLock, Mutex as StdMutex},
+        time::Instant as StdInstant,
+    };
 
     use anyhow::Context as _;
     use rcgen::{
-        BasicConstraints, CertificateParams, CertifiedIssuer, DnType, IsCa, KeyPair,
-        KeyUsagePurpose,
+        BasicConstraints, CertificateParams, CertificateRevocationListParams, CertifiedIssuer,
+        CrlDistributionPoint, CustomExtension, DnType, ExtendedKeyUsagePurpose, IsCa, KeyIdMethod,
+        KeyPair, KeyUsagePurpose, RevocationReason, RevokedCertParams, SerialNumber, date_time_ymd,
     };
     use rustls::crypto::ring;
     use serde_json::{from_value, json};
     use tokio::{
-        task::{spawn_blocking, yield_now},
-        time::timeout,
+        runtime::Handle,
+        sync::mpsc::error::TryRecvError,
+        task::yield_now,
+        time::{MissedTickBehavior, interval, timeout},
     };
     use tracing::{Level, subscriber};
     use tracing_subscriber::fmt as subscriber_fmt;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
 
     use super::*;
 
@@ -2445,6 +3154,245 @@ mod tests {
         Ok(issuer.der().clone())
     }
 
+    fn discovery_test_ca(common_name: &str) -> anyhow::Result<CertifiedIssuer<'static, KeyPair>> {
+        let mut params =
+            CertificateParams::new(Vec::<String>::new()).context("discovery CA params")?;
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        params
+            .distinguished_name
+            .push(DnType::CommonName, common_name);
+        let key = KeyPair::generate().context("discovery CA key")?;
+        CertifiedIssuer::self_signed(params, key).context("discovery self-signed CA")
+    }
+
+    fn discovery_test_intermediate(
+        cdp_url: &str,
+        issuer: &CertifiedIssuer<'static, KeyPair>,
+    ) -> anyhow::Result<CertifiedIssuer<'static, KeyPair>> {
+        let mut params = CertificateParams::new(Vec::<String>::new())
+            .context("discovery intermediate params")?;
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "discovery-intermediate");
+        params.crl_distribution_points = vec![CrlDistributionPoint {
+            uris: vec![cdp_url.to_owned()],
+        }];
+        params.use_authority_key_identifier_extension = true;
+        let key = KeyPair::generate().context("discovery intermediate key")?;
+        CertifiedIssuer::signed_by(params, key, issuer).context("discovery intermediate signed")
+    }
+
+    /// Build a named CA certificate with a caller-supplied key and CDP URL.
+    fn discovery_test_named_ca(
+        common_name: &str,
+        cdp_url: &str,
+        serial: u64,
+        key_pem: &str,
+        issuer: &CertifiedIssuer<'static, KeyPair>,
+    ) -> anyhow::Result<CertifiedIssuer<'static, KeyPair>> {
+        let mut params =
+            CertificateParams::new(Vec::<String>::new()).context("discovery named CA params")?;
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        params
+            .distinguished_name
+            .push(DnType::CommonName, common_name);
+        params.serial_number = Some(SerialNumber::from(serial));
+        params.crl_distribution_points = vec![CrlDistributionPoint {
+            uris: vec![cdp_url.to_owned()],
+        }];
+        params.use_authority_key_identifier_extension = true;
+        let key = KeyPair::from_pem(key_pem).context("discovery named CA key")?;
+        CertifiedIssuer::signed_by(params, key, issuer).context("discovery named CA signed")
+    }
+
+    fn discovery_test_leaf(
+        cdp_url: &str,
+        serial: u64,
+        issuer: Option<&CertifiedIssuer<'static, KeyPair>>,
+    ) -> anyhow::Result<CertificateDer<'static>> {
+        let mut params = CertificateParams::new(vec!["discovery-client".to_owned()])
+            .context("discovery leaf params")?;
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "discovery-client");
+        params.serial_number = Some(SerialNumber::from(serial));
+        params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyEncipherment,
+        ];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        params.crl_distribution_points = vec![CrlDistributionPoint {
+            uris: vec![cdp_url.to_owned()],
+        }];
+        let key = KeyPair::generate().context("discovery leaf key")?;
+        let cert = if let Some(signing_issuer) = issuer {
+            params.use_authority_key_identifier_extension = true;
+            params
+                .signed_by(&key, signing_issuer)
+                .context("discovery issued leaf")?
+        } else {
+            params
+                .self_signed(&key)
+                .context("discovery self-signed leaf")?
+        };
+        Ok(cert.der().clone())
+    }
+
+    fn discovery_test_set(
+        anchor: &CertificateDer<'static>,
+        config: MtlsConfig,
+    ) -> anyhow::Result<(Arc<CrlSet>, mpsc::UnboundedReceiver<String>)> {
+        install_ring_provider();
+        let mut roots = RootCertStore::empty();
+        roots.add(anchor.clone()).context("add discovery anchor")?;
+        let (tx, rx) = mpsc::unbounded_channel();
+        let set = CrlSet::new(
+            Arc::new(roots),
+            config,
+            tx,
+            HashMap::new(),
+            Arc::new(HashSet::new()),
+        )?;
+        Ok((set, rx))
+    }
+
+    /// Build a synthetic CRL cache entry for one issuer and source URL.
+    fn discovery_test_crl(
+        url: &str,
+        issuer: &CertifiedIssuer<'static, KeyPair>,
+        revoked_serial: u64,
+    ) -> anyhow::Result<(String, CachedCrl)> {
+        let revoked_crl: CertificateRevocationListDer<'static> = CertificateRevocationListParams {
+            this_update: date_time_ymd(2026, 1, 1),
+            next_update: date_time_ymd(2099, 1, 1),
+            crl_number: SerialNumber::from(1_u64),
+            issuing_distribution_point: None,
+            revoked_certs: vec![RevokedCertParams {
+                serial_number: SerialNumber::from(revoked_serial),
+                revocation_time: date_time_ymd(2026, 1, 1),
+                reason_code: Some(RevocationReason::KeyCompromise),
+                invalidity_date: None,
+            }],
+            key_identifier_method: KeyIdMethod::Sha256,
+        }
+        .signed_by(issuer)
+        .context("discovery CRL signed")?
+        .into();
+        let (this_update, next_update) = parse_crl_metadata(revoked_crl.as_ref())?;
+        Ok((
+            url.to_owned(),
+            CachedCrl {
+                der: revoked_crl,
+                this_update,
+                next_update,
+                fetched_at: SystemTime::now(),
+                source_url: url.to_owned(),
+            },
+        ))
+    }
+
+    /// Build a CRL set with several trust anchors and an initial cache.
+    fn discovery_test_multi_root_set(
+        anchors: &[&CertificateDer<'static>],
+        config: MtlsConfig,
+        initial_cache: HashMap<String, CachedCrl>,
+    ) -> anyhow::Result<(Arc<CrlSet>, mpsc::UnboundedReceiver<String>)> {
+        install_ring_provider();
+        let mut roots = RootCertStore::empty();
+        for &anchor in anchors {
+            roots.add(anchor.clone()).context("add discovery anchor")?;
+        }
+        let (tx, rx) = mpsc::unbounded_channel();
+        let set = CrlSet::new(
+            Arc::new(roots),
+            config,
+            tx,
+            initial_cache,
+            Arc::new(HashSet::new()),
+        )?;
+        Ok((set, rx))
+    }
+
+    /// Drain every currently queued discovery URL into a set.
+    fn drain_discovered(rx: &mut mpsc::UnboundedReceiver<String>) -> HashSet<String> {
+        from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// Holds the shared cross-signed discovery fixture for the three path tests;
+    /// no assertion lives in this fixture.
+    struct CrossSignedDiscoveryScenario {
+        root_r: CertifiedIssuer<'static, KeyPair>,
+        root_s: CertifiedIssuer<'static, KeyPair>,
+        cross_a: CertifiedIssuer<'static, KeyPair>,
+        cross_b: CertifiedIssuer<'static, KeyPair>,
+        leaf: CertificateDer<'static>,
+        url_leaf: String,
+        url_cross_a: String,
+        url_cross_b: String,
+    }
+
+    /// Builds the shared two-root cross-signed scenario for the three path tests;
+    /// no assertion lives in this helper.
+    fn cross_signed_discovery_scenario() -> anyhow::Result<CrossSignedDiscoveryScenario> {
+        let url_leaf = "http://127.0.0.1:9/cross-leaf.crl".to_owned();
+        let url_cross_a = "http://127.0.0.1:9/cross-a.crl".to_owned();
+        let url_cross_b = "http://127.0.0.1:9/cross-b.crl".to_owned();
+        let root_r = discovery_test_ca("discovery-root-r")?;
+        let root_s = discovery_test_ca("discovery-root-s")?;
+        let int_key = KeyPair::generate()?.serialize_pem();
+        let cross_a =
+            discovery_test_named_ca("discovery-cross", &url_cross_a, 501, &int_key, &root_r)?;
+        let cross_b =
+            discovery_test_named_ca("discovery-cross", &url_cross_b, 502, &int_key, &root_s)?;
+        let leaf = discovery_test_leaf(&url_leaf, 601, Some(&cross_a))?;
+        Ok(CrossSignedDiscoveryScenario {
+            root_r,
+            root_s,
+            cross_a,
+            cross_b,
+            leaf,
+            url_leaf,
+            url_cross_a,
+            url_cross_b,
+        })
+    }
+
+    /// Builds the revoked-first-copy cache for the shared cross-signed path tests;
+    /// no assertion lives in this helper.
+    fn cross_signed_initial_cache(
+        scenario: &CrossSignedDiscoveryScenario,
+    ) -> anyhow::Result<HashMap<String, CachedCrl>> {
+        Ok(HashMap::from([
+            discovery_test_crl(&scenario.url_cross_a, &scenario.root_r, 501)?,
+            discovery_test_crl(&scenario.url_leaf, &scenario.cross_a, 999)?,
+        ]))
+    }
+
+    /// Builds either presentation order for the three shared cross-signed path tests;
+    /// no assertion lives in this helper.
+    fn cross_signed_chain(
+        first: &CertifiedIssuer<'static, KeyPair>,
+        second: &CertifiedIssuer<'static, KeyPair>,
+    ) -> Vec<CertificateDer<'static>> {
+        vec![first.der().clone(), second.der().clone()]
+    }
+
     /// Build the mTLS configuration most unit tests start from.
     fn test_mtls_config() -> anyhow::Result<MtlsConfig> {
         from_value(json!({
@@ -2466,6 +3414,430 @@ mod tests {
             "crl_max_cache_entries": 16,
         }))
         .context("verifier mtls config")
+    }
+
+    // trusted-origin derivation (operator-trusted CRL/AIA origins)
+
+    /// Minimal DER length encoding (definite form, short or long).
+    fn der_len(len: usize) -> anyhow::Result<Vec<u8>> {
+        if len < 0x80 {
+            return Ok(vec![
+                u8::try_from(len).context("short DER length fits in a byte")?,
+            ]);
+        }
+        let mut bytes = Vec::new();
+        let mut remaining = len;
+        while remaining > 0 {
+            bytes.push(u8::try_from(remaining & 0xff).context("DER length byte")?);
+            remaining >>= 8_u32;
+        }
+        bytes.reverse();
+        let mut out =
+            vec![0x80 | u8::try_from(bytes.len()).context("DER length-of-length fits in 7 bits")?];
+        out.extend(bytes);
+        Ok(out)
+    }
+
+    /// Wrap `content` in a DER TLV with the given tag byte.
+    fn der_tlv(tag: u8, content: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let mut out = vec![tag];
+        out.extend(der_len(content.len())?);
+        out.extend_from_slice(content);
+        Ok(out)
+    }
+
+    /// DER encoding of the `id-ad-caIssuers` OID (1.3.6.1.5.5.7.48.2).
+    const OID_AD_CA_ISSUERS_DER: [u8; 10] =
+        [0x06, 0x08, 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x02];
+    /// DER encoding of the `id-ad-ocsp` OID (1.3.6.1.5.5.7.48.1).
+    const OID_AD_OCSP_DER: [u8; 10] = [0x06, 0x08, 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01];
+
+    /// Hand-encode an `AuthorityInfoAccessSyntax` extension value (RFC 5280
+    /// §4.2.2.1) naming one or more (method OID DER, URI) access
+    /// descriptions. `rcgen` has no native AIA field.
+    fn aia_extension_der(entries: &[(&[u8], &str)]) -> anyhow::Result<Vec<u8>> {
+        let mut access_descriptions = Vec::new();
+        for (oid_der, uri) in entries {
+            // GeneralName's uniformResourceIdentifier is context tag [6]
+            // IMPLICIT IA5String (RFC 5280 appendix A).
+            let general_name = der_tlv(0x86, uri.as_bytes())?;
+            let mut access_description = Vec::new();
+            access_description.extend_from_slice(oid_der);
+            access_description.extend(general_name);
+            access_descriptions.extend(der_tlv(0x30, &access_description)?);
+        }
+        der_tlv(0x30, &access_descriptions)
+    }
+
+    /// Build a self-signed CA certificate carrying a CDP extension with
+    /// `cdp_uris` and an Authority Information Access extension with
+    /// `aia_entries` (method OID DER, URI).
+    fn build_ca_with_cdp_and_aia(
+        common_name: &str,
+        cdp_uris: Vec<String>,
+        aia_entries: &[(&[u8], &str)],
+    ) -> anyhow::Result<CertificateDer<'static>> {
+        let mut params = CertificateParams::new(Vec::<String>::new()).context("ca params")?;
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        params
+            .distinguished_name
+            .push(DnType::CommonName, common_name);
+        if !cdp_uris.is_empty() {
+            params.crl_distribution_points = vec![CrlDistributionPoint { uris: cdp_uris }];
+        }
+        if !aia_entries.is_empty() {
+            let aia_der = aia_extension_der(aia_entries)?;
+            params
+                .custom_extensions
+                .push(CustomExtension::from_oid_content(
+                    &[1, 3, 6, 1, 5, 5, 7, 1, 1],
+                    aia_der,
+                ));
+        }
+        let key = KeyPair::generate().context("ca key")?;
+        let issuer: CertifiedIssuer<'static, KeyPair> =
+            CertifiedIssuer::self_signed(params, key).context("ca self-signed")?;
+        Ok(issuer.der().clone())
+    }
+
+    /// Pins that trusted-origin derivation reads CDP and AIA (caIssuers,
+    /// OCSP) URIs from BOTH the CA-bundle and server-chain inputs, keeps
+    /// only http(s), lowercases hosts, normalizes default ports, keeps
+    /// IP-literal hosts (including a bracketed IPv6 literal), and drops
+    /// userinfo-bearing and non-http(s) URIs.
+    #[test]
+    fn trusted_origins_derived_from_ca_bundle_and_server_chain() -> anyhow::Result<()> {
+        let ca_cert = build_ca_with_cdp_and_aia(
+            "trusted-origin-ca-bundle-cert",
+            vec![
+                "https://ca-cdp.example:443/crl".to_owned(),
+                "https://user:pass@ca-cdp.example/userinfo-crl".to_owned(),
+                "ldap://ca-cdp.example/crl".to_owned(),
+            ],
+            &[
+                (&OID_AD_CA_ISSUERS_DER, "http://ca-issuer.example:80/ca.crt"),
+                (&OID_AD_OCSP_DER, "http://192.0.2.1:8080/ocsp"),
+            ],
+        )?;
+        let server_cert = build_ca_with_cdp_and_aia(
+            "trusted-origin-server-chain-cert",
+            vec![
+                "HTTPS://CRL.Example.COM/x".to_owned(),
+                "https://[2001:db8::1]:8443/crl".to_owned(),
+            ],
+            &[],
+        )?;
+
+        let origins = collect_trusted_crl_origins(
+            slice::from_ref(&ca_cert),
+            slice::from_ref(&server_cert),
+            true,
+        );
+        let mut rendered: Vec<String> = origins.iter().map(Origin::ascii_serialization).collect();
+        rendered.sort();
+
+        assert_eq!(
+            rendered,
+            vec![
+                "http://192.0.2.1:8080".to_owned(),
+                "http://ca-issuer.example".to_owned(),
+                "https://[2001:db8::1]:8443".to_owned(),
+                "https://ca-cdp.example".to_owned(),
+                "https://crl.example.com".to_owned(),
+            ],
+            "exactly the five http(s) origins must survive, with userinfo and ldap:// \
+             dropped, hosts lowercased, and default ports normalized: {rendered:?}"
+        );
+        Ok(())
+    }
+
+    /// Pins that the connect-time resolver allowlist built from an
+    /// IP-literal trusted origin carries no CIDR entries: `screen_addrs`
+    /// applies CIDR entries to every hostname's resolved addresses, so an
+    /// IP-literal origin added as a CIDR would let a rebinding hostname
+    /// reach that same address on any port.
+    #[test]
+    fn ip_literal_trusted_origin_yields_no_resolver_cidr_entries() -> anyhow::Result<()> {
+        let origin = Url::parse("http://127.0.0.1:4242/crl")
+            .context("parse IP-literal origin URL")?
+            .origin();
+        let origins: HashSet<Origin> = once(origin).collect();
+
+        assert!(
+            trusted_hostnames(&origins).is_empty(),
+            "an IP-literal origin must not contribute a resolver hostname"
+        );
+        let allowlist = build_trusted_origin_allowlist(&origins);
+        assert!(
+            !allowlist.ip_allowed(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            "the resolver allowlist must hold no CIDR entry for an IP-literal trusted origin"
+        );
+        Ok(())
+    }
+
+    /// Pins that only a URL whose exact origin is trusted gets the trusted client: the same host on another port, or another scheme, gets the screened one.
+    #[tokio::test]
+    async fn crl_client_selection_uses_the_exact_origin() -> anyhow::Result<()> {
+        install_ring_provider();
+        let trusted_origin = Url::parse("http://localhost:4000/a.crl")
+            .context("parse trusted CRL origin")?
+            .origin();
+        let trusted: HashSet<Origin> = once(trusted_origin).collect();
+        let clients = CrlHttpClients::new(&trusted, Duration::from_secs(5))?;
+
+        let exact_url = Url::parse("http://localhost:4000/a.crl").context("parse exact URL")?;
+        let (exact_trusted, exact_client) = clients.for_url(&exact_url, &trusted);
+        assert!(
+            exact_trusted,
+            "exact trusted origin must be reported trusted"
+        );
+        assert!(
+            ptr::eq(exact_client, &raw const clients.trusted),
+            "exact trusted origin must use the trusted client"
+        );
+
+        let port_url = Url::parse("http://localhost:4001/a.crl").context("parse port URL")?;
+        let (port_trusted, port_client) = clients.for_url(&port_url, &trusted);
+        assert!(
+            !port_trusted,
+            "same hostname on another port must not be trusted"
+        );
+        assert!(
+            ptr::eq(port_client, &raw const clients.screened),
+            "same hostname on another port must use the screened client"
+        );
+
+        let scheme_url = Url::parse("https://localhost:4000/a.crl").context("parse scheme URL")?;
+        let (scheme_trusted, scheme_client) = clients.for_url(&scheme_url, &trusted);
+        assert!(
+            !scheme_trusted,
+            "same hostname and port under another scheme must not be trusted"
+        );
+        assert!(
+            ptr::eq(scheme_client, &raw const clients.screened),
+            "same hostname and port under another scheme must use the screened client"
+        );
+        Ok(())
+    }
+
+    /// Pins that connect-time screening matches the exact trusted origin: the screened client refuses a trusted hostname, the trusted client reaches it.
+    #[tokio::test]
+    async fn screened_crl_client_refuses_a_trusted_hostname_at_connect_time() -> anyhow::Result<()>
+    {
+        install_ring_provider();
+        let mut bound_listener = None;
+        for addr in ("localhost", 0)
+            .to_socket_addrs()
+            .context("resolve localhost bind candidates")?
+        {
+            if let Ok(bound) = TcpListener::bind(addr) {
+                bound_listener = Some(bound);
+                break;
+            }
+        }
+        let listener = bound_listener.context("no localhost address could be bound")?;
+        let port = listener
+            .local_addr()
+            .context("read mock listener address")?
+            .port();
+        let server = MockServer::builder().listener(listener).start().await;
+        Mock::given(method("GET"))
+            .and(path("/crl"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server)
+            .await;
+
+        let url = Url::parse(&format!("http://localhost:{port}/crl")).context("parse CRL URL")?;
+        let trusted: HashSet<Origin> = once(url.origin()).collect();
+        let clients = CrlHttpClients::new(&trusted, Duration::from_secs(5))?;
+
+        let status = clients.trusted.get(url.clone()).send().await?.status();
+        assert_eq!(
+            status,
+            reqwest::StatusCode::OK,
+            "trusted client must reach the trusted localhost origin"
+        );
+
+        let err = clients
+            .screened
+            .get(url)
+            .send()
+            .await
+            .err()
+            .context("screened client must reject localhost")?;
+        let mut rendered = err.to_string();
+        let mut current = err.source();
+        while let Some(inner) = current {
+            rendered.push_str(" :: ");
+            rendered.push_str(&inner.to_string());
+            current = inner.source();
+        }
+        assert!(
+            rendered.contains("blocked IP"),
+            "screened client error chain must expose blocked IP: {rendered}"
+        );
+        Ok(())
+    }
+
+    /// Pins that the trusted-origin match considers the full origin (scheme,
+    /// host, port), not just host and port.
+    ///
+    /// A loopback address trusted only under `https` must stay blocked when
+    /// the same host and port are requested under `http`.
+    #[tokio::test]
+    async fn fetch_crl_trusted_origin_match_is_scheme_sensitive() -> anyhow::Result<()> {
+        install_ring_provider();
+        let crl_cpu = Arc::new(Semaphore::new(CRL_CPU_PERMITS));
+        let trusted_origin = Url::parse("https://127.0.0.1:65535/crl")
+            .context("parse https trusted origin")?
+            .origin();
+        let trusted_origins: Arc<HashSet<Origin>> = Arc::new(once(trusted_origin).collect());
+        let clients = CrlHttpClients::new(&trusted_origins, Duration::from_secs(5))?;
+
+        let Err(err) = fetch_crl(
+            &clients,
+            "http://127.0.0.1:65535/crl",
+            true,
+            1024,
+            &crl_cpu,
+            &trusted_origins,
+        )
+        .await
+        else {
+            anyhow::bail!(
+                "a loopback origin trusted only under https must stay blocked under http"
+            );
+        };
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("loopback"),
+            "error must carry the loopback block reason: {rendered}"
+        );
+        Ok(())
+    }
+
+    /// Pins that a cloud-metadata address stays blocked even when its
+    /// origin is in the trusted set: the exception in
+    /// `reject_blocked_crl_ip` is unconditional on the block reason, not
+    /// just on `trusted_origin`.
+    ///
+    /// Both the client's own timeout and the outer `tokio::time::timeout`
+    /// bound this test's worst case: if the cloud-metadata exception were
+    /// ever dropped, the pre-flight would stop rejecting before any network
+    /// attempt, and the fetch would instead try to reach a real (unreachable
+    /// from a test sandbox) `169.254.169.254` for as long as the client's
+    /// timeout allows. Both bounds are generous for the passing case (the
+    /// pre-flight returns in microseconds, no network attempted) and make a
+    /// regression fail by assertion in bounded time instead of hanging until
+    /// an external test-runner kill.
+    #[tokio::test]
+    async fn fetch_crl_cloud_metadata_blocked_even_for_trusted_origin() -> anyhow::Result<()> {
+        install_ring_provider();
+        let crl_cpu = Arc::new(Semaphore::new(CRL_CPU_PERMITS));
+        let metadata_url = "http://169.254.169.254/latest/meta-data/";
+        let trusted_origin = Url::parse(metadata_url)
+            .context("parse cloud-metadata origin")?
+            .origin();
+        let trusted_origins: Arc<HashSet<Origin>> = Arc::new(once(trusted_origin).collect());
+        let clients = CrlHttpClients::new(&trusted_origins, Duration::from_millis(500))?;
+
+        let outcome = timeout(
+            Duration::from_secs(2),
+            fetch_crl(
+                &clients,
+                metadata_url,
+                true,
+                1024,
+                &crl_cpu,
+                &trusted_origins,
+            ),
+        )
+        .await
+        .context(
+            "cloud metadata must be rejected at the pre-flight stage, well within 2s; a \
+             mutant that drops the cloud-metadata exception would instead attempt a real \
+             network connection and hang here",
+        )?;
+
+        let Err(err) = outcome else {
+            anyhow::bail!("cloud metadata must stay blocked even for a trusted origin");
+        };
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("cloud_metadata"),
+            "error must carry the cloud_metadata block reason, proving the pre-flight check \
+             ran before any network attempt: {rendered}"
+        );
+        Ok(())
+    }
+
+    /// Pins the server-chain source of trusted CRL origins end to end
+    /// through the crate-internal `bootstrap_fetch_with_server_chain`: a CDP
+    /// named ONLY in the server certificate chain (never in the CA bundle)
+    /// is trusted and fetched.
+    ///
+    /// The production call site (`run_server` in `transport.rs`) that passes
+    /// the real server chain is not unit-testable here: it also loads TLS
+    /// listener state this module's tests do not construct. This test is the
+    /// nearest in-crate seam: it calls the exact crate-internal function
+    /// `run_server` calls, with the one parameter it is the only caller to
+    /// populate.
+    #[tokio::test]
+    async fn bootstrap_fetch_with_server_chain_trusts_server_chain_only_origin()
+    -> anyhow::Result<()> {
+        install_ring_provider();
+        let mock = MockServer::start().await;
+        let port = mock.address().port();
+        let cdp_url = format!("http://127.0.0.1:{port}/server-chain-only-crl");
+        Mock::given(method("GET"))
+            .and(path("/server-chain-only-crl"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(Vec::<u8>::new()))
+            .mount(&mock)
+            .await;
+
+        // The CA bundle names NO CDP at all: if the trusted set were ever
+        // derived from `ca_certs` alone, this origin would be absent from it
+        // and the fetch below would stay blocked.
+        let ca_cert = build_ca_with_cdp_and_aia("server-chain-only-ca", vec![], &[])?;
+        let server_chain_cert =
+            build_ca_with_cdp_and_aia("server-chain-only-leaf", vec![cdp_url.clone()], &[])?;
+
+        let mut roots = RootCertStore::empty();
+        roots.add(ca_cert.clone()).context("add ca root")?;
+
+        let (set, discover_rx) = bootstrap_fetch_with_server_chain(
+            Arc::new(roots),
+            slice::from_ref(&ca_cert),
+            slice::from_ref(&server_chain_cert),
+            test_mtls_config()?,
+        )
+        .await
+        .context("bootstrap with server chain")?;
+        drop(discover_rx);
+
+        // `__test_trigger_fetch` swallows fetch errors and never commits a
+        // non-CRL body to the cache, so the trust decision is asserted by
+        // the mock's received-request count, not by `__test_cache_contains`.
+        set.__test_trigger_fetch(&cdp_url)
+            .await
+            .context("trigger fetch of the server-chain-only trusted origin")?;
+        let received = mock
+            .received_requests()
+            .await
+            .context("request recording must be enabled")?;
+        assert!(
+            received
+                .iter()
+                .any(|request| request.url.path() == "/server-chain-only-crl"),
+            "a CDP named only in the server certificate chain must be trusted and reach \
+             the mock"
+        );
+        Ok(())
     }
 
     fn test_crl_set_with_receiver() -> anyhow::Result<(Arc<CrlSet>, mpsc::UnboundedReceiver<String>)>
@@ -2507,6 +3879,514 @@ mod tests {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let _inserted = pending.insert(url.to_owned());
+    }
+
+    /// Pins that CDP URLs from chains that do not verify cannot enter discovery.
+    #[test]
+    fn unverifiable_chain_cdps_are_not_discovered() -> anyhow::Result<()> {
+        let ca = discovery_test_ca("discovery-ca-x")?;
+        let mut config = test_mtls_config()?;
+        config.crl_deny_on_unavailable = false;
+        let (set, mut rx) = discovery_test_set(ca.der(), config)?;
+        let verifier = DynamicClientCertVerifier::new(Arc::clone(&set));
+        let attacker_url = "http://127.0.0.1:9/attacker.crl";
+        let leaf = discovery_test_leaf(attacker_url, 101, None)?;
+
+        assert!(
+            verifier
+                .verify_client_cert(&leaf, &[], UnixTime::now())
+                .is_err(),
+            "self-signed client certificate must not verify against CA X"
+        );
+        assert_eq!(
+            rx.try_recv(),
+            Err(TryRecvError::Empty),
+            "unverifiable chain must not enqueue attacker CDP URL"
+        );
+        assert!(
+            !pending_contains(&set, attacker_url),
+            "unverifiable chain must not mark attacker CDP URL pending"
+        );
+        assert!(
+            set.cdp_urls_on_verified_paths(&leaf, &[], UnixTime::now())
+                .is_none(),
+            "an unverifiable chain must yield no verified path"
+        );
+        Ok(())
+    }
+
+    /// Pins that first-contact discovery still admits a URL from a verified leaf.
+    #[test]
+    fn verifiable_chain_cdps_are_discovered() -> anyhow::Result<()> {
+        let ca = discovery_test_ca("discovery-ca-x")?;
+        let mut config = test_mtls_config()?;
+        config.crl_deny_on_unavailable = false;
+        let (set, mut rx) = discovery_test_set(ca.der(), config)?;
+        let verifier = DynamicClientCertVerifier::new(set);
+        let issued_url = "http://127.0.0.1:9/issued.crl";
+        let leaf = discovery_test_leaf(issued_url, 102, Some(&ca))?;
+
+        let _verdict = verifier.verify_client_cert(&leaf, &[], UnixTime::now());
+        assert_eq!(
+            rx.try_recv(),
+            Ok(issued_url.to_owned()),
+            "verified leaf CDP URL must be enqueued on first contact"
+        );
+        Ok(())
+    }
+
+    /// Pins that unverifiable chains do not consume verified-path discovery budget.
+    #[test]
+    fn unverifiable_chain_does_not_consume_discovery_budget() -> anyhow::Result<()> {
+        let ca = discovery_test_ca("discovery-ca-x")?;
+        let mut config = test_mtls_config()?;
+        config.crl_deny_on_unavailable = false;
+        config.crl_discovery_rate_per_min = 1;
+        let (set, mut rx) = discovery_test_set(ca.der(), config)?;
+        let verifier = DynamicClientCertVerifier::new(set);
+        let attacker_url = "http://127.0.0.1:9/attacker.crl";
+        let issued_url = "http://127.0.0.1:9/issued.crl";
+        let attacker_leaf = discovery_test_leaf(attacker_url, 103, None)?;
+        let issued_leaf = discovery_test_leaf(issued_url, 104, Some(&ca))?;
+
+        let _attacker_verdict = verifier.verify_client_cert(&attacker_leaf, &[], UnixTime::now());
+        let _issued_verdict = verifier.verify_client_cert(&issued_leaf, &[], UnixTime::now());
+
+        assert_eq!(
+            rx.try_recv(),
+            Ok(issued_url.to_owned()),
+            "verified leaf must receive the only discovery token"
+        );
+        assert_eq!(
+            rx.try_recv(),
+            Err(TryRecvError::Empty),
+            "unverifiable chain must not spend discovery budget"
+        );
+        Ok(())
+    }
+
+    /// Pins that certificates appended outside every verified path choose no discovery URL.
+    #[test]
+    fn cdps_outside_every_verified_path_are_not_discovered() -> anyhow::Result<()> {
+        let ca = discovery_test_ca("discovery-ca-x")?;
+        let evil = discovery_test_ca("discovery-evil-ca")?;
+        let mut config = test_mtls_config()?;
+        config.crl_deny_on_unavailable = false;
+        config.crl_end_entity_only = false;
+        let (set, mut rx) = discovery_test_set(ca.der(), config)?;
+        let verifier = DynamicClientCertVerifier::new(set);
+        let issued_url = "http://127.0.0.1:9/issued.crl";
+        let evil_url = "http://127.0.0.1:9/evil.crl";
+        let leaf = discovery_test_leaf(issued_url, 105, Some(&ca))?;
+        let evil_intermediate = discovery_test_intermediate(evil_url, &evil)?;
+
+        let _verdict = verifier.verify_client_cert(
+            &leaf,
+            slice::from_ref(evil_intermediate.der()),
+            UnixTime::now(),
+        );
+
+        assert_eq!(
+            rx.try_recv(),
+            Ok(issued_url.to_owned()),
+            "verified path leaf CDP URL must be discovered"
+        );
+        assert_eq!(
+            rx.try_recv(),
+            Err(TryRecvError::Empty),
+            "off-path appended certificate CDP URL must not be discovered"
+        );
+        Ok(())
+    }
+
+    /// Pins that intermediate certificates on a verified path still contribute CDP URLs.
+    #[test]
+    fn verified_path_intermediate_cdps_are_discovered() -> anyhow::Result<()> {
+        let root = discovery_test_ca("discovery-root")?;
+        let intermediate_url = "http://127.0.0.1:9/intermediate.crl";
+        let leaf_url = "http://127.0.0.1:9/leaf.crl";
+        let intermediate = discovery_test_intermediate(intermediate_url, &root)?;
+        let leaf = discovery_test_leaf(leaf_url, 106, Some(&intermediate))?;
+        let mut config = test_mtls_config()?;
+        config.crl_deny_on_unavailable = false;
+        let (set, mut rx) = discovery_test_set(root.der(), config)?;
+        let verifier = DynamicClientCertVerifier::new(set);
+
+        let _verdict = verifier.verify_client_cert(
+            &leaf,
+            slice::from_ref(intermediate.der()),
+            UnixTime::now(),
+        );
+        let discovered = [rx.try_recv()?, rx.try_recv()?]
+            .into_iter()
+            .collect::<HashSet<_>>();
+
+        assert_eq!(
+            discovered.len(),
+            2,
+            "verified leaf and intermediate CDP URLs must both be discovered"
+        );
+        assert!(
+            discovered.contains(leaf_url),
+            "verified leaf CDP URL must be discovered"
+        );
+        assert!(
+            discovered.contains(intermediate_url),
+            "verified intermediate CDP URL must be discovered"
+        );
+        Ok(())
+    }
+
+    /// Pins that discovery records every verified path, in either presentation order, so both copies of a cross-signed intermediate name their CRLs.
+    #[test]
+    fn every_verified_path_cdps_are_discovered() -> anyhow::Result<()> {
+        let scenario = cross_signed_discovery_scenario()?;
+        let mut config = test_mtls_config()?;
+        config.crl_deny_on_unavailable = false;
+        let expected_urls = HashSet::from([
+            scenario.url_leaf.clone(),
+            scenario.url_cross_a.clone(),
+            scenario.url_cross_b.clone(),
+        ]);
+
+        for chain in [
+            cross_signed_chain(&scenario.cross_a, &scenario.cross_b),
+            cross_signed_chain(&scenario.cross_b, &scenario.cross_a),
+        ] {
+            let (set, mut rx) = discovery_test_multi_root_set(
+                &[scenario.root_r.der(), scenario.root_s.der()],
+                config.clone(),
+                HashMap::new(),
+            )?;
+            let verifier = DynamicClientCertVerifier::new(set);
+
+            let _verdict = verifier.verify_client_cert(&scenario.leaf, &chain, UnixTime::now());
+            assert_eq!(
+                drain_discovered(&mut rx),
+                expected_urls,
+                "every verified path in either presentation order must contribute CDP URLs"
+            );
+        }
+        Ok(())
+    }
+
+    /// Pins that under the default fail-closed policy a client whose first cross-signed copy is revoked is refused only until the second copy's CRL is cached.
+    #[tokio::test]
+    async fn cross_signed_client_is_accepted_once_the_alternative_crl_is_cached()
+    -> anyhow::Result<()> {
+        let scenario = cross_signed_discovery_scenario()?;
+        let mut config = test_mtls_config()?;
+        config.crl_deny_on_unavailable = true;
+        let (set, mut rx) = discovery_test_multi_root_set(
+            &[scenario.root_r.der(), scenario.root_s.der()],
+            config,
+            cross_signed_initial_cache(&scenario)?,
+        )?;
+        let verifier = DynamicClientCertVerifier::new(Arc::clone(&set));
+        let chain = cross_signed_chain(&scenario.cross_a, &scenario.cross_b);
+
+        assert!(
+            verifier
+                .verify_client_cert(&scenario.leaf, &chain, UnixTime::now())
+                .is_err(),
+            "missing alternative CRL must fail closed after the first copy is revoked"
+        );
+        assert_eq!(
+            drain_discovered(&mut rx),
+            HashSet::from([scenario.url_cross_b.clone()]),
+            "the alternative cross-signed copy's CRL must be discovered"
+        );
+        let (url, cached) = discovery_test_crl(&scenario.url_cross_b, &scenario.root_s, 999)?;
+        assert!(
+            set.__test_try_insert_cache(&url, cached).await?,
+            "alternative CRL cache insertion must publish a verifier update"
+        );
+        assert!(
+            verifier
+                .verify_client_cert(&scenario.leaf, &chain, UnixTime::now())
+                .is_ok(),
+            "client must be accepted once the alternative non-revoking CRL is cached"
+        );
+        Ok(())
+    }
+
+    /// Pins that under fail-open the second cross-signed copy's CRL is discovered and enforced, so a revoked second copy is refused once that CRL is cached.
+    #[tokio::test]
+    async fn revoked_alternative_copy_is_refused_once_its_crl_is_cached() -> anyhow::Result<()> {
+        let scenario = cross_signed_discovery_scenario()?;
+        let mut config = test_mtls_config()?;
+        config.crl_deny_on_unavailable = false;
+        let (set, mut rx) = discovery_test_multi_root_set(
+            &[scenario.root_r.der(), scenario.root_s.der()],
+            config,
+            cross_signed_initial_cache(&scenario)?,
+        )?;
+        let verifier = DynamicClientCertVerifier::new(Arc::clone(&set));
+        let chain = cross_signed_chain(&scenario.cross_a, &scenario.cross_b);
+
+        assert!(
+            verifier
+                .verify_client_cert(&scenario.leaf, &chain, UnixTime::now())
+                .is_ok(),
+            "fail-open must accept before the alternative CRL is cached"
+        );
+        assert_eq!(
+            drain_discovered(&mut rx),
+            HashSet::from([scenario.url_cross_b.clone()]),
+            "the alternative cross-signed copy's CRL must be discovered under fail-open"
+        );
+        let (url, cached) = discovery_test_crl(&scenario.url_cross_b, &scenario.root_s, 502)?;
+        assert!(
+            set.__test_try_insert_cache(&url, cached).await?,
+            "revoking alternative CRL cache insertion must publish a verifier update"
+        );
+        assert!(
+            verifier
+                .verify_client_cert(&scenario.leaf, &chain, UnixTime::now())
+                .is_err(),
+            "client must be refused once the alternative copy's CRL revokes it"
+        );
+        Ok(())
+    }
+
+    /// Pins that byte-identical copies of one certificate cannot spend the path-search budget and hide another verified path.
+    #[test]
+    fn duplicated_intermediates_cannot_exhaust_discovery() -> anyhow::Result<()> {
+        let root_r = discovery_test_ca("discovery-root-r")?;
+        let root_s = discovery_test_ca("discovery-root-s")?;
+        let int_key = KeyPair::generate()?.serialize_pem();
+        let url_leaf = "http://127.0.0.1:9/dup-leaf.crl";
+        let url_cross_b = "http://127.0.0.1:9/dup-cross-b.crl";
+        let url_cross_m = "http://127.0.0.1:9/dup-cross-m.crl";
+        let url_m = "http://127.0.0.1:9/dup-upper-m.crl";
+        let ca_m = discovery_test_named_ca(
+            "discovery-upper-m",
+            url_m,
+            701,
+            &KeyPair::generate()?.serialize_pem(),
+            &root_r,
+        )?;
+        let cross_m =
+            discovery_test_named_ca("discovery-cross", url_cross_m, 702, &int_key, &ca_m)?;
+        let cross_b =
+            discovery_test_named_ca("discovery-cross", url_cross_b, 502, &int_key, &root_s)?;
+        let leaf = discovery_test_leaf(url_leaf, 603, Some(&cross_m))?;
+        let mut config = test_mtls_config()?;
+        config.crl_deny_on_unavailable = false;
+        let (set, mut rx) =
+            discovery_test_multi_root_set(&[root_r.der(), root_s.der()], config, HashMap::new())?;
+        let verifier = DynamicClientCertVerifier::new(set);
+        let chain = once(cross_m.der().clone())
+            .chain(repeat_n(ca_m.der().clone(), 40))
+            .chain(once(cross_b.der().clone()))
+            .collect::<Vec<_>>();
+
+        let _verdict = verifier.verify_client_cert(&leaf, &chain, UnixTime::now());
+        assert_eq!(
+            drain_discovered(&mut rx),
+            HashSet::from([
+                url_leaf.to_owned(),
+                url_cross_m.to_owned(),
+                url_m.to_owned(),
+                url_cross_b.to_owned(),
+            ]),
+            "duplicate intermediate bytes must not hide the alternative verified path"
+        );
+        Ok(())
+    }
+
+    /// Pins that every intermediate on a recorded path contributes its CDP URLs, not only the one next to the end entity.
+    #[test]
+    fn every_intermediate_on_a_verified_path_contributes() -> anyhow::Result<()> {
+        let root_r = discovery_test_ca("discovery-root-r")?;
+        let url_leaf = "http://127.0.0.1:9/layered-leaf.crl";
+        let url_upper = "http://127.0.0.1:9/layered-upper.crl";
+        let url_lower = "http://127.0.0.1:9/layered-lower.crl";
+        let upper = discovery_test_named_ca(
+            "discovery-upper",
+            url_upper,
+            801,
+            &KeyPair::generate()?.serialize_pem(),
+            &root_r,
+        )?;
+        let lower = discovery_test_named_ca(
+            "discovery-lower",
+            url_lower,
+            802,
+            &KeyPair::generate()?.serialize_pem(),
+            &upper,
+        )?;
+        let leaf = discovery_test_leaf(url_leaf, 604, Some(&lower))?;
+        let mut config = test_mtls_config()?;
+        config.crl_deny_on_unavailable = false;
+        let (set, mut rx) = discovery_test_set(root_r.der(), config)?;
+        let verifier = DynamicClientCertVerifier::new(set);
+        let chain = vec![lower.der().clone(), upper.der().clone()];
+
+        let _verdict = verifier.verify_client_cert(&leaf, &chain, UnixTime::now());
+        assert_eq!(
+            drain_discovered(&mut rx),
+            HashSet::from([
+                url_leaf.to_owned(),
+                url_lower.to_owned(),
+                url_upper.to_owned(),
+            ]),
+            "every intermediate on a verified path must contribute CDP URLs"
+        );
+        Ok(())
+    }
+
+    /// Pins that verified-path discovery is lazy and skipped for already-known URLs.
+    #[test]
+    fn discovery_gate_runs_once_and_only_for_new_candidates() -> anyhow::Result<()> {
+        let (set, _rx) = test_crl_set_with_receiver()?;
+        let url = "http://127.0.0.1:9/new.crl".to_owned();
+        let calls = Cell::new(0_usize);
+        let discoverable = || {
+            calls.set(calls.get().saturating_add(1));
+            Some(once(url.clone()).collect::<HashSet<_>>())
+        };
+
+        let _first = set.note_discovered_urls(slice::from_ref(&url), &[], discoverable);
+        assert_eq!(
+            calls.get(),
+            1,
+            "new URL must evaluate the discovery gate once"
+        );
+        mark_pending(&set, &url);
+        let _second = set.note_discovered_urls(slice::from_ref(&url), &[], || {
+            calls.set(calls.get().saturating_add(1));
+            Some(once(url.clone()).collect::<HashSet<_>>())
+        });
+        assert_eq!(
+            calls.get(),
+            1,
+            "already-pending URL must not evaluate the discovery gate"
+        );
+        Ok(())
+    }
+
+    fn root_store_with(anchor: &CertificateDer<'static>) -> anyhow::Result<Arc<RootCertStore>> {
+        let mut roots = RootCertStore::empty();
+        roots.add(anchor.clone()).context("add root anchor")?;
+        Ok(Arc::new(roots))
+    }
+
+    fn cached_crl_for_revoked_leaf(
+        issuer: &CertifiedIssuer<'static, KeyPair>,
+        revoked_serial: u64,
+    ) -> anyhow::Result<HashMap<String, CachedCrl>> {
+        let revoked_crl: CertificateRevocationListDer<'static> = CertificateRevocationListParams {
+            this_update: date_time_ymd(2026, 1, 1),
+            next_update: date_time_ymd(2027, 1, 1),
+            crl_number: SerialNumber::from(1_u64),
+            issuing_distribution_point: None,
+            revoked_certs: vec![RevokedCertParams {
+                serial_number: SerialNumber::from(revoked_serial),
+                revocation_time: date_time_ymd(2026, 1, 1),
+                reason_code: Some(RevocationReason::KeyCompromise),
+                invalidity_date: None,
+            }],
+            key_identifier_method: KeyIdMethod::Sha256,
+        }
+        .signed_by(issuer)
+        .context("revocation CRL signed")?
+        .into();
+        let (this_update, next_update) = parse_crl_metadata(revoked_crl.as_ref())?;
+        let mut cache = HashMap::new();
+        let _previous = cache.insert(
+            "memory://revoked".to_owned(),
+            CachedCrl {
+                der: revoked_crl,
+                this_update,
+                next_update,
+                fetched_at: SystemTime::now(),
+                source_url: "memory://revoked".to_owned(),
+            },
+        );
+        Ok(cache)
+    }
+
+    /// Pins that the extracted webpki path matches the live rustls verifier decision.
+    #[test]
+    fn verified_path_agrees_with_the_live_verifier() -> anyhow::Result<()> {
+        let root = discovery_test_ca("discovery-root")?;
+        let intermediate =
+            discovery_test_intermediate("http://127.0.0.1:9/intermediate.crl", &root)?;
+        let direct_leaf = discovery_test_leaf("http://127.0.0.1:9/direct.crl", 107, Some(&root))?;
+        let chained_leaf =
+            discovery_test_leaf("http://127.0.0.1:9/chained.crl", 108, Some(&intermediate))?;
+        let revoked_leaf = discovery_test_leaf("http://127.0.0.1:9/revoked.crl", 109, Some(&root))?;
+        let root_store = root_store_with(root.der())?;
+        let config = test_mtls_config()?;
+        let (root_set, _root_rx) = discovery_test_set(root.der(), config.clone())?;
+        let (intermediate_set, _intermediate_rx) =
+            discovery_test_set(intermediate.der(), config.clone())?;
+
+        assert!(
+            root_set
+                .cdp_urls_on_verified_paths(&direct_leaf, &[], UnixTime::now())
+                .is_some(),
+            "direct leaf path must verify for CDP extraction"
+        );
+        assert!(
+            root_set
+                .cdp_urls_on_verified_paths(
+                    &chained_leaf,
+                    slice::from_ref(intermediate.der()),
+                    UnixTime::now()
+                )
+                .is_some(),
+            "intermediate chain path must verify for CDP extraction"
+        );
+        assert!(
+            intermediate_set
+                .cdp_urls_on_verified_paths(&chained_leaf, &[], UnixTime::now())
+                .is_some(),
+            "leaf under configured intermediate anchor must verify for CDP extraction"
+        );
+
+        let cache = cached_crl_for_revoked_leaf(&root, 109)?;
+        let live_verifier = rebuild_verifier(&root_store, &config, &cache)?;
+        assert!(
+            root_set
+                .cdp_urls_on_verified_paths(&revoked_leaf, &[], UnixTime::now())
+                .is_some(),
+            "verified-path extraction must ignore revocation"
+        );
+        assert!(
+            rebuild_verifier(&root_store, &config, &HashMap::new())?
+                .verify_client_cert(&direct_leaf, &[], UnixTime::now())
+                .is_ok(),
+            "live verifier must accept direct leaf"
+        );
+        assert!(
+            rebuild_verifier(&root_store, &config, &HashMap::new())?
+                .verify_client_cert(
+                    &chained_leaf,
+                    slice::from_ref(intermediate.der()),
+                    UnixTime::now()
+                )
+                .is_ok(),
+            "live verifier must accept intermediate chain"
+        );
+        assert!(
+            rebuild_verifier(
+                &root_store_with(intermediate.der())?,
+                &config,
+                &HashMap::new()
+            )?
+            .verify_client_cert(&chained_leaf, &[], UnixTime::now())
+            .is_ok(),
+            "live verifier must accept leaf under intermediate anchor"
+        );
+        assert!(
+            live_verifier
+                .verify_client_cert(&revoked_leaf, &[], UnixTime::now())
+                .is_err(),
+            "live verifier with cached CRL must reject revoked leaf"
+        );
+        Ok(())
     }
 
     /// The pending marker must exist before a URL becomes observable on the
@@ -2566,8 +4446,8 @@ mod tests {
     /// driving `bootstrap_fetch`, because `bootstrap_fetch` cannot be reached
     /// from a test without weakening production SSRF screening.
     ///
-    /// `fetch_crl` performs its own DNS precheck -- `tokio::net::lookup_host`
-    /// followed by `ip_block_reason` -- *before* handing the request to
+    /// `fetch_crl` performs its own DNS precheck - `tokio::net::lookup_host`
+    /// followed by `ip_block_reason` - *before* handing the request to
     /// `reqwest`. That precheck is independent of the `dns_resolver` injected
     /// into the client, so a custom resolver cannot redirect a fetch to a
     /// local mock: a `wiremock` server on loopback is rejected as a blocked IP
@@ -2575,13 +4455,13 @@ mod tests {
     ///
     /// Reaching `bootstrap_fetch` end to end would therefore require either a
     /// test-only bypass of that precheck, or a CRL served from a public
-    /// non-private address. The first is deliberately not done -- a bypass
+    /// non-private address. The first is deliberately not done - a bypass
     /// seam next to CRL fetching is a worse security liability than the
-    /// coverage it would buy -- and the second is not available offline.
+    /// coverage it would buy - and the second is not available offline.
     ///
     /// This test asserts the property that actually matters: the cap is
     /// applied *before* `CrlSet::new`, so `cache`, `cached_urls`, and
-    /// `inner_verifier` are all derived from one already-bounded map. Post-hoc
+    /// `verifier_state` are all derived from one already-bounded map. Post-hoc
     /// mutation would violate the publication ordering documented above.
     ///
     /// If you are here to "improve" this by making it drive `bootstrap_fetch`:
@@ -2607,8 +4487,14 @@ mod tests {
             })
             .collect();
 
-        let set = new_crl_set_from_bootstrap_cache(arc_roots, config, discover_tx, initial_cache)
-            .context("bootstrap cache should build CRL set")?;
+        let set = new_crl_set_from_bootstrap_cache(
+            arc_roots,
+            config,
+            discover_tx,
+            initial_cache,
+            Arc::new(HashSet::new()),
+        )
+        .context("bootstrap cache should build CRL set")?;
         let cache_keys = {
             let cache = set.cache_lock().read().await;
             assert_eq!(cache.len(), cap, "bootstrap cache len must be capped");
@@ -2823,8 +4709,18 @@ mod tests {
         // provider before any Client is built (same pattern as the
         // transport/oauth test suites).
         drop(ring::default_provider().install_default());
-        let client = Client::new();
-        let Err(err) = fetch_crl(&client, "https://u:p@crl.example/ca.crl", false, 1024).await
+        let crl_cpu = Arc::new(Semaphore::new(CRL_CPU_PERMITS));
+        let trusted_origins = Arc::new(HashSet::new());
+        let clients = CrlHttpClients::new(&trusted_origins, Duration::from_secs(5))?;
+        let Err(err) = fetch_crl(
+            &clients,
+            "https://u:p@crl.example/ca.crl",
+            false,
+            1024,
+            &crl_cpu,
+            &trusted_origins,
+        )
+        .await
         else {
             anyhow::bail!("userinfo-bearing CRL URL must be rejected");
         };
@@ -2836,6 +4732,22 @@ mod tests {
         assert!(
             !rendered.contains("u:p"),
             "error must not echo the rejected credentials: {rendered}"
+        );
+        Ok(())
+    }
+
+    /// Pins that CRL fetch preflight rejects RFC 8215 local-use NAT64 targets.
+    #[tokio::test]
+    async fn crl_preflight_rejects_nat64_local_use_target() -> anyhow::Result<()> {
+        let url = "https://crl.example/ca.crl";
+        let ip = IpAddr::V6(Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 0, 0, 0x0808, 0x0808));
+        let Err(err) = reject_blocked_crl_ip(url, ip, false) else {
+            anyhow::bail!("local-use NAT64 CRL target must be rejected");
+        };
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("nat64_local_use"),
+            "error must carry the local-use NAT64 reason: {rendered}"
         );
         Ok(())
     }
@@ -3026,8 +4938,14 @@ mod tests {
         }
         let (discover_tx, discover_rx) = mpsc::unbounded_channel();
         drop(discover_rx);
-        let set = CrlSet::new(Arc::new(roots), config, discover_tx, initial_cache)
-            .context("crl set with prepopulated cache")?;
+        let set = CrlSet::new(
+            Arc::new(roots),
+            config,
+            discover_tx,
+            initial_cache,
+            Arc::new(HashSet::new()),
+        )
+        .context("crl set with prepopulated cache")?;
         urls.sort();
         Ok((set, urls))
     }
@@ -3686,7 +5604,7 @@ mod tests {
     // ---- WO-R6: per-peer CRL discovery admission ---------------------------
 
     /// A single peer draining its own per-peer discovery quota must not deny a
-    /// concurrent legitimate peer presenting a not-yet-cached CDP URL -- the
+    /// concurrent legitimate peer presenting a not-yet-cached CDP URL - the
     /// cross-peer starvation the process-global limiter allowed and per-peer
     /// keying removes. Also asserts the attributed path never fires the
     /// unattributed-fallback canary, proving the task-local scope was honoured.
@@ -3807,6 +5725,834 @@ mod tests {
         assert!(
             pending <= cap,
             "pending_urls ({pending}) must never exceed crl_max_seen_urls ({cap}) regardless of peer count"
+        );
+        Ok(())
+    }
+
+    // ---- CRL parsing and verifier rebuilds run on the blocking pool
+
+    /// Revoked-certificate count the shared large CRL fixture below starts
+    /// from; `adaptive_large_crl_der` grows it (doubling, bounded by
+    /// `LARGE_FIXTURE_ENTRIES_MAX`) until a single synchronous parse takes at
+    /// least the caller's target duration, so the fixture stays heavy enough
+    /// on a fast machine instead of a fixed count needing per-host tuning.
+    const LARGE_FIXTURE_ENTRIES: u64 = 16_000;
+
+    /// Upper bound on adaptive CRL fixture growth. The helpers stop as soon
+    /// as their target duration is met, so wall time and memory scale with
+    /// the runner's own speed: faster machines need more entries for the
+    /// same duration, but each entry costs them less. This cap is 8x the old
+    /// bound, so only a runner several times faster than the development box
+    /// should approach it; reaching it below target is a loud test-fixture
+    /// error, not a weak pass.
+    const LARGE_FIXTURE_ENTRIES_MAX: u64 = 1_024_000;
+
+    /// How many copies of the shared large fixture CRL the commit-path
+    /// progress and cancellation tests pre-populate the cache with, to
+    /// approximate a multi-CRL verifier rebuild at a scale a debug test
+    /// build can afford.
+    const COMMIT_FIXTURE_COUNT: usize = 3;
+
+    /// Floor for `yield_progress_count_until`'s counter. A mutant that runs
+    /// the measured CPU-bound work inline (no `.await` point at all) leaves
+    /// the counter at 0 or 1, since the executor never gets a chance to poll
+    /// it before the race ends; genuine offload lets the scheduler dispatch
+    /// the progress task repeatedly for the whole duration of the blocking
+    /// work, reaching into the hundreds even on a loaded CI box. 50 is a
+    /// large margin above the mutant's ceiling and a large margin below a
+    /// realistic genuine-offload count - with no wall-clock dependence at
+    /// all, since it counts scheduler dispatches, not elapsed time.
+    const PROGRESS_COUNT_FLOOR: u64 = 50;
+
+    /// Revoked-certificate entries for a large CRL fixture: `entry_count`
+    /// synthetic serials, all revoked for key compromise.
+    fn large_crl_revoked_certs(entry_count: u64) -> Vec<RevokedCertParams> {
+        (0..entry_count)
+            .map(|serial| RevokedCertParams {
+                serial_number: SerialNumber::from(serial),
+                revocation_time: date_time_ymd(2026, 1, 1),
+                reason_code: Some(RevocationReason::KeyCompromise),
+                invalidity_date: None,
+            })
+            .collect()
+    }
+
+    /// Sign a CRL with `entry_count` revoked entries, issued by `ca`.
+    fn sign_large_crl(
+        ca: &CertifiedIssuer<'static, KeyPair>,
+        entry_count: u64,
+    ) -> anyhow::Result<CertificateRevocationListDer<'static>> {
+        let der: CertificateRevocationListDer<'static> = CertificateRevocationListParams {
+            this_update: date_time_ymd(2026, 1, 1),
+            next_update: date_time_ymd(2027, 1, 1),
+            crl_number: SerialNumber::from(1_u64),
+            issuing_distribution_point: None,
+            revoked_certs: large_crl_revoked_certs(entry_count),
+            key_identifier_method: KeyIdMethod::Sha256,
+        }
+        .signed_by(ca)
+        .context("sign large CRL")?
+        .into();
+        Ok(der)
+    }
+
+    /// Build a self-signed CA with no CDP: the helper-level CPU-offload
+    /// tests below parse and rebuild the fixture directly and never fetch it
+    /// over the network.
+    fn build_large_crl_fixture_ca(
+        common_name: &str,
+    ) -> anyhow::Result<CertifiedIssuer<'static, KeyPair>> {
+        let mut params = CertificateParams::new(Vec::<String>::new()).context("CRL CA params")?;
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        params
+            .distinguished_name
+            .push(DnType::CommonName, common_name);
+        let key = KeyPair::generate().context("CRL CA key")?;
+        CertifiedIssuer::self_signed(params, key).context("CRL CA self-signed")
+    }
+
+    /// Build a self-signed CA and a CRL DER revoking `entry_count`
+    /// certificates, for the large-fixture CPU-offload tests.
+    fn generate_large_crl_der(
+        entry_count: u64,
+    ) -> anyhow::Result<CertificateRevocationListDer<'static>> {
+        let ca = build_large_crl_fixture_ca("large-crl-fixture-ca")?;
+        sign_large_crl(&ca, entry_count)
+    }
+
+    /// Build a `CachedCrl` from a DER buffer, parsing its real metadata
+    /// (unlike `synthetic_entry`'s minimal placeholder DER).
+    fn cached_crl_from_der(
+        der: CertificateRevocationListDer<'static>,
+        source_url: &str,
+    ) -> anyhow::Result<CachedCrl> {
+        let (this_update, next_update) =
+            parse_crl_metadata(der.as_ref()).context("parse fixture CRL metadata")?;
+        Ok(CachedCrl {
+            der,
+            this_update,
+            next_update,
+            fetched_at: SystemTime::now(),
+            source_url: source_url.to_owned(),
+        })
+    }
+
+    /// Grow `entry_count` by doubling (bounded by `LARGE_FIXTURE_ENTRIES_MAX`)
+    /// until a synchronous parse of the generated CRL takes at least
+    /// `target`, returning the DER that met it. Keeps the "fixture is heavy
+    /// enough" precondition the CPU-offload tests rely on adaptive to host
+    /// speed, instead of a fixed entry count a fast machine could outrun.
+    fn adaptive_large_crl_der(
+        target: Duration,
+    ) -> anyhow::Result<(CertificateRevocationListDer<'static>, Duration)> {
+        let mut entries = LARGE_FIXTURE_ENTRIES;
+        loop {
+            let der = generate_large_crl_der(entries)?;
+            let start = StdInstant::now();
+            let _parsed = parse_crl_metadata(der.as_ref()).context("adaptive fixture parse")?;
+            let parse_elapsed = start.elapsed();
+            if parse_elapsed >= target {
+                return Ok((der, parse_elapsed));
+            }
+            if entries >= LARGE_FIXTURE_ENTRIES_MAX {
+                anyhow::bail!(
+                    "large CRL fixture capped below target: parse_elapsed={parse_elapsed:?}, \
+                     target={target:?}, cap_entries={LARGE_FIXTURE_ENTRIES_MAX}; \
+                     this machine is faster than the fixture can compensate for, so enlarge \
+                     LARGE_FIXTURE_ENTRIES_MAX"
+                );
+            }
+            entries = entries.saturating_mul(2).min(LARGE_FIXTURE_ENTRIES_MAX);
+        }
+    }
+
+    /// One large CRL DER, generated once and shared by every helper-level
+    /// CPU-offload test in this module: fixture generation (signing every
+    /// revoked-certificate entry) is the slow part, and the DER is read-only
+    /// once built, so every test reuses this one instance instead of
+    /// regenerating it. Its parse baseline is at least 300 ms, which keeps the
+    /// cancellation permit race margin well above coarse CI scheduling stalls.
+    fn shared_large_crl_der() -> anyhow::Result<&'static CertificateRevocationListDer<'static>> {
+        Ok(&shared_large_crl_fixture()?.0)
+    }
+
+    fn shared_large_crl_parse_baseline() -> anyhow::Result<Duration> {
+        Ok(shared_large_crl_fixture()?.1)
+    }
+
+    fn shared_large_crl_fixture()
+    -> anyhow::Result<&'static (CertificateRevocationListDer<'static>, Duration)> {
+        static FIXTURE: LazyLock<
+            anyhow::Result<(CertificateRevocationListDer<'static>, Duration)>,
+        > = LazyLock::new(|| adaptive_large_crl_der(Duration::from_millis(300)));
+        FIXTURE
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
+    }
+
+    /// Run `fut` to completion while a task that does nothing but repeatedly
+    /// `tokio::task::yield_now().await` runs concurrently on this (possibly
+    /// single-threaded) runtime, returning how many times that loop body ran
+    /// alongside `fut`'s result.
+    ///
+    /// A pure scheduling-progress count, with no wall-clock dependence at
+    /// all: see `PROGRESS_COUNT_FLOOR` for why a mutant and genuine offload
+    /// are separated by orders of magnitude, not a ratio.
+    async fn yield_progress_count_until<F>(fut: F) -> (u64, anyhow::Result<()>)
+    where
+        F: Future<Output = anyhow::Result<()>>,
+    {
+        let counter = Arc::new(AtomicU64::new(0));
+        let task_counter = Arc::clone(&counter);
+        let progress = tokio::spawn(async move {
+            loop {
+                let _previous = task_counter.fetch_add(1, Ordering::Relaxed);
+                yield_now().await;
+            }
+        });
+
+        let result = fut.await;
+        progress.abort();
+        let _joined = progress.await;
+
+        (counter.load(Ordering::Relaxed), result)
+    }
+
+    /// Run `fut` to completion while a real-clock 5 ms ticker runs
+    /// concurrently on this (possibly single-threaded) runtime, returning the
+    /// largest gap observed between consecutive ticks alongside `fut`'s
+    /// result.
+    ///
+    /// A stalled executor thread (synchronous CPU work with no yield point)
+    /// shows up as one gap close to the stall's whole duration; an executor
+    /// that keeps yielding to work offloaded elsewhere (`spawn_blocking`)
+    /// shows only small, timer-jitter gaps. Used only by the end-to-end
+    /// bootstrap test below: that test's measured work interleaves with real
+    /// socket I/O, during which a plain scheduling-progress count keeps
+    /// advancing regardless of whether the CPU-bound parts are offloaded, so
+    /// a gap measurement is the only one of the two methods that can still
+    /// detect a stall there.
+    async fn max_ticker_gap_until<F>(fut: F) -> (Duration, anyhow::Result<()>)
+    where
+        F: Future<Output = anyhow::Result<()>>,
+    {
+        let max_gap_cell = Arc::new(StdMutex::new(Duration::ZERO));
+        // Seeded to the race's start, not left at a zero/placeholder value:
+        // a ticker that never gets polled even once (the executor is fully
+        // starved end to end) must still read back as one large gap, not a
+        // vacuous `Duration::ZERO` the inter-tick loop below never observed.
+        let last_tick = Arc::new(StdMutex::new(StdInstant::now()));
+        let ticker_max_gap = Arc::clone(&max_gap_cell);
+        let ticker_last_tick = Arc::clone(&last_tick);
+        let ticker = tokio::spawn(async move {
+            let mut ticks = interval(Duration::from_millis(5));
+            ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                let _tick = ticks.tick().await;
+                let now = StdInstant::now();
+                let gap = {
+                    let mut last_guard = ticker_last_tick
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    let gap = now.duration_since(*last_guard);
+                    *last_guard = now;
+                    gap
+                };
+                let mut max_guard = ticker_max_gap
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if gap > *max_guard {
+                    *max_guard = gap;
+                }
+            }
+        });
+
+        let result = fut.await;
+        // Close out any trailing gap since the last successful tick: the
+        // inter-tick loop above can only record a gap once a NEXT tick
+        // arrives to measure against, so a ticker that fell behind (or never
+        // ran at all) right up to `fut`'s completion would otherwise go
+        // unmeasured.
+        let now = StdInstant::now();
+        {
+            let last = *last_tick.lock().unwrap_or_else(PoisonError::into_inner);
+            let trailing_gap = now.duration_since(last);
+            let mut max_guard = max_gap_cell.lock().unwrap_or_else(PoisonError::into_inner);
+            if trailing_gap > *max_guard {
+                *max_guard = trailing_gap;
+            }
+        }
+        ticker.abort();
+        let _joined = ticker.await;
+
+        let max_gap = *max_gap_cell.lock().unwrap_or_else(PoisonError::into_inner);
+        (max_gap, result)
+    }
+
+    /// Pins that `fetch_crl`'s DER parse runs on the blocking pool: on a
+    /// current-thread runtime, a `yield_now`-looping progress counter keeps
+    /// advancing while a large CRL is parsed through
+    /// [`parse_crl_metadata_blocking`] (the same offload helper `fetch_crl`
+    /// calls), instead of being starved for the whole parse duration. A pure
+    /// scheduling-progress count: no wall-clock ratio, no `sleep`.
+    ///
+    /// Calls `parse_crl_metadata_blocking` directly rather than the full
+    /// `fetch_crl`: `fetch_crl` also screens the resolved address before
+    /// connecting, and a `wiremock` server only ever resolves to loopback,
+    /// which that unrelated, pre-existing screening always rejects. This is
+    /// the "nearest in-crate seam" that still exercises the real offloaded
+    /// parse path;
+    /// `bootstrap_fetch_offload_keeps_the_runtime_responsive_end_to_end`
+    /// below exercises the real network path, now that a trusted loopback
+    /// origin can be fetched.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_crl_offload_keeps_the_runtime_responsive() -> anyhow::Result<()> {
+        install_ring_provider();
+        let der = shared_large_crl_der()?;
+        let der_bytes = der.as_ref().to_vec();
+
+        let crl_cpu = Arc::new(Semaphore::new(CRL_CPU_PERMITS));
+        let (progress, parse_result) = yield_progress_count_until(async {
+            let _parsed = {
+                let permit = Arc::clone(&crl_cpu)
+                    .acquire_owned()
+                    .await
+                    .context("acquire CRL CPU permit")?;
+                parse_crl_metadata_blocking(der_bytes.clone(), permit)
+                    .await
+                    .map_err(anyhow::Error::from)?
+            };
+            Ok(())
+        })
+        .await;
+        parse_result
+            .context("offloaded parse_crl_metadata_blocking must succeed on the fixture")?;
+
+        assert!(
+            progress >= PROGRESS_COUNT_FLOOR,
+            "offloaded parse must not stall the runtime: the scheduler only dispatched the \
+             progress counter {progress} times while the parse ran (floor {PROGRESS_COUNT_FLOOR})"
+        );
+        Ok(())
+    }
+
+    /// Pins that `commit_cache_update_atomically`'s verifier rebuild and
+    /// identity recomputation run on the blocking pool: the same
+    /// scheduling-progress-count property as the parse test above, applied
+    /// to a commit that rebuilds a verifier over several large cached CRLs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn commit_rebuild_offload_keeps_the_runtime_responsive() -> anyhow::Result<()> {
+        install_ring_provider();
+        let der = shared_large_crl_der()?;
+
+        let mut config = test_mtls_config()?;
+        config.crl_max_cache_entries = 64;
+        let mut roots = RootCertStore::empty();
+        roots.add(test_ca_root()?).context("add ca root")?;
+        let arc_roots = Arc::new(roots);
+
+        let mut initial_cache = HashMap::new();
+        for index in 0..COMMIT_FIXTURE_COUNT {
+            let url = format!("memory://large-crl-{index}");
+            let entry = cached_crl_from_der(der.clone(), &url)?;
+            let _previous = initial_cache.insert(url, entry);
+        }
+
+        let extra_url = "memory://large-crl-extra".to_owned();
+        let extra_entry = cached_crl_from_der(der.clone(), &extra_url)?;
+
+        let (discover_tx, discover_rx) = mpsc::unbounded_channel();
+        drop(discover_rx);
+        let set = CrlSet::new(
+            Arc::clone(&arc_roots),
+            config,
+            discover_tx,
+            initial_cache,
+            Arc::new(HashSet::new()),
+        )?;
+
+        let (progress, commit_result) = yield_progress_count_until(async {
+            set.__test_try_insert_cache(&extra_url, extra_entry)
+                .await
+                .map(|_changed| ())
+                .map_err(anyhow::Error::from)
+        })
+        .await;
+        commit_result.context("offloaded commit must succeed")?;
+
+        assert!(
+            progress >= PROGRESS_COUNT_FLOOR,
+            "offloaded commit rebuild must not stall the runtime: the scheduler only \
+             dispatched the progress counter {progress} times while the rebuild ran \
+             (floor {PROGRESS_COUNT_FLOOR})"
+        );
+        Ok(())
+    }
+
+    /// Pins that the CRL CPU permit is held by the BLOCKING CLOSURE, not by
+    /// the awaiting future: aborting the task that awaits the offloaded
+    /// parse must not release the permit before the bounded parse actually
+    /// finishes.
+    ///
+    /// No fixed `sleep` anywhere in this test. The "permit still held right
+    /// after abort" assertion is safe from its one possible race - the
+    /// detached parse finishing before the assertion runs - by construction,
+    /// not by probability: the permit is only observed taken by POLLING
+    /// (`yield_now`, no sleep), so the very next statement runs within a
+    /// handful of scheduler ticks of that observation, well below the
+    /// fixture's generation-time parse baseline, which is grown to at least
+    /// 300 ms. A warm re-parse can legitimately be lower, so this test relies
+    /// on the helper's own cold measurement instead of gating on a fresh
+    /// wall-clock measurement. The eventual release is then proven by a
+    /// notification barrier
+    /// (`Semaphore::acquire_many_owned` under a generous `timeout`), not a
+    /// fixed `sleep`.
+    #[tokio::test]
+    async fn crl_cpu_permit_stays_held_until_blocking_parse_completes_after_cancellation()
+    -> anyhow::Result<()> {
+        install_ring_provider();
+        let der = shared_large_crl_der()?;
+        let der_bytes = der.as_ref().to_vec();
+
+        let baseline = shared_large_crl_parse_baseline()?;
+        assert!(
+            baseline >= Duration::from_millis(300),
+            "fixture must take at least 300 ms to parse synchronously (was {baseline:?})"
+        );
+
+        let crl_cpu = Arc::new(Semaphore::new(CRL_CPU_PERMITS));
+        let task_cpu = Arc::clone(&crl_cpu);
+        let handle = tokio::spawn(async move {
+            let permit = Arc::clone(&task_cpu)
+                .acquire_owned()
+                .await
+                .context("acquire CRL CPU permit")?;
+            parse_crl_metadata_blocking(der_bytes, permit)
+                .await
+                .map_err(anyhow::Error::from)
+        });
+
+        // Poll (no sleep) until the spawned task's `acquire_owned` has
+        // actually completed: the permit count only drops once that
+        // happens, so this cannot observe a false "taken" before it is true.
+        let observed = timeout(Duration::from_secs(5), async {
+            loop {
+                if crl_cpu.available_permits() < CRL_CPU_PERMITS {
+                    return;
+                }
+                yield_now().await;
+            }
+        })
+        .await;
+        observed.context("the permit must be observed taken within 5s")?;
+
+        handle.abort();
+        let _joined = handle.await;
+
+        assert_eq!(
+            crl_cpu.available_permits(),
+            CRL_CPU_PERMITS - 1,
+            "the permit must still be held immediately after the awaiting task is aborted: \
+             it is owned by the detached blocking closure, not by the aborted future"
+        );
+
+        // Notification barrier: both permits become acquirable again only
+        // once the detached parse actually finishes and drops its permit.
+        let permit_count =
+            u32::try_from(CRL_CPU_PERMITS).context("CRL_CPU_PERMITS must fit in a u32")?;
+        let _barrier = timeout(
+            Duration::from_secs(30),
+            Arc::clone(&crl_cpu).acquire_many_owned(permit_count),
+        )
+        .await
+        .context("the detached parse must release the permit within 30s")?
+        .context("acquire_many_owned must succeed")?;
+        Ok(())
+    }
+
+    /// Pins that a cancelled commit lets the bounded verifier rebuild finish
+    /// in the background and discards its result: the committed cache and
+    /// the published verifier stay at the previous generation, even once the
+    /// detached blocking work later completes.
+    ///
+    /// No fixed `sleep` anywhere in this test: both waits are
+    /// notification-driven (poll-until-permit-taken before aborting;
+    /// `acquire_many_owned` under a generous `timeout`; then a state-driven
+    /// drain that waits for the commit mutex and spawned-task count before the
+    /// final re-check), for the same reason given on the permit test above.
+    #[tokio::test]
+    async fn cancelled_commit_leaves_the_previous_generation_published() -> anyhow::Result<()> {
+        install_ring_provider();
+        let der = shared_large_crl_der()?;
+
+        let mut config = test_mtls_config()?;
+        config.crl_max_cache_entries = 64;
+        let mut roots = RootCertStore::empty();
+        roots.add(test_ca_root()?).context("add ca root")?;
+        let arc_roots = Arc::new(roots);
+
+        let small_url = "memory://small-baseline".to_owned();
+        let small_entry = synthetic_entry(SystemTime::now());
+        let mut initial_cache = HashMap::new();
+        let _previous = initial_cache.insert(small_url, small_entry);
+
+        let (discover_tx, discover_rx) = mpsc::unbounded_channel();
+        drop(discover_rx);
+        let set = CrlSet::new(
+            Arc::clone(&arc_roots),
+            config.clone(),
+            discover_tx,
+            initial_cache,
+            Arc::new(HashSet::new()),
+        )?;
+
+        let large_url = "memory://large-new-entry".to_owned();
+        let large_entry = cached_crl_from_der(der.clone(), &large_url)?;
+
+        // Read directly from the LIVE cache both times, with nothing in
+        // between: a `CachedCrl`'s DER reallocates on every `.clone()`, so
+        // comparing two independently-cloned snapshots would always differ
+        // in `der_ptr` even when nothing changed.
+        let pre_cache_identities = {
+            let cache = set.cache_lock().read().await;
+            crl_cache_identities(&cache)
+        };
+        let pre_committed_identities = set.verifier_state.load().committed_identities.clone();
+        let pre_cached_urls = set.verifier_state.load().cached_urls.clone();
+
+        let alive_tasks_before_commit = Handle::current().metrics().num_alive_tasks();
+        let task_set = Arc::clone(&set);
+        let handle = tokio::spawn(async move {
+            task_set
+                .__test_try_insert_cache(&large_url, large_entry)
+                .await
+        });
+
+        // Poll (no sleep) until the commit holds the CRL CPU permit:
+        // `commit_cache_update_atomically` acquires the permit and spawns
+        // the blocking rebuild in the same expression, with no `.await`
+        // point between them, so observing the permit taken also proves the
+        // detached rebuild has already been dispatched.
+        let permit_taken = timeout(Duration::from_secs(5), async {
+            loop {
+                if set.crl_cpu.available_permits() < CRL_CPU_PERMITS {
+                    return;
+                }
+                yield_now().await;
+            }
+        })
+        .await;
+        permit_taken.context("the commit must take the CRL CPU permit within 5s")?;
+
+        handle.abort();
+        let _joined = handle.await;
+
+        {
+            let cache_now = set.cache_lock().read().await;
+            assert_eq!(
+                crl_cache_identities(&cache_now),
+                pre_cache_identities,
+                "a cancelled commit must not publish a partial cache write"
+            );
+        }
+        let state_now = set.verifier_state.load();
+        assert_eq!(
+            state_now.committed_identities, pre_committed_identities,
+            "a cancelled commit must not publish new identities"
+        );
+        assert_eq!(
+            state_now.cached_urls, pre_cached_urls,
+            "a cancelled commit must not publish new coverage"
+        );
+        drop(state_now);
+
+        // Notification barrier: let the detached blocking rebuild actually
+        // finish (both permits become acquirable again only once it does),
+        // then prove again that its discarded result was never published
+        // late.
+        let permit_count =
+            u32::try_from(CRL_CPU_PERMITS).context("CRL_CPU_PERMITS must fit in a u32")?;
+        let _barrier = timeout(
+            Duration::from_secs(30),
+            Arc::clone(&set.crl_cpu).acquire_many_owned(permit_count),
+        )
+        .await
+        .context("the detached rebuild must release the permit within 30s")?
+        .context("acquire_many_owned must succeed")?;
+
+        // State-driven drain: a detached whole-commit mutant keeps
+        // `commit_lock` until its publication tail finishes. Tokio's runtime
+        // metric counts spawned async tasks; sampling before the commit task is
+        // spawned means a detached tail task of any shape must finish before
+        // the count returns to this baseline. Blocking-pool jobs are covered by
+        // the permit barrier above, so no fixed yield count or sleep is needed.
+        drain_cancelled_commit_tail(&set, alive_tasks_before_commit).await?;
+
+        assert_cancelled_commit_still_unpublished(
+            &set,
+            &pre_cache_identities,
+            &pre_committed_identities,
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn drain_cancelled_commit_tail(
+        set: &CrlSet,
+        alive_tasks_before_commit: usize,
+    ) -> anyhow::Result<()> {
+        timeout(Duration::from_secs(30), async {
+            loop {
+                {
+                    let _commit = set.commit_lock.lock().await;
+                }
+                if Handle::current().metrics().num_alive_tasks() <= alive_tasks_before_commit {
+                    return;
+                }
+                yield_now().await;
+            }
+        })
+        .await
+        .context("the cancelled commit tail must drain within 30s")?;
+        Ok(())
+    }
+
+    async fn assert_cancelled_commit_still_unpublished(
+        set: &CrlSet,
+        pre_cache_identities: &HashMap<String, EntryIdentity>,
+        pre_committed_identities: &HashMap<String, EntryIdentity>,
+    ) {
+        {
+            let cache_now = set.cache_lock().read().await;
+            assert_eq!(
+                &crl_cache_identities(&cache_now),
+                pre_cache_identities,
+                "the discarded blocking result must never be published late"
+            );
+        }
+        let state_after = set.verifier_state.load();
+        assert_eq!(
+            &state_after.committed_identities, pre_committed_identities,
+            "the discarded blocking result must never publish identities late"
+        );
+    }
+
+    /// Pins that a closed `crl_cpu` semaphore surfaces as an error instead of
+    /// a hang.
+    ///
+    /// Covers only the closed-semaphore sub-case of `JoinError` handling: a
+    /// genuine panic inside `rebuild_verifier` or `parse_crl_metadata` is not
+    /// cheaply testable without a new test-only fault-injection hook, which
+    /// this unit does not add (no new public or `test-helpers` item).
+    #[tokio::test]
+    async fn closed_crl_cpu_semaphore_surfaces_as_an_error_not_a_hang() -> anyhow::Result<()> {
+        install_ring_provider();
+        let mut config = test_mtls_config()?;
+        config.crl_max_cache_entries = 64;
+        let mut roots = RootCertStore::empty();
+        roots.add(test_ca_root()?).context("add ca root")?;
+        let (discover_tx, discover_rx) = mpsc::unbounded_channel();
+        drop(discover_rx);
+        let set = CrlSet::new(
+            Arc::new(roots),
+            config,
+            discover_tx,
+            HashMap::new(),
+            Arc::new(HashSet::new()),
+        )?;
+        set.crl_cpu.close();
+
+        let url = "memory://closed-semaphore".to_owned();
+        let entry = synthetic_entry(SystemTime::now());
+        let result = timeout(
+            Duration::from_secs(5),
+            set.__test_try_insert_cache(&url, entry),
+        )
+        .await
+        .context("commit must not hang when the CRL CPU semaphore is closed")?;
+
+        let Err(error) = result else {
+            anyhow::bail!("commit over a closed CRL CPU semaphore must fail, not succeed");
+        };
+        assert!(
+            error.to_string().contains("CRL CPU semaphore closed"),
+            "error must name the closed semaphore: {error}"
+        );
+        Ok(())
+    }
+
+    /// Build a self-signed CA carrying a CDP extension with one entry per
+    /// `cdp_urls` element, so the same CA can sign a large CRL served at
+    /// each of them (unlike `build_ca_with_cdp_and_aia`, this returns the
+    /// signer, not just the DER, because the end-to-end responsiveness test
+    /// below needs to sign a large CRL with it). Each URL gets its OWN
+    /// `CrlDistributionPoint` rather than sharing one with multiple URIs, so
+    /// every URL is fetched and cached as its own entry instead of being
+    /// treated as an RFC 5280 4.2.1.13 mirror of the others.
+    fn build_large_crl_ca_with_cdp(
+        common_name: &str,
+        cdp_urls: &[String],
+    ) -> anyhow::Result<CertifiedIssuer<'static, KeyPair>> {
+        let mut params = CertificateParams::new(Vec::<String>::new()).context("CRL CA params")?;
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        params
+            .distinguished_name
+            .push(DnType::CommonName, common_name);
+        params.crl_distribution_points = cdp_urls
+            .iter()
+            .map(|url| CrlDistributionPoint {
+                uris: vec![url.clone()],
+            })
+            .collect();
+        let key = KeyPair::generate().context("CRL CA key")?;
+        CertifiedIssuer::self_signed(params, key).context("CRL CA self-signed")
+    }
+
+    /// Grow `entry_count` by doubling (bounded by `LARGE_FIXTURE_ENTRIES_MAX`)
+    /// until BOTH a single synchronous parse AND a `rebuild_verifier` over
+    /// `copies` copies of the signed CRL take at least `target`, returning
+    /// the DER together with the two measurements that decided it. The
+    /// end-to-end responsiveness test below has two independently mutable
+    /// offload points (the per-fetch parse, and the final verifier build
+    /// over every fetched entry); each needs its own baseline heavy enough
+    /// to make that point's stall observable. Returning these measurements,
+    /// instead of having the caller re-measure the same operations
+    /// afterward, avoids a second source of timing noise: a cold-cache
+    /// first parse and a warm-cache re-parse of the same bytes can
+    /// legitimately differ, so a separate re-check could read below
+    /// `target` even though this loop's own measurement cleared it.
+    fn adaptive_e2e_crl_der(
+        ca: &CertifiedIssuer<'static, KeyPair>,
+        roots: &Arc<RootCertStore>,
+        config: &MtlsConfig,
+        copies: usize,
+        target: Duration,
+    ) -> anyhow::Result<(CertificateRevocationListDer<'static>, Duration, Duration)> {
+        let mut entries = LARGE_FIXTURE_ENTRIES;
+        loop {
+            let der = sign_large_crl(ca, entries)?;
+
+            let parse_start = StdInstant::now();
+            let _parsed = parse_crl_metadata(der.as_ref()).context("adaptive e2e fixture parse")?;
+            let parse_elapsed = parse_start.elapsed();
+
+            let mut candidate = HashMap::new();
+            for index in 0..copies {
+                let url = format!("memory://e2e-rebuild-probe-{index}");
+                let entry = cached_crl_from_der(der.clone(), &url)?;
+                let _previous = candidate.insert(url, entry);
+            }
+            let rebuild_start = StdInstant::now();
+            let _verifier = rebuild_verifier(roots, config, &candidate)
+                .context("adaptive e2e fixture rebuild")?;
+            let rebuild_elapsed = rebuild_start.elapsed();
+
+            if parse_elapsed >= target && rebuild_elapsed >= target {
+                return Ok((der, parse_elapsed, rebuild_elapsed));
+            }
+            if entries >= LARGE_FIXTURE_ENTRIES_MAX {
+                anyhow::bail!(
+                    "e2e CRL fixture capped below target: parse_elapsed={parse_elapsed:?}, \
+                     rebuild_elapsed={rebuild_elapsed:?}, target={target:?}, \
+                     cap_entries={LARGE_FIXTURE_ENTRIES_MAX}; this machine is faster than the \
+                     fixture can compensate for, so enlarge LARGE_FIXTURE_ENTRIES_MAX"
+                );
+            }
+            entries = entries.saturating_mul(2).min(LARGE_FIXTURE_ENTRIES_MAX);
+        }
+    }
+
+    /// Pins that `bootstrap_fetch`'s offloaded CRL parses and initial
+    /// verifier build keep a `current_thread` runtime responsive end to end,
+    /// through the real network path: trusted loopback origins (the CDPs
+    /// named in the configured CA certificate) can now be fetched through
+    /// `wiremock`, where before they would have been blocked at the
+    /// pre-flight stage.
+    ///
+    /// Unlike the helper-level progress-count tests above, a plain
+    /// scheduling-progress count cannot tell offload from a stall here: the
+    /// fetch itself also awaits real socket I/O, during which the counter
+    /// keeps advancing regardless of whether the CPU-bound parse and
+    /// verifier build are offloaded. This measures the LARGEST GAP between a
+    /// 5 ms ticker's ticks instead (`max_ticker_gap_until`): a stall shows up
+    /// as one outsized gap even with real I/O happening around it. Both
+    /// fixture baselines (a single fetch's parse, and the final rebuild over
+    /// every fetched entry) are grown inside the adaptive helper until both
+    /// clear 800 ms. The assertion allows up to half of the smaller baseline
+    /// as observed gap: with the 128,000-entry fixture on this machine, the
+    /// warm loaded noise maximum was 112 ms before this target increase, while
+    /// the new threshold is at least 400 ms. A real inline stall still lasts
+    /// at least twice the allowed gap by construction.
+    #[tokio::test(flavor = "current_thread")]
+    async fn bootstrap_fetch_offload_keeps_the_runtime_responsive_end_to_end() -> anyhow::Result<()>
+    {
+        install_ring_provider();
+        let mock = MockServer::start().await;
+        let port = mock.address().port();
+        let cdp_urls: Vec<String> = (0..=COMMIT_FIXTURE_COUNT)
+            .map(|index| format!("http://127.0.0.1:{port}/e2e-large-crl-{index}"))
+            .collect();
+
+        let ca = build_large_crl_ca_with_cdp("e2e-large-crl-ca", &cdp_urls)?;
+        let mut roots = RootCertStore::empty();
+        roots.add(ca.der().clone()).context("add ca root")?;
+        let arc_roots = Arc::new(roots);
+        let mut config = test_mtls_config()?;
+
+        let (der, fetch_baseline, rebuild_baseline) = adaptive_e2e_crl_der(
+            &ca,
+            &arc_roots,
+            &config,
+            cdp_urls.len(),
+            Duration::from_millis(800),
+        )?;
+        let der_bytes = der.as_ref().to_vec();
+        config.crl_max_response_bytes = u64::try_from(der_bytes.len())
+            .context("large fixture DER length must fit the CRL byte cap type")?
+            .saturating_add(1024);
+        for url in &cdp_urls {
+            let request_path = Url::parse(url).context("parse cdp url")?.path().to_owned();
+            Mock::given(method("GET"))
+                .and(path(request_path))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(der_bytes.clone()))
+                .mount(&mock)
+                .await;
+        }
+
+        let baseline = fetch_baseline.min(rebuild_baseline);
+
+        let ca_certs = vec![ca.der().clone()];
+        let (max_gap, bootstrap_result) = max_ticker_gap_until(async {
+            let (set, discover_rx) = bootstrap_fetch(arc_roots, &ca_certs, config)
+                .await
+                .map_err(anyhow::Error::from)?;
+            drop(discover_rx);
+            for url in &cdp_urls {
+                if !set.__test_cache_contains(url) {
+                    anyhow::bail!(
+                        "every large CRL must be fetched and cached at bootstrap: missing {url}"
+                    );
+                }
+            }
+            Ok(())
+        })
+        .await;
+        bootstrap_result.context("bootstrap_fetch over the large CRLs must succeed")?;
+
+        assert!(
+            max_gap.saturating_mul(2) <= baseline,
+            "bootstrap's offloaded parse and verifier rebuild must not stall the runtime: \
+             max_gap={max_gap:?}, baseline={baseline:?}"
         );
         Ok(())
     }

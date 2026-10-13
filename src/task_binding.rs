@@ -4,8 +4,8 @@
 //!
 //! MCP tasks (SEP-2663) hand the client a long-lived `taskId` that is later
 //! presented to `tasks/get`, `tasks/update`, and `tasks/cancel`. Upstream
-//! `rmcp` resolves those calls **by task ID alone** -- `TaskManager::get_task`
-//! and friends take no principal argument -- and this crate's RBAC layer
+//! `rmcp` resolves those calls **by task ID alone** - `TaskManager::get_task`
+//! and friends take no principal argument - and this crate's RBAC layer
 //! inspects only `tools/call`. Without the binding in this module, any
 //! *authenticated* identity holding another identity's task ID can read,
 //! update, or cancel that task.
@@ -111,7 +111,7 @@ pub(crate) fn wrap(
 ///
 /// SECURITY: the error is deliberately `None` rather than a reason enum.
 /// Callers must not be able to distinguish "malformed", "not wrapped",
-/// "signed for another identity", or "signed under a rotated secret" -- every
+/// "signed for another identity", or "signed under a rotated secret" - every
 /// failure is reported to the client as the same unknown-task error, so this
 /// never becomes an oracle confirming a task's existence to a non-owner.
 pub(crate) fn unwrap_and_verify(

@@ -122,8 +122,8 @@ fn identity_from_request(context: &RequestContext<RoleServer>) -> Option<AuthIde
 
 /// Verify an external task ID and recover the raw ID the handler knows.
 ///
-/// SECURITY: every failure mode -- malformed, unwrapped, signed for a different
-/// identity, or signed under a rotated secret -- collapses to the *same* error
+/// SECURITY: every failure mode - malformed, unwrapped, signed for a different
+/// identity, or signed under a rotated secret - collapses to the *same* error
 /// that upstream `rmcp` returns for a genuinely unknown task
 /// (`McpError::invalid_params("unknown task: ...")`). Distinguishing them would
 /// turn this into an oracle that confirms a task's existence to a non-owner.
@@ -253,7 +253,7 @@ impl<H: ServerHandler> ServerHandler for RbacContextHandler<H> {
     }
 
     // Synchronous and context-free: there is no request identity to scope, so
-    // plain delegation is required -- the trait default would shadow an inner
+    // plain delegation is required - the trait default would shadow an inner
     // override.
     fn negotiate_initialize(
         &self,
@@ -1272,7 +1272,7 @@ mod tests {
     /// `subscriptions/listen`, so a task status notification cannot carry a raw
     /// task ID past the binding today. This test asserts that refusal still
     /// holds. **It is expected to fail when a future `rmcp` release makes task
-    /// notifications routable** -- at which point the task ID inside
+    /// notifications routable** - at which point the task ID inside
     /// `TaskStatusNotificationParams` must be wrapped before it leaves the
     /// process, exactly as `call_tool` and `get_task` already wrap theirs.
     #[tokio::test]
@@ -1331,7 +1331,7 @@ mod tests {
         assert!(
             outcome.contains("UnsupportedNotification") && outcome.contains("notifications/tasks"),
             "TRIPWIRE: rmcp now routes task status notifications (got {outcome:?}). \
-             This is not a flaky test -- bind the task_id inside \
+             This is not a flaky test - bind the task_id inside \
              TaskStatusNotificationParams in RbacContextHandler::listen before \
              shipping this rmcp version, or identity A's raw task ID will leak \
              to whoever is subscribed."
@@ -1393,10 +1393,10 @@ mod tests {
     //
     // Each driver proves, by exact equality on the inner probe's record log
     // (and on sentinel values no rmcp default body can produce), that
-    // `RbacContextHandler` forwarded the call -- and, because the probe reads
+    // `RbacContextHandler` forwarded the call - and, because the probe reads
     // `current_role()` inside the method body, that it did so inside the
     // identity scope. Every driver also runs the same request against
-    // `PassthroughDefaults` -- the wrapper with all delegations deleted -- and
+    // `PassthroughDefaults` - the wrapper with all delegations deleted - and
     // asserts the probe stayed untouched. That second half is the per-method
     // mutation check.
     //
@@ -1624,7 +1624,7 @@ mod tests {
     /// to the test that proves the inner handler was reached.
     ///
     /// Parsed by `tests/integration/delegation_guard.rs`, which asserts this table covers
-    /// exactly its `DIRECTLY_DELEGATED ∪ BEHAVIORAL_WRAPPED` classification --
+    /// exactly its `DIRECTLY_DELEGATED ∪ BEHAVIORAL_WRAPPED` classification -
     /// so a method cannot be added or reclassified without a driver. The nine
     /// methods attributed to the macro-body drivers are each discharged by that
     /// driver plus the guard's macro-origin pin.
@@ -1823,7 +1823,7 @@ mod tests {
     type OutboundFrames = Arc<Mutex<Vec<ServerJsonRpcMessage>>>;
 
     /// Drive messages through a real service wrapping `inner`, and hand back
-    /// the outbound frames. Response order is not a contract -- callers match
+    /// the outbound frames. Response order is not a contract - callers match
     /// by JSON-RPC id with [`frame_for`].
     async fn drive_coverage_requests<H>(
         inner: H,
