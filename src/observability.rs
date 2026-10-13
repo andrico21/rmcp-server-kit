@@ -2694,8 +2694,8 @@ mod tests {
     // and does not attempt data-flow analysis.
     // -----------------------------------------------------------------
 
-    /// Drop comment lines and everything from the `#[cfg(test)] mod tests`
-    /// module onward. Mirrors `crate::error`'s guard precedent exactly.
+    /// Drop comment lines and everything from a `#[cfg(test)]`-annotated
+    /// `mod tests` or `pub(crate) mod tests` onward. Mirrors `crate::error`'s guard.
     fn production_source(src: &str) -> String {
         let lines: Vec<&str> = src.lines().collect();
         let mut out = String::with_capacity(src.len());
@@ -2704,7 +2704,11 @@ mod tests {
             if trimmed == "#[cfg(test)]"
                 && lines
                     .get(index.saturating_add(1))
-                    .is_some_and(|next| next.trim_start().starts_with("mod tests"))
+                    .is_some_and(|following_line| {
+                        let declaration = following_line.trim_start();
+                        declaration.starts_with("mod tests")
+                            || declaration.starts_with("pub(crate) mod tests")
+                    })
             {
                 break;
             }
@@ -3139,6 +3143,13 @@ mod tests {
             "#[cfg(test)]\nmod tests {\n    fn t() { tracing::debug!(?identity, \"x\"); }\n}";
         assert_eq!(
             find_debug_sigil_fields(in_test_module),
+            Vec::<String>::new()
+        );
+
+        let in_pub_crate_test_module =
+            "#[cfg(test)]\npub(crate) mod tests { fn t() { tracing::debug!(?identity, \"x\"); } }";
+        assert_eq!(
+            find_debug_sigil_fields(in_pub_crate_test_module),
             Vec::<String>::new()
         );
 

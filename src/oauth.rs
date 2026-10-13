@@ -1430,7 +1430,7 @@ impl OAuthConfig {
                     cidr_count = compiled.cidr_count(),
                     "oauth.ssrf_allowlist is configured: private/loopback OAuth/JWKS targets \
                      are now reachable. Cloud-metadata addresses remain blocked. \
-                     See SECURITY.md \"Operator allowlist\"."
+                     See SECURITY.md 'Operator allowlist'."
                 );
             }
         }
@@ -3639,8 +3639,8 @@ impl JwksCache {
                         tracing::info!(
                             expected = %self.shared.expected_audience,
                             "JWT accepted via azp-only audience fallback because \
-                             audience_validation_mode = \"permissive\". Acceptance is \
-                             intentionally wider than the spec; set \"warn\" or \"strict\" \
+                             audience_validation_mode = 'permissive'. Acceptance is \
+                             intentionally wider than the spec; set 'warn' or 'strict' \
                              to tighten it. This message logs once per process."
                         );
                     }
@@ -3657,9 +3657,9 @@ impl JwksCache {
                             azp = claims.azp.as_deref().unwrap_or("-"),
                             "JWT accepted via deprecated azp-only audience fallback. \
                              Configure your IdP to populate aud, or set \
-                             audience_validation_mode = \"strict\" once tokens carry aud correctly. \
+                             audience_validation_mode = 'strict' once tokens carry aud correctly. \
                              To silence this warning without changing acceptance, \
-                             set audience_validation_mode = \"permissive\". \
+                             set audience_validation_mode = 'permissive'. \
                              This warning logs once per process."
                         );
                     }
@@ -5512,7 +5512,7 @@ fn rewrite_client_auth_params(
 )]
 #[expect(clippy::panic_in_result_fn, reason = "a test fails by panicking")]
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 
     #[cfg(feature = "oauth-mtls-client")]
     use core::ptr;
@@ -6719,7 +6719,7 @@ role = "admin"
     use rsa::{pkcs8::EncodePrivateKey as _, traits::PublicKeyParts as _};
 
     /// Generate an RSA-2048 keypair and return `(private_pem, jwks_json)`.
-    fn generate_test_keypair(kid: &str) -> anyhow::Result<(String, serde_json::Value)> {
+    pub(crate) fn generate_test_keypair(kid: &str) -> anyhow::Result<(String, serde_json::Value)> {
         let mut rng = rand_core::OsRng;
         let private_key = rsa::RsaPrivateKey::new(&mut rng, 2048).context("keypair generation")?;
         let private_pem = private_key
@@ -6795,7 +6795,7 @@ role = "admin"
         jsonwebtoken::encode(&header, &claims, &encoding_key).context("JWT encoding")
     }
 
-    fn test_config(jwks_uri: &str) -> OAuthConfig {
+    pub(crate) fn test_config(jwks_uri: &str) -> OAuthConfig {
         OAuthConfig {
             require_subject: false,
             issuer: "https://auth.test.local".into(),
@@ -6833,7 +6833,7 @@ role = "admin"
         }
     }
 
-    fn test_cache(config: &OAuthConfig) -> anyhow::Result<JwksCache> {
+    pub(crate) fn test_cache(config: &OAuthConfig) -> anyhow::Result<JwksCache> {
         Ok(JwksCache::new(config)
             .map_err(anyhow::Error::msg)?
             .__test_allow_loopback_ssrf())

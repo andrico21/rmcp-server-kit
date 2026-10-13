@@ -19,7 +19,7 @@ use core::{
     time::Duration,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     path::PathBuf,
     sync::{LazyLock, Mutex, PoisonError},
     thread::available_parallelism,
@@ -40,12 +40,13 @@ use secrecy::{ExposeSecret as _, SecretString};
 #[cfg(not(feature = "oauth"))]
 use serde::de::IgnoredAny;
 use serde::{Deserialize, de::Error as SerdeDeError};
+use sha2::{Digest as _, Sha256};
 use tokio::{sync::Semaphore, task::spawn_blocking, time::timeout};
 use tracing::field;
 use x509_parser::prelude::{FromDer as _, GeneralName, X509Certificate};
 
 #[cfg(feature = "metrics")]
-use crate::metrics::record_rate_limit_deny;
+use crate::metrics::{record_auth_failure, record_rate_limit_deny};
 #[cfg(feature = "oauth")]
 use crate::oauth::{JwksCache, JwtValidationFailure, OAuthConfig, looks_like_jwt};
 use crate::{
@@ -209,6 +210,69 @@ struct AuthRejection {
     failure_class: AuthFailureClass,
     /// The credential owner, when known and owner logging is enabled.
     owner: Option<CredentialOwner>,
+    /// True only when the credential matched an API key slot that has expired;
+    /// such failures stay at WARN because the client cannot recover by itself.
+    api_key_expired: bool,
+}
+
+/// Operator-facing severity of an authentication rejection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuthFailureLogLevel {
+    /// Expected login or token-refresh flow.
+    Debug,
+    /// Actionable credential or abuse failure.
+    Warn,
+}
+
+impl AuthRejection {
+    /// Choose the level independently of opt-in credential-owner context.
+    const fn log_level(&self) -> AuthFailureLogLevel {
+        match self.failure_class {
+            AuthFailureClass::MissingCredential => AuthFailureLogLevel::Debug,
+            AuthFailureClass::ExpiredCredential => {
+                if self.api_key_expired {
+                    AuthFailureLogLevel::Warn
+                } else {
+                    AuthFailureLogLevel::Debug
+                }
+            }
+            AuthFailureClass::InvalidCredential
+            | AuthFailureClass::RateLimited
+            | AuthFailureClass::PreAuthGate => AuthFailureLogLevel::Warn,
+        }
+    }
+}
+
+/// Authentication outcomes counted by both admin diagnostics and metrics.
+#[derive(Clone, Copy)]
+enum CountedFailure {
+    /// A credential rejection or quota denial.
+    Class(AuthFailureClass),
+    /// Verification admission overload, separate from credential failures.
+    Overloaded,
+}
+
+/// Record a single settled outcome in both authentication accounting surfaces.
+#[cfg_attr(
+    not(feature = "metrics"),
+    expect(
+        unused_variables,
+        reason = "deliberate: src/auth.rs::record_counted_failure extensions and label are read only to record the auth failure metric"
+    )
+)]
+fn record_counted_failure(state: &AuthState, extensions: &Extensions, failure: CountedFailure) {
+    let label = match failure {
+        CountedFailure::Class(class) => {
+            state.counters.record_failure(class);
+            class.as_str()
+        }
+        CountedFailure::Overloaded => {
+            state.counters.record_overload();
+            "overloaded"
+        }
+    };
+    #[cfg(feature = "metrics")]
+    record_auth_failure(extensions, label);
 }
 
 /// Outcome of a failed bearer-token authentication attempt
@@ -1376,128 +1440,153 @@ pub(crate) struct TlsConnInfo {
     /// Verified mTLS client identity, if a client certificate was presented
     /// and successfully extracted during the TLS handshake.
     pub identity: Option<AuthIdentity>,
+    /// Process-unique serial of the TLS connection; distinguishes connections
+    /// that reuse a peer address.
+    pub conn_id: u64,
 }
+
+/// Serial allocated once for each TLS connection, independent of its peer address.
+static NEXT_TLS_CONN_ID: AtomicU64 = AtomicU64::new(0);
 
 impl TlsConnInfo {
     /// Construct a new [`TlsConnInfo`].
     #[must_use]
-    pub(crate) const fn new(addr: SocketAddr, identity: Option<AuthIdentity>) -> Self {
-        Self { addr, identity }
+    pub(crate) fn new(addr: SocketAddr, identity: Option<AuthIdentity>) -> Self {
+        Self {
+            addr,
+            identity,
+            conn_id: NEXT_TLS_CONN_ID.fetch_add(1, Ordering::Relaxed),
+        }
     }
 }
 
-/// Default hard cap on the number of distinct authenticated identities
-/// remembered by [`SeenIdentitySet`].
-///
-/// Sized to comfortably exceed realistic identity churn for an MCP server
-/// while bounding worst-case memory at roughly `4096 * avg_name_len`
-/// (~256 KiB at 64-byte names). Honest clients will never trigger eviction;
-/// hostile churn (rotating mTLS subjects or OAuth `sub` values) is bounded.
-const DEFAULT_SEEN_IDENTITY_CAP: usize = 4096;
+/// Default cap shared by token and mTLS connection presentations.
+const DEFAULT_SEEN_CREDENTIALS_CAP: usize = 4096;
 
-/// Bounded set tracking which authenticated identities have already been
-/// logged at INFO level (subsequent auths fall back to DEBUG).
+/// Bounded per-credential-presentation de-duplication of INFO success logs.
 ///
-/// # Why bounded?
-///
-/// `id.name` is attacker-influenced under mTLS (SAN/CN) and OAuth (`sub`).
-/// An unbounded [`std::collections::HashSet`] would grow with churn,
-/// producing both a slow memory leak and unbounded log-cardinality
-/// downstream (Loki/ES). The cap follows the same trade-off documented in
-/// [`crate::bounded_limiter`]: when an evicted identity reappears it
-/// re-fires INFO once. This is acceptable for diagnostic logging.
+/// Keys and bindings are keyed digests, never credential bytes. Tokens and
+/// mTLS connections share the cap. FIFO eviction re-logs a retained binding
+/// at INFO at most once per eviction when its credential reappears.
 ///
 /// # Concurrency
 ///
-/// Uses [`std::sync::Mutex`] because [`Self::insert_is_first`] is purely
+/// Uses [`std::sync::Mutex`] because [`Self::observe`] is purely
 /// synchronous and the critical section never `.await`s. The mutex is
-/// poison-tolerant: a poisoned set is still logically consistent
-/// (only writer is `insert_is_first`, which performs an atomic insert
-/// + bounded eviction; no torn invariants are possible).
-pub(crate) struct SeenIdentitySet {
-    /// Mutex-guarded set plus eviction queue.
+/// poison-tolerant: recovery affects diagnostic logging granularity, never
+/// authentication or authorization decisions.
+pub(crate) struct SeenCredentials {
+    /// Per-instance secret digest key; never logged or debug-printed.
+    key: [u8; 32],
+    /// Mutex-guarded bindings and eviction queue.
     inner: Mutex<SeenInner>,
 }
 
-/// Mutex-guarded state of a [`SeenIdentitySet`].
+/// Mutex-guarded state of a [`SeenCredentials`].
 struct SeenInner {
-    /// Identities currently remembered.
-    set: HashSet<String>,
+    /// Credential digests mapped to their latest name-and-role binding digests.
+    bindings: HashMap<[u8; 32], [u8; 32]>,
     /// Insertion-order FIFO used for bounded eviction. Tracking strict LRU
     /// would require touching the queue on every hit (under the mutex);
     /// FIFO is sufficient because the contract only promises "bounded
-    /// memory", not "remember the most recently seen identities".
-    order: VecDeque<String>,
-    /// Maximum number of identities retained.
+    /// memory", not "remember the most recently seen credentials".
+    order: VecDeque<[u8; 32]>,
+    /// Maximum number of credentials retained.
     cap: usize,
 }
 
-impl SeenIdentitySet {
-    /// Construct with the default cap of [`DEFAULT_SEEN_IDENTITY_CAP`].
+impl SeenCredentials {
+    /// Construct with the default cap of [`DEFAULT_SEEN_CREDENTIALS_CAP`].
     #[must_use]
     pub(crate) fn new() -> Self {
-        Self::with_cap(DEFAULT_SEEN_IDENTITY_CAP)
+        Self::with_cap(DEFAULT_SEEN_CREDENTIALS_CAP)
     }
 
     /// Construct with an explicit cap. A `cap` of `0` is silently raised
-    /// to `1` to keep the invariant `set.len() <= cap` non-vacuous.
+    /// to `1` to keep the invariant `bindings.len() <= cap` non-vacuous.
     #[must_use]
     pub(crate) fn with_cap(cap: usize) -> Self {
         let resolved_cap = cap.max(1);
+        let mut key = [0_u8; 32];
+        rand::fill(&mut key);
         Self {
+            key,
             inner: Mutex::new(SeenInner {
-                set: HashSet::with_capacity(resolved_cap.min(64)),
+                bindings: HashMap::with_capacity(resolved_cap.min(64)),
                 order: VecDeque::with_capacity(resolved_cap.min(64)),
                 cap: resolved_cap,
             }),
         }
     }
 
-    /// Insert `name`. Returns `true` if this is the first time `name` was
-    /// inserted (or it was previously evicted and reinserted), `false`
-    /// if it was already present.
+    /// Hash domain-separated, length-delimited parts with the per-instance key.
+    fn digest(&self, domain: u8, parts: &[&[u8]]) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(self.key);
+        digest.update([domain]);
+        for part in parts {
+            digest.update(part.len().to_le_bytes());
+            digest.update(part);
+        }
+        digest.finalize().into()
+    }
+
+    /// Observe a credential and its latest binding, returning whether to log INFO.
     ///
-    /// When the cap is reached, the oldest inserted entry is evicted to
-    /// make room. Eviction never blocks the caller.
-    pub(crate) fn insert_is_first(&self, name: &str) -> bool {
-        // The only writer is this method; a poisoned set remains
-        // logically consistent (atomic insert + bounded eviction preserve
-        // the `set.len() <= cap` invariant). Continuing past poison only
-        // affects diagnostic logging granularity, not correctness or
-        // security.
+    /// Changed bindings log INFO again without refreshing FIFO order; new
+    /// credentials evict the oldest insertion when the shared cap is reached.
+    pub(crate) fn observe(
+        &self,
+        method: AuthMethod,
+        credential: &[u8],
+        name: &str,
+        role: &str,
+    ) -> bool {
+        let cred = self.digest(1, &[auth_method_label(method).as_bytes(), credential]);
+        let binding = self.digest(2, &[name.as_bytes(), role.as_bytes()]);
         let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
 
-        if guard.set.contains(name) {
-            return false;
+        if let Some(previous) = guard.bindings.get_mut(&cred) {
+            if *previous == binding {
+                return false;
+            }
+            *previous = binding;
+            return true;
         }
-        // Cap enforcement: evict-then-insert keeps the invariant
-        // `set.len() <= cap` even when the cap is `1`.
-        if guard.set.len() >= guard.cap
+        if guard.bindings.len() >= guard.cap
             && let Some(evicted) = guard.order.pop_front()
         {
-            let _removed = guard.set.remove(&evicted);
+            let _removed = guard.bindings.remove(&evicted);
         }
-        let owned = name.to_owned();
-        let _inserted = guard.set.insert(owned.clone());
-        guard.order.push_back(owned);
+        let _previous = guard.bindings.insert(cred, binding);
+        guard.order.push_back(cred);
         true
     }
 
     /// Test-only snapshot of the current size.
     #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.inner
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .set
+            .bindings
             .len()
     }
 }
 
-impl Default for SeenIdentitySet {
+impl Default for SeenCredentials {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Credential presentation used transiently to classify successful authentication.
+#[derive(Clone, Copy)]
+enum PresentedCredential<'req> {
+    /// Borrowed Bearer token, never retained or logged in the clear.
+    Bearer(&'req str),
+    /// Process-unique serial shared by requests on one mTLS connection.
+    MtlsConnection(u64),
 }
 
 /// Per-item client context captured for `auth failed` logs.
@@ -1681,11 +1770,10 @@ pub(crate) struct AuthState {
     #[cfg(feature = "oauth")]
     /// Optional JWKS cache for OAuth JWT validation.
     pub jwks_cache: Option<Arc<JwksCache>>,
-    /// Tracks identity names that have already been logged at INFO level.
-    /// Subsequent auths for the same identity are logged at DEBUG.
-    /// Bounded to prevent attacker-driven memory growth via churned
-    /// mTLS subjects or OAuth `sub` claims (see [`SeenIdentitySet`]).
-    pub seen_identities: SeenIdentitySet,
+    /// Per-credential-presentation de-duplication using keyed digests, never
+    /// credential bytes. Tokens and mTLS connections share the bounded FIFO
+    /// cap; repeats with the same binding log DEBUG (see [`SeenCredentials`]).
+    pub seen_credentials: SeenCredentials,
     /// Lightweight in-memory auth success/failure counters for diagnostics.
     pub counters: AuthCounters,
     /// Absolute URL of this server's RFC 9728 Protected Resource Metadata,
@@ -1757,20 +1845,32 @@ impl AuthState {
             .collect()
     }
 
-    /// Log auth success: INFO on first occurrence per identity, DEBUG after.
-    ///
-    /// Backed by [`SeenIdentitySet`], a bounded FIFO set that caps
-    /// retained identities to prevent attacker-driven memory growth.
-    /// FIFO (not LRU) is intentional: this cache de-duplicates INFO logs,
-    /// not security state, so per-hit eviction-order mutation is not
-    /// justified. See [`SeenIdentitySet`] for the full trade-off rationale.
-    fn log_auth(&self, id: &AuthIdentity, method: &str) {
+    /// Log per-credential-presentation success: INFO for new or changed bindings,
+    /// DEBUG for repeats. Keyed digests retain no credential bytes; tokens and
+    /// mTLS connections share the FIFO cap, re-logging at most once per eviction.
+    fn log_auth(&self, id: &AuthIdentity, method: &str, presented: PresentedCredential<'_>) {
         self.counters.record_success(id.method);
-        let first = self.seen_identities.insert_is_first(&id.name);
+        let connection_bytes;
+        let (credential, credential_fp) = match presented {
+            PresentedCredential::Bearer(token) => (
+                token.as_bytes(),
+                self.log_context
+                    .fingerprint_salt
+                    .as_ref()
+                    .map(|salt| redact_with_salt(salt.expose_secret().as_bytes(), token)),
+            ),
+            PresentedCredential::MtlsConnection(conn_id) => {
+                connection_bytes = conn_id.to_le_bytes();
+                (connection_bytes.as_slice(), None)
+            }
+        };
+        let first = self
+            .seen_credentials
+            .observe(id.method, credential, &id.name, &id.role);
         if first {
-            tracing::info!(name = %id.name, role = %id.role, "{method} authenticated");
+            tracing::info!(name = %id.name, role = %id.role, credential_fp = credential_fp.as_deref().map(field::display), "{method} authenticated");
         } else {
-            tracing::debug!(name = %id.name, role = %id.role, "{method} authenticated");
+            tracing::debug!(name = %id.name, role = %id.role, credential_fp = credential_fp.as_deref().map(field::display), "{method} authenticated");
         }
     }
 }
@@ -2303,31 +2403,39 @@ fn auth_failure_fields(
     }
 }
 
-/// Emit the `auth failed` warn log with the configured context fields.
-fn log_auth_failure(
-    failure_class: AuthFailureClass,
-    owner: Option<&CredentialOwner>,
-    ctx: &AuthLogContext,
-    req: &Request<Body>,
-) {
-    let fields = auth_failure_fields(ctx, req, owner);
-    tracing::warn!(
-        failure_class = %failure_class.as_str(),
-        client_ip = fields.client_ip.map(field::display),
-        peer_ip = fields.peer_ip.map(field::display),
-        request_id = fields.request_id.as_deref(),
-        method = fields.method.as_ref().map(field::display),
-        path = fields.path.as_deref().map(field::display),
-        user_agent = fields.user_agent.as_deref(),
-        auth_scheme = fields.auth_scheme.map(field::display),
-        token_kind = fields.token_kind.map(field::display),
-        mcp_session = fields.mcp_session,
-        mcp_protocol_version = fields.mcp_protocol_version.as_deref(),
-        credential_fp = fields.credential_fp.as_deref().map(field::display),
-        credential_owner = fields.credential_owner.as_deref(),
-        credential_rejection = fields.credential_rejection.map(field::display),
-        "auth failed"
-    );
+/// Emit `auth failed` at its rejection level with the configured context fields.
+fn log_auth_failure(rejection: &AuthRejection, ctx: &AuthLogContext, req: &Request<Body>) {
+    macro_rules! auth_failed_event {
+        ($level:expr, $class:expr, $fields:ident) => {
+            tracing::event!(
+                $level,
+                failure_class = %$class.as_str(),
+                client_ip = $fields.client_ip.map(field::display),
+                peer_ip = $fields.peer_ip.map(field::display),
+                request_id = $fields.request_id.as_deref(),
+                method = $fields.method.as_ref().map(field::display),
+                path = $fields.path.as_deref().map(field::display),
+                user_agent = $fields.user_agent.as_deref(),
+                auth_scheme = $fields.auth_scheme.map(field::display),
+                token_kind = $fields.token_kind.map(field::display),
+                mcp_session = $fields.mcp_session,
+                mcp_protocol_version = $fields.mcp_protocol_version.as_deref(),
+                credential_fp = $fields.credential_fp.as_deref().map(field::display),
+                credential_owner = $fields.credential_owner.as_deref(),
+                credential_rejection = $fields.credential_rejection.map(field::display),
+                "auth failed"
+            )
+        };
+    }
+    let fields = auth_failure_fields(ctx, req, rejection.owner.as_ref());
+    match rejection.log_level() {
+        AuthFailureLogLevel::Debug => {
+            auth_failed_event!(tracing::Level::DEBUG, rejection.failure_class, fields);
+        }
+        AuthFailureLogLevel::Warn => {
+            auth_failed_event!(tracing::Level::WARN, rejection.failure_class, fields);
+        }
+    }
 }
 
 /// Build the 401 response for a failed authentication, including the
@@ -2382,6 +2490,7 @@ async fn authenticate_bearer_identity(
 ) -> Result<AuthIdentity, AuthFailure> {
     let mut failure_class = AuthFailureClass::MissingCredential;
     let mut owner = None;
+    let mut api_key_expired = false;
 
     #[cfg(feature = "oauth")]
     if let Some(cache) = &state.jwks_cache
@@ -2453,6 +2562,7 @@ async fn authenticate_bearer_identity(
             });
         }
         Some(ApiKeyVerdict::Expired { name }) => {
+            api_key_expired = true;
             failure_class = AuthFailureClass::ExpiredCredential;
             owner = Some(CredentialOwner {
                 name,
@@ -2469,6 +2579,7 @@ async fn authenticate_bearer_identity(
     Err(AuthFailure::Rejected(AuthRejection {
         failure_class,
         owner,
+        api_key_expired,
     }))
 }
 
@@ -2479,8 +2590,8 @@ async fn authenticate_bearer_identity(
 /// Returned directly by [`auth_middleware`], never through the 401 path: no
 /// `WWW-Authenticate` challenge, a generic body, and it does not consume the
 /// post-failure rate-limit budget.
-fn overloaded_response(state: &AuthState) -> Response {
-    state.counters.record_overload();
+fn overloaded_response(state: &AuthState, extensions: &Extensions) -> Response {
+    record_counted_failure(state, extensions, CountedFailure::Overloaded);
     OVERLOAD_LOG.record();
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -2500,13 +2611,21 @@ fn overloaded_response(state: &AuthState) -> Response {
 /// Side effects on rejection: increments the `pre_auth_gate` failure
 /// counter and emits a warn-level log. mTLS-authenticated requests must
 /// be admitted by the caller *before* invoking this helper.
-fn pre_auth_gate(state: &AuthState, client_key: Option<&RateLimitKey>) -> Option<Response> {
+fn pre_auth_gate(
+    state: &AuthState,
+    client_key: Option<&RateLimitKey>,
+    extensions: &Extensions,
+) -> Option<Response> {
     let limiter = state.pre_auth_limiter.as_ref()?;
     let key = client_key?;
     match limiter.check_key_detailed(key) {
         Ok(()) => None,
         Err(BoundedLimiterDeny::RateLimited(wait)) => {
-            state.counters.record_failure(AuthFailureClass::PreAuthGate);
+            record_counted_failure(
+                state,
+                extensions,
+                CountedFailure::Class(AuthFailureClass::PreAuthGate),
+            );
             tracing::warn!(
                 rate_limit_key = %key,
                 "auth rate limited by pre-auth gate (request rejected before credential verification)"
@@ -2613,8 +2732,13 @@ pub(crate) async fn auth_middleware(
     //    mTLS connections bypass the pre-auth abuse gate below: the TLS
     //    handshake already performed expensive crypto with a verified peer,
     //    so we trust them not to be a CPU-spray attacker.
-    if let Some(id) = tls_info.and_then(|ci| ci.0.identity) {
-        state.log_auth(&id, "mTLS");
+    if let Some(ConnectInfo(TlsConnInfo {
+        addr: _,
+        identity: Some(id),
+        conn_id,
+    })) = tls_info
+    {
+        state.log_auth(&id, "mTLS", PresentedCredential::MtlsConnection(conn_id));
         let _previous = req.extensions_mut().insert(id);
         return next.run(req).await;
     }
@@ -2622,38 +2746,47 @@ pub(crate) async fn auth_middleware(
     // 2. Pre-auth abuse gate: rejects CPU-spray attacks BEFORE the Argon2id
     //    verification path runs. Keyed by source IP. mTLS connections (above)
     //    are exempt; this gate only protects the bearer/JWT verification path.
-    if let Some(blocked) = pre_auth_gate(&state, client_key.as_ref()) {
+    if let Some(blocked) = pre_auth_gate(&state, client_key.as_ref(), req.extensions()) {
         #[cfg(feature = "metrics")]
         record_rate_limit_deny(req.extensions(), "auth_pre");
         return blocked;
     }
 
-    let failure_class = if let Some(value) = req.headers().get(header::AUTHORIZATION) {
+    let rejection = if let Some(value) = req.headers().get(header::AUTHORIZATION) {
         match value.to_str().ok().and_then(extract_bearer) {
             Some(token) => match authenticate_bearer_identity(&state, token).await {
                 Ok(id) => {
-                    state.log_auth(&id, auth_method_label(id.method));
+                    state.log_auth(
+                        &id,
+                        auth_method_label(id.method),
+                        PresentedCredential::Bearer(token),
+                    );
                     let _previous = req.extensions_mut().insert(id);
                     return next.run(req).await;
                 }
                 // Admission overload is returned directly: never through the
                 // 401 path, never counted as a credential failure, and it
                 // never consumes the post-failure rate-limit budget below.
-                Err(AuthFailure::Overloaded) => return overloaded_response(&state),
-                Err(AuthFailure::Rejected(rejection)) => (rejection.failure_class, rejection.owner),
+                Err(AuthFailure::Overloaded) => {
+                    return overloaded_response(&state, req.extensions());
+                }
+                Err(AuthFailure::Rejected(rejection)) => rejection,
             },
-            None => (AuthFailureClass::InvalidCredential, None),
+            None => AuthRejection {
+                failure_class: AuthFailureClass::InvalidCredential,
+                owner: None,
+                api_key_expired: false,
+            },
         }
     } else {
-        (AuthFailureClass::MissingCredential, None)
+        AuthRejection {
+            failure_class: AuthFailureClass::MissingCredential,
+            owner: None,
+            api_key_expired: false,
+        }
     };
 
-    log_auth_failure(
-        failure_class.0,
-        failure_class.1.as_ref(),
-        &state.log_context,
-        &req,
-    );
+    log_auth_failure(&rejection, &state.log_context, &req);
 
     // Rate limit check (applied after auth failure only).
     // Successful authentications do not consume rate limit budget.
@@ -2661,13 +2794,21 @@ pub(crate) async fn auth_middleware(
         && let Some(resp) = post_failure_rate_limit_response(limiter, key, req.extensions())
     {
         if resp.status() == StatusCode::TOO_MANY_REQUESTS {
-            state.counters.record_failure(AuthFailureClass::RateLimited);
+            record_counted_failure(
+                &state,
+                req.extensions(),
+                CountedFailure::Class(AuthFailureClass::RateLimited),
+            );
         }
         return resp;
     }
 
-    state.counters.record_failure(failure_class.0);
-    unauthorized_response(&state, failure_class.0)
+    record_counted_failure(
+        &state,
+        req.extensions(),
+        CountedFailure::Class(rejection.failure_class),
+    );
+    unauthorized_response(&state, rejection.failure_class)
 }
 
 #[expect(
@@ -3672,7 +3813,7 @@ mod tests {
             verification_hook: None,
             #[cfg(feature = "oauth")]
             jwks_cache: None,
-            seen_identities: SeenIdentitySet::new(),
+            seen_credentials: SeenCredentials::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
             log_context: AuthLogContext {
@@ -3692,6 +3833,7 @@ mod tests {
             .with_writer(logs.clone())
             .with_ansi(false)
             .without_time()
+            .with_max_level(tracing::Level::DEBUG)
             .finish();
         let app = auth_router(state);
         let _guard = set_default(subscriber);
@@ -3744,6 +3886,544 @@ mod tests {
         let mut fields = LogContextConfig::default();
         configure(&mut fields);
         fields
+    }
+
+    /// Request presenting the golden-vector API key through the real middleware.
+    fn success_bearer_request() -> anyhow::Result<Request<Body>> {
+        Ok(Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header(header::AUTHORIZATION, format!("Bearer {ARGON2_0_5_TOKEN}"))
+            .body(Body::empty())?)
+    }
+
+    /// A retained Bearer token logs INFO once, then DEBUG without exposing it.
+    #[tokio::test]
+    async fn success_log_info_once_per_bearer_token_then_debug() -> anyhow::Result<()> {
+        // Given a valid API key and an empty presentation cache.
+        let state = test_auth_state(vec![ApiKeyEntry::new("alice", ARGON2_0_5_HASH, "viewer")]);
+
+        // When the same token authenticates twice.
+        let (first_status, first) =
+            capture_auth_failure_log(Arc::clone(&state), success_bearer_request()?).await?;
+        let (repeat_status, repeat) =
+            capture_auth_failure_log(state, success_bearer_request()?).await?;
+
+        // Then only the first presentation is INFO and neither log exposes the token.
+        assert_eq!(first_status, StatusCode::OK);
+        assert_eq!(repeat_status, StatusCode::OK);
+        let message = "bearer token authenticated name=alice role=viewer";
+        assert!(
+            assert_auth_failed_line(&first, message)?.contains("INFO"),
+            "{first}"
+        );
+        assert!(
+            assert_auth_failed_line(&repeat, message)?.contains("DEBUG"),
+            "{repeat}"
+        );
+        assert!(
+            !repeat.contains("INFO"),
+            "repeat must not emit INFO: {repeat}"
+        );
+        assert!(
+            !first.contains(ARGON2_0_5_TOKEN),
+            "first must not expose the token"
+        );
+        assert!(
+            !repeat.contains(ARGON2_0_5_TOKEN),
+            "repeat must not expose the token"
+        );
+        Ok(())
+    }
+
+    /// A token's latest binding, rather than historical bindings, controls INFO.
+    #[tokio::test]
+    async fn success_log_info_on_role_change_and_back() -> anyhow::Result<()> {
+        // Given a valid token initially bound to viewer.
+        let state = test_auth_state(vec![ApiKeyEntry::new("alice", ARGON2_0_5_HASH, "viewer")]);
+        let mut all_logs = String::new();
+
+        // When its role changes viewer -> admin -> viewer, followed by a repeat.
+        for (role, level) in [
+            ("viewer", "INFO"),
+            ("admin", "INFO"),
+            ("viewer", "INFO"),
+            ("viewer", "DEBUG"),
+        ] {
+            state.api_keys.store(Arc::new(vec![ApiKeyEntry::new(
+                "alice",
+                ARGON2_0_5_HASH,
+                role,
+            )]));
+            let (status, logs) =
+                capture_auth_failure_log(Arc::clone(&state), success_bearer_request()?).await?;
+
+            // Then each changed binding is INFO, including a change back.
+            assert_eq!(status, StatusCode::OK);
+            let line = assert_auth_failed_line(&logs, "bearer token authenticated")?;
+            assert!(line.contains(level), "expected {level}: {line}");
+            assert!(line.contains(&format!("role={role}")), "{line}");
+            all_logs.push_str(&logs);
+        }
+        assert_eq!(
+            all_logs
+                .lines()
+                .filter(|line| line.contains("INFO") && line.contains("authenticated"))
+                .count(),
+            3
+        );
+        Ok(())
+    }
+
+    /// mTLS presentations are connections, including connections reusing an address.
+    #[tokio::test]
+    async fn success_log_mtls_info_per_connection() -> anyhow::Result<()> {
+        // Given fingerprinting enabled and two connections sharing a peer address.
+        let state = test_auth_state_with_log_context(
+            vec![],
+            knobs(|ctx| ctx.credential_fingerprint = true),
+        );
+        let peer: SocketAddr = "10.0.0.20:54321".parse()?;
+        let identity = AuthIdentity {
+            name: "cn=test-client".into(),
+            role: "viewer".into(),
+            method: AuthMethod::MtlsCertificate,
+            raw_token: None,
+            sub: None,
+        };
+        let conn = TlsConnInfo::new(peer, Some(identity.clone()));
+        let reused_peer = TlsConnInfo::new(peer, Some(identity));
+
+        // When one connection repeats and the new connection authenticates.
+        for (connection, level) in [
+            (conn.clone(), "INFO"),
+            (conn, "DEBUG"),
+            (reused_peer, "INFO"),
+        ] {
+            let mut req = auth_request("/mcp")?;
+            let _previous = req.extensions_mut().insert(ConnectInfo(connection));
+            let (status, logs) = capture_auth_failure_log(Arc::clone(&state), req).await?;
+
+            // Then only new connections are INFO and mTLS has no token fingerprint.
+            assert_eq!(status, StatusCode::OK);
+            let line = assert_auth_failed_line(
+                &logs,
+                "mTLS authenticated name=cn=test-client role=viewer",
+            )?;
+            assert!(line.contains(level), "expected {level}: {line}");
+            assert!(
+                !logs.contains("credential_fp"),
+                "mTLS must not carry credential_fp: {logs}"
+            );
+            if level == "DEBUG" {
+                assert!(!logs.contains("INFO"), "repeat must not emit INFO: {logs}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Bearer success fingerprints use the failure-log salt only when opted in.
+    #[tokio::test]
+    async fn success_log_carries_credential_fp_only_with_knob() -> anyhow::Result<()> {
+        // Given the same valid token with fingerprinting off and on.
+        for enabled in [false, true] {
+            let state = test_auth_state_with_log_context(
+                vec![ApiKeyEntry::new("alice", ARGON2_0_5_HASH, "viewer")],
+                knobs(|ctx| ctx.credential_fingerprint = enabled),
+            );
+
+            // When the Bearer credential authenticates.
+            let (status, logs) = capture_auth_failure_log(state, success_bearer_request()?).await?;
+
+            // Then the optional fingerprint exactly matches the failure fingerprint.
+            assert_eq!(status, StatusCode::OK);
+            let line = assert_auth_failed_line(&logs, "bearer token authenticated")?;
+            if enabled {
+                let fingerprint = line
+                    .split_once("credential_fp=")
+                    .context("fingerprint present")?
+                    .1;
+                assert_eq!(
+                    fingerprint,
+                    redact_with_salt(b"test-salt", ARGON2_0_5_TOKEN)
+                );
+            } else {
+                assert!(
+                    !line.contains("credential_fp"),
+                    "fingerprinting is opt-in: {line}"
+                );
+            }
+            assert!(!logs.contains(ARGON2_0_5_TOKEN), "token must not be logged");
+        }
+        Ok(())
+    }
+
+    /// Success and failure logs use the same fingerprint for one Bearer token.
+    #[tokio::test]
+    async fn success_and_failure_fingerprints_match_for_same_token() -> anyhow::Result<()> {
+        // Given fingerprinting enabled and a token that initially has no key entry.
+        let state = test_auth_state_with_log_context(
+            vec![],
+            knobs(|ctx| ctx.credential_fingerprint = true),
+        );
+
+        // When the token fails authentication, then succeeds after its key is added.
+        let (failed_status, failed_logs) =
+            capture_auth_failure_log(Arc::clone(&state), success_bearer_request()?).await?;
+        state.api_keys.store(Arc::new(vec![ApiKeyEntry::new(
+            "alice",
+            ARGON2_0_5_HASH,
+            "viewer",
+        )]));
+        let (success_status, success_logs) =
+            capture_auth_failure_log(state, success_bearer_request()?).await?;
+
+        // Then both log paths carry the fingerprint of the same token and salt.
+        assert_eq!(failed_status, StatusCode::UNAUTHORIZED);
+        assert_eq!(success_status, StatusCode::OK);
+        let failed_line = assert_auth_failed_line(&failed_logs, "auth failed")?;
+        let success_line = assert_auth_failed_line(&success_logs, "bearer token authenticated")?;
+        let failure_fp = credential_fp_from_line(failed_line)?;
+        let success_fp = credential_fp_from_line(success_line)?;
+        assert_eq!(failure_fp, success_fp);
+        assert_eq!(success_fp, redact_with_salt(b"test-salt", ARGON2_0_5_TOKEN));
+        Ok(())
+    }
+
+    /// Expected login flows are DEBUG, independently of owner logging.
+    #[tokio::test]
+    async fn auth_failure_level_matrix() -> anyhow::Result<()> {
+        for credential_owner in [false, true] {
+            for (authorization, expired_key, level, class) in [
+                (None, false, "DEBUG", "missing_credential"),
+                (
+                    Some(HeaderValue::from_static("Basic abc")),
+                    false,
+                    "WARN",
+                    "invalid_credential",
+                ),
+                (
+                    Some(HeaderValue::from_bytes(b"\xff")?),
+                    false,
+                    "WARN",
+                    "invalid_credential",
+                ),
+                (
+                    Some(HeaderValue::from_static("Bearer garbage-token")),
+                    false,
+                    "WARN",
+                    "invalid_credential",
+                ),
+                (
+                    Some(HeaderValue::from_str(&format!(
+                        "Bearer {ARGON2_0_5_TOKEN}"
+                    ))?),
+                    true,
+                    "WARN",
+                    "expired_credential",
+                ),
+            ] {
+                // Given each credential shape with owner logging off or on.
+                let keys = if expired_key {
+                    vec![slot_key(
+                        "old-key",
+                        ARGON2_0_5_HASH,
+                        Some("2020-01-01T00:00:00Z"),
+                    )?]
+                } else {
+                    vec![]
+                };
+                let state = test_auth_state_with_log_context(
+                    keys,
+                    knobs(|ctx| ctx.credential_owner = credential_owner),
+                );
+                let mut req = auth_request("/mcp")?;
+                if let Some(value) = authorization {
+                    let _previous = req.headers_mut().insert(header::AUTHORIZATION, value);
+                }
+
+                // When authentication rejects the presentation.
+                let (status, logs) = capture_auth_failure_log(state, req).await?;
+
+                // Then the event's level follows the credential, not the owner knob.
+                assert_eq!(status, StatusCode::UNAUTHORIZED);
+                let line =
+                    assert_auth_failed_line(&logs, &format!("auth failed failure_class={class}"))?;
+                assert!(line.contains(level), "owner={credential_owner}: {line}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/auth.rs::auth_failure_log_level_table keeps the uniform test signature while it only asserts"
+    )]
+    /// Every failure class has an explicit level for both expiry sources.
+    fn auth_failure_log_level_table() -> anyhow::Result<()> {
+        for (failure_class, jwt_level, key_level) in [
+            (
+                AuthFailureClass::MissingCredential,
+                AuthFailureLogLevel::Debug,
+                AuthFailureLogLevel::Debug,
+            ),
+            (
+                AuthFailureClass::InvalidCredential,
+                AuthFailureLogLevel::Warn,
+                AuthFailureLogLevel::Warn,
+            ),
+            (
+                AuthFailureClass::ExpiredCredential,
+                AuthFailureLogLevel::Debug,
+                AuthFailureLogLevel::Warn,
+            ),
+            (
+                AuthFailureClass::RateLimited,
+                AuthFailureLogLevel::Warn,
+                AuthFailureLogLevel::Warn,
+            ),
+            (
+                AuthFailureClass::PreAuthGate,
+                AuthFailureLogLevel::Warn,
+                AuthFailureLogLevel::Warn,
+            ),
+        ] {
+            for (api_key_expired, expected) in [(false, jwt_level), (true, key_level)] {
+                // Given a rejection with an explicit failure class and expiry source.
+                let rejection = AuthRejection {
+                    failure_class,
+                    owner: None,
+                    api_key_expired,
+                };
+                // When selecting the event level.
+                let level = rejection.log_level();
+                // Then all combinations obey the expected-flow split.
+                assert_eq!(
+                    level, expected,
+                    "class={failure_class:?}, api_key_expired={api_key_expired}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// OAuth fixture sharing the standard state construction and log context.
+    #[cfg(feature = "oauth")]
+    fn test_auth_state_with_jwks_cache(
+        fields: LogContextConfig,
+        cache: JwksCache,
+    ) -> Arc<AuthState> {
+        let credential_fingerprint = fields.credential_fingerprint;
+        Arc::new(AuthState {
+            api_keys: ArcSwap::new(Arc::new(vec![])),
+            rate_limiter: None,
+            pre_auth_limiter: None,
+            hash_permits: test_default_hash_permits(),
+            verification_wait: Duration::from_secs(1),
+            verification_hook: None,
+            jwks_cache: Some(Arc::new(cache)),
+            seen_credentials: SeenCredentials::new(),
+            counters: AuthCounters::default(),
+            resource_metadata_url: None,
+            log_context: AuthLogContext {
+                fields,
+                fingerprint_salt: credential_fingerprint
+                    .then(|| Arc::new(SecretString::from("test-salt"))),
+            },
+        })
+    }
+
+    /// An expired, signed JWT remains DEBUG with owner logging off and on.
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn auth_failure_level_debug_for_expired_jwt() -> anyhow::Result<()> {
+        use wiremock::matchers;
+
+        use crate::oauth::tests::{generate_test_keypair, test_cache, test_config};
+        // Given a real signing key served by a loopback JWKS endpoint.
+        let kid = "auth-log-expired-jwt";
+        let (pem, jwks) = generate_test_keypair(kid)?;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(matchers::method("GET"))
+            .and(matchers::path("/jwks.json"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&jwks))
+            .mount(&server)
+            .await;
+        let config = test_config(&format!("{}/jwks.json", server.uri()));
+        let encoding_key = jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes())?;
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        header.kid = Some(kid.into());
+        let now = jsonwebtoken::get_current_timestamp();
+        let token = jsonwebtoken::encode(
+            &header,
+            &serde_json::json!({
+                "iss": "https://auth.test.local", "aud": "https://mcp.test.local/mcp",
+                "sub": "expired-bot", "scope": "mcp:read", "exp": now - 120, "iat": now - 3720,
+            }),
+            &encoding_key,
+        )?;
+        for credential_owner in [false, true] {
+            let state = test_auth_state_with_jwks_cache(
+                knobs(|ctx| ctx.credential_owner = credential_owner),
+                test_cache(&config)?,
+            );
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri("/mcp")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())?;
+            // When the expired JWT is driven through authentication middleware.
+            let (status, logs) = capture_auth_failure_log(state, req).await?;
+            // Then expiry is an expected refresh flow, regardless of owner logging.
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            let line =
+                assert_auth_failed_line(&logs, "auth failed failure_class=expired_credential")?;
+            assert!(line.contains("DEBUG"), "{line}");
+            assert!(!logs.lines().any(|event| event.contains("WARN")), "{logs}");
+            assert!(!logs.contains(&token), "JWT must not be logged");
+        }
+        Ok(())
+    }
+
+    /// Settled failure metrics equal positive administrative counter values.
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn auth_failure_metric_matches_admin_counters() -> anyhow::Result<()> {
+        // Given independent missing, invalid, expired-key and gated requests.
+        for class in [
+            AuthFailureClass::MissingCredential,
+            AuthFailureClass::InvalidCredential,
+            AuthFailureClass::ExpiredCredential,
+            AuthFailureClass::PreAuthGate,
+        ] {
+            let keys = if class == AuthFailureClass::ExpiredCredential {
+                vec![slot_key(
+                    "old-key",
+                    ARGON2_0_5_HASH,
+                    Some("2020-01-01T00:00:00Z"),
+                )?]
+            } else {
+                vec![]
+            };
+            let mut state = test_auth_state(keys);
+            if class == AuthFailureClass::PreAuthGate {
+                Arc::get_mut(&mut state)
+                    .context("unique fixture state")?
+                    .pre_auth_limiter = Some(build_pre_auth_limiter(
+                    &RateLimitConfig::new(100).with_pre_auth_max_per_minute(1),
+                ));
+            }
+            let metrics = Arc::new(McpMetrics::new()?);
+            let app = auth_router(Arc::clone(&state));
+            let peer: SocketAddr = "10.0.0.32:54321".parse()?;
+            let request = || -> anyhow::Result<Request<Body>> {
+                let mut req = auth_request("/mcp")?;
+                match class {
+                    AuthFailureClass::MissingCredential | AuthFailureClass::PreAuthGate => {}
+                    AuthFailureClass::InvalidCredential => {
+                        let _previous = req
+                            .headers_mut()
+                            .insert(header::AUTHORIZATION, HeaderValue::from_static("Basic abc"));
+                    }
+                    AuthFailureClass::ExpiredCredential => {
+                        let _previous = req.headers_mut().insert(
+                            header::AUTHORIZATION,
+                            HeaderValue::from_str(&format!("Bearer {ARGON2_0_5_TOKEN}"))?,
+                        );
+                    }
+                    AuthFailureClass::RateLimited => {
+                        anyhow::bail!("covered by post-failure limiter test")
+                    }
+                }
+                let _peer = req.extensions_mut().insert(ConnectInfo(peer));
+                let _handle = req.extensions_mut().insert(Arc::clone(&metrics));
+                Ok(req)
+            };
+            if class == AuthFailureClass::PreAuthGate {
+                assert_eq!(
+                    app.clone().oneshot(request()?).await?.status(),
+                    StatusCode::UNAUTHORIZED
+                );
+            }
+            // When the failure settles with the same metrics handle.
+            let response = app.oneshot(request()?).await?;
+            // Then the class increments exactly once in both accounting surfaces.
+            assert_eq!(
+                response.status(),
+                if class == AuthFailureClass::PreAuthGate {
+                    StatusCode::TOO_MANY_REQUESTS
+                } else {
+                    StatusCode::UNAUTHORIZED
+                }
+            );
+            let snapshot = state.counters_snapshot();
+            let admin = match class {
+                AuthFailureClass::MissingCredential => snapshot.failure_missing_credential,
+                AuthFailureClass::InvalidCredential => snapshot.failure_invalid_credential,
+                AuthFailureClass::ExpiredCredential => snapshot.failure_expired_credential,
+                AuthFailureClass::PreAuthGate => snapshot.failure_pre_auth_gate,
+                AuthFailureClass::RateLimited => snapshot.failure_rate_limited,
+            };
+            let metric = metrics
+                .auth_failures_total
+                .with_label_values(&[class.as_str()])
+                .get();
+            assert_eq!(metric, 1, "{}", class.as_str());
+            assert_eq!(metric, admin, "{}", class.as_str());
+        }
+        Ok(())
+    }
+
+    /// Compare positive settled values on both authentication accounting surfaces.
+    #[cfg(feature = "metrics")]
+    fn assert_failure_metrics(metrics: &McpMetrics, expected: &[(&str, u64, u64)]) {
+        for &(label, count, admin) in expected {
+            let metric = metrics
+                .auth_failures_total
+                .with_label_values(&[label])
+                .get();
+            assert_eq!(metric, count, "{label}");
+            assert_eq!(metric, admin, "{label} must match admin counters");
+        }
+    }
+
+    /// Capacity exhaustion is not a counted authentication failure.
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn pre_auth_capacity_full_counts_nothing() -> anyhow::Result<()> {
+        use prometheus::core::Collector as _;
+        // Given a reject-new limiter with its sole tracked slot occupied.
+        let mut state = test_auth_state(vec![]);
+        Arc::get_mut(&mut state)
+            .context("unique fixture state")?
+            .pre_auth_limiter = Some(build_pre_auth_limiter(
+            &RateLimitConfig::new(100)
+                .with_pre_auth_max_per_minute(10)
+                .with_max_tracked_keys(1)
+                .with_key_eviction_policy(KeyEvictionPolicy::RejectNew),
+        ));
+        let metrics = Arc::new(McpMetrics::new()?);
+        let mut extensions = Extensions::new();
+        let _handle = extensions.insert(Arc::clone(&metrics));
+        let established = RateLimitKey::Ip("10.7.7.7".parse()?);
+        let unseen = RateLimitKey::Ip("10.7.7.8".parse()?);
+        assert!(pre_auth_gate(&state, Some(&established), &extensions).is_none());
+        // When an unseen source is denied for capacity, not quota.
+        let response =
+            pre_auth_gate(&state, Some(&unseen), &extensions).context("capacity deny")?;
+        // Then no auth-failure series is created or incremented.
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(state.counters_snapshot().failure_pre_auth_gate, 0);
+        assert!(
+            metrics
+                .auth_failures_total
+                .collect()
+                .iter()
+                .all(|family| family.get_metric().is_empty()),
+            "capacity deny must not create a failure series"
+        );
+        Ok(())
     }
 
     /// Auth failure log omits client context by default.
@@ -4234,7 +4914,7 @@ mod tests {
             verification_hook: None,
             #[cfg(feature = "oauth")]
             jwks_cache: None,
-            seen_identities: SeenIdentitySet::new(),
+            seen_credentials: SeenCredentials::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
             log_context: AuthLogContext::default(),
@@ -4376,17 +5056,18 @@ mod tests {
             verification_hook: None,
             #[cfg(feature = "oauth")]
             jwks_cache: None,
-            seen_identities: SeenIdentitySet::new(),
+            seen_credentials: SeenCredentials::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
             log_context: AuthLogContext::default(),
         };
         let ip = RateLimitKey::Ip("10.7.7.7".parse::<IpAddr>()?);
         assert!(
-            pre_auth_gate(&state, Some(&ip)).is_none(),
+            pre_auth_gate(&state, Some(&ip), &Extensions::new()).is_none(),
             "first request within quota"
         );
-        let resp = pre_auth_gate(&state, Some(&ip)).context("second request must be gated")?;
+        let resp = pre_auth_gate(&state, Some(&ip), &Extensions::new())
+            .context("second request must be gated")?;
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         let retry_after = resp
             .headers()
@@ -4417,16 +5098,17 @@ mod tests {
             verification_hook: None,
             #[cfg(feature = "oauth")]
             jwks_cache: None,
-            seen_identities: SeenIdentitySet::new(),
+            seen_credentials: SeenCredentials::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
             log_context: AuthLogContext::default(),
         };
         let established = RateLimitKey::Ip("10.7.7.7".parse::<IpAddr>()?);
         let unseen = RateLimitKey::Ip("10.7.7.8".parse::<IpAddr>()?);
-        assert!(pre_auth_gate(&state, Some(&established)).is_none());
+        assert!(pre_auth_gate(&state, Some(&established), &Extensions::new()).is_none());
 
-        let resp = pre_auth_gate(&state, Some(&unseen)).context("unseen key must be rejected")?;
+        let resp = pre_auth_gate(&state, Some(&unseen), &Extensions::new())
+            .context("unseen key must be rejected")?;
 
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(resp.headers().get(header::RETRY_AFTER).is_none());
@@ -4482,7 +5164,7 @@ mod tests {
             verification_hook: None,
             #[cfg(feature = "oauth")]
             jwks_cache: None,
-            seen_identities: SeenIdentitySet::new(),
+            seen_credentials: SeenCredentials::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
             log_context: AuthLogContext::default(),
@@ -4562,7 +5244,7 @@ mod tests {
             verification_hook: None,
             #[cfg(feature = "oauth")]
             jwks_cache: None,
-            seen_identities: SeenIdentitySet::new(),
+            seen_credentials: SeenCredentials::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
             log_context: AuthLogContext::default(),
@@ -4628,7 +5310,7 @@ mod tests {
             verification_hook: None,
             #[cfg(feature = "oauth")]
             jwks_cache: None,
-            seen_identities: SeenIdentitySet::new(),
+            seen_credentials: SeenCredentials::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
             log_context: AuthLogContext::default(),
@@ -4684,7 +5366,7 @@ mod tests {
             verification_hook: None,
             #[cfg(feature = "oauth")]
             jwks_cache: None,
-            seen_identities: SeenIdentitySet::new(),
+            seen_credentials: SeenCredentials::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
             log_context: AuthLogContext::default(),
@@ -4715,6 +5397,14 @@ mod tests {
         assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(counter("auth_post"), 1, "deny must count once");
         assert_eq!(counter("auth_pre"), 0, "pre-auth gate disabled here");
+        let snapshot = state.counters_snapshot();
+        assert_failure_metrics(
+            &metrics,
+            &[
+                ("rate_limited", 1, snapshot.failure_rate_limited),
+                ("invalid_credential", 1, snapshot.failure_invalid_credential),
+            ],
+        );
         Ok(())
     }
 
@@ -5108,107 +5798,145 @@ mod tests {
         Ok(())
     }
 
+    #[test]
     #[expect(
         clippy::unnecessary_wraps,
-        reason = "deliberate: src/auth.rs::seen_identity_set_first_then_repeat keeps the uniform test signature while it only asserts"
+        reason = "deliberate: src/auth.rs::observe_first_then_repeat keeps the uniform test signature while it only asserts"
     )]
-    /// Seen identity set first then repeat.
-    #[test]
-    fn seen_identity_set_first_then_repeat() -> anyhow::Result<()> {
-        let set = SeenIdentitySet::new();
-        assert!(set.insert_is_first("alice"), "first sighting is first");
+    /// First credential presentations are distinct from repeats.
+    fn observe_first_then_repeat() -> anyhow::Result<()> {
+        // Given an empty cache.
+        let set = SeenCredentials::new();
+        // When credentials are presented, then only first sightings return true.
         assert!(
-            !set.insert_is_first("alice"),
+            set.observe(AuthMethod::BearerToken, b"alice-token", "alice", "viewer"),
+            "first sighting is first"
+        );
+        assert!(
+            !set.observe(AuthMethod::BearerToken, b"alice-token", "alice", "viewer"),
             "second sighting is not first"
         );
-        assert!(set.insert_is_first("bob"));
+        assert!(set.observe(AuthMethod::BearerToken, b"bob-token", "bob", "viewer"));
         assert_eq!(set.len(), 2);
         Ok(())
     }
 
+    #[test]
     #[expect(
         clippy::unnecessary_wraps,
-        reason = "deliberate: src/auth.rs::seen_identity_set_evicts_oldest_at_cap keeps the uniform test signature while it only asserts"
+        reason = "deliberate: src/auth.rs::observe_evicts_oldest_at_cap keeps the uniform test signature while it only asserts"
     )]
-    /// Seen identity set evicts oldest at cap.
-    #[test]
-    fn seen_identity_set_evicts_oldest_at_cap() -> anyhow::Result<()> {
-        let set = SeenIdentitySet::with_cap(2);
-        assert!(set.insert_is_first("a"));
-        assert!(set.insert_is_first("b"));
+    /// Cap eviction allows re-inserted credentials to log INFO again.
+    fn observe_evicts_oldest_at_cap() -> anyhow::Result<()> {
+        // Given a two-credential cap.
+        let set = SeenCredentials::with_cap(2);
+        // When credentials churn, then evicted presentations are new again.
+        assert!(set.observe(AuthMethod::BearerToken, b"a", "alice", "viewer"));
+        assert!(set.observe(AuthMethod::BearerToken, b"b", "alice", "viewer"));
         // Cap reached; inserting "c" evicts "a".
-        assert!(set.insert_is_first("c"));
+        assert!(set.observe(AuthMethod::BearerToken, b"c", "alice", "viewer"));
         assert_eq!(set.len(), 2);
         // "a" was evicted, so it re-fires as "first" (matches the documented
         // bounded trade-off: re-INFO once on reappearance). Inserting "a"
         // here evicts "b" (next oldest), leaving {c, a}.
-        assert!(set.insert_is_first("a"));
+        assert!(set.observe(AuthMethod::BearerToken, b"a", "alice", "viewer"));
         assert_eq!(set.len(), 2);
         // "b" has now been evicted in turn, so it re-fires as "first" too.
-        assert!(set.insert_is_first("b"));
+        assert!(set.observe(AuthMethod::BearerToken, b"b", "alice", "viewer"));
         // Sanity: cap is never exceeded regardless of churn pattern.
         for i in 0..32_u32 {
-            let _churn_seen = set.insert_is_first(&format!("churn-{i}"));
+            let _churn_seen = set.observe(
+                AuthMethod::BearerToken,
+                format!("churn-{i}").as_bytes(),
+                "alice",
+                "viewer",
+            );
             assert!(set.len() <= 2, "cap invariant must hold");
         }
         Ok(())
     }
 
+    #[test]
     #[expect(
         clippy::unnecessary_wraps,
-        reason = "deliberate: src/auth.rs::seen_identity_set_cap_zero_is_raised_to_one keeps the uniform test signature while it only asserts"
+        reason = "deliberate: src/auth.rs::observe_cap_zero_is_raised_to_one keeps the uniform test signature while it only asserts"
     )]
-    /// Seen identity set cap zero is raised to one.
-    #[test]
-    fn seen_identity_set_cap_zero_is_raised_to_one() -> anyhow::Result<()> {
-        let set = SeenIdentitySet::with_cap(0);
-        assert!(set.insert_is_first("only"));
+    /// A zero cap still retains one credential.
+    fn observe_cap_zero_is_raised_to_one() -> anyhow::Result<()> {
+        // Given a zero configured cap.
+        let set = SeenCredentials::with_cap(0);
+        // When two credentials are presented, then each occupies the one slot.
+        assert!(set.observe(AuthMethod::BearerToken, b"only", "alice", "viewer"));
         assert_eq!(set.len(), 1);
         // Next insert evicts "only".
-        assert!(set.insert_is_first("next"));
+        assert!(set.observe(AuthMethod::BearerToken, b"next", "alice", "viewer"));
         assert_eq!(set.len(), 1);
         Ok(())
     }
 
+    #[test]
     #[expect(
         clippy::unnecessary_wraps,
-        reason = "deliberate: src/auth.rs::seen_identity_set_fifo_does_not_refresh_on_repeat_hit keeps the uniform test signature while it only asserts"
+        reason = "deliberate: src/auth.rs::observe_fifo_does_not_refresh_on_repeat_hit keeps the uniform test signature while it only asserts"
     )]
-    /// Seen identity set fifo does not refresh on repeat hit.
-    #[test]
-    fn seen_identity_set_fifo_does_not_refresh_on_repeat_hit() -> anyhow::Result<()> {
+    /// Repeat hits and changed bindings do not refresh FIFO insertion order.
+    fn observe_fifo_does_not_refresh_on_repeat_hit() -> anyhow::Result<()> {
         // Locks in the FIFO contract: repeat hits MUST NOT bump an entry
         // to the back of the eviction queue (that would be LRU).
-        let set = SeenIdentitySet::with_cap(2);
-        assert!(set.insert_is_first("a")); // order=[a]
-        assert!(set.insert_is_first("b")); // order=[a,b]
+        // Given two credentials in insertion order.
+        let set = SeenCredentials::with_cap(2);
+        assert!(set.observe(AuthMethod::BearerToken, b"a", "alice", "viewer")); // order=[a]
+        assert!(set.observe(AuthMethod::BearerToken, b"b", "alice", "viewer")); // order=[a,b]
         // Repeat hit on "a" - if this were LRU, "a" would move to the back
         // and "b" would be the next eviction victim. Under FIFO, "a" stays
         // at the front (oldest by insertion).
-        assert!(!set.insert_is_first("a"));
+        // When the oldest credential repeats, then its position stays unchanged.
+        assert!(!set.observe(AuthMethod::BearerToken, b"a", "alice", "viewer"));
+        assert!(set.observe(AuthMethod::BearerToken, b"a", "alice", "admin"));
         // Insert "c" forces eviction. Under FIFO, "a" (oldest by insertion)
         // is evicted; "b" survives. Under LRU, "b" would have been evicted.
-        assert!(set.insert_is_first("c"));
+        assert!(set.observe(AuthMethod::BearerToken, b"c", "alice", "viewer"));
         // Prove "a" was evicted: re-inserting fires as first again.
-        assert!(set.insert_is_first("a"));
+        assert!(set.observe(AuthMethod::BearerToken, b"a", "alice", "admin"));
         // Prove "b" was NOT evicted: re-inserting does NOT fire as first.
         // (If LRU semantics had snuck in, this assertion would fail.)
         // After the previous step, "a" eviction pushed out "b" as the new
         // oldest, so we must re-add "b" via a fresh insert path. To keep
         // the test deterministic we rebuild a small scenario:
-        let rebuilt = SeenIdentitySet::with_cap(2);
-        assert!(rebuilt.insert_is_first("x")); // order=[x]
-        assert!(rebuilt.insert_is_first("y")); // order=[x,y]
-        assert!(!rebuilt.insert_is_first("x")); // repeat hit (under FIFO: order unchanged)
-        assert!(rebuilt.insert_is_first("z")); // evicts "x" under FIFO
+        let rebuilt = SeenCredentials::with_cap(2);
+        assert!(rebuilt.observe(AuthMethod::BearerToken, b"x", "alice", "viewer")); // order=[x]
+        assert!(rebuilt.observe(AuthMethod::BearerToken, b"y", "alice", "viewer")); // order=[x,y]
+        assert!(!rebuilt.observe(AuthMethod::BearerToken, b"x", "alice", "viewer")); // repeat hit
+        assert!(rebuilt.observe(AuthMethod::BearerToken, b"z", "alice", "viewer")); // evicts "x"
         assert!(
-            !rebuilt.insert_is_first("y"),
+            !rebuilt.observe(AuthMethod::BearerToken, b"y", "alice", "viewer"),
             "y must still be present (FIFO did not evict it)"
         );
         assert!(
-            rebuilt.insert_is_first("x"),
+            rebuilt.observe(AuthMethod::BearerToken, b"x", "alice", "viewer"),
             "x must have been evicted by FIFO (would NOT have been evicted under LRU)"
         );
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/auth.rs::observe_distinguishes_credentials_methods_and_bindings keeps the uniform test signature while it only asserts"
+    )]
+    /// Credentials, methods and current bindings all distinguish presentations.
+    fn observe_distinguishes_credentials_methods_and_bindings() -> anyhow::Result<()> {
+        // Given independently keyed caches.
+        let seen = SeenCredentials::new();
+        let other = SeenCredentials::new();
+
+        // When credential bytes, method or binding changes, then it is a new presentation.
+        assert!(seen.observe(AuthMethod::BearerToken, b"token", "alice", "viewer"));
+        assert!(seen.observe(AuthMethod::BearerToken, b"token", "bob", "viewer"));
+        assert!(!seen.observe(AuthMethod::BearerToken, b"token", "bob", "viewer"));
+        assert!(seen.observe(AuthMethod::BearerToken, b"another-token", "bob", "viewer"));
+        assert!(seen.observe(AuthMethod::OAuthJwt, b"token", "bob", "viewer"));
+        assert_ne!(seen.digest(1, &[b"token"]), other.digest(1, &[b"token"]));
         Ok(())
     }
 
@@ -5231,7 +5959,7 @@ mod tests {
             verification_hook: hook,
             #[cfg(feature = "oauth")]
             jwks_cache: None,
-            seen_identities: SeenIdentitySet::new(),
+            seen_credentials: SeenCredentials::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
             log_context: AuthLogContext::default(),
@@ -5325,6 +6053,27 @@ mod tests {
         Ok(())
     }
 
+    fn permit_pool_test_request(
+        authorization: &str,
+        #[cfg(feature = "metrics")] metrics: &Arc<McpMetrics>,
+    ) -> anyhow::Result<Request<Body>> {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header("authorization", authorization)
+            .body(Body::empty())?;
+        #[cfg(feature = "metrics")]
+        {
+            let mut metrics_request = request;
+            let _handle = metrics_request.extensions_mut().insert(Arc::clone(metrics));
+            Ok(metrics_request)
+        }
+        #[cfg(not(feature = "metrics"))]
+        {
+            Ok(request)
+        }
+    }
+
     /// Pins the saturation contract end to end: active concurrent Argon2id
     /// verifications never exceed `max_concurrent_verifications`, a
     /// request beyond the pool waits roughly `verification_wait` and then
@@ -5342,15 +6091,16 @@ mod tests {
         let state = sec01_test_state(permits, verification_wait, Some(Arc::clone(&hook)));
         let app = auth_router(Arc::clone(&state));
         let permits_u64 = u64::try_from(permits).context("permits must fit in a u64")?;
-
+        #[cfg(feature = "metrics")]
+        let metrics = Arc::new(McpMetrics::new()?);
+        #[cfg(feature = "metrics")]
+        let request = |authorization: &str| permit_pool_test_request(authorization, &metrics);
+        #[cfg(not(feature = "metrics"))]
+        let request = |authorization: &str| permit_pool_test_request(authorization);
         let mut handles = Vec::new();
         for _ in 0..permits {
             let task_app = app.clone();
-            let req = Request::builder()
-                .method(Method::POST)
-                .uri("/mcp")
-                .header("authorization", "Bearer held-request")
-                .body(Body::empty())?;
+            let req = request("Bearer held-request")?;
             handles.push(tokio::spawn(async move { task_app.oneshot(req).await }));
         }
 
@@ -5371,11 +6121,7 @@ mod tests {
         // A third concurrent request has no permit available: it must wait
         // roughly `verification_wait` (never instantly - that would mean
         // the wait is ignored) and then receive 503, never a hang or 401.
-        let overload_req = Request::builder()
-            .method(Method::POST)
-            .uri("/mcp")
-            .header("authorization", "Bearer overloaded-request")
-            .body(Body::empty())?;
+        let overload_req = request("Bearer overloaded-request")?;
         let started = Instant::now();
         let overloaded = timeout(Duration::from_secs(5), app.clone().oneshot(overload_req))
             .await
@@ -5435,6 +6181,14 @@ mod tests {
             "the two held-then-released requests must be counted as invalid credential, \
              not overload"
         );
+        #[cfg(feature = "metrics")]
+        assert_failure_metrics(
+            &metrics,
+            &[
+                ("overloaded", 1, counters.failure_overloaded),
+                ("invalid_credential", 2, counters.failure_invalid_credential),
+            ],
+        );
         Ok(())
     }
 
@@ -5468,7 +6222,7 @@ mod tests {
             verification_hook: Some(Arc::clone(&hook)),
             #[cfg(feature = "oauth")]
             jwks_cache: None,
-            seen_identities: SeenIdentitySet::new(),
+            seen_credentials: SeenCredentials::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
             log_context: AuthLogContext::default(),

@@ -58,6 +58,11 @@ pub struct McpMetrics {
     /// four built-in per-IP limiters. Incremented at each deny site
     /// alongside the existing warn-level log.
     pub rate_limited_total: IntCounterVec,
+    /// Authentication failures by class. Label `class` is one of
+    /// `missing_credential`, `invalid_credential`, `expired_credential`,
+    /// `rate_limited`, `pre_auth_gate`, `overloaded` - the failure classes of
+    /// `/admin/auth/counters`. Incremented wherever those counters are.
+    pub auth_failures_total: IntCounterVec,
 }
 
 impl McpMetrics {
@@ -105,11 +110,24 @@ impl McpMetrics {
             .register(Box::new(rate_limited_total.clone()))
             .map_err(|error| RmcpServerKitError::Metrics(error.to_string()))?;
 
+        let auth_failures_total = IntCounterVec::new(
+            opts!(
+                "rmcp_server_kit_auth_failures_total",
+                "Authentication failures by class"
+            ),
+            &["class"],
+        )
+        .map_err(|error| RmcpServerKitError::Metrics(error.to_string()))?;
+        registry
+            .register(Box::new(auth_failures_total.clone()))
+            .map_err(|error| RmcpServerKitError::Metrics(error.to_string()))?;
+
         Ok(Self {
             registry,
             http_requests_total,
             http_request_duration_seconds,
             rate_limited_total,
+            auth_failures_total,
         })
     }
 
@@ -165,6 +183,19 @@ pub(crate) fn record_rate_limit_deny(ext: &Extensions, limiter: &str) {
             .rate_limited_total
             .with_label_values(&[limiter])
             .inc();
+    }
+}
+
+/// Record an authentication failure when the request has a metrics handle.
+///
+/// The handle is inserted by the transport's metrics middleware only when
+/// metrics are enabled; absent the extension this is a no-op, so auth failure
+/// sites behave identically with metrics disabled. `class` is one of
+/// `missing_credential`, `invalid_credential`, `expired_credential`,
+/// `rate_limited`, `pre_auth_gate`, `overloaded`.
+pub(crate) fn record_auth_failure(ext: &Extensions, class: &str) {
+    if let Some(handle) = ext.get::<Arc<McpMetrics>>() {
+        handle.auth_failures_total.with_label_values(&[class]).inc();
     }
 }
 
@@ -414,6 +445,33 @@ mod tests {
                 .with_label_values(&["auth_pre"])
                 .get(),
             2
+        );
+        Ok(())
+    }
+
+    /// Pins that the auth-failure counter increments only when the handle is present.
+    #[test]
+    fn record_auth_failure_increments_via_extension() -> anyhow::Result<()> {
+        let metrics = Arc::new(McpMetrics::new()?);
+        let mut ext = Extensions::new();
+        let _previous = ext.insert(Arc::clone(&metrics));
+        record_auth_failure(&ext, "missing_credential");
+        assert_eq!(
+            metrics
+                .auth_failures_total
+                .with_label_values(&["missing_credential"])
+                .get(),
+            1
+        );
+        // Absent handle: silent no-op (metrics disabled path).
+        let empty = Extensions::new();
+        record_auth_failure(&empty, "missing_credential");
+        assert_eq!(
+            metrics
+                .auth_failures_total
+                .with_label_values(&["missing_credential"])
+                .get(),
+            1
         );
         Ok(())
     }
