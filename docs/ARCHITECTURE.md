@@ -510,7 +510,7 @@ alone would be insufficient: non-CRL mTLS still relies on
 `[mtls]` is configured and `crl_enabled = true` (the default).
 
 Lifecycle:
-1. `bootstrap_fetch(roots, ca_certs, config)` (`src/mtls_revocation.rs:2134`) is
+1. `bootstrap_fetch(roots, ca_certs, config)` (`src/mtls_revocation.rs:2170`) is
    the public helper. `run_server` calls the crate-internal
    `bootstrap_fetch_with_server_chain(roots, ca_certs, server_chain, config)`
    *before* the listener is built. That path walks the configured CA chain,
@@ -519,7 +519,7 @@ Lifecycle:
    deadline, and seeds the cache. It also derives the trusted origins from
    the CDP and AIA caIssuers and OCSP URIs named in the CA bundle and the
    server certificate chain, then logs the sorted set once at INFO.
-2. The returned `Arc<CrlSet>` (`CrlSet`, `src/mtls_revocation.rs:329`) owns:
+2. The returned `Arc<CrlSet>` (`CrlSet`, `src/mtls_revocation.rs:330`) owns:
    - `verifier_state: ArcSwap<VerifierState>` - one published generation
      containing the current `Arc<dyn ClientCertVerifier>`, the URLs whose
      CRLs it enforces, and the committed cache-entry identities.
@@ -537,19 +537,19 @@ Lifecycle:
    - `roots` and `signature_algorithms` - the client-auth root store and the
      process-default provider's signature algorithms (captured once in
      `CrlSet::new`). The live verifier uses the same pair, and
-     `verified_path_cdp_urls` reuses them for the verified path check
+     `cdp_urls_on_verified_paths` reuses them for the verified path check
      described under "Discovery admission ordering".
    A commit publishes the rebuilt cache and `verifier_state` together under
    the cache write lock with no `.await` between them; handshake readers take
    a non-blocking cache `try_read()` and then load `verifier_state`.
-3. `DynamicClientCertVerifier` (`src/mtls_revocation.rs:1707`) is the
+3. `DynamicClientCertVerifier` (`src/mtls_revocation.rs:1743`) is the
    `Arc<dyn ClientCertVerifier>` handed to `rustls::ServerConfig`. It holds
    `{ inner: Arc<CrlSet>, dn_subjects }` and delegates every revocation
    precheck and rustls verifier decision to the `CrlSet` and its published
    `verifier_state`. Because `tokio_rustls::TlsAcceptor` clones the verifier
    `Arc` from the `ServerConfig` at construction, the dynamic verifier MUST
    be the Arc handed to rustls.
-4. `run_crl_refresher(set, rx, shutdown)` (`src/mtls_revocation.rs:2389`)
+4. `run_crl_refresher(set, rx, shutdown)` (`src/mtls_revocation.rs:2425`)
    is spawned by `run_server`. It:
    - Drains the `discover_tx` receiver and fetches any newly observed CDP URLs.
    - Re-fetches each cached CRL before its `nextUpdate`, clamped to
@@ -618,7 +618,7 @@ For OAuth, the guard covers:
 
 ### Discovery admission ordering
 
-`note_discovered_urls` (`src/mtls_revocation.rs:991`) implements a
+`note_discovered_urls` (`src/mtls_revocation.rs:1021`) implements a
 strict pending-before-send protocol to keep discovery retries correct:
 
 1. Sort and deduplicate the advertised URL set, select the relevant set
@@ -633,7 +633,7 @@ strict pending-before-send protocol to keep discovery retries correct:
    applies `check_scheme`, `reject_blocked_crl_ip`, `ip_block_reason`, and
    connect-time `SsrfScreeningResolver` screening before issuing any request.
 3. When candidates remain, run the `discoverable` closure once. It is
-   `CrlSet::verified_path_cdp_urls`: webpki path building from the presented
+   `CrlSet::cdp_urls_on_verified_paths`: webpki path building from the presented
    chain to the configured roots with the same signature algorithms as the
    live verifier, client-auth usage, and no revocation. A chain that does not
    verify yields `None`, which empties the candidates, so nothing is admitted
@@ -662,7 +662,7 @@ the first time the rate limiter engaged or the fetch failed, breaking
 revocation for the affected client identities. Per-peer keying additionally
 stops one peer's spray from fail-closing a concurrent legitimate peer. The
 current ordering is verified by `__test_check_discovery_rate`
-(`__test_check_discovery_rate`, `src/mtls_revocation.rs:1341`) and by the per-peer isolation test
+(`__test_check_discovery_rate`, `src/mtls_revocation.rs:1377`) and by the per-peer isolation test
 (`per_peer_discovery_quota_does_not_starve_other_peers`).
 
 Hot-reload: `ReloadHandle::refresh_crls()` (in `src/transport.rs`) calls

@@ -13,11 +13,12 @@
 //!
 //! Security note: CDP URLs are read before the revocation-checking verifier
 //! runs, so that `crl_deny_on_unavailable` can reject a client whose CRL was
-//! never fetched. Discovery admits only URLs named by certificates on the
-//! verified path of a chain that verifies against the configured roots. The
-//! check runs before key possession is proven and ignores revocation, so a copy
-//! of a valid chain can trigger only the URLs its issuing CA chose, while a
-//! self-made chain or an appended certificate chooses nothing.
+//! never fetched. Discovery admits only URLs named by certificates on a
+//! verified path of a chain that verifies against the configured roots, and
+//! every verified path counts. The check runs before key possession is proven
+//! and ignores revocation, so a copy of a valid chain can trigger only URLs
+//! chosen by the CAs that issued the certificates on its verified paths, while
+//! a self-made chain or a certificate on no verified path chooses nothing.
 //!
 //! The CA signature guarantees a CRL's contents and origin, so where a genuine
 //! CRL is downloaded from does not matter for trust. It does not stop the
@@ -34,7 +35,7 @@
 //! time through `SsrfScreeningResolver` to catch DNS rebinding (a URL whose
 //! exact origin is not trusted always uses a client that admits no blocked
 //! address, so a trusted hostname is trusted only on its trusted origin), no
-//! redirects, discovery only for certificates on the verified path, and the
+//! redirects, discovery only for certificates on a verified path, and the
 //! discovery-rate, concurrency, and body-size caps.
 //!
 //! Plain HTTP is allowed by default (`crl_allow_http = true`): the signature
@@ -945,40 +946,69 @@ impl CrlSet {
         let _removed = pending.remove(url);
     }
 
-    /// CDP URLs of the certificates on the verified path of a presented chain.
+    /// CDP URLs named by the end entity and by the intermediates on every
+    /// verified path of a presented chain.
     ///
-    /// The path is the end entity plus the intermediates webpki used to reach a
-    /// configured root, verified exactly as the live verifier does except for
-    /// revocation: same roots, same signature algorithms and client-auth usage.
-    /// Returns `None` when the chain does not verify.
-    fn verified_path_cdp_urls(
+    /// A verified path runs from the end entity to a configured root and is
+    /// verified exactly as the live verifier does except for revocation: same
+    /// roots, same signature algorithms and client-auth usage. webpki stops at
+    /// the first such path, so a `verify_path` callback records each candidate
+    /// path and rejects it to keep the search going; the search result is
+    /// therefore an error and is ignored. Byte-identical duplicate
+    /// intermediates are dropped first, so copies of one certificate cannot
+    /// spend webpki's per-call budget. The live verifier explores the same
+    /// distinct paths in the same order, but it gives up on a candidate at its
+    /// first revocation failure while this search verifies every candidate in
+    /// full, so only a chain offering dozens of distinct alternative paths can
+    /// exhaust this search's budget before the path the live verifier accepts.
+    /// Returns `None` when no path is recorded.
+    fn cdp_urls_on_verified_paths(
         &self,
         end_entity: &CertificateDer<'_>,
         intermediates: &[CertificateDer<'_>],
         now: UnixTime,
     ) -> Option<HashSet<String>> {
+        use core::cell::Cell;
+
         let cert = webpki::EndEntityCert::try_from(end_entity).ok()?;
-        let path = cert
-            .verify_for_usage(
-                self.signature_algorithms.all,
-                &self.roots.roots,
-                intermediates,
-                now,
-                webpki::KeyUsage::client_auth(),
-                None,
-                None,
-            )
-            .ok()?;
-        let mut urls = extract_cdp_urls(end_entity.as_ref(), self.config.crl_allow_http)
-            .into_iter()
-            .collect::<HashSet<_>>();
-        for intermediate in path.intermediate_certificates() {
-            urls.extend(extract_cdp_urls(
-                intermediate.der().as_ref(),
-                self.config.crl_allow_http,
-            ));
-        }
-        Some(urls)
+        let allow_http = self.config.crl_allow_http;
+        let mut seen_der = HashSet::new();
+        let distinct_intermediates = intermediates
+            .iter()
+            .filter(|&intermediate| seen_der.insert(intermediate.as_ref()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let recorded: Cell<Option<HashSet<String>>> = Cell::new(None);
+        let _search = cert.verify_for_usage(
+            self.signature_algorithms.all,
+            &self.roots.roots,
+            &distinct_intermediates,
+            now,
+            webpki::KeyUsage::client_auth(),
+            None,
+            Some(&|candidate: &webpki::VerifiedPath<'_>| {
+                let mut urls = recorded.take().unwrap_or_default();
+                urls.extend(
+                    candidate
+                        .intermediate_certificates()
+                        .flat_map(|intermediate| {
+                            extract_cdp_urls(intermediate.der().as_ref(), allow_http)
+                        }),
+                );
+                recorded.set(Some(urls));
+                // Rejecting every candidate keeps webpki building paths, because
+                // a `verify_path` error is non-fatal (rustls-webpki 0.103.15
+                // verify_cert.rs:91-94; only the budget errors are fatal,
+                // error.rs:357-364). So every verified path within the per-call
+                // budget is recorded, and the variant is otherwise irrelevant
+                // because the search result is ignored.
+                Err(webpki::Error::UnknownIssuer)
+            }),
+        );
+        recorded.into_inner().map(|mut urls| {
+            urls.extend(extract_cdp_urls(end_entity.as_ref(), allow_http));
+            urls
+        })
     }
 
     /// Enqueue newly-seen CDP URLs and run the synchronous fail-closed
@@ -987,7 +1017,7 @@ impl CrlSet {
     /// Returns `(deny, state)`. The caller MUST enforce with the returned
     /// `state.verifier` rather than re-loading: pre-check and enforcement have
     /// to observe the same verifier generation.
-    /// `discoverable` lazily returns the CDP URLs named by the verified path.
+    /// `discoverable` lazily returns the CDP URLs named by the verified paths of the presented chain.
     fn note_discovered_urls<F>(
         &self,
         end_entity_urls: &[String],
@@ -1002,21 +1032,27 @@ impl CrlSet {
         // already presented a chain that parses; this method must not panic
         // under attacker-controlled URL contents.
         //
-        // SECURITY: only URLs named by certificates on the verified path of a
-        // chain that verifies against the configured roots are discovered. The
-        // chain is checked before the client proves key possession and
-        // revocation is not considered, so a copy of a valid chain can only
-        // trigger the URLs its issuing CA chose. A self-made chain, or a
-        // certificate appended outside the verified path, can no longer choose
-        // URLs the server fetches - including any path on an operator-trusted
-        // origin - nor spend discovery budget. The gate runs lazily, at most
-        // once, only when there is something new.
+        // SECURITY: only URLs named by the end entity or by an intermediate on
+        // a verified path of a chain that verifies against the configured roots
+        // are discovered. Every verified path counts, within webpki's per-call
+        // budget and with byte-identical duplicate intermediates ignored, so
+        // the path the live verifier accepts is covered, including when a
+        // cross-signed intermediate is presented in two copies; only a chain
+        // offering dozens of distinct alternative paths can exhaust that budget
+        // first. The chain is checked before the client proves key possession
+        // and revocation is not considered, so a copy of a valid chain can only
+        // trigger URLs chosen by the CAs that issued the certificates on its
+        // verified paths. A self-made chain, or a certificate on no verified
+        // path, can no longer choose URLs the server fetches - including any
+        // path on an operator-trusted origin - nor spend discovery budget. The
+        // gate runs lazily, at most once, only when there is something new.
         //
         // The 64-URL cap, precheck and deny logic still operate on every
-        // presented CDP URL in `relevant_urls`. Off-path certificates are
-        // excluded from discovery only; they still count toward the cap. That
-        // deliberate choice avoids chain verification on every handshake and
-        // preserves the error returned for chains that do not verify.
+        // presented CDP URL in `relevant_urls`. Certificates on no verified
+        // path are excluded from discovery only; they still count toward the
+        // cap. That deliberate choice avoids chain verification on every
+        // handshake and preserves the error returned for chains that do not
+        // verify.
         let mut all_urls = Vec::with_capacity(
             end_entity_urls
                 .len()
@@ -1090,7 +1126,7 @@ impl CrlSet {
                 if dropped > 0 {
                     tracing::debug!(
                         dropped,
-                        "CRL discovery dropped CDP URLs not named by the verified certificate path"
+                        "CRL discovery dropped CDP URLs not named by a verified certificate path"
                     );
                 }
             } else {
@@ -1098,7 +1134,7 @@ impl CrlSet {
                 candidates.clear();
                 tracing::debug!(
                     dropped,
-                    "CRL discovery dropped CDP URLs not named by the verified certificate path"
+                    "CRL discovery dropped CDP URLs not named by a verified certificate path"
                 );
             }
         }
@@ -1759,12 +1795,12 @@ impl ClientCertVerifier for DynamicClientCertVerifier {
     ) -> Result<ClientCertVerified, TlsError> {
         // SECURITY: URLs are extracted before the revocation-checking inner
         // verifier so `crl_deny_on_unavailable = true` can fail closed on a
-        // never-fetched CDP. Only URLs named by certificates on the verified
-        // path of a chain that verifies against the configured roots are
-        // admitted to discovery. The chain is checked before key possession is
-        // proven and revocation is not considered. No HTTP happens on this
-        // path - the call to `note_discovered_urls` only enqueues onto a
-        // bounded, rate-limited channel. Do NOT reorder.
+        // never-fetched CDP. Only URLs named by certificates on a verified path
+        // of a chain that verifies against the configured roots are admitted to
+        // discovery. The chain is checked before key possession is proven and
+        // revocation is not considered. No HTTP happens on this path - the call
+        // to `note_discovered_urls` only enqueues onto a bounded, rate-limited
+        // channel. Do NOT reorder.
         let mut end_entity_urls =
             extract_cdp_urls(end_entity.as_ref(), self.inner.config.crl_allow_http);
         end_entity_urls.sort();
@@ -1784,7 +1820,7 @@ impl ClientCertVerifier for DynamicClientCertVerifier {
             self.inner
                 .note_discovered_urls(&end_entity_urls, &intermediate_urls, || {
                     self.inner
-                        .verified_path_cdp_urls(end_entity, intermediates, now)
+                        .cdp_urls_on_verified_paths(end_entity, intermediates, now)
                 });
         if revocation_unavailable {
             return Err(TlsError::General(
@@ -2817,7 +2853,7 @@ async fn fetch_crl(
     let parsed = Url::parse(url)
         .map_err(|error| RmcpServerKitError::Tls(format!("CRL URL parse {url}: {error}")))?;
 
-    // SECURITY: this URL can come from a certificate on the verified path of a
+    // SECURITY: this URL can come from a certificate on a verified path of a
     // presented chain; see the module docs for why the fetch must be screened
     // before any request.
     if let Err(reason) = check_scheme(&parsed, allow_http) {
@@ -3014,7 +3050,7 @@ mod tests {
     use core::{
         cell::Cell,
         error::Error as _,
-        iter::once,
+        iter::{from_fn, once, repeat_n},
         net::{Ipv4Addr, Ipv6Addr},
         ptr, slice,
         sync::atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -3154,6 +3190,34 @@ mod tests {
         CertifiedIssuer::signed_by(params, key, issuer).context("discovery intermediate signed")
     }
 
+    /// Build a named CA certificate with a caller-supplied key and CDP URL.
+    fn discovery_test_named_ca(
+        common_name: &str,
+        cdp_url: &str,
+        serial: u64,
+        key_pem: &str,
+        issuer: &CertifiedIssuer<'static, KeyPair>,
+    ) -> anyhow::Result<CertifiedIssuer<'static, KeyPair>> {
+        let mut params =
+            CertificateParams::new(Vec::<String>::new()).context("discovery named CA params")?;
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        params
+            .distinguished_name
+            .push(DnType::CommonName, common_name);
+        params.serial_number = Some(SerialNumber::from(serial));
+        params.crl_distribution_points = vec![CrlDistributionPoint {
+            uris: vec![cdp_url.to_owned()],
+        }];
+        params.use_authority_key_identifier_extension = true;
+        let key = KeyPair::from_pem(key_pem).context("discovery named CA key")?;
+        CertifiedIssuer::signed_by(params, key, issuer).context("discovery named CA signed")
+    }
+
     fn discovery_test_leaf(
         cdp_url: &str,
         serial: u64,
@@ -3203,6 +3267,127 @@ mod tests {
             Arc::new(HashSet::new()),
         )?;
         Ok((set, rx))
+    }
+
+    /// Build a synthetic CRL cache entry for one issuer and source URL.
+    fn discovery_test_crl(
+        url: &str,
+        issuer: &CertifiedIssuer<'static, KeyPair>,
+        revoked_serial: u64,
+    ) -> anyhow::Result<(String, CachedCrl)> {
+        let revoked_crl: CertificateRevocationListDer<'static> = CertificateRevocationListParams {
+            this_update: date_time_ymd(2026, 1, 1),
+            next_update: date_time_ymd(2099, 1, 1),
+            crl_number: SerialNumber::from(1_u64),
+            issuing_distribution_point: None,
+            revoked_certs: vec![RevokedCertParams {
+                serial_number: SerialNumber::from(revoked_serial),
+                revocation_time: date_time_ymd(2026, 1, 1),
+                reason_code: Some(RevocationReason::KeyCompromise),
+                invalidity_date: None,
+            }],
+            key_identifier_method: KeyIdMethod::Sha256,
+        }
+        .signed_by(issuer)
+        .context("discovery CRL signed")?
+        .into();
+        let (this_update, next_update) = parse_crl_metadata(revoked_crl.as_ref())?;
+        Ok((
+            url.to_owned(),
+            CachedCrl {
+                der: revoked_crl,
+                this_update,
+                next_update,
+                fetched_at: SystemTime::now(),
+                source_url: url.to_owned(),
+            },
+        ))
+    }
+
+    /// Build a CRL set with several trust anchors and an initial cache.
+    fn discovery_test_multi_root_set(
+        anchors: &[&CertificateDer<'static>],
+        config: MtlsConfig,
+        initial_cache: HashMap<String, CachedCrl>,
+    ) -> anyhow::Result<(Arc<CrlSet>, mpsc::UnboundedReceiver<String>)> {
+        install_ring_provider();
+        let mut roots = RootCertStore::empty();
+        for &anchor in anchors {
+            roots.add(anchor.clone()).context("add discovery anchor")?;
+        }
+        let (tx, rx) = mpsc::unbounded_channel();
+        let set = CrlSet::new(
+            Arc::new(roots),
+            config,
+            tx,
+            initial_cache,
+            Arc::new(HashSet::new()),
+        )?;
+        Ok((set, rx))
+    }
+
+    /// Drain every currently queued discovery URL into a set.
+    fn drain_discovered(rx: &mut mpsc::UnboundedReceiver<String>) -> HashSet<String> {
+        from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// Holds the shared cross-signed discovery fixture for the three path tests;
+    /// no assertion lives in this fixture.
+    struct CrossSignedDiscoveryScenario {
+        root_r: CertifiedIssuer<'static, KeyPair>,
+        root_s: CertifiedIssuer<'static, KeyPair>,
+        cross_a: CertifiedIssuer<'static, KeyPair>,
+        cross_b: CertifiedIssuer<'static, KeyPair>,
+        leaf: CertificateDer<'static>,
+        url_leaf: String,
+        url_cross_a: String,
+        url_cross_b: String,
+    }
+
+    /// Builds the shared two-root cross-signed scenario for the three path tests;
+    /// no assertion lives in this helper.
+    fn cross_signed_discovery_scenario() -> anyhow::Result<CrossSignedDiscoveryScenario> {
+        let url_leaf = "http://127.0.0.1:9/cross-leaf.crl".to_owned();
+        let url_cross_a = "http://127.0.0.1:9/cross-a.crl".to_owned();
+        let url_cross_b = "http://127.0.0.1:9/cross-b.crl".to_owned();
+        let root_r = discovery_test_ca("discovery-root-r")?;
+        let root_s = discovery_test_ca("discovery-root-s")?;
+        let int_key = KeyPair::generate()?.serialize_pem();
+        let cross_a =
+            discovery_test_named_ca("discovery-cross", &url_cross_a, 501, &int_key, &root_r)?;
+        let cross_b =
+            discovery_test_named_ca("discovery-cross", &url_cross_b, 502, &int_key, &root_s)?;
+        let leaf = discovery_test_leaf(&url_leaf, 601, Some(&cross_a))?;
+        Ok(CrossSignedDiscoveryScenario {
+            root_r,
+            root_s,
+            cross_a,
+            cross_b,
+            leaf,
+            url_leaf,
+            url_cross_a,
+            url_cross_b,
+        })
+    }
+
+    /// Builds the revoked-first-copy cache for the shared cross-signed path tests;
+    /// no assertion lives in this helper.
+    fn cross_signed_initial_cache(
+        scenario: &CrossSignedDiscoveryScenario,
+    ) -> anyhow::Result<HashMap<String, CachedCrl>> {
+        Ok(HashMap::from([
+            discovery_test_crl(&scenario.url_cross_a, &scenario.root_r, 501)?,
+            discovery_test_crl(&scenario.url_leaf, &scenario.cross_a, 999)?,
+        ]))
+    }
+
+    /// Builds either presentation order for the three shared cross-signed path tests;
+    /// no assertion lives in this helper.
+    fn cross_signed_chain(
+        first: &CertifiedIssuer<'static, KeyPair>,
+        second: &CertifiedIssuer<'static, KeyPair>,
+    ) -> Vec<CertificateDer<'static>> {
+        vec![first.der().clone(), second.der().clone()]
     }
 
     /// Build the mTLS configuration most unit tests start from.
@@ -3719,6 +3904,11 @@ mod tests {
             !pending_contains(&set, attacker_url),
             "unverifiable chain must not mark attacker CDP URL pending"
         );
+        assert!(
+            set.cdp_urls_on_verified_paths(&leaf, &[], UnixTime::now())
+                .is_none(),
+            "an unverifiable chain must yield no verified path"
+        );
         Ok(())
     }
 
@@ -3772,9 +3962,9 @@ mod tests {
         Ok(())
     }
 
-    /// Pins that certificates appended outside the verified path choose no discovery URL.
+    /// Pins that certificates appended outside every verified path choose no discovery URL.
     #[test]
-    fn cdps_outside_the_verified_path_are_not_discovered() -> anyhow::Result<()> {
+    fn cdps_outside_every_verified_path_are_not_discovered() -> anyhow::Result<()> {
         let ca = discovery_test_ca("discovery-ca-x")?;
         let evil = discovery_test_ca("discovery-evil-ca")?;
         let mut config = test_mtls_config()?;
@@ -3806,7 +3996,7 @@ mod tests {
         Ok(())
     }
 
-    /// Pins that intermediate certificates on the verified path still contribute CDP URLs.
+    /// Pins that intermediate certificates on a verified path still contribute CDP URLs.
     #[test]
     fn verified_path_intermediate_cdps_are_discovered() -> anyhow::Result<()> {
         let root = discovery_test_ca("discovery-root")?;
@@ -3840,6 +4030,205 @@ mod tests {
         assert!(
             discovered.contains(intermediate_url),
             "verified intermediate CDP URL must be discovered"
+        );
+        Ok(())
+    }
+
+    /// Pins that discovery records every verified path, in either presentation order, so both copies of a cross-signed intermediate name their CRLs.
+    #[test]
+    fn every_verified_path_cdps_are_discovered() -> anyhow::Result<()> {
+        let scenario = cross_signed_discovery_scenario()?;
+        let mut config = test_mtls_config()?;
+        config.crl_deny_on_unavailable = false;
+        let expected_urls = HashSet::from([
+            scenario.url_leaf.clone(),
+            scenario.url_cross_a.clone(),
+            scenario.url_cross_b.clone(),
+        ]);
+
+        for chain in [
+            cross_signed_chain(&scenario.cross_a, &scenario.cross_b),
+            cross_signed_chain(&scenario.cross_b, &scenario.cross_a),
+        ] {
+            let (set, mut rx) = discovery_test_multi_root_set(
+                &[scenario.root_r.der(), scenario.root_s.der()],
+                config.clone(),
+                HashMap::new(),
+            )?;
+            let verifier = DynamicClientCertVerifier::new(set);
+
+            let _verdict = verifier.verify_client_cert(&scenario.leaf, &chain, UnixTime::now());
+            assert_eq!(
+                drain_discovered(&mut rx),
+                expected_urls,
+                "every verified path in either presentation order must contribute CDP URLs"
+            );
+        }
+        Ok(())
+    }
+
+    /// Pins that under the default fail-closed policy a client whose first cross-signed copy is revoked is refused only until the second copy's CRL is cached.
+    #[tokio::test]
+    async fn cross_signed_client_is_accepted_once_the_alternative_crl_is_cached()
+    -> anyhow::Result<()> {
+        let scenario = cross_signed_discovery_scenario()?;
+        let mut config = test_mtls_config()?;
+        config.crl_deny_on_unavailable = true;
+        let (set, mut rx) = discovery_test_multi_root_set(
+            &[scenario.root_r.der(), scenario.root_s.der()],
+            config,
+            cross_signed_initial_cache(&scenario)?,
+        )?;
+        let verifier = DynamicClientCertVerifier::new(Arc::clone(&set));
+        let chain = cross_signed_chain(&scenario.cross_a, &scenario.cross_b);
+
+        assert!(
+            verifier
+                .verify_client_cert(&scenario.leaf, &chain, UnixTime::now())
+                .is_err(),
+            "missing alternative CRL must fail closed after the first copy is revoked"
+        );
+        assert_eq!(
+            drain_discovered(&mut rx),
+            HashSet::from([scenario.url_cross_b.clone()]),
+            "the alternative cross-signed copy's CRL must be discovered"
+        );
+        let (url, cached) = discovery_test_crl(&scenario.url_cross_b, &scenario.root_s, 999)?;
+        assert!(
+            set.__test_try_insert_cache(&url, cached).await?,
+            "alternative CRL cache insertion must publish a verifier update"
+        );
+        assert!(
+            verifier
+                .verify_client_cert(&scenario.leaf, &chain, UnixTime::now())
+                .is_ok(),
+            "client must be accepted once the alternative non-revoking CRL is cached"
+        );
+        Ok(())
+    }
+
+    /// Pins that under fail-open the second cross-signed copy's CRL is discovered and enforced, so a revoked second copy is refused once that CRL is cached.
+    #[tokio::test]
+    async fn revoked_alternative_copy_is_refused_once_its_crl_is_cached() -> anyhow::Result<()> {
+        let scenario = cross_signed_discovery_scenario()?;
+        let mut config = test_mtls_config()?;
+        config.crl_deny_on_unavailable = false;
+        let (set, mut rx) = discovery_test_multi_root_set(
+            &[scenario.root_r.der(), scenario.root_s.der()],
+            config,
+            cross_signed_initial_cache(&scenario)?,
+        )?;
+        let verifier = DynamicClientCertVerifier::new(Arc::clone(&set));
+        let chain = cross_signed_chain(&scenario.cross_a, &scenario.cross_b);
+
+        assert!(
+            verifier
+                .verify_client_cert(&scenario.leaf, &chain, UnixTime::now())
+                .is_ok(),
+            "fail-open must accept before the alternative CRL is cached"
+        );
+        assert_eq!(
+            drain_discovered(&mut rx),
+            HashSet::from([scenario.url_cross_b.clone()]),
+            "the alternative cross-signed copy's CRL must be discovered under fail-open"
+        );
+        let (url, cached) = discovery_test_crl(&scenario.url_cross_b, &scenario.root_s, 502)?;
+        assert!(
+            set.__test_try_insert_cache(&url, cached).await?,
+            "revoking alternative CRL cache insertion must publish a verifier update"
+        );
+        assert!(
+            verifier
+                .verify_client_cert(&scenario.leaf, &chain, UnixTime::now())
+                .is_err(),
+            "client must be refused once the alternative copy's CRL revokes it"
+        );
+        Ok(())
+    }
+
+    /// Pins that byte-identical copies of one certificate cannot spend the path-search budget and hide another verified path.
+    #[test]
+    fn duplicated_intermediates_cannot_exhaust_discovery() -> anyhow::Result<()> {
+        let root_r = discovery_test_ca("discovery-root-r")?;
+        let root_s = discovery_test_ca("discovery-root-s")?;
+        let int_key = KeyPair::generate()?.serialize_pem();
+        let url_leaf = "http://127.0.0.1:9/dup-leaf.crl";
+        let url_cross_b = "http://127.0.0.1:9/dup-cross-b.crl";
+        let url_cross_m = "http://127.0.0.1:9/dup-cross-m.crl";
+        let url_m = "http://127.0.0.1:9/dup-upper-m.crl";
+        let ca_m = discovery_test_named_ca(
+            "discovery-upper-m",
+            url_m,
+            701,
+            &KeyPair::generate()?.serialize_pem(),
+            &root_r,
+        )?;
+        let cross_m =
+            discovery_test_named_ca("discovery-cross", url_cross_m, 702, &int_key, &ca_m)?;
+        let cross_b =
+            discovery_test_named_ca("discovery-cross", url_cross_b, 502, &int_key, &root_s)?;
+        let leaf = discovery_test_leaf(url_leaf, 603, Some(&cross_m))?;
+        let mut config = test_mtls_config()?;
+        config.crl_deny_on_unavailable = false;
+        let (set, mut rx) =
+            discovery_test_multi_root_set(&[root_r.der(), root_s.der()], config, HashMap::new())?;
+        let verifier = DynamicClientCertVerifier::new(set);
+        let chain = once(cross_m.der().clone())
+            .chain(repeat_n(ca_m.der().clone(), 40))
+            .chain(once(cross_b.der().clone()))
+            .collect::<Vec<_>>();
+
+        let _verdict = verifier.verify_client_cert(&leaf, &chain, UnixTime::now());
+        assert_eq!(
+            drain_discovered(&mut rx),
+            HashSet::from([
+                url_leaf.to_owned(),
+                url_cross_m.to_owned(),
+                url_m.to_owned(),
+                url_cross_b.to_owned(),
+            ]),
+            "duplicate intermediate bytes must not hide the alternative verified path"
+        );
+        Ok(())
+    }
+
+    /// Pins that every intermediate on a recorded path contributes its CDP URLs, not only the one next to the end entity.
+    #[test]
+    fn every_intermediate_on_a_verified_path_contributes() -> anyhow::Result<()> {
+        let root_r = discovery_test_ca("discovery-root-r")?;
+        let url_leaf = "http://127.0.0.1:9/layered-leaf.crl";
+        let url_upper = "http://127.0.0.1:9/layered-upper.crl";
+        let url_lower = "http://127.0.0.1:9/layered-lower.crl";
+        let upper = discovery_test_named_ca(
+            "discovery-upper",
+            url_upper,
+            801,
+            &KeyPair::generate()?.serialize_pem(),
+            &root_r,
+        )?;
+        let lower = discovery_test_named_ca(
+            "discovery-lower",
+            url_lower,
+            802,
+            &KeyPair::generate()?.serialize_pem(),
+            &upper,
+        )?;
+        let leaf = discovery_test_leaf(url_leaf, 604, Some(&lower))?;
+        let mut config = test_mtls_config()?;
+        config.crl_deny_on_unavailable = false;
+        let (set, mut rx) = discovery_test_set(root_r.der(), config)?;
+        let verifier = DynamicClientCertVerifier::new(set);
+        let chain = vec![lower.der().clone(), upper.der().clone()];
+
+        let _verdict = verifier.verify_client_cert(&leaf, &chain, UnixTime::now());
+        assert_eq!(
+            drain_discovered(&mut rx),
+            HashSet::from([
+                url_leaf.to_owned(),
+                url_lower.to_owned(),
+                url_upper.to_owned(),
+            ]),
+            "every intermediate on a verified path must contribute CDP URLs"
         );
         Ok(())
     }
@@ -3933,13 +4322,13 @@ mod tests {
 
         assert!(
             root_set
-                .verified_path_cdp_urls(&direct_leaf, &[], UnixTime::now())
+                .cdp_urls_on_verified_paths(&direct_leaf, &[], UnixTime::now())
                 .is_some(),
             "direct leaf path must verify for CDP extraction"
         );
         assert!(
             root_set
-                .verified_path_cdp_urls(
+                .cdp_urls_on_verified_paths(
                     &chained_leaf,
                     slice::from_ref(intermediate.der()),
                     UnixTime::now()
@@ -3949,7 +4338,7 @@ mod tests {
         );
         assert!(
             intermediate_set
-                .verified_path_cdp_urls(&chained_leaf, &[], UnixTime::now())
+                .cdp_urls_on_verified_paths(&chained_leaf, &[], UnixTime::now())
                 .is_some(),
             "leaf under configured intermediate anchor must verify for CDP extraction"
         );
@@ -3958,7 +4347,7 @@ mod tests {
         let live_verifier = rebuild_verifier(&root_store, &config, &cache)?;
         assert!(
             root_set
-                .verified_path_cdp_urls(&revoked_leaf, &[], UnixTime::now())
+                .cdp_urls_on_verified_paths(&revoked_leaf, &[], UnixTime::now())
                 .is_some(),
             "verified-path extraction must ignore revocation"
         );
