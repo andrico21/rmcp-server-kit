@@ -4155,12 +4155,12 @@ mod tests {
         Ok(())
     }
 
-    #[test]
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/auth.rs::auth_failure_log_level_table keeps the uniform test signature while it only asserts"
     )]
     /// Every failure class has an explicit level for both expiry sources.
+    #[test]
     fn auth_failure_log_level_table() -> anyhow::Result<()> {
         for (failure_class, jwt_level, key_level) in [
             (
@@ -5798,12 +5798,12 @@ mod tests {
         Ok(())
     }
 
-    #[test]
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/auth.rs::observe_first_then_repeat keeps the uniform test signature while it only asserts"
     )]
     /// First credential presentations are distinct from repeats.
+    #[test]
     fn observe_first_then_repeat() -> anyhow::Result<()> {
         // Given an empty cache.
         let set = SeenCredentials::new();
@@ -5821,12 +5821,12 @@ mod tests {
         Ok(())
     }
 
-    #[test]
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/auth.rs::observe_evicts_oldest_at_cap keeps the uniform test signature while it only asserts"
     )]
     /// Cap eviction allows re-inserted credentials to log INFO again.
+    #[test]
     fn observe_evicts_oldest_at_cap() -> anyhow::Result<()> {
         // Given a two-credential cap.
         let set = SeenCredentials::with_cap(2);
@@ -5856,12 +5856,12 @@ mod tests {
         Ok(())
     }
 
-    #[test]
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/auth.rs::observe_cap_zero_is_raised_to_one keeps the uniform test signature while it only asserts"
     )]
     /// A zero cap still retains one credential.
+    #[test]
     fn observe_cap_zero_is_raised_to_one() -> anyhow::Result<()> {
         // Given a zero configured cap.
         let set = SeenCredentials::with_cap(0);
@@ -5874,12 +5874,12 @@ mod tests {
         Ok(())
     }
 
-    #[test]
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/auth.rs::observe_fifo_does_not_refresh_on_repeat_hit keeps the uniform test signature while it only asserts"
     )]
     /// Repeat hits and changed bindings do not refresh FIFO insertion order.
+    #[test]
     fn observe_fifo_does_not_refresh_on_repeat_hit() -> anyhow::Result<()> {
         // Locks in the FIFO contract: repeat hits MUST NOT bump an entry
         // to the back of the eviction queue (that would be LRU).
@@ -5919,12 +5919,12 @@ mod tests {
         Ok(())
     }
 
-    #[test]
     #[expect(
         clippy::unnecessary_wraps,
         reason = "deliberate: src/auth.rs::observe_distinguishes_credentials_methods_and_bindings keeps the uniform test signature while it only asserts"
     )]
     /// Credentials, methods and current bindings all distinguish presentations.
+    #[test]
     fn observe_distinguishes_credentials_methods_and_bindings() -> anyhow::Result<()> {
         // Given independently keyed caches.
         let seen = SeenCredentials::new();

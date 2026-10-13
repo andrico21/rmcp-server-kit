@@ -185,7 +185,11 @@ mod tests {
             .send()
             .await
             .context("send request with valid credentials")?;
-        assert_ne!(valid.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            valid.status(),
+            reqwest::StatusCode::OK,
+            "a valid token must complete MCP initialize"
+        );
 
         let metrics_body = scrape(&metrics_bind).await?;
         assert!(
