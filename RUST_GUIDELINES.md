@@ -129,7 +129,7 @@ defined cleanup order, and no panic path. `scripts/lint-ratchet/prose_gates.py
 | Impl | File:line | Finding |
 | ---- | --------- | ------- |
 | `ExposureTestGuard` | `src/diagnostics.rs:152` | Test-only. Restores the process-global switch snapshot in memory; sync, no I/O or await, no panic path. No defect. |
-| `Drop for PendingUrlGuard` | `src/mtls_revocation.rs:2496` | Clears the in-flight URL marker (poison-recovering mutex); sync, no I/O or await, no panic path. Ordering is explicit via `disarm()` before promotion. No defect. |
+| `Drop for PendingUrlGuard` | `src/mtls_revocation.rs:2498` | Clears the in-flight URL marker (poison-recovering mutex); sync, no I/O or await, no panic path. Ordering is explicit via `disarm()` before promotion. No defect. |
 | `RefreshCompletionGuard` | `src/oauth.rs:2879` | Publishes one JWKS refresh completion and releases watch waiters through sync mutex/watch operations; no I/O, await, blocking or panic path. No defect. |
 | `Drop for JwksCache` | `src/oauth.rs:2920` | Sync, non-blocking `CancellationToken::cancel` for cache-owned JWKS refresh tasks; no I/O, await or panic path. No defect. |
 | `TracingGuard` | `src/observability.rs:137` | Delegates to `AuditWorkerGuard` by taking the `Option`; sync, no await, no panic path. Bounded by design (5s). No defect. |

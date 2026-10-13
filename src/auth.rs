@@ -735,8 +735,8 @@ pub struct MtlsConfig {
     /// fetch) are evicted on demand so new hosts keep working; only when
     /// every entry has a concurrent in-flight fetch does the request
     /// return [`RmcpServerKitError::Config`] containing the literal substring
-    /// `"crl_host_semaphore_cap_exceeded"`. Bounds memory growth from
-    /// attacker-controlled CDP URLs pointing at unique hostnames.
+    /// `"crl_host_semaphore_cap_exceeded"`. Bounds memory growth when
+    /// presented certificates name CDP URLs on many distinct hostnames.
     /// Default: 1024.
     #[serde(default = "default_crl_max_host_semaphores")]
     pub crl_max_host_semaphores: usize,

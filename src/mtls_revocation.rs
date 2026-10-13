@@ -705,11 +705,13 @@ impl CrlSet {
         let mut admitted_urls = Vec::new();
 
         // POLICY: at cap the NEWEST entry is rejected, never an existing
-        // one (no LRU). Under adversarial unique-CDP churn an LRU would
-        // let an attacker evict the legitimate warm set by spamming
-        // throwaway CDP URLs; rejecting newcomers instead preserves
-        // revocation coverage for the established CA estate. Confirmed
-        // by Oracle review of the 1.13.0 rust-review fix plan.
+        // one (no LRU). Under unique-CDP churn an LRU would let any
+        // source of many distinct CDP URLs - since 3.20.0 that takes
+        // certificates on a verified path, such as those of a
+        // misbehaving issuing CA - evict the legitimate warm set;
+        // rejecting newcomers instead preserves revocation coverage for
+        // the established CA estate. Confirmed by Oracle review of the
+        // 1.13.0 rust-review fix plan.
         for (url, cached) in inserts {
             if candidate.len() >= self.config.crl_max_cache_entries && !candidate.contains_key(&url)
             {
@@ -2887,8 +2889,9 @@ async fn fetch_crl(
     let mut any_addr = false;
     for addr in addrs {
         any_addr = true;
-        // SECURITY: a client-chosen CDP host is resolved before connecting and
-        // each address is screened; see the module docs for the threat model.
+        // SECURITY: a CDP host named by a presented certificate is resolved
+        // before connecting and each address is screened; see the module
+        // docs for the threat model.
         reject_blocked_crl_ip(url, addr.ip(), trusted_origin)?;
     }
     if !any_addr {
