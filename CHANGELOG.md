@@ -153,6 +153,23 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   override. Startup now logs a WARN when full request-header logging is
   enabled with `session_id_header = "plain"` and `session_binding` is
   disabled.
+- **`rmcp_server_kit_auth_failures_total{class}` Prometheus counter** - the
+  new public field `McpMetrics::auth_failures_total` (an `IntCounterVec`)
+  counts authentication failures by `class`: `missing_credential`,
+  `invalid_credential`, `expired_credential`, `rate_limited`,
+  `pre_auth_gate`, or `overloaded`. One helper bumps it and
+  `/admin/auth/counters` together. With metrics enabled, matching per-class
+  cumulative counts agree once requests settle; the admin counter is bumped
+  first and the metric second, so a concurrent observation can differ
+  momentarily. The pre-auth gate's capacity-full `503` bumps neither. The
+  post-failure limiter's capacity-full `503`, which only
+  `key_eviction_policy = "reject_new"` can produce, also bumps neither, and
+  the request's own failure class goes uncounted too; its WARN line,
+  `auth post-failure limiter rejected unseen key because tracked-key capacity
+  is full`, is the only record. The counter is
+  registered in `McpMetrics::new` and re-bound at startup with the other
+  framework collectors, so the name joins the reserved `rmcp_server_kit_*`
+  namespace. Label values appear on first increment.
 
 ### Changed
 
@@ -245,6 +262,39 @@ migration note and a config opt-out - see the 3.1.0 notes below.
   Windows symlink audit test fails instead of skipping when CI sets
   `RMCP_REQUIRE_SYMLINK_TESTS=1`. No production behavior changed in any of
   this work.
+- **Authentication success logs once per new credential presentation** - the
+  INFO `<method> authenticated name=<n> role=<r>` line used to fire once per
+  identity name per process. It now fires for each new presentation per
+  auth-state/server instance, while the credential remains retained: a new
+  Bearer token string (API key or OAuth JWT), a new mTLS connection, or a
+  credential whose name or role changed (a change back to an earlier role
+  logs again). Repeats with the same name and role log at DEBUG. Repeat
+  detection keeps up to 4096 credentials as fixed-size digests under a
+  random key in the `SeenCredentials` instance (one per `AuthState`) and
+  stores no credential bytes; an evicted credential can log INFO once more.
+  With
+  `[server.log_context] credential_fingerprint = true`, the success line for
+  a Bearer credential carries the same `credential_fp` as that token's
+  `auth failed` lines. mTLS lines never carry it.
+- **Expected-flow authentication failures log at DEBUG** - `auth failed`
+  with `failure_class=missing_credential`, and with
+  `failure_class=expired_credential` for an expired OAuth JWT, now log at
+  DEBUG instead of WARN, because these 401s are routine steps of the MCP
+  OAuth flow. An expired API key and every `invalid_credential` failure,
+  including a non-Bearer or non-UTF-8 `Authorization` header, stay at WARN,
+  as do the post-failure rate limit, pre-auth gate and Argon2id overload
+  lines. The audit file mirrors INFO and above, so it no longer records the
+  two demoted classes; `rmcp_server_kit_auth_failures_total` and
+  `/admin/auth/counters` are their record. Alerts keyed on those WARN lines
+  must move to the counter (see the migration notes).
+- **Four log messages use single quotes instead of escaped double quotes** -
+  JSON logs no longer render `\"` inside them. The new substrings are
+  `See SECURITY.md 'Operator allowlist'.`,
+  `audience_validation_mode = 'permissive'. Acceptance is intentionally wider than the spec; set 'warn' or 'strict'`,
+  `audience_validation_mode = 'strict' once tokens carry aud correctly` (with
+  `set audience_validation_mode = 'permissive'.` in the same message), and
+  `rbac.allow_operation_matching = 'glob' to enable globbing`. Exact log
+  matchers must be updated.
 
 ### Fixed
 

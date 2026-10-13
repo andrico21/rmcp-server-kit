@@ -145,7 +145,7 @@ axum Router                                  src/transport.rs:2331  (build_app_r
    ├── 6. Optional metrics middleware        src/metrics.rs (records
    │      request count, duration histograms, in-flight gauge)
    │
-├── 7. Auth middleware                    src/auth.rs:2594 (`auth_middleware`)
+├── 7. Auth middleware                    src/auth.rs:2713 (`auth_middleware`)
    │      Determines AuthIdentity from one of:
    │        a) Authorization: Bearer <api-key>  → Argon2 verify against
    │           AuthState.api_keys (ArcSwap<Vec<ApiKeyEntry>>)
@@ -195,7 +195,7 @@ Open endpoints (no auth):
 | `GET  /healthz`                            | `healthz` (`src/transport.rs:4103`) |
 | `GET  /readyz`                             | `readyz`  (`src/transport.rs:4168`) - runs configured readiness check |
 | `GET  /version`                            | `version_payload` (`src/transport.rs:4118`) |
-| `GET  /metrics`                            | served by `serve_metrics` on a **separate listener** when `feature = "metrics"` (`src/metrics.rs:189`) |
+| `GET  /metrics`                            | served by `serve_metrics` on a **separate listener** when `feature = "metrics"` (`src/metrics.rs:220`) |
 | `GET  /.well-known/oauth-protected-resource` | feature = `oauth`, mounted in `build_app_router` (`src/transport.rs:2331`) |
 | `GET  /.well-known/oauth-authorization-server` | feature = `oauth` proxy, mounted by `install_oauth_proxy_routes` (`src/transport.rs:3336`) |
 
@@ -311,9 +311,9 @@ Startup-only.
 
 ### Construction
 `AuthState` is built inside `build_app_router()` at `src/transport.rs:2331`. It contains:
-- `AuthState::api_keys` hot-swap vector (`src/auth.rs:1662`)
+- `AuthState::api_keys` hot-swap vector (`src/auth.rs:1751`)
 - mTLS identities: stored **per-connection** on the
-  `TlsConnInfo` extension (`src/auth.rs:1373`), read by `auth_middleware` (`src/auth.rs:2594`).
+  `TlsConnInfo` extension (`src/auth.rs:1437`), read by `auth_middleware` (`src/auth.rs:2713`).
   No shared `SocketAddr`-keyed map exists - the previous design was replaced
   to avoid identity-binding races behind load balancers and to remove a
   `RwLock` from the request hot path.
@@ -330,11 +330,11 @@ Startup-only.
   entirely** (the TLS handshake already performed expensive crypto with a
   verified peer, so mTLS callers cannot be used to mount a CPU-spray
   attack).
-- `AuthState::jwks_cache` (`src/auth.rs:1683`) when `feature=oauth` is on and `oauth.issuer` is configured
+- `AuthState::jwks_cache` (`src/auth.rs:1772`) when `feature=oauth` is on and `oauth.issuer` is configured
 
 ### API key flow
 1. Client sends `Authorization: Bearer <api-key>`.
-2. `auth_middleware` (`src/auth.rs:2594`) first runs the **pre-auth abuse
+2. `auth_middleware` (`src/auth.rs:2713`) first runs the **pre-auth abuse
    gate** keyed by the request's source IP. If the gate is exhausted the
    middleware returns `429` immediately, *without* touching Argon2id.
 3. Otherwise the middleware looks up the key by an indexed prefix
@@ -356,7 +356,7 @@ threaded as `SecretString` from `AuthIdentity.raw_token` through
    to the **per-connection** extension in `extract_handshake_identity`
    (`extract_handshake_identity`, `src/transport.rs:3725`).
 3. `auth_middleware` reads the identity directly from that connection
-   state (`auth_middleware`, `src/auth.rs:2594`); no shared SocketAddr-keyed map is
+   state (`auth_middleware`, `src/auth.rs:2713`); no shared SocketAddr-keyed map is
    consulted, so there is no port-reuse aliasing risk.
 
 ### OAuth JWT flow (feature = `oauth`)
@@ -824,15 +824,33 @@ records the following standard server metrics:
 - `rmcp_server_kit_http_requests_total{method, path, status}` (counter)
 - `rmcp_server_kit_http_request_duration_seconds{method, path}` (histogram,
   buckets `[1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s]`)
+- `rmcp_server_kit_rate_limited_total{limiter}` (counter)
+- `rmcp_server_kit_auth_failures_total{class}` (counter). `class` is one of
+  `missing_credential`, `invalid_credential`, `expired_credential`,
+  `rate_limited`, `pre_auth_gate`, `overloaded`. `record_counted_failure` in
+  `src/auth.rs` bumps it alongside `AuthCounters`. With metrics enabled,
+  matching per-class cumulative counts agree once requests settle. The admin
+  counter is bumped first and the metric second, so a concurrent observation
+  can differ momentarily. The pre-auth `CapacityFull` 503 bumps neither. The post-failure limiter's
+  `CapacityFull` 503, which only `key_eviction_policy = "reject_new"` can
+  produce, also bumps neither, and the request's own failure class goes
+  uncounted too; its WARN line, `auth post-failure limiter rejected unseen
+  key because tracked-key capacity is full`, is the only record. The counter is
+  the alerting record for the failure classes that log at DEBUG. A PromQL
+  `rate(...)` query over this counter reports a rate over time, not a value
+  numerically equal to an admin counter.
 
-Operators that need additional collectors (in-flight gauge, auth-failure
-counter, RBAC-deny counter, etc.) can register custom metrics against the
+`ensure_framework_metrics_registered` in `src/transport.rs` binds all four
+families to the served registry at startup, so the `rmcp_server_kit_*`
+namespace is reserved: a custom collector that reuses one of these names
+collides with it. Operators that need additional collectors (RBAC-deny
+counter, in-flight gauge, etc.) can register custom metrics against the
 shared `McpMetrics::registry`, which is intentionally part of the public
 API surface.
 
 The `/metrics` endpoint is served on a **separate listener** (often a
 private bind address) configured via `MetricsConfig` - see
-`serve_metrics` (`src/metrics.rs:189`). This isolates
+`serve_metrics` (`src/metrics.rs:220`). This isolates
 operational telemetry from the public MCP listener.
 
 ---
@@ -843,7 +861,7 @@ Two ArcSwaps power runtime reconfiguration:
 
 | State            | Type                           | Defined at                  |
 |------------------|---------------------------------|-----------------------------|
-| API keys         | `AuthState` `api_keys` slot     | `src/auth.rs:1662`          |
+| API keys         | `AuthState` `api_keys` slot     | `src/auth.rs:1751`          |
 | RBAC policy      | `ReloadHandle` `rbac` slot      | `src/transport.rs:2007`      |
 
 Procedure:

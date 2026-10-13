@@ -1901,8 +1901,10 @@ tracing::info!(%prometheus_text, "exposition snapshot");
 ```
 
 Tracks:
-- `http_requests_total` - counter by method, path, status
-- `http_request_duration_seconds` - histogram by method, path
+- `rmcp_server_kit_http_requests_total` - counter by method, path, status
+- `rmcp_server_kit_http_request_duration_seconds` - histogram by method, path
+- `rmcp_server_kit_rate_limited_total` - counter by limiter
+- `rmcp_server_kit_auth_failures_total` - counter by authentication failure class
 
 #### `serve_metrics()`
 
@@ -1945,9 +1947,9 @@ let config = McpServerConfig::new("0.0.0.0:8443", "my-server", "0.1.0")
   too. A handle without an enabled listener is rejected at validation, and
   without a handle the framework constructs a fresh registry as before.
 - The `rmcp_server_kit_*` namespace is **reserved**. At startup the framework
-  registers its three collectors (`http_requests_total`,
-  `http_request_duration_seconds`, `rate_limited_total`) on the supplied
-  registry, evicting any descriptor-equivalent occupant first. A collector that
+  registers its four collectors (`http_requests_total`,
+  `http_request_duration_seconds`, `rate_limited_total`,
+  `auth_failures_total`) on the supplied registry, evicting any descriptor-equivalent occupant first. A collector that
   reuses a reserved name with different help text or variable labels is rejected
   when you try to register it (the registry's dimension record is sticky), and
   any conflict that survives startup fails closed with a `Startup` error naming
@@ -2116,6 +2118,26 @@ Prometheus counter `rmcp_server_kit_rate_limited_total` with a single
 alongside the existing warn-level log. Exempted extra-route requests
 increment nothing.
 
+Authentication failures have their own counter,
+`rmcp_server_kit_auth_failures_total`, with a single `class` label:
+`missing_credential`, `invalid_credential`, `expired_credential`,
+`rate_limited`, `pre_auth_gate`, or `overloaded`. One helper bumps it and the
+matching `/admin/auth/counters` field. With metrics enabled, matching
+per-class cumulative counts agree once requests settle. The admin counter is
+bumped first and the metric second, so a concurrent observation can differ
+momentarily (`class="missing_credential"` matches
+`failure_missing_credential`, and so on). A pre-auth gate rejection caused
+by a full tracked-key table (the `503` "rate limiter capacity exhausted"
+response) bumps neither. The post-failure limiter's capacity-full `503`, which only `key_eviction_policy = "reject_new"` can produce, also bumps neither, and the request's own failure class goes uncounted too; its WARN line, `auth post-failure limiter rejected unseen key because tracked-key capacity is full`, is the only record. The PromQL example below is a rate over time, not
+numerically equal to an admin counter. Because `missing_credential` and expired
+OAuth JWT failures now log at DEBUG (see
+[Authentication log levels](#authentication-log-levels)), alert on this counter
+rather than on log lines:
+
+```promql
+sum by (class) (rate(rmcp_server_kit_auth_failures_total[5m]))
+```
+
 Limitations to understand before relying on it:
 
 - **Direct peer keying.** Same semantics as `PeerAddr`: behind a
@@ -2195,7 +2217,7 @@ attribute probe noise without logging spoofable header material.
 | `request_id_header` | Names the header read when `request_id` is enabled. The default is `x-request-id`. On OpenShift, the IngressController's `spec.httpHeaders.uniqueId.name` sets this header router-side. |
 | `request_line` | Adds `method` and `path` to `auth failed` lines. The path excludes the query string. `incoming request` and `request completed` always include `method` and `path`; RBAC deny lines don't. |
 | `user_agent` | Adds `user_agent` to `auth failed` lines only. Values are quoted, control characters are stripped, and long values are truncated. |
-| `credential_fingerprint` | Adds a field named `credential_fp` to `auth failed` only, and only for Bearer credentials. The value is an 8-hex HMAC prefix, not a token fragment. Missing credentials, Basic credentials, other auth schemes, and mTLS failures don't get this field. |
+| `credential_fingerprint` | Adds a field named `credential_fp` to `auth failed` lines and to `authenticated` lines, only for Bearer credentials. The value is an 8-hex HMAC prefix, not a token fragment. Missing credentials, Basic credentials, other auth schemes, and mTLS successes and failures don't get this field. |
 | `credential_owner` | Adds `credential_owner` and `credential_rejection` to `auth failed` lines when a credential verifies but is rejected: an expired API key, or an OAuth JWT rejected for expiry, wrong audience, no mapped role, or missing subject. The label is the same identity the `authenticated` line logs. Off by default and not enabled by `recommended()`. |
 | `auth_scheme` | Adds `auth_scheme` and `token_kind` to `auth failed` lines. |
 | `mcp_hints` | Adds `mcp_session` and `mcp_protocol_version` to `auth failed` and `incoming request` lines. |
@@ -2232,14 +2254,40 @@ Rendering rules are stable. Client-supplied strings such as `user_agent` are
 quoted in structured fields, control characters are removed, and long strings
 are truncated before logging. `credential_fp` is emitted only for
 Bearer credentials and is an 8-hex HMAC prefix, so log readers can correlate
-repeated bad tokens without seeing token bytes.
+repeated bad tokens without seeing token bytes. The same token gets the same
+`credential_fp` on its `auth failed` and `authenticated` lines, which ties a
+token's failures to its successful authentication.
 
 Example lines with the recommended defaults:
 
-- `WARN rmcp_server_kit::auth: auth failed failure_class=missing_credential client_ip=203.0.113.7 peer_ip=10.0.0.42 method=POST path=/mcp user_agent="probe/1.0" auth_scheme=none mcp_session=false`
+- `DEBUG rmcp_server_kit::auth: auth failed failure_class=missing_credential client_ip=203.0.113.7 peer_ip=10.0.0.42 method=POST path=/mcp user_agent="probe/1.0" auth_scheme=none mcp_session=false`
 - `WARN rmcp_server_kit::rbac: RBAC denied user=viewer role=viewer tool="forbidden" host="-" client_ip=203.0.113.7 peer_ip=10.0.0.42`
 - `DEBUG rmcp_server_kit::transport: incoming request method=POST path=/mcp client_ip=203.0.113.7 peer_ip=10.0.0.42 mcp_session=false`
 - With `request_completion = true` added: `DEBUG rmcp_server_kit::transport: request completed method=POST path=/mcp status=401 latency_ms=0 client_ip=203.0.113.7 peer_ip=10.0.0.42`
+
+##### Authentication log levels
+
+Authentication lines are leveled so the default `info` filter shows each new
+credential and every actionable failure, while the routine steps of the MCP
+OAuth flow stay at DEBUG.
+
+| Line | Level |
+|---|---|
+| `<method> authenticated name=<n> role=<r>` (`<method>` is `bearer token`, `OAuth JWT`, or `mTLS`) | INFO for each new presentation: a new Bearer token string, a new mTLS connection, or a credential that now maps to a different name or role (including a change back to an earlier role). DEBUG for repeats with the same name and role. |
+| `auth failed failure_class=missing_credential` | DEBUG |
+| `auth failed failure_class=expired_credential` | DEBUG for an expired OAuth JWT, WARN for an expired API key |
+| `auth failed failure_class=invalid_credential` | WARN, including a non-Bearer or non-UTF-8 `Authorization` header |
+| Post-failure rate limit, pre-auth gate, and Argon2id overload lines | WARN, unchanged |
+
+The default `info` filter and the audit file (`audit_log_path`, which mirrors
+INFO and above only) don't carry DEBUG lines, so neither records
+`missing_credential` failures, expired-JWT failures, or repeat successes. Set
+`rmcp_server_kit::auth=debug` in the filter to see them in the main log.
+`rmcp_server_kit_auth_failures_total` and `/admin/auth/counters` are the
+record of the demoted failure classes. Repeat detection remembers up to 4096
+credentials as keyed digests, never raw token bytes, per auth-state/server
+instance while retained; under heavy churn an evicted long-lived credential
+can log INFO once more when it returns.
 
 Builder form:
 

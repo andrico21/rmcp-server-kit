@@ -255,6 +255,55 @@ log-leak material; set `session_binding = true`, or choose `"mask"` or
 `"hide"`, to clear it. The matching environment override is
 `RMCP_SERVER_KIT__SERVER__LOG_CONTEXT__SESSION_ID_HEADER`.
 
+### Authentication log levels and the auth-failure counter
+
+Authentication logging is now leveled for signal. No code change is needed,
+but log-based alerts and audit readers should check the following:
+
+- **WARN-keyed rules stop firing for expected 401s.** `auth failed` lines
+  with `failure_class=missing_credential`, and with
+  `failure_class=expired_credential` for an expired OAuth JWT, now log at
+  DEBUG. A log or alert rule that matches those WARN lines goes silent. Move
+  it to the new Prometheus counter, for example
+  `sum by (class) (rate(rmcp_server_kit_auth_failures_total[5m]))`, or poll
+  `/admin/auth/counters`. With metrics enabled, matching per-class cumulative
+  counts agree once requests settle. The admin counter is bumped first and the
+  metric second, so a concurrent observation can differ momentarily. The
+  PromQL example is a rate over time, not numerically equal to an admin
+  counter. With `key_eviction_policy = "reject_new"`, a failure rejected by
+  the post-failure limiter's capacity-full `503` is counted by neither; its
+  WARN line, `auth post-failure limiter rejected unseen key because
+  tracked-key capacity is full`, is the only record. An expired API key and every `invalid_credential` failure still
+  log at WARN, as do the post-failure rate limit, pre-auth gate and Argon2id
+  overload lines.
+- **The audit file no longer records those two classes.** It mirrors INFO
+  and above, so DEBUG `missing_credential` and expired-JWT failures leave it
+  along with the main log. The counter is their record. Set
+  `rmcp_server_kit::auth=debug` in the filter to see them in the main log.
+- **INFO success volume changes.** `<method> authenticated name=<n>
+  role=<r>` used to log at INFO once per identity name per process. It now
+  logs once per new credential presentation per auth-state/server instance,
+  while retained: once per token refresh, once per mTLS connection, and again
+  whenever a credential's name or role changes. Repeats log at DEBUG. The
+  4096-entry repeat-detection map evicts older credentials, so an evicted
+  long-lived credential can log INFO once more when it returns. With
+  `credential_fingerprint = true` the Bearer success line also carries
+  `credential_fp`.
+- **`rmcp_server_kit_auth_failures_total` is now a reserved name.** If you
+  registered your own collector with that name on a handle passed to
+  `with_metrics_handle`, it now collides with the framework collector.
+  Rename yours, or drop it in favor of the framework counter.
+
+Four log messages switched from escaped double quotes to single quotes -
+exact log matchers must be updated:
+
+| file | message (new wording) |
+|---|---|
+| `src/oauth.rs` | `See SECURITY.md 'Operator allowlist'.` |
+| `src/oauth.rs` | `audience_validation_mode = 'permissive'. Acceptance is intentionally wider than the spec; set 'warn' or 'strict'` |
+| `src/oauth.rs` | `audience_validation_mode = 'strict' once tokens carry aud correctly` and `set audience_validation_mode = 'permissive'.` |
+| `src/rbac.rs` | `rbac.allow_operation_matching = 'glob' to enable globbing` |
+
 ### Known limitations
 
 **CRL and AIA IPv6-literal endpoints:** a CRL or AIA URL whose host is an
@@ -302,7 +351,8 @@ retype above. The public additions are `AuthConfig::max_concurrent_verifications
 `AuthConfig::verification_wait` and their builders,
 `AuthCountersSnapshot::failure_overloaded`, and `SessionIdLogPolicy` with
 `LogContextConfig::session_id_header` and
-`McpServerConfig::with_session_id_log_policy`, all described above.
+`McpServerConfig::with_session_id_log_policy`, and the
+`McpMetrics::auth_failures_total` field, all described above.
 `AuthConfig::with_verification_wait` and
 `McpServerConfig::with_session_id_log_policy` are `const fn`, like
 `AuthConfig::with_max_concurrent_verifications`.

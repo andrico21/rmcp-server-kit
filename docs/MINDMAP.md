@@ -300,7 +300,7 @@ sequenceDiagram
     participant R as axum Router
     participant O as `origin_check_middleware`<br/>src/transport.rs:5160
     participant H as `security_headers_middleware`<br/>src/transport.rs:4373
-    participant A as `auth_middleware`<br/>src/auth.rs:2594
+    participant A as `auth_middleware`<br/>src/auth.rs:2713
     participant B as `rbac_middleware`<br/>src/rbac.rs:1354
     participant L as per-IP rate limit<br/>governor + bounded_limiter
     participant M as rmcp Streamable<br/>HTTP service
@@ -336,13 +336,13 @@ flowchart LR
     end
 
     subgraph SharedState["Shared state (lock-free / fine-grained)"]
-        AKS[(ArcSwap&lt;ApiKeys&gt;<br/>`AuthState` api_keys<br/>src/auth.rs:1662)]
+        AKS[(ArcSwap&lt;ApiKeys&gt;<br/>`AuthState` api_keys<br/>src/auth.rs:1751)]
         RBS[(ArcSwap&lt;RbacPolicy&gt;<br/>rbac_swap)]
         MTL[mTLS `AuthIdentity`<br/>per-connection<br/>TlsConnInfo extension<br/>src/auth.rs:76]
     end
 
     subgraph Hot["Request-time consumers"]
-        AM[`auth_middleware`<br/>src/auth.rs:2594]
+        AM[`auth_middleware`<br/>src/auth.rs:2713]
         BM[`rbac_middleware`<br/>src/rbac.rs:1354]
         TL["Task-locals<br/>`current_role` / `current_identity`<br/>`current_token` / `current_sub`<br/>src/rbac.rs:158-220"]
         TH[`HookedHandler`<br/>src/tool_hooks.rs:335]
@@ -435,7 +435,7 @@ graph TD
 | TLS / mTLS acceptor               | `src/transport.rs`                       | `TlsListener` L3657                                                          |
 | Origin / security headers (defs)  | `src/transport.rs`                       | `origin_check_middleware` L5160, `security_headers_middleware` ~L4373       |
 | Graceful shutdown                 | `src/transport.rs`                       | `shutdown_signal` L4191                                                      |
-| API key + mTLS auth               | `src/auth.rs`                            | `AuthIdentity` L76, `AuthState` ~L1660, `auth_middleware` L2594              |
+| API key + mTLS auth               | `src/auth.rs`                            | `AuthIdentity` L76, `AuthState` ~L1749, `auth_middleware` L2713              |
 | RBAC engine                       | `src/rbac.rs`                            | `RbacPolicy` L709, `current_role` L158, `current_identity` L180, `current_token` L202, `current_sub` L220, `rbac_middleware` L1354           |
 | Memory-bounded keyed limiter      | `src/bounded_limiter.rs`                 | `BoundedKeyedLimiter` L158                                                    |
 | Trusted-forwarder resolution      | `src/forwarded.rs`                       | `resolve_client_ip`, `FallbackReason` (rightmost-untrusted, fail-safe-to-direct) |
@@ -445,7 +445,7 @@ graph TD
 | Tool hooks / size cap             | `src/tool_hooks.rs`                      | `HookedHandler` L335                                                          |
 | Admin diagnostics                 | `src/admin.rs`                           | `require_admin_role` L182, `admin_router` L209                                |
 | Tracing / audit log               | `src/observability.rs`                   | `init_tracing_from_config` L96, `AuditWorkerGuard` L378                              |
-| Prometheus metrics                | `src/metrics.rs` (feature `metrics`)     | `McpMetrics` L49, `serve_metrics` L189                                         |
+| Prometheus metrics                | `src/metrics.rs` (feature `metrics`)     | `McpMetrics` L49, `serve_metrics` L220                                         |
 | Configuration (TOML)              | `src/config.rs` + `src/transport.rs`     | TOML schema + `McpServerConfig`                                               |
 | Error → HTTP mapping              | `src/error.rs`                           | `RmcpServerKitError` L46, `IntoResponse` L170                                           |
 | Integration reference             | `tests/integration/e2e.rs`               | `spawn_server` L507                                                           |
