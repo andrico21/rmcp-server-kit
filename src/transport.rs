@@ -61,9 +61,10 @@ use crate::oauth::{OAuthProxyConfig, OauthHttpClient};
 use crate::{
     admin::AdminState,
     auth::{
-        ApiKeyEntry, AuthConfig, AuthCounters, AuthIdentity, AuthLogContext, AuthState, MtlsConfig,
-        SeenCredentials, TlsConnInfo, auth_middleware, build_pre_auth_limiter, build_rate_limiter,
-        extract_mtls_identity, resolve_max_concurrent_verifications,
+        ApiKeyEntry, AuthConfig, AuthCounters, AuthIdentity, AuthLogContext, AuthState,
+        ChallengeConfig, MtlsConfig, SeenCredentials, TlsConnInfo, auth_middleware,
+        build_pre_auth_limiter, build_rate_limiter, extract_mtls_identity,
+        resolve_max_concurrent_verifications,
     },
     bounded_limiter::{BoundedKeyedLimiter, BoundedLimiterDeny, KeyEvictionPolicy},
     error::RmcpServerKitError,
@@ -2469,6 +2470,14 @@ where
                 })
                 .transpose()
                 .context("JWKS HTTP client")?;
+            #[cfg(feature = "oauth")]
+            let challenge = auth_config
+                .oauth
+                .as_ref()
+                .map(ChallengeConfig::from_oauth)
+                .unwrap_or_default();
+            #[cfg(not(feature = "oauth"))]
+            let challenge = ChallengeConfig::default();
 
             Some(Arc::new(AuthState {
                 api_keys: ArcSwap::new(Arc::new(auth_config.api_keys.clone())),
@@ -2493,6 +2502,7 @@ where
                 // client was actually challenged from.
                 resource_metadata_url: config.public_url.as_deref().map(mcp_resource_metadata_url),
                 log_context: AuthLogContext::new(&config.log_context, &rbac_swap.load()),
+                challenge,
             }))
         }
         _ => None,
@@ -6039,6 +6049,7 @@ mod tests {
             seen_credentials: SeenCredentials::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
+            challenge: ChallengeConfig::default(),
             log_context: AuthLogContext::default(),
         });
         Ok((state, token))
@@ -8397,6 +8408,44 @@ mod tests {
         Ok(())
     }
 
+    /// An injected challenge scope never reaches `serve`.
+    ///
+    /// A `challenge_scopes` entry smuggled past the builder by assigning the
+    /// public field (a quote plus CRLF header injection) is rejected by
+    /// `McpServerConfig::validate`, the only way to obtain the
+    /// `Validated<McpServerConfig>` that `serve` requires, so it can never
+    /// reach the unescaped `scope="..."` challenge parameter.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn challenge_scope_header_injection_is_rejected_before_serve() -> anyhow::Result<()> {
+        let mut oauth = OAuthConfig::builder(
+            "https://idp.example.test",
+            "mcp",
+            "https://idp.example.test/jwks.json",
+        )
+        .challenge_scopes(vec!["mcp:read".to_owned()])
+        .build();
+        oauth.challenge_scopes = Some(vec![
+            "mcp:read".to_owned(),
+            "x\"\r\nX-Injected: 1".to_owned(),
+        ]);
+        let mut auth = AuthConfig::with_keys(vec![]);
+        auth.oauth = Some(oauth);
+
+        let Err(err) = McpServerConfig::new("127.0.0.1:0", "t", "0.0.0")
+            .with_auth(auth)
+            .validate()
+        else {
+            anyhow::bail!("an injected challenge scope must fail validation");
+        };
+
+        assert!(
+            err.to_string().contains("oauth.challenge_scopes[1]"),
+            "{err}"
+        );
+        Ok(())
+    }
+
     /// Pins that an RBAC denial through the real wiring returns 403 and logs the
     /// resolved client fields.
     #[tokio::test]
@@ -10273,6 +10322,7 @@ mod tests {
             seen_credentials: SeenCredentials::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
+            challenge: ChallengeConfig::default(),
             log_context: AuthLogContext {
                 fields,
                 fingerprint_salt: None,

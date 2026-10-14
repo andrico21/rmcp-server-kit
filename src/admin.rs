@@ -238,8 +238,8 @@ mod tests {
     use super::*;
     use crate::{
         auth::{
-            ApiKeyEntry, AuthCounters, AuthLogContext, AuthMethod, SeenCredentials,
-            default_max_concurrent_verifications,
+            ApiKeyEntry, AuthCounters, AuthLogContext, AuthMethod, ChallengeConfig,
+            SeenCredentials, default_max_concurrent_verifications,
         },
         rbac::{RbacConfig, RoleConfig},
     };
@@ -262,6 +262,7 @@ mod tests {
             seen_credentials: SeenCredentials::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
+            challenge: ChallengeConfig::default(),
             log_context: AuthLogContext::default(),
         })
     }

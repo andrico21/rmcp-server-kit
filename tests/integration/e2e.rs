@@ -3304,6 +3304,99 @@ mod tests {
         Ok(())
     }
 
+    /// With `challenge_scopes = ["mcp:read"]` and
+    /// `omit_error_on_missing_credential = true`, a request without credentials
+    /// gets the RFC 6750 3.1 bare challenge plus the scope hint, a malformed
+    /// token keeps its `error` parameters after the hint, and neither status
+    /// nor body changes.
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn challenge_scope_and_bare_missing_credential() -> anyhow::Result<()> {
+        use wiremock::{Mock, ResponseTemplate, matchers};
+
+        let (_pem, jwks_body) = generate_oauth_test_keypair("challenge-kid")?;
+        let jwks = DualStackMock::start().await?;
+        jwks.mount(|| {
+            Mock::given(matchers::method("GET"))
+                .and(matchers::path("/jwks.json"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_body))
+        })
+        .await;
+        let oauth: OAuthConfig = serde_json::from_value(serde_json::json!({
+            "issuer": "https://idp.challenge.test/realms/challenge",
+            "audience": "mcp-challenge",
+            "jwks_uri": format!("http://localhost:{}/jwks.json", jwks.port()),
+            "allow_http_oauth_urls": true,
+            "ssrf_allowlist": {
+                "hosts": ["localhost"],
+                "cidrs": ["127.0.0.0/8"]
+            },
+            "scopes": [{"scope": "mcp:read", "role": "viewer"}],
+            "challenge_scopes": ["mcp:read"],
+            "omit_error_on_missing_credential": true
+        }))
+        .context("oauth config deserialization")?;
+        let mut auth = AuthConfig::with_keys(vec![]);
+        auth.oauth = Some(oauth);
+        let port = free_port().await?;
+        let base = spawn_server(
+            config_on_port(port)
+                .with_auth(auth)
+                .with_public_url(format!("http://127.0.0.1:{port}")),
+        )
+        .await?;
+        let url = format!("http://127.0.0.1:{port}/.well-known/oauth-protected-resource/mcp");
+        let client = reqwest::Client::new();
+
+        for (bearer, challenge, body) in [
+            (
+                None,
+                format!(r#"Bearer resource_metadata="{url}", scope="mcp:read""#),
+                "unauthorized: missing credential",
+            ),
+            (
+                Some("a.b.c"),
+                format!(
+                    r#"Bearer resource_metadata="{url}", scope="mcp:read", error="invalid_token", error_description="token is invalid""#
+                ),
+                "unauthorized: invalid credential",
+            ),
+        ] {
+            let unauthenticated = client
+                .post(format!("{base}/mcp"))
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream");
+            let request = match bearer {
+                Some(token) => unauthenticated.header("authorization", format!("Bearer {token}")),
+                None => unauthenticated,
+            };
+            let resp = request
+                .body(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"e2e","version":"0.0.1"}}}"#)
+                .send()
+                .await
+                .context("POST /mcp")?;
+
+            assert_eq!(resp.status(), 401, "{bearer:?}");
+            let challenges: Vec<&str> = resp
+                .headers()
+                .get_all("www-authenticate")
+                .iter()
+                .map(|value| value.to_str())
+                .collect::<Result<_, _>>()
+                .context("challenge is visible ASCII")?;
+            assert_eq!(challenges, [challenge.as_str()], "{bearer:?}");
+            assert_eq!(
+                resp.headers()
+                    .get("content-type")
+                    .and_then(|value| value.to_str().ok()),
+                Some("text/plain; charset=utf-8"),
+                "{bearer:?}"
+            );
+            assert_eq!(resp.text().await?, body, "{bearer:?}");
+        }
+        Ok(())
+    }
+
     // ==========================================================================
     // BUG-NEW: shutdown timeout double-signal regression test
     // ==========================================================================
