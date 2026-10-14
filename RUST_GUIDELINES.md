@@ -136,7 +136,7 @@ defined cleanup order, and no panic path. `scripts/lint-ratchet/prose_gates.py
 | `Drop for AuditWorkerGuard` | `src/observability.rs:392` | Signals shutdown then parks/joins the writer thread for at most `AUDIT_WRITER_JOIN_TIMEOUT` (5s); no async work or panic path. Bounded blocking is deliberate and documented. No defect. |
 | `Drop for CancelOnDrop` | `src/transport.rs:2966` | Sync, non-blocking `CancellationToken::cancel`; no I/O, await or panic path. Never disarmed on purpose. No defect. |
 | `Drop for TlsListener` | `src/transport.rs:3930` | Sync, non-blocking `JoinHandle::abort`; in-flight workers exit on the closed channel. No I/O, await or panic path. No defect. |
-| `Drop for ReleaseHookOnDrop` | `src/auth.rs:1649` | Test-only. Flips the `AtomicBool` gate of a `VerificationHook`; sync, no I/O or await, no panic path. Runs on unwind too, which unparks any `spawn_blocking` closure still busy-waiting before the test's `Runtime` drops. No defect. |
+| `Drop for ReleaseHookOnDrop` | `src/auth.rs:1738` | Test-only. Flips the `AtomicBool` gate of a `VerificationHook`; sync, no I/O or await, no panic path. Runs on unwind too, which unparks any `spawn_blocking` closure still busy-waiting before the test's `Runtime` drops. No defect. |
 
 ## Local deviations register
 
@@ -433,6 +433,30 @@ entry in the same PR that introduces a deviation.
    `closure_returning_async_block` expectation is needed. The verbose deny
    messages are unchanged (entry 1). Evidence: the task-19 migration record
    (`new-permanent-expects.txt`, `gates.txt`).
+
+22. **2026-10-13 - Expected-flow authentication attempts log at DEBUG.** Core
+   Section 10 ("Implement proper logging and monitoring") expects
+   authentication attempts, success and failure, to be logged. Here three
+   kinds of attempt log at DEBUG, below the default `info` filter: repeat
+   successes (a credential already logged at INFO with the same name and
+   role), `auth failed` with `failure_class=missing_credential`, and
+   `failure_class=expired_credential` for an expired OAuth JWT. Reason:
+   these 401s are normal steps of the MCP OAuth flow (a client probes
+   without a token, or refreshes an expired one), and at WARN they buried
+   actionable failures. Expired API keys, `invalid_credential` failures and
+   every new credential presentation still log at WARN or INFO. Effect on the
+   audit file: it mirrors INFO and above, so it no longer records the
+   demoted lines. Compensating controls: `/admin/auth/counters` counts each
+   failure class, and `rmcp_server_kit_auth_failures_total{class}` carries
+   the same counts when the `metrics` feature and listener are enabled, so
+   the core's "alert on a burst of 401s" moves to the counter. Neither
+   counts a capacity-full `503` from either auth limiter, which only
+   `key_eviction_policy = "reject_new"` can produce; for the post-failure
+   limiter the request's own failure class goes uncounted too, and its WARN
+   line, `auth post-failure limiter rejected unseen key because tracked-key
+   capacity is full`, is the only record.
+   The behavior is documented in `docs/GUIDE.md` (Authentication log levels)
+   and the 3.20.0 migration notes.
 Entries to be added by the work that creates them: "new in `<version>`"
 expects and profile deltas (the toolchain-drift work); the per-item frozen
 public-API expectations (the lint lanes, under entry 13's decision); the GitLab

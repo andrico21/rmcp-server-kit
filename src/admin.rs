@@ -238,7 +238,7 @@ mod tests {
     use super::*;
     use crate::{
         auth::{
-            ApiKeyEntry, AuthCounters, AuthLogContext, AuthMethod, SeenIdentitySet,
+            ApiKeyEntry, AuthCounters, AuthLogContext, AuthMethod, SeenCredentials,
             default_max_concurrent_verifications,
         },
         rbac::{RbacConfig, RoleConfig},
@@ -259,7 +259,7 @@ mod tests {
             verification_hook: None,
             #[cfg(feature = "oauth")]
             jwks_cache: None,
-            seen_identities: SeenIdentitySet::new(),
+            seen_credentials: SeenCredentials::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
             log_context: AuthLogContext::default(),

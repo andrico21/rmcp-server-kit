@@ -538,12 +538,12 @@ mod tests {
     /// produce false positives on legitimate caller-known echoes.
     const ERROR_BINDINGS: &[&str] = &["e", "err", "error", "source"];
 
-    /// Drop comment lines and everything from the `#[cfg(test)]` test
-    /// module onward.
+    /// Drop comment lines and everything from a `#[cfg(test)]`-annotated
+    /// `mod tests` or `pub(crate) mod tests` onward.
     ///
     /// Comments are stripped so documenting the anti-pattern cannot make
     /// this guard flag its own prose. The test-module cut anchors on
-    /// `#[cfg(test)]` *followed by* `mod tests`, because `config.rs`
+    /// `#[cfg(test)]` *followed by* either test-module declaration, because `config.rs`
     /// applies `#[cfg(test)]` to several consts near the top of the file
     /// and cutting at the first occurrence would silently skip the module.
     fn production_source(src: &str) -> String {
@@ -554,7 +554,11 @@ mod tests {
             if trimmed == "#[cfg(test)]"
                 && lines
                     .get(index.saturating_add(1))
-                    .is_some_and(|next| next.trim_start().starts_with("mod tests"))
+                    .is_some_and(|following_line| {
+                        let declaration = following_line.trim_start();
+                        declaration.starts_with("mod tests")
+                            || declaration.starts_with("pub(crate) mod tests")
+                    })
             {
                 break;
             }
@@ -677,6 +681,12 @@ mod tests {
 
         let in_tests = "fn ok() {}\n#[cfg(test)]\nmod tests {\n    RmcpServerKitError::Auth(format!(\"{e}\"));\n}";
         assert_eq!(find_error_interpolations(in_tests), Vec::<String>::new());
+
+        let in_pub_crate_tests = "fn ok() {}\n#[cfg(test)]\npub(crate) mod tests {\n    RmcpServerKitError::Auth(format!(\"{e}\"));\n}";
+        assert_eq!(
+            find_error_interpolations(in_pub_crate_tests),
+            Vec::<String>::new()
+        );
 
         // A `#[cfg(test)]` const must NOT truncate the scan (config.rs shape).
         let const_then_code = "#[cfg(test)]\nconst X: &[&str] = &[];\nfn f() { RmcpServerKitError::Auth(format!(\"{e}\")); }";

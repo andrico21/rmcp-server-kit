@@ -1172,7 +1172,7 @@ fn warn_on_literal_allow_globs(roles: &[RoleConfig], mode: AllowOperationMatchin
                 operation = %entry,
                 "allow entry contains '*' but operation matching is 'legacy'; \
                  the '*' is matched literally, not as a pattern - set \
-                 rbac.allow_operation_matching = \"glob\" to enable globbing, \
+                 rbac.allow_operation_matching = 'glob' to enable globbing, \
                  or list the operation names exactly"
             );
         }

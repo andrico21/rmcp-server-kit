@@ -35,6 +35,7 @@ mod tests {
     use reqwest::Client;
     use rmcp::{ServerHandler, model::ServerConfig};
     use rmcp_server_kit::{
+        auth::{ApiKeyEntry, AuthConfig, generate_api_key},
         metrics::McpMetrics,
         transport::{McpServerConfig, serve_with_listener},
     };
@@ -135,6 +136,73 @@ mod tests {
     fn base_config() -> McpServerConfig {
         McpServerConfig::new("127.0.0.1:0", "metrics-test", "0.0.1")
             .with_shutdown_timeout(Duration::from_millis(100))
+    }
+
+    /// Counts missing and invalid credentials separately in the served metrics.
+    #[tokio::test]
+    async fn auth_failures_are_counted_by_class() -> anyhow::Result<()> {
+        let (token, hash) = generate_api_key()?;
+        let port = reserve_port().await?;
+        let metrics_bind = format!("127.0.0.1:{port}");
+        let harness = spawn(
+            base_config()
+                .with_auth(AuthConfig::with_keys(vec![ApiKeyEntry::new(
+                    "k", hash, "viewer",
+                )]))
+                .with_metrics(metrics_bind.clone()),
+        )
+        .await?;
+
+        let client = Client::new();
+        let request_body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#;
+        let missing = client
+            .post(format!("{}/mcp", harness.base))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(request_body)
+            .send()
+            .await
+            .context("send request without credentials")?;
+        assert_eq!(missing.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        let invalid = client
+            .post(format!("{}/mcp", harness.base))
+            .header("authorization", "Bearer not-a-key")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(request_body)
+            .send()
+            .await
+            .context("send request with invalid credentials")?;
+        assert_eq!(invalid.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        let valid = client
+            .post(format!("{}/mcp", harness.base))
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(request_body)
+            .send()
+            .await
+            .context("send request with valid credentials")?;
+        assert_eq!(
+            valid.status(),
+            reqwest::StatusCode::OK,
+            "a valid token must complete MCP initialize"
+        );
+
+        let metrics_body = scrape(&metrics_bind).await?;
+        assert!(
+            metrics_body.lines().any(|line| line
+                == "rmcp_server_kit_auth_failures_total{class=\"missing_credential\"} 1"),
+            "missing credential counter must equal one: {metrics_body}"
+        );
+        assert!(
+            metrics_body.lines().any(|line| line
+                == "rmcp_server_kit_auth_failures_total{class=\"invalid_credential\"} 1"),
+            "invalid credential counter must equal one: {metrics_body}"
+        );
+        Ok(())
     }
 
     /// Pins that a caller-supplied handle is served with its custom collectors

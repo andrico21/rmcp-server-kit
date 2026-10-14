@@ -62,7 +62,7 @@ use crate::{
     admin::AdminState,
     auth::{
         ApiKeyEntry, AuthConfig, AuthCounters, AuthIdentity, AuthLogContext, AuthState, MtlsConfig,
-        SeenIdentitySet, TlsConnInfo, auth_middleware, build_pre_auth_limiter, build_rate_limiter,
+        SeenCredentials, TlsConnInfo, auth_middleware, build_pre_auth_limiter, build_rate_limiter,
         extract_mtls_identity, resolve_max_concurrent_verifications,
     },
     bounded_limiter::{BoundedKeyedLimiter, BoundedLimiterDeny, KeyEvictionPolicy},
@@ -397,8 +397,8 @@ pub struct LogContextConfig {
     /// Controls how the `Mcp-Session-Id` request header is rendered when
     /// full request-header logging is enabled. Default: [`SessionIdLogPolicy::Plain`].
     pub session_id_header: SessionIdLogPolicy,
-    /// Include `credential_fp` on `auth failed` lines, for Bearer
-    /// tokens only: the first 8 hex characters of HMAC-SHA256 keyed
+    /// Include `credential_fp` on `auth failed` and `authenticated` lines,
+    /// for Bearer credentials only: the first 8 hex characters of HMAC-SHA256 keyed
     /// with the RBAC redaction salt. Set `rbac.redaction_salt` for
     /// fingerprints that are stable across replicas.
     pub credential_fingerprint: bool,
@@ -831,9 +831,11 @@ pub struct McpServerConfig {
     /// Caller-supplied metrics registry handle (feature: `metrics`).
     ///
     /// When set, the metrics middleware records into this registry and the
-    /// `/metrics` listener serves it. The framework registers its own three
-    /// collectors on it at startup (evicting any descriptor-equivalent
-    /// occupant first) and fails startup closed on a reserved-name conflict.
+    /// `/metrics` listener serves it. The framework registers its own four
+    /// collectors (`http_requests_total`, `http_request_duration_seconds`,
+    /// `rate_limited_total`, and `auth_failures_total`) on it at startup
+    /// (evicting any descriptor-equivalent occupant first) and fails startup
+    /// closed on a reserved-name conflict.
     /// Set via [`Self::with_metrics_handle`]; supplying a handle requires
     /// [`Self::with_metrics`] as well.
     #[cfg(feature = "metrics")]
@@ -1619,7 +1621,7 @@ impl McpServerConfig {
     /// served metrics registry (feature: `metrics`).
     ///
     /// Register application collectors on `handle.registry` before passing it;
-    /// the framework registers (and verifies) its own three
+    /// the framework registers (and verifies) its own four
     /// `rmcp_server_kit_*` collectors on the same registry at startup, so
     /// those names are reserved. Supplying a handle does **not** enable the
     /// listener - call [`Self::with_metrics`] as well; a handle without an
@@ -2465,7 +2467,7 @@ where
                 verification_hook: None,
                 #[cfg(feature = "oauth")]
                 jwks_cache,
-                seen_identities: SeenIdentitySet::new(),
+                seen_credentials: SeenCredentials::new(),
                 counters: AuthCounters::default(),
                 // Absolute only when `public_url` supplies a trustworthy
                 // external origin. Without it `derive_server_url` falls back
@@ -2794,7 +2796,7 @@ where
         } else {
             Arc::new(McpMetrics::new().map_err(|error| anyhow::anyhow!("metrics init: {error}"))?)
         };
-        // Security hardening: the three framework collectors must be bound to
+        // Security hardening: the four framework collectors must be bound to
         // the served registry whatever the caller pre-registered there.
         // Evict-then-register; a conflict on the reserved namespace fails
         // startup closed instead of serving silently empty telemetry.
@@ -4271,7 +4273,7 @@ fn metrics_labels(req: &Request<Body>) -> (&'static str, String) {
     (method, path)
 }
 
-/// Bind the three framework collectors to `metrics.registry` authoritatively.
+/// Bind the four framework collectors to `metrics.registry` authoritatively.
 ///
 /// `Registry::register` compares descriptor and collector IDs, not object
 /// identity (and checks descriptor IDs *before* the dimension check), so a
@@ -4299,10 +4301,11 @@ fn ensure_framework_metrics_registered(metrics: &McpMetrics) -> Result<(), RmcpS
     // boxed clone of the same collector. `MetricVec` clones share one
     // `Arc<MetricVecCore>`, so descriptors and sample storage stay identical.
     type BoxedFactory<'factory> = &'factory dyn Fn() -> Box<dyn Collector>;
-    let factories: [BoxedFactory<'_>; 3] = [
+    let factories: [BoxedFactory<'_>; 4] = [
         &|| -> Box<dyn Collector> { Box::new(metrics.http_requests_total.clone()) },
         &|| -> Box<dyn Collector> { Box::new(metrics.http_request_duration_seconds.clone()) },
         &|| -> Box<dyn Collector> { Box::new(metrics.rate_limited_total.clone()) },
+        &|| -> Box<dyn Collector> { Box::new(metrics.auth_failures_total.clone()) },
     ];
 
     for make in factories {
@@ -6014,7 +6017,7 @@ mod tests {
             verification_hook: None,
             #[cfg(feature = "oauth")]
             jwks_cache: None,
-            seen_identities: SeenIdentitySet::new(),
+            seen_credentials: SeenCredentials::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
             log_context: AuthLogContext::default(),
@@ -10248,7 +10251,7 @@ mod tests {
             #[cfg(test)]
             verification_hook: None,
             jwks_cache: None,
-            seen_identities: SeenIdentitySet::new(),
+            seen_credentials: SeenCredentials::new(),
             counters: AuthCounters::default(),
             resource_metadata_url: None,
             log_context: AuthLogContext {
@@ -10787,6 +10790,31 @@ mod tests {
                 samples, 1,
                 "re-running the guard must not duplicate families"
             );
+
+            Ok(())
+        }
+
+        /// Repairs the registry when the auth-failure collector is missing.
+        #[test]
+        fn missing_auth_failures_collector_is_rebound() -> anyhow::Result<()> {
+            let metrics = McpMetrics::new().context("metrics build")?;
+            metrics
+                .registry
+                .unregister(Box::new(metrics.auth_failures_total.clone()))
+                .context("auth-failure collector was registered")?;
+
+            ensure_framework_metrics_registered(&metrics).context("guard repairs the registry")?;
+
+            metrics
+                .auth_failures_total
+                .with_label_values(&["missing_credential"])
+                .inc();
+            let gathered = metrics.registry.gather();
+            let family = gathered
+                .iter()
+                .find(|family| family.name() == "rmcp_server_kit_auth_failures_total")
+                .context("auth-failure family is served")?;
+            assert_eq!(family.get_metric().len(), 1, "sample must be served");
 
             Ok(())
         }
