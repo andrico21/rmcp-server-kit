@@ -2047,7 +2047,7 @@ mod tests {
 
     use super::*;
     #[cfg(feature = "oauth")]
-    use crate::oauth::{OAuthConfig, OAuthProxyConfig};
+    use crate::oauth::{OAuthConfig, OAuthProxyConfig, ProxyMode, ScopeMapping};
     use crate::{
         auth::{ApiKeyEntry, generate_api_key},
         transport::SessionIdLogPolicy,
@@ -3508,6 +3508,332 @@ client_ip = false
         Ok(())
     }
 
+    /// A 32-byte sealing secret accepted by `validate_configured_secret`.
+    #[cfg(feature = "oauth")]
+    const SEALING_SECRET: &str = "sealing-secret-a-0123456789abcdef";
+
+    /// A `ServerConfig` carrying the valid HTTPS OAuth config after `mutate`.
+    #[cfg(feature = "oauth")]
+    fn server_with_oauth_mutation<F>(mutate: F) -> ServerConfig
+    where
+        F: FnOnce(&mut OAuthConfig),
+    {
+        let mut oauth = validation_https_oauth_config();
+        mutate(&mut oauth);
+        server_config_with_oauth(oauth)
+    }
+
+    /// A passthrough proxy table with HTTPS upstream URLs.
+    #[cfg(feature = "oauth")]
+    fn validation_proxy() -> OAuthProxyConfig {
+        OAuthProxyConfig::builder(
+            "https://auth.example.com/authorize",
+            "https://auth.example.com/token",
+            "mcp",
+        )
+        .build()
+    }
+
+    /// An authorization-server proxy table with a valid sealing secret.
+    #[cfg(feature = "oauth")]
+    fn validation_as_proxy() -> OAuthProxyConfig {
+        let mut proxy = validation_proxy();
+        proxy.mode = ProxyMode::AuthorizationServer;
+        proxy.sealing_secret = Some(SecretString::from(SEALING_SECRET.to_owned()));
+        proxy
+    }
+
+    /// A `ServerConfig` whose OAuth proxy is `proxy` after `mutate`.
+    #[cfg(feature = "oauth")]
+    fn server_with_proxy_mutation<F>(mut proxy: OAuthProxyConfig, mutate: F) -> ServerConfig
+    where
+        F: FnOnce(&mut OAuthProxyConfig),
+    {
+        mutate(&mut proxy);
+        server_with_oauth_mutation(|oauth| oauth.proxy = Some(proxy))
+    }
+
+    /// One scope-to-role mapping.
+    #[cfg(feature = "oauth")]
+    fn scope_mapping(scope: &str, role: &str) -> ScopeMapping {
+        ScopeMapping {
+            scope: scope.to_owned(),
+            role: role.to_owned(),
+        }
+    }
+
+    /// Rejects `challenge_scopes = []` by both validators.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn challenge_scopes_rejects_empty_list() -> anyhow::Result<()> {
+        let server = server_with_oauth_mutation(|oauth| oauth.challenge_scopes = Some(vec![]));
+        assert_server_config_rejected_by_both(
+            "empty challenge_scopes",
+            &server,
+            "oauth.challenge_scopes must not be empty; omit it to disable the 401 scope hint",
+        )
+    }
+
+    /// Rejects `challenge_scopes` entries that are not RFC 6750 scope tokens.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn challenge_scopes_rejects_non_token_entries() -> anyhow::Result<()> {
+        for bad in ["", "mcp read", "say\"hi\"", "back\\slash"] {
+            let server = server_with_oauth_mutation(|oauth| {
+                oauth.challenge_scopes = Some(vec!["mcp:read".to_owned(), bad.to_owned()]);
+            });
+            assert_server_config_rejected_by_both(
+                &format!("challenge_scopes entry {bad:?}"),
+                &server,
+                "oauth.challenge_scopes[1]",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Rejects `offline_access` in `challenge_scopes`.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn challenge_scopes_rejects_offline_access() -> anyhow::Result<()> {
+        let server = server_with_oauth_mutation(|oauth| {
+            oauth.challenge_scopes = Some(vec!["offline_access".to_owned()]);
+        });
+        assert_server_config_rejected_by_both(
+            "offline_access challenge scope",
+            &server,
+            "oauth.challenge_scopes[0] = \"offline_access\"",
+        )
+    }
+
+    /// Rejects duplicate `challenge_scopes` entries.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn challenge_scopes_rejects_duplicates() -> anyhow::Result<()> {
+        let server = server_with_oauth_mutation(|oauth| {
+            oauth.challenge_scopes = Some(vec!["mcp:read".to_owned(), "mcp:read".to_owned()]);
+        });
+        assert_server_config_rejected_by_both(
+            "duplicate challenge scope",
+            &server,
+            "oauth.challenge_scopes[1] duplicates",
+        )
+    }
+
+    /// Rejects `insufficient_scope_challenge = true` together with `role_claim`.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn insufficient_scope_challenge_rejects_role_claim() -> anyhow::Result<()> {
+        let server = server_with_oauth_mutation(|oauth| {
+            oauth.insufficient_scope_challenge = true;
+            oauth.scopes = vec![scope_mapping("mcp:read", "viewer")];
+            oauth.role_claim = Some("realm_access.roles".to_owned());
+        });
+        assert_server_config_rejected_by_both(
+            "step-up with role_claim",
+            &server,
+            "oauth.insufficient_scope_challenge = true requires oauth.role_claim to be unset",
+        )
+    }
+
+    /// Rejects `insufficient_scope_challenge = true` without any scope mapping.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn insufficient_scope_challenge_rejects_empty_scopes() -> anyhow::Result<()> {
+        let server = server_with_oauth_mutation(|oauth| oauth.insufficient_scope_challenge = true);
+        assert_server_config_rejected_by_both(
+            "step-up without scopes",
+            &server,
+            "oauth.insufficient_scope_challenge = true requires at least one oauth.scopes",
+        )
+    }
+
+    /// Rejects `insufficient_scope_challenge = true` with a non-token mapped scope.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn insufficient_scope_challenge_rejects_non_token_scope() -> anyhow::Result<()> {
+        let server = server_with_oauth_mutation(|oauth| {
+            oauth.insufficient_scope_challenge = true;
+            oauth.scopes = vec![
+                scope_mapping("mcp:admin", "ops"),
+                scope_mapping("mcp read", "viewer"),
+            ];
+        });
+        assert_server_config_rejected_by_both(
+            "step-up with a non-token scope",
+            &server,
+            "oauth.scopes[1].scope = \"mcp read\" is not a valid RFC 6750 scope token",
+        )
+    }
+
+    /// Rejects an empty `additional_audiences` entry.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn additional_audiences_rejects_empty_entry() -> anyhow::Result<()> {
+        let server = server_with_oauth_mutation(|oauth| {
+            oauth.additional_audiences = vec!["extra".to_owned(), "  ".to_owned()];
+        });
+        assert_server_config_rejected_by_both(
+            "empty additional audience",
+            &server,
+            "oauth.additional_audiences[1] must not be empty",
+        )
+    }
+
+    /// Rejects duplicate `additional_audiences` entries.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn additional_audiences_rejects_duplicates() -> anyhow::Result<()> {
+        let server = server_with_oauth_mutation(|oauth| {
+            oauth.additional_audiences = vec!["extra".to_owned(), "extra".to_owned()];
+        });
+        assert_server_config_rejected_by_both(
+            "duplicate additional audience",
+            &server,
+            "oauth.additional_audiences[1] duplicates",
+        )
+    }
+
+    /// Rejects an `additional_audiences` entry equal to `audience`.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn additional_audiences_rejects_primary_audience() -> anyhow::Result<()> {
+        let server = server_with_oauth_mutation(|oauth| {
+            oauth.additional_audiences = vec![oauth.audience.clone()];
+        });
+        assert_server_config_rejected_by_both(
+            "additional audience equal to audience",
+            &server,
+            "oauth.additional_audiences[0] equals oauth.audience",
+        )
+    }
+
+    /// Rejects a `consent_ttl` that is not a humantime duration.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn consent_ttl_rejects_malformed_duration() -> anyhow::Result<()> {
+        let server = server_with_proxy_mutation(validation_proxy(), |proxy| {
+            proxy.consent_ttl = Some("soon".to_owned());
+        });
+        assert_server_config_rejected_by_both(
+            "malformed consent_ttl",
+            &server,
+            "oauth.proxy.consent_ttl \"soon\" is not a valid humantime duration",
+        )
+    }
+
+    /// Rejects a `consent_ttl` above the 400-day browser cookie cap.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn consent_ttl_rejects_more_than_400_days() -> anyhow::Result<()> {
+        let server = server_with_proxy_mutation(validation_proxy(), |proxy| {
+            proxy.consent_ttl = Some("400days 1s".to_owned());
+        });
+        assert_server_config_rejected_by_both(
+            "oversized consent_ttl",
+            &server,
+            "oauth.proxy.consent_ttl \"400days 1s\" exceeds 400 days",
+        )
+    }
+
+    /// Rejects authorization-server mode without `sealing_secret`.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn authorization_server_requires_sealing_secret() -> anyhow::Result<()> {
+        let server = server_with_proxy_mutation(validation_as_proxy(), |proxy| {
+            proxy.sealing_secret = None;
+        });
+        assert_server_config_rejected_by_both(
+            "authorization_server without sealing_secret",
+            &server,
+            "oauth.proxy.sealing_secret is required when oauth.proxy.mode = \"authorization_server\"",
+        )
+    }
+
+    /// Rejects authorization-server mode with a weak `sealing_secret`.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn authorization_server_rejects_weak_sealing_secret() -> anyhow::Result<()> {
+        for (weak, expected) in [
+            (
+                "too-short",
+                "oauth.proxy.sealing_secret must be at least 32 UTF-8 bytes",
+            ),
+            (
+                "                                    ",
+                "oauth.proxy.sealing_secret must not be empty or whitespace-only",
+            ),
+        ] {
+            let server = server_with_proxy_mutation(validation_as_proxy(), |proxy| {
+                proxy.sealing_secret = Some(SecretString::from(weak.to_owned()));
+            });
+            assert_server_config_rejected_by_both("weak sealing_secret", &server, expected)?;
+        }
+        Ok(())
+    }
+
+    /// Rejects authorization-server mode with a weak `sealing_secret_previous`.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn authorization_server_rejects_weak_previous_sealing_secret() -> anyhow::Result<()> {
+        let server = server_with_proxy_mutation(validation_as_proxy(), |proxy| {
+            proxy.sealing_secret_previous = Some(SecretString::from("too-short".to_owned()));
+        });
+        assert_server_config_rejected_by_both(
+            "weak sealing_secret_previous",
+            &server,
+            "oauth.proxy.sealing_secret_previous must be at least 32 UTF-8 bytes",
+        )
+    }
+
+    /// Rejects a `sealing_secret_previous` equal to `sealing_secret`.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn authorization_server_rejects_equal_previous_sealing_secret() -> anyhow::Result<()> {
+        let server = server_with_proxy_mutation(validation_as_proxy(), |proxy| {
+            proxy.sealing_secret_previous = Some(SecretString::from(SEALING_SECRET.to_owned()));
+        });
+        assert_server_config_rejected_by_both(
+            "previous sealing secret equal to current",
+            &server,
+            "oauth.proxy.sealing_secret_previous must differ from oauth.proxy.sealing_secret",
+        )
+    }
+
+    /// Rejects authorization-server mode with `authorization_server_metadata_issuer` set.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn authorization_server_rejects_metadata_issuer_override() -> anyhow::Result<()> {
+        let proxy = validation_as_proxy();
+        let server = server_with_oauth_mutation(|oauth| {
+            oauth.authorization_server_metadata_issuer =
+                Some("https://auth.example.com".to_owned());
+            oauth.proxy = Some(proxy);
+        });
+        assert_server_config_rejected_by_both(
+            "authorization_server with metadata issuer override",
+            &server,
+            "oauth.authorization_server_metadata_issuer must be unset when oauth.proxy.mode = \"authorization_server\"",
+        )
+    }
+
+    /// A consistent fully opted-in config passes the TOML validator.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn opted_in_oauth_knobs_pass_server_validation() -> anyhow::Result<()> {
+        let mut proxy = validation_as_proxy();
+        proxy.consent_ttl = Some("0s".to_owned());
+        let server = server_with_oauth_mutation(|oauth| {
+            oauth.challenge_scopes = Some(vec!["mcp:read".to_owned()]);
+            oauth.insufficient_scope_challenge = true;
+            oauth.scopes = vec![scope_mapping("mcp:read", "viewer")];
+            oauth.additional_audiences = vec!["extra".to_owned()];
+            oauth.accept_resource_audience = true;
+            oauth.omit_error_on_missing_credential = true;
+            oauth.proxy = Some(proxy);
+        });
+        validate_server_config(&server).context("consistent opt-in config validates")
+    }
+
     #[test]
     /// Pins that a TLS cert without a key is rejected.
     fn tls_cert_without_key_rejected() -> anyhow::Result<()> {
@@ -4523,6 +4849,62 @@ client_ip = false
             "OAuthConfig.jwks_max_response_bytes",
             "validated by OAuthConfig::validate",
         ),
+        (
+            "OAuthConfig.challenge_scopes",
+            "non-empty, scope-token, no offline_access, no duplicates; checked by OAuthConfig::validate",
+        ),
+        (
+            "OAuthConfig.insufficient_scope_challenge",
+            "requires scope-based roles with scope-token mappings; checked by OAuthConfig::validate",
+        ),
+        (
+            "OAuthConfig.additional_audiences",
+            "non-empty, unique, distinct from audience; checked by OAuthConfig::validate",
+        ),
+        (
+            "OAuthProxyConfig.authorize_url",
+            "validated by OAuthConfig::validate",
+        ),
+        (
+            "OAuthProxyConfig.token_url",
+            "validated by OAuthConfig::validate",
+        ),
+        (
+            "OAuthProxyConfig.introspection_url",
+            "validated by OAuthConfig::validate",
+        ),
+        (
+            "OAuthProxyConfig.revocation_url",
+            "validated by OAuthConfig::validate",
+        ),
+        (
+            "OAuthProxyConfig.expose_admin_endpoints",
+            "M3 admin-endpoint combination checked by OAuthConfig::validate",
+        ),
+        (
+            "OAuthProxyConfig.require_auth_on_admin_endpoints",
+            "M3 admin-endpoint combination checked by OAuthConfig::validate",
+        ),
+        (
+            "OAuthProxyConfig.allow_unauthenticated_admin_endpoints",
+            "M3 admin-endpoint combination checked by OAuthConfig::validate",
+        ),
+        (
+            "OAuthProxyConfig.mode",
+            "authorization_server requirements checked by OAuthConfig::validate",
+        ),
+        (
+            "OAuthProxyConfig.sealing_secret",
+            "required and strength-checked in authorization_server mode by OAuthConfig::validate",
+        ),
+        (
+            "OAuthProxyConfig.sealing_secret_previous",
+            "strength-checked and distinct in authorization_server mode by OAuthConfig::validate",
+        ),
+        (
+            "OAuthProxyConfig.consent_ttl",
+            "humantime duration capped at 400 days; checked by OAuthConfig::validate",
+        ),
     ];
 
     const AUTH_NESTED_VALIDATION_EXEMPT: &[(&str, &str)] = &[
@@ -4602,6 +4984,26 @@ client_ip = false
             "OAuthConfig.audience_validation_mode",
             "enum option; every variant and None are valid",
         ),
+        (
+            "OAuthConfig.accept_resource_audience",
+            "bool; no field-local invalid state exists",
+        ),
+        (
+            "OAuthConfig.omit_error_on_missing_credential",
+            "bool; no invalid state exists",
+        ),
+        (
+            "OAuthProxyConfig.client_id",
+            "opaque upstream client identifier forwarded verbatim",
+        ),
+        (
+            "OAuthProxyConfig.client_secret",
+            "optional opaque upstream credential; absence means a public client",
+        ),
+        (
+            "OAuthProxyConfig.strip_resource_param",
+            "bool; no invalid state exists",
+        ),
     ];
 
     fn prefixed_struct_fields(
@@ -4658,8 +5060,13 @@ client_ip = false
             "pub struct OAuthConfig {",
             "OAuthConfig",
         )?);
+        fields.extend(prefixed_struct_fields(
+            oauth_source,
+            "pub struct OAuthProxyConfig {",
+            "OAuthProxyConfig",
+        )?);
         assert!(
-            fields.len() >= 45,
+            fields.len() >= 64,
             "nested auth guard parsed only {} fields; update the parser",
             fields.len()
         );

@@ -21,6 +21,7 @@ use core::sync::atomic::AtomicU64;
 use core::{
     fmt,
     hint::cold_path,
+    str::FromStr,
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
@@ -63,6 +64,7 @@ use crate::{
     cancel::DetachOutcome,
     diagnostics::{oauth_claim_values, plaintext_oauth_tokens, upstream_error_bodies},
     error::RmcpServerKitError,
+    session_binding::validate_configured_secret,
     ssrf::{
         CidrEntry, CompiledSsrfAllowlist, check_url_literal_ip, ip_block_reason,
         redirect_target_reason_with_allowlist, sanitized_url_for_log,
@@ -949,6 +951,10 @@ fn compile_oauth_ssrf_allowlist(raw: &OAuthSsrfAllowlist) -> Result<CompiledSsrf
 /// OAuth 2.1 JWT configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "deliberate: src/oauth.rs::OAuthConfig is a flat TOML table of independent operator opt-ins; collapsing them into an enum would break both the public API and the deserialized schema"
+)]
 #[non_exhaustive]
 pub struct OAuthConfig {
     /// Token issuer (`iss` claim). Must match exactly.
@@ -1152,6 +1158,54 @@ pub struct OAuthConfig {
     /// remains empty / unchanged. Default: 1 MiB.
     #[serde(default = "default_jwks_max_bytes")]
     pub jwks_max_response_bytes: u64,
+    /// Scopes advertised as `scope="..."` in the `401` `WWW-Authenticate`
+    /// challenge, so clients request least privilege first (MCP scope
+    /// selection strategy).
+    ///
+    /// **Default: `None`** (no `scope` parameter; 3.20.0 behaviour). When
+    /// set, the list must be non-empty (omit the key to disable the hint),
+    /// every entry must be an RFC 6750 `scope-token`, `offline_access` is
+    /// refused (resource servers should not advertise it), and duplicates
+    /// are rejected. Environment override:
+    /// `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__CHALLENGE_SCOPES`
+    /// (comma-separated).
+    #[serde(default)]
+    pub challenge_scopes: Option<Vec<String>>,
+    /// Answer a tool call denied only for lack of scope with `403` and
+    /// `WWW-Authenticate: Bearer error="insufficient_scope"` naming a scope
+    /// that would unlock the call (MCP scope challenge).
+    ///
+    /// **Default: `false`** (bare `403`; 3.20.0 behaviour). Requires
+    /// scope-based roles: [`OAuthConfig::role_claim`] must be unset,
+    /// [`OAuthConfig::scopes`] must be non-empty, and every mapped scope must
+    /// be an RFC 6750 `scope-token`. Environment override:
+    /// `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__INSUFFICIENT_SCOPE_CHALLENGE`.
+    #[serde(default)]
+    pub insufficient_scope_challenge: bool,
+    /// Extra `aud` values accepted in addition to [`OAuthConfig::audience`].
+    ///
+    /// **Default: empty** (only `audience` matches; 3.20.0 behaviour).
+    /// Entries must be non-empty, unique, and different from `audience`.
+    /// Environment override:
+    /// `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ADDITIONAL_AUDIENCES`
+    /// (comma-separated).
+    #[serde(default)]
+    pub additional_audiences: Vec<String>,
+    /// Also accept tokens whose `aud` is this server's canonical RFC 8707
+    /// resource URL (`{public_url}/mcp`).
+    ///
+    /// **Default: `false`** (3.20.0 behaviour). Environment override:
+    /// `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ACCEPT_RESOURCE_AUDIENCE`.
+    #[serde(default)]
+    pub accept_resource_audience: bool,
+    /// Omit the `error` parameter from the `401` challenge sent to a request
+    /// that carries no credential at all, as RFC 6750 3.1 recommends.
+    ///
+    /// **Default: `false`** (`error="invalid_request"` is sent; 3.20.0
+    /// behaviour). Environment override:
+    /// `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__OMIT_ERROR_ON_MISSING_CREDENTIAL`.
+    #[serde(default)]
+    pub omit_error_on_missing_credential: bool,
 }
 
 /// Serde default for `jwks_cache_ttl` (`"10m"`).
@@ -1218,6 +1272,69 @@ impl AudienceValidationMode {
     }
 }
 
+/// How the built-in OAuth proxy ([`OAuthProxyConfig`]) fronts the upstream
+/// identity provider.
+///
+/// Deserialized from the exact lowercase strings `"passthrough"` and
+/// `"authorization_server"`; any other spelling is rejected.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ProxyMode {
+    /// Forward `/authorize` and `/token` to the upstream with the client id
+    /// swapped; the upstream redirects the browser straight back to the
+    /// client. **Default** and the only behaviour of 3.20.0 and earlier.
+    #[default]
+    Passthrough,
+    /// Act as an authorization server in front of the upstream: sealed
+    /// client registrations, a per-client consent page, and a local
+    /// `/oauth/callback` that re-stamps `iss` with this server's issuer.
+    /// Requires [`OAuthProxyConfig::sealing_secret`].
+    AuthorizationServer,
+}
+
+impl ProxyMode {
+    /// The TOML / environment spelling of this mode.
+    #[must_use]
+    #[inline]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Passthrough => "passthrough",
+            Self::AuthorizationServer => "authorization_server",
+        }
+    }
+}
+
+impl FromStr for ProxyMode {
+    type Err = RmcpServerKitError;
+
+    /// Parse the exact lowercase spelling produced by [`ProxyMode::as_str`].
+    #[inline]
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "passthrough" => Ok(Self::Passthrough),
+            "authorization_server" => Ok(Self::AuthorizationServer),
+            _ => Err(RmcpServerKitError::Config(format!(
+                "invalid proxy mode {raw:?}: expected \"passthrough\" or \"authorization_server\""
+            ))),
+        }
+    }
+}
+
+/// Whether `value` is an RFC 6750 3 `scope-token`: one or more `NQCHAR`
+/// bytes (`0x21`, `0x23-0x5B`, `0x5D-0x7E`), i.e. printable ASCII without
+/// space, `"` or `\`.
+pub(crate) fn is_rfc6750_scope_token(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, 0x21 | 0x23..=0x5B | 0x5D..=0x7E))
+}
+
+/// Longest accepted [`OAuthProxyConfig::consent_ttl`]: browsers cap cookie
+/// `Max-Age` at 400 days.
+const MAX_CONSENT_TTL: Duration = Duration::from_hours(400 * 24);
+
 impl Default for OAuthConfig {
     #[inline]
     fn default() -> Self {
@@ -1246,6 +1363,11 @@ impl Default for OAuthConfig {
             audience_validation_mode: None,
             jwks_max_response_bytes: default_jwks_max_bytes(),
             ssrf_allowlist: None,
+            challenge_scopes: None,
+            insufficient_scope_challenge: false,
+            additional_audiences: Vec::new(),
+            accept_resource_audience: false,
+            omit_error_on_missing_credential: false,
         }
     }
 }
@@ -1442,7 +1564,175 @@ impl OAuthConfig {
                 self.jwks_cache_ttl
             ))
         })?;
+        self.validate_scope_challenge_knobs()?;
+        self.validate_additional_audiences()?;
+        self.validate_proxy_mode_knobs()?;
         Ok(())
+    }
+
+    /// Field-local checks for `challenge_scopes` and
+    /// `insufficient_scope_challenge`.
+    ///
+    /// `scopes[*].scope` is checked only when `insufficient_scope_challenge`
+    /// is enabled, so a config 3.20.0 accepted is never rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RmcpServerKitError::Config`] naming the offending key.
+    fn validate_scope_challenge_knobs(&self) -> Result<(), RmcpServerKitError> {
+        if let Some(challenge_scopes) = &self.challenge_scopes {
+            if challenge_scopes.is_empty() {
+                return Err(RmcpServerKitError::Config(
+                    "oauth.challenge_scopes must not be empty; omit it to disable the 401 scope hint"
+                        .into(),
+                ));
+            }
+            for (index, scope) in challenge_scopes.iter().enumerate() {
+                if !is_rfc6750_scope_token(scope) {
+                    return Err(RmcpServerKitError::Config(format!(
+                        "oauth.challenge_scopes[{index}] = {scope:?} is not a valid RFC 6750 scope token \
+                         (non-empty printable ASCII without space, '\"' or '\\')"
+                    )));
+                }
+                if scope == "offline_access" {
+                    return Err(RmcpServerKitError::Config(format!(
+                        "oauth.challenge_scopes[{index}] = \"offline_access\" must not be advertised: \
+                         resource servers should not ask clients for offline_access"
+                    )));
+                }
+                if challenge_scopes
+                    .iter()
+                    .take(index)
+                    .any(|earlier| earlier == scope)
+                {
+                    return Err(RmcpServerKitError::Config(format!(
+                        "oauth.challenge_scopes[{index}] duplicates an earlier entry {scope:?}"
+                    )));
+                }
+            }
+        }
+        if !self.insufficient_scope_challenge {
+            return Ok(());
+        }
+        if self.role_claim.is_some() {
+            return Err(RmcpServerKitError::Config(
+                "oauth.insufficient_scope_challenge = true requires oauth.role_claim to be unset: \
+                 the step-up challenge can only name scopes mapped in oauth.scopes"
+                    .into(),
+            ));
+        }
+        if self.scopes.is_empty() {
+            return Err(RmcpServerKitError::Config(
+                "oauth.insufficient_scope_challenge = true requires at least one oauth.scopes mapping"
+                    .into(),
+            ));
+        }
+        for (index, mapping) in self.scopes.iter().enumerate() {
+            if !is_rfc6750_scope_token(&mapping.scope) {
+                return Err(RmcpServerKitError::Config(format!(
+                    "oauth.scopes[{index}].scope = {:?} is not a valid RFC 6750 scope token, \
+                     which oauth.insufficient_scope_challenge = true requires",
+                    mapping.scope
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Field-local checks for `additional_audiences`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RmcpServerKitError::Config`] naming the offending entry.
+    fn validate_additional_audiences(&self) -> Result<(), RmcpServerKitError> {
+        for (index, audience) in self.additional_audiences.iter().enumerate() {
+            if audience.trim().is_empty() {
+                return Err(RmcpServerKitError::Config(format!(
+                    "oauth.additional_audiences[{index}] must not be empty"
+                )));
+            }
+            if *audience == self.audience {
+                return Err(RmcpServerKitError::Config(format!(
+                    "oauth.additional_audiences[{index}] equals oauth.audience; list only extra audiences"
+                )));
+            }
+            if self
+                .additional_audiences
+                .iter()
+                .take(index)
+                .any(|earlier| earlier == audience)
+            {
+                return Err(RmcpServerKitError::Config(format!(
+                    "oauth.additional_audiences[{index}] duplicates an earlier entry {audience:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Field-local checks for `proxy.consent_ttl` and the
+    /// authorization-server proxy mode.
+    ///
+    /// Passthrough mode ignores `sealing_secret*`, so setting them there is
+    /// not an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RmcpServerKitError::Config`] naming the offending key.
+    fn validate_proxy_mode_knobs(&self) -> Result<(), RmcpServerKitError> {
+        use secrecy::ExposeSecret as _;
+
+        let Some(proxy) = &self.proxy else {
+            return Ok(());
+        };
+        if let Some(raw_ttl) = &proxy.consent_ttl {
+            let ttl = humantime::parse_duration(raw_ttl).map_err(|error| {
+                RmcpServerKitError::Config(format!(
+                    "oauth.proxy.consent_ttl {raw_ttl:?} is not a valid humantime duration \
+                     (e.g. \"30d\", \"12h\", \"0s\"): {error}"
+                ))
+            })?;
+            if ttl > MAX_CONSENT_TTL {
+                return Err(RmcpServerKitError::Config(format!(
+                    "oauth.proxy.consent_ttl {raw_ttl:?} exceeds 400 days, the browser cookie lifetime cap"
+                )));
+            }
+        }
+        match proxy.mode {
+            ProxyMode::Passthrough => Ok(()),
+            ProxyMode::AuthorizationServer => {
+                let Some(current) = &proxy.sealing_secret else {
+                    return Err(RmcpServerKitError::Config(
+                        "oauth.proxy.sealing_secret is required when \
+                         oauth.proxy.mode = \"authorization_server\""
+                            .into(),
+                    ));
+                };
+                validate_configured_secret("oauth.proxy.sealing_secret", current.expose_secret())?;
+                if let Some(previous) = &proxy.sealing_secret_previous {
+                    validate_configured_secret(
+                        "oauth.proxy.sealing_secret_previous",
+                        previous.expose_secret(),
+                    )?;
+                    if previous.expose_secret() == current.expose_secret() {
+                        return Err(RmcpServerKitError::Config(
+                            "oauth.proxy.sealing_secret_previous must differ from \
+                             oauth.proxy.sealing_secret"
+                                .into(),
+                        ));
+                    }
+                }
+                if self.authorization_server_metadata_issuer.is_some() {
+                    return Err(RmcpServerKitError::Config(
+                        "oauth.authorization_server_metadata_issuer must be unset when \
+                         oauth.proxy.mode = \"authorization_server\" (the issuer is always \
+                         this server's own URL)"
+                            .into(),
+                    ));
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Validate the URLs published by the discovery endpoints.
@@ -2119,6 +2409,46 @@ impl OAuthConfigBuilder {
         self
     }
 
+    /// Advertise these scopes in the `401` challenge. See
+    /// [`OAuthConfig::challenge_scopes`].
+    #[inline]
+    pub fn challenge_scopes(mut self, scopes: Vec<String>) -> Self {
+        self.inner.challenge_scopes = Some(scopes);
+        self
+    }
+
+    /// Enable the `insufficient_scope` step-up challenge. See
+    /// [`OAuthConfig::insufficient_scope_challenge`].
+    #[inline]
+    pub const fn insufficient_scope_challenge(mut self, enabled: bool) -> Self {
+        self.inner.insufficient_scope_challenge = enabled;
+        self
+    }
+
+    /// Replace the extra accepted audiences. See
+    /// [`OAuthConfig::additional_audiences`].
+    #[inline]
+    pub fn additional_audiences(mut self, audiences: Vec<String>) -> Self {
+        self.inner.additional_audiences = audiences;
+        self
+    }
+
+    /// Accept this server's canonical resource URL as an audience. See
+    /// [`OAuthConfig::accept_resource_audience`].
+    #[inline]
+    pub const fn accept_resource_audience(mut self, accept: bool) -> Self {
+        self.inner.accept_resource_audience = accept;
+        self
+    }
+
+    /// Omit `error` from the challenge for credential-less requests. See
+    /// [`OAuthConfig::omit_error_on_missing_credential`].
+    #[inline]
+    pub const fn omit_error_on_missing_credential(mut self, omit: bool) -> Self {
+        self.inner.omit_error_on_missing_credential = omit;
+        self
+    }
+
     /// Finalise the builder and return the [`OAuthConfig`].
     #[must_use]
     #[inline]
@@ -2496,6 +2826,47 @@ pub struct OAuthProxyConfig {
     /// requests.
     #[serde(default)]
     pub strip_resource_param: bool,
+    /// How the proxy fronts the upstream identity provider.
+    ///
+    /// **Default: [`ProxyMode::Passthrough`]** (3.20.0 behaviour).
+    /// [`ProxyMode::AuthorizationServer`] requires
+    /// [`Self::sealing_secret`] and an unset
+    /// [`OAuthConfig::authorization_server_metadata_issuer`]. Environment
+    /// override: `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__MODE`.
+    #[serde(default)]
+    pub mode: ProxyMode,
+    /// HMAC key that seals client registrations, consent, state and codes
+    /// in [`ProxyMode::AuthorizationServer`] mode. Every replica behind one
+    /// load balancer must share it.
+    ///
+    /// **Default: `None`.** Required (at least 32 UTF-8 bytes, not
+    /// whitespace-only) in authorization-server mode; ignored in passthrough
+    /// mode. Never logged; `Debug` prints it redacted. Environment override:
+    /// `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET` or
+    /// `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_FILE`.
+    #[serde(default)]
+    pub sealing_secret: Option<secrecy::SecretString>,
+    /// Previous sealing key, still accepted when opening sealed values so a
+    /// key rotation does not invalidate in-flight registrations and consent.
+    ///
+    /// **Default: `None`.** When set in authorization-server mode it must
+    /// pass the same strength check as [`Self::sealing_secret`] and differ
+    /// from it; ignored in passthrough mode. Never logged; `Debug` prints it
+    /// redacted. Environment override:
+    /// `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_PREVIOUS`
+    /// or
+    /// `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_PREVIOUS_FILE`.
+    #[serde(default)]
+    pub sealing_secret_previous: Option<secrecy::SecretString>,
+    /// How long a browser remembers consent for a client in
+    /// authorization-server mode (humantime string, e.g. `"30d"`).
+    ///
+    /// **Default: `None`, meaning 30 days.** `"0s"` always asks again; the
+    /// maximum is 400 days (the browser cookie lifetime cap). Read only in
+    /// authorization-server mode, but validated whenever set. Environment
+    /// override: `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__CONSENT_TTL`.
+    #[serde(default)]
+    pub consent_ttl: Option<String>,
 }
 
 impl OAuthProxyConfig {
@@ -2610,6 +2981,37 @@ impl OAuthProxyConfigBuilder {
     #[inline]
     pub const fn strip_resource_param(mut self, strip: bool) -> Self {
         self.inner.strip_resource_param = strip;
+        self
+    }
+
+    /// Select the proxy mode. See [`OAuthProxyConfig::mode`].
+    #[inline]
+    pub const fn mode(mut self, mode: ProxyMode) -> Self {
+        self.inner.mode = mode;
+        self
+    }
+
+    /// Set the sealing key required by [`ProxyMode::AuthorizationServer`].
+    /// See [`OAuthProxyConfig::sealing_secret`].
+    #[inline]
+    pub fn sealing_secret(mut self, secret: secrecy::SecretString) -> Self {
+        self.inner.sealing_secret = Some(secret);
+        self
+    }
+
+    /// Set the previous sealing key accepted during rotation. See
+    /// [`OAuthProxyConfig::sealing_secret_previous`].
+    #[inline]
+    pub fn sealing_secret_previous(mut self, secret: secrecy::SecretString) -> Self {
+        self.inner.sealing_secret_previous = Some(secret);
+        self
+    }
+
+    /// Set how long consent is remembered (humantime string, e.g. `"30d"`).
+    /// See [`OAuthProxyConfig::consent_ttl`].
+    #[inline]
+    pub fn consent_ttl(mut self, ttl: String) -> Self {
+        self.inner.consent_ttl = Some(ttl);
         self
     }
 
@@ -5979,6 +6381,11 @@ pub(crate) mod tests {
             audience_validation_mode: None,
             jwks_max_response_bytes: default_jwks_max_bytes(),
             ssrf_allowlist: None,
+            challenge_scopes: None,
+            insufficient_scope_challenge: false,
+            additional_audiences: Vec::new(),
+            accept_resource_audience: false,
+            omit_error_on_missing_credential: false,
         };
         let meta = protected_resource_metadata(
             "https://mcp.example.com/mcp",
@@ -6830,6 +7237,11 @@ role = "admin"
             audience_validation_mode: None,
             jwks_max_response_bytes: default_jwks_max_bytes(),
             ssrf_allowlist: None,
+            challenge_scopes: None,
+            insufficient_scope_challenge: false,
+            additional_audiences: Vec::new(),
+            accept_resource_audience: false,
+            omit_error_on_missing_credential: false,
         }
     }
 
@@ -9911,6 +10323,11 @@ role = "admin"
             audience_validation_mode: None,
             jwks_max_response_bytes: default_jwks_max_bytes(),
             ssrf_allowlist: None,
+            challenge_scopes: None,
+            insufficient_scope_challenge: false,
+            additional_audiences: Vec::new(),
+            accept_resource_audience: false,
+            omit_error_on_missing_credential: false,
         }
     }
 
@@ -11578,6 +11995,10 @@ role = "admin"
             require_auth_on_admin_endpoints: false,
             allow_unauthenticated_admin_endpoints: false,
             strip_resource_param: false,
+            mode: ProxyMode::Passthrough,
+            sealing_secret: None,
+            sealing_secret_previous: None,
+            consent_ttl: None,
         }
     }
 
@@ -12122,6 +12543,368 @@ role = "admin"
             "cache miss must fall back to inner client"
         );
 
+        Ok(())
+    }
+
+    // - Opt-in conformance knobs and the authorization-server proxy mode -
+
+    /// A 32-byte sealing secret accepted by `validate_configured_secret`.
+    const SEALING_SECRET_A: &str = "sealing-secret-a-0123456789abcdef";
+    /// A second, distinct 32-byte sealing secret.
+    const SEALING_SECRET_B: &str = "sealing-secret-b-0123456789abcdef";
+
+    /// The `[server.auth.oauth]` table (with its `proxy` sub-table) of the
+    /// complete TOML reference in `docs/GUIDE.md`, deserialized unchanged.
+    fn guide_reference_oauth_config() -> anyhow::Result<OAuthConfig> {
+        let guide = include_str!("../docs/GUIDE.md");
+        let (_, after_heading) = guide
+            .split_once("### Complete TOML configuration reference")
+            .context("GUIDE canonical TOML heading")?;
+        let (_, after_fence) = after_heading
+            .split_once("```toml\n")
+            .context("GUIDE canonical TOML fence start")?;
+        let (block, _) = after_fence
+            .split_once("```")
+            .context("GUIDE canonical TOML fence end")?;
+        let root: toml::Table = toml::from_str(block).context("GUIDE TOML parses")?;
+        let oauth = root
+            .get("server")
+            .and_then(|server| server.get("auth"))
+            .and_then(|auth| auth.get("oauth"))
+            .context("GUIDE TOML declares [server.auth.oauth]")?
+            .clone();
+        oauth
+            .try_into::<OAuthConfig>()
+            .context("GUIDE [server.auth.oauth] deserializes into OAuthConfig")
+    }
+
+    /// Deserialize an `OAuthProxyConfig` TOML table whose `mode` key is `mode`.
+    fn proxy_with_mode(mode: &str) -> anyhow::Result<OAuthProxyConfig> {
+        toml::from_str(&format!(
+            "authorize_url = \"https://auth.example.com/authorize\"\n\
+             token_url = \"https://auth.example.com/token\"\n\
+             client_id = \"mcp\"\n\
+             mode = \"{mode}\"\n"
+        ))
+        .with_context(|| format!("proxy table with mode = {mode:?}"))
+    }
+
+    /// The GUIDE reference config deserializes with every new knob at its 3.20.0 default.
+    #[test]
+    fn new_fields_default_from_3_20_toml() -> anyhow::Result<()> {
+        let cfg = guide_reference_oauth_config()?;
+
+        assert_eq!(cfg.challenge_scopes, None);
+        assert!(!cfg.insufficient_scope_challenge);
+        assert_eq!(cfg.additional_audiences, Vec::<String>::new());
+        assert!(!cfg.accept_resource_audience);
+        assert!(!cfg.omit_error_on_missing_credential);
+        let proxy = cfg.proxy.as_ref().context("GUIDE declares a proxy table")?;
+        assert_eq!(proxy.mode, ProxyMode::Passthrough);
+        assert!(proxy.sealing_secret.is_none());
+        assert!(proxy.sealing_secret_previous.is_none());
+        assert_eq!(proxy.consent_ttl, None);
+        cfg.validate()
+            .context("the unchanged GUIDE reference config must still validate")?;
+        Ok(())
+    }
+
+    /// A minimal 3.20.0-shaped config (required keys only) defaults every new knob and validates.
+    #[test]
+    fn minimal_3_20_config_defaults_new_fields_and_validates() -> anyhow::Result<()> {
+        let cfg: OAuthConfig = toml::from_str(
+            "issuer = \"https://auth.example.com\"\n\
+             audience = \"mcp\"\n\
+             jwks_uri = \"https://auth.example.com/jwks\"\n\
+             [proxy]\n\
+             authorize_url = \"https://auth.example.com/authorize\"\n\
+             token_url = \"https://auth.example.com/token\"\n\
+             client_id = \"mcp\"\n",
+        )
+        .context("minimal 3.20.0 config parses")?;
+
+        assert_eq!(cfg.challenge_scopes, None);
+        assert_eq!(cfg.additional_audiences, Vec::<String>::new());
+        let proxy = cfg.proxy.as_ref().context("proxy table declared")?;
+        assert_eq!(proxy.mode, ProxyMode::Passthrough);
+        assert_eq!(proxy.consent_ttl, None);
+        cfg.validate().context("minimal 3.20.0 config validates")?;
+        Ok(())
+    }
+
+    /// Every new knob deserializes from TOML to exactly the configured value.
+    #[test]
+    fn new_fields_deserialize_from_toml() -> anyhow::Result<()> {
+        use secrecy::ExposeSecret;
+
+        let cfg: OAuthConfig = toml::from_str(&format!(
+            "issuer = \"https://auth.example.com\"\n\
+             audience = \"mcp\"\n\
+             jwks_uri = \"https://auth.example.com/jwks\"\n\
+             challenge_scopes = [\"mcp:read\", \"mcp:write\"]\n\
+             insufficient_scope_challenge = true\n\
+             additional_audiences = [\"https://mcp.example.com/mcp\", \"legacy-aud\"]\n\
+             accept_resource_audience = true\n\
+             omit_error_on_missing_credential = true\n\
+             [[scopes]]\n\
+             scope = \"mcp:read\"\n\
+             role = \"viewer\"\n\
+             [proxy]\n\
+             authorize_url = \"https://auth.example.com/authorize\"\n\
+             token_url = \"https://auth.example.com/token\"\n\
+             client_id = \"mcp\"\n\
+             mode = \"authorization_server\"\n\
+             sealing_secret = \"{SEALING_SECRET_A}\"\n\
+             sealing_secret_previous = \"{SEALING_SECRET_B}\"\n\
+             consent_ttl = \"12h\"\n"
+        ))
+        .context("all-new-fields TOML parses")?;
+
+        assert_eq!(
+            cfg.challenge_scopes,
+            Some(vec!["mcp:read".to_owned(), "mcp:write".to_owned()])
+        );
+        assert!(cfg.insufficient_scope_challenge);
+        assert_eq!(
+            cfg.additional_audiences,
+            vec![
+                "https://mcp.example.com/mcp".to_owned(),
+                "legacy-aud".to_owned()
+            ]
+        );
+        assert!(cfg.accept_resource_audience);
+        assert!(cfg.omit_error_on_missing_credential);
+        let proxy = cfg.proxy.as_ref().context("proxy table declared")?;
+        assert_eq!(proxy.mode, ProxyMode::AuthorizationServer);
+        assert_eq!(
+            proxy
+                .sealing_secret
+                .as_ref()
+                .map(ExposeSecret::expose_secret),
+            Some(SEALING_SECRET_A)
+        );
+        assert_eq!(
+            proxy
+                .sealing_secret_previous
+                .as_ref()
+                .map(ExposeSecret::expose_secret),
+            Some(SEALING_SECRET_B)
+        );
+        assert_eq!(proxy.consent_ttl.as_deref(), Some("12h"));
+        cfg.validate()
+            .context("a fully opted-in, consistent config validates")?;
+        Ok(())
+    }
+
+    /// The builders set every new knob to the given value.
+    #[test]
+    fn builders_set_new_fields() -> anyhow::Result<()> {
+        use secrecy::ExposeSecret;
+
+        let proxy = OAuthProxyConfig::builder(
+            "https://auth.example.com/authorize",
+            "https://auth.example.com/token",
+            "mcp",
+        )
+        .mode(ProxyMode::AuthorizationServer)
+        .sealing_secret(secrecy::SecretString::from(SEALING_SECRET_A.to_owned()))
+        .sealing_secret_previous(secrecy::SecretString::from(SEALING_SECRET_B.to_owned()))
+        .consent_ttl("0s".to_owned())
+        .build();
+        let cfg = OAuthConfig::builder(
+            "https://auth.example.com",
+            "mcp",
+            "https://auth.example.com/jwks",
+        )
+        .scope("mcp:read", "viewer")
+        .challenge_scopes(vec!["mcp:read".to_owned()])
+        .insufficient_scope_challenge(true)
+        .additional_audiences(vec!["extra".to_owned()])
+        .accept_resource_audience(true)
+        .omit_error_on_missing_credential(true)
+        .proxy(proxy)
+        .build();
+
+        assert_eq!(cfg.challenge_scopes, Some(vec!["mcp:read".to_owned()]));
+        assert!(cfg.insufficient_scope_challenge);
+        assert_eq!(cfg.additional_audiences, vec!["extra".to_owned()]);
+        assert!(cfg.accept_resource_audience);
+        assert!(cfg.omit_error_on_missing_credential);
+        let built = cfg.proxy.as_ref().context("proxy attached")?;
+        assert_eq!(built.mode, ProxyMode::AuthorizationServer);
+        assert_eq!(
+            built
+                .sealing_secret
+                .as_ref()
+                .map(ExposeSecret::expose_secret),
+            Some(SEALING_SECRET_A)
+        );
+        assert_eq!(
+            built
+                .sealing_secret_previous
+                .as_ref()
+                .map(ExposeSecret::expose_secret),
+            Some(SEALING_SECRET_B)
+        );
+        assert_eq!(built.consent_ttl.as_deref(), Some("0s"));
+        cfg.validate().context("builder-made config validates")?;
+        Ok(())
+    }
+
+    /// `mode` is matched case-sensitively and unknown values fail to deserialize.
+    #[test]
+    fn proxy_mode_rejects_wrong_case_and_unknown_values() -> anyhow::Result<()> {
+        assert_eq!(
+            proxy_with_mode("passthrough")
+                .context("passthrough parses")?
+                .mode,
+            ProxyMode::Passthrough
+        );
+        for bad in ["Authorization_Server", "bogus", "Passthrough", ""] {
+            assert!(
+                proxy_with_mode(bad).is_err(),
+                "mode = {bad:?} must fail to deserialize"
+            );
+        }
+        Ok(())
+    }
+
+    /// `ProxyMode::from_str` round-trips `as_str` and lists both values on error.
+    #[test]
+    fn proxy_mode_from_str_round_trips_as_str() -> anyhow::Result<()> {
+        for mode in [ProxyMode::Passthrough, ProxyMode::AuthorizationServer] {
+            let parsed: ProxyMode = mode.as_str().parse().context("as_str parses back")?;
+            assert_eq!(parsed, mode);
+        }
+        for bad in ["Authorization_Server", "PASSTHROUGH", "bogus", ""] {
+            let Err(err) = bad.parse::<ProxyMode>() else {
+                anyhow::bail!("{bad:?} must not parse as a ProxyMode");
+            };
+            let message = err.to_string();
+            assert!(
+                message.contains("\"passthrough\"") && message.contains("\"authorization_server\""),
+                "error must list both accepted values; got {message:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/oauth.rs::is_rfc6750_scope_token_accepts_exactly_nqchar keeps the uniform test signature while it only asserts"
+    )]
+    /// The scope-token check accepts exactly the RFC 6750 NQCHAR byte ranges.
+    #[test]
+    fn is_rfc6750_scope_token_accepts_exactly_nqchar() -> anyhow::Result<()> {
+        for good in ["!", "#", "[", "]", "~", "mcp:read", "a/b.c-d_e"] {
+            assert!(is_rfc6750_scope_token(good), "{good:?} is a scope token");
+        }
+        for bad in [
+            "",
+            " ",
+            "a b",
+            "\"",
+            "\\",
+            "\u{7f}",
+            "\t",
+            "mcp\u{e9}",
+            "a\nb",
+        ] {
+            assert!(!is_rfc6750_scope_token(bad), "{bad:?} is not a scope token");
+        }
+        Ok(())
+    }
+
+    /// Configs that 3.20.0 accepted still validate: no new rule fires without its knob.
+    #[test]
+    fn three_twenty_accepted_configs_still_validate() -> anyhow::Result<()> {
+        let mut non_token_scopes = validation_https_config();
+        non_token_scopes.scopes = vec![
+            ScopeMapping {
+                scope: "mcp read".into(),
+                role: "viewer".into(),
+            },
+            ScopeMapping {
+                scope: "say \"hi\"".into(),
+                role: "ops".into(),
+            },
+        ];
+        non_token_scopes
+            .validate()
+            .context("non-token scopes without the step-up knob must validate")?;
+
+        let mut role_claim = validation_https_config();
+        role_claim.role_claim = Some("realm_access.roles".into());
+        role_claim
+            .validate()
+            .context("role_claim without the step-up knob must validate")?;
+
+        let mut legacy_issuer = validation_https_config();
+        legacy_issuer.authorization_server_metadata_issuer =
+            Some("https://auth.example.com".into());
+        legacy_issuer.proxy = Some(demo_proxy());
+        legacy_issuer
+            .validate()
+            .context("passthrough proxy with the legacy issuer opt-out must validate")?;
+
+        let mut ignored_secrets = validation_https_config();
+        let mut proxy = demo_proxy();
+        proxy.sealing_secret = Some(secrecy::SecretString::from("short".to_owned()));
+        proxy.sealing_secret_previous = Some(secrecy::SecretString::from("short".to_owned()));
+        ignored_secrets.proxy = Some(proxy);
+        ignored_secrets
+            .validate()
+            .context("passthrough mode ignores sealing secrets")?;
+        Ok(())
+    }
+
+    /// `consent_ttl` accepts `0s` and exactly 400 days.
+    #[test]
+    fn consent_ttl_accepts_zero_and_the_400_day_cap() -> anyhow::Result<()> {
+        for ttl in ["0s", "400days", "30d", "1h"] {
+            let mut cfg = validation_https_config();
+            let mut proxy = demo_proxy();
+            proxy.consent_ttl = Some(ttl.to_owned());
+            cfg.proxy = Some(proxy);
+            cfg.validate()
+                .with_context(|| format!("consent_ttl = {ttl:?} must validate"))?;
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "deliberate: src/oauth.rs::debug_redacts_sealing_secrets keeps the uniform test signature while it only asserts"
+    )]
+    /// `Debug` of a config carrying sealing secrets never prints the secret values.
+    #[test]
+    fn debug_redacts_sealing_secrets() -> anyhow::Result<()> {
+        let mut cfg = validation_https_config();
+        let mut proxy = demo_proxy();
+        proxy.mode = ProxyMode::AuthorizationServer;
+        proxy.sealing_secret = Some(secrecy::SecretString::from(SEALING_SECRET_A.to_owned()));
+        proxy.sealing_secret_previous =
+            Some(secrecy::SecretString::from(SEALING_SECRET_B.to_owned()));
+        cfg.proxy = Some(proxy);
+
+        let rendered = format!("{cfg:?}");
+        assert!(
+            rendered.contains("sealing_secret"),
+            "field names stay visible"
+        );
+        assert!(
+            !rendered.contains(SEALING_SECRET_A) && !rendered.contains(SEALING_SECRET_B),
+            "Debug must not print sealing secrets: {rendered}"
+        );
+        let builder_rendered = format!(
+            "{:?}",
+            OAuthProxyConfig::builder("https://a.example", "https://t.example", "c")
+                .sealing_secret(secrecy::SecretString::from(SEALING_SECRET_A.to_owned()))
+        );
+        assert!(
+            !builder_rendered.contains(SEALING_SECRET_A),
+            "builder Debug must not print sealing secrets: {builder_rendered}"
+        );
         Ok(())
     }
 }
