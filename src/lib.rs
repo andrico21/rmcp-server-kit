@@ -141,6 +141,8 @@ pub mod admin;
 pub mod secret;
 
 pub(crate) mod forwarded;
+#[cfg(all(test, feature = "oauth"))]
+pub(crate) mod oauth_seal;
 pub(crate) mod rbac_context;
 pub(crate) mod session_binding;
 pub(crate) mod ssrf;
