@@ -4235,4 +4235,953 @@ mod tests {
             .context("server shutdown returned an error")?;
         Ok(())
     }
+
+    // ==========================================================================
+    // Compat oracle: the 3.20.0 wire behaviour of an unchanged config
+    // ==========================================================================
+
+    /// Byte-level oracle for the wire behaviour an operator observes with an
+    /// unchanged 3.20.0 config (no post-3.20.0 knob set anywhere).
+    ///
+    /// Every expected value below was captured from the unmodified 3.20.0
+    /// tree and pasted verbatim; only the ephemeral ports are interpolated. A
+    /// failing test here means a wire change for an unchanged config: fix the
+    /// change, never the snapshot.
+    #[cfg(feature = "oauth")]
+    mod compat_3_20 {
+        use alloc::collections::BTreeMap;
+        use std::sync::LazyLock;
+
+        use reqwest::redirect::Policy;
+        use rmcp_server_kit::transport::SecurityHeadersConfig;
+        use wiremock::{Mock, ResponseTemplate, matchers};
+
+        use super::*;
+
+        /// `kid` of the mock IdP signing key.
+        const KID: &str = "compat-kid";
+        /// `issuer` of the OAuth config and `iss` of every minted token.
+        const ISSUER: &str = "https://idp.compat.test/realms/compat";
+        /// The single configured `audience`.
+        const AUDIENCE: &str = "mcp-compat";
+        /// Raw JSON the mock IdP `/token` endpoint answers with.
+        const UPSTREAM_TOKEN_BODY: &str = r#"{"access_token":"upstream-at","token_type":"Bearer","expires_in":300,"scope":"mcp:read"}"#;
+        /// MCP `initialize` request body used for every `POST /mcp` probe.
+        const INITIALIZE_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"compat","version":"0.0.1"}}}"#;
+        /// RFC 7636 appendix B `code_challenge` (43 characters).
+        const CODE_CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+        /// RFC 7636 appendix B `code_verifier`.
+        const CODE_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        /// `redirect_uri` every proxy probe sends, form-encoded.
+        const REDIRECT_URI_ENCODED: &str = "http%3A%2F%2F127.0.0.1%3A9%2Fcb";
+        /// 401 body for a request without any credential.
+        const MISSING_CREDENTIAL: &str = "unauthorized: missing credential";
+        /// 401 body for a credential that fails validation.
+        const INVALID_CREDENTIAL: &str = "unauthorized: invalid credential";
+        /// 401 body for an expired token.
+        const EXPIRED_CREDENTIAL: &str = "unauthorized: expired credential";
+        /// JSON body of the router fallback and of every unmounted route.
+        const NOT_FOUND_BODY: &str =
+            r#"{"error":"not_found","error_description":"The requested endpoint does not exist"}"#;
+        /// JSON body of the passthrough `/register` stub for the probe request.
+        const REGISTER_BODY: &str = r#"{"client_id":"static-client","client_name":"compat","redirect_uris":["http://127.0.0.1:9/cb"],"token_endpoint_auth_method":"none"}"#;
+        /// `content-type` of every plain-text 401/403 body.
+        const TEXT_PLAIN: &str = "text/plain; charset=utf-8";
+        /// The 11 security headers 3.20.0 puts on every plaintext response.
+        /// Kept local (not shared with [`default_security_header_values`]) so
+        /// an edit to a shared helper can never silently move the oracle.
+        const DEFAULT_SECURITY_HEADERS: [(&str, &str); 11] = [
+            ("cache-control", "no-store, max-age=0"),
+            (
+                "content-security-policy",
+                "default-src 'none'; form-action 'self'; object-src 'none'; frame-ancestors 'none'; upgrade-insecure-requests",
+            ),
+            ("cross-origin-embedder-policy", "require-corp"),
+            ("cross-origin-opener-policy", "same-origin"),
+            ("cross-origin-resource-policy", "same-origin"),
+            (
+                "permissions-policy",
+                "accelerometer=(), camera=(), geolocation=(), microphone=()",
+            ),
+            ("referrer-policy", "no-referrer"),
+            ("x-content-type-options", "nosniff"),
+            ("x-dns-prefetch-control", "off"),
+            ("x-frame-options", "deny"),
+            ("x-permitted-cross-domain-policies", "none"),
+        ];
+        /// C15 operator `Content-Security-Policy` override.
+        const C15_CSP: &str = "default-src 'none'; sandbox";
+        /// C15 operator `Referrer-Policy` override.
+        const C15_REFERRER_POLICY: &str = "strict-origin";
+        /// C15 operator `Cache-Control` override.
+        const C15_CACHE_CONTROL: &str = "no-store";
+        /// The security headers with the three C15 overrides applied.
+        const C15_SECURITY_HEADERS: [(&str, &str); 11] = [
+            ("cache-control", C15_CACHE_CONTROL),
+            ("content-security-policy", C15_CSP),
+            ("cross-origin-embedder-policy", "require-corp"),
+            ("cross-origin-opener-policy", "same-origin"),
+            ("cross-origin-resource-policy", "same-origin"),
+            (
+                "permissions-policy",
+                "accelerometer=(), camera=(), geolocation=(), microphone=()",
+            ),
+            ("referrer-policy", C15_REFERRER_POLICY),
+            ("x-content-type-options", "nosniff"),
+            ("x-dns-prefetch-control", "off"),
+            ("x-frame-options", "deny"),
+            ("x-permitted-cross-domain-policies", "none"),
+        ];
+
+        /// One RSA keypair for the whole module: generating a 2048-bit key in
+        /// an unoptimized build costs seconds, and no scenario needs its own.
+        static KEYPAIR: LazyLock<Result<(String, serde_json::Value), String>> =
+            LazyLock::new(|| generate_oauth_test_keypair(KID).map_err(|err| format!("{err:#}")));
+
+        /// The exact response an unchanged config produces: status, every
+        /// header except `date` (each name's values in `HeaderMap::get_all`
+        /// order) and the raw body bytes.
+        struct WireSnapshot {
+            /// HTTP status code.
+            status: u16,
+            /// Every `(name, value)` pair except `date`; a repeated name lists
+            /// its values in wire order.
+            headers: Vec<(&'static str, String)>,
+            /// Raw body; every captured body is ASCII.
+            body: String,
+        }
+
+        impl WireSnapshot {
+            /// A snapshot with `status`, `body` and no headers yet.
+            fn new(status: u16, body: &str) -> Self {
+                Self {
+                    status,
+                    headers: Vec::new(),
+                    body: body.to_owned(),
+                }
+            }
+
+            /// Appends literal header pairs in order.
+            fn headers(mut self, pairs: &[(&'static str, &str)]) -> Self {
+                self.headers
+                    .extend(pairs.iter().map(|&(name, value)| (name, value.to_owned())));
+                self
+            }
+
+            /// Appends one header whose value is built at run time.
+            fn header(mut self, name: &'static str, value: String) -> Self {
+                self.headers.push((name, value));
+                self
+            }
+
+            /// Appends `content-length` computed from the expected body, for
+            /// bodies that embed an ephemeral port.
+            fn content_length(self) -> Self {
+                let length = self.body.len().to_string();
+                self.header("content-length", length)
+            }
+        }
+
+        /// Groups `headers` by name, keeping each name's values in
+        /// `HeaderMap::get_all` order. `date` is excluded: it carries the
+        /// wall-clock time of the response, the only non-deterministic header
+        /// these scenarios produce.
+        fn header_multimap(headers: &HeaderMap) -> anyhow::Result<BTreeMap<String, Vec<String>>> {
+            let mut grouped = BTreeMap::new();
+            for name in headers.keys() {
+                if name.as_str() == "date" {
+                    continue;
+                }
+                let mut values = Vec::new();
+                for value in headers.get_all(name) {
+                    values.push(
+                        value
+                            .to_str()
+                            .with_context(|| format!("header {name} is visible ASCII"))?
+                            .to_owned(),
+                    );
+                }
+                drop(grouped.insert(name.as_str().to_owned(), values));
+            }
+            Ok(grouped)
+        }
+
+        /// Renders a response for the assertion messages.
+        fn render(status: u16, headers: &BTreeMap<String, Vec<String>>, body: &[u8]) -> String {
+            let header_lines: String = headers
+                .iter()
+                .flat_map(|(name, values)| {
+                    values.iter().map(move |value| format!("{name}: {value}\n"))
+                })
+                .collect();
+            format!(
+                "status: {status}\n{header_lines}body: {}",
+                String::from_utf8_lossy(body)
+            )
+        }
+
+        /// Asserts that `resp` matches `expected` exactly: status, the complete
+        /// header multimap except `date`, and the raw body bytes.
+        async fn assert_wire_eq(
+            resp: reqwest::Response,
+            expected: &WireSnapshot,
+        ) -> anyhow::Result<()> {
+            let status = resp.status().as_u16();
+            let headers = header_multimap(resp.headers())?;
+            let body = resp.bytes().await.context("read response body")?;
+            let mut expected_headers: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for (name, value) in &expected.headers {
+                expected_headers
+                    .entry((*name).to_owned())
+                    .or_default()
+                    .push(value.clone());
+            }
+            let actual = render(status, &headers, &body);
+            let wanted = render(expected.status, &expected_headers, expected.body.as_bytes());
+            assert_eq!(
+                status, expected.status,
+                "status drifted\nactual:\n{actual}\nexpected:\n{wanted}"
+            );
+            assert_eq!(
+                headers, expected_headers,
+                "headers drifted\nactual:\n{actual}\nexpected:\n{wanted}"
+            );
+            assert_eq!(
+                body.as_ref(),
+                expected.body.as_bytes(),
+                "body drifted\nactual:\n{actual}\nexpected:\n{wanted}"
+            );
+            Ok(())
+        }
+
+        /// Mock upstream IdP: serves the JWKS and a fixed `/token` answer on
+        /// both loopback addresses.
+        struct CompatIdp {
+            /// The dual-stack wiremock server.
+            mock: DualStackMock,
+        }
+
+        impl CompatIdp {
+            /// Starts the mock and mounts `/jwks.json` and `/token`.
+            async fn start() -> anyhow::Result<Self> {
+                let (_pem, jwks_body) = KEYPAIR
+                    .as_ref()
+                    .map_err(|err| anyhow::anyhow!("keypair generation: {err}"))?;
+                let mock = DualStackMock::start().await?;
+                mock.mount(|| {
+                    Mock::given(matchers::method("GET"))
+                        .and(matchers::path("/jwks.json"))
+                        .respond_with(ResponseTemplate::new(200).set_body_json(jwks_body))
+                })
+                .await;
+                mock.mount(|| {
+                    Mock::given(matchers::method("POST"))
+                        .and(matchers::path("/token"))
+                        .respond_with(
+                            ResponseTemplate::new(200)
+                                .set_body_raw(UPSTREAM_TOKEN_BODY, "application/json"),
+                        )
+                })
+                .await;
+                Ok(Self { mock })
+            }
+
+            /// `http://localhost:<port><path>` on the mock.
+            fn url(&self, path: &str) -> String {
+                format!("http://localhost:{}{path}", self.mock.port())
+            }
+
+            /// Mints an RS256 token signed by the mock key with `claims`.
+            fn token(claims: &serde_json::Value) -> anyhow::Result<String> {
+                let (pem, _jwks) = KEYPAIR
+                    .as_ref()
+                    .map_err(|err| anyhow::anyhow!("keypair generation: {err}"))?;
+                let encoding_key = jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes())
+                    .context("encoding key from PEM")?;
+                let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
+                header.kid = Some(KID.into());
+                jsonwebtoken::encode(&header, claims, &encoding_key).context("JWT encoding")
+            }
+
+            /// Bodies of every `POST /token` the mock received, on either
+            /// loopback address.
+            async fn token_request_bodies(&self) -> anyhow::Result<Vec<String>> {
+                let mut bodies = Vec::new();
+                for server in [Some(&self.mock.v4), self.mock.v6.as_ref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    let requests = server
+                        .received_requests()
+                        .await
+                        .context("request recording must be enabled")?;
+                    for request in requests.iter().filter(|req| req.url.path() == "/token") {
+                        bodies.push(
+                            String::from_utf8(request.body.clone())
+                                .context("upstream token body is UTF-8")?,
+                        );
+                    }
+                }
+                Ok(bodies)
+            }
+        }
+
+        /// Token claims with the configured issuer, a fresh `iat`, and the
+        /// given audience, scope and expiry offset in seconds from now.
+        fn claims(aud: &str, scope: &str, exp_offset: i64) -> serde_json::Value {
+            let now = jsonwebtoken::get_current_timestamp();
+            serde_json::json!({
+                "iss": ISSUER,
+                "aud": aud,
+                "sub": "compat-user",
+                "scope": scope,
+                "exp": now.saturating_add_signed(exp_offset),
+                "iat": now
+            })
+        }
+
+        /// The 3.20.0-shaped OAuth document: direct mode (no `proxy` table).
+        fn oauth_direct_json(idp: &CompatIdp) -> serde_json::Value {
+            serde_json::json!({
+                "issuer": ISSUER,
+                "audience": AUDIENCE,
+                "jwks_uri": idp.url("/jwks.json"),
+                "allow_http_oauth_urls": true,
+                "ssrf_allowlist": {
+                    "hosts": ["localhost"],
+                    "cidrs": ["127.0.0.0/8"]
+                },
+                "scopes": [
+                    {"scope": "mcp:admin", "role": "ops"},
+                    {"scope": "mcp:read", "role": "viewer"}
+                ]
+            })
+        }
+
+        /// Direct-mode OAuth config.
+        fn oauth_direct(idp: &CompatIdp) -> anyhow::Result<OAuthConfig> {
+            serde_json::from_value(oauth_direct_json(idp)).context("oauth config deserialization")
+        }
+
+        /// Direct-mode OAuth config plus a passthrough `proxy` table.
+        fn oauth_proxy(idp: &CompatIdp) -> anyhow::Result<OAuthConfig> {
+            let mut json = oauth_direct_json(idp);
+            let proxy = serde_json::json!({
+                "authorize_url": idp.url("/authorize"),
+                "token_url": idp.url("/token"),
+                "client_id": "static-client"
+            });
+            let previous = json
+                .as_object_mut()
+                .context("oauth document is an object")?
+                .insert("proxy".to_owned(), proxy);
+            anyhow::ensure!(previous.is_none(), "proxy key was already set");
+            serde_json::from_value(json).context("oauth config deserialization")
+        }
+
+        /// `viewer` may call only `echo`; `ops` may call every tool.
+        fn compat_rbac() -> Arc<RbacPolicy> {
+            Arc::new(RbacPolicy::new(&RbacConfig::with_roles(vec![
+                RoleConfig::new("viewer", vec!["echo".into()], vec!["*".into()]),
+                RoleConfig::new("ops", vec!["*".into()], vec!["*".into()]),
+            ])))
+        }
+
+        /// The server's own origin, `http://127.0.0.1:<port>`.
+        fn origin(port: u16) -> String {
+            format!("http://127.0.0.1:{port}")
+        }
+
+        /// OAuth server config with `oauth` as the only auth source and
+        /// [`compat_rbac`], without `public_url`.
+        fn oauth_server_config(port: u16, oauth: OAuthConfig) -> McpServerConfig {
+            let mut auth = AuthConfig::with_keys(vec![]);
+            auth.oauth = Some(oauth);
+            config_on_port(port)
+                .with_auth(auth)
+                .with_rbac(compat_rbac())
+        }
+
+        /// Like [`spawn_server`], but binds the listener before building the
+        /// config so `build` can name the real port (e.g. in `public_url`).
+        async fn spawn_on_known_port<B>(build: B) -> anyhow::Result<(ServerHarness, u16)>
+        where
+            B: FnOnce(u16) -> anyhow::Result<McpServerConfig>,
+        {
+            drop(ring::default_provider().install_default());
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let bound: SocketAddr = listener.local_addr()?;
+            let port = bound.port();
+            let validated = build(port)?.validate().context("test config valid")?;
+            let (ready_tx, ready_rx) = oneshot::channel::<SocketAddr>();
+            let shutdown = CancellationToken::new();
+            let shutdown_for_server = shutdown.clone();
+            let join = tokio::spawn(async move {
+                serve_with_listener(
+                    listener,
+                    validated,
+                    || TestHandler,
+                    Some(ready_tx),
+                    Some(shutdown_for_server),
+                )
+                .await
+            });
+            let signalled = timeout(Duration::from_secs(30), ready_rx)
+                .await
+                .context("server did not signal readiness within 30s")?
+                .context("server task aborted before readiness signal")?;
+            assert_eq!(
+                signalled, bound,
+                "ready_tx address mismatched the pre-bound listener"
+            );
+            Ok((
+                ServerHarness {
+                    base: format!("http://{bound}"),
+                    shutdown,
+                    join: Some(join),
+                },
+                port,
+            ))
+        }
+
+        /// Spawns the OAuth + passthrough-proxy server with `public_url` set
+        /// to its own origin.
+        async fn spawn_proxy_server(idp: &CompatIdp) -> anyhow::Result<(ServerHarness, u16)> {
+            let oauth = oauth_proxy(idp)?;
+            spawn_on_known_port(|port| {
+                Ok(oauth_server_config(port, oauth).with_public_url(origin(port)))
+            })
+            .await
+        }
+
+        /// A client that never follows redirects, so a 302 is observed as-is.
+        fn client() -> anyhow::Result<reqwest::Client> {
+            reqwest::Client::builder()
+                .redirect(Policy::none())
+                .build()
+                .context("build reqwest client")
+        }
+
+        /// `POST /mcp` with [`INITIALIZE_BODY`] and an optional bearer.
+        async fn post_initialize(
+            client: &reqwest::Client,
+            base: &str,
+            bearer: Option<&str>,
+        ) -> anyhow::Result<reqwest::Response> {
+            let request = client
+                .post(format!("{base}/mcp"))
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream");
+            let authed = match bearer {
+                Some(token) => request.header("authorization", format!("Bearer {token}")),
+                None => request,
+            };
+            authed
+                .body(INITIALIZE_BODY)
+                .send()
+                .await
+                .context("POST /mcp")
+        }
+
+        /// `GET /authorize` with a full PKCE authorization request.
+        async fn get_authorize(
+            client: &reqwest::Client,
+            base: &str,
+            port: u16,
+        ) -> anyhow::Result<reqwest::Response> {
+            let url = format!(
+                "{base}/authorize?response_type=code&client_id=anything&redirect_uri={REDIRECT_URI_ENCODED}&state=s1&code_challenge={CODE_CHALLENGE}&code_challenge_method=S256&scope=mcp%3Aread&resource=http%3A%2F%2F127.0.0.1%3A{port}%2Fmcp"
+            );
+            client.get(url).send().await.context("GET /authorize")
+        }
+
+        /// `POST /register` with a minimal RFC 7591 registration.
+        async fn post_register(
+            client: &reqwest::Client,
+            base: &str,
+        ) -> anyhow::Result<reqwest::Response> {
+            client
+                .post(format!("{base}/register"))
+                .header("content-type", "application/json")
+                .body(r#"{"redirect_uris":["http://127.0.0.1:9/cb"],"client_name":"compat"}"#)
+                .send()
+                .await
+                .context("POST /register")
+        }
+
+        /// `GET {base}{path}`.
+        async fn get_path(
+            client: &reqwest::Client,
+            base: &str,
+            path: &str,
+        ) -> anyhow::Result<reqwest::Response> {
+            client
+                .get(format!("{base}{path}"))
+                .send()
+                .await
+                .with_context(|| format!("GET {path}"))
+        }
+
+        /// The upstream `Location` the passthrough `/authorize` answers with.
+        fn upstream_authorize_location(idp: &CompatIdp, port: u16) -> String {
+            idp.url(&format!(
+                "/authorize?response_type=code&redirect_uri={REDIRECT_URI_ENCODED}&state=s1&code_challenge={CODE_CHALLENGE}&code_challenge_method=S256&scope=mcp%3Aread&resource=http%3A%2F%2F127.0.0.1%3A{port}%2Fmcp&client_id=static-client"
+            ))
+        }
+
+        /// RFC 9728 metadata body naming `authorization_server` and the
+        /// resource `http://127.0.0.1:<port>/mcp`.
+        fn protected_resource_body(authorization_server: &str, port: u16) -> String {
+            format!(
+                r#"{{"authorization_servers":["{authorization_server}"],"bearer_methods_supported":["header"],"resource":"{}/mcp","scopes_supported":["mcp:admin","mcp:read"]}}"#,
+                origin(port)
+            )
+        }
+
+        /// The absolute `resource_metadata` challenge parameter for `port`.
+        fn resource_metadata(port: u16) -> String {
+            format!(
+                r#"resource_metadata="{}/.well-known/oauth-protected-resource/mcp""#,
+                origin(port)
+            )
+        }
+
+        /// The default-headers 200 JSON snapshot of a metadata document.
+        fn json_200(body: &str) -> WireSnapshot {
+            WireSnapshot::new(200, body)
+                .headers(&DEFAULT_SECURITY_HEADERS)
+                .headers(&[("content-type", "application/json"), ("vary", "origin")])
+                .content_length()
+        }
+
+        /// The 404 snapshot of the router fallback and of an unmounted route.
+        fn not_found() -> WireSnapshot {
+            WireSnapshot::new(404, NOT_FOUND_BODY)
+                .headers(&DEFAULT_SECURITY_HEADERS)
+                .headers(&[
+                    ("content-length", "81"),
+                    ("content-type", "application/json"),
+                ])
+        }
+
+        /// The default-headers OAuth 401 snapshot with `challenge` as the
+        /// `WWW-Authenticate` value.
+        fn oauth_401(challenge: String, body: &str) -> WireSnapshot {
+            WireSnapshot::new(401, body)
+                .headers(&DEFAULT_SECURITY_HEADERS)
+                .headers(&[
+                    ("content-length", "32"),
+                    ("content-type", TEXT_PLAIN),
+                    ("vary", "origin"),
+                ])
+                .header("www-authenticate", challenge)
+        }
+
+        /// C1: both protected-resource metadata routes of the proxy config.
+        #[tokio::test]
+        async fn c1_protected_resource_metadata() -> anyhow::Result<()> {
+            let idp = CompatIdp::start().await?;
+            let (server, port) = spawn_proxy_server(&idp).await?;
+            let client = client()?;
+            let expected = json_200(&protected_resource_body(&origin(port), port));
+
+            let suffixed = get_path(
+                &client,
+                &server.base,
+                "/.well-known/oauth-protected-resource/mcp",
+            )
+            .await?;
+            assert_wire_eq(suffixed, &expected).await?;
+            let root = get_path(
+                &client,
+                &server.base,
+                "/.well-known/oauth-protected-resource",
+            )
+            .await?;
+            assert_wire_eq(root, &expected).await?;
+            Ok(())
+        }
+
+        /// C2: authorization-server metadata of the proxy config, without the
+        /// RFC 9207 `iss` parameter flag.
+        #[tokio::test]
+        async fn c2_authorization_server_metadata() -> anyhow::Result<()> {
+            let idp = CompatIdp::start().await?;
+            let (server, port) = spawn_proxy_server(&idp).await?;
+            let client = client()?;
+            let own = origin(port);
+            let body = format!(
+                r#"{{"authorization_endpoint":"{own}/authorize","code_challenge_methods_supported":["S256"],"grant_types_supported":["authorization_code","refresh_token"],"issuer":"{own}","registration_endpoint":"{own}/register","response_types_supported":["code"],"scopes_supported":["mcp:admin","mcp:read"],"token_endpoint":"{own}/token","token_endpoint_auth_methods_supported":["none"]}}"#
+            );
+
+            let resp = get_path(
+                &client,
+                &server.base,
+                "/.well-known/oauth-authorization-server",
+            )
+            .await?;
+            assert_wire_eq(resp, &json_200(&body)).await?;
+            let doc: serde_json::Value = get_path(
+                &client,
+                &server.base,
+                "/.well-known/oauth-authorization-server",
+            )
+            .await?
+            .json()
+            .await?;
+            assert!(
+                doc.get("authorization_response_iss_parameter_supported")
+                    .is_none(),
+                "3.20.0 never advertises authorization_response_iss_parameter_supported"
+            );
+            Ok(())
+        }
+
+        /// C3: `POST /mcp` without credentials.
+        #[tokio::test]
+        async fn c3_missing_credentials_challenge() -> anyhow::Result<()> {
+            let idp = CompatIdp::start().await?;
+            let (server, port) = spawn_proxy_server(&idp).await?;
+            let expected = oauth_401(
+                format!(
+                    r#"Bearer {}, error="invalid_request", error_description="missing bearer token or mTLS client certificate""#,
+                    resource_metadata(port)
+                ),
+                MISSING_CREDENTIAL,
+            );
+
+            let resp = post_initialize(&client()?, &server.base, None).await?;
+            assert_wire_eq(resp, &expected).await?;
+            Ok(())
+        }
+
+        /// C4: `POST /mcp` with a malformed JWT.
+        #[tokio::test]
+        async fn c4_malformed_jwt_challenge() -> anyhow::Result<()> {
+            let idp = CompatIdp::start().await?;
+            let (server, port) = spawn_proxy_server(&idp).await?;
+            let expected = oauth_401(
+                format!(
+                    r#"Bearer {}, error="invalid_token", error_description="token is invalid""#,
+                    resource_metadata(port)
+                ),
+                INVALID_CREDENTIAL,
+            );
+
+            let resp = post_initialize(&client()?, &server.base, Some("a.b.c")).await?;
+            assert_wire_eq(resp, &expected).await?;
+            Ok(())
+        }
+
+        /// C5: a valid `mcp:read` token calling a tool its role may not call
+        /// gets a bare 403 without `WWW-Authenticate`.
+        #[tokio::test]
+        async fn c5_rbac_deny_is_bare_403() -> anyhow::Result<()> {
+            let idp = CompatIdp::start().await?;
+            let (server, _port) = spawn_proxy_server(&idp).await?;
+            let token = CompatIdp::token(&claims(AUDIENCE, "mcp:read", 3600))?;
+            let expected = WireSnapshot::new(403, "admin_only denied for role 'viewer'")
+                .headers(&DEFAULT_SECURITY_HEADERS)
+                .headers(&[
+                    ("content-length", "35"),
+                    ("content-type", TEXT_PLAIN),
+                    ("vary", "origin"),
+                ]);
+
+            let resp = client()?
+                .post(format!("{}/mcp", server.base))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .body(tool_call_body("admin_only", &serde_json::json!({})))
+                .send()
+                .await?;
+            assert!(
+                resp.headers().get("www-authenticate").is_none(),
+                "3.20.0 RBAC deny carries no WWW-Authenticate"
+            );
+            assert_wire_eq(resp, &expected).await?;
+            Ok(())
+        }
+
+        /// C6: a token whose `aud` is the server's own resource URL instead of
+        /// the configured audience is rejected (no implicit audience widening).
+        #[tokio::test]
+        async fn c6_resource_url_audience_rejected() -> anyhow::Result<()> {
+            let idp = CompatIdp::start().await?;
+            let (server, port) = spawn_proxy_server(&idp).await?;
+            let resource = format!("{}/mcp", origin(port));
+            let token = CompatIdp::token(&claims(&resource, "mcp:read", 3600))?;
+            let expected = oauth_401(
+                format!(
+                    r#"Bearer {}, error="invalid_token", error_description="token is invalid""#,
+                    resource_metadata(port)
+                ),
+                INVALID_CREDENTIAL,
+            );
+
+            let resp = post_initialize(&client()?, &server.base, Some(&token)).await?;
+            assert_wire_eq(resp, &expected).await?;
+            Ok(())
+        }
+
+        /// C7: passthrough `/authorize` redirects to the upstream with the
+        /// client id swapped.
+        #[tokio::test]
+        async fn c7_authorize_redirect() -> anyhow::Result<()> {
+            let idp = CompatIdp::start().await?;
+            let (server, port) = spawn_proxy_server(&idp).await?;
+            let expected = WireSnapshot::new(302, "")
+                .headers(&DEFAULT_SECURITY_HEADERS)
+                .headers(&[("content-length", "0"), ("vary", "origin")])
+                .header("location", upstream_authorize_location(&idp, port));
+
+            let resp = get_authorize(&client()?, &server.base, port).await?;
+            assert_wire_eq(resp, &expected).await?;
+            Ok(())
+        }
+
+        /// C8: passthrough `/register` stub response.
+        #[tokio::test]
+        async fn c8_register_stub() -> anyhow::Result<()> {
+            let idp = CompatIdp::start().await?;
+            let (server, _port) = spawn_proxy_server(&idp).await?;
+            let expected = WireSnapshot::new(200, REGISTER_BODY)
+                .headers(&DEFAULT_SECURITY_HEADERS)
+                .headers(&[
+                    ("content-length", "130"),
+                    ("content-type", "application/json"),
+                    ("pragma", "no-cache"),
+                    ("vary", "Authorization"),
+                    ("vary", "origin"),
+                ]);
+
+            let resp = post_register(&client()?, &server.base).await?;
+            assert_wire_eq(resp, &expected).await?;
+            Ok(())
+        }
+
+        /// C9: passthrough `/token` forwards an exact form body upstream and
+        /// relays the upstream JSON verbatim.
+        #[tokio::test]
+        async fn c9_token_passthrough() -> anyhow::Result<()> {
+            let idp = CompatIdp::start().await?;
+            let (server, _port) = spawn_proxy_server(&idp).await?;
+            let expected = WireSnapshot::new(200, UPSTREAM_TOKEN_BODY)
+                .headers(&DEFAULT_SECURITY_HEADERS)
+                .headers(&[
+                    ("content-length", "88"),
+                    ("content-type", "application/json"),
+                    ("pragma", "no-cache"),
+                    ("vary", "Authorization"),
+                    ("vary", "origin"),
+                ]);
+
+            let resp = client()?
+                .post(format!("{}/token", server.base))
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(format!(
+                    "grant_type=authorization_code&code=c1&redirect_uri={REDIRECT_URI_ENCODED}&code_verifier={CODE_VERIFIER}&client_id=anything"
+                ))
+                .send()
+                .await?;
+            assert_wire_eq(resp, &expected).await?;
+            assert_eq!(
+                idp.token_request_bodies().await?,
+                vec![format!(
+                    "grant_type=authorization_code&code=c1&redirect_uri={REDIRECT_URI_ENCODED}&code_verifier={CODE_VERIFIER}&client_id=static-client"
+                )],
+                "the upstream must receive exactly one request with this exact form body"
+            );
+            Ok(())
+        }
+
+        /// C10: API-key-only server (no OAuth), `POST /mcp` without
+        /// credentials.
+        #[tokio::test]
+        async fn c10_api_key_missing_credentials_challenge() -> anyhow::Result<()> {
+            let (_token, hash) = generate_api_key()?;
+            let (server, _port) =
+                spawn_on_known_port(|port| {
+                    Ok(config_on_port(port).with_auth(AuthConfig::with_keys(vec![
+                        ApiKeyEntry::new("compat-key", hash, "ops"),
+                    ])))
+                })
+                .await?;
+            let expected = WireSnapshot::new(401, MISSING_CREDENTIAL)
+                .headers(&DEFAULT_SECURITY_HEADERS)
+                .headers(&[
+                    ("content-length", "32"),
+                    ("content-type", TEXT_PLAIN),
+                    (
+                        "www-authenticate",
+                        r#"Bearer error="invalid_request", error_description="missing bearer token or mTLS client certificate""#,
+                    ),
+                ]);
+
+            let resp = post_initialize(&client()?, &server.base, None).await?;
+            assert_wire_eq(resp, &expected).await?;
+            Ok(())
+        }
+
+        /// C11: OAuth direct mode (no `proxy` table, `public_url` set): both
+        /// metadata routes, and the proxy routes stay unmounted.
+        #[tokio::test]
+        async fn c11_direct_mode_routes() -> anyhow::Result<()> {
+            let idp = CompatIdp::start().await?;
+            let oauth = oauth_direct(&idp)?;
+            let (server, port) = spawn_on_known_port(|port| {
+                Ok(oauth_server_config(port, oauth).with_public_url(origin(port)))
+            })
+            .await?;
+            let client = client()?;
+            let metadata = json_200(&protected_resource_body(ISSUER, port));
+
+            let suffixed = get_path(
+                &client,
+                &server.base,
+                "/.well-known/oauth-protected-resource/mcp",
+            )
+            .await?;
+            assert_wire_eq(suffixed, &metadata).await?;
+            let root = get_path(
+                &client,
+                &server.base,
+                "/.well-known/oauth-protected-resource",
+            )
+            .await?;
+            assert_wire_eq(root, &metadata).await?;
+            let as_meta = get_path(
+                &client,
+                &server.base,
+                "/.well-known/oauth-authorization-server",
+            )
+            .await?;
+            assert_wire_eq(as_meta, &not_found()).await?;
+            let authorize = get_path(&client, &server.base, "/authorize").await?;
+            assert_wire_eq(authorize, &not_found()).await?;
+            Ok(())
+        }
+
+        /// C12: OAuth direct mode without `public_url`: the challenge carries
+        /// a relative `resource_metadata` and the metadata derives `resource`
+        /// from the bind address.
+        #[tokio::test]
+        async fn c12_direct_mode_without_public_url() -> anyhow::Result<()> {
+            let idp = CompatIdp::start().await?;
+            let oauth = oauth_direct(&idp)?;
+            let (server, port) =
+                spawn_on_known_port(|port| Ok(oauth_server_config(port, oauth))).await?;
+            let client = client()?;
+            let challenge_expected = WireSnapshot::new(401, MISSING_CREDENTIAL)
+                .headers(&DEFAULT_SECURITY_HEADERS)
+                .headers(&[
+                    ("content-length", "32"),
+                    ("content-type", TEXT_PLAIN),
+                    (
+                        "www-authenticate",
+                        r#"Bearer resource_metadata="/.well-known/oauth-protected-resource", error="invalid_request", error_description="missing bearer token or mTLS client certificate""#,
+                    ),
+                ]);
+            let metadata_expected = WireSnapshot::new(200, &protected_resource_body(ISSUER, port))
+                .headers(&DEFAULT_SECURITY_HEADERS)
+                .headers(&[("content-type", "application/json")])
+                .content_length();
+
+            let challenge = post_initialize(&client, &server.base, None).await?;
+            assert_wire_eq(challenge, &challenge_expected).await?;
+            let metadata = get_path(
+                &client,
+                &server.base,
+                "/.well-known/oauth-protected-resource",
+            )
+            .await?;
+            assert_wire_eq(metadata, &metadata_expected).await?;
+            Ok(())
+        }
+
+        /// C13: an expired token.
+        #[tokio::test]
+        async fn c13_expired_jwt_challenge() -> anyhow::Result<()> {
+            let idp = CompatIdp::start().await?;
+            let (server, port) = spawn_proxy_server(&idp).await?;
+            let token = CompatIdp::token(&claims(AUDIENCE, "mcp:read", -3600))?;
+            let expected = oauth_401(
+                format!(
+                    r#"Bearer {}, error="invalid_token", error_description="token is expired""#,
+                    resource_metadata(port)
+                ),
+                EXPIRED_CREDENTIAL,
+            );
+
+            let resp = post_initialize(&client()?, &server.base, Some(&token)).await?;
+            assert_wire_eq(resp, &expected).await?;
+            Ok(())
+        }
+
+        /// C14: an unknown path hits the router fallback.
+        #[tokio::test]
+        async fn c14_unknown_path_fallback() -> anyhow::Result<()> {
+            let idp = CompatIdp::start().await?;
+            let (server, _port) = spawn_proxy_server(&idp).await?;
+
+            let resp = get_path(&client()?, &server.base, "/does-not-exist").await?;
+            assert_wire_eq(resp, &not_found()).await?;
+            Ok(())
+        }
+
+        /// C15: operator `security_headers` overrides apply unchanged to the
+        /// 401 challenge, the `/authorize` redirect and the `/register` stub.
+        #[tokio::test]
+        async fn c15_security_header_overrides() -> anyhow::Result<()> {
+            let idp = CompatIdp::start().await?;
+            let oauth = oauth_proxy(&idp)?;
+            let mut overrides = SecurityHeadersConfig::default();
+            overrides.content_security_policy = Some(C15_CSP.to_owned());
+            overrides.referrer_policy = Some(C15_REFERRER_POLICY.to_owned());
+            overrides.cache_control = Some(C15_CACHE_CONTROL.to_owned());
+            let (server, port) = spawn_on_known_port(|port| {
+                Ok(oauth_server_config(port, oauth)
+                    .with_public_url(origin(port))
+                    .with_security_headers(overrides))
+            })
+            .await?;
+            let client = client()?;
+            let challenge_expected = WireSnapshot::new(401, MISSING_CREDENTIAL)
+                .headers(&C15_SECURITY_HEADERS)
+                .headers(&[
+                    ("content-length", "32"),
+                    ("content-type", TEXT_PLAIN),
+                    ("vary", "origin"),
+                ])
+                .header(
+                    "www-authenticate",
+                    format!(
+                        r#"Bearer {}, error="invalid_request", error_description="missing bearer token or mTLS client certificate""#,
+                        resource_metadata(port)
+                    ),
+                );
+            let authorize_expected = WireSnapshot::new(302, "")
+                .headers(&C15_SECURITY_HEADERS)
+                .headers(&[("content-length", "0"), ("vary", "origin")])
+                .header("location", upstream_authorize_location(&idp, port));
+            let register_expected = WireSnapshot::new(200, REGISTER_BODY)
+                .headers(&C15_SECURITY_HEADERS)
+                .headers(&[
+                    ("content-length", "130"),
+                    ("content-type", "application/json"),
+                    ("pragma", "no-cache"),
+                    ("vary", "Authorization"),
+                    ("vary", "origin"),
+                ]);
+
+            let challenge = post_initialize(&client, &server.base, None).await?;
+            assert_wire_eq(challenge, &challenge_expected).await?;
+            let authorize = get_authorize(&client, &server.base, port).await?;
+            assert_wire_eq(authorize, &authorize_expected).await?;
+            let register = post_register(&client, &server.base).await?;
+            assert_wire_eq(register, &register_expected).await?;
+            Ok(())
+        }
+    }
 }
