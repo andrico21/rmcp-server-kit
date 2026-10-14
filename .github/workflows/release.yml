@@ -64,7 +64,7 @@ jobs:
       # Check out the exact commit that CI ran against, not the tip of
       # `main`. workflow_run-triggered jobs default to the workflow file
       # on the default branch but the working-tree checkout is up to us.
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           # We need tags for the `git tag --points-at` lookup below.
