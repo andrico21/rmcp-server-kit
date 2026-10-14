@@ -1415,9 +1415,10 @@ pub(crate) async fn rbac_middleware(
                     return resp;
                 }
                 if policy.is_enabled()
-                    && let Some(resp) =
+                    && let Some((denial, resp)) =
                         enforce_tool_policy(&policy, &identity_name, &role, params, &deny_fields)
                 {
+                    drop(denial);
                     return resp;
                 }
             }
@@ -1516,8 +1517,8 @@ fn enforce_rate_limit(
     }
 }
 
-/// Apply RBAC tool/host + argument-allowlist checks. Returns `Some(response)`
-/// when the caller must be rejected. Assumes `policy.is_enabled()`.
+/// Apply RBAC tool/host + argument-allowlist checks. Returns the denial and
+/// response when the caller must be rejected. Assumes `policy.is_enabled()`.
 ///
 /// `identity_name` is passed explicitly (rather than read from
 /// [`current_identity()`]) because this function runs *before* the
@@ -1530,7 +1531,328 @@ fn enforce_tool_policy(
     role: &str,
     params: &serde_json::Value,
     fields: &DenyLogFields,
-) -> Option<Response> {
+) -> Option<(ToolDenial, Response)> {
+    let denial = evaluate_tool_call(policy, role, params).err()?;
+    denial.log(identity_name, role, fields);
+    let response = denial.error(role).into_response();
+    Some((denial, response))
+}
+
+/// The first failed tool-call constraint, with only denial-rendering context.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ToolDenial {
+    /// A supplied host cannot be interpreted as a host name.
+    NonStringHost {
+        /// Tool name used by the log and wire message.
+        tool: String,
+        /// JSON type name, never the caller's raw value.
+        value_type: &'static str,
+    },
+    /// The role cannot call this tool on the optional host.
+    RoleDenied {
+        /// Tool name used by the log and wire message.
+        tool: String,
+        /// Supplied string host, or absent for operation-only checks.
+        host: Option<String>,
+    },
+    /// Strict confinement does not permit this argument name.
+    StrictUnknownArgument {
+        /// Tool name used by the log and wire message.
+        tool: String,
+        /// Rejected top-level argument name.
+        argument: String,
+    },
+    /// Strict confinement cannot constrain a structured value.
+    StrictStructuredArgument {
+        /// Tool name used by the log and wire message.
+        tool: String,
+        /// Rejected top-level argument name.
+        argument: String,
+        /// JSON type name, never the caller's raw value.
+        value_type: &'static str,
+    },
+    /// A value allowlist cannot match a non-string argument.
+    NonStringAllowlistedArgument {
+        /// Tool name used by the log and wire message.
+        tool: String,
+        /// Rejected top-level argument name.
+        argument: String,
+        /// JSON type name, never the caller's raw value.
+        value_type: &'static str,
+    },
+    /// The value failed its allowlist; only its keyed digest is retained.
+    ArgumentNotAllowed {
+        /// Tool name used by the log and wire message.
+        tool: String,
+        /// Rejected top-level argument name.
+        argument: String,
+        /// Policy-keyed HMAC prefix for correlation without raw input.
+        arg_hmac: String,
+    },
+    /// A required argument was absent or not string-valued.
+    MissingRequiredArgument {
+        /// Tool name used by the log and wire message.
+        tool: String,
+        /// First unsatisfied requirement in policy order.
+        argument: String,
+    },
+}
+
+impl ToolDenial {
+    /// Render the existing client-safe RBAC error without logging.
+    fn error(&self, role: &str) -> RmcpServerKitError {
+        match self {
+            Self::NonStringHost {
+                tool: tool_name,
+                value_type: _,
+            } => RmcpServerKitError::Rbac(format!(
+                "argument 'host' must be a string for tool '{tool_name}'"
+            )),
+            Self::RoleDenied {
+                tool: tool_name,
+                host: _,
+            } => RmcpServerKitError::Rbac(format!("{tool_name} denied for role '{role}'")),
+            Self::StrictUnknownArgument {
+                tool: tool_name,
+                argument: arg_key,
+            } => RmcpServerKitError::Rbac(format!(
+                "argument '{arg_key}' is not permitted for tool '{tool_name}'"
+            )),
+            Self::StrictStructuredArgument {
+                tool: tool_name,
+                argument: arg_key,
+                value_type: _,
+            } => RmcpServerKitError::Rbac(format!(
+                "argument '{arg_key}' must not be an object or array for tool '{tool_name}'"
+            )),
+            Self::NonStringAllowlistedArgument {
+                tool: tool_name,
+                argument: arg_key,
+                value_type: _,
+            } => RmcpServerKitError::Rbac(format!(
+                "argument '{arg_key}' must be a string for tool '{tool_name}'"
+            )),
+            Self::ArgumentNotAllowed {
+                tool: tool_name,
+                argument: arg_key,
+                arg_hmac: _,
+            } => RmcpServerKitError::Rbac(format!(
+                "argument '{arg_key}' value not in allowlist for tool '{tool_name}'"
+            )),
+            Self::MissingRequiredArgument {
+                tool: tool_name,
+                argument: missing,
+            } => RmcpServerKitError::Rbac(format!(
+                "argument '{missing}' is required for tool '{tool_name}'"
+            )),
+        }
+    }
+
+    /// Emit the existing deny event with its original field order.
+    fn log(&self, identity_name: &str, role: &str, fields: &DenyLogFields) {
+        match self {
+            Self::NonStringHost { tool, value_type } => {
+                log_non_string_host(identity_name, role, fields, tool, value_type);
+            }
+            Self::RoleDenied { tool, host } => {
+                log_role_denied(identity_name, role, fields, tool, host.as_deref());
+            }
+            Self::StrictUnknownArgument { tool, argument } => {
+                log_strict_unknown_argument(identity_name, role, fields, tool, argument);
+            }
+            Self::StrictStructuredArgument {
+                tool,
+                argument,
+                value_type,
+            } => log_strict_structured_argument(
+                identity_name,
+                role,
+                fields,
+                tool,
+                argument,
+                value_type,
+            ),
+            Self::NonStringAllowlistedArgument {
+                tool,
+                argument,
+                value_type,
+            } => log_non_string_allowlisted_argument(
+                identity_name,
+                role,
+                fields,
+                tool,
+                argument,
+                value_type,
+            ),
+            Self::ArgumentNotAllowed {
+                tool,
+                argument,
+                arg_hmac,
+            } => log_argument_not_allowed(identity_name, role, fields, tool, argument, arg_hmac),
+            Self::MissingRequiredArgument { tool, argument } => {
+                log_missing_required_argument(identity_name, role, fields, tool, argument);
+            }
+        }
+    }
+}
+
+/// Emit the original host-shape denial event.
+fn log_non_string_host(
+    identity_name: &str,
+    role: &str,
+    fields: &DenyLogFields,
+    tool: &str,
+    value_type: &str,
+) {
+    tracing::warn!(
+        user = %identity_name,
+        role = %role,
+        tool = tool,
+        value_type = value_type,
+        client_ip = fields.client_ip.map(field::display),
+        peer_ip = fields.peer_ip.map(field::display),
+        request_id = fields.request_id.as_deref(),
+        "non-string host argument rejected"
+    );
+}
+
+/// Emit the original role denial event.
+fn log_role_denied(
+    identity_name: &str,
+    role: &str,
+    fields: &DenyLogFields,
+    tool: &str,
+    host: Option<&str>,
+) {
+    tracing::warn!(
+        user = %identity_name,
+        role = %role,
+        tool = tool,
+        host = host.unwrap_or("-"),
+        client_ip = fields.client_ip.map(field::display),
+        peer_ip = fields.peer_ip.map(field::display),
+        request_id = fields.request_id.as_deref(),
+        "RBAC denied"
+    );
+}
+
+/// Emit the original strict unknown-argument denial event.
+fn log_strict_unknown_argument(
+    identity_name: &str,
+    role: &str,
+    fields: &DenyLogFields,
+    tool: &str,
+    argument: &str,
+) {
+    tracing::warn!(
+        user = %identity_name,
+        role = %role,
+        tool = tool,
+        argument = argument,
+        client_ip = fields.client_ip.map(field::display),
+        peer_ip = fields.peer_ip.map(field::display),
+        request_id = fields.request_id.as_deref(),
+        "unknown argument rejected by strict allowlist"
+    );
+}
+
+/// Emit the original strict structured-argument denial event.
+fn log_strict_structured_argument(
+    identity_name: &str,
+    role: &str,
+    fields: &DenyLogFields,
+    tool: &str,
+    argument: &str,
+    value_type: &str,
+) {
+    tracing::warn!(
+        user = %identity_name,
+        role = %role,
+        tool = tool,
+        argument = argument,
+        value_type = value_type,
+        client_ip = fields.client_ip.map(field::display),
+        peer_ip = fields.peer_ip.map(field::display),
+        request_id = fields.request_id.as_deref(),
+        "structured argument rejected by strict allowlist"
+    );
+}
+
+/// Emit the original non-string allowlisted-argument denial event.
+fn log_non_string_allowlisted_argument(
+    identity_name: &str,
+    role: &str,
+    fields: &DenyLogFields,
+    tool: &str,
+    argument: &str,
+    value_type: &str,
+) {
+    tracing::warn!(
+        user = %identity_name,
+        role = %role,
+        tool = tool,
+        argument = argument,
+        value_type = value_type,
+        client_ip = fields.client_ip.map(field::display),
+        peer_ip = fields.peer_ip.map(field::display),
+        request_id = fields.request_id.as_deref(),
+        "non-string argument rejected by allowlist"
+    );
+}
+
+/// Emit the original disallowed-value denial event.
+fn log_argument_not_allowed(
+    identity_name: &str,
+    role: &str,
+    fields: &DenyLogFields,
+    tool: &str,
+    argument: &str,
+    arg_hmac: &str,
+) {
+    tracing::warn!(
+        user = %identity_name,
+        role = %role,
+        tool = tool,
+        argument = argument,
+        arg_hmac = %arg_hmac,
+        client_ip = fields.client_ip.map(field::display),
+        peer_ip = fields.peer_ip.map(field::display),
+        request_id = fields.request_id.as_deref(),
+        "argument not in allowlist"
+    );
+}
+
+/// Emit the original missing-argument denial event.
+fn log_missing_required_argument(
+    identity_name: &str,
+    role: &str,
+    fields: &DenyLogFields,
+    tool: &str,
+    argument: &str,
+) {
+    tracing::warn!(
+        user = %identity_name,
+        role = %role,
+        tool = tool,
+        argument = argument,
+        client_ip = fields.client_ip.map(field::display),
+        peer_ip = fields.peer_ip.map(field::display),
+        request_id = fields.request_id.as_deref(),
+        "required argument missing"
+    );
+}
+
+/// Evaluate tool/host and argument constraints without logs or HTTP responses.
+///
+/// Assumes the caller is enforcing an enabled policy, as the middleware does.
+///
+/// # Errors
+/// Returns the first failed constraint in the existing enforcement order.
+pub(crate) fn evaluate_tool_call(
+    policy: &RbacPolicy,
+    role: &str,
+    params: &serde_json::Value,
+) -> Result<(), ToolDenial> {
     let tool_name = params
         .get("name")
         .and_then(|value| value.as_str())
@@ -1539,7 +1861,7 @@ fn enforce_tool_policy(
         .get("arguments")
         .and_then(|arguments| arguments.get("host"));
 
-    // M2 precedent (see `check_argument`): a caller-supplied `host` of the
+    // M2 precedent: a caller-supplied `host` of the
     // wrong JSON type must not silently downgrade the host-glob check to an
     // operation-only check. `as_str()` on an array/object/number/bool/null
     // yields `None`, which would route to `check_operation` and skip
@@ -1549,22 +1871,10 @@ fn enforce_tool_policy(
     if let Some(value) = host_value
         && !value.is_string()
     {
-        tracing::warn!(
-            user = %identity_name,
-            role = %role,
-            tool = tool_name,
-            value_type = json_value_type(value),
-            client_ip = fields.client_ip.map(field::display),
-            peer_ip = fields.peer_ip.map(field::display),
-            request_id = fields.request_id.as_deref(),
-            "non-string host argument rejected"
-        );
-        return Some(
-            RmcpServerKitError::Rbac(format!(
-                "argument 'host' must be a string for tool '{tool_name}'"
-            ))
-            .into_response(),
-        );
+        return Err(ToolDenial::NonStringHost {
+            tool: tool_name.to_owned(),
+            value_type: json_value_type(value),
+        });
     }
     // Absent `host` still routes to `check_operation` by design: hostless
     // tools (`ping`, `list_hosts`) legitimately carry no host argument.
@@ -1575,20 +1885,10 @@ fn enforce_tool_policy(
         |host_name| policy.check(role, tool_name, host_name),
     );
     if decision == RbacDecision::Deny {
-        tracing::warn!(
-            user = %identity_name,
-            role = %role,
-            tool = tool_name,
-            host = host.unwrap_or("-"),
-            client_ip = fields.client_ip.map(field::display),
-            peer_ip = fields.peer_ip.map(field::display),
-            request_id = fields.request_id.as_deref(),
-            "RBAC denied"
-        );
-        return Some(
-            RmcpServerKitError::Rbac(format!("{tool_name} denied for role '{role}'"))
-                .into_response(),
-        );
+        return Err(ToolDenial::RoleDenied {
+            tool: tool_name.to_owned(),
+            host: host.map(str::to_owned),
+        });
     }
 
     let args = params
@@ -1597,186 +1897,46 @@ fn enforce_tool_policy(
     let strict = policy.strict_argument_names(role, tool_name);
     if let Some(arguments) = args {
         for (arg_key, arg_val) in arguments {
-            if let Some(permitted) = &strict
-                && let Some(resp) = check_strict_argument(
-                    identity_name,
-                    role,
-                    tool_name,
-                    permitted,
-                    arg_key,
-                    arg_val,
-                    fields,
-                )
-            {
-                return Some(resp);
+            if let Some(permitted) = &strict {
+                if !permitted.contains(&arg_key.as_str()) {
+                    return Err(ToolDenial::StrictUnknownArgument {
+                        tool: tool_name.to_owned(),
+                        argument: arg_key.to_owned(),
+                    });
+                }
+                if arg_val.is_object() || arg_val.is_array() {
+                    return Err(ToolDenial::StrictStructuredArgument {
+                        tool: tool_name.to_owned(),
+                        argument: arg_key.to_owned(),
+                        value_type: json_value_type(arg_val),
+                    });
+                }
             }
-            if let Some(resp) = check_argument(
-                policy,
-                identity_name,
-                role,
-                tool_name,
-                arg_key,
-                arg_val,
-                fields,
-            ) {
-                return Some(resp);
+            if policy.has_argument_allowlist(role, tool_name, arg_key) {
+                let Some(val_str) = arg_val.as_str() else {
+                    return Err(ToolDenial::NonStringAllowlistedArgument {
+                        tool: tool_name.to_owned(),
+                        argument: arg_key.to_owned(),
+                        value_type: json_value_type(arg_val),
+                    });
+                };
+                if !policy.argument_allowed(role, tool_name, arg_key, val_str) {
+                    return Err(ToolDenial::ArgumentNotAllowed {
+                        tool: tool_name.to_owned(),
+                        argument: arg_key.to_owned(),
+                        arg_hmac: policy.redact_arg(val_str),
+                    });
+                }
             }
         }
     }
-    check_required_arguments(policy, identity_name, role, tool_name, args, fields)
-}
-
-/// Deny arguments outside the allowlisted set when strict confinement is on.
-///
-/// Object and array values are denied outright: their contents cannot be
-/// constrained, so admitting them would reopen the bypass one level down.
-fn check_strict_argument(
-    identity_name: &str,
-    role: &str,
-    tool_name: &str,
-    permitted: &[&str],
-    arg_key: &str,
-    arg_val: &serde_json::Value,
-    fields: &DenyLogFields,
-) -> Option<Response> {
-    if !permitted.contains(&arg_key) {
-        tracing::warn!(
-            user = %identity_name,
-            role = %role,
-            tool = tool_name,
-            argument = arg_key,
-            client_ip = fields.client_ip.map(field::display),
-            peer_ip = fields.peer_ip.map(field::display),
-            request_id = fields.request_id.as_deref(),
-            "unknown argument rejected by strict allowlist"
-        );
-        return Some(
-            RmcpServerKitError::Rbac(format!(
-                "argument '{arg_key}' is not permitted for tool '{tool_name}'"
-            ))
-            .into_response(),
-        );
+    if let Some(missing) = policy.missing_required_argument(role, tool_name, args) {
+        return Err(ToolDenial::MissingRequiredArgument {
+            tool: tool_name.to_owned(),
+            argument: missing.to_owned(),
+        });
     }
-    if arg_val.is_object() || arg_val.is_array() {
-        tracing::warn!(
-            user = %identity_name,
-            role = %role,
-            tool = tool_name,
-            argument = arg_key,
-            value_type = json_value_type(arg_val),
-            client_ip = fields.client_ip.map(field::display),
-            peer_ip = fields.peer_ip.map(field::display),
-            request_id = fields.request_id.as_deref(),
-            "structured argument rejected by strict allowlist"
-        );
-        return Some(
-            RmcpServerKitError::Rbac(format!(
-                "argument '{arg_key}' must not be an object or array for tool '{tool_name}'"
-            ))
-            .into_response(),
-        );
-    }
-    None
-}
-
-/// Deny when a `required` argument is missing or not string-valued.
-///
-/// Absence can only be judged here: [`check_argument`] is keyed by a present
-/// argument and structurally cannot observe a missing one. This runs even when
-/// `args` is `None` - i.e. the call carried no `arguments` object, or a
-/// non-object - because returning early on that would let a caller skip every
-/// `required` constraint by omitting the object entirely.
-fn check_required_arguments(
-    policy: &RbacPolicy,
-    identity_name: &str,
-    role: &str,
-    tool_name: &str,
-    args: Option<&serde_json::Map<String, serde_json::Value>>,
-    fields: &DenyLogFields,
-) -> Option<Response> {
-    let missing = policy.missing_required_argument(role, tool_name, args)?;
-    tracing::warn!(
-        user = %identity_name,
-        role = %role,
-        tool = tool_name,
-        argument = missing,
-        client_ip = fields.client_ip.map(field::display),
-        peer_ip = fields.peer_ip.map(field::display),
-        request_id = fields.request_id.as_deref(),
-        "required argument missing"
-    );
-    Some(
-        RmcpServerKitError::Rbac(format!(
-            "argument '{missing}' is required for tool '{tool_name}'"
-        ))
-        .into_response(),
-    )
-}
-
-/// Deny a present argument whose value is not permitted by its allowlist.
-///
-/// Non-string values for an allowlisted argument are denied (fail closed);
-/// the log records the value's type, never the value itself.
-fn check_argument(
-    policy: &RbacPolicy,
-    identity_name: &str,
-    role: &str,
-    tool_name: &str,
-    arg_key: &str,
-    arg_val: &serde_json::Value,
-    fields: &DenyLogFields,
-) -> Option<Response> {
-    if !policy.has_argument_allowlist(role, tool_name, arg_key) {
-        return None;
-    }
-    let Some(val_str) = arg_val.as_str() else {
-        // M2: an allowlist is configured for this argument but the
-        // caller sent a non-string JSON value (array/object/number/
-        // bool/null), which can never satisfy a `Vec<String>`
-        // allowlist. Fail closed; log the type (not the value) so
-        // operators see the rejected shape without leaking inputs.
-        tracing::warn!(
-            user = %identity_name,
-            role = %role,
-            tool = tool_name,
-            argument = arg_key,
-            value_type = json_value_type(arg_val),
-            client_ip = fields.client_ip.map(field::display),
-            peer_ip = fields.peer_ip.map(field::display),
-            request_id = fields.request_id.as_deref(),
-            "non-string argument rejected by allowlist"
-        );
-        return Some(
-            RmcpServerKitError::Rbac(format!(
-                "argument '{arg_key}' must be a string for tool '{tool_name}'"
-            ))
-            .into_response(),
-        );
-    };
-    if policy.argument_allowed(role, tool_name, arg_key, val_str) {
-        return None;
-    }
-    // Redact the raw value: log an HMAC-SHA256 prefix instead of
-    // the literal string. Operators correlate hashes across log
-    // lines without ever exposing potentially sensitive inputs
-    // (paths, IDs, tokens accidentally passed as args, etc.).
-    tracing::warn!(
-        user = %identity_name,
-        role = %role,
-        tool = tool_name,
-        argument = arg_key,
-        arg_hmac = %policy.redact_arg(val_str),
-        client_ip = fields.client_ip.map(field::display),
-        peer_ip = fields.peer_ip.map(field::display),
-        request_id = fields.request_id.as_deref(),
-        "argument not in allowlist"
-    );
-    Some(
-        RmcpServerKitError::Rbac(format!(
-            "argument '{arg_key}' value not in allowlist for tool '{tool_name}'"
-        ))
-        .into_response(),
-    )
+    Ok(())
 }
 
 /// Name of the JSON value's type, for shape-only deny log fields.
@@ -5170,6 +5330,342 @@ mod tests {
             msg.contains("typo_roles"),
             "error must name the offending key: {msg}"
         );
+        Ok(())
+    }
+
+    fn evaluator_policy(strict: bool) -> RbacPolicy {
+        let mut config = RbacConfig::with_roles(vec![
+            RoleConfig::new("viewer", vec!["t".into()], vec!["dev-*".into()])
+                .with_argument_allowlists(vec![
+                    ArgumentAllowlist::new_required("t", "x", vec!["ok".into()])
+                        .with_deny_unknown_arguments(strict),
+                ]),
+        ]);
+        config.redaction_salt = Some(SecretString::from("task-4-fixture"));
+        RbacPolicy::new(&config)
+    }
+
+    async fn assert_evaluator_denial(
+        input: (bool, &str, serde_json::Value),
+        expected: ToolDenial,
+        message: &str,
+    ) -> anyhow::Result<()> {
+        let (strict, role, args) = input;
+        let policy = evaluator_policy(strict);
+        let params = serde_json::json!({"name": "t", "arguments": args});
+        assert_eq!(evaluate_tool_call(&policy, role, &params), Err(expected));
+        let (denial, response) =
+            enforce_tool_policy(&policy, "alice", role, &params, &DenyLogFields::default())
+                .context("call must deny")?;
+        assert_eq!(denial.error(role).client_message(), message);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response.into_body().collect().await?.to_bytes().as_ref(),
+            message.as_bytes()
+        );
+        Ok(())
+    }
+
+    /// Host shape denial precedes role and argument checks.
+    #[tokio::test]
+    async fn evaluate_tool_call_non_string_host() -> anyhow::Result<()> {
+        assert_evaluator_denial(
+            (false, "unknown", serde_json::json!({"host": ["bad"]})),
+            ToolDenial::NonStringHost {
+                tool: "t".into(),
+                value_type: "array",
+            },
+            "argument 'host' must be a string for tool 't'",
+        )
+        .await
+    }
+
+    /// Role denial retains the host and exact wire message.
+    #[tokio::test]
+    async fn evaluate_tool_call_role_denied() -> anyhow::Result<()> {
+        assert_evaluator_denial(
+            (false, "unknown", serde_json::json!({"host": "dev-1"})),
+            ToolDenial::RoleDenied {
+                tool: "t".into(),
+                host: Some("dev-1".into()),
+            },
+            "t denied for role 'unknown'",
+        )
+        .await
+    }
+
+    /// Strict unknown arguments precede missing requirements.
+    #[tokio::test]
+    async fn evaluate_tool_call_strict_unknown_argument() -> anyhow::Result<()> {
+        assert_evaluator_denial(
+            (true, "viewer", serde_json::json!({"z": true})),
+            ToolDenial::StrictUnknownArgument {
+                tool: "t".into(),
+                argument: "z".into(),
+            },
+            "argument 'z' is not permitted for tool 't'",
+        )
+        .await
+    }
+
+    /// Strict structured denial precedes the value allowlist.
+    #[tokio::test]
+    async fn evaluate_tool_call_strict_structured_argument() -> anyhow::Result<()> {
+        assert_evaluator_denial(
+            (true, "viewer", serde_json::json!({"x": {"nested": true}})),
+            ToolDenial::StrictStructuredArgument {
+                tool: "t".into(),
+                argument: "x".into(),
+                value_type: "object",
+            },
+            "argument 'x' must not be an object or array for tool 't'",
+        )
+        .await
+    }
+
+    /// Non-string allowlisted arguments fail closed.
+    #[tokio::test]
+    async fn evaluate_tool_call_non_string_allowlisted_argument() -> anyhow::Result<()> {
+        assert_evaluator_denial(
+            (false, "viewer", serde_json::json!({"x": true})),
+            ToolDenial::NonStringAllowlistedArgument {
+                tool: "t".into(),
+                argument: "x".into(),
+                value_type: "bool",
+            },
+            "argument 'x' must be a string for tool 't'",
+        )
+        .await
+    }
+
+    /// Disallowed values retain their redacted correlation and exact 403 text.
+    #[tokio::test]
+    async fn evaluate_tool_call_argument_not_allowed() -> anyhow::Result<()> {
+        let policy = evaluator_policy(false);
+        let params = serde_json::json!({"name": "t", "arguments": {"x": "bad"}});
+        assert!(matches!(
+            evaluate_tool_call(&policy, "viewer", &params),
+            Err(ToolDenial::ArgumentNotAllowed {
+                tool: _,
+                argument: _,
+                arg_hmac: _
+            })
+        ));
+        assert_evaluator_denial(
+            (false, "viewer", serde_json::json!({"x": "bad"})),
+            ToolDenial::ArgumentNotAllowed {
+                tool: "t".into(),
+                argument: "x".into(),
+                arg_hmac: "66d0b40b".into(),
+            },
+            "argument 'x' value not in allowlist for tool 't'",
+        )
+        .await
+    }
+
+    /// Missing required arguments retain their exact denial message.
+    #[tokio::test]
+    async fn evaluate_tool_call_missing_required_argument() -> anyhow::Result<()> {
+        assert_evaluator_denial(
+            (false, "viewer", serde_json::json!({})),
+            ToolDenial::MissingRequiredArgument {
+                tool: "t".into(),
+                argument: "x".into(),
+            },
+            "argument 'x' is required for tool 't'",
+        )
+        .await
+    }
+
+    // Frozen pre-refactor inline verdict, intentionally independent of the evaluator.
+    fn old_inline_tool_verdict(policy: &RbacPolicy, role: &str, params: &JsonValue) -> bool {
+        let tool = params.get("name").and_then(JsonValue::as_str).unwrap_or("");
+        let host = params.get("arguments").and_then(|args| args.get("host"));
+        if host.is_some_and(|value| !value.is_string()) {
+            return false;
+        }
+        let decision = host.and_then(JsonValue::as_str).map_or_else(
+            || policy.check_operation(role, tool),
+            |value| policy.check(role, tool, value),
+        );
+        if decision == RbacDecision::Deny {
+            return false;
+        }
+        let args = params.get("arguments").and_then(JsonValue::as_object);
+        let strict = policy.strict_argument_names(role, tool);
+        if let Some(arguments) = args {
+            for (key, value) in arguments {
+                if strict.as_ref().is_some_and(|permitted| {
+                    !permitted.contains(&key.as_str()) || value.is_object() || value.is_array()
+                }) {
+                    return false;
+                }
+                if policy.has_argument_allowlist(role, tool, key)
+                    && !value
+                        .as_str()
+                        .is_some_and(|text| policy.argument_allowed(role, tool, key, text))
+                {
+                    return false;
+                }
+            }
+        }
+        policy.missing_required_argument(role, tool, args).is_none()
+    }
+
+    /// The evaluator matches pre-refactor verdicts for malformed and oversized inputs.
+    #[tokio::test]
+    async fn evaluate_tool_call_matches_old_inline_matrix() -> anyhow::Result<()> {
+        for strict in [false, true] {
+            let policy = evaluator_policy(strict);
+            for role in ["viewer", "unknown", ""] {
+                for tool in ["t", "other", ""] {
+                    for args in [
+                        serde_json::json!({"x": "ok"}),
+                        serde_json::json!({"x": "bad"}),
+                        serde_json::json!({"x": "ok extra"}),
+                        serde_json::json!({"x": "\""}),
+                        serde_json::json!({"x": "bad".repeat(100_000)}),
+                        serde_json::json!({"x": {"nested": [true]}}),
+                        serde_json::json!({"x": ["ok"]}),
+                        serde_json::json!({"x": null}),
+                        serde_json::json!({"x": 42_u32}),
+                        serde_json::json!({"x": true}),
+                        serde_json::json!({"x": "ok", "z": true}),
+                        serde_json::json!({"host": "prod-1", "x": "ok"}),
+                        serde_json::json!({"host": "dev-1", "x": "ok"}),
+                        serde_json::json!({"host": null, "x": "ok"}),
+                        serde_json::json!({"host": ["dev-1"], "x": "ok"}),
+                        serde_json::json!({"host": {"nested": true}, "x": "ok"}),
+                        serde_json::json!({"host": true, "x": "ok"}),
+                        serde_json::json!({"host": 42_u32, "x": "ok"}),
+                        serde_json::json!({}),
+                        serde_json::json!(null),
+                        serde_json::json!("not-an-object"),
+                    ] {
+                        let params = serde_json::json!({"name": tool, "arguments": args});
+                        assert_eq!(
+                            evaluate_tool_call(&policy, role, &params).is_ok(),
+                            old_inline_tool_verdict(&policy, role, &params),
+                            "verdict drift: strict={strict} role={role} tool={tool}",
+                        );
+                    }
+                    let params = serde_json::json!({"name": tool});
+                    assert_eq!(
+                        evaluate_tool_call(&policy, role, &params).is_ok(),
+                        old_inline_tool_verdict(&policy, role, &params)
+                    );
+                }
+            }
+        }
+        let policy = evaluator_policy(false);
+        for params in [
+            serde_json::json!(null),
+            serde_json::json!([]),
+            serde_json::json!({"name": true}),
+        ] {
+            assert_eq!(
+                evaluate_tool_call(&policy, "viewer", &params).is_ok(),
+                old_inline_tool_verdict(&policy, "viewer", &params)
+            );
+        }
+        let (_, response) = enforce_tool_policy(
+            &policy,
+            "alice",
+            "viewer",
+            &serde_json::json!({"name": "t"}),
+            &DenyLogFields::default(),
+        )
+        .context("missing argument denies")?;
+        assert_eq!(
+            response.into_body().collect().await?.to_bytes().as_ref(),
+            b"argument 'x' is required for tool 't'"
+        );
+        Ok(())
+    }
+
+    /// Denial logs and responses match the captured pre-refactor bytes.
+    #[tokio::test]
+    async fn evaluate_tool_call_preserves_deny_surface() -> anyhow::Result<()> {
+        let fields = DenyLogFields {
+            client_ip: Some("198.51.100.4".parse()?),
+            peer_ip: Some("10.0.0.1".parse()?),
+            request_id: Some(Arc::from("task-4")),
+        };
+        for (role, strict, args, event, message) in [
+            (
+                "viewer",
+                false,
+                serde_json::json!({"host": ["bad"]}),
+                "non-string host argument rejected user=alice role=viewer tool=\"t\" value_type=\"array\"",
+                "argument 'host' must be a string for tool 't'",
+            ),
+            (
+                "unknown",
+                false,
+                serde_json::json!({"host": "dev-1"}),
+                "RBAC denied user=alice role=unknown tool=\"t\" host=\"dev-1\"",
+                "t denied for role 'unknown'",
+            ),
+            (
+                "viewer",
+                true,
+                serde_json::json!({"z": true}),
+                "unknown argument rejected by strict allowlist user=alice role=viewer tool=\"t\" argument=\"z\"",
+                "argument 'z' is not permitted for tool 't'",
+            ),
+            (
+                "viewer",
+                true,
+                serde_json::json!({"x": {"nested": true}}),
+                "structured argument rejected by strict allowlist user=alice role=viewer tool=\"t\" argument=\"x\" value_type=\"object\"",
+                "argument 'x' must not be an object or array for tool 't'",
+            ),
+            (
+                "viewer",
+                false,
+                serde_json::json!({"x": true}),
+                "non-string argument rejected by allowlist user=alice role=viewer tool=\"t\" argument=\"x\" value_type=\"bool\"",
+                "argument 'x' must be a string for tool 't'",
+            ),
+            (
+                "viewer",
+                false,
+                serde_json::json!({"x": "bad"}),
+                "argument not in allowlist user=alice role=viewer tool=\"t\" argument=\"x\" arg_hmac=66d0b40b",
+                "argument 'x' value not in allowlist for tool 't'",
+            ),
+            (
+                "viewer",
+                false,
+                serde_json::json!({}),
+                "required argument missing user=alice role=viewer tool=\"t\" argument=\"x\"",
+                "argument 'x' is required for tool 't'",
+            ),
+        ] {
+            let policy = evaluator_policy(strict);
+            let params = serde_json::json!({"name": "t", "arguments": args});
+            let logs = CapturedLogs::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .without_time()
+                .finish();
+            let (_, response) = subscriber::with_default(subscriber, || {
+                enforce_tool_policy(&policy, "alice", role, &params, &fields)
+            })
+            .context("fixture must deny")?;
+            assert_eq!(
+                logs.contents(),
+                format!(
+                    " WARN rmcp_server_kit::rbac: {event} client_ip=198.51.100.4 peer_ip=10.0.0.1 request_id=\"task-4\"\n"
+                )
+            );
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(
+                response.into_body().collect().await?.to_bytes().as_ref(),
+                message.as_bytes()
+            );
+        }
         Ok(())
     }
 
