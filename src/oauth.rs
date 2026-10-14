@@ -64,6 +64,7 @@ use crate::{
     cancel::DetachOutcome,
     diagnostics::{oauth_claim_values, plaintext_oauth_tokens, upstream_error_bodies},
     error::RmcpServerKitError,
+    rbac::first_matching_scope_role,
     session_binding::validate_configured_secret,
     ssrf::{
         CidrEntry, CompiledSsrfAllowlist, check_url_literal_ip, ip_block_reason,
@@ -4132,12 +4133,15 @@ impl JwksCache {
             .split_whitespace()
             .collect();
 
-        self.shared
-            .scopes
-            .iter()
-            .find(|mapping| token_scopes.contains(&mapping.scope.as_str()))
-            .map(|mapping| mapping.role.clone())
-            .ok_or(JwtValidationFailure::Invalid)
+        first_matching_scope_role(
+            self.shared
+                .scopes
+                .iter()
+                .map(|mapping| (mapping.scope.as_str(), mapping.role.as_str())),
+            &token_scopes,
+        )
+        .map(str::to_owned)
+        .ok_or(JwtValidationFailure::Invalid)
     }
 
     /// Look up a decoding key by kid + algorithm. Refreshes JWKS on miss,

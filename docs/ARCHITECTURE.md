@@ -409,7 +409,7 @@ the policy's salt, returning an 8-char hex prefix (`redact_with_salt`, `src/rbac
 2. For `POST /mcp`, reads the body (bounded by body-size layer), parses
    JSON-RPC, and inspects `method`. Only enforces on `tools/call`.
 3. Calls `enforce_tool_policy(&policy, &identity_name, &role, params)`
-(`enforce_tool_policy`, `src/rbac.rs:1527`).
+(`enforce_tool_policy`, `src/rbac.rs:1548`).
 4. Calls the per-IP tool rate limiter
    (`build_tool_rate_limiter_with_policy`, `src/rbac.rs:71`), returning
    `429` if exceeded. The limiter is backed
@@ -943,7 +943,7 @@ held. Only the runtime-only fields above survive from the base. It is fallible
 **Environment (opt-in)** - three inherent methods, one per section owning
 targeted fields: `ServerConfig::apply_env_overrides` (`src/config.rs:802`),
 `ObservabilityConfig::apply_env_overrides` (`src/config.rs:1162`) and
-`RbacConfig::apply_env_overrides` (`src/rbac.rs:2065`). Each returns
+`RbacConfig::apply_env_overrides` (`src/rbac.rs:2085`). Each returns
 `Vec<EnvOverride>` (`src/config.rs:92`) for audit logging, with `value: None`
 for secret targets. Curated variables under the `RMCP_SERVER_KIT__`
 prefix; `__` separates TOML path segments because field names already contain

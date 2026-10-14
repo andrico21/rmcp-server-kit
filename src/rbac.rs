@@ -1445,6 +1445,26 @@ pub(crate) async fn rbac_middleware(
     }
 }
 
+/// Resolve a role from scope mappings by first match in configuration order.
+///
+/// Returns the role of the first `(scope, role)` mapping whose scope is
+/// present in `granted`. Configuration order wins over the order of `granted`.
+/// Matching is exact (case-sensitive, no trimming); an empty `granted` slice or
+/// no overlap yields `None`.
+#[cfg(any(test, feature = "oauth"))]
+pub(crate) fn first_matching_scope_role<'mapping, I>(
+    mappings: I,
+    granted: &[&str],
+) -> Option<&'mapping str>
+where
+    I: IntoIterator<Item = (&'mapping str, &'mapping str)>,
+{
+    mappings
+        .into_iter()
+        .find(|(scope, _role)| granted.contains(scope))
+        .map(|(_scope, role)| role)
+}
+
 /// Extract the `params` object for every top-level `tools/call` message.
 ///
 /// Supports either a single JSON-RPC object or a JSON-RPC batch array. Any
@@ -5746,6 +5766,80 @@ mod tests {
                 "denied tool {:?} must stay denied",
                 tool
             );
+        }
+    }
+
+    /// Config order beats token order: the earlier mapping wins even when the
+    /// token lists the later scope first.
+    #[test]
+    fn first_matching_scope_role_config_order_beats_token_order() -> anyhow::Result<()> {
+        let mappings = [("a", "role-a"), ("b", "role-b")];
+        let granted = ["b", "a"];
+        let got = first_matching_scope_role(mappings.iter().copied(), &granted);
+        anyhow::ensure!(got == Some("role-a"), "unexpected role: {got:?}");
+        Ok(())
+    }
+
+    /// A granted set with no configured scope yields `None`.
+    #[test]
+    fn first_matching_scope_role_no_match_is_none() -> anyhow::Result<()> {
+        let mappings = [("a", "role-a"), ("b", "role-b")];
+        let granted = ["c", "A"];
+        let got = first_matching_scope_role(mappings.iter().copied(), &granted);
+        anyhow::ensure!(got.is_none(), "unexpected role: {got:?}");
+        Ok(())
+    }
+
+    /// An empty granted set yields `None`.
+    #[test]
+    fn first_matching_scope_role_empty_granted_is_none() -> anyhow::Result<()> {
+        let mappings = [("a", "role-a")];
+        let got = first_matching_scope_role(mappings.iter().copied(), &[]);
+        anyhow::ensure!(got.is_none(), "unexpected role: {got:?}");
+        Ok(())
+    }
+
+    /// The first scope hit wins even when its configured role string is empty.
+    #[test]
+    fn first_matching_scope_role_returns_empty_role_for_first_hit() -> anyhow::Result<()> {
+        let first = [("a", ""), ("b", "rb")];
+        let got_first = first_matching_scope_role(first.iter().copied(), &["a", "b"]);
+        anyhow::ensure!(got_first == Some(""), "unexpected role: {got_first:?}");
+        let second = [("b", "rb"), ("a", "")];
+        let got_second = first_matching_scope_role(second.iter().copied(), &["a"]);
+        anyhow::ensure!(got_second == Some(""), "unexpected role: {got_second:?}");
+        Ok(())
+    }
+
+    /// FROZEN COPY of the pre-refactor inline loop from `JwksCache::resolve_role`
+    /// (differential oracle; never update it to follow the implementation).
+    fn frozen_old_inline_scope_role<'mapping>(
+        mappings: &'mapping [(String, String)],
+        token_scopes: &[&str],
+    ) -> Option<&'mapping str> {
+        mappings
+            .iter()
+            .find(|mapping| token_scopes.contains(&mapping.0.as_str()))
+            .map(|mapping| mapping.1.as_str())
+    }
+
+    proptest! {
+        /// The shared helper equals the frozen old inline loop for arbitrary
+        /// (including empty, duplicate, case-differing, whitespace) scopes.
+        #[test]
+        fn first_matching_scope_role_matches_frozen_inline_loop(
+            mappings in collection::vec(("[a-cA-C :]{0,3}", "[r-t]{0,2}"), 0..8),
+            granted in collection::vec("[a-cA-C :]{0,3}", 0..200),
+        ) {
+            let granted_refs: Vec<&str> = granted.iter().map(String::as_str).collect();
+            let expected = frozen_old_inline_scope_role(&mappings, &granted_refs);
+            let actual = first_matching_scope_role(
+                mappings
+                    .iter()
+                    .map(|(scope, role)| (scope.as_str(), role.as_str())),
+                &granted_refs,
+            );
+            prop_assert_eq!(actual, expected);
         }
     }
 }
