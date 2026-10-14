@@ -1851,6 +1851,8 @@ impl McpServerConfig {
     /// configuration violates: admin/auth wiring, TLS cert-key pairing, mTLS
     /// without TLS, bind address, URL, origin, or size-limit checks.
     fn check(&self) -> Result<(), RmcpServerKitError> {
+        #[cfg(feature = "oauth")]
+        use crate::config::check_shared_oauth_relations;
         use crate::config::{
             SharedConfigViolation, check_auth_nested_config, check_shared_config_invariants,
         };
@@ -1968,6 +1970,19 @@ impl McpServerConfig {
         // 10. Nested auth config: API-key identities, OAuth URL/capacity
         //     checks, auth limiter capacity, and mTLS capacity.
         check_auth_nested_config(self.auth.as_ref())?;
+
+        // 10b. Relations between the OAuth opt-ins and public_url /
+        //      allowed_origins (shared with the TOML validator). Runs
+        //      whenever OAuth is configured, even with auth disabled: the
+        //      proxy routes are mounted regardless of `auth.enabled`.
+        #[cfg(feature = "oauth")]
+        if let Some(oauth_cfg) = self.auth.as_ref().and_then(|auth| auth.oauth.as_ref()) {
+            check_shared_oauth_relations(
+                oauth_cfg,
+                self.public_url.as_deref(),
+                &self.allowed_origins,
+            )?;
+        }
 
         // 11. tls_handshake_timeout must be > 0. A zero deadline would
         //     reap every handshake before it could complete, rejecting
@@ -4996,7 +5011,11 @@ fn parse_request_origin_tuple(value: &str) -> Option<(String, String, u16)> {
 
 /// Parse a configured allowlist entry: the request rules, plus one optional
 /// root trailing `/`, which is normalized away.
-fn parse_config_origin_tuple(value: &str) -> Option<(String, String, u16)> {
+///
+/// Also used by `config::check_shared_oauth_relations` so the startup check
+/// that the `public_url` origin is allowlisted normalizes exactly like the
+/// runtime origin check.
+pub(crate) fn parse_config_origin_tuple(value: &str) -> Option<(String, String, u16)> {
     parse_origin(value, true)
 }
 

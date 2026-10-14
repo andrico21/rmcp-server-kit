@@ -4,8 +4,6 @@ use std::{env, fs, path::PathBuf};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 
-#[cfg(feature = "oauth")]
-use crate::oauth;
 use crate::{
     auth::{AuthConfig, MtlsConfig, RateLimitConfig},
     bounded_limiter::KeyEvictionPolicy,
@@ -19,6 +17,8 @@ use crate::{
         validate_trusted_proxy_entry,
     },
 };
+#[cfg(feature = "oauth")]
+use crate::{oauth, transport::parse_config_origin_tuple};
 
 #[cfg(test)]
 const SERVER_CONFIG_BRIDGED_FIELDS: &[&str] = &[
@@ -1984,6 +1984,139 @@ pub(crate) fn check_auth_nested_config(auth: Option<&AuthConfig>) -> RmcpResult<
     Ok(())
 }
 
+/// TOML key and value of the authorization-server proxy mode, for messages.
+#[cfg(feature = "oauth")]
+const AS_MODE_KEY: &str = "server.auth.oauth.proxy.mode = \"authorization_server\"";
+
+/// Validate the relations between the opt-in OAuth knobs and the server-level
+/// `public_url` / `allowed_origins`, shared by both validators.
+///
+/// Runs whenever `auth.oauth` is configured, regardless of `auth.enabled`:
+/// the proxy routes are mounted without consulting `auth.enabled`. Every rule
+/// fires only when an opt-in knob is set, so a config that sets none of them
+/// is never rejected here. Callers run it after `public_url` and every
+/// `allowed_origins` entry passed their own field checks.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] naming the TOML key and env var
+/// when `accept_resource_audience` lacks `public_url`, or when the
+/// authorization-server proxy mode lacks a usable `public_url`, has an
+/// `allowed_origins` list without the `public_url` origin, or advertises
+/// `authorization_servers` other than its own issuer.
+#[cfg(feature = "oauth")]
+pub(crate) fn check_shared_oauth_relations(
+    oauth_cfg: &oauth::OAuthConfig,
+    public_url: Option<&str>,
+    allowed_origins: &[String],
+) -> RmcpResult<()> {
+    if oauth_cfg.accept_resource_audience && public_url.is_none() {
+        return Err(RmcpServerKitError::Config(format!(
+            "server.auth.oauth.accept_resource_audience = true \
+             (env {SERVER_OAUTH_ACCEPT_RESOURCE_AUDIENCE_ENV}) requires server.public_url \
+             (env {SERVER_PUBLIC_URL_ENV}): the accepted resource audience is server.public_url \
+             followed by /mcp"
+        )));
+    }
+    let Some(proxy) = &oauth_cfg.proxy else {
+        return Ok(());
+    };
+    match proxy.mode {
+        oauth::ProxyMode::Passthrough => Ok(()),
+        oauth::ProxyMode::AuthorizationServer => {
+            check_authorization_server_relations(oauth_cfg, public_url, allowed_origins)
+        }
+    }
+}
+
+/// `public_url` as quoted in an error message, or a placeholder when it
+/// contains `@`: a userinfo part may carry a credential, which must not reach
+/// the startup log.
+#[cfg(feature = "oauth")]
+fn public_url_for_message(url: &str) -> String {
+    if url.contains('@') {
+        "<value containing '@' not shown>".to_owned()
+    } else {
+        format!("\"{}\"", url.escape_debug())
+    }
+}
+
+/// The `public_url`, `allowed_origins` and `authorization_servers` rules of
+/// the authorization-server proxy mode (see [`check_shared_oauth_relations`]).
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] on the first violated rule.
+#[cfg(feature = "oauth")]
+fn check_authorization_server_relations(
+    oauth_cfg: &oauth::OAuthConfig,
+    public_url: Option<&str>,
+    allowed_origins: &[String],
+) -> RmcpResult<()> {
+    let Some(url) = public_url else {
+        return Err(RmcpServerKitError::Config(format!(
+            "{AS_MODE_KEY} (env {SERVER_OAUTH_PROXY_MODE_ENV}) requires server.public_url \
+             (env {SERVER_PUBLIC_URL_ENV}): it is the issuer this server advertises and the \
+             origin its consent page posts back to"
+        )));
+    };
+    // `public_url` already passed `validate_public_url_value`, so it starts
+    // with a lowercase `http://` or `https://`.
+    if !url.starts_with("https://") && !oauth_cfg.allow_http_oauth_urls {
+        return Err(RmcpServerKitError::Config(format!(
+            "server.public_url {} (env {SERVER_PUBLIC_URL_ENV}) must use https when \
+             {AS_MODE_KEY} (env {SERVER_OAUTH_PROXY_MODE_ENV}); set \
+             server.auth.oauth.allow_http_oauth_urls = true only for local development",
+            public_url_for_message(url)
+        )));
+    }
+    // A browser sends the ASCII (punycode) host and never userinfo in
+    // `Origin`, so either would make the consent post-back unmatchable.
+    let parsed_origin = (url.is_ascii() && !url.contains('@'))
+        .then(|| parse_config_origin_tuple(url))
+        .flatten();
+    let Some(origin) = parsed_origin else {
+        return Err(RmcpServerKitError::Config(format!(
+            "server.public_url {} (env {SERVER_PUBLIC_URL_ENV}) must be a bare origin, \
+             scheme://host[:port] with an optional trailing '/', ASCII only and without \
+             userinfo, path, query or fragment, when {AS_MODE_KEY} \
+             (env {SERVER_OAUTH_PROXY_MODE_ENV}): it is the advertised issuer, and the \
+             authorization server metadata is served only at the root",
+            public_url_for_message(url)
+        )));
+    };
+    if !allowed_origins.is_empty()
+        && !allowed_origins
+            .iter()
+            .any(|entry| parse_config_origin_tuple(entry).as_ref() == Some(&origin))
+    {
+        return Err(RmcpServerKitError::Config(format!(
+            "server.allowed_origins does not contain the origin of server.public_url {url:?} \
+             (env {SERVER_PUBLIC_URL_ENV}) while {AS_MODE_KEY} \
+             (env {SERVER_OAUTH_PROXY_MODE_ENV}): the consent form posts back to this origin \
+             through the origin check (origin_check_middleware); add it to \
+             server.allowed_origins or leave the list empty to derive it from \
+             server.public_url"
+        )));
+    }
+    // Same trimming as `transport::derive_server_url`, which yields the
+    // issuer of the served authorization server metadata; explicit
+    // `authorization_servers` are advertised verbatim, so anything else
+    // would contradict that issuer (RFC 8414 section 3.3).
+    let issuer = url.trim_end_matches('/');
+    if let Some(servers) = &oauth_cfg.authorization_servers
+        && !matches!(servers.as_slice(), [only] if only == issuer)
+    {
+        return Err(RmcpServerKitError::Config(format!(
+            "server.auth.oauth.authorization_servers must be unset or exactly [{issuer:?}] \
+             when {AS_MODE_KEY} (env {SERVER_OAUTH_PROXY_MODE_ENV}): this server is then the \
+             authorization server, and its metadata issuer is server.public_url \
+             (env {SERVER_PUBLIC_URL_ENV}) without a trailing '/'; got {servers:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// Reject a zero auth verification-wait duration.
 ///
 /// # Errors
@@ -2259,6 +2392,14 @@ pub fn validate_server_config(server: &ServerConfig) -> RmcpResult<()> {
         validate_public_url_value(url).map_err(RmcpServerKitError::Config)?;
     }
     validate_security_headers(&server.security_headers)?;
+
+    // Runs after `public_url` and `allowed_origins` passed their own checks,
+    // like in `McpServerConfig::check`.
+    #[cfg(feature = "oauth")]
+    if let Some(oauth_cfg) = server.auth.as_ref().and_then(|auth| auth.oauth.as_ref()) {
+        let public_url = server.public_url.as_deref();
+        check_shared_oauth_relations(oauth_cfg, public_url, &server.allowed_origins)?;
+    }
 
     Ok(())
 }
@@ -4266,7 +4407,7 @@ client_ip = false
     fn opted_in_oauth_knobs_pass_server_validation() -> anyhow::Result<()> {
         let mut proxy = validation_as_proxy();
         proxy.consent_ttl = Some("0s".to_owned());
-        let server = server_with_oauth_mutation(|oauth| {
+        let mut server = server_with_oauth_mutation(|oauth| {
             oauth.challenge_scopes = Some(vec!["mcp:read".to_owned()]);
             oauth.insufficient_scope_challenge = true;
             oauth.scopes = vec![scope_mapping("mcp:read", "viewer")];
@@ -4275,7 +4416,382 @@ client_ip = false
             oauth.omit_error_on_missing_credential = true;
             oauth.proxy = Some(proxy);
         });
+        // `accept_resource_audience` and the authorization-server mode both
+        // require `public_url` (cross-field rules R1 and R2).
+        server.public_url = Some("https://mcp.example".to_owned());
         validate_server_config(&server).context("consistent opt-in config validates")
+    }
+
+    /// Asserts that both validators accept `server`.
+    #[cfg(feature = "oauth")]
+    fn assert_server_config_accepted_by_both(
+        label: &str,
+        server: &ServerConfig,
+    ) -> anyhow::Result<()> {
+        validate_server_config(server)
+            .with_context(|| format!("{label} must pass validate_server_config"))?;
+        let _validated = server
+            .apply_to_mcp_config(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0"))
+            .with_context(|| format!("{label} must bridge to the builder config"))?
+            .validate()
+            .with_context(|| format!("{label} must pass McpServerConfig::check"))?;
+        Ok(())
+    }
+
+    /// A `ServerConfig` with OAuth after `mutate`, `public_url`, and `auth.enabled`.
+    #[cfg(feature = "oauth")]
+    fn relations_server<F>(public_url: Option<&str>, auth_enabled: bool, mutate: F) -> ServerConfig
+    where
+        F: FnOnce(&mut OAuthConfig),
+    {
+        let mut server = server_with_oauth_mutation(mutate);
+        server.public_url = public_url.map(str::to_owned);
+        if let Some(auth) = server.auth.as_mut() {
+            auth.enabled = auth_enabled;
+        }
+        server
+    }
+
+    /// Switches `oauth` to the authorization-server proxy mode.
+    #[cfg(feature = "oauth")]
+    fn as_mode(oauth: &mut OAuthConfig) {
+        oauth.proxy = Some(validation_as_proxy());
+    }
+
+    /// R1: `accept_resource_audience = true` without `public_url` is rejected
+    /// by both validators, whether or not auth is enabled.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn public_url_relations_r1_resource_audience_requires_public_url() -> anyhow::Result<()> {
+        for enabled in [true, false] {
+            let server = relations_server(None, enabled, |oauth| {
+                oauth.accept_resource_audience = true;
+            });
+            assert_server_config_rejected_by_both(
+                &format!("R1 without public_url (auth.enabled = {enabled})"),
+                &server,
+                &format!(
+                    "server.auth.oauth.accept_resource_audience = true \
+                     (env {SERVER_OAUTH_ACCEPT_RESOURCE_AUDIENCE_ENV}) requires \
+                     server.public_url (env {SERVER_PUBLIC_URL_ENV})"
+                ),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// R1 happy path: `accept_resource_audience = true` with `public_url`
+    /// passes both validators, with or without a proxy of either mode.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn public_url_relations_r1_accepts_resource_audience_with_public_url() -> anyhow::Result<()> {
+        let direct = relations_server(Some("http://127.0.0.1:8080/base"), true, |oauth| {
+            oauth.accept_resource_audience = true;
+        });
+        assert_server_config_accepted_by_both("R1 direct with public_url", &direct)?;
+        let proxied = relations_server(Some("https://mcp.example"), true, |oauth| {
+            oauth.accept_resource_audience = true;
+            as_mode(oauth);
+        });
+        assert_server_config_accepted_by_both("R1 with authorization_server proxy", &proxied)
+    }
+
+    /// R2: authorization-server mode without `public_url` is rejected by both
+    /// validators, also when `auth.enabled = false` (the proxy routes are
+    /// mounted regardless of `auth.enabled`).
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn public_url_relations_r2_authorization_server_requires_public_url() -> anyhow::Result<()> {
+        for enabled in [true, false] {
+            let server = relations_server(None, enabled, as_mode);
+            assert_server_config_rejected_by_both(
+                &format!("R2 without public_url (auth.enabled = {enabled})"),
+                &server,
+                &format!(
+                    "server.auth.oauth.proxy.mode = \"authorization_server\" \
+                     (env {SERVER_OAUTH_PROXY_MODE_ENV}) requires server.public_url \
+                     (env {SERVER_PUBLIC_URL_ENV})"
+                ),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// R2: authorization-server mode rejects an `http` `public_url` unless
+    /// `allow_http_oauth_urls = true`.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn public_url_relations_r2_requires_https_unless_http_allowed() -> anyhow::Result<()> {
+        for enabled in [true, false] {
+            let server = relations_server(Some("http://mcp.example"), enabled, as_mode);
+            assert_server_config_rejected_by_both(
+                &format!("R2 http public_url (auth.enabled = {enabled})"),
+                &server,
+                &format!(
+                    "server.public_url \"http://mcp.example\" (env {SERVER_PUBLIC_URL_ENV}) \
+                     must use https when server.auth.oauth.proxy.mode = \"authorization_server\""
+                ),
+            )?;
+        }
+        let allowed = relations_server(Some("http://127.0.0.1:18080"), true, |oauth| {
+            oauth.allow_http_oauth_urls = true;
+            as_mode(oauth);
+        });
+        assert_server_config_accepted_by_both(
+            "R2 http public_url with allow_http_oauth_urls",
+            &allowed,
+        )
+    }
+
+    /// R2: authorization-server mode rejects a `public_url` that is not a bare
+    /// origin (path, query, fragment, userinfo, whitespace, non-ASCII host,
+    /// port zero).
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn public_url_relations_r2_rejects_non_origin_public_url() -> anyhow::Result<()> {
+        for (bad, enabled) in [
+            ("https://mcp.example/mcp", true),
+            ("https://mcp.example//", false),
+            ("https://mcp.example/?x", true),
+            ("https://mcp.example?x", true),
+            ("https://mcp.example#x", false),
+            ("https://mcp.example/#x", true),
+            ("https://user@mcp.example", true),
+            ("https://user:pw@mcp.example", false),
+            ("https://mcp.example ", true),
+            ("https://b\u{fc}cher.example", true),
+            ("https://mcp.example:0", true),
+            ("https://", true),
+        ] {
+            let server = relations_server(Some(bad), enabled, as_mode);
+            assert_server_config_rejected_by_both(
+                &format!("R2 public_url {bad:?} (auth.enabled = {enabled})"),
+                &server,
+                &format!("(env {SERVER_PUBLIC_URL_ENV}) must be a bare origin"),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// R2 errors never echo a `public_url` userinfo part, which may carry a
+    /// credential, through either validator.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn public_url_relations_r2_error_hides_userinfo() -> anyhow::Result<()> {
+        for (public_url, allow_http) in [
+            ("https://admin:s3cret@mcp.example", false),
+            ("http://admin:s3cret@mcp.example", false),
+            ("http://admin:s3cret@mcp.example", true),
+        ] {
+            let server = relations_server(Some(public_url), true, |oauth| {
+                oauth.allow_http_oauth_urls = allow_http;
+                as_mode(oauth);
+            });
+            let builder_result = server
+                .apply_to_mcp_config(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0"))?
+                .validate()
+                .map(|_| ());
+            for (validator, result) in [
+                ("validate_server_config", validate_server_config(&server)),
+                ("McpServerConfig::check", builder_result),
+            ] {
+                let Err(err) = result else {
+                    anyhow::bail!("{validator} must reject {public_url:?}");
+                };
+                let message = err.to_string();
+                assert!(
+                    message.contains("server.public_url <value containing '@' not shown>")
+                        && !message.contains("s3cret"),
+                    "{validator} must reject {public_url:?} without echoing it: {message}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// R2 happy path: bare-origin `public_url` shapes pass both validators in
+    /// authorization-server mode.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn public_url_relations_r2_accepts_bare_origins() -> anyhow::Result<()> {
+        let long_host = format!("https://{}.example", "a".repeat(4096));
+        for good in [
+            "https://mcp.example",
+            "https://mcp.example/",
+            "https://MCP.Example",
+            "https://mcp.example:8443",
+            "https://[::1]:8443",
+            "https://xn--bcher-kva.example",
+            long_host.as_str(),
+        ] {
+            let server = relations_server(Some(good), true, as_mode);
+            assert_server_config_accepted_by_both(&format!("R2 public_url {good:?}"), &server)?;
+        }
+        Ok(())
+    }
+
+    /// R3: authorization-server mode with a non-empty `allowed_origins` that
+    /// lacks the `public_url` origin is rejected by both validators.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn public_url_relations_r3_rejects_allowlist_without_public_origin() -> anyhow::Result<()> {
+        for (public_url, origins, enabled) in [
+            ("https://mcp.example", vec!["https://other.example"], true),
+            ("https://mcp.example", vec!["https://other.example"], false),
+            ("https://mcp.example", vec!["http://mcp.example"], true),
+            (
+                "https://mcp.example:8443",
+                vec!["https://mcp.example"],
+                true,
+            ),
+            (
+                "https://mcp.example",
+                vec!["https://mcp.example:8443"],
+                false,
+            ),
+            ("https://mcp.example", vec!["null"], true),
+        ] {
+            let mut server = relations_server(Some(public_url), enabled, as_mode);
+            server.allowed_origins = origins.iter().map(|origin| (*origin).to_owned()).collect();
+            assert_server_config_rejected_by_both(
+                &format!("R3 {public_url:?} vs {origins:?} (auth.enabled = {enabled})"),
+                &server,
+                &format!(
+                    "server.allowed_origins does not contain the origin of server.public_url \
+                     {public_url:?} (env {SERVER_PUBLIC_URL_ENV})"
+                ),
+            )?;
+            let Err(err) = validate_server_config(&server) else {
+                anyhow::bail!("R3 must be rejected");
+            };
+            assert!(
+                err.to_string()
+                    .contains("consent form posts back to this origin"),
+                "R3 error must give the consent-form reason: {err}"
+            );
+        }
+        Ok(())
+    }
+
+    /// R3 happy path: allowlist entries that normalize to the `public_url`
+    /// origin (case, default port, trailing slash) pass both validators, and
+    /// an empty allowlist is not subject to R3.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn public_url_relations_r3_accepts_normalized_allowlist_entries() -> anyhow::Result<()> {
+        for (public_url, origins) in [
+            ("https://mcp.example", vec![]),
+            ("https://mcp.example", vec!["https://mcp.example"]),
+            ("https://mcp.example/", vec!["HTTPS://MCP.EXAMPLE"]),
+            ("https://MCP.example", vec!["https://mcp.example/"]),
+            ("https://mcp.example", vec!["https://mcp.example:443"]),
+            ("https://mcp.example:443", vec!["https://mcp.example"]),
+            (
+                "https://mcp.example:8443",
+                vec!["null", "https://mcp.example:8443/"],
+            ),
+            ("https://[::1]:8443", vec!["https://[::1]:8443"]),
+        ] {
+            let mut server = relations_server(Some(public_url), true, as_mode);
+            server.allowed_origins = origins.iter().map(|origin| (*origin).to_owned()).collect();
+            assert_server_config_accepted_by_both(
+                &format!("R3 {public_url:?} vs {origins:?}"),
+                &server,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// R4: authorization-server mode rejects `authorization_servers` that is
+    /// not exactly the emitted issuer, including a trailing-slash variant.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn public_url_relations_r4_rejects_foreign_authorization_servers() -> anyhow::Result<()> {
+        for (public_url, servers, enabled) in [
+            ("https://mcp.example", vec!["https://mcp.example/"], true),
+            ("https://mcp.example/", vec!["https://mcp.example/"], false),
+            (
+                "https://mcp.example",
+                vec!["https://auth.example.com"],
+                true,
+            ),
+            ("https://mcp.example", vec![], true),
+            (
+                "https://mcp.example",
+                vec!["https://mcp.example", "https://auth.example.com"],
+                true,
+            ),
+            ("https://MCP.example", vec!["https://mcp.example"], true),
+        ] {
+            let server = relations_server(Some(public_url), enabled, |oauth| {
+                oauth.authorization_servers =
+                    Some(servers.iter().map(|server| (*server).to_owned()).collect());
+                as_mode(oauth);
+            });
+            let issuer = public_url.trim_end_matches('/');
+            assert_server_config_rejected_by_both(
+                &format!("R4 {public_url:?} vs {servers:?} (auth.enabled = {enabled})"),
+                &server,
+                &format!(
+                    "server.auth.oauth.authorization_servers must be unset or exactly \
+                     [{issuer:?}] when server.auth.oauth.proxy.mode = \"authorization_server\" \
+                     (env {SERVER_OAUTH_PROXY_MODE_ENV})"
+                ),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// R4 happy path: unset, or a single entry byte-equal to the emitted issuer.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn public_url_relations_r4_accepts_unset_or_exact_issuer() -> anyhow::Result<()> {
+        for (public_url, servers) in [
+            ("https://mcp.example", None),
+            ("https://mcp.example", Some(vec!["https://mcp.example"])),
+            ("https://mcp.example/", Some(vec!["https://mcp.example"])),
+        ] {
+            let server = relations_server(Some(public_url), true, |oauth| {
+                oauth.authorization_servers = servers
+                    .as_ref()
+                    .map(|list| list.iter().map(|server| (*server).to_owned()).collect());
+                as_mode(oauth);
+            });
+            assert_server_config_accepted_by_both(
+                &format!("R4 {public_url:?} vs {servers:?}"),
+                &server,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// 3.20.0-shaped configs (no new knob set) are not affected by any of the
+    /// relation rules: passthrough and direct OAuth keep accepting a missing,
+    /// `http`, path-carrying `public_url`, a foreign allowlist, and a
+    /// trailing-slash `authorization_servers` entry.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn public_url_relations_leave_3_20_configs_unaffected() -> anyhow::Result<()> {
+        assert_server_config_accepted_by_both("default ServerConfig", &ServerConfig::default())?;
+        for public_url in [None, Some("http://127.0.0.1:8080/base?x#y")] {
+            for enabled in [true, false] {
+                let direct = relations_server(public_url, enabled, |_| {});
+                assert_server_config_accepted_by_both(
+                    &format!("direct OAuth, public_url {public_url:?}, enabled {enabled}"),
+                    &direct,
+                )?;
+                let mut passthrough = relations_server(public_url, enabled, |oauth| {
+                    oauth.proxy = Some(validation_proxy());
+                    oauth.authorization_servers = Some(vec!["https://mcp.example/".to_owned()]);
+                });
+                passthrough.allowed_origins = vec!["https://other.example".to_owned()];
+                assert_server_config_accepted_by_both(
+                    &format!("passthrough proxy, public_url {public_url:?}, enabled {enabled}"),
+                    &passthrough,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     #[test]
