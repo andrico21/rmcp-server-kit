@@ -3304,6 +3304,13 @@ jwks_uri = "https://auth.example.com/.well-known/jwks.json"  # env: RMCP_SERVER_
 # narrow that set - HS* and `none` are never selectable.
 allowed_algorithms = ["RS256"]  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ALLOWED_ALGORITHMS
 jwks_cache_ttl = "10m"
+# Optional opt-ins, all off by default. List-valued env variables take a
+# comma-separated value.
+# challenge_scopes = ["mcp:read"]  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__CHALLENGE_SCOPES
+# insufficient_scope_challenge = false  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__INSUFFICIENT_SCOPE_CHALLENGE
+# additional_audiences = ["https://mcp.example.com/mcp"]  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ADDITIONAL_AUDIENCES
+# accept_resource_audience = false  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ACCEPT_RESOURCE_AUDIENCE
+# omit_error_on_missing_credential = false  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__OMIT_ERROR_ON_MISSING_CREDENTIAL
 
 [[server.auth.oauth.scopes]]
 scope = "mcp:admin"
@@ -3324,6 +3331,14 @@ client_id = "my-mcp-server"
 # alongside a differing api:// scope (AADSTS9010010). Leave false to
 # preserve spec behaviour. Never strips PKCE/state/redirect_uri.
 strip_resource_param = false  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__STRIP_RESOURCE_PARAM
+# Proxy mode: "passthrough" (default) or "authorization_server". The sealing
+# secrets and consent_ttl are only read in "authorization_server" mode.
+# mode = "passthrough"  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__MODE
+# sealing_secret = "replace-with-32-plus-random-bytes"  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET
+# sealing_secret_previous = "previous-secret-kept-during-rotation"  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_PREVIOUS
+# (Kubernetes: use RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_FILE and
+# RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_PREVIOUS_FILE to supply them from mounted Secret files.)
+# consent_ttl = "30d"  # env: RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__CONSENT_TTL
 
 [rbac]
 enabled = true
@@ -3482,6 +3497,17 @@ call order is:
 | `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__JWKS_URI` | `server.auth.oauth.jwks_uri` | String | requires `oauth` feature |
 | `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ALLOWED_ALGORITHMS` | `server.auth.oauth.allowed_algorithms` | comma-separated algorithm list | requires `oauth` feature; may only narrow the built-in set |
 | `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__STRIP_RESOURCE_PARAM` | `server.auth.oauth.proxy.strip_resource_param` | bool | requires `oauth` feature; also requires `[server.auth.oauth.proxy]` to be declared |
+| `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__CHALLENGE_SCOPES` | `server.auth.oauth.challenge_scopes` | comma-separated scope list | requires `oauth` feature; an empty list is rejected |
+| `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__INSUFFICIENT_SCOPE_CHALLENGE` | `server.auth.oauth.insufficient_scope_challenge` | bool | requires `oauth` feature |
+| `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ADDITIONAL_AUDIENCES` | `server.auth.oauth.additional_audiences` | comma-separated audience list | requires `oauth` feature; an empty list is rejected |
+| `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ACCEPT_RESOURCE_AUDIENCE` | `server.auth.oauth.accept_resource_audience` | bool | requires `oauth` feature |
+| `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__OMIT_ERROR_ON_MISSING_CREDENTIAL` | `server.auth.oauth.omit_error_on_missing_credential` | bool | requires `oauth` feature |
+| `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__MODE` | `server.auth.oauth.proxy.mode` | ProxyMode | requires `oauth` feature; `passthrough` or `authorization_server`; also requires `[server.auth.oauth.proxy]` to be declared |
+| `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET` | `server.auth.oauth.proxy.sealing_secret` | SecretString | requires `oauth` feature; secret; redacted in report; also requires `[server.auth.oauth.proxy]` to be declared |
+| `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_FILE` | `server.auth.oauth.proxy.sealing_secret` | Path | requires `oauth` feature; secret; redacted in report; also requires `[server.auth.oauth.proxy]` to be declared |
+| `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_PREVIOUS` | `server.auth.oauth.proxy.sealing_secret_previous` | SecretString | requires `oauth` feature; secret; redacted in report; also requires `[server.auth.oauth.proxy]` to be declared |
+| `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_PREVIOUS_FILE` | `server.auth.oauth.proxy.sealing_secret_previous` | Path | requires `oauth` feature; secret; redacted in report; also requires `[server.auth.oauth.proxy]` to be declared |
+| `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__CONSENT_TTL` | `server.auth.oauth.proxy.consent_ttl` | humantime duration | requires `oauth` feature; also requires `[server.auth.oauth.proxy]` to be declared |
 | `RMCP_SERVER_KIT__OBSERVABILITY__LOG_FORMAT` | `observability.log_format` | String | |
 | `RMCP_SERVER_KIT__OBSERVABILITY__METRICS_ENABLED` | `observability.metrics_enabled` | bool | |
 | `RMCP_SERVER_KIT__OBSERVABILITY__METRICS_BIND` | `observability.metrics_bind` | String | |
@@ -3492,6 +3518,8 @@ call order is:
 | `RMCP_SERVER_KIT__RBAC__REDACTION_SALT` | `rbac.redaction_salt` | SecretString | secret; redacted in report |
 | `RMCP_SERVER_KIT__RBAC__REDACTION_SALT_FILE` | `rbac.redaction_salt` | Path | secret; redacted in report |
 <!-- END ENV_OVERRIDE_TABLE -->
+
+Replicas behind one load balancer must use identical values for every OAuth opt-in and proxy variable: these knobs change the wire behaviour, so replicas that disagree answer the same client differently.
 
 #### Naming convention
 
@@ -3511,6 +3539,8 @@ An empty or whitespace-only salt (either form) is rejected with `RmcpServerKitEr
 
 **File normalization.** Exactly one terminal line ending is stripped from the file contents: `\r\n` (CRLF), a lone `\n` (LF), or a lone `\r` (CR). All other content is preserved exactly, including leading and trailing spaces and any internal newlines. The same logical secret therefore produces the same redaction salt whether supplied inline (no trailing newline) or written to a file with a standard trailing newline (`echo "my-salt" > salt.txt` produces `my-salt\n`, which normalizes to `my-salt`). Spaces surrounding the value are significant: `"  my-salt  "` and `"my-salt"` hash differently.
 
+The proxy sealing secrets (`RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET` and `..._SEALING_SECRET_PREVIOUS`, each with a `_FILE` sibling) follow the same rules as `RMCP_SERVER_KIT__SERVER__SESSION_BINDING_SECRET`: the direct and `_FILE` variables of one secret must not both be set, the file loses exactly one terminal line ending, and the value must be at least 32 UTF-8 bytes and not whitespace-only. Every error names the variable and never echoes the value.
+
 #### Audit report
 
 Each method returns `Vec<EnvOverride>`. Each entry carries:
@@ -3520,13 +3550,13 @@ Each method returns `Vec<EnvOverride>`. Each entry carries:
 - `source` - `EnvOverrideSource::Env` (value read directly from the variable) or `EnvOverrideSource::File` (value read from the file named by a `_FILE` variable)
 - `value` - the applied string for non-secret targets; `None` for secret-typed targets
 
-Secret-typed targets (`server.session_binding_secret`, `rbac.redaction_salt`) always carry `value: None`. The secret never appears in `EnvOverride::value` or in its `Debug` output. Log the report after initializing tracing so any env variable that shadowed a TOML value leaves a structured trail at startup, as shown in [`examples/config_file_server.rs`](../examples/config_file_server.rs).
+Secret-typed targets (`server.session_binding_secret`, `server.auth.oauth.proxy.sealing_secret`, `server.auth.oauth.proxy.sealing_secret_previous`, `rbac.redaction_salt`) always carry `value: None`. The secret never appears in `EnvOverride::value` or in its `Debug` output. Log the report after initializing tracing so any env variable that shadowed a TOML value leaves a structured trail at startup, as shown in [`examples/config_file_server.rs`](../examples/config_file_server.rs).
 
 #### `oauth` feature interaction
 
-The three `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__*` variables require the `oauth` Cargo feature. Setting any one of them in a binary built without `--features oauth` is a startup error, never a silent no-op: `ServerConfig::apply_env_overrides` returns `RmcpServerKitError::Config` naming the variable and stating it requires the `oauth` feature.
+Every `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__*` variable requires the `oauth` Cargo feature. Setting any one of them in a binary built without `--features oauth` is a startup error, never a silent no-op: `ServerConfig::apply_env_overrides` returns `RmcpServerKitError::Config` naming the variable and stating it requires the `oauth` feature.
 
-When the `oauth` feature is enabled, `[server.auth.oauth]` must already be declared in TOML. The method cannot create the table; it only populates fields within an existing one. If the table is absent, the call fails with `RmcpServerKitError::Config` instructing the operator to declare `[server.auth.oauth]` first.
+When the `oauth` feature is enabled, `[server.auth.oauth]` must already be declared in TOML. The method cannot create the table; it only populates fields within an existing one. If the table is absent, the call fails with `RmcpServerKitError::Config` instructing the operator to declare `[server.auth.oauth]` first. Likewise every `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__*` variable requires a declared `[server.auth.oauth.proxy]` table.
 
 The intended Kubernetes pattern: declare a minimal `[server.auth.oauth]` stub in a ConfigMap (with `role_claim` and other static RBAC-mapping config), and supply the environment-specific `issuer`, `audience`, and `jwks_uri` via Secrets or Deployment env vars.
 

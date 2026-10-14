@@ -233,6 +233,83 @@ pub(crate) const ENV_OVERRIDE_SPECS: &[EnvOverrideSpec] = &[
         redacted: false,
     },
     EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__CHALLENGE_SCOPES",
+        target_field: "server.auth.oauth.challenge_scopes",
+        value_type: "comma-separated scope list",
+        required_feature: Some("oauth"),
+        redacted: false,
+    },
+    EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__INSUFFICIENT_SCOPE_CHALLENGE",
+        target_field: "server.auth.oauth.insufficient_scope_challenge",
+        value_type: "bool",
+        required_feature: Some("oauth"),
+        redacted: false,
+    },
+    EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ADDITIONAL_AUDIENCES",
+        target_field: "server.auth.oauth.additional_audiences",
+        value_type: "comma-separated audience list",
+        required_feature: Some("oauth"),
+        redacted: false,
+    },
+    EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ACCEPT_RESOURCE_AUDIENCE",
+        target_field: "server.auth.oauth.accept_resource_audience",
+        value_type: "bool",
+        required_feature: Some("oauth"),
+        redacted: false,
+    },
+    EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__OMIT_ERROR_ON_MISSING_CREDENTIAL",
+        target_field: "server.auth.oauth.omit_error_on_missing_credential",
+        value_type: "bool",
+        required_feature: Some("oauth"),
+        redacted: false,
+    },
+    EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__MODE",
+        target_field: "server.auth.oauth.proxy.mode",
+        value_type: "ProxyMode",
+        required_feature: Some("oauth"),
+        redacted: false,
+    },
+    EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET",
+        target_field: "server.auth.oauth.proxy.sealing_secret",
+        value_type: "SecretString",
+        required_feature: Some("oauth"),
+        redacted: true,
+    },
+    EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_FILE",
+        target_field: "server.auth.oauth.proxy.sealing_secret",
+        value_type: "Path",
+        required_feature: Some("oauth"),
+        redacted: true,
+    },
+    EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_PREVIOUS",
+        target_field: "server.auth.oauth.proxy.sealing_secret_previous",
+        value_type: "SecretString",
+        required_feature: Some("oauth"),
+        redacted: true,
+    },
+    EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_PREVIOUS_FILE",
+        target_field: "server.auth.oauth.proxy.sealing_secret_previous",
+        value_type: "Path",
+        required_feature: Some("oauth"),
+        redacted: true,
+    },
+    EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__CONSENT_TTL",
+        target_field: "server.auth.oauth.proxy.consent_ttl",
+        value_type: "humantime duration",
+        required_feature: Some("oauth"),
+        redacted: false,
+    },
+    EnvOverrideSpec {
         env_var: "RMCP_SERVER_KIT__OBSERVABILITY__LOG_FORMAT",
         target_field: "observability.log_format",
         value_type: "String",
@@ -333,6 +410,43 @@ pub(crate) const SERVER_OAUTH_PROXY_STRIP_RESOURCE_PARAM_ENV: &str =
 /// Environment variable name for the `server.auth.oauth.allowed_algorithms` override.
 pub(crate) const SERVER_OAUTH_ALLOWED_ALGORITHMS_ENV: &str =
     "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ALLOWED_ALGORITHMS";
+/// Environment variable name for the `server.auth.oauth.challenge_scopes` override.
+pub(crate) const SERVER_OAUTH_CHALLENGE_SCOPES_ENV: &str =
+    "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__CHALLENGE_SCOPES";
+/// Environment variable name for the `server.auth.oauth.insufficient_scope_challenge` override.
+pub(crate) const SERVER_OAUTH_INSUFFICIENT_SCOPE_CHALLENGE_ENV: &str =
+    "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__INSUFFICIENT_SCOPE_CHALLENGE";
+/// Environment variable name for the `server.auth.oauth.additional_audiences` override.
+pub(crate) const SERVER_OAUTH_ADDITIONAL_AUDIENCES_ENV: &str =
+    "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ADDITIONAL_AUDIENCES";
+/// Environment variable name for the `server.auth.oauth.accept_resource_audience` override.
+pub(crate) const SERVER_OAUTH_ACCEPT_RESOURCE_AUDIENCE_ENV: &str =
+    "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ACCEPT_RESOURCE_AUDIENCE";
+/// Environment variable name for the
+/// `server.auth.oauth.omit_error_on_missing_credential` override.
+pub(crate) const SERVER_OAUTH_OMIT_ERROR_ON_MISSING_CREDENTIAL_ENV: &str =
+    "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__OMIT_ERROR_ON_MISSING_CREDENTIAL";
+/// Environment variable name for the `server.auth.oauth.proxy.mode` override.
+pub(crate) const SERVER_OAUTH_PROXY_MODE_ENV: &str =
+    "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__MODE";
+/// Environment variable name for the direct `server.auth.oauth.proxy.sealing_secret` override.
+pub(crate) const SERVER_OAUTH_PROXY_SEALING_SECRET_ENV: &str =
+    "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET";
+/// Environment variable name for the file-backed
+/// `server.auth.oauth.proxy.sealing_secret` override.
+pub(crate) const SERVER_OAUTH_PROXY_SEALING_SECRET_FILE_ENV: &str =
+    "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_FILE";
+/// Environment variable name for the direct
+/// `server.auth.oauth.proxy.sealing_secret_previous` override.
+pub(crate) const SERVER_OAUTH_PROXY_SEALING_SECRET_PREVIOUS_ENV: &str =
+    "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_PREVIOUS";
+/// Environment variable name for the file-backed
+/// `server.auth.oauth.proxy.sealing_secret_previous` override.
+pub(crate) const SERVER_OAUTH_PROXY_SEALING_SECRET_PREVIOUS_FILE_ENV: &str =
+    "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_PREVIOUS_FILE";
+/// Environment variable name for the `server.auth.oauth.proxy.consent_ttl` override.
+pub(crate) const SERVER_OAUTH_PROXY_CONSENT_TTL_ENV: &str =
+    "RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__CONSENT_TTL";
 /// Environment variable name for the `observability.log_format` override.
 pub(crate) const OBSERVABILITY_LOG_FORMAT_ENV: &str = "RMCP_SERVER_KIT__OBSERVABILITY__LOG_FORMAT";
 /// Environment variable name for the `observability.metrics_enabled` override.
@@ -661,7 +775,8 @@ impl ServerConfig {
     /// # Errors
     ///
     /// Returns [`RmcpServerKitError::Config`] when an override cannot be parsed, when an
-    /// OAuth override lacks a declared `[server.auth.oauth]` parent, or when an
+    /// OAuth override lacks a declared `[server.auth.oauth]` parent, when a proxy
+    /// override lacks a declared `[server.auth.oauth.proxy]` table, or when an
     /// OAuth override is used in a build without the `oauth` feature.
     ///
     /// # Examples
@@ -901,7 +1016,8 @@ impl ServerConfig {
             ));
             proxy.strip_resource_param = value;
         }
-        Ok(())
+        apply_oauth_opt_in_env(oauth, oauth_env.opt_in, applied)?;
+        apply_oauth_proxy_env(oauth.proxy.as_mut(), oauth_env.proxy, applied)
     }
 
     /// Apply this TOML server schema to a programmatic MCP server base.
@@ -1257,6 +1373,10 @@ struct OAuthEnvOverrides {
     allowed_algorithms: Option<String>,
     /// `proxy.strip_resource_param` override, when set.
     proxy_strip_resource_param: Option<String>,
+    /// Opt-in resource-server overrides.
+    opt_in: OAuthOptInEnv,
+    /// Overrides scoped to `[server.auth.oauth.proxy]`.
+    proxy: OAuthProxyEnv,
 }
 
 impl OAuthEnvOverrides {
@@ -1272,28 +1392,368 @@ impl OAuthEnvOverrides {
             jwks_uri: read_env(SERVER_OAUTH_JWKS_URI_ENV)?,
             allowed_algorithms: read_env(SERVER_OAUTH_ALLOWED_ALGORITHMS_ENV)?,
             proxy_strip_resource_param: read_env(SERVER_OAUTH_PROXY_STRIP_RESOURCE_PARAM_ENV)?,
+            opt_in: OAuthOptInEnv::read()?,
+            proxy: OAuthProxyEnv::read()?,
         })
     }
 
     /// Whether any OAuth environment override is set.
-    const fn is_set(&self) -> bool {
-        self.issuer.is_some()
-            || self.audience.is_some()
-            || self.jwks_uri.is_some()
-            || self.allowed_algorithms.is_some()
-            || self.proxy_strip_resource_param.is_some()
+    fn is_set(&self) -> bool {
+        self.first_set().is_some()
     }
 
     /// Name of the first set OAuth environment variable.
     fn first_set_var(&self) -> &'static str {
-        first_set_oauth_env(
-            self.issuer.as_deref(),
-            self.audience.as_deref(),
-            self.jwks_uri.as_deref(),
-            self.allowed_algorithms.as_deref(),
-            self.proxy_strip_resource_param.as_deref(),
-        )
+        self.first_set().unwrap_or(SERVER_OAUTH_ISSUER_ENV)
     }
+
+    /// First set OAuth variable: the five original variables in their
+    /// original order, then the opt-in variables, then the proxy variables.
+    fn first_set(&self) -> Option<&'static str> {
+        first_set_oauth_env(&[
+            (SERVER_OAUTH_ISSUER_ENV, self.issuer.is_some()),
+            (SERVER_OAUTH_AUDIENCE_ENV, self.audience.is_some()),
+            (SERVER_OAUTH_JWKS_URI_ENV, self.jwks_uri.is_some()),
+            (
+                SERVER_OAUTH_ALLOWED_ALGORITHMS_ENV,
+                self.allowed_algorithms.is_some(),
+            ),
+            (
+                SERVER_OAUTH_PROXY_STRIP_RESOURCE_PARAM_ENV,
+                self.proxy_strip_resource_param.is_some(),
+            ),
+        ])
+        .or_else(|| first_set_oauth_env(&self.opt_in.set_flags()))
+        .or_else(|| self.proxy.first_set_var())
+    }
+}
+
+/// Raw OAuth opt-in environment overrides read before being applied.
+struct OAuthOptInEnv {
+    /// `challenge_scopes` override, when set.
+    challenge_scopes: Option<String>,
+    /// `insufficient_scope_challenge` override, when set.
+    insufficient_scope_challenge: Option<String>,
+    /// `additional_audiences` override, when set.
+    additional_audiences: Option<String>,
+    /// `accept_resource_audience` override, when set.
+    accept_resource_audience: Option<String>,
+    /// `omit_error_on_missing_credential` override, when set.
+    omit_error_on_missing_credential: Option<String>,
+}
+
+impl OAuthOptInEnv {
+    /// Read every OAuth opt-in environment override.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RmcpServerKitError::Config`] when a variable is not valid UTF-8.
+    fn read() -> Result<Self, RmcpServerKitError> {
+        Ok(Self {
+            challenge_scopes: read_env(SERVER_OAUTH_CHALLENGE_SCOPES_ENV)?,
+            insufficient_scope_challenge: read_env(SERVER_OAUTH_INSUFFICIENT_SCOPE_CHALLENGE_ENV)?,
+            additional_audiences: read_env(SERVER_OAUTH_ADDITIONAL_AUDIENCES_ENV)?,
+            accept_resource_audience: read_env(SERVER_OAUTH_ACCEPT_RESOURCE_AUDIENCE_ENV)?,
+            omit_error_on_missing_credential: read_env(
+                SERVER_OAUTH_OMIT_ERROR_ON_MISSING_CREDENTIAL_ENV,
+            )?,
+        })
+    }
+
+    /// Every opt-in variable and whether it is set, in declaration order.
+    const fn set_flags(&self) -> [(&'static str, bool); 5] {
+        [
+            (
+                SERVER_OAUTH_CHALLENGE_SCOPES_ENV,
+                self.challenge_scopes.is_some(),
+            ),
+            (
+                SERVER_OAUTH_INSUFFICIENT_SCOPE_CHALLENGE_ENV,
+                self.insufficient_scope_challenge.is_some(),
+            ),
+            (
+                SERVER_OAUTH_ADDITIONAL_AUDIENCES_ENV,
+                self.additional_audiences.is_some(),
+            ),
+            (
+                SERVER_OAUTH_ACCEPT_RESOURCE_AUDIENCE_ENV,
+                self.accept_resource_audience.is_some(),
+            ),
+            (
+                SERVER_OAUTH_OMIT_ERROR_ON_MISSING_CREDENTIAL_ENV,
+                self.omit_error_on_missing_credential.is_some(),
+            ),
+        ]
+    }
+}
+
+/// Raw `[server.auth.oauth.proxy]` environment overrides read before being applied.
+struct OAuthProxyEnv {
+    /// `proxy.mode` override, when set.
+    mode: Option<String>,
+    /// `proxy.sealing_secret` override sources.
+    sealing_secret: SecretEnvPair,
+    /// `proxy.sealing_secret_previous` override sources.
+    sealing_secret_previous: SecretEnvPair,
+    /// `proxy.consent_ttl` override, when set.
+    consent_ttl: Option<String>,
+}
+
+impl OAuthProxyEnv {
+    /// Read every proxy-scoped environment override.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RmcpServerKitError::Config`] when a variable is not valid UTF-8.
+    fn read() -> Result<Self, RmcpServerKitError> {
+        Ok(Self {
+            mode: read_env(SERVER_OAUTH_PROXY_MODE_ENV)?,
+            sealing_secret: SecretEnvPair::read(
+                SERVER_OAUTH_PROXY_SEALING_SECRET_ENV,
+                SERVER_OAUTH_PROXY_SEALING_SECRET_FILE_ENV,
+            )?,
+            sealing_secret_previous: SecretEnvPair::read(
+                SERVER_OAUTH_PROXY_SEALING_SECRET_PREVIOUS_ENV,
+                SERVER_OAUTH_PROXY_SEALING_SECRET_PREVIOUS_FILE_ENV,
+            )?,
+            consent_ttl: read_env(SERVER_OAUTH_PROXY_CONSENT_TTL_ENV)?,
+        })
+    }
+
+    /// Name of the first set proxy-scoped variable, in declaration order.
+    fn first_set_var(&self) -> Option<&'static str> {
+        first_set_oauth_env(&[(SERVER_OAUTH_PROXY_MODE_ENV, self.mode.is_some())])
+            .or_else(|| first_set_oauth_env(&self.sealing_secret.set_flags()))
+            .or_else(|| first_set_oauth_env(&self.sealing_secret_previous.set_flags()))
+            .or_else(|| {
+                first_set_oauth_env(&[(
+                    SERVER_OAUTH_PROXY_CONSENT_TTL_ENV,
+                    self.consent_ttl.is_some(),
+                )])
+            })
+    }
+}
+
+/// A secret settable directly or through a `_FILE`-suffixed sibling variable.
+struct SecretEnvPair {
+    /// Variable carrying the secret itself.
+    direct_var: &'static str,
+    /// Variable naming a file that holds the secret.
+    file_var: &'static str,
+    /// Value of `direct_var`, when set.
+    direct: Option<SecretString>,
+    /// Value of `file_var` (a path), when set.
+    file: Option<String>,
+}
+
+impl SecretEnvPair {
+    /// Read both variables of the pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RmcpServerKitError::Config`] when a variable is not valid UTF-8.
+    fn read(direct_var: &'static str, file_var: &'static str) -> Result<Self, RmcpServerKitError> {
+        Ok(Self {
+            direct_var,
+            file_var,
+            direct: read_env(direct_var)?.map(SecretString::from),
+            file: read_env(file_var)?,
+        })
+    }
+
+    /// Both variables of the pair and whether each is set.
+    const fn set_flags(&self) -> [(&'static str, bool); 2] {
+        [
+            (self.direct_var, self.direct.is_some()),
+            (self.file_var, self.file.is_some()),
+        ]
+    }
+
+    #[cfg(feature = "oauth")]
+    /// Resolve the pair into a validated secret, the variable that supplied
+    /// it, and its source, with the same rules as the session-binding secret.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RmcpServerKitError::Config`] when both variables are set, when
+    /// the file cannot be read, or when the secret fails validation.
+    fn resolve(
+        self,
+    ) -> Result<Option<(SecretString, &'static str, EnvOverrideSource)>, RmcpServerKitError> {
+        match (self.direct, self.file) {
+            (None, None) => Ok(None),
+            (Some(_), Some(_)) => Err(RmcpServerKitError::Config(format!(
+                "{} and {} must not both be set",
+                self.direct_var, self.file_var
+            ))),
+            (Some(secret), None) => {
+                session_binding::validate_configured_secret(
+                    self.direct_var,
+                    secret.expose_secret(),
+                )?;
+                Ok(Some((secret, self.direct_var, EnvOverrideSource::Env)))
+            }
+            (None, Some(path)) => {
+                let raw_secret = fs::read_to_string(PathBuf::from(&path)).map_err(|error| {
+                    RmcpServerKitError::Config(format!(
+                        "failed to read {} file {path:?}: {error}",
+                        self.file_var
+                    ))
+                })?;
+                let secret = normalize_text_secret_file(raw_secret);
+                session_binding::validate_configured_secret(self.file_var, &secret)?;
+                Ok(Some((
+                    SecretString::from(secret),
+                    self.file_var,
+                    EnvOverrideSource::File,
+                )))
+            }
+        }
+    }
+}
+
+#[cfg(feature = "oauth")]
+/// Apply the opt-in resource-server overrides onto a declared OAuth config.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] naming the variable whose value
+/// cannot be parsed.
+fn apply_oauth_opt_in_env(
+    oauth: &mut oauth::OAuthConfig,
+    env: OAuthOptInEnv,
+    applied: &mut Vec<EnvOverride>,
+) -> Result<(), RmcpServerKitError> {
+    if let Some(raw) = env.challenge_scopes {
+        oauth.challenge_scopes = Some(parse_env_list(SERVER_OAUTH_CHALLENGE_SCOPES_ENV, &raw)?);
+        applied.push(env_report(
+            SERVER_OAUTH_CHALLENGE_SCOPES_ENV,
+            "server.auth.oauth.challenge_scopes",
+            raw,
+        ));
+    }
+    if let Some(raw) = env.insufficient_scope_challenge {
+        oauth.insufficient_scope_challenge =
+            parse_env_bool(SERVER_OAUTH_INSUFFICIENT_SCOPE_CHALLENGE_ENV, &raw)?;
+        applied.push(env_report(
+            SERVER_OAUTH_INSUFFICIENT_SCOPE_CHALLENGE_ENV,
+            "server.auth.oauth.insufficient_scope_challenge",
+            raw,
+        ));
+    }
+    if let Some(raw) = env.additional_audiences {
+        oauth.additional_audiences = parse_env_list(SERVER_OAUTH_ADDITIONAL_AUDIENCES_ENV, &raw)?;
+        applied.push(env_report(
+            SERVER_OAUTH_ADDITIONAL_AUDIENCES_ENV,
+            "server.auth.oauth.additional_audiences",
+            raw,
+        ));
+    }
+    if let Some(raw) = env.accept_resource_audience {
+        oauth.accept_resource_audience =
+            parse_env_bool(SERVER_OAUTH_ACCEPT_RESOURCE_AUDIENCE_ENV, &raw)?;
+        applied.push(env_report(
+            SERVER_OAUTH_ACCEPT_RESOURCE_AUDIENCE_ENV,
+            "server.auth.oauth.accept_resource_audience",
+            raw,
+        ));
+    }
+    if let Some(raw) = env.omit_error_on_missing_credential {
+        oauth.omit_error_on_missing_credential =
+            parse_env_bool(SERVER_OAUTH_OMIT_ERROR_ON_MISSING_CREDENTIAL_ENV, &raw)?;
+        applied.push(env_report(
+            SERVER_OAUTH_OMIT_ERROR_ON_MISSING_CREDENTIAL_ENV,
+            "server.auth.oauth.omit_error_on_missing_credential",
+            raw,
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "oauth")]
+/// Apply the proxy-scoped overrides onto a declared `[server.auth.oauth.proxy]`.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] when a proxy variable is set but the
+/// proxy table is not declared, or naming the variable whose value cannot be
+/// parsed, read, or validated.
+fn apply_oauth_proxy_env(
+    declared_proxy: Option<&mut oauth::OAuthProxyConfig>,
+    env: OAuthProxyEnv,
+    applied: &mut Vec<EnvOverride>,
+) -> Result<(), RmcpServerKitError> {
+    let Some(first_var) = env.first_set_var() else {
+        return Ok(());
+    };
+    // Fail closed like `STRIP_RESOURCE_PARAM`: these variables populate an
+    // existing proxy, never create one.
+    let Some(proxy) = declared_proxy else {
+        return Err(RmcpServerKitError::Config(format!(
+            "{first_var} requires declaring [server.auth.oauth.proxy] before applying env overrides"
+        )));
+    };
+    if let Some(raw) = env.mode {
+        proxy.mode = parse_env_value(
+            SERVER_OAUTH_PROXY_MODE_ENV,
+            &raw,
+            "ProxyMode (passthrough or authorization_server)",
+        )?;
+        applied.push(env_report(
+            SERVER_OAUTH_PROXY_MODE_ENV,
+            "server.auth.oauth.proxy.mode",
+            raw,
+        ));
+    }
+    if let Some((secret, env_var, source)) = env.sealing_secret.resolve()? {
+        proxy.sealing_secret = Some(secret);
+        applied.push(secret_env_report(
+            env_var,
+            "server.auth.oauth.proxy.sealing_secret",
+            source,
+        ));
+    }
+    if let Some((secret, env_var, source)) = env.sealing_secret_previous.resolve()? {
+        proxy.sealing_secret_previous = Some(secret);
+        applied.push(secret_env_report(
+            env_var,
+            "server.auth.oauth.proxy.sealing_secret_previous",
+            source,
+        ));
+    }
+    if let Some(raw) = env.consent_ttl {
+        // Parsed only to name the variable on a malformed value; the range
+        // check stays in `OAuthConfig::validate`.
+        let _ttl = parse_duration_field(SERVER_OAUTH_PROXY_CONSENT_TTL_ENV, &raw)?;
+        applied.push(env_report(
+            SERVER_OAUTH_PROXY_CONSENT_TTL_ENV,
+            "server.auth.oauth.proxy.consent_ttl",
+            raw.clone(),
+        ));
+        proxy.consent_ttl = Some(raw);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "oauth")]
+/// Split a comma-separated env value, trimming entries and dropping empty ones.
+///
+/// # Errors
+///
+/// Returns [`RmcpServerKitError::Config`] naming `env_var` when no entry remains.
+fn parse_env_list(env_var: &str, raw: &str) -> Result<Vec<String>, RmcpServerKitError> {
+    let entries: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    if entries.is_empty() {
+        return Err(RmcpServerKitError::Config(format!(
+            "{env_var} must list at least one non-empty comma-separated entry; unset the variable to disable the override"
+        )));
+    }
+    Ok(entries)
 }
 
 /// Stable doc anchor for the `ObservabilityConfig` reference section.
@@ -1316,27 +1776,9 @@ fn reject_oauth_env_overrides(oauth_env: &OAuthEnvOverrides) -> Result<(), RmcpS
     }
 }
 
-/// Return the first set OAuth environment variable of the five, for error messages.
-const fn first_set_oauth_env(
-    issuer: Option<&str>,
-    audience: Option<&str>,
-    jwks_uri: Option<&str>,
-    allowed_algorithms: Option<&str>,
-    proxy_strip_resource_param: Option<&str>,
-) -> &'static str {
-    if issuer.is_some() {
-        SERVER_OAUTH_ISSUER_ENV
-    } else if audience.is_some() {
-        SERVER_OAUTH_AUDIENCE_ENV
-    } else if jwks_uri.is_some() {
-        SERVER_OAUTH_JWKS_URI_ENV
-    } else if allowed_algorithms.is_some() {
-        SERVER_OAUTH_ALLOWED_ALGORITHMS_ENV
-    } else if proxy_strip_resource_param.is_some() {
-        SERVER_OAUTH_PROXY_STRIP_RESOURCE_PARAM_ENV
-    } else {
-        SERVER_OAUTH_ISSUER_ENV
-    }
+/// Return the first variable flagged as set, scanning in slice order.
+fn first_set_oauth_env(flags: &[(&'static str, bool)]) -> Option<&'static str> {
+    flags.iter().find_map(|&(var, set)| set.then_some(var))
 }
 
 /// Parse a human-readable duration, naming `field` and `value` on failure.
@@ -2034,6 +2476,8 @@ fn default_sse_keep_alive() -> String {
 )]
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "oauth")]
+    use std::process;
     use std::{
         collections::{HashMap, HashSet},
         io::{self, Write},
@@ -4427,7 +4871,11 @@ client_ip = false
 
     /// Extract the `pub` field names of a struct from this file's own source.
     fn struct_pub_fields(marker: &str) -> anyhow::Result<Vec<String>> {
-        let source = include_str!("config.rs").replace("\r\n", "\n");
+        struct_pub_fields_in(&include_str!("config.rs").replace("\r\n", "\n"), marker)
+    }
+
+    /// Extract the `pub` field names of struct `marker` from `source`.
+    fn struct_pub_fields_in(source: &str, marker: &str) -> anyhow::Result<Vec<String>> {
         let (_, after) = source
             .split_once(marker)
             .with_context(|| format!("struct start marker {marker:?} not found"))?;
@@ -4492,16 +4940,69 @@ client_ip = false
         "observability.log_level",
         "observability.audit_log_path",
         "observability.log_request_headers",
+        // OAuth fields predating 3.21; env exposure not requested
+        "server.auth.oauth.scopes",
+        "server.auth.oauth.role_claim",
+        "server.auth.oauth.role_mappings",
+        "server.auth.oauth.jwks_cache_ttl",
+        "server.auth.oauth.proxy",
+        "server.auth.oauth.token_exchange",
+        "server.auth.oauth.ca_cert_path",
+        "server.auth.oauth.allow_http_oauth_urls",
+        "server.auth.oauth.ssrf_allowlist",
+        "server.auth.oauth.max_jwks_keys",
+        "server.auth.oauth.authorization_servers",
+        "server.auth.oauth.authorization_server_metadata_issuer",
+        "server.auth.oauth.require_subject",
+        "server.auth.oauth.strict_audience_validation",
+        "server.auth.oauth.audience_validation_mode",
+        "server.auth.oauth.jwks_max_response_bytes",
+        "server.auth.oauth.proxy.authorize_url",
+        "server.auth.oauth.proxy.token_url",
+        "server.auth.oauth.proxy.client_id",
+        "server.auth.oauth.proxy.client_secret",
+        "server.auth.oauth.proxy.introspection_url",
+        "server.auth.oauth.proxy.revocation_url",
+        "server.auth.oauth.proxy.expose_admin_endpoints",
+        "server.auth.oauth.proxy.require_auth_on_admin_endpoints",
+        "server.auth.oauth.proxy.allow_unauthenticated_admin_endpoints",
     ];
 
     #[test]
     /// Pins that every config field is either env-overridable or deliberately excluded.
     fn every_config_field_is_env_overridable_or_excluded() -> anyhow::Result<()> {
-        for (marker, prefix) in [
-            ("pub struct ServerConfig {", "server"),
-            ("pub struct ObservabilityConfig {", "observability"),
-        ] {
-            for field in struct_pub_fields(marker)? {
+        let config_source = include_str!("config.rs").replace("\r\n", "\n");
+        #[cfg(feature = "oauth")]
+        let oauth_source = include_str!("oauth.rs").replace("\r\n", "\n");
+        #[cfg(feature = "oauth")]
+        let oauth_scans = [
+            (
+                oauth_source.as_str(),
+                "pub struct OAuthConfig {",
+                "server.auth.oauth",
+            ),
+            (
+                oauth_source.as_str(),
+                "pub struct OAuthProxyConfig {",
+                "server.auth.oauth.proxy",
+            ),
+        ];
+        #[cfg(not(feature = "oauth"))]
+        let oauth_scans: [(&str, &str, &str); 0] = [];
+        let scans = [
+            (
+                config_source.as_str(),
+                "pub struct ServerConfig {",
+                "server",
+            ),
+            (
+                config_source.as_str(),
+                "pub struct ObservabilityConfig {",
+                "observability",
+            ),
+        ];
+        for (source, marker, prefix) in scans.into_iter().chain(oauth_scans) {
+            for field in struct_pub_fields_in(source, marker)? {
                 let target = format!("{prefix}.{field}");
                 let overridable = ENV_OVERRIDE_SPECS
                     .iter()
@@ -5919,6 +6420,666 @@ client_ip = false
         Ok(())
     }
 
+    /// Every OAuth env var in first-set reporting order: the five 3.20 vars
+    /// first (their relative order is frozen), then the 3.21 vars.
+    const OAUTH_ENV_FIRST_SET_ORDER: [&str; 16] = [
+        SERVER_OAUTH_ISSUER_ENV,
+        SERVER_OAUTH_AUDIENCE_ENV,
+        SERVER_OAUTH_JWKS_URI_ENV,
+        SERVER_OAUTH_ALLOWED_ALGORITHMS_ENV,
+        SERVER_OAUTH_PROXY_STRIP_RESOURCE_PARAM_ENV,
+        SERVER_OAUTH_CHALLENGE_SCOPES_ENV,
+        SERVER_OAUTH_INSUFFICIENT_SCOPE_CHALLENGE_ENV,
+        SERVER_OAUTH_ADDITIONAL_AUDIENCES_ENV,
+        SERVER_OAUTH_ACCEPT_RESOURCE_AUDIENCE_ENV,
+        SERVER_OAUTH_OMIT_ERROR_ON_MISSING_CREDENTIAL_ENV,
+        SERVER_OAUTH_PROXY_MODE_ENV,
+        SERVER_OAUTH_PROXY_SEALING_SECRET_ENV,
+        SERVER_OAUTH_PROXY_SEALING_SECRET_FILE_ENV,
+        SERVER_OAUTH_PROXY_SEALING_SECRET_PREVIOUS_ENV,
+        SERVER_OAUTH_PROXY_SEALING_SECRET_PREVIOUS_FILE_ENV,
+        SERVER_OAUTH_PROXY_CONSENT_TTL_ENV,
+    ];
+
+    /// Proxy-scoped 3.21 env vars, in declaration order.
+    #[cfg(feature = "oauth")]
+    const OAUTH_PROXY_ENV_VARS: [&str; 6] = [
+        SERVER_OAUTH_PROXY_MODE_ENV,
+        SERVER_OAUTH_PROXY_SEALING_SECRET_ENV,
+        SERVER_OAUTH_PROXY_SEALING_SECRET_FILE_ENV,
+        SERVER_OAUTH_PROXY_SEALING_SECRET_PREVIOUS_ENV,
+        SERVER_OAUTH_PROXY_SEALING_SECRET_PREVIOUS_FILE_ENV,
+        SERVER_OAUTH_PROXY_CONSENT_TTL_ENV,
+    ];
+
+    /// Sealing secret used by the env tests (at least 32 bytes).
+    #[cfg(feature = "oauth")]
+    const ENV_SEALING_SECRET: &str = "env-sealing-secret-current-0123456789abcdef";
+    /// Previous sealing secret used by the env tests (at least 32 bytes).
+    #[cfg(feature = "oauth")]
+    const ENV_SEALING_SECRET_PREVIOUS: &str = "env-sealing-secret-previous-0123456789abcdef";
+
+    #[cfg(feature = "oauth")]
+    /// One env report entry flattened for exact comparison.
+    type ReportRow<'row> = (&'row str, &'row str, EnvOverrideSource, Option<&'row str>);
+
+    #[cfg(feature = "oauth")]
+    fn report_rows(report: &[EnvOverride]) -> Vec<ReportRow<'_>> {
+        report
+            .iter()
+            .map(|entry| {
+                (
+                    entry.env_var.as_str(),
+                    entry.target_field.as_str(),
+                    entry.source,
+                    entry.value.as_deref(),
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "oauth")]
+    /// A process-unique temp file holding `contents`; the caller removes it.
+    fn env_temp_file(tag: &str, contents: &str) -> anyhow::Result<PathBuf> {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("clock after epoch")?
+            .as_nanos();
+        let path = env::temp_dir().join(format!(
+            "rmcp-server-kit-{tag}-{}-{nanos}.txt",
+            process::id()
+        ));
+        fs::write(&path, contents).context("write temp file")?;
+        Ok(path)
+    }
+
+    /// A `ServerConfig` with a declared `[server.auth.oauth]` table and the
+    /// given optional `[server.auth.oauth.proxy]` table.
+    #[cfg(feature = "oauth")]
+    fn env_oauth_server_config(proxy: Option<OAuthProxyConfig>) -> ServerConfig {
+        let mut auth = AuthConfig::with_keys(vec![]);
+        auth.oauth = Some(OAuthConfig {
+            proxy,
+            ..OAuthConfig::default()
+        });
+        ServerConfig {
+            auth: Some(auth),
+            ..ServerConfig::default()
+        }
+    }
+
+    #[cfg(feature = "oauth")]
+    fn env_proxy() -> OAuthProxyConfig {
+        OAuthProxyConfig::builder(
+            "https://idp.example/authorize",
+            "https://idp.example/token",
+            "mcp",
+        )
+        .build()
+    }
+
+    #[cfg(feature = "oauth")]
+    fn env_oauth(cfg: &ServerConfig) -> anyhow::Result<&OAuthConfig> {
+        cfg.auth
+            .as_ref()
+            .and_then(|auth| auth.oauth.as_ref())
+            .context("oauth config must be present")
+    }
+
+    #[cfg(feature = "oauth")]
+    fn env_oauth_proxy(cfg: &ServerConfig) -> anyhow::Result<&OAuthProxyConfig> {
+        env_oauth(cfg)?
+            .proxy
+            .as_ref()
+            .context("oauth proxy must be present")
+    }
+
+    /// Apply env overrides to `cfg` under `vars` and return the error text.
+    fn env_apply_error(
+        vars: &[(&str, Option<&str>)],
+        mut cfg: ServerConfig,
+    ) -> anyhow::Result<String> {
+        with_env_vars(vars, || match cfg.apply_env_overrides() {
+            Ok(_) => Err(anyhow::anyhow!("env overrides {vars:?} must be rejected")),
+            Err(err) => Ok(err.to_string()),
+        })
+    }
+
+    #[test]
+    /// Pins the first-set variable named in parent-table and feature errors:
+    /// the five 3.20 vars keep their order and the new vars follow it.
+    fn oauth_env_first_set_precedence_follows_declaration_order() -> anyhow::Result<()> {
+        for (index, expected) in OAUTH_ENV_FIRST_SET_ORDER.iter().enumerate() {
+            let set = OAUTH_ENV_FIRST_SET_ORDER
+                .get(index..)
+                .context("suffix in range")?
+                .iter()
+                .map(|var| (*var, Some("x")))
+                .collect::<Vec<_>>();
+            let msg = env_apply_error(&set, ServerConfig::default())?;
+            assert_eq!(
+                msg.strip_prefix("configuration error: ")
+                    .and_then(|rest| rest.split_whitespace().next()),
+                Some(*expected),
+                "{msg}"
+            );
+            #[cfg(feature = "oauth")]
+            assert!(msg.contains("[server.auth.oauth]"), "{msg}");
+            #[cfg(not(feature = "oauth"))]
+            assert!(msg.contains("oauth` feature"), "{msg}");
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "oauth"))]
+    #[test]
+    /// Pins that every 3.21 OAuth env var is rejected when the feature is off.
+    fn new_oauth_env_vars_feature_off_fail_closed() -> anyhow::Result<()> {
+        let new_vars = OAUTH_ENV_FIRST_SET_ORDER
+            .get(5..)
+            .context("3.21 vars follow the five 3.20 vars")?;
+        for var in new_vars {
+            let cfg = ServerConfig {
+                auth: Some(AuthConfig::with_keys(vec![])),
+                ..ServerConfig::default()
+            };
+            let msg = env_apply_error(&[(var, Some("true"))], cfg)?;
+            assert!(msg.contains(var), "{msg}");
+            assert!(msg.contains("oauth` feature"), "{msg}");
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "oauth")]
+    #[test]
+    /// Pins that the five OAuth opt-in env vars land on their fields and are
+    /// reported with the raw value.
+    fn oauth_opt_in_env_overrides_apply_and_report() -> anyhow::Result<()> {
+        let challenge = " mcp:read, ,mcp:write ";
+        let audiences = "https://mcp.example/mcp,legacy-aud";
+        with_env_vars(
+            &[
+                (SERVER_OAUTH_CHALLENGE_SCOPES_ENV, Some(challenge)),
+                (SERVER_OAUTH_INSUFFICIENT_SCOPE_CHALLENGE_ENV, Some("true")),
+                (SERVER_OAUTH_ADDITIONAL_AUDIENCES_ENV, Some(audiences)),
+                (SERVER_OAUTH_ACCEPT_RESOURCE_AUDIENCE_ENV, Some("true")),
+                (
+                    SERVER_OAUTH_OMIT_ERROR_ON_MISSING_CREDENTIAL_ENV,
+                    Some("true"),
+                ),
+            ],
+            || -> anyhow::Result<()> {
+                let mut cfg = env_oauth_server_config(None);
+                let report = cfg
+                    .apply_env_overrides()
+                    .context("opt-in env overrides must apply")?;
+                let oauth = env_oauth(&cfg)?;
+                assert_eq!(
+                    oauth.challenge_scopes.as_deref(),
+                    Some(["mcp:read".to_owned(), "mcp:write".to_owned()].as_slice())
+                );
+                assert!(oauth.insufficient_scope_challenge);
+                assert_eq!(
+                    oauth.additional_audiences,
+                    ["https://mcp.example/mcp", "legacy-aud"]
+                );
+                assert!(oauth.accept_resource_audience);
+                assert!(oauth.omit_error_on_missing_credential);
+                let env = EnvOverrideSource::Env;
+                assert_eq!(
+                    report_rows(&report),
+                    [
+                        (
+                            SERVER_OAUTH_CHALLENGE_SCOPES_ENV,
+                            "server.auth.oauth.challenge_scopes",
+                            env,
+                            Some(challenge),
+                        ),
+                        (
+                            SERVER_OAUTH_INSUFFICIENT_SCOPE_CHALLENGE_ENV,
+                            "server.auth.oauth.insufficient_scope_challenge",
+                            env,
+                            Some("true"),
+                        ),
+                        (
+                            SERVER_OAUTH_ADDITIONAL_AUDIENCES_ENV,
+                            "server.auth.oauth.additional_audiences",
+                            env,
+                            Some(audiences),
+                        ),
+                        (
+                            SERVER_OAUTH_ACCEPT_RESOURCE_AUDIENCE_ENV,
+                            "server.auth.oauth.accept_resource_audience",
+                            env,
+                            Some("true"),
+                        ),
+                        (
+                            SERVER_OAUTH_OMIT_ERROR_ON_MISSING_CREDENTIAL_ENV,
+                            "server.auth.oauth.omit_error_on_missing_credential",
+                            env,
+                            Some("true"),
+                        ),
+                    ]
+                );
+                Ok(())
+            },
+        )
+    }
+
+    #[cfg(feature = "oauth")]
+    #[test]
+    /// Pins that the proxy env vars land on a declared proxy, that secrets are
+    /// reported without a value, and that no secret reaches any `Debug` output.
+    fn oauth_proxy_env_overrides_apply_and_report_redacted() -> anyhow::Result<()> {
+        let previous_file = env_temp_file(
+            "sealing-previous",
+            &format!("{ENV_SEALING_SECRET_PREVIOUS}\n"),
+        )?;
+        let previous_path = previous_file.to_string_lossy().to_string();
+        let outcome = with_env_vars(
+            &[
+                (SERVER_OAUTH_PROXY_MODE_ENV, Some("authorization_server")),
+                (
+                    SERVER_OAUTH_PROXY_SEALING_SECRET_ENV,
+                    Some(ENV_SEALING_SECRET),
+                ),
+                (
+                    SERVER_OAUTH_PROXY_SEALING_SECRET_PREVIOUS_FILE_ENV,
+                    Some(previous_path.as_str()),
+                ),
+                (SERVER_OAUTH_PROXY_CONSENT_TTL_ENV, Some("1h")),
+            ],
+            || -> anyhow::Result<()> {
+                let mut cfg = env_oauth_server_config(Some(env_proxy()));
+                let report = cfg
+                    .apply_env_overrides()
+                    .context("proxy env overrides must apply")?;
+                let proxy = env_oauth_proxy(&cfg)?;
+                assert_eq!(proxy.mode, ProxyMode::AuthorizationServer);
+                assert_eq!(
+                    proxy
+                        .sealing_secret
+                        .as_ref()
+                        .map(SecretString::expose_secret),
+                    Some(ENV_SEALING_SECRET)
+                );
+                assert_eq!(
+                    proxy
+                        .sealing_secret_previous
+                        .as_ref()
+                        .map(SecretString::expose_secret),
+                    Some(ENV_SEALING_SECRET_PREVIOUS)
+                );
+                assert_eq!(proxy.consent_ttl.as_deref(), Some("1h"));
+                assert_eq!(
+                    report_rows(&report),
+                    [
+                        (
+                            SERVER_OAUTH_PROXY_MODE_ENV,
+                            "server.auth.oauth.proxy.mode",
+                            EnvOverrideSource::Env,
+                            Some("authorization_server"),
+                        ),
+                        (
+                            SERVER_OAUTH_PROXY_SEALING_SECRET_ENV,
+                            "server.auth.oauth.proxy.sealing_secret",
+                            EnvOverrideSource::Env,
+                            None,
+                        ),
+                        (
+                            SERVER_OAUTH_PROXY_SEALING_SECRET_PREVIOUS_FILE_ENV,
+                            "server.auth.oauth.proxy.sealing_secret_previous",
+                            EnvOverrideSource::File,
+                            None,
+                        ),
+                        (
+                            SERVER_OAUTH_PROXY_CONSENT_TTL_ENV,
+                            "server.auth.oauth.proxy.consent_ttl",
+                            EnvOverrideSource::Env,
+                            Some("1h"),
+                        ),
+                    ]
+                );
+                let rendered = format!("{report:?} {proxy:?} {cfg:?}");
+                assert!(!rendered.contains(ENV_SEALING_SECRET), "{rendered}");
+                assert!(
+                    !rendered.contains(ENV_SEALING_SECRET_PREVIOUS),
+                    "{rendered}"
+                );
+                Ok(())
+            },
+        );
+        fs::remove_file(&previous_file).context("remove secret file")?;
+        outcome
+    }
+
+    #[cfg(feature = "oauth")]
+    #[test]
+    /// Pins the swapped secret sources: a `_FILE` current secret loses exactly
+    /// one trailing newline and a direct previous secret is taken verbatim.
+    fn oauth_proxy_secret_file_strips_exactly_one_newline() -> anyhow::Result<()> {
+        let current_file = env_temp_file("sealing-current", &format!("{ENV_SEALING_SECRET}\n\n"))?;
+        let current_path = current_file.to_string_lossy().to_string();
+        let outcome = with_env_vars(
+            &[
+                (
+                    SERVER_OAUTH_PROXY_SEALING_SECRET_FILE_ENV,
+                    Some(current_path.as_str()),
+                ),
+                (
+                    SERVER_OAUTH_PROXY_SEALING_SECRET_PREVIOUS_ENV,
+                    Some(ENV_SEALING_SECRET_PREVIOUS),
+                ),
+            ],
+            || -> anyhow::Result<()> {
+                let mut cfg = env_oauth_server_config(Some(env_proxy()));
+                let report = cfg
+                    .apply_env_overrides()
+                    .context("swapped secret sources must apply")?;
+                let proxy = env_oauth_proxy(&cfg)?;
+                assert_eq!(
+                    proxy
+                        .sealing_secret
+                        .as_ref()
+                        .map(SecretString::expose_secret),
+                    Some(format!("{ENV_SEALING_SECRET}\n").as_str())
+                );
+                assert_eq!(
+                    proxy
+                        .sealing_secret_previous
+                        .as_ref()
+                        .map(SecretString::expose_secret),
+                    Some(ENV_SEALING_SECRET_PREVIOUS)
+                );
+                assert_eq!(
+                    report_rows(&report),
+                    [
+                        (
+                            SERVER_OAUTH_PROXY_SEALING_SECRET_FILE_ENV,
+                            "server.auth.oauth.proxy.sealing_secret",
+                            EnvOverrideSource::File,
+                            None,
+                        ),
+                        (
+                            SERVER_OAUTH_PROXY_SEALING_SECRET_PREVIOUS_ENV,
+                            "server.auth.oauth.proxy.sealing_secret_previous",
+                            EnvOverrideSource::Env,
+                            None,
+                        ),
+                    ]
+                );
+                Ok(())
+            },
+        );
+        fs::remove_file(&current_file).context("remove secret file")?;
+        outcome
+    }
+
+    #[cfg(feature = "oauth")]
+    #[test]
+    /// Pins that `PROXY__MODE` round-trips both spellings onto the proxy.
+    fn oauth_proxy_mode_env_round_trips() -> anyhow::Result<()> {
+        for (start, wanted) in [
+            (ProxyMode::Passthrough, ProxyMode::AuthorizationServer),
+            (ProxyMode::AuthorizationServer, ProxyMode::Passthrough),
+        ] {
+            with_env_vars(
+                &[(SERVER_OAUTH_PROXY_MODE_ENV, Some(wanted.as_str()))],
+                || -> anyhow::Result<()> {
+                    let mut proxy = env_proxy();
+                    proxy.mode = start;
+                    let mut cfg = env_oauth_server_config(Some(proxy));
+                    let report = cfg.apply_env_overrides().context("mode env must apply")?;
+                    assert_eq!(env_oauth_proxy(&cfg)?.mode, wanted);
+                    assert_eq!(
+                        report_rows(&report),
+                        [(
+                            SERVER_OAUTH_PROXY_MODE_ENV,
+                            "server.auth.oauth.proxy.mode",
+                            EnvOverrideSource::Env,
+                            Some(wanted.as_str()),
+                        )]
+                    );
+                    Ok(())
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "oauth")]
+    #[test]
+    /// Pins that malformed opt-in and proxy values fail closed naming the var.
+    fn oauth_new_env_malformed_values_name_the_var() -> anyhow::Result<()> {
+        for (var, value, expected) in [
+            (
+                SERVER_OAUTH_INSUFFICIENT_SCOPE_CHALLENGE_ENV,
+                "maybe",
+                "bool",
+            ),
+            (SERVER_OAUTH_ACCEPT_RESOURCE_AUDIENCE_ENV, "1", "bool"),
+            (
+                SERVER_OAUTH_OMIT_ERROR_ON_MISSING_CREDENTIAL_ENV,
+                "TRUE",
+                "bool",
+            ),
+            (SERVER_OAUTH_PROXY_MODE_ENV, "bogus", "ProxyMode"),
+            (
+                SERVER_OAUTH_PROXY_MODE_ENV,
+                "Authorization_Server",
+                "ProxyMode",
+            ),
+            (SERVER_OAUTH_PROXY_MODE_ENV, "", "ProxyMode"),
+            (
+                SERVER_OAUTH_PROXY_CONSENT_TTL_ENV,
+                "soon",
+                "invalid duration",
+            ),
+            (SERVER_OAUTH_PROXY_CONSENT_TTL_ENV, "", "invalid duration"),
+            (SERVER_OAUTH_CHALLENGE_SCOPES_ENV, "", "at least one"),
+            (SERVER_OAUTH_CHALLENGE_SCOPES_ENV, " , ,", "at least one"),
+            (SERVER_OAUTH_ADDITIONAL_AUDIENCES_ENV, ",", "at least one"),
+        ] {
+            let msg = env_apply_error(
+                &[(var, Some(value))],
+                env_oauth_server_config(Some(env_proxy())),
+            )?;
+            assert!(msg.contains(var), "{var}={value:?}: {msg}");
+            assert!(msg.contains(expected), "{var}={value:?}: {msg}");
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "oauth")]
+    #[test]
+    /// Pins that every proxy-scoped var needs a declared proxy table.
+    fn oauth_proxy_env_without_declared_proxy_fails_closed() -> anyhow::Result<()> {
+        for var in OAUTH_PROXY_ENV_VARS {
+            let msg = env_apply_error(&[(var, Some("1h"))], env_oauth_server_config(None))?;
+            assert!(msg.contains(var), "{msg}");
+            assert!(
+                msg.contains("requires declaring [server.auth.oauth.proxy]"),
+                "{msg}"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "oauth")]
+    #[test]
+    /// Pins that a direct secret and its `_FILE` sibling are mutually exclusive.
+    fn oauth_proxy_secret_env_and_file_conflict_rejected() -> anyhow::Result<()> {
+        for (direct, file) in [
+            (
+                SERVER_OAUTH_PROXY_SEALING_SECRET_ENV,
+                SERVER_OAUTH_PROXY_SEALING_SECRET_FILE_ENV,
+            ),
+            (
+                SERVER_OAUTH_PROXY_SEALING_SECRET_PREVIOUS_ENV,
+                SERVER_OAUTH_PROXY_SEALING_SECRET_PREVIOUS_FILE_ENV,
+            ),
+        ] {
+            let msg = env_apply_error(
+                &[
+                    (direct, Some(ENV_SEALING_SECRET)),
+                    (file, Some("/nonexistent")),
+                ],
+                env_oauth_server_config(Some(env_proxy())),
+            )?;
+            assert_eq!(
+                msg,
+                format!("configuration error: {direct} and {file} must not both be set")
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "oauth")]
+    #[test]
+    /// Pins that an unreadable `_FILE` path (missing or a directory) fails closed.
+    fn oauth_proxy_secret_file_unreadable_rejected() -> anyhow::Result<()> {
+        let missing = env::temp_dir()
+            .join(format!(
+                "rmcp-server-kit-missing-{}-secret.txt",
+                process::id()
+            ))
+            .to_string_lossy()
+            .to_string();
+        let directory = env::temp_dir().to_string_lossy().to_string();
+        for var in [
+            SERVER_OAUTH_PROXY_SEALING_SECRET_FILE_ENV,
+            SERVER_OAUTH_PROXY_SEALING_SECRET_PREVIOUS_FILE_ENV,
+        ] {
+            for path in [missing.as_str(), directory.as_str()] {
+                let msg = env_apply_error(
+                    &[(var, Some(path))],
+                    env_oauth_server_config(Some(env_proxy())),
+                )?;
+                assert!(msg.contains(&format!("failed to read {var} file")), "{msg}");
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "oauth")]
+    #[test]
+    /// Pins that a short or blank secret is rejected naming the var, from
+    /// either source, without echoing the value.
+    fn oauth_proxy_weak_secret_rejected_naming_the_var() -> anyhow::Result<()> {
+        let short_file = env_temp_file("sealing-short", "short-secret-value\n")?;
+        let blank_file = env_temp_file("sealing-blank", "\n")?;
+        let short_path = short_file.to_string_lossy().to_string();
+        let blank_path = blank_file.to_string_lossy().to_string();
+        let cases = [
+            (
+                SERVER_OAUTH_PROXY_SEALING_SECRET_ENV,
+                "short-secret-value",
+                "at least 32",
+            ),
+            (
+                SERVER_OAUTH_PROXY_SEALING_SECRET_ENV,
+                "   ",
+                "must not be empty",
+            ),
+            (
+                SERVER_OAUTH_PROXY_SEALING_SECRET_PREVIOUS_ENV,
+                "short-secret-value",
+                "at least 32",
+            ),
+            (
+                SERVER_OAUTH_PROXY_SEALING_SECRET_FILE_ENV,
+                short_path.as_str(),
+                "at least 32",
+            ),
+            (
+                SERVER_OAUTH_PROXY_SEALING_SECRET_PREVIOUS_FILE_ENV,
+                blank_path.as_str(),
+                "must not be empty",
+            ),
+        ];
+        let outcome = cases.iter().try_for_each(|(var, value, expected)| {
+            let msg = env_apply_error(
+                &[(var, Some(value))],
+                env_oauth_server_config(Some(env_proxy())),
+            )?;
+            assert!(
+                msg.starts_with(&format!("configuration error: {var} must")),
+                "{msg}"
+            );
+            assert!(msg.contains(expected), "{msg}");
+            assert!(!msg.contains("short-secret-value"), "{msg}");
+            Ok::<(), anyhow::Error>(())
+        });
+        fs::remove_file(&short_file).context("remove short secret file")?;
+        fs::remove_file(&blank_file).context("remove blank secret file")?;
+        outcome
+    }
+
+    #[cfg(feature = "oauth")]
+    #[test]
+    /// Pins that with no new var set a TOML config carrying every new knob
+    /// comes out of `apply_env_overrides` unchanged with an empty report.
+    fn oauth_new_knobs_unchanged_without_env() -> anyhow::Result<()> {
+        type Snapshot = (
+            Option<Vec<String>>,
+            [bool; 3],
+            Vec<String>,
+            ProxyMode,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        fn snapshot(cfg: &ServerConfig) -> anyhow::Result<Snapshot> {
+            let oauth = env_oauth(cfg)?;
+            let proxy = env_oauth_proxy(cfg)?;
+            let expose = |secret: Option<&SecretString>| {
+                secret.map(|value| value.expose_secret().to_owned())
+            };
+            Ok((
+                oauth.challenge_scopes.clone(),
+                [
+                    oauth.insufficient_scope_challenge,
+                    oauth.accept_resource_audience,
+                    oauth.omit_error_on_missing_credential,
+                ],
+                oauth.additional_audiences.clone(),
+                proxy.mode,
+                expose(proxy.sealing_secret.as_ref()),
+                expose(proxy.sealing_secret_previous.as_ref()),
+                proxy.consent_ttl.clone(),
+            ))
+        }
+        let mut cfg: ServerConfig = toml::from_str(&format!(
+            r#"
+                [auth.oauth]
+                issuer = "https://idp.example/"
+                audience = "mcp"
+                jwks_uri = "https://idp.example/jwks"
+                challenge_scopes = ["mcp:read"]
+                insufficient_scope_challenge = true
+                additional_audiences = ["extra-aud"]
+                accept_resource_audience = true
+                omit_error_on_missing_credential = true
+                [auth.oauth.proxy]
+                authorize_url = "https://idp.example/authorize"
+                token_url = "https://idp.example/token"
+                client_id = "mcp"
+                mode = "authorization_server"
+                sealing_secret = "{ENV_SEALING_SECRET}"
+                sealing_secret_previous = "{ENV_SEALING_SECRET_PREVIOUS}"
+                consent_ttl = "2h"
+            "#
+        ))
+        .context("TOML with every new knob must parse")?;
+        let before = snapshot(&cfg)?;
+        let report = with_env_vars(&[], || cfg.apply_env_overrides())
+            .context("no env set must apply cleanly")?;
+        assert_eq!(report, []);
+        assert_eq!(snapshot(&cfg)?, before);
+        assert_eq!(before.3, ProxyMode::AuthorizationServer);
+        Ok(())
+    }
+
     #[test]
     /// Pins that a bad observability bool env var fails closed.
     fn e9_bad_observability_bool_env_fails_closed() -> anyhow::Result<()> {
@@ -6152,7 +7313,7 @@ client_ip = false
                 .iter()
                 .filter(|spec| spec.value_type == "Path")
                 .count(),
-            4
+            6
         );
         Ok(())
     }
@@ -6176,6 +7337,8 @@ client_ip = false
     // the key would be ambiguous rather than helpful.
     const INLINE_ENV_ANNOTATION_EXEMPTIONS: &[&str] = &[
         SERVER_SESSION_BINDING_SECRET_FILE_ENV,
+        SERVER_OAUTH_PROXY_SEALING_SECRET_FILE_ENV,
+        SERVER_OAUTH_PROXY_SEALING_SECRET_PREVIOUS_FILE_ENV,
         RBAC_REDACTION_SALT_FILE_ENV,
     ];
 
@@ -6249,6 +7412,72 @@ client_ip = false
         (
             SERVER_OAUTH_PROXY_STRIP_RESOURCE_PARAM_ENV,
             "server.auth.oauth.proxy.strip_resource_param",
+            Some("oauth"),
+            false,
+        ),
+        (
+            SERVER_OAUTH_CHALLENGE_SCOPES_ENV,
+            "server.auth.oauth.challenge_scopes",
+            Some("oauth"),
+            false,
+        ),
+        (
+            SERVER_OAUTH_INSUFFICIENT_SCOPE_CHALLENGE_ENV,
+            "server.auth.oauth.insufficient_scope_challenge",
+            Some("oauth"),
+            false,
+        ),
+        (
+            SERVER_OAUTH_ADDITIONAL_AUDIENCES_ENV,
+            "server.auth.oauth.additional_audiences",
+            Some("oauth"),
+            false,
+        ),
+        (
+            SERVER_OAUTH_ACCEPT_RESOURCE_AUDIENCE_ENV,
+            "server.auth.oauth.accept_resource_audience",
+            Some("oauth"),
+            false,
+        ),
+        (
+            SERVER_OAUTH_OMIT_ERROR_ON_MISSING_CREDENTIAL_ENV,
+            "server.auth.oauth.omit_error_on_missing_credential",
+            Some("oauth"),
+            false,
+        ),
+        (
+            SERVER_OAUTH_PROXY_MODE_ENV,
+            "server.auth.oauth.proxy.mode",
+            Some("oauth"),
+            false,
+        ),
+        (
+            SERVER_OAUTH_PROXY_SEALING_SECRET_ENV,
+            "server.auth.oauth.proxy.sealing_secret",
+            Some("oauth"),
+            true,
+        ),
+        (
+            SERVER_OAUTH_PROXY_SEALING_SECRET_FILE_ENV,
+            "server.auth.oauth.proxy.sealing_secret",
+            Some("oauth"),
+            true,
+        ),
+        (
+            SERVER_OAUTH_PROXY_SEALING_SECRET_PREVIOUS_ENV,
+            "server.auth.oauth.proxy.sealing_secret_previous",
+            Some("oauth"),
+            true,
+        ),
+        (
+            SERVER_OAUTH_PROXY_SEALING_SECRET_PREVIOUS_FILE_ENV,
+            "server.auth.oauth.proxy.sealing_secret_previous",
+            Some("oauth"),
+            true,
+        ),
+        (
+            SERVER_OAUTH_PROXY_CONSENT_TTL_ENV,
+            "server.auth.oauth.proxy.consent_ttl",
             Some("oauth"),
             false,
         ),

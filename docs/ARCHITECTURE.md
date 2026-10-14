@@ -922,8 +922,8 @@ retiring.
 
 **TOML** - the deserializable sections:
 
-- `ServerConfig` - `src/config.rs:373`
-- `ObservabilityConfig` - `src/config.rs:1365`
+- `ServerConfig` - `src/config.rs:487`
+- `ObservabilityConfig` - `src/config.rs:1807`
 - `SecurityHeadersConfig` - `src/transport.rs:292`
 - `AuthConfig`, `MtlsConfig`, `RateLimitConfig` - `src/auth.rs`
 - `RbacConfig` - `src/rbac.rs`
@@ -934,15 +934,15 @@ sections into its own root type. `[server]`, `[rbac]` and `[observability]`
 are a convention from [`docs/GUIDE.md`](GUIDE.md), not a type.
 
 `ServerConfig` was schema-only until 3.4.0 - nothing in the crate consumed it.
-`ServerConfig::apply_to_mcp_config` (`src/config.rs:945`) is the bridge that
+`ServerConfig::apply_to_mcp_config` (`src/config.rs:1061`) is the bridge that
 makes it reachable. It uses **replacement semantics**: authoritative for every
 bridgeable transport field, with `None`/`false` clearing whatever the base
 held. Only the runtime-only fields above survive from the base. It is fallible
 (duration strings parse here) and never reads the environment.
 
 **Environment (opt-in)** - three inherent methods, one per section owning
-targeted fields: `ServerConfig::apply_env_overrides` (`src/config.rs:687`),
-`ObservabilityConfig::apply_env_overrides` (`src/config.rs:1046`) and
+targeted fields: `ServerConfig::apply_env_overrides` (`src/config.rs:802`),
+`ObservabilityConfig::apply_env_overrides` (`src/config.rs:1162`) and
 `RbacConfig::apply_env_overrides` (`src/rbac.rs:1905`). Each returns
 `Vec<EnvOverride>` (`src/config.rs:92`) for audit logging, with `value: None`
 for secret targets. Curated variables under the `RMCP_SERVER_KIT__`
