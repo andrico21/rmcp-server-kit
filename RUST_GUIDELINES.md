@@ -134,7 +134,7 @@ defined cleanup order, and no panic path. `scripts/lint-ratchet/prose_gates.py
 | `Drop for JwksCache` | `src/oauth.rs:3329` | Sync, non-blocking `CancellationToken::cancel` for cache-owned JWKS refresh tasks; no I/O, await or panic path. No defect. |
 | `TracingGuard` | `src/observability.rs:137` | Delegates to `AuditWorkerGuard` by taking the `Option`; sync, no await, no panic path. Bounded by design (5s). No defect. |
 | `Drop for AuditWorkerGuard` | `src/observability.rs:392` | Signals shutdown then parks/joins the writer thread for at most `AUDIT_WRITER_JOIN_TIMEOUT` (5s); no async work or panic path. Bounded blocking is deliberate and documented. No defect. |
-| `Drop for CancelOnDrop` | `src/transport.rs:3016` | Sync, non-blocking `CancellationToken::cancel`; no I/O, await or panic path. Never disarmed on purpose. No defect. |
+| `Drop for CancelOnDrop` | `src/transport.rs:3048` | Sync, non-blocking `CancellationToken::cancel`; no I/O, await or panic path. Never disarmed on purpose. No defect. |
 | `Drop for TlsListener` | `src/transport.rs:4010` | Sync, non-blocking `JoinHandle::abort`; in-flight workers exit on the closed channel. No I/O, await or panic path. No defect. |
 | `Drop for ReleaseHookOnDrop` | `src/auth.rs:1738` | Test-only. Flips the `AtomicBool` gate of a `VerificationHook`; sync, no I/O or await, no panic path. Runs on unwind too, which unparks any `spawn_blocking` closure still busy-waiting before the test's `Runtime` drops. No defect. |
 

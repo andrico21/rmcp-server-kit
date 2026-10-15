@@ -443,6 +443,7 @@ mod tests {
 
     fn test_identity(name: &str, method: AuthMethod, sub: Option<&str>) -> AuthIdentity {
         AuthIdentity {
+            granted_scopes: None,
             name: name.to_owned(),
             role: "ops".to_owned(),
             method,

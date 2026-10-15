@@ -74,6 +74,11 @@ use crate::{
 )]
 #[derive(Clone)]
 #[non_exhaustive]
+#[expect(
+    clippy::partial_pub_fields,
+    clippy::field_scoped_visibility_modifiers,
+    reason = "deliberate: AuthIdentity::granted_scopes must stay crate-private authorization context"
+)]
 pub struct AuthIdentity {
     /// Human-readable identity name (e.g. API key label or cert CN).
     pub name: String,
@@ -90,8 +95,14 @@ pub struct AuthIdentity {
     /// JWT `sub` claim (stable user identifier, e.g. Keycloak UUID).
     /// Used for token store keying. `None` for non-JWT auth.
     pub sub: Option<String>,
+    /// Verified token scopes for scope-derived roles; never exposed in Debug.
+    pub(crate) granted_scopes: Option<Arc<[String]>>,
 }
 
+#[expect(
+    clippy::missing_fields_in_debug,
+    reason = "deliberate: AuthIdentity::fmt omits verified scopes to preserve byte-identical redacted Debug output"
+)]
 impl Debug for AuthIdentity {
     /// Redacts `raw_token` and `sub` to prevent secret leakage via
     /// `format!("{:?}")` or `tracing::debug!(?identity)`.
@@ -2035,6 +2046,7 @@ pub fn extract_mtls_identity(cert_der: &[u8], default_role: &str) -> Option<Auth
     }
 
     Some(AuthIdentity {
+        granted_scopes: None,
         name: resolved_name,
         role: default_role.to_owned(),
         method: AuthMethod::MtlsCertificate,
@@ -2127,6 +2139,7 @@ fn extract_bearer(value: &str) -> Option<&str> {
 pub fn verify_bearer_token(token: &str, keys: &[ApiKeyEntry]) -> Option<AuthIdentity> {
     match verify_bearer_token_verdict(token, keys) {
         ApiKeyVerdict::Active { name, role } => Some(AuthIdentity {
+            granted_scopes: None,
             name,
             role,
             method: AuthMethod::BearerToken,
@@ -2609,6 +2622,7 @@ async fn authenticate_bearer_identity(
     match verdict {
         Some(ApiKeyVerdict::Active { name, role }) => {
             return Ok(AuthIdentity {
+                granted_scopes: None,
                 name,
                 role,
                 method: AuthMethod::BearerToken,
@@ -4041,6 +4055,7 @@ mod tests {
         );
         let peer: SocketAddr = "10.0.0.20:54321".parse()?;
         let identity = AuthIdentity {
+            granted_scopes: None,
             name: "cn=test-client".into(),
             role: "viewer".into(),
             method: AuthMethod::MtlsCertificate,
@@ -5314,6 +5329,7 @@ mod tests {
         let app = auth_router(Arc::clone(&state));
         let peer: SocketAddr = "10.0.0.20:54321".parse()?;
         let identity = AuthIdentity {
+            granted_scopes: None,
             name: "cn=test-client".into(),
             role: "viewer".into(),
             method: AuthMethod::MtlsCertificate,
@@ -5612,6 +5628,7 @@ mod tests {
     #[test]
     fn auth_identity_debug_redacts_raw_token() -> anyhow::Result<()> {
         let id = AuthIdentity {
+            granted_scopes: None,
             name: "alice".into(),
             role: "admin".into(),
             method: AuthMethod::OAuthJwt,
@@ -5651,6 +5668,7 @@ mod tests {
         // For non-OAuth identities (mTLS / API key) the secret fields are
         // None; redacted Debug output should distinguish that from "present".
         let id = AuthIdentity {
+            granted_scopes: None,
             name: "viewer-key".into(),
             role: "viewer".into(),
             method: AuthMethod::BearerToken,

@@ -197,6 +197,7 @@ mod tests {
     /// Build a bearer-token identity with the given name.
     fn identity(name: &str) -> AuthIdentity {
         AuthIdentity {
+            granted_scopes: None,
             name: name.to_owned(),
             role: "ops".to_owned(),
             method: AuthMethod::BearerToken,

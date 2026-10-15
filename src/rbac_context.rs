@@ -639,6 +639,7 @@ mod tests {
 
     fn viewer() -> AuthIdentity {
         AuthIdentity {
+            granted_scopes: None,
             name: "viewer-key".to_owned(),
             role: "viewer".to_owned(),
             method: AuthMethod::BearerToken,
@@ -988,6 +989,7 @@ mod tests {
 
     fn identity_named(name: &str) -> AuthIdentity {
         AuthIdentity {
+            granted_scopes: None,
             name: name.to_owned(),
             role: "viewer".to_owned(),
             method: AuthMethod::BearerToken,

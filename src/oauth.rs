@@ -3900,6 +3900,15 @@ impl JwksCache {
         let name = identity_label(&claims, sub.as_deref());
 
         Ok(AuthIdentity {
+            granted_scopes: self.shared.role_claim.is_none().then(|| {
+                claims
+                    .scope
+                    .as_deref()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Arc<[String]>>()
+            }),
             name,
             role,
             method: AuthMethod::OAuthJwt,
@@ -12304,6 +12313,395 @@ role = "admin"
     // -----------------------------------------------------------------------
     // JWKS refresh cooldown tests
     // -----------------------------------------------------------------------
+
+    /// Scope-derived identities retain verified scopes but claim-derived identities do not.
+    #[tokio::test]
+    async fn step_up_granted_scopes_follow_role_source_and_debug_stays_redacted()
+    -> anyhow::Result<()> {
+        // Given signed tokens with ordinary, duplicate and odd-whitespace
+        // scopes, and one holding every scope-alphabet spelling (no or empty
+        // namespace, dots, slashes, a URL, case variants, digits, `~ % +`,
+        // punctuation, role names, 200 bytes) behind Unicode separators.
+        let kid = "step-up-scopes";
+        let (pem, jwks) = generate_test_keypair(kid)?;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(matchers::method("GET"))
+            .and(matchers::path("/jwks.json"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&jwks))
+            .mount(&server)
+            .await;
+        let long = format!("mcp:{}", "long".repeat(49));
+        let separators = [" ", "\u{3000}", "\t", "\u{a0}", "\u{2003}", "\u{85}", "\n"];
+        let mut alphabet = String::from("mcp:read");
+        for (spelling, separator) in [
+            "read",
+            "admin",
+            "mcp:",
+            ":read",
+            "a:b:c",
+            "mcp.read",
+            "api/read",
+            "https://example.test/scope/read",
+            "mcp:read-only",
+            "mcp_admin",
+            "READ",
+            "Mcp:Admin",
+            "mcp:v2",
+            "scope42",
+            "mcp:~a%2B+b",
+            "!#$&'()*,;<=>?@[]^`{|}",
+            "ops",
+            "viewer",
+            "urn:example:mcp:tools.admin",
+            long.as_str(),
+        ]
+        .into_iter()
+        .zip(separators.into_iter().cycle())
+        {
+            alphabet.push_str(separator);
+            alphabet.push_str(spelling);
+        }
+        for scope in [
+            "mcp:read other".to_owned(),
+            " \tmcp:read\nother  mcp:read \r".to_owned(),
+            "MCP:READ mcp:read Other".to_owned(),
+            format!("mcp:read {}", "other ".repeat(4096)),
+            alphabet,
+        ] {
+            for claim_role in [false, true] {
+                let mut config = test_config(&format!("{}/jwks.json", server.uri()));
+                if claim_role {
+                    config.role_claim = Some("scope".into());
+                    config.role_mappings = vec![RoleMapping {
+                        claim_value: "mcp:read".into(),
+                        role: "viewer".into(),
+                    }];
+                }
+                let cache = test_cache(&config)?;
+                let token = mint_token(
+                    &pem,
+                    kid,
+                    "https://auth.test.local",
+                    "https://mcp.test.local/mcp",
+                    "scope-user",
+                    &scope,
+                )?;
+                // When the actual JWT validator authenticates the token.
+                let identity = cache
+                    .validate_token(&token)
+                    .await
+                    .context("scope identity")?;
+                // Then only scope resolution carries scopes, and Debug is byte-identical.
+                let expected = (!claim_role).then(|| {
+                    scope
+                        .split_whitespace()
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                });
+                assert_eq!(identity.granted_scopes.as_deref(), expected.as_deref());
+                assert_eq!(
+                    format!("{identity:?}"),
+                    "AuthIdentity { name: \"scope-user\", role: \"viewer\", method: OAuthJwt, raw_token: \"<none>\", sub: \"<redacted>\" }"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Unicode-whitespace scopes are split for hints as role resolution splits them.
+    ///
+    /// A hint is issued iff adding that scope to the verified claim really
+    /// changes the resolved role to one that may make the call.
+    #[tokio::test]
+    async fn step_up_unicode_whitespace_scopes_hint_like_real_resolution() -> anyhow::Result<()> {
+        use crate::rbac::{RbacConfig, RbacPolicy, RoleConfig, ScopeChallenge, evaluate_tool_call};
+
+        // Given claims joined by ideographic, no-break and em spaces, both
+        // mapping orders, and roles that each own one exclusive tool.
+        let kid = "step-up-unicode-ws";
+        let (pem, jwks) = generate_test_keypair(kid)?;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(matchers::method("GET"))
+            .and(matchers::path("/jwks.json"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&jwks))
+            .mount(&server)
+            .await;
+        let policy = RbacPolicy::new(&RbacConfig::with_roles(vec![
+            RoleConfig::new(
+                "viewer",
+                vec!["echo".into(), "view_only".into()],
+                vec!["*".into()],
+            ),
+            RoleConfig::new(
+                "ops",
+                vec!["echo".into(), "admin_only".into()],
+                vec!["*".into()],
+            ),
+        ]));
+        let admin = ("mcp:admin", "ops");
+        let read = ("mcp:read", "viewer");
+        let mut any_hint = false;
+        for mappings in [vec![admin, read], vec![read, admin]] {
+            let mut config = test_config(&format!("{}/jwks.json", server.uri()));
+            config.scopes = mappings
+                .iter()
+                .map(|(scope, role)| ScopeMapping {
+                    scope: (*scope).into(),
+                    role: (*role).into(),
+                })
+                .collect();
+            let cache = test_cache(&config)?;
+            let challenge = ScopeChallenge {
+                scope_roles: config
+                    .scopes
+                    .iter()
+                    .map(|mapping| (mapping.scope.clone(), mapping.role.clone()))
+                    .collect(),
+                resource_metadata: "/.well-known/oauth-protected-resource".into(),
+            };
+            for claim in [
+                "mcp:read\u{3000}mcp:admin",
+                "mcp:read\u{a0}mcp:admin",
+                "mcp:admin\u{2003}other",
+                "\u{3000}mcp:read\u{a0}",
+                "other\u{a0}mcp:admin",
+            ] {
+                let token = mint_token(
+                    &pem,
+                    kid,
+                    "https://auth.test.local",
+                    "https://mcp.test.local/mcp",
+                    "scope-user",
+                    claim,
+                )?;
+                // When the actual validator populates the identity from the token.
+                let identity = cache.validate_token(&token).await.context("identity")?;
+                let claims: Claims =
+                    serde_json::from_value(serde_json::json!({"scope":claim,"exp":u64::MAX}))?;
+                let resolved = cache
+                    .resolve_role(&claims)
+                    .map_err(|_failure| anyhow::anyhow!("claim role"))?;
+                assert_eq!(identity.role, resolved, "{mappings:?} {claim:?}");
+                for tool in ["echo", "view_only", "admin_only", "never_allowed"] {
+                    let params = serde_json::json!({"name":tool});
+                    let hint = challenge.unlocking_scope(&policy, &identity, &[&params]);
+                    let mut unlocking = Vec::new();
+                    for mapping in &config.scopes {
+                        let union: Claims = serde_json::from_value(
+                            serde_json::json!({"scope":format!("{claim} {}", mapping.scope),"exp":u64::MAX}),
+                        )?;
+                        let role = cache
+                            .resolve_role(&union)
+                            .map_err(|_failure| anyhow::anyhow!("union role"))?;
+                        if role != identity.role
+                            && evaluate_tool_call(&policy, &role, &params).is_ok()
+                        {
+                            unlocking.push(mapping.scope.as_str());
+                        }
+                    }
+                    // Then the hint is exactly the first scope whose addition really
+                    // changes the resolved role to one that passes the call.
+                    assert_eq!(
+                        hint,
+                        unlocking.first().copied(),
+                        "{mappings:?} {claim:?} {tool}"
+                    );
+                    any_hint |= hint.is_some();
+                }
+            }
+        }
+        assert!(any_hint, "fixture never produces a hint");
+        Ok(())
+    }
+
+    /// One exact-hint pin: token scope claim, tool name and the expected hint.
+    type StepUpPin = (&'static str, &'static str, Option<&'static str>);
+
+    /// Scope mappings in configuration order with the hints pinned for them.
+    type StepUpOrder = (Vec<(&'static str, &'static str)>, Vec<StepUpPin>);
+
+    /// Token scope claims: case variants, duplicates, padding and unmapped scopes.
+    const STEP_UP_TOKEN_SCOPES: [&str; 12] = [
+        "mcp:read",
+        "mcp:admin",
+        "mcp:read mcp:admin",
+        "mcp:read mcp:read other",
+        " \tmcp:read\n mcp:read ",
+        "MCP:READ",
+        "MCP:READ mcp:x",
+        "mcp:read mcp:x",
+        "Mcp:Admin mcp:read",
+        "MCP:ADMIN mcp:read",
+        "mcp:x",
+        "mcp:root",
+    ];
+
+    /// Two- to four-mapping orders (several with more than one unlocking scope,
+    /// one with a case-variant configured scope) and their exact hint pins.
+    fn step_up_jwks_orders() -> Vec<StepUpOrder> {
+        let read = ("mcp:read", "viewer");
+        let admin = ("mcp:admin", "ops");
+        let root = ("mcp:root", "root");
+        let nobody = ("mcp:x", "nobody");
+        let upper_admin = ("MCP:ADMIN", "root");
+        vec![
+            (vec![read, admin], vec![("mcp:read", "admin_only", None)]),
+            (
+                vec![admin, read],
+                vec![("mcp:read", "admin_only", Some("mcp:admin"))],
+            ),
+            (
+                vec![root, admin, read],
+                vec![
+                    ("mcp:read", "admin_only", Some("mcp:root")),
+                    (" \tmcp:read\n mcp:read ", "admin_only", Some("mcp:root")),
+                    ("mcp:admin", "admin_only", Some("mcp:root")),
+                ],
+            ),
+            (
+                vec![admin, root, read],
+                vec![
+                    ("mcp:read", "admin_only", Some("mcp:admin")),
+                    ("mcp:read", "root_only", Some("mcp:root")),
+                    ("mcp:admin", "root_only", None),
+                ],
+            ),
+            (
+                vec![read, root, admin],
+                vec![("mcp:read", "admin_only", None)],
+            ),
+            (
+                vec![read, admin, nobody],
+                vec![
+                    ("MCP:READ mcp:x", "admin_only", Some("mcp:admin")),
+                    ("MCP:READ mcp:x", "echo", Some("mcp:read")),
+                    ("mcp:read mcp:x", "admin_only", None),
+                ],
+            ),
+            (
+                vec![nobody, admin, read, root],
+                vec![
+                    ("mcp:read", "admin_only", Some("mcp:admin")),
+                    ("Mcp:Admin mcp:read", "admin_only", Some("mcp:admin")),
+                ],
+            ),
+            (
+                vec![upper_admin, admin, read],
+                vec![
+                    ("mcp:read", "root_only", Some("MCP:ADMIN")),
+                    ("mcp:read", "admin_only", Some("MCP:ADMIN")),
+                    ("mcp:admin", "root_only", Some("MCP:ADMIN")),
+                ],
+            ),
+            (
+                vec![read, admin, root],
+                vec![("mcp:read mcp:x", "root_only", None)],
+            ),
+        ]
+    }
+
+    /// Real JWT role resolution independently proves every step-up hint can unlock its call.
+    #[tokio::test]
+    async fn step_up_hints_agree_with_real_jwks_role_resolution() -> anyhow::Result<()> {
+        use crate::rbac::{RbacConfig, RbacPolicy, RoleConfig, ScopeChallenge, evaluate_tool_call};
+
+        // Given two- to four-mapping orders (several with more than one unlocking
+        // scope, one with a case-variant configured scope), case-variant, duplicate
+        // and whitespace-padded token scopes, and exact hints pinned per order.
+        let policy = RbacPolicy::new(&RbacConfig::with_roles(vec![
+            RoleConfig::new("viewer", vec!["echo".into()], vec!["*".into()]),
+            RoleConfig::new(
+                "ops",
+                vec!["echo".into(), "admin_only".into()],
+                vec!["*".into()],
+            ),
+            RoleConfig::new(
+                "root",
+                vec!["echo".into(), "admin_only".into(), "root_only".into()],
+                vec!["*".into()],
+            ),
+        ]));
+        let orders = step_up_jwks_orders();
+        let mut pins_checked = 0_usize;
+        for (mappings, pins) in &orders {
+            let mut config = test_config("http://localhost:1/jwks.json");
+            config.scopes = mappings
+                .iter()
+                .map(|(scope, role)| ScopeMapping {
+                    scope: (*scope).into(),
+                    role: (*role).into(),
+                })
+                .collect();
+            let cache = test_cache(&config)?;
+            let challenge = ScopeChallenge {
+                scope_roles: config
+                    .scopes
+                    .iter()
+                    .map(|mapping| (mapping.scope.clone(), mapping.role.clone()))
+                    .collect(),
+                resource_metadata: "/.well-known/oauth-protected-resource".into(),
+            };
+            for scope in STEP_UP_TOKEN_SCOPES {
+                let claims: Claims =
+                    serde_json::from_value(serde_json::json!({"scope":scope,"exp":u64::MAX}))?;
+                // A token whose scopes resolve to no role is rejected before RBAC runs.
+                let Ok(current_role) = cache.resolve_role(&claims) else {
+                    continue;
+                };
+                let identity = AuthIdentity {
+                    name: "scope-user".into(),
+                    role: current_role,
+                    method: AuthMethod::OAuthJwt,
+                    raw_token: None,
+                    sub: None,
+                    granted_scopes: Some(scope.split_whitespace().map(str::to_owned).collect()),
+                };
+                for tool in ["echo", "admin_only", "root_only", "never_allowed"] {
+                    let params = serde_json::json!({"name":tool});
+                    // When the hint is compared with exhaustive real JWT resolution.
+                    let hint = challenge.unlocking_scope(&policy, &identity, &[&params]);
+                    let mut unlocking = Vec::new();
+                    for mapping in &config.scopes {
+                        if scope
+                            .split_whitespace()
+                            .any(|granted| granted == mapping.scope)
+                        {
+                            continue;
+                        }
+                        let union: Claims = serde_json::from_value(
+                            serde_json::json!({"scope":format!("{scope} {}", mapping.scope),"exp":u64::MAX}),
+                        )?;
+                        let role = cache
+                            .resolve_role(&union)
+                            .map_err(|_failure| anyhow::anyhow!("union role"))?;
+                        if role != identity.role
+                            && evaluate_tool_call(&policy, &role, &params).is_ok()
+                        {
+                            unlocking.push(mapping.scope.as_str());
+                        }
+                    }
+                    // Then the first actual unlocking scope in config order is exactly the hint.
+                    assert_eq!(
+                        hint,
+                        unlocking.first().copied(),
+                        "{mappings:?} {scope:?} {tool}"
+                    );
+                    for (_, _, expected) in pins
+                        .iter()
+                        .filter(|(pin_scope, pin_tool, _)| *pin_scope == scope && *pin_tool == tool)
+                    {
+                        assert_eq!(hint, *expected, "pin {mappings:?} {scope:?} {tool}");
+                        pins_checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            pins_checked,
+            orders.iter().map(|(_, pins)| pins.len()).sum::<usize>()
+        );
+        Ok(())
+    }
 
     /// Deduplicates concurrent cache misses into exactly one JWKS fetch.
     #[tokio::test]

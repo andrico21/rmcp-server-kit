@@ -58,6 +58,8 @@ use crate::oauth::JwksCache;
 use crate::oauth::OAuthConfig;
 #[cfg(feature = "oauth")]
 use crate::oauth::{OAuthProxyConfig, OauthHttpClient, ProxyMode};
+#[cfg(feature = "oauth")]
+use crate::rbac::ScopeChallenge;
 use crate::{
     admin::AdminState,
     auth::{
@@ -2617,10 +2619,38 @@ where
 
         let rbac_for_mw = Arc::clone(&rbac_swap);
         let deny_log_knobs = DenyLogKnobs::from_config(&config.log_context);
+        #[cfg(feature = "oauth")]
+        let scope_challenge = config
+            .auth
+            .as_ref()
+            .and_then(|auth| auth.oauth.as_ref())
+            .filter(|oauth| oauth.insufficient_scope_challenge)
+            .map(|oauth| {
+                Arc::new(ScopeChallenge {
+                    scope_roles: oauth
+                        .scopes
+                        .iter()
+                        .map(|mapping| (mapping.scope.clone(), mapping.role.clone()))
+                        .collect(),
+                    resource_metadata: config.public_url.as_deref().map_or_else(
+                        || "/.well-known/oauth-protected-resource".into(),
+                        mcp_resource_metadata_url,
+                    ),
+                })
+            });
+        #[cfg(not(feature = "oauth"))]
+        let scope_challenge = None;
         mcp_router = mcp_router.layer(from_fn(move |req, next| {
             let policy = rbac_for_mw.load_full();
             let tl = tool_limiter.clone();
-            rbac_middleware(policy, tl, deny_log_knobs, req, next)
+            rbac_middleware(
+                policy,
+                tl,
+                deny_log_knobs,
+                scope_challenge.clone(),
+                req,
+                next,
+            )
         }));
     }
 

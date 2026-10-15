@@ -3397,6 +3397,1093 @@ mod tests {
         Ok(())
     }
 
+    /// Step-up names a scope that unlocks the call without changing the denial body.
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn insufficient_scope_challenge_names_unlocking_scope() -> anyhow::Result<()> {
+        use wiremock::{Mock, ResponseTemplate, matchers};
+
+        // Given a read-only token and an admin-first scope mapping.
+        let kid = "step-up-kid";
+        let (pem, jwks_body) = generate_oauth_test_keypair(kid)?;
+        let jwks = DualStackMock::start().await?;
+        jwks.mount(|| {
+            Mock::given(matchers::method("GET"))
+                .and(matchers::path("/jwks.json"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_body))
+        })
+        .await;
+        let token = mint_oauth_test_token(&pem, kid)?;
+        for enabled in [true, false] {
+            let oauth: OAuthConfig = serde_json::from_value(serde_json::json!({
+                "issuer": "https://auth.test.local",
+                "audience": "https://mcp.test.local/mcp",
+                "jwks_uri": format!("http://localhost:{}/jwks.json", jwks.port()),
+                "allow_http_oauth_urls": true,
+                "ssrf_allowlist": {"hosts": ["localhost"], "cidrs": ["127.0.0.0/8"]},
+                "scopes": [{"scope": "mcp:admin", "role": "ops"}, {"scope": "mcp:read", "role": "viewer"}],
+                "insufficient_scope_challenge": enabled
+            }))?;
+            let mut auth = AuthConfig::with_keys(vec![]);
+            auth.oauth = Some(oauth);
+            let policy = Arc::new(RbacPolicy::new(&RbacConfig::with_roles(vec![
+                RoleConfig::new("viewer", vec!["echo".into()], vec!["*".into()]),
+                RoleConfig::new("ops", vec!["*".into()], vec!["*".into()]),
+            ])));
+            let port = free_port().await?;
+            let base = spawn_server(
+                config_on_port(port)
+                    .with_auth(auth)
+                    .with_rbac(policy)
+                    .with_public_url(format!("http://127.0.0.1:{port}")),
+            )
+            .await?;
+
+            // When the caller requests a tool forbidden to its current role.
+            let response = reqwest::Client::new().post(format!("{base}/mcp"))
+                .bearer_auth(&token)
+                .json(&serde_json::json!({"jsonrpc": "2.0", "id": 1_u32, "method": "tools/call", "params": {"name": "admin_only", "arguments": {}}}))
+                .send().await?;
+
+            // Then only the opt-in header differs; access remains denied.
+            assert_eq!(response.status(), 403);
+            let expected = enabled.then(|| format!(r#"Bearer error="insufficient_scope", scope="mcp:admin", resource_metadata="http://127.0.0.1:{port}/.well-known/oauth-protected-resource/mcp", error_description="additional scope required""#));
+            assert_eq!(
+                response
+                    .headers()
+                    .get_all("www-authenticate")
+                    .iter()
+                    .map(|value| value.to_str())
+                    .collect::<Result<Vec<_>, _>>()?,
+                expected.as_deref().into_iter().collect::<Vec<_>>()
+            );
+            assert_eq!(
+                response.text().await?,
+                "admin_only denied for role 'viewer'"
+            );
+        }
+        Ok(())
+    }
+
+    /// OAuth settings for the step-up mapping-order scenarios.
+    #[cfg(feature = "oauth")]
+    fn step_up_auth(
+        jwks_port: u16,
+        scopes: &serde_json::Value,
+        enabled: bool,
+    ) -> anyhow::Result<AuthConfig> {
+        let oauth: OAuthConfig = serde_json::from_value(serde_json::json!({
+            "issuer": "https://auth.test.local",
+            "audience": "https://mcp.test.local/mcp",
+            "jwks_uri": format!("http://localhost:{jwks_port}/jwks.json"),
+            "allow_http_oauth_urls": true,
+            "ssrf_allowlist": {"hosts": ["localhost"], "cidrs": ["127.0.0.0/8"]},
+            "scopes": scopes,
+            "insufficient_scope_challenge": enabled
+        }))?;
+        let mut auth = AuthConfig::with_keys(vec![]);
+        auth.oauth = Some(oauth);
+        Ok(auth)
+    }
+
+    /// Roles whose names prefix each other, plus a strictly widening chain.
+    #[cfg(feature = "oauth")]
+    fn step_up_e2e_policy() -> Arc<RbacPolicy> {
+        let star = || vec!["*".to_owned()];
+        Arc::new(RbacPolicy::new(&RbacConfig::with_roles(vec![
+            RoleConfig::new("viewer", vec!["echo".into()], star()),
+            RoleConfig::new(
+                "viewer-plus",
+                vec!["echo".into(), "admin_only".into()],
+                star(),
+            ),
+            RoleConfig::new("ops-ro", vec!["echo".into()], star()),
+            RoleConfig::new("ops", vec!["echo".into(), "admin_only".into()], star()),
+            RoleConfig::new(
+                "root",
+                vec!["echo".into(), "admin_only".into(), "root_only".into()],
+                star(),
+            ),
+        ])))
+    }
+
+    /// Knob-on versus knob-off comparison of one mapping-order scenario.
+    #[cfg(feature = "oauth")]
+    struct StepUpOrderCase {
+        /// `oauth.scopes` exactly as configured, in order.
+        scopes: serde_json::Value,
+        /// Tool the `mcp:read` token's role is denied.
+        tool: &'static str,
+        /// Role the real JWT resolution assigns to the `mcp:read` token.
+        role: &'static str,
+        /// Whether the server advertises an absolute `public_url`.
+        public_url: bool,
+        /// Scope the knob-on challenge must name, or `None` for a bare 403.
+        hint: Option<&'static str>,
+    }
+
+    /// Mapping lists whose config order differs from sorted order, with a
+    /// duplicate scope, more than two entries, and prefix-related role names.
+    #[cfg(feature = "oauth")]
+    fn step_up_order_cases() -> Vec<StepUpOrderCase> {
+        let map = |scope: &str, role: &str| serde_json::json!({"scope": scope, "role": role});
+        let case = |scopes: Vec<serde_json::Value>, tool, role, public_url, hint| StepUpOrderCase {
+            scopes: serde_json::Value::Array(scopes),
+            tool,
+            role,
+            public_url,
+            hint,
+        };
+        vec![
+            // Read first: adding mcp:admin still resolves to viewer, so no hint.
+            case(
+                vec![map("mcp:read", "viewer"), map("mcp:admin", "ops")],
+                "admin_only",
+                "viewer",
+                true,
+                None,
+            ),
+            // Duplicate scope: the first mcp:admin mapping (ops) wins, never root.
+            case(
+                vec![
+                    map("mcp:admin", "ops"),
+                    map("mcp:admin", "root"),
+                    map("mcp:read", "viewer"),
+                ],
+                "root_only",
+                "viewer",
+                false,
+                None,
+            ),
+            // Config order, not alphabetical order, picks the hint.
+            case(
+                vec![
+                    map("mcp:zeta", "ops"),
+                    map("mcp:alpha", "root"),
+                    map("mcp:read", "viewer"),
+                ],
+                "admin_only",
+                "viewer",
+                true,
+                Some("mcp:zeta"),
+            ),
+            // Only the third of four mappings unlocks the call.
+            case(
+                vec![
+                    map("mcp:x", "ops-ro"),
+                    map("mcp:y", "ops-ro"),
+                    map("mcp:admin", "ops"),
+                    map("mcp:read", "viewer"),
+                ],
+                "admin_only",
+                "viewer",
+                false,
+                Some("mcp:admin"),
+            ),
+            // The current role is a longer name than the unlocking role.
+            case(
+                vec![map("mcp:admin", "ops"), map("mcp:read", "ops-ro")],
+                "admin_only",
+                "ops-ro",
+                true,
+                Some("mcp:admin"),
+            ),
+            // The unlocking role is a longer name than the current role.
+            case(
+                vec![map("mcp:plus", "viewer-plus"), map("mcp:read", "viewer")],
+                "admin_only",
+                "viewer",
+                false,
+                Some("mcp:plus"),
+            ),
+        ]
+    }
+
+    /// Status, step-up challenge, every other header except `date`, and body.
+    #[cfg(feature = "oauth")]
+    type StepUpOutcome = (
+        reqwest::StatusCode,
+        Option<String>,
+        Vec<(String, String)>,
+        String,
+    );
+
+    /// Calls `tool` on a fresh `config` server with `token`, after checking
+    /// that its unauthenticated 401 never carries a scope hint.
+    #[cfg(feature = "oauth")]
+    async fn step_up_outcome(
+        config: McpServerConfig,
+        token: &str,
+        tool: &str,
+    ) -> anyhow::Result<StepUpOutcome> {
+        let base = spawn_server(config).await?;
+        let client = reqwest::Client::new();
+        let call = serde_json::json!({"jsonrpc": "2.0", "id": 1_u32, "method": "tools/call", "params": {"name": tool, "arguments": {}}});
+        let unauthenticated = client
+            .post(format!("{base}/mcp"))
+            .json(&call)
+            .send()
+            .await?;
+        assert_eq!(unauthenticated.status(), 401);
+        for value in unauthenticated.headers().get_all("www-authenticate") {
+            assert!(!value.to_str()?.contains("insufficient_scope"), "{value:?}");
+        }
+        let response = client
+            .post(format!("{base}/mcp"))
+            .bearer_auth(token)
+            .json(&call)
+            .send()
+            .await?;
+        let status = response.status();
+        let challenge = response
+            .headers()
+            .get("www-authenticate")
+            .map(|value| value.to_str().map(str::to_owned))
+            .transpose()?;
+        assert_eq!(
+            response
+                .headers()
+                .get_all("www-authenticate")
+                .iter()
+                .count(),
+            usize::from(challenge.is_some()),
+            "a hinted 403 carries exactly one challenge field"
+        );
+        let mut headers: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .filter(|(name, _)| *name != "date" && *name != "www-authenticate")
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_owned(),
+                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
+        headers.sort();
+        Ok((status, challenge, headers, response.text().await?))
+    }
+
+    /// `serve()` resolves hints from the configured mapping list as written:
+    /// order, duplicate scopes and prefix-related role names are preserved.
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn insufficient_scope_challenge_follows_configured_mapping_order() -> anyhow::Result<()> {
+        use wiremock::{Mock, ResponseTemplate, matchers};
+
+        // Given an `mcp:read` token, real JWKS validation and every order case.
+        let kid = "step-up-order-kid";
+        let (pem, jwks_body) = generate_oauth_test_keypair(kid)?;
+        let jwks = DualStackMock::start().await?;
+        jwks.mount(|| {
+            Mock::given(matchers::method("GET"))
+                .and(matchers::path("/jwks.json"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_body))
+        })
+        .await;
+        let token = mint_oauth_test_token(&pem, kid)?;
+        for case in step_up_order_cases() {
+            let port = free_port().await?;
+            let origin = format!("http://127.0.0.1:{port}");
+            // The trailing slash must not leak into the advertised metadata URL.
+            let public_url = case.public_url.then(|| format!("{origin}/"));
+            let mut outcomes = Vec::new();
+            for enabled in [true, false] {
+                let mut config = config_on_port(0)
+                    .with_auth(step_up_auth(jwks.port(), &case.scopes, enabled)?)
+                    .with_rbac(step_up_e2e_policy());
+                if let Some(url) = &public_url {
+                    config = config.with_public_url(url.clone());
+                }
+                // When the token's current role is denied the tool.
+                outcomes.push(step_up_outcome(config, &token, case.tool).await?);
+            }
+            // Then the knob only adds the configured-order hint to the same 403.
+            let metadata = if case.public_url {
+                format!("{origin}/.well-known/oauth-protected-resource/mcp")
+            } else {
+                "/.well-known/oauth-protected-resource".to_owned()
+            };
+            let expected = case.hint.map(|scope| format!(r#"Bearer error="insufficient_scope", scope="{scope}", resource_metadata="{metadata}", error_description="additional scope required""#));
+            let [
+                (on_status, on_challenge, on_headers, on_body),
+                (off_status, off_challenge, off_headers, off_body),
+            ] = outcomes.as_slice()
+            else {
+                anyhow::bail!("expected two outcomes, got {}", outcomes.len());
+            };
+            let label = format!("{} {}", case.scopes, case.tool);
+            assert_eq!(*on_status, 403, "{label}");
+            assert_eq!(*off_status, 403, "{label}");
+            assert_eq!(*on_challenge, expected, "{label}");
+            assert_eq!(*off_challenge, None, "{label}");
+            assert_eq!(on_headers, off_headers, "{label}");
+            assert_eq!(
+                *on_body,
+                format!("{} denied for role '{}'", case.tool, case.role),
+                "{label}"
+            );
+            assert_eq!(off_body, on_body, "{label}");
+        }
+        Ok(())
+    }
+
+    /// Role table that both the matrix server policy and its oracle read:
+    /// role name, allowed tools, and host globs.
+    #[cfg(feature = "oauth")]
+    const STEP_UP_MATRIX_ROLES: [(&str, &[&str], &[&str]); 7] = [
+        ("viewer", &["echo"], &["*"]),
+        ("viewer-plus", &["echo", "admin_only"], &["*"]),
+        ("ops-ro", &["echo"], &["*"]),
+        ("ops", &["echo", "admin_only"], &["*"]),
+        ("root", &["echo", "admin_only", "root_only"], &["*"]),
+        ("prod-admin", &["admin_only"], &["prod-*"]),
+        ("solo-admin", &["admin_only"], &["*"]),
+    ];
+
+    /// One matrix tool call: the tool name and an optional string `host`.
+    #[cfg(feature = "oauth")]
+    type StepUpMatrixCall = (&'static str, Option<&'static str>);
+
+    /// One real-server matrix configuration: tool calls sent as a batch in
+    /// both orientations, with the hint pinned for each orientation.
+    #[cfg(feature = "oauth")]
+    struct StepUpMatrixCase {
+        /// `oauth.scopes` in configuration order.
+        mappings: Vec<(&'static str, &'static str)>,
+        /// The token's `scope` claim.
+        token_scope: &'static str,
+        /// Calls of the batch in order; the other orientation is reversed.
+        calls: Vec<StepUpMatrixCall>,
+        /// Expected knob-on hint for the batch and for its reverse.
+        pins: [Option<&'static str>; 2],
+    }
+
+    /// Orders, duplicates, prefix roles, empty-role mappings held by the token,
+    /// and batches that only a later candidate (or no candidate) fully unlocks.
+    #[cfg(feature = "oauth")]
+    fn step_up_matrix_cases() -> Vec<StepUpMatrixCase> {
+        let case = |mappings, token_scope, calls: [&'static str; 2], pins| StepUpMatrixCase {
+            mappings,
+            token_scope,
+            calls: calls.map(|tool| (tool, None)).to_vec(),
+            pins,
+        };
+        let (admin, read, root) = (
+            ("mcp:admin", "ops"),
+            ("mcp:read", "viewer"),
+            ("mcp:root", "root"),
+        );
+        let blank = ("mcp:blank", "");
+        let (ops_ro_x, ops_ro_y) = (("mcp:x", "ops-ro"), ("mcp:y", "ops-ro"));
+        let echo_admin = ["echo", "admin_only"];
+        let admin_root = ["admin_only", "root_only"];
+        let both = |scope| [Some(scope), Some(scope)];
+        let none = [None, None];
+        let mut cases = vec![
+            case(vec![admin, read], "mcp:read", echo_admin, both("mcp:admin")),
+            case(vec![read, admin], "mcp:read", echo_admin, none),
+            case(
+                vec![blank, admin, read],
+                "mcp:blank mcp:read",
+                echo_admin,
+                none,
+            ),
+            case(
+                vec![blank, admin, read],
+                "mcp:read",
+                echo_admin,
+                both("mcp:admin"),
+            ),
+            case(
+                vec![admin, blank, read],
+                "mcp:blank mcp:read",
+                echo_admin,
+                both("mcp:admin"),
+            ),
+            case(
+                vec![admin, root, read],
+                "mcp:read",
+                admin_root,
+                both("mcp:root"),
+            ),
+            case(vec![admin, read], "mcp:read", ["admin_only", "nope"], none),
+            case(
+                vec![("mcp:zeta", "ops"), ("mcp:alpha", "root"), read],
+                "mcp:read",
+                echo_admin,
+                both("mcp:zeta"),
+            ),
+            case(
+                vec![admin, ("mcp:admin", "root"), read],
+                "mcp:read",
+                admin_root,
+                none,
+            ),
+            case(
+                vec![admin, ("mcp:read", "ops-ro")],
+                "mcp:read",
+                echo_admin,
+                both("mcp:admin"),
+            ),
+            case(
+                vec![("mcp:plus", "viewer-plus"), read],
+                "mcp:read",
+                ["admin_only", "echo"],
+                both("mcp:plus"),
+            ),
+            case(
+                vec![ops_ro_x, ops_ro_y, admin, read],
+                "mcp:read",
+                echo_admin,
+                both("mcp:admin"),
+            ),
+            case(
+                vec![root, admin, read],
+                "mcp:read mcp:admin",
+                admin_root,
+                both("mcp:root"),
+            ),
+            case(vec![admin, read], "mcp:admin", ["echo", "root_only"], none),
+            case(
+                vec![ops_ro_x, root, read],
+                "mcp:read",
+                ["echo", "root_only"],
+                both("mcp:root"),
+            ),
+            case(
+                vec![("MCP:ADMIN", "root"), admin, read],
+                "mcp:read",
+                admin_root,
+                both("MCP:ADMIN"),
+            ),
+        ];
+        cases.extend(step_up_matrix_host_and_long_cases());
+        cases
+    }
+
+    /// Three unlocking candidates, non-nested candidate roles, host-restricted
+    /// roles with string hosts in both cases and absent hosts, and batches of
+    /// four to eight calls.
+    #[cfg(feature = "oauth")]
+    fn step_up_matrix_host_and_long_cases() -> Vec<StepUpMatrixCase> {
+        let case = |mappings, token_scope, calls, pins| StepUpMatrixCase {
+            mappings,
+            token_scope,
+            calls,
+            pins,
+        };
+        let (admin, read, root) = (
+            ("mcp:admin", "ops"),
+            ("mcp:read", "viewer"),
+            ("mcp:root", "root"),
+        );
+        let (prod, solo) = (("mcp:prod", "prod-admin"), ("mcp:solo", "solo-admin"));
+        let on = |host| ("admin_only", Some(host));
+        let (echo, admin_call) = (("echo", None), ("admin_only", None));
+        let both = |scope| [Some(scope), Some(scope)];
+        let none = [None, None];
+        let prod_hosts: Vec<StepUpMatrixCall> = ["prod-1", "prod-2", "PROD-3", "prod-4"]
+            .into_iter()
+            .chain(["prod-5", "prod-6", "prod-7"])
+            .map(on)
+            .collect();
+        let mut prod_then_dev = prod_hosts.clone();
+        prod_then_dev.push(on("dev-1"));
+        vec![
+            case(
+                vec![("mcp:a", "ops"), ("mcp:b", "root"), ("mcp:c", "root"), read],
+                "mcp:read",
+                vec![echo, admin_call],
+                both("mcp:a"),
+            ),
+            case(vec![solo, read], "mcp:read", vec![echo, admin_call], none),
+            case(
+                vec![solo, admin, read],
+                "mcp:read",
+                vec![echo, admin_call],
+                both("mcp:admin"),
+            ),
+            case(
+                vec![prod, read],
+                "mcp:read",
+                vec![on("dev-1"), on("prod-1")],
+                none,
+            ),
+            case(
+                vec![prod, read],
+                "mcp:read",
+                vec![on("prod-1"), on("PROD-2")],
+                both("mcp:prod"),
+            ),
+            case(
+                vec![prod, read],
+                "mcp:read",
+                vec![on("prod-1"), admin_call],
+                both("mcp:prod"),
+            ),
+            case(
+                vec![prod, root, read],
+                "mcp:read",
+                vec![on("dev-1"), on("prod-1")],
+                both("mcp:root"),
+            ),
+            case(
+                vec![admin, prod],
+                "mcp:prod",
+                vec![on("dev-1"), on("prod-1")],
+                both("mcp:admin"),
+            ),
+            case(
+                vec![prod, admin],
+                "mcp:prod",
+                vec![on("dev-1"), on("prod-1")],
+                none,
+            ),
+            case(
+                vec![admin, read],
+                "mcp:read",
+                vec![admin_call, admin_call, admin_call, ("nope", None)],
+                none,
+            ),
+            case(
+                vec![admin, read],
+                "mcp:read",
+                vec![echo, admin_call, echo, admin_call, on("dev-9")],
+                both("mcp:admin"),
+            ),
+            case(vec![prod, read], "mcp:read", prod_then_dev, none),
+            case(vec![prod, read], "mcp:read", prod_hosts, both("mcp:prod")),
+        ]
+    }
+
+    /// Independent host glob rule: `*` matches any host, `prefix*` matches by
+    /// prefix, anything else matches exactly, all ASCII-case-insensitively.
+    #[cfg(feature = "oauth")]
+    fn step_up_matrix_host_matches(glob: &str, host: &str) -> bool {
+        let (pattern, name) = (glob.to_ascii_lowercase(), host.to_ascii_lowercase());
+        pattern
+            .strip_suffix('*')
+            .map_or(pattern == name, |prefix| name.starts_with(prefix))
+    }
+
+    /// Whether `role` may make `call` per [`STEP_UP_MATRIX_ROLES`]: the tool
+    /// is allowed and a string host, when present, matches a host glob.
+    #[cfg(feature = "oauth")]
+    fn step_up_matrix_allows(role: &str, (tool, host): StepUpMatrixCall) -> bool {
+        STEP_UP_MATRIX_ROLES.iter().any(|(name, tools, globs)| {
+            *name == role
+                && tools.contains(&tool)
+                && host.is_none_or(|requested| {
+                    globs
+                        .iter()
+                        .any(|glob| step_up_matrix_host_matches(glob, requested))
+                })
+        })
+    }
+
+    /// Real `resolve_role` semantics: the first mapping in configuration
+    /// order whose scope is granted wins, whatever the token order.
+    #[cfg(feature = "oauth")]
+    fn step_up_matrix_resolve(
+        mappings: &[(&'static str, &'static str)],
+        granted: &[&str],
+    ) -> Option<&'static str> {
+        mappings
+            .iter()
+            .find(|(scope, _)| granted.contains(scope))
+            .map(|(_, role)| *role)
+    }
+
+    /// Independent oracle: the resolved role, the first denied tool, and the
+    /// first configured scope whose addition changes the role to one that
+    /// passes every call of the batch.
+    #[cfg(feature = "oauth")]
+    fn step_up_matrix_oracle(
+        case: &StepUpMatrixCase,
+        batch: &[StepUpMatrixCall],
+    ) -> anyhow::Result<(&'static str, Option<&'static str>, Option<&'static str>)> {
+        let granted: Vec<&str> = case.token_scope.split_whitespace().collect();
+        let current = step_up_matrix_resolve(&case.mappings, &granted)
+            .context("the token scope must resolve to a role")?;
+        let denied = batch
+            .iter()
+            .copied()
+            .find(|call| !step_up_matrix_allows(current, *call))
+            .map(|(tool, _host)| tool);
+        let hint = denied.and_then(|_| {
+            case.mappings.iter().map(|(scope, _)| *scope).find(|scope| {
+                let mut union = granted.clone();
+                union.push(*scope);
+                step_up_matrix_resolve(&case.mappings, &union).is_some_and(|role| {
+                    role != current && batch.iter().all(|call| step_up_matrix_allows(role, *call))
+                })
+            })
+        });
+        Ok((current, denied, hint))
+    }
+
+    /// A signed `mcp` token carrying `scope`.
+    #[cfg(feature = "oauth")]
+    fn mint_scoped_oauth_test_token(pem: &str, kid: &str, scope: &str) -> anyhow::Result<String> {
+        let key = jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes())
+            .context("encoding key from PEM")?;
+        let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
+        header.kid = Some(kid.into());
+        let now = jsonwebtoken::get_current_timestamp();
+        let claims = serde_json::json!({
+            "iss": "https://auth.test.local",
+            "aud": "https://mcp.test.local/mcp",
+            "sub": "step-up-matrix",
+            "scope": scope,
+            "exp": now.saturating_add(3600),
+            "iat": now
+        });
+        jsonwebtoken::encode(&header, &claims, &key).context("JWT encoding")
+    }
+
+    /// Status, every challenge field, every other header except `date`, and body.
+    #[cfg(feature = "oauth")]
+    type StepUpBatchOutcome = (
+        reqwest::StatusCode,
+        Vec<String>,
+        Vec<(String, String)>,
+        String,
+    );
+
+    /// Sends `batch` as a JSON-RPC batch of `tools/call` requests.
+    #[cfg(feature = "oauth")]
+    async fn step_up_batch_outcome(
+        base: &str,
+        token: &str,
+        batch: &[StepUpMatrixCall],
+    ) -> anyhow::Result<StepUpBatchOutcome> {
+        let body: Vec<serde_json::Value> = batch
+            .iter()
+            .zip(1_u32..)
+            .map(|((tool, host), id)| {
+                let arguments = host.map_or_else(
+                    || serde_json::json!({}),
+                    |name| serde_json::json!({"host": name}),
+                );
+                serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": tool, "arguments": arguments}})
+            })
+            .collect();
+        let response = reqwest::Client::new()
+            .post(format!("{base}/mcp"))
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await?;
+        let status = response.status();
+        let challenges = response
+            .headers()
+            .get_all("www-authenticate")
+            .iter()
+            .map(|value| value.to_str().map(str::to_owned))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut headers: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .filter(|(name, _)| *name != "date" && *name != "www-authenticate")
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_owned(),
+                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
+        headers.sort();
+        Ok((status, challenges, headers, response.text().await?))
+    }
+
+    /// Runs `cases` against real servers: every configuration, both batch
+    /// orientations and both knob states must agree with the independent
+    /// oracle, and the knob only ever adds one challenge field to an
+    /// otherwise identical 403. One server per configuration and knob state.
+    #[cfg(feature = "oauth")]
+    async fn step_up_matrix_check(cases: &[StepUpMatrixCase]) -> anyhow::Result<()> {
+        use wiremock::{Mock, ResponseTemplate, matchers};
+
+        // Given real JWKS validation and a policy built from the oracle's
+        // role table.
+        let kid = "step-up-matrix-kid";
+        let (pem, jwks_body) = generate_oauth_test_keypair(kid)?;
+        let jwks = DualStackMock::start().await?;
+        jwks.mount(|| {
+            Mock::given(matchers::method("GET"))
+                .and(matchers::path("/jwks.json"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_body))
+        })
+        .await;
+        let policy = Arc::new(RbacPolicy::new(&RbacConfig::with_roles(
+            STEP_UP_MATRIX_ROLES
+                .iter()
+                .map(|(role, tools, hosts)| {
+                    RoleConfig::new(
+                        *role,
+                        tools.iter().map(|tool| (*tool).to_owned()).collect(),
+                        hosts.iter().map(|host| (*host).to_owned()).collect(),
+                    )
+                })
+                .collect(),
+        )));
+        for case in cases {
+            let token = mint_scoped_oauth_test_token(&pem, kid, case.token_scope)?;
+            let scopes: Vec<serde_json::Value> = case
+                .mappings
+                .iter()
+                .map(|(scope, role)| serde_json::json!({"scope": scope, "role": role}))
+                .collect();
+            let reversed: Vec<StepUpMatrixCall> = case.calls.iter().rev().copied().collect();
+            let batches = [case.calls.clone(), reversed];
+            let mut outcomes = Vec::new();
+            for enabled in [true, false] {
+                let base = spawn_server(
+                    config_on_port(0)
+                        .with_auth(step_up_auth(
+                            jwks.port(),
+                            &serde_json::Value::Array(scopes.clone()),
+                            enabled,
+                        )?)
+                        .with_rbac(Arc::clone(&policy)),
+                )
+                .await?;
+                // When both batch orientations reach the same server.
+                for batch in &batches {
+                    outcomes.push(step_up_batch_outcome(&base.to_string(), &token, batch).await?);
+                }
+            }
+            let [on_ab, on_ba, off_ab, off_ba] = outcomes.as_slice() else {
+                anyhow::bail!("expected four outcomes, got {}", outcomes.len());
+            };
+            // Then each outcome matches the oracle and the pinned hint, and
+            // knob on and off differ only by that single challenge field.
+            for ((batch, pin), (on, off)) in batches
+                .iter()
+                .zip(case.pins)
+                .zip([(on_ab, off_ab), (on_ba, off_ba)])
+            {
+                let label = format!("{:?} {:?} {batch:?}", case.mappings, case.token_scope);
+                let (current, first_denied, hint) = step_up_matrix_oracle(case, batch)?;
+                assert_eq!(hint, pin, "oracle disagrees with the pin: {label}");
+                let denied = first_denied.context("every matrix batch is denied")?;
+                let expected = hint.map(|scope| format!(r#"Bearer error="insufficient_scope", scope="{scope}", resource_metadata="/.well-known/oauth-protected-resource", error_description="additional scope required""#));
+                let (on_status, on_challenges, on_headers, on_body) = on;
+                let (off_status, off_challenges, off_headers, off_body) = off;
+                assert_eq!(*on_status, 403, "{label}");
+                assert_eq!(
+                    *on_body,
+                    format!("{denied} denied for role '{current}'"),
+                    "{label}"
+                );
+                assert_eq!(
+                    *on_challenges,
+                    expected.into_iter().collect::<Vec<_>>(),
+                    "{label}"
+                );
+                assert!(off_challenges.is_empty(), "{label}: {off_challenges:?}");
+                assert_eq!(off_status, on_status, "{label}");
+                assert_eq!(off_headers, on_headers, "{label}");
+                assert_eq!(off_body, on_body, "{label}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Real-server matrix: every configuration, both batch orientations and
+    /// both knob states agree with an independent oracle built from the real
+    /// role resolution rule and the policy table, and the knob only ever adds
+    /// one challenge field to an otherwise identical 403.
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn insufficient_scope_challenge_matrix_matches_independent_oracle() -> anyhow::Result<()>
+    {
+        // Given every `mcp:<word>`-shaped matrix configuration.
+        let cases = step_up_matrix_cases();
+        // When and Then: each configuration agrees with the oracle.
+        step_up_matrix_check(&cases).await?;
+        assert!(cases.len() >= 29, "{} configurations", cases.len());
+        assert!(
+            cases.iter().any(|case| case.calls.len() >= 8),
+            "an eight-call batch is covered"
+        );
+        Ok(())
+    }
+
+    /// A 200-byte scope token (namespace prefix plus 49 `long` words).
+    #[cfg(feature = "oauth")]
+    const STEP_UP_LONG_SCOPE: &str = concat!(
+        "mcp:",
+        "longlonglonglonglonglonglonglonglonglonglonglong",
+        "longlonglonglonglonglonglonglonglonglonglonglong",
+        "longlonglonglonglonglonglonglonglonglonglonglong",
+        "longlonglonglonglonglonglonglonglonglonglonglong",
+        "long",
+    );
+
+    /// Scope spellings real authorization servers use, all valid RFC 6750
+    /// scope tokens: un-namespaced, empty or leading namespace, nested
+    /// namespaces, dots, slashes, URLs, dashes and underscores, upper and
+    /// mixed case, digits, a 200-byte token, `~ % +` and the remaining
+    /// punctuation, and a scope spelled like a role name.
+    #[cfg(feature = "oauth")]
+    const STEP_UP_SCOPE_ALPHABET: [&str; 20] = [
+        "read",
+        "admin",
+        "mcp:",
+        ":read",
+        "a:b:c",
+        "mcp.read",
+        "api/read",
+        "https://example.test/scope/read",
+        "mcp:read-only",
+        "mcp_admin",
+        "READ",
+        "Mcp:Admin",
+        "mcp:v2",
+        "scope42",
+        STEP_UP_LONG_SCOPE,
+        "mcp:~a%2B+b",
+        "!#$&'()*,;<=>?@[]^`{|}",
+        "ops",
+        "viewer",
+        "urn:example:mcp:tools.admin",
+    ];
+
+    /// For every alphabet scope `s` next to `mcp:read`: `s` first and
+    /// unlocking is the hint; `s` first and held keeps the role, so no hint
+    /// (the step-up loop shape). Then hand-pinned mixes of alphabet scopes,
+    /// case variants of one word, role-name scopes and tokens separated by
+    /// Unicode whitespace.
+    #[cfg(feature = "oauth")]
+    fn step_up_matrix_alphabet_cases() -> Vec<StepUpMatrixCase> {
+        let case = |mappings, token_scope, calls: [&'static str; 2], pins| StepUpMatrixCase {
+            mappings,
+            token_scope,
+            calls: calls.map(|tool| (tool, None)).to_vec(),
+            pins,
+        };
+        let echo_admin = ["echo", "admin_only"];
+        let admin_root = ["admin_only", "root_only"];
+        let both = |scope| [Some(scope), Some(scope)];
+        let none = [None, None];
+        let url = "https://example.test/scope/read";
+        let mut cases: Vec<StepUpMatrixCase> = STEP_UP_SCOPE_ALPHABET
+            .into_iter()
+            .flat_map(|scope| {
+                [
+                    case(
+                        vec![(scope, "ops"), ("mcp:read", "viewer")],
+                        "mcp:read",
+                        echo_admin,
+                        both(scope),
+                    ),
+                    case(
+                        vec![(scope, "viewer"), ("mcp:read", "ops")],
+                        scope,
+                        echo_admin,
+                        none,
+                    ),
+                ]
+            })
+            .collect();
+        cases.extend([
+            case(
+                vec![(url, "root"), ("api/read", "viewer"), ("mcp:", "ops")],
+                "read\u{3000}mcp:\u{a0}api/read",
+                echo_admin,
+                both(url),
+            ),
+            case(
+                vec![("api/read", "viewer"), ("mcp:", "ops"), (url, "root")],
+                "read\u{3000}mcp:\u{a0}api/read",
+                echo_admin,
+                none,
+            ),
+            case(
+                vec![("READ", "root"), ("read", "viewer")],
+                "read",
+                admin_root,
+                both("READ"),
+            ),
+            case(
+                vec![("read", "viewer"), ("READ", "ops")],
+                "READ\u{2003}Read",
+                admin_root,
+                none,
+            ),
+            case(
+                vec![("viewer", "ops"), ("ops", "viewer")],
+                "ops",
+                echo_admin,
+                both("viewer"),
+            ),
+            case(
+                vec![("ops", "viewer"), ("viewer", "ops")],
+                "ops\tmcp:read",
+                echo_admin,
+                none,
+            ),
+            case(
+                vec![
+                    ("a:b:c", "ops"),
+                    (STEP_UP_LONG_SCOPE, "root"),
+                    (":read", "viewer"),
+                ],
+                "\u{2003}:read\n",
+                admin_root,
+                both(STEP_UP_LONG_SCOPE),
+            ),
+            case(
+                vec![
+                    ("mcp.read", "ops"),
+                    ("mcp:~a%2B+b", "root"),
+                    ("mcp:", "viewer"),
+                ],
+                "mcp:\u{3000}other",
+                admin_root,
+                both("mcp:~a%2B+b"),
+            ),
+            case(
+                vec![("mcp:", "viewer"), ("mcp:~a%2B+b", "root")],
+                "mcp:\u{85}mcp:~a%2B+b",
+                admin_root,
+                none,
+            ),
+        ]);
+        cases
+    }
+
+    /// The real-server matrix over the scope alphabet: for every alphabet
+    /// scope the knob-on hint is the oracle's first unlocking scope in
+    /// configuration order, and knob off is a bare 403. Fixtures built only
+    /// from `mcp:<word>` scopes cannot catch a simulation that loses or
+    /// rewrites mappings or granted scopes of another shape.
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn insufficient_scope_challenge_scope_alphabet_matches_independent_oracle()
+    -> anyhow::Result<()> {
+        // Given every alphabet configuration.
+        let cases = step_up_matrix_alphabet_cases();
+        // When and Then: each configuration agrees with the oracle.
+        step_up_matrix_check(&cases).await?;
+        assert_eq!(STEP_UP_LONG_SCOPE.len(), 200, "the long scope is 200 bytes");
+        assert!(
+            cases.len() >= 2 * STEP_UP_SCOPE_ALPHABET.len() + 9,
+            "{} configurations",
+            cases.len()
+        );
+        Ok(())
+    }
+
+    /// The quoted `resource_metadata` parameter of every `WWW-Authenticate` field.
+    #[cfg(feature = "oauth")]
+    fn resource_metadata_params(response: &reqwest::Response) -> anyhow::Result<Vec<String>> {
+        response
+            .headers()
+            .get_all("www-authenticate")
+            .iter()
+            .map(|value| {
+                let (_, rest) = value
+                    .to_str()?
+                    .split_once("resource_metadata=\"")
+                    .context("challenge carries resource_metadata")?;
+                let (url, _) = rest.split_once('"').context("closing quote")?;
+                Ok(url.to_owned())
+            })
+            .collect()
+    }
+
+    /// With a mixed-case `public_url` the step-up challenge advertises the
+    /// 401 challenge's `resource_metadata` byte for byte, next to the
+    /// case-preserving metadata `resource`, and with the knob on an allowed
+    /// `tools/list` carries no `WWW-Authenticate` field at all.
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn insufficient_scope_challenge_reuses_the_401_metadata_url_verbatim()
+    -> anyhow::Result<()> {
+        use wiremock::{Mock, ResponseTemplate, matchers};
+
+        // Given real JWKS validation, the knob on, and a public_url whose
+        // host and path carry upper-case letters.
+        let kid = "step-up-case-kid";
+        let (pem, jwks_body) = generate_oauth_test_keypair(kid)?;
+        let jwks = DualStackMock::start().await?;
+        jwks.mount(|| {
+            Mock::given(matchers::method("GET"))
+                .and(matchers::path("/jwks.json"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_body))
+        })
+        .await;
+        let public_url = "http://MCP.Example.test:8443/Tenant";
+        let scopes = serde_json::json!([
+            {"scope": "mcp:admin", "role": "ops"},
+            {"scope": "mcp:read", "role": "viewer"}
+        ]);
+        let base = spawn_server(
+            config_on_port(0)
+                .with_auth(step_up_auth(jwks.port(), &scopes, true)?)
+                .with_rbac(step_up_e2e_policy())
+                .with_public_url(public_url),
+        )
+        .await?;
+        let token = mint_scoped_oauth_test_token(&pem, kid, "mcp:read")?;
+        let client = reqwest::Client::new();
+        let call = serde_json::json!({"jsonrpc": "2.0", "id": 1_u32, "method": "tools/call", "params": {"name": "admin_only", "arguments": {}}});
+
+        // When the same denied call arrives without and with the token, and
+        // the token then lists tools in an initialized session.
+        let unauthenticated = client
+            .post(format!("{base}/mcp"))
+            .json(&call)
+            .send()
+            .await?;
+        let denied = client
+            .post(format!("{base}/mcp"))
+            .bearer_auth(&token)
+            .json(&call)
+            .send()
+            .await?;
+        let session_id = mcp_initialize_with_bearer(&client, &base.base, Some(&token)).await?;
+        let listed = client
+            .post(format!("{base}/mcp"))
+            .bearer_auth(&token)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-session-id", &session_id)
+            .body(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
+            .send()
+            .await?;
+        let prm: serde_json::Value = client
+            .get(format!("{base}/.well-known/oauth-protected-resource/mcp"))
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        // Then both challenges name the same case-preserving metadata URL.
+        let metadata = format!("{public_url}/.well-known/oauth-protected-resource/mcp");
+        assert_eq!(unauthenticated.status(), 401);
+        assert_eq!(
+            resource_metadata_params(&unauthenticated)?,
+            [metadata.as_str()]
+        );
+        assert_eq!(denied.status(), 403);
+        assert_eq!(resource_metadata_params(&denied)?, [metadata.as_str()]);
+        assert_eq!(
+            prm.get("resource").and_then(serde_json::Value::as_str),
+            Some(format!("{public_url}/mcp").as_str())
+        );
+        // And the allowed listing is never decorated.
+        assert_eq!(listed.status(), 200);
+        assert_eq!(
+            listed.headers().get_all("www-authenticate").iter().count(),
+            0
+        );
+        Ok(())
+    }
+
     /// `iss` of every audience-widening token and the configured issuer.
     #[cfg(feature = "oauth")]
     const AUDIENCE_ISSUER: &str = "https://idp.audience.test/realms/audience";

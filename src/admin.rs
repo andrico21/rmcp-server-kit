@@ -287,6 +287,7 @@ mod tests {
         let mut req = Request::builder().uri(uri).body(Body::empty())?;
         if let Some(assigned_role) = role {
             let _previous = req.extensions_mut().insert(AuthIdentity {
+                granted_scopes: None,
                 name: "tester".into(),
                 role: assigned_role.to_owned(),
                 method: AuthMethod::BearerToken,
