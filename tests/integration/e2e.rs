@@ -3397,6 +3397,279 @@ mod tests {
         Ok(())
     }
 
+    /// `iss` of every audience-widening token and the configured issuer.
+    #[cfg(feature = "oauth")]
+    const AUDIENCE_ISSUER: &str = "https://idp.audience.test/realms/audience";
+
+    /// Mock IdP serving a fresh signing key for the audience-widening tests.
+    #[cfg(feature = "oauth")]
+    struct AudienceIdp {
+        /// The dual-stack JWKS mock; kept alive for the test's duration.
+        jwks: DualStackMock,
+        /// PKCS#8 PEM of the signing key.
+        pem: String,
+    }
+
+    #[cfg(feature = "oauth")]
+    impl AudienceIdp {
+        /// `kid` of the signing key.
+        const KID: &'static str = "audience-kid";
+
+        /// Starts the JWKS mock.
+        async fn start() -> anyhow::Result<Self> {
+            use wiremock::{Mock, ResponseTemplate, matchers};
+
+            let (pem, jwks_body) = generate_oauth_test_keypair(Self::KID)?;
+            let jwks = DualStackMock::start().await?;
+            jwks.mount(|| {
+                Mock::given(matchers::method("GET"))
+                    .and(matchers::path("/jwks.json"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(&jwks_body))
+            })
+            .await;
+            Ok(Self { jwks, pem })
+        }
+
+        /// Direct-mode OAuth config with audience `mcp-audience` plus `extra`
+        /// top-level keys.
+        fn oauth(&self, extra: &serde_json::Value) -> anyhow::Result<OAuthConfig> {
+            let mut json = serde_json::json!({
+                "issuer": AUDIENCE_ISSUER,
+                "audience": "mcp-audience",
+                "jwks_uri": format!("http://localhost:{}/jwks.json", self.jwks.port()),
+                "allow_http_oauth_urls": true,
+                "ssrf_allowlist": {
+                    "hosts": ["localhost"],
+                    "cidrs": ["127.0.0.0/8"]
+                },
+                "scopes": [{"scope": "mcp:read", "role": "viewer"}]
+            });
+            let object = json
+                .as_object_mut()
+                .context("oauth document is an object")?;
+            for (key, value) in extra
+                .as_object()
+                .context("extra oauth keys are an object")?
+            {
+                drop(object.insert(key.clone(), value.clone()));
+            }
+            serde_json::from_value(json).context("oauth config deserialization")
+        }
+
+        /// A valid `mcp:read` token whose claims carry `aud` and, when given,
+        /// `azp`.
+        fn token(&self, aud: &serde_json::Value, azp: Option<&str>) -> anyhow::Result<String> {
+            let encoding_key = jsonwebtoken::EncodingKey::from_rsa_pem(self.pem.as_bytes())
+                .context("encoding key from PEM")?;
+            let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
+            header.kid = Some(Self::KID.into());
+            let now = jsonwebtoken::get_current_timestamp();
+            let mut claims = serde_json::json!({
+                "iss": AUDIENCE_ISSUER,
+                "aud": aud,
+                "sub": "audience-user",
+                "scope": "mcp:read",
+                "exp": now.saturating_add(3600),
+                "iat": now
+            });
+            if let Some(authorized_party) = azp {
+                drop(
+                    claims
+                        .as_object_mut()
+                        .context("claims are an object")?
+                        .insert("azp".to_owned(), serde_json::Value::from(authorized_party)),
+                );
+            }
+            jsonwebtoken::encode(&header, &claims, &encoding_key).context("JWT encoding")
+        }
+    }
+
+    /// Spawns an OAuth-only server whose `public_url` is its own origin and
+    /// returns it with that origin.
+    #[cfg(feature = "oauth")]
+    async fn spawn_audience_server(oauth: OAuthConfig) -> anyhow::Result<(ServerHarness, String)> {
+        let mut auth = AuthConfig::with_keys(vec![]);
+        auth.oauth = Some(oauth);
+        let port = free_port().await?;
+        let public_url = format!("http://127.0.0.1:{port}");
+        let server = spawn_server(
+            config_on_port(port)
+                .with_auth(auth)
+                .with_public_url(public_url.clone()),
+        )
+        .await?;
+        Ok((server, public_url))
+    }
+
+    /// Initializes a session with `token`, then returns the `tools/list`
+    /// status and the number of listed tools.
+    #[cfg(feature = "oauth")]
+    async fn tools_list_with_token(base: &str, token: &str) -> anyhow::Result<(u16, usize)> {
+        let client = reqwest::Client::new();
+        let session_id = mcp_initialize_with_bearer(&client, base, Some(token)).await?;
+        let resp = client
+            .post(format!("{base}/mcp"))
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-session-id", &session_id)
+            .body(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
+            .send()
+            .await
+            .context("tools/list request")?;
+        let status = resp.status().as_u16();
+        let body = mcp_response_json(resp).await?;
+        let tools = body
+            .get("result")
+            .and_then(|result| result.get("tools"))
+            .and_then(serde_json::Value::as_array)
+            .context("tools/list result carries a tools array")?;
+        Ok((status, tools.len()))
+    }
+
+    /// With `accept_resource_audience = true` and `public_url` set, a token
+    /// whose `aud` is `{public_url}/mcp` (alone or inside an array)
+    /// authenticates and lists tools; near misses of that URL, another
+    /// resource, and an azp-only match on it stay rejected with 401 under the
+    /// default strict mode.
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn resource_audience_accepted_when_opted_in() -> anyhow::Result<()> {
+        let idp = AudienceIdp::start().await?;
+        let (server, public_url) = spawn_audience_server(
+            idp.oauth(&serde_json::json!({ "accept_resource_audience": true }))?,
+        )
+        .await?;
+        let resource = format!("{public_url}/mcp");
+
+        for aud in [
+            serde_json::json!(resource),
+            serde_json::json!(["https://other.example/mcp", resource]),
+        ] {
+            let token = idp.token(&aud, None)?;
+            assert_eq!(
+                tools_list_with_token(&server.base, &token).await?,
+                (200, 0),
+                "aud={aud}"
+            );
+        }
+
+        let port = public_url.rsplit(':').next().context("public_url port")?;
+        let client = reqwest::Client::new();
+        let mut rejected = 0_usize;
+        for (aud, azp) in [
+            (format!("{resource}/"), None),
+            (public_url.clone(), None),
+            (format!("http://localhost:{port}/mcp"), None),
+            (format!("https://127.0.0.1:{port}/mcp"), None),
+            (format!("http://user@127.0.0.1:{port}/mcp"), None),
+            (format!("HTTP://127.0.0.1:{port}/MCP"), None),
+            ("https://other.example/mcp".to_owned(), None),
+            (
+                "https://other.example/mcp".to_owned(),
+                Some(resource.as_str()),
+            ),
+        ] {
+            let token = idp.token(&serde_json::json!(aud), azp)?;
+            assert_eq!(
+                initialize_status(&client, &server.base, &token).await?,
+                401,
+                "aud={aud} azp={azp:?}"
+            );
+            rejected = rejected.saturating_add(1);
+        }
+        assert_eq!(rejected, 8);
+        Ok(())
+    }
+
+    /// With `additional_audiences = ["https://alt.example/mcp"]`, a token for
+    /// that audience authenticates and lists tools, the configured
+    /// `audience` still does, and the server's own resource URL is not
+    /// implicitly accepted (`accept_resource_audience` is off).
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn additional_audience_accepted_when_listed() -> anyhow::Result<()> {
+        let idp = AudienceIdp::start().await?;
+        let (server, public_url) = spawn_audience_server(
+            idp.oauth(&serde_json::json!({ "additional_audiences": ["https://alt.example/mcp"] }))?,
+        )
+        .await?;
+
+        for aud in ["https://alt.example/mcp", "mcp-audience"] {
+            let token = idp.token(&serde_json::json!(aud), None)?;
+            assert_eq!(
+                tools_list_with_token(&server.base, &token).await?,
+                (200, 0),
+                "aud={aud}"
+            );
+        }
+
+        let client = reqwest::Client::new();
+        for aud in [
+            format!("{public_url}/mcp"),
+            "https://alt.example/mcp/".to_owned(),
+        ] {
+            let token = idp.token(&serde_json::json!(aud), None)?;
+            assert_eq!(
+                initialize_status(&client, &server.base, &token).await?,
+                401,
+                "aud={aud}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The PRM `resource` and the accepted resource audience are one value.
+    ///
+    /// With `public_url` on a host other than the bind host and the knob on,
+    /// both PRM locations advertise `{public_url}/mcp`, and a token whose
+    /// `aud` is exactly that advertised string authenticates, while a token
+    /// for a resource derived from the bind address is rejected.
+    #[cfg(feature = "oauth")]
+    #[tokio::test]
+    async fn prm_resource_equals_accepted_resource_audience() -> anyhow::Result<()> {
+        let idp = AudienceIdp::start().await?;
+        let mut auth = AuthConfig::with_keys(vec![]);
+        auth.oauth = Some(idp.oauth(&serde_json::json!({ "accept_resource_audience": true }))?);
+        let port = free_port().await?;
+        let public_url = "https://mcp.example.test";
+        let server = spawn_server(
+            config_on_port(port)
+                .with_auth(auth)
+                .with_public_url(public_url),
+        )
+        .await?;
+        let client = reqwest::Client::new();
+
+        for path in [
+            "/.well-known/oauth-protected-resource/mcp",
+            "/.well-known/oauth-protected-resource",
+        ] {
+            let prm: serde_json::Value = client
+                .get(format!("{}{path}", server.base))
+                .send()
+                .await
+                .context("PRM request")?
+                .json()
+                .await
+                .context("PRM body")?;
+            assert_eq!(
+                prm.get("resource").and_then(serde_json::Value::as_str),
+                Some("https://mcp.example.test/mcp"),
+                "{path}"
+            );
+        }
+
+        let token = idp.token(&serde_json::json!("https://mcp.example.test/mcp"), None)?;
+        assert_eq!(tools_list_with_token(&server.base, &token).await?, (200, 0));
+        let bind_token = idp.token(&serde_json::json!(format!("{}/mcp", server.base)), None)?;
+        assert_eq!(
+            initialize_status(&client, &server.base, &bind_token).await?,
+            401
+        );
+        Ok(())
+    }
+
     // ==========================================================================
     // BUG-NEW: shutdown timeout double-signal regression test
     // ==========================================================================

@@ -3175,6 +3175,13 @@ struct JwksCacheShared {
     /// Expected audience value from config; checked against `aud` and,
     /// per `audience_mode`, optionally `azp`.
     expected_audience: String,
+    /// Extra values accepted in `aud` only (never via the `azp` fallback),
+    /// from [`OAuthConfig::additional_audiences`].
+    additional_audiences: Vec<String>,
+    /// This server's canonical resource URL, accepted in `aud` only; set by
+    /// `build_app_router` when [`OAuthConfig::accept_resource_audience`] is on
+    /// and `public_url` is configured, `None` otherwise.
+    resource_audience: Option<String>,
     /// How `aud`/`azp` are validated.
     audience_mode: AudienceValidationMode,
     /// Whether tokens without `sub` are rejected.
@@ -3522,7 +3529,11 @@ impl JwksCacheShared {
     /// Returns [`RmcpServerKitError::Startup`] when the CA bundle named by
     /// `config.ca_cert_path` cannot be read or parsed, contains no
     /// certificates, or the HTTP client cannot be built.
-    fn new(config: &OAuthConfig, shutdown: &CancellationToken) -> Result<Self, RmcpServerKitError> {
+    fn new(
+        config: &OAuthConfig,
+        shutdown: &CancellationToken,
+        resource_audience: Option<String>,
+    ) -> Result<Self, RmcpServerKitError> {
         // Ensure crypto providers are installed (idempotent - ok() ignores
         // the error if already installed by another call in the same process).
         drop(default_provider().install_default());
@@ -3672,6 +3683,8 @@ impl JwksCacheShared {
             http,
             validation_template: validation,
             expected_audience: config.audience.clone(),
+            additional_audiences: config.additional_audiences.clone(),
+            resource_audience,
             audience_mode: config.effective_audience_validation_mode(),
             require_subject: config.require_subject,
             azp_fallback_warned: AtomicBool::new(false),
@@ -3726,10 +3739,31 @@ impl JwksCache {
         config: &OAuthConfig,
         shutdown: CancellationToken,
     ) -> Result<Self, RmcpServerKitError> {
+        Self::with_shutdown_and_resource_audience(config, shutdown, None)
+    }
+
+    #[inline]
+    /// Build a cache with a caller-provided shutdown token that also accepts
+    /// `resource_audience` (this server's canonical resource URL) in `aud`.
+    ///
+    /// # Errors
+    ///
+    /// Same error conditions as [`new`](Self::new).
+    pub(crate) fn with_shutdown_and_resource_audience(
+        config: &OAuthConfig,
+        shutdown: CancellationToken,
+        resource_audience: Option<String>,
+    ) -> Result<Self, RmcpServerKitError> {
         Ok(Self {
-            shared: Arc::new(JwksCacheShared::new(config, &shutdown)?),
+            shared: Arc::new(JwksCacheShared::new(config, &shutdown, resource_audience)?),
             shutdown,
         })
+    }
+
+    /// Test-only: the resource audience this cache accepts in `aud`.
+    #[cfg(test)]
+    pub(crate) fn __test_resource_audience(&self) -> Option<&str> {
+        self.shared.resource_audience.as_deref()
     }
 
     /// Test-only: disable initial-target SSRF screening for loopback-backed
@@ -4013,8 +4047,10 @@ impl JwksCache {
 
     /// Manual audience check.
     ///
-    /// Resolves per [`AudienceValidationMode`]: `aud` matches always
-    /// accept silently. `azp`-only matches accept silently in
+    /// Resolves per [`AudienceValidationMode`]: an `aud` entry equal (exact
+    /// string match) to `audience`, to any `additional_audiences` entry, or
+    /// to the resource audience when one was configured always accepts
+    /// silently. `azp`-only matches (on `audience` alone) accept silently in
     /// [`AudienceValidationMode::Permissive`], accept with a one-shot
     /// `tracing::warn!` per process in [`AudienceValidationMode::Warn`],
     /// and reject in [`AudienceValidationMode::Strict`]. No-claim-match
@@ -4024,7 +4060,18 @@ impl JwksCache {
     ///
     /// Returns the [`JwtValidationFailure`] classification for the mismatch.
     fn check_audience(&self, claims: &Claims) -> Result<(), JwtValidationFailure> {
-        if claims.aud.contains(&self.shared.expected_audience) {
+        if claims.aud.contains(&self.shared.expected_audience)
+            || self
+                .shared
+                .additional_audiences
+                .iter()
+                .any(|audience| claims.aud.contains(audience))
+            || self
+                .shared
+                .resource_audience
+                .as_deref()
+                .is_some_and(|audience| claims.aud.contains(audience))
+        {
             return Ok(());
         }
         let azp_match = claims
@@ -11269,6 +11316,369 @@ role = "admin"
             "permissive mode must record its own once-per-process log flag"
         );
 
+        Ok(())
+    }
+
+    /// The configured `audience` of [`test_config`].
+    const TEST_AUDIENCE: &str = "https://mcp.test.local/mcp";
+    /// The extra audience the widening tests list in `additional_audiences`.
+    const EXTRA_AUDIENCE: &str = "https://alt.example/mcp";
+    /// The resource audience the widening tests pass to the crate-private
+    /// constructor (what `build_app_router` derives from `public_url`).
+    const RESOURCE_AUDIENCE: &str = "https://rs.example:8443/mcp";
+    /// Every audience validation mode, in a fixed order.
+    const ALL_AUDIENCE_MODES: [AudienceValidationMode; 3] = [
+        AudienceValidationMode::Strict,
+        AudienceValidationMode::Warn,
+        AudienceValidationMode::Permissive,
+    ];
+
+    /// Builds a cache for audience checks only (construction fetches no
+    /// JWKS) through the crate-private resource-audience constructor.
+    fn audience_cache(
+        mode: AudienceValidationMode,
+        additional: &[&str],
+        resource: Option<&str>,
+    ) -> anyhow::Result<JwksCache> {
+        let mut config = test_config("http://127.0.0.1:9/jwks.json");
+        config.audience_validation_mode = Some(mode);
+        config.additional_audiences = additional.iter().map(|aud| (*aud).to_owned()).collect();
+        JwksCache::with_shutdown_and_resource_audience(
+            &config,
+            CancellationToken::new(),
+            resource.map(str::to_owned),
+        )
+        .map_err(anyhow::Error::msg)
+    }
+
+    /// Parses an optional `aud` value and an optional `azp` into [`Claims`].
+    fn audience_claims(
+        aud: Option<&serde_json::Value>,
+        azp: Option<&str>,
+    ) -> anyhow::Result<Claims> {
+        let mut object = serde_json::Map::new();
+        if let Some(aud_value) = aud {
+            drop(object.insert("aud".to_owned(), aud_value.clone()));
+        }
+        if let Some(azp_value) = azp {
+            drop(object.insert("azp".to_owned(), serde_json::Value::from(azp_value)));
+        }
+        serde_json::from_value(serde_json::Value::Object(object)).context("claims deserialization")
+    }
+
+    /// FROZEN COPY of the 3.20.0 `check_audience` acceptance rule.
+    ///
+    /// Kept as the todo 9 differential oracle. DO NOT EDIT: it is the
+    /// parent's decision with only its log side effects removed, and every
+    /// cache with the new audience knobs off must reproduce it exactly.
+    fn frozen_3_20_audience_accepts(
+        expected: &str,
+        mode: AudienceValidationMode,
+        claims: &Claims,
+    ) -> bool {
+        if claims.aud.0.iter().any(|candidate| candidate == expected) {
+            return true;
+        }
+        let azp_match = claims.azp.as_deref().is_some_and(|azp| azp == expected);
+        if azp_match {
+            match mode {
+                AudienceValidationMode::Permissive | AudienceValidationMode::Warn => return true,
+                AudienceValidationMode::Strict => {}
+            }
+        }
+        false
+    }
+
+    /// Accepts `aud` equal to `audience` or to any `additional_audiences`
+    /// entry, as a string or inside an array, under every mode.
+    #[test]
+    fn check_audience_accepts_additional_audience() -> anyhow::Result<()> {
+        let accepted = [
+            serde_json::json!(TEST_AUDIENCE),
+            serde_json::json!(EXTRA_AUDIENCE),
+            serde_json::json!("legacy-aud"),
+            serde_json::json!(["https://other.example/mcp", EXTRA_AUDIENCE]),
+            serde_json::json!([EXTRA_AUDIENCE, EXTRA_AUDIENCE]),
+        ];
+        let mut checked = 0_usize;
+        for mode in ALL_AUDIENCE_MODES {
+            let cache = audience_cache(mode, &[EXTRA_AUDIENCE, "legacy-aud"], None)?;
+            for aud in &accepted {
+                assert_eq!(
+                    cache.check_audience(&audience_claims(Some(aud), None)?),
+                    Ok(()),
+                    "{mode:?} aud={aud}"
+                );
+                checked = checked.saturating_add(1);
+            }
+        }
+        assert_eq!(checked, 15);
+        Ok(())
+    }
+
+    /// Accepts `aud` equal to the resource audience only when the cache was
+    /// built with one; the same token is rejected by a cache without it.
+    #[test]
+    fn check_audience_accepts_resource_audience_only_when_set() -> anyhow::Result<()> {
+        let resource_shapes = [
+            serde_json::json!(RESOURCE_AUDIENCE),
+            serde_json::json!(["https://other.example/mcp", RESOURCE_AUDIENCE]),
+        ];
+        let mut checked = 0_usize;
+        for mode in ALL_AUDIENCE_MODES {
+            let with_resource = audience_cache(mode, &[], Some(RESOURCE_AUDIENCE))?;
+            let without_resource = audience_cache(mode, &[], None)?;
+            for aud in &resource_shapes {
+                let claims = audience_claims(Some(aud), None)?;
+                assert_eq!(
+                    with_resource.check_audience(&claims),
+                    Ok(()),
+                    "{mode:?} aud={aud}"
+                );
+                assert_eq!(
+                    without_resource.check_audience(&claims),
+                    Err(JwtValidationFailure::Invalid),
+                    "{mode:?} aud={aud}"
+                );
+                checked = checked.saturating_add(1);
+            }
+        }
+        assert_eq!(checked, 6);
+        Ok(())
+    }
+
+    /// Only exact members of the accept set pass.
+    ///
+    /// Another resource, near misses of the extra and resource audiences
+    /// (trailing slash, case, port, scheme, userinfo, whitespace, missing
+    /// path) and empty shapes are rejected under every mode.
+    #[test]
+    fn check_audience_rejects_other_resource() -> anyhow::Result<()> {
+        let rejected = [
+            Some(serde_json::json!("https://other.example/mcp")),
+            Some(serde_json::json!(["https://other.example/mcp"])),
+            Some(serde_json::json!("https://rs.example:8443/mcp/")),
+            Some(serde_json::json!("HTTPS://RS.EXAMPLE:8443/MCP")),
+            Some(serde_json::json!("https://rs.example:8443/MCP")),
+            Some(serde_json::json!("https://rs.example/mcp")),
+            Some(serde_json::json!("https://rs.example:443/mcp")),
+            Some(serde_json::json!("http://rs.example:8443/mcp")),
+            Some(serde_json::json!("https://user@rs.example:8443/mcp")),
+            Some(serde_json::json!(" https://rs.example:8443/mcp")),
+            Some(serde_json::json!("https://rs.example:8443")),
+            Some(serde_json::json!("https://alt.example/mcp/")),
+            Some(serde_json::json!("https://ALT.example/mcp")),
+            Some(serde_json::json!("https://alt.example:443/mcp")),
+            Some(serde_json::json!("http://alt.example/mcp")),
+            Some(serde_json::json!("https://mcp.test.local/mcp/")),
+            Some(serde_json::json!("")),
+            Some(serde_json::json!([])),
+            Some(serde_json::json!([""])),
+            Some(serde_json::json!(["", ""])),
+            None,
+        ];
+        let mut checked = 0_usize;
+        for mode in ALL_AUDIENCE_MODES {
+            let cache = audience_cache(mode, &[EXTRA_AUDIENCE], Some(RESOURCE_AUDIENCE))?;
+            for aud in &rejected {
+                assert_eq!(
+                    cache.check_audience(&audience_claims(aud.as_ref(), None)?),
+                    Err(JwtValidationFailure::Invalid),
+                    "{mode:?} aud={aud:?}"
+                );
+                checked = checked.saturating_add(1);
+            }
+        }
+        assert_eq!(checked, 63);
+        Ok(())
+    }
+
+    /// The `azp` fallback stays bound to `audience`.
+    ///
+    /// With extra and resource audiences configured, an azp-only match on
+    /// `audience` keeps the
+    /// existing per-mode outcome (Permissive and Warn accept, Strict
+    /// rejects), an azp equal to an extra or resource audience never
+    /// accepts, and an `aud` match on an extra audience never touches the
+    /// azp once-per-process flags.
+    #[test]
+    fn check_audience_azp_fallback_stays_bound_to_audience() -> anyhow::Result<()> {
+        let other = serde_json::json!("https://some-other-resource.example.com");
+        for (mode, azp_on_audience) in [
+            (AudienceValidationMode::Permissive, Ok(())),
+            (AudienceValidationMode::Warn, Ok(())),
+            (
+                AudienceValidationMode::Strict,
+                Err(JwtValidationFailure::Invalid),
+            ),
+        ] {
+            let cache = audience_cache(mode, &[EXTRA_AUDIENCE], Some(RESOURCE_AUDIENCE))?;
+            let extra_aud = audience_claims(
+                Some(&serde_json::json!(EXTRA_AUDIENCE)),
+                Some(TEST_AUDIENCE),
+            )?;
+            assert_eq!(cache.check_audience(&extra_aud), Ok(()), "{mode:?}");
+            assert!(
+                !cache.shared.azp_fallback_warned.load(Ordering::Relaxed)
+                    && !cache.shared.azp_permissive_logged.load(Ordering::Relaxed),
+                "{mode:?}: an aud match must not take the azp fallback"
+            );
+            for azp in [EXTRA_AUDIENCE, RESOURCE_AUDIENCE] {
+                assert_eq!(
+                    cache.check_audience(&audience_claims(Some(&other), Some(azp))?),
+                    Err(JwtValidationFailure::Invalid),
+                    "{mode:?} azp={azp}"
+                );
+            }
+            assert_eq!(
+                cache.check_audience(&audience_claims(Some(&other), Some(TEST_AUDIENCE))?),
+                azp_on_audience,
+                "{mode:?}"
+            );
+            assert_eq!(
+                cache.shared.azp_fallback_warned.load(Ordering::Relaxed),
+                mode == AudienceValidationMode::Warn,
+                "{mode:?}: only Warn sets the warn-once flag"
+            );
+            assert_eq!(
+                cache.shared.azp_permissive_logged.load(Ordering::Relaxed),
+                mode == AudienceValidationMode::Permissive,
+                "{mode:?}: only Permissive sets its log-once flag"
+            );
+        }
+        Ok(())
+    }
+
+    /// Differential oracle over `aud` shapes x `azp` values x modes.
+    ///
+    /// A cache built through the public `JwksCache::new` path (knobs off, and with
+    /// only `accept_resource_audience` set, which `new` ignores) decides
+    /// exactly like the frozen 3.20.0 rule; a cache with an extra and a
+    /// resource audience decides like the frozen rule widened by exact
+    /// membership of those two strings and nothing else.
+    #[test]
+    fn check_audience_differs_from_3_20_only_by_exact_opt_in_members() -> anyhow::Result<()> {
+        let aud_shapes = [
+            None,
+            Some(serde_json::json!(TEST_AUDIENCE)),
+            Some(serde_json::json!([TEST_AUDIENCE])),
+            Some(serde_json::json!([TEST_AUDIENCE, TEST_AUDIENCE])),
+            Some(serde_json::json!([
+                "https://other.example/mcp",
+                TEST_AUDIENCE
+            ])),
+            Some(serde_json::json!("https://mcp.test.local/mcp/")),
+            Some(serde_json::json!("HTTPS://MCP.TEST.LOCAL/MCP")),
+            Some(serde_json::json!("https://mcp.test.local:443/mcp")),
+            Some(serde_json::json!("http://mcp.test.local/mcp")),
+            Some(serde_json::json!("https://user@mcp.test.local/mcp")),
+            Some(serde_json::json!(EXTRA_AUDIENCE)),
+            Some(serde_json::json!([EXTRA_AUDIENCE, "x"])),
+            Some(serde_json::json!("https://alt.example/mcp/")),
+            Some(serde_json::json!(RESOURCE_AUDIENCE)),
+            Some(serde_json::json!(["x", RESOURCE_AUDIENCE])),
+            Some(serde_json::json!("https://rs.example:8443/mcp/")),
+            Some(serde_json::json!("https://rs.example/mcp")),
+            Some(serde_json::json!("https://other.example/mcp")),
+            Some(serde_json::json!("")),
+            Some(serde_json::json!([])),
+            Some(serde_json::json!([""])),
+            Some(serde_json::json!("https://auth.test.local")),
+            Some(serde_json::json!("http://127.0.0.1:9/jwks.json")),
+            Some(serde_json::json!("https://attacker.example/mcp")),
+            Some(serde_json::json!(["zq9-sentinel-5f3a1c7e"])),
+        ];
+        let azp_shapes = [
+            None,
+            Some(TEST_AUDIENCE),
+            Some(EXTRA_AUDIENCE),
+            Some(RESOURCE_AUDIENCE),
+            Some("https://other.example/mcp"),
+            Some(""),
+        ];
+        let mut cases = 0_usize;
+        let mut accepted_by_frozen = 0_usize;
+        let mut widened = 0_usize;
+        for mode in ALL_AUDIENCE_MODES {
+            let mut off_config = test_config("http://127.0.0.1:9/jwks.json");
+            off_config.audience_validation_mode = Some(mode);
+            let knobs_off = test_cache(&off_config)?;
+            off_config.accept_resource_audience = true;
+            let flag_only = test_cache(&off_config)?;
+            let knobs_on = audience_cache(mode, &[EXTRA_AUDIENCE], Some(RESOURCE_AUDIENCE))?;
+            for aud in &aud_shapes {
+                for azp in azp_shapes {
+                    let claims = audience_claims(aud.as_ref(), azp)?;
+                    let frozen = frozen_3_20_audience_accepts(TEST_AUDIENCE, mode, &claims);
+                    let member = claims.aud.0.iter().any(|candidate| {
+                        candidate == EXTRA_AUDIENCE || candidate == RESOURCE_AUDIENCE
+                    });
+                    let case = format!("{mode:?} aud={aud:?} azp={azp:?}");
+                    assert_eq!(knobs_off.check_audience(&claims).is_ok(), frozen, "{case}");
+                    assert_eq!(flag_only.check_audience(&claims).is_ok(), frozen, "{case}");
+                    assert_eq!(
+                        knobs_on.check_audience(&claims).is_ok(),
+                        frozen || member,
+                        "{case}"
+                    );
+                    cases = cases.saturating_add(1);
+                    accepted_by_frozen = accepted_by_frozen.saturating_add(usize::from(frozen));
+                    widened = widened.saturating_add(usize::from(!frozen && member));
+                }
+            }
+        }
+        assert_eq!(cases, 450);
+        assert!(
+            accepted_by_frozen > 0
+                && widened > 0
+                && cases > accepted_by_frozen.saturating_add(widened)
+        );
+        Ok(())
+    }
+
+    /// Every public or knob-only cache path leaves the resource audience unset.
+    ///
+    /// `JwksCache::new`, `with_shutdown` and the crate-private constructor
+    /// with `None` carry no resource audience, also when the config sets
+    /// `accept_resource_audience` (the knob alone must do nothing), and the
+    /// unset cache rejects the issuer, the `jwks_uri`, a foreign resource and
+    /// a sentinel as `aud`.
+    #[test]
+    fn check_audience_resource_audience_unset_for_knob_only_constructors() -> anyhow::Result<()> {
+        let mut checked = 0_usize;
+        for accept in [false, true] {
+            let mut config = test_config("http://127.0.0.1:9/jwks.json");
+            config.accept_resource_audience = accept;
+            let caches = [
+                JwksCache::new(&config).map_err(anyhow::Error::msg)?,
+                JwksCache::with_shutdown(&config, CancellationToken::new())
+                    .map_err(anyhow::Error::msg)?,
+                JwksCache::with_shutdown_and_resource_audience(
+                    &config,
+                    CancellationToken::new(),
+                    None,
+                )
+                .map_err(anyhow::Error::msg)?,
+            ];
+            for cache in &caches {
+                assert_eq!(cache.__test_resource_audience(), None, "accept={accept}");
+                for aud in [
+                    "https://auth.test.local",
+                    "http://127.0.0.1:9/jwks.json",
+                    "https://attacker.example/mcp",
+                    "zq9-sentinel-5f3a1c7e",
+                ] {
+                    assert_eq!(
+                        cache
+                            .check_audience(&audience_claims(Some(&serde_json::json!(aud)), None)?),
+                        Err(JwtValidationFailure::Invalid),
+                        "accept={accept} aud={aud}"
+                    );
+                    checked = checked.saturating_add(1);
+                }
+            }
+        }
+        assert_eq!(checked, 24);
         Ok(())
     }
 
