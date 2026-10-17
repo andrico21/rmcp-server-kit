@@ -722,6 +722,11 @@ pub struct McpServerConfig {
         note = "use McpServerConfig::with_sse_keep_alive(); direct field access will become pub(crate) in a future major release"
     )]
     pub sse_keep_alive: Duration,
+    /// Reconnect hint sent as an SSE priming event (`id:` + `retry:` with
+    /// empty `data:`) at the start of every SSE response stream, per MCP
+    /// 2025-11-25 resumability. `None` disables the priming event.
+    /// Default: 3 seconds (rmcp's default).
+    sse_retry: Option<Duration>,
     /// Callback invoked once the server is built, delivering a
     /// [`ReloadHandle`] for hot-reloading auth keys and RBAC policy
     /// at runtime (e.g. on SIGHUP). Only useful when auth/RBAC is enabled.
@@ -1017,6 +1022,7 @@ impl McpServerConfig {
             session_store: None,
             event_store: None,
             sse_keep_alive: Duration::from_secs(15),
+            sse_retry: Some(Duration::from_secs(3)),
             on_reload_ready: None,
             extra_router: None,
             public_url: None,
@@ -1312,6 +1318,15 @@ impl McpServerConfig {
     #[inline]
     pub fn with_sse_keep_alive(mut self, interval: Duration) -> Self {
         self.sse_keep_alive = interval;
+        self
+    }
+
+    /// Override the SSE priming-event retry hint. `None` disables the
+    /// priming event, for clients whose SSE parser requires the stream to
+    /// start with a `data:` line. Default: 3 seconds.
+    #[must_use]
+    pub fn with_sse_retry(mut self, retry: Option<Duration>) -> Self {
+        self.sse_retry = retry;
         self
     }
 
@@ -2405,6 +2420,7 @@ where
     let mut rmcp_config = StreamableHttpServerConfig::default()
         .with_allowed_hosts(allowed_hosts)
         .with_sse_keep_alive(Some(config.sse_keep_alive))
+        .with_sse_retry(config.sse_retry)
         // Propagate the public cap into rmcp's own body limit. rmcp otherwise
         // enforces its 4 MiB default and silently under-delivers any larger
         // configured value; equal caps keep the OUTER tower layer (installed
@@ -2426,6 +2442,7 @@ where
         {
             let mut mgr = LocalSessionManager::default();
             mgr.session_config.keep_alive = Some(config.session_idle_timeout);
+            mgr.session_config.sse_retry = config.sse_retry;
             if let Some(store) = event_store {
                 mgr = mgr.with_event_store(store);
             }
