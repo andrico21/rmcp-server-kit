@@ -21,15 +21,22 @@ pub(crate) const MAX_SEALED_LEN: usize = 8192;
 /// Cryptographic purpose of a sealed payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SealKind {
+    /// Registered downstream client metadata.
     Client,
+    /// Browser-bound pending consent transaction.
     ConsentRequest,
+    /// Approved authorization flow stored in a browser cookie.
     State,
+    /// Upstream authorization code bound to a downstream transaction.
     Code,
+    /// Remembered browser approvals.
     Consent,
+    /// Upstream refresh token bound to a downstream client.
     Refresh,
 }
 
 impl SealKind {
+    /// Complete purpose set used for eager key derivation.
     const ALL: [Self; 6] = [
         Self::Client,
         Self::ConsentRequest,
@@ -39,6 +46,7 @@ impl SealKind {
         Self::Refresh,
     ];
 
+    /// Stable domain-separation label for this purpose.
     const fn label(self) -> &'static str {
         match self {
             Self::Client => "client",
@@ -54,21 +62,28 @@ impl SealKind {
 /// Stable errors that never retain token or payload contents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum SealError {
+    /// Encoded token exceeds the bounded wire size.
     #[error("sealed token exceeds length limit")]
     TooLong,
+    /// Wire syntax or base64 encoding is invalid.
     #[error("malformed sealed token")]
     Malformed,
+    /// Authentication or key initialization failed.
     #[error("sealed token authentication failed")]
     BadMac,
+    /// Authenticated JSON cannot represent the requested payload.
     #[error("invalid sealed payload")]
     Payload,
 }
 
+/// Initialized purpose keys or their fail-closed construction errors.
 type KindKeys = [(SealKind, Result<Hmac<Sha256>, SealError>); 6];
 
 /// Domain-separated current signing keys and optional previous verifying keys.
 pub(crate) struct Sealer {
+    /// Active signing and verification keys.
     current: KindKeys,
+    /// Retired keys accepted only during verification.
     previous: Option<KindKeys>,
 }
 
@@ -154,6 +169,7 @@ impl Sealer {
     }
 }
 
+/// Derive independent MAC keys for every sealed-payload purpose.
 fn derive_keys(secret: &SecretString) -> KindKeys {
     SealKind::ALL.map(|kind| {
         let key = Hmac::<Sha256>::new_from_slice(secret.expose_secret().as_bytes())

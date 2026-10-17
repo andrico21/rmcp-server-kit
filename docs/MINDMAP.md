@@ -296,10 +296,10 @@ mindmap
 sequenceDiagram
     autonumber
     participant C as Client
-    participant TLS as `TlsListener`<br/>src/transport.rs:3769
+    participant TLS as `TlsListener`<br/>src/transport.rs:3792
     participant R as axum Router
-    participant O as `origin_check_middleware`<br/>src/transport.rs:5277
-    participant H as `security_headers_middleware`<br/>src/transport.rs:4486
+    participant O as `origin_check_middleware`<br/>src/transport.rs:5333
+    participant H as `security_headers_middleware`<br/>src/transport.rs:4509
     participant A as `auth_middleware`<br/>src/auth.rs:2782
     participant B as `rbac_middleware`<br/>src/rbac.rs:1354
     participant L as per-IP rate limit<br/>governor + bounded_limiter
@@ -430,16 +430,16 @@ graph TD
 | Area                              | Module / file                           | Notable symbols (file:line)                                                  |
 |-----------------------------------|------------------------------------------|-------------------------------------------------------------------------------|
 | Server entry (HTTP)               | `src/transport.rs`                       | `serve` L3096, `McpServerConfig` L482, `ReloadHandle` ~L2019              |
-| Server entry (stdio, no auth)     | `src/transport.rs`                       | `serve_stdio` L5622                                                          |
+| Server entry (stdio, no auth)     | `src/transport.rs`                       | `serve_stdio` L5678                                                          |
 | Router builder + middleware wire  | `src/transport.rs`                       | `build_app_router` L2347; security headers, peer-addr normalization, request logging, and origin checks are wired there |
-| TLS / mTLS acceptor               | `src/transport.rs`                       | `TlsListener` L3769                                                          |
-| Origin / security headers (defs)  | `src/transport.rs`                       | `origin_check_middleware` L5277, `security_headers_middleware` ~L4486       |
-| Graceful shutdown                 | `src/transport.rs`                       | `shutdown_signal` L4303                                                      |
+| TLS / mTLS acceptor               | `src/transport.rs`                       | `TlsListener` L3792                                                          |
+| Origin / security headers (defs)  | `src/transport.rs`                       | `origin_check_middleware` L5333, `security_headers_middleware` ~L4509       |
+| Graceful shutdown                 | `src/transport.rs`                       | `shutdown_signal` L4326                                                      |
 | API key + mTLS auth               | `src/auth.rs`                            | `AuthIdentity` L76, `AuthState` ~L1760, `auth_middleware` L2782              |
 | RBAC engine                       | `src/rbac.rs`                            | `RbacPolicy` L709, `current_role` L158, `current_identity` L180, `current_token` L202, `current_sub` L220, `rbac_middleware` L1354           |
 | Memory-bounded keyed limiter      | `src/bounded_limiter.rs`                 | `BoundedKeyedLimiter` L158                                                    |
 | Trusted-forwarder resolution      | `src/forwarded.rs`                       | `resolve_client_ip`, `FallbackReason` (rightmost-untrusted, fail-safe-to-direct) |
-| OAuth JWT / JWKS                  | `src/oauth.rs` (feature `oauth`)         | `JwksCache` L3146, `JWKS_REFRESH_COOLDOWN` ~L3337, `select_jwks_key` L4020 |
+| OAuth JWT / JWKS                  | `src/oauth.rs` (feature `oauth`)         | `JwksCache` L3146, `JWKS_REFRESH_COOLDOWN` ~L3337, `select_jwks_key` L4038 |
 | SSRF guard (outbound HTTP)        | `src/ssrf.rs`                            | per-hop scheme/userinfo/IP-literal blocks                                     |
 | mTLS revocation (CRL)             | `src/mtls_revocation.rs`                 | `CrlSet` L330, `DynamicClientCertVerifier` L1745, `bootstrap_fetch` L2172       |
 | Tool hooks / size cap             | `src/tool_hooks.rs`                      | `HookedHandler` L335                                                          |

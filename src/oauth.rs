@@ -2871,6 +2871,14 @@ pub struct OAuthProxyConfig {
 }
 
 impl OAuthProxyConfig {
+    /// Resolve the validated browser-consent duration; omission means 30 days.
+    pub(crate) fn effective_consent_ttl(&self) -> Duration {
+        self.consent_ttl
+            .as_deref()
+            .and_then(|value| humantime::parse_duration(value).ok())
+            .unwrap_or(Duration::from_hours(720))
+    }
+
     /// Start building an [`OAuthProxyConfig`] with the three required
     /// upstream fields.
     ///

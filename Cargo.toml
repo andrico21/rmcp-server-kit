@@ -329,6 +329,11 @@ path = "tests/integration/oauth_http_client.rs"
 required-features = ["oauth", "test-helpers"]
 
 [[test]]
+name = "oauth_as_proxy"
+path = "tests/integration/oauth_as_proxy.rs"
+required-features = ["oauth"]
+
+[[test]]
 name = "origin_validation"
 path = "tests/integration/origin_validation.rs"
 

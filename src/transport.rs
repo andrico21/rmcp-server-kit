@@ -2802,6 +2802,7 @@ where
             auth_state.as_ref(),
             config.max_request_body,
             &config.admin_role,
+            &config.name,
         )?;
     }
 
@@ -3422,6 +3423,7 @@ fn install_oauth_proxy_routes(
     auth_state: Option<&Arc<AuthState>>,
     max_request_body: usize,
     admin_role: &str,
+    server_name: &str,
 ) -> Result<axum::Router, RmcpServerKitError> {
     use axum::{
         extract::RawQuery,
@@ -3430,11 +3432,34 @@ fn install_oauth_proxy_routes(
     };
     use tower_http::limit::RequestBodyLimitLayer;
 
-    use crate::oauth::{authorization_server_metadata, handle_authorize, handle_token};
+    use crate::{
+        oauth::{authorization_server_metadata, handle_authorize, handle_token},
+        oauth_as::install_routes,
+    };
 
     let Some(proxy) = &oauth_config.proxy else {
         return Ok(router);
     };
+
+    match proxy.mode {
+        ProxyMode::Passthrough => {}
+        ProxyMode::AuthorizationServer => {
+            let facade = install_routes(proxy, server_url, server_name)?;
+            let http = OauthHttpClient::with_config(oauth_config)?;
+            let admin = if proxy.expose_admin_endpoints
+                && (proxy.introspection_url.is_some() || proxy.revocation_url.is_some())
+            {
+                build_oauth_admin_router(proxy, http, auth_state, admin_role)?
+            } else {
+                axum::Router::new()
+            };
+            return Ok(router.merge(
+                facade
+                    .merge(admin)
+                    .layer(RequestBodyLimitLayer::new(max_request_body)),
+            ));
+        }
+    }
 
     // Single shared HTTP client for all proxy endpoints. Cloning is
     // cheap (refcounted) and shares the underlying connection pool.
@@ -4492,6 +4517,8 @@ pub(crate) async fn security_headers_middleware(
     use axum::http::header;
 
     let mut resp = next.run(req).await;
+    #[cfg(feature = "oauth")]
+    let page_headers = resp.extensions().get::<PageSecurityHeaders>().cloned();
     let headers = resp.headers_mut();
 
     // Strip server identity headers to reduce information leakage.
@@ -4574,7 +4601,35 @@ pub(crate) async fn security_headers_middleware(
         );
     }
 
+    #[cfg(feature = "oauth")]
+    if let Some(page) = page_headers {
+        let _csp = headers.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(page.csp),
+        );
+        let _referrer = headers.insert(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("same-origin"),
+        );
+        let _cache = headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
     resp
+}
+
+/// Mandatory browser-page policy, independent of API-header operator overrides.
+#[cfg(feature = "oauth")]
+#[derive(Clone)]
+pub(crate) struct PageSecurityHeaders {
+    /// Mandatory script-free policy for this page type.
+    csp: &'static str,
+}
+
+#[cfg(feature = "oauth")]
+impl PageSecurityHeaders {
+    /// Mark an authorization page with its script-free policy.
+    pub(crate) const fn new(csp: &'static str) -> Self {
+        Self { csp }
+    }
 }
 
 /// Set a single security header on the response, honouring the
@@ -4717,7 +4772,10 @@ pub(crate) fn validate_security_headers(
 /// cancel-safe: the only await is `next.run(req)`; header mutation afterwards
 /// is synchronous, so cancellation simply drops the response before it is sent.
 #[cfg(feature = "oauth")]
-async fn oauth_token_cache_headers_middleware(req: Request<Body>, next: Next) -> Response {
+pub(crate) async fn oauth_token_cache_headers_middleware(
+    req: Request<Body>,
+    next: Next,
+) -> Response {
     use axum::http::header;
 
     let mut resp = next.run(req).await;
