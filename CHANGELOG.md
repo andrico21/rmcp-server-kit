@@ -11,6 +11,14 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Added
+
+- `McpServerConfig::with_sse_retry(Option<Duration>)` controls the SSE
+  priming event (`id:`/`retry:` with empty `data:`) that rmcp sends at the
+  start of each SSE response stream. `None` disables it for clients whose
+  parser rejects a stream that doesn't open with `data:` (e.g. AWS Bedrock
+  AgentCore). Default stays `Some(3s)`, matching rmcp.
+
 ## [3.20.0] - 2026-10-13
 
 ### Breaking
