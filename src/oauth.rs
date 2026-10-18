@@ -5196,8 +5196,6 @@ pub async fn handle_token(
     proxy: &OAuthProxyConfig,
     body: &str,
 ) -> Response {
-    use axum::{http::header, response::IntoResponse as _};
-
     // Replace client_id in the form body with the upstream client_id.
     let mut upstream_body =
         rewrite_client_auth_params(body, &proxy.client_id, proxy.strip_resource_param);
@@ -5217,6 +5215,18 @@ pub async fn handle_token(
             urlencoding::encode(secret.expose_secret())
         );
     }
+
+    relay_token_request(http, proxy, upstream_body).await
+}
+
+/// Send an explicitly constructed token form and relay the bounded upstream bytes.
+// cancel-safe: no local state is changed; cancellation can consume the upstream grant without returning its result.
+pub(crate) async fn relay_token_request(
+    http: &OauthHttpClient,
+    proxy: &OAuthProxyConfig,
+    upstream_body: String,
+) -> Response {
+    use axum::{http::header, response::IntoResponse as _};
 
     let result = http
         .send_screened(

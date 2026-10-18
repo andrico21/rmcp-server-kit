@@ -11,6 +11,13 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+### Added
+
+- Authorization-server proxy callback and token exchange with stateless,
+  client-bound authorization codes and refresh tokens, PKCE verification,
+  refresh-token admin adapters, key rotation and issuer-consistent metadata.
+  Passthrough proxy behavior remains unchanged.
+
 ## [3.20.0] - 2026-10-13
 
 ### Breaking

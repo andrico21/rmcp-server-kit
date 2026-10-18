@@ -78,6 +78,8 @@ use crate::{
         session_binding_middleware,
     },
 };
+#[cfg(feature = "oauth")]
+use crate::{oauth_as::unwrap_refresh_token_param, oauth_seal::Sealer};
 
 /// Map an internal `anyhow::Error` chain into a public [`RmcpServerKitError::Startup`]
 /// at the public API boundary, flattening the chain via the alternate
@@ -3434,7 +3436,7 @@ fn install_oauth_proxy_routes(
 
     use crate::{
         oauth::{authorization_server_metadata, handle_authorize, handle_token},
-        oauth_as::install_routes,
+        oauth_as::{admin_sealer, install_routes},
     };
 
     let Some(proxy) = &oauth_config.proxy else {
@@ -3444,12 +3446,13 @@ fn install_oauth_proxy_routes(
     match proxy.mode {
         ProxyMode::Passthrough => {}
         ProxyMode::AuthorizationServer => {
-            let facade = install_routes(proxy, server_url, server_name)?;
+            let facade = install_routes(oauth_config, server_url, server_name)?;
             let http = OauthHttpClient::with_config(oauth_config)?;
             let admin = if proxy.expose_admin_endpoints
                 && (proxy.introspection_url.is_some() || proxy.revocation_url.is_some())
             {
-                build_oauth_admin_router(proxy, http, auth_state, admin_role)?
+                let sealer = Arc::new(admin_sealer(proxy)?);
+                build_oauth_admin_router(proxy, http, auth_state, admin_role, Some(sealer))?
             } else {
                 axum::Router::new()
             };
@@ -3530,7 +3533,7 @@ fn install_oauth_proxy_routes(
     }
 
     let admin_router = if admin_routes_enabled {
-        build_oauth_admin_router(proxy, http, auth_state, admin_role)?
+        build_oauth_admin_router(proxy, http, auth_state, admin_role, None)?
     } else {
         axum::Router::new()
     };
@@ -3569,6 +3572,7 @@ fn build_oauth_admin_router(
     http: OauthHttpClient,
     auth_state: Option<&Arc<AuthState>>,
     admin_role: &str,
+    refresh_unwrap: Option<Arc<Sealer>>,
 ) -> Result<axum::Router, RmcpServerKitError> {
     use axum::{middleware::from_fn, routing::post};
 
@@ -3580,24 +3584,46 @@ fn build_oauth_admin_router(
     if proxy.introspection_url.is_some() {
         let proxy_introspect = proxy.clone();
         let introspect_http = http.clone();
+        let unwrap = refresh_unwrap.clone();
         admin_router = admin_router.route(
             "/introspect",
             post(move |body: String| {
                 let proxy_config = proxy_introspect.clone();
                 let http_client = introspect_http.clone();
-                async move { handle_introspect(&http_client, &proxy_config, &body).await }
+                let token_sealer = unwrap.clone();
+                async move {
+                    let upstream_body = match token_sealer {
+                        Some(sealer) => match unwrap_refresh_token_param(&sealer, &body) {
+                            Ok(adapted) => adapted,
+                            Err(response) => return response,
+                        },
+                        None => body,
+                    };
+                    handle_introspect(&http_client, &proxy_config, &upstream_body).await
+                }
             }),
         );
     }
     if proxy.revocation_url.is_some() {
         let proxy_revoke = proxy.clone();
         let revoke_http = http;
+        let unwrap = refresh_unwrap;
         admin_router = admin_router.route(
             "/revoke",
             post(move |body: String| {
                 let proxy_config = proxy_revoke.clone();
                 let http_client = revoke_http.clone();
-                async move { handle_revoke(&http_client, &proxy_config, &body).await }
+                let token_sealer = unwrap.clone();
+                async move {
+                    let upstream_body = match token_sealer {
+                        Some(sealer) => match unwrap_refresh_token_param(&sealer, &body) {
+                            Ok(adapted) => adapted,
+                            Err(response) => return response,
+                        },
+                        None => body,
+                    };
+                    handle_revoke(&http_client, &proxy_config, &upstream_body).await
+                }
             }),
         );
     }
@@ -11181,7 +11207,7 @@ mod tests {
         )
         .build();
         let http = OauthHttpClient::with_config(&oauth_config).context("oauth http client")?;
-        build_oauth_admin_router(&proxy, http, Some(state), "admin").context("admin router")
+        build_oauth_admin_router(&proxy, http, Some(state), "admin", None).context("admin router")
     }
 
     /// Builds a POST request carrying a bearer token and a form body.

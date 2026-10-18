@@ -8,7 +8,7 @@ use core::time::Duration;
 
 use axum::{
     Json, Router,
-    body::Bytes,
+    body::{Bytes, to_bytes},
     extract::{RawQuery, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::from_fn,
@@ -23,7 +23,10 @@ use url::{Url, form_urlencoded};
 
 use crate::{
     RmcpServerKitError,
-    oauth::{OAuthProxyConfig, is_rfc6750_scope_token},
+    oauth::{
+        OAuthConfig, OAuthProxyConfig, OauthHttpClient, authorization_server_metadata,
+        is_rfc6750_scope_token, relay_token_request,
+    },
     oauth_seal::{SealKind, Sealer, now_unix, sha256_b64},
     transport::{PageSecurityHeaders, oauth_token_cache_headers_middleware},
 };
@@ -52,6 +55,10 @@ struct AsState {
     cookie_suffix: String,
     /// Browser approval lifetime, with zero disabling remembered approval.
     consent_ttl: Duration,
+    /// Exact upstream issuer accepted on authorization responses.
+    upstream_issuer: String,
+    /// Shared screened upstream connection pool.
+    http: OauthHttpClient,
 }
 
 /// Integrity-protected downstream registration with compact wire member names.
@@ -109,6 +116,32 @@ struct FlowState {
     exp: u64,
 }
 
+/// Short-lived upstream authorization code with approved downstream bindings.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CodeWrap {
+    /// Upstream authorization code.
+    kc: String,
+    /// Digest of the redeeming downstream registration.
+    cid: String,
+    /// Exact approved redirect URI.
+    ru: String,
+    /// Approved S256 challenge.
+    cc: String,
+    /// Exclusive redemption deadline in Unix seconds.
+    exp: u64,
+}
+
+/// Upstream refresh credential bound to its downstream client.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RefreshWrap {
+    /// Upstream refresh credential, bounded to 4096 bytes.
+    rt: String,
+    /// Downstream registration digest retained across rotations.
+    cid: String,
+}
+
 /// Browser approvals in most-recently-used order.
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -142,15 +175,19 @@ struct Registration {
     client_name: Option<String>,
 }
 
-/// Install only the front half of the stateless facade.
+/// Install the stateless authorization-server facade without changing passthrough helpers.
 ///
 /// # Errors
 /// Returns a configuration error for missing secrets or an unusable issuer URL.
 pub(crate) fn install_routes(
-    proxy: &OAuthProxyConfig,
+    oauth: &OAuthConfig,
     issuer_url: &str,
     server_name: &str,
 ) -> Result<Router, RmcpServerKitError> {
+    let proxy = oauth
+        .proxy
+        .as_ref()
+        .ok_or_else(|| RmcpServerKitError::Config("oauth.proxy is required".into()))?;
     let secret = proxy.sealing_secret.as_ref().ok_or_else(|| {
         RmcpServerKitError::Config("oauth.proxy.sealing_secret is required".into())
     })?;
@@ -184,15 +221,47 @@ pub(crate) fn install_routes(
         cookie_secure: issuer.scheme() == "https",
         cookie_suffix: suffix,
         consent_ttl: proxy.effective_consent_ttl(),
+        upstream_issuer: oauth.issuer.clone(),
+        http: OauthHttpClient::with_config(oauth)?,
     });
+    let mut metadata = authorization_server_metadata(&state.issuer_url, oauth);
+    if let Some(object) = metadata.as_object_mut() {
+        drop(object.insert(
+            "authorization_response_iss_parameter_supported".into(),
+            serde_json::Value::Bool(true),
+        ));
+    }
     Ok(Router::new()
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(move || {
+                let document = metadata.clone();
+                async move { Json(document) }
+            }),
+        )
         .route(
             "/register",
             post(register).layer(from_fn(oauth_token_cache_headers_middleware)),
         )
         .route("/authorize", get(authorize))
         .route("/oauth/consent", post(consent))
+        .route("/oauth/callback", get(callback))
+        .route(
+            "/token",
+            post(token).layer(from_fn(oauth_token_cache_headers_middleware)),
+        )
         .with_state(state))
+}
+
+/// Construct the admin adapter's purpose-separated current and rotation keys.
+///
+/// # Errors
+/// Returns a configuration error if the required AS secret is absent.
+pub(crate) fn admin_sealer(proxy: &OAuthProxyConfig) -> Result<Sealer, RmcpServerKitError> {
+    let secret = proxy.sealing_secret.as_ref().ok_or_else(|| {
+        RmcpServerKitError::Config("oauth.proxy.sealing_secret is required".into())
+    })?;
+    Ok(Sealer::new(secret, proxy.sealing_secret_previous.as_ref()))
 }
 
 /// Encode every HTML metacharacter before interpolation into text or attributes.
@@ -726,6 +795,315 @@ impl AsState {
     }
 }
 
+/// Complete a browser transaction and clear its presented state credentials.
+// cancel-safe: callback processing is synchronous and publishes only response cookies.
+async fn callback(
+    State(state): State<Arc<AsState>>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let raw = query.as_deref().unwrap_or_default();
+    let mut response = callback_response(&state, &headers, raw);
+    let selected: BTreeSet<String> = form_urlencoded::parse(raw.as_bytes())
+        .filter(|(name, value)| name == "state" && valid_state(value))
+        .map(|(_name, value)| state.cookie_name("state", Some(&sha256_b64(&value))))
+        .collect();
+    for cookie_name in selected {
+        state.set_cookie(&mut response, &cookie_name, "", 0);
+    }
+    response
+}
+
+/// Require the exact encoding shape of a generated 256-bit state nonce.
+fn valid_state(value: &str) -> bool {
+    value.len() == 43
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+}
+
+/// Authenticate browser state before trusting the upstream outcome or redirecting.
+fn callback_response(state: &AsState, headers: &HeaderMap, raw: &str) -> Response {
+    let pairs = match parameters(raw, false) {
+        Ok(pairs) => pairs,
+        Err(reason) => return rejected(reason, false),
+    };
+    let Some(nonce) = param(&pairs, "state").filter(|value| valid_state(value)) else {
+        return rejected("callback_state", true);
+    };
+    let hash = sha256_b64(nonce);
+    let Some(sealed) = cookie(headers, &state.cookie_name("state", Some(&hash))) else {
+        return rejected("state_missing", true);
+    };
+    let Ok(flow) = state.sealer.open::<FlowState>(SealKind::State, sealed) else {
+        return rejected("state_seal", true);
+    };
+    if flow.exp <= now_unix() || !bool::from(flow.nh.as_bytes().ct_eq(hash.as_bytes())) {
+        return rejected("state_binding", true);
+    }
+    if param(&pairs, "iss").is_some_and(|issuer| issuer != state.upstream_issuer) {
+        return rejected("issuer_mismatch", true);
+    }
+    let Ok(mut target) = Url::parse(&flow.ru) else {
+        return rejected("callback_redirect", true);
+    };
+    {
+        let mut query = target.query_pairs_mut();
+        if let Some(error) = param(&pairs, "error") {
+            let filtered: String = error
+                .bytes()
+                .filter(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                .take(64)
+                .map(char::from)
+                .collect();
+            let _pair = query.append_pair(
+                "error",
+                if filtered.is_empty() {
+                    "server_error"
+                } else {
+                    &filtered
+                },
+            );
+            if let Some(description) = param(&pairs, "error_description") {
+                let safe_description: String = description
+                    .bytes()
+                    .filter(|byte| (0x20..=0x7e).contains(byte) && !b"\"\\".contains(byte))
+                    .take(256)
+                    .map(char::from)
+                    .collect();
+                let _description = query.append_pair("error_description", &safe_description);
+            }
+        } else {
+            let Some(code) = param(&pairs, "code").filter(|value| value.len() <= 2048) else {
+                return rejected("callback_code", false);
+            };
+            let wrapped = CodeWrap {
+                kc: code.to_owned(),
+                cid: flow.cid,
+                ru: flow.ru,
+                cc: flow.cc,
+                exp: now_unix().saturating_add(120),
+            };
+            let Ok(sealed_code) = state.sealer.seal(SealKind::Code, &wrapped) else {
+                return rejected("code_seal", true);
+            };
+            let _pair = query.append_pair("code", &sealed_code);
+        }
+        if let Some(client_state) = flow.st {
+            let _pair = query.append_pair("state", &client_state);
+        }
+        let _pair = query.append_pair("iss", &state.issuer_url);
+    }
+    redirect(&target)
+}
+
+/// Emit a content-free RFC 6749 section 5.2 error with the required status.
+fn token_error(code: &'static str) -> Response {
+    let status = if code == "invalid_client" {
+        StatusCode::UNAUTHORIZED
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    tracing::debug!(reason = code, "oauth authorization-server request rejected");
+    (status, Json(serde_json::json!({"error":code}))).into_response()
+}
+
+/// Authenticate downstream bindings and serialize only the grant-specific allowlist.
+///
+/// # Errors
+/// Returns an RFC 6749 error code before any upstream operation on invalid inputs.
+fn token_form(
+    state: &AsState,
+    pairs: &[(String, String)],
+) -> Result<(String, String), &'static str> {
+    use secrecy::ExposeSecret as _;
+    let grant = param(pairs, "grant_type").ok_or("invalid_request")?;
+    let mut form = form_urlencoded::Serializer::new(String::new());
+    let cid = match grant {
+        "authorization_code" => {
+            let client = param(pairs, "client_id").ok_or("invalid_request")?;
+            let code = param(pairs, "code").ok_or("invalid_request")?;
+            let verifier = param(pairs, "code_verifier")
+                .filter(|value| valid_challenge(value))
+                .ok_or("invalid_request")?;
+            let ru = param(pairs, "redirect_uri").ok_or("invalid_request")?;
+            let _registration = state
+                .sealer
+                .open::<ClientReg>(SealKind::Client, client)
+                .map_err(|_error| "invalid_client")?;
+            let wrapped = state
+                .sealer
+                .open::<CodeWrap>(SealKind::Code, code)
+                .map_err(|_error| "invalid_grant")?;
+            if wrapped.exp <= now_unix()
+                || sha256_b64(client) != wrapped.cid
+                || ru != wrapped.ru
+                || !bool::from(sha256_b64(verifier).as_bytes().ct_eq(wrapped.cc.as_bytes()))
+            {
+                return Err("invalid_grant");
+            }
+            let _pairs = form
+                .append_pair("grant_type", grant)
+                .append_pair("code", &wrapped.kc)
+                .append_pair(
+                    "redirect_uri",
+                    &format!("{}/oauth/callback", state.issuer_url),
+                )
+                .append_pair("code_verifier", verifier);
+            wrapped.cid
+        }
+        "refresh_token" => {
+            let refresh = param(pairs, "refresh_token").ok_or("invalid_request")?;
+            let wrapped = state
+                .sealer
+                .open::<RefreshWrap>(SealKind::Refresh, refresh)
+                .map_err(|_error| "invalid_grant")?;
+            if wrapped.rt.len() > 4096 {
+                return Err("invalid_grant");
+            }
+            if let Some(client) = param(pairs, "client_id") {
+                let _registration = state
+                    .sealer
+                    .open::<ClientReg>(SealKind::Client, client)
+                    .map_err(|_error| "invalid_client")?;
+                if sha256_b64(client) != wrapped.cid {
+                    return Err("invalid_grant");
+                }
+            }
+            let _pairs = form
+                .append_pair("grant_type", grant)
+                .append_pair("refresh_token", &wrapped.rt);
+            if let Some(scope) = param(pairs, "scope") {
+                if !scope.split(' ').all(is_rfc6750_scope_token) {
+                    return Err("invalid_request");
+                }
+                let _pair = form.append_pair("scope", scope);
+            }
+            wrapped.cid
+        }
+        _ => return Err("unsupported_grant_type"),
+    };
+    let mut resources = 0_u8;
+    for (name, value) in pairs {
+        if name == "resource" {
+            resources = resources.saturating_add(1);
+            if resources > 2
+                || value.len() > 256
+                || !Url::parse(value).is_ok_and(|url| url.fragment().is_none())
+            {
+                return Err("invalid_request");
+            }
+            if !state.proxy.strip_resource_param {
+                let _pair = form.append_pair("resource", value);
+            }
+        }
+    }
+    let _pair = form.append_pair("client_id", &state.proxy.client_id);
+    if let Some(secret) = &state.proxy.client_secret {
+        let _secret = form.append_pair("client_secret", secret.expose_secret());
+    }
+    Ok((form.finish(), cid))
+}
+
+/// Exchange a locally authenticated grant and bind any rotated refresh credential.
+// cancel-safe: no local flow state is persisted; cancellation after upstream exchange may consume the grant.
+async fn token(State(state): State<Arc<AsState>>, body: String) -> Response {
+    let pairs = match parameters(&body, true) {
+        Ok(pairs) => pairs,
+        Err(_reason) => return token_error("invalid_request"),
+    };
+    let (form, cid) = match token_form(&state, &pairs) {
+        Ok(form) => form,
+        Err(code) => return token_error(code),
+    };
+    let response = relay_token_request(&state.http, &state.proxy, form).await;
+    if !response.status().is_success() {
+        return response;
+    }
+    let (parts, upstream_body) = response.into_parts();
+    let Ok(bytes) = to_bytes(upstream_body, 1024 * 1024).await else {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error":"server_error"})),
+        )
+            .into_response();
+    };
+    let Ok(mut object) =
+        serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&bytes)
+    else {
+        return Response::from_parts(parts, bytes.into());
+    };
+    if let Some(refresh) = object
+        .get("refresh_token")
+        .and_then(serde_json::Value::as_str)
+    {
+        if refresh.len() > 4096 {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error":"server_error"})),
+            )
+                .into_response();
+        }
+        let Ok(wrapped) = state.sealer.seal(
+            SealKind::Refresh,
+            &RefreshWrap {
+                rt: refresh.to_owned(),
+                cid,
+            },
+        ) else {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error":"server_error"})),
+            )
+                .into_response();
+        };
+        drop(object.insert("refresh_token".into(), serde_json::Value::String(wrapped)));
+    }
+    match serde_json::to_vec(&object) {
+        Ok(encoded) => Response::from_parts(parts, encoded.into()),
+        Err(_error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error":"server_error"})),
+        )
+            .into_response(),
+    }
+}
+
+/// Unwrap only authenticated facade refresh tokens, preserving access-token bodies verbatim.
+///
+/// # Errors
+/// Returns an RFC 6749 error for duplicate token parameters or oversized forms.
+#[expect(
+    clippy::result_large_err,
+    reason = "deliberate: oauth_as::unwrap_refresh_token_param preserves the specified Response error boundary"
+)]
+pub(crate) fn unwrap_refresh_token_param(sealer: &Sealer, body: &str) -> Result<String, Response> {
+    if body.len() > PARAM_LIMIT {
+        return Err(token_error("invalid_request"));
+    }
+    let pairs: Vec<(String, String)> = form_urlencoded::parse(body.as_bytes())
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect();
+    if pairs
+        .iter()
+        .filter(|(name, _value)| name == "token")
+        .count()
+        > 1
+    {
+        return Err(token_error("invalid_request"));
+    }
+    let Some(refresh) = param(&pairs, "token")
+        .and_then(|value| sealer.open::<RefreshWrap>(SealKind::Refresh, value).ok())
+    else {
+        return Ok(body.to_owned());
+    };
+    let mut form = form_urlencoded::Serializer::new(String::new());
+    for (name, value) in &pairs {
+        let _pair = form.append_pair(name, if name == "token" { &refresh.rt } else { value });
+    }
+    Ok(form.finish())
+}
+
 #[cfg(test)]
 #[expect(
     clippy::missing_errors_doc,
@@ -763,8 +1141,11 @@ mod tests {
         context.proxy.sealing_secret = Some(SecretString::from(
             "unit-test-secret-with-at-least-32-bytes",
         ));
+        let mut oauth =
+            OAuthConfig::builder("https://idp.example", "unit", "https://idp.example/jwks").build();
+        oauth.proxy = Some(context.proxy.clone());
         let router = install_routes(
-            &context.proxy,
+            &oauth,
             config.public_url.as_deref().context("public URL")?,
             &config.name,
         )?;
@@ -963,6 +1344,11 @@ mod tests {
             cookie_secure: secure,
             cookie_suffix: "aabbccdd".into(),
             consent_ttl: Duration::from_hours(720),
+            upstream_issuer: "https://idp.example".into(),
+            http: OauthHttpClient::with_config(
+                &OAuthConfig::builder("https://idp.example", "unit", "https://idp.example/jwks")
+                    .build(),
+            )?,
         })
     }
 
@@ -1276,6 +1662,519 @@ mod tests {
             "approved transaction binding"
         );
         ensure!(flow.nh == sha256_b64(&state_nonce), "nonce digest binding");
+        Ok(())
+    }
+
+    #[cfg(test)]
+    include!("oauth_as_fix12_tests.rs");
+
+    // Task 12: authenticated wrapper and callback contract closure.
+
+    /// Build distinct signed grant inputs without depending on callback serialization.
+    fn grant_fixture(context: &AsState) -> anyhow::Result<Vec<(String, String)>> {
+        let client = context.sealer.seal(
+            SealKind::Client,
+            &ClientReg {
+                ru: vec!["https://consumer.example/return-distinct".into()],
+                name: Some("Grant fixture independent client".into()),
+                iat: 1973,
+            },
+        )?;
+        let verifier = "unit-verifier-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ._~-";
+        let code = context.sealer.seal(
+            SealKind::Code,
+            &CodeWrap {
+                kc: "unit-upstream-code-Z9".into(),
+                cid: sha256_b64(&client),
+                ru: "https://consumer.example/return-distinct".into(),
+                cc: sha256_b64(verifier),
+                exp: now_unix().saturating_add(119),
+            },
+        )?;
+        Ok(vec![
+            ("grant_type".into(), "authorization_code".into()),
+            ("client_id".into(), client),
+            ("code".into(), code),
+            (
+                "redirect_uri".into(),
+                "https://consumer.example/return-distinct".into(),
+            ),
+            ("code_verifier".into(), verifier.into()),
+        ])
+    }
+
+    /// Each code binding is authenticated independently before an upstream form can exist.
+    #[test]
+    fn task12_code_binding_and_expiry_table() -> anyhow::Result<()> {
+        // Given
+        let context = state(false)?;
+        let original = grant_fixture(&context)?;
+        for field in ["cid", "ru", "cc", "exp", "tamper", "foreign_key"] {
+            let mut pairs = original.clone();
+            let encoded = param(&pairs, "code").context("code")?;
+            let mut payload: CodeWrap = context.sealer.open(SealKind::Code, encoded)?;
+            match field {
+                "cid" => payload.cid = sha256_b64("unrelated-client"),
+                "ru" => payload.ru = "https://foreign.example/different".into(),
+                "cc" => {
+                    payload.cc = sha256_b64("other-verifier-abcdefghijklmnopqrstuvwxyz0123456789");
+                }
+                "exp" => payload.exp = now_unix().saturating_sub(1),
+                "tamper" | "foreign_key" => {}
+                _ => anyhow::bail!("unknown binding fixture"),
+            }
+            let code = match field {
+                "tamper" => format!("{encoded}x"),
+                "foreign_key" => Sealer::new(
+                    &SecretString::from("unknown-key-with-more-than-thirty-two-bytes"),
+                    None,
+                )
+                .seal(SealKind::Code, &payload)?,
+                _ => context.sealer.seal(SealKind::Code, &payload)?,
+            };
+            for (name, value) in &mut pairs {
+                if name == "code" {
+                    *value = code.clone();
+                }
+            }
+            // When / Then
+            ensure!(
+                token_form(&context, &pairs) == Err("invalid_grant"),
+                "independent code binding {field}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Both upstream grant forms contain exactly their allowed key/value pairs despite client junk.
+    #[test]
+    fn task12_upstream_allowlist_table() -> anyhow::Result<()> {
+        // Given
+        let mut context = state(false)?;
+        context.proxy.client_id = "operator-static-client-unique".into();
+        context.proxy.client_secret =
+            Some(SecretString::from("operator-secret-allowlist-distinct"));
+        for stripped in [false, true] {
+            context.proxy.strip_resource_param = stripped;
+            for refresh in [false, true] {
+                let mut pairs = grant_fixture(&context)?;
+                let client = param(&pairs, "client_id").context("client")?.to_owned();
+                let bound = sha256_b64(&client);
+                let wrapped = context.sealer.seal(
+                    SealKind::Refresh,
+                    &RefreshWrap {
+                        rt: "refresh-upstream-unique-42".into(),
+                        cid: bound.clone(),
+                    },
+                )?;
+                if refresh {
+                    pairs = vec![
+                        ("grant_type".into(), "refresh_token".into()),
+                        ("refresh_token".into(), wrapped),
+                        ("scope".into(), "scope:refresh_unique".into()),
+                    ];
+                }
+                pairs.extend([
+                    ("resource".into(), "https://resource-one.example/mcp".into()),
+                    (
+                        "resource".into(),
+                        "https://resource-two.example/service".into(),
+                    ),
+                    (
+                        "client_secret".into(),
+                        "attacker-secret-never-forward".into(),
+                    ),
+                    ("unknown".into(), "discard-this-parameter".into()),
+                ]);
+                if !refresh {
+                    pairs.push(("scope".into(), "scope:code_must_disappear".into()));
+                }
+                // When
+                let (encoded, cid) = token_form(&context, &pairs).map_err(anyhow::Error::msg)?;
+                let actual: Vec<(String, String)> = form_urlencoded::parse(encoded.as_bytes())
+                    .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                    .collect();
+                let mut expected = if refresh {
+                    vec![
+                        ("grant_type".into(), "refresh_token".into()),
+                        ("refresh_token".into(), "refresh-upstream-unique-42".into()),
+                        ("scope".into(), "scope:refresh_unique".into()),
+                    ]
+                } else {
+                    vec![
+                        ("grant_type".into(), "authorization_code".into()),
+                        ("code".into(), "unit-upstream-code-Z9".into()),
+                        (
+                            "redirect_uri".into(),
+                            "https://facade.example/oauth/callback".into(),
+                        ),
+                        (
+                            "code_verifier".into(),
+                            "unit-verifier-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ._~-".into(),
+                        ),
+                    ]
+                };
+                if !stripped {
+                    expected.extend([
+                        ("resource".into(), "https://resource-one.example/mcp".into()),
+                        (
+                            "resource".into(),
+                            "https://resource-two.example/service".into(),
+                        ),
+                    ]);
+                }
+                expected.extend([
+                    ("client_id".into(), "operator-static-client-unique".into()),
+                    (
+                        "client_secret".into(),
+                        "operator-secret-allowlist-distinct".into(),
+                    ),
+                ]);
+                // Then
+                ensure!(
+                    actual == expected && cid == bound,
+                    "complete allowlist refresh={refresh} stripped={stripped}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Callback payloads preserve distinct approved fields and the exact 120-second code lifetime.
+    #[tokio::test]
+    async fn task12_callback_wrapper_fields_and_cookie_table() -> anyhow::Result<()> {
+        // Given
+        let context = Arc::new(state(false)?);
+        let nonce = "nonce-Q0123456789abcdefghijklmnopqrstuvwxyz";
+        for outcome in [
+            "code",
+            "error",
+            "issuer",
+            "missing_code",
+            "expired",
+            "nonce",
+            "tamper",
+            "duplicate",
+        ] {
+            let flow = FlowState {
+                cid: sha256_b64("approved-client-distinct"),
+                ru: "https://callback.example/approved?prior=unique".into(),
+                st: Some("approved-client-state-unique".into()),
+                cc: sha256_b64("approved-verifier-distinct-0123456789abcdefghijklmnopqrstuvwxyz"),
+                nh: if outcome == "nonce" {
+                    sha256_b64("foreign-nonce")
+                } else {
+                    sha256_b64(nonce)
+                },
+                exp: if outcome == "expired" {
+                    now_unix().saturating_sub(1)
+                } else {
+                    now_unix().saturating_add(587)
+                },
+            };
+            let sealed = context.sealer.seal(SealKind::State, &flow)?;
+            let cookie_name = context.cookie_name("state", Some(&sha256_b64(nonce)));
+            let mut headers = HeaderMap::new();
+            let _header = headers.insert(
+                header::COOKIE,
+                HeaderValue::from_str(&format!(
+                    "{cookie_name}={}",
+                    if outcome == "tamper" {
+                        format!("{sealed}x")
+                    } else {
+                        sealed
+                    }
+                ))?,
+            );
+            let mut pairs = vec![("state", nonce)];
+            match outcome {
+                "error" => pairs.extend([
+                    ("error", "access_denied"),
+                    ("error_description", "Permission denied uniquely"),
+                ]),
+                "issuer" => pairs.extend([
+                    ("code", "callback-code-unique"),
+                    ("iss", "https://foreign.example"),
+                ]),
+                "missing_code" => {}
+                "duplicate" => {
+                    pairs.extend([("code", "callback-code-unique"), ("code", "other-code")]);
+                }
+                _ => pairs.push(("code", "callback-code-unique")),
+            }
+            let raw = form_urlencoded::Serializer::new(String::new())
+                .extend_pairs(pairs)
+                .finish();
+            let before = now_unix();
+            // When
+            let response =
+                callback(State(Arc::clone(&context)), headers, RawQuery(Some(raw))).await;
+            // Then
+            ensure!(
+                response
+                    .headers()
+                    .get(header::SET_COOKIE)
+                    .context("clear")?
+                    .to_str()?
+                    == format!("{cookie_name}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0"),
+                "always clear {outcome}"
+            );
+            if matches!(outcome, "code" | "error") {
+                ensure!(response.status() == 302, "callback redirect");
+                let url = Url::parse(
+                    response
+                        .headers()
+                        .get(header::LOCATION)
+                        .context("location")?
+                        .to_str()?,
+                )?;
+                ensure!(
+                    url.query_pairs()
+                        .any(|(key, value)| key == "iss" && value == "https://facade.example")
+                        && url.query_pairs().any(|(key, value)| key == "state"
+                            && value == "approved-client-state-unique"),
+                    "redirect bindings"
+                );
+                if outcome == "code" {
+                    assert_callback_code(&context, &url, &flow, before)?;
+                }
+            } else {
+                ensure!(
+                    response.status() == 400 && !response.headers().contains_key(header::LOCATION),
+                    "integrity error no redirect {outcome}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Open the observed browser code and compare all fields to the approved input fixture.
+    fn assert_callback_code(
+        context: &AsState,
+        url: &Url,
+        flow: &FlowState,
+        before: u64,
+    ) -> anyhow::Result<()> {
+        let code = url
+            .query_pairs()
+            .find(|(key, _)| key == "code")
+            .context("code")?
+            .1
+            .into_owned();
+        let opened: CodeWrap = context.sealer.open(SealKind::Code, &code)?;
+        ensure!(
+            opened.kc == "callback-code-unique"
+                && opened.cid == flow.cid
+                && opened.ru == flow.ru
+                && opened.cc == flow.cc
+                && (before.saturating_add(120)..=now_unix().saturating_add(120))
+                    .contains(&opened.exp),
+            "exact approved envelope"
+        );
+        Ok(())
+    }
+
+    /// Current and retired keys unwrap admin credentials while access token bytes stay untouched.
+    #[test]
+    fn task12_refresh_rotation_and_admin_unwrap_table() -> anyhow::Result<()> {
+        // Given
+        let current = SecretString::from("current-key-0123456789-abcdefghijklmnopqrstuvwxyz");
+        let previous = SecretString::from("previous-key-9876543210-ZYXWVUTSRQPONMLKJIHGFEDCBA");
+        let rotating = Sealer::new(&current, Some(&previous));
+        for signer in [Sealer::new(&current, None), Sealer::new(&previous, None)] {
+            let token = signer.seal(
+                SealKind::Refresh,
+                &RefreshWrap {
+                    rt: "admin-raw-refresh-distinct".into(),
+                    cid: "client-digest-admin-distinct".into(),
+                },
+            )?;
+            let form = form_urlencoded::Serializer::new(String::new())
+                .extend_pairs([
+                    ("token", token.as_str()),
+                    ("token_type_hint", "refresh_token"),
+                ])
+                .finish();
+            // When
+            let decoded = unwrap_refresh_token_param(&rotating, &form)
+                .map_err(|_response| anyhow::anyhow!("adapter error"))?;
+            // Then
+            ensure!(
+                decoded == "token=admin-raw-refresh-distinct&token_type_hint=refresh_token",
+                "rotation raw credential"
+            );
+            let opened: RefreshWrap = rotating.open(SealKind::Refresh, &token)?;
+            ensure!(
+                opened.rt == "admin-raw-refresh-distinct"
+                    && opened.cid == "client-digest-admin-distinct",
+                "refresh fields"
+            );
+        }
+        let access = "token=access%2fraw+verbatim&custom=%41";
+        ensure!(
+            unwrap_refresh_token_param(&rotating, access).is_ok_and(|body| body == access),
+            "access bytes untouched"
+        );
+        let repeated_hint = "token=unwrapped-access&hint=a&hint=b";
+        ensure!(
+            unwrap_refresh_token_param(&rotating, repeated_hint)
+                .is_ok_and(|body| body == repeated_hint),
+            "only repeated token is rejected by admin adapter"
+        );
+        ensure!(
+            unwrap_refresh_token_param(&rotating, "token=a&token=b").is_err(),
+            "duplicate token rejected"
+        );
+        Ok(())
+    }
+
+    /// Token numeric boundaries and unreserved verifier alphabet are enforced before upstream I/O.
+    #[test]
+    fn task12_token_numeric_and_charset_boundaries() -> anyhow::Result<()> {
+        // Given
+        let context = state(false)?;
+        for length in [42_usize, 43, 44, 127, 128, 129] {
+            let mut pairs = grant_fixture(&context)?;
+            let verifier: String = (0..length)
+                .map(|index| {
+                    char::from(
+                        b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._~-"
+                            .get(index.checked_rem(66).unwrap_or_default())
+                            .copied()
+                            .unwrap_or(b'Z'),
+                    )
+                })
+                .collect();
+            let encoded = param(&pairs, "code").context("code")?;
+            let mut code: CodeWrap = context.sealer.open(SealKind::Code, encoded)?;
+            code.cc = sha256_b64(&verifier);
+            let sealed = context.sealer.seal(SealKind::Code, &code)?;
+            for (name, value) in &mut pairs {
+                match name.as_str() {
+                    "code" => *value = sealed.clone(),
+                    "code_verifier" => *value = verifier.clone(),
+                    _ => {}
+                }
+            }
+            // When / Then
+            ensure!(
+                token_form(&context, &pairs).is_ok() == (43..=128).contains(&length),
+                "verifier length {length}"
+            );
+        }
+        for bad in ["/", "+", "=", " ", "\t", "%", "\u{e9}"] {
+            let mut pairs = grant_fixture(&context)?;
+            for (name, value) in &mut pairs {
+                if name == "code_verifier" {
+                    *value = format!("0123456789abcdefghijklmnopqrstuvwxyzABCDEFG{bad}");
+                }
+            }
+            ensure!(
+                token_form(&context, &pairs) == Err("invalid_request"),
+                "verifier alphabet"
+            );
+        }
+        for count in [1_usize, 2, 3] {
+            for size in [255_usize, 256, 257] {
+                let mut pairs = grant_fixture(&context)?;
+                let prefix = "https://resource.example/";
+                let resource = format!("{prefix}{}", "r".repeat(size.saturating_sub(prefix.len())));
+                for _ in 0..count {
+                    pairs.push(("resource".into(), resource.clone()));
+                }
+                ensure!(
+                    token_form(&context, &pairs).is_ok() == (count <= 2 && size <= 256),
+                    "resource count/length"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Callback bounds accept the exact cap and filter upstream error text without active delimiters.
+    #[test]
+    fn task12_callback_numeric_boundaries() -> anyhow::Result<()> {
+        // Given
+        let context = state(false)?;
+        let nonce = "state-X0123456789abcdefghijklmnopqrstuvwxyz";
+        ensure!(nonce.len() == 43, "state fixture");
+        let flow = FlowState {
+            cid: "callback-bound-client".into(),
+            ru: "https://bounds.example/return".into(),
+            st: None,
+            cc: "approved-challenge-distinct-boundary".into(),
+            nh: sha256_b64(nonce),
+            exp: now_unix().saturating_add(593),
+        };
+        let sealed = context.sealer.seal(SealKind::State, &flow)?;
+        let mut headers = HeaderMap::new();
+        let _header = headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!(
+                "{}={sealed}",
+                context.cookie_name("state", Some(&flow.nh))
+            ))?,
+        );
+        for size in [2047_usize, 2048, 2049] {
+            let code: String = (0..size)
+                .map(|index| {
+                    char::from(
+                        b"0123456789abcdefghijklmnopqrstuvwxyz"
+                            .get(index.checked_rem(36).unwrap_or_default())
+                            .copied()
+                            .unwrap_or(b'Z'),
+                    )
+                })
+                .collect();
+            let raw = form_urlencoded::Serializer::new(String::new())
+                .extend_pairs([("state", nonce), ("code", code.as_str())])
+                .finish();
+            // When
+            let response = callback_response(&context, &headers, &raw);
+            // Then
+            ensure!(
+                response.status() == if size <= 2048 { 302 } else { 400 },
+                "upstream code cap {size}"
+            );
+        }
+        for size in [63, 64, 65, 255, 256, 257] {
+            let error = format!("{}-!", "E".repeat(size));
+            let description = format!("{}\"\\\n", "D".repeat(size));
+            let raw = form_urlencoded::Serializer::new(String::new())
+                .extend_pairs([
+                    ("state", nonce),
+                    ("error", error.as_str()),
+                    ("error_description", description.as_str()),
+                ])
+                .finish();
+            let response = callback_response(&context, &headers, &raw);
+            let target = Url::parse(
+                response
+                    .headers()
+                    .get(header::LOCATION)
+                    .context("location")?
+                    .to_str()?,
+            )?;
+            let pairs: Vec<_> = target.query_pairs().collect();
+            ensure!(
+                pairs
+                    .iter()
+                    .any(|(key, value)| key == "error" && value == &"E".repeat(size.min(64)))
+                    && pairs.iter().any(|(key, value)| key == "error_description"
+                        && value == &"D".repeat(size.min(256))),
+                "upstream error filtering"
+            );
+            ensure!(
+                !pairs.iter().any(|(key, _)| key == "state"),
+                "absent client state not invented"
+            );
+        }
+        for size in [42, 43, 44] {
+            ensure!(
+                valid_state(&"S".repeat(size)) == (size == 43),
+                "state length"
+            );
+        }
         Ok(())
     }
 

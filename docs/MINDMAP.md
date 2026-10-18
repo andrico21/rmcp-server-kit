@@ -296,10 +296,10 @@ mindmap
 sequenceDiagram
     autonumber
     participant C as Client
-    participant TLS as `TlsListener`<br/>src/transport.rs:3792
+    participant TLS as `TlsListener`<br/>src/transport.rs:3820
     participant R as axum Router
-    participant O as `origin_check_middleware`<br/>src/transport.rs:5333
-    participant H as `security_headers_middleware`<br/>src/transport.rs:4509
+    participant O as `origin_check_middleware`<br/>src/transport.rs:5361
+    participant H as `security_headers_middleware`<br/>src/transport.rs:4537
     participant A as `auth_middleware`<br/>src/auth.rs:2782
     participant B as `rbac_middleware`<br/>src/rbac.rs:1354
     participant L as per-IP rate limit<br/>governor + bounded_limiter
@@ -430,11 +430,11 @@ graph TD
 | Area                              | Module / file                           | Notable symbols (file:line)                                                  |
 |-----------------------------------|------------------------------------------|-------------------------------------------------------------------------------|
 | Server entry (HTTP)               | `src/transport.rs`                       | `serve` L3096, `McpServerConfig` L482, `ReloadHandle` ~L2019              |
-| Server entry (stdio, no auth)     | `src/transport.rs`                       | `serve_stdio` L5678                                                          |
+| Server entry (stdio, no auth)     | `src/transport.rs`                       | `serve_stdio` L5706                                                          |
 | Router builder + middleware wire  | `src/transport.rs`                       | `build_app_router` L2347; security headers, peer-addr normalization, request logging, and origin checks are wired there |
-| TLS / mTLS acceptor               | `src/transport.rs`                       | `TlsListener` L3792                                                          |
-| Origin / security headers (defs)  | `src/transport.rs`                       | `origin_check_middleware` L5333, `security_headers_middleware` ~L4509       |
-| Graceful shutdown                 | `src/transport.rs`                       | `shutdown_signal` L4326                                                      |
+| TLS / mTLS acceptor               | `src/transport.rs`                       | `TlsListener` L3820                                                          |
+| Origin / security headers (defs)  | `src/transport.rs`                       | `origin_check_middleware` L5361, `security_headers_middleware` ~L4537       |
+| Graceful shutdown                 | `src/transport.rs`                       | `shutdown_signal` L4354                                                      |
 | API key + mTLS auth               | `src/auth.rs`                            | `AuthIdentity` L76, `AuthState` ~L1760, `auth_middleware` L2782              |
 | RBAC engine                       | `src/rbac.rs`                            | `RbacPolicy` L709, `current_role` L158, `current_identity` L180, `current_token` L202, `current_sub` L220, `rbac_middleware` L1354           |
 | Memory-bounded keyed limiter      | `src/bounded_limiter.rs`                 | `BoundedKeyedLimiter` L158                                                    |

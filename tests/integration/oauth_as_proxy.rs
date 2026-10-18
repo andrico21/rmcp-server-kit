@@ -15,7 +15,10 @@ mod tests {
 
     use anyhow::{Context as _, ensure};
     use reqwest::{Client, Response, redirect::Policy};
-    use rmcp::ServerHandler;
+    use rmcp::{
+        ServerHandler,
+        model::{ServerCapabilities, ServerConfig},
+    };
     use rmcp_server_kit::{
         auth::AuthConfig,
         oauth::OAuthConfig,
@@ -36,14 +39,18 @@ mod tests {
 
     #[derive(Clone)]
     struct Handler;
-    impl ServerHandler for Handler {}
+    impl ServerHandler for Handler {
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        }
+    }
 
     struct Harness {
         base: String,
         client: Client,
         stop: CancellationToken,
         tasks: JoinSet<rmcp_server_kit::Result<()>>,
-        _upstream: wiremock::MockServer,
+        upstream: wiremock::MockServer,
     }
 
     // Drop audit: cancellation is synchronous; JoinSet aborts remaining tasks, without I/O or panic.
@@ -66,6 +73,27 @@ mod tests {
 
         /// Optionally configure deliberately incompatible API header overrides.
         async fn start_options(ttl: &str, mode: &str, overrides: bool) -> anyhow::Result<Self> {
+            Self::start_extended(ttl, mode, overrides, false).await
+        }
+
+        /// Enable admin adapters and trailing-slash metadata for the part-B wire tables.
+        async fn start_extended(
+            ttl: &str,
+            mode: &str,
+            overrides: bool,
+            extended: bool,
+        ) -> anyhow::Result<Self> {
+            Self::start_public(ttl, mode, (overrides, extended), None).await
+        }
+
+        /// Start a replica with an optional shared public origin independent of its listener.
+        async fn start_public(
+            ttl: &str,
+            mode: &str,
+            options: (bool, bool),
+            public: Option<&str>,
+        ) -> anyhow::Result<Self> {
+            let (overrides, extended) = options;
             drop(ring::default_provider().install_default());
             let upstream = wiremock::MockServer::start().await;
             let origin = format!("http://localhost:{}", upstream.address().port());
@@ -75,15 +103,28 @@ mod tests {
             let oauth: OAuthConfig = serde_json::from_value(json!({
                 "issuer": origin, "audience": "as-test", "jwks_uri": format!("{origin}/jwks"),
                 "allow_http_oauth_urls": true,
+                "scopes":[{"scope":"task12:read","role":"viewer"}],
                 "ssrf_allowlist": {"hosts":["localhost"],"cidrs":["127.0.0.0/8"]},
                 "proxy": {"mode":mode, "authorize_url":format!("{origin}/authorize"),
                     "token_url":format!("{origin}/token"),"client_id":"static-upstream",
+                    "expose_admin_endpoints":extended,"require_auth_on_admin_endpoints":!extended,"allow_unauthenticated_admin_endpoints":extended,
+                    "introspection_url":format!("{origin}/introspect"),"revocation_url":format!("{origin}/revoke"),
+                    "sealing_secret_previous":"previous-lane12-key-with-more-than-32-bytes",
                     "sealing_secret":"fixture-secret-with-at-least-32-bytes", "consent_ttl":ttl}
             }))?;
             let mut auth = AuthConfig::with_keys(vec![]);
             auth.oauth = Some(oauth);
             let configured = McpServerConfig::new(addr.to_string(), "Test server", "1")
-                .with_public_url(base.clone())
+                .with_public_url(public.map_or_else(
+                    || {
+                        if extended {
+                            format!("{base}/")
+                        } else {
+                            base.clone()
+                        }
+                    },
+                    str::to_owned,
+                ))
                 .with_auth(auth);
             let config = if overrides {
                 let mut headers = SecurityHeadersConfig::default();
@@ -113,7 +154,7 @@ mod tests {
                     .build()?,
                 stop,
                 tasks,
-                _upstream: upstream,
+                upstream,
             })
         }
 
@@ -1384,6 +1425,1119 @@ mod tests {
     }
 
     // allow: SIZE_OK - the assigned integration target owns the facade contract tables; file splitting is outside this tests-only fix-up.
+    // Task 12: callback, downstream bindings and upstream token allowlists.
+
+    /// Approve a distinct transaction and retain only its browser state credential.
+    async fn approved_flow(
+        server: &Harness,
+        cid: &str,
+        verifier: &str,
+    ) -> anyhow::Result<(String, String)> {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        use sha2::{Digest as _, Sha256};
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+        let mut pairs = Harness::params(cid);
+        pairs.retain(|(key, _)| *key != "code_challenge");
+        pairs.push(("code_challenge", &challenge));
+        let (request, csrf) = consent_form(server.authorize(&pairs, None).await?).await?;
+        let approved = server.decide(&request, &csrf, "approve").await?;
+        ensure!(approved.status() == 302, "approved flow");
+        let nonce = location(&approved)?
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .context("upstream state")?
+            .1
+            .into_owned();
+        let cookie = approved
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find(|value| value.starts_with("rmcp_state_"))
+            .context("state cookie")?
+            .split(';')
+            .next()
+            .context("cookie pair")?
+            .to_owned();
+        Ok((nonce, cookie))
+    }
+
+    /// Deliver an upstream outcome using the genuine per-flow browser credential.
+    async fn callback_flow(
+        server: &Harness,
+        flow: &(String, String),
+        code: &str,
+    ) -> anyhow::Result<Response> {
+        Ok(server
+            .client
+            .get(format!(
+                "{}/oauth/callback?{}",
+                server.base,
+                url::form_urlencoded::Serializer::new(String::new())
+                    .extend_pairs([("state", flow.0.as_str()), ("code", code)])
+                    .finish()
+            ))
+            .header("cookie", &flow.1)
+            .send()
+            .await?)
+    }
+
+    /// Redeem through the real token route with a complete public-client form.
+    async fn redeem(
+        server: &Harness,
+        cid: &str,
+        code: &str,
+        verifier: &str,
+    ) -> anyhow::Result<Response> {
+        use url::form_urlencoded;
+        let form = form_urlencoded::Serializer::new(String::new())
+            .extend_pairs([
+                ("grant_type", "authorization_code"),
+                ("client_id", cid),
+                ("code", code),
+                ("redirect_uri", CALLBACK),
+                ("code_verifier", verifier),
+            ])
+            .finish();
+        Ok(server
+            .client
+            .post(format!("{}/token", server.base))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(form)
+            .send()
+            .await?)
+    }
+
+    /// The completed browser flow redeems the wrapped code and preserves upstream JSON members.
+    #[tokio::test]
+    async fn full_flow_end_to_end() -> anyhow::Result<()> {
+        use url::form_urlencoded;
+        use wiremock::{
+            Mock, ResponseTemplate,
+            matchers::{method, path},
+        };
+        // Given
+        let server = Harness::start("30days").await?;
+        let cid = server
+            .register("Task12 full flow distinct application")
+            .await?;
+        let verifier = "verifier-A0123456789abcdefghijklmnopqrstuvwxyz._~-XYZ";
+        let flow = approved_flow(&server, &cid, verifier).await?;
+        let jwt = upstream_jwt(&server).await?;
+        Mock::given(method("POST")).and(path("/token")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"access_token":jwt, "refresh_token":"upstream-refresh-task12", "expires_in":1739_u64,"custom":{"preserved":true}}))).expect(1).mount(&server.upstream).await;
+        // When
+        let callback = callback_flow(&server, &flow, "upstream-code-task12-distinct").await?;
+        ensure!(callback.status() == 302, "callback status");
+        ensure!(
+            callback
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .any(|value| value.to_str().is_ok_and(|text| text
+                    == format!(
+                        "{}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0",
+                        flow.1.split_once('=').map_or("", |pair| pair.0)
+                    ))),
+            "callback clears state"
+        );
+        let target = location(&callback)?;
+        let code = target
+            .query_pairs()
+            .find(|(key, _)| key == "code")
+            .context("wrapped code")?
+            .1
+            .into_owned();
+        let response = redeem(&server, &cid, &code, verifier).await?;
+        // Then
+        ensure!(response.status() == 200, "token response");
+        let output: Value = response.json().await?;
+        ensure!(
+            output.get("access_token") == Some(&json!(jwt))
+                && output.get("expires_in") == Some(&json!(1739_u64))
+                && output.get("custom") == Some(&json!({"preserved":true})),
+            "upstream JSON members"
+        );
+        let refresh = output
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .context("refresh wrapper")?;
+        ensure!(
+            reference_open("refresh", refresh)?
+                == json!({"rt":"upstream-refresh-task12","cid":fixture_digest(&cid)}),
+            "refresh binding wrapper"
+        );
+        let requests = server
+            .upstream
+            .received_requests()
+            .await
+            .context("requests")?;
+        let actual: Vec<_> =
+            form_urlencoded::parse(&requests.first().context("token request")?.body)
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect();
+        let expected = vec![
+            ("grant_type".into(), "authorization_code".into()),
+            ("code".into(), "upstream-code-task12-distinct".into()),
+            (
+                "redirect_uri".into(),
+                format!("{}/oauth/callback", server.base),
+            ),
+            ("code_verifier".into(), verifier.into()),
+            ("client_id".into(), "static-upstream".into()),
+        ];
+        ensure!(actual == expected, "complete upstream form");
+        for (key, value) in [("state", "client-state"), ("iss", server.base.as_str())] {
+            ensure!(
+                target
+                    .query_pairs()
+                    .any(|(name, received)| name == key && received == value),
+                "client redirect binding {key}"
+            );
+        }
+        let metadata: Value = server
+            .client
+            .get(format!(
+                "{}/.well-known/oauth-authorization-server",
+                server.base
+            ))
+            .send()
+            .await?
+            .json()
+            .await?;
+        ensure!(
+            metadata.get("issuer") == Some(&json!(server.base))
+                && metadata.get("authorization_response_iss_parameter_supported")
+                    == Some(&json!(true)),
+            "AS metadata"
+        );
+        assert_tools_list(&server, &jwt).await?;
+        server.close().await
+    }
+
+    /// Initialize MCP and list tools through the JWT-authenticated transport surface.
+    async fn assert_tools_list(server: &Harness, jwt: &str) -> anyhow::Result<()> {
+        let initialized = server.client.post(format!("{}/mcp",server.base)).bearer_auth(jwt).header("accept","application/json, text/event-stream").header("content-type","application/json").body(r#"{"jsonrpc":"2.0","id":940,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"task12-client","version":"1"}}}"#).send().await?;
+        ensure!(initialized.status() == 200, "MCP initialized");
+        let session = initialized
+            .headers()
+            .get("mcp-session-id")
+            .context("MCP session")?
+            .to_str()?
+            .to_owned();
+        let listing = server
+            .client
+            .post(format!("{}/mcp", server.base))
+            .bearer_auth(jwt)
+            .header("mcp-session-id", session)
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .body(r#"{"jsonrpc":"2.0","id":941,"method":"tools/list"}"#)
+            .send()
+            .await?;
+        ensure!(
+            listing.status() == 200,
+            "upstream JWT tools/list status {}",
+            listing.status()
+        );
+        Ok(())
+    }
+
+    /// Mint a real RS256 upstream JWT and publish its key through the upstream JWKS route.
+    async fn upstream_jwt(server: &Harness) -> anyhow::Result<String> {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        use rsa::{
+            pkcs8::{EncodePrivateKey as _, LineEnding},
+            rand_core,
+            traits::PublicKeyParts as _,
+        };
+        use wiremock::{
+            Mock, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let (pem,jwks) = spawn_blocking(|| -> anyhow::Result<_> {
+            let key = rsa::RsaPrivateKey::new(&mut rand_core::OsRng,2048)?;
+            let public = key.to_public_key();
+            let jwks = json!({"keys":[{"kty":"RSA","use":"sig","alg":"RS256","kid":"task12-upstream-key","n":URL_SAFE_NO_PAD.encode(public.n().to_bytes_be()),"e":URL_SAFE_NO_PAD.encode(public.e().to_bytes_be())}]});
+            Ok((key.to_pkcs8_pem(LineEnding::LF)?.to_string(),jwks))
+        }).await??;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jwks))
+            .mount(&server.upstream)
+            .await;
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        header.kid = Some("task12-upstream-key".into());
+        let claims = json!({"iss":format!("http://localhost:{}",server.upstream.address().port()),"aud":"as-test","sub":"task12-resource-owner-distinct","scope":"task12:read","iat":jsonwebtoken::get_current_timestamp(),"exp":jsonwebtoken::get_current_timestamp().saturating_add(1937)});
+        Ok(jsonwebtoken::encode(
+            &header,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes())?,
+        )?)
+    }
+
+    /// A foreign issuer is a nonredirecting integrity error that still clears state.
+    #[tokio::test]
+    async fn callback_rejects_issuer_mismatch() -> anyhow::Result<()> {
+        // Given
+        let server = Harness::start("30days").await?;
+        let cid = server.register("Issuer mismatch app").await?;
+        let flow = approved_flow(
+            &server,
+            &cid,
+            "verifier-B9876543210ZYXWVUTSRQPONMLKJIHGFEDCBA._~-",
+        )
+        .await?;
+        // When
+        let response = server
+            .client
+            .get(format!(
+                "{}/oauth/callback?{}",
+                server.base,
+                url::form_urlencoded::Serializer::new(String::new())
+                    .extend_pairs([
+                        ("state", flow.0.as_str()),
+                        ("code", "issuer-bound-code"),
+                        ("iss", "https://foreign-issuer.example"),
+                    ])
+                    .finish()
+            ))
+            .header("cookie", &flow.1)
+            .send()
+            .await?;
+        // Then
+        ensure!(
+            response.status() == 400 && !response.headers().contains_key("location"),
+            "issuer mismatch page"
+        );
+        ensure!(
+            response
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .any(|value| value.to_str().is_ok_and(|text| text
+                    == format!(
+                        "{}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0",
+                        flow.1.split_once('=').map_or("", |pair| pair.0)
+                    ))),
+            "error clears cookie"
+        );
+        server.close().await
+    }
+
+    /// Another registered client cannot redeem a genuine code and no upstream call occurs.
+    #[tokio::test]
+    async fn token_rejects_foreign_client() -> anyhow::Result<()> {
+        // Given
+        let server = Harness::start("30days").await?;
+        let cid = server.register("Owner client A").await?;
+        let foreign = server.register("Foreign client B").await?;
+        let verifier = "verifier-CabcdefghijkLMNOPQRSTUVWXYZ0123456789._~-";
+        let flow = approved_flow(&server, &cid, verifier).await?;
+        let callback = callback_flow(&server, &flow, "foreign-client-upstream-code").await?;
+        let target = location(&callback)?;
+        let code = target
+            .query_pairs()
+            .find(|(key, _)| key == "code")
+            .context("code")?
+            .1
+            .into_owned();
+        // When
+        let response = redeem(&server, &foreign, &code, verifier).await?;
+        // Then
+        ensure!(
+            response.status() == 400
+                && response.json::<Value>().await?.get("error") == Some(&json!("invalid_grant")),
+            "foreign client rejected"
+        );
+        ensure!(
+            server
+                .upstream
+                .received_requests()
+                .await
+                .context("requests")?
+                .is_empty(),
+            "no upstream side effect"
+        );
+        server.close().await
+    }
+
+    /// Missing, repeated and unsupported token parameters return RFC 6749 JSON errors.
+    #[tokio::test]
+    async fn token_error_contract_table() -> anyhow::Result<()> {
+        // Given
+        let server = Harness::start("30days").await?;
+        for (body, status, error) in [
+            ("", 400, "invalid_request"),
+            ("grant_type=password", 400, "unsupported_grant_type"),
+            ("grant_type=refresh_token", 400, "invalid_request"),
+            ("grant_type=authorization_code", 400, "invalid_request"),
+            (
+                "grant_type=refresh_token&refresh_token=raw",
+                400,
+                "invalid_grant",
+            ),
+            (
+                "grant_type=refresh_token&grant_type=refresh_token",
+                400,
+                "invalid_request",
+            ),
+        ] {
+            // When
+            let response = server
+                .client
+                .post(format!("{}/token", server.base))
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(body)
+                .send()
+                .await?;
+            // Then
+            ensure!(
+                response.status() == status && !response.headers().contains_key("location"),
+                "token error status"
+            );
+            ensure!(
+                response
+                    .headers()
+                    .get("cache-control")
+                    .context("no store")?
+                    .to_str()?
+                    .split(',')
+                    .any(|directive| directive.trim() == "no-store"),
+                "token never cached"
+            );
+            ensure!(
+                response.json::<Value>().await?.get("error") == Some(&json!(error)),
+                "RFC error {error}"
+            );
+        }
+        server.close().await
+    }
+
+    /// A substituted upstream code cannot bypass the downstream challenge before contacting the IdP.
+    #[tokio::test]
+    async fn task12_two_flow_pkce_substitution_is_local_rejection() -> anyhow::Result<()> {
+        // Given
+        let server = Harness::start("30days").await?;
+        let first = server.register("Substitution client A distinct").await?;
+        let second = server.register("Substitution client B different").await?;
+        let verifier_a = "PKCE-A0123456789abcdefghijklmnopqrstuvwxyzUVWXYZ._~-";
+        let verifier_b = "PKCE-B9876543210ZYXWVUTSRQPONMLKJIHGFEDCBAabcdef._~-";
+        let _flow_a = approved_flow(&server, &first, verifier_a).await?;
+        let flow_b = approved_flow(&server, &second, verifier_b).await?;
+        let callback = callback_flow(&server, &flow_b, "upstream-code-from-client-A").await?;
+        let target = location(&callback)?;
+        let code = target
+            .query_pairs()
+            .find(|(key, _)| key == "code")
+            .context("code")?
+            .1
+            .into_owned();
+        // When
+        let response = redeem(&server, &second, &code, verifier_a).await?;
+        // Then
+        ensure!(
+            response.status() == 400
+                && response.json::<Value>().await?.get("error") == Some(&json!("invalid_grant")),
+            "substitution denied"
+        );
+        ensure!(
+            server
+                .upstream
+                .received_requests()
+                .await
+                .context("requests")?
+                .is_empty(),
+            "PKCE checked before upstream"
+        );
+        server.close().await
+    }
+
+    /// Refresh credentials retain their original client binding even across upstream rotation.
+    #[tokio::test]
+    async fn task12_refresh_binding_rotation_and_optional_client() -> anyhow::Result<()> {
+        use url::form_urlencoded;
+        use wiremock::{
+            Mock, ResponseTemplate,
+            matchers::{method, path},
+        };
+        // Given
+        let server = Harness::start("30days").await?;
+        let owner = server.register("Refresh original owner A").await?;
+        let verifier = "refresh-flow-verifier-0123456789abcdefghijklmnopqrstuvwxyz._~-";
+        let code = reference_seal(
+            "fixture-secret-with-at-least-32-bytes",
+            "code",
+            &json!({"kc":"refresh-initial-code-unique","cid":fixture_digest(&owner),"ru":CALLBACK,
+                "cc":fixture_digest(verifier),"exp":jsonwebtoken::get_current_timestamp().saturating_add(117)}),
+        )?;
+        Mock::given(method("POST")).and(path("/token")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"access_token":"refresh-access-initial","refresh_token":"raw-refresh-initial-A"}))).mount(&server.upstream).await;
+        let initial: Value = redeem(&server, &owner, &code, verifier)
+            .await?
+            .json()
+            .await?;
+        let mut wrapped = initial
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .context("refresh")?
+            .to_owned();
+        ensure!(
+            reference_open("refresh", &wrapped)?
+                == json!({"rt":"raw-refresh-initial-A","cid":fixture_digest(&owner)}),
+            "initial independent owner and raw token"
+        );
+        for (client, raw, rotated) in [
+            (
+                Some(owner.as_str()),
+                "raw-refresh-initial-A",
+                "raw-refresh-rotation-B",
+            ),
+            (
+                Some(owner.as_str()),
+                "raw-refresh-rotation-B",
+                "raw-refresh-rotation-C",
+            ),
+            (None, "raw-refresh-rotation-C", "raw-refresh-rotation-D"),
+        ] {
+            server.upstream.reset().await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    json!({"access_token":"refresh-access-rotated","refresh_token":rotated}),
+                ))
+                .expect(1)
+                .mount(&server.upstream)
+                .await;
+            let mut pairs = vec![
+                ("grant_type", "refresh_token"),
+                ("refresh_token", wrapped.as_str()),
+            ];
+            if let Some(cid) = client {
+                pairs.push(("client_id", cid));
+            }
+            let form = form_urlencoded::Serializer::new(String::new())
+                .extend_pairs(pairs)
+                .finish();
+            // When
+            let response = server
+                .client
+                .post(format!("{}/token", server.base))
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(form)
+                .send()
+                .await?;
+            // Then
+            ensure!(response.status() == 200, "refresh status");
+            let json: Value = response.json().await?;
+            let issued = json
+                .get("refresh_token")
+                .and_then(Value::as_str)
+                .context("rotated")?;
+            ensure!(
+                reference_open("refresh", issued)?
+                    == json!({"rt":rotated,"cid":fixture_digest(&owner)}),
+                "rotation raw token and independent owner digest"
+            );
+            let requests = server
+                .upstream
+                .received_requests()
+                .await
+                .context("requests")?;
+            ensure!(
+                requests.len() == 1
+                    && requests.first().context("refresh request")?.body
+                        == format!(
+                            "grant_type=refresh_token&refresh_token={raw}&client_id=static-upstream"
+                        )
+                        .as_bytes(),
+                "exact refresh form uses this generation raw token"
+            );
+            wrapped = issued.to_owned();
+        }
+        server.close().await
+    }
+
+    /// Local malformed callback inputs remain nonredirecting pages with forced security headers.
+    #[tokio::test]
+    async fn task12_callback_error_and_clear_table() -> anyhow::Result<()> {
+        // Given
+        let server = Harness::start("30days").await?;
+        for query in [
+            "",
+            "state=short",
+            "state=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "state=x&state=y",
+            "code=x&code=y",
+        ] {
+            // When
+            let response = server
+                .client
+                .get(format!("{}/oauth/callback?{query}", server.base))
+                .send()
+                .await?;
+            // Then
+            ensure!(
+                response.status() == 400 && !response.headers().contains_key("location"),
+                "callback integrity page"
+            );
+            for (header, expected) in [
+                (
+                    "content-security-policy",
+                    "default-src 'none'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'",
+                ),
+                ("referrer-policy", "same-origin"),
+                ("cache-control", "no-store"),
+                ("x-frame-options", "DENY"),
+                ("x-content-type-options", "nosniff"),
+            ] {
+                ensure!(
+                    response
+                        .headers()
+                        .get(header)
+                        .context("security header")?
+                        .to_str()?
+                        .eq_ignore_ascii_case(expected),
+                    "callback header {header}"
+                );
+            }
+            ensure!(
+                response.text().await?.starts_with("<!DOCTYPE html>"),
+                "HTML error page"
+            );
+        }
+        server.close().await
+    }
+
+    /// Upstream non-JSON successes and error bytes are not rewritten in authorization-server mode.
+    #[tokio::test]
+    async fn task12_upstream_response_relay_table() -> anyhow::Result<()> {
+        use wiremock::{
+            Mock, ResponseTemplate,
+            matchers::{method, path},
+        };
+        // Given
+        let server = Harness::start("30days").await?;
+        let client = server.register("Response relay contract").await?;
+        let verifier = "relay-verifier-0123456789abcdefghijklmnopqrstuvwxyz._~-";
+        for (status, body) in [
+            (200, "not json upstream body"),
+            (
+                400,
+                "{ \"error\": \"invalid_grant\", \"refresh_token\": \"raw-error-only\" }",
+            ),
+            (201, "[1, 2, 3]"),
+        ] {
+            server.upstream.reset().await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(status).set_body_string(body))
+                .mount(&server.upstream)
+                .await;
+            let flow = approved_flow(&server, &client, verifier).await?;
+            let callback = callback_flow(&server, &flow, "relay-distinct-upstream-code").await?;
+            let target = location(&callback)?;
+            let code = target
+                .query_pairs()
+                .find(|(key, _)| key == "code")
+                .context("code")?
+                .1
+                .into_owned();
+            // When
+            let response = redeem(&server, &client, &code, verifier).await?;
+            // Then
+            ensure!(
+                response.status() == status && response.text().await? == body,
+                "upstream exact status/bytes"
+            );
+        }
+        server.close().await
+    }
+
+    /// The issuer chain is byte-identical with either public URL spelling.
+    #[tokio::test]
+    async fn task12_discovery_chain_trailing_slash_table() -> anyhow::Result<()> {
+        // Given
+        for trailing in [false, true] {
+            let server =
+                Harness::start_extended("30days", "authorization_server", false, trailing).await?;
+            let client = server.register("Discovery chain application").await?;
+            let flow = approved_flow(
+                &server,
+                &client,
+                "discovery-verifier-0123456789abcdefghijklmnopqrstuvwxyz._~-",
+            )
+            .await?;
+            // When
+            let response = callback_flow(&server, &flow, "discovery-upstream-code").await?;
+            let target = location(&response)?;
+            let metadata: Value = server
+                .client
+                .get(format!(
+                    "{}/.well-known/oauth-authorization-server",
+                    server.base
+                ))
+                .send()
+                .await?
+                .json()
+                .await?;
+            let resource: Value = server
+                .client
+                .get(format!(
+                    "{}/.well-known/oauth-protected-resource/mcp",
+                    server.base
+                ))
+                .send()
+                .await?
+                .json()
+                .await?;
+            // Then
+            ensure!(
+                metadata.get("issuer") == Some(&json!(server.base))
+                    && resource
+                        .get("authorization_servers")
+                        .and_then(Value::as_array)
+                        .and_then(|values| values.first())
+                        == metadata.get("issuer")
+                    && target
+                        .query_pairs()
+                        .any(|(key, value)| key == "iss" && value == server.base),
+                "discovery chain trailing={trailing}"
+            );
+            server.close().await?;
+        }
+        Ok(())
+    }
+
+    /// Admin routes unwrap current/previous refresh wrappers and retain unwrapped access-token behavior.
+    #[tokio::test]
+    async fn task12_admin_unwrap_wire_table() -> anyhow::Result<()> {
+        use wiremock::{
+            Mock, ResponseTemplate,
+            matchers::{method, path},
+        };
+        // Given
+        let server = Harness::start_extended("30days", "authorization_server", false, true).await?;
+        for endpoint in ["introspect", "revoke"] {
+            Mock::given(method("POST"))
+                .and(path(format!("/{endpoint}")))
+                .respond_with(ResponseTemplate::new(200).set_body_string("{\"active\":true}"))
+                .mount(&server.upstream)
+                .await;
+            for secret in [
+                "fixture-secret-with-at-least-32-bytes",
+                "previous-lane12-key-with-more-than-32-bytes",
+            ] {
+                let wrapped = reference_seal(
+                    secret,
+                    "refresh",
+                    &json!({"rt":"admin-upstream-refresh-unique","cid":"admin-client-binding-unique"}),
+                )?;
+                let form = url::form_urlencoded::Serializer::new(String::new())
+                    .extend_pairs([
+                        ("token", wrapped.as_str()),
+                        ("token_type_hint", "refresh_token"),
+                    ])
+                    .finish();
+                // When
+                let response = server
+                    .client
+                    .post(format!("{}/{endpoint}", server.base))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(form)
+                    .send()
+                    .await?;
+                // Then
+                ensure!(response.status() == 200, "admin status");
+                let requests = server
+                    .upstream
+                    .received_requests()
+                    .await
+                    .context("requests")?;
+                ensure!(requests.last().context("admin request")?.body == b"token=admin-upstream-refresh-unique&token_type_hint=refresh_token&client_id=static-upstream","admin exact raw form");
+            }
+            for (body, status) in [
+                ("token=access%2Funique&custom=kept", 200),
+                ("token=a&token=b", 400),
+            ] {
+                let response = server
+                    .client
+                    .post(format!("{}/{endpoint}", server.base))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(body)
+                    .send()
+                    .await?;
+                ensure!(response.status() == status, "admin raw/duplicate status");
+                if status == 200 {
+                    let requests = server
+                        .upstream
+                        .received_requests()
+                        .await
+                        .context("requests")?;
+                    ensure!(
+                        requests.last().context("access request")?.body
+                            == b"token=access%2Funique&custom=kept&client_id=static-upstream",
+                        "admin access form unchanged"
+                    );
+                } else {
+                    ensure!(
+                        response.json::<Value>().await?.get("error")
+                            == Some(&json!("invalid_request")),
+                        "admin duplicate JSON"
+                    );
+                }
+            }
+        }
+        server.close().await
+    }
+
+    /// Independently encode the documented purpose-separated integrity envelope for rotation fixtures.
+    fn reference_seal(secret: &str, label: &str, payload: &Value) -> anyhow::Result<String> {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        use hmac::{Hmac, KeyInit as _, Mac as _};
+        use sha2::Sha256;
+        let mut derivation = Hmac::<Sha256>::new_from_slice(secret.as_bytes())?;
+        derivation.update(format!("rmcp-server-kit/oauth-as/v1/{label}").as_bytes());
+        let mut mac = Hmac::<Sha256>::new_from_slice(&derivation.finalize().into_bytes())?;
+        let message = format!(
+            "v1.{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload)?)
+        );
+        mac.update(message.as_bytes());
+        Ok(format!(
+            "{message}.{}",
+            URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+        ))
+    }
+
+    /// Hash fixture inputs independently of the server's binding implementation.
+    fn fixture_digest(value: &str) -> String {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        use sha2::{Digest as _, Sha256};
+        URL_SAFE_NO_PAD.encode(Sha256::digest(value.as_bytes()))
+    }
+
+    /// Authenticate an observed wrapper using the independent fixture sealer before opening it.
+    fn reference_open(label: &str, token: &str) -> anyhow::Result<Value> {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        use hmac::{Hmac, KeyInit as _, Mac as _};
+        use sha2::Sha256;
+        let (message, tag) = token.rsplit_once('.').context("envelope tag")?;
+        let mut derivation =
+            Hmac::<Sha256>::new_from_slice(b"fixture-secret-with-at-least-32-bytes")?;
+        derivation.update(format!("rmcp-server-kit/oauth-as/v1/{label}").as_bytes());
+        let mut mac = Hmac::<Sha256>::new_from_slice(&derivation.finalize().into_bytes())?;
+        mac.update(message.as_bytes());
+        mac.verify_slice(&URL_SAFE_NO_PAD.decode(tag)?)?;
+        visible_payload(token)
+    }
+
+    include!("oauth_as_proxy_fix12.rs");
+
+    /// Independently sealed previous-key codes redeem, while unknown keys and expired codes fail locally.
+    #[tokio::test]
+    async fn task12_code_rotation_and_expiry_wire_table() -> anyhow::Result<()> {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        use sha2::{Digest as _, Sha256};
+        use wiremock::{
+            Mock, ResponseTemplate,
+            matchers::{method, path},
+        };
+        // Given
+        let server = Harness::start("30days").await?;
+        let client = server.register("Previous code key app").await?;
+        let verifier = "previous-key-verifier-0123456789abcdefghijklmnopqrstuvwxyz._~-";
+        let digest = URL_SAFE_NO_PAD.encode(Sha256::digest(client.as_bytes()));
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"access_token":"previous-key-access-distinct"})),
+            )
+            .expect(1)
+            .mount(&server.upstream)
+            .await;
+        for (key, expired, status) in [
+            ("previous-lane12-key-with-more-than-32-bytes", false, 200),
+            ("foreign-lane12-key-never-configured-here", false, 400),
+            ("fixture-secret-with-at-least-32-bytes", true, 400),
+        ] {
+            let deadline = if expired {
+                1_u64
+            } else {
+                jsonwebtoken::get_current_timestamp().saturating_add(113)
+            };
+            let code = reference_seal(
+                key,
+                "code",
+                &json!({"kc":"previous-key-upstream-code","cid":digest,"ru":CALLBACK,"cc":challenge,"exp":deadline}),
+            )?;
+            // When
+            let response = redeem(&server, &client, &code, verifier).await?;
+            // Then
+            ensure!(response.status() == status, "code key/expiry");
+        }
+        server.close().await
+    }
+
+    /// Shared signing keys allow registration/approval on one replica and callback/exchange on another.
+    #[tokio::test]
+    async fn task12_two_replicas_share_stateless_flow() -> anyhow::Result<()> {
+        use wiremock::{
+            Mock, ResponseTemplate,
+            matchers::{method, path},
+        };
+        // Given
+        let first = Harness::start("30days").await?;
+        let second = Harness::start("30days").await?;
+        let client = first.register("Cross replica client unique").await?;
+        let verifier = "replica-verifier-0123456789abcdefghijklmnopqrstuvwxyz._~-";
+        let flow = approved_flow(&first, &client, verifier).await?;
+        let cookie_name = flow.1.split_once('=').context("cookie")?.0;
+        let other_flow = approved_flow(&second, &client, verifier).await?;
+        let second_name = other_flow.1.split_once('=').context("second cookie")?.0;
+        let nonce_suffix = cookie_name
+            .get(cookie_name.len().saturating_sub(16)..)
+            .context("nonce suffix")?;
+        let issuer_prefix = second_name
+            .get(..second_name.len().saturating_sub(17))
+            .context("issuer prefix")?;
+        let cookie_value = flow.1.split_once('=').context("cookie value")?.1;
+        let cross_flow = (
+            flow.0,
+            format!("{issuer_prefix}_{nonce_suffix}={cookie_value}"),
+        );
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"access_token":"replica-upstream-access"})),
+            )
+            .expect(1)
+            .mount(&second.upstream)
+            .await;
+        // When
+        let callback = callback_flow(&second, &cross_flow, "replica-upstream-code").await?;
+        let target = location(&callback)?;
+        let code = target
+            .query_pairs()
+            .find(|(key, _)| key == "code")
+            .context("code")?
+            .1
+            .into_owned();
+        let response = redeem(&second, &client, &code, verifier).await?;
+        // Then
+        ensure!(response.status() == 200, "replica exchange");
+        first.close().await?;
+        second.close().await
+    }
+
+    /// Drive a full browser-to-token flow using bounded curl processes without writing credentials.
+    #[tokio::test]
+    async fn task12_live_curl_complete_flow() -> anyhow::Result<()> {
+        use wiremock::{
+            Mock, ResponseTemplate,
+            matchers::{method, path},
+        };
+        // Given
+        let server = Harness::start("30days").await?;
+        let client = server.register("Live curl complete app").await?;
+        let verifier = "live-curl-verifier-0123456789abcdefghijklmnopqrstuvwxyz._~-";
+        let flow = approved_flow(&server, &client, verifier).await?;
+        Mock::given(method("POST")).and(path("/token")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"access_token":"live-curl-upstream-access","refresh_token":"live-curl-upstream-refresh"}))).expect(1).mount(&server.upstream).await;
+        // When
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs([
+                ("state", flow.0.as_str()),
+                ("code", "live-curl-upstream-code"),
+            ])
+            .finish();
+        let callback = curl(vec![
+            format!("{}/oauth/callback?{query}", server.base),
+            "-H".into(),
+            format!("cookie: {}", flow.1),
+        ])
+        .await?;
+        let location_header = callback
+            .lines()
+            .find_map(|line| line.strip_prefix("location: "))
+            .context("curl redirect")?;
+        let target = url::Url::parse(location_header.trim())?;
+        let code = target
+            .query_pairs()
+            .find(|(key, _)| key == "code")
+            .context("code")?
+            .1
+            .into_owned();
+        let form = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs([
+                ("grant_type", "authorization_code"),
+                ("client_id", client.as_str()),
+                ("code", code.as_str()),
+                ("redirect_uri", CALLBACK),
+                ("code_verifier", verifier),
+            ])
+            .finish();
+        let token = curl(vec![
+            format!("{}/token", server.base),
+            "-H".into(),
+            "content-type: application/x-www-form-urlencoded".into(),
+            "-d".into(),
+            form,
+        ])
+        .await?;
+        // Then
+        let clear = format!(
+            "set-cookie: {}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0",
+            flow.1.split_once('=').context("cookie name")?.0
+        );
+        ensure!(
+            callback.starts_with("HTTP/1.1 302")
+                && callback.lines().any(|line| line.trim_end() == clear),
+            "curl callback exact clearing cookie"
+        );
+        ensure!(token.starts_with("HTTP/1.1 200"), "curl token status");
+        let body: Value =
+            serde_json::from_str(token.split_once("\r\n\r\n").context("curl body")?.1)?;
+        let refresh = body
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .context("curl refresh")?;
+        ensure!(
+            body == json!({"access_token":"live-curl-upstream-access","refresh_token":refresh}),
+            "curl exact response members"
+        );
+        ensure!(
+            reference_open("refresh", refresh)?
+                == json!({"rt":"live-curl-upstream-refresh","cid":fixture_digest(&client)}),
+            "curl refresh owner and raw token"
+        );
+        if let Ok(path) = env::var("RMCP_LANE12_LIVE_OUTPUT") {
+            spawn_blocking(move || fs::write(path,"Live loopback serve_with_listener + wiremock upstream.\nRegistration 201; authorize 200; consent approval 302.\ncurl GET /oauth/callback: HTTP/1.1 302, state cookie Max-Age=0.\ncurl POST /token: HTTP/1.1 200, access token relayed, refresh token wrapped.\nBoth curl processes exited 0. Credentials intentionally omitted from artifact.\n")).await??;
+        }
+        server.close().await
+    }
+
+    /// The upstream response cap fails closed at cap plus one and preserves bytes at/below it.
+    #[tokio::test]
+    async fn task12_token_body_cap_table() -> anyhow::Result<()> {
+        use wiremock::{
+            Mock, ResponseTemplate,
+            matchers::{method, path},
+        };
+        // Given
+        let server = Harness::start("30days").await?;
+        let client = server.register("Token response cap app").await?;
+        let verifier = "body-cap-verifier-0123456789abcdefghijklmnopqrstuvwxyz._~-";
+        for size in [0x000f_ffff_usize, 0x0010_0000, 0x0010_0001] {
+            server.upstream.reset().await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("b".repeat(size)))
+                .mount(&server.upstream)
+                .await;
+            let flow = approved_flow(&server, &client, verifier).await?;
+            let callback = callback_flow(&server, &flow, "body-cap-upstream-code").await?;
+            let target = location(&callback)?;
+            let code = target
+                .query_pairs()
+                .find(|(key, _)| key == "code")
+                .context("code")?
+                .1
+                .into_owned();
+            // When
+            let response = redeem(&server, &client, &code, verifier).await?;
+            // Then
+            ensure!(
+                response.status() == if size <= 0x0010_0000 { 200 } else { 502 },
+                "body cap status"
+            );
+            if size <= 0x0010_0000 {
+                ensure!(response.bytes().await?.len() == size, "exact body length");
+            } else {
+                ensure!(
+                    response.json::<Value>().await?.get("error") == Some(&json!("server_error")),
+                    "cap RFC JSON"
+                );
+            }
+        }
+        server.close().await
+    }
+
+    /// Passthrough admin adapters preserve exact upstream request forms and response bytes.
+    #[tokio::test]
+    async fn task12_passthrough_admin_bytes_oracle() -> anyhow::Result<()> {
+        use wiremock::{
+            Mock, ResponseTemplate,
+            matchers::{method, path},
+        };
+        // Given
+        let server = Harness::start_extended("30days", "passthrough", false, true).await?;
+        for endpoint in ["introspect", "revoke"] {
+            let response_bytes = "{ \"active\" : true, \"refresh_token\" : \"raw-not-wrapped\" }\n";
+            Mock::given(method("POST"))
+                .and(path(format!("/{endpoint}")))
+                .respond_with(ResponseTemplate::new(202).set_body_string(response_bytes))
+                .mount(&server.upstream)
+                .await;
+            // When
+            let response = server
+                .client
+                .post(format!("{}/{endpoint}", server.base))
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body("token=access%2Fraw&token=second&hint=%41&client_id=ignored")
+                .send()
+                .await?;
+            // Then
+            ensure!(
+                response.status() == 202 && response.text().await? == response_bytes,
+                "passthrough exact response"
+            );
+            let requests = server
+                .upstream
+                .received_requests()
+                .await
+                .context("requests")?;
+            ensure!(
+                requests.last().context("request")?.body
+                    == b"token=access%2Fraw&token=second&hint=A&client_id=static-upstream",
+                "passthrough exact form"
+            );
+        }
+        server.close().await
+    }
+
+    /// Passthrough token responses retain refresh strings and whitespace without JSON rewriting.
+    #[tokio::test]
+    async fn task12_passthrough_refresh_bytes_oracle() -> anyhow::Result<()> {
+        use wiremock::{
+            Mock, ResponseTemplate,
+            matchers::{method, path},
+        };
+        // Given
+        let server = Harness::start_mode("30days", "passthrough").await?;
+        let original = "{ \"access_token\" : \"passthrough-access-unique\", \"refresh_token\" : \"passthrough-refresh-never-wrapped\", \"expires_in\" : 1913 }\n";
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(original))
+            .expect(1)
+            .mount(&server.upstream)
+            .await;
+        // When
+        let response = server.client.post(format!("{}/token",server.base)).header("content-type","application/x-www-form-urlencoded").body("grant_type=refresh_token&refresh_token=raw-input-distinct&client_id=ignored-downstream").send().await?;
+        // Then
+        ensure!(
+            response.status() == 200 && response.text().await? == original,
+            "passthrough refresh exact bytes"
+        );
+        let requests = server
+            .upstream
+            .received_requests()
+            .await
+            .context("requests")?;
+        ensure!(requests.first().context("request")?.body == b"grant_type=refresh_token&refresh_token=raw-input-distinct&client_id=static-upstream","passthrough refresh exact form");
+        server.close().await
+    }
+
     // Fix2 systematic contract closure: boundaries, error kinds, cookies and interpolation.
 
     /// Decode the public integrity-only envelope without treating it as authenticated input.
