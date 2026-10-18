@@ -8615,10 +8615,10 @@ mod tests {
         Ok(())
     }
 
-    /// Message of the G4b startup warning.
+    /// Message of the missing-`public_url` startup warning.
     #[cfg(feature = "oauth")]
     const PUBLIC_URL_UNSET_WARNING: &str = "OAuth is configured without public_url";
-    /// Full G4b warning message, verbatim from the plan.
+    /// Full missing-`public_url` warning message, verbatim.
     #[cfg(feature = "oauth")]
     const PUBLIC_URL_UNSET_WARNING_FULL: &str = "OAuth is configured without public_url: Protected Resource Metadata advertises a resource derived from the bind address and the 401 challenge carries a relative resource_metadata URL; set server.public_url (env RMCP_SERVER_KIT__SERVER__PUBLIC_URL)";
     /// Message of the OAuth opt-in summary line.
@@ -8675,7 +8675,7 @@ mod tests {
         Ok(logs)
     }
 
-    /// OAuth without `public_url` logs the G4b warning exactly once at router
+    /// OAuth without `public_url` logs the startup warning exactly once at router
     /// build, naming the bind-address-derived resource, and logs no opt-in
     /// summary for an otherwise 3.20.0-shaped config.
     #[cfg(feature = "oauth")]
@@ -8701,7 +8701,7 @@ mod tests {
         Ok(())
     }
 
-    /// A 3.20.0-shaped OAuth config with `public_url` logs neither the G4b
+    /// A 3.20.0-shaped OAuth config with `public_url` logs neither the startup
     /// warning nor the opt-in summary, and a config without OAuth logs no
     /// warning even without `public_url`.
     #[cfg(feature = "oauth")]
@@ -8904,7 +8904,7 @@ mod tests {
     }
 
     /// One opt-in knob with `public_url` unset logs exactly one summary AND
-    /// exactly one G4b warning.
+    /// exactly one missing-`public_url` warning.
     #[cfg(feature = "oauth")]
     #[tokio::test]
     async fn opt_in_summary_logged_even_without_public_url() -> anyhow::Result<()> {
@@ -9115,11 +9115,11 @@ mod tests {
     }
 
     /// `accept_resource_audience = true` without `public_url` still logs the
-    /// G4b warning exactly once and one opt-in summary, and the cache gets no
+    /// startup warning exactly once and one opt-in summary, and the cache gets no
     /// resource audience (the `public_url` guard).
     ///
     /// `serve()` validation rejects this combination, but the router build
-    /// follows the plan literally; the config is set directly on the struct.
+    /// still wires it as given; the config is set directly on the struct.
     #[cfg(feature = "oauth")]
     #[tokio::test]
     async fn accept_resource_audience_without_public_url_warns_and_wires_nothing()
@@ -9150,10 +9150,10 @@ mod tests {
         Ok(())
     }
 
-    /// Pins that the G4b warning and the opt-in summary fire even with
+    /// Pins that the startup warning and the opt-in summary fire even with
     /// `auth.enabled = false` while `auth.oauth` is `Some`.
     ///
-    /// Rationale: the plan says "when OAuth is configured", and the
+    /// Rationale: the warning applies "when OAuth is configured", and the
     /// Protected Resource Metadata is still served from the OAuth config
     /// whether or not the auth middleware is enabled, so the warning about
     /// its derived resource stays relevant. No JWT cache exists then.
@@ -9192,7 +9192,7 @@ mod tests {
     }
 
     /// Full cross product of the build-time OAuth knobs against an oracle
-    /// derived from the plan text (todo 9: G4 wiring, G4b warning, summary).
+    /// derived from the documented contract (wiring, warning, summary).
     ///
     /// Expected, per combination: the warning appears once iff `public_url`
     /// is unset (whatever `auth.enabled`); the summary appears once iff at

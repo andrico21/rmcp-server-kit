@@ -1,5 +1,5 @@
 //! Stateless authorization-server registration and browser consent boundary.
-// allow: SIZE_OK - the plan fixes this staged facade in one module; payloads and handlers share one security boundary.
+// allow: SIZE_OK - the sealed payload types and the handlers form one security boundary, so they stay in one module.
 
 extern crate alloc;
 
@@ -1120,6 +1120,8 @@ mod tests {
     use super::*;
     use crate::transport::McpServerConfig;
 
+    mod binding_near_misses;
+
     #[tokio::test]
     #[expect(
         deprecated,
@@ -1665,10 +1667,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(test)]
-    include!("oauth_as_fix12_tests.rs");
-
-    // Task 12: authenticated wrapper and callback contract closure.
+    // Authenticated wrapper and callback contracts.
 
     /// Build distinct signed grant inputs without depending on callback serialization.
     fn grant_fixture(context: &AsState) -> anyhow::Result<Vec<(String, String)>> {
@@ -1705,7 +1704,7 @@ mod tests {
 
     /// Each code binding is authenticated independently before an upstream form can exist.
     #[test]
-    fn task12_code_binding_and_expiry_table() -> anyhow::Result<()> {
+    fn code_grant_rejects_each_binding_mismatch_and_expiry() -> anyhow::Result<()> {
         // Given
         let context = state(false)?;
         let original = grant_fixture(&context)?;
@@ -1748,7 +1747,7 @@ mod tests {
 
     /// Both upstream grant forms contain exactly their allowed key/value pairs despite client junk.
     #[test]
-    fn task12_upstream_allowlist_table() -> anyhow::Result<()> {
+    fn upstream_grant_forms_carry_only_allowlisted_pairs() -> anyhow::Result<()> {
         // Given
         let mut context = state(false)?;
         context.proxy.client_id = "operator-static-client-unique".into();
@@ -1842,7 +1841,8 @@ mod tests {
 
     /// Callback payloads preserve distinct approved fields and the exact 120-second code lifetime.
     #[tokio::test]
-    async fn task12_callback_wrapper_fields_and_cookie_table() -> anyhow::Result<()> {
+    async fn callback_code_preserves_approved_fields_and_120_second_lifetime() -> anyhow::Result<()>
+    {
         // Given
         let context = Arc::new(state(false)?);
         let nonce = "nonce-Q0123456789abcdefghijklmnopqrstuvwxyz";
@@ -1976,7 +1976,7 @@ mod tests {
 
     /// Current and retired keys unwrap admin credentials while access token bytes stay untouched.
     #[test]
-    fn task12_refresh_rotation_and_admin_unwrap_table() -> anyhow::Result<()> {
+    fn admin_unwrap_accepts_current_and_retired_refresh_keys() -> anyhow::Result<()> {
         // Given
         let current = SecretString::from("current-key-0123456789-abcdefghijklmnopqrstuvwxyz");
         let previous = SecretString::from("previous-key-9876543210-ZYXWVUTSRQPONMLKJIHGFEDCBA");
@@ -2030,7 +2030,7 @@ mod tests {
 
     /// Token numeric boundaries and unreserved verifier alphabet are enforced before upstream I/O.
     #[test]
-    fn task12_token_numeric_and_charset_boundaries() -> anyhow::Result<()> {
+    fn token_enforces_numeric_and_pkce_charset_bounds_before_upstream() -> anyhow::Result<()> {
         // Given
         let context = state(false)?;
         for length in [42_usize, 43, 44, 127, 128, 129] {
@@ -2093,7 +2093,7 @@ mod tests {
 
     /// Callback bounds accept the exact cap and filter upstream error text without active delimiters.
     #[test]
-    fn task12_callback_numeric_boundaries() -> anyhow::Result<()> {
+    fn callback_accepts_exact_caps_and_filters_upstream_error_text() -> anyhow::Result<()> {
         // Given
         let context = state(false)?;
         let nonce = "state-X0123456789abcdefghijklmnopqrstuvwxyz";
@@ -2178,11 +2178,11 @@ mod tests {
         Ok(())
     }
 
-    // Fix2: expiry, cookie and renderer contract tables using the real signing boundary.
+    // Expiry, cookie and renderer contract tables using the real signing boundary.
 
     /// A genuine request at its deadline or one second beyond it is refused with its real cookie.
     #[tokio::test]
-    async fn fix2_consent_expiry_boundary_table() -> anyhow::Result<()> {
+    async fn consent_request_is_refused_at_and_after_its_deadline() -> anyhow::Result<()> {
         // Given
         let context = Arc::new(state(false)?);
         for seconds_ago in [0, 1] {
@@ -2226,7 +2226,7 @@ mod tests {
 
     /// All three cookie families have exact secure/development names and complete set/clear attributes.
     #[test]
-    fn fix2_cookie_serialization_table() -> anyhow::Result<()> {
+    fn cookie_families_serialize_exact_names_and_attributes() -> anyhow::Result<()> {
         // Given
         for secure in [false, true] {
             let context = state(secure)?;
@@ -2277,7 +2277,7 @@ mod tests {
 
     /// Cookie parser limits select the first accepted value at both sides of the cap.
     #[test]
-    fn fix2_cookie_size_boundary_table() -> anyhow::Result<()> {
+    fn cookie_parser_selects_first_value_within_size_cap() -> anyhow::Result<()> {
         // Given
         for size in [4095, 4096, 4097] {
             let value = "a".repeat(size);
@@ -2304,7 +2304,7 @@ mod tests {
 
     /// Renderer interpolation escapes every metacharacter even in a synthetic hidden field.
     #[tokio::test]
-    async fn fix2_renderer_interpolation_table() -> anyhow::Result<()> {
+    async fn renderer_escapes_every_metacharacter_in_each_field() -> anyhow::Result<()> {
         use axum::body::to_bytes;
         // Given
         let hostile = "<img/src=x>&'\"";
@@ -2340,11 +2340,11 @@ mod tests {
         Ok(())
     }
 
-    // Fix3: authenticated-state distinct-values table.
+    // Authenticated-state distinct-values tables.
 
     /// A nondefault approved challenge remains bound inside the authenticated flow cookie.
     #[test]
-    fn reviewer_11d_distinct_pkce_is_bound() -> anyhow::Result<()> {
+    fn nondefault_pkce_challenge_stays_bound_in_flow_cookie() -> anyhow::Result<()> {
         // Given
         let context = state(false)?;
         let mut pending = request("client-a");
@@ -2370,7 +2370,7 @@ mod tests {
     }
 
     /// Read generated response cookies without accepting their attributes as credential data.
-    fn fix3_cookies(response: &Response) -> anyhow::Result<HeaderMap> {
+    fn cookie_request_headers(response: &Response) -> anyhow::Result<HeaderMap> {
         let mut headers = HeaderMap::new();
         for value in response.headers().get_all(header::SET_COOKIE) {
             let pair = value.to_str()?.split(';').next().context("cookie pair")?;
@@ -2380,7 +2380,7 @@ mod tests {
     }
 
     /// Open both approval outputs and compare every carried field with independent source data.
-    fn fix3_approved_fields(
+    fn assert_approved_flow_fields(
         context: &AsState,
         pending: &ConsentRequest,
         response: &Response,
@@ -2398,7 +2398,7 @@ mod tests {
             .map(|(key, value)| (key.into_owned(), value.into_owned()))
             .collect();
         let upstream_nonce = param(&pairs, "state").context("upstream nonce")?;
-        let headers = fix3_cookies(response)?;
+        let headers = cookie_request_headers(response)?;
         let hash = sha256_b64(upstream_nonce);
         let token =
             cookie(&headers, &context.cookie_name("state", Some(&hash))).context("state cookie")?;
@@ -2484,10 +2484,10 @@ mod tests {
     #[tokio::test]
     #[expect(
         clippy::too_many_lines,
-        reason = "deliberate: oauth_as::tests::fix3_authenticated_state_distinct_values_table keeps source/output fields in one reviewable security transaction"
+        reason = "deliberate: oauth_as::tests::authenticated_state_preserves_distinct_values_per_transaction keeps source/output fields in one reviewable security transaction"
     )]
     /// Authorization, approval and denial preserve distinct fields through real authenticated envelopes.
-    async fn fix3_authenticated_state_distinct_values_table() -> anyhow::Result<()> {
+    async fn authenticated_state_preserves_distinct_values_per_transaction() -> anyhow::Result<()> {
         use axum::body::to_bytes;
         // Given: each row uses a different client, callback, state, challenge and hint set.
         for (row, challenge) in [
@@ -2539,7 +2539,7 @@ mod tests {
             .await;
             // Then: authenticate the generated request, not just its visible JSON payload.
             ensure!(page.status() == 200, "distinct fixture renders consent");
-            let cookies = fix3_cookies(&page)?;
+            let cookies = cookie_request_headers(&page)?;
             let html = String::from_utf8(to_bytes(page.into_body(), 0x8000).await?.to_vec())?;
             let token = html
                 .split("name=\"request\" value=\"")
@@ -2617,13 +2617,13 @@ mod tests {
                         continue;
                     }
                     // Then
-                    let cleared = fix3_cookies(&response)?;
+                    let cleared = cookie_request_headers(&response)?;
                     ensure!(
                         cookie(&cleared, &csrf_name) == Some(""),
                         "original CSRF cookie cleared"
                     );
                     match decision {
-                        "approve" => fix3_approved_fields(&context, &pending, &response)?,
+                        "approve" => assert_approved_flow_fields(&context, &pending, &response)?,
                         "deny" => {
                             let mut expected = Url::parse(&redirect)?;
                             let _query = expected

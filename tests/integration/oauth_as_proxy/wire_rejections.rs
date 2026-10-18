@@ -1,10 +1,10 @@
-// Fix-round wire regressions share the existing real-listener harness.
+//! Callback and token rejections observed through the real-listener harness.
 
-include!("oauth_as_proxy_fix12_replica.rs");
+use super::*;
 
 /// Issuer comparison is byte-exact, including near misses that URL normalization would hide.
 #[tokio::test]
-async fn fix12_callback_issuer_near_miss_table() -> anyhow::Result<()> {
+async fn callback_rejects_issuer_near_misses() -> anyhow::Result<()> {
     // Given
     let server = Harness::start("30days").await?;
     let cid = server.register("Issuer exactness fixture").await?;
@@ -90,7 +90,7 @@ async fn fix12_callback_issuer_near_miss_table() -> anyhow::Result<()> {
 
 /// Malformed callbacks cannot use ambient Lax cookies to abort unrelated browser logins.
 #[tokio::test]
-async fn fix12_invalid_state_preserves_ambient_flows() -> anyhow::Result<()> {
+async fn invalid_state_preserves_ambient_flows() -> anyhow::Result<()> {
     // Given
     let server = Harness::start("30days").await?;
     let cid = server.register("Ambient flows fixture").await?;
@@ -129,7 +129,7 @@ async fn fix12_invalid_state_preserves_ambient_flows() -> anyhow::Result<()> {
 
 /// The real token route rejects client migration mistakes, smuggling and broken grant bindings locally.
 #[tokio::test]
-async fn fix12_token_wire_rejection_table() -> anyhow::Result<()> {
+async fn token_route_rejects_bad_clients_and_bindings_locally() -> anyhow::Result<()> {
     // Given
     let server = Harness::start("30days").await?;
     let owner = server.register("Wire rejection owner").await?;

@@ -9,6 +9,8 @@
     reason = "test code is not rendered API documentation"
 )]
 #[cfg(test)]
+// On an inline module `path` names the directory of its file submodules.
+#[path = "oauth_as_proxy"]
 mod tests {
     use core::{net::SocketAddr, time::Duration};
     use std::{env, fs, process::Command};
@@ -33,6 +35,9 @@ mod tests {
         time::timeout,
     };
     use tokio_util::sync::CancellationToken;
+
+    mod refresh_and_replicas;
+    mod wire_rejections;
 
     const CALLBACK: &str = "http://127.0.0.1:18999/cb?original=1";
     const CHALLENGE: &str = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG";
@@ -1424,8 +1429,8 @@ mod tests {
         Ok(String::from_utf8(output.stdout)?)
     }
 
-    // allow: SIZE_OK - the assigned integration target owns the facade contract tables; file splitting is outside this tests-only fix-up.
-    // Task 12: callback, downstream bindings and upstream token allowlists.
+    // allow: SIZE_OK - one integration target exercises the facade end to end through shared harness helpers and contract tables.
+    // Callback, downstream bindings and upstream token allowlists.
 
     /// Approve a distinct transaction and retain only its browser state credential.
     async fn approved_flow(
@@ -1815,7 +1820,7 @@ mod tests {
 
     /// A substituted upstream code cannot bypass the downstream challenge before contacting the IdP.
     #[tokio::test]
-    async fn task12_two_flow_pkce_substitution_is_local_rejection() -> anyhow::Result<()> {
+    async fn pkce_substitution_across_flows_is_rejected_locally() -> anyhow::Result<()> {
         // Given
         let server = Harness::start("30days").await?;
         let first = server.register("Substitution client A distinct").await?;
@@ -1854,7 +1859,7 @@ mod tests {
 
     /// Refresh credentials retain their original client binding even across upstream rotation.
     #[tokio::test]
-    async fn task12_refresh_binding_rotation_and_optional_client() -> anyhow::Result<()> {
+    async fn refresh_keeps_client_binding_across_upstream_rotation() -> anyhow::Result<()> {
         use url::form_urlencoded;
         use wiremock::{
             Mock, ResponseTemplate,
@@ -1958,7 +1963,7 @@ mod tests {
 
     /// Local malformed callback inputs remain nonredirecting pages with forced security headers.
     #[tokio::test]
-    async fn task12_callback_error_and_clear_table() -> anyhow::Result<()> {
+    async fn malformed_callbacks_render_nonredirecting_pages() -> anyhow::Result<()> {
         // Given
         let server = Harness::start("30days").await?;
         for query in [
@@ -2009,7 +2014,7 @@ mod tests {
 
     /// Upstream non-JSON successes and error bytes are not rewritten in authorization-server mode.
     #[tokio::test]
-    async fn task12_upstream_response_relay_table() -> anyhow::Result<()> {
+    async fn upstream_token_responses_are_relayed_unrewritten() -> anyhow::Result<()> {
         use wiremock::{
             Mock, ResponseTemplate,
             matchers::{method, path},
@@ -2054,7 +2059,7 @@ mod tests {
 
     /// The issuer chain is byte-identical with either public URL spelling.
     #[tokio::test]
-    async fn task12_discovery_chain_trailing_slash_table() -> anyhow::Result<()> {
+    async fn discovery_issuer_chain_ignores_public_url_trailing_slash() -> anyhow::Result<()> {
         // Given
         for trailing in [false, true] {
             let server =
@@ -2109,7 +2114,7 @@ mod tests {
 
     /// Admin routes unwrap current/previous refresh wrappers and retain unwrapped access-token behavior.
     #[tokio::test]
-    async fn task12_admin_unwrap_wire_table() -> anyhow::Result<()> {
+    async fn admin_routes_unwrap_current_and_previous_refresh_wrappers() -> anyhow::Result<()> {
         use wiremock::{
             Mock, ResponseTemplate,
             matchers::{method, path},
@@ -2230,11 +2235,9 @@ mod tests {
         visible_payload(token)
     }
 
-    include!("oauth_as_proxy_fix12.rs");
-
     /// Independently sealed previous-key codes redeem, while unknown keys and expired codes fail locally.
     #[tokio::test]
-    async fn task12_code_rotation_and_expiry_wire_table() -> anyhow::Result<()> {
+    async fn previous_key_codes_redeem_and_unknown_or_expired_codes_fail() -> anyhow::Result<()> {
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
         use sha2::{Digest as _, Sha256};
         use wiremock::{
@@ -2281,7 +2284,7 @@ mod tests {
 
     /// Shared signing keys allow registration/approval on one replica and callback/exchange on another.
     #[tokio::test]
-    async fn task12_two_replicas_share_stateless_flow() -> anyhow::Result<()> {
+    async fn two_replicas_share_one_stateless_flow() -> anyhow::Result<()> {
         use wiremock::{
             Mock, ResponseTemplate,
             matchers::{method, path},
@@ -2333,7 +2336,7 @@ mod tests {
 
     /// Drive a full browser-to-token flow using bounded curl processes without writing credentials.
     #[tokio::test]
-    async fn task12_live_curl_complete_flow() -> anyhow::Result<()> {
+    async fn curl_drives_complete_browser_to_token_flow() -> anyhow::Result<()> {
         use wiremock::{
             Mock, ResponseTemplate,
             matchers::{method, path},
@@ -2419,7 +2422,7 @@ mod tests {
 
     /// The upstream response cap fails closed at cap plus one and preserves bytes at/below it.
     #[tokio::test]
-    async fn task12_token_body_cap_table() -> anyhow::Result<()> {
+    async fn upstream_token_body_cap_fails_closed_above_limit() -> anyhow::Result<()> {
         use wiremock::{
             Mock, ResponseTemplate,
             matchers::{method, path},
@@ -2465,7 +2468,7 @@ mod tests {
 
     /// Passthrough admin adapters preserve exact upstream request forms and response bytes.
     #[tokio::test]
-    async fn task12_passthrough_admin_bytes_oracle() -> anyhow::Result<()> {
+    async fn passthrough_admin_preserves_exact_forms_and_bytes() -> anyhow::Result<()> {
         use wiremock::{
             Mock, ResponseTemplate,
             matchers::{method, path},
@@ -2508,7 +2511,7 @@ mod tests {
 
     /// Passthrough token responses retain refresh strings and whitespace without JSON rewriting.
     #[tokio::test]
-    async fn task12_passthrough_refresh_bytes_oracle() -> anyhow::Result<()> {
+    async fn passthrough_token_responses_keep_refresh_bytes() -> anyhow::Result<()> {
         use wiremock::{
             Mock, ResponseTemplate,
             matchers::{method, path},
@@ -2538,7 +2541,7 @@ mod tests {
         server.close().await
     }
 
-    // Fix2 systematic contract closure: boundaries, error kinds, cookies and interpolation.
+    // Boundaries, error kinds, cookies and interpolation.
 
     /// Decode the public integrity-only envelope without treating it as authenticated input.
     fn visible_payload(token: &str) -> anyhow::Result<Value> {
@@ -2571,7 +2574,7 @@ mod tests {
 
     /// Every authorize numeric boundary observes both neighbors and the exact outcome class.
     #[tokio::test]
-    async fn fix2_authorize_boundary_table() -> anyhow::Result<()> {
+    async fn authorize_rejects_values_at_each_size_bound() -> anyhow::Result<()> {
         use core::iter::repeat_n;
         // Given
         let server = Harness::start("1234s").await?;
@@ -2651,7 +2654,7 @@ mod tests {
 
     /// Registration count, per-URI, aggregate and character bounds distinguish both neighbors.
     #[tokio::test]
-    async fn fix2_registration_boundary_table() -> anyhow::Result<()> {
+    async fn registration_bounds_distinguish_both_neighbors() -> anyhow::Result<()> {
         // Given
         let server = Harness::start("1234s").await?;
         let mut cases = Vec::new();
@@ -2744,7 +2747,7 @@ mod tests {
 
     /// All protocol-error causes preserve only registered destinations and the original state.
     #[tokio::test]
-    async fn fix2_protocol_error_kind_table() -> anyhow::Result<()> {
+    async fn protocol_errors_redirect_only_to_registered_uri_with_state() -> anyhow::Result<()> {
         // Given
         let server = Harness::start("1234s").await?;
         let cid = server.register("Error table").await?;
@@ -2800,7 +2803,7 @@ mod tests {
 
     /// Every ASCII PKCE character is classified at an otherwise valid length.
     #[tokio::test]
-    async fn fix2_pkce_charset_table() -> anyhow::Result<()> {
+    async fn pkce_classifies_every_ascii_character() -> anyhow::Result<()> {
         // Given
         let server = Harness::start("1234s").await?;
         let cid = server.register("Alphabet table").await?;
@@ -2827,7 +2830,7 @@ mod tests {
 
     /// A slash at the end of a query is not equivalent to the registered query.
     #[tokio::test]
-    async fn fix2_redirect_query_trailing_slash_is_distinct() -> anyhow::Result<()> {
+    async fn redirect_query_trailing_slash_is_distinct() -> anyhow::Result<()> {
         // Given
         let server = Harness::start("1234s").await?;
         let cid = server.register("Exact query").await?;
@@ -2846,7 +2849,7 @@ mod tests {
 
     /// The observable pending-request deadline is exactly ten minutes after page issuance.
     #[tokio::test]
-    async fn fix2_pending_request_lifetime_is_600_seconds() -> anyhow::Result<()> {
+    async fn pending_request_lifetime_is_600_seconds() -> anyhow::Result<()> {
         use std::time::{SystemTime, UNIX_EPOCH};
         // Given
         let server = Harness::start("1234s").await?;
@@ -2949,7 +2952,7 @@ mod tests {
 
     /// Page, approve, deny, fast-path and zero-TTL transitions serialize exact cookie contracts.
     #[tokio::test]
-    async fn fix2_cookie_transition_table() -> anyhow::Result<()> {
+    async fn consent_transitions_serialize_exact_cookies() -> anyhow::Result<()> {
         // Given
         for ttl in ["1234s", "0s"] {
             let server = Harness::start(ttl).await?;
@@ -2993,7 +2996,7 @@ mod tests {
 
     /// Each reachable untrusted HTML field is inert, while forbidden scope quotes fail as protocol errors.
     #[tokio::test]
-    async fn fix2_interpolation_table() -> anyhow::Result<()> {
+    async fn untrusted_html_fields_are_inert() -> anyhow::Result<()> {
         // Given
         let server = Harness::start("1234s").await?;
         let uri = "https://example.test/cb?x=<img/src=x>&quote='\"";
@@ -3062,7 +3065,7 @@ mod tests {
 
     /// Every reachable integrity rejection is an inert nonredirecting page rather than a protocol redirect.
     #[tokio::test]
-    async fn fix2_integrity_error_page_table() -> anyhow::Result<()> {
+    async fn integrity_rejections_render_nonredirecting_pages() -> anyhow::Result<()> {
         // Given
         let server = Harness::start("1234s").await?;
         let cid = server.register("Integrity table").await?;
@@ -3155,15 +3158,15 @@ mod tests {
         server.close().await
     }
 
-    // Fix3: distinct authenticated-state fields observed through HTTP.
+    // Distinct authenticated-state fields observed through HTTP.
 
     #[tokio::test]
     #[expect(
         clippy::too_many_lines,
-        reason = "deliberate: tests::fix3_distinct_state_http_table keeps each source and observable output in one transaction"
+        reason = "deliberate: tests::distinct_browser_transactions_keep_their_fields keeps each source and observable output in one transaction"
     )]
     /// Distinct browser transactions preserve payload fields and the corresponding upstream redirect.
-    async fn fix3_distinct_state_http_table() -> anyhow::Result<()> {
+    async fn distinct_browser_transactions_keep_their_fields() -> anyhow::Result<()> {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};

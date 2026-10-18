@@ -11395,7 +11395,7 @@ role = "admin"
 
     /// FROZEN COPY of the 3.20.0 `check_audience` acceptance rule.
     ///
-    /// Kept as the todo 9 differential oracle. DO NOT EDIT: it is the
+    /// Kept as the differential oracle. DO NOT EDIT: it is the
     /// parent's decision with only its log side effects removed, and every
     /// cache with the new audience knobs off must reproduce it exactly.
     fn frozen_3_20_audience_accepts(

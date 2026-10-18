@@ -1,5 +1,9 @@
+//! Near-miss tables for the authenticated grant and state bindings.
+
+use super::*;
+
 /// Generate close unequal inputs without relying only on unrelated foreign values.
-fn fix12_near_misses(value: &str) -> Vec<String> {
+fn near_misses(value: &str) -> Vec<String> {
     vec![
         value.to_uppercase(),
         format!("{value}/"),
@@ -20,7 +24,7 @@ fn fix12_near_misses(value: &str) -> Vec<String> {
 
 /// Every authenticated grant field rejects near misses independently of sibling bindings.
 #[test]
-fn fix12_grant_binding_near_miss_table() -> anyhow::Result<()> {
+fn grant_bindings_reject_each_near_miss() -> anyhow::Result<()> {
     // Given
     let context = state(false)?;
     let original = grant_fixture(&context)?;
@@ -34,7 +38,7 @@ fn fix12_grant_binding_near_miss_table() -> anyhow::Result<()> {
             "cc" => &expected.cc,
             _ => anyhow::bail!("fixture field"),
         };
-        for miss in fix12_near_misses(expected_value) {
+        for miss in near_misses(expected_value) {
             let mut payload: CodeWrap = context.sealer.open(SealKind::Code, code)?;
             match field {
                 "cid" => payload.cid = miss,
@@ -56,7 +60,7 @@ fn fix12_grant_binding_near_miss_table() -> anyhow::Result<()> {
             );
         }
     }
-    for redirect in fix12_near_misses(&expected.ru) {
+    for redirect in near_misses(&expected.ru) {
         let mut pairs = original.clone();
         for (key, value) in &mut pairs {
             if key == "redirect_uri" {
@@ -68,7 +72,7 @@ fn fix12_grant_binding_near_miss_table() -> anyhow::Result<()> {
             "request redirect near miss"
         );
     }
-    for miss in fix12_near_misses(&sha256_b64(client)) {
+    for miss in near_misses(&sha256_b64(client)) {
         let refresh = context.sealer.seal(
             SealKind::Refresh,
             &RefreshWrap {
@@ -92,7 +96,7 @@ fn fix12_grant_binding_near_miss_table() -> anyhow::Result<()> {
 /// State digest equality and all approved handoff fields stay distinct across transactions.
 #[tokio::test]
 // cancel-safe: test invokes synchronous callback processing with no persistent state.
-async fn fix12_state_binding_and_handoff_table() -> anyhow::Result<()> {
+async fn state_nonce_near_misses_fail_and_handoff_fields_stay_distinct() -> anyhow::Result<()> {
     use core::iter::once;
     // Given
     let context = Arc::new(state(false)?);
@@ -107,7 +111,7 @@ async fn fix12_state_binding_and_handoff_table() -> anyhow::Result<()> {
             exp: now_unix().saturating_add(ordinal.saturating_add(500)),
         };
         let cookie_name = context.cookie_name("state", Some(&sha256_b64(nonce)));
-        for nh in once(flow.nh.clone()).chain(fix12_near_misses(&flow.nh)) {
+        for nh in once(flow.nh.clone()).chain(near_misses(&flow.nh)) {
             let accepted = nh == flow.nh;
             let candidate = FlowState {
                 cid: flow.cid.clone(),

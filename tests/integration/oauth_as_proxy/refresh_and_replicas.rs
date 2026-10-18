@@ -1,6 +1,10 @@
+//! Refresh client binding and replicas that share one public origin.
+
+use super::*;
+
 /// Foreign and static client IDs return complete error bodies without contacting upstream.
 #[tokio::test]
-async fn fix12_refresh_foreign_client_wire_table() -> anyhow::Result<()> {
+async fn refresh_rejects_foreign_and_static_clients_locally() -> anyhow::Result<()> {
     // Given
     let server = Harness::start("30days").await?;
     let owner = server.register("Refresh rejection owner A").await?;
@@ -51,7 +55,7 @@ async fn fix12_refresh_foreign_client_wire_table() -> anyhow::Result<()> {
 
 /// Replicas sharing an issuer accept the untouched browser cookie without renaming it.
 #[tokio::test]
-async fn fix12_same_public_origin_replicas() -> anyhow::Result<()> {
+async fn same_public_origin_replicas_share_cookie() -> anyhow::Result<()> {
     use url::form_urlencoded;
     use wiremock::{
         Mock, ResponseTemplate,
