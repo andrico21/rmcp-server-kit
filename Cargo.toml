@@ -43,6 +43,10 @@ path = "src/lib.rs"
 name = "oauth_server"
 required-features = ["oauth"]
 
+[[example]]
+name = "oauth_proxy_as_demo"
+required-features = ["oauth"]
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
