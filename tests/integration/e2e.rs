@@ -6637,4 +6637,817 @@ mod tests {
             Ok(())
         }
     }
+
+    // ==========================================================================
+    // Keycloak 26.6 token shape: ES384, `at+jwt`, array `aud`, role claims
+    // ==========================================================================
+
+    /// Pins acceptance of access tokens shaped like the ones a Keycloak 26.6
+    /// realm issues: an ES384 signature, the RFC 9068 header `typ: at+jwt`,
+    /// an array `aud` plus `azp`, and roles under `realm_access.roles`,
+    /// `resource_access.<client>.roles` and `groups`.
+    ///
+    /// Every value is a generic placeholder. Each accepted token is paired
+    /// with a tampered-signature twin and an expired twin that the same
+    /// server rejects, so no 200 below is vacuous; each rejection is paired
+    /// with an acceptance that differs only in the property under test.
+    #[cfg(feature = "oauth")]
+    mod keycloak_26_token_shape {
+        use std::sync::LazyLock;
+
+        use wiremock::{Mock, ResponseTemplate, matchers};
+
+        use super::*;
+
+        /// `kid` of the ES384 realm key.
+        const EC_KID: &str = "kc-es384";
+        /// `kid` of the RS256 realm key served next to it in K8.
+        const RSA_KID: &str = "kc-rs256";
+        /// Client id of the MCP client: the configured `audience` and `azp`.
+        const CLIENT_ID: &str = "mcp-example";
+        /// Path of the realm JWKS on the mock IdP.
+        const CERTS_PATH: &str = "/realms/example/protocol/openid-connect/certs";
+        /// The role claim K1 and K4-K8 map.
+        const REALM_ROLES: &str = "realm_access.roles";
+        /// The realm role K1 and K4-K8 map to `viewer`.
+        const REALM_ROLE: &str = "mcp-users";
+        /// An audience alias configured through `additional_audiences`.
+        const ALIAS: &str = "mcp-example-alias";
+        /// Bytes per P-384 affine coordinate.
+        const P384_COORDINATE_LEN: usize = 48;
+        /// Seconds an expired twin lies in the past, beyond the 60 s leeway.
+        const EXPIRED_BY: u64 = 600;
+        /// MCP `initialize` request body.
+        const INITIALIZE_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"keycloak-shape","version":"0.0.1"}}}"#;
+        /// MCP `tools/list` request body.
+        const TOOLS_LIST_BODY: &str = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
+        /// Accepted: `initialize` 200, then `tools/list` 200 in that session.
+        const ACCEPTED: (u16, Option<u16>) = (200, Some(200));
+        /// Rejected: `initialize` 401 and no session to list tools in.
+        const REJECTED: (u16, Option<u16>) = (401, None);
+        /// `error_description` of every rejection except expiry.
+        const DESC_INVALID: &str = "token is invalid";
+        /// `error_description` of an expired token.
+        const DESC_EXPIRED: &str = "token is expired";
+
+        /// The exact challenge for a server at `base`: Bearer, the
+        /// protected-resource metadata URL, `error="invalid_token"` and
+        /// `description`.
+        fn invalid_token_challenge(base: &str, description: &str) -> String {
+            format!(
+                r#"Bearer resource_metadata="{base}/.well-known/oauth-protected-resource/mcp", error="invalid_token", error_description="{description}""#
+            )
+        }
+
+        /// The module's ES384 realm key.
+        struct EcKey {
+            /// PKCS#8 PEM of the P-384 private key.
+            pem: String,
+            /// Public JWK (`kty = EC`, `crv = P-384`) as Keycloak publishes it.
+            jwk: serde_json::Value,
+        }
+
+        /// One P-384 key for the whole module.
+        static EC_KEY: LazyLock<Result<EcKey, String>> =
+            LazyLock::new(|| generate_es384_key().map_err(|err| format!("{err:#}")));
+
+        /// One RSA key for K8: 2048-bit generation in an unoptimized build
+        /// costs seconds.
+        static RSA_KEY: LazyLock<Result<(String, serde_json::Value), String>> =
+            LazyLock::new(|| {
+                generate_oauth_test_keypair(RSA_KID).map_err(|err| format!("{err:#}"))
+            });
+
+        /// Generates a P-384 key and its JWK from the uncompressed public
+        /// point `0x04 || X(48) || Y(48)`.
+        fn generate_es384_key() -> anyhow::Result<EcKey> {
+            let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384)
+                .context("P-384 key generation")?;
+            let Some((&0x04, coordinates)) = key_pair.public_key_raw().split_first() else {
+                anyhow::bail!("P-384 public key is not an uncompressed point");
+            };
+            let (x, y) = coordinates
+                .split_at_checked(P384_COORDINATE_LEN)
+                .context("P-384 point carries a 48-byte X")?;
+            anyhow::ensure!(
+                y.len() == P384_COORDINATE_LEN,
+                "P-384 point carries a 48-byte Y"
+            );
+            Ok(EcKey {
+                pem: key_pair.serialize_pem(),
+                jwk: serde_json::json!({
+                    "kty": "EC",
+                    "crv": "P-384",
+                    "x": URL_SAFE_NO_PAD.encode(x),
+                    "y": URL_SAFE_NO_PAD.encode(y),
+                    "kid": EC_KID,
+                    "alg": "ES384",
+                    "use": "sig"
+                }),
+            })
+        }
+
+        /// The shared ES384 key.
+        fn ec_key() -> anyhow::Result<&'static EcKey> {
+            EC_KEY
+                .as_ref()
+                .map_err(|err| anyhow::anyhow!("P-384 key generation: {err}"))
+        }
+
+        /// The shared RSA key: PKCS#8 PEM and its JWKS document.
+        fn rsa_key() -> anyhow::Result<&'static (String, serde_json::Value)> {
+            RSA_KEY
+                .as_ref()
+                .map_err(|err| anyhow::anyhow!("RSA key generation: {err}"))
+        }
+
+        /// Which realm key signs a token, with which header shape.
+        #[derive(Clone, Copy, Debug)]
+        enum Signer {
+            /// ES384 with the RFC 9068 header `typ: at+jwt`, as Keycloak
+            /// 26.6 issues for a client with RFC 9068 tokens enabled.
+            Es384AtJwt,
+            /// RS256 with the classic header `typ: JWT`.
+            Rs256Jwt,
+        }
+
+        impl Signer {
+            /// Signs `claims` with `kid` set to this signer's realm key.
+            fn sign(self, claims: &serde_json::Value) -> anyhow::Result<String> {
+                let (header, key) = match self {
+                    Self::Es384AtJwt => {
+                        let mut header = jsonwebtoken::Header::new(Algorithm::ES384);
+                        header.kid = Some(EC_KID.into());
+                        header.typ = Some("at+jwt".into());
+                        let key = jsonwebtoken::EncodingKey::from_ec_pem(ec_key()?.pem.as_bytes())
+                            .context("EC encoding key from PEM")?;
+                        (header, key)
+                    }
+                    Self::Rs256Jwt => {
+                        let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
+                        header.kid = Some(RSA_KID.into());
+                        header.typ = Some("JWT".into());
+                        let key = jsonwebtoken::EncodingKey::from_rsa_pem(rsa_key()?.0.as_bytes())
+                            .context("RSA encoding key from PEM")?;
+                        (header, key)
+                    }
+                };
+                jsonwebtoken::encode(&header, claims, &key).context("JWT encoding")
+            }
+        }
+
+        /// Mock Keycloak realm serving its JWKS on both loopback addresses.
+        struct KeycloakIdp {
+            /// The dual-stack wiremock server.
+            mock: DualStackMock,
+        }
+
+        impl KeycloakIdp {
+            /// Starts a realm whose JWKS holds exactly `keys`.
+            async fn start(keys: Vec<serde_json::Value>) -> anyhow::Result<Self> {
+                let body = serde_json::json!({ "keys": keys });
+                let mock = DualStackMock::start().await?;
+                mock.mount(|| {
+                    Mock::given(matchers::method("GET"))
+                        .and(matchers::path(CERTS_PATH))
+                        .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+                })
+                .await;
+                Ok(Self { mock })
+            }
+
+            /// Starts a realm whose JWKS holds only the ES384 key.
+            async fn es384() -> anyhow::Result<Self> {
+                Self::start(vec![ec_key()?.jwk.clone()]).await
+            }
+
+            /// `iss` of every token and the configured `issuer`.
+            fn issuer(&self) -> String {
+                format!("http://localhost:{}/realms/example", self.mock.port())
+            }
+
+            /// OAuth config: audience [`CLIENT_ID`], default (`strict`)
+            /// audience mode, default `allowed_algorithms`, `role_claim =`
+            /// [`REALM_ROLES`] mapping [`REALM_ROLE`] to `viewer`; each
+            /// top-level key of `overrides` replaces the default.
+            fn oauth(&self, overrides: &serde_json::Value) -> anyhow::Result<OAuthConfig> {
+                let mut json = serde_json::json!({
+                    "issuer": self.issuer(),
+                    "audience": CLIENT_ID,
+                    "jwks_uri": format!("http://localhost:{}{CERTS_PATH}", self.mock.port()),
+                    "allow_http_oauth_urls": true,
+                    "ssrf_allowlist": {
+                        "hosts": ["localhost"],
+                        "cidrs": ["127.0.0.0/8"]
+                    },
+                    "role_claim": REALM_ROLES,
+                    "role_mappings": [{"claim_value": REALM_ROLE, "role": "viewer"}]
+                });
+                let object = json
+                    .as_object_mut()
+                    .context("oauth document is an object")?;
+                for (key, value) in overrides
+                    .as_object()
+                    .context("oauth overrides are an object")?
+                {
+                    drop(object.insert(key.clone(), value.clone()));
+                }
+                serde_json::from_value(json).context("oauth config deserialization")
+            }
+
+            /// Claims modelled on a Keycloak 26.6 access token for
+            /// [`CLIENT_ID`], expiring 180 s from now.
+            fn claims(&self) -> serde_json::Value {
+                let now = jsonwebtoken::get_current_timestamp();
+                serde_json::json!({
+                    "exp": now.saturating_add(180),
+                    "iat": now,
+                    "auth_time": now,
+                    "jti": "00000000-0000-4000-8000-000000000001",
+                    "iss": self.issuer(),
+                    "aud": [CLIENT_ID, "other-service", "account"],
+                    "sub": "00000000-0000-4000-8000-000000000002",
+                    "typ": "Bearer",
+                    "azp": CLIENT_ID,
+                    "sid": "00000000-0000-4000-8000-000000000003",
+                    "scope": "openid profile email",
+                    "realm_access": {"roles": [REALM_ROLE]},
+                    "resource_access": {"mcp-example": {"roles": ["tool-admin"]}},
+                    "groups": ["mcp-operators"]
+                })
+            }
+        }
+
+        /// `claims` with the top-level `key` set to `value`.
+        fn with_claim(
+            mut claims: serde_json::Value,
+            key: &str,
+            value: serde_json::Value,
+        ) -> anyhow::Result<serde_json::Value> {
+            drop(
+                claims
+                    .as_object_mut()
+                    .context("claims are an object")?
+                    .insert(key.to_owned(), value),
+            );
+            Ok(claims)
+        }
+
+        /// `viewer` may call only `echo`.
+        fn viewer_rbac() -> Arc<RbacPolicy> {
+            Arc::new(RbacPolicy::new(&RbacConfig::with_roles(vec![
+                RoleConfig::new("viewer", vec!["echo".into()], vec!["*".into()]),
+            ])))
+        }
+
+        /// Spawns an OAuth-only server through `serve_with_listener` on an
+        /// ephemeral port with `public_url = http://127.0.0.1:<port>` (equal
+        /// to the harness `base`) and [`viewer_rbac`].
+        async fn spawn_keycloak_server(oauth: OAuthConfig) -> anyhow::Result<ServerHarness> {
+            drop(ring::default_provider().install_default());
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let bound: SocketAddr = listener.local_addr()?;
+            let public_url = format!("http://{bound}");
+            let mut auth = AuthConfig::with_keys(vec![]);
+            auth.oauth = Some(oauth);
+            let validated = config_on_port(bound.port())
+                .with_auth(auth)
+                .with_rbac(viewer_rbac())
+                .with_public_url(public_url.clone())
+                .validate()
+                .context("test config valid")?;
+            let (ready_tx, ready_rx) = oneshot::channel::<SocketAddr>();
+            let shutdown = CancellationToken::new();
+            let shutdown_for_server = shutdown.clone();
+            let join = tokio::spawn(async move {
+                serve_with_listener(
+                    listener,
+                    validated,
+                    || TestHandler,
+                    Some(ready_tx),
+                    Some(shutdown_for_server),
+                )
+                .await
+            });
+            let signalled = timeout(Duration::from_secs(30), ready_rx)
+                .await
+                .context("server did not signal readiness within 30s")?
+                .context("server task aborted before readiness signal")?;
+            assert_eq!(
+                signalled, bound,
+                "ready_tx address mismatched the pre-bound listener"
+            );
+            Ok(ServerHarness {
+                base: public_url,
+                shutdown,
+                join: Some(join),
+            })
+        }
+
+        /// A `POST /mcp` carrying `token` as the bearer.
+        fn mcp_request(
+            client: &reqwest::Client,
+            base: &str,
+            token: &str,
+        ) -> reqwest::RequestBuilder {
+            client
+                .post(format!("{base}/mcp"))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+        }
+
+        /// MCP `initialize` with `token`, then `tools/list` in the returned
+        /// session: the two statuses (`None` when no session was issued). A
+        /// 200 listing must carry a `result.tools` array.
+        async fn outcome(base: &str, token: &str) -> anyhow::Result<(u16, Option<u16>)> {
+            let client = reqwest::Client::new();
+            let init = mcp_request(&client, base, token)
+                .body(INITIALIZE_BODY)
+                .send()
+                .await
+                .context("initialize request")?;
+            let init_status = init.status().as_u16();
+            let Some(session_header) = init.headers().get("mcp-session-id") else {
+                return Ok((init_status, None));
+            };
+            let session = session_header
+                .to_str()
+                .context("session id is ASCII")?
+                .to_owned();
+            let list = mcp_request(&client, base, token)
+                .header("mcp-session-id", session)
+                .body(TOOLS_LIST_BODY)
+                .send()
+                .await
+                .context("tools/list request")?;
+            let list_status = list.status().as_u16();
+            if list_status == 200 {
+                let body = mcp_response_json(list).await?;
+                anyhow::ensure!(
+                    body.get("result")
+                        .and_then(|result| result.get("tools"))
+                        .is_some_and(serde_json::Value::is_array),
+                    "tools/list result carries a tools array: {body}"
+                );
+            }
+            Ok((init_status, Some(list_status)))
+        }
+
+        /// `token` with one bit of its signature flipped; header and payload
+        /// stay byte-identical.
+        fn tamper_signature(token: &str) -> anyhow::Result<String> {
+            let (signed, signature) = token.rsplit_once('.').context("JWT has a signature")?;
+            let mut bytes = URL_SAFE_NO_PAD
+                .decode(signature)
+                .context("JWT signature is base64url")?;
+            let first = bytes.first_mut().context("JWT signature is not empty")?;
+            *first ^= 0x01;
+            Ok(format!("{signed}.{}", URL_SAFE_NO_PAD.encode(bytes)))
+        }
+
+        /// Asserts that `signer` over `claims` is accepted by `base`, and that
+        /// its tampered-signature twin and its expired twin (same header,
+        /// `exp` in the past) are rejected by the same server.
+        async fn assert_accepted(
+            base: &str,
+            signer: Signer,
+            claims: &serde_json::Value,
+        ) -> anyhow::Result<()> {
+            let token = signer.sign(claims)?;
+            assert_eq!(
+                outcome(base, &token).await?,
+                ACCEPTED,
+                "{signer:?} token must be accepted: {claims}"
+            );
+            assert_token_rejected(
+                base,
+                &tamper_signature(&token)?,
+                DESC_INVALID,
+                &format!("{signer:?} token with a tampered signature"),
+            )
+            .await?;
+            let now = jsonwebtoken::get_current_timestamp();
+            let expired_exp =
+                with_claim(claims.clone(), "exp", now.saturating_sub(EXPIRED_BY).into())?;
+            let expired = with_claim(
+                expired_exp,
+                "iat",
+                now.saturating_sub(EXPIRED_BY.saturating_mul(2)).into(),
+            )?;
+            assert_token_rejected(
+                base,
+                &signer.sign(&expired)?,
+                DESC_EXPIRED,
+                &format!("{signer:?} token with exp in the past"),
+            )
+            .await?;
+            Ok(())
+        }
+
+        /// The `WWW-Authenticate` challenge of the `initialize` response to
+        /// `token` (`None` when the header is absent).
+        async fn challenge_of(base: &str, token: &str) -> anyhow::Result<Option<String>> {
+            let client = reqwest::Client::new();
+            let init = mcp_request(&client, base, token)
+                .body(INITIALIZE_BODY)
+                .send()
+                .await
+                .context("initialize request")?;
+            init.headers()
+                .get("www-authenticate")
+                .map(|value| value.to_str().map(str::to_owned))
+                .transpose()
+                .context("challenge is ASCII")
+        }
+
+        /// Asserts that `token` is rejected with the status pair
+        /// [`REJECTED`] and the exact Bearer `invalid_token` challenge
+        /// carrying `description`.
+        async fn assert_token_rejected(
+            base: &str,
+            token: &str,
+            description: &str,
+            what: &str,
+        ) -> anyhow::Result<()> {
+            assert_eq!(
+                outcome(base, token).await?,
+                REJECTED,
+                "{what}: must be rejected"
+            );
+            assert_eq!(
+                challenge_of(base, token).await?,
+                Some(invalid_token_challenge(base, description)),
+                "{what}: 401 must carry the Bearer invalid_token challenge"
+            );
+            Ok(())
+        }
+
+        /// Asserts that the ES384 `at+jwt` token over `claims` is rejected.
+        async fn assert_rejected(base: &str, claims: &serde_json::Value) -> anyhow::Result<()> {
+            let token = Signer::Es384AtJwt.sign(claims)?;
+            assert_token_rejected(base, &token, DESC_INVALID, &format!("token over {claims}")).await
+        }
+
+        /// A role-bearing claim of the Keycloak token, with the dot path a
+        /// deployment configures as `role_claim` and the realm mapping.
+        #[derive(Clone, Copy, Debug)]
+        enum RoleShape {
+            /// `realm_access.roles`, mapped value `mcp-users`.
+            Realm,
+            /// `resource_access.mcp-example.roles`, mapped value `tool-admin`.
+            Resource,
+            /// `groups`, mapped value `mcp-operators`.
+            Groups,
+        }
+
+        impl RoleShape {
+            /// Every role-bearing claim shape.
+            const ALL: [Self; 3] = [Self::Realm, Self::Resource, Self::Groups];
+
+            /// The configured `role_claim` dot path.
+            const fn role_claim(self) -> &'static str {
+                match self {
+                    Self::Realm => REALM_ROLES,
+                    Self::Resource => "resource_access.mcp-example.roles",
+                    Self::Groups => "groups",
+                }
+            }
+
+            /// The claim value mapped to `viewer` when this is the
+            /// configured `role_claim`.
+            const fn mapped(self) -> &'static str {
+                match self {
+                    Self::Realm => REALM_ROLE,
+                    Self::Resource => "tool-admin",
+                    Self::Groups => "mcp-operators",
+                }
+            }
+
+            /// The top-level claim holding this shape.
+            const fn top_level(self) -> &'static str {
+                match self {
+                    Self::Realm => "realm_access",
+                    Self::Resource => "resource_access",
+                    Self::Groups => "groups",
+                }
+            }
+
+            /// This claim holding exactly `values`, in Keycloak's nesting.
+            fn value(self, values: &[&str]) -> serde_json::Value {
+                match self {
+                    Self::Realm => serde_json::json!({"roles": values}),
+                    Self::Resource => serde_json::json!({
+                        "mcp-example": {"roles": values}
+                    }),
+                    Self::Groups => serde_json::json!(values),
+                }
+            }
+
+            /// `claims` with this claim holding `values`, or removed when
+            /// `values` is `None`.
+            fn set(
+                self,
+                mut claims: serde_json::Value,
+                values: Option<&[&str]>,
+            ) -> anyhow::Result<serde_json::Value> {
+                let Some(held) = values else {
+                    drop(
+                        claims
+                            .as_object_mut()
+                            .context("claims are an object")?
+                            .remove(self.top_level()),
+                    );
+                    return Ok(claims);
+                };
+                with_claim(claims, self.top_level(), self.value(held))
+            }
+        }
+
+        /// A role value no mapping names.
+        const UNMAPPED_ROLE: &str = "unmapped-role";
+
+        /// Spawns a server whose `role_claim` is `configured` and whose only
+        /// mapping sends `configured.mapped()` to `viewer`.
+        async fn spawn_role_server(
+            idp: &KeycloakIdp,
+            configured: RoleShape,
+        ) -> anyhow::Result<ServerHarness> {
+            spawn_keycloak_server(idp.oauth(&serde_json::json!({
+                "role_claim": configured.role_claim(),
+                "role_mappings": [{"claim_value": configured.mapped(), "role": "viewer"}]
+            }))?)
+            .await
+        }
+
+        /// One `role_claim` scenario (K1-K3).
+        struct RoleClaimCase {
+            /// The configured role claim.
+            shape: RoleShape,
+            /// A multi-valued claim with the mapped value last, as Keycloak
+            /// emits when the user holds several roles or groups.
+            mapped_last: &'static [&'static str],
+            /// Values of the configured claim without the mapped value.
+            unmapped: &'static [&'static str],
+        }
+
+        /// Runs a [`RoleClaimCase`]: the base token, then the mapped-last
+        /// variant, are accepted; the unmapped variant gets the existing
+        /// outcome for "no role mapping matches": 401 at authentication
+        /// (`resolve_role` fails, so RBAC never runs). In the unmapped
+        /// variant every OTHER role-bearing claim carries the mapped value,
+        /// so a resolver that reads any claim but the configured one accepts.
+        async fn run_role_claim_case(case: RoleClaimCase) -> anyhow::Result<()> {
+            let idp = KeycloakIdp::es384().await?;
+            let server = spawn_role_server(&idp, case.shape).await?;
+            let claims = idp.claims();
+
+            assert_accepted(&server.base, Signer::Es384AtJwt, &claims).await?;
+            let mapped_last = case.shape.set(claims.clone(), Some(case.mapped_last))?;
+            assert_eq!(
+                outcome(&server.base, &Signer::Es384AtJwt.sign(&mapped_last)?).await?,
+                ACCEPTED,
+                "{}: mapped value after other values must be accepted",
+                case.shape.role_claim()
+            );
+            let mut unmapped = case.shape.set(claims, Some(case.unmapped))?;
+            for other in RoleShape::ALL
+                .into_iter()
+                .filter(|other| other.top_level() != case.shape.top_level())
+            {
+                unmapped = other.set(unmapped, Some(&[case.shape.mapped()]))?;
+            }
+            assert_rejected(&server.base, &unmapped).await
+        }
+
+        /// Cross-claim isolation over every (configured `role_claim`) x
+        /// (other claim carrying the mapped role) combination: the role is
+        /// read only from the configured claim. Per configured claim: the
+        /// positive row (only it carries the mapped role, the others hold
+        /// unrelated values) is accepted; each other claim alone carrying the
+        /// mapped role, over a configured claim that holds an unmapped value
+        /// or is absent, and all other claims carrying it together, are
+        /// rejected with the "no mapping matches" outcome.
+        #[tokio::test]
+        async fn role_read_only_from_configured_claim() -> anyhow::Result<()> {
+            let idp = KeycloakIdp::es384().await?;
+            for configured in RoleShape::ALL {
+                let server = spawn_role_server(&idp, configured).await?;
+                let mapped = [configured.mapped()];
+                let unrelated = [UNMAPPED_ROLE];
+                let others: Vec<RoleShape> = RoleShape::ALL
+                    .into_iter()
+                    .filter(|other| other.top_level() != configured.top_level())
+                    .collect();
+
+                let configured_only = configured.set(idp.claims(), Some(&mapped))?;
+                let positive = others.iter().try_fold(configured_only, |claims, other| {
+                    other.set(claims, Some(&unrelated))
+                })?;
+                assert_eq!(
+                    outcome(&server.base, &Signer::Es384AtJwt.sign(&positive)?).await?,
+                    ACCEPTED,
+                    "{configured:?}: configured claim carrying the mapped role is accepted"
+                );
+
+                for configured_claim in [Some(&unrelated[..]), None] {
+                    let base_claims = configured.set(idp.claims(), configured_claim)?;
+                    for carrier in &others {
+                        let only_carrier =
+                            others
+                                .iter()
+                                .try_fold(base_claims.clone(), |claims, other| {
+                                    let values: &[&str] =
+                                        if other.top_level() == carrier.top_level() {
+                                            &mapped
+                                        } else {
+                                            &unrelated
+                                        };
+                                    other.set(claims, Some(values))
+                                })?;
+                        assert_rejected(&server.base, &only_carrier).await?;
+                    }
+                    let all_others = others.iter().try_fold(base_claims, |claims, other| {
+                        other.set(claims, Some(&mapped))
+                    })?;
+                    assert_rejected(&server.base, &all_others).await?;
+                }
+            }
+            Ok(())
+        }
+
+        /// K1: `role_claim = "realm_access.roles"` mapping `mcp-users` to
+        /// `viewer` accepts the Keycloak-shaped ES384 `at+jwt` token.
+        #[tokio::test]
+        async fn k1_realm_access_roles_accepted() -> anyhow::Result<()> {
+            run_role_claim_case(RoleClaimCase {
+                shape: RoleShape::Realm,
+                mapped_last: &[
+                    "default-roles-example",
+                    "offline_access",
+                    "uma_authorization",
+                    REALM_ROLE,
+                ],
+                unmapped: &["default-roles-example", UNMAPPED_ROLE],
+            })
+            .await
+        }
+
+        /// K2: `role_claim = "groups"` mapping `mcp-operators` to `viewer`
+        /// accepts the token.
+        #[tokio::test]
+        async fn k2_groups_accepted() -> anyhow::Result<()> {
+            run_role_claim_case(RoleClaimCase {
+                shape: RoleShape::Groups,
+                mapped_last: &["other-group", "mcp-operators"],
+                unmapped: &["other-group"],
+            })
+            .await
+        }
+
+        /// K3: `role_claim = "resource_access.mcp-example.roles"` mapping
+        /// `tool-admin` to `viewer` accepts the token; the same role under
+        /// another client does not count.
+        #[tokio::test]
+        async fn k3_resource_access_client_roles_accepted() -> anyhow::Result<()> {
+            run_role_claim_case(RoleClaimCase {
+                shape: RoleShape::Resource,
+                mapped_last: &["tool-reader", "tool-admin"],
+                unmapped: &["tool-reader"],
+            })
+            .await?;
+            let idp = KeycloakIdp::es384().await?;
+            let server = spawn_role_server(&idp, RoleShape::Resource).await?;
+            let other_client = with_claim(
+                idp.claims(),
+                "resource_access",
+                serde_json::json!({
+                    "mcp-example": {"roles": ["tool-reader"]},
+                    "other-service": {"roles": ["tool-admin"]}
+                }),
+            )?;
+            assert_rejected(&server.base, &other_client).await
+        }
+
+        /// K4: `audience = "mcp-other"` in strict mode rejects the token
+        /// whose array `aud` lacks it, though `azp` and other `aud` entries
+        /// are set (no `azp` or multi-`aud` widening); the same server
+        /// accepts a token whose `aud` names it.
+        #[tokio::test]
+        async fn k4_audience_not_in_aud_rejected() -> anyhow::Result<()> {
+            let idp = KeycloakIdp::es384().await?;
+            let server =
+                spawn_keycloak_server(idp.oauth(&serde_json::json!({"audience": "mcp-other"}))?)
+                    .await?;
+            let claims = idp.claims();
+
+            assert_rejected(&server.base, &claims).await?;
+            let named = with_claim(claims, "aud", serde_json::json!(["mcp-other", "account"]))?;
+            assert_accepted(&server.base, Signer::Es384AtJwt, &named).await
+        }
+
+        /// K5: a token whose `aud` holds only other services while `azp`
+        /// names the client is rejected in strict mode and accepted only
+        /// through the deprecated `azp` fallback of `warn` mode.
+        #[tokio::test]
+        async fn k5_azp_only_audience_strict_rejected_warn_accepted() -> anyhow::Result<()> {
+            let idp = KeycloakIdp::es384().await?;
+            let claims = idp.claims();
+            let azp_only = with_claim(
+                claims.clone(),
+                "aud",
+                serde_json::json!(["other-service", "account"]),
+            )?;
+
+            let strict = spawn_keycloak_server(idp.oauth(&serde_json::json!({}))?).await?;
+            assert_rejected(&strict.base, &azp_only).await?;
+            assert_accepted(&strict.base, Signer::Es384AtJwt, &claims).await?;
+
+            let warn = spawn_keycloak_server(
+                idp.oauth(&serde_json::json!({"audience_validation_mode": "warn"}))?,
+            )
+            .await?;
+            assert_accepted(&warn.base, Signer::Es384AtJwt, &azp_only).await
+        }
+
+        /// K6 (resource URL): `accept_resource_audience = true` accepts a
+        /// token whose only `aud` is `<public_url>/mcp` (an "Included Custom
+        /// Audience" mapper set to the resource URL); an unconfigured alias
+        /// stays rejected.
+        #[tokio::test]
+        async fn k6_resource_url_audience_accepted() -> anyhow::Result<()> {
+            let idp = KeycloakIdp::es384().await?;
+            let server = spawn_keycloak_server(
+                idp.oauth(&serde_json::json!({"accept_resource_audience": true}))?,
+            )
+            .await?;
+            let claims = idp.claims();
+            let resource = format!("{}/mcp", server.base);
+
+            let resource_aud = with_claim(claims.clone(), "aud", serde_json::json!([resource]))?;
+            assert_accepted(&server.base, Signer::Es384AtJwt, &resource_aud).await?;
+            let alias_aud = with_claim(claims, "aud", serde_json::json!([ALIAS]))?;
+            assert_rejected(&server.base, &alias_aud).await
+        }
+
+        /// K6 (alias): `additional_audiences = ["mcp-example-alias"]` accepts
+        /// a token whose only `aud` is the alias; with the resource-URL knob
+        /// off, `<public_url>/mcp` stays rejected.
+        #[tokio::test]
+        async fn k6_additional_audience_accepted() -> anyhow::Result<()> {
+            let idp = KeycloakIdp::es384().await?;
+            let server = spawn_keycloak_server(
+                idp.oauth(&serde_json::json!({"additional_audiences": [ALIAS]}))?,
+            )
+            .await?;
+            let claims = idp.claims();
+            let resource = format!("{}/mcp", server.base);
+
+            let alias_aud = with_claim(claims.clone(), "aud", serde_json::json!([ALIAS]))?;
+            assert_accepted(&server.base, Signer::Es384AtJwt, &alias_aud).await?;
+            let resource_aud = with_claim(claims, "aud", serde_json::json!([resource]))?;
+            assert_rejected(&server.base, &resource_aud).await
+        }
+
+        /// K7: `allowed_algorithms = ["ES256"]` rejects the ES384 token that
+        /// a server allowing `ES384` accepts.
+        #[tokio::test]
+        async fn k7_es384_outside_allowed_algorithms_rejected() -> anyhow::Result<()> {
+            let idp = KeycloakIdp::es384().await?;
+            let claims = idp.claims();
+
+            let narrowed = spawn_keycloak_server(
+                idp.oauth(&serde_json::json!({"allowed_algorithms": ["ES256"]}))?,
+            )
+            .await?;
+            assert_rejected(&narrowed.base, &claims).await?;
+
+            let allowed = spawn_keycloak_server(
+                idp.oauth(&serde_json::json!({"allowed_algorithms": ["ES384"]}))?,
+            )
+            .await?;
+            assert_accepted(&allowed.base, Signer::Es384AtJwt, &claims).await
+        }
+
+        /// K8: against a realm JWKS holding both an RSA and the ES384 key,
+        /// the same claims signed RS256 with `typ: JWT` and signed ES384 with
+        /// `typ: at+jwt` are both accepted: the RFC 9068 `typ` is not
+        /// required (MCP does not mandate it) and not refused.
+        #[tokio::test]
+        async fn k8_rs256_jwt_and_es384_at_jwt_both_accepted() -> anyhow::Result<()> {
+            let rsa_jwk = rsa_key()?
+                .1
+                .get("keys")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|keys| keys.first())
+                .context("RSA JWKS holds one key")?
+                .clone();
+            let idp = KeycloakIdp::start(vec![rsa_jwk, ec_key()?.jwk.clone()]).await?;
+            let server = spawn_keycloak_server(idp.oauth(&serde_json::json!({}))?).await?;
+            let claims = idp.claims();
+
+            assert_accepted(&server.base, Signer::Rs256Jwt, &claims).await?;
+            assert_accepted(&server.base, Signer::Es384AtJwt, &claims).await
+        }
+    }
 }
