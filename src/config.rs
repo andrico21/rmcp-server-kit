@@ -2041,6 +2041,24 @@ fn public_url_for_message(url: &str) -> String {
     }
 }
 
+/// Bytes a browser `Origin` host never contains.
+///
+/// The WHATWG URL parser treats them as delimiters or rewrites them (a
+/// backslash becomes a path separator), so the advertised issuer would differ
+/// from the origin the browser sends.
+#[cfg(feature = "oauth")]
+const NON_ORIGIN_HOST_BYTES: &[u8] = b"\\\"<>|%^`{}";
+
+/// `true` when the authority of `url` holds a byte from
+/// [`NON_ORIGIN_HOST_BYTES`], a space or a control character.
+#[cfg(feature = "oauth")]
+fn authority_has_non_origin_byte(url: &str) -> bool {
+    let authority = url.split_once("://").map_or(url, |(_, rest)| rest);
+    authority.bytes().any(|byte| {
+        byte == b' ' || byte.is_ascii_control() || NON_ORIGIN_HOST_BYTES.contains(&byte)
+    })
+}
+
 /// The `public_url`, `allowed_origins` and `authorization_servers` rules of
 /// the authorization-server proxy mode (see [`check_shared_oauth_relations`]).
 ///
@@ -2072,9 +2090,10 @@ fn check_authorization_server_relations(
     }
     // A browser sends the ASCII (punycode) host and never userinfo in
     // `Origin`, so either would make the consent post-back unmatchable.
-    let parsed_origin = (url.is_ascii() && !url.contains('@'))
-        .then(|| parse_config_origin_tuple(url))
-        .flatten();
+    let parsed_origin =
+        (url.is_ascii() && !url.contains('@') && !authority_has_non_origin_byte(url))
+            .then(|| parse_config_origin_tuple(url))
+            .flatten();
     let Some(origin) = parsed_origin else {
         return Err(RmcpServerKitError::Config(format!(
             "server.public_url {} (env {SERVER_PUBLIC_URL_ENV}) must be a bare origin, \
@@ -2107,11 +2126,16 @@ fn check_authorization_server_relations(
     if let Some(servers) = &oauth_cfg.authorization_servers
         && !matches!(servers.as_slice(), [only] if only == issuer)
     {
+        let shown = servers
+            .iter()
+            .map(|entry| public_url_for_message(entry))
+            .collect::<Vec<_>>()
+            .join(", ");
         return Err(RmcpServerKitError::Config(format!(
             "server.auth.oauth.authorization_servers must be unset or exactly [{issuer:?}] \
              when {AS_MODE_KEY} (env {SERVER_OAUTH_PROXY_MODE_ENV}): this server is then the \
              authorization server, and its metadata issuer is server.public_url \
-             (env {SERVER_PUBLIC_URL_ENV}) without a trailing '/'; got {servers:?}"
+             (env {SERVER_PUBLIC_URL_ENV}) without a trailing '/'; got [{shown}]"
         )));
     }
     Ok(())
@@ -4626,6 +4650,149 @@ client_ip = false
         ] {
             let server = relations_server(Some(good), true, as_mode);
             assert_server_config_accepted_by_both(&format!("R2 public_url {good:?}"), &server)?;
+        }
+        Ok(())
+    }
+
+    /// R2: a host byte that a browser `Origin` never contains, or that the
+    /// WHATWG URL parser treats as a delimiter, is rejected by both validators
+    /// in every host position (middle, end, after the port, inside an IPv6
+    /// literal), with the same bare-origin error naming the key and env var.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn public_url_relations_r2_rejects_non_origin_host_bytes() -> anyhow::Result<()> {
+        let bytes = [
+            '\\', '"', '<', '>', '|', '%', '^', '`', '{', '}', ' ', '\t', '\n', '\r', '\u{1}',
+            '\u{7f}', '\0',
+        ];
+        for byte in bytes {
+            for (template, enabled) in [
+                (format!("https://mcp.example{byte}evil"), true),
+                (format!("https://mcp{byte}.example"), false),
+                (format!("https://mcp.example{byte}"), true),
+                (format!("https://{byte}mcp.example"), false),
+                (format!("https://mcp.example:8443{byte}"), true),
+                (format!("https://[::1{byte}]:8443"), true),
+            ] {
+                let server = relations_server(Some(&template), enabled, as_mode);
+                assert_server_config_rejected_by_both(
+                    &format!("R2 public_url {template:?} (auth.enabled = {enabled})"),
+                    &server,
+                    &format!(
+                        "server.public_url \"{}\" (env {SERVER_PUBLIC_URL_ENV}) must be a bare origin",
+                        template.escape_debug()
+                    ),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// R2: the same bytes stay rejected where an existing rule already rejects
+    /// them (userinfo, path, query, fragment).
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn public_url_relations_r2_rejects_non_origin_bytes_outside_host() -> anyhow::Result<()> {
+        for bad in [
+            "https://us\\er@mcp.example",
+            "https://us|er:pw@mcp.example",
+            "https://mcp.example/a\\b",
+            "https://mcp.example/a|b",
+            "https://mcp.example/%2e",
+            "https://mcp.example?a|b",
+            "https://mcp.example?a=\\",
+            "https://mcp.example#a^b",
+            "https://mcp.example/{x}",
+        ] {
+            let server = relations_server(Some(bad), true, as_mode);
+            assert_server_config_rejected_by_both(
+                &format!("R2 public_url {bad:?}"),
+                &server,
+                &format!("(env {SERVER_PUBLIC_URL_ENV}) must be a bare origin"),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// R2 over-strictness guard: host spellings a browser sends as `Origin`
+    /// (uppercase, punycode, bracketed IPv6, explicit port, loopback over
+    /// `http` with `allow_http_oauth_urls`) stay accepted.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn public_url_relations_r2_host_byte_rule_keeps_valid_origins() -> anyhow::Result<()> {
+        for good in [
+            "https://mcp.example",
+            "https://mcp.example/",
+            "https://MCP.Example",
+            "https://mcp.example:8443",
+            "https://xn--bcher-kva.example",
+            "https://[::1]:8443",
+            "https://mcp-1.example_x.example",
+        ] {
+            let server = relations_server(Some(good), true, as_mode);
+            assert_server_config_accepted_by_both(&format!("R2 public_url {good:?}"), &server)?;
+        }
+        let local = relations_server(Some("http://localhost:8080"), true, |oauth| {
+            oauth.allow_http_oauth_urls = true;
+            as_mode(oauth);
+        });
+        assert_server_config_accepted_by_both("R2 http://localhost:8080", &local)
+    }
+
+    /// The host-byte rule is authorization-server only: the same odd
+    /// `public_url` stays accepted in direct and passthrough modes (no
+    /// 3.20.0-accepted config is newly rejected).
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn public_url_relations_r2_host_byte_rule_ignores_other_modes() -> anyhow::Result<()> {
+        for odd in [
+            "https://mcp.example\\evil",
+            "https://mcp.example|x",
+            "https://mcp.example/%2e",
+        ] {
+            let direct = relations_server(Some(odd), true, |_| {});
+            assert_server_config_accepted_by_both(&format!("direct {odd:?}"), &direct)?;
+            let passthrough = relations_server(Some(odd), true, |oauth| {
+                oauth.proxy = Some(validation_proxy());
+            });
+            assert_server_config_accepted_by_both(&format!("passthrough {odd:?}"), &passthrough)?;
+        }
+        Ok(())
+    }
+
+    /// R4: the error never echoes an `authorization_servers` entry that has
+    /// userinfo (`@`), and escapes control characters in the others, through
+    /// both validators.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn public_url_relations_r4_error_redacts_entries() -> anyhow::Result<()> {
+        let server = relations_server(Some("https://mcp.example"), true, |oauth| {
+            oauth.authorization_servers = Some(vec![
+                "https://auth.example/s3cret@x".to_owned(),
+                "https://auth.example/\u{1b}[31mred\nline".to_owned(),
+            ]);
+            as_mode(oauth);
+        });
+        let builder_result = server
+            .apply_to_mcp_config(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0"))?
+            .validate()
+            .map(|_| ());
+        for (validator, result) in [
+            ("validate_server_config", validate_server_config(&server)),
+            ("McpServerConfig::check", builder_result),
+        ] {
+            let Err(err) = result else {
+                anyhow::bail!("{validator} must reject foreign authorization_servers");
+            };
+            let message = err.to_string();
+            assert!(
+                message.contains("<value containing '@' not shown>")
+                    && !message.contains("s3cret")
+                    && !message.contains('\u{1b}')
+                    && !message.contains('\n')
+                    && message.contains("\\u{1b}[31mred\\nline"),
+                "{validator} must redact and escape the entries: {message}"
+            );
         }
         Ok(())
     }
