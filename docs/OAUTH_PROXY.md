@@ -283,7 +283,7 @@ sequenceDiagram
 | 4 | browser | Keycloak login | Keycloak: static client, the one redirect URI, PKCE |
 | 5 | browser | `GET /oauth/callback?code&state&iss` | this server: `state` must be a well-formed 43-character nonce; the state cookie named after its digest must exist, open, be unexpired and match; if `iss` is present it must equal `oauth.issuer` byte for byte. Any failure is a `400` HTML page with no redirect. On success the upstream code is wrapped together with the client, the redirect URI and the approved PKCE challenge (valid 120 s), and the browser goes back to the client with `code`, the client's original `state` and `iss=https://mcp.example`. An upstream `error` is passed on sanitized, also with `iss` |
 | 6 | client | `POST /token` with `grant_type=authorization_code`, `client_id`, `code`, `redirect_uri`, `code_verifier` | this server: a `client_id` that does not open gives `401 invalid_client`; a code that does not open, is older than 120 s, belongs to another client, names another `redirect_uri` or does not match the verifier gives `400 invalid_grant`, before Keycloak is contacted. The upstream form is built from an allowlist only: `grant_type`, upstream `code`, `redirect_uri=https://mcp.example/oauth/callback`, `code_verifier`, up to two `resource` values (unless `strip_resource_param`), the static `client_id` and `client_secret` |
-| 6a | this server | upstream token response | a successful JSON response has its `refresh_token` replaced by a wrapper bound to the client; any other upstream response, error or not, is relayed unchanged |
+| 6a | this server | upstream token response | a successful JSON response has its `refresh_token` replaced by a wrapper bound to the client; if that upstream `refresh_token` is longer than 4096 bytes, this server answers `502` with `{"error":"server_error"}` instead of relaying the response; any other upstream response, error or not, is relayed unchanged |
 | 7 | client | `POST /token` with `grant_type=refresh_token` | this server: the wrapper must open (`invalid_grant` otherwise); a `client_id`, if sent, must be the one the wrapper is bound to; `scope` is forwarded if every token is valid. A rotated refresh token from Keycloak is wrapped again with the same binding |
 | 8 | client | `POST /introspect`, `POST /revoke` (only when exposed) | a `token` value that opens as a refresh wrapper (current or previous key) is replaced by the upstream refresh token; anything else, such as an access token, is forwarded as sent. A repeated `token` parameter gives `invalid_request` |
 
@@ -737,6 +737,8 @@ Sources, as fetched on 2026-10-18:
   sections "Migrating to 23.0.0", "Migrating to 23.0.2" and "Migrating to 26.8.0".
 - **Keycloak Server Administration Guide**: <https://www.keycloak.org/docs/latest/server_admin/index.html>
   (latest at the time of fetching).
+- **Keycloak token exchange guide**: <https://www.keycloak.org/securing-apps/token-exchange>,
+  page version 26.8.1 ("Configuring and using token exchange").
 
 The guide lists RFC 8707 resource indicators and the OAuth Client ID Metadata
 Document (CIMD) as experimental in Keycloak, and rates Keycloak's MCP
@@ -750,14 +752,18 @@ checklist, not something this project tested against a live Keycloak.
   `client-id-metadata-document` executor, and a client policy (`cimd-policy`)
   with the `client-id-uri` condition (URI scheme `https`, **Trusted domains**
   for the client id hosts) that applies the profile. The executor's own
-  **Trusted domains** list also covers redirect and metadata URLs; clients
-  with loopback redirects need **Restrict same domain** set to `OFF`. Source:
+  **Trusted domains** list also covers the client metadata URLs, and its
+  **Restrict same domain** option, when `ON`, requires the redirect URI to be
+  under the same trusted domain; clients with loopback redirects need
+  **Restrict same domain** set to `OFF`. Source:
   Keycloak MCP guide, "Setting up the client profile/policy for OAuth Client
   ID Metadata Document".
 - **Resource indicators.** Start Keycloak with
   `--features=resource-indicators` (or `--features=cimd,resource-indicators`).
-  With the feature on, Keycloak "issues the access token whose `aud` claim
-  includes only the value of the `resource` parameter", and the CIMD
+  With the feature on, for a request that carries a `resource` parameter
+  configured as the MCP server client's resource URI, Keycloak "issues the
+  access token whose `aud` claim includes only the value of the `resource`
+  parameter" (any other value is rejected with `invalid_target`), and the CIMD
   executor's **Resource indicator allow list** must contain the MCP server's
   URL, here `https://mcp.example/mcp`. Source: Keycloak MCP guide, "With
   Resource Indicators for OAuth 2.0".
@@ -810,6 +816,218 @@ role claim instead, for example `role_claim = "realm_access.roles"` with
 `role_mappings` (see the [guide](GUIDE.md#oauthconfig)). Note that
 `insufficient_scope_challenge` requires scope mappings and cannot be combined
 with `role_claim`.
+
+### Keycloak 26.x deployment patterns
+
+The realm configuration of a real deployment was reviewed for this guide, and
+the patterns below come from that review. Nothing from that realm appears
+here: every name is a placeholder.
+
+**What backs these statements.** Statements about this server's behaviour
+come from the crate's code and tests, mostly the
+`keycloak_26_token_shape` tests in `tests/integration/e2e.rs`. Those tests
+use tokens *shaped* like the ones a Keycloak 26.6 realm issues, signed with a
+key the test generates and served from a `wiremock` JWKS. They do not talk to
+a live Keycloak, and a real MCP client completing a flow against a live
+Keycloak is not verified. Statements about Keycloak itself cite the Keycloak
+page they come from (the versions listed at the top of this section), or say
+"not verified against Keycloak documentation".
+
+**Signing.**
+
+- The realm's **Default Signature Algorithm** ("The default algorithm used to
+  assign tokens for the realm", Server Administration Guide, Tokens tab)
+  decides how access tokens are signed by default (for a per-client setting,
+  see the last bullet). ES384 is in this server's default
+  algorithm set, so ES384 tokens are accepted without setting
+  `allowed_algorithms` (tests K1 to K6).
+- Tokens with the RFC 9068 header `typ: at+jwt` are accepted, and so are
+  tokens with `typ: JWT`: this server does not check `typ` (test K8).
+- Pin `allowed_algorithms` to the algorithm your realm actually signs access
+  tokens with. A token signed with an algorithm outside the list is rejected
+  (test K7), so a pin that is too narrow locks out every client whose tokens
+  are signed with an algorithm outside it, at once.
+- Keycloak can also set a signature algorithm per client. That a per-client
+  setting takes precedence over the realm default, and that Keycloak falls
+  back to a built-in algorithm when neither is set, is **not verified against
+  Keycloak documentation**. Check the clients that obtain tokens for this
+  server as well as the realm default before you pin.
+
+**Audience.** MCP requires that this server accepts only tokens issued for
+it. With the default `audience_validation_mode = "strict"` a token is
+accepted when its `aud` contains `audience`, an `additional_audiences` entry,
+or (with `accept_resource_audience = true`) `https://mcp.example/mcp`. Other
+values next to it in an array `aud` neither help nor hurt (tests K4, K5, K6).
+
+- **Recommended:** create a Keycloak client for this server (here
+  `mcp-example`) and give each MCP client an `Audience` mapper whose
+  **Included Client Audience** is that client. Set `audience = "mcp-example"`
+  and keep strict mode. The Keycloak MCP guide describes this mapper for the
+  resource-indicators setup ("configure the MCP client as an RP with an
+  `Audience` mapper whose **Included Client Audience** targets the MCP server
+  client").
+- **RFC 8707 style:** an `Audience` mapper whose **Included Custom Audience**
+  is `https://mcp.example/mcp`, together with `accept_resource_audience = true`
+  (test K6). This is the guide's "Without Resource Indicators for OAuth 2.0"
+  recipe; with Keycloak's `resource-indicators` feature, a request that
+  carries the `resource` parameter gets a token whose `aud` holds only the
+  resource URL, so this knob is needed in that setup too.
+- **Avoid:** a mapper that adds only another service's audience. Such a token
+  names this client at most in `azp`. Strict mode rejects it, and short of
+  listing the other audience in `additional_audiences`, only the
+  deprecated `azp` fallback of `audience_validation_mode = "warn"` or
+  `"permissive"` accepts it, when `azp` names this client (test K5). That
+  fallback is not MCP conformant.
+- **Extra audiences widen a token.** This server accepts a token that also
+  names other services (test K5 accepts the base token, whose `aud` lists
+  three values). The reverse holds as well: any service that accepts a token
+  on one of those other `aud` values accepts this one too, as far as the
+  audience check goes. Add only the audiences a token really needs.
+
+**Tokens for downstream services.** `rbac::current_token()` returns the
+inbound bearer token exactly as the client sent it. Sending it on to another
+service is the token passthrough that the
+[MCP Security Best Practices](https://modelcontextprotocol.io/specification/2026-07-28/basic/security_best_practices)
+forbid. Configure `[server.auth.oauth.token_exchange]` instead (see
+[`TokenExchangeConfig`](GUIDE.md#tokenexchangeconfig-optional)) and have the
+tool handler call `oauth::exchange_token` or `oauth::exchange_token_with_cancel`
+with that inbound token as `subject_token`; send the exchanged token
+downstream. The crate does not run the exchange on its own. On the Keycloak
+side this is **Standard token exchange** (Keycloak "Configuring and using
+token exchange" guide):
+
+- it is enabled by default, but the requesting client (`client_id` of the
+  `token_exchange` table) must have the **Standard Token Exchange** switch on
+  and must be a confidential client;
+- the `subject_token` must name the requesting client in `aud`, otherwise
+  Keycloak rejects the request. The guide adds: "The only exception is, if
+  client exchanges his own token, which was issued to it." In direct mode
+  that exception does not apply, because the inbound token was issued to the
+  MCP client, not to this server's client. With the recommended audience
+  mapper above the requirement holds when the requesting client is this
+  server's own client.
+  With the `resource-indicators` feature, a token requested with the
+  `resource` parameter has only the resource URL in `aud`, so the
+  requirement is not met; this combination is not tested here;
+- Keycloak token exchange "does not yet have support for the resource
+  parameter", so set `audience` in the `token_exchange` table and leave
+  `resource` out.
+
+**Roles.** Where Keycloak groups or realm roles decide access, map roles from
+a claim with `role_claim`: `realm_access.roles`, `resource_access.<client>.roles`
+or `groups` (tests K1, K2, K3). The role is read only from the configured
+claim (test `role_read_only_from_configured_claim`), and a token where no
+mapping matches is rejected with `401`. Values are compared as exact strings
+and the first mapping in configuration order that matches wins.
+
+- For `groups`, configure the group names exactly as they appear in the
+  token. Test K2 uses names without a leading `/`; the name of Keycloak's
+  group mapper option that switches between full paths and plain names is
+  not verified against Keycloak documentation.
+- The path is split at every `.`, so `resource_access.<client>.roles` only
+  works for a client id without a dot (`resolve_claim_path` in `src/oauth.rs`).
+- Keycloak's lightweight access tokens "do not carry roles over the wire"
+  (Server Administration Guide). A lightweight token carries a claim only
+  when its protocol mapper has **Add to lightweight access token** turned on
+  (default off, same guide, "Using a lightweight access token in Keycloak").
+  If such tokens reach this server and the mapper for the configured claim
+  has that switch off, a `role_claim` finds nothing and every request with
+  such a token gets `401`.
+- With `role_claim` set, the step-up challenge is unavailable by design:
+  startup validation rejects `insufficient_scope_challenge = true` together
+  with `role_claim`. `challenge_scopes` still works, but it only tells clients
+  which scopes to request; it helps only if matching `mcp:*` client scopes
+  exist in Keycloak.
+
+A direct-mode configuration that follows these patterns:
+
+```toml
+[server]
+listen_addr = "0.0.0.0"
+listen_port = 8080
+public_url = "https://mcp.example"
+
+[server.auth]
+enabled = true
+
+[server.auth.oauth]
+issuer = "https://idp.example/realms/example"
+audience = "mcp-example"
+jwks_uri = "https://idp.example/realms/example/protocol/openid-connect/certs"
+allowed_algorithms = ["ES384"]
+role_claim = "realm_access.roles"
+
+[[server.auth.oauth.role_mappings]]
+claim_value = "mcp-admins"
+role = "admin"
+
+[[server.auth.oauth.role_mappings]]
+claim_value = "mcp-users"
+role = "viewer"
+
+[server.auth.oauth.token_exchange]
+token_url = "https://idp.example/realms/example/protocol/openid-connect/token"
+client_id = "mcp-example"
+client_secret = "replace-with-the-keycloak-client-secret"
+audience = "downstream-api"
+
+[rbac]
+enabled = true
+
+[[rbac.roles]]
+name = "admin"
+allow = ["*"]
+
+[[rbac.roles]]
+name = "viewer"
+allow = ["search"]
+```
+
+**Application-owned facade.** Some applications mount their own authorize,
+callback and token routes with `with_extra_router`. Without a proxy table this
+server advertises Keycloak's issuer in PRM `authorization_servers` and mounts
+no authorization server metadata of its own (`resolve_authorization_servers`
+in `src/oauth.rs`), so such an application sets `authorization_servers` to
+its own origin and serves `/.well-known/oauth-authorization-server` itself.
+The opt-ins `challenge_scopes`, `omit_error_on_missing_credential`,
+`additional_audiences` and `accept_resource_audience` work the same way there,
+because they act on token validation and the `401` challenge, not on the
+proxy. `proxy.mode = "authorization_server"` is the framework's replacement
+for such a facade:
+
+| | Application-owned facade | `authorization_server` mode |
+|---|---|---|
+| Per-client consent | whatever the application builds | consent page per client, remembered per browser profile (section 4) |
+| `iss` on the redirect to the client | whatever the application sends | always this server's issuer (section 4) |
+| PKCE binding | whatever the application checks | the client's S256 challenge is bound into the wrapped code and checked before Keycloak is contacted (section 4) |
+| Refresh-token binding | whatever the application does | each refresh token is wrapped and bound to the client across rotations (section 4) |
+| PRM `authorization_servers` | set it to the application's origin | unset, or exactly the issuer (section 6) |
+
+```toml,fragment
+[server.auth.oauth]
+authorization_servers = ["https://mcp.example"]
+```
+
+**Refresh tokens.** Leaving the realm's **Revoke Refresh Token** off is
+acceptable only while Keycloak refresh tokens reach nothing but a
+confidential client, which must authenticate when it refreshes (RFC 6749
+section 6); for example a facade that keeps them on the server. In direct and
+passthrough mode, MCP clients receive Keycloak's refresh tokens themselves. In
+`authorization_server` mode the client can read the upstream refresh token
+inside its wrapper (section 4), and anyone holding the wrapper can refresh
+through this server, because `client_id` is optional on a refresh. Keep the
+rotation recommendation from the `authorization_server` settings above for
+that mode.
+
+**Registration and CIMD.** The Keycloak MCP guide lists three ways a client
+gets a client id: Client ID Metadata Documents, pre-registration and Dynamic
+Client Registration. When a realm blocks anonymous Dynamic Client
+Registration and has no CIMD client policy, MCP clients that onboard
+themselves cannot register at Keycloak directly. For them, enable `cimd` with
+a `cimd-policy` (see "Direct mode" above) before you rely on direct mode, or
+use an application-owned facade or `authorization_server` mode. Clients that
+an administrator creates in Keycloak (pre-registration) remain a valid route
+for direct mode.
 
 ## 9. Scope ordering and step-up
 
@@ -885,8 +1103,12 @@ expect those users to sign in again.
    new key; values sealed with either key still open.
 2. After the longest client registration lifetime you want to honour, remove
    `sealing_secret_previous`. Registrations and refresh-token wrappers sealed
-   only under the dropped key stop working: affected clients get
-   `invalid_client` and register again, and their users sign in again.
+   only under the dropped key stop working. A refresh with such a wrapper gets
+   `400 invalid_grant`, because the wrapper is opened before `client_id` is
+   looked at; the user signs in again. An authorization-code `/token` request
+   whose `client_id` was sealed under the dropped key gets
+   `401 invalid_client` (and `/authorize` shows a `400` page); that client
+   registers again.
 
 Never swap the key without phase 1: every registration, consent cookie and
 refresh wrapper would fail at once.
@@ -937,7 +1159,7 @@ DEBUG for plain protocol errors.
 | Consent page shown every time | `consent_ttl = "0s"`; a broader scope was requested; a different browser profile; the browser drops the cookie; replicas use different secrets or `public_url` values | check `consent_ttl`, the scopes requested, and that all replicas share secret and `public_url` |
 | Login works on one replica only | replicas differ in `sealing_secret`, `public_url` or `mode` | give every replica identical values, then restart them together |
 | Tokens rejected with an audience mismatch | `aud` holds the resource URL or another value, not `audience` | set `accept_resource_audience = true` or list the value in `additional_audiences`; or add a Keycloak audience mapper (section 8) |
-| `invalid_client` after a secret rotation | the old key was dropped, or replaced without phase 1 | follow the two-phase rotation; affected clients have to register again |
+| `401 invalid_client` on an authorization-code `/token` request, or `400 invalid_grant` on a refresh, after a secret rotation | the old key was dropped, or replaced without phase 1: a `client_id` sealed under it no longer opens (`invalid_client`), and neither does a refresh wrapper sealed under it (`invalid_grant`, checked before `client_id`) | follow the two-phase rotation; affected clients register again and their users sign in again |
 | `401 invalid_client` or a `400` page right after migrating | the client still uses the static client id from passthrough | let the client register again, or remove and re-add the server in that client (section 10) |
 
 ## 13. Try it locally

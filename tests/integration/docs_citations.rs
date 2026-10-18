@@ -829,7 +829,7 @@ mod tests {
         let doc = fs::read_to_string(root.join(DOC)).context("read OAUTH_PROXY.md")?;
         let fences = extract_toml_fences(&doc);
 
-        assert_eq!(fences.len(), 9, "OAUTH_PROXY.md TOML fence count drifted");
+        assert_eq!(fences.len(), 11, "OAUTH_PROXY.md TOML fence count drifted");
         for block in &fences {
             match block.info.as_str() {
                 "toml" => assert_operator_config_block_validates(DOC, block)?,
