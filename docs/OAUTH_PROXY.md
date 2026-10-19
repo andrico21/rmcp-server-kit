@@ -297,7 +297,9 @@ Details worth knowing:
   the AS metadata `issuer` and the PRM `authorization_servers[0]`. The AS
   metadata additionally announces `authorization_response_iss_parameter_supported: true`.
   The issuer is `public_url` without a trailing slash, so `https://mcp.example`
-  and `https://mcp.example/` produce identical documents.
+  and `https://mcp.example/` produce identical documents. A `public_url` with
+  capitals or an explicit default port, such as `https://MCP.Example` or
+  `https://mcp.example:443`, is rejected at startup with the canonical form.
 - **The `iss` check is byte-exact.** At `/oauth/callback` the `iss` that
   Keycloak sends is compared with `oauth.issuer` as raw bytes: no case
   folding, no trailing-slash or percent-decoding tolerance. A missing `iss` is
@@ -405,8 +407,11 @@ Startup validation in `authorization_server` mode, enforced identically by
 `allow_http_oauth_urls = true`; it must be a bare origin
 (`scheme://host[:port]`, optionally with one trailing `/`), ASCII only, with
 no userinfo, path, query or fragment, and no backslash or other byte a
-browser `Origin` never contains; a non-empty `allowed_origins` must contain
-its origin; `authorization_servers` must be unset or exactly the issuer;
+browser `Origin` never contains; it must be written in its canonical URL
+form (lowercase host, no explicit default port, compressed IPv6), because the
+advertised issuer must be byte-identical to the metadata issuer (RFC 8414
+section 3.3), and the error shows the form to use; a non-empty
+`allowed_origins` must contain its origin; `authorization_servers` must be unset or exactly the issuer;
 `authorization_server_metadata_issuer` must be unset; `sealing_secret` must
 be set. The `public_url`, `allowed_origins`, `authorization_servers` and
 `sealing_secret*` errors name both the TOML key and the env var to change.

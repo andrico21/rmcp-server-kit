@@ -2094,7 +2094,13 @@ fn check_authorization_server_relations(
         (url.is_ascii() && !url.contains('@') && !authority_has_non_origin_byte(url))
             .then(|| parse_config_origin_tuple(url))
             .flatten();
-    let Some(origin) = parsed_origin else {
+    // `Url` serializes the canonical form the metadata issuer is built from
+    // (`install_routes`); the hand-written origin parser does not validate
+    // every host syntax, so a `Url` parse failure is the bare-origin error.
+    let parsed_canonical = url::Url::parse(url)
+        .ok()
+        .map(|parsed| parsed.as_str().trim_end_matches('/').to_owned());
+    let (Some(origin), Some(canonical)) = (parsed_origin, parsed_canonical) else {
         return Err(RmcpServerKitError::Config(format!(
             "server.public_url {} (env {SERVER_PUBLIC_URL_ENV}) must be a bare origin, \
              scheme://host[:port] with an optional trailing '/', ASCII only and without \
@@ -2104,6 +2110,16 @@ fn check_authorization_server_relations(
             public_url_for_message(url)
         )));
     };
+    if canonical != url.trim_end_matches('/') {
+        return Err(RmcpServerKitError::Config(format!(
+            "server.public_url {} (env {SERVER_PUBLIC_URL_ENV}) must be written in its \
+             canonical form, use {canonical:?}, when {AS_MODE_KEY} \
+             (env {SERVER_OAUTH_PROXY_MODE_ENV}): the advertised issuer must be \
+             byte-identical to the authorization server metadata issuer, RFC 8414 \
+             section 3.3",
+            public_url_for_message(url)
+        )));
+    }
     if !allowed_origins.is_empty()
         && !allowed_origins
             .iter()
@@ -4864,7 +4880,6 @@ client_ip = false
         for good in [
             "https://mcp.example",
             "https://mcp.example/",
-            "https://MCP.Example",
             "https://mcp.example:8443",
             "https://[::1]:8443",
             "https://xn--bcher-kva.example",
@@ -4937,7 +4952,7 @@ client_ip = false
     }
 
     /// R2 over-strictness guard: host spellings a browser sends as `Origin`
-    /// (uppercase, punycode, bracketed IPv6, explicit port, loopback over
+    /// (punycode, bracketed IPv6, explicit port, loopback over
     /// `http` with `allow_http_oauth_urls`) stay accepted.
     #[cfg(feature = "oauth")]
     #[test]
@@ -4945,10 +4960,10 @@ client_ip = false
         for good in [
             "https://mcp.example",
             "https://mcp.example/",
-            "https://MCP.Example",
             "https://mcp.example:8443",
             "https://xn--bcher-kva.example",
             "https://[::1]:8443",
+            "https://[2001:db8::1]",
             "https://mcp-1.example_x.example",
         ] {
             let server = relations_server(Some(good), true, as_mode);
@@ -5072,9 +5087,9 @@ client_ip = false
             ("https://mcp.example", vec![]),
             ("https://mcp.example", vec!["https://mcp.example"]),
             ("https://mcp.example/", vec!["HTTPS://MCP.EXAMPLE"]),
-            ("https://MCP.example", vec!["https://mcp.example/"]),
+            ("https://mcp.example", vec!["https://MCP.example/"]),
             ("https://mcp.example", vec!["https://mcp.example:443"]),
-            ("https://mcp.example:443", vec!["https://mcp.example"]),
+            ("https://mcp.example/", vec!["https://MCP.Example:443/"]),
             (
                 "https://mcp.example:8443",
                 vec!["null", "https://mcp.example:8443/"],
@@ -5110,7 +5125,7 @@ client_ip = false
                 vec!["https://mcp.example", "https://auth.example.com"],
                 true,
             ),
-            ("https://MCP.example", vec!["https://mcp.example"], true),
+            ("https://mcp.example", vec!["https://MCP.example"], true),
         ] {
             let server = relations_server(Some(public_url), enabled, |oauth| {
                 oauth.authorization_servers =
@@ -5150,6 +5165,268 @@ client_ip = false
                 &format!("R4 {public_url:?} vs {servers:?}"),
                 &server,
             )?;
+        }
+        Ok(())
+    }
+
+    /// Canonical `public_url` origins (scheme, host, optional non-default
+    /// port) that cover DNS names, IPv4, bracketed IPv6 and punycode, with and
+    /// without a port, over `https` and `http`.
+    #[cfg(feature = "oauth")]
+    const CANONICAL_PUBLIC_URLS: &[&str] = &[
+        "https://mcp.example",
+        "https://mcp.example.com",
+        "https://mcp.example.com:8443",
+        "https://xn--bcher-kva.example",
+        "https://xn--bcher-kva.example:8443",
+        "https://127.0.0.1",
+        "https://127.0.0.1:8443",
+        "https://[::1]",
+        "https://[::1]:8443",
+        "https://[2001:db8::1]",
+        "http://localhost",
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
+        "http://[::1]:8080",
+    ];
+
+    /// Non-canonical spellings with the canonical form each normalizes to,
+    /// generated from [`CANONICAL_PUBLIC_URLS`] (uppercase host, mixed-case
+    /// host, explicit default port, both together) plus fixed spellings that
+    /// need a different normalization (expanded IPv6, IPv4 shorthand).
+    #[cfg(feature = "oauth")]
+    fn non_canonical_public_urls() -> Vec<(String, String)> {
+        let mut cases = Vec::new();
+        for canonical in CANONICAL_PUBLIC_URLS {
+            let Some((scheme, rest)) = canonical.split_once("://") else {
+                continue;
+            };
+            let default_port: u16 = if scheme == "https" { 443 } else { 80 };
+            let mut upper_next = true;
+            let mixed: String = rest
+                .chars()
+                .map(|ch| {
+                    let shown = if upper_next {
+                        ch.to_ascii_uppercase()
+                    } else {
+                        ch
+                    };
+                    upper_next = !upper_next;
+                    shown
+                })
+                .collect();
+            let mut spellings = vec![rest.to_ascii_uppercase(), mixed];
+            if !rest.rsplit(':').next().is_some_and(|tail| {
+                !tail.is_empty() && tail.bytes().all(|byte| byte.is_ascii_digit())
+            }) {
+                spellings.push(format!("{rest}:{default_port}"));
+                spellings.push(format!("{}:{default_port}", rest.to_ascii_uppercase()));
+            }
+            for spelling in spellings {
+                if spelling != rest {
+                    cases.push((format!("{scheme}://{spelling}"), (*canonical).to_owned()));
+                }
+            }
+        }
+        for (input, canonical) in [
+            ("https://[0:0:0:0:0:0:0:1]:8443", "https://[::1]:8443"),
+            ("https://[0:0::1]", "https://[::1]"),
+            ("https://[0:0:0:0:0:0:0:1]", "https://[::1]"),
+            ("https://[2001:DB8::1]", "https://[2001:db8::1]"),
+            ("https://[2001:db8:0:0:0:0:0:1]", "https://[2001:db8::1]"),
+            ("http://[::1]:80", "http://[::1]"),
+            ("https://127.1", "https://127.0.0.1"),
+            ("https://0x7f.0.0.1:8443", "https://127.0.0.1:8443"),
+            (
+                "https://XN--BCHER-KVA.example",
+                "https://xn--bcher-kva.example",
+            ),
+        ] {
+            cases.push((input.to_owned(), canonical.to_owned()));
+        }
+        cases
+    }
+
+    /// `ServerConfig` in the authorization-server mode over `http` or `https`.
+    #[cfg(feature = "oauth")]
+    fn canonical_rule_as_server(public_url: &str, enabled: bool) -> ServerConfig {
+        relations_server(Some(public_url), enabled, |oauth| {
+            oauth.allow_http_oauth_urls = true;
+            as_mode(oauth);
+        })
+    }
+
+    /// Canonical rule: authorization-server mode rejects every non-canonical
+    /// `public_url` spelling (with and without a trailing slash) through both
+    /// validators, and the error shows the canonical form, names the key and
+    /// the env var, gives the RFC 8414 reason and never echoes userinfo.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn public_url_relations_canonical_rejects_non_canonical_spellings() -> anyhow::Result<()> {
+        let cases = non_canonical_public_urls();
+        assert!(
+            cases.len() >= 39,
+            "generator must cover many spellings, got {}",
+            cases.len()
+        );
+        for (input, canonical) in &cases {
+            for candidate in [input.clone(), format!("{input}/")] {
+                let server = canonical_rule_as_server(&candidate, true);
+                for expected in [
+                    format!("use \"{canonical}\""),
+                    format!("server.public_url \"{candidate}\" (env {SERVER_PUBLIC_URL_ENV})"),
+                    "RFC 8414 section 3.3".to_owned(),
+                ] {
+                    assert_server_config_rejected_by_both(
+                        &format!("canonical rule {candidate:?}"),
+                        &server,
+                        &expected,
+                    )?;
+                }
+                let Err(err) = validate_server_config(&server) else {
+                    anyhow::bail!("{candidate:?} must be rejected");
+                };
+                assert!(!err.to_string().contains('@'), "no userinfo: {err}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Canonical rule: the spellings named by the operator-facing examples are
+    /// rejected with the canonical form, including the expanded IPv6 literal.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn public_url_relations_canonical_rejects_documented_spellings() -> anyhow::Result<()> {
+        for (input, canonical) in [
+            ("https://MCP.Example.com", "https://mcp.example.com"),
+            ("https://mcp.example.com:443", "https://mcp.example.com"),
+            ("http://localhost:80", "http://localhost"),
+            ("https://[0:0:0:0:0:0:0:1]:8443", "https://[::1]:8443"),
+        ] {
+            let server = canonical_rule_as_server(input, false);
+            assert_server_config_rejected_by_both(
+                &format!("canonical rule {input:?}"),
+                &server,
+                &format!(
+                    "(env {SERVER_PUBLIC_URL_ENV}) must be written in its canonical form, \
+                     use \"{canonical}\""
+                ),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Canonical rule: canonical spellings (with or without one trailing
+    /// slash, and a host with a trailing dot, which the URL parser keeps)
+    /// pass both validators.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn public_url_relations_canonical_accepts_canonical_spellings() -> anyhow::Result<()> {
+        let mut accepted: Vec<String> = Vec::new();
+        for canonical in CANONICAL_PUBLIC_URLS {
+            accepted.push((*canonical).to_owned());
+            accepted.push(format!("{canonical}/"));
+        }
+        accepted.push("https://mcp.example.".to_owned());
+        for good in &accepted {
+            let server = canonical_rule_as_server(good, true);
+            assert_server_config_accepted_by_both(&format!("canonical {good:?}"), &server)?;
+        }
+        Ok(())
+    }
+
+    /// Canonical rule: a trailing double slash and an uppercase scheme are
+    /// decided by the earlier rules (bare origin, `http(s)://` prefix), not by
+    /// the canonical rule.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn public_url_relations_canonical_leaves_earlier_rules_in_charge() -> anyhow::Result<()> {
+        let server = canonical_rule_as_server("https://mcp.example//", true);
+        assert_server_config_rejected_by_both(
+            "double trailing slash",
+            &server,
+            "must be a bare origin",
+        )?;
+        let as_server = relations_server(Some("HTTPS://mcp.example"), true, as_mode);
+        let passthrough = relations_server(Some("HTTPS://mcp.example"), true, |oauth| {
+            oauth.proxy = Some(validation_proxy());
+        });
+        let direct = relations_server(Some("HTTPS://mcp.example"), true, |_| {});
+        for (label, uppercase_scheme) in [
+            ("authorization_server", &as_server),
+            ("passthrough", &passthrough),
+            ("direct", &direct),
+        ] {
+            assert_server_config_rejected_by_both(
+                label,
+                uppercase_scheme,
+                "must start with http:// or https://",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Canonical rule: a host the origin parser lets through but the URL
+    /// parser refuses (bad IPv6 literal, out-of-range IPv4, invalid punycode)
+    /// gets the bare-origin error, not the canonical-form error.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn public_url_relations_canonical_reports_unparsable_host_as_bare_origin() -> anyhow::Result<()>
+    {
+        for bad in [
+            "https://[zzz]:8443",
+            "https://[1:2:3]",
+            "https://999.999.999.999",
+            "https://1.2.3.256:8443",
+            "https://xn--9.example",
+        ] {
+            let server = canonical_rule_as_server(bad, true);
+            assert_server_config_rejected_by_both(
+                &format!("unparsable host {bad:?}"),
+                &server,
+                &format!("(env {SERVER_PUBLIC_URL_ENV}) must be a bare origin"),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Canonical rule: it is decided before the allowlist and the
+    /// `authorization_servers` rules, so the operator sees the spelling
+    /// problem first.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn public_url_relations_canonical_runs_before_later_relation_rules() -> anyhow::Result<()> {
+        let foreign_servers = relations_server(Some("https://MCP.Example.com"), true, |oauth| {
+            oauth.authorization_servers = Some(vec!["https://auth.example.com".to_owned()]);
+            as_mode(oauth);
+        });
+        assert_server_config_rejected_by_both(
+            "foreign authorization_servers",
+            &foreign_servers,
+            "use \"https://mcp.example.com\"",
+        )?;
+        let mut foreign_origins = canonical_rule_as_server("https://MCP.Example.com", true);
+        foreign_origins.allowed_origins = vec!["https://other.example".to_owned()];
+        assert_server_config_rejected_by_both(
+            "foreign allowed_origins",
+            &foreign_origins,
+            "use \"https://mcp.example.com\"",
+        )
+    }
+
+    /// Canonical rule: only the authorization-server mode is affected;
+    /// passthrough and direct OAuth keep accepting every non-canonical
+    /// spelling.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn public_url_relations_canonical_ignores_other_modes() -> anyhow::Result<()> {
+        for (input, _canonical) in non_canonical_public_urls() {
+            let direct = relations_server(Some(&input), true, |_| {});
+            assert_server_config_accepted_by_both(&format!("direct {input:?}"), &direct)?;
+            let passthrough = relations_server(Some(&input), true, |oauth| {
+                oauth.proxy = Some(validation_proxy());
+            });
+            assert_server_config_accepted_by_both(&format!("passthrough {input:?}"), &passthrough)?;
         }
         Ok(())
     }

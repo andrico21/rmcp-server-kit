@@ -93,6 +93,15 @@ required) and [`docs/OAUTH_PROXY.md`](docs/OAUTH_PROXY.md).
   `authorization_server` HTML pages only (consent and error pages). Every
   other response keeps the operator's header settings.
 
+### Fixed
+
+- In `authorization_server` mode a non-canonical `server.public_url` (capitals
+  in the host, an explicit default port such as `:443`, an expanded IPv6
+  literal) is rejected at startup with the canonical form to use, because the
+  advertised issuer must be byte-identical to the authorization server
+  metadata issuer (RFC 8414 section 3.3). Passthrough and direct modes are
+  unchanged.
+
 ### Notes
 
 - A configuration that sets none of the new knobs keeps byte-identical

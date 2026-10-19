@@ -2113,6 +2113,43 @@ mod tests {
         Ok(())
     }
 
+    /// A non-canonical public URL is rejected by `validate()` before `serve`, naming the canonical form.
+    #[tokio::test]
+    async fn discovery_issuer_chain_rejects_non_canonical_public_url() -> anyhow::Result<()> {
+        // Given
+        for (spelling, canonical) in [
+            ("https://MCP.Example.com", "https://mcp.example.com"),
+            ("https://mcp.example.com:443", "https://mcp.example.com"),
+            ("http://LOCALHOST:8080", "http://localhost:8080"),
+            ("http://localhost:80", "http://localhost"),
+            ("https://[0:0:0:0:0:0:0:1]:8443", "https://[::1]:8443"),
+        ] {
+            // When
+            let result = Harness::start_public(
+                "30days",
+                "authorization_server",
+                (false, false),
+                Some(spelling),
+            )
+            .await;
+            // Then
+            let message = match result {
+                Ok(server) => {
+                    server.close().await?;
+                    anyhow::bail!("{spelling} must be rejected before serve");
+                }
+                Err(err) => err.to_string(),
+            };
+            ensure!(
+                message.contains(&format!("use {canonical:?}"))
+                    && message.contains("server.public_url")
+                    && message.contains("RFC 8414 section 3.3"),
+                "{spelling}: {message}"
+            );
+        }
+        Ok(())
+    }
+
     /// Admin routes unwrap current/previous refresh wrappers and retain unwrapped access-token behavior.
     #[tokio::test]
     async fn admin_routes_unwrap_current_and_previous_refresh_wrappers() -> anyhow::Result<()> {
