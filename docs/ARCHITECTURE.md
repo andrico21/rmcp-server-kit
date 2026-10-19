@@ -61,6 +61,9 @@ src/
 ├── auth.rs              authn primitives: ApiKeyEntry, AuthState, mw     (~1600 LOC)
 ├── rbac.rs              authz: RbacPolicy, task-locals, mw, rate-limit   (~1500 LOC)
 ├── oauth.rs             OAuth 2.1 + JWKS cache (feature = "oauth")       (~3000 LOC)
+├── oauth_as.rs          authorization_server proxy mode: register, consent, callback, token (feature = "oauth")
+├── oauth_as/tests/      binding near-miss unit tests of oauth_as.rs
+├── oauth_seal.rs        HMAC-SHA256 sealed values (Sealer) for oauth_as.rs (feature = "oauth")
 ├── mtls_revocation.rs   CDP-driven CRL fetcher + dynamic verifier
 ├── bounded_limiter.rs   Memory-bounded keyed rate limiter (LRU prune)
 ├── ssrf.rs              Shared SSRF guard logic (literal-IP + per-hop)
@@ -198,6 +201,12 @@ Open endpoints (no auth):
 | `GET  /metrics`                            | served by `serve_metrics` on a **separate listener** when `feature = "metrics"` (`src/metrics.rs:220`) |
 | `GET  /.well-known/oauth-protected-resource` | feature = `oauth`, mounted in `build_app_router` (`src/transport.rs:2347`) |
 | `GET  /.well-known/oauth-authorization-server` | feature = `oauth` proxy, mounted by `install_oauth_proxy_routes` (`src/transport.rs:3418`) |
+| `POST /register` (`authorization_server` mode) | `register` (`src/oauth_as.rs:343`) - validates redirect URIs and answers `201` with a sealed per-client `client_id` |
+| `GET  /authorize` (`authorization_server` mode) | `authorize` (`src/oauth_as.rs:439`) - opens the sealed client, checks the exact `redirect_uri` and S256 PKCE, serves the consent page (or skips it on remembered consent) |
+| `POST /oauth/consent` (`authorization_server` mode) | `consent` (`src/oauth_as.rs:604`) - CSRF-checked approve/deny; approval sets the state and consent cookies and redirects to the upstream IdP |
+| `GET  /oauth/callback` (`authorization_server` mode) | `callback` (`src/oauth_as.rs:800`) - checks the state cookie and upstream `iss`, wraps the code, redirects to the client with this server's `iss` |
+| `POST /token` (`authorization_server` mode) | `token` (`src/oauth_as.rs:1010`) - opens the wrapped code or refresh token, checks client, `redirect_uri` and PKCE, sends an allowlisted form upstream |
+| `POST /introspect`, `/revoke` (`authorization_server` mode, only when exposed) | `unwrap_refresh_token_param` (`src/oauth_as.rs:1080`) swaps a sealed refresh wrapper for the upstream token, then the passthrough handlers forward |
 
 Authenticated endpoints:
 
@@ -311,7 +320,7 @@ Startup-only.
 
 ### Construction
 `AuthState` is built inside `build_app_router()` at `src/transport.rs:2347`. It contains:
-- `AuthState::api_keys` hot-swap vector (`src/auth.rs:1751`)
+- `AuthState::api_keys` hot-swap vector (`src/auth.rs:1762`)
 - mTLS identities: stored **per-connection** on the
   `TlsConnInfo` extension (`src/auth.rs:1448`), read by `auth_middleware` (`src/auth.rs:2782`).
   No shared `SocketAddr`-keyed map exists - the previous design was replaced
@@ -716,6 +725,22 @@ the server's own URL via `install_oauth_proxy_routes` (`src/transport.rs:3418`):
 These let downstream MCP clients discover OAuth via the same origin as
 `/mcp`, simplifying CORS and CSP configuration.
 
+The proxy runs in one of two modes, selected by `OAuthProxyConfig::mode`
+(`ProxyMode`, `src/oauth.rs:1284`). `passthrough` (the default) is the
+3.20.0 proxy above: `/authorize` redirects to the upstream with the client id
+swapped, the upstream redirects the browser straight back to the client, and
+`/register` echoes the static client id. `authorization_server` returns early
+from `install_oauth_proxy_routes` into
+`install_routes` (`src/oauth_as.rs:182`): this server registers clients itself,
+shows a per-client consent page, receives the upstream redirect at
+`/oauth/callback`, re-stamps `iss` with its own issuer and binds codes and
+refresh tokens to the client. It keeps no server-side state; every
+registration, consent, state cookie, code and refresh wrapper is sealed by
+`Sealer` (`src/oauth_seal.rs:83`) with a key derived per purpose from
+`sealing_secret`. The HTML pages carry their own CSP through
+`PageSecurityHeaders` (`src/transport.rs:4648`). Flows, knobs and Keycloak
+settings for both modes are in [`OAUTH_PROXY.md`](OAUTH_PROXY.md).
+
 ### Hardening defaults
 - Allowed algorithms: configured per `OAuthConfig` (default: `RS256`, `ES256`).
 - Symmetric keys (`HS*`) are rejected by default - protects against
@@ -861,7 +886,7 @@ Two ArcSwaps power runtime reconfiguration:
 
 | State            | Type                           | Defined at                  |
 |------------------|---------------------------------|-----------------------------|
-| API keys         | `AuthState` `api_keys` slot     | `src/auth.rs:1751`          |
+| API keys         | `AuthState` `api_keys` slot     | `src/auth.rs:1762`          |
 | RBAC policy      | `ReloadHandle` `rbac` slot      | `src/transport.rs:2023`      |
 
 Procedure:

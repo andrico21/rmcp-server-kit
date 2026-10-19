@@ -804,7 +804,7 @@ mod tests {
         let doc = fs::read_to_string(root.join("docs/GUIDE.md")).context("read GUIDE.md")?;
         let fences = extract_toml_fences(&doc);
 
-        assert_eq!(fences.len(), 18, "GUIDE.md TOML fence count drifted");
+        assert_eq!(fences.len(), 20, "GUIDE.md TOML fence count drifted");
         for block in &fences {
             match block.info.as_str() {
                 "toml" => assert_operator_config_block_parses("docs/GUIDE.md", block)?,

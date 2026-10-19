@@ -49,6 +49,9 @@ rmcp-server-kit/
 │   ├── bounded_limiter.rs      Memory-bounded keyed rate limiter (used by RBAC per-IP/per-tool limiter)
 │   ├── forwarded.rs            Trusted-forwarder client-IP resolution (XFF / RFC 7239, rightmost-untrusted)
 │   ├── oauth.rs                OAuth 2.1 JWT + JWKS cache (feature = "oauth")
+│   ├── oauth_as.rs             OAuth proxy `authorization_server` mode: register, consent, callback, token (feature = "oauth")
+│   ├── oauth_as/tests/         binding_near_misses.rs - unit tests of oauth_as.rs bindings
+│   ├── oauth_seal.rs           HMAC-SHA256 sealed values (`Sealer`) used by oauth_as.rs (feature = "oauth")
 │   ├── mtls_revocation.rs      CDP-driven CRL fetcher + cache + dynamic ClientCertVerifier
 │   ├── ssrf.rs                 Per-hop SSRF guard for outbound HTTP (JWKS / CRL / OAuth fetches)
 │   ├── admin.rs                Admin diagnostics router (/admin/*)
@@ -81,18 +84,22 @@ rmcp-server-kit/
 │       ├── limiter_memory.rs        (#[ignore]d release RSS gate)
 │       ├── metrics_handle.rs        (feature = "metrics")
 │       ├── metrics_headers.rs       (feature = "metrics")
+│       ├── oauth_as_proxy.rs        (feature = "oauth") `authorization_server` proxy mode end to end
+│       ├── oauth_as_proxy/          refresh_and_replicas.rs, wire_rejections.rs (submodules of oauth_as_proxy.rs)
 │       ├── oauth_http_client.rs     (features = "oauth", "test-helpers")
 │       ├── origin_validation.rs
 │       └── ssrf_resolver.rs         (features = "oauth", "test-helpers")
 ├── examples/
 │   ├── minimal_server.rs     Minimal runnable example (`cargo run --example minimal_server`)
 │   ├── api_key_rbac.rs       API-key auth + RBAC + argument allowlist example
-│   └── oauth_server.rs       OAuth 2.1 resource server example (requires `--features oauth`)
+│   ├── oauth_server.rs       OAuth 2.1 resource server example (requires `--features oauth`)
+│   └── oauth_proxy_as_demo.rs  `authorization_server` proxy demo with a fake IdP (requires `--features oauth`)
 ├── docs/
 │   ├── GUIDE.md              ★ Consumer-facing guide (architecture, TOML config, examples)
 │   ├── ARCHITECTURE.md       ★ Deep architecture map for agents (file:line citations)
 │   ├── MINDMAP.md            ★ Mermaid mindmap of the project
 │   ├── MIGRATION.md          Version-migration notes
+│   ├── OAUTH_PROXY.md        OAuth proxy modes, flow dissections, knobs, Keycloak settings
 │   ├── RELEASING.md          Release process
 │   ├── rust-guidelines/      Vendored universal guidelines (core + overlays; do not edit)
 │   └── RUST_1_95_NOTES.md    Notes on Rust 1.95 idioms used here
@@ -191,17 +198,18 @@ ephemeral loopback ports.
 `tests/integration/` (loopback ports, `wiremock` or file reads): `crl_ssrf`,
 `crl_trusted_origin`, `delegation_guard`, `docs_citations`, `e2e`, `e2e_oauth_mtls`,
 `jwks_key_cap`, `jwks_redirect_ssrf`, `limiter_memory` (`#[ignore]`d), `metrics_handle`,
-`metrics_headers`, `oauth_http_client`, `origin_validation`, `ssrf_resolver`.
+`metrics_headers`, `oauth_as_proxy`, `oauth_http_client`, `origin_validation`, `ssrf_resolver`.
 
 **Feature-gated targets.** Each test file is declared with an explicit `[[test]]`
-target in `Cargo.toml`; ten of them carry `required-features`, so running a
+target in `Cargo.toml`; twelve of them carry `required-features`, so running a
 gated target without its features now **errors** with "requires the features"
 instead of silently running an empty binary:
 
 - `test-helpers`: `crl_h3_regression`, `crl_map_bounds`, `crl_trusted_origin`
-- `oauth`: `oauth_url_validation`
+- `oauth`: `oauth_url_validation`, `oauth_as_proxy`
 - `oauth` **and** `test-helpers`: `jwks_key_cap`, `jwks_redirect_ssrf`,
-  `oauth_http_client`, `ssrf_resolver`, `e2e_oauth_mtls`
+  `oauth_http_client`, `ssrf_resolver`
+- `oauth`, `oauth-mtls-client` **and** `test-helpers`: `e2e_oauth_mtls`
 - `metrics`: `metrics_handle`, `metrics_headers`
 
 Always use `--all-features` locally; CI additionally runs a feature matrix so
@@ -364,6 +372,12 @@ The core's current-Rust idioms (for example `Vec::push_mut` /
 | mTLS identity extraction                       | `src/transport.rs` - `extract_mtls_identity` call site (near `run_tls_acceptor`, `src/transport.rs:3911`)   |
 | mTLS CRL revocation (CDP-driven)               | `src/mtls_revocation.rs` - `CrlSet`, `DynamicClientCertVerifier`, `bootstrap_fetch`, `run_crl_refresher` |
 | OAuth JWT validation / JWKS cache              | `src/oauth.rs` - `JwksCache`, feature-gated           |
+| OAuth `401` scope hint / bare missing-credential challenge | `src/auth.rs` - `ChallengeConfig`, `build_www_authenticate_value`; knobs `OAuthConfig::challenge_scopes`, `omit_error_on_missing_credential` |
+| OAuth step-up (`insufficient_scope` `403`)     | `src/rbac.rs` - `ScopeChallenge::unlocking_scope`, `decorate_scope_denial`; knob `OAuthConfig::insufficient_scope_challenge` |
+| Accepted JWT audiences (extra + resource URL)  | `src/oauth.rs` - `check_audience`, `validate_additional_audiences`; knobs `additional_audiences`, `accept_resource_audience`; resource URL built in `build_app_router` (`src/transport.rs`) |
+| OAuth proxy `authorization_server` mode        | `src/oauth_as.rs` - `install_routes`, `register`, `authorize`, `consent`, `callback`, `token`, `unwrap_refresh_token_param`; mode switch in `src/transport.rs` - `install_oauth_proxy_routes`; `ProxyMode` in `src/oauth.rs`; page headers `PageSecurityHeaders`; startup rules in `src/config.rs` - `check_shared_oauth_relations`; long-form docs `docs/OAUTH_PROXY.md` |
+| Sealed values (proxy registrations, consent, state, codes, refresh wrappers) | `src/oauth_seal.rs` - `Sealer`, `SealKind`, `MAX_SEALED_LEN`; keys from `OAuthProxyConfig::sealing_secret` / `sealing_secret_previous` |
+| OAuth opt-in startup logs (missing `public_url` WARN, opt-in INFO) | `src/transport.rs` - `build_app_router`, `log_enabled_oauth_opt_ins` |
 | RBAC policy evaluation                         | `src/rbac.rs` - `RbacPolicy::check`, `enforce_tool_policy` |
 | Per-tool argument allowlist                    | `src/rbac.rs` - `ArgumentAllowlist`, `argument_allowed` |
 | Per-IP tool rate limit                         | `src/rbac.rs` - `build_tool_rate_limiter`             |

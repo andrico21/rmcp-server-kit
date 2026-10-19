@@ -11,12 +11,88 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 ## [Unreleased]
 
+Opt-in MCP 2026-07-28 authorization features. Every new knob defaults to the
+3.20.0 behaviour; see [`docs/MIGRATION.md`](docs/MIGRATION.md) (no action
+required) and [`docs/OAUTH_PROXY.md`](docs/OAUTH_PROXY.md).
+
 ### Added
 
+- `OAuthConfig::challenge_scopes` (builder `challenge_scopes`, env
+  `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__CHALLENGE_SCOPES`, comma-separated):
+  adds `scope="..."` to the `401` `WWW-Authenticate` challenge. Default unset.
+- `OAuthConfig::insufficient_scope_challenge` (builder
+  `insufficient_scope_challenge`, env
+  `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__INSUFFICIENT_SCOPE_CHALLENGE`): a
+  tool call denied by RBAC gets `403` with
+  `WWW-Authenticate: Bearer error="insufficient_scope"` naming a mapped scope
+  that would unlock the call, found by simulating first-match role
+  resolution; when no scope helps the bare `403` stays. Default `false`.
+- `OAuthConfig::additional_audiences` (builder `additional_audiences`, env
+  `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ADDITIONAL_AUDIENCES`,
+  comma-separated): extra accepted `aud` values. Default empty.
+- `OAuthConfig::accept_resource_audience` (builder
+  `accept_resource_audience`, env
+  `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ACCEPT_RESOURCE_AUDIENCE`): accept
+  `aud` equal to `{public_url}/mcp` (RFC 8707). Requires `public_url`.
+  Default `false`.
+- `OAuthConfig::omit_error_on_missing_credential` (builder
+  `omit_error_on_missing_credential`, env
+  `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__OMIT_ERROR_ON_MISSING_CREDENTIAL`):
+  no `error` parameter in the challenge for a request without any
+  credential (RFC 6750 section 3.1). Default `false`.
+- `OAuthProxyConfig::mode` with the new `#[non_exhaustive]` enum
+  `ProxyMode` (`Passthrough`, the default, or `AuthorizationServer`; builder
+  `mode`, env `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__MODE`).
+- `OAuthProxyConfig::sealing_secret` and `sealing_secret_previous` (builders
+  of the same name, env
+  `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET` /
+  `..._SEALING_SECRET_PREVIOUS`, each with a `_FILE` sibling): HMAC keys for
+  the sealed values of `authorization_server` mode, redacted in `Debug` and
+  in the env-override report.
+- `OAuthProxyConfig::consent_ttl` (builder `consent_ttl`, env
+  `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__CONSENT_TTL`): how long a
+  browser remembers consent; unset means 30 days, `"0s"` always asks, at
+  most 400 days.
+- Authorization-server proxy mode (`mode = "authorization_server"`):
+  stateless sealed client registration at `/register`, a per-client consent
+  page at `/authorize` and `/oauth/consent`, a local `/oauth/callback` that
+  re-stamps `iss` with this server's issuer, and `authorization_response_iss_parameter_supported`
+  in the authorization server metadata.
 - Authorization-server proxy callback and token exchange with stateless,
   client-bound authorization codes and refresh tokens, PKCE verification,
   refresh-token admin adapters, key rotation and issuer-consistent metadata.
   Passthrough proxy behavior remains unchanged.
+- Startup validation for the new opt-ins: each rule fires only when its knob
+  is set, and every error names the offending field; the `public_url`,
+  `allowed_origins` and `authorization_servers` errors also name the env var.
+- A startup INFO line, `oauth opt-in features enabled`, logged only when at
+  least one opt-in is enabled, with booleans and counts only.
+- Example `oauth_proxy_as_demo` (`cargo run --example oauth_proxy_as_demo
+  --features oauth`): the `authorization_server` flow against an in-process
+  fake identity provider.
+- Documentation: [`docs/OAUTH_PROXY.md`](docs/OAUTH_PROXY.md) (proxy modes,
+  flow dissections, configuration examples, Keycloak settings per mode), new
+  GUIDE field-table rows, Recipe 7 (Keycloak, direct mode with CIMD) and
+  Recipe 8 (OAuth proxy in `authorization_server` mode).
+
+### Changed
+
+- A startup WARN is logged once when OAuth is configured without
+  `public_url`, because Protected Resource Metadata then advertises a
+  resource derived from the bind address and the `401` challenge carries a
+  relative `resource_metadata` URL. Wire behaviour is unchanged.
+- `security_headers_middleware` honours a page-level `Content-Security-Policy`,
+  `Referrer-Policy: same-origin` and `Cache-Control: no-store` for the new
+  `authorization_server` HTML pages only (consent and error pages). Every
+  other response keeps the operator's header settings.
+
+### Notes
+
+- A configuration that sets none of the new knobs keeps byte-identical
+  3.20.0 wire behaviour (status, headers, bodies, routes, redirects, upstream
+  request bodies, token acceptance), pinned by the `compat_3_20` suite in
+  `tests/integration/e2e.rs`. The only addition is the WARN line above when
+  `public_url` is unset.
 
 ## [3.20.0] - 2026-10-13
 

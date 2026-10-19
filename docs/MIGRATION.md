@@ -3,6 +3,95 @@
 This guide shows how to wire the standalone `rmcp-server-kit` crate into a
 downstream project, and how to migrate across breaking major releases.
 
+## Migrating to the next release (unreleased): opt-in MCP 2026-07-28 authorization features
+
+**No action required.** Every new knob defaults to the 3.20.0 behaviour, no
+existing default, field type or public signature changes, and a 3.20.0
+TOML, environment or builder configuration keeps its 3.20.0 wire behaviour
+(status codes, headers, bodies, routes, redirects, upstream requests and
+token acceptance). New validation rules only fire when a new knob is set.
+
+The one visible difference for an unchanged configuration is a new startup
+WARN line, logged once when OAuth is configured and `public_url` is not set:
+
+```text
+OAuth is configured without public_url: Protected Resource Metadata advertises a resource derived from the bind address and the 401 challenge carries a relative resource_metadata URL; set server.public_url (env RMCP_SERVER_KIT__SERVER__PUBLIC_URL)
+```
+
+The warning describes what 3.20.0 already did; nothing changes on the wire.
+Set `server.public_url` (or `McpServerConfig::with_public_url`) to the URL
+clients actually reach to silence it, which is also what every opt-in below
+that depends on this server's own URL needs.
+
+When at least one opt-in below is enabled the server also logs one INFO
+line, `oauth opt-in features enabled`, with booleans and counts only. Every
+opt-in is settable through an environment variable, so make sure all
+replicas run the same values.
+
+All knobs need the `oauth` feature. Field details are in the
+[`OAuthConfig`](GUIDE.md#oauthconfig) and
+[`OAuthProxyConfig`](GUIDE.md#oauthproxyconfig-optional) tables, and the
+flows, examples and Keycloak settings in [`OAUTH_PROXY.md`](OAUTH_PROXY.md).
+
+### Scope hint in the `401` challenge (`challenge_scopes`)
+
+Set `challenge_scopes = ["mcp:read"]` under `[server.auth.oauth]` (env
+`RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__CHALLENGE_SCOPES`, comma-separated)
+to add `scope="mcp:read"` to every `401` `WWW-Authenticate` challenge, so
+clients ask for least privilege first. Omit the key to keep the 3.20.0
+challenge.
+
+### Step-up challenge on RBAC denial (`insufficient_scope_challenge`)
+
+Set `insufficient_scope_challenge = true` (env
+`RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__INSUFFICIENT_SCOPE_CHALLENGE`) to
+answer a denied tool call with `403` plus
+`WWW-Authenticate: Bearer error="insufficient_scope", scope="..."` when one
+more mapped scope would allow the call. It needs `scopes` mappings and no
+`role_claim`. Mappings are matched first-match in configuration order, so
+list the most capable scope first; see
+[scope ordering and step-up](OAUTH_PROXY.md#9-scope-ordering-and-step-up).
+
+### Extra accepted audiences (`additional_audiences`)
+
+List extra `aud` values in `additional_audiences` (env
+`RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ADDITIONAL_AUDIENCES`,
+comma-separated). Entries must be non-empty, unique and different from
+`audience`.
+
+### Resource-URL audience (`accept_resource_audience`)
+
+Set `accept_resource_audience = true` (env
+`RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ACCEPT_RESOURCE_AUDIENCE`) to also
+accept tokens whose `aud` is `{public_url}/mcp`, as identity providers that
+implement RFC 8707 resource indicators issue them. `public_url` is required.
+
+### Bare challenge for a missing credential (`omit_error_on_missing_credential`)
+
+Set `omit_error_on_missing_credential = true` (env
+`RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__OMIT_ERROR_ON_MISSING_CREDENTIAL`) so
+a request without any credential gets a `401` challenge with no `error`
+parameter, as RFC 6750 section 3.1 recommends. The default keeps
+`error="invalid_request"`.
+
+### Authorization-server proxy mode (`proxy.mode`, `sealing_secret`, `sealing_secret_previous`, `consent_ttl`)
+
+`[server.auth.oauth.proxy]` keeps the passthrough proxy unless you set
+`mode = "authorization_server"` (env
+`RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__MODE`). That mode needs
+`public_url`, a `sealing_secret` of at least 32 bytes shared by every
+replica (env `..._PROXY__SEALING_SECRET` or `..._PROXY__SEALING_SECRET_FILE`)
+and an unset `authorization_server_metadata_issuer`, and Keycloak needs the
+single redirect URI `{public_url}/oauth/callback`. `sealing_secret_previous`
+(env `..._PROXY__SEALING_SECRET_PREVIOUS` or `..._PREVIOUS_FILE`) keeps
+sealed values from the old key valid during a rotation, and `consent_ttl`
+(env `..._PROXY__CONSENT_TTL`, default 30 days) sets how long a browser
+remembers consent. Clients that cached the static client id from the
+passthrough `/register` are rejected and have to register again, and users
+holding an old refresh token sign in again;
+[migrating passthrough to authorization_server](OAUTH_PROXY.md#10-migrating-passthrough---authorization_server)
+has the full checklist.
+
 ## Migrating to 3.20.0: audit-log hardening, Argon2id admission control, CRL trust, and one breaking API change
 
 ### `JwksCache::new` returns the crate error type (breaking)

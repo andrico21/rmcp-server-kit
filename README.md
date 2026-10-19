@@ -70,6 +70,7 @@ cargo run --example minimal_server
 cargo run --example api_key_rbac
 cargo run --example config_file_server
 cargo run --example oauth_server --features oauth
+cargo run --example oauth_proxy_as_demo --features oauth
 ```
 
 ### Common configurations
@@ -181,6 +182,13 @@ let config = McpServerConfig::new("127.0.0.1:8443", "my-server", "0.1.0")
   admin diagnostics, graceful shutdown, configurable TLS and mTLS.
 - **Auth**: API-key (Argon2 hashed), mTLS client certs, OAuth 2.1 JWT
   validation against JWKS (feature-gated).
+- **OAuth proxy modes**: an optional OAuth proxy in front of your identity
+  provider, either the 3.20.0 passthrough proxy (default) or the opt-in
+  `authorization_server` mode with per-client consent and `iss`-consistent
+  redirects, plus opt-in MCP authorization features (scope hints, step-up
+  challenge, resource-URL audiences). See
+  [docs/OAUTH_PROXY.md](docs/OAUTH_PROXY.md) for flows, configuration and
+  Keycloak settings (feature-gated).
 - **RBAC**: Tool-scoped allow-lists with per-role argument constraints and
   task-local `current_role()` / `current_identity()` accessors.
 - **Observability**: Tracing, JSON logs, optional audit-file sink.
