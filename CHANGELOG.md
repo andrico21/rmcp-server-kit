@@ -75,6 +75,12 @@ required) and [`docs/OAUTH_PROXY.md`](docs/OAUTH_PROXY.md).
   flow dissections, configuration examples, Keycloak settings per mode), new
   GUIDE field-table rows, Recipe 7 (Keycloak, direct mode with CIMD) and
   Recipe 8 (OAuth proxy in `authorization_server` mode).
+- In `authorization_server` mode, `/register` rejects invisible and
+  bidirectional format characters in `client_name` and in redirect URIs
+  (`invalid_client_metadata` / `invalid_redirect_uri`, the character is not
+  echoed), and the consent page renders the name inside a `<bdi>` isolate with
+  the unverified marker outside it; an emoji sequence joined by U+200D is
+  rejected as a documented trade-off.
 
 ### Changed
 

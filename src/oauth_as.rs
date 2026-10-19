@@ -318,7 +318,12 @@ fn registration_error(code: &'static str) -> Response {
 
 /// Parse a bounded web callback without userinfo, fragments or parser control bytes.
 fn redirect_uri(value: &str) -> Option<Url> {
-    if value.len() > 512 || value.chars().any(char::is_control) || value.contains('\\') {
+    if value.len() > 512
+        || value
+            .chars()
+            .any(|ch| ch.is_control() || is_spoofing_char(ch))
+        || value.contains('\\')
+    {
         return None;
     }
     let url = Url::parse(value).ok()?;
@@ -338,6 +343,28 @@ fn loopback(url: &Url) -> bool {
     matches!(url.host_str(), Some("127.0.0.1" | "[::1]" | "localhost"))
 }
 
+/// Report whether a character can hide, reorder or visually fake neighbouring text.
+///
+/// Covers the bidirectional controls (U+061C, U+200E, U+200F, U+202A to U+202E,
+/// U+2066 to U+2069) and the invisible formatting or separator characters
+/// (U+200B to U+200D, U+2060 to U+2064, U+FEFF, U+00AD, U+2028, U+2029). Letters
+/// of right-to-left scripts are not in this set.
+const fn is_spoofing_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{061C}'
+            | '\u{200E}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{200B}'..='\u{200D}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{FEFF}'
+            | '\u{00AD}'
+            | '\u{2028}'
+            | '\u{2029}'
+    )
+}
+
 /// Register a public downstream client without retaining server-side state.
 // cancel-safe: body extraction completes before this synchronous, stateless response construction.
 async fn register(State(state): State<Arc<AsState>>, body: Bytes) -> Response {
@@ -353,11 +380,12 @@ async fn register(State(state): State<Arc<AsState>>, body: Bytes) -> Response {
     {
         return registration_error("invalid_redirect_uri");
     }
-    if input
-        .client_name
-        .as_ref()
-        .is_some_and(|name| name.chars().count() > 128 || name.chars().any(char::is_control))
-    {
+    if input.client_name.as_ref().is_some_and(|name| {
+        name.chars().count() > 128
+            || name
+                .chars()
+                .any(|ch| ch.is_control() || is_spoofing_char(ch))
+    }) {
         return registration_error("invalid_client_metadata");
     }
     let client = ClientReg {
@@ -561,7 +589,7 @@ fn consent_page(
         || "An unnamed application".to_owned(),
         |value| {
             format!(
-                "{} (name supplied by the application, not verified)",
+                "<bdi>{}</bdi> (name supplied by the application, not verified)",
                 html_escape(value)
             )
         },
@@ -1121,6 +1149,7 @@ mod tests {
     use crate::transport::McpServerConfig;
 
     mod binding_near_misses;
+    mod client_name_chars;
 
     #[tokio::test]
     #[expect(
@@ -2325,7 +2354,7 @@ mod tests {
         let html = String::from_utf8(to_bytes(response.into_body(), 0x8000).await?.to_vec())?;
         for expected in [
             format!("Authorize access to {escaped}."),
-            format!("{escaped} (name supplied"),
+            format!("<bdi>{escaped}</bdi> (name supplied"),
             format!("https://example.test/cb?{escaped}"),
             format!("<li>{escaped}</li>"),
             format!("name=\"request\" value=\"{escaped}\""),
