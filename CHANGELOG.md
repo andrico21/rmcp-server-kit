@@ -109,6 +109,12 @@ required) and [`docs/OAUTH_PROXY.md`](docs/OAUTH_PROXY.md).
   already sealed client. Joined emoji sequences, tag-sequence flags and the
   Mongolian free variation selectors are rejected as a documented trade-off.
 
+### Security
+
+- Bumped `rustls` from 0.23.45 to 0.23.46 to resolve RUSTSEC-2026-0346,
+  RUSTSEC-2026-0347, RUSTSEC-2026-0348 and RUSTSEC-2026-0349; `Cargo.lock` and
+  the `cargo-vet` exemptions are refreshed together.
+
 ### Notes
 
 - A configuration that sets none of the new knobs keeps byte-identical
