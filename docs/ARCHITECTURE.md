@@ -1035,7 +1035,8 @@ with `--cfg docsrs`), `Rustdoc (stable)`, `MSRV (1.99.0)` (lint-capped),
 `Memory bounds`, `Validate docs (citations + links)`, the `lint-ratchet`
 self-tests, and the five permanent lint gates. `cargo-geiger` and the nightly
 `Rustdoc (latest nightly canary)` run informational; `cargo-mutants` is
-schedule-only.
+schedule-only (the `oauth`-feature modules `src/oauth_as.rs` and
+`src/oauth_seal.rs` run in the separate `mutants-oauth` job).
 
 The lint gates are stdlib-only Python under `scripts/lint-ratchet/`:
 `catalog_gate.py` (every `#[expect]` reason is in the sanctioned catalog),

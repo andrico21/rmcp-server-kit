@@ -92,6 +92,9 @@ required) and [`docs/OAUTH_PROXY.md`](docs/OAUTH_PROXY.md).
   `Referrer-Policy: same-origin` and `Cache-Control: no-store` for the new
   `authorization_server` HTML pages only (consent and error pages). Every
   other response keeps the operator's header settings.
+- CI only: a new nightly `mutants-oauth` job (GitHub and GitLab) runs cargo-mutants
+  with `--features oauth` over `src/oauth_as.rs` and `src/oauth_seal.rs`, which
+  the default-feature mutants jobs cannot compile. The existing jobs are unchanged.
 
 ### Fixed
 
