@@ -5,7 +5,7 @@ use core::slice::from_ref;
 use super::*;
 
 /// Reference model: every rejected code point range, inclusive, as written in the policy.
-const RANGES: [(u32, u32); 9] = [
+const RANGES: [(u32, u32); 23] = [
     (0x061C, 0x061C),
     (0x200E, 0x200F),
     (0x202A, 0x202E),
@@ -15,6 +15,20 @@ const RANGES: [(u32, u32); 9] = [
     (0xFEFF, 0xFEFF),
     (0x00AD, 0x00AD),
     (0x2028, 0x2029),
+    (0x034F, 0x034F),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x2065, 0x2065),
+    (0x206A, 0x206F),
+    (0x2800, 0x2800),
+    (0x3164, 0x3164),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFFB),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE00FF),
+    (0xE01F0, 0xE0FFF),
 ];
 
 /// Whether the reference model rejects this code point.
@@ -22,17 +36,25 @@ fn in_ranges(code: u32) -> bool {
     RANGES.iter().any(|(lo, hi)| (*lo..=*hi).contains(&code))
 }
 
-/// Every rejected character, derived from the range definitions.
+/// Every rejected character for the HTTP sweeps: every code point of a range with at most 32
+/// members, and only the first, middle and last code point of a larger range.
 fn rejected_chars() -> Vec<char> {
     RANGES
         .iter()
-        .flat_map(|(lo, hi)| *lo..=*hi)
+        .flat_map(|(lo, hi)| {
+            let codes: Vec<u32> = if hi.saturating_sub(*lo) < 32 {
+                (*lo..=*hi).collect()
+            } else {
+                vec![*lo, lo.midpoint(*hi), *hi]
+            };
+            codes
+        })
         .filter_map(char::from_u32)
         .collect()
 }
 
 /// The characters just below and above each rejected range that are not rejected themselves,
-/// plus a fixed set of legal look-alikes.
+/// plus legal look-alikes and the variation selectors that emoji sequences need.
 fn outside_chars() -> Vec<char> {
     let mut codes: Vec<u32> = RANGES
         .iter()
@@ -40,16 +62,21 @@ fn outside_chars() -> Vec<char> {
         .filter(|code| !in_ranges(*code))
         .collect();
     codes.extend([
-        0x2058, 0x2065, 0x202F, 0x200A, 0x2027, 0xFEFE, 0xFF00, 0x061B, 0x00AC, 0x00AE, 0x2070,
-        0x2010, 0x061D, 0x205F, 0x206A,
+        0x2058, 0x202F, 0x200A, 0x2027, 0xFEFE, 0xFF00, 0x061B, 0x00AC, 0x00AE, 0x2070, 0x2010,
+        0x061D, 0x205F, 0xFE00, 0xFE0E, 0xFE0F, 0xE0100, 0xE01EF, 0x2764, 0x1F680,
     ]);
     codes.sort_unstable();
     codes.dedup();
     codes.into_iter().filter_map(char::from_u32).collect()
 }
 
-/// One character of each range group, used where a full sweep is not needed.
-const GROUP_SAMPLES: [char; 4] = ['\u{061C}', '\u{202E}', '\u{2066}', '\u{200B}'];
+/// The first and last code point of every rejected range, used where a full sweep is not needed.
+fn range_samples() -> Vec<char> {
+    let mut codes: Vec<u32> = RANGES.iter().flat_map(|(lo, hi)| [*lo, *hi]).collect();
+    codes.sort_unstable();
+    codes.dedup();
+    codes.into_iter().filter_map(char::from_u32).collect()
+}
 
 /// A 128-character name with `ch` at character index `index`, filler elsewhere.
 fn name_with_at(ch: char, index: usize) -> String {
@@ -237,8 +264,22 @@ async fn consent_page_without_a_name_keeps_the_unnamed_fallback() -> anyhow::Res
     let html = server.page(cid).await?.text().await?;
     // Then
     ensure!(
-        html.contains("<p>An unnamed application</p>") && !html.contains("<bdi>"),
+        html.contains("<p>An unnamed application</p>"),
         "fallback unchanged"
+    );
+    let paragraph = html
+        .split("<p>An unnamed application")
+        .nth(1)
+        .and_then(|rest| rest.split("</p>").next())
+        .context("fallback paragraph")?;
+    ensure!(
+        !paragraph.contains("<bdi>"),
+        "fallback paragraph has no isolate"
+    );
+    ensure!(
+        html.contains("<bdi>http://127.0.0.1:18999/cb?original=1</bdi>")
+            && html.contains("<bdi><strong>127.0.0.1</strong></bdi>"),
+        "redirect URI and host are isolated even without a name"
     );
     server.close().await
 }
@@ -341,7 +382,7 @@ async fn registration_rejects_spoofing_characters_at_every_redirect_uri_position
         "https://example.test/second",
         "https://example.test/third",
     ];
-    for ch in GROUP_SAMPLES {
+    for ch in range_samples() {
         for position in 0..clean.len() {
             let uris: Vec<String> = clean
                 .iter()
@@ -388,7 +429,18 @@ async fn registration_rejects_spoofing_characters_at_every_redirect_uri_position
 async fn passthrough_registration_echoes_spoofing_names_unchanged() -> anyhow::Result<()> {
     // Given
     let server = Harness::start_mode("30days", "passthrough").await?;
-    for ch in ['\u{202E}', '\u{2066}', '\u{200B}', '\u{FEFF}', '\u{0007}'] {
+    for ch in [
+        '\u{202E}',
+        '\u{2066}',
+        '\u{200B}',
+        '\u{FEFF}',
+        '\u{0007}',
+        '\u{3164}',
+        '\u{034F}',
+        '\u{2065}',
+        '\u{E0001}',
+        '\u{FFF9}',
+    ] {
         let name = format!("lead{ch}tail");
         // When
         let (status, body) = post_registration(
@@ -469,7 +521,7 @@ async fn registration_rejects_redirect_spoofing_for_every_name_shape_and_positio
                 owned.len()
             );
         }
-        for ch in GROUP_SAMPLES {
+        for ch in range_samples() {
             for (count, position) in [(1, 0), (3, 0), (3, 1), (3, 2)] {
                 let uris: Vec<String> = clean
                     .iter()
@@ -520,7 +572,7 @@ async fn nameless_registration_rejects_redirect_spoofing_with_any_optional_metad
             control_status == 201,
             "clean name-less control, mask {mask}: {control_status}"
         );
-        for ch in GROUP_SAMPLES {
+        for ch in range_samples() {
             let uris = vec![
                 "https://example.test/a".to_owned(),
                 format!("https://example.test/b{ch}"),
@@ -825,7 +877,7 @@ async fn registration_rejects_spoofing_characters_in_every_redirect_uri_shape() 
     // Given
     let server = Harness::start("30days").await?;
     for shape in &URI_SHAPES {
-        for ch in GROUP_SAMPLES {
+        for ch in range_samples() {
             for (place, uri) in shape.spoofed(ch) {
                 for name in [None, Some("Shape spoofing fixture")] {
                     // When
@@ -846,6 +898,460 @@ async fn registration_rejects_spoofing_characters_in_every_redirect_uri_shape() 
                         u32::from(ch)
                     );
                 }
+            }
+        }
+    }
+    server.close().await
+}
+
+/// The HTML text a browser receives for an untrusted value.
+fn escaped(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// The signing secret shared by every harness server.
+const FIXTURE_SECRET: &str = "fixture-secret-with-at-least-32-bytes";
+
+/// A client identifier sealed independently of the server, forged to model a client minted under looser rules.
+fn sealed_client(uris: &[String], name: Option<&str>) -> anyhow::Result<String> {
+    reference_seal(
+        FIXTURE_SECRET,
+        "client",
+        &json!({"ru":uris,"n":name,"iat":1_700_000_000_u64}),
+    )
+}
+
+/// Open `/authorize` for `uri` under client `cid` and return the status with the body text.
+async fn authorize_uri(server: &Harness, cid: &str, uri: &str) -> anyhow::Result<(u16, String)> {
+    let mut pairs = Harness::params(cid);
+    pairs.retain(|(key, _)| *key != "redirect_uri");
+    pairs.push(("redirect_uri", uri));
+    let response = server.authorize(&pairs, None).await?;
+    let status = response.status().as_u16();
+    Ok((status, response.text().await?))
+}
+
+/// An emoji with a variation selector registers and is rendered inside the name isolate.
+#[tokio::test]
+async fn registration_accepts_an_emoji_with_a_variation_selector() -> anyhow::Result<()> {
+    // Given
+    let server = Harness::start("30days").await?;
+    let name = "Heart \u{2764}\u{FE0F}";
+    for sample in [name, "Tag \u{E0100} \u{FE00} \u{E01EF} \u{FE0E} end"] {
+        // When
+        let (status, body) = post_registration(
+            &server,
+            &json!({"redirect_uris":[CALLBACK],"client_name":sample}),
+        )
+        .await?;
+        // Then
+        ensure!(status == 201, "variation selectors accepted: {status}");
+        let parsed: Value = serde_json::from_str(&body)?;
+        ensure!(
+            parsed.get("client_name") == Some(&json!(sample)),
+            "name unchanged"
+        );
+    }
+    let cid = server.register(name).await?;
+    let html = server.page(&cid).await?.text().await?;
+    ensure!(
+        html.contains(&format!(
+            "<p><bdi>{name}</bdi> (name supplied by the application, not verified)</p>"
+        )),
+        "rendered inside the isolate"
+    );
+    server.close().await
+}
+
+/// A sealed client whose redirect URI holds a rejected character never reaches the consent page.
+#[tokio::test]
+async fn authorize_rejects_a_sealed_client_with_a_spoofing_redirect_uri() -> anyhow::Result<()> {
+    // Given
+    let server = Harness::start("30days").await?;
+    let clean = [
+        "https://example.test/first",
+        "http://127.0.0.1:18999/second?mode=web",
+        "https://callbacks.example.test/oauth/return/handler/with/a/long/path",
+    ];
+    let clean_uris: Vec<String> = clean.iter().map(|uri| (*uri).to_owned()).collect();
+    let control = sealed_client(&clean_uris, Some("Sealed control"))?;
+    for uri in clean {
+        // When
+        let (status, html) = authorize_uri(&server, &control, uri).await?;
+        // Then
+        ensure!(
+            status == 200 && html.contains("Authorize access"),
+            "clean sealed client reaches consent for {uri}: {status}"
+        );
+    }
+    for ch in range_samples() {
+        for position in 0..clean.len() {
+            let uris: Vec<String> = clean_uris
+                .iter()
+                .enumerate()
+                .map(|(i, uri)| {
+                    if i == position {
+                        format!("{uri}{ch}")
+                    } else {
+                        uri.clone()
+                    }
+                })
+                .collect();
+            for name in [None, Some("Sealed spoofing fixture")] {
+                let cid = sealed_client(&uris, name)?;
+                for (index, candidate) in uris.iter().enumerate() {
+                    // When
+                    let (status, html) = authorize_uri(&server, &cid, candidate).await?;
+                    // Then
+                    if index == position {
+                        ensure!(
+                            status == 400
+                                && html.contains("<h1>Authorization request rejected</h1>")
+                                && !html.contains("Authorize access")
+                                && !html.contains(ch),
+                            "U+{:04X} in sealed URI {position} rejected, got {status}",
+                            u32::from(ch)
+                        );
+                    } else {
+                        ensure!(
+                            status == 200 && html.contains("Authorize access"),
+                            "clean sibling {index} of U+{:04X} in {position} still works: {status}",
+                            u32::from(ch)
+                        );
+                    }
+                }
+            }
+        }
+    }
+    server.close().await
+}
+
+/// The consent page isolates the redirect URI and its host for every accepted URI shape.
+#[tokio::test]
+async fn consent_page_isolates_the_redirect_uri_and_host_for_every_uri_shape() -> anyhow::Result<()>
+{
+    // Given
+    let server = Harness::start("30days").await?;
+    for shape in URI_SHAPES.iter().filter(|shape| shape.accepted) {
+        let uri = shape.clean(0);
+        let host = url::Url::parse(&uri)?
+            .host_str()
+            .context("host")?
+            .to_owned();
+        let cid = sealed_client(from_ref(&uri), None)?;
+        // When
+        let (status, html) = authorize_uri(&server, &cid, &uri).await?;
+        // Then
+        ensure!(status == 200, "{} consent page: {status}", shape.label);
+        let expected = format!(
+            "sent to: <bdi>{}</bdi> <bdi><strong>{}</strong></bdi></p>",
+            escaped(&uri),
+            escaped(&host)
+        );
+        ensure!(
+            html.contains(&expected),
+            "{} isolated fragment",
+            shape.label
+        );
+    }
+    server.close().await
+}
+
+/// Hostile characters in the redirect URI stay escaped inside the isolate and the name marker stays outside.
+#[tokio::test]
+async fn consent_page_escapes_hostile_redirect_uri_characters_inside_the_isolate()
+-> anyhow::Result<()> {
+    // Given
+    let server = Harness::start("30days").await?;
+    for uri in [
+        "https://example.test/cb?x=<img/src=x>&quote='\"",
+        "https://ex&a'mple.test/cb?q=1&r=2",
+        "https://example.test/a'b&c",
+    ] {
+        let host = url::Url::parse(uri)?.host_str().context("host")?.to_owned();
+        let cid = sealed_client(&[uri.to_owned()], Some("Hostile URI fixture"))?;
+        // When
+        let (status, html) = authorize_uri(&server, &cid, uri).await?;
+        // Then
+        ensure!(status == 200, "hostile URI consent page: {status}");
+        let expected = format!(
+            "sent to: <bdi>{}</bdi> <bdi><strong>{}</strong></bdi></p>",
+            escaped(uri),
+            escaped(&host)
+        );
+        ensure!(html.contains(&expected), "escaped inside isolates: {uri}");
+        ensure!(!html.contains("<img/src=x>"), "no injected element");
+        ensure!(
+            html.contains(
+                "<p><bdi>Hostile URI fixture</bdi> (name supplied by the application, not verified)</p>"
+            ),
+            "marker stays outside the name isolate"
+        );
+    }
+    server.close().await
+}
+
+/// A remembered approval for a sealed client does not let a spoofing redirect URI skip the check.
+#[tokio::test]
+async fn remembered_approval_does_not_bypass_redirect_uri_validation() -> anyhow::Result<()> {
+    // Given
+    let server = Harness::start("30days").await?;
+    let clean = "https://example.test/first";
+    for ch in range_samples() {
+        let hostile = format!("https://example.test/second{ch}");
+        let uris = vec![clean.to_owned(), hostile.clone()];
+        let cid = sealed_client(&uris, Some("Remembered fixture"))?;
+        let mut pairs = Harness::params(&cid);
+        pairs.retain(|(key, _)| *key != "redirect_uri");
+        pairs.push(("redirect_uri", clean));
+        let (token, csrf) = consent_form(server.authorize(&pairs, None).await?).await?;
+        let approved = server.decide(&token, &csrf, "approve").await?;
+        let remembered = response_cookie(&approved, "rmcp_consent_")?;
+        // When
+        let control = server.authorize(&pairs, Some(&remembered)).await?;
+        let mut spoofed = Harness::params(&cid);
+        spoofed.retain(|(key, _)| *key != "redirect_uri");
+        spoofed.push(("redirect_uri", hostile.as_str()));
+        let response = server.authorize(&spoofed, Some(&remembered)).await?;
+        // Then
+        ensure!(control.status() == 302, "remembered clean URI redirects");
+        ensure!(
+            response.status() == 400 && !response.headers().contains_key("location"),
+            "U+{:04X} URI rejected despite remembered approval: {}",
+            u32::from(ch),
+            response.status()
+        );
+    }
+    server.close().await
+}
+
+/// What `/authorize` must answer for one request shape.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Answer {
+    /// The consent page (HTTP 200).
+    Page,
+    /// A protocol error redirected to the registered URI (HTTP 302 with `error` and `iss`).
+    Redirect,
+    /// A nonredirecting error page (HTTP 400 without a `Location` header).
+    Plain,
+}
+
+/// One way an authorization request can be defective, and what a clean client receives for it.
+struct Defect {
+    label: &'static str,
+    /// Keys removed from the valid parameters.
+    drop: &'static [&'static str],
+    /// Pairs appended after removal.
+    add: &'static [(&'static str, &'static str)],
+    /// Whether the request targets a URI that no sealed entry holds.
+    unmatched: bool,
+    expected: Answer,
+}
+
+/// The authorization-request defects, each with the answer a clean sealed client receives.
+const DEFECTS: [Defect; 15] = [
+    Defect {
+        label: "no defect",
+        drop: &[],
+        add: &[],
+        unmatched: false,
+        expected: Answer::Page,
+    },
+    Defect {
+        label: "response_type token",
+        drop: &["response_type"],
+        add: &[("response_type", "token")],
+        unmatched: false,
+        expected: Answer::Redirect,
+    },
+    Defect {
+        label: "missing response_type",
+        drop: &["response_type"],
+        add: &[],
+        unmatched: false,
+        expected: Answer::Redirect,
+    },
+    Defect {
+        label: "missing code_challenge",
+        drop: &["code_challenge"],
+        add: &[],
+        unmatched: false,
+        expected: Answer::Redirect,
+    },
+    Defect {
+        label: "short code_challenge",
+        drop: &["code_challenge"],
+        add: &[("code_challenge", "short")],
+        unmatched: false,
+        expected: Answer::Redirect,
+    },
+    Defect {
+        label: "bad charset code_challenge",
+        drop: &["code_challenge"],
+        add: &[(
+            "code_challenge",
+            "abcdefghijklmnopqrstuvwxyz0123456789ABCDE!!",
+        )],
+        unmatched: false,
+        expected: Answer::Redirect,
+    },
+    Defect {
+        label: "method plain",
+        drop: &["code_challenge_method"],
+        add: &[("code_challenge_method", "plain")],
+        unmatched: false,
+        expected: Answer::Redirect,
+    },
+    Defect {
+        label: "missing method",
+        drop: &["code_challenge_method"],
+        add: &[],
+        unmatched: false,
+        expected: Answer::Redirect,
+    },
+    Defect {
+        label: "duplicated state",
+        drop: &[],
+        add: &[("state", "second-state")],
+        unmatched: false,
+        expected: Answer::Plain,
+    },
+    Defect {
+        label: "duplicated response_type",
+        drop: &[],
+        add: &[("response_type", "code")],
+        unmatched: false,
+        expected: Answer::Plain,
+    },
+    Defect {
+        label: "unmatched redirect_uri",
+        drop: &[],
+        add: &[],
+        unmatched: true,
+        expected: Answer::Plain,
+    },
+    Defect {
+        label: "long code_challenge",
+        drop: &["code_challenge"],
+        add: &[("code_challenge", LONG_CHALLENGE)],
+        unmatched: false,
+        expected: Answer::Redirect,
+    },
+    Defect {
+        label: "oversized state",
+        drop: &["state"],
+        add: &[("state", OVERSIZED)],
+        unmatched: false,
+        expected: Answer::Redirect,
+    },
+    Defect {
+        label: "oversized scope",
+        drop: &["scope"],
+        add: &[("scope", OVERSIZED)],
+        unmatched: false,
+        expected: Answer::Redirect,
+    },
+    Defect {
+        label: "duplicated code_challenge_method",
+        drop: &[],
+        add: &[("code_challenge_method", "S256")],
+        unmatched: false,
+        expected: Answer::Plain,
+    },
+];
+
+/// A 129-character challenge, one past the maximum.
+const LONG_CHALLENGE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+/// A 513-character value, one past the state and scope maximum.
+const OVERSIZED: &str = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+
+/// The sealed redirect URIs used by the defect table.
+const DEFECT_URIS: [&str; 3] = [
+    "https://example.test/first",
+    "http://127.0.0.1:18999/second?mode=web",
+    "https://callbacks.example.test/oauth/return/handler/with/a/long/path",
+];
+
+/// Send an authorization request for `uri` shaped by `defect` and classify the answer.
+async fn classify(
+    server: &Harness,
+    cid: &str,
+    uri: &str,
+    defect: &Defect,
+) -> anyhow::Result<(Answer, String)> {
+    let target = if defect.unmatched {
+        "https://unregistered.example.test/elsewhere"
+    } else {
+        uri
+    };
+    let mut pairs = Harness::params(cid);
+    pairs.retain(|(key, _)| *key != "redirect_uri" && !defect.drop.contains(key));
+    pairs.push(("redirect_uri", target));
+    pairs.extend_from_slice(defect.add);
+    let response = server.authorize(&pairs, None).await?;
+    let status = response.status().as_u16();
+    let location = response.headers().contains_key("location");
+    let body = response.text().await?;
+    let answer = match (status, location) {
+        (200, false) => Answer::Page,
+        (302, true) => Answer::Redirect,
+        (400, false) => Answer::Plain,
+        other => anyhow::bail!("{}: unexpected {other:?}", defect.label),
+    };
+    Ok((answer, body))
+}
+
+/// A protocol defect never turns a sealed spoofing redirect URI into a redirect target.
+#[tokio::test]
+async fn sealed_spoofing_redirect_uri_is_never_a_redirect_target_for_any_request_defect()
+-> anyhow::Result<()> {
+    // Given
+    let server = Harness::start("30days").await?;
+    let clean_uris: Vec<String> = DEFECT_URIS.iter().map(|uri| (*uri).to_owned()).collect();
+    let control = sealed_client(&clean_uris, Some("Defect control"))?;
+    for defect in &DEFECTS {
+        for uri in DEFECT_URIS {
+            // When
+            let (answer, _) = classify(&server, &control, uri, defect).await?;
+            // Then
+            ensure!(
+                answer == defect.expected,
+                "clean sealed client, {}: {answer:?}",
+                defect.label
+            );
+        }
+    }
+    for ch in range_samples() {
+        for position in 0..DEFECT_URIS.len() {
+            let uris: Vec<String> = clean_uris
+                .iter()
+                .enumerate()
+                .map(|(i, uri)| {
+                    if i == position {
+                        format!("{uri}{ch}")
+                    } else {
+                        uri.clone()
+                    }
+                })
+                .collect();
+            let cid = sealed_client(&uris, Some("Defect spoofing fixture"))?;
+            let hostile = uris.get(position).context("hostile URI")?;
+            for defect in &DEFECTS {
+                // When
+                let (answer, body) = classify(&server, &cid, hostile, defect).await?;
+                // Then
+                ensure!(
+                    answer == Answer::Plain && !body.contains(ch),
+                    "U+{:04X} in sealed URI {position}, {}: {answer:?}",
+                    u32::from(ch),
+                    defect.label
+                );
             }
         }
     }

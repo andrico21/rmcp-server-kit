@@ -345,23 +345,39 @@ fn loopback(url: &Url) -> bool {
 
 /// Report whether a character can hide, reorder or visually fake neighbouring text.
 ///
-/// Covers the bidirectional controls (U+061C, U+200E, U+200F, U+202A to U+202E,
-/// U+2066 to U+2069) and the invisible formatting or separator characters
-/// (U+200B to U+200D, U+2060 to U+2064, U+FEFF, U+00AD, U+2028, U+2029). Letters
-/// of right-to-left scripts are not in this set.
+/// The set is the Unicode `Default_Ignorable_Code_Point` property minus the variation
+/// selector blocks U+FE00 to U+FE0F and U+E0100 to U+E01EF, plus the invisible characters
+/// that are not default ignorable: U+2028, U+2029, U+2800 and U+FFF9 to U+FFFB. It includes
+/// the bidirectional controls, the zero-width and invisible formatting characters, the
+/// Hangul and Khmer fillers and the tag characters. Letters of right-to-left scripts are
+/// not in this set.
+///
+/// Trade-offs: the variation selectors stay accepted so that emoji such as a heart with
+/// U+FE0F remain valid. The zero-width joiner is rejected, so joined emoji sequences are
+/// not accepted; tag-sequence flags such as the flag of England are rejected with the tag
+/// characters; and the Mongolian free variation selectors U+180B to U+180D and U+180F are
+/// rejected.
 const fn is_spoofing_char(ch: char) -> bool {
     matches!(
         ch,
-        '\u{061C}'
-            | '\u{200E}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2066}'..='\u{2069}'
-            | '\u{200B}'..='\u{200D}'
-            | '\u{2060}'..='\u{2064}'
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{17B4}'..='\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{2800}'
+            | '\u{3164}'
             | '\u{FEFF}'
-            | '\u{00AD}'
-            | '\u{2028}'
-            | '\u{2029}'
+            | '\u{FFA0}'
+            | '\u{FFF0}'..='\u{FFFB}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E00FF}'
+            | '\u{E01F0}'..='\u{E0FFF}'
     )
 }
 
@@ -484,6 +500,9 @@ async fn authorize(
     else {
         return rejected("redirect_uri", false);
     };
+    if redirect_uri(ru).is_none() {
+        return rejected("redirect_uri", false);
+    }
     let mut request = ConsentRequest {
         cid: sha256_b64(cid),
         ru: ru.to_owned(),
@@ -617,7 +636,7 @@ fn consent_page(
     page(
         StatusCode::OK,
         &format!(
-            "<h1>Authorize access</h1><p>Authorize access to {}.</p><p>{name}</p><p>After approval you will be sent to: {} <strong>{}</strong></p>{local}{scopes}<form method=\"post\" action=\"/oauth/consent\"><input type=\"hidden\" name=\"request\" value=\"{}\"><button name=\"decision\" value=\"approve\">Approve</button><button name=\"decision\" value=\"deny\">Deny</button></form>",
+            "<h1>Authorize access</h1><p>Authorize access to {}.</p><p>{name}</p><p>After approval you will be sent to: <bdi>{}</bdi> <bdi><strong>{}</strong></bdi></p>{local}{scopes}<form method=\"post\" action=\"/oauth/consent\"><input type=\"hidden\" name=\"request\" value=\"{}\"><button name=\"decision\" value=\"approve\">Approve</button><button name=\"decision\" value=\"deny\">Deny</button></form>",
             html_escape(&state.server_name),
             html_escape(&request.ru),
             html_escape(host),

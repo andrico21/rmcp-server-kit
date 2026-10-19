@@ -101,6 +101,13 @@ required) and [`docs/OAUTH_PROXY.md`](docs/OAUTH_PROXY.md).
   advertised issuer must be byte-identical to the authorization server
   metadata issuer (RFC 8414 section 3.3). Passthrough and direct modes are
   unchanged.
+- In `authorization_server` mode `/register` and `/authorize` reject every Unicode
+  default-ignorable or invisible character (for example U+3164, U+034F, tag
+  characters and U+2800) in `client_name` and redirect URIs, except the variation
+  selectors that emoji need; the redirect URI and its host are shown inside
+  `<bdi>` isolates; and `/authorize` re-validates the matched redirect URI of an
+  already sealed client. Joined emoji sequences, tag-sequence flags and the
+  Mongolian free variation selectors are rejected as a documented trade-off.
 
 ### Notes
 

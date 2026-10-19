@@ -3,7 +3,7 @@
 use super::*;
 
 /// Reference model: every rejected code point range, inclusive.
-const RANGES: [(u32, u32); 9] = [
+const RANGES: [(u32, u32); 23] = [
     (0x061C, 0x061C),
     (0x200E, 0x200F),
     (0x202A, 0x202E),
@@ -13,6 +13,20 @@ const RANGES: [(u32, u32); 9] = [
     (0xFEFF, 0xFEFF),
     (0x00AD, 0x00AD),
     (0x2028, 0x2029),
+    (0x034F, 0x034F),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x2065, 0x2065),
+    (0x206A, 0x206F),
+    (0x2800, 0x2800),
+    (0x3164, 0x3164),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFFB),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE00FF),
+    (0xE01F0, 0xE0FFF),
 ];
 
 /// Whether the reference model rejects this code point.
@@ -20,7 +34,8 @@ fn model_rejects(code: u32) -> bool {
     RANGES.iter().any(|(lo, hi)| (*lo..=*hi).contains(&code))
 }
 
-/// Every range edge is a spoofing character and the neighbours outside it are not.
+/// Every code point of every range is a spoofing character and the neighbours outside are not,
+/// including the variation selector blocks that emoji sequences need.
 #[test]
 fn spoofing_classification_matches_each_range_edge() -> anyhow::Result<()> {
     // Given
@@ -29,8 +44,9 @@ fn spoofing_classification_matches_each_range_edge() -> anyhow::Result<()> {
         .flat_map(|(lo, hi)| [lo - 1, hi + 1])
         .filter(|code| !model_rejects(*code))
         .chain([
-            0x2058, 0x2065, 0x202F, 0x200A, 0x2027, 0xFEFE, 0xFF00, 0x061B, 0x00AC, 0x00AE, 0x2070,
-            0x2010, 0x061D, 0x205F, 0x206A, 0x062A, 0x05D0, 0x61, 0x20,
+            0x2058, 0x202F, 0x200A, 0x2027, 0xFEFE, 0xFF00, 0x061B, 0x00AC, 0x00AE, 0x2070, 0x2010,
+            0x061D, 0x205F, 0x062A, 0x05D0, 0x61, 0x20, 0xFE00, 0xFE0E, 0xFE0F, 0xE0100, 0xE01EF,
+            0x2764, 0x1F680, 0x1F3F4,
         ])
         .collect();
     // When / Then

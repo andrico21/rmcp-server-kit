@@ -459,7 +459,7 @@ graph TD
 | Memory-bounded keyed limiter      | `src/bounded_limiter.rs`                 | `BoundedKeyedLimiter` L158                                                    |
 | Trusted-forwarder resolution      | `src/forwarded.rs`                       | `resolve_client_ip`, `FallbackReason` (rightmost-untrusted, fail-safe-to-direct) |
 | OAuth JWT / JWKS                  | `src/oauth.rs` (feature `oauth`)         | `JwksCache` L3161, `JWKS_REFRESH_COOLDOWN` ~L3352, `select_jwks_key` L4053 |
-| OAuth proxy `authorization_server` mode | `src/oauth_as.rs` (feature `oauth`)  | `install_routes` L182, `register` L370, `callback` L828, `token` L1038       |
+| OAuth proxy `authorization_server` mode | `src/oauth_as.rs` (feature `oauth`)  | `install_routes` L182, `register` L386, `callback` L847, `token` L1057       |
 | Sealed proxy values               | `src/oauth_seal.rs` (feature `oauth`)    | `Sealer` L83, `SealKind` L23, `MAX_SEALED_LEN` L19                            |
 | SSRF guard (outbound HTTP)        | `src/ssrf.rs`                            | per-hop scheme/userinfo/IP-literal blocks                                     |
 | mTLS revocation (CRL)             | `src/mtls_revocation.rs`                 | `CrlSet` L330, `DynamicClientCertVerifier` L1745, `bootstrap_fetch` L2172       |
