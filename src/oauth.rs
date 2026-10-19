@@ -62,6 +62,11 @@ use url::form_urlencoded;
 use crate::{
     auth::{AuthIdentity, AuthMethod, CredentialOwner, RejectionReason},
     cancel::DetachOutcome,
+    config::{
+        SERVER_OAUTH_PROXY_SEALING_SECRET_ENV, SERVER_OAUTH_PROXY_SEALING_SECRET_FILE_ENV,
+        SERVER_OAUTH_PROXY_SEALING_SECRET_PREVIOUS_ENV,
+        SERVER_OAUTH_PROXY_SEALING_SECRET_PREVIOUS_FILE_ENV,
+    },
     diagnostics::{oauth_claim_values, plaintext_oauth_tokens, upstream_error_bodies},
     error::RmcpServerKitError,
     rbac::first_matching_scope_role,
@@ -1702,25 +1707,35 @@ impl OAuthConfig {
         match proxy.mode {
             ProxyMode::Passthrough => Ok(()),
             ProxyMode::AuthorizationServer => {
+                let current_hint = sealing_secret_hint(
+                    "server.auth.oauth.proxy.sealing_secret",
+                    SERVER_OAUTH_PROXY_SEALING_SECRET_ENV,
+                    SERVER_OAUTH_PROXY_SEALING_SECRET_FILE_ENV,
+                );
+                let previous_hint = sealing_secret_hint(
+                    "server.auth.oauth.proxy.sealing_secret_previous",
+                    SERVER_OAUTH_PROXY_SEALING_SECRET_PREVIOUS_ENV,
+                    SERVER_OAUTH_PROXY_SEALING_SECRET_PREVIOUS_FILE_ENV,
+                );
                 let Some(current) = &proxy.sealing_secret else {
-                    return Err(RmcpServerKitError::Config(
+                    return Err(RmcpServerKitError::Config(format!(
                         "oauth.proxy.sealing_secret is required when \
-                         oauth.proxy.mode = \"authorization_server\""
-                            .into(),
-                    ));
+                         oauth.proxy.mode = \"authorization_server\" (set {current_hint})"
+                    )));
                 };
-                validate_configured_secret("oauth.proxy.sealing_secret", current.expose_secret())?;
+                validate_configured_secret("oauth.proxy.sealing_secret", current.expose_secret())
+                    .map_err(|err| with_secret_hint(err, &current_hint))?;
                 if let Some(previous) = &proxy.sealing_secret_previous {
                     validate_configured_secret(
                         "oauth.proxy.sealing_secret_previous",
                         previous.expose_secret(),
-                    )?;
+                    )
+                    .map_err(|err| with_secret_hint(err, &previous_hint))?;
                     if previous.expose_secret() == current.expose_secret() {
-                        return Err(RmcpServerKitError::Config(
+                        return Err(RmcpServerKitError::Config(format!(
                             "oauth.proxy.sealing_secret_previous must differ from \
-                             oauth.proxy.sealing_secret"
-                                .into(),
-                        ));
+                             oauth.proxy.sealing_secret ({previous_hint}; {current_hint})"
+                        )));
                     }
                 }
                 if self.authorization_server_metadata_issuer.is_some() {
@@ -4357,6 +4372,22 @@ async fn wait_for_refresh_generation(
             () = shutdown.cancelled() => return,
         }
     }
+}
+
+/// Render the "TOML key plus env vars" hint used in sealing-secret errors.
+fn sealing_secret_hint(toml_key: &str, env_var: &str, file_env_var: &str) -> String {
+    format!("{toml_key} (env {env_var} or {file_env_var})")
+}
+
+/// Append the "where to fix it" hint to a sealing-secret strength error.
+///
+/// Only the hint (field and env var names) is added; the secret value is
+/// never part of either message.
+fn with_secret_hint(err: RmcpServerKitError, hint: &str) -> RmcpServerKitError {
+    let RmcpServerKitError::Config(message) = &err else {
+        return err;
+    };
+    RmcpServerKitError::Config(format!("{message}; set {hint}"))
 }
 
 #[cfg(test)]

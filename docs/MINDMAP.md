@@ -458,7 +458,7 @@ graph TD
 | RBAC engine                       | `src/rbac.rs`                            | `RbacPolicy` L709, `current_role` L158, `current_identity` L180, `current_token` L202, `current_sub` L220, `rbac_middleware` L1354           |
 | Memory-bounded keyed limiter      | `src/bounded_limiter.rs`                 | `BoundedKeyedLimiter` L158                                                    |
 | Trusted-forwarder resolution      | `src/forwarded.rs`                       | `resolve_client_ip`, `FallbackReason` (rightmost-untrusted, fail-safe-to-direct) |
-| OAuth JWT / JWKS                  | `src/oauth.rs` (feature `oauth`)         | `JwksCache` L3146, `JWKS_REFRESH_COOLDOWN` ~L3337, `select_jwks_key` L4038 |
+| OAuth JWT / JWKS                  | `src/oauth.rs` (feature `oauth`)         | `JwksCache` L3161, `JWKS_REFRESH_COOLDOWN` ~L3352, `select_jwks_key` L4053 |
 | OAuth proxy `authorization_server` mode | `src/oauth_as.rs` (feature `oauth`)  | `install_routes` L182, `register` L343, `callback` L800, `token` L1010       |
 | Sealed proxy values               | `src/oauth_seal.rs` (feature `oauth`)    | `Sealer` L83, `SealKind` L23, `MAX_SEALED_LEN` L19                            |
 | SSRF guard (outbound HTTP)        | `src/ssrf.rs`                            | per-hop scheme/userinfo/IP-literal blocks                                     |

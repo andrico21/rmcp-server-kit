@@ -408,8 +408,8 @@ no userinfo, path, query or fragment, and no backslash or other byte a
 browser `Origin` never contains; a non-empty `allowed_origins` must contain
 its origin; `authorization_servers` must be unset or exactly the issuer;
 `authorization_server_metadata_issuer` must be unset; `sealing_secret` must
-be set. The `public_url`, `allowed_origins` and `authorization_servers`
-errors name both the TOML key and the env var to change.
+be set. The `public_url`, `allowed_origins`, `authorization_servers` and
+`sealing_secret*` errors name both the TOML key and the env var to change.
 
 When at least one opt-in is enabled the server logs one INFO line,
 `oauth opt-in features enabled`, with booleans and counts only. Opt-ins are

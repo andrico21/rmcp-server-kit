@@ -4344,7 +4344,7 @@ client_ip = false
         )
     }
 
-    /// Rejects authorization-server mode without `sealing_secret`.
+    /// Rejects authorization-server mode without `sealing_secret`, naming the key and both env vars.
     #[cfg(feature = "oauth")]
     #[test]
     fn authorization_server_requires_sealing_secret() -> anyhow::Result<()> {
@@ -4355,13 +4355,23 @@ client_ip = false
             "authorization_server without sealing_secret",
             &server,
             "oauth.proxy.sealing_secret is required when oauth.proxy.mode = \"authorization_server\"",
+        )?;
+        assert_server_config_rejected_by_both(
+            "authorization_server without sealing_secret names key and env",
+            &server,
+            &format!(
+                "server.auth.oauth.proxy.sealing_secret (env {SERVER_OAUTH_PROXY_SEALING_SECRET_ENV} or {SERVER_OAUTH_PROXY_SEALING_SECRET_FILE_ENV})"
+            ),
         )
     }
 
-    /// Rejects authorization-server mode with a weak `sealing_secret`.
+    /// Rejects authorization-server mode with a weak `sealing_secret`, naming the key and both env vars, never the value.
     #[cfg(feature = "oauth")]
     #[test]
     fn authorization_server_rejects_weak_sealing_secret() -> anyhow::Result<()> {
+        let hint = format!(
+            "server.auth.oauth.proxy.sealing_secret (env {SERVER_OAUTH_PROXY_SEALING_SECRET_ENV} or {SERVER_OAUTH_PROXY_SEALING_SECRET_FILE_ENV})"
+        );
         for (weak, expected) in [
             (
                 "too-short",
@@ -4376,11 +4386,12 @@ client_ip = false
                 proxy.sealing_secret = Some(SecretString::from(weak.to_owned()));
             });
             assert_server_config_rejected_by_both("weak sealing_secret", &server, expected)?;
+            assert_server_config_rejected_by_both("weak sealing_secret hint", &server, &hint)?;
         }
         Ok(())
     }
 
-    /// Rejects authorization-server mode with a weak `sealing_secret_previous`.
+    /// Rejects authorization-server mode with a weak `sealing_secret_previous`, naming the key and both env vars.
     #[cfg(feature = "oauth")]
     #[test]
     fn authorization_server_rejects_weak_previous_sealing_secret() -> anyhow::Result<()> {
@@ -4391,10 +4402,17 @@ client_ip = false
             "weak sealing_secret_previous",
             &server,
             "oauth.proxy.sealing_secret_previous must be at least 32 UTF-8 bytes",
+        )?;
+        assert_server_config_rejected_by_both(
+            "weak sealing_secret_previous hint",
+            &server,
+            &format!(
+                "server.auth.oauth.proxy.sealing_secret_previous (env {SERVER_OAUTH_PROXY_SEALING_SECRET_PREVIOUS_ENV} or {SERVER_OAUTH_PROXY_SEALING_SECRET_PREVIOUS_FILE_ENV})"
+            ),
         )
     }
 
-    /// Rejects a `sealing_secret_previous` equal to `sealing_secret`.
+    /// Rejects a `sealing_secret_previous` equal to `sealing_secret`, naming both keys and all four env vars.
     #[cfg(feature = "oauth")]
     #[test]
     fn authorization_server_rejects_equal_previous_sealing_secret() -> anyhow::Result<()> {
@@ -4405,7 +4423,211 @@ client_ip = false
             "previous sealing secret equal to current",
             &server,
             "oauth.proxy.sealing_secret_previous must differ from oauth.proxy.sealing_secret",
+        )?;
+        assert_server_config_rejected_by_both(
+            "equal previous sealing secret hint",
+            &server,
+            &format!(
+                "(server.auth.oauth.proxy.sealing_secret_previous (env {SERVER_OAUTH_PROXY_SEALING_SECRET_PREVIOUS_ENV} or {SERVER_OAUTH_PROXY_SEALING_SECRET_PREVIOUS_FILE_ENV}); server.auth.oauth.proxy.sealing_secret (env {SERVER_OAUTH_PROXY_SEALING_SECRET_ENV} or {SERVER_OAUTH_PROXY_SEALING_SECRET_FILE_ENV}))"
+            ),
         )
+    }
+
+    /// Hint naming the `sealing_secret` key and both of its env vars.
+    #[cfg(feature = "oauth")]
+    fn current_sealing_hint() -> String {
+        format!(
+            "server.auth.oauth.proxy.sealing_secret (env {SERVER_OAUTH_PROXY_SEALING_SECRET_ENV} or {SERVER_OAUTH_PROXY_SEALING_SECRET_FILE_ENV})"
+        )
+    }
+
+    /// Hint naming the `sealing_secret_previous` key and both of its env vars.
+    #[cfg(feature = "oauth")]
+    fn previous_sealing_hint() -> String {
+        format!(
+            "server.auth.oauth.proxy.sealing_secret_previous (env {SERVER_OAUTH_PROXY_SEALING_SECRET_PREVIOUS_ENV} or {SERVER_OAUTH_PROXY_SEALING_SECRET_PREVIOUS_FILE_ENV})"
+        )
+    }
+
+    /// Both validators' full error strings for `server`; fails when either accepts it.
+    #[cfg(feature = "oauth")]
+    fn both_error_messages(server: &ServerConfig) -> anyhow::Result<[String; 2]> {
+        let standalone = server
+            .apply_to_mcp_config(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0"))?
+            .validate()
+            .map(|_| ());
+        let (Err(toml), Err(builder)) = (validate_server_config(server), standalone) else {
+            anyhow::bail!("sealing secret config must be rejected by both validators");
+        };
+        Ok([toml.to_string(), builder.to_string()])
+    }
+
+    /// The four sealing-secret failures produce these exact, complete error strings in both validators.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn authorization_server_sealing_secret_errors_are_exact() -> anyhow::Result<()> {
+        let cur = current_sealing_hint();
+        let prev = previous_sealing_hint();
+        let weak_prev = server_with_proxy_mutation(validation_as_proxy(), |proxy| {
+            proxy.sealing_secret_previous = Some(SecretString::from("too-short".to_owned()));
+        });
+        let equal_prev = server_with_proxy_mutation(validation_as_proxy(), |proxy| {
+            proxy.sealing_secret_previous = Some(SecretString::from(SEALING_SECRET.to_owned()));
+        });
+        let missing = server_with_proxy_mutation(validation_as_proxy(), |proxy| {
+            proxy.sealing_secret = None;
+        });
+        let weak_cur = server_with_proxy_mutation(validation_as_proxy(), |proxy| {
+            proxy.sealing_secret = Some(SecretString::from("too-short".to_owned()));
+        });
+        let cases = [
+            (
+                "missing",
+                &missing,
+                format!(
+                    "configuration error: oauth.proxy.sealing_secret is required when oauth.proxy.mode = \"authorization_server\" (set {cur})"
+                ),
+            ),
+            (
+                "weak current",
+                &weak_cur,
+                format!(
+                    "configuration error: oauth.proxy.sealing_secret must be at least 32 UTF-8 bytes; set {cur}"
+                ),
+            ),
+            (
+                "equal previous",
+                &equal_prev,
+                format!(
+                    "configuration error: oauth.proxy.sealing_secret_previous must differ from oauth.proxy.sealing_secret ({prev}; {cur})"
+                ),
+            ),
+            (
+                "weak previous",
+                &weak_prev,
+                format!(
+                    "configuration error: oauth.proxy.sealing_secret_previous must be at least 32 UTF-8 bytes; set {prev}"
+                ),
+            ),
+        ];
+        for (label, server, expected) in cases {
+            for message in both_error_messages(server)? {
+                assert_eq!(message, expected, "{label}: complete message differs");
+            }
+        }
+        Ok(())
+    }
+
+    /// A rejected sealing secret never leaks its value, a prefix, a suffix, or its length into either validator's error text.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn authorization_server_errors_never_reveal_secret_bytes() -> anyhow::Result<()> {
+        let weak_markers = [
+            "Qz9#Vk",
+            "LEAKMARKER-weak-7f3a",
+            "Jx4%Lm6^Nb0&Rt3*Yc1!Wp8",
+            "Zq!7Xv#Kd9$Mw2%Pr5^Tb8&Hn4*Yc",
+            "\t\t\t\t\t\t\t\n",
+        ];
+        let strong_marker = "Qz9#Vk2!Wp8$Jx4%Lm6^Nb0&Rt3*Yc1";
+        let mut probes: Vec<(ServerConfig, &str)> = Vec::new();
+        for marker in weak_markers {
+            probes.push((
+                server_with_proxy_mutation(validation_as_proxy(), |proxy| {
+                    proxy.sealing_secret = Some(SecretString::from(marker.to_owned()));
+                }),
+                marker,
+            ));
+            probes.push((
+                server_with_proxy_mutation(validation_as_proxy(), |proxy| {
+                    proxy.sealing_secret_previous = Some(SecretString::from(marker.to_owned()));
+                }),
+                marker,
+            ));
+        }
+        probes.push((
+            server_with_proxy_mutation(validation_as_proxy(), |proxy| {
+                proxy.sealing_secret = Some(SecretString::from(strong_marker.to_owned()));
+                proxy.sealing_secret_previous = Some(SecretString::from(strong_marker.to_owned()));
+            }),
+            strong_marker,
+        ));
+        for (server, marker) in &probes {
+            for message in both_error_messages(server)? {
+                let scrubbed = message.replace("32 UTF-8 bytes", "");
+                let len = marker.len().to_string();
+                assert!(
+                    !scrubbed.contains(&len),
+                    "error must not reveal the secret length {len}; got {message:?}"
+                );
+                let bytes = marker.as_bytes();
+                for window in bytes.windows(4) {
+                    let text = String::from_utf8_lossy(window);
+                    assert!(
+                        !message.contains(text.as_ref()),
+                        "error must not echo any 4-byte window of the secret; got {message:?}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The secret strength rule is 32 UTF-8 bytes, for both the current and the previous secret.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn authorization_server_sealing_secret_boundary_is_32_bytes() -> anyhow::Result<()> {
+        let cur = current_sealing_hint();
+        let prev = previous_sealing_hint();
+        let two_byte = "\u{e9}";
+        let rejected: [(String, &str); 4] = [
+            (String::new(), "must not be empty or whitespace-only"),
+            ("x".to_owned(), "must be at least 32 UTF-8 bytes"),
+            ("x".repeat(31), "must be at least 32 UTF-8 bytes"),
+            (
+                format!("{two_byte}{}", "x".repeat(29)),
+                "must be at least 32 UTF-8 bytes",
+            ),
+        ];
+        for (secret, rule) in rejected {
+            let current = server_with_proxy_mutation(validation_as_proxy(), |proxy| {
+                proxy.sealing_secret = Some(SecretString::from(secret.clone()));
+            });
+            let previous = server_with_proxy_mutation(validation_as_proxy(), |proxy| {
+                proxy.sealing_secret_previous = Some(SecretString::from(secret.clone()));
+            });
+            for message in both_error_messages(&current)? {
+                assert_eq!(
+                    message,
+                    format!("configuration error: oauth.proxy.sealing_secret {rule}; set {cur}"),
+                    "current secret of {} bytes",
+                    secret.len()
+                );
+            }
+            for message in both_error_messages(&previous)? {
+                assert_eq!(
+                    message,
+                    format!(
+                        "configuration error: oauth.proxy.sealing_secret_previous {rule}; set {prev}"
+                    ),
+                    "previous secret of {} bytes",
+                    secret.len()
+                );
+            }
+        }
+        for secret in ["c".repeat(32), "c".repeat(33), two_byte.repeat(16)] {
+            let mut current = server_with_proxy_mutation(validation_as_proxy(), |proxy| {
+                proxy.sealing_secret = Some(SecretString::from(secret.clone()));
+            });
+            current.public_url = Some("https://mcp.example".to_owned());
+            assert_server_config_accepted_by_both("accepted current secret", &current)?;
+            let mut previous = server_with_proxy_mutation(validation_as_proxy(), |proxy| {
+                proxy.sealing_secret_previous = Some(SecretString::from(secret.clone()));
+            });
+            previous.public_url = Some("https://mcp.example".to_owned());
+            assert_server_config_accepted_by_both("accepted previous secret", &previous)?;
+        }
+        Ok(())
     }
 
     /// Rejects authorization-server mode with `authorization_server_metadata_issuer` set.

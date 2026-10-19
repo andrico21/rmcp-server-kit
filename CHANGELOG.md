@@ -64,7 +64,8 @@ required) and [`docs/OAUTH_PROXY.md`](docs/OAUTH_PROXY.md).
   Passthrough proxy behavior remains unchanged.
 - Startup validation for the new opt-ins: each rule fires only when its knob
   is set, and every error names the offending field; the `public_url`,
-  `allowed_origins` and `authorization_servers` errors also name the env var.
+  `allowed_origins`, `authorization_servers` and `sealing_secret*` errors also
+  name the env var (both the direct and the `_FILE` variable for the secrets).
 - A startup INFO line, `oauth opt-in features enabled`, logged only when at
   least one opt-in is enabled, with booleans and counts only.
 - Example `oauth_proxy_as_demo` (`cargo run --example oauth_proxy_as_demo

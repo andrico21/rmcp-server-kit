@@ -704,12 +704,12 @@ recommended.
 
 ### Validation flow
 1. Client sends `Authorization: Bearer <jwt>`.
-2. `JwksCache::validate_token(token)` (`validate_token`, `src/oauth.rs:3794`):
+2. `JwksCache::validate_token(token)` (`validate_token`, `src/oauth.rs:3809`):
    - Decodes the JWT header to get `kid` and `alg`.
    - `lookup_key()` looks up by `kid` in the cached JWKS
-     (`lookup_key`, `src/oauth.rs:4680`).
-   - If not found, calls `refresh_with_cooldown()` (`src/oauth.rs:4252`):
-       - Enforces `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:3337`) so multiple
+     (`lookup_key`, `src/oauth.rs:4711`).
+   - If not found, calls `refresh_with_cooldown()` (`src/oauth.rs:4267`):
+       - Enforces `JWKS_REFRESH_COOLDOWN` (`src/oauth.rs:3352`) so multiple
        invalid tokens cannot DoS the JWKS endpoint.
      - Deduplicates concurrent refreshes.
    - Validates signature, `iss`, `aud`, `exp`, `nbf` using `jsonwebtoken`.
@@ -726,7 +726,7 @@ These let downstream MCP clients discover OAuth via the same origin as
 `/mcp`, simplifying CORS and CSP configuration.
 
 The proxy runs in one of two modes, selected by `OAuthProxyConfig::mode`
-(`ProxyMode`, `src/oauth.rs:1284`). `passthrough` (the default) is the
+(`ProxyMode`, `src/oauth.rs:1289`). `passthrough` (the default) is the
 3.20.0 proxy above: `/authorize` redirects to the upstream with the client id
 swapped, the upstream redirects the browser straight back to the client, and
 `/register` echoes the static client id. `authorization_server` returns early
@@ -1096,7 +1096,7 @@ Wired in `build_app_router` (`src/transport.rs:2347`);
    exhaust the rate-limit budget for authenticated callers.
 
 4. **JWKS refresh is rate-limited.** Removing `JWKS_REFRESH_COOLDOWN`
-   (`JWKS_REFRESH_COOLDOWN`, `src/oauth.rs:3337`) creates a DoS vector against the issuer's JWKS endpoint.
+   (`JWKS_REFRESH_COOLDOWN`, `src/oauth.rs:3352`) creates a DoS vector against the issuer's JWKS endpoint.
 
 5. **No symmetric JWT algorithms by default.** `HS*` algorithms with a
    public JWKS would enable algorithm-confusion attacks. Don't add them
