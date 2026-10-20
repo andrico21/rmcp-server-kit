@@ -75,6 +75,18 @@ required) and [`docs/OAUTH_PROXY.md`](docs/OAUTH_PROXY.md).
   flow dissections, configuration examples, Keycloak settings per mode), new
   GUIDE field-table rows, Recipe 7 (Keycloak, direct mode with CIMD) and
   Recipe 8 (OAuth proxy in `authorization_server` mode).
+- Executed configuration examples in
+  [`docs/OAUTH_PROXY.md` section 7](docs/OAUTH_PROXY.md#7-configuration-examples):
+  resource-server cases R1-R8 and proxy cases P1-P7, each with a complete
+  TOML configuration, the environment overrides that apply on top of it, the
+  identity-provider settings and the documented HTTP exchanges, plus two
+  settings matrices (resource-server settings for every case, proxy settings
+  for P1-P7).
+- Integration test target `oauth_cases` (requires `oauth`): serves every case
+  configuration through the real transport on loopback against a fake
+  identity provider and asserts each documented exchange, checks every env
+  block against its case configuration and the GUIDE env-override table, and
+  fails when a settings-matrix cell disagrees with its case.
 - In `authorization_server` mode, `/register` rejects invisible and
   bidirectional format characters in `client_name` and in redirect URIs
   (`invalid_client_metadata` / `invalid_redirect_uri`, the character is not

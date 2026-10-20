@@ -19,7 +19,7 @@ This workspace runs with:
   `dbg_macro = "deny"`
 
 Consequently, even pedantic-tier lint additions in 1.95 WILL produce
-warnings on upgrade. Read the [Clippy 1.95](#clippy-195) section before
+warnings on upgrade. Read the [Clippy 1.95](#4-clippy-195) section before
 running `cargo clippy` against this workspace on the new toolchain.
 
 ---

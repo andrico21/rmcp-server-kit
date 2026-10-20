@@ -89,8 +89,20 @@ sealed values from the old key valid during a rotation, and `consent_ttl`
 remembers consent. Clients that cached the static client id from the
 passthrough `/register` are rejected and have to register again, and users
 holding an old refresh token sign in again;
-[migrating passthrough to authorization_server](OAUTH_PROXY.md#10-migrating-passthrough---authorization_server)
+[case P7, migration passthrough -> `authorization_server`](OAUTH_PROXY.md#p7---migration-passthrough---authorization_server)
 has the full checklist.
+
+In `authorization_server` mode `public_url` must also be written in its
+canonical form: a lowercase host, no explicit default port (`:443` for
+`https`, `:80` for `http`), a compressed IPv6 literal and a dotted-decimal
+IPv4 address; one trailing `/` stays allowed. Startup rejects any other
+spelling, for example `https://MCP.Example` or `https://mcp.example:443`,
+with an error that names the canonical form to use, because the issuer
+advertised in Protected Resource Metadata must be byte-identical to the
+authorization server metadata `issuer` (RFC 8414 section 3.3). The rule
+applies only in this mode, which is new in this release, so no 3.20.0
+configuration is affected; passthrough and direct modes accept `public_url`
+as before.
 
 ## Migrating to 3.20.0: audit-log hardening, Argon2id admission control, CRL trust, and one breaking API change
 

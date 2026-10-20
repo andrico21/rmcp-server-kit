@@ -123,7 +123,7 @@ MCP client                    MCP server (https://mcp.example)       Keycloak
     |<---------------------------------|                                 |
     |  POST /register                  |                                 |
     |--------------------------------->|                                 |
-    |  { client_id: "mcp-example" }  (B) shared static client, no consent|
+    |  { client_id: "mcp-proxy" }  (B) shared static client, no consent  |
     |<---------------------------------|                                 |
     |  browser GET /authorize          |                                 |
     |--------------------------------->|                                 |
@@ -237,7 +237,7 @@ MCP client / browser          MCP server (https://mcp.example)       Keycloak
  3 POST /oauth/consent request=<sealed>&decision=approve + CSRF cookie |
    ----------------------------->| open request, check expiry + CSRF  |
    <- 302 to Keycloak + state cookie (10 min) + consent cookie        |
-      client_id=mcp-example, redirect_uri=https://mcp.example/oauth/callback,
+      client_id=mcp-proxy, redirect_uri=https://mcp.example/oauth/callback,
       state=<new random nonce>, code_challenge=<client's challenge>   |
  4 browser -> Keycloak login ---------------------------------------->|
    <- 302 https://mcp.example/oauth/callback?code&state&iss ----------|

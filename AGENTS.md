@@ -86,6 +86,8 @@ rmcp-server-kit/
 │       ├── metrics_headers.rs       (feature = "metrics")
 │       ├── oauth_as_proxy.rs        (feature = "oauth") `authorization_server` proxy mode end to end
 │       ├── oauth_as_proxy/          refresh_and_replicas.rs, wire_rejections.rs (submodules of oauth_as_proxy.rs)
+│       ├── oauth_cases.rs           (feature = "oauth") executes the documented OAuth cases R1-R8, P1-P7 in docs/OAUTH_PROXY.md
+│       ├── oauth_cases/             grammar, runtime, environment, matrix and catalogue submodules of oauth_cases.rs
 │       ├── oauth_http_client.rs     (features = "oauth", "test-helpers")
 │       ├── origin_validation.rs
 │       └── ssrf_resolver.rs         (features = "oauth", "test-helpers")
@@ -198,15 +200,15 @@ ephemeral loopback ports.
 `tests/integration/` (loopback ports, `wiremock` or file reads): `crl_ssrf`,
 `crl_trusted_origin`, `delegation_guard`, `docs_citations`, `e2e`, `e2e_oauth_mtls`,
 `jwks_key_cap`, `jwks_redirect_ssrf`, `limiter_memory` (`#[ignore]`d), `metrics_handle`,
-`metrics_headers`, `oauth_as_proxy`, `oauth_http_client`, `origin_validation`, `ssrf_resolver`.
+`metrics_headers`, `oauth_as_proxy`, `oauth_cases`, `oauth_http_client`, `origin_validation`, `ssrf_resolver`.
 
 **Feature-gated targets.** Each test file is declared with an explicit `[[test]]`
-target in `Cargo.toml`; twelve of them carry `required-features`, so running a
+target in `Cargo.toml`; thirteen of them carry `required-features`, so running a
 gated target without its features now **errors** with "requires the features"
 instead of silently running an empty binary:
 
 - `test-helpers`: `crl_h3_regression`, `crl_map_bounds`, `crl_trusted_origin`
-- `oauth`: `oauth_url_validation`, `oauth_as_proxy`
+- `oauth`: `oauth_url_validation`, `oauth_as_proxy`, `oauth_cases`
 - `oauth` **and** `test-helpers`: `jwks_key_cap`, `jwks_redirect_ssrf`,
   `oauth_http_client`, `ssrf_resolver`
 - `oauth`, `oauth-mtls-client` **and** `test-helpers`: `e2e_oauth_mtls`
@@ -403,6 +405,7 @@ The core's current-Rust idioms (for example `Vec::push_mut` /
 | Lint gates (catalog / allow / profile-equality / prose) | `scripts/lint-ratchet/{catalog_gate,allow_gate,profile_eq,prose_gates,dash_gate}.py`; shared helpers in `scripts/lint-ratchet/common.py` |
 | Vendored-guideline index / deviations register         | `RUST_GUIDELINES.md` (index); `docs/rust-guidelines/` (vendored bytes - never edit) |
 | Test tiers / `required-features` wiring                | `Cargo.toml` `[[test]]` tables; `tests/unit/` and `tests/integration/` |
+| Executed OAuth case examples / settings matrices       | `tests/integration/oauth_cases.rs` and `tests/integration/oauth_cases/` - `grammar::parse_cases`, `runtime::run_case`, `library::execute`, `environment::check_env`, `matrix_check::check_matrix`, `knobs::check_knobs`, `catalogue` `EXPECTED_CASES` (extend it with every new case); the cases themselves live in `docs/OAUTH_PROXY.md` section 7 |
 
 ---
 

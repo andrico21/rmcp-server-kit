@@ -49,8 +49,8 @@ fn catalogue_rejects_when_a_case_or_exchange_is_missing() -> anyhow::Result<()> 
     check(&cases)?;
     let error = check(&[]).err().context("missing catalogue accepted")?;
     ensure!(error.to_string().contains("R6"));
-    let case = cases.first_mut().context("R6 missing")?;
-    let _removed = case.exchanges.pop().context("second R6 exchange missing")?;
+    let case = cases.first_mut().context("first case P1 missing")?;
+    let _removed = case.exchanges.pop().context("second P1 exchange missing")?;
     ensure!(check(&cases).is_err(), "missing exchange accepted");
     Ok(())
 }

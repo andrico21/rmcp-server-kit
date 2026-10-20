@@ -39,7 +39,7 @@ You supply a `ServerHandler` implementation; rmcp-server-kit handles everything 
   - [Recipe 7](#recipe-7-keycloak-direct-mode-with-cimd) - Keycloak, direct mode with CIMD
   - [Recipe 8](#recipe-8-oauth-proxy-in-authorization_server-mode) - OAuth proxy in `authorization_server` mode
   - [OAuth proxy modes, flows and Keycloak settings](OAUTH_PROXY.md) - separate guide
-- [Configuration via TOML](#configuration-via-toml)
+- [Configuration via TOML](#complete-toml-configuration-reference)
 - [Testing Your Server](#testing-your-server)
 
 ---
@@ -3291,6 +3291,10 @@ set in Keycloak (CIMD, audience mappers, client scopes) is in
 the flow itself is dissected in
 [direct mode](OAUTH_PROXY.md#2-flow-dissection-direct-mode).
 
+Complete, tested variants: see cases
+[R1-R8](OAUTH_PROXY.md#settings-matrix-resource-server) in
+[docs/OAUTH_PROXY.md](OAUTH_PROXY.md#7-configuration-examples).
+
 ### Recipe 8: OAuth proxy in `authorization_server` mode
 
 For clients that need this server to be the authorization server, in front
@@ -3341,6 +3345,10 @@ covers the flow step by step, the startup rules, secret rotation with
 `sealing_secret_previous`, the Keycloak settings and the migration from
 passthrough. To try the flow locally against an in-process fake identity
 provider, run `cargo run --example oauth_proxy_as_demo --features oauth`.
+
+Complete, tested variants: see cases
+[P3-P7](OAUTH_PROXY.md#settings-matrix-proxy) in
+[docs/OAUTH_PROXY.md](OAUTH_PROXY.md#7-configuration-examples).
 
 ---
 

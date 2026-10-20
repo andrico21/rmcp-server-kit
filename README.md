@@ -187,8 +187,10 @@ let config = McpServerConfig::new("127.0.0.1:8443", "my-server", "0.1.0")
   `authorization_server` mode with per-client consent and `iss`-consistent
   redirects, plus opt-in MCP authorization features (scope hints, step-up
   challenge, resource-URL audiences). See
-  [docs/OAUTH_PROXY.md](docs/OAUTH_PROXY.md) for flows, configuration and
-  Keycloak settings (feature-gated).
+  [docs/OAUTH_PROXY.md](docs/OAUTH_PROXY.md) for flows, configuration,
+  Keycloak settings and a
+  [settings matrix](docs/OAUTH_PROXY.md#settings-matrix-resource-server) of
+  tested example cases (feature-gated).
 - **RBAC**: Tool-scoped allow-lists with per-role argument constraints and
   task-local `current_role()` / `current_identity()` accessors.
 - **Observability**: Tracing, JSON logs, optional audit-file sink.
