@@ -2059,6 +2059,21 @@ fn authority_has_non_origin_byte(url: &str) -> bool {
     })
 }
 
+/// `true` when `host`, without one optional trailing dot, is a DNS name of LDH labels: each 1 to 63 bytes of `a-z`, `0-9` or `-`, not starting or ending with `-`, at most 253 bytes in total.
+#[cfg(feature = "oauth")]
+fn is_dns_host(host: &str) -> bool {
+    let name = host.strip_suffix('.').unwrap_or(host);
+    name.len() <= 253
+        && name.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
+}
+
 /// The `public_url`, `allowed_origins` and `authorization_servers` rules of
 /// the authorization-server proxy mode (see [`check_shared_oauth_relations`]).
 ///
@@ -2097,9 +2112,10 @@ fn check_authorization_server_relations(
     // `Url` serializes the canonical form the metadata issuer is built from
     // (`install_routes`); the hand-written origin parser does not validate
     // every host syntax, so a `Url` parse failure is the bare-origin error.
-    let parsed_canonical = url::Url::parse(url)
-        .ok()
-        .map(|parsed| parsed.as_str().trim_end_matches('/').to_owned());
+    let parsed = url::Url::parse(url).ok();
+    let parsed_canonical = parsed
+        .as_ref()
+        .map(|value| value.as_str().trim_end_matches('/').to_owned());
     let (Some(origin), Some(canonical)) = (parsed_origin, parsed_canonical) else {
         return Err(RmcpServerKitError::Config(format!(
             "server.public_url {} (env {SERVER_PUBLIC_URL_ENV}) must be a bare origin, \
@@ -2110,6 +2126,18 @@ fn check_authorization_server_relations(
             public_url_for_message(url)
         )));
     };
+    if let Some(url::Host::Domain(host)) = parsed.as_ref().and_then(url::Url::host)
+        && !is_dns_host(host)
+    {
+        return Err(RmcpServerKitError::Config(format!(
+            "server.public_url {} (env {SERVER_PUBLIC_URL_ENV}) must have a host that is a DNS \
+             name (dot-separated labels of 1 to 63 letters, digits or hyphens, not starting or \
+             ending with a hyphen, at most 253 characters) or an IP address literal, when \
+             {AS_MODE_KEY} (env {SERVER_OAUTH_PROXY_MODE_ENV}): the host {host:?} does not \
+             follow that rule",
+            public_url_for_message(url)
+        )));
+    }
     if canonical != url.trim_end_matches('/') {
         return Err(RmcpServerKitError::Config(format!(
             "server.public_url {} (env {SERVER_PUBLIC_URL_ENV}) must be written in its \
@@ -4876,7 +4904,7 @@ client_ip = false
     #[cfg(feature = "oauth")]
     #[test]
     fn public_url_relations_r2_accepts_bare_origins() -> anyhow::Result<()> {
-        let long_host = format!("https://{}.example", "a".repeat(4096));
+        let long_host = format!("https://{}.example", "a".repeat(63));
         for good in [
             "https://mcp.example",
             "https://mcp.example/",
@@ -4964,7 +4992,7 @@ client_ip = false
             "https://xn--bcher-kva.example",
             "https://[::1]:8443",
             "https://[2001:db8::1]",
-            "https://mcp-1.example_x.example",
+            "https://mcp-1.example-x.example",
         ] {
             let server = relations_server(Some(good), true, as_mode);
             assert_server_config_accepted_by_both(&format!("R2 public_url {good:?}"), &server)?;
@@ -5312,6 +5340,92 @@ client_ip = false
                      use \"{canonical}\""
                 ),
             )?;
+        }
+        Ok(())
+    }
+
+    /// Host rule: authorization-server mode rejects a `public_url` host that
+    /// is not a DNS name of letters, digits and hyphens (empty or overlong
+    /// labels, a hyphen at a label edge, `_`, `*`, `;`, a name over 253
+    /// characters) through both validators, naming the key and the env var.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn public_url_relations_host_rejects_non_dns_hosts() -> anyhow::Result<()> {
+        let label = "a".repeat(63);
+        let mut rejected = vec![
+            "https://.mcp.example".to_owned(),
+            "https://a..b".to_owned(),
+            "https://*.example".to_owned(),
+            "https://mcp.example;x".to_owned(),
+            "https://mcp_example.com".to_owned(),
+            "https://mcp.example..".to_owned(),
+            "https://-mcp.example".to_owned(),
+            "https://mcp-.example".to_owned(),
+            "https://mcp-1.example_x.example".to_owned(),
+            format!("https://{}.example", "a".repeat(64)),
+            format!("https://{}.example", "a".repeat(4096)),
+        ];
+        let long_host = format!("{label}.{label}.{label}.{}", "c".repeat(62));
+        assert_eq!(long_host.len(), 254, "host length");
+        rejected.push(format!("https://{long_host}"));
+        for url in &rejected {
+            let server = canonical_rule_as_server(url, true);
+            for expected in [
+                "must have a host that is a DNS name",
+                "server.public_url",
+                SERVER_PUBLIC_URL_ENV,
+            ] {
+                assert_server_config_rejected_by_both(
+                    &format!("host rule {url:?}"),
+                    &server,
+                    expected,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Host rule: DNS names at the label and length limits, punycode, a
+    /// digit-led label and one trailing dot pass both validators in
+    /// authorization-server mode.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn public_url_relations_host_accepts_dns_and_ip_hosts() -> anyhow::Result<()> {
+        let label = "a".repeat(63);
+        let long_host = format!("{label}.{label}.{label}.{}", "c".repeat(61));
+        assert_eq!(long_host.len(), 253, "host length");
+        for good in [
+            "https://a-b.example".to_owned(),
+            "https://1.example".to_owned(),
+            format!("https://{label}.example"),
+            "https://xn--bcher-kva.example".to_owned(),
+            "https://mcp.example.".to_owned(),
+            format!("https://{long_host}"),
+        ] {
+            let server = canonical_rule_as_server(&good, true);
+            assert_server_config_accepted_by_both(&format!("host rule {good:?}"), &server)?;
+        }
+        Ok(())
+    }
+
+    /// Host rule: it is authorization-server only; direct and passthrough
+    /// modes keep accepting the same hosts.
+    #[cfg(feature = "oauth")]
+    #[test]
+    fn public_url_host_rule_ignores_other_modes() -> anyhow::Result<()> {
+        let long_label = format!("https://{}.example", "a".repeat(64));
+        for odd in [
+            "https://mcp_example.com",
+            "https://*.example",
+            "https://mcp.example;x",
+            long_label.as_str(),
+        ] {
+            let direct = relations_server(Some(odd), true, |_| {});
+            assert_server_config_accepted_by_both(&format!("direct {odd:?}"), &direct)?;
+            let passthrough = relations_server(Some(odd), true, |oauth| {
+                oauth.proxy = Some(validation_proxy());
+            });
+            assert_server_config_accepted_by_both(&format!("passthrough {odd:?}"), &passthrough)?;
         }
         Ok(())
     }

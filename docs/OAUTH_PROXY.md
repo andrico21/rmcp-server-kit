@@ -408,7 +408,9 @@ Startup validation in `authorization_server` mode, enforced identically by
 (`scheme://host[:port]`, optionally with one trailing `/`), ASCII only, with
 no userinfo, path, query or fragment, and no backslash or other byte a
 browser `Origin` never contains; it must be written in its canonical URL
-form (lowercase host, no explicit default port, compressed IPv6), because the
+form (lowercase host, no explicit default port, compressed IPv6), its host
+must be a DNS name of letters, digits and hyphens (no underscore, no empty
+label, no `*`) or an IP address literal, because the
 advertised issuer must be byte-identical to the metadata issuer (RFC 8414
 section 3.3), and the error shows the form to use; a non-empty
 `allowed_origins` must contain its origin; `authorization_servers` must be unset or exactly the issuer;

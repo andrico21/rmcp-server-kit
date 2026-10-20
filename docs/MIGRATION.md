@@ -99,10 +99,12 @@ IPv4 address; one trailing `/` stays allowed. Startup rejects any other
 spelling, for example `https://MCP.Example` or `https://mcp.example:443`,
 with an error that names the canonical form to use, because the issuer
 advertised in Protected Resource Metadata must be byte-identical to the
-authorization server metadata `issuer` (RFC 8414 section 3.3). The rule
-applies only in this mode, which is new in this release, so no 3.20.0
-configuration is affected; passthrough and direct modes accept `public_url`
-as before.
+authorization server metadata `issuer` (RFC 8414 section 3.3). Its host must
+also be a DNS name made of letters, digits and hyphens, or an IP address
+literal; `https://mcp_example.com` or `https://*.example` is rejected at
+startup. The rule applies only in this mode, which is new in this release,
+so no 3.20.0 configuration is affected; passthrough and direct modes accept
+`public_url` as before.
 
 ## Migrating to 3.20.0: audit-log hardening, Argon2id admission control, CRL trust, and one breaking API change
 

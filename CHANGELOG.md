@@ -115,7 +115,9 @@ required) and [`docs/OAUTH_PROXY.md`](docs/OAUTH_PROXY.md).
   literal) is rejected at startup with the canonical form to use, because the
   advertised issuer must be byte-identical to the authorization server
   metadata issuer (RFC 8414 section 3.3). Passthrough and direct modes are
-  unchanged.
+  unchanged. A host that is not a DNS name of letters, digits and hyphens or an
+  IP address literal, such as `https://mcp_example.com` or `https://*.example`,
+  is rejected too.
 - In `authorization_server` mode `/register` and `/authorize` reject every Unicode
   default-ignorable or invisible character (for example U+3164, U+034F, tag
   characters and U+2800) in `client_name` and redirect URIs, except the variation
