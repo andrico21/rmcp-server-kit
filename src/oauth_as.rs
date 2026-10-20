@@ -31,11 +31,13 @@ use crate::{
     transport::{PageSecurityHeaders, oauth_token_cache_headers_middleware},
 };
 
-/// Script-free consent page policy, allowing upstream form redirect chains.
-const CONSENT_CSP: &str = "default-src 'none'; frame-ancestors 'none'; base-uri 'none'";
-/// Error pages cannot initiate form submissions.
-const ERROR_CSP: &str =
-    "default-src 'none'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'";
+/// Constant page stylesheet: readable text, wrapped long values and 44 px tap targets.
+const PAGE_STYLE: &str = "body{font-family:system-ui,sans-serif;margin:1rem;max-width:40rem;overflow-wrap:anywhere}button{min-height:44px;min-width:44px;padding:.5em 1em;margin:0 .5rem .5rem 0;font-size:1rem}";
+/// Script-free consent page policy, allowing upstream form redirect chains and, by its
+/// SHA-256 hash, only the constant [`PAGE_STYLE`] element.
+const CONSENT_CSP: &str = "default-src 'none'; style-src 'sha256-duPJE+yRsr7GWUwbG4KlBrtEWYrMTMxBbEoskxCsGOA='; frame-ancestors 'none'; base-uri 'none'";
+/// Error pages cannot initiate form submissions; styled by the same hashed [`PAGE_STYLE`].
+const ERROR_CSP: &str = "default-src 'none'; style-src 'sha256-duPJE+yRsr7GWUwbG4KlBrtEWYrMTMxBbEoskxCsGOA='; form-action 'none'; frame-ancestors 'none'; base-uri 'none'";
 /// Aggregate encoded parameter cap before allocation and sealing.
 const PARAM_LIMIT: usize = 0x8000;
 
@@ -282,7 +284,7 @@ fn html_escape(value: &str) -> String {
 /// Wrap already escaped markup and request mandatory page-only security headers.
 fn page(status: StatusCode, content: &str, csp: &'static str) -> Response {
     let mut response = (status, Html(format!(
-        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"referrer\" content=\"same-origin\"><title>Authorization</title></head><body>{content}</body></html>"
+        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"referrer\" content=\"same-origin\"><title>Authorization</title><style>{PAGE_STYLE}</style></head><body>{content}</body></html>"
     ))).into_response();
     let _previous = response
         .extensions_mut()

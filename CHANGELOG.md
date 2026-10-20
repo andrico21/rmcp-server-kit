@@ -123,6 +123,12 @@ required) and [`docs/OAUTH_PROXY.md`](docs/OAUTH_PROXY.md).
   `<bdi>` isolates; and `/authorize` re-validates the matched redirect URI of an
   already sealed client. Joined emoji sequences, tag-sequence flags and the
   Mongolian free variation selectors are rejected as a documented trade-off.
+- The `authorization_server` consent and error pages are readable and tappable
+  on phones: they declare a device-width viewport and carry one constant inline
+  stylesheet (wrapped long names and redirect URIs, Approve and Deny buttons at
+  least 44 by 44 CSS px) that the page `Content-Security-Policy` admits by its
+  SHA-256 hash in a new `style-src` directive; no script, no external resource
+  and no `unsafe-inline`.
 
 ### Security
 

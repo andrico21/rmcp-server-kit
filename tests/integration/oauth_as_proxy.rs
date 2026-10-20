@@ -37,6 +37,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     mod client_name_spoofing;
+    mod phone_layout;
     mod refresh_and_replicas;
     mod wire_rejections;
 
@@ -405,7 +406,7 @@ mod tests {
                 .headers()
                 .get("content-security-policy")
                 .context("CSP")?
-                == "default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
+                == "default-src 'none'; style-src 'sha256-duPJE+yRsr7GWUwbG4KlBrtEWYrMTMxBbEoskxCsGOA='; frame-ancestors 'none'; base-uri 'none'",
             "CSP"
         );
         ensure!(
@@ -1078,7 +1079,7 @@ mod tests {
                 .headers()
                 .get("content-security-policy")
                 .context("CSP")?
-                == "default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
+                == "default-src 'none'; style-src 'sha256-duPJE+yRsr7GWUwbG4KlBrtEWYrMTMxBbEoskxCsGOA='; frame-ancestors 'none'; base-uri 'none'",
             "consent CSP"
         );
         ensure!(
@@ -1086,7 +1087,7 @@ mod tests {
                 .headers()
                 .get("content-security-policy")
                 .context("error CSP")?
-                == "default-src 'none'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'",
+                == "default-src 'none'; style-src 'sha256-duPJE+yRsr7GWUwbG4KlBrtEWYrMTMxBbEoskxCsGOA='; form-action 'none'; frame-ancestors 'none'; base-uri 'none'",
             "error CSP"
         );
         for page in [&response, &error] {
@@ -1988,7 +1989,7 @@ mod tests {
             for (header, expected) in [
                 (
                     "content-security-policy",
-                    "default-src 'none'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'",
+                    "default-src 'none'; style-src 'sha256-duPJE+yRsr7GWUwbG4KlBrtEWYrMTMxBbEoskxCsGOA='; form-action 'none'; frame-ancestors 'none'; base-uri 'none'",
                 ),
                 ("referrer-policy", "same-origin"),
                 ("cache-control", "no-store"),
