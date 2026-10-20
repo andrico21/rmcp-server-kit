@@ -193,10 +193,10 @@ Existing workarounds, each with a cost:
   a client that checks the metadata `issuer` against the URL it fetched it
   from rejects it.
 
-  ```toml,fragment
-  [server.auth.oauth]
-  authorization_server_metadata_issuer = "https://idp.example/realms/example"
-  ```
+```toml,fragment
+[server.auth.oauth]
+authorization_server_metadata_issuer = "https://idp.example/realms/example"
+```
 
 - Keycloak's per-client switch **Exclude Issuer From Authentication Response**
   stops Keycloak from adding `iss` (source: Keycloak upgrading guide,
@@ -430,6 +430,63 @@ proxy, `[server.auth.oauth.proxy]`. `client_secret`, the URLs of the proxy
 table and the scope mappings have no env var: keep the TOML file itself in a
 mounted Secret if it holds a client secret. Generate sealing secrets with
 something like `openssl rand -base64 48`.
+
+Case-tagged examples are executable contracts. The fence grammar is:
+
+- `toml,case=<ID>`: complete operator config; `sh,case=<ID>`: env overrides
+  on top of that TOML. An optional `sh,case=<ID>,alt` gives an alternative;
+  both blocks are checked. IDs match `[A-Za-z0-9_-]{1,16}`.
+  Env lines are `NAME=value`, optionally prefixed by `export `, with blank
+  lines and full-line `#` comments allowed. Single or double quotes surround
+  literal values; shell expansion, escapes and inline comments are not evaluated.
+- `http,case=<ID>,request`: `METHOD /path HTTP/1.1`, headers, then an optional
+  blank line and body. The next fence, after optional prose, is
+  `http,case=<ID>,response`: `HTTP/1.1 <code> <reason>`, expected headers,
+  then an optional blank line and literal body. Unlisted headers are ignored;
+  header names must be HTTP tokens and are case-insensitive. `<any>` matches
+  any substring, even empty, in header values and bodies. Status code and reason
+  match literally and case-sensitively; the observed reason is the code's canonical HTTP reason
+  (or `Unknown` for an unregistered code), including when the wire omits it.
+  A listed header matches if any occurrence in the response matches; expected
+  lines do not consume occurrences exclusively, so two identical expected lines
+  need only one actual occurrence.
+- An optional `http,case=<ID>,upstream` after a response asserts the IdP request:
+  `METHOD /path`, optional headers, a blank line, then `name=value` form fields.
+  Only requests recorded during that exchange are eligible; unlisted headers
+  and fields are ignored; `<any>` works in their values.
+  After `rust,ignore`, an upstream fence instead denotes a library-call exchange
+  (only `exchange_token`, added with R7). Exchanges never share cookies or values.
+- `Authorization: Bearer <jwt {JSON}>` mints an RS256 token with kid `case-key`.
+  Defaults are the case issuer, `sub: "user-1"`, current `iat`, and `exp` five
+  minutes later; JSON keys override them. `<jwt>` uses just the defaults.
+  Case-looking fences use exact lower-case keys; malformed infos are errors.
+  Unrelated fences are ignored except between a request and its response.
+
+Section 7 accepts plain fences only: a fence line starts in column 0 with
+exactly three backticks and is closed by a bare column-0 line of three
+backticks (optional trailing spaces are accepted on either line). Indented,
+tilde, quoted, list-item, nested and four-backtick fences, inline-code lines
+that start with three backticks, tabs in fence lines, and HTML comments are
+errors in section 7. Outside section 7 any fence whose info mentions `case=`
+(case-insensitive, with optional spaces before `=`) is an error. Outside
+section 7 only plain column-0 fences are examined, by the docs test that
+validates TOML blocks. Column-0 `## ` headings must have the numbered prefixes
+`## 1. ` through `## 13. ` exactly once each, in order, even inside code
+blocks; do not insert section-like headings into examples. CRLF is normalized;
+a lone carriage return is an error.
+
+**What the test changes:** section 7 alone is executed. Before parsing the config,
+requests and expectations, the harness replaces `https://idp.example` and
+`https://login.microsoftonline.com` with an ephemeral dual-stack loopback IdP
+at `http://localhost:<port>`. It sets `allow_http_oauth_urls = true` and
+`ssrf_allowlist = { hosts = ["localhost"], cidrs = ["127.0.0.0/8"] }` on OAuth.
+When sealing secrets are supplied only by env, it injects the fixed test values
+`case-test-sealing-secret-0123456789abcdef` and
+`case-test-previous-secret-0123456789abcd`; it never reads mounted secret files.
+JWKS and configured token/admin endpoints are mocked at their rewritten paths;
+Keycloak settings are documentation, not live-Keycloak tests. The MCP listener
+uses an ephemeral loopback port, retaining the documented public URL and sending
+every request header, including Host, as written. Redirects are never followed.
 
 ### (A) Direct mode with Keycloak, CIMD and `accept_resource_audience`
 
@@ -701,9 +758,9 @@ RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__CHALLENGE_SCOPES=mcp:read
 RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__INSUFFICIENT_SCOPE_CHALLENGE=true
 ```
 
-### (H) RFC 6750 bare challenge
+### R6 - RFC 6750 bare missing-credential challenge
 
-```toml
+```toml,case=R6
 [server]
 listen_addr = "0.0.0.0"
 listen_port = 8080
@@ -723,7 +780,7 @@ scope = "mcp:read"
 role = "viewer"
 ```
 
-```sh
+```sh,case=R6
 RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__OMIT_ERROR_ON_MISSING_CREDENTIAL=true
 ```
 
@@ -731,6 +788,27 @@ A request with no credential then gets
 `WWW-Authenticate: Bearer resource_metadata="https://mcp.example/.well-known/oauth-protected-resource/mcp"`
 with no `error`. Requests carrying a bad or expired token still get
 `error="invalid_token"`.
+
+```http,case=R6,request
+POST /mcp HTTP/1.1
+Host: mcp.example
+```
+
+```http,case=R6,response
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer resource_metadata="https://mcp.example/.well-known/oauth-protected-resource/mcp"
+```
+
+```http,case=R6,request
+POST /mcp HTTP/1.1
+Host: mcp.example
+Authorization: Bearer a.b.c
+```
+
+```http,case=R6,response
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer resource_metadata="https://mcp.example/.well-known/oauth-protected-resource/mcp", error="invalid_token", error_description="token is invalid"
+```
 
 ## 8. Keycloak settings per mode
 

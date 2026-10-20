@@ -21,6 +21,12 @@
 //! a parseable citation.
 //!
 //! Drift fixes are easy: re-read the cited code and update the number.
+#[path = "oauth_cases/case_info.rs"]
+mod case_info;
+#[cfg(test)]
+#[path = "oauth_cases/fence_tables.rs"]
+mod fence_tables;
+
 #[cfg_attr(
     target_os = "linux",
     expect(
@@ -49,7 +55,6 @@
 #[cfg(test)]
 mod tests {
     extern crate alloc;
-
     use alloc::collections::BTreeMap;
     use core::sync::atomic::{AtomicU64, Ordering};
     use std::{
@@ -67,6 +72,8 @@ mod tests {
         rbac::RbacConfig,
     };
     use serde::Deserialize;
+
+    use crate::case_info::{document_fences, validate_document};
 
     /// How far (in lines, each direction) an anchor symbol may sit from the
     /// cited line/range. The doc headers promise "approximate" citations;
@@ -660,11 +667,8 @@ mod tests {
     fn extract_toml_fences(doc: &str) -> Vec<TomlFence> {
         let mut fences = Vec::new();
         let mut open: Option<TomlFence> = None;
-
         for (idx, line) in doc.lines().enumerate() {
-            let line_no = idx.saturating_add(1);
             let trimmed = line.trim_start();
-
             if let Some(mut fence) = open.take() {
                 if trimmed == "```" {
                     fences.push(fence);
@@ -675,19 +679,17 @@ mod tests {
                 }
                 continue;
             }
-
             if let Some(raw_info) = trimmed.strip_prefix("```") {
                 let info = raw_info.trim();
                 if info == "toml" || info.starts_with("toml,") {
                     open = Some(TomlFence {
-                        line: line_no,
+                        line: idx.saturating_add(1),
                         info: info.to_owned(),
                         body: String::new(),
                     });
                 }
             }
         }
-
         fences
     }
 
@@ -827,13 +829,28 @@ mod tests {
         const DOC: &str = "docs/OAUTH_PROXY.md";
         let root = workspace_root();
         let doc = fs::read_to_string(root.join(DOC)).context("read OAUTH_PROXY.md")?;
-        let fences = extract_toml_fences(&doc);
+        validate_document(&doc)?;
+        let fences: Vec<_> = document_fences(&doc)?
+            .into_iter()
+            .filter(|fence| fence.info == "toml" || fence.info.starts_with("toml,"))
+            .map(|fence| TomlFence {
+                line: fence.line,
+                info: fence.info,
+                body: fence.body,
+            })
+            .collect();
 
         assert_eq!(fences.len(), 11, "OAUTH_PROXY.md TOML fence count drifted");
         for block in &fences {
             match block.info.as_str() {
                 "toml" => assert_operator_config_block_validates(DOC, block)?,
                 "toml,fragment" => assert_toml_fragment_parses(DOC, block)?,
+                info if info
+                    .strip_prefix("toml,case=")
+                    .is_some_and(|id| !id.is_empty() && !id.contains(',')) =>
+                {
+                    assert_operator_config_block_parses(DOC, block)?;
+                }
                 other => anyhow::bail!(
                     "{DOC}:{} uses unsupported TOML fence info string `{other}`; use `toml` for complete operator config or `toml,fragment` for intentionally incomplete excerpts",
                     block.line

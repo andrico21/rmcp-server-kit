@@ -338,6 +338,11 @@ path = "tests/integration/oauth_as_proxy.rs"
 required-features = ["oauth"]
 
 [[test]]
+name = "oauth_cases"
+path = "tests/integration/oauth_cases.rs"
+required-features = ["oauth"]
+
+[[test]]
 name = "origin_validation"
 path = "tests/integration/origin_validation.rs"
 
