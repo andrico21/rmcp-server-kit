@@ -27,7 +27,7 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
-use core::time::Duration;
+use core::{fmt, time::Duration};
 use std::{env, fs, path::PathBuf};
 
 use rmcp::{
@@ -106,15 +106,41 @@ impl ServerHandler for ConfigFileHandler {
     }
 }
 
-/// Runs the example: load config, apply env overrides, serve.
+/// Startup error whose `Debug` is the error's `Display`, so `main` prints a readable message.
+struct ReadableError(rmcp_server_kit::RmcpServerKitError);
+
+impl fmt::Debug for ReadableError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+/// Runs the example and reports a startup error as text.
 // cancel-safe: process entry point; dropping this future tears down the server and its runtime.
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() -> rmcp_server_kit::Result<()> {
+async fn main() -> Result<(), ReadableError> {
+    run().await.map_err(ReadableError)
+}
+
+/// Runs the example: load config, apply env overrides, serve.
+///
+/// # Errors
+/// Returns an error if configuration, tracing initialization, or serving fails.
+// cancel-safe: process entry point; dropping this future tears down the server and its runtime.
+async fn run() -> rmcp_server_kit::Result<()> {
     // With no argument, use the embedded config so this example runs without
     // external files. Passing a path demonstrates the real-file path using
     // `std::fs::read_to_string` at startup.
     let raw_config = match env::args_os().nth(1) {
-        Some(path) => fs::read_to_string(PathBuf::from(path))?,
+        Some(path) => {
+            let file_path = PathBuf::from(path);
+            fs::read_to_string(&file_path).map_err(|error| {
+                rmcp_server_kit::RmcpServerKitError::Config(format!(
+                    "cannot read config file {}: {error}",
+                    file_path.display()
+                ))
+            })?
+        }
         None => EMBEDDED_CONFIG.to_owned(),
     };
     let mut app_config: AppConfig = toml::from_str(&raw_config)?;

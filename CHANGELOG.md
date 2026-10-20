@@ -115,6 +115,7 @@ required) and [`docs/OAUTH_PROXY.md`](docs/OAUTH_PROXY.md).
 
 ### Fixed
 
+- `examples/config_file_server.rs` prints a startup error as text instead of a debug dump and names a config file it cannot read.
 - In `authorization_server` mode a non-canonical `server.public_url` (capitals
   in the host, an explicit default port such as `:443`, an expanded IPv6
   literal) is rejected at startup with the canonical form to use, because the
