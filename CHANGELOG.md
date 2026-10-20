@@ -110,6 +110,8 @@ required) and [`docs/OAUTH_PROXY.md`](docs/OAUTH_PROXY.md).
   is unchanged. The GitLab default-feature `mutants` job no longer lists
   `src/oauth.rs`, which that build cannot compile, and uses the same 360 s
   per-mutant timeout as GitHub.
+- CI only: the Markdown link checks on GitHub and GitLab also verify heading
+  anchors (`lychee --include-fragments`).
 
 ### Fixed
 

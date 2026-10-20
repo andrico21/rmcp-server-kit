@@ -498,7 +498,7 @@ numbered entry only if one of these situations arises later.
    table, register dates. Never vendor `README.md`; never edit the vendored
    bytes; never write upstream.
 4. Run the gates: `cargo test --all-features --test docs_citations`,
-   `lychee --offline --no-progress README.md RUST_GUIDELINES.md docs/*.md`,
+   `lychee --offline --include-fragments --no-progress README.md RUST_GUIDELINES.md docs/*.md`,
    the five lint gates (`python3 scripts/lint-ratchet/catalog_gate.py`,
    `allow_gate.py --enforce`, `profile_eq.py --clippy-toml`,
    `prose_gates.py --enforce`, `dash_gate.py --enforce`), plus the usual

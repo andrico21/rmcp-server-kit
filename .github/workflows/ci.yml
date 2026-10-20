@@ -288,7 +288,7 @@ jobs:
       - name: Check Markdown links (offline)
         uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2
         with:
-          args: --offline --no-progress README.md RUST_GUIDELINES.md docs/*.md
+          args: --offline --include-fragments --no-progress README.md RUST_GUIDELINES.md docs/*.md
           fail: true
 
   lint-ratchet:

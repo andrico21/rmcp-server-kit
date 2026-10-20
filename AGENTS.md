@@ -178,7 +178,7 @@ rmcp-server-kit/
 | MSRV check (lint-capped)         | `RUSTFLAGS="--cap-lints=warn" CARGO_BUILD_WARNINGS=allow cargo +1.99.0 build --all-features` |
 | Semver check (library)           | `cargo semver-checks check-release`                                  |
 | Lint gates (CI)                  | `python3 scripts/lint-ratchet/catalog_gate.py`; `allow_gate.py --enforce`; `profile_eq.py --clippy-toml`; `prose_gates.py --enforce`; `dash_gate.py --enforce` |
-| Docs citations + links (CI)      | `cargo test --all-features --test docs_citations` and `lychee --offline --no-progress README.md RUST_GUIDELINES.md docs/*.md` |
+| Docs citations + links (CI)      | `cargo test --all-features --test docs_citations` and `lychee --offline --include-fragments --no-progress README.md RUST_GUIDELINES.md docs/*.md` |
 
 **CI definition lives in**:
 
