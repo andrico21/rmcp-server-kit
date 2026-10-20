@@ -1,5 +1,7 @@
 //! Phone readability and tap targets of the consent and error pages under their page policy.
 
+use std::path::Path;
+
 use super::{
     page_markup::{
         attribute_names, buttons, declarations, directive, hash_source, head, pixels, start_tags,
@@ -243,5 +245,28 @@ async fn consent_buttons_submit_the_decision_their_label_names() -> anyhow::Resu
             assert_error_redirect(&decided, "access_denied", &server.base)?;
         }
     }
+    server.close().await
+}
+
+/// The consent-page policy quoted in `docs/OAUTH_PROXY.md` row 2a is the header the server sends.
+#[tokio::test]
+async fn documented_consent_policy_is_the_served_header() -> anyhow::Result<()> {
+    // Given
+    let server = Harness::start("30days").await?;
+    let (_status, csp, _html) = fetch(&server, PageKind::Consent).await?;
+    // When
+    let doc =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/OAUTH_PROXY.md"))?;
+    let rows: Vec<&str> = doc
+        .lines()
+        .filter(|line| line.starts_with("| 2a |"))
+        .collect();
+    // Then
+    ensure!(rows.len() == 1, "one row 2a, found {}", rows.len());
+    let row = rows.first().context("row 2a")?;
+    ensure!(
+        row.contains(&format!("`Content-Security-Policy: {csp}`")),
+        "docs/OAUTH_PROXY.md row 2a quotes the served policy {csp:?}"
+    );
     server.close().await
 }
