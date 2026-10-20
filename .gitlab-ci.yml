@@ -365,13 +365,17 @@ mutants:
       allow_failure: true
   allow_failure: true
   timeout: 4h
+  parallel: 4
   variables:
     # Mutation runs only need the build to compile. Deny-level lints make
     # mutants unviable, so cap lints via `--cap-lints=true` and let warnings
     # through for this job.
     CARGO_BUILD_WARNINGS: allow
+  # src/oauth.rs is compiled only with --features oauth and is left out, as on GitHub (its mutants could only report MISSED here);
+  # src/oauth_as.rs and src/oauth_seal.rs run in mutants-oauth. 360 s matches GitHub MUTANTS_TEST_TIMEOUT;
+  # about 364 mutants at ~1.44 min each need 4 shards to fit the 4 h job timeout.
   script:
-    - rtk cargo mutants --no-shuffle --cap-lints=true --timeout 300 -f src/rbac.rs -f src/auth.rs -f src/oauth.rs || true
+    - rtk cargo mutants --no-shuffle --cap-lints=true --timeout 360 --sharding round-robin --shard $((CI_NODE_INDEX - 1))/$CI_NODE_TOTAL -f src/rbac.rs -f src/auth.rs || true
   artifacts:
     when: always
     expire_in: 1 month

@@ -106,7 +106,10 @@ required) and [`docs/OAUTH_PROXY.md`](docs/OAUTH_PROXY.md).
   other response keeps the operator's header settings.
 - CI only: a new nightly `mutants-oauth` job (GitHub and GitLab) runs cargo-mutants
   with `--features oauth` over `src/oauth_as.rs` and `src/oauth_seal.rs`, which
-  the default-feature mutants jobs cannot compile. The existing jobs are unchanged.
+  the default-feature mutants jobs cannot compile. The GitHub default-feature job
+  is unchanged. The GitLab default-feature `mutants` job no longer lists
+  `src/oauth.rs`, which that build cannot compile, and uses the same 360 s
+  per-mutant timeout as GitHub.
 
 ### Fixed
 
