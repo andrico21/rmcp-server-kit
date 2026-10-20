@@ -267,7 +267,7 @@ async fn upstream_rejects_when_recorded_request_is_absent() -> anyhow::Result<()
         .err()
         .context("missing upstream accepted")?;
     ensure!(
-        error.to_string().contains("upstream"),
+        format!("{error:#}").contains("upstream"),
         "upstream error context missing"
     );
     Ok(())

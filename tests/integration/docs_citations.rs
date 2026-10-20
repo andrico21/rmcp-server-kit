@@ -840,7 +840,7 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(fences.len(), 11, "OAUTH_PROXY.md TOML fence count drifted");
+        assert_eq!(fences.len(), 17, "OAUTH_PROXY.md TOML fence count drifted");
         for block in &fences {
             match block.info.as_str() {
                 "toml" => assert_operator_config_block_validates(DOC, block)?,

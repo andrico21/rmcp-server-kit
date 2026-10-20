@@ -25,6 +25,9 @@ mod tests {
     mod grammar;
     mod grammar_tables;
     mod identity;
+    mod library;
+    mod library_rows;
+    mod library_tables;
     mod mock;
     mod network;
     mod runtime;

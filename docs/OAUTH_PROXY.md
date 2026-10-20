@@ -423,13 +423,21 @@ same values.
 
 ## 7. Configuration examples
 
-Each example is a TOML file plus the equivalent environment for a
-Kubernetes-style deployment. Env vars override the TOML values; they cannot
+Each example is a TOML file plus the env overrides that apply on top of it
+in a Kubernetes-style deployment. Env vars override TOML values; they cannot
 create tables, so the TOML must still declare `[server.auth.oauth]` and, for a
-proxy, `[server.auth.oauth.proxy]`. `client_secret`, the URLs of the proxy
-table and the scope mappings have no env var: keep the TOML file itself in a
-mounted Secret if it holds a client secret. Generate sealing secrets with
-something like `openssl rand -base64 48`.
+proxy, `[server.auth.oauth.proxy]`. Several keys have no env var at all:
+`audience_validation_mode`, `role_claim`, `role_mappings`, `scopes`,
+`token_exchange`, `authorization_servers`, `client_secret` and the URLs of the
+proxy table. An env block therefore lists only variables from the
+[GUIDE env table](GUIDE.md#environment-variable-overrides-opt-in); keep the TOML file
+itself in a mounted Secret if it holds a client secret. Generate sealing
+secrets with something like `openssl rand -base64 48`.
+
+Resource-server cases R1-R8 come first, one per deployment shape: R1
+pre-registered client with realm roles, R2 CIMD and resource indicators, R3
+audience migration, R4 roles from claims, R5 scope hint and step-up, R6 bare
+missing-credential challenge, R7 token exchange, R8 application-owned facade.
 
 Case-tagged examples are executable contracts. The fence grammar is:
 
@@ -454,8 +462,12 @@ Case-tagged examples are executable contracts. The fence grammar is:
   `METHOD /path`, optional headers, a blank line, then `name=value` form fields.
   Only requests recorded during that exchange are eligible; unlisted headers
   and fields are ignored; `<any>` works in their values.
-  After `rust,ignore`, an upstream fence instead denotes a library-call exchange
-  (only `exchange_token`, added with R7). Exchanges never share cookies or values.
+  After `rust,ignore`, an upstream fence instead denotes a library-call exchange:
+  the snippet must show exactly one `oauth::exchange_token(...)` call (any other
+  `oauth::` function is an error), and the test performs that call with the
+  case's parsed `token_exchange` table, an `OauthHttpClient` built from the
+  case's OAuth table, and the subject token `subject-token`, then asserts the
+  recorded IdP request. Exchanges never share cookies or values.
 - `Authorization: Bearer <jwt {JSON}>` mints an RS256 token with kid `case-key`.
   Defaults are the case issuer, `sub: "user-1"`, current `iat`, and `exp` five
   minutes later; JSON keys override them. `<jwt>` uses just the defaults.
@@ -488,9 +500,123 @@ Keycloak settings are documentation, not live-Keycloak tests. The MCP listener
 uses an ephemeral loopback port, retaining the documented public URL and sending
 every request header, including Host, as written. Redirects are never followed.
 
-### (A) Direct mode with Keycloak, CIMD and `accept_resource_audience`
+### R1 - Direct mode, pre-registered Keycloak client, client-id audience, strict mode, realm-role mapping
 
-```toml
+Use when an administrator creates the MCP client in Keycloak and access is
+decided by realm roles, not by OAuth scopes.
+
+```toml,case=R1
+[server]
+listen_addr = "0.0.0.0"
+listen_port = 8080
+public_url = "https://mcp.example"
+
+[server.auth]
+enabled = true
+
+[server.auth.oauth]
+issuer = "https://idp.example/realms/example"
+audience = "mcp-example"
+jwks_uri = "https://idp.example/realms/example/protocol/openid-connect/certs"
+audience_validation_mode = "strict"
+role_claim = "realm_access.roles"
+
+[[server.auth.oauth.role_mappings]]
+claim_value = "mcp-admins"
+role = "admin"
+
+[[server.auth.oauth.role_mappings]]
+claim_value = "mcp-users"
+role = "viewer"
+
+[rbac]
+enabled = true
+
+[[rbac.roles]]
+name = "admin"
+allow = ["*"]
+
+[[rbac.roles]]
+name = "viewer"
+allow = ["search"]
+```
+
+```sh,case=R1
+RMCP_SERVER_KIT__SERVER__PUBLIC_URL=https://mcp.example
+RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ISSUER=https://idp.example/realms/example
+RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__AUDIENCE=mcp-example
+RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__JWKS_URI=https://idp.example/realms/example/protocol/openid-connect/certs
+```
+
+Keycloak settings:
+
+| Setting | Value |
+| --- | --- |
+| **Clients** > **Create client** | `mcp-example`, created by an administrator (pre-registration, one of the three registration routes of the Keycloak MCP guide) |
+| `mcp-example` > **Valid Redirect URIs** | the MCP client's loopback redirect URIs; exact, case-sensitive match, wildcard only at the end (Server Administration Guide; upgrading guide, "Migrating to 23.0.2") |
+| `mcp-example` > **PKCE method** | `S256` (Server Administration Guide, "PKCE method") |
+| Dedicated client scope > **Add mapper** > `Audience` | **Included Client Audience** = `mcp-example` (Keycloak MCP guide) |
+| **Realm roles** | `mcp-users` and `mcp-admins`, assigned to users; a mapper that writes them to `realm_access.roles` (claim name not verified against Keycloak documentation; the token shape is the one of test K1) |
+
+Section 8 lists the Keycloak pages and versions these settings come from.
+
+Without a token the client gets the default challenge:
+
+```http,case=R1,request
+POST /mcp HTTP/1.1
+Host: mcp.example
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"example-client","version":"1.0"}}}
+```
+
+```http,case=R1,response
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer resource_metadata="https://mcp.example/.well-known/oauth-protected-resource/mcp", error="invalid_request", error_description="missing bearer token or mTLS client certificate"
+```
+
+A token shaped like Keycloak's, with the client id in `aud` and the realm role
+`mcp-users`, initializes a session:
+
+```http,case=R1,request
+POST /mcp HTTP/1.1
+Host: mcp.example
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Authorization: Bearer <jwt {"aud":["mcp-example","account"],"azp":"mcp-example","realm_access":{"roles":["mcp-users"]}}>
+
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"example-client","version":"1.0"}}}
+```
+
+```http,case=R1,response
+HTTP/1.1 200 OK
+```
+
+Strict mode ignores `azp`: the same token without `mcp-example` in `aud` is
+rejected.
+
+```http,case=R1,request
+POST /mcp HTTP/1.1
+Host: mcp.example
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Authorization: Bearer <jwt {"aud":["account"],"azp":"mcp-example","realm_access":{"roles":["mcp-users"]}}>
+
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"example-client","version":"1.0"}}}
+```
+
+```http,case=R1,response
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer resource_metadata="https://mcp.example/.well-known/oauth-protected-resource/mcp", error="invalid_token", error_description="token is invalid"
+```
+
+### R2 - Direct mode with CIMD, resource indicators and `accept_resource_audience`
+
+Use when MCP clients register themselves through Client ID Metadata Documents
+and request tokens with an RFC 8707 `resource` parameter.
+
+```toml,case=R2
 [server]
 listen_addr = "0.0.0.0"
 listen_port = 8080
@@ -515,7 +641,7 @@ scope = "mcp:read"
 role = "viewer"
 ```
 
-```sh
+```sh,case=R2
 RMCP_SERVER_KIT__SERVER__PUBLIC_URL=https://mcp.example
 RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ISSUER=https://idp.example/realms/example
 RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__AUDIENCE=mcp-example
@@ -524,7 +650,637 @@ RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ACCEPT_RESOURCE_AUDIENCE=true
 ```
 
 No proxy table: clients register with Keycloak (CIMD) and log in there.
-Keycloak settings are in section 8.
+
+Keycloak settings (details and sources in section 8, "Direct mode"):
+
+| Setting | Value |
+| --- | --- |
+| Server start option | `--features=cimd,resource-indicators` |
+| **Client profile** (`cimd-profile`) | executor `client-id-metadata-document`; **Trusted domains** = the client id hosts; **Restrict same domain** `OFF` for loopback redirects; **Resource indicator allow list** = `https://mcp.example/mcp` |
+| **Client policy** (`cimd-policy`) | condition `client-id-uri`, URI scheme `https`, applies `cimd-profile` |
+| Client scopes `mcp:read`, `mcp:admin` | `Optional` client scopes |
+
+With the resource-indicators feature, a token requested with
+`resource=https://mcp.example/mcp` carries only that URL in `aud` (Keycloak
+MCP guide, "With Resource Indicators for OAuth 2.0"). `audience =
+"mcp-example"` alone would reject it; `accept_resource_audience = true` makes
+this server accept its own resource URL as well:
+
+```http,case=R2,request
+POST /mcp HTTP/1.1
+Host: mcp.example
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Authorization: Bearer <jwt {"aud":"https://mcp.example/mcp","scope":"mcp:read"}>
+
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"example-client","version":"1.0"}}}
+```
+
+```http,case=R2,response
+HTTP/1.1 200 OK
+```
+
+The protected-resource metadata names Keycloak as the authorization server,
+so clients discover where to register and log in:
+
+```http,case=R2,request
+GET /.well-known/oauth-protected-resource/mcp HTTP/1.1
+Host: mcp.example
+```
+
+```http,case=R2,response
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"authorization_servers":["https://idp.example/realms/example"],"bearer_methods_supported":["header"],"resource":"https://mcp.example/mcp","scopes_supported":["mcp:admin","mcp:read"]}
+```
+
+### R3 - `additional_audiences`: one server reachable under two hostnames, or moving from a client-id audience to the resource URL
+
+Use when tokens minted for old audiences must keep working while clients move
+to the resource URL `https://mcp.example/mcp`.
+
+```toml,case=R3
+[server]
+listen_addr = "0.0.0.0"
+listen_port = 8080
+public_url = "https://mcp.example"
+
+[server.auth]
+enabled = true
+
+[server.auth.oauth]
+issuer = "https://idp.example/realms/example"
+audience = "https://mcp.example/mcp"
+jwks_uri = "https://idp.example/realms/example/protocol/openid-connect/certs"
+additional_audiences = ["https://mcp-old.example/mcp", "mcp-example-legacy"]
+
+[[server.auth.oauth.scopes]]
+scope = "mcp:read"
+role = "viewer"
+```
+
+```sh,case=R3
+RMCP_SERVER_KIT__SERVER__PUBLIC_URL=https://mcp.example
+RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__AUDIENCE=https://mcp.example/mcp
+RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ADDITIONAL_AUDIENCES=https://mcp-old.example/mcp,mcp-example-legacy
+```
+
+Keycloak settings:
+
+| Setting | Value |
+| --- | --- |
+| Client scope `mcp:read` > **Add mapper** > `Audience` | **Included Custom Audience** = `https://mcp.example/mcp` for new tokens (Keycloak MCP guide, "Without Resource Indicators for OAuth 2.0") |
+| Old `Audience` mappers | keep them until no client holds a token for an old audience, then remove them and the matching `additional_audiences` entries |
+
+During the move, a token for either old audience is still accepted:
+
+```http,case=R3,request
+POST /mcp HTTP/1.1
+Host: mcp.example
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Authorization: Bearer <jwt {"aud":"https://mcp-old.example/mcp","scope":"mcp:read"}>
+
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"example-client","version":"1.0"}}}
+```
+
+```http,case=R3,response
+HTTP/1.1 200 OK
+```
+
+```http,case=R3,request
+POST /mcp HTTP/1.1
+Host: mcp.example
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Authorization: Bearer <jwt {"aud":"mcp-example-legacy","scope":"mcp:read"}>
+
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"example-client","version":"1.0"}}}
+```
+
+```http,case=R3,response
+HTTP/1.1 200 OK
+```
+
+A token for any other audience is still rejected:
+
+```http,case=R3,request
+POST /mcp HTTP/1.1
+Host: mcp.example
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Authorization: Bearer <jwt {"aud":"https://other.example/mcp","scope":"mcp:read"}>
+
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"example-client","version":"1.0"}}}
+```
+
+```http,case=R3,response
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer resource_metadata="https://mcp.example/.well-known/oauth-protected-resource/mcp", error="invalid_token", error_description="token is invalid"
+```
+
+`additional_audiences` only widens the token check. Serving the same server
+under a second hostname also needs the ingress to rewrite `Host` to the
+`public_url` host: `/mcp` accepts only the loopback names, the bind address
+and the `public_url` host (`derive_allowed_hosts` in `src/transport.rs`).
+A request that arrives with the old hostname is refused even with a valid
+token:
+
+```http,case=R3,request
+POST /mcp HTTP/1.1
+Host: mcp-old.example
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Authorization: Bearer <jwt {"aud":"https://mcp-old.example/mcp","scope":"mcp:read"}>
+
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"example-client","version":"1.0"}}}
+```
+
+```http,case=R3,response
+HTTP/1.1 403 Forbidden
+
+Forbidden: Host header is not allowed
+```
+
+### R4 - Roles from `realm_access.roles`, `resource_access.<client>.roles` and `groups`
+
+Use when Keycloak roles or groups, not OAuth scopes, decide what a user may
+call. The three configs differ only in `role_claim` and the mapped values;
+pick the one that matches where your realm puts the entitlement.
+
+Keycloak settings for R4a, R4b and R4c (a token whose claim matches no mapping
+gets `401`; see "Roles" in section 8):
+
+| Setting | Value |
+| --- | --- |
+| R4a: **Realm roles** | `mcp-users`, assigned to users, written to `realm_access.roles` (test K1) |
+| R4b: `mcp-example` > **Roles** | client role `mcp-user`, written to `resource_access.mcp-example.roles` (test K3) |
+| R4c: **Groups** + a group membership mapper | group `mcp-users`, claim `groups`, with the mapper's full-path option off so names have no leading `/` (test K2; the option's name is not verified against Keycloak documentation) |
+| Mapper > **Add to lightweight access token** | `ON` if lightweight access tokens reach this server (Server Administration Guide) |
+| Dedicated client scope > **Add mapper** > `Audience` | **Included Client Audience** = `mcp-example` |
+
+R4a reads realm roles:
+
+```toml,case=R4a
+[server]
+listen_addr = "0.0.0.0"
+listen_port = 8080
+public_url = "https://mcp.example"
+
+[server.auth]
+enabled = true
+
+[server.auth.oauth]
+issuer = "https://idp.example/realms/example"
+audience = "mcp-example"
+jwks_uri = "https://idp.example/realms/example/protocol/openid-connect/certs"
+role_claim = "realm_access.roles"
+
+[[server.auth.oauth.role_mappings]]
+claim_value = "mcp-users"
+role = "viewer"
+
+[rbac]
+enabled = true
+
+[[rbac.roles]]
+name = "viewer"
+allow = ["search"]
+```
+
+```sh,case=R4a
+RMCP_SERVER_KIT__SERVER__PUBLIC_URL=https://mcp.example
+RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__AUDIENCE=mcp-example
+```
+
+```http,case=R4a,request
+POST /mcp HTTP/1.1
+Host: mcp.example
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Authorization: Bearer <jwt {"aud":"mcp-example","realm_access":{"roles":["mcp-users"]}}>
+
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"example-client","version":"1.0"}}}
+```
+
+```http,case=R4a,response
+HTTP/1.1 200 OK
+```
+
+R4b reads the client roles of `mcp-example`. The path is split at every `.`,
+so this form only works for a client id without a dot:
+
+```toml,case=R4b
+[server]
+listen_addr = "0.0.0.0"
+listen_port = 8080
+public_url = "https://mcp.example"
+
+[server.auth]
+enabled = true
+
+[server.auth.oauth]
+issuer = "https://idp.example/realms/example"
+audience = "mcp-example"
+jwks_uri = "https://idp.example/realms/example/protocol/openid-connect/certs"
+role_claim = "resource_access.mcp-example.roles"
+
+[[server.auth.oauth.role_mappings]]
+claim_value = "mcp-user"
+role = "viewer"
+
+[rbac]
+enabled = true
+
+[[rbac.roles]]
+name = "viewer"
+allow = ["search"]
+```
+
+```sh,case=R4b
+RMCP_SERVER_KIT__SERVER__PUBLIC_URL=https://mcp.example
+RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__AUDIENCE=mcp-example
+```
+
+```http,case=R4b,request
+POST /mcp HTTP/1.1
+Host: mcp.example
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Authorization: Bearer <jwt {"aud":"mcp-example","resource_access":{"mcp-example":{"roles":["mcp-user"]}}}>
+
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"example-client","version":"1.0"}}}
+```
+
+```http,case=R4b,response
+HTTP/1.1 200 OK
+```
+
+R4c reads group membership:
+
+```toml,case=R4c
+[server]
+listen_addr = "0.0.0.0"
+listen_port = 8080
+public_url = "https://mcp.example"
+
+[server.auth]
+enabled = true
+
+[server.auth.oauth]
+issuer = "https://idp.example/realms/example"
+audience = "mcp-example"
+jwks_uri = "https://idp.example/realms/example/protocol/openid-connect/certs"
+role_claim = "groups"
+
+[[server.auth.oauth.role_mappings]]
+claim_value = "mcp-users"
+role = "viewer"
+
+[rbac]
+enabled = true
+
+[[rbac.roles]]
+name = "viewer"
+allow = ["search"]
+```
+
+```sh,case=R4c
+RMCP_SERVER_KIT__SERVER__PUBLIC_URL=https://mcp.example
+RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__AUDIENCE=mcp-example
+```
+
+```http,case=R4c,request
+POST /mcp HTTP/1.1
+Host: mcp.example
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Authorization: Bearer <jwt {"aud":"mcp-example","groups":["mcp-users"]}>
+
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"example-client","version":"1.0"}}}
+```
+
+```http,case=R4c,response
+HTTP/1.1 200 OK
+```
+
+### R5 - Scope-based roles with scope hint and step-up
+
+Use when Keycloak grants `mcp:*` client scopes per user and clients should be
+told which scope to ask for first and which one to add for a denied call.
+Mappings are listed broadest first, which section 9 explains.
+
+```toml,case=R5
+[server]
+listen_addr = "0.0.0.0"
+listen_port = 8080
+public_url = "https://mcp.example"
+
+[server.auth]
+enabled = true
+
+[server.auth.oauth]
+issuer = "https://idp.example/realms/example"
+audience = "mcp-example"
+jwks_uri = "https://idp.example/realms/example/protocol/openid-connect/certs"
+challenge_scopes = ["mcp:read"]
+insufficient_scope_challenge = true
+
+[[server.auth.oauth.scopes]]
+scope = "mcp:admin"
+role = "ops"
+
+[[server.auth.oauth.scopes]]
+scope = "mcp:read"
+role = "viewer"
+
+[rbac]
+enabled = true
+
+[[rbac.roles]]
+name = "ops"
+allow = ["*"]
+
+[[rbac.roles]]
+name = "viewer"
+allow = ["search"]
+```
+
+```sh,case=R5
+RMCP_SERVER_KIT__SERVER__PUBLIC_URL=https://mcp.example
+RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__CHALLENGE_SCOPES=mcp:read
+RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__INSUFFICIENT_SCOPE_CHALLENGE=true
+```
+
+Keycloak settings:
+
+| Setting | Value |
+| --- | --- |
+| **Client scopes** `mcp:read`, `mcp:admin` | `Optional` client scopes, each with an `Audience` mapper whose **Included Client Audience** is `mcp-example` (Keycloak MCP guide) |
+| Who may receive `mcp:admin` | only users entitled to `ops`; see "Scope gating caveat" in section 8 |
+
+The `401` challenge carries the least-privilege scope hint:
+
+```http,case=R5,request
+POST /mcp HTTP/1.1
+Host: mcp.example
+Content-Type: application/json
+Accept: application/json, text/event-stream
+
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"example-client","version":"1.0"}}}
+```
+
+```http,case=R5,response
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer resource_metadata="https://mcp.example/.well-known/oauth-protected-resource/mcp", scope="mcp:read", error="invalid_request", error_description="missing bearer token or mTLS client certificate"
+```
+
+A viewer calling a tool only `ops` may use is told which scope unlocks it:
+
+```http,case=R5,request
+POST /mcp HTTP/1.1
+Host: mcp.example
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Authorization: Bearer <jwt {"aud":"mcp-example","scope":"mcp:read"}>
+
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"restart","arguments":{}}}
+```
+
+```http,case=R5,response
+HTTP/1.1 403 Forbidden
+WWW-Authenticate: Bearer error="insufficient_scope", scope="mcp:admin", resource_metadata="https://mcp.example/.well-known/oauth-protected-resource/mcp", error_description="additional scope required"
+
+restart denied for role 'viewer'
+```
+
+### R6 - RFC 6750 bare missing-credential challenge
+
+Use when clients expect the RFC 6750 section 3.1 challenge, which has no
+`error` parameter when the request carries no credential.
+
+```toml,case=R6
+[server]
+listen_addr = "0.0.0.0"
+listen_port = 8080
+public_url = "https://mcp.example"
+
+[server.auth]
+enabled = true
+
+[server.auth.oauth]
+issuer = "https://idp.example/realms/example"
+audience = "mcp-example"
+jwks_uri = "https://idp.example/realms/example/protocol/openid-connect/certs"
+omit_error_on_missing_credential = true
+
+[[server.auth.oauth.scopes]]
+scope = "mcp:read"
+role = "viewer"
+```
+
+```sh,case=R6
+RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__OMIT_ERROR_ON_MISSING_CREDENTIAL=true
+```
+
+Keycloak settings:
+
+| Setting | Value |
+| --- | --- |
+| Realm and clients | as in R1 or R2; this knob changes only the challenge this server sends |
+
+A request with no credential then gets
+`WWW-Authenticate: Bearer resource_metadata="https://mcp.example/.well-known/oauth-protected-resource/mcp"`
+with no `error`. Requests carrying a bad or expired token still get
+`error="invalid_token"`.
+
+```http,case=R6,request
+POST /mcp HTTP/1.1
+Host: mcp.example
+```
+
+```http,case=R6,response
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer resource_metadata="https://mcp.example/.well-known/oauth-protected-resource/mcp"
+```
+
+```http,case=R6,request
+POST /mcp HTTP/1.1
+Host: mcp.example
+Authorization: Bearer a.b.c
+```
+
+```http,case=R6,response
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer resource_metadata="https://mcp.example/.well-known/oauth-protected-resource/mcp", error="invalid_token", error_description="token is invalid"
+```
+
+### R7 - Downstream calls via RFC 8693 token exchange instead of token passthrough
+
+Use when a tool handler calls another API on the user's behalf. Forwarding
+the inbound token there is the token passthrough that the
+[MCP Security Best Practices](https://modelcontextprotocol.io/specification/2026-07-28/basic/security_best_practices)
+forbid; exchange it for a token issued to the downstream API instead.
+
+```toml,case=R7
+[server]
+listen_addr = "0.0.0.0"
+listen_port = 8080
+public_url = "https://mcp.example"
+
+[server.auth]
+enabled = true
+
+[server.auth.oauth]
+issuer = "https://idp.example/realms/example"
+audience = "mcp-example"
+jwks_uri = "https://idp.example/realms/example/protocol/openid-connect/certs"
+
+[[server.auth.oauth.scopes]]
+scope = "mcp:read"
+role = "viewer"
+
+[server.auth.oauth.token_exchange]
+token_url = "https://idp.example/realms/example/protocol/openid-connect/token"
+client_id = "mcp-example"
+client_secret = "replace-with-the-keycloak-client-secret"
+audience = "downstream-api"
+```
+
+```sh,case=R7
+RMCP_SERVER_KIT__SERVER__PUBLIC_URL=https://mcp.example
+RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ISSUER=https://idp.example/realms/example
+RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__AUDIENCE=mcp-example
+```
+
+The `token_exchange` table has no env vars, so keep this TOML file in a
+mounted Secret because it holds the client secret. Startup validation
+requires exactly one of `client_secret` and `client_cert`.
+
+Keycloak settings ("Tokens for downstream services" in section 8 has the
+details and the Keycloak token exchange guide it quotes):
+
+| Setting | Value |
+| --- | --- |
+| `mcp-example` > **Client authentication** | `ON` (confidential client); its secret goes into `client_secret` |
+| `mcp-example` > **Standard Token Exchange** | `ON` |
+| Inbound tokens | carry `mcp-example` in `aud` (the `Audience` mapper of R1) |
+| Downstream client | `downstream-api`, the value of `audience` in the table |
+
+The crate does not exchange tokens on its own. A tool handler does it with the
+bearer token of the current request:
+
+```rust,ignore
+use rmcp::ErrorData;
+use rmcp_server_kit::{oauth, rbac, secret::ExposeSecret as _};
+
+// `http` is built once with `oauth::OauthHttpClient::with_config(&oauth_config)`;
+// `exchange` is the parsed `[server.auth.oauth.token_exchange]` table.
+let subject = rbac::current_token()
+    .ok_or_else(|| ErrorData::invalid_request("no bearer token", None))?;
+let downstream = oauth::exchange_token(&http, &exchange, subject.expose_secret())
+    .await
+    .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+// Send `downstream.access_token` to the downstream API, never `subject`.
+```
+
+The test performs this call with the case's `token_exchange` table and the
+subject token `subject-token`, and checks the request Keycloak receives. With
+`client_secret` set the client authenticates with HTTP Basic, and the form
+carries no `client_id`:
+
+```http,case=R7,upstream
+POST /realms/example/protocol/openid-connect/token
+Content-Type: application/x-www-form-urlencoded
+Accept: application/json
+Authorization: Basic <any>
+
+grant_type=urn:ietf:params:oauth:grant-type:token-exchange
+subject_token=subject-token
+subject_token_type=urn:ietf:params:oauth:token-type:access_token
+requested_token_type=urn:ietf:params:oauth:token-type:access_token
+audience=downstream-api
+```
+
+### R8 - App-owned OAuth facade (`authorization_servers = [public_url]`, `with_extra_router`)
+
+Use when the application mounts its own authorization endpoints next to `/mcp`
+and clients must discover them instead of Keycloak.
+
+```toml,case=R8
+[server]
+listen_addr = "0.0.0.0"
+listen_port = 8080
+public_url = "https://mcp.example"
+
+[server.auth]
+enabled = true
+
+[server.auth.oauth]
+issuer = "https://idp.example/realms/example"
+audience = "mcp-example"
+jwks_uri = "https://idp.example/realms/example/protocol/openid-connect/certs"
+authorization_servers = ["https://mcp.example"]
+
+[[server.auth.oauth.scopes]]
+scope = "mcp:read"
+role = "viewer"
+```
+
+```sh,case=R8
+RMCP_SERVER_KIT__SERVER__PUBLIC_URL=https://mcp.example
+RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ISSUER=https://idp.example/realms/example
+```
+
+`authorization_servers` has no env var. There is no `proxy` table: without
+one this server would advertise Keycloak's issuer (section 8,
+"Application-owned facade"), so the list names the application's own origin.
+
+Keycloak settings:
+
+| Setting | Value |
+| --- | --- |
+| The facade's client | a confidential client of the application, with the facade's callback as its only **Valid Redirect URI** |
+| Tokens the facade hands out | still issued by Keycloak, so `issuer` and `jwks_uri` stay Keycloak's; they carry `mcp-example` in `aud` |
+
+```http,case=R8,request
+GET /.well-known/oauth-protected-resource/mcp HTTP/1.1
+Host: mcp.example
+```
+
+```http,case=R8,response
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"authorization_servers":["https://mcp.example"],"bearer_methods_supported":["header"],"resource":"https://mcp.example/mcp","scopes_supported":["mcp:read"]}
+```
+
+The application mounts its endpoints, including its own
+`/.well-known/oauth-authorization-server`, through `with_extra_router`:
+
+```rust,ignore
+use axum::{Router, routing::{get, post}};
+
+let facade = Router::new()
+    .route("/.well-known/oauth-authorization-server", get(app_metadata))
+    .route("/authorize", get(app_authorize))
+    .route("/callback", get(app_callback))
+    .route("/token", post(app_token));
+let mcp_config = server_config.apply_to_mcp_config(base)?.with_extra_router(facade);
+```
+
+What the application then owns, compared with the framework's
+[`authorization_server` mode](#4-flow-dissection-authorization_server-proxy),
+which replaces such a facade:
+
+| | Application-owned facade | `authorization_server` mode |
+|---|---|---|
+| Per-client consent | whatever the application builds | consent page per client, remembered per browser profile (section 4) |
+| `iss` on the redirect to the client | whatever the application sends | always this server's issuer (section 4) |
+| PKCE binding | whatever the application checks | the client's S256 challenge is bound into the wrapped code and checked before Keycloak is contacted (section 4) |
+| Refresh-token binding | whatever the application does | each refresh token is wrapped and bound to the client across rotations (section 4) |
+| PRM `authorization_servers` | set it to the application's origin | unset, or exactly the issuer (section 6) |
 
 ### (B) Passthrough proxy exactly as in 3.20.0
 
@@ -712,104 +1468,6 @@ RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_PREVIOUS_FILE=/var/r
 
 See section 10 for when phase 2 is safe.
 
-### (G) Scope hint and step-up
-
-Mappings are listed broadest first, which section 9 explains.
-
-```toml
-[server]
-listen_addr = "0.0.0.0"
-listen_port = 8080
-public_url = "https://mcp.example"
-
-[server.auth]
-enabled = true
-
-[server.auth.oauth]
-issuer = "https://idp.example/realms/example"
-audience = "mcp-example"
-jwks_uri = "https://idp.example/realms/example/protocol/openid-connect/certs"
-challenge_scopes = ["mcp:read"]
-insufficient_scope_challenge = true
-
-[[server.auth.oauth.scopes]]
-scope = "mcp:admin"
-role = "admin"
-
-[[server.auth.oauth.scopes]]
-scope = "mcp:read"
-role = "viewer"
-
-[rbac]
-enabled = true
-
-[[rbac.roles]]
-name = "admin"
-allow = ["*"]
-
-[[rbac.roles]]
-name = "viewer"
-allow = ["search"]
-```
-
-```sh
-RMCP_SERVER_KIT__SERVER__PUBLIC_URL=https://mcp.example
-RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__CHALLENGE_SCOPES=mcp:read
-RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__INSUFFICIENT_SCOPE_CHALLENGE=true
-```
-
-### R6 - RFC 6750 bare missing-credential challenge
-
-```toml,case=R6
-[server]
-listen_addr = "0.0.0.0"
-listen_port = 8080
-public_url = "https://mcp.example"
-
-[server.auth]
-enabled = true
-
-[server.auth.oauth]
-issuer = "https://idp.example/realms/example"
-audience = "mcp-example"
-jwks_uri = "https://idp.example/realms/example/protocol/openid-connect/certs"
-omit_error_on_missing_credential = true
-
-[[server.auth.oauth.scopes]]
-scope = "mcp:read"
-role = "viewer"
-```
-
-```sh,case=R6
-RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__OMIT_ERROR_ON_MISSING_CREDENTIAL=true
-```
-
-A request with no credential then gets
-`WWW-Authenticate: Bearer resource_metadata="https://mcp.example/.well-known/oauth-protected-resource/mcp"`
-with no `error`. Requests carrying a bad or expired token still get
-`error="invalid_token"`.
-
-```http,case=R6,request
-POST /mcp HTTP/1.1
-Host: mcp.example
-```
-
-```http,case=R6,response
-HTTP/1.1 401 Unauthorized
-WWW-Authenticate: Bearer resource_metadata="https://mcp.example/.well-known/oauth-protected-resource/mcp"
-```
-
-```http,case=R6,request
-POST /mcp HTTP/1.1
-Host: mcp.example
-Authorization: Bearer a.b.c
-```
-
-```http,case=R6,response
-HTTP/1.1 401 Unauthorized
-WWW-Authenticate: Bearer resource_metadata="https://mcp.example/.well-known/oauth-protected-resource/mcp", error="invalid_token", error_description="token is invalid"
-```
-
 ## 8. Keycloak settings per mode
 
 Sources, as fetched on 2026-10-18:
@@ -850,7 +1508,8 @@ checklist, not something this project tested against a live Keycloak.
   executor's **Resource indicator allow list** must contain the MCP server's
   URL, here `https://mcp.example/mcp`. Source: Keycloak MCP guide, "With
   Resource Indicators for OAuth 2.0".
-- **Pair it with `accept_resource_audience = true`** (example A). With only
+- **Pair it with `accept_resource_audience = true`** (case
+  [R2](#r2---direct-mode-with-cimd-resource-indicators-and-accept_resource_audience)). With only
   the resource URL in `aud`, `audience = "mcp-example"` no longer matches;
   `accept_resource_audience` makes this server accept `https://mcp.example/mcp`.
   Alternatively list that URL in `additional_audiences`.
@@ -1075,21 +1734,10 @@ its own origin and serves `/.well-known/oauth-authorization-server` itself.
 The opt-ins `challenge_scopes`, `omit_error_on_missing_credential`,
 `additional_audiences` and `accept_resource_audience` work the same way there,
 because they act on token validation and the `401` challenge, not on the
-proxy. `proxy.mode = "authorization_server"` is the framework's replacement
-for such a facade:
-
-| | Application-owned facade | `authorization_server` mode |
-|---|---|---|
-| Per-client consent | whatever the application builds | consent page per client, remembered per browser profile (section 4) |
-| `iss` on the redirect to the client | whatever the application sends | always this server's issuer (section 4) |
-| PKCE binding | whatever the application checks | the client's S256 challenge is bound into the wrapped code and checked before Keycloak is contacted (section 4) |
-| Refresh-token binding | whatever the application does | each refresh token is wrapped and bound to the client across rotations (section 4) |
-| PRM `authorization_servers` | set it to the application's origin | unset, or exactly the issuer (section 6) |
-
-```toml,fragment
-[server.auth.oauth]
-authorization_servers = ["https://mcp.example"]
-```
+proxy. Case
+[R8](#r8---app-owned-oauth-facade-authorization_servers--public_url-with_extra_router)
+shows the configuration and compares the facade with
+`proxy.mode = "authorization_server"`, the framework's replacement for it.
 
 **Refresh tokens.** Leaving the realm's **Revoke Refresh Token** off is
 acceptable only while Keycloak refresh tokens reach nothing but a
@@ -1141,8 +1789,9 @@ viewer and calls a tool only `admin` may use. The simulation tries adding
 still picks `mcp:read`, so the role stays `viewer`. No scope helps, the
 response is a plain `403`, and no hint is sent. A naive hint of `mcp:admin`
 would have sent the client into a loop: it would get the scope and still be
-a viewer. Swap the two mappings (example G) and the same request gets
-`scope="mcp:admin"`.
+a viewer. Swap the two mappings (case
+[R5](#r5---scope-based-roles-with-scope-hint-and-step-up)) and the same
+request gets `scope="mcp:admin"`.
 
 `challenge_scopes` (the `401` hint) and `insufficient_scope_challenge`
 (the `403` step-up) complement each other: the first tells a client which

@@ -11,6 +11,7 @@ use rmcp::{
     model::{ServerCapabilities, ServerConfig as HandlerConfig},
 };
 use rmcp_server_kit::{
+    oauth::OAuthConfig,
     rbac::RbacPolicy,
     transport::{McpServerConfig, serve_with_listener},
 };
@@ -47,14 +48,12 @@ pub(super) async fn run_case(case: &Case, identity: &Identity) -> anyhow::Result
     let upstream_base = mock.base();
     let config = operator_config(case, &upstream_base)?;
     mount_endpoints(&mock, &config, identity).await?;
-    let issuer = config
+    let oauth = config
         .server
         .auth
         .as_ref()
         .and_then(|auth| auth.oauth.as_ref())
-        .context("case issuer")?
-        .issuer
-        .clone();
+        .context("case OAuth configuration")?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let mut bridged = config.server.apply_to_mcp_config(McpServerConfig::new(
@@ -84,14 +83,15 @@ pub(super) async fn run_case(case: &Case, identity: &Identity) -> anyhow::Result
     let client = super::network::client()?;
     let mut executed = 0_usize;
     for exchange in &case.exchanges {
+        executed = executed.saturating_add(1);
         execute(
             exchange,
             (&client, &format!("http://{addr}")),
             (&mock, &upstream_base),
-            (identity, &issuer),
+            (identity, oauth),
         )
-        .await?;
-        executed = executed.saturating_add(1);
+        .await
+        .with_context(|| format!("case {} exchange {executed}", case.id))?;
         tracing::info!(case = %case.id, exchange = executed, "documented exchange executed");
     }
     stop.cancel();
@@ -106,7 +106,7 @@ async fn execute(
     exchange: &Exchange,
     client: (&Client, &str),
     upstream: (&DualStackMock, &str),
-    jwt: (&Identity, &str),
+    jwt: (&Identity, &OAuthConfig),
 ) -> anyhow::Result<()> {
     match exchange {
         Exchange::Http {
@@ -115,7 +115,9 @@ async fn execute(
             upstream: expected_upstream,
         } => {
             let offsets = upstream.0.offsets().await?;
-            let raw = jwt.0.substitute(&rewrite(request, upstream.1), jwt.1)?;
+            let raw = jwt
+                .0
+                .substitute(&rewrite(request, upstream.1), &jwt.1.issuer)?;
             let message = Message::parse(&raw)?;
             let (method, target) = message.request_target()?;
             let mut builder = client
@@ -171,11 +173,7 @@ async fn execute(
         Exchange::Library {
             snippet,
             upstream: library_upstream,
-        } => anyhow::bail!(
-            "Unsupported library-call execution (exchange_token deferred to resource cases); snippet bytes {}, upstream bytes {}",
-            snippet.len(),
-            library_upstream.len()
-        ),
+        } => super::library::execute(snippet, library_upstream, jwt.1, upstream).await?,
     }
     Ok(())
 }

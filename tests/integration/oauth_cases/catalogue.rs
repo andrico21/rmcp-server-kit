@@ -6,7 +6,18 @@ use anyhow::{Context as _, ensure};
 
 use super::grammar::Case;
 
-const EXPECTED_CASES: &[(&str, usize)] = &[("R6", 2)];
+const EXPECTED_CASES: &[(&str, usize)] = &[
+    ("R1", 3),
+    ("R2", 2),
+    ("R3", 4),
+    ("R4a", 1),
+    ("R4b", 1),
+    ("R4c", 1),
+    ("R5", 2),
+    ("R6", 2),
+    ("R7", 1),
+    ("R8", 1),
+];
 
 pub(super) fn check(cases: &[Case]) -> anyhow::Result<()> {
     let observed: Vec<_> = cases
