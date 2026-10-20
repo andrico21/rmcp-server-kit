@@ -504,7 +504,55 @@ Keycloak settings are documentation, not live-Keycloak tests. The MCP listener
 uses an ephemeral loopback port, retaining the documented public URL and sending
 every request header, including Host, as written. Redirects are never followed.
 
+#### Settings matrix: resource server
+
+The two matrices show the settings of every case at a glance. A `-` means
+the key is absent from the case TOML, so its default applies; any other value
+is the TOML value exactly as the case writes it. A secret shows `set` when the
+case TOML or its main env block supplies it and `set (file)` when the main env
+block names the `_FILE` variable; `table` marks a
+`[server.auth.oauth.token_exchange]` table. "Roles from" shows `scopes` for
+`[[server.auth.oauth.scopes]]` mappings, otherwise the `role_claim` value. The
+Keycloak columns are notes; a test compares every other cell with the case
+config and env block.
+
+| Case | `public_url` | `audience` | `audience_validation_mode` | `accept_resource_audience` | `additional_audiences` | Roles from | `challenge_scopes` | `insufficient_scope_challenge` | `omit_error_on_missing_credential` | `token_exchange` | `authorization_servers` | Keycloak side |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| [R1](#r1---direct-mode-pre-registered-keycloak-client-client-id-audience-strict-mode-realm-role-mapping) | `"https://mcp.example"` | `"mcp-example"` | `"strict"` | - | - | `"realm_access.roles"` | - | - | - | - | - | pre-registered client `mcp-example`, realm roles, `Audience` mapper |
+| [R2](#r2---direct-mode-with-cimd-resource-indicators-and-accept_resource_audience) | `"https://mcp.example"` | `"mcp-example"` | - | `true` | - | scopes | - | - | - | - | - | CIMD and resource indicators, optional `mcp:*` client scopes |
+| [R3](#r3---additional_audiences-one-server-reachable-under-two-hostnames-or-moving-from-a-client-id-audience-to-the-resource-url) | `"https://mcp.example"` | `"https://mcp.example/mcp"` | - | - | `["https://mcp-old.example/mcp", "mcp-example-legacy"]` | scopes | - | - | - | - | - | `Audience` mapper with the resource URL; old mappers kept while migrating |
+| [R4a](#r4---roles-from-realm_accessroles-resource_accessclientroles-and-groups) | `"https://mcp.example"` | `"mcp-example"` | - | - | - | `"realm_access.roles"` | - | - | - | - | - | realm role `mcp-users` |
+| [R4b](#r4---roles-from-realm_accessroles-resource_accessclientroles-and-groups) | `"https://mcp.example"` | `"mcp-example"` | - | - | - | `"resource_access.mcp-example.roles"` | - | - | - | - | - | client role `mcp-user` of `mcp-example` |
+| [R4c](#r4---roles-from-realm_accessroles-resource_accessclientroles-and-groups) | `"https://mcp.example"` | `"mcp-example"` | - | - | - | `"groups"` | - | - | - | - | - | group `mcp-users` with a group membership mapper |
+| [R5](#r5---scope-based-roles-with-scope-hint-and-step-up) | `"https://mcp.example"` | `"mcp-example"` | - | - | - | scopes | `["mcp:read"]` | `true` | - | - | - | optional `mcp:*` client scopes with `Audience` mappers |
+| [R6](#r6---rfc-6750-bare-missing-credential-challenge) | `"https://mcp.example"` | `"mcp-example"` | - | - | - | scopes | - | - | `true` | - | - | as in R1 or R2 |
+| [R7](#r7---downstream-calls-via-rfc-8693-token-exchange-instead-of-token-passthrough) | `"https://mcp.example"` | `"mcp-example"` | - | - | - | scopes | - | - | - | table | - | confidential `mcp-example` with **Standard Token Exchange** `ON` |
+| [R8](#r8---app-owned-oauth-facade-authorization_servers--public_url-with_extra_router) | `"https://mcp.example"` | `"mcp-example"` | - | - | - | scopes | - | - | - | - | `["https://mcp.example"]` | confidential client of the application facade |
+| [P1](#p1---passthrough-proxy-exactly-as-in-3200) | `"https://mcp.example"` | `"mcp-example"` | - | - | - | scopes | - | - | - | - | - | static client `mcp-proxy` |
+| [P2](#p2---passthrough-for-microsoft-entra-id-with-strip_resource_param) | `"https://mcp.example"` | `"api://mcp-example"` | - | - | - | `"roles"` | - | - | - | - | - | Entra app registration, app role `Mcp.Read` |
+| [P3](#p3---authorization_server-mode-single-replica) | `"https://mcp.example"` | `"mcp-example"` | - | - | - | scopes | - | - | - | - | - | confidential client `mcp-proxy` |
+| [P4](#p4---authorization_server-mode-several-replicas-secret-from-a-mounted-file) | `"https://mcp.example"` | `"mcp-example"` | - | - | - | scopes | - | - | - | - | - | as in P3 |
+| [P5](#p5---signing-secret-rotation-with-sealing_secret_previous) | `"https://mcp.example"` | `"mcp-example"` | - | - | - | scopes | - | - | - | - | - | as in P3 or P4 |
+| [P6](#p6---authorization_server-mode-with-introspect-and-revoke-refresh-token-unwrapping) | `"https://mcp.example"` | `"mcp-example"` | - | - | - | scopes | - | - | - | - | - | as in P3 |
+| [P7](#p7---migration-passthrough---authorization_server) | `"https://mcp.example"` | `"mcp-example"` | - | - | - | scopes | - | - | - | - | - | as in P1, then as in P3 |
+
+#### Settings matrix: proxy
+
+Only cases with a `[server.auth.oauth.proxy]` table have a row here.
+
+| Case | `mode` | `client_secret` | `strip_resource_param` | `sealing_secret` | `sealing_secret_previous` | `consent_ttl` | `expose_admin_endpoints` | Keycloak redirect URIs |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| [P1](#p1---passthrough-proxy-exactly-as-in-3200) | - | - | - | - | - | - | - | the MCP clients' loopback redirect URIs |
+| [P2](#p2---passthrough-for-microsoft-entra-id-with-strip_resource_param) | - | - | `true` | - | - | - | - | the MCP clients' redirect URIs, on the app registration |
+| [P3](#p3---authorization_server-mode-single-replica) | `"authorization_server"` | set | - | set (file) | - | `"30d"` | - | exactly `https://mcp.example/oauth/callback` |
+| [P4](#p4---authorization_server-mode-several-replicas-secret-from-a-mounted-file) | `"authorization_server"` | set | - | set (file) | - | - | - | `https://mcp.example/oauth/callback`, shared by every replica |
+| [P5](#p5---signing-secret-rotation-with-sealing_secret_previous) | `"authorization_server"` | set | - | set (file) | set (file) | - | - | as in P3 |
+| [P6](#p6---authorization_server-mode-with-introspect-and-revoke-refresh-token-unwrapping) | `"authorization_server"` | set | - | set (file) | - | - | `true` | as in P3 |
+| [P7](#p7---migration-passthrough---authorization_server) | `"authorization_server"` | - | - | set (file) | - | - | - | add `https://mcp.example/oauth/callback`, later remove the loopback patterns |
+
 ### R1 - Direct mode, pre-registered Keycloak client, client-id audience, strict mode, realm-role mapping
+
+Settings: [resource-server matrix](#settings-matrix-resource-server), row R1.
 
 Use when an administrator creates the MCP client in Keycloak and access is
 decided by realm roles, not by OAuth scopes.
@@ -617,6 +665,8 @@ WWW-Authenticate: Bearer resource_metadata="https://mcp.example/.well-known/oaut
 
 ### R2 - Direct mode with CIMD, resource indicators and `accept_resource_audience`
 
+Settings: [resource-server matrix](#settings-matrix-resource-server), row R2.
+
 Use when MCP clients register themselves through Client ID Metadata Documents
 and request tokens with an RFC 8707 `resource` parameter.
 
@@ -700,6 +750,8 @@ Content-Type: application/json
 ```
 
 ### R3 - `additional_audiences`: one server reachable under two hostnames, or moving from a client-id audience to the resource URL
+
+Settings: [resource-server matrix](#settings-matrix-resource-server), row R3.
 
 Use when tokens minted for old audiences must keep working while clients move
 to the resource URL `https://mcp.example/mcp`.
@@ -808,6 +860,8 @@ Forbidden: Host header is not allowed
 ```
 
 ### R4 - Roles from `realm_access.roles`, `resource_access.<client>.roles` and `groups`
+
+Settings: [resource-server matrix](#settings-matrix-resource-server), rows R4a, R4b and R4c.
 
 Use when Keycloak roles or groups, not OAuth scopes, decide what a user may
 call. The three configs differ only in `role_claim` and the mapped values;
@@ -971,6 +1025,8 @@ HTTP/1.1 200 OK
 
 ### R5 - Scope-based roles with scope hint and step-up
 
+Settings: [resource-server matrix](#settings-matrix-resource-server), row R5.
+
 Use when Keycloak grants `mcp:*` client scopes per user and clients should be
 told which scope to ask for first and which one to add for a denied call.
 Mappings are listed broadest first, which section 9 explains.
@@ -1061,6 +1117,8 @@ restart denied for role 'viewer'
 
 ### R6 - RFC 6750 bare missing-credential challenge
 
+Settings: [resource-server matrix](#settings-matrix-resource-server), row R6.
+
 Use when clients expect the RFC 6750 section 3.1 challenge, which has no
 `error` parameter when the request carries no credential.
 
@@ -1121,6 +1179,8 @@ WWW-Authenticate: Bearer resource_metadata="https://mcp.example/.well-known/oaut
 ```
 
 ### R7 - Downstream calls via RFC 8693 token exchange instead of token passthrough
+
+Settings: [resource-server matrix](#settings-matrix-resource-server), row R7.
 
 Use when a tool handler calls another API on the user's behalf. Forwarding
 the inbound token there is the token passthrough that the
@@ -1209,6 +1269,8 @@ audience=downstream-api
 
 ### R8 - App-owned OAuth facade (`authorization_servers = [public_url]`, `with_extra_router`)
 
+Settings: [resource-server matrix](#settings-matrix-resource-server), row R8.
+
 Use when the application mounts its own authorization endpoints next to `/mcp`
 and clients must discover them instead of Keycloak.
 
@@ -1287,6 +1349,8 @@ which replaces such a facade:
 | PRM `authorization_servers` | set it to the application's origin | unset, or exactly the issuer (section 6) |
 
 ### P1 - Passthrough proxy exactly as in 3.20.0
+
+Settings: [resource-server matrix](#settings-matrix-resource-server) and [proxy matrix](#settings-matrix-proxy), row P1.
 
 Use when an existing 3.20.0 deployment keeps its proxy unchanged: one static
 Keycloak client for every MCP client, and no consent page of this server's own.
@@ -1372,6 +1436,8 @@ Location: https://idp.example/realms/example/protocol/openid-connect/auth?respon
 
 ### P2 - Passthrough for Microsoft Entra ID with `strip_resource_param`
 
+Settings: [resource-server matrix](#settings-matrix-resource-server) and [proxy matrix](#settings-matrix-proxy), row P2.
+
 Use when the passthrough proxy forwards to the Microsoft identity platform
 v2.0 endpoints of Microsoft Entra ID.
 
@@ -1438,6 +1504,8 @@ Location: https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000
 ```
 
 ### P3 - `authorization_server` mode, single replica
+
+Settings: [resource-server matrix](#settings-matrix-resource-server) and [proxy matrix](#settings-matrix-proxy), row P3.
 
 Use when MCP clients must see this server as their authorization server, with
 per-client registration, consent and `iss` on every redirect (MCP 2026-07-28),
@@ -1556,6 +1624,8 @@ Content-Type: application/json
 
 ### P4 - `authorization_server` mode, several replicas, secret from a mounted file
 
+Settings: [resource-server matrix](#settings-matrix-resource-server) and [proxy matrix](#settings-matrix-proxy), row P4.
+
 Use when several replicas behind one load balancer serve the same
 `public_url`. Every replica gets the same TOML, the same env and the same
 mounted secret file, so a registration, consent or code sealed by one replica
@@ -1624,6 +1694,8 @@ Content-Type: application/json
 ```
 
 ### P5 - Signing-secret rotation with `sealing_secret_previous`
+
+Settings: [resource-server matrix](#settings-matrix-resource-server) and [proxy matrix](#settings-matrix-proxy), row P5.
 
 Use when the sealing secret of a running `authorization_server` deployment
 must change without logging every client out at once.
@@ -1718,6 +1790,8 @@ Content-Type: application/json
 
 ### P6 - `authorization_server` mode with `/introspect` and `/revoke` (refresh-token unwrapping)
 
+Settings: [resource-server matrix](#settings-matrix-resource-server) and [proxy matrix](#settings-matrix-proxy), row P6.
+
 Use when clients or resource servers need token introspection or revocation
 through this server.
 
@@ -1810,6 +1884,8 @@ Content-Type: application/json
 ```
 
 ### P7 - Migration passthrough -> `authorization_server`
+
+Settings: [resource-server matrix](#settings-matrix-resource-server) and [proxy matrix](#settings-matrix-proxy), row P7.
 
 Use when a deployment running case
 [P1](#p1---passthrough-proxy-exactly-as-in-3200) moves to

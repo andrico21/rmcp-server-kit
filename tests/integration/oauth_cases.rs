@@ -25,9 +25,17 @@ mod tests {
     mod grammar;
     mod grammar_tables;
     mod identity;
+    mod knob_tables;
+    mod knobs;
     mod library;
     mod library_rows;
     mod library_tables;
+    mod matrix;
+    mod matrix_check;
+    mod matrix_rows;
+    mod matrix_rows_cells;
+    mod matrix_tables;
+    mod matrix_tests;
     mod mock;
     mod network;
     mod runtime;
