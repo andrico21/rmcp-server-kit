@@ -383,6 +383,14 @@ const fn is_spoofing_char(ch: char) -> bool {
     )
 }
 
+/// The registration rule for an application display name: at most 128 characters, no control character and no [`is_spoofing_char`] character.
+fn client_name_allowed(name: &str) -> bool {
+    name.chars().count() <= 128
+        && !name
+            .chars()
+            .any(|ch| ch.is_control() || is_spoofing_char(ch))
+}
+
 /// Register a public downstream client without retaining server-side state.
 // cancel-safe: body extraction completes before this synchronous, stateless response construction.
 async fn register(State(state): State<Arc<AsState>>, body: Bytes) -> Response {
@@ -398,12 +406,11 @@ async fn register(State(state): State<Arc<AsState>>, body: Bytes) -> Response {
     {
         return registration_error("invalid_redirect_uri");
     }
-    if input.client_name.as_ref().is_some_and(|name| {
-        name.chars().count() > 128
-            || name
-                .chars()
-                .any(|ch| ch.is_control() || is_spoofing_char(ch))
-    }) {
+    if input
+        .client_name
+        .as_deref()
+        .is_some_and(|name| !client_name_allowed(name))
+    {
         return registration_error("invalid_client_metadata");
     }
     let client = ClientReg {
@@ -606,7 +613,17 @@ fn consent_page(
     request: &ConsentRequest,
     token: &str,
 ) -> Response {
-    let name = client.name.as_ref().map_or_else(
+    let allowed = client
+        .name
+        .as_deref()
+        .filter(|value| client_name_allowed(value));
+    if client.name.is_some() && allowed.is_none() {
+        tracing::debug!(
+            reason = "client_name",
+            "sealed client name fails the registration rules; shown as unnamed"
+        );
+    }
+    let name = allowed.map_or_else(
         || "An unnamed application".to_owned(),
         |value| {
             format!(

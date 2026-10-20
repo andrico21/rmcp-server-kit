@@ -201,12 +201,12 @@ Open endpoints (no auth):
 | `GET  /metrics`                            | served by `serve_metrics` on a **separate listener** when `feature = "metrics"` (`src/metrics.rs:220`) |
 | `GET  /.well-known/oauth-protected-resource` | feature = `oauth`, mounted in `build_app_router` (`src/transport.rs:2347`) |
 | `GET  /.well-known/oauth-authorization-server` | feature = `oauth` proxy, mounted by `install_oauth_proxy_routes` (`src/transport.rs:3418`) |
-| `POST /register` (`authorization_server` mode) | `register` (`src/oauth_as.rs:388`) - validates redirect URIs and answers `201` with a sealed per-client `client_id` |
-| `GET  /authorize` (`authorization_server` mode) | `authorize` (`src/oauth_as.rs:485`) - opens the sealed client, checks the exact `redirect_uri` and S256 PKCE, serves the consent page (or skips it on remembered consent) |
-| `POST /oauth/consent` (`authorization_server` mode) | `consent` (`src/oauth_as.rs:653`) - CSRF-checked approve/deny; approval sets the state and consent cookies and redirects to the upstream IdP |
-| `GET  /oauth/callback` (`authorization_server` mode) | `callback` (`src/oauth_as.rs:849`) - checks the state cookie and upstream `iss`, wraps the code, redirects to the client with this server's `iss` |
-| `POST /token` (`authorization_server` mode) | `token` (`src/oauth_as.rs:1059`) - opens the wrapped code or refresh token, checks client, `redirect_uri` and PKCE, sends an allowlisted form upstream |
-| `POST /introspect`, `/revoke` (`authorization_server` mode, only when exposed) | `unwrap_refresh_token_param` (`src/oauth_as.rs:1129`) swaps a sealed refresh wrapper for the upstream token, then the passthrough handlers forward |
+| `POST /register` (`authorization_server` mode) | `register` (`src/oauth_as.rs:396`) - validates redirect URIs and answers `201` with a sealed per-client `client_id` |
+| `GET  /authorize` (`authorization_server` mode) | `authorize` (`src/oauth_as.rs:492`) - opens the sealed client, checks the exact `redirect_uri` and S256 PKCE, serves the consent page (or skips it on remembered consent) |
+| `POST /oauth/consent` (`authorization_server` mode) | `consent` (`src/oauth_as.rs:670`) - CSRF-checked approve/deny; approval sets the state and consent cookies and redirects to the upstream IdP |
+| `GET  /oauth/callback` (`authorization_server` mode) | `callback` (`src/oauth_as.rs:866`) - checks the state cookie and upstream `iss`, wraps the code, redirects to the client with this server's `iss` |
+| `POST /token` (`authorization_server` mode) | `token` (`src/oauth_as.rs:1076`) - opens the wrapped code or refresh token, checks client, `redirect_uri` and PKCE, sends an allowlisted form upstream |
+| `POST /introspect`, `/revoke` (`authorization_server` mode, only when exposed) | `unwrap_refresh_token_param` (`src/oauth_as.rs:1146`) swaps a sealed refresh wrapper for the upstream token, then the passthrough handlers forward |
 
 Authenticated endpoints:
 

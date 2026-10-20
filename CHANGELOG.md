@@ -123,6 +123,8 @@ required) and [`docs/OAUTH_PROXY.md`](docs/OAUTH_PROXY.md).
   `<bdi>` isolates; and `/authorize` re-validates the matched redirect URI of an
   already sealed client. Joined emoji sequences, tag-sequence flags and the
   Mongolian free variation selectors are rejected as a documented trade-off.
+  A sealed `client_name` that fails these rules, for example one sealed by an
+  older version, is shown as "An unnamed application" on the consent page.
 - The `authorization_server` consent and error pages are readable and tappable
   on phones: they declare a device-width viewport and carry one constant inline
   stylesheet (wrapped long names and redirect URIs, Approve and Deny buttons at

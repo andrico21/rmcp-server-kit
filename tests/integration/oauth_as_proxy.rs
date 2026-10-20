@@ -40,6 +40,7 @@ mod tests {
     mod page_markup;
     mod phone_layout;
     mod refresh_and_replicas;
+    mod sealed_client_names;
     mod wire_rejections;
 
     const CALLBACK: &str = "http://127.0.0.1:18999/cb?original=1";

@@ -918,7 +918,7 @@ fn escaped(value: &str) -> String {
 const FIXTURE_SECRET: &str = "fixture-secret-with-at-least-32-bytes";
 
 /// A client identifier sealed independently of the server, forged to model a client minted under looser rules.
-fn sealed_client(uris: &[String], name: Option<&str>) -> anyhow::Result<String> {
+pub(super) fn sealed_client(uris: &[String], name: Option<&str>) -> anyhow::Result<String> {
     reference_seal(
         FIXTURE_SECRET,
         "client",

@@ -79,6 +79,45 @@ fn spoofing_classification_agrees_with_the_model_for_every_scalar_value() -> any
     Ok(())
 }
 
+/// The registration name rule accepts and rejects one sample of each class, and over the whole
+/// scalar value space it rejects exactly the control and spoofing characters.
+#[test]
+fn client_name_rule_accepts_and_rejects_each_class() -> anyhow::Result<()> {
+    // Given
+    let accepted = [
+        "Plain name".to_owned(),
+        "\u{5E9}\u{5DC}\u{5D5}\u{5DD}".to_owned(),
+        "Heart \u{2764}\u{FE0F}".to_owned(),
+        "y".repeat(128),
+        String::new(),
+    ];
+    let rejected = [
+        "MarkerOne\u{202E}x".to_owned(),
+        "MarkerTwo\u{200B}x".to_owned(),
+        "MarkerThree\u{3164}x".to_owned(),
+        "MarkerFour\u{E0041}x".to_owned(),
+        "MarkerFive\u{7}x".to_owned(),
+        "MarkerSix\u{2028}x".to_owned(),
+        format!("MarkerSeven{}", "x".repeat(118)),
+    ];
+    // When / Then
+    for name in &accepted {
+        ensure!(client_name_allowed(name), "accepted: {name:?}");
+    }
+    for name in &rejected {
+        ensure!(!client_name_allowed(name), "rejected: {name:?}");
+    }
+    for ch in '\0'..=char::MAX {
+        let control_or_spoofing = ch.is_control() || is_spoofing_char(ch);
+        ensure!(
+            client_name_allowed(&format!("a{ch}b")) != control_or_spoofing,
+            "U+{:04X} classification",
+            u32::from(ch)
+        );
+    }
+    Ok(())
+}
+
 /// A sealed client identifier returns the accepted Arabic name byte for byte.
 #[tokio::test]
 // cancel-safe: test body only; no state outlives an await.

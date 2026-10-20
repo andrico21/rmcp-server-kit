@@ -90,6 +90,7 @@ rmcp-server-kit/
 │       │   ├── page_markup.rs           Start tags and attribute names of served pages, shared by the page tests
 │       │   ├── phone_layout.rs          Phone readability and tap targets of the consent and error pages
 │       │   ├── refresh_and_replicas.rs  Refresh client binding and replicas that share one public origin
+│       │   ├── sealed_client_names.rs   Sealed client names that fail the registration rules, shown as unnamed
 │       │   └── wire_rejections.rs       Callback and token rejections observed through the real-listener harness
 │       ├── oauth_cases.rs           (feature = "oauth") executes the documented OAuth cases R1-R8, P1-P7 in docs/OAUTH_PROXY.md
 │       ├── oauth_cases/             grammar, runtime, environment, matrix and catalogue submodules of oauth_cases.rs
