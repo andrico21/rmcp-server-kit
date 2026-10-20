@@ -130,3 +130,91 @@ fn headers_reject_when_names_are_not_http_tokens() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// The 1-based line of the `occurrence`-th fence opener with this info string.
+fn opener_line(markdown: &str, info: &str, occurrence: usize) -> anyhow::Result<usize> {
+    let opener = format!("```{info}");
+    markdown
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| *line == opener)
+        .nth(occurrence)
+        .map(|(index, _)| index.saturating_add(1))
+        .with_context(|| format!("opener {opener:?} #{occurrence}"))
+}
+
+/// Every number that follows the word `line ` in `text`.
+fn named_lines(text: &str) -> Vec<usize> {
+    text.match_indices("line ")
+        .filter_map(|(offset, word)| {
+            let tail = text.get(offset.saturating_add(word.len())..)?;
+            let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse().ok()
+        })
+        .collect()
+}
+
+/// A grammar error that concerns one fence names that fence's line, and a second upstream
+/// after the same response or snippet is reported as a duplicate upstream.
+#[test]
+fn grammar_errors_name_the_defect_and_its_line() -> anyhow::Result<()> {
+    // Given: documents that each break the grammar once, with the fence that names the defect.
+    let upstream = fence("http,case=X,upstream", "POST /token HTTP/1.1");
+    let request = fence("http,case=X,request", "POST /mcp HTTP/1.1");
+    let response = exchange("POST /mcp HTTP/1.1", "HTTP/1.1 401 Unauthorized");
+    let rows = [
+        (
+            "HTTP duplicate upstream",
+            format!("{response}{upstream}{upstream}"),
+            ("http,case=X,upstream", 1),
+            Some("duplicate upstream"),
+        ),
+        (
+            "library duplicate upstream",
+            format!("{}{upstream}{upstream}", fence("rust,ignore", "call()")),
+            ("http,case=X,upstream", 1),
+            Some("duplicate upstream"),
+        ),
+        (
+            "request interrupted",
+            format!("{request}{}", fence("toml,case=Y", "[server]")),
+            ("toml,case=Y", 0),
+            None,
+        ),
+        (
+            "request without response",
+            request,
+            ("http,case=X,request", 0),
+            None,
+        ),
+        (
+            "env before TOML",
+            format!("{response}{}", fence("sh,case=Z", "# no overrides")),
+            ("sh,case=Z", 0),
+            None,
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (label, tail, (info, occurrence), defect) in rows {
+        let markdown = document(&tail);
+        let line = opener_line(&markdown, info, occurrence)?;
+        // When: parse the document.
+        let error = parse_cases(&markdown)
+            .err()
+            .with_context(|| format!("{label}: accepted"))?;
+        // Then: the chain names the defect and the line of the fence.
+        let chain = format!("{error:#}");
+        if !named_lines(&chain).contains(&line) {
+            failures.push(format!("{label}: line {line} not named: {chain}"));
+        }
+        if let Some(text) = defect
+            && !chain.contains(text)
+        {
+            failures.push(format!("{label}: {text:?} not named: {chain}"));
+        }
+    }
+    ensure!(failures.is_empty(), "{}", failures.join("\n"));
+    let valid = document(&format!("{response}{upstream}"));
+    ensure!(parse_cases(&valid)?.len() == 1, "valid document rejected");
+    Ok(())
+}

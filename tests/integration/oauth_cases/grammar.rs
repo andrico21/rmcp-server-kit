@@ -37,15 +37,16 @@ fn section_fences(markdown: &str) -> anyhow::Result<Vec<super::case_info::Fence>
 
 pub(super) fn parse_cases(markdown: &str) -> anyhow::Result<Vec<Case>> {
     let mut cases = BTreeMap::<String, Case>::new();
-    let mut pending: Option<(String, String)> = None;
+    let mut pending: Option<(String, String, usize)> = None;
     let mut previous: Option<(String, usize)> = None;
     let mut snippet = None;
     for fence in section_fences(markdown)? {
-        if let Some((id, _)) = &pending {
+        if let Some((id, _, request_line)) = &pending {
             ensure!(
                 fence.info == format!("http,case={id},response"),
-                "case {id}: request interrupted by fence {:?}",
-                fence.info
+                "case {id}: request at line {request_line} interrupted by fence {:?} at line {}",
+                fence.info,
+                fence.line
             );
         }
         if fence.info == "rust,ignore" {
@@ -64,23 +65,28 @@ pub(super) fn parse_cases(markdown: &str) -> anyhow::Result<Vec<Case>> {
             .and_then(|part| part.strip_prefix("case="))
             .with_context(|| {
                 format!(
-                    "invalid case fence {:?}: case ID must be second",
-                    fence.info
+                    "line {}: invalid case fence {:?}: case ID must be second",
+                    fence.line, fence.info
                 )
             })?;
         let result = assemble(
             &mut cases,
             id,
             &parts,
-            &fence.body,
+            &fence,
             &mut pending,
             &mut previous,
             &mut snippet,
         );
-        result.with_context(|| format!("case {id}: invalid fence {}", fence.info))?;
+        result.with_context(|| {
+            format!(
+                "line {}: case {id}: invalid fence {}",
+                fence.line, fence.info
+            )
+        })?;
     }
-    if let Some((id, _)) = pending {
-        anyhow::bail!("case {id}: request without response");
+    if let Some((id, _, line)) = pending {
+        anyhow::bail!("case {id}: request at line {line} without response");
     }
     ensure!(!cases.is_empty(), "section 7 contains zero cases");
     for case in cases.values() {
@@ -102,11 +108,12 @@ fn assemble(
     cases: &mut BTreeMap<String, Case>,
     id: &str,
     parts: &[&str],
-    body: &str,
-    pending: &mut Option<(String, String)>,
+    fence: &super::case_info::Fence,
+    pending: &mut Option<(String, String, usize)>,
     previous: &mut Option<(String, usize)>,
     snippet: &mut Option<String>,
 ) -> anyhow::Result<()> {
+    let body = fence.body.as_str();
     match parts {
         ["toml", _] => {
             ensure!(pending.is_none(), "request must be followed by response");
@@ -137,11 +144,12 @@ fn assemble(
             ensure!(pending.is_none(), "request must be followed by response");
             ensure!(cases.contains_key(id), "request before TOML");
             let _target = Message::parse(body)?.request_target()?;
-            *pending = Some((id.to_owned(), body.to_owned()));
+            *pending = Some((id.to_owned(), body.to_owned(), fence.line));
             *previous = None;
         }
         ["http", _, "response"] => {
-            let (request_id, request) = pending.take().context("response without request")?;
+            let (request_id, request, _line) =
+                pending.take().context("response without request")?;
             ensure!(
                 request_id == id,
                 "response case differs from request case {request_id}"
@@ -163,27 +171,33 @@ fn assemble(
                     snippet: code,
                     upstream: body.to_owned(),
                 });
+                *previous = Some((id.to_owned(), case.exchanges.len().saturating_sub(1)));
             } else {
                 let (previous_id, position) = previous
-                    .take()
+                    .as_ref()
                     .context("upstream without preceding response or rust,ignore")?;
                 ensure!(previous_id == id, "upstream case differs from response");
                 match case
                     .exchanges
-                    .get_mut(position)
+                    .get_mut(*position)
                     .context("missing exchange")?
                 {
                     Exchange::Http {
-                        upstream,
+                        upstream: Some(_),
+                        request: _,
+                        response: _,
+                    }
+                    | Exchange::Library {
+                        snippet: _,
+                        upstream: _,
+                    } => anyhow::bail!("duplicate upstream for the same exchange"),
+                    Exchange::Http {
+                        upstream: upstream @ None,
                         request: _,
                         response: _,
                     } => {
                         *upstream = Some(body.to_owned());
                     }
-                    Exchange::Library {
-                        snippet: _,
-                        upstream: _,
-                    } => anyhow::bail!("duplicate library upstream"),
                 }
             }
         }
