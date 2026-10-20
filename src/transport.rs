@@ -8529,7 +8529,7 @@ mod tests {
     async fn expired_api_key_through_real_wiring_names_owner_and_returns_expired_challenge()
     -> anyhow::Result<()> {
         let logs = CapturedLogs::default();
-        let _guard = capture_debug_logs(logs.clone());
+        let _capture = capture_debug_logs_pinned(logs.clone());
         let mut fields = LogContextConfig::recommended();
         fields.credential_owner = true;
         let expired_entry = ApiKeyEntry::new(
@@ -8635,7 +8635,6 @@ mod tests {
     /// The returned extra `NoSubscriber` dispatch keeps two dispatchers live,
     /// so every registration combines all of them; the explicit rebuild then
     /// covers callsites registered before this capture existed.
-    #[cfg(feature = "oauth")]
     fn capture_debug_logs_pinned(logs: CapturedLogs) -> (tracing::Dispatch, DefaultGuard) {
         use tracing::{callsite::rebuild_interest_cache, subscriber::NoSubscriber};
 
@@ -8643,6 +8642,27 @@ mod tests {
         let guard = capture_debug_logs(logs);
         rebuild_interest_cache();
         (multi_dispatcher_pin, guard)
+    }
+
+    /// A capture still records an event whose callsite another thread without a subscriber registered first.
+    #[test]
+    fn pinned_capture_keeps_an_event_first_registered_on_another_thread() -> anyhow::Result<()> {
+        use std::thread;
+
+        fn emit() {
+            tracing::debug!("pinned capture probe");
+        }
+
+        let logs = CapturedLogs::default();
+        let capture = capture_debug_logs_pinned(logs.clone());
+        thread::spawn(emit)
+            .join()
+            .map_err(|_panic| anyhow::anyhow!("event emitter thread panicked"))?;
+        emit();
+        drop(capture);
+
+        assert!(logs.contents().contains("pinned capture probe"));
+        Ok(())
     }
 
     /// Builds the router for an OAuth config adjusted by `configure` (and

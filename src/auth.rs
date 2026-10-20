@@ -3898,6 +3898,8 @@ mod tests {
         state: Arc<AuthState>,
         req: Request<Body>,
     ) -> anyhow::Result<(StatusCode, String)> {
+        use tracing::{callsite::rebuild_interest_cache, subscriber::NoSubscriber};
+
         let logs = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(logs.clone())
@@ -3906,7 +3908,10 @@ mod tests {
             .with_max_level(tracing::Level::DEBUG)
             .finish();
         let app = auth_router(state);
+        // See capture_debug_logs_pinned in src/transport.rs for the callsite interest cache race.
+        let _multi_dispatcher_pin = tracing::Dispatch::new(NoSubscriber::default());
         let _guard = set_default(subscriber);
+        rebuild_interest_cache();
         let status = app
             .oneshot(req)
             .await
