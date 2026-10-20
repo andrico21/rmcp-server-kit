@@ -22,13 +22,28 @@ pub(super) fn style_texts(markup: &str) -> Vec<&str> {
         .collect()
 }
 
+/// Elements the reader does not model (foreign content and the other raw-text or ignored-content elements); served pages must contain none of them.
+pub(super) const UNMODELLED_ELEMENTS: [&str; 9] = [
+    "iframe",
+    "math",
+    "noembed",
+    "noframes",
+    "noscript",
+    "plaintext",
+    "svg",
+    "template",
+    "xmp",
+];
+
 /// Every start tag of `markup`: from a `<` followed by an ASCII letter, to the `>` that ends it.
 ///
 /// Supported HTML subset: start tags with quoted or unquoted attributes, and the raw-text
 /// elements `style`, `script`, `textarea` and `title`, whose content up to the matching end
-/// tag (or the end of input) is text, not markup. A `>` or `<` inside a quoted attribute value
-/// neither ends nor starts a tag. Text after a last unterminated tag is still returned. End
-/// tags, `<!` declarations and escaped `&lt;` text are not start tags.
+/// tag (`</name` in any letter case followed by ASCII whitespace, `/`, `>` or the end of
+/// input; otherwise the end of input) is text, not markup. A `>` or `<` inside a quoted
+/// attribute value neither ends nor starts a tag. Text after a last unterminated tag is still
+/// returned. End tags, `<!` declarations and escaped `&lt;` text are not start tags. The
+/// elements in [`UNMODELLED_ELEMENTS`] are not modelled: their content is read as markup.
 pub(super) fn start_tags(markup: &str) -> Vec<&str> {
     let lower = markup.to_ascii_lowercase();
     let mut tags = Vec::new();
@@ -57,7 +72,16 @@ pub(super) fn start_tags(markup: &str) -> Vec<&str> {
             let closing = format!("</{name}");
             from = lower
                 .get(from..)
-                .and_then(|tail| tail.find(&closing))
+                .and_then(|tail| {
+                    tail.match_indices(&closing).find_map(|(offset, matched)| {
+                        tail.as_bytes()
+                            .get(offset.saturating_add(matched.len()))
+                            .is_none_or(|byte| {
+                                byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>')
+                            })
+                            .then_some(offset)
+                    })
+                })
                 .map_or(markup.len(), |end| from.saturating_add(end));
         }
     }
@@ -194,117 +218,4 @@ pub(super) fn buttons(markup: &str) -> Vec<Button> {
             })
         })
         .collect()
-}
-
-/// Attribute names are read from the tag itself, never from a value or a neighbouring word.
-#[test]
-fn attribute_names_lists_the_names_of_one_start_tag() -> anyhow::Result<()> {
-    // Given: tags with accepted and rejected spellings of a style attribute
-    let rows: [(&str, &[&str]); 12] = [
-        ("<p style=\"x\"", &["style"]),
-        ("<p style='x'", &["style"]),
-        ("<p style=x", &["style"]),
-        ("<p STYLE=x", &["style"]),
-        ("<p style = \"x\"", &["style"]),
-        ("<p class=\"a\"style=\"x\"", &["class", "style"]),
-        ("<p/style=x", &["style"]),
-        ("<p data-style=\"x\"", &["data-style"]),
-        ("<p class=\"style=x\"", &["class"]),
-        ("<p title='style=x'", &["title"]),
-        ("<p", &[]),
-        ("<input disabled name=a", &["disabled", "name"]),
-    ];
-    for (tag, expected) in rows {
-        // When
-        let names = attribute_names(tag);
-        // Then
-        ensure!(names == expected, "{tag}: {names:?}");
-    }
-    Ok(())
-}
-
-/// Only a `<` followed by a letter starts a tag; text, end tags and escaped markup do not.
-#[test]
-fn start_tags_finds_only_real_start_tags() -> anyhow::Result<()> {
-    // Given: documents with and without start tags
-    let rows: [(&str, &[&str]); 12] = [
-        ("a style=x &lt;style&gt;b&lt;/style&gt;", &[]),
-        ("<p>t</p>", &["<p"]),
-        ("<p a=1><b>x</b>", &["<p a=1", "<b"]),
-        ("a < b and 1<2", &[]),
-        ("<p style=x", &["<p style=x"]),
-        // A comment is not skipped: the tag-like text inside it is reported, which is why the
-        // page tests also assert that no served page contains a comment.
-        ("<!-- <p style=x> -->", &["<p style=x"]),
-        ("<style>/* <p style=x> */</style>", &["<style"]),
-        ("<STYLE>a <p style=x></Style><b>", &["<STYLE", "<b"]),
-        ("<script>if (a<b) {}</script><i>", &["<script", "<i"]),
-        ("<title>a <p style=x></title><u>", &["<title", "<u"]),
-        // Without an end tag the raw text runs to the end of input, so nothing follows it.
-        ("<style>a <p style=x>", &["<style"]),
-        ("<styles>x</styles><p>", &["<styles", "<p"]),
-    ];
-    for (markup, expected) in rows {
-        // When
-        let tags = start_tags(markup);
-        // Then
-        ensure!(tags == expected, "{markup}: {tags:?}");
-    }
-    Ok(())
-}
-
-/// An element name is lowercased and ends at whitespace or a slash.
-#[test]
-fn tag_name_is_the_lowercased_element_name() -> anyhow::Result<()> {
-    // Given
-    let rows = [
-        ("<style", "style"),
-        ("<STYLE media=x", "style"),
-        ("<br/", "br"),
-        ("<styles", "styles"),
-    ];
-    for (tag, expected) in rows {
-        // When
-        let name = tag_name(tag);
-        // Then
-        ensure!(name == expected, "{tag}: {name}");
-    }
-    Ok(())
-}
-
-/// A quoted value hides `>` and `<`, so it neither ends a tag early nor starts a nested one.
-#[test]
-fn quoted_values_neither_end_nor_start_tags() -> anyhow::Result<()> {
-    // Given: documents whose attribute values contain angle brackets
-    let rows: [(&str, &[&str]); 5] = [
-        ("<p title=\">\" style=\"x\">", &["title,style"]),
-        ("<p title='>' STYLE=x>t", &["title,style"]),
-        ("<p title=\"<b style=x>\">", &["title"]),
-        ("<a href=x>y</a><b c>", &["href", "c"]),
-        ("<p title=\"<b style=x>", &["title"]),
-    ];
-    for (markup, expected) in rows {
-        // When
-        let names: Vec<String> = start_tags(markup)
-            .into_iter()
-            .map(|tag| attribute_names(tag).join(","))
-            .collect();
-        // Then
-        ensure!(names == expected, "{markup}: {names:?}");
-    }
-    Ok(())
-}
-
-/// Raw-text content never contributes attributes, so only the real element after it is seen.
-#[test]
-fn raw_text_content_is_skipped_before_the_next_tag() -> anyhow::Result<()> {
-    // Given: a style element whose text spells a quote and a tag, then a real styled element
-    let markup = "<style>/* <x title=\" */</style><p style=x>";
-    // When
-    let tags = start_tags(markup);
-    let names: Vec<String> = tags.iter().flat_map(|tag| attribute_names(tag)).collect();
-    // Then
-    ensure!(tags == ["<style", "<p style=x"], "{tags:?}");
-    ensure!(names == ["style"], "{names:?}");
-    Ok(())
 }

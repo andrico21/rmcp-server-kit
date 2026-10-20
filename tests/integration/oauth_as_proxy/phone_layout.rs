@@ -4,8 +4,8 @@ use std::path::Path;
 
 use super::{
     page_markup::{
-        attribute_names, buttons, declarations, directive, hash_source, head, pixels, start_tags,
-        style_start_tags, style_texts,
+        UNMODELLED_ELEMENTS, attribute_names, buttons, declarations, directive, hash_source, head,
+        pixels, start_tags, style_start_tags, style_texts, tag_name,
     },
     *,
 };
@@ -130,6 +130,15 @@ async fn every_page_stylesheet_is_admitted_only_by_its_hash() -> anyhow::Result<
             ensure!(
                 !attribute_names(tag).iter().any(|name| name == "style"),
                 "{kind:?} has no style attribute, which a hash source cannot admit: {tag}"
+            );
+            let name = tag_name(tag);
+            ensure!(
+                !UNMODELLED_ELEMENTS.contains(&name.as_str()),
+                "{kind:?} uses no element the page-markup reader does not model: {tag}"
+            );
+            ensure!(
+                !matches!(name.as_str(), "script" | "link"),
+                "{kind:?} loads no script and no external resource: {tag}"
             );
         }
         ensure!(!html.contains("<!--"), "{kind:?} has no comment");

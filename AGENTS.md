@@ -88,6 +88,7 @@ rmcp-server-kit/
 │       ├── oauth_as_proxy/          submodules of oauth_as_proxy.rs
 │       │   ├── client_name_spoofing.rs  Display-name spoofing characters at registration, name isolation on the consent page
 │       │   ├── page_markup.rs           Start tags and attribute names of served pages, shared by the page tests
+│       │   ├── page_markup_tables.rs    Table tests of the page-markup reader
 │       │   ├── phone_layout.rs          Phone readability and tap targets of the consent and error pages
 │       │   ├── refresh_and_replicas.rs  Refresh client binding and replicas that share one public origin
 │       │   ├── sealed_client_names.rs   Sealed client names that fail the registration rules, shown as unnamed

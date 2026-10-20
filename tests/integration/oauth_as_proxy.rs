@@ -38,6 +38,7 @@ mod tests {
 
     mod client_name_spoofing;
     mod page_markup;
+    mod page_markup_tables;
     mod phone_layout;
     mod refresh_and_replicas;
     mod sealed_client_names;
