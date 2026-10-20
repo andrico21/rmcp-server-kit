@@ -7,6 +7,13 @@ use anyhow::{Context as _, ensure};
 use super::grammar::Case;
 
 const EXPECTED_CASES: &[(&str, usize)] = &[
+    ("P1", 2),
+    ("P2", 1),
+    ("P3", 3),
+    ("P4", 1),
+    ("P5", 1),
+    ("P6", 2),
+    ("P7", 1),
     ("R1", 3),
     ("R2", 2),
     ("R3", 4),

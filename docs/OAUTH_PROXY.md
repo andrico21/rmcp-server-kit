@@ -365,7 +365,7 @@ replaced with the fixed values above. Registrations do not expire: a sealed
 | Refresh tokens | relayed as issued | wrapped and bound to the client |
 | Keycloak redirect URIs | every client redirect URI pattern | exactly `https://mcp.example/oauth/callback` |
 | State | none | none on the server; `sealing_secret` shared by every replica |
-| Typical failure modes | client aborts on `iss` mismatch; clients share one consent | clock skew between replicas, mismatched secrets or `public_url` between replicas, cached static client ids after migration (section 10) |
+| Typical failure modes | client aborts on `iss` mismatch; clients share one consent | clock skew between replicas, mismatched secrets or `public_url` between replicas, cached static client ids after migration (case P7) |
 
 ## 6. Configuration knobs
 
@@ -438,6 +438,10 @@ Resource-server cases R1-R8 come first, one per deployment shape: R1
 pre-registered client with realm roles, R2 CIMD and resource indicators, R3
 audience migration, R4 roles from claims, R5 scope hint and step-up, R6 bare
 missing-credential challenge, R7 token exchange, R8 application-owned facade.
+Proxy cases P1-P7 follow: P1 passthrough as in 3.20.0, P2 passthrough for
+Microsoft Entra ID, P3 `authorization_server` mode on one replica, P4 several
+replicas, P5 sealing-secret rotation, P6 `/introspect` and `/revoke`, P7 the
+migration from passthrough to `authorization_server` mode.
 
 Case-tagged examples are executable contracts. The fence grammar is:
 
@@ -1282,9 +1286,19 @@ which replaces such a facade:
 | Refresh-token binding | whatever the application does | each refresh token is wrapped and bound to the client across rotations (section 4) |
 | PRM `authorization_servers` | set it to the application's origin | unset, or exactly the issuer (section 6) |
 
-### (B) Passthrough proxy exactly as in 3.20.0
+### P1 - Passthrough proxy exactly as in 3.20.0
 
-```toml
+Use when an existing 3.20.0 deployment keeps its proxy unchanged: one static
+Keycloak client for every MCP client, and no consent page of this server's own.
+
+This case is **not MCP 2026-07-28 conformant**. Every client gets the same
+static client id and no consent (break point B), and Keycloak 23 or later
+sends clients an `iss` that differs from this server's issuer (break point A,
+section 3). It stays the default so that upgrades change nothing; case
+[P7](#p7---migration-passthrough---authorization_server) moves it to
+`authorization_server` mode.
+
+```toml,case=P1
 [server]
 listen_addr = "0.0.0.0"
 listen_port = 8080
@@ -1305,10 +1319,10 @@ role = "viewer"
 [server.auth.oauth.proxy]
 authorize_url = "https://idp.example/realms/example/protocol/openid-connect/auth"
 token_url = "https://idp.example/realms/example/protocol/openid-connect/token"
-client_id = "mcp-example"
+client_id = "mcp-proxy"
 ```
 
-```sh
+```sh,case=P1
 RMCP_SERVER_KIT__SERVER__PUBLIC_URL=https://mcp.example
 RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ISSUER=https://idp.example/realms/example
 RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__AUDIENCE=mcp-example
@@ -1319,9 +1333,49 @@ A 3.20.0 configuration needs no change after upgrading: with no new knob
 set, the wire behaviour is identical. The only possible difference is one
 startup WARN when `public_url` is missing.
 
-### (C) Passthrough for Microsoft Entra ID with `strip_resource_param`
+Keycloak settings (section 8, "Passthrough"):
 
-```toml
+| Setting | Value |
+| --- | --- |
+| **Clients** > `mcp-proxy` | one static client shared by every MCP client; its id is `proxy.client_id` |
+| `mcp-proxy` > **Valid Redirect URIs** | every redirect URI your MCP clients use, ideally loopback patterns only; exact, case-sensitive match, wildcard only at the end (Server Administration Guide; upgrading guide, "Migrating to 23.0.2") |
+| `mcp-proxy` > **PKCE method** | `S256` (Server Administration Guide, "PKCE method") |
+| `mcp-proxy` > **Exclude Issuer From Authentication Response** | one of the two workarounds for break point A, deprecated by Keycloak (upgrading guide, "Migrating to 26.8.0"); prefer case P7 |
+
+The metadata names this server as issuer and does not advertise
+`authorization_response_iss_parameter_supported`:
+
+```http,case=P1,request
+GET /.well-known/oauth-authorization-server HTTP/1.1
+Host: mcp.example
+```
+
+```http,case=P1,response
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"authorization_endpoint":"https://mcp.example/authorize","code_challenge_methods_supported":["S256"],"grant_types_supported":["authorization_code","refresh_token"],"issuer":"https://mcp.example","registration_endpoint":"https://mcp.example/register","response_types_supported":["code"],"scopes_supported":["mcp:read"],"token_endpoint":"https://mcp.example/token","token_endpoint_auth_methods_supported":["none"]}
+```
+
+`/authorize` answers with a redirect to Keycloak. The query is re-serialised,
+the client's `client_id` is dropped and `client_id=mcp-proxy` is appended last:
+
+```http,case=P1,request
+GET /authorize?response_type=code&client_id=example-client&redirect_uri=http%3A%2F%2F127.0.0.1%3A18999%2Fcb&scope=mcp%3Aread&state=example-state&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256 HTTP/1.1
+Host: mcp.example
+```
+
+```http,case=P1,response
+HTTP/1.1 302 Found
+Location: https://idp.example/realms/example/protocol/openid-connect/auth?response_type=code&redirect_uri=http%3A%2F%2F127.0.0.1%3A18999%2Fcb&scope=mcp%3Aread&state=example-state&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&client_id=mcp-proxy
+```
+
+### P2 - Passthrough for Microsoft Entra ID with `strip_resource_param`
+
+Use when the passthrough proxy forwards to the Microsoft identity platform
+v2.0 endpoints of Microsoft Entra ID.
+
+```toml,case=P2
 [server]
 listen_addr = "0.0.0.0"
 listen_port = 8080
@@ -1344,11 +1398,11 @@ role = "viewer"
 [server.auth.oauth.proxy]
 authorize_url = "https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/oauth2/v2.0/authorize"
 token_url = "https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/oauth2/v2.0/token"
-client_id = "11111111-1111-1111-1111-111111111111"
+client_id = "mcp-proxy"
 strip_resource_param = true
 ```
 
-```sh
+```sh,case=P2
 RMCP_SERVER_KIT__SERVER__PUBLIC_URL=https://mcp.example
 RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ALLOWED_ALGORITHMS=RS256
 RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__STRIP_RESOURCE_PARAM=true
@@ -1357,11 +1411,44 @@ RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__STRIP_RESOURCE_PARAM=true
 Entra ID v2.0 rejects a `resource` parameter sent next to a differing
 `api://` scope (`AADSTS9010010`), and MCP clients always send `resource`.
 Only `resource` is dropped; PKCE, `state` and `redirect_uri` are always
-forwarded.
+forwarded. Passthrough is not MCP 2026-07-28 conformant here either (case P1).
 
-### (D) `authorization_server` mode, single replica
+Entra settings (documentation, not tested; Microsoft's error-code reference,
+fetched 2026-10-20, does not list `AADSTS9010010`; the error is reported
+against the v2.0 endpoints in issue
+[microsoft/vscode#321249](https://github.com/microsoft/vscode/issues/321249),
+2026-06-13):
 
-```toml
+| Setting | Value |
+| --- | --- |
+| **App registrations** > the proxy's application > **Application (client) ID** | goes into `proxy.client_id`; Entra shows a GUID where this example has the placeholder `mcp-proxy` |
+| **Directory (tenant) ID** | replaces `00000000-0000-0000-0000-000000000000` in every URL above |
+| **App roles** | `Mcp.Read`, assigned to users; Entra writes assigned app roles to the `roles` claim (not verified against Microsoft documentation here) |
+
+The client's `resource` is not in the redirect:
+
+```http,case=P2,request
+GET /authorize?response_type=code&client_id=example-client&redirect_uri=http%3A%2F%2F127.0.0.1%3A18999%2Fcb&scope=api%3A%2F%2Fmcp-example%2FMcp.Read&state=example-state&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&resource=https%3A%2F%2Fmcp.example%2Fmcp HTTP/1.1
+Host: mcp.example
+```
+
+```http,case=P2,response
+HTTP/1.1 302 Found
+Location: https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/oauth2/v2.0/authorize?response_type=code&redirect_uri=http%3A%2F%2F127.0.0.1%3A18999%2Fcb&scope=api%3A%2F%2Fmcp-example%2FMcp.Read&state=example-state&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&client_id=mcp-proxy
+```
+
+### P3 - `authorization_server` mode, single replica
+
+Use when MCP clients must see this server as their authorization server, with
+per-client registration, consent and `iss` on every redirect (MCP 2026-07-28),
+and one replica serves them.
+
+This file deliberately has no `sealing_secret`: on its own it fails
+validation, and the env block supplies the secret from a mounted file. The
+file path is a placeholder; the test never reads it (see "What the test
+changes" above).
+
+```toml,case=P3
 [server]
 listen_addr = "0.0.0.0"
 listen_port = 8080
@@ -1386,34 +1473,95 @@ role = "viewer"
 [server.auth.oauth.proxy]
 authorize_url = "https://idp.example/realms/example/protocol/openid-connect/auth"
 token_url = "https://idp.example/realms/example/protocol/openid-connect/token"
-client_id = "mcp-example"
+client_id = "mcp-proxy"
 client_secret = "replace-with-the-keycloak-client-secret"
 mode = "authorization_server"
-# Placeholder: replace with at least 32 random bytes from your secret store.
-sealing_secret = "replace-with-at-least-32-random-bytes-from-a-secret-store"
 consent_ttl = "30d"
 ```
 
-```sh
+```sh,case=P3
 RMCP_SERVER_KIT__SERVER__PUBLIC_URL=https://mcp.example
 RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__MODE=authorization_server
-RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_FILE=/var/run/secrets/mcp/sealing-secret
 RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__CONSENT_TTL=30d
+RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_FILE=/var/run/secrets/mcp/sealing-secret
 ```
 
-The placeholder secret only exists so the file passes validation on its own.
-In production drop the `sealing_secret` line and supply the secret through
-`..._SEALING_SECRET_FILE`, as shown; the env value replaces the TOML value.
-Setting both `..._SEALING_SECRET` and `..._SEALING_SECRET_FILE` is a startup
-error.
+Without a mounted file, pass the secret as a value instead. Setting both
+`..._SEALING_SECRET` and `..._SEALING_SECRET_FILE` is a startup error.
 
-### (E) `authorization_server` mode, several replicas with a shared secret file
+```sh,case=P3,alt
+RMCP_SERVER_KIT__SERVER__PUBLIC_URL=https://mcp.example
+RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__MODE=authorization_server
+RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__CONSENT_TTL=30d
+# Placeholder: at least 32 random bytes from your secret store.
+RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET=replace-with-at-least-32-random-bytes-from-a-secret-store
+```
 
-Every replica gets the same TOML, the same env and the same mounted secret
-file. This file deliberately has no `sealing_secret`: on its own it fails
-validation, and the env block supplies the secret.
+Keycloak settings (section 8, "`authorization_server`"):
 
-```toml,fragment
+| Setting | Value |
+| --- | --- |
+| **Clients** > `mcp-proxy` > **Valid Redirect URIs** | exactly `https://mcp.example/oauth/callback`, no wildcard |
+| `mcp-proxy` > **PKCE method** | `S256`; this server always sends an S256 challenge |
+| `mcp-proxy` > **Client authentication** | `ON` (confidential client) is recommended; its secret goes into `client_secret` |
+| Realm settings > **Tokens** > **Revoke Refresh Token** | `ON`: "When Enabled, Keycloak revokes refresh tokens and issues another token that the client must use" (Server Administration Guide, Tokens tab) |
+
+The metadata names this server as issuer and advertises RFC 9207 `iss`:
+
+```http,case=P3,request
+GET /.well-known/oauth-authorization-server HTTP/1.1
+Host: mcp.example
+```
+
+```http,case=P3,response
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"authorization_endpoint":"https://mcp.example/authorize","authorization_response_iss_parameter_supported":true,"code_challenge_methods_supported":["S256"],"grant_types_supported":["authorization_code","refresh_token"],"issuer":"https://mcp.example","registration_endpoint":"https://mcp.example/register","response_types_supported":["code"],"scopes_supported":["mcp:admin","mcp:read"],"token_endpoint":"https://mcp.example/token","token_endpoint_auth_methods_supported":["none"]}
+```
+
+Registration answers `201` with a sealed client id; nothing is stored. The
+sealed value and `client_id_issued_at` differ on every call, hence `<any>`:
+
+```http,case=P3,request
+POST /register HTTP/1.1
+Host: mcp.example
+Content-Type: application/json
+
+{"redirect_uris":["http://127.0.0.1:18999/cb"],"client_name":"Example Client"}
+```
+
+```http,case=P3,response
+HTTP/1.1 201 Created
+Content-Type: application/json
+Cache-Control: no-store<any>
+Pragma: no-cache
+
+{"client_id":"v1.<any>","client_id_issued_at":<any>,"client_name":"Example Client","grant_types":["authorization_code","refresh_token"],"redirect_uris":["http://127.0.0.1:18999/cb"],"response_types":["code"],"token_endpoint_auth_method":"none"}
+```
+
+PRM points clients at this server, not at Keycloak:
+
+```http,case=P3,request
+GET /.well-known/oauth-protected-resource/mcp HTTP/1.1
+Host: mcp.example
+```
+
+```http,case=P3,response
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"authorization_servers":["https://mcp.example"],"bearer_methods_supported":["header"],"resource":"https://mcp.example/mcp","scopes_supported":["mcp:admin","mcp:read"]}
+```
+
+### P4 - `authorization_server` mode, several replicas, secret from a mounted file
+
+Use when several replicas behind one load balancer serve the same
+`public_url`. Every replica gets the same TOML, the same env and the same
+mounted secret file, so a registration, consent or code sealed by one replica
+opens on any other.
+
+```toml,case=P4
 [server]
 listen_addr = "0.0.0.0"
 listen_port = 8080
@@ -1434,12 +1582,12 @@ role = "viewer"
 [server.auth.oauth.proxy]
 authorize_url = "https://idp.example/realms/example/protocol/openid-connect/auth"
 token_url = "https://idp.example/realms/example/protocol/openid-connect/token"
-client_id = "mcp-example"
+client_id = "mcp-proxy"
 client_secret = "replace-with-the-keycloak-client-secret"
 mode = "authorization_server"
 ```
 
-```sh
+```sh,case=P4
 # Identical on every replica.
 RMCP_SERVER_KIT__SERVER__PUBLIC_URL=https://mcp.example
 RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__MODE=authorization_server
@@ -1447,26 +1595,314 @@ RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_FILE=/var/run/secret
 ```
 
 Keep the replicas' clocks in sync (NTP): expiry times are written by one
-replica and checked by another.
+replica and checked by another. The cross-replica flow is tested by
+`two_replicas_share_one_stateless_flow` in
+[`tests/integration/oauth_as_proxy.rs`](../tests/integration/oauth_as_proxy.rs)
+and `same_public_origin_replicas_share_cookie` in
+[`tests/integration/oauth_as_proxy/refresh_and_replicas.rs`](../tests/integration/oauth_as_proxy/refresh_and_replicas.rs);
+the exchange below shows one replica.
 
-### (F) Secret rotation with `sealing_secret_previous`
+Keycloak settings:
 
-```toml,fragment
-[server.auth.oauth.proxy]
-mode = "authorization_server"
-# Supplied through the _FILE variables below; shown here only as structure.
-# sealing_secret = "<new secret>"
-# sealing_secret_previous = "<old secret>"
+| Setting | Value |
+| --- | --- |
+| `mcp-proxy` | as in P3; the one **Valid Redirect URI** `https://mcp.example/oauth/callback` serves every replica, because all of them share `public_url` |
+
+```http,case=P4,request
+POST /register HTTP/1.1
+Host: mcp.example
+Content-Type: application/json
+
+{"redirect_uris":["http://127.0.0.1:18999/cb"]}
 ```
 
-```sh
+```http,case=P4,response
+HTTP/1.1 201 Created
+Content-Type: application/json
+
+{"client_id":"v1.<any>","client_id_issued_at":<any>,"grant_types":["authorization_code","refresh_token"],"redirect_uris":["http://127.0.0.1:18999/cb"],"response_types":["code"],"token_endpoint_auth_method":"none"}
+```
+
+### P5 - Signing-secret rotation with `sealing_secret_previous`
+
+Use when the sealing secret of a running `authorization_server` deployment
+must change without logging every client out at once.
+
+```toml,case=P5
+[server]
+listen_addr = "0.0.0.0"
+listen_port = 8080
+public_url = "https://mcp.example"
+
+[server.auth]
+enabled = true
+
+[server.auth.oauth]
+issuer = "https://idp.example/realms/example"
+audience = "mcp-example"
+jwks_uri = "https://idp.example/realms/example/protocol/openid-connect/certs"
+
+[[server.auth.oauth.scopes]]
+scope = "mcp:read"
+role = "viewer"
+
+[server.auth.oauth.proxy]
+authorize_url = "https://idp.example/realms/example/protocol/openid-connect/auth"
+token_url = "https://idp.example/realms/example/protocol/openid-connect/token"
+client_id = "mcp-proxy"
+client_secret = "replace-with-the-keycloak-client-secret"
+mode = "authorization_server"
+```
+
+Phase 1 of the rotation, on every replica:
+
+```sh,case=P5
+RMCP_SERVER_KIT__SERVER__PUBLIC_URL=https://mcp.example
+RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__MODE=authorization_server
 # Phase 1: the new key seals, the old key still opens.
 RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_FILE=/var/run/secrets/mcp/sealing-secret-new
 RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_PREVIOUS_FILE=/var/run/secrets/mcp/sealing-secret-old
 # Phase 2, later: remove the _PREVIOUS_FILE variable.
 ```
 
-See section 10 for when phase 2 is safe.
+The same phase with the secrets as values:
+
+```sh,case=P5,alt
+RMCP_SERVER_KIT__SERVER__PUBLIC_URL=https://mcp.example
+RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__MODE=authorization_server
+# Placeholders: at least 32 random bytes each, and different from each other.
+RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET=replace-with-the-new-secret-of-at-least-32-bytes
+RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_PREVIOUS=replace-with-the-old-secret-of-at-least-32-bytes
+```
+
+Two-phase rotation:
+
+1. Configure the new key as `sealing_secret` and the old one as
+   `sealing_secret_previous` on every replica. New values are sealed with the
+   new key; values sealed with either key still open.
+2. After the longest client registration lifetime you want to honour, remove
+   `sealing_secret_previous`. Registrations and refresh-token wrappers sealed
+   only under the dropped key stop working. A refresh with such a wrapper gets
+   `400 invalid_grant`, because the wrapper is opened before `client_id` is
+   looked at; the user signs in again. An authorization-code `/token` request
+   whose `client_id` was sealed under the dropped key gets
+   `401 invalid_client` (and `/authorize` shows a `400` page); that client
+   registers again.
+
+Never swap the key without phase 1: every registration, consent cookie and
+refresh wrapper would fail at once. That values sealed under the previous key
+still open is tested by `previous_key_codes_redeem_and_unknown_or_expired_codes_fail`
+and `admin_routes_unwrap_current_and_previous_refresh_wrappers` in
+[`tests/integration/oauth_as_proxy.rs`](../tests/integration/oauth_as_proxy.rs).
+
+Keycloak settings:
+
+| Setting | Value |
+| --- | --- |
+| Realm and `mcp-proxy` | unchanged from P3 or P4; the sealing secret never reaches Keycloak |
+
+The test of this case supplies two fixed test secrets in place of the files
+and checks that the server starts with both:
+
+```http,case=P5,request
+GET /.well-known/oauth-authorization-server HTTP/1.1
+Host: mcp.example
+```
+
+```http,case=P5,response
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"authorization_endpoint":"https://mcp.example/authorize","authorization_response_iss_parameter_supported":true,"code_challenge_methods_supported":["S256"],"grant_types_supported":["authorization_code","refresh_token"],"issuer":"https://mcp.example","registration_endpoint":"https://mcp.example/register","response_types_supported":["code"],"scopes_supported":["mcp:read"],"token_endpoint":"https://mcp.example/token","token_endpoint_auth_methods_supported":["none"]}
+```
+
+### P6 - `authorization_server` mode with `/introspect` and `/revoke` (refresh-token unwrapping)
+
+Use when clients or resource servers need token introspection or revocation
+through this server.
+
+```toml,case=P6
+[server]
+listen_addr = "0.0.0.0"
+listen_port = 8080
+public_url = "https://mcp.example"
+
+[server.auth]
+enabled = true
+
+[server.auth.oauth]
+issuer = "https://idp.example/realms/example"
+audience = "mcp-example"
+jwks_uri = "https://idp.example/realms/example/protocol/openid-connect/certs"
+
+[[server.auth.oauth.scopes]]
+scope = "mcp:admin"
+role = "admin"
+
+[[server.auth.oauth.scopes]]
+scope = "mcp:read"
+role = "viewer"
+
+[server.auth.oauth.proxy]
+authorize_url = "https://idp.example/realms/example/protocol/openid-connect/auth"
+token_url = "https://idp.example/realms/example/protocol/openid-connect/token"
+client_id = "mcp-proxy"
+client_secret = "replace-with-the-keycloak-client-secret"
+introspection_url = "https://idp.example/realms/example/protocol/openid-connect/token/introspect"
+revocation_url = "https://idp.example/realms/example/protocol/openid-connect/revoke"
+expose_admin_endpoints = true
+require_auth_on_admin_endpoints = true
+mode = "authorization_server"
+```
+
+```sh,case=P6
+RMCP_SERVER_KIT__SERVER__PUBLIC_URL=https://mcp.example
+RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__MODE=authorization_server
+RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_FILE=/var/run/secrets/mcp/sealing-secret
+```
+
+The four admin keys have no env var. With `require_auth_on_admin_endpoints`
+both endpoints need a valid token whose role is the admin role (`admin`, here
+from `mcp:admin`). Refresh tokens that this server handed out are wrappers;
+before forwarding to Keycloak it replaces a wrapper in the `token` form field
+by the Keycloak refresh token inside it (`unwrap_refresh_token_param` in
+`src/oauth_as.rs`), with the current or the previous sealing key. Other
+tokens are forwarded unchanged. This is tested by
+`admin_routes_unwrap_current_and_previous_refresh_wrappers` in
+[`tests/integration/oauth_as_proxy.rs`](../tests/integration/oauth_as_proxy.rs).
+
+Keycloak settings:
+
+| Setting | Value |
+| --- | --- |
+| `introspection_url`, `revocation_url` | `introspection_endpoint` and `revocation_endpoint` from the realm's `/.well-known/openid-configuration` (copy them from there) |
+| `mcp-proxy` | as in P3; this server authenticates to both endpoints with `client_id` and `client_secret` |
+
+Without credentials `/revoke` is refused before Keycloak is contacted:
+
+```http,case=P6,request
+POST /revoke HTTP/1.1
+Host: mcp.example
+Content-Type: application/x-www-form-urlencoded
+
+token=example-token
+```
+
+```http,case=P6,response
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer resource_metadata="https://mcp.example/.well-known/oauth-protected-resource/mcp", error="invalid_request", error_description="missing bearer token or mTLS client certificate"
+
+unauthorized: missing credential
+```
+
+The metadata lists both endpoints:
+
+```http,case=P6,request
+GET /.well-known/oauth-authorization-server HTTP/1.1
+Host: mcp.example
+```
+
+```http,case=P6,response
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"authorization_endpoint":"https://mcp.example/authorize","authorization_response_iss_parameter_supported":true,"code_challenge_methods_supported":["S256"],"grant_types_supported":["authorization_code","refresh_token"],"introspection_endpoint":"https://mcp.example/introspect","introspection_endpoint_auth_methods_supported":["bearer"],"issuer":"https://mcp.example","registration_endpoint":"https://mcp.example/register","response_types_supported":["code"],"revocation_endpoint":"https://mcp.example/revoke","revocation_endpoint_auth_methods_supported":["bearer"],"scopes_supported":["mcp:admin","mcp:read"],"token_endpoint":"https://mcp.example/token","token_endpoint_auth_methods_supported":["none"]}
+```
+
+### P7 - Migration passthrough -> `authorization_server`
+
+Use when a deployment running case
+[P1](#p1---passthrough-proxy-exactly-as-in-3200) moves to
+`authorization_server` mode. Before: the P1 configuration. After: the same
+file with `mode` and a sealing secret, keeping the static client `mcp-proxy`.
+
+```toml,case=P7
+[server]
+listen_addr = "0.0.0.0"
+listen_port = 8080
+public_url = "https://mcp.example"
+
+[server.auth]
+enabled = true
+
+[server.auth.oauth]
+issuer = "https://idp.example/realms/example"
+audience = "mcp-example"
+jwks_uri = "https://idp.example/realms/example/protocol/openid-connect/certs"
+
+[[server.auth.oauth.scopes]]
+scope = "mcp:read"
+role = "viewer"
+
+[server.auth.oauth.proxy]
+authorize_url = "https://idp.example/realms/example/protocol/openid-connect/auth"
+token_url = "https://idp.example/realms/example/protocol/openid-connect/token"
+client_id = "mcp-proxy"
+mode = "authorization_server"
+```
+
+```sh,case=P7
+RMCP_SERVER_KIT__SERVER__PUBLIC_URL=https://mcp.example
+RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__MODE=authorization_server
+RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__SEALING_SECRET_FILE=/var/run/secrets/mcp/sealing-secret
+```
+
+Steps:
+
+1. Generate a sealing secret of at least 32 random bytes and store it where
+   every replica can read it (for example a Kubernetes Secret mounted as a
+   file).
+2. In Keycloak, add `https://mcp.example/oauth/callback` to the static
+   client's **Valid Redirect URIs**. Keep the old loopback patterns for now.
+3. Set `public_url` to the `https` origin clients use, without a path.
+4. Set `mode = "authorization_server"` (or the `..._PROXY__MODE` env var) and
+   the secret **on every replica at once**. Mixed modes behind one load
+   balancer break logins.
+5. Deploy.
+6. Verify: `/.well-known/oauth-authorization-server` shows
+   `authorization_response_iss_parameter_supported: true`, `/register`
+   answers `201` with a long sealed `client_id` (the exchanges of case
+   [P3](#p3---authorization_server-mode-single-replica)), and a browser login
+   reaches the consent page. The demo in section 13 shows the full sequence.
+7. Remove the old loopback redirect patterns from the Keycloak client.
+
+Keycloak settings:
+
+| Setting | Value |
+| --- | --- |
+| `mcp-proxy` > **Valid Redirect URIs** | add `https://mcp.example/oauth/callback` (step 2), later remove the loopback patterns (step 7) |
+
+What clients see: a client that cached the static client id from the old
+`/register` gets a `400` page at `/authorize` and `401 invalid_client` at
+`/token`. An old refresh token that is not a wrapper gets `400 invalid_grant`,
+so users sign in again. A client may register again by itself; if it does
+not, remove the server from that client and add it again.
+
+A code redemption with the cached static client id. `grant_type`,
+`client_id`, `code`, a well-formed `code_verifier` and `redirect_uri` must all
+be present, otherwise the answer is `400 invalid_request` (`token_form` in
+`src/oauth_as.rs`):
+
+```http,case=P7,request
+POST /token HTTP/1.1
+Host: mcp.example
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=authorization_code&client_id=mcp-proxy&code=x&code_verifier=exampleCodeVerifier0123456789abcdefghijklmn&redirect_uri=http%3A%2F%2F127.0.0.1%3A18999%2Fcb
+```
+
+```http,case=P7,response
+HTTP/1.1 401 Unauthorized
+Content-Type: application/json
+Cache-Control: no-store<any>
+Pragma: no-cache
+
+{"error":"invalid_client"}
+```
+
+**Rollback**: remove `mode` (or set `"passthrough"`) everywhere. Refresh
+wrappers issued in `authorization_server` mode mean nothing to Keycloak, so
+expect those users to sign in again.
 
 ## 8. Keycloak settings per mode
 
@@ -1783,8 +2219,8 @@ the call if granted"; the server cannot make Keycloak grant it, and the MCP
 specification puts the retry limit on the client.
 
 Worked example with the mappings `mcp:read -> viewer` listed **before**
-`mcp:admin -> admin`, and a token holding only `mcp:read`. The caller is a
-viewer and calls a tool only `admin` may use. The simulation tries adding
+`mcp:admin -> ops`, and a token holding only `mcp:read`. The caller is a
+viewer and calls a tool only `ops` may use. The simulation tries adding
 `mcp:admin`: the scope set becomes `mcp:read mcp:admin`, and first-match
 still picks `mcp:read`, so the role stays `viewer`. No scope helps, the
 response is a plain `403`, and no hint is sent. A naive hint of `mcp:admin`
@@ -1802,48 +2238,10 @@ approval the remembered scopes are merged.
 
 ## 10. Migrating passthrough -> authorization_server
 
-1. Generate a sealing secret of at least 32 random bytes and store it where
-   every replica can read it (for example a Kubernetes Secret mounted as a
-   file).
-2. In Keycloak, add `https://mcp.example/oauth/callback` to the static
-   client's **Valid Redirect URIs**. Keep the old loopback patterns for now.
-3. Set `public_url` to the `https` origin clients use, without a path.
-4. Set `mode = "authorization_server"` (or the `..._PROXY__MODE` env var) and
-   the secret **on every replica at once**. Mixed modes behind one load
-   balancer break logins.
-5. Deploy.
-6. Verify: `/.well-known/oauth-authorization-server` shows
-   `authorization_response_iss_parameter_supported: true`, `/register`
-   answers `201` with a long sealed `client_id`, and a browser login reaches
-   the consent page. The demo in section 13 shows the full sequence.
-7. Remove the old loopback redirect patterns from the Keycloak client.
-
-What clients see: a client that cached the static client id from the old
-`/register` gets a `400` page at `/authorize` and `401 invalid_client` at
-`/token`. An old refresh token that is not a wrapper gets `400 invalid_grant`,
-so users sign in again. A client may register again by itself; if it does
-not, remove the server from that client and add it again.
-
-**Rollback**: remove `mode` (or set `"passthrough"`) everywhere. Refresh
-wrappers issued in `authorization_server` mode mean nothing to Keycloak, so
-expect those users to sign in again.
-
-**Two-phase secret rotation**:
-
-1. Configure the new key as `sealing_secret` and the old one as
-   `sealing_secret_previous` on every replica. New values are sealed with the
-   new key; values sealed with either key still open.
-2. After the longest client registration lifetime you want to honour, remove
-   `sealing_secret_previous`. Registrations and refresh-token wrappers sealed
-   only under the dropped key stop working. A refresh with such a wrapper gets
-   `400 invalid_grant`, because the wrapper is opened before `client_id` is
-   looked at; the user signs in again. An authorization-code `/token` request
-   whose `client_id` was sealed under the dropped key gets
-   `401 invalid_client` (and `/authorize` shows a `400` page); that client
-   registers again.
-
-Never swap the key without phase 1: every registration, consent cookie and
-refresh wrapper would fail at once.
+The ordered migration steps, what clients see afterwards and the rollback
+are case [P7](#p7---migration-passthrough---authorization_server) in section
+7. The two-phase sealing-secret rotation is case
+[P5](#p5---signing-secret-rotation-with-sealing_secret_previous).
 
 ## 11. Security model
 
@@ -1855,7 +2253,7 @@ refresh wrapper would fail at once.
 | Authorization code injection | the client receives a wrapped code bound to its `client_id`, its redirect URI and the approved PKCE challenge, valid 120 s; `/token` checks all three plus the verifier before contacting Keycloak |
 | Mix-up | the client gets `iss` equal to this server's issuer on every redirect; Keycloak's `iss` is checked byte-exactly at the callback |
 | Consent bypass via a stolen cookie | the consent cookie is sealed, `HttpOnly`, `Secure` and `__Host-` (with `https`), and bound to a client and its scopes; whoever holds a browser's cookies can still use that browser's remembered consent until `consent_ttl` ends |
-| Key compromise | anyone with `sealing_secret` can forge registrations, consent and wrapped values; rotate as in section 10 and keep the secret out of TOML in production |
+| Key compromise | anyone with `sealing_secret` can forge registrations, consent and wrapped values; rotate as in case P5 and keep the secret out of TOML in production |
 | Replay | not prevented locally (no storage, see section 4); relies on Keycloak treating authorization codes as single-use |
 | Clock skew between replicas | lifetimes are absolute Unix times written by one replica and checked by another; skew shortens or lengthens the 600 s and 120 s windows; keep clocks synchronised |
 | Reserved paths | `/oauth/consent` and `/oauth/callback` belong to the proxy; an application route there would conflict |
@@ -1892,7 +2290,7 @@ DEBUG for plain protocol errors.
 | Login works on one replica only | replicas differ in `sealing_secret`, `public_url` or `mode` | give every replica identical values, then restart them together |
 | Tokens rejected with an audience mismatch | `aud` holds the resource URL or another value, not `audience` | set `accept_resource_audience = true` or list the value in `additional_audiences`; or add a Keycloak audience mapper (section 8) |
 | `401 invalid_client` on an authorization-code `/token` request, or `400 invalid_grant` on a refresh, after a secret rotation | the old key was dropped, or replaced without phase 1: a `client_id` sealed under it no longer opens (`invalid_client`), and neither does a refresh wrapper sealed under it (`invalid_grant`, checked before `client_id`) | follow the two-phase rotation; affected clients register again and their users sign in again |
-| `401 invalid_client` or a `400` page right after migrating | the client still uses the static client id from passthrough | let the client register again, or remove and re-add the server in that client (section 10) |
+| `401 invalid_client` or a `400` page right after migrating | the client still uses the static client id from passthrough | let the client register again, or remove and re-add the server in that client (case P7) |
 
 ## 13. Try it locally
 

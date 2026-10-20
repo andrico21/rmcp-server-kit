@@ -121,6 +121,52 @@ fn env_table_distinguishes_when_main_or_alternative_values_drift() -> anyhow::Re
     Ok(())
 }
 
+/// The previous sealing key is supplied only when the main env block names its variable.
+#[test]
+fn previous_sealing_table_supplies_key_when_named_only_in_environment() -> anyhow::Result<()> {
+    use super::{configuration::operator_config, fixtures::CONFIG};
+    for (names, previous_expected) in [
+        (
+            &["SEALING_SECRET_FILE", "SEALING_SECRET_PREVIOUS_FILE"][..],
+            true,
+        ),
+        (&["SEALING_SECRET", "SEALING_SECRET_PREVIOUS"][..], true),
+        (&["SEALING_SECRET_FILE"][..], false),
+        (
+            &["SEALING_SECRET_FILE", "SEALING_SECRET_PREVIOUSFILE"][..],
+            false,
+        ),
+    ] {
+        // Given: AS mode with both keys absent from TOML and named only by env.
+        let env = names
+            .iter()
+            .map(|name| format!("RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__PROXY__{name}=unused"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let case = Case {
+            id: "AS".into(),
+            toml: format!("{CONFIG}\nmode='authorization_server'"),
+            env: vec![env],
+            exchanges: Vec::new(),
+        };
+        // When: apply the documented test additions and validate.
+        let config = operator_config(&case, "http://localhost:12345")?;
+        let proxy = config
+            .server
+            .auth
+            .as_ref()
+            .and_then(|auth| auth.oauth.as_ref())
+            .and_then(|oauth| oauth.proxy.as_ref())
+            .context("proxy table")?;
+        // Then: only a named previous-key variable supplies the fixed previous key.
+        ensure!(
+            proxy.sealing_secret_previous.is_some() == previous_expected,
+            "{names:?}: previous key presence differs"
+        );
+    }
+    Ok(())
+}
+
 /// Mounted-file and value secrets enable AS validation without reading operator files.
 #[test]
 fn sealing_table_accepts_when_secret_is_named_only_in_environment() -> anyhow::Result<()> {
