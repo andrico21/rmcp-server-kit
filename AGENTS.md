@@ -87,6 +87,7 @@ rmcp-server-kit/
 │       ├── oauth_as_proxy.rs        (feature = "oauth") `authorization_server` proxy mode end to end
 │       ├── oauth_as_proxy/          submodules of oauth_as_proxy.rs
 │       │   ├── client_name_spoofing.rs  Display-name spoofing characters at registration, name isolation on the consent page
+│       │   ├── page_markup.rs           Start tags and attribute names of served pages, shared by the page tests
 │       │   ├── phone_layout.rs          Phone readability and tap targets of the consent and error pages
 │       │   ├── refresh_and_replicas.rs  Refresh client binding and replicas that share one public origin
 │       │   └── wire_rejections.rs       Callback and token rejections observed through the real-listener harness

@@ -37,6 +37,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     mod client_name_spoofing;
+    mod page_markup;
     mod phone_layout;
     mod refresh_and_replicas;
     mod wire_rejections;

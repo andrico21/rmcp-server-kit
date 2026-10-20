@@ -1,9 +1,12 @@
 //! Phone readability and tap targets of the consent and error pages under their page policy.
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
-use sha2::{Digest as _, Sha256};
-
-use super::*;
+use super::{
+    page_markup::{
+        attribute_names, buttons, declarations, directive, hash_source, head, pixels, start_tags,
+        style_start_tags, style_texts,
+    },
+    *,
+};
 
 /// The HTML pages of `authorization_server` mode that share one page template.
 #[derive(Clone, Copy, Debug)]
@@ -14,20 +17,30 @@ enum PageKind {
     AuthorizeError,
     /// The nonredirecting error page served by `/oauth/callback` for a malformed state.
     CallbackError,
+    /// The consent page of a client whose name spells markup, which the page must escape.
+    ConsentWithMarkupName,
 }
 
 /// Every page kind; each table-driven test below runs against all of them.
-const PAGE_KINDS: [PageKind; 3] = [
+const PAGE_KINDS: [PageKind; 4] = [
     PageKind::Consent,
+    PageKind::ConsentWithMarkupName,
     PageKind::AuthorizeError,
     PageKind::CallbackError,
 ];
+
+/// A client name whose text looks like an inline style attribute and a style element.
+const MARKUP_NAME: &str = "Phone style=x <style>b</style>";
 
 /// Fetch one page kind and return its status, CSP header and HTML body.
 async fn fetch(server: &Harness, kind: PageKind) -> anyhow::Result<(u16, String, String)> {
     let response = match kind {
         PageKind::Consent => {
             let cid = server.register("Phone layout").await?;
+            server.page(&cid).await?
+        }
+        PageKind::ConsentWithMarkupName => {
+            let cid = server.register(MARKUP_NAME).await?;
             server.page(&cid).await?
         }
         PageKind::AuthorizeError => server.page("not-sealed").await?,
@@ -49,108 +62,6 @@ async fn fetch(server: &Harness, kind: PageKind) -> anyhow::Result<(u16, String,
     Ok((status, csp, response.text().await?))
 }
 
-/// The markup between `<head>` and `</head>`.
-fn head(html: &str) -> anyhow::Result<&str> {
-    html.split_once("<head>")
-        .and_then(|(_, rest)| rest.split_once("</head>"))
-        .map(|(inside, _)| inside)
-        .context("head element")
-}
-
-/// The text content of every `<style>` element in `markup`, in document order.
-fn style_texts(markup: &str) -> Vec<&str> {
-    markup
-        .split("<style>")
-        .skip(1)
-        .filter_map(|rest| rest.split_once("</style>").map(|(text, _)| text))
-        .collect()
-}
-
-/// The start tag up to its `>` of every `<style` element in `markup`, matched in any letter case.
-fn style_start_tags(markup: &str) -> Vec<&str> {
-    let lower = markup.to_ascii_lowercase();
-    lower
-        .match_indices("<style")
-        .filter_map(|(start, _)| {
-            let next = lower.get(start..)?.strip_prefix("<style")?.chars().next();
-            next.is_some_and(|after| after.is_ascii_whitespace() || matches!(after, '>' | '/'))
-                .then(|| markup.get(start..))?
-        })
-        .map(|rest| rest.split_once('>').map_or(rest, |(tag, _)| tag))
-        .collect()
-}
-
-/// The CSP hash source a browser computes for an inline element with this exact text.
-fn hash_source(text: &str) -> String {
-    format!(
-        "'sha256-{}'",
-        STANDARD.encode(Sha256::digest(text.as_bytes()))
-    )
-}
-
-/// The source list of one CSP directive, or `None` when the policy omits the directive.
-fn directive<'policy>(csp: &'policy str, name: &str) -> Option<Vec<&'policy str>> {
-    csp.split(';').find_map(|part| {
-        let mut tokens = part.split_ascii_whitespace();
-        (tokens.next() == Some(name)).then(|| tokens.collect())
-    })
-}
-
-/// The declarations of the rule whose selector is exactly `selector`.
-fn declarations<'sheet>(sheet: &'sheet str, selector: &str) -> Vec<&'sheet str> {
-    sheet
-        .split('}')
-        .filter_map(|rule| rule.split_once('{'))
-        .filter(|(rule_selector, _)| rule_selector.trim() == selector)
-        .flat_map(|(_, body)| body.split(';').map(str::trim))
-        .filter(|declaration| !declaration.is_empty())
-        .collect()
-}
-
-/// The CSS pixel value of `property` in `rule`, when it is given in `px`.
-fn pixels(rule: &[&str], property: &str) -> Option<u32> {
-    rule.iter().find_map(|declaration| {
-        let (name, value) = declaration.split_once(':')?;
-        (name.trim() == property)
-            .then(|| value.trim().strip_suffix("px")?.parse().ok())
-            .flatten()
-    })
-}
-
-/// A button of the consent form: its submitted name and value, and its visible label.
-struct Button {
-    /// The submitted field name.
-    name: String,
-    /// The submitted field value.
-    value: String,
-    /// The label text the user taps.
-    label: String,
-}
-
-/// The value of attribute `name` inside one start tag.
-fn attribute(tag: &str, name: &str) -> Option<String> {
-    tag.split_once(&format!(" {name}=\""))
-        .and_then(|(_, rest)| rest.split_once('"'))
-        .map(|(value, _)| value.to_owned())
-}
-
-/// Every `<button>` of `markup` with its attributes and label.
-fn buttons(markup: &str) -> Vec<Button> {
-    markup
-        .split("<button")
-        .skip(1)
-        .filter_map(|rest| {
-            let (tag, after) = rest.split_once('>')?;
-            let (label, _) = after.split_once("</button>")?;
-            Some(Button {
-                name: attribute(tag, "name")?,
-                value: attribute(tag, "value")?,
-                label: label.to_owned(),
-            })
-        })
-        .collect()
-}
-
 /// Every page sets a device-width layout viewport exactly once, inside its head.
 #[tokio::test]
 async fn every_page_declares_a_device_width_viewport_once_in_its_head() -> anyhow::Result<()> {
@@ -161,9 +72,13 @@ async fn every_page_declares_a_device_width_viewport_once_in_its_head() -> anyho
         // When
         let (status, _csp, html) = fetch(&server, kind).await?;
         // Then
+        let expected = match kind {
+            PageKind::Consent | PageKind::ConsentWithMarkupName => 200,
+            PageKind::AuthorizeError | PageKind::CallbackError => 400,
+        };
         ensure!(
-            matches!((kind, status), (PageKind::Consent, 200) | (_, 400)),
-            "{kind:?} status {status}"
+            status == expected,
+            "{kind:?} status {status}, want {expected}"
         );
         ensure!(
             html.matches("name=\"viewport\"").count() == 1,
@@ -209,13 +124,19 @@ async fn every_page_stylesheet_is_admitted_only_by_its_hash() -> anyhow::Result<
         for forbidden in ["unsafe-inline", "unsafe-hashes", "unsafe-eval", "nonce-"] {
             ensure!(!csp.contains(forbidden), "{kind:?} CSP has no {forbidden}");
         }
-        let lower = html.to_ascii_lowercase();
-        ensure!(
-            !lower
-                .split_ascii_whitespace()
-                .any(|word| word.starts_with("style=")),
-            "{kind:?} has no style attribute in any case or quoting, which a hash source cannot admit"
-        );
+        for tag in start_tags(&html) {
+            ensure!(
+                !attribute_names(tag).iter().any(|name| name == "style"),
+                "{kind:?} has no style attribute, which a hash source cannot admit: {tag}"
+            );
+        }
+        ensure!(!html.contains("<!--"), "{kind:?} has no comment");
+        if matches!(kind, PageKind::ConsentWithMarkupName) {
+            ensure!(
+                html.contains("Phone style=x &lt;style&gt;b&lt;/style&gt;"),
+                "{kind:?} shows the name as escaped text"
+            );
+        }
         ensure!(
             !html.contains("<script") && !html.contains("<link"),
             "{kind:?} loads no script and no external resource"
