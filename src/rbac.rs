@@ -2483,6 +2483,48 @@ mod tests {
             // Then: any tool rmcp dispatches was inspected by RBAC.
             prop_assert!(result.is_ok(), "{result:?}");
         }
+
+        /// Checks valid tools/call envelopes always take a dispatch path and satisfy RBAC inspection.
+        #[test]
+        fn differential_invariant_holds_for_valid_envelopes(id in 0_usize..3, frags in collection::vec(0_usize..5, 1..6)) {
+            // Given: unique envelope fields and params fragments that preserve duplicate keys.
+            const PARAM_FRAGMENTS: [&str; 5] = [
+                r#""name":"allowed""#,
+                r#""name":"denied""#,
+                r#""arguments":{}"#,
+                r#""arguments":{"p":"bad","p":"ok"}"#,
+                r#""arguments":{"p":"ok"}"#,
+            ];
+            let request_id = match id {
+                0 => "1",
+                1 => r#""a""#,
+                _ => "1.0",
+            };
+            let params = frags
+                .into_iter()
+                .filter_map(|index| PARAM_FRAGMENTS.get(index).copied())
+                .collect::<Vec<_>>();
+            let raw = format!(
+                r#"{{"jsonrpc":"2.0","id":{request_id},"method":"tools/call","params":{{{}}}}}"#,
+                params.join(",")
+            );
+
+            // When: rmcp and RBAC inspect the generated envelope.
+            let outcome = rmcp_outcome(&raw);
+            // Then: every generated envelope is dispatched and satisfies the differential invariant.
+            prop_assert!(
+                matches!(
+                    &outcome,
+                    RmcpOutcome::ToolCall {
+                        name: _,
+                        arguments: _,
+                    } | RmcpOutcome::CustomToolsCall
+                ),
+                "expected tools/call dispatch for {raw}, got {outcome:?}"
+            );
+            let result = check_differential_invariant(&raw, outcome);
+            prop_assert!(result.is_ok(), "{result:?}");
+        }
     }
 
     fn with_rbac_env<R>(vars: &[(&str, Option<&str>)], run: impl FnOnce() -> R) -> R {
