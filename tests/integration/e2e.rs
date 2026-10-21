@@ -245,7 +245,7 @@ mod tests {
 
         #[expect(
             clippy::integer_division_remainder_used,
-            reason = "tokio select expands to remainder arithmetic even in biased mode"
+            reason = "external macro: tokio::select"
         )]
         async fn call_tool(
             &self,

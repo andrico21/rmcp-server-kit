@@ -2271,7 +2271,7 @@ mod tests {
 
     #[expect(
         clippy::wildcard_enum_match_arm,
-        reason = "the differential classifies all non-tool requests alike, including future non-exhaustive variants"
+        reason = "foreign non-exhaustive enum: rmcp::model::ClientRequest"
     )]
     fn rmcp_outcome(raw: &str) -> RmcpOutcome {
         use rmcp::model::{ClientJsonRpcMessage, ClientRequest, JsonRpcMessage};
