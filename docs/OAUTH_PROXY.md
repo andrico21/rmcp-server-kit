@@ -379,7 +379,7 @@ env var can only be set in TOML or through the builder.
 | TOML key | Env var | Type | Default | Mode | Effect |
 |---|---|---|---|---|---|
 | `server.public_url` | `RMCP_SERVER_KIT__SERVER__PUBLIC_URL` | string | unset | all | externally visible origin. Drives the PRM `resource`, the absolute `resource_metadata` URL, the AS metadata `issuer` and, in `authorization_server` mode, the callback URI and cookie names. Unset with OAuth configured logs a startup WARN |
-| `challenge_scopes` | `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__CHALLENGE_SCOPES` (comma-separated) | list of strings | unset | all | adds `scope="..."` to the `401` challenge. Non-empty, RFC 6750 scope tokens, no duplicates, `offline_access` refused |
+| `challenge_scopes` | `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__CHALLENGE_SCOPES` (comma-separated) | list of strings | unset | all | adds `scope="..."` to the `401` challenge. Non-empty, RFC 6750 scope tokens, no duplicates, `offline_access` refused. A default rmcp 3.6 client still also requests every PRM `scopes_supported` entry, so this alone does not limit its first request (section 9) |
 | `insufficient_scope_challenge` | `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__INSUFFICIENT_SCOPE_CHALLENGE` | bool | `false` | all | a tool call denied by RBAC gets `WWW-Authenticate: Bearer error="insufficient_scope", scope=...` when one more mapped scope would allow it (section 9). Requires `scopes` mappings and no `role_claim` |
 | `additional_audiences` | `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ADDITIONAL_AUDIENCES` (comma-separated) | list of strings | `[]` | all | extra accepted `aud` values. Non-empty, unique, different from `audience` |
 | `accept_resource_audience` | `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__ACCEPT_RESOURCE_AUDIENCE` | bool | `false` | all | also accepts `aud` equal to `{public_url}/mcp`. Requires `public_url` |
@@ -2308,11 +2308,42 @@ a viewer. Swap the two mappings (case
 request gets `scope="mcp:admin"`.
 
 `challenge_scopes` (the `401` hint) and `insufficient_scope_challenge`
-(the `403` step-up) complement each other: the first tells a client which
-scopes to ask for up front, the second tells it which one to add later. In
+(the `403` step-up) complement each other: the first names the scopes a
+client should start with, the second names the one to add later. In
 `authorization_server` mode a request for a broader scope than the browser
 already approved for that client shows the consent page again; after
 approval the remembered scopes are merged.
+
+**What an rmcp 3.6 client actually requests.** The hint is advice; the
+client decides what goes into its authorization request. An rmcp 3.6 or
+later client behaves like this:
+
+1. **Explicit scopes.** When the application configures scopes on the
+   client, it sends exactly those, plus `offline_access` when the
+   authorization server metadata lists it.
+2. **Automatic selection (the default).** With no explicit scopes, the
+   client requests the union of three sets: the scopes it requested before,
+   the challenge `scope`, and every Protected Resource Metadata
+   `scopes_supported` entry. This server lists every configured `scopes`
+   mapping in PRM `scopes_supported`, admin scopes included, and omits the
+   field when no mapping exists. Only when all three sets are empty does the
+   client fall back to the authorization server's whole `scopes_supported`
+   list (in both proxy modes that is this server's own metadata, which lists
+   the same mapped scopes). So `challenge_scopes` alone does not limit the
+   first request: a default client still asks for every mapped scope.
+3. **Opt-in initial selection.** A client built with
+   `with_initial_scope_selection()` requests the challenge scopes when the
+   challenge names any, otherwise PRM `scopes_supported`, otherwise nothing.
+4. **`offline_access`.** In every case it is appended only to a non-empty
+   selection, and only when the authorization server metadata lists it.
+
+For least privilege, configure the client's scopes explicitly, or enable
+initial selection on the client together with `challenge_scopes` on this
+server. Don't hide scopes from PRM to get the same effect: PRM must stay a
+truthful list of what this resource accepts. Whatever the client asks for,
+this server still resolves the role from the first matching `scopes`
+mapping, and the authorization server decides which scopes it actually
+grants.
 
 ## 10. Migrating passthrough -> authorization_server
 
