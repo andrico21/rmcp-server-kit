@@ -48,7 +48,7 @@ version = "1.0.104"
 criteria = "safe-to-deploy"
 
 [[exemptions.arc-swap]]
-version = "1.9.2"
+version = "1.9.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.argon2]]
@@ -72,7 +72,7 @@ version = "2.0.2"
 criteria = "safe-to-run"
 
 [[exemptions.async-compression]]
-version = "0.4.50"
+version = "0.4.51"
 criteria = "safe-to-deploy"
 
 [[exemptions.async-trait]]
@@ -172,7 +172,7 @@ version = "0.3.0"
 criteria = "safe-to-run"
 
 [[exemptions.cc]]
-version = "1.8.0"
+version = "1.9.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.cfg-if]]
@@ -220,15 +220,15 @@ version = "0.5.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.combine]]
-version = "4.6.8"
+version = "4.6.9"
 criteria = "safe-to-deploy"
 
 [[exemptions.compression-codecs]]
-version = "0.4.45"
+version = "0.4.46"
 criteria = "safe-to-deploy"
 
 [[exemptions.compression-core]]
-version = "0.4.33"
+version = "0.4.34"
 criteria = "safe-to-deploy"
 
 [[exemptions.const-oid]]
@@ -260,7 +260,7 @@ version = "0.3.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.crc32fast]]
-version = "1.5.2"
+version = "1.5.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.criterion]]
@@ -380,7 +380,7 @@ version = "0.13.8"
 criteria = "safe-to-deploy"
 
 [[exemptions.equivalent]]
-version = "1.0.2"
+version = "1.0.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.errno]]
@@ -400,7 +400,7 @@ version = "0.2.9"
 criteria = "safe-to-deploy"
 
 [[exemptions.find-msvc-tools]]
-version = "0.1.14"
+version = "0.1.15"
 criteria = "safe-to-deploy"
 
 [[exemptions.flate2]]
@@ -656,7 +656,7 @@ version = "1.5.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.libc]]
-version = "0.2.190"
+version = "0.2.191"
 criteria = "safe-to-deploy"
 
 [[exemptions.libm]]
@@ -1016,7 +1016,7 @@ version = "0.2.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.rustls-webpki]]
-version = "0.103.15"
+version = "0.103.16"
 criteria = "safe-to-deploy"
 
 [[exemptions.rustversion]]
@@ -1036,7 +1036,7 @@ version = "1.0.6"
 criteria = "safe-to-deploy"
 
 [[exemptions.schannel]]
-version = "0.1.29"
+version = "0.1.30"
 criteria = "safe-to-deploy"
 
 [[exemptions.schemars]]
@@ -1252,7 +1252,7 @@ version = "1.2.1"
 criteria = "safe-to-run"
 
 [[exemptions.tokio]]
-version = "1.53.2"
+version = "1.54.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.tokio-macros]]
@@ -1428,7 +1428,7 @@ version = "1.1.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.webpki-root-certs]]
-version = "1.0.9"
+version = "1.0.10"
 criteria = "safe-to-deploy"
 
 [[exemptions.winapi]]
@@ -1552,11 +1552,11 @@ version = "0.8.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.zerocopy]]
-version = "0.8.62"
+version = "0.8.63"
 criteria = "safe-to-deploy"
 
 [[exemptions.zerocopy-derive]]
-version = "0.8.62"
+version = "0.8.63"
 criteria = "safe-to-deploy"
 
 [[exemptions.zerofrom]]

@@ -112,6 +112,18 @@ required) and [`docs/OAUTH_PROXY.md`](docs/OAUTH_PROXY.md).
   per-mutant timeout as GitHub.
 - CI only: the Markdown link checks on GitHub and GitLab also verify heading
   anchors (`lychee --include-fragments`).
+- Dependency refresh: 16 semver-compatible `Cargo.lock` updates - `tokio`
+  1.53.2 -> 1.54.0, `arc-swap` 1.9.2 -> 1.9.3, `rustls-webpki`
+  0.103.15 -> 0.103.16 and `webpki-root-certs` 1.0.9 -> 1.0.10 (see Security),
+  `async-compression` 0.4.50 -> 0.4.51, `compression-codecs` 0.4.45 -> 0.4.46,
+  `compression-core` 0.4.33 -> 0.4.34, `crc32fast` 1.5.2 -> 1.5.3, `combine`
+  4.6.8 -> 4.6.9, `equivalent` 1.0.2 -> 1.0.3, `libc` 0.2.190 -> 0.2.191,
+  `zerocopy` / `zerocopy-derive` 0.8.62 -> 0.8.63, `cc` 1.8.0 -> 1.9.0,
+  `find-msvc-tools` 0.1.14 -> 0.1.15 and `schannel` 0.1.29 -> 0.1.30. No
+  `Cargo.toml` requirement changed and `rmcp` stays at 3.5.1 (3.6.0 is
+  available and needs the `docs/RMCP_UPGRADE_CHECKLIST.md` review). The
+  `supply-chain/config.toml` cargo-vet exemptions are re-pinned to the 16 new
+  versions; `cargo vet --locked` passes.
 
 ### Fixed
 
@@ -145,6 +157,12 @@ required) and [`docs/OAUTH_PROXY.md`](docs/OAUTH_PROXY.md).
 - Bumped `rustls` from 0.23.45 to 0.23.46 to resolve RUSTSEC-2026-0346,
   RUSTSEC-2026-0347, RUSTSEC-2026-0348 and RUSTSEC-2026-0349; `Cargo.lock` and
   the `cargo-vet` exemptions are refreshed together.
+- Bumped `rustls-webpki` from 0.103.15 to 0.103.16 (RUSTSEC-2026-0382,
+  certificate verification may accept distrusted intermediates) and
+  `webpki-root-certs` from 1.0.9 to 1.0.10 (RUSTSEC-2026-0383, bundled roots
+  trusted distrusted emSign intermediates; reached through `reqwest`'s
+  `rustls-platform-verifier`). `cargo audit` and `cargo deny check` are clean
+  again.
 
 ### Notes
 
