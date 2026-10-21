@@ -19,6 +19,11 @@ maintenance. Every new knob defaults to the 3.20.0 behaviour; see
 
 ### Added
 
+- `McpServerConfig::with_sse_retry(Option<Duration>)` controls the SSE
+  priming event (`id:`/`retry:` with empty `data:`) that rmcp sends at the
+  start of each SSE response stream. `None` disables it for clients whose
+  parser rejects a stream that doesn't open with `data:` (e.g. AWS Bedrock
+  AgentCore). Default stays `Some(3s)`, matching rmcp.
 - `OAuthConfig::challenge_scopes` (builder `challenge_scopes`, env
   `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__CHALLENGE_SCOPES`, comma-separated):
   adds `scope="..."` to the `401` `WWW-Authenticate` challenge. Default unset.
