@@ -258,8 +258,13 @@ where
     F: Fn() -> H + Send + Sync + Clone + 'static,
 ```
 
-Starts the HTTP server. The `handler_factory` is a closure that creates a
-fresh handler for each MCP session. The server:
+Starts the HTTP server. The `handler_factory` is a closure that builds a
+handler. It runs for each new MCP session and, for MCP 2026-07-28 stateless
+requests, for each request. rmcp calls it before it validates the standard
+request headers, so building a handler does not mean a request will be
+dispatched to it. Keep the factory cheap, synchronous and safe to call
+repeatedly; share long-lived state (connection pools, task stores, caches)
+through `Arc` values captured by the closure. The server:
 
 - Binds TCP (or TLS when cert/key provided)
 - Registers `/healthz` (always 200), `/readyz` (custom or mirrors healthz),
@@ -2580,6 +2585,43 @@ If you configure only an event store and then test the legacy session-bound path
 through another replica, rmcp still has to recover the session first; add a
 shared `SessionStore` and shared binding secret for that path.
 
+#### Standard request headers and nested x-mcp-header (2026-07-28)
+
+rmcp checks these rules only when a request's `MCP-Protocol-Version` header is
+2026-07-28 or later. Older clients see no change.
+
+- **Request metadata.** Every 2026-07-28 request other than `initialize` must
+  carry `_meta` with `io.modelcontextprotocol/protocolVersion` and
+  `io.modelcontextprotocol/clientCapabilities`.
+- **`Mcp-Method`.** Required on every request except `initialize`, and it must
+  equal the body's `method`. An `initialize` request may omit it, but a value
+  it does supply must still be `initialize`.
+- **`Mcp-Name`.** Required for `tools/call` and `prompts/get` (taken from
+  `params.name`), for `resources/read`, `resources/subscribe` and
+  `resources/unsubscribe` (from `params.uri`), and for `tasks/get`,
+  `tasks/update` and `tasks/cancel` (from `params.taskId`).
+- **`x-mcp-header` placement.** A tool's input schema may put `x-mcp-header`
+  only on a `string`, `integer` or `boolean` property reached from the root
+  through `properties` keys alone, not under `$ref`/`$defs`, `items`, or
+  `allOf`/`anyOf`/`oneOf`. Header names must be unique, compared
+  case-insensitively. An rmcp client drops a listed tool whose annotations
+  break these rules, and the server never checks an annotation outside the
+  `properties` chain.
+- **Nested enforcement.** Since rmcp 3.6.0, annotations on nested properties
+  are enforced for `tools/call`, as top-level ones are. The matching
+  `Mcp-Param-<name>` header is required when the argument is present and
+  rejected when it is absent or null. Its value is compared with the argument
+  after decoding the `=?base64?...?=` form.
+
+A request that breaks any of these rules gets HTTP 400 with a JSON-RPC error
+body. They're integrity checks between headers and body, not authorization:
+RBAC still authorizes `tools/call` on the JSON-RPC body, including any
+argument allowlist.
+
+Nested enforcement depends on rmcp 3.6.0 or later in your resolved dependency
+tree. This crate requires `rmcp = "3"`, so check `Cargo.lock` if you rely on
+it.
+
 ### Customising security headers
 
 By default, rmcp-server-kit emits twelve OWASP security headers on every
@@ -3574,6 +3616,13 @@ diagnostics.
 selects the separate `serve_stdio()` entry point, which bypasses auth, RBAC,
 TLS, and origin checks entirely. Routing between `serve()` and `serve_stdio()`
 is the caller's responsibility; the bridge covers `serve()` only.
+
+**stdio transport limits.** With rmcp 3.6.0 or later resolved, `serve_stdio()`
+drops (and logs) any incoming line over 16 MiB without a JSON-RPC reply, so
+that request stays pending until the client times out or cancels, and it drops
+a final message that has no trailing newline at EOF. `serve_stdio()` keeps
+rmcp's blocking `stdio()`; to get rmcp's non-blocking Linux pipe transport,
+serve your handler with `rmcp::transport::stdio_pipes()` yourself.
 
 ### Environment variable overrides (opt-in)
 

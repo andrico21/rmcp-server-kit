@@ -3088,6 +3088,15 @@ fn spawn_external_shutdown_bridge(
 /// token. This typestate guarantees, at compile time, that the server
 /// never starts with an invalid configuration.
 ///
+/// # Handler factory
+///
+/// `handler_factory` runs for each new MCP session and, for MCP 2026-07-28
+/// stateless requests, for each request. rmcp calls it before it validates
+/// the standard request headers, so building a handler does not mean a
+/// request will be dispatched to it. Keep the factory cheap, synchronous and
+/// safe to call repeatedly; share long-lived state (connection pools, task
+/// stores, caches) through `Arc` values captured by the closure.
+///
 /// # Errors
 ///
 /// Returns [`RmcpServerKitError::Startup`] if binding to `config.bind_addr`
@@ -3160,6 +3169,15 @@ where
 /// All three optional parameters degrade gracefully: if `ready_tx` is
 /// `None`, no signal is sent; if `shutdown` is `None`, the server only
 /// stops on an OS signal (just like [`serve`]).
+///
+/// # Handler factory
+///
+/// `handler_factory` runs for each new MCP session and, for MCP 2026-07-28
+/// stateless requests, for each request. rmcp calls it before it validates
+/// the standard request headers, so building a handler does not mean a
+/// request will be dispatched to it. Keep the factory cheap, synchronous and
+/// safe to call repeatedly; share long-lived state (connection pools, task
+/// stores, caches) through `Arc` values captured by the closure.
 ///
 /// # Errors
 ///
@@ -5688,6 +5706,21 @@ fn mask_session_id_for_log(value: &str) -> String {
 /// Use this only when the MCP client spawns the server as a trusted subprocess
 /// (e.g. Claude Desktop, VS Code Copilot). For network-accessible deployments,
 /// use `serve()` (Streamable HTTP) instead.
+///
+/// # Transport limits
+///
+/// With rmcp 3.6.0 or later resolved, an incoming line longer than 16 MiB is
+/// dropped and logged with no JSON-RPC reply, so that request stays pending
+/// until the client times out or cancels it. A final message without a
+/// trailing newline at EOF is also dropped.
+///
+/// This function keeps rmcp's blocking `rmcp::transport::stdio()`.
+/// Applications on rmcp 3.6.0 or later that want rmcp's non-blocking Linux
+/// pipe transport can serve their handler with
+/// `rmcp::transport::stdio_pipes()` themselves. On Linux it panics when
+/// called outside a Tokio runtime or inside one built without the IO driver;
+/// on other platforms, or when stdin and stdout are not both pipes, it falls
+/// back to the blocking stdio handles.
 ///
 /// # Errors
 ///
