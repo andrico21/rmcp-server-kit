@@ -2255,6 +2255,236 @@ mod tests {
     use crate::metrics::McpMetrics;
     use crate::transport::{ClientIp, PeerAddr, RequestId};
 
+    // rmcp parser differential (RMCP_UPGRADE_CHECKLIST.md section 3)
+    #[derive(Debug, PartialEq)]
+    enum RmcpOutcome {
+        ToolCall {
+            name: String,
+            arguments: Option<Map<String, JsonValue>>,
+        },
+        CustomToolsCall,
+        OtherRequest,
+        Notification,
+        Response,
+        Reject,
+    }
+
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "the differential classifies all non-tool requests alike, including future non-exhaustive variants"
+    )]
+    fn rmcp_outcome(raw: &str) -> RmcpOutcome {
+        use rmcp::model::{ClientJsonRpcMessage, ClientRequest, JsonRpcMessage};
+
+        match serde_json::from_str::<ClientJsonRpcMessage>(raw) {
+            Ok(JsonRpcMessage::Request(request)) => match request.request {
+                ClientRequest::CallToolRequest(call) => RmcpOutcome::ToolCall {
+                    name: call.params.name.into_owned(),
+                    arguments: call.params.arguments,
+                },
+                ClientRequest::CustomRequest(custom) if custom.method == "tools/call" => {
+                    RmcpOutcome::CustomToolsCall
+                }
+                _ => RmcpOutcome::OtherRequest,
+            },
+            Ok(JsonRpcMessage::Notification(_)) => RmcpOutcome::Notification,
+            Ok(JsonRpcMessage::Response(_) | JsonRpcMessage::Error(_)) => RmcpOutcome::Response,
+            Err(_) => RmcpOutcome::Reject,
+        }
+    }
+
+    fn rbac_extracted(raw: &str) -> Vec<JsonValue> {
+        serde_json::from_str::<JsonValue>(raw).map_or_else(
+            |_| Vec::new(),
+            |value| extract_tool_calls(&value).into_iter().cloned().collect(),
+        )
+    }
+
+    #[derive(Clone, Copy)]
+    enum Expected {
+        Reject,
+        CustomToolsCall,
+        Notification,
+        ToolCall(&'static str, Option<&'static str>),
+    }
+
+    const DIFFERENTIAL_CORPUS: &[(&str, &str, Expected)] = &[
+        (
+            "row 1 dup params allowed last",
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"denied","arguments":{}},"params":{"name":"allowed","arguments":{}}}"#,
+            Expected::Reject,
+        ),
+        (
+            "row 2 dup params denied last",
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"allowed","arguments":{}},"params":{"name":"denied","arguments":{}}}"#,
+            Expected::Reject,
+        ),
+        (
+            "row 3 dup name",
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"denied","name":"allowed","arguments":{}}}"#,
+            Expected::CustomToolsCall,
+        ),
+        (
+            "row 4 dup arguments",
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"t","arguments":{"p":"bad"},"arguments":{"p":"ok"}}}"#,
+            Expected::CustomToolsCall,
+        ),
+        (
+            "row 5 dup argument key",
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"t","arguments":{"p":"bad","p":"ok"}}}"#,
+            Expected::ToolCall("t", Some(r#"{"p":"ok"}"#)),
+        ),
+        (
+            "row 6 dup method call first",
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","method":"ping","params":{"name":"denied"}}"#,
+            Expected::Reject,
+        ),
+        (
+            "row 7 dup method call last",
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping","method":"tools/call","params":{"name":"denied"}}"#,
+            Expected::Reject,
+        ),
+        (
+            "row 8 float id",
+            r#"{"jsonrpc":"2.0","id":1.0,"method":"tools/call","params":{"name":"denied"}}"#,
+            Expected::ToolCall("denied", None),
+        ),
+        (
+            "row 9 null id",
+            r#"{"jsonrpc":"2.0","id":null,"method":"tools/call","params":{"name":"denied"}}"#,
+            Expected::Reject,
+        ),
+        (
+            "row 10 call plus result",
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"denied"},"result":{}}"#,
+            Expected::Reject,
+        ),
+        (
+            "row 11 dup id",
+            r#"{"jsonrpc":"2.0","id":1,"id":2,"method":"tools/call","params":{"name":"denied"}}"#,
+            Expected::Reject,
+        ),
+        (
+            "row 12 params then null",
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"denied"},"params":null}"#,
+            Expected::Reject,
+        ),
+        (
+            "row 13 batch",
+            r#"[{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"denied"}}]"#,
+            Expected::Reject,
+        ),
+        (
+            "row 14 valid",
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"allowed","arguments":{"p":"ok"}}}"#,
+            Expected::ToolCall("allowed", Some(r#"{"p":"ok"}"#)),
+        ),
+        (
+            "row 15 string id",
+            r#"{"jsonrpc":"2.0","id":"a","method":"tools/call","params":{"name":"allowed"}}"#,
+            Expected::ToolCall("allowed", None),
+        ),
+        // Benign: no tool name exists; RBAC extracts nothing and rmcp calls on_custom_request.
+        (
+            "row 16 no params",
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call"}"#,
+            Expected::CustomToolsCall,
+        ),
+        (
+            "row 17 notification",
+            r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"denied"}}"#,
+            Expected::Notification,
+        ),
+    ];
+
+    fn check_differential_invariant(raw: &str, outcome: RmcpOutcome) -> anyhow::Result<()> {
+        let extracted = rbac_extracted(raw);
+        match outcome {
+            RmcpOutcome::ToolCall { name, arguments } => {
+                assert_eq!(
+                    extracted.len(),
+                    1,
+                    "RBAC must inspect exactly one call: {raw}"
+                );
+                let params = extracted.first().context("dispatched tool has params")?;
+                assert_eq!(
+                    params.get("name").and_then(JsonValue::as_str),
+                    Some(name.as_str()),
+                    "{raw}"
+                );
+                assert_eq!(
+                    params.get("arguments").and_then(JsonValue::as_object),
+                    arguments.as_ref(),
+                    "{raw}"
+                );
+            }
+            RmcpOutcome::CustomToolsCall => {
+                let value: JsonValue = serde_json::from_str(raw)?;
+                if value.get("params").is_some() {
+                    assert!(
+                        !extracted.is_empty(),
+                        "custom tools/call params must be inspected: {raw}"
+                    );
+                }
+            }
+            RmcpOutcome::OtherRequest
+            | RmcpOutcome::Notification
+            | RmcpOutcome::Response
+            | RmcpOutcome::Reject => {}
+        }
+        Ok(())
+    }
+
+    /// Pins upstream parser outcomes and RBAC inspection of every dispatched tool.
+    #[test]
+    fn rbac_and_rmcp_agree_on_every_dispatched_tool_call() -> anyhow::Result<()> {
+        // Given: raw wire fixtures preserve duplicate keys.
+        for &(label, raw, expected) in DIFFERENTIAL_CORPUS {
+            let pinned = match expected {
+                Expected::Reject => RmcpOutcome::Reject,
+                Expected::CustomToolsCall => RmcpOutcome::CustomToolsCall,
+                Expected::Notification => RmcpOutcome::Notification,
+                Expected::ToolCall(name, arguments) => RmcpOutcome::ToolCall {
+                    name: name.to_owned(),
+                    arguments: arguments.map(serde_json::from_str).transpose()?,
+                },
+            };
+            // When: rmcp parses the same bytes that RBAC inspects.
+            let outcome = rmcp_outcome(raw);
+            // Then: both the pinned outcome and the security invariant hold.
+            assert_eq!(
+                outcome, pinned,
+                "{label}: rmcp parsing changed: re-run docs/RMCP_UPGRADE_CHECKLIST.md section 3"
+            );
+            check_differential_invariant(raw, outcome)?;
+        }
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Checks RBAC inspection across permutations of duplicated wire fields.
+        #[test]
+        fn differential_invariant_holds_for_duplicated_keys(frags in collection::vec(0_usize..11, 1..8)) {
+            // Given: fragments are raw so duplicate fields survive construction.
+            const FRAGMENTS: [&str; 11] = [
+                r#""jsonrpc":"2.0""#, r#""id":1"#, r#""id":1.0"#, r#""id":null"#,
+                r#""method":"tools/call""#, r#""method":"ping""#,
+                r#""params":{"name":"allowed","arguments":{}}"#,
+                r#""params":{"name":"denied","arguments":{}}"#,
+                r#""params":{"name":"allowed","name":"denied"}"#,
+                r#""params":null"#, r#""result":{}"#,
+            ];
+            let fields = frags.into_iter().filter_map(|index| FRAGMENTS.get(index).copied()).collect::<Vec<_>>();
+            let raw = format!("{{{}}}", fields.join(","));
+            // When: both parsers consume the same raw object.
+            let result = check_differential_invariant(&raw, rmcp_outcome(&raw));
+            // Then: any tool rmcp dispatches was inspected by RBAC.
+            prop_assert!(result.is_ok(), "{result:?}");
+        }
+    }
+
     fn with_rbac_env<R>(vars: &[(&str, Option<&str>)], run: impl FnOnce() -> R) -> R {
         temp_env::with_vars(
             [
