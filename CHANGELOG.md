@@ -13,7 +13,8 @@ migration note and a config opt-out - see the 3.1.0 notes below.
 
 Opt-in MCP 2026-07-28 authorization features, follow-ups to the rmcp 3.6.0
 lockfile move (tests, docs and one internal change), an SSE priming opt-out
-for clients that reject the priming event, and dependency maintenance. Every new knob defaults to the 3.20.0 behaviour; see
+for clients that reject the priming event, and dependency maintenance. Every
+new knob defaults to the 3.20.0 behaviour; see
 [`docs/MIGRATION.md`](docs/MIGRATION.md) (no action required) and
 [`docs/OAUTH_PROXY.md`](docs/OAUTH_PROXY.md).
 
@@ -24,11 +25,12 @@ for clients that reject the priming event, and dependency maintenance. Every new
   TOML `[server] sse_priming_enabled` (env
   `RMCP_SERVER_KIT__SERVER__SSE_PRIMING_ENABLED`) and `sse_retry`
   (file-only). The priming event (a `retry:` hint with an empty `data:` line)
-  opens each SSE response stream and gives clients a `Last-Event-ID` resume
-  point; turn it off for clients whose SSE parser requires a stream to start
-  with `data:`, such as AWS Bedrock AgentCore. An `sse_retry` under 1ms is
-  rejected. The default is unchanged: priming on with `retry: 3000`
-  (issue #69, PR #70, thanks @nlogozzo).
+  gives clients a `Last-Event-ID` resume point; rmcp sends it on every
+  legacy-session stream, and on a 2026-07-28 stateless stream only when an
+  event store is configured. Turn it off for clients whose SSE parser requires
+  a stream to start with `data:`, such as AWS Bedrock AgentCore. An
+  `sse_retry` under 1ms is rejected. The default is unchanged: priming on
+  with `retry: 3000` (issue #69, PR #70, thanks @nlogozzo).
 - `OAuthConfig::challenge_scopes` (builder `challenge_scopes`, env
   `RMCP_SERVER_KIT__SERVER__AUTH__OAUTH__CHALLENGE_SCOPES`, comma-separated):
   adds `scope="..."` to the `401` `WWW-Authenticate` challenge. Default unset.

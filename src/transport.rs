@@ -1332,10 +1332,10 @@ impl McpServerConfig {
     /// Override the reconnect hint carried by the SSE priming event.
     /// Default: 3 seconds.
     ///
-    /// The priming event (`id:` + `retry:` with empty `data:`) opens every
-    /// SSE response stream. It gives clients a `Last-Event-ID` resume point
-    /// on legacy-session streams and, when an event store is configured, on
-    /// 2026-07-28 stateless streams. This only sets the hint; it leaves the
+    /// rmcp sends the priming event (`id:` + `retry:` with empty `data:`) on
+    /// every legacy-session stream, and on a 2026-07-28 stateless stream only
+    /// when an event store is configured. It gives clients a `Last-Event-ID`
+    /// resume point on those streams. This only sets the hint; it leaves the
     /// priming on/off state unchanged (see [`Self::disable_sse_priming`]).
     /// rmcp writes the hint in whole milliseconds, so [`Self::validate`]
     /// rejects anything under 1 ms.

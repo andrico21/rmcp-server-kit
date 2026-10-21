@@ -624,10 +624,12 @@ pub struct ServerConfig {
     /// Default: 15 seconds.
     #[serde(default = "default_sse_keep_alive")]
     pub sse_keep_alive: String,
-    /// Open every SSE response stream with a priming event (`id:` +
-    /// `retry:` with empty `data:`), per MCP 2025-11-25 resumability. Set
-    /// `false` for clients whose SSE parser requires the stream to start
-    /// with `data:`, such as AWS Bedrock `AgentCore`. Default: true.
+    /// Send the SSE priming event (`id:` + `retry:` with empty `data:`), per
+    /// MCP 2025-11-25 resumability. rmcp sends it on every legacy-session
+    /// stream, and on a 2026-07-28 stateless stream only when an event store
+    /// is configured. Set `false` for clients whose SSE parser requires the
+    /// stream to start with `data:`, such as AWS Bedrock `AgentCore`.
+    /// Default: true.
     #[serde(default = "default_sse_priming_enabled")]
     pub sse_priming_enabled: bool,
     /// Reconnect hint carried by the SSE priming event, as a humantime
