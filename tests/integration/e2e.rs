@@ -104,6 +104,30 @@ mod tests {
     #[derive(Clone)]
     struct TestHandler;
 
+    #[derive(Clone)]
+    struct RecordingToolHandler {
+        called: Arc<StdMutex<Vec<String>>>,
+    }
+
+    impl ServerHandler for RecordingToolHandler {
+        fn get_info(&self) -> RmcpServerConfig {
+            RmcpServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        }
+
+        fn call_tool(
+            &self,
+            request: CallToolRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<CallToolResponse, rmcp::ErrorData>> + MaybeSendFuture + '_
+        {
+            self.called
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(request.name.into_owned());
+            ready(Ok(CallToolResult::success(vec![]).into()))
+        }
+    }
+
     impl ServerHandler for TestHandler {
         fn get_info(&self) -> RmcpServerConfig {
             RmcpServerConfig::new(ServerCapabilities::builder().enable_tools().build())
@@ -1200,6 +1224,71 @@ mod tests {
             body.get("result").is_some() || body.get("error").is_some(),
             "{context}: JSON-RPC response must carry result or error: {body}"
         );
+        Ok(())
+    }
+
+    /// Proves malformed parser inputs never dispatch a tool RBAC did not inspect.
+    #[tokio::test]
+    async fn rbac_parser_differential_never_dispatches_an_uninspected_tool() -> anyhow::Result<()> {
+        use std::io::{Write as _, stdout};
+        // Given: an authenticated session permits only the control tool.
+        let (token, hash) = generate_api_key()?;
+        let called = Arc::new(StdMutex::new(Vec::new()));
+        let handler = RecordingToolHandler {
+            called: Arc::clone(&called),
+        };
+        let policy = Arc::new(RbacPolicy::new(&RbacConfig::with_roles(vec![
+            RoleConfig::new("ops", vec!["allowed_tool".into()], vec!["*".into()]),
+        ])));
+        let cfg = config_on_port(0)
+            .with_auth(test_auth_config(vec![ApiKeyEntry::new(
+                "ops-key", hash, "ops",
+            )]))
+            .with_rbac(policy);
+        let base = spawn_server_with(cfg, move || handler.clone()).await?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?;
+        let session = mcp_initialize_with_bearer(&client, &base.base, Some(&token)).await?;
+        let bodies = [
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"denied_tool"},"params":{"name":"allowed_tool"}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"denied_tool","name":"allowed_tool"}}"#,
+            r#"{"jsonrpc":"2.0","id":3.0,"method":"tools/call","params":{"name":"denied_tool"}}"#,
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"allowed_tool"}}"#,
+        ];
+        // When: duplicate fields, a floating id, and the valid control reach the real router.
+        for (index, body) in bodies.into_iter().enumerate() {
+            let response = client
+                .post(format!("{}/mcp", base.base))
+                .bearer_auth(&token)
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-session-id", &session)
+                .body(body)
+                .send()
+                .await?;
+            let status = response.status();
+            let text = response.text().await?;
+            writeln!(stdout(), "parser case {index}: {status} {text}")?;
+            // Then: malformed requests cannot succeed, and only the control is dispatched.
+            match index {
+                0 | 1 => assert!(
+                    !(status == 200 && text.contains("\"result\"")),
+                    "case {index}: {status} {text}"
+                ),
+                2 => assert_eq!(status, 403, "float-id denied call: {text}"),
+                3 => {
+                    assert_eq!(status, 200, "control: {text}");
+                    assert!(
+                        text.contains("\"result\""),
+                        "control must return result: {text}"
+                    );
+                }
+                _ => anyhow::bail!("unexpected parser differential case"),
+            }
+        }
+        let observed = called.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(*observed, vec!["allowed_tool"]);
         Ok(())
     }
 
