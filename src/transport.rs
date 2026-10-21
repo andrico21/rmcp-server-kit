@@ -474,13 +474,10 @@ impl LogContextConfig {
     clippy::struct_excessive_bools,
     reason = "server configuration naturally has many boolean feature flags"
 )]
-#[cfg_attr(
-    feature = "metrics",
-    expect(
-        clippy::field_scoped_visibility_modifiers,
-        clippy::partial_pub_fields,
-        reason = "public API frozen until the next major release"
-    )
+#[expect(
+    clippy::field_scoped_visibility_modifiers,
+    clippy::partial_pub_fields,
+    reason = "public API frozen until the next major release"
 )]
 #[non_exhaustive]
 pub struct McpServerConfig {
@@ -727,11 +724,16 @@ pub struct McpServerConfig {
         note = "use McpServerConfig::with_sse_keep_alive(); direct field access will become pub(crate) in a future major release"
     )]
     pub sse_keep_alive: Duration,
-    /// Reconnect hint sent as an SSE priming event (`id:` + `retry:` with
-    /// empty `data:`) at the start of every SSE response stream, per MCP
-    /// 2025-11-25 resumability. `None` disables the priming event.
-    /// Default: 3 seconds (rmcp's default).
-    sse_retry: Option<Duration>,
+    /// Whether SSE response streams open with a priming event (`id:` +
+    /// `retry:` with empty `data:`), per MCP 2025-11-25 resumability.
+    /// Set via [`McpServerConfig::disable_sse_priming`] or
+    /// [`McpServerConfig::with_sse_priming_enabled`]. Default: `true`.
+    pub(crate) sse_priming_enabled: bool,
+    /// Reconnect hint carried by the SSE priming event. rmcp writes it in
+    /// whole milliseconds, so it must be at least 1 ms. Set via
+    /// [`McpServerConfig::with_sse_retry`]. Default: 3 seconds (rmcp's
+    /// default).
+    pub(crate) sse_retry: Duration,
     /// Callback invoked once the server is built, delivering a
     /// [`ReloadHandle`] for hot-reloading auth keys and RBAC policy
     /// at runtime (e.g. on SIGHUP). Only useful when auth/RBAC is enabled.
@@ -1027,7 +1029,8 @@ impl McpServerConfig {
             session_store: None,
             event_store: None,
             sse_keep_alive: Duration::from_secs(15),
-            sse_retry: Some(Duration::from_secs(3)),
+            sse_priming_enabled: true,
+            sse_retry: Duration::from_secs(3),
             on_reload_ready: None,
             extra_router: None,
             public_url: None,
@@ -1326,12 +1329,35 @@ impl McpServerConfig {
         self
     }
 
-    /// Override the SSE priming-event retry hint. `None` disables the
-    /// priming event, for clients whose SSE parser requires the stream to
-    /// start with a `data:` line. Default: 3 seconds.
+    /// Override the reconnect hint carried by the SSE priming event.
+    /// Default: 3 seconds.
+    ///
+    /// The priming event (`id:` + `retry:` with empty `data:`) opens every
+    /// SSE response stream. It gives clients a `Last-Event-ID` resume point
+    /// on legacy-session streams and, when an event store is configured, on
+    /// 2026-07-28 stateless streams. This only sets the hint; it leaves the
+    /// priming on/off state unchanged (see [`Self::disable_sse_priming`]).
+    /// rmcp writes the hint in whole milliseconds, so [`Self::validate`]
+    /// rejects anything under 1 ms.
     #[must_use]
-    pub fn with_sse_retry(mut self, retry: Option<Duration>) -> Self {
+    #[inline]
+    pub fn with_sse_retry(mut self, retry: Duration) -> Self {
         self.sse_retry = retry;
+        self
+    }
+
+    /// Stop sending the SSE priming event, so every SSE response stream
+    /// starts with a `data:` line carrying a JSON-RPC message.
+    ///
+    /// Use this for clients whose SSE parser requires the stream to start
+    /// with `data:`, such as AWS Bedrock `AgentCore` (issue #69). The cost is
+    /// that clients lose the `Last-Event-ID` resume point the priming event
+    /// gives them on legacy-session streams and, when an event store is
+    /// configured, on 2026-07-28 stateless streams. Default: priming on.
+    #[must_use]
+    #[inline]
+    pub fn disable_sse_priming(mut self) -> Self {
+        self.sse_priming_enabled = false;
         self
     }
 
@@ -2024,6 +2050,17 @@ impl McpServerConfig {
             ));
         }
 
+        // 13. sse_retry must be at least 1 ms. rmcp writes the hint in whole
+        //     milliseconds, so anything shorter becomes `retry: 0`. Checked
+        //     even while priming is disabled, so flipping the switch can
+        //     never make a running config invalid. Mirrors the TOML-side
+        //     check in `src/config.rs`.
+        if self.sse_retry.as_millis() == 0 {
+            return Err(RmcpServerKitError::Config(
+                "sse_retry must be at least 1ms; call disable_sse_priming() to turn the priming event off".into(),
+            ));
+        }
+
         Ok(())
     }
 }
@@ -2437,10 +2474,11 @@ where
     // `origin_check_middleware`): it covers every route and runs before auth.
     // rmcp's internal `allowed_origins` is intentionally left unset to avoid
     // double enforcement with diverging semantics.
+    let sse_retry = config.sse_priming_enabled.then_some(config.sse_retry);
     let mut rmcp_config = StreamableHttpServerConfig::default()
         .with_allowed_hosts(allowed_hosts)
         .with_sse_keep_alive(Some(config.sse_keep_alive))
-        .with_sse_retry(config.sse_retry)
+        .with_sse_retry(sse_retry)
         // Propagate the public cap into rmcp's own body limit. rmcp otherwise
         // enforces its 4 MiB default and silently under-delivers any larger
         // configured value; equal caps keep the OUTER tower layer (installed
@@ -2462,7 +2500,7 @@ where
         {
             let mut mgr = LocalSessionManager::default();
             mgr.session_config.keep_alive = Some(config.session_idle_timeout);
-            mgr.session_config.sse_retry = config.sse_retry;
+            mgr.session_config.sse_retry = sse_retry;
             if let Some(store) = event_store {
                 mgr = mgr.with_event_store(store);
             }
@@ -5910,6 +5948,15 @@ impl McpServerConfig {
         self
     }
 
+    /// Replace the SSE priming enabled flag exactly. See
+    /// [`Self::disable_sse_priming`] for what the priming event does.
+    #[must_use]
+    #[inline]
+    pub fn with_sse_priming_enabled(mut self, enabled: bool) -> Self {
+        self.sse_priming_enabled = enabled;
+        self
+    }
+
     /// Replace the optional global in-flight request cap exactly.
     #[must_use]
     #[inline]
@@ -6508,6 +6555,137 @@ mod tests {
         let err = cfg.validate().err().context("zero handshake timeout")?;
         assert!(err.to_string().contains("tls_handshake_timeout"));
 
+        Ok(())
+    }
+
+    /// Pins the SSE priming defaults: the priming event is on and carries
+    /// rmcp's 3 s reconnect hint.
+    #[test]
+    fn sse_priming_defaults_are_enabled_with_three_second_retry() -> anyhow::Result<()> {
+        let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0");
+        anyhow::ensure!(cfg.sse_priming_enabled, "priming must default to on");
+        anyhow::ensure!(
+            cfg.sse_retry == Duration::from_secs(3),
+            "default retry hint must be 3 s, got {:?}",
+            cfg.sse_retry
+        );
+        Ok(())
+    }
+
+    /// Pins that `with_sse_retry` stores the hint and leaves priming on.
+    #[test]
+    fn sse_retry_builder_stores_the_hint() -> anyhow::Result<()> {
+        let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
+            .with_sse_retry(Duration::from_millis(1500));
+        anyhow::ensure!(
+            cfg.sse_retry == Duration::from_millis(1500),
+            "retry hint not stored: {:?}",
+            cfg.sse_retry
+        );
+        anyhow::ensure!(
+            cfg.sse_priming_enabled,
+            "with_sse_retry must not disable priming"
+        );
+        Ok(())
+    }
+
+    /// Pins that `disable_sse_priming` turns the priming event off.
+    #[test]
+    fn sse_disable_priming_builder_turns_priming_off() -> anyhow::Result<()> {
+        let cfg =
+            McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0").disable_sse_priming();
+        anyhow::ensure!(!cfg.sse_priming_enabled, "priming must be off");
+        Ok(())
+    }
+
+    /// Pins that the clearing-capable bridge setter replaces the priming flag
+    /// exactly, in both directions.
+    #[test]
+    fn sse_priming_enabled_bridge_setter_replaces_the_flag() -> anyhow::Result<()> {
+        let off = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
+            .with_sse_priming_enabled(false);
+        anyhow::ensure!(
+            !off.sse_priming_enabled,
+            "setter(false) must turn priming off"
+        );
+        let on = off.with_sse_priming_enabled(true);
+        anyhow::ensure!(
+            on.sse_priming_enabled,
+            "setter(true) must turn priming back on"
+        );
+        Ok(())
+    }
+
+    /// Pins that the order of `disable_sse_priming` and `with_sse_retry` does
+    /// not matter: both orders end with priming off and the hint stored.
+    #[test]
+    fn sse_builder_call_order_does_not_matter() -> anyhow::Result<()> {
+        let disable_first = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
+            .disable_sse_priming()
+            .with_sse_retry(Duration::from_secs(5));
+        let retry_first = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
+            .with_sse_retry(Duration::from_secs(5))
+            .disable_sse_priming();
+        for (label, cfg) in [
+            ("disable first", disable_first),
+            ("retry first", retry_first),
+        ] {
+            anyhow::ensure!(!cfg.sse_priming_enabled, "{label}: priming must be off");
+            anyhow::ensure!(
+                cfg.sse_retry == Duration::from_secs(5),
+                "{label}: retry hint must be 5 s, got {:?}",
+                cfg.sse_retry
+            );
+        }
+        Ok(())
+    }
+
+    /// Pins that retry hints rmcp would write as `retry: 0` (zero and any
+    /// sub-millisecond value) are rejected by `validate()`.
+    #[test]
+    fn sse_retry_under_one_millisecond_is_rejected() -> anyhow::Result<()> {
+        for retry in [Duration::from_micros(999), Duration::ZERO] {
+            let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
+                .with_sse_retry(retry);
+            let err = cfg
+                .validate()
+                .err()
+                .with_context(|| format!("{retry:?} must be rejected"))?;
+            anyhow::ensure!(
+                err.to_string().contains("sse_retry"),
+                "error for {retry:?} must name sse_retry: {err}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Pins that a 1 ms retry hint, the smallest rmcp can express, validates.
+    #[test]
+    fn sse_retry_of_one_millisecond_is_accepted() -> anyhow::Result<()> {
+        let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
+            .with_sse_retry(Duration::from_millis(1));
+        let _validated = match cfg.validate() {
+            Ok(validated) => validated,
+            Err(error) => anyhow::bail!("1 ms retry must validate: {error:#}"),
+        };
+        Ok(())
+    }
+
+    /// Pins that the retry hint is validated even while priming is disabled,
+    /// so turning priming back on can never make a running config invalid.
+    #[test]
+    fn sse_retry_zero_is_rejected_with_priming_disabled() -> anyhow::Result<()> {
+        let cfg = McpServerConfig::new("127.0.0.1:8080", "test-server", "1.0.0")
+            .disable_sse_priming()
+            .with_sse_retry(Duration::ZERO);
+        let err = cfg
+            .validate()
+            .err()
+            .context("zero retry must be rejected with priming off")?;
+        anyhow::ensure!(
+            err.to_string().contains("sse_retry"),
+            "error must name sse_retry: {err}"
+        );
         Ok(())
     }
 
