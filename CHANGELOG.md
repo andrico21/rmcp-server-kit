@@ -257,6 +257,11 @@ maintenance. Every new knob defaults to the 3.20.0 behaviour; see
   least 44 by 44 CSS px) that the page `Content-Security-Policy` admits by its
   SHA-256 hash in a new `style-src` directive; no script, no external resource
   and no `unsafe-inline`.
+- Bumped the yanked `tokio` 1.54.0 to 1.54.1 in `Cargo.lock`. `deny.toml` sets
+  `yanked = "deny"`, so the `cargo-deny` CI job failed on `error[yanked]`. The
+  `tokio` `safe-to-deploy` exemption in `supply-chain/config.toml` was
+  regenerated in the same change (`cargo vet regenerate exemptions`) so
+  `cargo vet --locked` stays green. The `Cargo.toml` requirement is unchanged.
 
 ### Security
 
