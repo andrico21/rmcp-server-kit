@@ -112,6 +112,11 @@ maintenance. Every new knob defaults to the 3.20.0 behaviour; see
 
 ### Changed
 
+- CI only: `actions/checkout` v7.0.1 and `actions/upload-artifact` v7.0.2;
+  `softprops/action-gh-release` v3 and `Swatinem/rust-cache` v2.9.1 re-pinned
+  to their tag commits. Dependabot ignores `dtolnay/rust-toolchain` because it
+  is pinned by branch name and Dependabot rewrites every pin to one commit,
+  dropping the toolchain selected by the branch name (see #63).
 - A startup WARN is logged once when OAuth is configured without
   `public_url`, because Protected Resource Metadata then advertises a
   resource derived from the bind address and the `401` challenge carries a

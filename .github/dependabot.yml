@@ -4,3 +4,9 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    ignore:
+      # Pinned by branch name (stable, nightly, 1.99.0, master); Dependabot
+      # rewrites every pin to one commit and drops the toolchain the branch
+      # name selected (see #63). Refresh these pins by hand with the
+      # toolchain-bump procedure in RUST_GUIDELINES.md.
+      - dependency-name: "dtolnay/rust-toolchain"
