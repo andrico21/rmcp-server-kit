@@ -1181,7 +1181,7 @@ extra_route_rate_limit = 60
 | `session_binding_secret` | `Option<SecretString>` | `None` | Shared HMAC secret for session binding across replicas; at least 32 UTF-8 bytes. Also used by `task_binding`, domain-separated so a session token can never verify as a task token. No `session_store` or `event_store` TOML field exists because stores are trait objects supplied in code. For cross-instance continuity, also supply a `SessionStore` in code via `McpServerConfig::with_session_store` |
 | `task_binding` | `bool` | `false` | Stateless signed wrapper for MCP task IDs (SEP-2663), preventing one authenticated identity from reading, updating, or cancelling another's task via a leaked `taskId`. Off by default because it changes the wire format of `taskId` values; handlers keep seeing raw IDs, so only a consumer that persists the *client-visible* ID as its own key is affected. Reuses `session_binding_secret`; multi-replica deployments must share it |
 | `sse_keep_alive` | `String` | `"15s"` | Humantime duration; SSE keep-alive ping interval |
-| `sse_priming_enabled` | `bool` | `true` | Send the SSE priming event, a `retry:` hint with an empty `data:` line, at the start of each SSE response stream. rmcp sends it on every legacy-session stream, and on a 2026-07-28 stateless stream only when an event store is configured. It gives clients a `Last-Event-ID` resume point on those streams. Clients whose SSE parser requires the first line of a stream to carry data, for example AWS Bedrock AgentCore (issue #69), need `sse_priming_enabled = false` (env `RMCP_SERVER_KIT__SERVER__SSE_PRIMING_ENABLED=false`). See [Resumable SSE event replay](#resumable-sse-event-replay) for the trade-off |
+| `sse_priming_enabled` | `bool` | `true` | Send the SSE priming event, a `retry:` hint with an empty `data:` line, at the start of each new SSE response stream. rmcp sends it on every new legacy-session stream, and on a 2026-07-28 stateless stream only when an event store is configured. It gives clients a `Last-Event-ID` resume point on those streams. A stream resumed with `Last-Event-ID` gets no new priming event. Clients whose SSE parser requires the first line of a stream to carry data, for example AWS Bedrock AgentCore (issue #69), need `sse_priming_enabled = false` (env `RMCP_SERVER_KIT__SERVER__SSE_PRIMING_ENABLED=false`). See [Resumable SSE event replay](#resumable-sse-event-replay) for the trade-off |
 | `sse_retry` | `String` | `"3s"` | Humantime duration; reconnect hint carried by the SSE priming event. Must be at least `1ms` (rmcp writes it in whole milliseconds), and is checked even when `sse_priming_enabled = false` |
 | `public_url` | `Option<String>` | `None` | Externally reachable base URL (e.g. `https://mcp.example.com`); required when `listen_addr` is `0.0.0.0` behind a reverse proxy or container |
 | `compression_enabled` | `bool` | `false` | Enable gzip/br response compression |
@@ -2601,7 +2601,7 @@ not create resumption from nothing: the implementation must persist each event
 before returning the ID that will be sent to the client.
 
 **The SSE priming event is the first resume point.** On the legacy session
-lifecycle rmcp opens each SSE response stream with a priming event (a
+lifecycle rmcp opens each new SSE response stream with a priming event (a
 `retry:` hint and an empty `data:` line) unless priming is disabled. On the
 2026-07-28 stateless path rmcp sends no priming event unless an event store
 is configured; with a store it persists the priming event like any other

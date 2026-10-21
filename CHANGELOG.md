@@ -26,7 +26,7 @@ maintenance. Every new knob defaults to the 3.20.0 behaviour; see
   TOML `[server] sse_priming_enabled` (env
   `RMCP_SERVER_KIT__SERVER__SSE_PRIMING_ENABLED`) and `sse_retry`
   (file-only). The priming event (a `retry:` hint with an empty `data:` line)
-  gives clients a `Last-Event-ID` resume point; rmcp sends it on every
+  gives clients a `Last-Event-ID` resume point; rmcp sends it on every new
   legacy-session stream, and on a 2026-07-28 stateless stream only when an
   event store is configured. Turn it off for clients whose SSE parser requires
   a stream to start with `data:`, such as AWS Bedrock AgentCore. An

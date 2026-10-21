@@ -724,7 +724,7 @@ pub struct McpServerConfig {
         note = "use McpServerConfig::with_sse_keep_alive(); direct field access will become pub(crate) in a future major release"
     )]
     pub sse_keep_alive: Duration,
-    /// Whether SSE response streams open with a priming event (`id:` +
+    /// Whether new SSE response streams open with a priming event (`id:` +
     /// `retry:` with empty `data:`), per MCP 2025-11-25 resumability.
     /// Set via [`McpServerConfig::disable_sse_priming`] or
     /// [`McpServerConfig::with_sse_priming_enabled`]. Default: `true`.
@@ -1333,7 +1333,7 @@ impl McpServerConfig {
     /// Default: 3 seconds.
     ///
     /// rmcp sends the priming event (`id:` + `retry:` with empty `data:`) on
-    /// every legacy-session stream, and on a 2026-07-28 stateless stream only
+    /// every new legacy-session stream, and on a 2026-07-28 stateless stream only
     /// when an event store is configured. It gives clients a `Last-Event-ID`
     /// resume point on those streams. This only sets the hint; it leaves the
     /// priming on/off state unchanged (see [`Self::disable_sse_priming`]).
@@ -1346,13 +1346,13 @@ impl McpServerConfig {
         self
     }
 
-    /// Stop sending the SSE priming event, so every SSE response stream
+    /// Stop sending the SSE priming event, so every new SSE response stream
     /// starts with a `data:` line carrying a JSON-RPC message.
     ///
     /// Use this for clients whose SSE parser requires the stream to start
     /// with `data:`, such as AWS Bedrock `AgentCore` (issue #69). The cost is
     /// that clients lose the `Last-Event-ID` resume point the priming event
-    /// gives them on legacy-session streams and, when an event store is
+    /// gives them on new legacy-session streams and, when an event store is
     /// configured, on 2026-07-28 stateless streams. Default: priming on.
     #[must_use]
     #[inline]
