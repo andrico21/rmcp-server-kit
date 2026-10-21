@@ -2414,14 +2414,14 @@ where
     use anyhow::Context as _;
     use axum::{
         error_handling::HandleErrorLayer,
-        http::header::{AUTHORIZATION, CONTENT_TYPE},
+        http::header::{CONTENT_TYPE, ORIGIN, WWW_AUTHENTICATE},
         middleware::from_fn,
         routing::get,
     };
     use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
     use tower_http::{
         compression::{CompressionLayer, DefaultPredicate, predicate::SizeAbove},
-        cors::{AllowOrigin, CorsLayer},
+        cors::{AllowHeaders, AllowOrigin, CorsLayer},
         limit::RequestBodyLimitLayer,
         timeout::TimeoutLayer,
     };
@@ -2868,9 +2868,9 @@ where
     // also decorate origin-403, CORS-preflight, overload-503, and 404-fallback
     // responses. See the `security_headers_middleware` install site below.
 
-    // CORS preflight layer (required for browser-based MCP clients).
-    // Uses the same effective origins as the origin check middleware
-    // (including auto-derived origin from public_url).
+    // Browser MCP CORS uses a strict request-header allowlist before mirroring
+    // and exposes protocol response headers only for allowed origins. The
+    // effective origins include the origin auto-derived from public_url.
     if !cors_origins.is_empty() {
         // Align CORS with the origin middleware: the predicate matches the
         // same normalized `AllowedOrigin` set, so an entry that normalizes
@@ -2884,9 +2884,17 @@ where
         });
         let cors = CorsLayer::new()
             .allow_origin(allow_origin)
-            .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-            .allow_headers([CONTENT_TYPE, AUTHORIZATION]);
+            .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+            .allow_headers(AllowHeaders::mirror_request())
+            .expose_headers([
+                HeaderName::from_static("mcp-session-id"),
+                WWW_AUTHENTICATE,
+                HeaderName::from_static("last-event-id"),
+                HeaderName::from_static("mcp-protocol-version"),
+            ])
+            .vary([ORIGIN]);
         router = router.layer(cors);
+        router = router.layer(from_fn(cors_header_policy));
     }
 
     // Optional response compression (gzip + brotli). Skips small bodies
@@ -3083,6 +3091,78 @@ where
             name: config.name.clone(),
         },
     ))
+}
+
+/// Request headers admitted by browser MCP preflights.
+const CORS_ALLOWED_REQUEST_HEADERS: [&str; 7] = [
+    "content-type",
+    "authorization",
+    "mcp-session-id",
+    "mcp-protocol-version",
+    "last-event-id",
+    "mcp-method",
+    "mcp-name",
+];
+
+/// Prefix for named MCP parameter request headers.
+const CORS_PARAM_HEADER_PREFIX: &str = "mcp-param-";
+
+/// Accepts only the MCP allowlist or syntactically valid named parameter headers.
+fn cors_request_headers_allowed(value: &HeaderValue) -> bool {
+    let Ok(header_list) = value.to_str() else {
+        return false;
+    };
+    header_list
+        .split(',')
+        .map(str::trim_ascii)
+        .filter(|name| !name.is_empty())
+        .all(|name| {
+            CORS_ALLOWED_REQUEST_HEADERS
+                .iter()
+                .any(|allowed| name.eq_ignore_ascii_case(allowed))
+                || (name.len() > CORS_PARAM_HEADER_PREFIX.len()
+                    && name
+                        .get(..CORS_PARAM_HEADER_PREFIX.len())
+                        .is_some_and(|prefix| {
+                            prefix.eq_ignore_ascii_case(CORS_PARAM_HEADER_PREFIX)
+                        })
+                    && HeaderName::from_bytes(name.as_bytes()).is_ok())
+        })
+}
+
+/// Filters preflight headers before mirroring and preserves origin-less responses.
+// cancel-safe: holds no shared state across await; dropping it drops only the inner future.
+async fn cors_header_policy(mut req: Request<Body>, next: Next) -> Response {
+    use axum::http::header::{
+        ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_REQUEST_HEADERS,
+        VARY,
+    };
+
+    let is_options = req.method() == Method::OPTIONS;
+    if is_options
+        && req
+            .headers()
+            .get_all(ACCESS_CONTROL_REQUEST_HEADERS)
+            .iter()
+            .any(|value| !cors_request_headers_allowed(value))
+    {
+        let _removed = req.headers_mut().remove(ACCESS_CONTROL_REQUEST_HEADERS);
+        tracing::debug!(
+            "CORS preflight requested a header outside the MCP allowlist; no request headers granted"
+        );
+    }
+
+    let mut response = next.run(req).await;
+    if !response.headers().contains_key(ACCESS_CONTROL_ALLOW_ORIGIN) {
+        let _removed = response.headers_mut().remove(ACCESS_CONTROL_EXPOSE_HEADERS);
+    }
+    if is_options {
+        let _vary_appended = response.headers_mut().append(
+            VARY,
+            HeaderValue::from_static("access-control-request-headers"),
+        );
+    }
+    response
 }
 
 /// Cancels the held [`CancellationToken`] when dropped.
@@ -11340,6 +11420,249 @@ mod tests {
         let resp = app.oneshot(req).await?;
         assert_owasp_headers(&resp, "cors-preflight");
 
+        Ok(())
+    }
+
+    /// Grants the MCP request headers and parameter headers on browser preflight.
+    #[tokio::test]
+    async fn cors_preflight_grants_mcp_and_param_headers() -> anyhow::Result<()> {
+        // Given an allowed browser requesting the full MCP header set.
+        let app = m5_router(None)?;
+        let requested = "content-type,authorization,mcp-session-id,mcp-protocol-version,last-event-id,mcp-method,mcp-name,mcp-param-region";
+        let req = Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/mcp")
+            .header(header::ORIGIN, "http://good.example")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "DELETE")
+            .header(header::ACCESS_CONTROL_REQUEST_HEADERS, requested)
+            .body(Body::empty())?;
+
+        // When the real router handles the preflight.
+        let resp = app.oneshot(req).await?;
+
+        // Then it grants the requested headers, DELETE and the allowed origin.
+        assert!(resp.status().is_success());
+        assert_eq!(
+            resp.headers().get(header::ACCESS_CONTROL_ALLOW_HEADERS),
+            Some(&HeaderValue::from_static(requested))
+        );
+        assert!(
+            resp.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_METHODS)
+                .context("allowed methods")?
+                .to_str()?
+                .split(',')
+                .any(|method| method.trim() == "DELETE")
+        );
+        assert_eq!(
+            resp.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&HeaderValue::from_static("http://good.example"))
+        );
+        assert!(
+            resp.headers()
+                .get_all(header::VARY)
+                .iter()
+                .any(|value| value
+                    .to_str()
+                    .is_ok_and(|vary_list| vary_list.split(',').any(|name| name
+                        .trim()
+                        .eq_ignore_ascii_case("access-control-request-headers"))))
+        );
+        Ok(())
+    }
+
+    /// Refuses every requested header when any preflight value is outside the allowlist.
+    #[tokio::test]
+    async fn cors_preflight_refuses_unlisted_headers() -> anyhow::Result<()> {
+        for (values, request_method) in [
+            (vec!["content-type,x-evil"], Some("POST")),
+            (vec!["mcp-param-"], Some("POST")),
+            (vec!["content-type", "x-evil"], Some("POST")),
+            (vec!["x-evil"], None),
+        ] {
+            // Given an unlisted name, including a duplicate field or bare OPTIONS.
+            let app = m5_router(None)?;
+            let mut req = Request::builder()
+                .method(Method::OPTIONS)
+                .uri("/mcp")
+                .header(header::ORIGIN, "http://good.example");
+            if let Some(method) = request_method {
+                req = req.header(header::ACCESS_CONTROL_REQUEST_METHOD, method);
+            }
+            for value in &values {
+                req = req.header(header::ACCESS_CONTROL_REQUEST_HEADERS, *value);
+            }
+
+            // When the real router handles the preflight.
+            let resp = app.oneshot(req.body(Body::empty())?).await?;
+
+            // Then none of the requested headers are granted.
+            assert!(
+                resp.headers()
+                    .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+                    .is_none(),
+                "must refuse {values:?}, method {request_method:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Matches request header names without ASCII case sensitivity.
+    #[tokio::test]
+    async fn cors_preflight_header_match_ignores_case() -> anyhow::Result<()> {
+        // Given mixed-case MCP header names from an allowed browser.
+        let app = m5_router(None)?;
+        let requested = "Mcp-Session-Id, MCP-Param-Region";
+        let req = Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/mcp")
+            .header(header::ORIGIN, "http://good.example")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .header(header::ACCESS_CONTROL_REQUEST_HEADERS, requested)
+            .body(Body::empty())?;
+
+        // When the real router handles the preflight.
+        let resp = app.oneshot(req).await?;
+
+        // Then the original requested value is mirrored unchanged.
+        assert_eq!(
+            resp.headers().get(header::ACCESS_CONTROL_ALLOW_HEADERS),
+            Some(&HeaderValue::from_static(requested))
+        );
+        Ok(())
+    }
+
+    /// Exposes the MCP session, challenge, event and protocol response headers.
+    #[tokio::test]
+    async fn cors_response_exposes_mcp_headers() -> anyhow::Result<()> {
+        // Given a normal request from an allowed browser.
+        let app = m5_router(None)?;
+        let req = Request::builder()
+            .uri("/healthz")
+            .header(header::ORIGIN, "http://good.example")
+            .body(Body::empty())?;
+
+        // When the real router responds.
+        let resp = app.oneshot(req).await?;
+
+        // Then browser code can read all four MCP response headers.
+        let exposed = resp
+            .headers()
+            .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
+            .context("exposed headers")?
+            .to_str()?;
+        for expected in [
+            "mcp-session-id",
+            "www-authenticate",
+            "last-event-id",
+            "mcp-protocol-version",
+        ] {
+            assert!(
+                exposed
+                    .split(',')
+                    .any(|name| name.trim().eq_ignore_ascii_case(expected)),
+                "missing {expected}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Preserves the 3.20.0 CORS headers for native clients without Origin.
+    #[tokio::test]
+    async fn cors_response_without_origin_is_unchanged() -> anyhow::Result<()> {
+        for (method, uri) in [(Method::GET, "/healthz"), (Method::POST, "/mcp")] {
+            // Given a native request without Origin.
+            let app = m5_router(None)?;
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())?;
+
+            // When the real router responds.
+            let resp = app.oneshot(req).await?;
+
+            // Then neither exposure nor an origin grant is added and Vary is unchanged.
+            assert!(
+                resp.headers()
+                    .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
+                    .is_none(),
+                "unexpected exposure on {uri}"
+            );
+            assert!(
+                resp.headers()
+                    .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .is_none(),
+                "unexpected origin grant on {uri}"
+            );
+            let vary = resp
+                .headers()
+                .get_all(header::VARY)
+                .iter()
+                .map(HeaderValue::to_str)
+                .collect::<Result<Vec<_>, _>>()?;
+            assert_eq!(vary, ["origin"], "Vary changed on {uri}");
+        }
+        Ok(())
+    }
+
+    /// Rejects a disallowed browser origin before granting CORS headers.
+    #[tokio::test]
+    async fn cors_preflight_from_disallowed_origin_is_not_granted() -> anyhow::Result<()> {
+        // Given a preflight from a disallowed browser origin.
+        let app = m5_router(None)?;
+        let req = Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/mcp")
+            .header(header::ORIGIN, "http://evil.example")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
+            .body(Body::empty())?;
+
+        // When the real router handles it.
+        let resp = app.oneshot(req).await?;
+
+        // Then the origin check rejects it without an origin grant.
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(
+            resp.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none()
+        );
+        Ok(())
+    }
+
+    /// Checks the request-header allowlist at its parsing boundaries.
+    #[test]
+    fn cors_request_headers_allowed_table() -> anyhow::Result<()> {
+        // Given allowed names, malformed names and empty list entries.
+        for (bytes, allowed) in [
+            (b"content-type".as_slice(), true),
+            (b"authorization", true),
+            (b"mcp-session-id", true),
+            (b"mcp-protocol-version", true),
+            (b"last-event-id", true),
+            (b"mcp-method", true),
+            (b"mcp-name", true),
+            (b"MCP-SESSION-ID, MCP-PARAM-REGION", true),
+            (b" \tcontent-type\t , mcp-param-region ", true),
+            (b"", true),
+            (b", ,\t,", true),
+            (b",content-type,,mcp-param-region,", true),
+            (b"mcp-param-", false),
+            (b"x-evil", false),
+            (b"accept", false),
+            (b"mcp-param-region:bad", false),
+            (b"mcp-param-region bad", false),
+            (b"content-type,\xff", false),
+        ] {
+            let value = HeaderValue::from_bytes(bytes)?;
+
+            // When the header list is parsed against the policy.
+            let actual = cors_request_headers_allowed(&value);
+
+            // Then only the allowed input classes are accepted.
+            assert_eq!(actual, allowed, "header list {value:?}");
+        }
         Ok(())
     }
 
