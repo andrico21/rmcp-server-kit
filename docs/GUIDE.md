@@ -3421,6 +3421,8 @@ max_request_body = 1048576
 expose_build_metadata = false
 # public_url = "https://mcp.example.com"  # env: RMCP_SERVER_KIT__SERVER__PUBLIC_URL
 admin_enabled = false  # env: RMCP_SERVER_KIT__SERVER__ADMIN_ENABLED
+sse_priming_enabled = true  # env: RMCP_SERVER_KIT__SERVER__SSE_PRIMING_ENABLED
+sse_retry = "3s"
 request_log_exclude_paths = ["/healthz", "/readyz"]
 
 [server.log_context]
@@ -3667,6 +3669,7 @@ call order is:
 | `RMCP_SERVER_KIT__SERVER__TLS_CERT_PATH` | `server.tls_cert_path` | Path | |
 | `RMCP_SERVER_KIT__SERVER__TLS_KEY_PATH` | `server.tls_key_path` | Path | |
 | `RMCP_SERVER_KIT__SERVER__ADMIN_ENABLED` | `server.admin_enabled` | bool | |
+| `RMCP_SERVER_KIT__SERVER__SSE_PRIMING_ENABLED` | `server.sse_priming_enabled` | bool | |
 | `RMCP_SERVER_KIT__SERVER__KEY_EVICTION_POLICY` | `server.key_eviction_policy` | KeyEvictionPolicy | |
 | `RMCP_SERVER_KIT__SERVER__LOG_CONTEXT__SESSION_ID_HEADER` | `server.log_context.session_id_header` | SessionIdLogPolicy | |
 | `RMCP_SERVER_KIT__SERVER__SESSION_BINDING_SECRET` | `server.session_binding_secret` | SecretString | secret; redacted in report |

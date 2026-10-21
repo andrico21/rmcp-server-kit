@@ -947,8 +947,8 @@ retiring.
 
 **TOML** - the deserializable sections:
 
-- `ServerConfig` - `src/config.rs:487`
-- `ObservabilityConfig` - `src/config.rs:1807`
+- `ServerConfig` - `src/config.rs:499`
+- `ObservabilityConfig` - `src/config.rs:1844`
 - `SecurityHeadersConfig` - `src/transport.rs:293`
 - `AuthConfig`, `MtlsConfig`, `RateLimitConfig` - `src/auth.rs`
 - `RbacConfig` - `src/rbac.rs`
@@ -959,7 +959,7 @@ sections into its own root type. `[server]`, `[rbac]` and `[observability]`
 are a convention from [`docs/GUIDE.md`](GUIDE.md), not a type.
 
 `ServerConfig` was schema-only until 3.4.0 - nothing in the crate consumed it.
-`ServerConfig::apply_to_mcp_config` (`src/config.rs:1061`) is the bridge that
+`ServerConfig::apply_to_mcp_config` (`src/config.rs:1096`) is the bridge that
 makes it reachable. It uses **replacement semantics**: authoritative for every
 bridgeable transport field, with `None`/`false` clearing whatever the base
 held. Only the runtime-only fields above survive from the base. It is fallible
