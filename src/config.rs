@@ -5761,20 +5761,25 @@ client_ip = false
 
     #[test]
     /// Pins that TOML retry hints rmcp would write as `retry: 0` are rejected,
-    /// naming `server.sse_retry`.
+    /// naming `server.sse_retry`, with priming on and with
+    /// `sse_priming_enabled = false`, so turning priming back on can never
+    /// make a running config invalid.
     fn sse_retry_toml_under_one_millisecond_rejected() -> anyhow::Result<()> {
-        for value in ["999us", "0s"] {
-            let cfg = ServerConfig {
-                sse_retry: value.into(),
-                ..ServerConfig::default()
-            };
-            let Err(err) = validate_server_config(&cfg) else {
-                anyhow::bail!("sse_retry = {value:?} must be rejected");
-            };
-            anyhow::ensure!(
-                err.to_string().contains("server.sse_retry"),
-                "error for {value:?} must name server.sse_retry: {err}"
-            );
+        for priming in [true, false] {
+            for value in ["999us", "0s"] {
+                let cfg = ServerConfig {
+                    sse_priming_enabled: priming,
+                    sse_retry: value.into(),
+                    ..ServerConfig::default()
+                };
+                let Err(err) = validate_server_config(&cfg) else {
+                    anyhow::bail!("sse_retry = {value:?} with priming {priming} must be rejected");
+                };
+                anyhow::ensure!(
+                    err.to_string().contains("server.sse_retry"),
+                    "error for {value:?} with priming {priming} must name server.sse_retry: {err}"
+                );
+            }
         }
         Ok(())
     }
