@@ -47,6 +47,8 @@ const SERVER_CONFIG_BRIDGED_FIELDS: &[&str] = &[
     "session_binding_secret",
     "task_binding",
     "sse_keep_alive",
+    "sse_priming_enabled",
+    "sse_retry",
     "public_url",
     "compression_enabled",
     "compression_min_size",
@@ -165,6 +167,13 @@ pub(crate) const ENV_OVERRIDE_SPECS: &[EnvOverrideSpec] = &[
     EnvOverrideSpec {
         env_var: "RMCP_SERVER_KIT__SERVER__ADMIN_ENABLED",
         target_field: "server.admin_enabled",
+        value_type: "bool",
+        required_feature: None,
+        redacted: false,
+    },
+    EnvOverrideSpec {
+        env_var: "RMCP_SERVER_KIT__SERVER__SSE_PRIMING_ENABLED",
+        target_field: "server.sse_priming_enabled",
         value_type: "bool",
         required_feature: None,
         redacted: false,
@@ -386,6 +395,9 @@ pub(crate) const SERVER_TLS_CERT_PATH_ENV: &str = "RMCP_SERVER_KIT__SERVER__TLS_
 pub(crate) const SERVER_TLS_KEY_PATH_ENV: &str = "RMCP_SERVER_KIT__SERVER__TLS_KEY_PATH";
 /// Environment variable name for the `server.admin_enabled` override.
 pub(crate) const SERVER_ADMIN_ENABLED_ENV: &str = "RMCP_SERVER_KIT__SERVER__ADMIN_ENABLED";
+/// Environment variable name for the `server.sse_priming_enabled` override.
+pub(crate) const SERVER_SSE_PRIMING_ENABLED_ENV: &str =
+    "RMCP_SERVER_KIT__SERVER__SSE_PRIMING_ENABLED";
 /// Environment variable name for the `server.key_eviction_policy` override.
 pub(crate) const SERVER_KEY_EVICTION_POLICY_ENV: &str =
     "RMCP_SERVER_KIT__SERVER__KEY_EVICTION_POLICY";
@@ -612,6 +624,17 @@ pub struct ServerConfig {
     /// Default: 15 seconds.
     #[serde(default = "default_sse_keep_alive")]
     pub sse_keep_alive: String,
+    /// Open every SSE response stream with a priming event (`id:` +
+    /// `retry:` with empty `data:`), per MCP 2025-11-25 resumability. Set
+    /// `false` for clients whose SSE parser requires the stream to start
+    /// with `data:`, such as AWS Bedrock `AgentCore`. Default: true.
+    #[serde(default = "default_sse_priming_enabled")]
+    pub sse_priming_enabled: bool,
+    /// Reconnect hint carried by the SSE priming event, as a humantime
+    /// duration. rmcp writes it in whole milliseconds, so it must be at
+    /// least `1ms`. Default: `3s`.
+    #[serde(default = "default_sse_retry")]
+    pub sse_retry: String,
     /// Externally reachable base URL (e.g. `https://mcp.example.com`).
     /// When set, OAuth metadata endpoints advertise this URL instead of
     /// the listen address. Required when the server binds to `0.0.0.0`
@@ -706,6 +729,8 @@ impl fmt::Debug for ServerConfig {
             )
             .field("task_binding", &self.task_binding)
             .field("sse_keep_alive", &self.sse_keep_alive)
+            .field("sse_priming_enabled", &self.sse_priming_enabled)
+            .field("sse_retry", &self.sse_retry)
             .field("public_url", &self.public_url)
             .field("compression_enabled", &self.compression_enabled)
             .field("compression_min_size", &self.compression_min_size)
@@ -751,6 +776,8 @@ impl Default for ServerConfig {
             session_binding_secret: None,
             task_binding: false,
             sse_keep_alive: default_sse_keep_alive(),
+            sse_priming_enabled: default_sse_priming_enabled(),
+            sse_retry: default_sse_retry(),
             public_url: None,
             compression_enabled: false,
             compression_min_size: default_compression_min_size(),
@@ -838,6 +865,14 @@ impl ServerConfig {
             applied.push(env_report(
                 SERVER_ADMIN_ENABLED_ENV,
                 "server.admin_enabled",
+                raw,
+            ));
+        }
+        if let Some(raw) = read_env(SERVER_SSE_PRIMING_ENABLED_ENV)? {
+            self.sse_priming_enabled = parse_env_bool(SERVER_SSE_PRIMING_ENABLED_ENV, &raw)?;
+            applied.push(env_report(
+                SERVER_SSE_PRIMING_ENABLED_ENV,
+                "server.sse_priming_enabled",
                 raw,
             ));
         }
@@ -1086,6 +1121,8 @@ impl ServerConfig {
                 "server.sse_keep_alive",
                 &self.sse_keep_alive,
             )?)
+            .with_sse_retry(parse_duration_field("server.sse_retry", &self.sse_retry)?)
+            .with_sse_priming_enabled(self.sse_priming_enabled)
             .with_tls_handshake_timeout(parse_duration_field(
                 "server.tls_handshake_timeout",
                 &self.tls_handshake_timeout,
@@ -2415,6 +2452,7 @@ pub fn validate_server_config(server: &ServerConfig) -> RmcpResult<()> {
             server.session_idle_timeout.as_str(),
         ),
         ("server.sse_keep_alive", server.sse_keep_alive.as_str()),
+        ("server.sse_retry", server.sse_retry.as_str()),
         (
             "server.tls_handshake_timeout",
             server.tls_handshake_timeout.as_str(),
@@ -2437,6 +2475,8 @@ pub fn validate_server_config(server: &ServerConfig) -> RmcpResult<()> {
             "server.tls_handshake_timeout must be greater than zero".into(),
         ));
     }
+
+    check_sse_retry_floor(server)?;
 
     // A zero-permit handshake semaphore would never admit a handshake,
     // deadlocking the TLS accept path. Mirrors check #12 in
@@ -2469,6 +2509,27 @@ pub fn validate_server_config(server: &ServerConfig) -> RmcpResult<()> {
         check_shared_oauth_relations(oauth_cfg, public_url, &server.allowed_origins)?;
     }
 
+    Ok(())
+}
+
+/// Reject a `server.sse_retry` under 1 ms.
+///
+/// rmcp writes the SSE retry hint in whole milliseconds, so anything shorter
+/// becomes `retry: 0`. Checked even while priming is disabled. Mirrors check
+/// #13 in `McpServerConfig::check`. A malformed value is reported by the
+/// duration loop in [`validate_server_config`].
+///
+/// # Errors
+///
+/// Returns `RmcpServerKitError::Config` naming `server.sse_retry` when the
+/// value parses to less than 1 ms.
+fn check_sse_retry_floor(server: &ServerConfig) -> RmcpResult<()> {
+    if humantime::parse_duration(&server.sse_retry).is_ok_and(|duration| duration.as_millis() == 0)
+    {
+        return Err(RmcpServerKitError::Config(
+            "server.sse_retry must be at least 1ms; set sse_priming_enabled = false to turn the priming event off".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -2667,6 +2728,14 @@ const fn default_compression_min_size() -> u16 {
 /// Default SSE keep-alive interval: `15s`.
 fn default_sse_keep_alive() -> String {
     "15s".into()
+}
+/// Default for sending the SSE priming event: `true`.
+const fn default_sse_priming_enabled() -> bool {
+    true
+}
+/// Default SSE priming retry hint: `3s`.
+fn default_sse_retry() -> String {
+    "3s".into()
 }
 
 #[expect(
@@ -5647,6 +5716,100 @@ client_ip = false
     }
 
     #[test]
+    /// Pins the TOML defaults of the SSE priming settings: priming on, `3s`.
+    fn sse_priming_toml_defaults_are_enabled_with_three_seconds() -> anyhow::Result<()> {
+        let cfg: ServerConfig = toml::from_str("").context("empty TOML must parse")?;
+        anyhow::ensure!(cfg.sse_priming_enabled, "priming must default to on");
+        anyhow::ensure!(
+            cfg.sse_retry == "3s",
+            "sse_retry must default to 3s, got {:?}",
+            cfg.sse_retry
+        );
+        anyhow::ensure!(
+            ServerConfig::default().sse_priming_enabled,
+            "Default impl must agree with the serde default"
+        );
+        anyhow::ensure!(
+            ServerConfig::default().sse_retry == "3s",
+            "Default impl must agree with the serde default"
+        );
+        Ok(())
+    }
+
+    #[test]
+    /// Pins that TOML `sse_priming_enabled = false` and `sse_retry` bridge into
+    /// `McpServerConfig`.
+    fn sse_priming_toml_settings_bridge_into_mcp_config() -> anyhow::Result<()> {
+        let src: ServerConfig = toml::from_str(
+            "sse_priming_enabled = false\n\
+             sse_retry = \"1500ms\"",
+        )
+        .context("explicit SSE priming settings parse")?;
+        let bridged = src
+            .apply_to_mcp_config(McpServerConfig::new("127.0.0.1:0", "t", "0.0.0"))
+            .context("SSE priming settings must bridge")?;
+        anyhow::ensure!(!bridged.sse_priming_enabled, "priming must bridge as off");
+        anyhow::ensure!(
+            bridged.sse_retry == Duration::from_millis(1500),
+            "sse_retry must bridge as 1500ms, got {:?}",
+            bridged.sse_retry
+        );
+        Ok(())
+    }
+
+    #[test]
+    /// Pins that TOML retry hints rmcp would write as `retry: 0` are rejected,
+    /// naming `server.sse_retry`.
+    fn sse_retry_toml_under_one_millisecond_rejected() -> anyhow::Result<()> {
+        for value in ["999us", "0s"] {
+            let cfg = ServerConfig {
+                sse_retry: value.into(),
+                ..ServerConfig::default()
+            };
+            let Err(err) = validate_server_config(&cfg) else {
+                anyhow::bail!("sse_retry = {value:?} must be rejected");
+            };
+            anyhow::ensure!(
+                err.to_string().contains("server.sse_retry"),
+                "error for {value:?} must name server.sse_retry: {err}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    /// Pins that a `1ms` TOML retry hint, the smallest rmcp can express,
+    /// validates.
+    fn sse_retry_toml_one_millisecond_accepted() -> anyhow::Result<()> {
+        let cfg = ServerConfig {
+            sse_retry: "1ms".into(),
+            ..ServerConfig::default()
+        };
+        if let Err(err) = validate_server_config(&cfg) {
+            anyhow::bail!("sse_retry = \"1ms\" must validate: {err}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    /// Pins that a malformed TOML retry hint is rejected, naming
+    /// `server.sse_retry`.
+    fn sse_retry_toml_malformed_rejected() -> anyhow::Result<()> {
+        let cfg = ServerConfig {
+            sse_retry: "soon".into(),
+            ..ServerConfig::default()
+        };
+        let Err(err) = validate_server_config(&cfg) else {
+            anyhow::bail!("sse_retry = \"soon\" must be rejected");
+        };
+        anyhow::ensure!(
+            err.to_string().contains("server.sse_retry"),
+            "error must name server.sse_retry: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
     /// Pins that zero max-concurrent TLS handshakes is rejected.
     fn zero_max_concurrent_tls_handshakes_rejected() -> anyhow::Result<()> {
         let cfg = ServerConfig {
@@ -6206,6 +6369,9 @@ client_ip = false
         "server.security_headers",
         // Tuning knobs intentionally file-only: changing them per-process via
         // the environment invites drift between replicas of the same service.
+        // `server.sse_priming_enabled` is the deliberate exception: it is a
+        // client-compatibility switch, so it has an env override while its
+        // sibling `server.sse_retry` stays file-only.
         "server.tls_handshake_timeout",
         "server.max_concurrent_tls_handshakes",
         "server.shutdown_timeout",
@@ -6225,6 +6391,7 @@ client_ip = false
         // security control invites per-process drift.
         "server.task_binding",
         "server.sse_keep_alive",
+        "server.sse_retry",
         "server.compression_enabled",
         "server.compression_min_size",
         "server.max_concurrent_requests",
@@ -6515,6 +6682,7 @@ client_ip = false
     /// while `validate_server_config` reported `Ok`.
     const VALIDATION_PARITY_EXEMPT: &[(&str, &str)] = &[
         ("compression_enabled", "bool; no invalid state exists"),
+        ("sse_priming_enabled", "bool; no invalid state exists"),
         (
             "compression_min_size",
             "zero is meaningful (compress every response); neither validator has a rule for it",
@@ -8517,6 +8685,30 @@ client_ip = false
     }
 
     #[test]
+    /// Pins that the SSE priming env override turns priming off and is
+    /// reported as an override.
+    fn sse_priming_enabled_env_override_applies_and_reports() -> anyhow::Result<()> {
+        with_env_vars(
+            &[(SERVER_SSE_PRIMING_ENABLED_ENV, Some("false"))],
+            || -> anyhow::Result<()> {
+                let mut cfg = ServerConfig::default();
+                let report = cfg
+                    .apply_env_overrides()
+                    .context("SSE priming env override must apply")?;
+                anyhow::ensure!(!cfg.sse_priming_enabled, "env must turn priming off");
+                anyhow::ensure!(report.len() == 1, "one override expected: {report:?}");
+                let entry = report.first().context("one override must be reported")?;
+                anyhow::ensure!(entry.env_var == SERVER_SSE_PRIMING_ENABLED_ENV);
+                anyhow::ensure!(entry.target_field == "server.sse_priming_enabled");
+                anyhow::ensure!(entry.source == EnvOverrideSource::Env);
+                anyhow::ensure!(entry.value.as_deref() == Some("false"));
+                Ok(())
+            },
+        )?;
+        Ok(())
+    }
+
+    #[test]
     /// Pins that a bad key-eviction-policy env value fails closed.
     fn bad_key_eviction_policy_env_fails_closed() -> anyhow::Result<()> {
         with_env_vars(
@@ -8654,6 +8846,12 @@ client_ip = false
         (
             SERVER_ADMIN_ENABLED_ENV,
             "server.admin_enabled",
+            None,
+            false,
+        ),
+        (
+            SERVER_SSE_PRIMING_ENABLED_ENV,
+            "server.sse_priming_enabled",
             None,
             false,
         ),

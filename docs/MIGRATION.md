@@ -17,6 +17,8 @@ token acceptance) for this crate's own code; rmcp-owned behaviour follows
 your resolved rmcp version. New validation rules only fire when a new knob
 is set.
 
+No action required for the SSE priming opt-out; the default stays on.
+
 The one visible difference for an unchanged configuration is a new startup
 WARN line, logged once when OAuth is configured and `public_url` is not set:
 

@@ -47,8 +47,8 @@ The crate has two transports:
 
 | Transport          | Function                                            | Auth/RBAC/TLS  | Use case                                         |
 |--------------------|-----------------------------------------------------|----------------|--------------------------------------------------|
-| **Streamable HTTP**| `serve()` - `src/transport.rs:3105`                 | **Yes**        | Production network deployment                    |
-| stdio              | `serve_stdio()` - `src/transport.rs:5739`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
+| **Streamable HTTP**| `serve()` - `src/transport.rs:3160`                 | **Yes**        | Production network deployment                    |
+| stdio              | `serve_stdio()` - `src/transport.rs:5794`           | **No**         | Local subprocess MCP (desktop apps, IDEs)        |
 
 ---
 
@@ -105,25 +105,25 @@ There are **no circular dependencies**.
 
 A complete HTTP request to `/mcp` flows through these layers, top-to-bottom
 (outermost → innermost). The corresponding code lives in
-`build_app_router` (`src/transport.rs:2347`) and in each module.
+`build_app_router` (`src/transport.rs:2399`) and in each module.
 
 ```
 TCP / TLS handshake                         `TlsListener` src/transport.rs:3838
    │  - Handshakes run CONCURRENTLY on a background acceptor task
-│    (`run_tls_acceptor`, src/transport.rs:3929): 256-permit in-flight
+│    (`run_tls_acceptor`, src/transport.rs:3984): 256-permit in-flight
    │    cap, 10 s per-handshake timeout; axum receives only completed
    │    connections via a bounded channel.
    │  - mTLS: client cert verified during the handshake; the resulting
    │    AuthIdentity is attached to the **per-connection** TlsConnInfo
    │    extension (no shared SocketAddr-keyed map).
    ▼
-axum Router                                  src/transport.rs:2347  (build_app_router)
+axum Router                                  src/transport.rs:2399  (build_app_router)
    │
-├── 0. Security headers                   `security_headers_middleware` src/transport.rs:4555
+├── 0. Security headers                   `security_headers_middleware` src/transport.rs:4610
    │      Outermost response-only decoration: HSTS, CSP,
    │      X-Frame-Options=DENY, X-Content-Type-Options, ...
    │
-├── 1. Origin check                       `origin_check_middleware` src/transport.rs:5379
+├── 1. Origin check                       `origin_check_middleware` src/transport.rs:5434
    │      Rejects 403 if Origin/Host not allowed (MCP spec requirement)
    │
    ├── 2. Peer-address normalization         src/transport.rs (normalize_peer_addr_middleware)
@@ -195,12 +195,12 @@ Open endpoints (no auth):
 
 | Path                                       | Handler                                       |
 |--------------------------------------------|-----------------------------------------------|
-| `GET  /healthz`                            | `healthz` (`src/transport.rs:4284`) |
-| `GET  /readyz`                             | `readyz`  (`src/transport.rs:4349`) - runs configured readiness check |
+| `GET  /healthz`                            | `healthz` (`src/transport.rs:4339`) |
+| `GET  /readyz`                             | `readyz`  (`src/transport.rs:4404`) - runs configured readiness check |
 | `GET  /version`                            | `version_payload` (`src/transport.rs:4299`) |
 | `GET  /metrics`                            | served by `serve_metrics` on a **separate listener** when `feature = "metrics"` (`src/metrics.rs:220`) |
-| `GET  /.well-known/oauth-protected-resource` | feature = `oauth`, mounted in `build_app_router` (`src/transport.rs:2347`) |
-| `GET  /.well-known/oauth-authorization-server` | feature = `oauth` proxy, mounted by `install_oauth_proxy_routes` (`src/transport.rs:3436`) |
+| `GET  /.well-known/oauth-protected-resource` | feature = `oauth`, mounted in `build_app_router` (`src/transport.rs:2399`) |
+| `GET  /.well-known/oauth-authorization-server` | feature = `oauth` proxy, mounted by `install_oauth_proxy_routes` (`src/transport.rs:3491`) |
 | `POST /register` (`authorization_server` mode) | `register` (`src/oauth_as.rs:396`) - validates redirect URIs and answers `201` with a sealed per-client `client_id` |
 | `GET  /authorize` (`authorization_server` mode) | `authorize` (`src/oauth_as.rs:492`) - opens the sealed client, checks the exact `redirect_uri` and S256 PKCE, serves the consent page (or skips it on remembered consent) |
 | `POST /oauth/consent` (`authorization_server` mode) | `consent` (`src/oauth_as.rs:670`) - CSRF-checked approve/deny; approval sets the state and consent cookies and redirects to the upstream IdP |
@@ -215,7 +215,7 @@ Authenticated endpoints:
 | `POST /mcp`         | Yes  | The MCP JSON-RPC endpoint (Streamable HTTP)    |
 | `GET  /mcp`         | Yes  | SSE stream for server → client messages        |
 | `*    /admin/*`     | Yes (role: `admin`) | `AdminConfig` in `src/admin.rs:50`            |
-| `POST /authorize`, `/token`, `/register`, `/introspect`, `/revoke` | feature `oauth` proxy via `build_oauth_admin_router` | `src/transport.rs:3585` |
+| `POST /authorize`, `/token`, `/register`, `/introspect`, `/revoke` | feature `oauth` proxy via `build_oauth_admin_router` | `src/transport.rs:3640` |
 
 ---
 
@@ -233,7 +233,7 @@ Top-level builder-style config consumed by `serve()`. Holds:
 - optional readiness check callback (`Arc<dyn Fn() -> bool + Send + Sync>`)
 - public URL (used in OAuth metadata responses)
 
-### `ReloadHandle` - `src/transport.rs:2019`
+### `ReloadHandle` - `src/transport.rs:2071`
 Returned (optionally) from `serve()` when the consumer needs runtime
 hot-reload. Methods:
 - `try_reload_auth_keys(new_keys)` - validates, then atomically swaps
@@ -319,7 +319,7 @@ Startup-only.
 **File**: `src/auth.rs` (~600 LOC).
 
 ### Construction
-`AuthState` is built inside `build_app_router()` at `src/transport.rs:2347`. It contains:
+`AuthState` is built inside `build_app_router()` at `src/transport.rs:2399`. It contains:
 - `AuthState::api_keys` hot-swap vector (`src/auth.rs:1762`)
 - mTLS identities: stored **per-connection** on the
   `TlsConnInfo` extension (`src/auth.rs:1448`), read by `auth_middleware` (`src/auth.rs:2782`).
@@ -363,7 +363,7 @@ threaded as `SecretString` from `AuthIdentity.raw_token` through
 2. It extracts CN/SAN as `name`, derives `role` from the configured
    subject→role mapping, and attaches `AuthIdentity { method: Mtls, … }`
    to the **per-connection** extension in `extract_handshake_identity`
-   (`extract_handshake_identity`, `src/transport.rs:3906`).
+   (`extract_handshake_identity`, `src/transport.rs:3961`).
 3. `auth_middleware` reads the identity directly from that connection
    state (`auth_middleware`, `src/auth.rs:2782`); no shared SocketAddr-keyed map is
    consulted, so there is no port-reuse aliasing risk.
@@ -467,7 +467,7 @@ replacement for `TcpListener`.
 Lifecycle (concurrent-acceptor design, since the 1.8.1 review fixes):
 1. `TlsListener::new(...)` reads PEM cert + key, builds a `rustls::ServerConfig`,
    optionally wraps with mTLS verification using configured root CAs, then
-   spawns `run_tls_acceptor` (`src/transport.rs:3929`) as the dedicated background acceptor task that owns the listener.
+   spawns `run_tls_acceptor` (`src/transport.rs:3984`) as the dedicated background acceptor task that owns the listener.
 2. The acceptor task loops: acquires a permit from a semaphore sized by
    `max_concurrent_tls_handshakes` (default 256 via
    `DEFAULT_MAX_CONCURRENT_TLS_HANDSHAKES`; configurable since 1.9.0 via
@@ -718,7 +718,7 @@ recommended.
 
 ### Optional OAuth 2.1 proxy
 When `oauth.proxy` is configured, rmcp-server-kit mounts thin proxy endpoints under
-the server's own URL via `install_oauth_proxy_routes` (`src/transport.rs:3436`):
+the server's own URL via `install_oauth_proxy_routes` (`src/transport.rs:3491`):
 - `/.well-known/oauth-authorization-server`
 - `/authorize`, `/token`, `/register`, `/introspect`, `/revoke`
 
@@ -738,7 +738,7 @@ refresh tokens to the client. It keeps no server-side state; every
 registration, consent, state cookie, code and refresh wrapper is sealed by
 `Sealer` (`src/oauth_seal.rs:83`) with a key derived per purpose from
 `sealing_secret`. The HTML pages carry their own CSP through
-`PageSecurityHeaders` (`src/transport.rs:4666`). Flows, knobs and Keycloak
+`PageSecurityHeaders` (`src/transport.rs:4721`). Flows, knobs and Keycloak
 settings for both modes are in [`OAUTH_PROXY.md`](OAUTH_PROXY.md).
 
 ### Hardening defaults
@@ -887,7 +887,7 @@ Two ArcSwaps power runtime reconfiguration:
 | State            | Type                           | Defined at                  |
 |------------------|---------------------------------|-----------------------------|
 | API keys         | `AuthState` `api_keys` slot     | `src/auth.rs:1762`          |
-| RBAC policy      | `ReloadHandle` `rbac` slot      | `src/transport.rs:2023`      |
+| RBAC policy      | `ReloadHandle` `rbac` slot      | `src/transport.rs:2075`      |
 
 Procedure:
 1. Consumer calls `reload_handle.try_reload_auth_keys(new_keys)` (fallible,
@@ -947,8 +947,8 @@ retiring.
 
 **TOML** - the deserializable sections:
 
-- `ServerConfig` - `src/config.rs:487`
-- `ObservabilityConfig` - `src/config.rs:1807`
+- `ServerConfig` - `src/config.rs:499`
+- `ObservabilityConfig` - `src/config.rs:1844`
 - `SecurityHeadersConfig` - `src/transport.rs:293`
 - `AuthConfig`, `MtlsConfig`, `RateLimitConfig` - `src/auth.rs`
 - `RbacConfig` - `src/rbac.rs`
@@ -959,7 +959,7 @@ sections into its own root type. `[server]`, `[rbac]` and `[observability]`
 are a convention from [`docs/GUIDE.md`](GUIDE.md), not a type.
 
 `ServerConfig` was schema-only until 3.4.0 - nothing in the crate consumed it.
-`ServerConfig::apply_to_mcp_config` (`src/config.rs:1061`) is the bridge that
+`ServerConfig::apply_to_mcp_config` (`src/config.rs:1096`) is the bridge that
 makes it reachable. It uses **replacement semantics**: authoritative for every
 bridgeable transport field, with `None`/`false` clearing whatever the base
 held. Only the runtime-only fields above survive from the base. It is fallible
@@ -1086,12 +1086,12 @@ These are **non-negotiable**. Breaking any of them is a security regression.
 
 1. **Origin check runs before auth.** Reordering would allow unauthenticated
    browser-origin requests to hit the auth path and amplify timing oracles.
-Wired in `build_app_router` (`src/transport.rs:2347`);
-`origin_check_middleware` is at `src/transport.rs:5379`.
+Wired in `build_app_router` (`src/transport.rs:2399`);
+`origin_check_middleware` is at `src/transport.rs:5434`.
 
 2. **Auth runs before RBAC.** Without an `AuthIdentity`, RBAC has no role
    to evaluate. `build_app_router` installs the auth layer before the RBAC
-   layer (`build_app_router`, `src/transport.rs:2347`).
+   layer (`build_app_router`, `src/transport.rs:2399`).
 
 3. **Per-IP rate limiter sits inside auth.** Anonymous IPs cannot
    exhaust the rate-limit budget for authenticated callers.
