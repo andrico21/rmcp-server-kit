@@ -470,7 +470,11 @@ impl<H: ServerHandler> ServerHandler for RbacContextHandler<H> {
 #[cfg(test)]
 mod tests {
     use alloc::collections::VecDeque;
-    use core::{convert::Infallible, future::pending, time::Duration};
+    use core::{
+        convert::Infallible,
+        future::{pending, ready},
+        time::Duration,
+    };
     use std::sync::{Mutex, PoisonError};
 
     use anyhow::Context as _;
@@ -491,7 +495,11 @@ mod tests {
         service::serve_directly,
         transport::Transport,
     };
-    use tokio::{sync::Notify, task::yield_now, time::timeout};
+    use tokio::{
+        sync::Notify,
+        task::yield_now,
+        time::{sleep, timeout},
+    };
 
     use super::*;
     use crate::{
@@ -1226,6 +1234,93 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct TaskCancelProbe {
+        seen: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl ServerHandler for TaskCancelProbe {
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(probe_capabilities())
+        }
+
+        async fn get_task(
+            &self,
+            _request: GetTaskParams,
+            context: RequestContext<RoleServer>,
+        ) -> Result<GetTaskResult, ErrorData> {
+            self.seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push("get_task");
+            let event = match timeout(Duration::from_secs(10), context.ct.cancelled()).await {
+                Ok(()) => "get_task_cancelled",
+                Err(_) => "get_task_timeout",
+            };
+            self.seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(event);
+            Err(ErrorData::internal_error("cancelled", None))
+        }
+
+        fn cancel_task(
+            &self,
+            _request: CancelTaskParams,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<(), ErrorData>> + Send + '_ {
+            self.seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push("cancel_task");
+            ready(Ok(()))
+        }
+    }
+
+    /// Pins request cancellation independently of EOF and task cancellation.
+    #[tokio::test]
+    async fn cancelling_a_tasks_get_request_never_cancels_the_task() -> anyhow::Result<()> {
+        // Given: a never-EOF transport carries a task-status request.
+        let probe = TaskCancelProbe::default();
+        let mut request: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc":"2.0","id":1_u32,"method":"tasks/get","params":{"taskId":"raw-task"}
+        }))?;
+        attach_meta(&mut request, coverage_meta())?;
+        attach_identity(&mut request, viewer())?;
+        let notification: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1_u32}
+        }))?;
+        let transport = OpenTransport {
+            inbound: VecDeque::from(vec![request, notification]),
+            outbound: Arc::new(Mutex::new(Vec::new())),
+        };
+        let handler = RbacContextHandler::new(probe.clone(), viewer_policy(), false);
+        let running = serve_directly::<RoleServer, _, _, Infallible, _>(handler, transport, None);
+        // When: the client cancels request 1, not the underlying task.
+        // Then: the handler sees cancellation before service shutdown.
+        let observed = timeout(Duration::from_secs(11), async {
+            while probe
+                .seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len()
+                < 2
+            {
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        let snapshot = probe
+            .seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let _quit = running.cancel().await;
+        observed.with_context(|| format!("missing get_task_cancelled; log={snapshot:?}"))?;
+        assert_eq!(snapshot, vec!["get_task", "get_task_cancelled"]);
+        Ok(())
     }
 
     /// Like [`InMemoryTransport`] but never reports end-of-stream, so a

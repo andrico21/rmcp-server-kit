@@ -994,10 +994,14 @@ fn serialized_size(result: &CallToolResult, max: Option<usize>) -> SizeMeasure {
 #[cfg(test)]
 mod tests {
     use core::{
+        future::ready,
         sync::atomic::{AtomicUsize, Ordering},
         time::Duration,
     };
-    use std::{sync::Mutex, time::Instant};
+    use std::{
+        sync::{Mutex, PoisonError},
+        time::Instant,
+    };
 
     use anyhow::Context as _;
     use rmcp::{
@@ -1283,6 +1287,86 @@ mod tests {
     #[derive(Clone, Default)]
     struct ForwardingProbe {
         seen: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    #[derive(Clone, Default)]
+    struct TaskCancelProbe {
+        seen: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl ServerHandler for TaskCancelProbe {
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(probe_capabilities())
+        }
+
+        async fn get_task(
+            &self,
+            _request: GetTaskParams,
+            context: RequestContext<RoleServer>,
+        ) -> Result<GetTaskResult, ErrorData> {
+            self.seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push("get_task");
+            let event = match timeout(Duration::from_secs(10), context.ct.cancelled()).await {
+                Ok(()) => "get_task_cancelled",
+                Err(_) => "get_task_timeout",
+            };
+            self.seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(event);
+            Err(ErrorData::internal_error("cancelled", None))
+        }
+
+        fn cancel_task(
+            &self,
+            _request: CancelTaskParams,
+            _context: RequestContext<RoleServer>,
+        ) -> impl Future<Output = Result<(), ErrorData>> + Send + '_ {
+            self.seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push("cancel_task");
+            ready(Ok(()))
+        }
+    }
+
+    /// Pins that cancelling a task-status request never invokes task cancellation.
+    #[tokio::test]
+    async fn cancelling_a_tasks_get_request_never_cancels_the_task() -> anyhow::Result<()> {
+        // Given: an open duplex service holds a pending tasks/get request.
+        let probe = TaskCancelProbe::default();
+        let (_reader, mut writer, service) = forwarding_transport(probe.clone(), coverage_hooks());
+        send_notification(
+            &mut writer,
+            coverage_request(1, "tasks/get", json!({"taskId":"raw-task"}))?,
+        )
+        .await?;
+        // When: the client cancels request 1, not the underlying task.
+        send_notification(&mut writer, json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1_u32}})).await?;
+        // Then: cancellation is observed without any cancel_task dispatch.
+        let observed = timeout(Duration::from_secs(11), async {
+            while probe
+                .seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len()
+                < 2
+            {
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        let snapshot = probe
+            .seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let _quit = service.cancel().await;
+        observed.with_context(|| format!("missing get_task_cancelled; log={snapshot:?}"))?;
+        assert_eq!(snapshot, vec!["get_task", "get_task_cancelled"]);
+        Ok(())
     }
 
     impl ForwardingProbe {
