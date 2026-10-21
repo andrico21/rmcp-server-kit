@@ -5971,6 +5971,219 @@ mod tests {
         Ok(session_id)
     }
 
+    // ==========================================================================
+    // SSE priming event (issue #69)
+    // ==========================================================================
+
+    /// Read an SSE response body to its end and return its non-empty lines in
+    /// order. Each SSE event is written as `data:`, then `id:`, then `retry:`
+    /// lines, so a priming event yields a `data:` line with no payload.
+    async fn sse_lines(resp: reqwest::Response) -> anyhow::Result<Vec<String>> {
+        let body = resp.text().await.context("read SSE response body")?;
+        Ok(body
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+
+    /// Client whose every request (body read included) is bounded by 30 s.
+    fn sse_client() -> anyhow::Result<reqwest::Client> {
+        Ok(reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()?)
+    }
+
+    /// Send a 2025-06-18 `initialize` and return the SSE lines of its
+    /// response plus the negotiated `Mcp-Session-Id`.
+    async fn sse_initialize(
+        client: &reqwest::Client,
+        base: &str,
+    ) -> anyhow::Result<(Vec<String>, String)> {
+        let resp = client
+            .post(format!("{base}/mcp"))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1_u32,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": { "name": "e2e", "version": "0.0.1" }
+                    }
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .context("initialize request")?;
+        anyhow::ensure!(resp.status() == 200, "initialize must succeed");
+        let session_id = resp
+            .headers()
+            .get("mcp-session-id")
+            .context("server must return Mcp-Session-Id")?
+            .to_str()
+            .context("session id is ascii")?
+            .to_owned();
+        Ok((sse_lines(resp).await?, session_id))
+    }
+
+    /// Complete the handshake on `session_id` with `notifications/initialized`,
+    /// then send one in-session `tools/call` and return its SSE lines.
+    /// `TestHandler` answers the call with an error, still on an SSE stream.
+    async fn sse_in_session_call(
+        client: &reqwest::Client,
+        base: &str,
+        session_id: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let initialized = client
+            .post(format!("{base}/mcp"))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-session-id", session_id)
+            .body(
+                serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
+                    .to_string(),
+            )
+            .send()
+            .await
+            .context("initialized notification")?;
+        anyhow::ensure!(
+            initialized.status() == 202,
+            "initialized notification must be accepted, got {}",
+            initialized.status()
+        );
+        let resp = client
+            .post(format!("{base}/mcp"))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-session-id", session_id)
+            .body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2_u32,
+                    "method": "tools/call",
+                    "params": { "name": "any_tool", "arguments": {} }
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .context("in-session tools/call")?;
+        anyhow::ensure!(resp.status() == 200, "in-session call must stream");
+        sse_lines(resp).await
+    }
+
+    /// Require a stream without a priming event: its first line carries the
+    /// JSON payload and no line carries a `retry:` hint.
+    fn ensure_unprimed(lines: &[String], stream: &str) -> anyhow::Result<()> {
+        let first = lines.first().map_or("", String::as_str);
+        anyhow::ensure!(
+            first.starts_with("data: {"),
+            "{stream} stream must start with a JSON data line, got {lines:?}"
+        );
+        anyhow::ensure!(
+            !lines.iter().any(|line| line.starts_with("retry:")),
+            "{stream} stream must carry no retry hint, got {lines:?}"
+        );
+        Ok(())
+    }
+
+    /// Require a primed stream: some line equals `retry: <millis>` and the
+    /// first line is not the JSON payload.
+    fn ensure_primed(lines: &[String], stream: &str, millis: u32) -> anyhow::Result<()> {
+        let hint = format!("retry: {millis}");
+        anyhow::ensure!(
+            lines.contains(&hint),
+            "{stream} stream must carry `{hint}`, got {lines:?}"
+        );
+        anyhow::ensure!(
+            !lines
+                .first()
+                .is_some_and(|line| line.starts_with("data: {")),
+            "{stream} stream must open with the priming event, got {lines:?}"
+        );
+        Ok(())
+    }
+
+    /// Pins that `disable_sse_priming()` removes the priming event from both
+    /// the initialize stream and an in-session request stream (issue #69).
+    #[tokio::test]
+    async fn sse_priming_disabled_streams_start_with_data() -> anyhow::Result<()> {
+        // Given: a server built with priming disabled.
+        let server = spawn_server(config_on_port(0).disable_sse_priming()).await?;
+        let client = sse_client()?;
+
+        // When: a client initializes and then calls a tool on the session.
+        let (init_lines, session_id) = sse_initialize(&client, &server.base).await?;
+        let call_lines = sse_in_session_call(&client, &server.base, &session_id).await?;
+
+        // Then: both streams start with the JSON payload and carry no retry hint.
+        ensure_unprimed(&init_lines, "initialize")?;
+        ensure_unprimed(&call_lines, "in-session")
+    }
+
+    /// Pins that the default configuration primes the initialize stream and
+    /// in-session request streams with a `retry: 3000` hint.
+    #[tokio::test]
+    async fn sse_priming_default_sends_retry_hint() -> anyhow::Result<()> {
+        // Given: a server with the default SSE settings.
+        let server = spawn_server(config_on_port(0)).await?;
+        let client = sse_client()?;
+
+        // When: a client initializes and then calls a tool on the session.
+        let (init_lines, session_id) = sse_initialize(&client, &server.base).await?;
+        let call_lines = sse_in_session_call(&client, &server.base, &session_id).await?;
+
+        // Then: both streams open with the priming event carrying 3000 ms.
+        ensure_primed(&init_lines, "initialize", 3000)?;
+        ensure_primed(&call_lines, "in-session", 3000)
+    }
+
+    /// Pins that `with_sse_retry` replaces the default hint on the wire.
+    #[tokio::test]
+    async fn sse_retry_override_changes_the_hint() -> anyhow::Result<()> {
+        // Given: a server whose retry hint is 1500 ms.
+        let server =
+            spawn_server(config_on_port(0).with_sse_retry(Duration::from_millis(1500))).await?;
+        let client = sse_client()?;
+
+        // When: a client initializes.
+        let (init_lines, _session_id) = sse_initialize(&client, &server.base).await?;
+
+        // Then: the stream carries the override and not the default.
+        ensure_primed(&init_lines, "initialize", 1500)?;
+        anyhow::ensure!(
+            !init_lines.iter().any(|line| line == "retry: 3000"),
+            "the default hint must be replaced, got {init_lines:?}"
+        );
+        Ok(())
+    }
+
+    /// Pins that `[server] sse_priming_enabled = false` in TOML reaches the
+    /// listener and removes the priming event.
+    #[tokio::test]
+    async fn toml_sse_priming_enabled_false_disables_priming() -> anyhow::Result<()> {
+        // Given: a server bridged from TOML with priming disabled.
+        let cfg = toml_backed_config(
+            "
+                [server]
+                sse_priming_enabled = false
+            ",
+        )?;
+        let server = spawn_server(cfg).await?;
+        let client = sse_client()?;
+
+        // When: a client initializes.
+        let (init_lines, _session_id) = sse_initialize(&client, &server.base).await?;
+
+        // Then: the stream starts with the JSON payload and has no retry hint.
+        ensure_unprimed(&init_lines, "initialize")
+    }
+
     /// A tool call still running when `shutdown_timeout` expires must have its
     /// response stream terminated by the force-exit path.
     ///
