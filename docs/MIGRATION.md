@@ -15,21 +15,42 @@ TOML, environment or builder configuration keeps its 3.20.0 wire behaviour
 (status codes, headers, bodies, routes, redirects, upstream requests and
 token acceptance) for this crate's own code; rmcp-owned behaviour follows
 your resolved rmcp version. New validation rules only fire when a new knob
-is set.
+is set. The one exception is CORS: with allowed origins configured (or
+derived from `public_url`), OPTIONS responses and responses to an allowed
+`Origin` carry the new CORS headers described below; responses to other
+requests without an `Origin` header are unchanged.
 
 No action required for the SSE priming opt-out; the default stays on.
 
-The one visible difference for an unchanged configuration is a new startup
+The visible differences for an unchanged configuration are a new startup
 WARN line, logged once when OAuth is configured and `public_url` is not set:
 
 ```text
 OAuth is configured without public_url: Protected Resource Metadata advertises a resource derived from the bind address and the 401 challenge carries a relative resource_metadata URL; set server.public_url (env RMCP_SERVER_KIT__SERVER__PUBLIC_URL)
 ```
 
-The warning describes what 3.20.0 already did; nothing changes on the wire.
+The warning describes what 3.20.0 already did; the warning itself changes
+nothing on the wire.
 Set `server.public_url` (or `McpServerConfig::with_public_url`) to the URL
 clients actually reach to silence it, which is also what every opt-in below
 that depends on this server's own URL needs.
+
+The second difference is CORS for browser MCP clients (#71). It applies only
+when the server has allowed origins, configured in `allowed_origins` or
+derived from `public_url`, which is exactly when 3.20.0 already installed its
+CORS layer. Preflights now allow `DELETE` as well as `GET`, `POST` and
+`OPTIONS`, and grant the MCP request headers (`Content-Type`,
+`Authorization`, `Mcp-Session-Id`, `Mcp-Protocol-Version`, `Last-Event-Id`,
+`Mcp-Method`, `Mcp-Name`, any `Mcp-Param-*`) instead of only `Content-Type`
+and `Authorization`. A preflight asking for any other header gets no
+`Access-Control-Allow-Headers`. Responses to an allowed `Origin` also expose
+`Mcp-Session-Id`, `WWW-Authenticate`, `Last-Event-Id` and
+`Mcp-Protocol-Version`. Responses to requests without an `Origin` header,
+other than OPTIONS, are unchanged. There is no opt-out because none is
+needed: the origin allowlist is still the gate, so a disallowed origin is
+rejected before CORS runs, and the request-header list is strict, so a
+browser can send nothing beyond the MCP headers. Details are in
+[GUIDE.md](GUIDE.md#cors-for-browser-mcp-clients).
 
 When at least one opt-in below is enabled the server also logs one INFO
 line, `oauth opt-in features enabled`, with booleans and counts only. Every

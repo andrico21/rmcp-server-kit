@@ -341,6 +341,178 @@ mod tests {
         Ok(())
     }
 
+    /// Send a CORS preflight for `/mcp` from [`ALLOWED`], optionally asking for
+    /// request headers.
+    async fn preflight(
+        base: &str,
+        method: &str,
+        request_headers: Option<&str>,
+    ) -> anyhow::Result<reqwest::Response> {
+        let mut request = reqwest::Client::new()
+            .request(reqwest::Method::OPTIONS, format!("{base}/mcp"))
+            .header("origin", ALLOWED)
+            .header("access-control-request-method", method);
+        if let Some(names) = request_headers {
+            request = request.header("access-control-request-headers", names);
+        }
+        timeout(Duration::from_secs(10), request.send())
+            .await
+            .context("preflight timed out")?
+            .context("preflight request")
+    }
+
+    /// The lowercased, trimmed names listed across every
+    /// `access-control-expose-headers` value of `resp`.
+    fn exposed_names(resp: &reqwest::Response) -> anyhow::Result<Vec<String>> {
+        let mut names = Vec::new();
+        for value in resp.headers().get_all("access-control-expose-headers") {
+            let text = value.to_str().context("expose-headers is ASCII")?;
+            names.extend(
+                text.split(',')
+                    .map(|name| name.trim().to_ascii_lowercase())
+                    .filter(|name| !name.is_empty()),
+            );
+        }
+        Ok(names)
+    }
+
+    /// Pins the browser CORS flow on a real listener.
+    ///
+    /// Preflights grant the MCP request headers and methods, `initialize`
+    /// exposes `mcp-session-id`, an unlisted header is refused, and a request
+    /// without `Origin` is unchanged.
+    #[tokio::test]
+    async fn browser_preflight_and_initialize_expose_the_session_id() -> anyhow::Result<()> {
+        let harness = spawn(base_config().with_allowed_origins([ALLOWED])).await?;
+
+        // (1) The MCP headers, including an `Mcp-Param-*` name, are granted.
+        let sent = "content-type,mcp-protocol-version,mcp-param-region";
+        let granted = preflight(&harness.base, "POST", Some(sent)).await?;
+        assert!(
+            granted.status().is_success(),
+            "preflight must pass, got {}",
+            granted.status()
+        );
+        assert_eq!(
+            granted
+                .headers()
+                .get("access-control-allow-headers")
+                .and_then(|value| value.to_str().ok()),
+            Some(sent),
+            "the allowed request headers must be mirrored"
+        );
+
+        // (2) `DELETE` (session termination) is an allowed method.
+        let delete = preflight(&harness.base, "DELETE", None).await?;
+        let methods = delete
+            .headers()
+            .get("access-control-allow-methods")
+            .and_then(|value| value.to_str().ok())
+            .context("preflight must list the allowed methods")?;
+        assert!(
+            methods
+                .split(',')
+                .any(|method| method.trim().eq_ignore_ascii_case("DELETE")),
+            "DELETE must be allowed, got {methods:?}"
+        );
+
+        // (3) A browser can read the session id from `initialize`.
+        let initialized = timeout(
+            Duration::from_secs(10),
+            mcp_initialize(&harness.base, Some(ALLOWED)),
+        )
+        .await
+        .context("initialize with origin timed out")??;
+        assert_eq!(initialized.status(), 200);
+        assert!(
+            initialized.headers().get("mcp-session-id").is_some(),
+            "initialize must return a session id"
+        );
+        let exposed = exposed_names(&initialized)?;
+        assert!(
+            exposed.iter().any(|name| name == "mcp-session-id"),
+            "mcp-session-id must be exposed to the browser, got {exposed:?}"
+        );
+
+        // (4) A header outside the allowlist gets no grant.
+        let refused = preflight(&harness.base, "POST", Some("x-evil")).await?;
+        assert!(
+            refused
+                .headers()
+                .get("access-control-allow-headers")
+                .is_none(),
+            "an unlisted request header must not be granted"
+        );
+
+        // (5) A non-browser client (no `Origin`) sees the 3.20.0 headers.
+        let plain = timeout(Duration::from_secs(10), mcp_initialize(&harness.base, None))
+            .await
+            .context("initialize without origin timed out")??;
+        assert_eq!(plain.status(), 200);
+        assert!(
+            plain
+                .headers()
+                .get("access-control-expose-headers")
+                .is_none(),
+            "a request without Origin must not get expose-headers"
+        );
+        let vary = plain
+            .headers()
+            .get_all("vary")
+            .iter()
+            .map(|value| value.to_str().context("vary is ASCII"))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        assert_eq!(vary, ["origin"], "vary must stay exactly `origin`");
+        Ok(())
+    }
+
+    /// Pins that a browser on an allowed origin can read the `401` challenge:
+    /// the CORS layer wraps auth, so the rejection carries the CORS grant and
+    /// exposes `www-authenticate`.
+    #[tokio::test]
+    async fn browser_gets_the_401_challenge_through_cors() -> anyhow::Result<()> {
+        let (_, hash) = generate_api_key().context("generate api key")?;
+        let config =
+            base_config()
+                .with_allowed_origins([ALLOWED])
+                .with_auth(AuthConfig::with_keys(vec![ApiKeyEntry::new(
+                    "k", hash, "r",
+                )]));
+        let harness = spawn(config).await?;
+
+        let resp = timeout(
+            Duration::from_secs(10),
+            reqwest::Client::new()
+                .post(format!("{}/mcp", harness.base))
+                .header("origin", ALLOWED)
+                .header("content-type", "application/json")
+                .body("{}")
+                .send(),
+        )
+        .await
+        .context("unauthenticated request timed out")?
+        .context("unauthenticated request")?;
+
+        assert_eq!(resp.status(), 401);
+        assert_eq!(
+            resp.headers()
+                .get("access-control-allow-origin")
+                .and_then(|value| value.to_str().ok()),
+            Some(ALLOWED),
+            "the 401 must carry the CORS grant"
+        );
+        let exposed = exposed_names(&resp)?;
+        assert!(
+            exposed.iter().any(|name| name == "www-authenticate"),
+            "www-authenticate must be exposed to the browser, got {exposed:?}"
+        );
+        assert!(
+            resp.headers().get("www-authenticate").is_some(),
+            "the 401 must carry the challenge"
+        );
+        Ok(())
+    }
+
     /// Pins that `validate` rejects origin entries that can never match.
     #[test]
     fn config_validation_rejects_entries_that_cannot_match() -> anyhow::Result<()> {

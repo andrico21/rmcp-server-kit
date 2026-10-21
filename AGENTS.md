@@ -241,8 +241,8 @@ consumer applications and `examples/`.
 | Entry                                    | File                                                                  | Notes                                                                                                  |
 |------------------------------------------|----------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------|
 | Crate root / public API                  | [`src/lib.rs`](src/lib.rs)                                            | Re-exports all public modules                                                                          |
-| **Server entry (HTTP)**                  | [`src/transport.rs`](src/transport.rs) - `serve()` (~line 3160)        | The function consumers call. Wires rmcp + axum + middleware + TLS + admin + metrics                    |
-| Server entry (stdio)                     | [`src/transport.rs`](src/transport.rs) - `serve_stdio()` (~line 5794) | For desktop/IDE clients. **Bypasses auth/RBAC/TLS** - use only for local subprocess MCP                |
+| **Server entry (HTTP)**                  | [`src/transport.rs`](src/transport.rs) - `serve()` (~line 3243)        | The function consumers call. Wires rmcp + axum + middleware + TLS + admin + metrics                    |
+| Server entry (stdio)                     | [`src/transport.rs`](src/transport.rs) - `serve_stdio()` (~line 5874) | For desktop/IDE clients. **Bypasses auth/RBAC/TLS** - use only for local subprocess MCP                |
 | Config builder                           | [`src/transport.rs`](src/transport.rs) - `McpServerConfig::new` (`src/transport.rs:990`) | Builder-style config struct                                                                       |
 | Hot-reload handle                        | [`src/transport.rs`](src/transport.rs) - `ReloadHandle` (~line 2071)   | `try_reload_auth_keys` / `reload_auth_keys` / `reload_rbac` for runtime reconfig without restart      |
 | Runnable example                         | [`examples/minimal_server.rs`](examples/minimal_server.rs)            | Smallest possible consumer of `serve()`                                                                |
@@ -254,7 +254,7 @@ consumer applications and `examples/`.
 
 ```
                    ┌──────────────────────────────────┐
-   HTTP request ─► │  TlsListener  (TLS / mTLS)       │  `TlsListener` src/transport.rs:3838
+   HTTP request ─► │  TlsListener  (TLS / mTLS)       │  `TlsListener` src/transport.rs:3973
                    └────────────────┬─────────────────┘
                                     ▼
                    ┌──────────────────────────────────┐
@@ -272,7 +272,7 @@ consumer applications and `examples/`.
         (executed top-to-bottom on request)            │
                                                        │
         0. Security headers - outermost, response-only decoration; pass-through on requests
-        1. Origin check       `origin_check_middleware` src/transport.rs:5434    │  spec: MCP origin validation
+        1. Origin check       `origin_check_middleware` src/transport.rs:5514    │  spec: MCP origin validation
            Logs only the requests it rejects.
         2. Peer-addr normalize (normalize_peer_addr_middleware) │  mirrors TLS peer into ConnectInfo<SocketAddr> + public PeerAddr (both branches)
         2b. Request log (request_log_middleware): DEBUG `incoming request` / `request completed`, skips request_log_exclude_paths, client fields per [server.log_context] knobs
@@ -378,7 +378,7 @@ The core's current-Rust idioms (for example `Vec::push_mut` /
 |------------------------------------------------|--------------------------------------------------------|
 | Server entry / router / middleware order       | `src/transport.rs` - `serve()` and surrounding helpers |
 | API key authentication                         | `src/auth.rs` - `AuthState`, `ApiKeyEntry`, `auth_middleware` |
-| mTLS identity extraction                       | `src/transport.rs` - `extract_mtls_identity` call site (near `run_tls_acceptor`, `src/transport.rs:3984`)   |
+| mTLS identity extraction                       | `src/transport.rs` - `extract_mtls_identity` call site (near `run_tls_acceptor`, `src/transport.rs:4064`)   |
 | mTLS CRL revocation (CDP-driven)               | `src/mtls_revocation.rs` - `CrlSet`, `DynamicClientCertVerifier`, `bootstrap_fetch`, `run_crl_refresher` |
 | OAuth JWT validation / JWKS cache              | `src/oauth.rs` - `JwksCache`, feature-gated           |
 | OAuth `401` scope hint / bare missing-credential challenge | `src/auth.rs` - `ChallengeConfig`, `build_www_authenticate_value`; knobs `OAuthConfig::challenge_scopes`, `omit_error_on_missing_credential` |
@@ -405,7 +405,7 @@ The core's current-Rust idioms (for example `Vec::push_mut` /
 | Security-header TOML controls                  | `src/transport.rs` - `SecurityHeadersConfig`; `src/config.rs` - `ServerConfig::security_headers` |
 | Error type → HTTP status mapping               | `src/error.rs` - `RmcpServerKitError::into_response`           |
 | Origin / security headers / CORS               | `src/transport.rs` - `origin_check_middleware`, `security_headers_middleware` |
-| Graceful shutdown (Ctrl-C / SIGTERM)           | `src/transport.rs` - `shutdown_signal()` (`src/transport.rs:4427`) |
+| Graceful shutdown (Ctrl-C / SIGTERM)           | `src/transport.rs` - `shutdown_signal()` (`src/transport.rs:4507`) |
 | Hot-reload of keys / RBAC                      | `src/transport.rs` - `ReloadHandle` (~line 2071)       |
 | Environment variable override mapping          | `src/config.rs` - `ServerConfig::apply_env_overrides`, `ObservabilityConfig::apply_env_overrides`; `src/rbac.rs` - `RbacConfig::apply_env_overrides` |
 | `rmcp` / `rmcp-macros` version bump in `Cargo.toml` / `Cargo.lock` | `docs/RMCP_UPGRADE_CHECKLIST.md` - the checks to run; `tests/integration/delegation_guard.rs` - the trait-surface guard |
