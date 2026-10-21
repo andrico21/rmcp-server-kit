@@ -624,10 +624,12 @@ pub struct ServerConfig {
     /// Default: 15 seconds.
     #[serde(default = "default_sse_keep_alive")]
     pub sse_keep_alive: String,
-    /// Open every SSE response stream with a priming event (`id:` +
-    /// `retry:` with empty `data:`), per MCP 2025-11-25 resumability. Set
-    /// `false` for clients whose SSE parser requires the stream to start
-    /// with `data:`, such as AWS Bedrock `AgentCore`. Default: true.
+    /// Send the SSE priming event (`id:` + `retry:` with empty `data:`), per
+    /// MCP 2025-11-25 resumability. rmcp sends it on every legacy-session
+    /// stream, and on a 2026-07-28 stateless stream only when an event store
+    /// is configured. Set `false` for clients whose SSE parser requires the
+    /// stream to start with `data:`, such as AWS Bedrock `AgentCore`.
+    /// Default: true.
     #[serde(default = "default_sse_priming_enabled")]
     pub sse_priming_enabled: bool,
     /// Reconnect hint carried by the SSE priming event, as a humantime
@@ -5759,20 +5761,25 @@ client_ip = false
 
     #[test]
     /// Pins that TOML retry hints rmcp would write as `retry: 0` are rejected,
-    /// naming `server.sse_retry`.
+    /// naming `server.sse_retry`, with priming on and with
+    /// `sse_priming_enabled = false`, so turning priming back on can never
+    /// make a running config invalid.
     fn sse_retry_toml_under_one_millisecond_rejected() -> anyhow::Result<()> {
-        for value in ["999us", "0s"] {
-            let cfg = ServerConfig {
-                sse_retry: value.into(),
-                ..ServerConfig::default()
-            };
-            let Err(err) = validate_server_config(&cfg) else {
-                anyhow::bail!("sse_retry = {value:?} must be rejected");
-            };
-            anyhow::ensure!(
-                err.to_string().contains("server.sse_retry"),
-                "error for {value:?} must name server.sse_retry: {err}"
-            );
+        for priming in [true, false] {
+            for value in ["999us", "0s"] {
+                let cfg = ServerConfig {
+                    sse_priming_enabled: priming,
+                    sse_retry: value.into(),
+                    ..ServerConfig::default()
+                };
+                let Err(err) = validate_server_config(&cfg) else {
+                    anyhow::bail!("sse_retry = {value:?} with priming {priming} must be rejected");
+                };
+                anyhow::ensure!(
+                    err.to_string().contains("server.sse_retry"),
+                    "error for {value:?} with priming {priming} must name server.sse_retry: {err}"
+                );
+            }
         }
         Ok(())
     }
